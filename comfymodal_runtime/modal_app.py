@@ -301,12 +301,12 @@ _RESIDENCY_DIAGNOSTICS_ENABLED: bool = (
 _V2_FULL_TRACE_ENABLED: bool = (
     os.environ.get("COMFYMODAL_V2_FULL_TRACE", "") == "1"
 )
-# ── V2 PromptExecutor CPU contention profiler gate ────────────────────
-# Inert when COMFYMODAL_V2_EXEC_PROFILE != '1'.
-_V2_EXEC_PROFILE: bool = (
-    os.environ.get("COMFYMODAL_V2_EXEC_PROFILE", "") == "1"
+# ── CPU isolation diagnostic gate ─────────────────────────────────────
+# Inert when COMFYMODAL_V2_CPU_ISOLATION != '1'.
+_V2_CPU_ISOLATION: bool = (
+    os.environ.get("COMFYMODAL_V2_CPU_ISOLATION", "") == "1"
 )
-_V2_EXEC_PROFILE_BASE = "/tmp/v2-exec-profile"
+
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
@@ -1413,15 +1413,6 @@ def _finalize_full_trace(
                 f"trace_id={_trace_id} error_type=ReportError",
                 flush=True,
             )
-        # ── Include v2 exec profile files in the bundle ──
-        _exec_profile_dir = Path(_V2_EXEC_PROFILE_BASE) / request_id
-        if _exec_profile_dir.is_dir():
-            _dest = Path(session.base_dir) / "raw" / "v2-exec-profile"
-            _dest.mkdir(parents=True, exist_ok=True)
-            import shutil as _shutil
-            for _f in _exec_profile_dir.iterdir():
-                if _f.is_file():
-                    _shutil.copy2(str(_f), str(_dest / _f.name))
         # ── 8. Package bundle (not traced) ──
         _bundle = _build_full_trace_bundle(session)
         if _bundle is None:
@@ -1876,6 +1867,7 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_PROFILE_VOLUME": os.environ.get(
             "COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles"
         ),
+        "COMFYMODAL_V2_CPU_ISOLATION": os.environ.get("COMFYMODAL_V2_CPU_ISOLATION", "0"),
     }
     memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
     if memory_mb is not None:
@@ -2020,8 +2012,6 @@ def _reference_image() -> Any:
         # Install viztracer before add_local_python_source when full-trace is enabled
         if _V2_FULL_TRACE_ENABLED:
             image = image.pip_install("viztracer==1.1.1")
-        if _V2_EXEC_PROFILE:
-            image = image.pip_install("pyinstrument>=4.0")
         for module_name in V2_SOURCE_MODULES:
             image = image.add_local_python_source(module_name)
         return image
@@ -6769,6 +6759,19 @@ class ModalRuntimeEntrypoint:
                                     _milestones["first_executing_node"] = _node_str
                                     _milestones["first_executing_node_class"] = _class_node
                                     _milestones["first_executing_node_ns"] = _event_ns
+                                    # CPU isolation: executor_cache_and_dependency_setup ended
+                                    if _V2_CPU_ISOLATION:
+                                        print(
+                                            f"[v2.cpu_isolation] marker=ended operation=executor_cache_and_dependency_setup "
+                                            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                                            flush=True,
+                                        )
+                                        time.sleep(5)
+                                        print(
+                                            f"[v2.cpu_isolation] marker=after operation=executor_cache_and_dependency_setup "
+                                            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                                            flush=True,
+                                        )
                                 # First model-loader node: *Loader, Checkpoint, UNETLoader,
                                 # VAELoader, CLIPLoader/DualCLIPLoader/LoraLoader; exclude CLIPTextEncode
                                 _class_lower = _class_node.lower()
@@ -6943,48 +6946,19 @@ class ModalRuntimeEntrypoint:
                     flush=True,
                 )
 
-            # ── V2 PromptExecutor CPU contention profiler ──
-            if _V2_EXEC_PROFILE:
-                _profile_request_id = str(context.request_id)
-                _profile_cpu = os.cpu_count()
-                try:
-                    _profile_affinity = len(os.sched_getaffinity(0))
-                except Exception:
-                    _profile_affinity = -1
-                import torch as _torch
-                _profile_intra = _torch.get_num_threads() if hasattr(_torch, "get_num_threads") else -1
-                _profile_inter = _torch.get_num_interop_threads() if hasattr(_torch, "get_num_interop_threads") else -1
-                _profile_tid = threading.get_ident()
-                _profile_omp = os.environ.get("OMP_NUM_THREADS", "")
-                _profile_mkl = os.environ.get("MKL_NUM_THREADS", "")
-                _profile_openblas = os.environ.get("OPENBLAS_NUM_THREADS", "")
-                _profile_numexpr = os.environ.get("NUMEXPR_NUM_THREADS", "")
+            # ── CPU isolation: executor_cache_and_dependency_setup ──
+            if _V2_CPU_ISOLATION:
                 print(
-                    "[v2.exec_thread_config] "
-                    f"os_cpu_count={_profile_cpu} "
-                    f"affinity_count={_profile_affinity} "
-                    f"torch_intraop_threads={_profile_intra} "
-                    f"torch_interop_threads={_profile_inter} "
-                    f"OMP_NUM_THREADS={_profile_omp} "
-                    f"MKL_NUM_THREADS={_profile_mkl} "
-                    f"OPENBLAS_NUM_THREADS={_profile_openblas} "
-                    f"NUMEXPR_NUM_THREADS={_profile_numexpr} "
-                    f"pid={os.getpid()} "
-                    f"python_thread_id={_profile_tid}",
+                    f"[v2.cpu_isolation] marker=before operation=executor_cache_and_dependency_setup "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
                     flush=True,
                 )
-                from pyinstrument import Profiler as _Profiler
-                _profiler = _Profiler(
-                    interval=0.002,
-                    async_mode="enabled",
-                    use_timing_thread=True,
+                await asyncio.sleep(5)
+                print(
+                    f"[v2.cpu_isolation] marker=started operation=executor_cache_and_dependency_setup "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
                 )
-                _profiler.start()
-                _profile_start_ns = time.monotonic_ns()
-            else:
-                _profiler = None
-                _profile_request_id = None
-                _profile_start_ns = None
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -6994,34 +6968,6 @@ class ModalRuntimeEntrypoint:
                     else:
                         executor.execute(**execute_kwargs)
             finally:
-                # ── V2 PromptExecutor CPU contention profiler: stop ──
-                if _V2_EXEC_PROFILE and _profiler is not None:
-                    _profile_wall_ms: float | None = None
-                    _profile_text_path: str | None = None
-                    _profile_html_path: str | None = None
-                    try:
-                        _profiler.stop()
-                        _profile_wall_ms = round((time.monotonic_ns() - _profile_start_ns) / 1_000_000, 3)
-                        _profile_dir = Path(_V2_EXEC_PROFILE_BASE) / _profile_request_id
-                        _profile_dir.mkdir(parents=True, exist_ok=True)
-                        _profile_text_path = str(_profile_dir / "profile.txt")
-                        _profile_html_path = str(_profile_dir / "profile.html")
-                        _profiler.write_html(_profile_html_path)
-                        _text_output = _profiler.output_text(unicode=True, color=False)
-                        with open(_profile_text_path, "w", encoding="utf-8") as _f:
-                            _f.write(_text_output)
-                        print(
-                            f"[v2.exec_profile] status=ok request_id={_profile_request_id} "
-                            f"wall_ms={_profile_wall_ms} text_path={_profile_text_path} "
-                            f"html_path={_profile_html_path}",
-                            flush=True,
-                        )
-                    except Exception as _profile_exc:
-                        print(
-                            f"[v2.exec_profile] status=error request_id={_profile_request_id} "
-                            f"error={type(_profile_exc).__name__}:{_profile_exc}",
-                            flush=True,
-                        )
                 # ── Torch profiler: stop on SAME PromptExecutor thread ──
                 if _ft_torch_started:
                     try:
@@ -7817,7 +7763,31 @@ class ModalRuntimeEntrypoint:
 
         async def seeded_set_prompt(*args: Any, **kwargs: Any) -> Any:
             # Let set_prompt initialize cache keys
+            if _V2_CPU_ISOLATION:
+                print(
+                    f"[v2.cpu_isolation] marker=before operation=executor_set_prompt "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+                await asyncio.sleep(5)
+                print(
+                    f"[v2.cpu_isolation] marker=started operation=executor_set_prompt "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
             result = await original_set_prompt(*args, **kwargs)
+            if _V2_CPU_ISOLATION:
+                print(
+                    f"[v2.cpu_isolation] marker=ended operation=executor_set_prompt "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+                await asyncio.sleep(5)
+                print(
+                    f"[v2.cpu_isolation] marker=after operation=executor_set_prompt "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
             trace.emit(
                 "executor_seed_apply_start",
                 phase="execution",
