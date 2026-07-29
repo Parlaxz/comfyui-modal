@@ -211,6 +211,10 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.memory, 24576)
 
+    def test_default_cpu_is_48(self):
+        spec = ModalRuntimeSpec()
+        self.assertEqual(spec.cpu, 48)
+
     def test_memory_from_env(self):
         os.environ["COMFYMODAL_V2_MEMORY_MB"] = "24576"
         spec = ModalRuntimeSpec()
@@ -747,6 +751,16 @@ class TestAppClsContract(unittest.TestCase):
         """The default return value is exactly the Modal-canonical casing."""
         result = parse_gpu_request()
         self.assertEqual(result, ("RTX-PRO-6000",))
+
+    def test_spec_cloud_default_gcp(self):
+        """ModalRuntimeSpec defaults to cloud='gcp'."""
+        spec = ModalRuntimeSpec()
+        self.assertEqual(spec.cloud, "gcp")
+
+    def test_spec_cpu_default_48(self):
+        """ModalRuntimeSpec defaults to cpu=48."""
+        spec = ModalRuntimeSpec()
+        self.assertEqual(spec.cpu, 48)
 
 
 if __name__ == "__main__":
