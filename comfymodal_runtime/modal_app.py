@@ -6574,6 +6574,11 @@ class ModalRuntimeEntrypoint:
         trace.emit("pregraph_setup_start", phase="execution", metadata={
             "prompt_id": prompt_id,
         })
+        production_enabled = False
+        register_request = None
+        cleanup_request = None
+        cleanup_registry = None
+        pop_outputs = None
         _pregraph_error: str | None = None
         try:
             legacy_options = plan.execution_options.to_legacy_dict()
@@ -6907,6 +6912,20 @@ class ModalRuntimeEntrypoint:
             else:
                 clear_residency_sampler_callback()
             _final_diag: dict[str, Any] | None = None
+            # ── Torch profiler: start on PromptExecutor thread before execution ──
+            _ft_torch_started = False
+            try:
+                _ft_torch = getattr(self, '_full_trace_session', None)
+                if _ft_torch is not None:
+                    _ft_torch.start_torch_profiler()
+                    _ft_torch_started = True
+            except Exception as _ft_torch_start_exc:
+                print(
+                    f"[v2.full_trace] stage=start_torch_profiler "
+                    f"status=error error_type={type(_ft_torch_start_exc).__name__}",
+                    flush=True,
+                )
+
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -6916,6 +6935,19 @@ class ModalRuntimeEntrypoint:
                     else:
                         executor.execute(**execute_kwargs)
             finally:
+                # ── Torch profiler: stop on SAME PromptExecutor thread ──
+                if _ft_torch_started:
+                    try:
+                        _ft_torch = getattr(self, '_full_trace_session', None)
+                        if _ft_torch is not None:
+                            _ft_torch.stop_torch_profiler()
+                    except Exception as _ft_torch_stop_exc:
+                        print(
+                            f"[v2.full_trace] stage=stop_torch_profiler "
+                            f"status=error error_type={type(_ft_torch_stop_exc).__name__}",
+                            flush=True,
+                        )
+
                 _V2_WORKFLOW_HASH.reset(_wf_hash_token)
                 # Clear residency sampler callback (must happen before end_activation_diagnostics)
                 clear_residency_sampler_callback()
@@ -7913,6 +7945,28 @@ class ModalRuntimeEntrypoint:
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        try:
+            async for event in self._run_plan_stream_impl(
+                plan_payload, request_id=request_id, cancelled=cancelled,
+            ):
+                yield event
+        except Exception as exc:
+            yield {
+                "type": "error",
+                "phase": "setup_failed",
+                "message": (
+                    f"run_plan_stream failed: {type(exc).__name__}: {exc}"
+                ),
+                "request_id": request_id or "",
+            }
+
+    async def _run_plan_stream_impl(
+        self,
+        plan_payload: Mapping[str, Any],
+        *,
+        request_id: str = "",
+        cancelled: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         # â”€â”€ TRUE METHOD FIRST LINE (before any identity or trace exists) â”€â”€
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
@@ -8152,16 +8206,10 @@ class ModalRuntimeEntrypoint:
                     flush=True,
                 )
 
-        # Start Torch profiler at first claimed request when COMFYMODAL_V2_FULL_TRACE_TORCH != "0"
-        if _full_trace_claimed:
-            try:
-                _ft.start_torch_profiler()
-            except Exception as _ft_torch_exc:
-                print(
-                    f"[v2.full_trace] stage=start_torch_profiler "
-                    f"status=error error_type={type(_ft_torch_exc).__name__}",
-                    flush=True,
-                )
+        # Torch profiler is now started inside the PromptExecutor wrapper
+        # (see the try/finally around executor.execute below) so that both
+        # start_torch_profiler() and stop_torch_profiler() run on the SAME
+        # PromptExecutor thread, avoiding Kineto thread mismatch + SIGSEGV.
 
         if context.trace is not None:
             _auth_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
