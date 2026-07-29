@@ -28,6 +28,14 @@ import inspect
 import os
 import threading
 import time
+
+# ── CPU isolation diagnostic gate ─────────────────────────────────────
+_V2_CPU_ISOLATION: bool = (
+    os.environ.get("COMFYMODAL_V2_CPU_ISOLATION", "") == "1"
+)
+# Set by _patched_exec_node when sampler node enters; cleared by sampling wrapper
+# after sampling_start to print the sampler_setup ended marker.
+_v2_iso_sampler_setup_active: bool = False
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 
@@ -1685,6 +1693,31 @@ def install_pre_sampler_hooks() -> None:
                 and ("loader" in _class_lower or "checkpoint" in _class_lower)
             )
 
+            # ── CPU isolation: classify per-node operations ──
+            _iso_op: str | None = None
+            if _V2_CPU_ISOLATION:
+                if "vae" == _class_lower.strip() and "decode" in _class_lower:
+                    _iso_op = "vae_decode"
+                elif "comfymodalproductionoutput" in _class_lower or "comfymodalproductionimagecompareroutput" in _class_lower:
+                    _iso_op = "output_encode"
+                elif _is_clip_text_encode:
+                    _iso_op = "clip_encode"
+                elif _is_sampler:
+                    _iso_op = "sampler_setup"
+                    _v2_iso_sampler_setup_active = True
+            if _iso_op:
+                print(
+                    f"[v2.cpu_isolation] marker=before operation={_iso_op} "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+                time.sleep(5)
+                print(
+                    f"[v2.cpu_isolation] marker=started operation={_iso_op} "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+
             # Set current node context for nested load_models_gpu attribution
             _ctx_token = _current_node_context.set((node_id, node_class))
             _encode_ctx_token = _encode_from_tokens_active.set(False)
@@ -1715,6 +1748,20 @@ def install_pre_sampler_hooks() -> None:
                 _elapsed = _ns_ms(_t0)
                 _current_node_context.reset(_ctx_token)
                 _encode_from_tokens_active.reset(_encode_ctx_token)
+
+                # ── CPU isolation: ended marker for clip_encode, vae_decode, output_encode ──
+                if _iso_op and _iso_op in ("clip_encode", "vae_decode", "output_encode"):
+                    print(
+                        f"[v2.cpu_isolation] marker=ended operation={_iso_op} "
+                        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                    )
+                    time.sleep(5)
+                    print(
+                        f"[v2.cpu_isolation] marker=after operation={_iso_op} "
+                        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                    )
 
                 # ── Hard cutoff at authoritative sampling_start ──────────────
                 cutoff_ns = _sampling_cutoff_perf_ns.get()
@@ -1813,12 +1860,47 @@ def install_pre_sampler_hooks() -> None:
             if not _load_roles:
                 _load_roles.append("other")
             _roles_str = ",".join(sorted(_load_roles))
+
+            # ── CPU isolation: clip_gpu_load / unet_gpu_load ──
+            _iso_load_role: str | None = None
+            if _V2_CPU_ISOLATION:
+                if "CLIP" in _load_roles:
+                    _iso_load_role = "clip_gpu_load"
+                elif "UNET" in _load_roles:
+                    _iso_load_role = "unet_gpu_load"
+            if _iso_load_role:
+                print(
+                    f"[v2.cpu_isolation] marker=before operation={_iso_load_role} "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+                time.sleep(5)
+                print(
+                    f"[v2.cpu_isolation] marker=started operation={_iso_load_role} "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+
             _cpu_timer_load = _CpuTimer("load_models_gpu", _roles_str)
             _cpu_timer_load.__enter__()
             try:
                 return _orig_load_models(*args, **kwargs)
             finally:
                 _cpu_timer_load.__exit__()
+
+                # ── CPU isolation: ended marker for clip_gpu_load / unet_gpu_load ──
+                if _iso_load_role:
+                    print(
+                        f"[v2.cpu_isolation] marker=ended operation={_iso_load_role} "
+                        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                    )
+                    time.sleep(5)
+                    print(
+                        f"[v2.cpu_isolation] marker=after operation={_iso_load_role} "
+                        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                )
                 _elapsed = _ns_ms(_t0)
 
                 # Clip if cutoff fired mid-operation
@@ -1849,6 +1931,48 @@ def install_pre_sampler_hooks() -> None:
                     state.setdefault("_load_model_calls", []).append(_load_record)
 
         _mm.load_models_gpu = _patched_load_models_gpu
+
+    # ── 3b. nodes.VAELoader.load_vae (vae_file_load isolation) ─────────
+    try:
+        import nodes as _nodes_iso
+    except ImportError:
+        _nodes_iso = None
+    if _nodes_iso is not None:
+        try:
+            _vae_loader_cls = _nodes_iso.NODE_CLASS_MAPPINGS.get("VAELoader")
+            _orig_load_vae = getattr(_vae_loader_cls, "load_vae", None) if _vae_loader_cls is not None else None
+        except Exception:
+            _orig_load_vae = None
+        if _orig_load_vae is not None:
+            def _patched_load_vae(*args: Any, **kwargs: Any) -> Any:
+                if _V2_CPU_ISOLATION:
+                    print(
+                        f"[v2.cpu_isolation] marker=before operation=vae_file_load "
+                        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                    )
+                    time.sleep(5)
+                    print(
+                        f"[v2.cpu_isolation] marker=started operation=vae_file_load "
+                        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                    )
+                try:
+                    return _orig_load_vae(*args, **kwargs)
+                finally:
+                    if _V2_CPU_ISOLATION:
+                        print(
+                            f"[v2.cpu_isolation] marker=ended operation=vae_file_load "
+                            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                            flush=True,
+                        )
+                        time.sleep(5)
+                        print(
+                            f"[v2.cpu_isolation] marker=after operation=vae_file_load "
+                            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                            flush=True,
+                        )
+            _vae_loader_cls.load_vae = _patched_load_vae
 
     # ── 4. comfy.sd.CLIP.encode_from_tokens (raw CLIP encode wall time) ─
     try:
@@ -2419,6 +2543,36 @@ def _build_sampling_wrapper() -> Callable:
             _sampling_cutoff_perf_ns.set(_cutoff_ns)
             # Signal all active CPU-owner timers to freeze measurements at cutoff
             _signal_cpu_timers(_cutoff_ns)
+
+        # ── CPU isolation: sampler_setup ended marker (fired at sampling_start boundary) ──
+        if _V2_CPU_ISOLATION and _v2_iso_sampler_setup_active:
+            _v2_iso_sampler_setup_active = False
+            print(
+                f"[v2.cpu_isolation] marker=ended operation=sampler_setup "
+                f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                flush=True,
+            )
+            time.sleep(5)
+            print(
+                f"[v2.cpu_isolation] marker=after operation=sampler_setup "
+                f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                flush=True,
+            )
+
+        # ── CPU isolation: sampling operation ──
+        if _V2_CPU_ISOLATION:
+            print(
+                f"[v2.cpu_isolation] marker=before operation=sampling "
+                f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                flush=True,
+            )
+            time.sleep(5)
+            print(
+                f"[v2.cpu_isolation] marker=started operation=sampling "
+                f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                flush=True,
+            )
+
         try:
             return executor(*args, **kwargs)
         finally:
@@ -2430,6 +2584,20 @@ def _build_sampling_wrapper() -> Callable:
                 "steps": steps,
                 "source": "sampler_sample_wrapper",
             })
+
+            # ── CPU isolation: sampling ended marker ──
+            if _V2_CPU_ISOLATION:
+                print(
+                    f"[v2.cpu_isolation] marker=ended operation=sampling "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
+                time.sleep(5)
+                print(
+                    f"[v2.cpu_isolation] marker=after operation=sampling "
+                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
 
     return _wrapper
 
