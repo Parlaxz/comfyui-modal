@@ -88,17 +88,7 @@ from .output_delivery import (
 )
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
-from .restore_worker_probe import (
-    capture_runtime_fingerprint,
-    start_restore_worker_probe,
-    set_restore_worker_probe_phase,
-    set_restore_fingerprint,
-    finish_restore_worker_probe,
-    claim_restore_entry,
-    _V2_SNAPSHOT_CAPTURE_FINGERPRINT,
-    _fingerprint_summary,
-    _diff_fingerprints,
-)
+
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
     ("unet_load",      "t4b_unet_load_start",      "t4b_unet_load_end"),
@@ -1876,6 +1866,10 @@ def _runtime_env() -> dict[str, str]:
     memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
     if memory_mb is not None:
         env["COMFYMODAL_V2_MEMORY_MB"] = memory_mb
+    # Propagate COMFYMODAL_V2_RESTORE_TORCH_THREADS without hardcoded default.
+    # Absent remains absent; present values are passed through exactly (no strip).
+    if "COMFYMODAL_V2_RESTORE_TORCH_THREADS" in os.environ:
+        env["COMFYMODAL_V2_RESTORE_TORCH_THREADS"] = os.environ["COMFYMODAL_V2_RESTORE_TORCH_THREADS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -3229,7 +3223,7 @@ class ModalRuntimeEntrypoint:
         self._lifecycle_trace: RuntimeTrace | None = None
         # Stable module-level identity so snapshot boundaries cannot erase identity.
         self.container_session_id: str = _V2_CONTAINER_SESSION_ID
-        # Propagate container_session_id to env so capture_runtime_fingerprint can read it
+        # Propagate container_session_id to env for downstream diagnostics.
         os.environ["COMFYMODAL_CONTAINER_SESSION_ID"] = self.container_session_id
         self._restore_count: int = 0
         self._request_count: int = 0
@@ -3246,6 +3240,15 @@ class ModalRuntimeEntrypoint:
         self._cpu_snapshot_clip_storage_registry: Any | None = None
         # Full-trace session (None when disabled or not yet created)
         self._full_trace_session: Any | None = None
+        # ── Torch thread-limit lifecycle state (restore-time) ──────────
+        # One-shot guard: set to True after _apply_torch_thread_limit completes
+        # (even when disabled).  Prevents reapplication per restored lifecycle.
+        self._torch_thread_limit_applied: bool = False
+        # Restore timing fields activated from the lifecycle helper:
+        self._restore_torch_intraop_threads: int | None = None
+        self._restore_actual_torch_intraop_threads: int | None = None
+        self._restore_torch_interop_threads: int | None = None
+        self._restore_torch_thread_limit_status: str = "unset"
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -3327,6 +3330,16 @@ class ModalRuntimeEntrypoint:
             self._cpu_snapshot_unet_runtime_state = None
         if not hasattr(self, "_full_trace_session"):
             self._full_trace_session = None
+        if not hasattr(self, "_torch_thread_limit_applied"):
+            self._torch_thread_limit_applied = False
+        if not hasattr(self, "_restore_torch_intraop_threads"):
+            self._restore_torch_intraop_threads = None
+        if not hasattr(self, "_restore_actual_torch_intraop_threads"):
+            self._restore_actual_torch_intraop_threads = None
+        if not hasattr(self, "_restore_torch_interop_threads"):
+            self._restore_torch_interop_threads = None
+        if not hasattr(self, "_restore_torch_thread_limit_status"):
+            self._restore_torch_thread_limit_status = "unset"
 
     def _cpu_snapshot_profile(self, api: Any) -> Mapping[str, Any] | None:
         """Derive a validated warmup profile for a CPU model snapshot.
@@ -4178,20 +4191,6 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
 
-        # ── Capture startup snapshot fingerprint ─────────────────────
-        _snap_fp = capture_runtime_fingerprint(
-            coordinator_state=self._capture_coordinator_state(),
-            bridge_snapshot=self._preload_bridge.diagnostic_snapshot(),
-        )
-        _V2_SNAPSHOT_CAPTURE_FINGERPRINT.clear()
-        _V2_SNAPSHOT_CAPTURE_FINGERPRINT["_fp_object"] = _snap_fp
-        _V2_SNAPSHOT_CAPTURE_FINGERPRINT["stage"] = "capture"
-        self._snapshot_capture_fingerprint = _snap_fp
-        print(
-            f"[v2.snapshot_fingerprint] stage=capture {_fingerprint_summary(_snap_fp)}",
-            flush=True,
-        )
-
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -4208,40 +4207,213 @@ class ModalRuntimeEntrypoint:
             "_cachedit_preimport": _cd_preimport,
         }
 
+    def _apply_torch_thread_limit(self) -> None:
+        """Apply torch intraop thread limit at earliest restore point.
+
+        Strict parsing: absent/empty/whitespace-only = disabled.
+        ASCII positive base-10 integer accepted.
+        0, negative, non-integers, float, boolean strings raise RuntimeError.
+        One-shot guard prevents reapplication per restored lifecycle.
+        Stores lightweight state for activation diagnosis.
+        """
+        if self._torch_thread_limit_applied:
+            return
+        self._torch_thread_limit_applied = True
+        # Read raw env without stripping; preserve for error messages.
+        _raw_raw = os.environ.get("COMFYMODAL_V2_RESTORE_TORCH_THREADS", "")
+        _disabled = not _raw_raw.strip()
+        import torch as _torch_limit
+
+        _pid = os.getpid()
+        _wall_ns = time.time_ns()
+
+        # Capture before state (always)
+        _before_intraop = _torch_limit.get_num_threads()
+        _before_interop = _torch_limit.get_num_interop_threads()
+        try:
+            _before_native_count = len(os.listdir("/proc/self/task"))
+        except Exception:
+            _before_native_count = -1
+
+        if _disabled:
+            print(
+                f"[v2.restore_torch_threads] event=before "
+                f"requested=disabled "
+                f"intraop={_before_intraop} "
+                f"interop={_before_interop} "
+                f"native_thread_count={_before_native_count} "
+                f"pid={_pid} "
+                f"wall_unix_ns={_wall_ns}",
+                flush=True,
+            )
+            print(
+                f"[v2.restore_torch_threads] event=after "
+                f"requested=disabled "
+                f"intraop={_before_intraop} "
+                f"interop={_before_interop} "
+                f"native_thread_count={_before_native_count} "
+                f"wall_ms=0.0 "
+                f"process_cpu_ms=0.0 "
+                f"status=disabled",
+                flush=True,
+            )
+            self._restore_torch_intraop_threads = None
+            self._restore_actual_torch_intraop_threads = _before_intraop
+            self._restore_torch_interop_threads = _before_interop
+            self._restore_torch_thread_limit_status = "disabled"
+            return
+
+        # Emit before line for nonempty configuration (even if invalid).
+        print(
+            f"[v2.restore_torch_threads] event=before "
+            f"requested={_raw_raw} "
+            f"intraop={_before_intraop} "
+            f"interop={_before_interop} "
+            f"native_thread_count={_before_native_count} "
+            f"pid={_pid} "
+            f"wall_unix_ns={_wall_ns}",
+            flush=True,
+        )
+
+        # Strict parse: raw value must be ASCII digits only (no surrounding
+        # whitespace, signs, floats, booleans, etc.).
+        if not (_raw_raw.isascii() and _raw_raw.isdigit()):
+            print(
+                f"[v2.restore_torch_threads] event=after "
+                f"requested={_raw_raw} "
+                f"intraop={_before_intraop} "
+                f"interop={_before_interop} "
+                f"native_thread_count={_before_native_count} "
+                f"wall_ms=0.0 "
+                f"process_cpu_ms=0.0 "
+                f"status=error "
+                f"error_type=RuntimeError "
+                f"error=not a valid positive base-10 integer",
+                flush=True,
+            )
+            self._restore_torch_intraop_threads = None
+            self._restore_actual_torch_intraop_threads = _before_intraop
+            self._restore_torch_interop_threads = _before_interop
+            self._restore_torch_thread_limit_status = "error"
+            raise RuntimeError(
+                f"COMFYMODAL_V2_RESTORE_TORCH_THREADS={_raw_raw!r} is not a valid "
+                f"positive base-10 integer"
+            )
+        _requested = int(_raw_raw)
+        if _requested <= 0:
+            print(
+                f"[v2.restore_torch_threads] event=after "
+                f"requested={_requested} "
+                f"intraop={_before_intraop} "
+                f"interop={_before_interop} "
+                f"native_thread_count={_before_native_count} "
+                f"wall_ms=0.0 "
+                f"process_cpu_ms=0.0 "
+                f"status=error "
+                f"error_type=RuntimeError "
+                f"error=must be a positive integer (>0)",
+                flush=True,
+            )
+            self._restore_torch_intraop_threads = None
+            self._restore_actual_torch_intraop_threads = _before_intraop
+            self._restore_torch_interop_threads = _before_interop
+            self._restore_torch_thread_limit_status = "error"
+            raise RuntimeError(
+                f"COMFYMODAL_V2_RESTORE_TORCH_THREADS={_requested} must be a "
+                f"positive integer (>0)"
+            )
+
+        # Measure the set_num_threads call
+        _set_wall_start = time.perf_counter_ns()
+        _set_cpu_start = time.process_time_ns()
+        try:
+            _torch_limit.set_num_threads(_requested)
+        except Exception as _set_exc:
+            _after_intraop = _torch_limit.get_num_threads()
+            _after_interop = _torch_limit.get_num_interop_threads()
+            try:
+                _after_native_count = len(os.listdir("/proc/self/task"))
+            except Exception:
+                _after_native_count = -1
+            _set_wall_ns = time.perf_counter_ns() - _set_wall_start
+            _set_cpu_ns = time.process_time_ns() - _set_cpu_start
+            print(
+                f"[v2.restore_torch_threads] event=after "
+                f"requested={_requested} "
+                f"intraop={_after_intraop} "
+                f"interop={_after_interop} "
+                f"native_thread_count={_after_native_count} "
+                f"wall_ms={round(_set_wall_ns / 1_000_000, 3)} "
+                f"process_cpu_ms={round(_set_cpu_ns / 1_000_000, 3)} "
+                f"status=error "
+                f"error_type={type(_set_exc).__name__} "
+                f"error={_set_exc}",
+                flush=True,
+            )
+            self._restore_torch_intraop_threads = _requested
+            self._restore_actual_torch_intraop_threads = _after_intraop
+            self._restore_torch_interop_threads = _after_interop
+            self._restore_torch_thread_limit_status = "error"
+            raise
+
+        _set_wall_ns = time.perf_counter_ns() - _set_wall_start
+        _set_cpu_ns = time.process_time_ns() - _set_cpu_start
+        _after_intraop = _torch_limit.get_num_threads()
+        _after_interop = _torch_limit.get_num_interop_threads()
+        try:
+            _after_native_count = len(os.listdir("/proc/self/task"))
+        except Exception:
+            _after_native_count = -1
+
+        _actual = _after_intraop
+        if _actual != _requested:
+            print(
+                f"[v2.restore_torch_threads] event=after "
+                f"requested={_requested} "
+                f"intraop={_actual} "
+                f"interop={_after_interop} "
+                f"native_thread_count={_after_native_count} "
+                f"wall_ms={round(_set_wall_ns / 1_000_000, 3)} "
+                f"process_cpu_ms={round(_set_cpu_ns / 1_000_000, 3)} "
+                f"status=error "
+                f"error_type=RuntimeError "
+                f"error=torch.set_num_threads({_requested}) resulted in {_actual}",
+                flush=True,
+            )
+            self._restore_torch_intraop_threads = _requested
+            self._restore_actual_torch_intraop_threads = _actual
+            self._restore_torch_interop_threads = _after_interop
+            self._restore_torch_thread_limit_status = "error"
+            raise RuntimeError(
+                f"torch.set_num_threads({_requested}) resulted in {_actual}"
+            )
+
+        _status = "already_set" if _before_intraop == _requested else "applied"
+
+        print(
+            f"[v2.restore_torch_threads] event=after "
+            f"requested={_requested} "
+            f"intraop={_actual} "
+            f"interop={_after_interop} "
+            f"native_thread_count={_after_native_count} "
+            f"wall_ms={round(_set_wall_ns / 1_000_000, 3)} "
+            f"process_cpu_ms={round(_set_cpu_ns / 1_000_000, 3)} "
+            f"status={_status}",
+            flush=True,
+        )
+
+        self._restore_torch_intraop_threads = _requested
+        self._restore_actual_torch_intraop_threads = _actual
+        self._restore_torch_interop_threads = _after_interop
+        self._restore_torch_thread_limit_status = _status
+
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
 
-        # ── V2 snapshot-restore fingerprint (one-shot, before anything else) ──
-        if claim_restore_entry():
-            _rst_wall = time.time_ns()
-            _rst_mono = time.monotonic_ns()
-            _rst_fp = capture_runtime_fingerprint(
-                coordinator_state=self._capture_coordinator_state(),
-                bridge_snapshot=self._preload_bridge.diagnostic_snapshot(),
-            )
-            self._snapshot_restore_fingerprint = _rst_fp
-            set_restore_fingerprint(_rst_fp)
-            print(
-                f"[v2.snapshot_fingerprint] stage=restore {_fingerprint_summary(_rst_fp)}",
-                flush=True,
-            )
-            # Diff against startup capture (module fallback authoritatively)
-            # Prefer module-level _V2_SNAPSHOT_CAPTURE_FINGERPRINT, then instance attr
-            _capture_obj: Any = _V2_SNAPSHOT_CAPTURE_FINGERPRINT.get("_fp_object")
-            if _capture_obj is None:
-                _capture_obj = getattr(self, "_snapshot_capture_fingerprint", None)
-            if _capture_obj is not None:
-                try:
-                    print(
-                        f"[v2.snapshot_fingerprint_diff] {_diff_fingerprints(_capture_obj, _rst_fp)}",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-            # Start watcher before normal restore immediately (no sleep/Event.wait)
-            _watcher = start_restore_worker_probe()
-        else:
-            _watcher = None
+        # ── Torch thread limit: earliest executable point ─────────────────
+        # Applied before normal restore work, _configure_runtime, plan
+        # reading, bootstrap, snapshot validation/retarget/activation.
+        self._apply_torch_thread_limit()
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
@@ -4318,7 +4490,6 @@ class ModalRuntimeEntrypoint:
         try:
             identity = _capture_remote_identity()
             self._configure_runtime()
-            set_restore_worker_probe_phase("configure_runtime")
             trace = RuntimeTrace(process="remote")
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
@@ -4390,7 +4561,6 @@ class ModalRuntimeEntrypoint:
             trace.emit("restore_plan_read_start", phase="restore")
             try:
                 self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
-                set_restore_worker_probe_phase("restore_plan_read")
                 trace.emit(
                     "restore_plan_read_end",
                     phase="restore",
@@ -4411,7 +4581,6 @@ class ModalRuntimeEntrypoint:
                 _RES4LYF_PREPARED.clear()
                 _CACHEDIT_PREPARED.clear()
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
-                set_restore_worker_probe_phase("bootstrap_restore")
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
 
@@ -4624,7 +4793,6 @@ class ModalRuntimeEntrypoint:
                 plan = self._restore_plan
 
                 # ── 5. cpu_snapshot_identity_match ──
-                set_restore_worker_probe_phase("snapshot_identity_validation")
                 def _do_identity_match():
                     _identity_check_start_ns = time.monotonic_ns()
                     km = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
@@ -4815,7 +4983,6 @@ class ModalRuntimeEntrypoint:
                         raise
 
                     # ── 8. retarget_cpu_snapshot_models ──
-                    set_restore_worker_probe_phase("snapshot_retarget")
                     def _do_retarget():
                         return retarget_cpu_snapshot_models(
                             models, model_management=_mm,
@@ -4956,7 +5123,6 @@ class ModalRuntimeEntrypoint:
                         _do_validate_bf16()
 
                     # ── 9. activate_snapshot_bridge ──
-                    set_restore_worker_probe_phase("snapshot_bridge_activation")
                     _retarget_start_ns = 0
                     def _do_activate_bridge():
                         nonlocal _retarget_start_ns
@@ -5417,7 +5583,6 @@ class ModalRuntimeEntrypoint:
             )
             # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # ── 12. restore_finalization ──
-            set_restore_worker_probe_phase("restore_finalization")
             def _do_restore_finalization():
                 global _LATEST_LIFECYCLE_TIMING
 
@@ -5600,7 +5765,6 @@ class ModalRuntimeEntrypoint:
 
             trace.emit("v2_restore_return", phase="restore")
             _restore_result["trace"] = trace.to_dict()
-            set_restore_worker_probe_phase("restore_returned")
             set_restore_return_marker(
                 restored_instance_id=restored_instance_id,
                 restore_session_id=restore_session_id,
@@ -5661,7 +5825,6 @@ class ModalRuntimeEntrypoint:
         self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
         self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
-        set_restore_worker_probe_phase("prompt_executor_entry")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
@@ -5844,11 +6007,9 @@ class ModalRuntimeEntrypoint:
             _cpu_snapshot_active=_cpu_snapshot_active,
             _execution_prefill_scheduled=_execution_prefill_scheduled,
         )
-        set_restore_worker_probe_phase("clip_encode")
         try:
             with request_execution_trace_scope(trace):
                 with self._preload_bridge.request_scope():
-                    set_restore_worker_probe_phase("sampler")
                     result: dict[str, Any] = await self._execute_v2_prompt_executor(
                         plan,
                         context,
@@ -5942,7 +6103,6 @@ class ModalRuntimeEntrypoint:
             if "_stage_timings" in result:
                 result["trace"]["stages"] = result.pop("_stage_timings")
             result["container_session_id"] = _cid
-            set_restore_worker_probe_phase("probe_complete")
             result["restore_plan_generation"] = str(self._restore_plan.generation if self._restore_plan else "")
             _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
             if _rt is not None:
@@ -5969,6 +6129,10 @@ class ModalRuntimeEntrypoint:
                     "cpu_overlap_gpu_load_ms",
                     "clip_to_sampler_node_ms", "sampler_node_to_sampler_start_ms",
                     "diagnostic_accounted_ms", "diagnostic_unattributed_ms",
+                    "restore_requested_torch_intraop_threads",
+                    "restore_actual_torch_intraop_threads",
+                    "restore_torch_interop_threads",
+                    "restore_torch_thread_limit_status",
                 )
                 for _f in _AD_FIELD_SPEC:
                     _v = _ad_from_result.get(_f)
@@ -7067,7 +7231,6 @@ class ModalRuntimeEntrypoint:
                 execution_prefill_scheduled=_ad_prefill_scheduled,
             )
             _ad_state = get_activation_diagnostics()
-            set_restore_worker_probe_phase("unet_gpu_activation")
             # ── Set residency sampler callback for this request scope ──
             _residency_sampler = self._sample_snapshot_residency
             if _RESIDENCY_DIAGNOSTICS_ENABLED:
@@ -7795,6 +7958,20 @@ class ModalRuntimeEntrypoint:
                 _ad["cpu_overlap_prefill_clip_ms"] = _cpu_summary.get("cpu_overlap_prefill_clip_ms")
                 _ad["cpu_overlap_gpu_load_ms"] = _cpu_summary.get("cpu_overlap_gpu_load_ms")
 
+                # ── Restore-time torch thread limit fields ────────────────
+                _ad["restore_requested_torch_intraop_threads"] = getattr(
+                    self, "_restore_torch_intraop_threads", None
+                )
+                _ad["restore_actual_torch_intraop_threads"] = getattr(
+                    self, "_restore_actual_torch_intraop_threads", None
+                )
+                _ad["restore_torch_interop_threads"] = getattr(
+                    self, "_restore_torch_interop_threads", None
+                )
+                _ad["restore_torch_thread_limit_status"] = getattr(
+                    self, "_restore_torch_thread_limit_status", "unset"
+                )
+
                 # Attach to result trace
                 result.setdefault("trace", {})
                 if isinstance(result["trace"], dict):
@@ -8130,7 +8307,6 @@ class ModalRuntimeEntrypoint:
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # ── TRUE METHOD FIRST LINE (before any identity or trace exists) ──
-        set_restore_worker_probe_phase("run_plan_stream_entry")
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
@@ -8160,7 +8336,6 @@ class ModalRuntimeEntrypoint:
 
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
-        set_restore_worker_probe_phase("plan_materialization")
 
         # â”€â”€ Compute method entry gap before any trace output â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _method_entry_gap_results: dict[str, Any] = {}
@@ -8860,6 +9035,11 @@ def _build_decorated_v2_class() -> type:
         self._cgroup_sampler = None
         self._cpu_snapshot_unet_runtime_state = None
         self._full_trace_session = None
+        self._torch_thread_limit_applied = False
+        self._restore_torch_intraop_threads = None
+        self._restore_actual_torch_intraop_threads = None
+        self._restore_torch_interop_threads = None
+        self._restore_torch_thread_limit_status = None
         self._v2_initialized = True
 
     # Wrap each Modal-exposed method to lazy-init first.

@@ -5211,16 +5211,6 @@ class ModelPreloadCoordinator:
                     max_workers=self._max_workers,
                     thread_name_prefix="comfymodal-restore",
                 )
-                import os as _os
-                try:
-                    actual_threads = len(self._pool._threads)
-                except Exception:
-                    actual_threads = 0
-                print(
-                    f"[v2.restore_coordinator] event=pool_created "
-                    f"max_workers={self._max_workers} thread_count={actual_threads} pid={_os.getpid()}",
-                    flush=True,
-                )
             return self._pool
 
     def _submit(
@@ -5270,25 +5260,6 @@ class ModelPreloadCoordinator:
             started = time.time()
             _queue_wait_ms = round((time.monotonic_ns() - _submit_started_ns) / 1_000_000, 3)
             setattr(preparation.diagnostics, f"{effective_diag}_started_at", started)
-            # ── Worker started log ─────────────────────────────
-            import threading as _thr
-            _thr_ident = _thr.current_thread().ident
-            _thr_native_id = _thr.current_thread().native_id
-            _thr_name = _thr.current_thread().name[:40]
-            _thr_pid = os.getpid()
-            # Capture actual pool thread count
-            try:
-                _pool_thread_count = len(self._pool._threads) if self._pool is not None else 0
-            except Exception:
-                _pool_thread_count = 0
-            print(
-                f"[v2.restore_worker] event=started "
-                f"lane={name} pid={_thr_pid} "
-                f"native_tid={_thr_native_id} python_ident={_thr_ident} thread_name={_thr_name} "
-                f"pool_thread_count={_pool_thread_count} "
-                f"queue_wait_ms={_queue_wait_ms}",
-                flush=True,
-            )
             # ── Activate per-worker lane context ────────────────
             ctx_token = None
             if lane_trace is not None:
@@ -5335,16 +5306,8 @@ class ModelPreloadCoordinator:
                             "worker_duration_ms": round((completed - started) * 1000, 3),
                         },
                     )
-                # ── Worker ended log (success) ──────────────────
-                _worker_dur_ms = round((completed - started) * 1000, 3)
-                print(
-                    f"[v2.restore_worker] event=ended "
-                    f"lane={name} pid={_thr_pid} "
-                    f"native_tid={_thr_native_id} python_ident={_thr_ident} thread_name={_thr_name} "
-                    f"queue_wait_ms={_queue_wait_ms} duration_ms={_worker_dur_ms} status=ok",
-                    flush=True,
-                )
                 # ── Terminal event (success) ────────────────────
+                _worker_dur_ms = round((completed - started) * 1000, 3)
                 if lane_trace is not None:
                     lane_trace.ready(
                         worker_duration_ms=_worker_dur_ms,
@@ -5365,16 +5328,8 @@ class ModelPreloadCoordinator:
                             "worker_duration_ms": round((completed - started) * 1000, 3),
                         },
                     )
-                # ── Worker ended log (failure) ──────────────────
-                _fail_dur_ms = round((completed - started) * 1000, 3)
-                print(
-                    f"[v2.restore_worker] event=ended "
-                    f"lane={name} pid={_thr_pid} "
-                    f"native_tid={_thr_native_id} python_ident={_thr_ident} thread_name={_thr_name} "
-                    f"queue_wait_ms={_queue_wait_ms} duration_ms={_fail_dur_ms} status=error",
-                    flush=True,
-                )
                 # ── Terminal event (failure) ────────────────────
+                _fail_dur_ms = round((completed - started) * 1000, 3)
                 if lane_trace is not None:
                     lane_trace.failed(
                         error_category=type(exc).__name__,
@@ -5477,12 +5432,7 @@ class V2LoaderBridge:
             clip_loader=self._load_clip,
             vae_loader=self._load_vae,
             prefill_loader=self._prefill,
-            max_workers=1,
-        )
-        import os as _os
-        print(
-            f"[v2.restore_coordinator] event=created max_workers=1 pid={_os.getpid()}",
-            flush=True,
+            max_workers=3,
         )
         self._nodes: Any | None = None
         self._original_methods: dict[str, Callable[..., Any]] = {}
