@@ -1771,7 +1771,8 @@ class ModalRuntimeSpec:
     runtime_state_path: str = RUNTIME_STATE_PATH
     profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
-    cpu: int = 4
+    cloud: str = "gcp"
+    cpu: int = 48
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1
@@ -8782,6 +8783,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         _volumes[spec.profile_path] = _pv
     return resources["app"].cls(
         gpu=_gpu_arg,
+        cloud=spec.cloud,
         cpu=spec.cpu,
         memory=spec.memory,
         timeout=spec.timeout,
