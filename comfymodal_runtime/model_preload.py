@@ -344,6 +344,335 @@ _unet_subfn_nesting_depth: ContextVar[int] = ContextVar("_unet_subfn_nesting_dep
 # Accumulator for "not_observed" GPU wrapper calls (no lane/request scope).
 _not_observed_gpu_calls: int = 0
 
+# ── V2 UNET isolation diagnostics (temporary instrumentation) ──────────
+# Hard-coded (NO environment gate).  Consumed once by the first outermost
+# load_models_gpu call that contains a registered snapshot UNET during an
+# active request/activation diagnostic context.
+
+_V2_UNET_ISOLATION_LOCK: RLock = RLock()
+"""Lock protecting the process-global one-shot claim."""
+_V2_UNET_ISOLATION_CLAIMED: bool = False
+"""Process-global one-shot: True once the instrumentation has been claimed."""
+_V2_UNET_ISOLATION_THREAD: ContextVar[int] = ContextVar(
+    "_v2_unet_isolation_thread", default=0
+)
+"""Thread guard: set to nonzero thread ID while instrumentation is active."""
+
+
+def _install_v2_unet_isolation(
+    models: Any,
+    request_trace: Any,
+) -> Callable[[], None] | None:
+    """Install temporary v2.unet_isolation monkeypatches.
+
+    Qualifications (verified in order, before any sleep):
+      1. Process-global one-shot claim (lock-protected).
+      2. ``_has_registered_unet_in_models(models)`` is True.
+      3. ``request_trace`` is not None (active request/diagnostic context).
+
+    When qualifications pass:
+      - Emit ``unavailable`` lines for the six non-distinct boundary points.
+      - Monkeypatch ``comfy.model_management.cleanup_models_gc`` around the
+        first direct call (``unload_or_cleanup_models`` operation).
+      - Monkeypatch ``ModelPatcher.load`` / ``ModelPatcherDynamic.load`` for
+        the first instance whose ``self`` satisfies
+        ``_has_registered_unet_in_models([self])``
+        (``model_patcher_load_entry`` operation).
+      - Return a cleanup callable that restores all monkeypatched originals
+        (safe to call multiple times; handles unavailable symbols
+        conservatively).
+
+    Returns ``None`` when qualifications are not met.
+    """
+    import sys as _sys
+    import threading as _threading
+
+    # 1. Process-global one-shot claim
+    global _V2_UNET_ISOLATION_CLAIMED
+    with _V2_UNET_ISOLATION_LOCK:
+        if _V2_UNET_ISOLATION_CLAIMED:
+            return None
+        _tid = _threading.get_ident()
+        _existing = _V2_UNET_ISOLATION_THREAD.get()
+        if _existing != 0:
+            return None  # Already active on some thread
+        _V2_UNET_ISOLATION_CLAIMED = True
+        _V2_UNET_ISOLATION_THREAD.set(_tid)
+
+    # 2. Verify predicate (before any sleep)
+    if not _has_registered_unet_in_models(models):
+        _V2_UNET_ISOLATION_THREAD.set(0)
+        return None
+    if request_trace is None:
+        _V2_UNET_ISOLATION_THREAD.set(0)
+        return None
+
+    # 3. Emit unavailable lines (exact reasons from spec)
+    print(
+        "[v2.unet_isolation] marker=unavailable "
+        "operation=unet_load_models_gpu_entry "
+        "reason=function entry is a boundary point, not a distinct callable sub-operation",
+        flush=True,
+    )
+    print(
+        "[v2.unet_isolation] marker=unavailable "
+        "operation=patch_weights "
+        "reason=patch_weight_to_device is invoked per weight key inside loops; "
+        "no distinct aggregate callable boundary exists",
+        flush=True,
+    )
+    print(
+        "[v2.unet_isolation] marker=unavailable "
+        "operation=model_to_cuda "
+        "reason=module.to is invoked per submodule inside a loop; "
+        "no distinct aggregate callable boundary exists",
+        flush=True,
+    )
+    print(
+        "[v2.unet_isolation] marker=unavailable "
+        "operation=post_load_bookkeeping "
+        "reason=bookkeeping is inline code with no distinct callable boundary",
+        flush=True,
+    )
+    print(
+        "[v2.unet_isolation] marker=unavailable "
+        "operation=cuda_synchronize "
+        "reason=torch.cuda.synchronize is invoked per module inside a loop; "
+        "no distinct aggregate callable boundary exists",
+        flush=True,
+    )
+    print(
+        "[v2.unet_isolation] marker=unavailable "
+        "operation=unet_load_models_gpu_return "
+        "reason=function return is a boundary point, not a distinct callable sub-operation",
+        flush=True,
+    )
+
+    # 4. Resolve live modules (conservative: handle absent symbols)
+    _mm_mod = _sys.modules.get("comfy.model_management")
+    _mp_mod = _sys.modules.get("comfy.model_patcher")
+
+    # ── Saved originals ──
+    _orig_cleanup: Any = None
+    _orig_mp_load: Any = None
+    _orig_mpd_load: Any = None
+    _ModelPatcher_cls: Any = None
+    _ModelPatcherDynamic_cls: Any = None
+
+    # ── Per-operation one-shot flags (closure-scoped) ──
+    __cleanup_claimed: bool = False
+    __mp_claimed: bool = False
+
+    # 5. Monkeypatch comfy.model_management.cleanup_models_gc
+    if _mm_mod is not None:
+        _orig_cleanup = getattr(_mm_mod, "cleanup_models_gc", None)
+        if callable(_orig_cleanup) and not getattr(
+            _orig_cleanup, "_comfy_modal_v2_isolation_cleanup", False
+        ):
+            @functools.wraps(_orig_cleanup)
+            def _cleanup_wrapper() -> Any:
+                nonlocal __cleanup_claimed
+                if (
+                    not __cleanup_claimed
+                    and _threading.get_ident() == _tid
+                ):
+                    __cleanup_claimed = True
+                    _start_mark = time.time_ns()
+                    print(
+                        f"[v2.unet_isolation] marker=started "
+                        f"operation=unload_or_cleanup_models "
+                        f"wall_unix_ns={_start_mark} "
+                        f"monotonic_ns={time.monotonic_ns()}",
+                        flush=True,
+                    )
+                    time.sleep(5)
+                    _call_start = time.monotonic_ns()
+                    try:
+                        return _orig_cleanup()
+                    finally:
+                        _call_end = time.monotonic_ns()
+                        _duration_ms = round(
+                            (_call_end - _call_start) / 1_000_000, 3
+                        )
+                        time.sleep(5)
+                        print(
+                            f"[v2.unet_isolation] marker=ended "
+                            f"operation=unload_or_cleanup_models "
+                            f"wall_unix_ns={time.time_ns()} "
+                            f"monotonic_ns={time.monotonic_ns()} "
+                            f"duration_ms={_duration_ms}",
+                            flush=True,
+                        )
+                else:
+                    if _orig_cleanup is not None:
+                        return _orig_cleanup()
+                    return None
+
+            setattr(
+                _cleanup_wrapper, "_comfy_modal_v2_isolation_cleanup", True
+            )
+            setattr(_mm_mod, "cleanup_models_gc", _cleanup_wrapper)
+
+    # 6. Monkeypatch ModelPatcher.load
+    if _mp_mod is not None:
+        _ModelPatcher_cls = getattr(_mp_mod, "ModelPatcher", None)
+        if _ModelPatcher_cls is not None:
+            _orig_mp_load = getattr(_ModelPatcher_cls, "load", None)
+            if callable(_orig_mp_load) and not getattr(
+                _orig_mp_load, "_comfy_modal_v2_isolation_mp_load", False
+            ):
+                @functools.wraps(_orig_mp_load)
+                def _mp_load_wrapper(
+                    self: Any,
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> Any:
+                    nonlocal __mp_claimed
+                    if (
+                        not __mp_claimed
+                        and _threading.get_ident() == _tid
+                        and _has_registered_unet_in_models([self])
+                    ):
+                        __mp_claimed = True
+                        _start_mark = time.time_ns()
+                        print(
+                            f"[v2.unet_isolation] marker=started "
+                            f"operation=model_patcher_load_entry "
+                            f"wall_unix_ns={_start_mark} "
+                            f"monotonic_ns={time.monotonic_ns()}",
+                            flush=True,
+                        )
+                        time.sleep(5)
+                        _call_start = time.monotonic_ns()
+                        try:
+                            return _orig_mp_load(self, *args, **kwargs)
+                        finally:
+                            _call_end = time.monotonic_ns()
+                            _duration_ms = round(
+                                (_call_end - _call_start) / 1_000_000, 3
+                            )
+                            time.sleep(5)
+                            print(
+                                f"[v2.unet_isolation] marker=ended "
+                                f"operation=model_patcher_load_entry "
+                                f"wall_unix_ns={time.time_ns()} "
+                                f"monotonic_ns={time.monotonic_ns()} "
+                                f"duration_ms={_duration_ms}",
+                                flush=True,
+                            )
+                    else:
+                        if _orig_mp_load is not None:
+                            return _orig_mp_load(self, *args, **kwargs)
+                        return None
+
+                setattr(
+                    _mp_load_wrapper,
+                    "_comfy_modal_v2_isolation_mp_load",
+                    True,
+                )
+                setattr(_ModelPatcher_cls, "load", _mp_load_wrapper)
+
+    # 7. Monkeypatch ModelPatcherDynamic.load
+    if _mp_mod is not None:
+        _ModelPatcherDynamic_cls = getattr(
+            _mp_mod, "ModelPatcherDynamic", None
+        )
+        if _ModelPatcherDynamic_cls is not None:
+            _orig_mpd_load = getattr(
+                _ModelPatcherDynamic_cls, "load", None
+            )
+            if callable(_orig_mpd_load) and not getattr(
+                _orig_mpd_load, "_comfy_modal_v2_isolation_mp_load", False
+            ):
+                @functools.wraps(_orig_mpd_load)
+                def _mpd_load_wrapper(
+                    self: Any,
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> Any:
+                    nonlocal __mp_claimed
+                    if (
+                        not __mp_claimed
+                        and _threading.get_ident() == _tid
+                        and _has_registered_unet_in_models([self])
+                    ):
+                        __mp_claimed = True
+                        _start_mark = time.time_ns()
+                        print(
+                            f"[v2.unet_isolation] marker=started "
+                            f"operation=model_patcher_load_entry "
+                            f"wall_unix_ns={_start_mark} "
+                            f"monotonic_ns={time.monotonic_ns()}",
+                            flush=True,
+                        )
+                        time.sleep(5)
+                        _call_start = time.monotonic_ns()
+                        try:
+                            return _orig_mpd_load(self, *args, **kwargs)
+                        finally:
+                            _call_end = time.monotonic_ns()
+                            _duration_ms = round(
+                                (_call_end - _call_start) / 1_000_000, 3
+                            )
+                            time.sleep(5)
+                            print(
+                                f"[v2.unet_isolation] marker=ended "
+                                f"operation=model_patcher_load_entry "
+                                f"wall_unix_ns={time.time_ns()} "
+                                f"monotonic_ns={time.monotonic_ns()} "
+                                f"duration_ms={_duration_ms}",
+                                flush=True,
+                            )
+                    else:
+                        if _orig_mpd_load is not None:
+                            return _orig_mpd_load(
+                                self, *args, **kwargs
+                            )
+                        return None
+
+                setattr(
+                    _mpd_load_wrapper,
+                    "_comfy_modal_v2_isolation_mp_load",
+                    True,
+                )
+                setattr(
+                    _ModelPatcherDynamic_cls, "load", _mpd_load_wrapper
+                )
+
+    # 8. Return cleanup callable (restore originals, reset thread guard)
+    def _cleanup() -> None:
+        # Restore cleanup_models_gc
+        if _orig_cleanup is not None and _mm_mod is not None:
+            try:
+                setattr(_mm_mod, "cleanup_models_gc", _orig_cleanup)
+            except Exception:
+                pass
+        # Restore ModelPatcher.load
+        if _orig_mp_load is not None and _ModelPatcher_cls is not None:
+            try:
+                setattr(_ModelPatcher_cls, "load", _orig_mp_load)
+            except Exception:
+                pass
+        # Restore ModelPatcherDynamic.load
+        if (
+            _orig_mpd_load is not None
+            and _ModelPatcherDynamic_cls is not None
+        ):
+            try:
+                setattr(
+                    _ModelPatcherDynamic_cls, "load", _orig_mpd_load
+                )
+            except Exception:
+                pass
+        # Reset thread guard (process-global one-shot stays True — never reset)
+        try:
+            _V2_UNET_ISOLATION_THREAD.set(0)
+        except Exception:
+            pass
+
+    return _cleanup
+
+
 # ── Residency sampler callback (request-scoped, separate from activation state) ──
 # ContextVar for a callable that _make_gpu_loader_wrapper and unet_forward_probe
 # invoke at UNET GPU load before/after and first_unet_forward respectively.
@@ -724,6 +1053,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _h2d_metric_name: str = ""
         # Activation diagnostics record (captured on outermost entry)
         _gpu_record: dict[str, Any] | None = None
+        # V2 UNET isolation cleanup callable (set only when instrumentation installed)
+        _v2_isolation_cleanup: Callable[[], None] | None = None
         if before == 0:
             count = _gpu_request_call_count_var.get()
             _gpu_request_call_count_var.set(count + 1)
@@ -810,6 +1141,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     "request_id": request_trace.request_id,
                     "caller_classification": _caller,
                 })
+                # ── V2 UNET isolation diagnostics (temporary monkeypatches) ──
+                _v2_isolation_cleanup = _install_v2_unet_isolation(models, request_trace)
             if lane is None and request_trace is None:
                 # Installed wrapper called outside any lane/request scope
                 _caller = "not_observed"
@@ -1003,6 +1336,12 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                             _res_cb_after("unet_gpu_load_after", request_trace)
                         except Exception:
                             pass
+            # ── Restore v2.unet_isolation temporary monkeypatches ──
+            if _v2_isolation_cleanup is not None:
+                try:
+                    _v2_isolation_cleanup()
+                except Exception:
+                    pass
     wrapper._comfy_modal_gpu_wrapper = True
     return wrapper
 
