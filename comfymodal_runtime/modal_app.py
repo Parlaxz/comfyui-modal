@@ -1660,6 +1660,52 @@ def _parse_memory_mb() -> int:
     return val
 
 
+def _parse_evict_models_before_snapshot() -> bool:
+    """Strict parse COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT.
+
+    Absent, empty, or ``"0"`` → disabled (False).
+    ``"1"`` → enabled (True).
+    Any other nonempty value → RuntimeError.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT", "")
+    if not raw:
+        return False
+    if raw == "1":
+        return True
+    if raw == "0":
+        return False
+    raise RuntimeError(
+        f"COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT={raw!r} is invalid; "
+        f"expected absent, empty, '0', or '1'"
+    )
+
+
+def _parse_evict_restore_idle_seconds() -> int:
+    """Strict parse COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS.
+
+    Absent, empty, or ``"0"`` → 0 (no idle).
+    Positive base-10 ASCII integer accepted.
+    Negative, float, boolean, or non-numeric → RuntimeError.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS", "")
+    if not raw:
+        return 0
+    # Must be ASCII digits only (positive integer), no signs, dots, or letters.
+    if not raw.isascii() or not raw.isdigit():
+        raise RuntimeError(
+            f"COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS={raw!r} is invalid; "
+            f"expected absent, empty, '0', or a positive base-10 integer"
+        )
+    val = int(raw)
+    if val < 0:
+        raise RuntimeError(
+            f"COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS={val} must be a "
+            f"positive integer or 0"
+        )
+    # val == 0 is explicitly accepted (no idle)
+    return val
+
+
 def _snapshot_target_fingerprint(
     spec: ModalRuntimeSpec | None = None,
 ) -> str:
@@ -1870,6 +1916,11 @@ def _runtime_env() -> dict[str, str]:
     # Absent remains absent; present values are passed through exactly (no strip).
     if "COMFYMODAL_V2_RESTORE_TORCH_THREADS" in os.environ:
         env["COMFYMODAL_V2_RESTORE_TORCH_THREADS"] = os.environ["COMFYMODAL_V2_RESTORE_TORCH_THREADS"]
+    # Propagate eviction env vars (absent → absent in remote env).
+    for _ev_key in ("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT",
+                    "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS"):
+        if _ev_key in os.environ:
+            env[_ev_key] = os.environ[_ev_key]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -2309,7 +2360,140 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
     return info
 
 
-# â”€â”€ GPU allocation reporting (remote runtime capabilities) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Lightweight process memory helper (Linux-safe) ──────────────────────
+# Uses only /proc/self/status, /proc/self/smaps_rollup,
+# os.listdir('/proc/self/task'), torch thread counts, and len(sys.modules).
+# No object graph scanning, tensor enumeration, or forbidden tools.
+
+
+def _collect_process_memory(
+    *,
+    fields: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Lightweight Linux-safe process memory and thread snapshot.
+
+    Returns a dict of requested *fields* (default: all).  Each memory field
+    is a numeric MiB value (``float`` or ``int``) or ``"absent"``.  Thread
+    and module fields are ``int`` or ``"absent"``.
+
+    Reads only ``/proc/self/status``, ``/proc/self/smaps_rollup``,
+    ``os.listdir('/proc/self/task')``, ``torch.*``, ``len(sys.modules)``.
+    No tensor/map scans, psutil, tracemalloc, objgraph, subprocesses.
+
+    Memory fields: ``vm_rss_mib``, ``vm_hwm_mib``,
+    ``smaps_rss_mib``, ``smaps_pss_mib``, ``smaps_private_clean_mib``,
+    ``smaps_private_dirty_mib``, ``smaps_shared_clean_mib``,
+    ``smaps_shared_dirty_mib``, ``smaps_anonymous_mib``.
+    Thread/module fields: ``native_thread_count``, ``torch_intraop_threads``,
+    ``torch_interop_threads``, ``loaded_module_count``.
+    """
+    _ALL_FIELDS = (
+        "vm_rss_mib", "vm_hwm_mib",
+        "smaps_rss_mib", "smaps_pss_mib",
+        "smaps_private_clean_mib", "smaps_private_dirty_mib",
+        "smaps_shared_clean_mib", "smaps_shared_dirty_mib",
+        "smaps_anonymous_mib",
+        "native_thread_count",
+        "torch_intraop_threads", "torch_interop_threads",
+        "loaded_module_count",
+    )
+    if fields is None:
+        fields = _ALL_FIELDS
+    result: dict[str, Any] = {}
+    for f in fields:
+        result[f] = "absent"
+
+    # ── /proc/self/status: VmRSS → vm_rss_mib, VmHWM → vm_hwm_mib ──
+    _need_vm = any(f in fields for f in ("vm_rss_mib", "vm_hwm_mib"))
+    if _need_vm:
+        try:
+            with open("/proc/self/status") as _f:
+                for _line in _f:
+                    if "vm_rss_mib" in fields and result.get("vm_rss_mib") == "absent" and _line.startswith("VmRSS:"):
+                        _parts = _line.split()
+                        if len(_parts) >= 2:
+                            try:
+                                result["vm_rss_mib"] = int(_parts[1]) / 1024.0
+                            except (ValueError, TypeError):
+                                pass
+                    if "vm_hwm_mib" in fields and result.get("vm_hwm_mib") == "absent" and _line.startswith("VmHWM:"):
+                        _parts = _line.split()
+                        if len(_parts) >= 2:
+                            try:
+                                result["vm_hwm_mib"] = int(_parts[1]) / 1024.0
+                            except (ValueError, TypeError):
+                                pass
+        except Exception:
+            pass
+
+    # ── /proc/self/smaps_rollup ──
+    _SMAPS_FIELD_MAP = {
+        "Rss": "smaps_rss_mib",
+        "Pss": "smaps_pss_mib",
+        "Private_Clean": "smaps_private_clean_mib",
+        "Private_Dirty": "smaps_private_dirty_mib",
+        "Shared_Clean": "smaps_shared_clean_mib",
+        "Shared_Dirty": "smaps_shared_dirty_mib",
+        "Anonymous": "smaps_anonymous_mib",
+    }
+    _need_smaps = any(f in fields for f in _SMAPS_FIELD_MAP.values())
+    if _need_smaps:
+        try:
+            with open("/proc/self/smaps_rollup") as _f:
+                for _line in _f:
+                    for _skey, _tkey in _SMAPS_FIELD_MAP.items():
+                        if _tkey in fields and result.get(_tkey) == "absent" and _line.startswith(_skey + ":"):
+                            _parts = _line.split()
+                            if len(_parts) >= 2:
+                                try:
+                                    result[_tkey] = int(_parts[1]) / 1024.0
+                                except (ValueError, TypeError):
+                                    pass
+        except Exception:
+            pass
+
+    # ── native_thread_count ──
+    if "native_thread_count" in fields:
+        try:
+            result["native_thread_count"] = len(os.listdir("/proc/self/task"))
+        except Exception:
+            pass
+
+    # ── torch thread counts ──
+    if "torch_intraop_threads" in fields:
+        try:
+            import torch as _t
+            result["torch_intraop_threads"] = _t.get_num_threads()
+        except Exception:
+            pass
+    if "torch_interop_threads" in fields:
+        try:
+            import torch as _t2
+            result["torch_interop_threads"] = _t2.get_num_interop_threads()
+        except Exception:
+            pass
+
+    # ── loaded_module_count ──
+    if "loaded_module_count" in fields:
+        try:
+            result["loaded_module_count"] = len(sys.modules)
+        except Exception:
+            pass
+
+    return result
+
+
+def _numeric_value(value: Any, fallback: Any = "absent") -> Any:
+    """Return *value* when it is a numeric (int/float), else *fallback*.
+
+    Avoids the unsafe ``a or b`` pattern where 0/falsy values are rejected.
+    """
+    if isinstance(value, (int, float)):
+        return value
+    return fallback
+
+
+# ── GPU allocation reporting (remote runtime capabilities) ─────────────
 
 
 def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, Any]:
@@ -3249,6 +3433,16 @@ class ModalRuntimeEntrypoint:
         self._restore_actual_torch_intraop_threads: int | None = None
         self._restore_torch_interop_threads: int | None = None
         self._restore_torch_thread_limit_status: str = "unset"
+        # ── Snapshot model eviction state (startup-only) ────────────────
+        # Bool flag: True when models were successfully evicted before capture.
+        self._snapshot_models_evicted_before_capture: bool = False
+        # Primitive metadata marker: set after successful eviction.  Stores
+        # only status/rss/id/alive fields — no live refs.
+        self._eviction_marker: dict[str, Any] | None = None
+        # Snapshot-state metadata captured before eviction for restore
+        # reconciliation.  Populated with primitive-only fields; empty dict
+        # by default.
+        self._snapshot_eviction_metadata: dict[str, Any] = {}
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -3340,6 +3534,498 @@ class ModalRuntimeEntrypoint:
             self._restore_torch_interop_threads = None
         if not hasattr(self, "_restore_torch_thread_limit_status"):
             self._restore_torch_thread_limit_status = "unset"
+        if not hasattr(self, "_snapshot_models_evicted_before_capture"):
+            self._snapshot_models_evicted_before_capture = False
+        if not hasattr(self, "_eviction_marker"):
+            self._eviction_marker = None
+        if not hasattr(self, "_snapshot_eviction_metadata"):
+            self._snapshot_eviction_metadata = {}
+        if not hasattr(self, "_cpu_snapshot_unet_storage_registry"):
+            self._cpu_snapshot_unet_storage_registry = None
+        if not hasattr(self, "_cpu_snapshot_clip_storage_registry"):
+            self._cpu_snapshot_clip_storage_registry = None
+
+    def _evict_snapshot_models(
+        self,
+        cpu_models: Any,
+        bootstrap_state: Any,
+    ) -> dict[str, Any]:
+        """Evict CPU snapshot models from process memory before snapshot.
+
+        Called only when COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=1
+        and both top-level CLIP/UNET models exist.  Uses weakrefs to
+        verify model death, clears bridge/registries/identities, unloads
+        from Comfy model-management, runs gc/malloc_trim, and validates
+        RSS drop.  Stores a primitive marker on ``self._eviction_marker``.
+
+        Returns the eviction marker dict.  Raises RuntimeError on
+        any validation failure.
+        """
+        import gc as _gc
+        import weakref as _wr
+
+        # ── 1. Pre-eviction primitive state record ──
+        _model_key = getattr(cpu_models, "model_key", None)
+        _policy = getattr(cpu_models, "compute_policy", "default")
+        _policy_ver = getattr(cpu_models, "policy_version", 0)
+        _key_hash = getattr(_model_key, "stable_hash", "")[:16] or "absent"
+        _unet_obj = getattr(cpu_models, "unet", None)
+        _clip_obj = getattr(cpu_models, "clip", None)
+        _unet_ident = getattr(_model_key, "unet_identity", "absent")
+        _clip_ident = getattr(_model_key, "clip_identity", "absent")
+        _unet_id = str(id(_unet_obj)) if _unet_obj is not None else "none"
+        _clip_id = str(id(_clip_obj)) if _clip_obj is not None else "none"
+        _unet_type = type(_unet_obj).__name__ if _unet_obj is not None else "none"
+        _clip_type = type(_clip_obj).__name__ if _clip_obj is not None else "none"
+        _unet_present = int(_unet_obj is not None)
+        _clip_present = int(_clip_obj is not None)
+
+        # Snapshot-state metadata: primitive-only fields for restore reconciliation
+        self._snapshot_eviction_metadata = {
+            "clip_present": _clip_present,
+            "unet_present": _unet_present,
+            "clip_type": _clip_type,
+            "unet_type": _unet_type,
+            "clip_object_id": _clip_id,
+            "unet_object_id": _unet_id,
+            "cpu_snapshot_model_key_hash": _key_hash,
+            "cpu_snapshot_compute_policy": _policy,
+            "cpu_snapshot_policy_version": _policy_ver,
+        }
+        # Module-loaded booleans via sys.modules (no imports)
+        _mods = set(sys.modules.keys())
+        self._snapshot_eviction_metadata["torch_module_loaded"] = any(
+            m.startswith("torch") for m in _mods
+        )
+        self._snapshot_eviction_metadata["transformers_module_loaded"] = "transformers" in _mods
+        self._snapshot_eviction_metadata["diffusers_module_loaded"] = "diffusers" in _mods
+        self._snapshot_eviction_metadata["cache_dit_module_loaded"] = "cache_dit" in _mods
+        self._snapshot_eviction_metadata["comfy_module_loaded"] = any(
+            m.startswith("comfy") for m in _mods
+        )
+        del _mods
+
+        # Torch/native thread/module counts
+        _pre_mem = _collect_process_memory(fields=(
+            "vm_rss_mib", "vm_hwm_mib",
+            "smaps_rss_mib", "smaps_pss_mib",
+            "smaps_private_clean_mib", "smaps_private_dirty_mib",
+            "smaps_shared_clean_mib", "smaps_shared_dirty_mib",
+            "smaps_anonymous_mib",
+            "native_thread_count", "torch_intraop_threads",
+            "torch_interop_threads", "loaded_module_count",
+        ))
+        _pre_rss_mib = _numeric_value(_pre_mem.get("smaps_rss_mib"), _numeric_value(_pre_mem.get("vm_rss_mib"), "absent"))
+        _pre_anon_mib = _numeric_value(_pre_mem.get("smaps_anonymous_mib"), "absent")
+        _pre_priv_dirty_mib = _numeric_value(_pre_mem.get("smaps_private_dirty_mib"), "absent")
+        _pre_native = _pre_mem.get("native_thread_count", "absent")
+        _pre_intraop = _pre_mem.get("torch_intraop_threads", "absent")
+        _pre_interop = _pre_mem.get("torch_interop_threads", "absent")
+        _pre_modules = _pre_mem.get("loaded_module_count", "absent")
+
+        self._snapshot_eviction_metadata["torch_intraop_threads"] = _pre_intraop
+        self._snapshot_eviction_metadata["torch_interop_threads"] = _pre_interop
+        self._snapshot_eviction_metadata["native_thread_count"] = _pre_native
+        self._snapshot_eviction_metadata["loaded_module_count"] = _pre_modules
+
+        # ── 2. Weakref CLIP and UNET (fail clearly if unsupported) ──
+        if _unet_obj is not None:
+            try:
+                _unet_wr = _wr.ref(_unet_obj)
+            except TypeError:
+                raise RuntimeError(
+                    f"weakref.ref unsupported for UNET object (type={_unet_type})"
+                )
+        else:
+            _unet_wr = None
+        if _clip_obj is not None:
+            try:
+                _clip_wr = _wr.ref(_clip_obj)
+            except TypeError:
+                raise RuntimeError(
+                    f"weakref.ref unsupported for CLIP object (type={_clip_type})"
+                )
+        else:
+            _clip_wr = None
+
+        # ── 3. Clear bridge ──
+        self._preload_bridge.clear()
+
+        # ── 4. Prove active preparation absent and futures absent ──
+        _diag = getattr(self._preload_bridge, "diagnostic_snapshot", lambda: {})()
+        _bridge_active_prep = 0
+        if isinstance(_diag, dict):
+            _active_prep = _diag.get("active_preparation_exists") or _diag.get("current_preparation_exists") or False
+            _bridge_active_prep = 1 if _active_prep else 0
+        # Also check futures directly
+        _coord = getattr(self._preload_bridge, "coordinator", None)
+        _prep = getattr(_coord, "_active", None) if _coord is not None else None
+        if _prep is not None:
+            for _lane_name in ("unet", "clip", "vae", "prefill"):
+                _fut = getattr(_prep, f"{_lane_name}_future", None)
+                if _fut is not None:
+                    pass  # just verifying clear succeeded, no need to store
+            _bridge_active_prep = 1
+        del _diag, _coord, _prep
+
+        # ── 5. Clear snapshot loader outputs/identities and execution seed flags ──
+        if bootstrap_state is not None:
+            bootstrap_state.snapshot_loader_outputs = {}
+            bootstrap_state.snapshot_model_identities = {}
+            bootstrap_state.snapshot_execution_seed = None
+            bootstrap_state.snapshot_seed_built = False
+
+        # ── 6. Preserve certificate/workflow/custom-node/dependency/Sage/CacheDiT/RES4LYF ──
+        # Do NOT touch: _V2_CERT_PROCESS_CACHE, _V2_WORKFLOW_HASH,
+        # _RES4LYF_HOOK_INSTALLED, preimport results, dependency manifests,
+        # runtime volumes, GPU state, outputs_to_execute.
+        # Only clear prepared state derived from snapshot models:
+        global _RES4LYF_PREPARED, _CACHEDIT_PREPARED
+        _RES4LYF_PREPARED.clear()
+        _CACHEDIT_PREPARED.clear()
+
+        # ── 7. Unload exact models from Comfy model-management if present ──
+        _lm = _lm_model = None
+        try:
+            import comfy.model_management as _mm
+            _loaded_list = _mm.loaded_models() if callable(getattr(_mm, "loaded_models", None)) else []
+            for _lm in list(_loaded_list):
+                _lm_model = getattr(_lm, "model", None)
+                if _lm_model is _unet_obj or _lm_model is _clip_obj:
+                    try:
+                        _mm.unload_model(_lm)
+                    except Exception:
+                        pass
+            # Delete every temporary strong alias before weakref verification:
+            del _lm, _lm_model, _loaded_list
+        except Exception:
+            pass
+
+        # ── 8. Clear runtime registries and self._cpu_snapshot_models references ──
+        self._cpu_snapshot_unet_runtime_state = None
+        self._cpu_snapshot_unet_storage_registry = None
+        self._cpu_snapshot_clip_storage_registry = None
+        self._cpu_snapshot_models_active = False
+        if cpu_models is not None:
+            cpu_models.unet = None
+            cpu_models.clip = None
+        # Clear self reference
+        self._cpu_snapshot_models = None
+        # Delete local alias to cpu_models so no local holds models alive
+        del cpu_models
+        # Delete local object references
+        del _unet_obj, _clip_obj
+
+        # ── 9. gc.collect() × 2 ──
+        _gc.collect()
+        _gc.collect()
+        _after_gc_mem = _collect_process_memory(fields=(
+            "vm_rss_mib", "vm_hwm_mib",
+            "smaps_rss_mib", "smaps_pss_mib",
+            "smaps_private_clean_mib", "smaps_private_dirty_mib",
+            "smaps_shared_clean_mib", "smaps_shared_dirty_mib",
+            "smaps_anonymous_mib",
+            "native_thread_count", "torch_intraop_threads",
+            "torch_interop_threads", "loaded_module_count",
+        ))
+        _after_rss_mib = _numeric_value(_after_gc_mem.get("smaps_rss_mib"), _numeric_value(_after_gc_mem.get("vm_rss_mib"), "absent"))
+        _after_anon_mib = _numeric_value(_after_gc_mem.get("smaps_anonymous_mib"), "absent")
+        _after_priv_dirty_mib = _numeric_value(_after_gc_mem.get("smaps_private_dirty_mib"), "absent")
+
+        # ── 10. Best-effort libc malloc_trim(0) ──
+        _trim_status = "unsupported"
+        _trim_result = "absent"
+        try:
+            import ctypes as _ct
+            _libc = _ct.CDLL("libc.so.6", use_errno=True)
+            _libc.malloc_trim.argtypes = [_ct.c_size_t]
+            _libc.malloc_trim.restype = _ct.c_int
+            _trim_ret = _libc.malloc_trim(0)
+            _trim_status = "applied"
+            _trim_result = _trim_ret
+        except (AttributeError, OSError):
+            _trim_status = "unsupported"
+        except Exception:
+            _trim_status = "error"
+            _trim_result = "absent"
+
+        # ── 11. Final gc.collect() after trim ──
+        _gc.collect()
+        _after_trim_mem = _collect_process_memory(fields=(
+            "vm_rss_mib", "vm_hwm_mib",
+            "smaps_rss_mib", "smaps_pss_mib",
+            "smaps_private_clean_mib", "smaps_private_dirty_mib",
+            "smaps_shared_clean_mib", "smaps_shared_dirty_mib",
+            "smaps_anonymous_mib",
+            "native_thread_count", "torch_intraop_threads",
+            "torch_interop_threads", "loaded_module_count",
+        ))
+        _after_trim_rss_mib = _numeric_value(_after_trim_mem.get("smaps_rss_mib"), _numeric_value(_after_trim_mem.get("vm_rss_mib"), "absent"))
+        _after_trim_anon_mib = _numeric_value(_after_trim_mem.get("smaps_anonymous_mib"), "absent")
+        _after_trim_priv_dirty_mib = _numeric_value(_after_trim_mem.get("smaps_private_dirty_mib"), "absent")
+        _after_native = _after_trim_mem.get("native_thread_count", "absent")
+        _after_intraop = _after_trim_mem.get("torch_intraop_threads", "absent")
+        _after_interop = _after_trim_mem.get("torch_interop_threads", "absent")
+        _after_modules = _after_trim_mem.get("loaded_module_count", "absent")
+
+        # ── Emit three memory stages (before/after_gc/after_trim) ──
+        print(
+            f"[v2.snapshot_model_eviction_memory] stage=before "
+            f"vm_rss_mib={_pre_mem.get('vm_rss_mib', 'absent')} "
+            f"vm_hwm_mib={_pre_mem.get('vm_hwm_mib', 'absent')} "
+            f"smaps_rss_mib={_pre_mem.get('smaps_rss_mib', 'absent')} "
+            f"smaps_pss_mib={_pre_mem.get('smaps_pss_mib', 'absent')} "
+            f"smaps_private_clean_mib={_pre_mem.get('smaps_private_clean_mib', 'absent')} "
+            f"smaps_private_dirty_mib={_pre_priv_dirty_mib} "
+            f"smaps_shared_clean_mib={_pre_mem.get('smaps_shared_clean_mib', 'absent')} "
+            f"smaps_shared_dirty_mib={_pre_mem.get('smaps_shared_dirty_mib', 'absent')} "
+            f"smaps_anonymous_mib={_pre_anon_mib} "
+            f"native_thread_count={_pre_native} "
+            f"torch_intraop_threads={_pre_intraop} "
+            f"torch_interop_threads={_pre_interop} "
+            f"loaded_module_count={_pre_modules}",
+            flush=True,
+        )
+        print(
+            f"[v2.snapshot_model_eviction_memory] stage=after_gc "
+            f"vm_rss_mib={_after_gc_mem.get('vm_rss_mib', 'absent')} "
+            f"vm_hwm_mib={_after_gc_mem.get('vm_hwm_mib', 'absent')} "
+            f"smaps_rss_mib={_after_gc_mem.get('smaps_rss_mib', 'absent')} "
+            f"smaps_pss_mib={_after_gc_mem.get('smaps_pss_mib', 'absent')} "
+            f"smaps_private_clean_mib={_after_gc_mem.get('smaps_private_clean_mib', 'absent')} "
+            f"smaps_private_dirty_mib={_after_priv_dirty_mib} "
+            f"smaps_shared_clean_mib={_after_gc_mem.get('smaps_shared_clean_mib', 'absent')} "
+            f"smaps_shared_dirty_mib={_after_gc_mem.get('smaps_shared_dirty_mib', 'absent')} "
+            f"smaps_anonymous_mib={_after_anon_mib} "
+            f"native_thread_count={_after_gc_mem.get('native_thread_count', 'absent')} "
+            f"torch_intraop_threads={_after_gc_mem.get('torch_intraop_threads', 'absent')} "
+            f"torch_interop_threads={_after_gc_mem.get('torch_interop_threads', 'absent')} "
+            f"loaded_module_count={_after_gc_mem.get('loaded_module_count', 'absent')}",
+            flush=True,
+        )
+        print(
+            f"[v2.snapshot_model_eviction_memory] stage=after_trim "
+            f"vm_rss_mib={_after_trim_mem.get('vm_rss_mib', 'absent')} "
+            f"vm_hwm_mib={_after_trim_mem.get('vm_hwm_mib', 'absent')} "
+            f"smaps_rss_mib={_after_trim_mem.get('smaps_rss_mib', 'absent')} "
+            f"smaps_pss_mib={_after_trim_mem.get('smaps_pss_mib', 'absent')} "
+            f"smaps_private_clean_mib={_after_trim_mem.get('smaps_private_clean_mib', 'absent')} "
+            f"smaps_private_dirty_mib={_after_trim_priv_dirty_mib} "
+            f"smaps_shared_clean_mib={_after_trim_mem.get('smaps_shared_clean_mib', 'absent')} "
+            f"smaps_shared_dirty_mib={_after_trim_mem.get('smaps_shared_dirty_mib', 'absent')} "
+            f"smaps_anonymous_mib={_after_trim_anon_mib} "
+            f"native_thread_count={_after_native} "
+            f"torch_intraop_threads={_after_intraop} "
+            f"torch_interop_threads={_after_interop} "
+            f"loaded_module_count={_after_modules}",
+            flush=True,
+        )
+
+        # ── 12. Verify weakrefs dead ──
+        _unet_alive = _unet_wr() is not None if _unet_wr is not None else False
+        _clip_alive = _clip_wr() is not None if _clip_wr is not None else False
+        _clip_alive_flag = 1 if _clip_alive else 0
+        _unet_alive_flag = 1 if _unet_alive else 0
+        if _unet_alive or _clip_alive:
+            _alive_parts = []
+            if _unet_alive:
+                _alive_parts.append(f"UNET(id={_unet_id})")
+            if _clip_alive:
+                _alive_parts.append(f"CLIP(id={_clip_id})")
+            _alive_msg = "; ".join(_alive_parts)
+            _known_ref_state = {
+                "bridge_active_preparation": _bridge_active_prep,
+                "cpu_snapshot_unet_runtime_state_present": int(
+                    self._cpu_snapshot_unet_runtime_state is not None
+                ),
+                "cpu_snapshot_models_active": int(self._cpu_snapshot_models_active),
+            }
+            print(
+                f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                f"enabled=1 status=object_still_alive "
+                f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
+                f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+                f"bridge_active_preparation={_bridge_active_prep} "
+                f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
+                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
+                f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib=absent "
+                f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
+                f"anonymous_drop_mib=absent "
+                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
+                f"private_dirty_drop_mib=absent "
+                f"native_threads_before={_pre_native} native_threads_after={_after_native} "
+                f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
+                f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
+                f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
+                f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result} "
+                f"known_reference_state={_known_ref_state}",
+                flush=True,
+            )
+            raise RuntimeError(
+                f"Model eviction failed: weakrefs still alive: {_alive_msg}"
+            )
+
+        # ── 13. Fail if memory evidence unavailable ──
+        if _pre_rss_mib == "absent" or _after_trim_rss_mib == "absent":
+            print(
+                f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                f"enabled=1 status=error "
+                f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
+                f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+                f"bridge_active_preparation={_bridge_active_prep} "
+                f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
+                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
+                f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib=absent "
+                f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
+                f"anonymous_drop_mib=absent "
+                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
+                f"private_dirty_drop_mib=absent "
+                f"native_threads_before={_pre_native} native_threads_after={_after_native} "
+                f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
+                f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
+                f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
+                f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "Model eviction failed: memory evidence unavailable "
+                f"(pre_rss={_pre_rss_mib!r} post_rss={_after_trim_rss_mib!r})"
+            )
+
+        # ── 14. Compute RSS drop (smaps preferred, fallback vm) ──
+        _rss_drop_mib = float(_pre_rss_mib) - float(_after_trim_rss_mib)
+        _anonymous_drop_mib = "absent"
+        if isinstance(_pre_anon_mib, (int, float)) and isinstance(_after_trim_anon_mib, (int, float)):
+            _anonymous_drop_mib = float(_pre_anon_mib) - float(_after_trim_anon_mib)
+        _private_dirty_drop_mib = "absent"
+        if isinstance(_pre_priv_dirty_mib, (int, float)) and isinstance(_after_trim_priv_dirty_mib, (int, float)):
+            _private_dirty_drop_mib = float(_pre_priv_dirty_mib) - float(_after_trim_priv_dirty_mib)
+
+        if _rss_drop_mib < 8192.0:
+            print(
+                f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                f"enabled=1 status=insufficient_rss_drop "
+                f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
+                f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+                f"bridge_active_preparation={_bridge_active_prep} "
+                f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
+                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
+                f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib={_rss_drop_mib:.1f} "
+                f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
+                f"anonymous_drop_mib={_anonymous_drop_mib} "
+                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
+                f"private_dirty_drop_mib={_private_dirty_drop_mib} "
+                f"native_threads_before={_pre_native} native_threads_after={_after_native} "
+                f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
+                f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
+                f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
+                f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
+                flush=True,
+            )
+            raise RuntimeError(
+                f"Model eviction failed: RSS drop {_rss_drop_mib:.1f} MiB "
+                f"< 8192 MiB threshold"
+            )
+
+        # ── 15. Emit final success line ──
+        print(
+            f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+            f"enabled=1 status=evicted "
+            f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
+            f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+            f"bridge_active_preparation={_bridge_active_prep} "
+            f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
+            f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
+            f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib={_rss_drop_mib:.1f} "
+            f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
+            f"anonymous_drop_mib={_anonymous_drop_mib} "
+            f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
+            f"private_dirty_drop_mib={_private_dirty_drop_mib} "
+            f"native_threads_before={_pre_native} native_threads_after={_after_native} "
+            f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
+            f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
+            f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
+            f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
+            flush=True,
+        )
+
+        # Store primitive marker on entrypoint (no objects/weakrefs/dicts)
+        self._eviction_marker = {
+            "status": "evicted",
+            "rss_before_mib": _pre_rss_mib,
+            "rss_after_trim_mib": _after_trim_rss_mib,
+            "rss_drop_mib": _rss_drop_mib,
+            "clip_original_id": _clip_id,
+            "unet_original_id": _unet_id,
+            "clip_alive_after_cleanup": _clip_alive_flag,
+            "unet_alive_after_cleanup": _unet_alive_flag,
+        }
+        self._snapshot_models_evicted_before_capture = True
+        return self._eviction_marker
+
+    def _restore_eviction_boundary(self) -> None:
+        """Earliest executable restore point: inspect marker and apply idle.
+
+        Emits ``[v2.snapshot_model_eviction] stage=restore_observed``,
+        then if marker present and configured idle > 0, emits idle
+        start/end lines with time.sleep().  Must precede all other
+        restore work (torch thread limit, full-trace, GPU, etc.).
+        """
+        _marker_present = 1 if getattr(self, "_snapshot_models_evicted_before_capture", False) else 0
+        _ev_marker = getattr(self, "_eviction_marker", None)
+        if _marker_present == 0 and _ev_marker is not None:
+            _marker_present = 1
+        _cpu_snap_models_present = 1 if getattr(self, "_cpu_snapshot_models", None) is not None else 0
+        _clip_present_flag = 0
+        _unet_present_flag = 0
+        if _ev_marker is not None:
+            _clip_present_flag = _ev_marker.get("clip_alive_after_cleanup", 0)
+            _unet_present_flag = _ev_marker.get("unet_alive_after_cleanup", 0)
+        elif _marker_present == 1 or getattr(self, "_snapshot_eviction_metadata", {}):
+            _clip_present_flag = self._snapshot_eviction_metadata.get("clip_present", 0)
+            _unet_present_flag = self._snapshot_eviction_metadata.get("unet_present", 0)
+        _restore_obs_mem = _collect_process_memory(fields=(
+            "vm_rss_mib", "native_thread_count",
+            "torch_intraop_threads", "torch_interop_threads",
+        ))
+        _rss_after_mib = _restore_obs_mem.get("vm_rss_mib", "absent")
+        _native_count = _restore_obs_mem.get("native_thread_count", "absent")
+        _torch_intraop = _restore_obs_mem.get("torch_intraop_threads", "absent")
+        _torch_interop = _restore_obs_mem.get("torch_interop_threads", "absent")
+        print(
+            f"[v2.snapshot_model_eviction] stage=restore_observed "
+            f"marker={_marker_present} "
+            f"cpu_snapshot_models_present={_cpu_snap_models_present} "
+            f"clip_present={_clip_present_flag} "
+            f"unet_present={_unet_present_flag} "
+            f"rss_after_restore_mib={_rss_after_mib} "
+            f"native_thread_count={_native_count} "
+            f"torch_intraop={_torch_intraop} "
+            f"torch_interop={_torch_interop} "
+            f"wall_unix_ns={time.time_ns()}",
+            flush=True,
+        )
+        # Apply idle if marker present AND configured idle > 0.
+        if _marker_present == 1:
+            _idle_seconds = _parse_evict_restore_idle_seconds()
+            if _idle_seconds > 0:
+                _idle_start_ns = time.time_ns()
+                _idle_mono_ns = time.monotonic_ns()
+                print(
+                    f"[v2.snapshot_model_eviction_idle] event=start "
+                    f"seconds={_idle_seconds} "
+                    f"wall_unix_ns={_idle_start_ns} "
+                    f"monotonic_ns={_idle_mono_ns}",
+                    flush=True,
+                )
+                time.sleep(_idle_seconds)
+                print(
+                    f"[v2.snapshot_model_eviction_idle] event=end "
+                    f"seconds={_idle_seconds} "
+                    f"wall_unix_ns={time.time_ns()} "
+                    f"monotonic_ns={time.monotonic_ns()}",
+                    flush=True,
+                )
 
     def _cpu_snapshot_profile(self, api: Any) -> Mapping[str, Any] | None:
         """Derive a validated warmup profile for a CPU model snapshot.
@@ -4191,6 +4877,52 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
 
+        # ── Model eviction before snapshot (gated) ──────────────────────
+        # Inserted after successful CacheDiT pre-import and immediately
+        # before the final startup-ready log/return.  Uses the actual
+        # local BootstrapState `state`, not self.bootstrap.
+        # No local aliases such as _cpu_unet/_cpu_clip are created that
+        # could accidentally keep model objects alive.
+        # No status=skip output: gate enabled without models → error.
+        if _parse_evict_models_before_snapshot():
+            _cpu_models = getattr(self, "_cpu_snapshot_models", None)
+            if _cpu_models is not None:
+                if _cpu_models.unet is not None and _cpu_models.clip is not None:
+                    self._evict_snapshot_models(_cpu_models, state)
+                    # _evict_snapshot_models already clears self._cpu_snapshot_models.
+                    # Delete any local alias to assist gc:
+                    del _cpu_models
+                else:
+                    print(
+                        "[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                        "enabled=1 status=error "
+                        f"unet_present={int(_cpu_models.unet is not None)} "
+                        f"clip_present={int(_cpu_models.clip is not None)} "
+                        "reason=models_incomplete",
+                        flush=True,
+                    )
+                    del _cpu_models
+                    raise RuntimeError(
+                        "Snapshot eviction gate enabled but models incomplete: "
+                        f"unet={int(_cpu_models.unet is not None)} "
+                        f"clip={int(_cpu_models.clip is not None)}"
+                    )
+            else:
+                print(
+                    "[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                    "enabled=1 status=error reason=no_snapshot_models",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    "Snapshot eviction gate enabled but _cpu_snapshot_models is None"
+                )
+        else:
+            print(
+                "[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                "enabled=0 status=disabled",
+                flush=True,
+            )
+
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -4409,6 +5141,16 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+
+        # ── Eviction restore: inspect marker and apply idle ──────────────
+        # FIRST executable ordering: marker inspection and idle delay
+        # must precede lazy_init_snapshot_state, _apply_torch_thread_limit,
+        # full-trace, timestamp setup, samplers, host reporting,
+        # identity/config/plan/bootstrap/GPU.
+        # _restore_eviction_boundary uses getattr defaults so is safe
+        # before lazy_init on older unpickled instances.
+        self._restore_eviction_boundary()
+        self._lazy_init_snapshot_state()
 
         # ── Torch thread limit: earliest executable point ─────────────────
         # Applied before normal restore work, _configure_runtime, plan
