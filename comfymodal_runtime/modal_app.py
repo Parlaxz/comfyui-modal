@@ -1772,7 +1772,7 @@ class ModalRuntimeSpec:
     profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
     cloud: str = "gcp"
-    cpu: int = 48
+    cpu: int = 24
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1

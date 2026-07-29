@@ -211,9 +211,9 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.memory, 24576)
 
-    def test_default_cpu_is_48(self):
+    def test_default_cpu_is_24(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.cpu, 48)
+        self.assertEqual(spec.cpu, 24)
 
     def test_memory_from_env(self):
         os.environ["COMFYMODAL_V2_MEMORY_MB"] = "24576"
@@ -757,10 +757,10 @@ class TestAppClsContract(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.cloud, "gcp")
 
-    def test_spec_cpu_default_48(self):
-        """ModalRuntimeSpec defaults to cpu=48."""
+    def test_spec_cpu_default_24(self):
+        """ModalRuntimeSpec defaults to cpu=24."""
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.cpu, 48)
+        self.assertEqual(spec.cpu, 24)
 
 
 if __name__ == "__main__":
