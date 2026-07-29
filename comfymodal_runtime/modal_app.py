@@ -1644,9 +1644,9 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
 
 def _parse_memory_mb() -> int:
     """Parse COMFYMODAL_V2_MEMORY_MB, default 24576, positive int required."""
-    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "24576").strip()
+    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "40960").strip()
     if not raw:
-        return 24576
+        return 40960
     try:
         val = int(raw)
     except (ValueError, TypeError):
@@ -1771,8 +1771,7 @@ class ModalRuntimeSpec:
     runtime_state_path: str = RUNTIME_STATE_PATH
     profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
-    cloud: str = "gcp"
-    cpu: int = 24
+    cpu: int = 16
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1
@@ -8783,7 +8782,6 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         _volumes[spec.profile_path] = _pv
     return resources["app"].cls(
         gpu=_gpu_arg,
-        cloud=spec.cloud,
         cpu=spec.cpu,
         memory=spec.memory,
         timeout=spec.timeout,

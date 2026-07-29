@@ -207,13 +207,13 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.gpu, ("H100", "T4"))
 
-    def test_default_memory_is_24576(self):
+    def test_default_memory_is_40960(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 24576)
+        self.assertEqual(spec.memory, 40960)
 
-    def test_default_cpu_is_24(self):
+    def test_default_cpu_is_16(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.cpu, 24)
+        self.assertEqual(spec.cpu, 16)
 
     def test_memory_from_env(self):
         os.environ["COMFYMODAL_V2_MEMORY_MB"] = "24576"
@@ -679,9 +679,9 @@ class TestAppClsContract(unittest.TestCase):
         gpu_list = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
         self.assertEqual(gpu_list, "RTX-PRO-6000")
 
-    def test_spec_memory_default_24576(self):
+    def test_spec_memory_default_40960(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 24576)
+        self.assertEqual(spec.memory, 40960)
 
     def test_spec_min_containers_zero(self):
         spec = ModalRuntimeSpec()
@@ -752,15 +752,10 @@ class TestAppClsContract(unittest.TestCase):
         result = parse_gpu_request()
         self.assertEqual(result, ("RTX-PRO-6000",))
 
-    def test_spec_cloud_default_gcp(self):
-        """ModalRuntimeSpec defaults to cloud='gcp'."""
+    def test_spec_cpu_default_16(self):
+        """ModalRuntimeSpec defaults to cpu=16."""
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.cloud, "gcp")
-
-    def test_spec_cpu_default_24(self):
-        """ModalRuntimeSpec defaults to cpu=24."""
-        spec = ModalRuntimeSpec()
-        self.assertEqual(spec.cpu, 24)
+        self.assertEqual(spec.cpu, 16)
 
 
 if __name__ == "__main__":
