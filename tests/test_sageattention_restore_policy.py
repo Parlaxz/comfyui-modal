@@ -67,5 +67,67 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
         self.assertEqual(result, "pytorch")
 
 
+class SageAttentionImportBlockerPatternTests(unittest.TestCase):
+    """Test the _is_cuda_module pattern used by both import blockers.
+
+    The pattern is replicated here because _BlockCudaModuleImport is nested
+    inside _force_cpu_during_snapshot / _force_triton_during_snapshot and is
+    not directly importable.
+    """
+
+    @staticmethod
+    def _is_cuda_module(name: str) -> bool:
+        return (
+            name.endswith("_cuda")
+            or name.startswith("cuda_")
+            or "_cuda_" in name
+            or name.startswith("sageattn._")
+            or name.startswith("sageattention._")
+        )
+
+    # --- Modules that SHOULD be blocked ---
+
+    def test_blocks_sageattn_cuda_ext(self):
+        self.assertTrue(self._is_cuda_module("sageattn_qk_int8_pv_fp16_cuda"))
+
+    def test_blocks_sageattn_fp8_cuda_ext(self):
+        self.assertTrue(self._is_cuda_module("sageattn_qk_int8_pv_fp8_cuda"))
+
+    def test_blocks_sageattn_native_submodule(self):
+        self.assertTrue(self._is_cuda_module("sageattn._qattn_sm120"))
+
+    def test_blocks_sageattn_generic_underscore(self):
+        self.assertTrue(self._is_cuda_module("sageattn._C"))
+
+    def test_blocks_sageattention_native_submodule(self):
+        self.assertTrue(self._is_cuda_module("sageattention._C"))
+
+    def test_blocks_generic_cuda_suffix(self):
+        self.assertTrue(self._is_cuda_module("foo_cuda"))
+
+    def test_blocks_cuda_prefix(self):
+        self.assertTrue(self._is_cuda_module("cuda_foo"))
+
+    def test_blocks_infix_cuda(self):
+        self.assertTrue(self._is_cuda_module("foo_cuda_bar"))
+
+    # --- Modules that should NOT be blocked ---
+
+    def test_allows_sageattn_package(self):
+        self.assertFalse(self._is_cuda_module("sageattn"))
+
+    def test_allows_sageattention_package(self):
+        self.assertFalse(self._is_cuda_module("sageattention"))
+
+    def test_allows_torch_c(self):
+        self.assertFalse(self._is_cuda_module("torch._C"))
+
+    def test_allows_random_module(self):
+        self.assertFalse(self._is_cuda_module("numpy"))
+
+    def test_allows_comfyui_core(self):
+        self.assertFalse(self._is_cuda_module("comfy.sd"))
+
+
 if __name__ == "__main__":
     unittest.main()
