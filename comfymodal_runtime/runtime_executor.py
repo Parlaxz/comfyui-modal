@@ -2440,62 +2440,6 @@ def _build_sampling_wrapper() -> Callable:
 # Pre-built SAMPLER_SAMPLE wrapper singleton.
 _COMFYMODAL_V2_SAMPLING_WRAPPER: Callable = _build_sampling_wrapper()
 
-def _restore_isolation_scope(name: str, fn: Callable[[], Any], enabled: bool = True) -> Any:
-    """Run one restore operation with the temporary isolation gaps."""
-    if not enabled:
-        return fn()
-
-    print(
-        f"[v2.restore_isolation] started GAP_BEFORE_{name} "
-        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-        flush=True,
-    )
-    time.sleep(5)
-    print(
-        f"[v2.restore_isolation] ended GAP_BEFORE_{name} "
-        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-        flush=True,
-    )
-
-    started = time.perf_counter()
-    print(
-        f"[v2.restore_isolation] started {name} "
-        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-        flush=True,
-    )
-    try:
-        result = fn()
-    except BaseException as exc:
-        print(
-            f"[v2.restore_isolation] ended {name} "
-            f"status=error error={type(exc).__name__}:{exc} "
-            f"duration_ms={(time.perf_counter() - started) * 1000:.3f} "
-            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-            flush=True,
-        )
-        raise
-    else:
-        print(
-            f"[v2.restore_isolation] ended {name} "
-            f"status=ok duration_ms={(time.perf_counter() - started) * 1000:.3f} "
-            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-            flush=True,
-        )
-
-    print(
-        f"[v2.restore_isolation] started GAP_AFTER_{name} "
-        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-        flush=True,
-    )
-    time.sleep(5)
-    print(
-        f"[v2.restore_isolation] ended GAP_AFTER_{name} "
-        f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-        flush=True,
-    )
-
-    return result
-
 
 def ensure_sampling_timing_wrapper(model_patcher: Any) -> bool:
     """Install authoritative ``SAMPLER_SAMPLE`` timing wrapper on *model_patcher*.

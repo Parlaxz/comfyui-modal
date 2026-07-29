@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 from .contracts import SnapshotExecutionSeed
-from .runtime_executor import _restore_isolation_scope
 from .trace import RuntimeTrace
 
 _log = logging.getLogger(__name__)
@@ -1260,7 +1259,7 @@ class RuntimeBootstrap:
     # REMOVED: _build_and_store_snapshot_certificate — placeholder superseded
     # by the V2 workflow certificate built in ModalRuntimeEntrypoint.startup().
 
-    def restore(self, *, trace: RuntimeTrace | None = None, _restore_isolation_enabled: bool = False) -> BootstrapState:
+    def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
         self.state.restore_started_at = time.time()
         # Phase 0/3 — capture identity/environment metadata at lifecycle entry
@@ -1288,7 +1287,7 @@ class RuntimeBootstrap:
                     self.restore_gpu_state()
                 if trace:
                     trace.emit("restore_gpu_state_end", phase="restore")
-            _restore_isolation_scope("restore_gpu_state", _do_restore_gpu_state, enabled=_restore_isolation_enabled)
+            _do_restore_gpu_state()
 
             # ── 2. initialize_cuda_context ──
             def _do_initialize_cuda():
@@ -1307,7 +1306,7 @@ class RuntimeBootstrap:
                             "cuda_available": str(self.state.cuda.get("cuda_available", "")),
                         },
                     )
-            _restore_isolation_scope("initialize_cuda_context", _do_initialize_cuda, enabled=_restore_isolation_enabled)
+            _do_initialize_cuda()
 
             # ── Lane B: Sage exact-match fast path ──
             # After initialize_cuda, read sys.modules and verify the snapshot
@@ -1393,7 +1392,7 @@ class RuntimeBootstrap:
                     self.reload_runtime_state()
                 if trace:
                     trace.emit("reload_runtime_state_end", phase="restore")
-            _restore_isolation_scope("reload_runtime_state", _do_reload_runtime_state, enabled=_restore_isolation_enabled)
+            _do_reload_runtime_state()
 
             # ── 4. reload_models ──
             def _do_reload_models():
@@ -1403,7 +1402,7 @@ class RuntimeBootstrap:
                     self.reload_models()
                 if trace:
                     trace.emit("reload_models_end", phase="restore")
-            _restore_isolation_scope("reload_models", _do_reload_models, enabled=_restore_isolation_enabled)
+            _do_reload_models()
 
             # Lane B: restore prescan identity from persisted record
             if self.read_current_custom_node_identity is None:
