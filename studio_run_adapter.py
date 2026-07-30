@@ -75,6 +75,7 @@ from studio_models import (
 )
 from timing_trace import TRACE_VERSION, coerce_t0_from_browser, merge_remote_trace_into
 from warmup_profile import prepare_active_next_profile
+from execution_runtime import resolve_execution_mode, MODE_V2
 
 _log = logging.getLogger(__name__)
 
@@ -1337,6 +1338,9 @@ def build_single_run_spec(
         controls=controls,
         preset_label=preset.get("label", ""),
     )
+    _mode_resolution = resolve_execution_mode(modal_options=modal_options, extra=trace_ctx)
+    studio_meta["execution_mode"] = _mode_resolution["mode"]
+    studio_meta["execution_mode_source"] = _mode_resolution["source"]
 
     _prod_enabled = bool(production_options.get("enabled"))
     _prod_output_ids = production_options.get("output_node_ids", []) if _prod_enabled else []
@@ -1406,6 +1410,8 @@ def build_single_run_spec(
         "production_output_ids": _prod_output_ids,
         "production_plan_used": _prod_plan_used,
         "production_output_count": len(_prod_output_ids),
+        "execution_mode": _mode_resolution["mode"],
+        "execution_mode_source": _mode_resolution["source"],
         "production_source_hash": (production_report or {}).get("source_workflow_hash", ""),
         "production_plan_hash": (production_report or {}).get("production_plan_hash", ""),
         "production_compiled_hash": (production_report or {}).get("compiled_workflow_hash", ""),
@@ -1725,6 +1731,9 @@ def build_experiment_spec(
         feature_id=feature_id,
         experiment_source=_experiment_source,
     )
+    _mode_resolution = resolve_execution_mode(modal_options=modal_options)
+    studio_meta["execution_mode"] = _mode_resolution["mode"]
+    studio_meta["execution_mode_source"] = _mode_resolution["source"]
 
     # ── Production options per checkpoint (no compile — deferred to canonical executor) ──
     # Normalize production options, resolve output_node_ids from each preset's
@@ -1848,9 +1857,10 @@ def build_experiment_spec(
 
 
 def _playground_runtime_mode() -> str:
-    """Return the shared runtime switch used by Direct and Playground."""
-    mode = os.environ.get("COMFYMODAL_RUNTIME", "legacy").strip().lower()
-    return mode if mode in {"legacy", "v2", "shadow"} else "legacy"
+    """Legacy compatibility wrapper. Use execution_runtime.resolve_execution_mode instead."""
+    from execution_runtime import resolve_execution_mode
+    resolved = resolve_execution_mode()
+    return resolved["mode"]
 
 
 def _record_shadow_plan_comparison(
@@ -2046,6 +2056,7 @@ async def _schedule_and_start(
     generation_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     generation_start_dt = datetime.fromisoformat(generation_start.replace("Z", "+00:00"))
 
+    from execution_runtime import resolve_execution_mode, MODE_V2
     from experiment_runner import LocalRemoteInvoker
     from local_artifacts import get_studio_outputs_dir
     from modal_client import run_prompt_stream
@@ -2098,18 +2109,42 @@ async def _schedule_and_start(
         except Exception:
             pass
 
-    invoker = LocalRemoteInvoker(
-        run_prompt_stream,
-        experiment_id=exp_id,
-        node_dir=str(node_dir) if node_dir else "",
-        stream_event_sink=_progress_sink,
-        profile_preparer=profile_preparer,
-        gpu=gpu,
-        modal_options=_effective_modal_options,
-        workspace=workspace,
-        production_report=_prod_report,
-        studio_output_dir=str(get_studio_outputs_dir()),
+    # ── Phase 8: choose invoker based on captured execution_mode ──
+    _exec_mode_resolved = resolve_execution_mode(
+        modal_options=modal_options,
+        extra={"execution_mode": compilation.get("execution_mode")},
+        modal_settings=None,
     )
+    _effective_modal_options["execution_mode"] = _exec_mode_resolved["mode"]
+    _effective_modal_options["execution_mode_source"] = _exec_mode_resolved["source"]
+    compilation.setdefault("execution_mode", _exec_mode_resolved["mode"])
+    compilation.setdefault("execution_mode_source", _exec_mode_resolved["source"])
+    _use_v2 = _exec_mode_resolved["mode"] == MODE_V2
+
+    if _use_v2:
+        from comfymodal_runtime.v2_experiment_invoker import V2ExperimentInvoker
+        invoker = V2ExperimentInvoker(
+            experiment_id=exp_id,
+            execution_mode=_exec_mode_resolved["mode"],
+            execution_mode_source=_exec_mode_resolved["source"],
+            modal_options=_effective_modal_options,
+            gpu=gpu,
+            workspace=workspace,
+            stream_event_sink=_progress_sink,
+        )
+    else:
+        invoker = LocalRemoteInvoker(
+            run_prompt_stream,
+            experiment_id=exp_id,
+            node_dir=str(node_dir) if node_dir else "",
+            stream_event_sink=_progress_sink,
+            profile_preparer=profile_preparer,
+            gpu=gpu,
+            modal_options=_effective_modal_options,
+            workspace=workspace,
+            production_report=_prod_report,
+            studio_output_dir=str(get_studio_outputs_dir()),
+        )
     sched = await REGISTRY.get_or_create_scheduler(
         exp_id,
         compilation=compilation,
@@ -3344,20 +3379,40 @@ async def handle_studio_run_async(
     Returns a completed result dict on success in direct mode, or a
     submission response dict in scheduler (legacy) mode.
     """
-    mode = _playground_runtime_mode()
-    if direct and mode == "v2":
+    from execution_runtime import resolve_execution_mode, MODE_V2
+    # Phase 8: capture the engine once at submission time.  The captured
+    # request option is forwarded through every downstream path.
+    _req_settings = {}
+    try:
+        from __init__ import _load_modal_settings as _ls
+        _req_settings = _ls()
+    except Exception:
+        pass
+    resolved = resolve_execution_mode(
+        modal_options=modal_options,
+        modal_settings=_req_settings,
+    )
+    mode = resolved["mode"]
+    _effective_modal_options = dict(modal_options or {})
+    _effective_modal_options["execution_mode"] = mode
+
+    # Forward captured execution_mode through trace_ctx for history/metadata
+    if isinstance(trace_ctx, dict):
+        trace_ctx["execution_mode"] = mode
+        trace_ctx["execution_mode_source"] = resolved["source"]
+
+    if direct and mode == MODE_V2:
         return await playground_adapter_direct_run(
             preset_id, feature_id, controls, node_dir,
-            modal_options=modal_options, gpu=gpu,
+            modal_options=_effective_modal_options, gpu=gpu,
             workspace=workspace, trace_ctx=trace_ctx,
         )
-
     if direct:
         # Legacy is the safe default. Shadow builds and compares the v2 plan,
         # then executes exactly one legacy generation.
         ctx = _prepare_studio_run_context(
             preset_id, feature_id, controls, node_dir,
-            trace_ctx=trace_ctx, modal_options=modal_options, workspace=workspace,
+            trace_ctx=trace_ctx, modal_options=_effective_modal_options, workspace=workspace,
         )
         if ctx.get("status") != "ok":
             return ctx
@@ -3367,7 +3422,7 @@ async def handle_studio_run_async(
             ctx,
             node_dir,
             gpu=gpu,
-            modal_options=modal_options,
+            modal_options=_effective_modal_options,
             workspace=workspace,
         )
         if mode == "shadow":
@@ -3377,14 +3432,14 @@ async def handle_studio_run_async(
     # ── Scheduler (legacy) path — shared context then scheduler ──
     ctx = _prepare_studio_run_context(
         preset_id, feature_id, controls, node_dir,
-        trace_ctx=trace_ctx, modal_options=modal_options, workspace=workspace,
+        trace_ctx=trace_ctx, modal_options=_effective_modal_options, workspace=workspace,
     )
     if ctx.get("status") != "ok":
         return ctx
 
     return _handle_studio_run_scheduler(
         ctx, node_dir,
-        gpu=gpu, modal_options=modal_options, workspace=workspace,
+        gpu=gpu, modal_options=_effective_modal_options, workspace=workspace,
     )
 
 

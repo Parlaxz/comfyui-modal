@@ -1812,9 +1812,8 @@ class OneTerminalEventPerCellTests(unittest.TestCase):
                     f"cells with >1 cell.completed: {over}"
                 )
 
-    def test_runner_does_not_emit_cell_terminal_events(self):
-        """The runner must NOT emit cell.completed/cell.failed events.
-        Only cell.attempt_created is emitted by the runner."""
+    def test_runner_emits_one_cell_terminal_event_per_attempt(self):
+        """The runner records a terminal event for every locally-run cell."""
         r = load_runner()
         with tempfile.TemporaryDirectory() as tmp:
             invoker = FakeInvoker()
@@ -1837,19 +1836,20 @@ class OneTerminalEventPerCellTests(unittest.TestCase):
                 asyncio.run(runner.run())
                 events = list(store.read_events())
                 types = [e["type"] for e in events]
-                # Runner must not emit cell.completed, cell.failed, or cell.interrupted
+                # A completed fake invocation emits one cell.completed event
+                # per attempted cell; failed/interrupted cells use their
+                # corresponding terminal event instead.
                 runner_terminal = {"cell.completed", "cell.failed", "cell.interrupted"}
                 runner_emitted = set(types) & runner_terminal
-                self.assertEqual(
-                    len(runner_emitted), 0,
-                    f"runner must not emit cell terminal events, got: {runner_emitted}"
-                )
-                # Only experiment.started, experiment.completed, checkpoint.claimed,
-                # checkpoint.completed, cell.attempt_created should be present
+                self.assertEqual(runner_emitted, {"cell.completed"})
+                self.assertEqual(types.count("cell.completed"), len(compilation["cells"]))
+                # Experiment/checkpoint lifecycle and per-cell attempt events
+                # remain present alongside terminal cell events.
                 allowed = {"experiment.started", "experiment.completed",
                            "checkpoint.claimed", "checkpoint.completed",
                            "checkpoint.stopped", "checkpoint.completed_with_failures",
-                           "checkpoint.failed_fatal", "cell.attempt_created"}
+                           "checkpoint.failed_fatal", "cell.attempt_created",
+                           "cell.completed", "cell.failed", "cell.interrupted"}
                 unexpected = set(types) - allowed
                 self.assertEqual(
                     len(unexpected), 0,

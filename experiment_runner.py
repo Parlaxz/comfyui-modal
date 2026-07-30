@@ -1027,17 +1027,22 @@ class ExperimentRunner:
                     prev_prefix = prefix
                     attempt_id = cell.get("attempt_id", f"a_{uuid.uuid4().hex[:8]}")
                     result = await self._invoker.run_cell(worker_invocation_id, cell)
-                    # For LocalRemoteInvoker (Studio single runs), emit
-                    # cell.completed with output_paths so the frontend can
-                    # display results. CheckpointStreamInvoker uses the
-                    # stream event sink (_on_remote_event) instead.
-                    if result.get("output_paths"):
+                    # Emit a terminal cell.completed event for every locally
+                    # executed cell.  Output paths are optional: V2 may
+                    # return descriptor-only output or a successful result
+                    # without a materialized image, but the scheduler and
+                    # History still need a truthful terminal event.
+                    if result.get("output_paths") or result.get("status") == "completed":
                         cell_completed_payload = {
                             "cell_key": cell.get("cell_key", ""),
                             "checkpoint_id": ck["id"],
-                            "output_paths": result["output_paths"],
+                            "output_paths": result.get("output_paths", []),
                             "attempt_id": attempt_id,
+                            "execution_mode": result.get("execution_mode") or self._compilation.get("execution_mode", ""),
+                            "execution_mode_source": result.get("execution_mode_source") or self._compilation.get("execution_mode_source", "request"),
                         }
+                        if result.get("primary_asset_id"):
+                            cell_completed_payload["primary_asset_id"] = result["primary_asset_id"]
                         # Keep the compact validation candidate available to
                         # the Studio finalizer without carrying remote output
                         # data through the durable event.
@@ -1071,6 +1076,8 @@ class ExperimentRunner:
                                 "checkpoint_id": ck["id"],
                                 "error": result.get("error", "Cell execution failed"),
                                 "attempt_id": attempt_id,
+                                "execution_mode": result.get("execution_mode") or self._compilation.get("execution_mode", ""),
+                                "execution_mode_source": result.get("execution_mode_source") or self._compilation.get("execution_mode_source", "request"),
                             }
                             tp = result.get("timing_payload")
                             if tp:
@@ -1441,7 +1448,13 @@ class LocalRemoteInvoker:
             local_trace.mark("t9_local_materialized")
             local_trace.mark("t10_local_materialized")
             _mutable_trace["output_materialized"] = local_trace.get("output_materialized")
-            result = {"status": "completed", "result": data, "output_paths": saved}
+            result = {
+                "status": "completed",
+                "result": data,
+                "output_paths": saved,
+                "execution_mode": (self._modal_options or {}).get("execution_mode", "v1"),
+                "execution_mode_source": (self._modal_options or {}).get("execution_mode_source", "request"),
+            }
 
             # ── Merge mutable-trace markers back into local_trace ──
             if isinstance(_mutable_trace, dict):
@@ -1484,7 +1497,7 @@ class LocalRemoteInvoker:
             return result
 
         except Exception as exc:
-            result = {"status": "failed", "error": str(exc)}
+            result: dict[str, Any] = {"status": "failed", "error": str(exc)}
             # Preserve any partial timing accumulated before the crash.
             if _last_remote_data is not None:
                 tp = extract_remote_timing_payload(_last_remote_data)
