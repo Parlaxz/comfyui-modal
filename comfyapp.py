@@ -7306,12 +7306,14 @@ _GPU_SOURCE_BYTES = sum(
 _APP_SOURCE_BYTES = os.path.getsize(__file__)
 
 def _add_gpu_python_sources(img):
+    img = img.add_local_python_source("comfyapp", copy=True)
     for _module_name in _GPU_COMFYMODAL_PYTHON_SOURCES:
         img = img.add_local_python_source(_module_name, copy=True)
     return img
 
 
 def _add_cpu_python_sources(img):
+    img = img.add_local_python_source("comfyapp", copy=True)
     for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
         img = img.add_local_python_source(_module_name, copy=True)
     return img
