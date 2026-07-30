@@ -566,6 +566,45 @@ class FullEvictionTests(unittest.TestCase):
         self.assertFalse(ep._cpu_snapshot_models_active)
         self.assertIsNone(ep._cpu_snapshot_models)
 
+    def test_full_eviction_removes_exact_comfy_ownership(self):
+        """Only exact target records are removed from model-management state."""
+        import types
+
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        other = _FakeModel("other")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+
+        class _LoadedRecord:
+            def __init__(self, model):
+                self.model = model
+
+        records = [_LoadedRecord(unet), _LoadedRecord(clip), _LoadedRecord(other)]
+        fake_mm = types.SimpleNamespace(current_loaded_models=records)
+
+        def _free_memory(_required, _device, keep_loaded=None, **_kwargs):
+            fake_mm.current_loaded_models[:] = list(keep_loaded or [])
+            return []
+
+        fake_mm.free_memory = _free_memory
+        fake_mm.cleanup_models = lambda: None
+        fake_comfy = types.ModuleType("comfy")
+        fake_comfy.__path__ = []
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "none"
+        with patch.dict(sys.modules, {
+            "comfy": fake_comfy,
+            "comfy.model_management": fake_mm,
+        }):
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._full_memory_side_effect()):
+                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertEqual(ep._snapshot_eviction_metadata["comfy_owned_target_count_before"], 2)
+        self.assertEqual(ep._snapshot_eviction_metadata["comfy_owned_target_count_after"], 0)
+        self.assertEqual(len(fake_mm.current_loaded_models), 1)
+        self.assertIs(fake_mm.current_loaded_models[0].model, other)
+
     def test_full_eviction_retained_role_none_defaults(self):
         """retained_role=none leaves dedicated attrs at defaults."""
         marker, metadata, ep = self._run_full_evict_no_reload()

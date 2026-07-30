@@ -3811,20 +3811,57 @@ class ModalRuntimeEntrypoint:
         _RES4LYF_PREPARED.clear()
         _CACHEDIT_PREPARED.clear()
 
-        # ── 7. Unload from Comfy model_management ──
+        # ── 7. Remove exact models from Comfy model-management ownership ──
+        _comfy_owned_before = 0
+        _comfy_owned_after = 0
         try:
             import comfy.model_management as _mm
-            _loaded_list = _mm.loaded_models() if callable(getattr(_mm, "loaded_models", None)) else []
-            for _lm in list(_loaded_list):
-                _lm_model = getattr(_lm, "model", None)
-                if _lm_model is _unet_obj or _lm_model is _clip_obj:
-                    try:
-                        _mm.unload_model(_lm)
-                    except Exception:
-                        pass
-            del _lm, _lm_model, _loaded_list
+            _loaded_records = getattr(_mm, "current_loaded_models", None)
+            _free_memory = getattr(_mm, "free_memory", None)
+            if isinstance(_loaded_records, list) and callable(_free_memory):
+                _records = list(_loaded_records)
+                _targets = (_unet_obj, _clip_obj)
+                _comfy_owned_before = sum(
+                    1 for _record in _records
+                    if getattr(_record, "model", None) is _unet_obj
+                    or getattr(_record, "model", None) is _clip_obj
+                )
+                _keep_loaded = [
+                    _record for _record in _records
+                    if all(
+                        getattr(_record, "model", None) is not _target
+                        for _target in _targets
+                    )
+                ]
+                _free_memory(1e32, None, keep_loaded=_keep_loaded)
+                _cleanup_models = getattr(_mm, "cleanup_models", None)
+                if callable(_cleanup_models):
+                    _cleanup_models()
+                _comfy_owned_after = sum(
+                    1 for _record in list(_loaded_records)
+                    if getattr(_record, "model", None) is _unet_obj
+                    or getattr(_record, "model", None) is _clip_obj
+                )
+                del _records, _targets, _keep_loaded
+            else:
+                _loaded_models = (
+                    _mm.loaded_models()
+                    if callable(getattr(_mm, "loaded_models", None)) else []
+                )
+                _unload_model = getattr(_mm, "unload_model_and_clones", None)
+                if callable(_unload_model):
+                    for _loaded_model in list(_loaded_models):
+                        if _loaded_model is _unet_obj or _loaded_model is _clip_obj:
+                            _unload_model(
+                                _loaded_model,
+                                unload_additional_models=False,
+                                all_devices=True,
+                            )
+                del _loaded_models, _unload_model
         except Exception:
             pass
+        self._snapshot_eviction_metadata["comfy_owned_target_count_before"] = _comfy_owned_before
+        self._snapshot_eviction_metadata["comfy_owned_target_count_after"] = _comfy_owned_after
 
         # ── 8. Clear runtime/storage registries and self attrs ──
         self._cpu_snapshot_unet_runtime_state = None
