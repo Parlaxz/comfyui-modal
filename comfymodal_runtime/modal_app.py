@@ -3594,50 +3594,94 @@ class ModalRuntimeEntrypoint:
         self,
         cpu_models: Any,
         bootstrap_state: Any,
+        *,
+        reload_unet_fn: Callable | None = None,
+        reload_clip_fn: Callable | None = None,
+        snap_ctx_cm: Callable | None = None,
+        target_gpus: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
-        """Evict CPU snapshot models from process memory before snapshot.
+        """Evict BOTH CPU snapshot models unconditionally, then reload
+        the selected role (clip/unet/none) via stored loader closures.
 
-        Called only when COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=1
-        and both top-level CLIP/UNET models exist.  Uses weakrefs to
-        verify model death, clears bridge/registries/identities, unloads
-        from Comfy model-management, runs gc/malloc_trim, and validates
-        RSS drop.  Stores a primitive marker on ``self._eviction_marker``.
+        Before eviction copies primitive metadata from the models.
+        After full eviction succeeds, reloads exactly the selected role
+        and stores the fresh object on ``_snapshot_eviction_retained_model``.
+        Normal snapshot model state/bridge/loader outputs/seed remain absent.
 
-        Returns the eviction marker dict.  Raises RuntimeError on
-        any validation failure.
+        Returns primitive metadata dict (no live objects).  Raises
+        RuntimeError on any validation failure.
         """
         import gc as _gc
         import weakref as _wr
 
-        # ── 1. Pre-eviction primitive state record ──
+        # ── 1. Pre-eviction primitive metadata ──
         _model_key = getattr(cpu_models, "model_key", None)
-        _policy = getattr(cpu_models, "compute_policy", "default")
-        _policy_ver = getattr(cpu_models, "policy_version", 0)
+        _normalized_profile = copy.deepcopy(
+            getattr(cpu_models, "normalized_profile", {}) or {}
+        )
+        _model_spec = copy.deepcopy(getattr(cpu_models, "model_spec", {}) or {})
+        _compute_policy = getattr(cpu_models, "compute_policy", "default")
+        _policy_version = getattr(cpu_models, "policy_version", 0)
+        _model_target_gpus = getattr(cpu_models, "target_gpus", ())
         _key_hash = getattr(_model_key, "stable_hash", "")[:16] or "absent"
         _unet_obj = getattr(cpu_models, "unet", None)
         _clip_obj = getattr(cpu_models, "clip", None)
         _unet_ident = getattr(_model_key, "unet_identity", "absent")
         _clip_ident = getattr(_model_key, "clip_identity", "absent")
+        _clip_type_model = getattr(_model_key, "clip_type", "absent")
         _unet_id = str(id(_unet_obj)) if _unet_obj is not None else "none"
         _clip_id = str(id(_clip_obj)) if _clip_obj is not None else "none"
         _unet_type = type(_unet_obj).__name__ if _unet_obj is not None else "none"
-        _clip_type = type(_clip_obj).__name__ if _clip_obj is not None else "none"
+        _clip_type_name = type(_clip_obj).__name__ if _clip_obj is not None else "none"
         _unet_present = int(_unet_obj is not None)
         _clip_present = int(_clip_obj is not None)
 
-        # Snapshot-state metadata: primitive-only fields for restore reconciliation
+        _weight_dtype = "default"
+        if isinstance(_normalized_profile, dict):
+            _profile_weight_dtype = _normalized_profile.get("weight_dtype")
+            if _profile_weight_dtype:
+                _weight_dtype = str(_profile_weight_dtype)
+        _retained_role = _parse_evict_retain_role()
+        self._snapshot_eviction_retained_role = _retained_role
+
+        # Primitive metadata dict for return (no live objects)
+        _eviction_metadata: dict[str, Any] = {
+            "model_key_unet_identity": _unet_ident,
+            "model_key_clip_identity": _clip_ident,
+            "model_key_clip_type": _clip_type_model,
+            "model_key_hash": _key_hash,
+            "compute_policy": _compute_policy,
+            "policy_version": _policy_version,
+            "weight_dtype": _weight_dtype,
+            "unet_present": _unet_present,
+            "clip_present": _clip_present,
+        }
+        _effective_target_gpus = _model_target_gpus or target_gpus or ()
+        if isinstance(_effective_target_gpus, (tuple, list)):
+            _eviction_metadata["target_gpus"] = tuple(_effective_target_gpus)
+        if isinstance(_normalized_profile, dict):
+            for _k in ("mode", "unet", "clip1", "clip2", "clip_type", "weight_dtype"):
+                if _k in _normalized_profile:
+                    _eviction_metadata[f"normalized_{_k}"] = _normalized_profile[_k]
+
+        # Snapshot-eviction metadata (persistent primitive fields)
         self._snapshot_eviction_metadata = {
             "clip_present": _clip_present,
             "unet_present": _unet_present,
-            "clip_type": _clip_type,
+            "clip_type": _clip_type_name,
             "unet_type": _unet_type,
             "clip_object_id": _clip_id,
             "unet_object_id": _unet_id,
             "cpu_snapshot_model_key_hash": _key_hash,
-            "cpu_snapshot_compute_policy": _policy,
-            "cpu_snapshot_policy_version": _policy_ver,
+            "cpu_snapshot_compute_policy": _compute_policy,
+            "cpu_snapshot_policy_version": _policy_version,
+            "weight_dtype": _weight_dtype,
+            "retained_role": _retained_role,
         }
-        # Module-loaded booleans via sys.modules (no imports)
+        if isinstance(_normalized_profile, dict):
+            for _k in ("mode", "unet", "clip1", "clip2", "clip_type"):
+                if _k in _normalized_profile:
+                    self._snapshot_eviction_metadata[f"normalized_{_k}"] = _normalized_profile[_k]
         _mods = set(sys.modules.keys())
         self._snapshot_eviction_metadata["torch_module_loaded"] = any(
             m.startswith("torch") for m in _mods
@@ -3650,7 +3694,6 @@ class ModalRuntimeEntrypoint:
         )
         del _mods
 
-        # Torch/native thread/module counts
         _pre_mem = _collect_process_memory(fields=(
             "vm_rss_mib", "vm_hwm_mib",
             "smaps_rss_mib", "smaps_pss_mib",
@@ -3667,47 +3710,34 @@ class ModalRuntimeEntrypoint:
         _pre_intraop = _pre_mem.get("torch_intraop_threads", "absent")
         _pre_interop = _pre_mem.get("torch_interop_threads", "absent")
         _pre_modules = _pre_mem.get("loaded_module_count", "absent")
-
         self._snapshot_eviction_metadata["torch_intraop_threads"] = _pre_intraop
         self._snapshot_eviction_metadata["torch_interop_threads"] = _pre_interop
         self._snapshot_eviction_metadata["native_thread_count"] = _pre_native
         self._snapshot_eviction_metadata["loaded_module_count"] = _pre_modules
 
-        # ── 1b. Retained model selection (role-based experiment) ──
-        _retained_role = _parse_evict_retain_role() if _parse_evict_models_before_snapshot() else "none"
-        self._snapshot_eviction_retained_role = _retained_role
-        _retained_obj: Any = None
-        if _retained_role == "clip":
-            _retained_obj = _clip_obj
-            if _retained_obj is None:
-                print(
-                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                    f"enabled=1 status=error failure=retained_model_missing "
-                    f"retain_role=clip retained_model_present=0 retained_model_id=0 "
-                    f"retained_model_type=absent clip_original_id={_clip_id} "
-                    f"unet_original_id={_unet_id}",
-                    flush=True,
-                )
-                raise RuntimeError(
-                    "Eviction retain role is 'clip' but clip object is None"
-                )
-        elif _retained_role == "unet":
-            _retained_obj = _unet_obj
-            if _retained_obj is None:
-                print(
-                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                    f"enabled=1 status=error failure=retained_model_missing "
-                    f"retain_role=unet retained_model_present=0 retained_model_id=0 "
-                    f"retained_model_type=absent clip_original_id={_clip_id} "
-                    f"unet_original_id={_unet_id}",
-                    flush=True,
-                )
-                raise RuntimeError(
-                    "Eviction retain role is 'unet' but unet object is None"
-                )
-        # retained_role == "none": _retained_obj remains None
+        # EMIT stage=full_models_loaded (pre-eviction RSS)
+        _stage_rss = lambda m: _numeric_value(m.get("smaps_rss_mib"), _numeric_value(m.get("vm_rss_mib"), "absent"))
+        _stage_anon = lambda m: _numeric_value(m.get("smaps_anonymous_mib"), "absent")
+        _stage_priv = lambda m: _numeric_value(m.get("smaps_private_dirty_mib"), "absent")
+        print(
+            f"[v2.snapshot_model_eviction_memory] stage=full_models_loaded "
+            f"vm_rss_mib={_pre_mem.get('vm_rss_mib', 'absent')} "
+            f"vm_hwm_mib={_pre_mem.get('vm_hwm_mib', 'absent')} "
+            f"smaps_rss_mib={_pre_mem.get('smaps_rss_mib', 'absent')} "
+            f"smaps_pss_mib={_pre_mem.get('smaps_pss_mib', 'absent')} "
+            f"smaps_private_clean_mib={_pre_mem.get('smaps_private_clean_mib', 'absent')} "
+            f"smaps_private_dirty_mib={_pre_priv_dirty_mib} "
+            f"smaps_shared_clean_mib={_pre_mem.get('smaps_shared_clean_mib', 'absent')} "
+            f"smaps_shared_dirty_mib={_pre_mem.get('smaps_shared_dirty_mib', 'absent')} "
+            f"smaps_anonymous_mib={_pre_anon_mib} "
+            f"native_thread_count={_pre_native} "
+            f"torch_intraop_threads={_pre_intraop} "
+            f"torch_interop_threads={_pre_interop} "
+            f"loaded_module_count={_pre_modules}",
+            flush=True,
+        )
 
-        # ── 2. Weakref CLIP and UNET (fail clearly if unsupported) ──
+        # ── 2. Weakref BOTH models ──
         if _unet_obj is not None:
             try:
                 _unet_wr = _wr.ref(_unet_obj)
@@ -3722,49 +3752,66 @@ class ModalRuntimeEntrypoint:
                 _clip_wr = _wr.ref(_clip_obj)
             except TypeError:
                 raise RuntimeError(
-                    f"weakref.ref unsupported for CLIP object (type={_clip_type})"
+                    f"weakref.ref unsupported for CLIP object (type={_clip_type_name})"
                 )
         else:
             _clip_wr = None
 
-        # ── 3. Clear bridge ──
+        # ── 3. Capture bridge state, then clear it ──
+        _diag = getattr(self._preload_bridge, "diagnostic_snapshot", lambda: {})()
+        _bridge_active_prep_before_clear = 0
+        if isinstance(_diag, dict):
+            _active_prep = _diag.get("active_preparation_exists") or _diag.get("current_preparation_exists") or False
+            _bridge_active_prep_before_clear = 1 if _active_prep else 0
+        _coord = getattr(self._preload_bridge, "coordinator", None)
+        _prep = getattr(_coord, "_active", None) if _coord is not None else None
+        if _prep is not None:
+            _bridge_active_prep_before_clear = 1
+        del _diag, _coord, _prep
         self._preload_bridge.clear()
 
-        # ── 4. Prove active preparation absent and futures absent ──
+        # ── 4. Prove bridge preparation is absent after clear ──
         _diag = getattr(self._preload_bridge, "diagnostic_snapshot", lambda: {})()
         _bridge_active_prep = 0
         if isinstance(_diag, dict):
             _active_prep = _diag.get("active_preparation_exists") or _diag.get("current_preparation_exists") or False
             _bridge_active_prep = 1 if _active_prep else 0
-        # Also check futures directly
         _coord = getattr(self._preload_bridge, "coordinator", None)
         _prep = getattr(_coord, "_active", None) if _coord is not None else None
         if _prep is not None:
-            for _lane_name in ("unet", "clip", "vae", "prefill"):
-                _fut = getattr(_prep, f"{_lane_name}_future", None)
-                if _fut is not None:
-                    pass  # just verifying clear succeeded, no need to store
             _bridge_active_prep = 1
         del _diag, _coord, _prep
 
-        # ── 5. Clear snapshot loader outputs/identities and execution seed flags ──
+        # ── 5. Clear bootstrap state ──
         if bootstrap_state is not None:
             bootstrap_state.snapshot_loader_outputs = {}
             bootstrap_state.snapshot_model_identities = {}
             bootstrap_state.snapshot_execution_seed = None
             bootstrap_state.snapshot_seed_built = False
+        _snapshot_loader_output_count = 0
+        _snapshot_seed_present = 0
+        if bootstrap_state is not None:
+            _snapshot_loader_output_count = len(
+                getattr(bootstrap_state, "snapshot_loader_outputs", {}) or {}
+            )
+            _snapshot_seed_present = int(
+                getattr(bootstrap_state, "snapshot_execution_seed", None) is not None
+                or bool(getattr(bootstrap_state, "snapshot_seed_built", False))
+            )
+        if _bridge_active_prep or _snapshot_loader_output_count or _snapshot_seed_present:
+            raise RuntimeError(
+                "Full eviction failed: normal snapshot state repopulated after cleanup "
+                f"(bridge_active_preparation={_bridge_active_prep} "
+                f"snapshot_loader_output_count={_snapshot_loader_output_count} "
+                f"snapshot_seed_present={_snapshot_seed_present})"
+            )
 
-        # ── 6. Preserve certificate/workflow/custom-node/dependency/Sage/CacheDiT/RES4LYF ──
-        # Do NOT touch: _V2_CERT_PROCESS_CACHE, _V2_WORKFLOW_HASH,
-        # _RES4LYF_HOOK_INSTALLED, preimport results, dependency manifests,
-        # runtime volumes, GPU state, outputs_to_execute.
-        # Only clear prepared state derived from snapshot models:
+        # ── 6. Clear RES4LYF/CACHEDIT prepared state ──
         global _RES4LYF_PREPARED, _CACHEDIT_PREPARED
         _RES4LYF_PREPARED.clear()
         _CACHEDIT_PREPARED.clear()
 
-        # ── 7. Unload exact models from Comfy model-management if present ──
-        _lm = _lm_model = None
+        # ── 7. Unload from Comfy model_management ──
         try:
             import comfy.model_management as _mm
             _loaded_list = _mm.loaded_models() if callable(getattr(_mm, "loaded_models", None)) else []
@@ -3775,12 +3822,11 @@ class ModalRuntimeEntrypoint:
                         _mm.unload_model(_lm)
                     except Exception:
                         pass
-            # Delete every temporary strong alias before weakref verification:
             del _lm, _lm_model, _loaded_list
         except Exception:
             pass
 
-        # ── 8. Clear runtime registries and self._cpu_snapshot_models references ──
+        # ── 8. Clear runtime/storage registries and self attrs ──
         self._cpu_snapshot_unet_runtime_state = None
         self._cpu_snapshot_unet_storage_registry = None
         self._cpu_snapshot_clip_storage_registry = None
@@ -3788,28 +3834,10 @@ class ModalRuntimeEntrypoint:
         if cpu_models is not None:
             cpu_models.unet = None
             cpu_models.clip = None
-        # Clear self reference
         self._cpu_snapshot_models = None
-        # Delete local alias to cpu_models so no local holds models alive
-        del cpu_models
-        # Delete local object references
-        del _unet_obj, _clip_obj
+        del cpu_models, _unet_obj, _clip_obj
 
-        # ── 8b. Retained model: assign to dedicated attr after normal ownership gone ──
-        if _retained_obj is not None:
-            self._snapshot_eviction_retained_model = _retained_obj
-            self._snapshot_eviction_retained_model_id = id(_retained_obj)
-            self._snapshot_eviction_retained_model_type = type(_retained_obj).__name__
-            _retained_obj_wr = _wr.ref(_retained_obj) if _retained_obj is not None else None
-            # Delete temporary strong ref; the dedicated attr now owns it.
-            del _retained_obj
-        else:
-            self._snapshot_eviction_retained_model = None
-            self._snapshot_eviction_retained_model_id = 0
-            self._snapshot_eviction_retained_model_type = ""
-            _retained_obj_wr = None
-
-        # ── 9. gc.collect() × 2 ──
+        # ── 9. gc.collect() x2 + memory ──
         _gc.collect()
         _gc.collect()
         _after_gc_mem = _collect_process_memory(fields=(
@@ -3821,11 +3849,11 @@ class ModalRuntimeEntrypoint:
             "native_thread_count", "torch_intraop_threads",
             "torch_interop_threads", "loaded_module_count",
         ))
-        _after_rss_mib = _numeric_value(_after_gc_mem.get("smaps_rss_mib"), _numeric_value(_after_gc_mem.get("vm_rss_mib"), "absent"))
-        _after_anon_mib = _numeric_value(_after_gc_mem.get("smaps_anonymous_mib"), "absent")
-        _after_priv_dirty_mib = _numeric_value(_after_gc_mem.get("smaps_private_dirty_mib"), "absent")
+        _after_gc_rss_mib = _stage_rss(_after_gc_mem)
+        _after_gc_anon_mib = _stage_anon(_after_gc_mem)
+        _after_gc_priv_mib = _stage_priv(_after_gc_mem)
 
-        # ── 10. Best-effort libc malloc_trim(0) ──
+        # ── 10. malloc_trim(0) ──
         _trim_status = "unsupported"
         _trim_result = "absent"
         try:
@@ -3842,7 +3870,7 @@ class ModalRuntimeEntrypoint:
             _trim_status = "error"
             _trim_result = "absent"
 
-        # ── 11. Final gc.collect() after trim ──
+        # ── 11. Final gc after trim + memory ──
         _gc.collect()
         _after_trim_mem = _collect_process_memory(fields=(
             "vm_rss_mib", "vm_hwm_mib",
@@ -3853,81 +3881,24 @@ class ModalRuntimeEntrypoint:
             "native_thread_count", "torch_intraop_threads",
             "torch_interop_threads", "loaded_module_count",
         ))
-        _after_trim_rss_mib = _numeric_value(_after_trim_mem.get("smaps_rss_mib"), _numeric_value(_after_trim_mem.get("vm_rss_mib"), "absent"))
-        _after_trim_anon_mib = _numeric_value(_after_trim_mem.get("smaps_anonymous_mib"), "absent")
-        _after_trim_priv_dirty_mib = _numeric_value(_after_trim_mem.get("smaps_private_dirty_mib"), "absent")
+        _after_trim_rss_mib = _stage_rss(_after_trim_mem)
+        _after_trim_anon_mib = _stage_anon(_after_trim_mem)
+        _after_trim_priv_mib = _stage_priv(_after_trim_mem)
         _after_native = _after_trim_mem.get("native_thread_count", "absent")
         _after_intraop = _after_trim_mem.get("torch_intraop_threads", "absent")
         _after_interop = _after_trim_mem.get("torch_interop_threads", "absent")
         _after_modules = _after_trim_mem.get("loaded_module_count", "absent")
 
-        # ── Emit three memory stages (before/after_gc/after_trim) ──
-        print(
-            f"[v2.snapshot_model_eviction_memory] stage=before "
-            f"vm_rss_mib={_pre_mem.get('vm_rss_mib', 'absent')} "
-            f"vm_hwm_mib={_pre_mem.get('vm_hwm_mib', 'absent')} "
-            f"smaps_rss_mib={_pre_mem.get('smaps_rss_mib', 'absent')} "
-            f"smaps_pss_mib={_pre_mem.get('smaps_pss_mib', 'absent')} "
-            f"smaps_private_clean_mib={_pre_mem.get('smaps_private_clean_mib', 'absent')} "
-            f"smaps_private_dirty_mib={_pre_priv_dirty_mib} "
-            f"smaps_shared_clean_mib={_pre_mem.get('smaps_shared_clean_mib', 'absent')} "
-            f"smaps_shared_dirty_mib={_pre_mem.get('smaps_shared_dirty_mib', 'absent')} "
-            f"smaps_anonymous_mib={_pre_anon_mib} "
-            f"native_thread_count={_pre_native} "
-            f"torch_intraop_threads={_pre_intraop} "
-            f"torch_interop_threads={_pre_interop} "
-            f"loaded_module_count={_pre_modules}",
-            flush=True,
-        )
-        print(
-            f"[v2.snapshot_model_eviction_memory] stage=after_gc "
-            f"vm_rss_mib={_after_gc_mem.get('vm_rss_mib', 'absent')} "
-            f"vm_hwm_mib={_after_gc_mem.get('vm_hwm_mib', 'absent')} "
-            f"smaps_rss_mib={_after_gc_mem.get('smaps_rss_mib', 'absent')} "
-            f"smaps_pss_mib={_after_gc_mem.get('smaps_pss_mib', 'absent')} "
-            f"smaps_private_clean_mib={_after_gc_mem.get('smaps_private_clean_mib', 'absent')} "
-            f"smaps_private_dirty_mib={_after_priv_dirty_mib} "
-            f"smaps_shared_clean_mib={_after_gc_mem.get('smaps_shared_clean_mib', 'absent')} "
-            f"smaps_shared_dirty_mib={_after_gc_mem.get('smaps_shared_dirty_mib', 'absent')} "
-            f"smaps_anonymous_mib={_after_anon_mib} "
-            f"native_thread_count={_after_gc_mem.get('native_thread_count', 'absent')} "
-            f"torch_intraop_threads={_after_gc_mem.get('torch_intraop_threads', 'absent')} "
-            f"torch_interop_threads={_after_gc_mem.get('torch_interop_threads', 'absent')} "
-            f"loaded_module_count={_after_gc_mem.get('loaded_module_count', 'absent')}",
-            flush=True,
-        )
-        print(
-            f"[v2.snapshot_model_eviction_memory] stage=after_trim "
-            f"vm_rss_mib={_after_trim_mem.get('vm_rss_mib', 'absent')} "
-            f"vm_hwm_mib={_after_trim_mem.get('vm_hwm_mib', 'absent')} "
-            f"smaps_rss_mib={_after_trim_mem.get('smaps_rss_mib', 'absent')} "
-            f"smaps_pss_mib={_after_trim_mem.get('smaps_pss_mib', 'absent')} "
-            f"smaps_private_clean_mib={_after_trim_mem.get('smaps_private_clean_mib', 'absent')} "
-            f"smaps_private_dirty_mib={_after_trim_priv_dirty_mib} "
-            f"smaps_shared_clean_mib={_after_trim_mem.get('smaps_shared_clean_mib', 'absent')} "
-            f"smaps_shared_dirty_mib={_after_trim_mem.get('smaps_shared_dirty_mib', 'absent')} "
-            f"smaps_anonymous_mib={_after_trim_anon_mib} "
-            f"native_thread_count={_after_native} "
-            f"torch_intraop_threads={_after_intraop} "
-            f"torch_interop_threads={_after_interop} "
-            f"loaded_module_count={_after_modules}",
-            flush=True,
-        )
-
-        # ── 12. Verify weakrefs dead ──
-        # Retained model (role=clip/unet) is held by dedicated attr; it is
-        # checked separately in section 12b below — exclude it here.
+        # ── 12. Verify BOTH original weakrefs dead ──
         _unet_alive = _unet_wr() is not None if _unet_wr is not None else False
         _clip_alive = _clip_wr() is not None if _clip_wr is not None else False
-        _clip_alive_flag = 1 if _clip_alive else 0
-        _unet_alive_flag = 1 if _unet_alive else 0
-        _unexpected_unet_alive = _unet_alive and not (_retained_role == "unet")
-        _unexpected_clip_alive = _clip_alive and not (_retained_role == "clip")
-        if _unexpected_unet_alive or _unexpected_clip_alive:
+        _original_unet_alive_flag = 1 if _unet_alive else 0
+        _original_clip_alive_flag = 1 if _clip_alive else 0
+        if _unet_alive or _clip_alive:
             _alive_parts = []
-            if _unexpected_unet_alive:
+            if _unet_alive:
                 _alive_parts.append(f"UNET(id={_unet_id})")
-            if _unexpected_clip_alive:
+            if _clip_alive:
                 _alive_parts.append(f"CLIP(id={_clip_id})")
             _alive_msg = "; ".join(_alive_parts)
             _known_ref_state = {
@@ -3941,196 +3912,347 @@ class ModalRuntimeEntrypoint:
                 f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
                 f"enabled=1 status=object_still_alive "
                 f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-                f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+                f"original_clip_alive_after_full_eviction={_original_clip_alive_flag} "
+                f"original_unet_alive_after_full_eviction={_original_unet_alive_flag} "
                 f"bridge_active_preparation={_bridge_active_prep} "
+                f"bridge_active_preparation_before_clear={_bridge_active_prep_before_clear} "
                 f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
-                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
+                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_gc_rss_mib} "
                 f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib=absent "
                 f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
                 f"anonymous_drop_mib=absent "
-                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
+                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_mib} "
                 f"private_dirty_drop_mib=absent "
-                f"native_threads_before={_pre_native} native_threads_after={_after_native} "
-                f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
-                f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
-                f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
                 f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result} "
                 f"known_reference_state={_known_ref_state}",
                 flush=True,
             )
             raise RuntimeError(
-                f"Model eviction failed: weakrefs still alive: {_alive_msg}"
+                f"Full eviction failed: original weakrefs still alive: {_alive_msg}"
             )
 
-        # ── 12b. Verify retained model weakref liveness and identity ──
-        if _retained_role != "none" and _retained_obj_wr is not None:
-            if _retained_obj_wr() is None:
-                print(
-                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                    f"enabled=1 status=error failure=retained_model_dead "
-                    f"retain_role={_retained_role} retained_model_present=0 "
-                    f"retained_model_id={self._snapshot_eviction_retained_model_id} "
-                    f"retained_model_type={self._snapshot_eviction_retained_model_type or 'absent'} "
-                    f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-                    f"clip_alive_after_cleanup={_clip_alive_flag} "
-                    f"unet_alive_after_cleanup={_unet_alive_flag}",
-                    flush=True,
-                )
-                raise RuntimeError(
-                    f"Eviction retained model (role={_retained_role}) weakref "
-                    f"is dead after gc/trim — model was lost"
-                )
-            _retained_model = self._snapshot_eviction_retained_model
-            if _retained_model is None or id(_retained_model) != self._snapshot_eviction_retained_model_id:
-                print(
-                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                    f"enabled=1 status=error failure=retained_model_identity_mismatch "
-                    f"retain_role={_retained_role} retained_model_present={int(_retained_model is not None)} "
-                    f"retained_model_id={self._snapshot_eviction_retained_model_id} "
-                    f"retained_model_type={self._snapshot_eviction_retained_model_type or 'absent'} "
-                    f"clip_original_id={_clip_id} unet_original_id={_unet_id}",
-                    flush=True,
-                )
-                raise RuntimeError(
-                    f"Eviction retained model (role={_retained_role}) identity "
-                    f"mismatch after gc/trim"
-                )
-            del _retained_model
-        # Clean up retained weakref
-        del _retained_obj_wr
-
-        # ── 13. Fail if memory evidence unavailable ──
+        # ── 13. Memory evidence check ──
         if _pre_rss_mib == "absent" or _after_trim_rss_mib == "absent":
             print(
                 f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
                 f"enabled=1 status=error "
                 f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-                f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+                f"original_clip_alive_after_full_eviction={_original_clip_alive_flag} "
+                f"original_unet_alive_after_full_eviction={_original_unet_alive_flag} "
                 f"bridge_active_preparation={_bridge_active_prep} "
-                f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
-                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
+                f"bridge_active_preparation_before_clear={_bridge_active_prep_before_clear} "
+                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_gc_rss_mib} "
                 f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib=absent "
-                f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
-                f"anonymous_drop_mib=absent "
-                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
-                f"private_dirty_drop_mib=absent "
-                f"native_threads_before={_pre_native} native_threads_after={_after_native} "
-                f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
-                f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
-                f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
                 f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
                 flush=True,
             )
             raise RuntimeError(
-                "Model eviction failed: memory evidence unavailable "
+                "Full eviction failed: memory evidence unavailable "
                 f"(pre_rss={_pre_rss_mib!r} post_rss={_after_trim_rss_mib!r})"
             )
 
-        # ── 14. Compute RSS drop (smaps preferred, fallback vm) ──
-        _rss_drop_mib = float(_pre_rss_mib) - float(_after_trim_rss_mib)
-        _anonymous_drop_mib = "absent"
-        if isinstance(_pre_anon_mib, (int, float)) and isinstance(_after_trim_anon_mib, (int, float)):
-            _anonymous_drop_mib = float(_pre_anon_mib) - float(_after_trim_anon_mib)
-        _private_dirty_drop_mib = "absent"
-        if isinstance(_pre_priv_dirty_mib, (int, float)) and isinstance(_after_trim_priv_dirty_mib, (int, float)):
-            _private_dirty_drop_mib = float(_pre_priv_dirty_mib) - float(_after_trim_priv_dirty_mib)
-
-        # Role-specific RSS floor: none/clip=8192 MiB, unet=4096 MiB
-        _rss_floor_mib = 8192.0 if _retained_role in ("none", "clip") else 4096.0
-        if _rss_drop_mib < _rss_floor_mib:
+        # ── 14. RSS drop always >= 8192 MiB ──
+        _full_eviction_rss_drop_mib = float(_pre_rss_mib) - float(_after_trim_rss_mib)
+        if _full_eviction_rss_drop_mib < 8192.0:
             print(
                 f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
                 f"enabled=1 status=insufficient_rss_drop "
                 f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-                f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+                f"original_clip_alive_after_full_eviction={_original_clip_alive_flag} "
+                f"original_unet_alive_after_full_eviction={_original_unet_alive_flag} "
                 f"bridge_active_preparation={_bridge_active_prep} "
-                f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
-                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
-                f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib={_rss_drop_mib:.1f} "
+                f"bridge_active_preparation_before_clear={_bridge_active_prep_before_clear} "
+                f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_gc_rss_mib} "
+                f"rss_after_trim_mib={_after_trim_rss_mib} "
+                f"full_eviction_rss_drop_mib={_full_eviction_rss_drop_mib:.1f} "
                 f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
-                f"anonymous_drop_mib={_anonymous_drop_mib} "
-                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
-                f"private_dirty_drop_mib={_private_dirty_drop_mib} "
-                f"native_threads_before={_pre_native} native_threads_after={_after_native} "
-                f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
-                f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
-                f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
+                f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_mib} "
                 f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
                 flush=True,
             )
             raise RuntimeError(
-                f"Model eviction failed: RSS drop {_rss_drop_mib:.1f} MiB "
-                f"< {_rss_floor_mib:.0f} MiB threshold "
-                f"(retained_role={_retained_role})"
+                f"Full eviction failed: RSS drop {_full_eviction_rss_drop_mib:.1f} MiB "
+                f"< 8192 MiB threshold"
             )
 
-        # ── 15. Emit final success line ──
-        _retained_model_present = (
-            1 if _retained_role != "none" and self._snapshot_eviction_retained_model is not None
-            else 0
+        # EMIT after_full_eviction memory stage
+        print(
+            f"[v2.snapshot_model_eviction_memory] stage=after_full_eviction "
+            f"vm_rss_mib={_after_trim_mem.get('vm_rss_mib', 'absent')} "
+            f"vm_hwm_mib={_after_trim_mem.get('vm_hwm_mib', 'absent')} "
+            f"smaps_rss_mib={_after_trim_mem.get('smaps_rss_mib', 'absent')} "
+            f"smaps_pss_mib={_after_trim_mem.get('smaps_pss_mib', 'absent')} "
+            f"smaps_private_clean_mib={_after_trim_mem.get('smaps_private_clean_mib', 'absent')} "
+            f"smaps_private_dirty_mib={_after_trim_priv_mib} "
+            f"smaps_shared_clean_mib={_after_trim_mem.get('smaps_shared_clean_mib', 'absent')} "
+            f"smaps_shared_dirty_mib={_after_trim_mem.get('smaps_shared_dirty_mib', 'absent')} "
+            f"smaps_anonymous_mib={_after_trim_anon_mib} "
+            f"native_thread_count={_after_native} "
+            f"torch_intraop_threads={_after_intraop} "
+            f"torch_interop_threads={_after_interop} "
+            f"loaded_module_count={_after_modules}",
+            flush=True,
         )
-        _retained_model_matches_original = (
-            1
-            if (
-                _retained_model_present
-                and (
-                    (_retained_role == "clip" and str(self._snapshot_eviction_retained_model_id) == _clip_id)
-                    or (_retained_role == "unet" and str(self._snapshot_eviction_retained_model_id) == _unet_id)
-                )
-            )
-            else 0
-        )
-        _rss_drop_required_mib = _rss_floor_mib
-        _rss_drop_requirement_met = 1 if _rss_drop_mib >= _rss_floor_mib else 0
+
+        # ── 15. Emit status=full_eviction_complete ──
         print(
             f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-            f"enabled=1 status=evicted "
+            f"enabled=1 status=full_eviction_complete "
             f"retain_role={_retained_role} "
-            f"retained_model_present={_retained_model_present} "
-            f"retained_model_id={self._snapshot_eviction_retained_model_id} "
-            f"retained_model_type={self._snapshot_eviction_retained_model_type or 'absent'} "
-            f"retained_model_matches_original={_retained_model_matches_original} "
             f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-            f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
-            f"rss_drop_required_mib={_rss_drop_required_mib} "
-            f"rss_drop_requirement_met={_rss_drop_requirement_met} "
-            f"cpu_snapshot_models_present=0 "
-            f"bridge_active_preparation={_bridge_active_prep} "
-            f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
-            f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
-            f"rss_after_trim_mib={_after_trim_rss_mib} rss_drop_mib={_rss_drop_mib:.1f} "
-            f"anonymous_before_mib={_pre_anon_mib} anonymous_after_mib={_after_trim_anon_mib} "
-            f"anonymous_drop_mib={_anonymous_drop_mib} "
-            f"private_dirty_before_mib={_pre_priv_dirty_mib} private_dirty_after_mib={_after_trim_priv_dirty_mib} "
-            f"private_dirty_drop_mib={_private_dirty_drop_mib} "
-            f"native_threads_before={_pre_native} native_threads_after={_after_native} "
-            f"torch_intraop_before={_pre_intraop} torch_intraop_after={_after_intraop} "
-            f"torch_interop_before={_pre_interop} torch_interop_after={_after_interop} "
-            f"loaded_modules_before={_pre_modules} loaded_modules_after={_after_modules} "
+            f"original_clip_alive_after_full_eviction=0 "
+            f"original_unet_alive_after_full_eviction=0 "
+            f"full_eviction_rss_drop_mib={_full_eviction_rss_drop_mib:.1f} "
+            f"rss_before_mib={_pre_rss_mib} rss_after_eviction_mib={_after_trim_rss_mib} "
             f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
             flush=True,
         )
 
-        # Store primitive marker on entrypoint (no objects/weakrefs/dicts)
+        # ── 16. Reload selected role after full eviction succeeds ──
+        _reloaded_model: Any = None
+        _reloaded_id = 0
+        _reloaded_type = ""
+        _after_reload_rss_mib: Any = "absent"
+        _selected_reload_rss_rise_mib: Any = "absent"
+        _final_reduction_from_full_mib: Any = "absent"
+        _storage_count = 0
+        _storage_total_bytes = 0
+        _storage_total_mib: Any = "absent"
+        _reload_ok = False
+
+        if _retained_role != "none":
+            if not all(c is not None for c in (reload_unet_fn, reload_clip_fn, snap_ctx_cm)):
+                raise RuntimeError(
+                    f"Eviction retain role is {_retained_role!r} but reload "
+                    f"closures are missing (reload_unet_fn={reload_unet_fn is not None}, "
+                    f"reload_clip_fn={reload_clip_fn is not None}, "
+                    f"snap_ctx_cm={snap_ctx_cm is not None})"
+                )
+            import comfy.utils as _cu
+            _MISSING = object()
+            _mmap_orig = getattr(_cu, "DISABLE_MMAP", _MISSING)
+            try:
+                with cast(ContextManager[Any], snap_ctx_cm()):
+                    _cu.DISABLE_MMAP = True
+                    if _retained_role == "unet":
+                        _unet_name = ""
+                        if isinstance(_normalized_profile, dict):
+                            _unet_name = _normalized_profile.get("unet", "")
+                        if not _unet_name:
+                            raise RuntimeError(
+                                f"reload UNET: normalized_profile has no 'unet' field"
+                            )
+                        _reloaded_model = reload_unet_fn(_unet_name, _weight_dtype)
+                    else:
+                        _clip_name = ""
+                        _clip_type_str = ""
+                        _clip2 = ""
+                        if isinstance(_normalized_profile, dict):
+                            _clip_name = _normalized_profile.get("clip1", "")
+                            _clip_type_str = _normalized_profile.get("clip_type", "")
+                            _clip2 = _normalized_profile.get("clip2", "")
+                        if not _clip_name:
+                            raise RuntimeError(
+                                f"reload CLIP: normalized_profile has no 'clip1' field"
+                            )
+                        if _clip2:
+                            _reloaded_model = reload_clip_fn(
+                                _clip_name, _clip2, _clip_type_str, "default"
+                            )
+                        else:
+                            _reloaded_model = reload_clip_fn(
+                                _clip_name, _clip_type_str, "default"
+                            )
+            finally:
+                if _mmap_orig is _MISSING:
+                    delattr(_cu, "DISABLE_MMAP")
+                else:
+                    _cu.DISABLE_MMAP = _mmap_orig
+                del _mmap_orig, _MISSING, _cu
+
+            if _reloaded_model is None:
+                raise RuntimeError(
+                    f"Reloaded {_retained_role} model is None after full eviction"
+                )
+            _reloaded_id = id(_reloaded_model)
+            _original_selected_id = int(_unet_id) if _retained_role == "unet" else int(_clip_id)
+            if _reloaded_id == _original_selected_id:
+                raise RuntimeError(
+                    f"Reloaded {_retained_role} has same id() as original "
+                    f"(id={_original_selected_id}) – not a fresh load"
+                )
+
+            self._snapshot_eviction_retained_model = _reloaded_model
+            self._snapshot_eviction_retained_model_id = _reloaded_id
+            _reloaded_type = type(_reloaded_model).__name__
+            self._snapshot_eviction_retained_model_type = _reloaded_type
+            _reload_ok = True
+
+            # Build storage registry on reloaded payload
+            try:
+                _reg = build_unique_storage_registry(_reloaded_model)
+                if _reg is not None:
+                    _ranges = getattr(_reg, "ranges", ()) or ()
+                    _storage_count = len(_ranges)
+                    _storage_total_bytes = getattr(_reg, "total_bytes", 0) or 0
+                    _storage_total_mib = round(
+                        float(_storage_total_bytes) / (1024.0 * 1024.0), 3
+                    )
+            except Exception:
+                _storage_count = 0
+                _storage_total_bytes = 0
+                _storage_total_mib = 0.0
+
+            # RSS after reload
+            _after_reload_mem = _collect_process_memory(fields=(
+                "vm_rss_mib", "vm_hwm_mib",
+                "smaps_rss_mib", "smaps_pss_mib",
+                "smaps_private_clean_mib", "smaps_private_dirty_mib",
+                "smaps_shared_clean_mib", "smaps_shared_dirty_mib",
+                "smaps_anonymous_mib",
+                "native_thread_count", "torch_intraop_threads",
+                "torch_interop_threads", "loaded_module_count",
+            ))
+            _after_reload_rss_mib = _numeric_value(
+                _after_reload_mem.get("smaps_rss_mib"),
+                _numeric_value(_after_reload_mem.get("vm_rss_mib"), "absent"),
+            )
+            if isinstance(_after_reload_rss_mib, (int, float)) and isinstance(_after_trim_rss_mib, (int, float)):
+                _selected_reload_rss_rise_mib = round(
+                    float(_after_reload_rss_mib) - float(_after_trim_rss_mib), 1
+                )
+            if isinstance(_after_reload_rss_mib, (int, float)) and isinstance(_pre_rss_mib, (int, float)):
+                _final_reduction_from_full_mib = round(
+                    float(_pre_rss_mib) - float(_after_reload_rss_mib), 1
+                )
+
+            # Role-specific floors
+            if _retained_role == "clip":
+                if not (isinstance(_selected_reload_rss_rise_mib, (int, float)) and _selected_reload_rss_rise_mib >= 2048.0):
+                    raise RuntimeError(
+                        f"CLIP reload: RSS rise {_selected_reload_rss_rise_mib} MiB "
+                        f"< 2048 MiB threshold"
+                    )
+                if not (isinstance(_final_reduction_from_full_mib, (int, float)) and _final_reduction_from_full_mib >= 4096.0):
+                    raise RuntimeError(
+                        f"CLIP reload: final reduction {_final_reduction_from_full_mib} MiB "
+                        f"< 4096 MiB threshold"
+                    )
+                if _storage_total_bytes < 4096 * 1024 * 1024:
+                    raise RuntimeError(
+                        f"CLIP reload: storage {_storage_total_bytes} bytes "
+                        f"< 4096 MiB threshold"
+                    )
+            else:
+                if not (isinstance(_selected_reload_rss_rise_mib, (int, float)) and _selected_reload_rss_rise_mib >= 4096.0):
+                    raise RuntimeError(
+                        f"UNET reload: RSS rise {_selected_reload_rss_rise_mib} MiB "
+                        f"< 4096 MiB threshold"
+                    )
+                if not (isinstance(_final_reduction_from_full_mib, (int, float)) and _final_reduction_from_full_mib >= 4096.0):
+                    raise RuntimeError(
+                        f"UNET reload: final reduction {_final_reduction_from_full_mib} MiB "
+                        f"< 4096 MiB threshold"
+                    )
+                if _storage_total_bytes < 8192 * 1024 * 1024:
+                    raise RuntimeError(
+                        f"UNET reload: storage {_storage_total_bytes} bytes "
+                        f"< 8192 MiB threshold"
+                    )
+
+        # EMIT after_selected_reload memory stage
+        _after_reload_vm = _after_reload_mem if _reload_ok else _after_trim_mem
+        print(
+            f"[v2.snapshot_model_eviction_memory] stage=after_selected_reload "
+            f"vm_rss_mib={_after_reload_vm.get('vm_rss_mib', 'absent')} "
+            f"vm_hwm_mib={_after_reload_vm.get('vm_hwm_mib', 'absent')} "
+            f"smaps_rss_mib={_after_reload_vm.get('smaps_rss_mib', 'absent')} "
+            f"smaps_pss_mib={_after_reload_vm.get('smaps_pss_mib', 'absent')} "
+            f"smaps_private_clean_mib={_after_reload_vm.get('smaps_private_clean_mib', 'absent')} "
+            f"smaps_private_dirty_mib={_after_reload_vm.get('smaps_private_dirty_mib', 'absent')} "
+            f"smaps_shared_clean_mib={_after_reload_vm.get('smaps_shared_clean_mib', 'absent')} "
+            f"smaps_shared_dirty_mib={_after_reload_vm.get('smaps_shared_dirty_mib', 'absent')} "
+            f"smaps_anonymous_mib={_after_reload_vm.get('smaps_anonymous_mib', 'absent')} "
+            f"native_thread_count={_after_reload_vm.get('native_thread_count', 'absent')} "
+            f"torch_intraop_threads={_after_reload_vm.get('torch_intraop_threads', 'absent')} "
+            f"torch_interop_threads={_after_reload_vm.get('torch_interop_threads', 'absent')} "
+            f"loaded_module_count={_after_reload_vm.get('loaded_module_count', 'absent')}",
+            flush=True,
+        )
+
+        # ── 17. Emit final snapshot_pre_capture status=ready ──
+        _retained_model_present = 1 if _reload_ok and self._snapshot_eviction_retained_model is not None else 0
+        _retained_weakref_alive = 0
+        if _reload_ok and _reloaded_model is not None:
+            _rw = _wr.ref(_reloaded_model)
+            _retained_weakref_alive = 1 if _rw() is not None else 0
+            del _rw
+        print(
+            f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+            f"enabled=1 status=ready "
+            f"retain_role={_retained_role} "
+            f"retained_model_present={_retained_model_present} "
+            f"retained_model_id={_reloaded_id} "
+            f"retained_model_type={_reloaded_type or 'absent'} "
+            f"retained_weakref_alive={_retained_weakref_alive} "
+            f"original_clip_alive_after_full_eviction=0 "
+            f"original_unet_alive_after_full_eviction=0 "
+            f"reloaded_model_present={_retained_model_present} "
+            f"reloaded_model_id={_reloaded_id} "
+            f"reloaded_model_is_new_object={int(_reload_ok)} "
+            f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
+            f"normal_cpu_snapshot_models_present=0 "
+            f"clip_present=0 unet_present=0 "
+            f"full_eviction_rss_drop_mib={_full_eviction_rss_drop_mib:.1f} "
+            f"selected_reload_rss_rise_mib={_selected_reload_rss_rise_mib} "
+            f"final_reduction_from_full_mib={_final_reduction_from_full_mib} "
+            f"selected_storage_count={_storage_count} "
+            f"selected_storage_total_bytes={_storage_total_bytes} "
+            f"selected_storage_total_mib={_storage_total_mib} "
+            f"full_models_rss_mib={_pre_rss_mib} "
+            f"after_full_eviction_rss_mib={_after_trim_rss_mib} "
+            f"after_selected_reload_rss_mib={_after_reload_rss_mib} "
+            f"bridge_active_preparation={_bridge_active_prep} "
+            f"bridge_active_preparation_before_clear={_bridge_active_prep_before_clear} "
+            f"snapshot_loader_output_count={_snapshot_loader_output_count} "
+            f"snapshot_seed_present={_snapshot_seed_present} "
+            f"native_threads={_after_reload_vm.get('native_thread_count', 'absent')} "
+            f"torch_intraop={_after_reload_vm.get('torch_intraop_threads', 'absent')} "
+            f"torch_interop={_after_reload_vm.get('torch_interop_threads', 'absent')} "
+            f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
+            flush=True,
+        )
+
+        # Store primitive marker
         self._eviction_marker = {
-            "status": "evicted",
+            "status": "full_eviction_complete",
             "retain_role": _retained_role,
             "retained_model_present": _retained_model_present,
-            "retained_model_id": self._snapshot_eviction_retained_model_id,
-            "retained_model_type": self._snapshot_eviction_retained_model_type,
-            "retained_model_matches_original": _retained_model_matches_original,
+            "retained_model_id": _reloaded_id,
+            "retained_model_type": _reloaded_type,
+            "retained_model_present": _retained_model_present,
+            "reloaded_model_is_new_object": int(_reload_ok),
+            "original_clip_alive_after_full_eviction": 0,
+            "original_unet_alive_after_full_eviction": 0,
             "clip_original_id": _clip_id,
             "unet_original_id": _unet_id,
-            "clip_alive_after_cleanup": _clip_alive_flag,
-            "unet_alive_after_cleanup": _unet_alive_flag,
+            "full_eviction_rss_drop_mib": _full_eviction_rss_drop_mib,
+            "selected_reload_rss_rise_mib": _selected_reload_rss_rise_mib,
+            "final_reduction_from_full_mib": _final_reduction_from_full_mib,
+            "selected_storage_count": _storage_count,
+            "selected_storage_total_bytes": _storage_total_bytes,
+            "selected_storage_total_mib": _storage_total_mib,
             "rss_before_mib": _pre_rss_mib,
-            "rss_after_trim_mib": _after_trim_rss_mib,
-            "rss_drop_mib": _rss_drop_mib,
-            "rss_drop_required_mib": _rss_drop_required_mib,
-            "rss_drop_requirement_met": _rss_drop_requirement_met,
+            "rss_after_eviction_mib": _after_trim_rss_mib,
+            "rss_after_reload_mib": _after_reload_rss_mib,
+            "bridge_active_preparation": _bridge_active_prep,
+            "snapshot_loader_output_count": _snapshot_loader_output_count,
+            "snapshot_seed_present": _snapshot_seed_present,
         }
         self._snapshot_models_evicted_before_capture = True
-        return self._eviction_marker
+        if _reload_ok:
+            del _reloaded_model
+        return _eviction_metadata
 
     def _restore_eviction_boundary(self) -> None:
         """Earliest executable restore point: inspect marker, apply idle,
@@ -4160,10 +4282,13 @@ class ModalRuntimeEntrypoint:
         _retained_id: int = getattr(self, "_snapshot_eviction_retained_model_id", 0)
         _retained_type: str = getattr(self, "_snapshot_eviction_retained_model_type", "")
         _restore_obs_mem = _collect_process_memory(fields=(
-            "vm_rss_mib", "native_thread_count",
+            "smaps_rss_mib", "vm_rss_mib", "native_thread_count",
             "torch_intraop_threads", "torch_interop_threads",
         ))
-        _rss_after_mib = _restore_obs_mem.get("vm_rss_mib", "absent")
+        _rss_after_mib = _numeric_value(
+            _restore_obs_mem.get("smaps_rss_mib"),
+            _numeric_value(_restore_obs_mem.get("vm_rss_mib"), "absent"),
+        )
         _native_count = _restore_obs_mem.get("native_thread_count", "absent")
         _torch_intraop = _restore_obs_mem.get("torch_intraop_threads", "absent")
         _torch_interop = _restore_obs_mem.get("torch_interop_threads", "absent")
@@ -5218,7 +5343,13 @@ class ModalRuntimeEntrypoint:
             _cpu_models = getattr(self, "_cpu_snapshot_models", None)
             if _cpu_models is not None:
                 if _cpu_models.unet is not None and _cpu_models.clip is not None:
-                    self._evict_snapshot_models(_cpu_models, state)
+                    self._evict_snapshot_models(
+                        _cpu_models, state,
+                        reload_unet_fn=_cpu_load_unet,
+                        reload_clip_fn=_cpu_load_clip,
+                        snap_ctx_cm=_snap_ctx,
+                        target_gpus=_target_gpus,
+                    )
                     # _evict_snapshot_models already clears self._cpu_snapshot_models.
                     # Delete any local alias to assist gc:
                     del _cpu_models

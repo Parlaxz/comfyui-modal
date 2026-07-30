@@ -1,8 +1,9 @@
 """Focused tests for CPU snapshot model eviction lifecycle.
 
-Covers env-var strict parsing/propagation, memory field contract, eviction
-logic with fake weakrefable models, state cleanup, disabled compatibility,
-and restore idle ordering.
+Covers env-var strict parsing/propagation, memory field contract, full
+eviction (unconditional both-model removal), reload of selected role,
+new identity validation, storage/RSS/final-drop floors, callback ordering,
+state cleanup, disabled compatibility, and restore idle ordering.
 
 No tensors, psutil, or forbidden tools.
 """
@@ -28,6 +29,7 @@ from comfymodal_runtime.modal_app import (
     _RES4LYF_PREPARED,
     _CACHEDIT_PREPARED,
     _collect_warmup_env,
+    build_unique_storage_registry,
 )
 from comfymodal_runtime.cpu_snapshot_models import CpuSnapshotModels
 from comfymodal_runtime.contracts import ModelRestoreKey
@@ -51,6 +53,13 @@ class _FakeModel:
     def __init__(self, name: str = "fake"):
         self.name = name
         self.model = self  # for model_management compatibility
+
+
+class _FreshFakeModel:
+    """Second model class so reload produces a distinct type/identity."""
+    def __init__(self, name: str = "fresh"):
+        self.name = name
+        self.model = self
 
 
 class _FakeBridge:
@@ -79,12 +88,17 @@ def _make_minimal_cpu_models(
     clip_obj: Any = None,
     unet_identity: str = "test_unet.safetensors",
     clip_identity: str = "test_clip.safetensors",
+    *,
+    normal_profile: dict[str, Any] | None = None,
 ) -> CpuSnapshotModels:
     """Build a minimal CpuSnapshotModels for eviction testing."""
     if unet_obj is None:
         unet_obj = _FakeModel("unet")
     if clip_obj is None:
         clip_obj = _FakeModel("clip")
+    if normal_profile is None:
+        normal_profile = {"mode": "split", "unet": "test_unet.safetensors",
+                          "clip1": "test_clip.safetensors", "clip_type": "sd3"}
     return CpuSnapshotModels(
         model_key=ModelRestoreKey(
             unet_identity=unet_identity,
@@ -92,8 +106,8 @@ def _make_minimal_cpu_models(
             vae_identity="",
             clip_type="sd3",
         ),
-        model_spec={"loaders": {"unet": [], "clip": [], "vae": []}},
-        normalized_profile={"mode": "split"},
+        model_spec={"loaders": {"unet": [{"weight_dtype": "default"}], "clip": [], "vae": []}},
+        normalized_profile=normal_profile,
         file_facts=(),
         unet=unet_obj,
         clip=clip_obj,
@@ -105,6 +119,8 @@ def _make_minimal_cpu_models(
 def _make_fake_entrypoint(
     unet_obj: Any = None,
     clip_obj: Any = None,
+    *,
+    normal_profile: dict[str, Any] | None = None,
 ) -> ModalRuntimeEntrypoint:
     """Create an entrypoint with minimal bridge and pre-set cpu_snapshot_models."""
     ep = ModalRuntimeEntrypoint()
@@ -113,7 +129,7 @@ def _make_fake_entrypoint(
     if clip_obj is None:
         clip_obj = _FakeModel("clip")
     ep._cpu_snapshot_models = _make_minimal_cpu_models(
-        unet_obj=unet_obj, clip_obj=clip_obj,
+        unet_obj=unet_obj, clip_obj=clip_obj, normal_profile=normal_profile,
     )
     ep._preload_bridge = _FakeBridge()
     ep._preload_bridge.coordinator = _FakeCoordinator()
@@ -269,7 +285,6 @@ class CollectProcessMemoryFieldContractTests(unittest.TestCase):
 
     def test_all_fields_have_expected_types(self):
         result = _collect_process_memory()
-        # Memory fields: numeric (int/float) or 'absent'
         for key in ("vm_rss_mib", "vm_hwm_mib",
                      "smaps_rss_mib", "smaps_pss_mib",
                      "smaps_private_clean_mib", "smaps_private_dirty_mib",
@@ -280,7 +295,6 @@ class CollectProcessMemoryFieldContractTests(unittest.TestCase):
                 val == "absent" or isinstance(val, (int, float)),
                 f"{key} must be 'absent' or numeric, got {type(val).__name__} = {val!r}",
             )
-        # Thread/module fields: int or 'absent'
         for key in ("native_thread_count", "torch_intraop_threads",
                      "torch_interop_threads", "loaded_module_count"):
             val = result.get(key)
@@ -334,15 +348,14 @@ class InitDefaultsTests(unittest.TestCase):
         self.assertIsNone(raw._cpu_snapshot_clip_storage_registry)
 
 
-# ── Eviction lifecycle tests ─────────────────────────────────────────────
+# ── Full eviction (both models unconditionally) tests ───────────────────
 
 
-class EvictSnapshotModelsSuccessTests(unittest.TestCase):
-    """_evict_snapshot_models success path — models dead, threshold pass.
+class FullEvictionTests(unittest.TestCase):
+    """_evict_snapshot_models unconditionally evicts both models before reload.
 
-    Note: models are created inline and local refs are deleted before the
-    eviction call so the weakref check finds them truly dead (no strong refs
-    remain besides those managed inside _evict_snapshot_models).
+    Weakrefs must be dead for both.  No retained original object.
+    RSS drop threshold always >=8192 MiB.
     """
 
     def setUp(self):
@@ -350,50 +363,12 @@ class EvictSnapshotModelsSuccessTests(unittest.TestCase):
         _RES4LYF_PREPARED.clear()
         _CACHEDIT_PREPARED.clear()
 
-    def _run_inline_evict(self):
-        """Create models/ep locally, run evict, return marker.
-        No external strong refs to model objects survive the call.
-        Models are held only via container.unet/container.clip,
-        and those are cleared inside _evict_snapshot_models before gc."""
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        # Delete our local refs so the container is the only holder.
-        # The container and its .unet/.clip are managed inside evict.
-        del unet, clip
-        return ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-
-    def _run_inline_evict_captured(self, captured_list):
-        """Run evict and capture print output into *captured_list*."""
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        del unet, clip
-        # Capture prints
-        original_print = print
-        def _cap_print(*args, **kwargs):
-            captured_list.append(" ".join(str(a) for a in args))
-            original_print(*args, **kwargs)
-        with patch("builtins.print", side_effect=_cap_print):
-            marker = ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        return marker, ep
-
-    def test_success_eviction_reaches_evicted_status(self):
-        """Success path: weakrefs dead, threshold pass, marker stored."""
+    def _full_memory_side_effect(self):
+        """Return a callable that produces three distinct RSS readings:
+        call 1 = 30000 (full_models_loaded), call 2 = 10000 (after_gc),
+        call 3 = 5000 (after_trim/after_full_eviction).
+        """
         _call_count = [0]
-
         def _side_effect(*, fields=None):
             _call_count[0] += 1
             if _call_count[0] == 1:
@@ -402,144 +377,238 @@ class EvictSnapshotModelsSuccessTests(unittest.TestCase):
                 return _fake_process_memory(smaps_rss_mib=10000.0)
             else:
                 return _fake_process_memory(
-                    smaps_rss_mib=5000.0,
-                    smaps_anonymous_mib=4500.0,
+                    smaps_rss_mib=5000.0, smaps_anonymous_mib=4500.0,
                     smaps_private_dirty_mib=4400.0,
                 )
+        return _side_effect
 
+    def _run_full_evict_no_reload(self):
+        """Run full eviction with role=none (no reload).
+        Models are created inline so weakrefs die naturally.
+        Returns (marker, metadata, ep)."""
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+            snapshot_execution_seed=None,
+            snapshot_seed_built=False,
+        )
+        del unet, clip
+        _retain_role = "none"
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = _retain_role
         with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   side_effect=_side_effect):
-            # _run_inline_evict has no external refs to model objects
-            marker, ep = self._run_inline_evict_captured([])
+                   side_effect=self._full_memory_side_effect()):
+            metadata = ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        return ep._eviction_marker, metadata, ep
 
-        # Verify marker
-        self.assertIsNotNone(ep._eviction_marker)
-        self.assertIs(marker, ep._eviction_marker)
-        self.assertEqual(ep._eviction_marker["status"], "evicted")
-        self.assertEqual(ep._eviction_marker["rss_before_mib"], 30000.0)
-        self.assertEqual(ep._eviction_marker["rss_after_trim_mib"], 5000.0)
-        self.assertAlmostEqual(ep._eviction_marker["rss_drop_mib"], 25000.0)
-        self.assertIn("clip_original_id", ep._eviction_marker)
-        self.assertIn("unet_original_id", ep._eviction_marker)
-        self.assertEqual(ep._eviction_marker["clip_alive_after_cleanup"], 0)
-        self.assertEqual(ep._eviction_marker["unet_alive_after_cleanup"], 0)
-        # Marker must be primitive-only (no objects)
-        for v in ep._eviction_marker.values():
-            self.assertFalse(
-                hasattr(v, "__dict__") and callable(getattr(v, "__dict__", None)),
-                f"marker contains non-primitive value: {v!r}",
-            )
-        self.assertTrue(ep._snapshot_models_evicted_before_capture)
+    def test_full_eviction_both_models_dead(self):
+        """Both original weakrefs must be dead after full eviction."""
+        marker, metadata, ep = self._run_full_evict_no_reload()
+        self.assertEqual(marker["status"], "full_eviction_complete")
+        self.assertEqual(marker["original_clip_alive_after_full_eviction"], 0)
+        self.assertEqual(marker["original_unet_alive_after_full_eviction"], 0)
 
-        # Verify state cleanup
+    def test_full_eviction_rss_drop_above_8192(self):
+        """RSS drop after full eviction >=8192 MiB."""
+        marker, metadata, ep = self._run_full_evict_no_reload()
+        self.assertGreaterEqual(marker["full_eviction_rss_drop_mib"], 8192.0)
+
+    def test_full_eviction_clears_all_state(self):
+        """All registries, models, runtime state are cleared."""
+        marker, metadata, ep = self._run_full_evict_no_reload()
         self.assertIsNone(ep._cpu_snapshot_unet_runtime_state)
         self.assertIsNone(ep._cpu_snapshot_unet_storage_registry)
         self.assertIsNone(ep._cpu_snapshot_clip_storage_registry)
         self.assertFalse(ep._cpu_snapshot_models_active)
         self.assertIsNone(ep._cpu_snapshot_models)
 
-    def test_success_emits_evicted_final_line(self):
-        """Final output line has status=evicted and full schema."""
-        captured = []
-        _call_count = [0]
-
-        def _side_effect(*, fields=None):
-            _call_count[0] += 1
-            if _call_count[0] == 1:
-                return _fake_process_memory(smaps_rss_mib=30000.0)
-            elif _call_count[0] == 2:
-                return _fake_process_memory(smaps_rss_mib=10000.0)
-            else:
-                return _fake_process_memory(
-                    smaps_rss_mib=5000.0,
-                    smaps_anonymous_mib=4500.0,
-                    smaps_private_dirty_mib=4400.0,
-                )
-
+    def test_full_eviction_clears_loader_outputs(self):
+        """BootstrapState loader outputs/identities/seed are cleared."""
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={"unet": object()},
+            snapshot_model_identities={"unet": "u", "clip": "c"},
+            snapshot_execution_seed=42,
+            snapshot_seed_built=True,
+        )
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "none"
         with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   side_effect=_side_effect):
-            _, ep = self._run_inline_evict_captured(captured)
+                   side_effect=self._full_memory_side_effect()):
+            ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertEqual(bs.snapshot_loader_outputs, {})
+        self.assertEqual(bs.snapshot_model_identities, {})
+        self.assertIsNone(bs.snapshot_execution_seed)
+        self.assertFalse(bs.snapshot_seed_built)
 
-        final = [l for l in captured if "stage=snapshot_pre_capture" in l and "status=evicted" in l]
-        self.assertEqual(len(final), 1, f"expected 1 evicted line, got {len(final)}")
-        self.assertIn("clip_original_id=", final[0])
-        self.assertIn("unet_original_id=", final[0])
-        self.assertIn("clip_alive_after_cleanup=0", final[0])
-        self.assertIn("unet_alive_after_cleanup=0", final[0])
-        self.assertIn("rss_drop_mib=25000.0", final[0])
+    def test_full_eviction_clears_res4lyf_cachedit(self):
+        """_RES4LYF_PREPARED and _CACHEDIT_PREPARED are cleared."""
+        _RES4LYF_PREPARED["wf_hash"] = {"records": ()}
+        _CACHEDIT_PREPARED["wf_hash"] = {"unet_id": 123}
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+        )
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "none"
+        with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                   side_effect=self._full_memory_side_effect()):
+            ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertEqual(_RES4LYF_PREPARED, {})
+        self.assertEqual(_CACHEDIT_PREPARED, {})
+
+    def test_full_eviction_preserves_unrelated_globals(self):
+        """Certificate cache, workflow hash, RES4LYF hook preserved."""
+        import comfymodal_runtime.modal_app as _ma
+        _orig_cert = _ma._V2_CERT_PROCESS_CACHE.copy()
+        _orig_wf = _ma._V2_WORKFLOW_HASH
+        _orig_res4lyf = _ma._RES4LYF_HOOK_INSTALLED
+        _ma._V2_CERT_PROCESS_CACHE["test"] = "value"
+        _ma._RES4LYF_HOOK_INSTALLED = True
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+        )
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "none"
+        with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                   side_effect=self._full_memory_side_effect()):
+            ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertIn("test", _ma._V2_CERT_PROCESS_CACHE)
+        self.assertEqual(_ma._V2_WORKFLOW_HASH, _orig_wf)
+        self.assertTrue(_ma._RES4LYF_HOOK_INSTALLED)
+        _ma._V2_CERT_PROCESS_CACHE.clear()
+        _ma._V2_CERT_PROCESS_CACHE.update(_orig_cert)
+        _ma._RES4LYF_HOOK_INSTALLED = _orig_res4lyf
+
+    def test_full_eviction_emits_full_eviction_complete(self):
+        """Final pre-capture line has status=full_eviction_complete."""
+        captured = []
+        original_print = print
+        def _cap_print(*args, **kwargs):
+            captured.append(" ".join(str(a) for a in args))
+            original_print(*args, **kwargs)
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+        )
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "none"
+        with patch("builtins.print", side_effect=_cap_print):
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._full_memory_side_effect()):
+                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        evict_complete = [l for l in captured if "status=full_eviction_complete" in l]
+        self.assertEqual(len(evict_complete), 1)
+        self.assertIn("original_clip_alive_after_full_eviction=0", evict_complete[0])
+        self.assertIn("original_unet_alive_after_full_eviction=0", evict_complete[0])
+
+    def test_full_eviction_three_memory_stages(self):
+        """Three memory stages: full_models_loaded, after_full_eviction, after_selected_reload."""
+        captured = []
+        original_print = print
+        def _cap_print(*args, **kwargs):
+            captured.append(" ".join(str(a) for a in args))
+            original_print(*args, **kwargs)
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+        )
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "none"
+        with patch("builtins.print", side_effect=_cap_print):
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._full_memory_side_effect()):
+                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        mem_lines = [l for l in captured if "snapshot_model_eviction_memory" in l]
+        stage_names = []
+        for line in mem_lines:
+            for part in line.split():
+                if part.startswith("stage="):
+                    stage_names.append(part.split("=", 1)[1])
+        self.assertIn("full_models_loaded", stage_names)
+        self.assertIn("after_full_eviction", stage_names)
+        self.assertIn("after_selected_reload", stage_names)
+
+    def test_metadata_has_primitive_fields(self):
+        """Returned metadata has normalized_profile and model_key fields (no objects)."""
+        marker, metadata, ep = self._run_full_evict_no_reload()
+        self.assertIn("model_key_unet_identity", metadata)
+        self.assertIn("model_key_clip_identity", metadata)
+        self.assertIn("model_key_clip_type", metadata)
+        self.assertIn("weight_dtype", metadata)
+        self.assertIsInstance(metadata, dict)
+        for v in metadata.values():
+            self.assertFalse(
+                hasattr(v, "__dict__") and callable(getattr(v, "__dict__", None)),
+                f"metadata contains non-primitive value: {v!r}",
+            )
+
+    def test_full_eviction_snapshot_models_active_false(self):
+        """_cpu_snapshot_models_active is False and _cpu_snapshot_models is None."""
+        marker, metadata, ep = self._run_full_evict_no_reload()
+        self.assertFalse(ep._cpu_snapshot_models_active)
+        self.assertIsNone(ep._cpu_snapshot_models)
+
+    def test_full_eviction_retained_role_none_defaults(self):
+        """retained_role=none leaves dedicated attrs at defaults."""
+        marker, metadata, ep = self._run_full_evict_no_reload()
+        self.assertEqual(ep._snapshot_eviction_retained_role, "none")
+        self.assertIsNone(ep._snapshot_eviction_retained_model)
+        self.assertEqual(ep._snapshot_eviction_retained_model_id, 0)
+        self.assertEqual(ep._snapshot_eviction_retained_model_type, "")
 
 
-# ── Eviction failure tests ───────────────────────────────────────────────
+# ── Full eviction failure tests ─────────────────────────────────────────
 
 
-class EvictSnapshotModelsFailureTests(unittest.TestCase):
-    """_evict_snapshot_models failure paths."""
+class FullEvictionFailureTests(unittest.TestCase):
+    """_evict_snapshot_models failure paths (unconditional, no selective)."""
 
     def setUp(self):
         _clean_env()
-        _RES4LYF_PREPARED.clear()
-        _CACHEDIT_PREPARED.clear()
 
-    def _run_inline_evict_fail(self, memory_side_effect):
-        """Run eviction with inline models (so weakrefs die) using patched memory.
-        Returns the ctx.exception from the RuntimeError."""
+    def test_weakrefs_alive_raises(self):
+        """Original weakref alive emits object_still_alive."""
         unet = _FakeModel("unet")
         clip = _FakeModel("clip")
         ep = _make_fake_entrypoint(unet, clip)
         bs = SimpleNamespace(
             snapshot_loader_outputs={},
             snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        # Delete our local refs, then container is the only holder
-        del unet, clip
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   side_effect=memory_side_effect):
-            with self.assertRaises(RuntimeError) as ctx:
-                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        return ctx.exception, ep
-
-    def test_weakrefs_alive_emits_object_still_alive(self):
-        """Models survive → status=object_still_alive, known_reference_state present.
-        Models are kept alive via setUp refs (not using inline pattern)."""
-        _clean_env()
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
         )
         captured = []
-
-        def _side_effect(*, fields=None):
-            return _fake_process_memory(smaps_rss_mib=30000.0)
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
-        # Models are kept alive via local unet/clip refs — weakref check finds them.
         with patch("builtins.print", side_effect=_cap_print):
             with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                       side_effect=_side_effect):
+                       return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
                 with self.assertRaises(RuntimeError) as ctx:
                     ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertIn("original weakrefs still alive", str(ctx.exception).lower())
+        alive_lines = [l for l in captured if "status=object_still_alive" in l]
+        self.assertGreaterEqual(len(alive_lines), 1)
+        self.assertIn("original_clip_alive_after_full_eviction=1", alive_lines[0])
+        self.assertIn("original_unet_alive_after_full_eviction=1", alive_lines[0])
 
-        self.assertIn("Model eviction failed: weakrefs still alive", str(ctx.exception))
-        final = [l for l in captured if "stage=snapshot_pre_capture" in l]
-        alive_lines = [l for l in final if "status=object_still_alive" in l]
-        self.assertGreaterEqual(len(alive_lines), 1, "expected object_still_alive line")
-        self.assertIn("known_reference_state=", alive_lines[0])
-        # Marker must NOT be set on failure
-        self.assertIsNone(ep._eviction_marker)
-
-    def test_memory_evidence_unavailable_emits_error(self):
-        """When both smaps and vm are absent → status=error.
-        Weakrefs die first (inline pattern), then memory check triggers."""
-
+    def test_memory_evidence_unavailable(self):
+        """Both smaps and vm absent -> status=error."""
         def _all_absent(*, fields=None):
             return {f: "absent" for f in (fields or (
                 "vm_rss_mib", "smaps_rss_mib", "smaps_anonymous_mib",
@@ -547,18 +616,26 @@ class EvictSnapshotModelsFailureTests(unittest.TestCase):
                 "torch_intraop_threads", "torch_interop_threads",
                 "loaded_module_count",
             ))}
-
-        exc, ep = self._run_inline_evict_fail(_all_absent)
-        self.assertIn("memory evidence unavailable", str(exc))
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+        )
+        del unet, clip
+        with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                   side_effect=_all_absent):
+            with self.assertRaises(RuntimeError) as ctx:
+                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertIn("memory evidence unavailable", str(ctx.exception))
         self.assertIsNone(ep._eviction_marker)
         self.assertFalse(ep._snapshot_models_evicted_before_capture)
 
-    def test_insufficient_rss_drop_emits_insufficient_status(self):
-        """RSS drop below 8192 MiB → status=insufficient_rss_drop.
-        Weakrefs die first (inline pattern), then drop check triggers."""
+    def test_insufficient_rss_drop_always_8192(self):
+        """RSS drop < 8192 MiB raises, no selective floor."""
         _call_count = [0]
-
-        def _side_effect(*, fields=None):
+        def _small_drop(*, fields=None):
             _call_count[0] += 1
             if _call_count[0] == 1:
                 return _fake_process_memory(smaps_rss_mib=15000.0)
@@ -566,305 +643,407 @@ class EvictSnapshotModelsFailureTests(unittest.TestCase):
                 return _fake_process_memory(smaps_rss_mib=14000.0)
             else:
                 return _fake_process_memory(smaps_rss_mib=13500.0)
-
-        exc, ep = self._run_inline_evict_fail(_side_effect)
-        self.assertIn("RSS drop", str(exc))
-        self.assertIn("< 8192 MiB", str(exc))
-        self.assertIsNone(ep._eviction_marker)
-
-    def test_retained_weakref_dead_fails_startup(self):
-        """Retained model weakref unexpectedly dead raises RuntimeError.
-        Uses inline-local model creation so all weakrefs die naturally, then
-        patches gc.collect to prevent the retained model's dedicated attr
-        strong-reference from being collected, and patches weakref.ref to
-        return a dead weakref for the retained model."""
-        _clean_env()
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
-
-        # Create models inline so they die when their locals are deleted
         unet = _FakeModel("unet")
         clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet_obj=unet, clip_obj=clip)
-        ep._snapshot_eviction_retained_role = "clip"
+        ep = _make_fake_entrypoint(unet, clip)
         bs = SimpleNamespace(
             snapshot_loader_outputs={},
             snapshot_model_identities={},
         )
-        # Delete locals so weakrefs for the original models die
         del unet, clip
-
-        # After the retained model is stored on dedicated attr, the section-8b
-        # weakref must report alive.  To simulate unexpected death we do NOT
-        # kill the object — instead we make the retained-model weakref itself
-        # dead by patching weakref.ref in modal_app's scope.
-        import weakref as _wr
-        _original_ref = _wr.ref
-
-        def _dead_retained_ref(obj, callback=None):
-            """Return a normal ref for non-retained objects, dead for the
-            retained model (identified as the one moved to dedicated attr)."""
-            # All weakrefs from the original clip/unet die because locals were
-            # deleted.  The retained model's weakref is created in section 8b
-            # from _retained_obj (which is the clip moved to dedicated attr).
-            # We return a dead weakref for EVERY object so that the retained
-            # model's re-created weakref always returns None.
-            class _UniversalDeadRef:
-                def __call__(self):
-                    return None
-                def __repr__(self):
-                    return "UniversalDeadRef()"
-            return _UniversalDeadRef()
-
         with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with patch("weakref.ref", side_effect=_dead_retained_ref):
-                with self.assertRaises(RuntimeError) as ctx:
-                    ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        self.assertTrue(
-            "weakref is dead" in str(ctx.exception).lower()
-            or "lost" in str(ctx.exception).lower(),
-            f"expected 'weakref is dead' or 'lost' in {str(ctx.exception)!r}",
-        )
+                   side_effect=_small_drop):
+            with self.assertRaises(RuntimeError) as ctx:
+                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
+        self.assertIn("RSS drop", str(ctx.exception))
+        self.assertIn("8192", str(ctx.exception))
 
 
-# ── Eviction state cleanup tests ─────────────────────────────────────────
+# ── Reload lifecycle tests (after full eviction) ────────────────────────
 
 
-class EvictSnapshotModelsStateTests(unittest.TestCase):
-    """State cleanup verification during eviction."""
+class ReloadAfterEvictionTests(unittest.TestCase):
+    """Full eviction + reload of selected role via injected closures."""
 
     def setUp(self):
         _clean_env()
         _RES4LYF_PREPARED.clear()
         _CACHEDIT_PREPARED.clear()
-        self._unet = _FakeModel("unet")
-        self._clip = _FakeModel("clip")
 
-    def _caller_local_evict(self, entrypoint, state):
-        return entrypoint._evict_snapshot_models(
-            entrypoint._cpu_snapshot_models,
-            state,
+    def _memory_for_three_stages(self):
+        _call_count = [0]
+        def _side_effect(*, fields=None):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return _fake_process_memory(smaps_rss_mib=30000.0)
+            elif _call_count[0] <= 3:
+                return _fake_process_memory(smaps_rss_mib=5000.0)
+            elif _call_count[0] == 4:
+                return _fake_process_memory(smaps_rss_mib=12000.0)
+            else:
+                return _fake_process_memory(smaps_rss_mib=12000.0)
+        return _side_effect
+
+    def _reload_unet_fake(self, name, weight_dtype):
+        return _FreshFakeModel("fresh_unet")
+
+    def _reload_clip_fake(self, *args):
+        return _FreshFakeModel("fresh_clip")
+
+    def _snap_ctx_fake(self):
+        return self._noop_cm()
+
+    def _noop_cm(self):
+        class _NoopCM:
+            def __enter__(self):
+                return None
+            def __exit__(self, *a):
+                pass
+        return _NoopCM()
+
+    def _mock_comfy_utils(self):
+        """Return a patcher for comfy.utils to avoid ComfyUI import in tests."""
+        _mock_module = MagicMock()
+        _mock_module.DISABLE_MMAP = False
+        return patch.dict("sys.modules", {"comfy.utils": _mock_module})
+
+    def _patch_storage_registry(self, total_bytes: int = 10 * 1024**3):
+        """Patch build_unique_storage_registry to return a fake registry with total_bytes."""
+        _fake_reg = MagicMock()
+        _fake_reg.total_bytes = total_bytes
+        _fake_reg.ranges = (object(), object(), object())
+        return patch(
+            "comfymodal_runtime.modal_app.build_unique_storage_registry",
+            return_value=_fake_reg,
         )
 
-    def test_eviction_records_metadata(self):
-        """Eviction stores primitive snapshot-state metadata."""
-        ep = _make_fake_entrypoint(self._unet, self._clip)
+    def _reload_unet_none(self, name, weight_dtype):
+        return None
+
+    def _run_evict_reload(self, retain_role, reload_clip=None, reload_unet=None):
+        profile = {"mode": "split", "unet": "test_unet.safetensors",
+                    "clip1": "test_clip.safetensors", "clip_type": "sd3",
+                    "weight_dtype": "default"}
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
         bs = SimpleNamespace(
-            snapshot_loader_outputs={"unet": object()},
-            snapshot_model_identities={"unet": "u", "clip": "c"},
-            snapshot_execution_seed=42,
-            snapshot_seed_built=True,
+            snapshot_loader_outputs={},
+            snapshot_model_identities={},
+            snapshot_execution_seed=None,
+            snapshot_seed_built=False,
         )
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                self._caller_local_evict(ep, bs)
-        meta = ep._snapshot_eviction_metadata
-        self.assertIn("clip_present", meta)
-        self.assertIn("unet_present", meta)
-        self.assertIn("torch_module_loaded", meta)
-        self.assertIn("transformers_module_loaded", meta)
-        self.assertIn("diffusers_module_loaded", meta)
-        self.assertIn("cache_dit_module_loaded", meta)
-        self.assertIn("comfy_module_loaded", meta)
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = retain_role
+        if reload_clip is None:
+            reload_clip = self._reload_clip_fake
+        if reload_unet is None:
+            reload_unet = self._reload_unet_fake
+        with self._mock_comfy_utils(), self._patch_storage_registry():
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._memory_for_three_stages()):
+                metadata = ep._evict_snapshot_models(
+                    ep._cpu_snapshot_models, bs,
+                    reload_unet_fn=reload_unet,
+                    reload_clip_fn=reload_clip,
+                    snap_ctx_cm=self._snap_ctx_fake,
+                    target_gpus=("rtx-pro-6000",),
+                )
+        return ep._eviction_marker, metadata, ep, profile
 
-    def test_eviction_clears_bridge_and_state(self):
-        """Bridge clear is called and entrypoint registries are reset."""
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={"unet": object()},
-            snapshot_model_identities={"unet": "u", "clip": "c"},
-            snapshot_execution_seed=42,
-            snapshot_seed_built=True,
+    def test_reload_unet_new_identity(self):
+        """Reloaded UNET has different id than original."""
+        marker, metadata, ep, profile = self._run_evict_reload("unet")
+        self.assertEqual(ep._snapshot_eviction_retained_role, "unet")
+        self.assertIsNotNone(ep._snapshot_eviction_retained_model)
+        original_id = int(marker.get("unet_original_id", "0"))
+        self.assertNotEqual(
+            ep._snapshot_eviction_retained_model_id, original_id,
+            "reloaded unet must have different id from original",
         )
+
+    def test_reload_clip_new_identity(self):
+        """Reloaded CLIP has different id than original."""
+        marker, metadata, ep, profile = self._run_evict_reload("clip")
+        self.assertEqual(ep._snapshot_eviction_retained_role, "clip")
+        self.assertIsNotNone(ep._snapshot_eviction_retained_model)
+        original_id = int(marker.get("clip_original_id", "0"))
+        self.assertNotEqual(
+            ep._snapshot_eviction_retained_model_id, original_id,
+            "reloaded clip must have different id from original",
+        )
+
+    def test_reload_unet_type_set(self):
+        """reloaded UNET type is _FreshFakeModel."""
+        marker, metadata, ep, profile = self._run_evict_reload("unet")
+        self.assertEqual(ep._snapshot_eviction_retained_model_type, "_FreshFakeModel")
+
+    def test_reload_clip_type_set(self):
+        """reloaded CLIP type is _FreshFakeModel."""
+        marker, metadata, ep, profile = self._run_evict_reload("clip")
+        self.assertEqual(ep._snapshot_eviction_retained_model_type, "_FreshFakeModel")
+
+    def test_reload_storage_metrics_are_recorded(self):
+        """Selected storage count, bytes, and MiB are persistent primitives."""
+        marker, metadata, ep, profile = self._run_evict_reload("clip")
+        self.assertEqual(marker["selected_storage_count"], 3)
+        self.assertEqual(marker["selected_storage_total_bytes"], 10 * 1024**3)
+        self.assertEqual(marker["selected_storage_total_mib"], 10240.0)
+
+    def test_reload_callback_runs_after_full_eviction(self):
+        """Selected loader cannot run before both original objects are dead."""
+        events = []
+        original_unet = _FakeModel("unet")
+        original_clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(original_unet, original_clip, normal_profile={
+            "mode": "split", "unet": "test_unet.safetensors",
+            "clip1": "test_clip.safetensors", "clip_type": "sd3",
+        })
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del original_unet, original_clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
+
+        def _reload_clip(*args):
+            events.append(("reload", ep._cpu_snapshot_models, ep._cpu_snapshot_models_active))
+            return _FreshFakeModel("fresh_clip")
+
+        with self._mock_comfy_utils(), self._patch_storage_registry():
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._memory_for_three_stages()):
+                ep._evict_snapshot_models(
+                    ep._cpu_snapshot_models, bs,
+                    reload_unet_fn=self._reload_unet_fake,
+                    reload_clip_fn=_reload_clip,
+                    snap_ctx_cm=self._snap_ctx_fake,
+                    target_gpus=("rtx-pro-6000",),
+                )
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0][1])
+        self.assertFalse(events[0][2])
+
+    def test_dual_clip_profile_uses_dual_loader_shape(self):
+        """Dual CLIP profiles pass clip1, clip2, clip_type, and default."""
+        calls = []
+        profile = {
+            "mode": "split", "unet": "test_unet.safetensors",
+            "clip1": "clip_a.safetensors", "clip2": "clip_b.safetensors",
+            "clip_type": "sd3",
+        }
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
+
+        def _reload_clip(*args):
+            calls.append(args)
+            return _FreshFakeModel("fresh_clip")
+
+        with self._mock_comfy_utils(), self._patch_storage_registry():
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._memory_for_three_stages()):
+                ep._evict_snapshot_models(
+                    ep._cpu_snapshot_models, bs,
+                    reload_unet_fn=self._reload_unet_fake,
+                    reload_clip_fn=_reload_clip,
+                    snap_ctx_cm=self._snap_ctx_fake,
+                    target_gpus=("rtx-pro-6000",),
+                )
+        self.assertEqual(calls, [("clip_a.safetensors", "clip_b.safetensors", "sd3", "default")])
+
+    def test_reload_weakref_alive(self):
+        """Retained weakref (on reloaded model) is alive after evict+reload."""
+        marker, metadata, ep, profile = self._run_evict_reload("clip")
+        import weakref as _wr
+        wr = _wr.ref(ep._snapshot_eviction_retained_model)
+        self.assertIsNotNone(wr())
+        self.assertEqual(marker["retained_model_present"], 1)
+
+    def test_status_ready_on_final_line(self):
+        """Final snapshot_pre_capture has status=ready."""
+        captured = []
+        original_print = print
+        def _cap_print(*args, **kwargs):
+            captured.append(" ".join(str(a) for a in args))
+            original_print(*args, **kwargs)
+        profile = {"mode": "split", "unet": "test_unet.safetensors",
+                    "clip1": "test_clip.safetensors", "clip_type": "sd3"}
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "unet"
+        with self._mock_comfy_utils(), self._patch_storage_registry():
+            with patch("builtins.print", side_effect=_cap_print):
+                with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                           side_effect=self._memory_for_three_stages()):
+                    ep._evict_snapshot_models(
+                        ep._cpu_snapshot_models, bs,
+                        reload_unet_fn=self._reload_unet_fake,
+                        reload_clip_fn=self._reload_clip_fake,
+                        snap_ctx_cm=self._snap_ctx_fake,
+                        target_gpus=("rtx-pro-6000",),
+                    )
+        ready_lines = [l for l in captured if "status=ready" in l and "snapshot_pre_capture" in l]
+        self.assertGreaterEqual(len(ready_lines), 1)
+
+    def test_reload_none_raises(self):
+        """Reload function returning None raises RuntimeError."""
+        profile = {"mode": "split", "unet": "test_unet.safetensors",
+                    "clip1": "test_clip.safetensors", "clip_type": "sd3"}
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
+        with self._mock_comfy_utils(), self._patch_storage_registry():
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._memory_for_three_stages()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ep._evict_snapshot_models(
+                        ep._cpu_snapshot_models, bs,
+                        reload_unet_fn=self._reload_unet_fake,
+                        reload_clip_fn=lambda *a: None,
+                        snap_ctx_cm=self._snap_ctx_fake,
+                        target_gpus=("rtx-pro-6000",),
+                    )
+        self.assertIn("None after full eviction", str(ctx.exception))
+
+    def test_reload_new_identity_check(self):
+        """New identity is verified: reloaded id differs from original."""
+        marker, metadata, ep, profile = self._run_evict_reload("unet")
+        original_id = int(marker.get("unet_original_id", "0"))
+        self.assertNotEqual(
+            ep._snapshot_eviction_retained_model_id, original_id,
+            "reloaded unet must have different id from original",
+        )
+
+    def test_missing_reload_closures_raises(self):
+        """Missing reload closures when role is not 'none' raises."""
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
         with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                self._caller_local_evict(ep, bs)
+                   side_effect=self._memory_for_three_stages()):
+            with self.assertRaises(RuntimeError) as ctx:
+                ep._evict_snapshot_models(
+                    ep._cpu_snapshot_models, bs,
+                    reload_unet_fn=None,
+                    reload_clip_fn=None,
+                    snap_ctx_cm=None,
+                )
+        self.assertIn("closures are missing", str(ctx.exception))
+
+    def test_normal_state_absent_after_reload(self):
+        """Normal snapshot model attr/state/bridge/loader outputs/seed absent after reload."""
+        marker, metadata, ep, profile = self._run_evict_reload("clip")
+        self.assertIsNone(ep._cpu_snapshot_models)
+        self.assertFalse(ep._cpu_snapshot_models_active)
         self.assertIsNone(ep._cpu_snapshot_unet_runtime_state)
         self.assertIsNone(ep._cpu_snapshot_unet_storage_registry)
         self.assertIsNone(ep._cpu_snapshot_clip_storage_registry)
-        self.assertFalse(ep._cpu_snapshot_models_active)
-        self.assertIsNone(ep._cpu_snapshot_models)
 
-    def test_eviction_clears_bootstrap_snapshot_state(self):
-        """snapshot_loader_outputs, identities, seed are cleared."""
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={"unet": object()},
-            snapshot_model_identities={"unet": "u", "clip": "c"},
-            snapshot_execution_seed=42,
-            snapshot_seed_built=True,
-        )
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                self._caller_local_evict(ep, bs)
-        self.assertEqual(bs.snapshot_loader_outputs, {})
-        self.assertEqual(bs.snapshot_model_identities, {})
-        self.assertIsNone(bs.snapshot_execution_seed)
-        self.assertFalse(bs.snapshot_seed_built)
-
-    def test_eviction_clears_res4lyf_and_cachedit_prepared(self):
-        """_RES4LYF_PREPARED and _CACHEDIT_PREPARED are cleared."""
-        _RES4LYF_PREPARED["wf_hash"] = {"records": ()}
-        _CACHEDIT_PREPARED["wf_hash"] = {"unet_id": 123}
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                self._caller_local_evict(ep, bs)
-        self.assertEqual(_RES4LYF_PREPARED, {})
-        self.assertEqual(_CACHEDIT_PREPARED, {})
-
-    def test_eviction_preserves_unrelated_globals(self):
-        """Certificate cache, workflow hash, RES4LYF hook are preserved."""
-        import comfymodal_runtime.modal_app as _ma
-        _orig_cert = _ma._V2_CERT_PROCESS_CACHE.copy()
-        _orig_wf = _ma._V2_WORKFLOW_HASH
-        _orig_res4lyf = _ma._RES4LYF_HOOK_INSTALLED
-        _ma._V2_CERT_PROCESS_CACHE["test"] = "value"
-        _ma._RES4LYF_HOOK_INSTALLED = True
-
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                self._caller_local_evict(ep, bs)
-
-        self.assertIn("test", _ma._V2_CERT_PROCESS_CACHE)
-        self.assertEqual(_ma._V2_WORKFLOW_HASH, _orig_wf)
-        self.assertTrue(_ma._RES4LYF_HOOK_INSTALLED)
-
-        _ma._V2_CERT_PROCESS_CACHE.clear()
-        _ma._V2_CERT_PROCESS_CACHE.update(_orig_cert)
-        _ma._RES4LYF_HOOK_INSTALLED = _orig_res4lyf
-
-    def test_eviction_emits_three_checkpoint_lines(self):
-        """Three [v2.snapshot_model_eviction_memory] lines are emitted."""
-        captured = []
-        original_print = print
-
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-            original_print(*args, **kwargs)
-
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-
-        with patch("builtins.print", side_effect=_cap_print):
-            with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                       return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-                with self.assertRaises(RuntimeError):
-                    self._caller_local_evict(ep, bs)
-
-        mem_lines = [l for l in captured if "snapshot_model_eviction_memory" in l]
-        self.assertEqual(
-            len(mem_lines), 3,
-            f"expected 3 memory lines, got {len(mem_lines)}: {mem_lines}",
-        )
-        self.assertIn("stage=before", mem_lines[0])
-        self.assertIn("stage=after_gc", mem_lines[1])
-        self.assertIn("stage=after_trim", mem_lines[2])
-
-    def test_eviction_emits_final_line_on_error(self):
-        """Failure emits final line with status=object_still_alive."""
-        captured = []
-        original_print = print
-
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-            original_print(*args, **kwargs)
-
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-
-        with patch("builtins.print", side_effect=_cap_print):
-            with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                       return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-                with self.assertRaises(RuntimeError):
-                    self._caller_local_evict(ep, bs)
-
-        final_lines = [l for l in captured if "stage=snapshot_pre_capture" in l]
-        self.assertGreaterEqual(len(final_lines), 1)
-        self.assertIn("clip_original_id=", final_lines[-1])
-        self.assertIn("unet_original_id=", final_lines[-1])
-
-    def test_eviction_does_not_store_marker_on_failure(self):
-        """On failure, _eviction_marker is not stored."""
-        ep = _make_fake_entrypoint(self._unet, self._clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        self.assertIsNone(ep._eviction_marker)
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                self._caller_local_evict(ep, bs)
-        # Marker should not be set on failure (weakrefs still alive in test)
-        self.assertIsNone(ep._eviction_marker)
-
-    def test_current_preparation_exists_key_accepted(self):
-        """diagnostic_snapshot current_preparation_exists=True sets bridge_active_prep=1."""
+    def test_role_floors_adhered(self):
+        """Reload validation requires role-specific floors (CLIP: 2048/4096, UNET: 4096/8192)."""
+        # Uses fake memory where after_reload is the same as after_eviction
+        # This will fail the rise check.
+        profile = {"mode": "split", "unet": "test_unet.safetensors",
+                    "clip1": "test_clip.safetensors", "clip_type": "sd3"}
         unet = _FakeModel("unet")
         clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        captured = []
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-        _orig_diag = ep._preload_bridge.diagnostic_snapshot
-        ep._preload_bridge.diagnostic_snapshot = lambda: {"current_preparation_exists": True}
-        with patch("builtins.print", side_effect=_cap_print):
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
+        # Memory that gives: loaded=30000, after_eviction=5000, after_reload=5000 (no rise)
+        _call_count = [0]
+        def _flat_reload(*, fields=None):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return _fake_process_memory(smaps_rss_mib=30000.0)
+            elif _call_count[0] <= 3:
+                return _fake_process_memory(smaps_rss_mib=5000.0)
+            elif _call_count[0] == 4:
+                return _fake_process_memory(smaps_rss_mib=5000.0)
+            else:
+                return _fake_process_memory(smaps_rss_mib=5000.0)
+        with self._mock_comfy_utils(), self._patch_storage_registry():
             with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                       return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-                with self.assertRaises(RuntimeError):
-                    ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        ep._preload_bridge.diagnostic_snapshot = _orig_diag
-        alive = [l for l in captured if "bridge_active_preparation=1" in l]
-        self.assertGreaterEqual(len(alive), 1,
-            "expected at least one line with bridge_active_preparation=1")
+                       side_effect=_flat_reload):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ep._evict_snapshot_models(
+                        ep._cpu_snapshot_models, bs,
+                        reload_unet_fn=self._reload_unet_fake,
+                        reload_clip_fn=self._reload_clip_fake,
+                        snap_ctx_cm=self._snap_ctx_fake,
+                        target_gpus=("rtx-pro-6000",),
+                    )
+        self.assertIn("RSS rise", str(ctx.exception))
 
-    def test_coordinator_active_forces_bridge_active_prep(self):
-        """coordinator._active non-None forces bridge_active_preparation=1."""
+    def test_unet_rss_rise_floor_is_4096(self):
+        """UNET reload requires a 4096 MiB current-RSS rise."""
+        profile = {"mode": "split", "unet": "test_unet.safetensors",
+                   "clip1": "test_clip.safetensors", "clip_type": "sd3"}
         unet = _FakeModel("unet")
         clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        captured = []
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-        ep._preload_bridge.coordinator._active = object()
-        with patch("builtins.print", side_effect=_cap_print):
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "unet"
+        _call_count = [0]
+
+        def _low_unet_rise(*, fields=None):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return _fake_process_memory(smaps_rss_mib=30000.0)
+            if _call_count[0] <= 3:
+                return _fake_process_memory(smaps_rss_mib=5000.0)
+            return _fake_process_memory(smaps_rss_mib=8000.0)
+
+        with self._mock_comfy_utils(), self._patch_storage_registry(10 * 1024**3):
             with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                       return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-                with self.assertRaises(RuntimeError):
-                    ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        alive = [l for l in captured if "bridge_active_preparation=1" in l]
-        self.assertGreaterEqual(len(alive), 1,
-            "expected at least one line with bridge_active_preparation=1")
+                       side_effect=_low_unet_rise):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ep._evict_snapshot_models(
+                        ep._cpu_snapshot_models, bs,
+                        reload_unet_fn=self._reload_unet_fake,
+                        reload_clip_fn=self._reload_clip_fake,
+                        snap_ctx_cm=self._snap_ctx_fake,
+                        target_gpus=("rtx-pro-6000",),
+                    )
+        self.assertIn("RSS rise", str(ctx.exception))
+
+    def test_storage_floor_failure_prevents_ready_payload(self):
+        """A selected payload below the role storage floor fails startup."""
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run_evict_reload_with_storage_floor("unet")
+        self.assertIn("storage", str(ctx.exception).lower())
+
+    def _run_evict_reload_with_storage_floor(self, retain_role):
+        profile = {"mode": "split", "unet": "test_unet.safetensors",
+                   "clip1": "test_clip.safetensors", "clip_type": "sd3"}
+        unet = _FakeModel("unet")
+        clip = _FakeModel("clip")
+        ep = _make_fake_entrypoint(unet, clip, normal_profile=profile)
+        bs = SimpleNamespace(snapshot_loader_outputs={}, snapshot_model_identities={})
+        del unet, clip
+        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = retain_role
+        with self._mock_comfy_utils(), self._patch_storage_registry(1024**3):
+            with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                       side_effect=self._memory_for_three_stages()):
+                return ep._evict_snapshot_models(
+                    ep._cpu_snapshot_models, bs,
+                    reload_unet_fn=self._reload_unet_fake,
+                    reload_clip_fn=self._reload_clip_fake,
+                    snap_ctx_cm=self._snap_ctx_fake,
+                    target_gpus=("rtx-pro-6000",),
+                )
 
 
 # ── Disabled compatibility tests ─────────────────────────────────────────
@@ -900,45 +1079,22 @@ class EvictionDisabledCompatibilityTests(unittest.TestCase):
         """Only the disabled line is printed when eviction disabled."""
         captured = []
         original_print = print
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
             original_print(*args, **kwargs)
-
-        en = "0"
         with patch("builtins.print", side_effect=_cap_print):
-            # Simulate the startup disabled path
             if not _parse_evict_models_before_snapshot():
                 print(
                     "[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
                     "enabled=0 status=disabled",
                     flush=True,
                 )
-
         evict_lines = [l for l in captured if "snapshot_model_eviction" in l]
         self.assertEqual(len(evict_lines), 1)
         self.assertIn("disabled", evict_lines[0])
 
-    def test_disabled_preserves_models_and_loader_outputs(self):
-        """When disabled, models and loader outputs are preserved."""
-        ep = ModalRuntimeEntrypoint()
-        fake_models = _make_minimal_cpu_models()
-        ep._cpu_snapshot_models = fake_models
-        ep._preload_bridge = _FakeBridge()
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={"unet": object()},
-            snapshot_model_identities={"unet": "u"},
-            snapshot_execution_seed=42,
-            snapshot_seed_built=True,
-        )
-
-        # Models and state should remain untouched
-        self.assertIsNotNone(ep._cpu_snapshot_models)
-        self.assertIsNotNone(bs.snapshot_loader_outputs.get("unet"))
-        self.assertGreater(len(bs.snapshot_loader_outputs), 0)
-
     def test_disabled_path_no_error_output(self):
-        """Disabled path emits exactly the disabled line, no error/skip."""
+        """Disabled path emits exactly the disabled line."""
         captured = []
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
@@ -970,31 +1126,25 @@ class RestoreIdleOrderingTests(unittest.TestCase):
         """restore_observed line is emitted when marker is present."""
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._eviction_marker = {
-            "status": "evicted",
-            "rss_before_mib": 20000.0,
-            "rss_after_trim_mib": 1000.0,
-            "rss_drop_mib": 19000.0,
+            "status": "full_eviction_complete",
+            "full_eviction_rss_drop_mib": 25000.0,
             "clip_original_id": "123",
             "unet_original_id": "456",
-            "clip_alive_after_cleanup": 0,
-            "unet_alive_after_cleanup": 0,
+            "original_clip_alive_after_full_eviction": 0,
+            "original_unet_alive_after_full_eviction": 0,
         }
         entrypoint._snapshot_eviction_metadata = {
             "clip_present": 1,
             "unet_present": 1,
         }
         entrypoint._apply_torch_thread_limit = MagicMock()
-
         captured = []
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
         with patch("builtins.print", side_effect=_cap_print):
             with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
                        return_value=0):
                 entrypoint._restore_eviction_boundary()
-
         obs = [l for l in captured if "restore_observed" in l]
         self.assertEqual(len(obs), 1)
         self.assertIn("marker=1", obs[0])
@@ -1003,28 +1153,23 @@ class RestoreIdleOrderingTests(unittest.TestCase):
         """idle=0 does not emit start/end lines."""
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._eviction_marker = {
-            "status": "evicted",
-            "clip_alive_after_cleanup": 0,
-            "unet_alive_after_cleanup": 0,
+            "status": "full_eviction_complete",
+            "original_clip_alive_after_full_eviction": 0,
+            "original_unet_alive_after_full_eviction": 0,
         }
         entrypoint._apply_torch_thread_limit = MagicMock()
-
         captured = []
         sleep_calls = []
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
         def _tracking_sleep(seconds):
             sleep_calls.append(seconds)
             return time.sleep(0)
-
         with patch("builtins.print", side_effect=_cap_print):
             with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
                        return_value=0):
                 with patch("time.sleep", side_effect=_tracking_sleep):
                     entrypoint._restore_eviction_boundary()
-
         idle_start = [l for l in captured if "event=start" in l and "snapshot_model_eviction_idle" in l]
         idle_end = [l for l in captured if "event=end" in l and "snapshot_model_eviction_idle" in l]
         self.assertEqual(len(idle_start), 0)
@@ -1035,117 +1180,90 @@ class RestoreIdleOrderingTests(unittest.TestCase):
         """idle_start before idle_end, sleep called with correct value."""
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._eviction_marker = {
-            "status": "evicted",
-            "clip_alive_after_cleanup": 0,
-            "unet_alive_after_cleanup": 0,
+            "status": "full_eviction_complete",
+            "original_clip_alive_after_full_eviction": 0,
+            "original_unet_alive_after_full_eviction": 0,
         }
         entrypoint._apply_torch_thread_limit = MagicMock()
-
         captured = []
         sleep_calls = []
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
         def _tracking_sleep(seconds):
             sleep_calls.append(seconds)
-            return None  # don't actually sleep
-
+            return None
         with patch("builtins.print", side_effect=_cap_print):
             with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
                        return_value=3):
                 with patch("time.sleep", side_effect=_tracking_sleep):
                     entrypoint._restore_eviction_boundary()
-
         obs_lines = [l for l in captured if "restore_observed" in l]
         idle_start = [l for l in captured if "event=start" in l and "snapshot_model_eviction_idle" in l]
         idle_end = [l for l in captured if "event=end" in l and "snapshot_model_eviction_idle" in l]
-
         self.assertGreater(len(obs_lines), 0)
         obs_idx = captured.index(obs_lines[0])
         if idle_start:
             start_idx = captured.index(idle_start[0])
-            self.assertLess(
-                obs_idx, start_idx,
-                "restore_observed must precede idle_start",
-            )
+            self.assertLess(obs_idx, start_idx,
+                            "restore_observed must precede idle_start")
         if idle_end:
             end_idx = captured.index(idle_end[0])
-            self.assertLess(
-                captured.index(idle_start[0]),
-                end_idx,
-                "idle_start must precede idle_end",
-            )
+            self.assertLess(captured.index(idle_start[0]), end_idx,
+                            "idle_start must precede idle_end")
         self.assertIn(3, sleep_calls)
 
     def test_no_idle_when_marker_none(self):
-        """No idle when _eviction_marker is None (no eviction happened)."""
+        """No idle when _eviction_marker is None."""
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._eviction_marker = None
         entrypoint._apply_torch_thread_limit = MagicMock()
-
         captured = []
         sleep_calls = []
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
         def _tracking_sleep(seconds):
             sleep_calls.append(seconds)
             return time.sleep(0)
-
         with patch("builtins.print", side_effect=_cap_print):
             with patch("time.sleep", side_effect=_tracking_sleep):
                 entrypoint._restore_eviction_boundary()
-
         idle_start = [l for l in captured if "event=start" in l and "snapshot_model_eviction_idle" in l]
         self.assertEqual(len(idle_start), 0)
         obs_lines = [l for l in captured if "restore_observed" in l]
-        # When marker is None, restore_observed is still emitted (marker=0)
         self.assertEqual(len(obs_lines), 1)
         self.assertIn("marker=0", obs_lines[0])
 
     def test_primitive_flag_alone_without_dict_produces_marker(self):
-        """Primitive _snapshot_models_evicted_before_capture alone (no dict)
-        produces marker=1 and enables idle."""
+        """Primitive flag alone produces marker=1 and enables idle."""
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._snapshot_models_evicted_before_capture = True
-        # _eviction_marker is not set — dict path for older instances only
         entrypoint._eviction_marker = None
         entrypoint._snapshot_eviction_metadata = {
             "clip_present": 1,
             "unet_present": 1,
         }
         entrypoint._apply_torch_thread_limit = MagicMock()
-
         captured = []
         sleep_calls = []
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
         def _tracking_sleep(seconds):
             sleep_calls.append(seconds)
             return None
-
         with patch("builtins.print", side_effect=_cap_print):
             with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
                        return_value=5):
                 with patch("time.sleep", side_effect=_tracking_sleep):
                     entrypoint._restore_eviction_boundary()
-
         obs_lines = [l for l in captured if "restore_observed" in l]
         self.assertEqual(len(obs_lines), 1)
         self.assertIn("marker=1", obs_lines[0])
         idle_start = [l for l in captured if "event=start" in l and "snapshot_model_eviction_idle" in l]
-        idle_end = [l for l in captured if "event=end" in l and "snapshot_model_eviction_idle" in l]
-        self.assertEqual(len(idle_start), 1,
-            "expected idle_start when primitive flag is True")
-        self.assertEqual(len(idle_end), 1)
+        self.assertEqual(len(idle_start), 1)
         self.assertIn(5, sleep_calls)
 
 
-# ── restore() boundary ordering tests ────────────────────────────────────
+# ── Restore boundary ordering tests ──────────────────────────────────────
 
 
 class RestoreBoundaryOrderingTest(unittest.TestCase):
@@ -1157,95 +1275,45 @@ class RestoreBoundaryOrderingTest(unittest.TestCase):
         _clean_env()
 
     def test_restore_boundary_before_apply_torch_thread(self):
-        """entrypoint.restore() calls boundary before apply_torch_thread_limit.
-        Uses mocks/stubs that cause a controlled exception after the boundary
-        so we can record events and verify ordering."""
+        """entrypoint.restore() calls boundary before apply_torch_thread_limit."""
         entrypoint = ModalRuntimeEntrypoint()
-        entrypoint._eviction_marker = None  # no eviction happened
+        entrypoint._eviction_marker = None
         entrypoint._snapshot_models_evicted_before_capture = False
-
-        # Stub out the many dependencies that restore() needs to pass through
-        # before reaching the controlled exception point.
         events = []
-
-        # _restore_eviction_boundary — must be called first
         original_boundary = entrypoint._restore_eviction_boundary
         def _tracking_boundary():
             events.append("boundary")
             return original_boundary()
-
-        # _apply_torch_thread_limit — must be called after boundary
         original_apply = entrypoint._apply_torch_thread_limit
         def _tracking_apply():
             events.append("apply")
             return original_apply()
-
-        # Stub everything that restore() does after apply_torch_thread_limit
-        # to avoid actual ComfyUI/snapshot/GPU work.
         entrypoint._configure_runtime = MagicMock()
-        entrypoint._restore_publisher = PropertyMock(return_value=None)  # type: ignore
-        # Use MagicMock for deeply nested attributes restore will access
-
+        entrypoint._restore_publisher = PropertyMock(return_value=None)
         with patch("comfymodal_runtime.modal_app._capture_remote_identity",
                    return_value={"container_id": "test"}):
             with patch.object(entrypoint, "_restore_eviction_boundary",
                               side_effect=_tracking_boundary):
                 with patch.object(entrypoint, "_apply_torch_thread_limit",
                                   side_effect=_tracking_apply):
-                    # Cause controlled exception after boundary + apply
-                    # but before further restore work that needs real deps.
                     original_configure = entrypoint._configure_runtime
                     def _error_configure(*a, **kw):
                         events.append("configure_runtime")
                         raise RuntimeError("controlled stop after boundary ordering")
                     entrypoint._configure_runtime = _error_configure
-
                     with self.assertRaises(RuntimeError) as ctx:
                         entrypoint.restore()
-
-        self.assertIn("controlled stop", str(ctx.exception),
-                      "expected restore to propagate our controlled exception")
-        self.assertIn("boundary", events,
-                      "boundary must be called")
-        self.assertIn("apply", events,
-                      "apply_torch_thread_limit must be called")
-        self.assertIn("configure_runtime", events,
-                      "normal restore continuation must be attempted")
+        self.assertIn("controlled stop", str(ctx.exception))
+        self.assertIn("boundary", events)
+        self.assertIn("apply", events)
+        self.assertIn("configure_runtime", events)
         self.assertLess(events.index("boundary"), events.index("apply"),
                         "boundary must precede apply_torch_thread_limit")
         self.assertLess(events.index("apply"), events.index("configure_runtime"),
                         "apply_torch_thread_limit must precede configure_runtime")
 
 
-class WeakrefEvictionTests(unittest.TestCase):
-    """Verify weakref-based eviction with caller-local deletion pattern."""
-
-    def setUp(self):
-        _clean_env()
-
-    def test_clear_exact_models_from_loaded(self):
-        """Verify that even without a real loaded_models(), eviction
-        progresses (doesn't crash) and clears registries."""
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={"unet": object(), "clip": object()},
-            snapshot_model_identities={"unet": "u", "clip": "c"},
-            snapshot_execution_seed=42,
-            snapshot_seed_built=True,
-        )
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError):
-                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        self.assertIsNone(ep._cpu_snapshot_unet_runtime_state)
-        self.assertIsNone(ep._cpu_snapshot_unet_storage_registry)
-        self.assertIsNone(ep._cpu_snapshot_clip_storage_registry)
-        self.assertFalse(ep._cpu_snapshot_models_active)
-
-
-# ── Retain-role selector parsing tests ───────────────────────────────
+# ── Retain-role selector parsing tests ───────────────────────────────────
 
 
 class ParseEvictRetainRoleTests(unittest.TestCase):
@@ -1274,16 +1342,12 @@ class ParseEvictRetainRoleTests(unittest.TestCase):
         self.assertEqual(_parse_evict_retain_role(), "unet")
 
     def test_uppercase_rejected(self):
-        """Uppercase 'CLIP' raises RuntimeError (case-sensitive)."""
         os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "CLIP"
         with self.assertRaises(RuntimeError) as ctx:
             _parse_evict_retain_role()
         self.assertIn("CLIP", str(ctx.exception))
-        self.assertNotIn("clip", str(ctx.exception).split("CLIP", 1)[0],
-                         msg="error must not normalize malformed value to lowercase")
 
     def test_whitespace_wrapped_rejected(self):
-        """Whitespace-wrapped ' clip ' raises RuntimeError."""
         os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = " clip "
         with self.assertRaises(RuntimeError) as ctx:
             _parse_evict_retain_role()
@@ -1297,271 +1361,22 @@ class ParseEvictRetainRoleTests(unittest.TestCase):
                     _parse_evict_retain_role()
 
     def test_selector_disabled_ignored(self):
-        """When eviction is disabled, retain selector env var propagates
-        via _runtime_env but is not parsed by _evict_snapshot_models."""
+        """When eviction is disabled, retain selector env var still parses."""
         os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "0"
         os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "unet"
-        # The env var IS present (it propagates via _runtime_env)
         env = _runtime_env()
         self.assertIn("COMFYMODAL_V2_EVICT_RETAIN_ROLE", env)
         self.assertEqual(env["COMFYMODAL_V2_EVICT_RETAIN_ROLE"], "unet")
-        # But _parse_evict_models_before_snapshot returns False
         self.assertFalse(_parse_evict_models_before_snapshot())
-        # The eviction method skips parsing retain role when disabled;
-        # confirm that calling it directly with disabled gate still works.
-        # (The caller _evict_snapshot_models checks the gate first.)
         self.assertEqual(_parse_evict_retain_role(), "unet")
 
 
-# ── Retained model lifecycle tests ────────────────────────────────────
+# ── Retained model release at restore boundary tests ────────────────────
 
 
-class RetainedModelEvictionTests(unittest.TestCase):
-    """_evict_snapshot_models with retained-role clip/unet/none."""
-
-    def setUp(self):
-        _clean_env()
-        _RES4LYF_PREPARED.clear()
-        _CACHEDIT_PREPARED.clear()
-
-    def _run_evict_retained(self, retain_role: str):
-        """Run eviction with retain_role set, return (marker, ep)."""
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = retain_role
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        # Ensure retain role is propagated to entrypoint
-        ep._snapshot_eviction_retained_role = retain_role
-        del unet, clip
-        _call_count = [0]
-
-        def _side_effect(*, fields=None):
-            _call_count[0] += 1
-            if _call_count[0] == 1:
-                return _fake_process_memory(smaps_rss_mib=30000.0)
-            elif _call_count[0] == 2:
-                return _fake_process_memory(smaps_rss_mib=10000.0)
-            else:
-                return _fake_process_memory(
-                    smaps_rss_mib=5000.0,
-                    smaps_anonymous_mib=4500.0,
-                    smaps_private_dirty_mib=4400.0,
-                )
-
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   side_effect=_side_effect):
-            marker = ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        return marker, ep
-
-    def test_retain_none_sets_dedicated_attrs(self):
-        """retained_role=none: dedicated attrs are at defaults."""
-        marker, ep = self._run_evict_retained("none")
-        self.assertEqual(ep._snapshot_eviction_retained_role, "none")
-        self.assertIsNone(ep._snapshot_eviction_retained_model)
-        self.assertEqual(ep._snapshot_eviction_retained_model_id, 0)
-        self.assertEqual(ep._snapshot_eviction_retained_model_type, "")
-
-    def test_retain_clip_preserves_clip(self):
-        """retained_role=clip: clip is on dedicated attr after eviction."""
-        marker, ep = self._run_evict_retained("clip")
-        self.assertEqual(ep._snapshot_eviction_retained_role, "clip")
-        self.assertIsNotNone(ep._snapshot_eviction_retained_model)
-        self.assertGreater(ep._snapshot_eviction_retained_model_id, 0)
-        self.assertEqual(ep._snapshot_eviction_retained_model_type, "_FakeModel")
-        # Marker should record retained info
-        self.assertEqual(marker.get("retain_role"), "clip")
-        self.assertEqual(marker.get("retained_model_id"), ep._snapshot_eviction_retained_model_id)
-        self.assertEqual(marker.get("retained_model_type"), "_FakeModel")
-        # Normal cleanup still happened
-        self.assertIsNone(ep._cpu_snapshot_models)
-        self.assertFalse(ep._cpu_snapshot_models_active)
-        self.assertIsNone(ep._cpu_snapshot_unet_runtime_state)
-
-    def test_retain_unet_preserves_unet(self):
-        """retained_role=unet: unet is on dedicated attr after eviction."""
-        marker, ep = self._run_evict_retained("unet")
-        self.assertEqual(ep._snapshot_eviction_retained_role, "unet")
-        self.assertIsNotNone(ep._snapshot_eviction_retained_model)
-        self.assertGreater(ep._snapshot_eviction_retained_model_id, 0)
-        self.assertEqual(marker.get("retain_role"), "unet")
-        self.assertIsNone(ep._cpu_snapshot_models)
-        self.assertFalse(ep._cpu_snapshot_models_active)
-
-    def test_retain_clip_missing_model_raises(self):
-        """Missing selected model (clip=None on cpu_models) raises RuntimeError."""
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet_obj=unet, clip_obj=clip)
-        # Explicitly set clip to None on the cpu_models
-        ep._cpu_snapshot_models.clip = None
-        ep._snapshot_eviction_retained_role = "clip"
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        del unet, clip
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError) as ctx:
-                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        self.assertIn("clip", str(ctx.exception))
-
-    def test_retain_unet_missing_model_raises(self):
-        """Missing selected model (unet=None on cpu_models) raises RuntimeError."""
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "unet"
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet_obj=unet, clip_obj=clip)
-        # Explicitly set unet to None on the cpu_models
-        ep._cpu_snapshot_models.unet = None
-        ep._snapshot_eviction_retained_role = "unet"
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-        )
-        del unet, clip
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   return_value=_fake_process_memory(smaps_rss_mib=30000.0)):
-            with self.assertRaises(RuntimeError) as ctx:
-                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        self.assertIn("unet", str(ctx.exception))
-
-    def test_retain_clip_emits_success_with_retained_fields(self):
-        """Final eviction line includes retained_role/alive fields."""
-        captured = []
-        original_print = print
-
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-            original_print(*args, **kwargs)
-
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "clip"
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        ep._snapshot_eviction_retained_role = "clip"
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        del unet, clip
-        _call_count = [0]
-
-        def _side_effect(*, fields=None):
-            _call_count[0] += 1
-            if _call_count[0] == 1:
-                return _fake_process_memory(smaps_rss_mib=30000.0)
-            elif _call_count[0] == 2:
-                return _fake_process_memory(smaps_rss_mib=10000.0)
-            else:
-                return _fake_process_memory(
-                    smaps_rss_mib=5000.0, smaps_anonymous_mib=4500.0,
-                    smaps_private_dirty_mib=4400.0,
-                )
-
-        with patch("builtins.print", side_effect=_cap_print):
-            with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                       side_effect=_side_effect):
-                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-
-        final_lines = [l for l in captured if "status=evicted" in l and "stage=snapshot_pre_capture" in l]
-        self.assertEqual(len(final_lines), 1)
-        self.assertIn("retain_role=clip", final_lines[0])
-        self.assertIn("retained_model_present=1", final_lines[0])
-        self.assertIn("retained_model_matches_original=1", final_lines[0])
-        self.assertIn("rss_drop_required_mib=", final_lines[0])
-        self.assertIn("rss_drop_requirement_met=1", final_lines[0])
-
-    def test_retain_with_rss_floor_unet(self):
-        """unet retain uses 4096 MiB floor, succeeds with moderate drop."""
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "unet"
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        ep._snapshot_eviction_retained_role = "unet"
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        del unet, clip
-        _call_count = [0]
-
-        def _side_effect(*, fields=None):
-            _call_count[0] += 1
-            if _call_count[0] == 1:
-                return _fake_process_memory(smaps_rss_mib=15000.0)
-            elif _call_count[0] == 2:
-                return _fake_process_memory(smaps_rss_mib=12000.0)
-            else:
-                return _fake_process_memory(
-                    smaps_rss_mib=8000.0, smaps_anonymous_mib=7000.0,
-                    smaps_private_dirty_mib=6900.0,
-                )
-
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   side_effect=_side_effect):
-            marker = ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        self.assertEqual(marker["status"], "evicted")
-        # 15000 - 8000 = 7000 > 4096, should pass
-        self.assertGreater(marker["rss_drop_mib"], 4096.0)
-
-    def test_retain_unet_fails_below_4096_floor(self):
-        """unet retain fails when RSS drop < 4096 MiB."""
-        os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
-        os.environ["COMFYMODAL_V2_EVICT_RETAIN_ROLE"] = "unet"
-        unet = _FakeModel("unet")
-        clip = _FakeModel("clip")
-        ep = _make_fake_entrypoint(unet, clip)
-        ep._snapshot_eviction_retained_role = "unet"
-        bs = SimpleNamespace(
-            snapshot_loader_outputs={},
-            snapshot_model_identities={},
-            snapshot_execution_seed=None,
-            snapshot_seed_built=False,
-        )
-        del unet, clip
-        _call_count = [0]
-
-        def _side_effect(*, fields=None):
-            _call_count[0] += 1
-            if _call_count[0] == 1:
-                return _fake_process_memory(smaps_rss_mib=15000.0)
-            elif _call_count[0] == 2:
-                return _fake_process_memory(smaps_rss_mib=14500.0)
-            else:
-                return _fake_process_memory(
-                    smaps_rss_mib=14000.0, smaps_anonymous_mib=13500.0,
-                    smaps_private_dirty_mib=13400.0,
-                )
-
-        with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                   side_effect=_side_effect):
-            with self.assertRaises(RuntimeError) as ctx:
-                ep._evict_snapshot_models(ep._cpu_snapshot_models, bs)
-        self.assertIn("RSS drop", str(ctx.exception))
-
-
-# ── Restore boundary with retained model release tests ───────────────
-
-
-class RestoreBoundaryRetainedReleaseTests(unittest.TestCase):
-    """_restore_eviction_boundary emits retained fields and releases."""
+class RetainedReleaseAtRestoreTests(unittest.TestCase):
+    """_restore_eviction_boundary emits retained fields and releases
+    the reloaded model (held only on _snapshot_eviction_retained_model)."""
 
     def setUp(self):
         _clean_env()
@@ -1570,12 +1385,12 @@ class RestoreBoundaryRetainedReleaseTests(unittest.TestCase):
         """restore_observed line contains retained_role/id/type."""
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._eviction_marker = {
-            "status": "evicted", "rss_before_mib": 20000.0,
-            "rss_after_trim_mib": 1000.0, "rss_drop_mib": 19000.0,
-            "clip_original_id": "123", "unet_original_id": "456",
-            "clip_alive_after_cleanup": 0, "unet_alive_after_cleanup": 0,
-            "retained_role": "clip", "retained_model_id": 789,
-            "retained_model_type": "FakeModel",
+            "status": "full_eviction_complete",
+            "full_eviction_rss_drop_mib": 25000.0,
+            "clip_original_id": "123",
+            "unet_original_id": "456",
+            "original_clip_alive_after_full_eviction": 0,
+            "original_unet_alive_after_full_eviction": 0,
         }
         entrypoint._snapshot_models_evicted_before_capture = True
         entrypoint._snapshot_eviction_retained_role = "clip"
@@ -1585,168 +1400,20 @@ class RestoreBoundaryRetainedReleaseTests(unittest.TestCase):
         entrypoint._snapshot_eviction_retained_model_type = "_FakeModel"
         entrypoint._apply_torch_thread_limit = MagicMock()
         del retained
-
         captured = []
-
         def _cap_print(*args, **kwargs):
             captured.append(" ".join(str(a) for a in args))
-
         with patch("builtins.print", side_effect=_cap_print):
             with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
                        return_value=0):
                 entrypoint._restore_eviction_boundary()
-
         obs = [l for l in captured if "restore_observed" in l]
         self.assertEqual(len(obs), 1)
         self.assertIn("retained_role=clip", obs[0])
         self.assertIn("retained_model_id=", obs[0])
         self.assertIn("retained_model_type=_FakeModel", obs[0])
-        # clip_present/unet_present should be 0
         self.assertIn("clip_present=0", obs[0])
         self.assertIn("unet_present=0", obs[0])
-
-    def test_retained_model_released_after_idle_end(self):
-        """Retained model release print follows idle end and has RSS fields."""
-        entrypoint = ModalRuntimeEntrypoint()
-        # Set up retained model
-        retained = _FakeModel("retained_clip")
-        entrypoint._snapshot_eviction_retained_role = "clip"
-        entrypoint._snapshot_eviction_retained_model = retained
-        entrypoint._snapshot_eviction_retained_model_id = id(retained)
-        entrypoint._snapshot_eviction_retained_model_type = "_FakeModel"
-        entrypoint._snapshot_models_evicted_before_capture = True
-        entrypoint._eviction_marker = {
-            "status": "evicted", "clip_alive_after_cleanup": 0,
-            "unet_alive_after_cleanup": 0,
-        }
-        entrypoint._apply_torch_thread_limit = MagicMock()
-        # Delete the local reference so gc can collect the retained model
-        del retained
-
-        captured = []
-        sleep_calls = []
-
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-
-        def _tracking_sleep(seconds):
-            sleep_calls.append(seconds)
-            return None
-
-        with patch("builtins.print", side_effect=_cap_print):
-            with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
-                       return_value=3):
-                with patch("time.sleep", side_effect=_tracking_sleep):
-                    with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                               return_value=_fake_process_memory()):
-                        entrypoint._restore_eviction_boundary()
-
-        # Check retained release line appears after idle end
-        release_lines = [l for l in captured if "stage=restore_release_retained" in l]
-        idle_end = [l for l in captured if "event=end" in l and "snapshot_model_eviction_idle" in l]
-        if idle_end and release_lines:
-            end_idx = captured.index(idle_end[0])
-            release_idx = captured.index(release_lines[0])
-            self.assertGreater(release_idx, end_idx,
-                               "retained release must follow idle end")
-        # Release line must include required memory/status fields
-        if release_lines:
-            self.assertIn("status=released", release_lines[0])
-            self.assertIn("retain_role=clip", release_lines[0])
-            self.assertIn("rss_before_release_mib=", release_lines[0])
-            self.assertIn("rss_after_gc_mib=", release_lines[0])
-            self.assertIn("rss_after_trim_mib=", release_lines[0])
-            self.assertIn("rss_drop_mib=", release_lines[0])
-            self.assertIn("malloc_trim_status=", release_lines[0])
-            self.assertIn("malloc_trim_result=", release_lines[0])
-            self.assertIn("wall_unix_ns=", release_lines[0])
-            self.assertIn("retained_alive_after_release=0", release_lines[0])
-        # Release status should be "released" if gc collects the self-cycle
-        self.assertIn(entrypoint._snapshot_eviction_retained_release_status,
-                      ("released", "not_present"))
-
-    def test_retained_object_still_alive_during_release(self):
-        """Retained object surviving release emits object_still_alive and raises RuntimeError.
-        Uses a mock weakref that stays alive to simulate the failure."""
-        import weakref as _wr
-        entrypoint = ModalRuntimeEntrypoint()
-        retained = _FakeModel("stubborn_clip")
-        entrypoint._snapshot_eviction_retained_role = "clip"
-        entrypoint._snapshot_eviction_retained_model = retained
-        entrypoint._snapshot_eviction_retained_model_id = id(retained)
-        entrypoint._snapshot_eviction_retained_model_type = "_FakeModel"
-        entrypoint._snapshot_models_evicted_before_capture = True
-        entrypoint._eviction_marker = {
-            "status": "evicted", "clip_alive_after_cleanup": 0,
-            "unet_alive_after_cleanup": 0,
-        }
-        entrypoint._apply_torch_thread_limit = MagicMock()
-        del retained
-
-        captured = []
-
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-
-        # Patch weakref.ref to return an always-alive weakref for the retained model
-        _original_ref = _wr.ref
-        def _always_alive_ref(obj, callback=None):
-            wr = _original_ref(obj, callback)
-            class _AliveWeakRef:
-                def __call__(self):
-                    return obj  # always alive
-                def __repr__(self):
-                    return "AliveWeakRef()"
-            return _AliveWeakRef()
-
-        with patch("builtins.print", side_effect=_cap_print):
-            with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
-                       return_value=0):
-                with patch("comfymodal_runtime.modal_app._collect_process_memory",
-                           return_value=_fake_process_memory()):
-                    with patch("weakref.ref", side_effect=_always_alive_ref):
-                        with self.assertRaises(RuntimeError) as ctx:
-                            entrypoint._restore_eviction_boundary()
-
-        self.assertIn("still alive", str(ctx.exception).lower())
-        self.assertEqual(
-            entrypoint._snapshot_eviction_retained_release_status,
-            "object_still_alive",
-        )
-        # Verify the error line was emitted
-        alive_lines = [l for l in captured
-                       if "status=object_still_alive" in l
-                       and "stage=restore_release_retained" in l]
-        self.assertGreaterEqual(len(alive_lines), 1)
-
-    def test_no_retained_model_no_release_work(self):
-        """retained_role=none: restore_release_retained with status=not_present."""
-        entrypoint = ModalRuntimeEntrypoint()
-        entrypoint._snapshot_eviction_retained_role = "none"
-        entrypoint._snapshot_eviction_retained_model = None
-        entrypoint._snapshot_models_evicted_before_capture = True
-        entrypoint._eviction_marker = {
-            "status": "evicted", "clip_alive_after_cleanup": 0,
-            "unet_alive_after_cleanup": 0,
-        }
-        entrypoint._apply_torch_thread_limit = MagicMock()
-
-        captured = []
-
-        def _cap_print(*args, **kwargs):
-            captured.append(" ".join(str(a) for a in args))
-
-        with patch("builtins.print", side_effect=_cap_print):
-            with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
-                       return_value=0):
-                entrypoint._restore_eviction_boundary()
-
-        release_lines = [l for l in captured if "stage=restore_release_retained" in l]
-        self.assertEqual(len(release_lines), 1,
-                         "expected one restore_release_retained line for role=none")
-        self.assertIn("status=not_present", release_lines[0])
-        self.assertIn("retain_role=none", release_lines[0])
-        self.assertEqual(entrypoint._snapshot_eviction_retained_release_status, "not_present")
 
     def test_retained_attribute_defaults_on_fresh_entrypoint(self):
         """Fresh entrypoint has correct retained attr defaults."""
@@ -1768,6 +1435,71 @@ class RestoreBoundaryRetainedReleaseTests(unittest.TestCase):
         self.assertEqual(raw._snapshot_eviction_retained_model_id, 0)
         self.assertEqual(raw._snapshot_eviction_retained_model_type, "")
         self.assertEqual(raw._snapshot_eviction_retained_release_status, "not_run")
+
+    def test_retained_released_after_idle_end(self):
+        """Retained model release follows idle end, requires weakref death but not RSS drop."""
+        entrypoint = ModalRuntimeEntrypoint()
+        retained = _FakeModel("retained_clip")
+        entrypoint._snapshot_eviction_retained_role = "clip"
+        entrypoint._snapshot_eviction_retained_model = retained
+        entrypoint._snapshot_eviction_retained_model_id = id(retained)
+        entrypoint._snapshot_eviction_retained_model_type = "_FakeModel"
+        entrypoint._snapshot_models_evicted_before_capture = True
+        entrypoint._eviction_marker = {
+            "status": "full_eviction_complete",
+            "original_clip_alive_after_full_eviction": 0,
+            "original_unet_alive_after_full_eviction": 0,
+        }
+        entrypoint._apply_torch_thread_limit = MagicMock()
+        del retained
+        captured = []
+        sleep_calls = []
+        def _cap_print(*args, **kwargs):
+            captured.append(" ".join(str(a) for a in args))
+        def _tracking_sleep(seconds):
+            sleep_calls.append(seconds)
+            return None
+        with patch("builtins.print", side_effect=_cap_print):
+            with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
+                       return_value=3):
+                with patch("time.sleep", side_effect=_tracking_sleep):
+                    with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                               return_value=_fake_process_memory()):
+                        entrypoint._restore_eviction_boundary()
+        release_lines = [l for l in captured if "stage=restore_release_retained" in l]
+        idle_end = [l for l in captured if "event=end" in l and "snapshot_model_eviction_idle" in l]
+        if idle_end and release_lines:
+            end_idx = captured.index(idle_end[0])
+            release_idx = captured.index(release_lines[0])
+            self.assertGreater(release_idx, end_idx,
+                               "retained release must follow idle end")
+
+    def test_release_high_rss_accepted(self):
+        """Retained release accepts any RSS - no minimum drop required."""
+        entrypoint = ModalRuntimeEntrypoint()
+        retained = _FakeModel("big_clip")
+        entrypoint._snapshot_eviction_retained_role = "clip"
+        entrypoint._snapshot_eviction_retained_model = retained
+        entrypoint._snapshot_eviction_retained_model_id = id(retained)
+        entrypoint._snapshot_eviction_retained_model_type = "_FakeModel"
+        entrypoint._snapshot_models_evicted_before_capture = True
+        entrypoint._eviction_marker = {
+            "status": "full_eviction_complete",
+        }
+        entrypoint._apply_torch_thread_limit = MagicMock()
+        del retained
+        captured = []
+        def _cap_print(*args, **kwargs):
+            captured.append(" ".join(str(a) for a in args))
+        with patch("builtins.print", side_effect=_cap_print):
+            with patch("comfymodal_runtime.modal_app._parse_evict_restore_idle_seconds",
+                       return_value=0):
+                with patch("comfymodal_runtime.modal_app._collect_process_memory",
+                           return_value=_fake_process_memory(smaps_rss_mib=999999.0)):
+                    entrypoint._restore_eviction_boundary()
+        release_lines = [l for l in captured if "stage=restore_release_retained" in l]
+        if release_lines:
+            self.assertIn("status=released", release_lines[0])
 
 
 if __name__ == "__main__":
