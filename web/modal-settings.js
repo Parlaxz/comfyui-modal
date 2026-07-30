@@ -1551,6 +1551,83 @@ function buildPanel() {
 
   scrollContent.appendChild(gpuSection);
 
+  // === EXECUTION ENGINE SECTION ===
+  const engineSection = document.createElement("div");
+  engineSection.style.cssText = "display:flex; flex-direction:column; gap:6px;";
+  const engineLabel = document.createElement("span");
+  engineLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  engineLabel.textContent = "Execution Engine";
+  const engineSelect = document.createElement("select");
+  engineSelect.style.cssText = inputStyle();
+  const engineStatus = document.createElement("div");
+  engineStatus.style.cssText = "font-size:11px; color:#666; line-height:1.4; min-height:14px;";
+  const engineReadiness = document.createElement("div");
+  engineReadiness.style.cssText = "font-size:10px; color:#666; line-height:1.4;";
+  engineSection.appendChild(engineLabel);
+  engineSection.appendChild(engineSelect);
+  engineSection.appendChild(engineStatus);
+  engineSection.appendChild(engineReadiness);
+
+  function renderExecutionEngineConfig(config) {
+    const modes = Array.isArray(config && config.available_execution_modes)
+      ? config.available_execution_modes
+      : [{ value: "v2", label: "V2 - Recommended" }, { value: "v1", label: "V1 - Legacy fallback" }];
+    while (engineSelect.firstChild) engineSelect.removeChild(engineSelect.firstChild);
+    modes.forEach((mode) => {
+      const option = document.createElement("option");
+      option.value = mode.value;
+      option.textContent = mode.label;
+      engineSelect.appendChild(option);
+    });
+    const current = (config && config.execution_mode) || "v2";
+    engineSelect.value = current;
+    window._comfyModalExecutionMode = current;
+    const locked = !!(config && config.execution_mode_locked);
+    engineSelect.disabled = locked;
+    engineStatus.textContent = locked
+      ? "Managed by COMFYMODAL_RUNTIME"
+      : "Current engine: " + current.toUpperCase() + " - Applies to future runs only";
+    engineStatus.style.color = locked ? "#f5a623" : "#666";
+    const readiness = config && config.execution_readiness;
+    if (readiness) {
+      const v1 = readiness.v1 && readiness.v1.status || "unknown";
+      const v2 = readiness.v2 && readiness.v2.status || "unknown";
+      engineReadiness.textContent = "V1 deployment: " + v1 + " - V2 deployment: " + v2;
+      if (v2 === "unavailable") engineReadiness.textContent += " (V2 - Deployment required)";
+    }
+  }
+
+  api.fetchApi(`${MODAL_PREFIX}/config`).then((response) => response.json()).then(renderExecutionEngineConfig).catch(() => {
+    renderExecutionEngineConfig({ execution_mode: "v2" });
+    engineStatus.textContent = "Current engine: V2 - Applies to future runs only - server status unknown";
+  });
+  engineSelect.addEventListener("change", async () => {
+    const selected = engineSelect.value;
+    engineSelect.disabled = true;
+    try {
+      const response = await api.fetchApi(`${MODAL_PREFIX}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ execution_mode: selected }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.status === "error") throw new Error(data.message || "Could not save execution engine");
+      window._comfyModalExecutionMode = selected;
+      engineStatus.textContent = "Current engine: " + selected.toUpperCase() + " - Applies to future runs only";
+      window.dispatchEvent(new CustomEvent("comfymodal:execution-mode-changed", { detail: data }));
+    } catch (error) {
+      engineStatus.textContent = error.message || "Could not save execution engine";
+      engineStatus.style.color = "#e05050";
+    } finally {
+      engineSelect.disabled = false;
+    }
+  });
+  const engineSyncHandler = (event) => {
+    if (event && event.detail && event.detail.execution_mode) renderExecutionEngineConfig(event.detail);
+  };
+  window.addEventListener("comfymodal:execution-mode-changed", engineSyncHandler);
+  scrollContent.appendChild(engineSection);
+
   // === OUTPUT OPTIONS SECTION (Collapsible) ===
   const _STORAGE_FORMAT = "comfymodal_output_format";
   const _STORAGE_QUALITY = "comfymodal_quality";
@@ -1581,7 +1658,8 @@ function buildPanel() {
       save_folder: _saveFolderValue,
       save_metadata_sidecar: _sidecarValue,
     };
-    // Sync to server
+    // Sync to server — only update local/window state and notify
+    // after a successful response.
     try {
       api.fetchApi(`${MODAL_PREFIX}/config`, {
         method: "POST",
@@ -1595,27 +1673,31 @@ function buildPanel() {
           save_folder: _saveFolderValue,
           save_metadata_sidecar: _sidecarValue,
         }),
+      }).then(function (resp) {
+        if (resp && resp.ok) {
+          try {
+            window.dispatchEvent(new CustomEvent("comfymodal:output-preferences-changed", { detail: window._comfyModalOutputOptions }));
+          } catch {}
+        }
+      }).catch(function () {
+        // Server sync failure — local state preserved
       });
     } catch {}
   }
 
-  // Init from server config
+  // Init from server config — server is authoritative.
+  // Apply all server values regardless of localStorage state so
+  // initial sync always reflects the backend.
   (async () => {
     try {
       const r = await api.fetchApi(`${MODAL_PREFIX}/config`);
       const cfg = await r.json();
-      if (cfg.output_format !== undefined && !localStorage.getItem(_STORAGE_FORMAT))
-        _outFmtValue = cfg.output_format;
-      if (cfg.quality !== undefined && !localStorage.getItem(_STORAGE_QUALITY))
-        _qualValue = cfg.quality;
-      if (cfg.webp_lossless_compression !== undefined && !localStorage.getItem(_STORAGE_WEBP_LC))
-        _webpLcValue = cfg.webp_lossless_compression;
-      if (cfg.auto_save_local !== undefined && !localStorage.getItem(_STORAGE_AUTOSAVE))
-        _autoSaveValue = Boolean(cfg.auto_save_local);
-      if (cfg.save_folder && !localStorage.getItem(_STORAGE_SAVEFOLDER))
-        _saveFolderValue = normalizeOutputSaveFolder(cfg.save_folder);
-      if (cfg.save_metadata_sidecar !== undefined && !localStorage.getItem(_STORAGE_SIDECAR))
-        _sidecarValue = cfg.save_metadata_sidecar !== false;
+      if (cfg.output_format !== undefined) _outFmtValue = cfg.output_format;
+      if (cfg.quality !== undefined) _qualValue = cfg.quality;
+      if (cfg.webp_lossless_compression !== undefined) _webpLcValue = cfg.webp_lossless_compression;
+      if (cfg.auto_save_local !== undefined) _autoSaveValue = Boolean(cfg.auto_save_local);
+      if (cfg.save_folder) _saveFolderValue = normalizeOutputSaveFolder(cfg.save_folder);
+      if (cfg.save_metadata_sidecar !== undefined) _sidecarValue = cfg.save_metadata_sidecar !== false;
       _persistOutputSettings();
     } catch {}
   })();

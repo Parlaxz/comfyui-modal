@@ -393,16 +393,62 @@ export function results_tab_render(rootEl, api, options = {}) {
       : null;
     const modelName = getModelShortName(attempt);
     const runtime = getCellRuntime(attempt);
-    const card = el("div", {
+    // ── Download button helper for cell images ──────────────────────────
+  var dlBtn = null;
+  if (imageUrl) {
+    dlBtn = el("button", {
+      class: "testing-results-download-btn",
+      "data-testid": "cell-download-" + cellIndex,
+      "aria-label": "Download image",
+      text: "\u2b07",
+      style: "position:absolute;top:4px;left:4px;z-index:3;background:rgba(0,0,0,0.6);border:1px solid #555;color:#ccc;width:22px;height:22px;border-radius:3px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;padding:0;line-height:1;",
+    });
+    dlBtn.addEventListener("click", async function (e) {
+      e.stopPropagation();
+      dlBtn.disabled = true;
+      dlBtn.textContent = "\u23f3";
+      try {
+        var resp = await fetch(imageUrl);
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        var blob = await resp.blob();
+        var ext = (blob.type.split("/")[1] || "png").replace(/[^a-zA-Z0-9]/g, "");
+        var filenameBase = (cell.cell_key || "cell-" + cellIndex).replace(/[^a-zA-Z0-9_-]/g, "_").substring(0, 80);
+        var filename = filenameBase + "." + ext;
+        var objUrl = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = objUrl;
+        a.download = filename;
+        // Safe anchor download: no navigation, revoke after triggering
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () { if (a.parentNode) a.parentNode.removeChild(a); URL.revokeObjectURL(objUrl); }, 100);
+      } catch (err) {
+        // Surface error non-intrusively (visible failure, button recovers via finally)
+        var errEl = document.createElement("span");
+        errEl.textContent = "DL failed";
+        errEl.style.cssText = "position:absolute;top:4px;left:4px;z-index:3;color:#f87171;font-size:9px;background:rgba(0,0,0,0.7);padding:2px 4px;border-radius:2px;";
+        // Find thumb container and append
+        var thumbEl = card.querySelector(".testing-results-cell-thumb");
+        if (thumbEl) thumbEl.appendChild(errEl);
+        setTimeout(function () { if (errEl.parentNode) errEl.remove(); }, 3000);
+      } finally {
+        dlBtn.disabled = false;
+        dlBtn.textContent = "\u2b07";
+      }
+    });
+  }
+
+  const card = el("div", {
       class: `testing-results-cell testing-results-cell-${cellStatus}${compact ? " testing-results-cell-compact" : ""}`,
       "data-cell-key": cell.cell_key,
       "data-testid": "cell-card",
       "data-cell-status": cellStatus,
     }, [
-      el("div", { class: "testing-results-cell-thumb" }, [
+      el("div", { class: "testing-results-cell-thumb", style: "position:relative;" }, [
         imageUrl
           ? el("img", { src: imageUrl, class: "testing-results-cell-img", alt: "cell output" })
           : el("div", { class: "testing-results-cell-thumb-placeholder", text: cellStatus === "running" ? "" : cellStatus }),
+        dlBtn, // Download button overlay
         cellStatus === "running"
           ? el("div", { class: "testing-results-running-spinner" })
           : null,
@@ -1166,6 +1212,7 @@ export function results_tab_render(rootEl, api, options = {}) {
   let pollTimer = null;
   let snapshot = null;
   let lastEvents = [];
+  let _layerUnreg = null;
 
   async function refreshSnapshot() {
     if (!experimentId) return;
@@ -1214,13 +1261,29 @@ export function results_tab_render(rootEl, api, options = {}) {
   const _selectionListener = () => renderComparison(shell, apiBase);
   window.addEventListener("testing-selection-changed", _selectionListener);
 
-  // Escape key closes the detail panel
-  const _detailKeyHandler = function (ev) {
-    if (ev.key === "Escape" && _detailCell) {
-      closeDetailPanel();
-    }
-  };
-  window.addEventListener("keydown", _detailKeyHandler);
+  // Layer-based Escape: close detail panel at layer 3 (preview)
+  // Import the layer registry from studio-ui.js
+  try {
+    import("./studio-ui.js").then(function (ui) {
+      _layerUnreg = ui.registerLayerHandler(3, {
+        escape: function () {
+          if (_detailCell) {
+            closeDetailPanel();
+            return true;
+          }
+          return false;
+        },
+      });
+    });
+  } catch (e) {
+    // Fallback: manual keydown listener
+    const _detailKeyHandler = function (ev) {
+      if (ev.key === "Escape" && _detailCell) {
+        closeDetailPanel();
+      }
+    };
+    window.addEventListener("keydown", _detailKeyHandler);
+  }
 
   // Event delegation for comparison action buttons
   shell.addEventListener("click", (ev) => {
@@ -1251,7 +1314,10 @@ export function results_tab_render(rootEl, api, options = {}) {
       if (_selectionListener) {
         window.removeEventListener("testing-selection-changed", _selectionListener);
       }
-      window.removeEventListener("keydown", _detailKeyHandler);
+      if (_layerUnreg) {
+        _layerUnreg();
+        _layerUnreg = null;
+      }
     },
     updateProgress(snap, evs) { snapshot = snap; if (evs) lastEvents = evs; updateProgressBar(shell, snap, lastEvents); },
   };

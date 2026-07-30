@@ -692,33 +692,136 @@ export function renderAxisEditor(controlId, state, actions) {
 
       // Quick-add buttons for common steps/guidance values (preserving existing behavior)
       if (def.type === "number") {
-        let quickValues = [];
+        var quickRow = document.createElement("div");
+        quickRow.style.marginTop = "4px";
+        quickRow.style.display = "flex";
+        quickRow.style.gap = "4px";
+        quickRow.style.flexWrap = "wrap";
+
+        if (controlId === "seed") {
+          // ── Seed: Next seed button ──────────────────────────────
+          // Compute the next finite numeric seed: find the max finite
+          // value among current axis values, then append max+1.
+          // Uses CONTROL_DEFS.seed.max as the authoritative schema max
+          // (not a duplicated hardcoded constant).  Handles:
+          //   [100]       → appends 101
+          //   [100,101]   → appends 102 (no duplicate)
+          //   [-1]        → appends 0
+          //   blank + 50  → appends 51 (blanks are ignored as NaN)
+          var nextSeedBtn = document.createElement("button");
+          nextSeedBtn.className = "comfymodal-secondary-btn";
+          nextSeedBtn.textContent = "Next seed";
+          nextSeedBtn.title = "Append the next finite seed value";
+          nextSeedBtn.style.fontSize = "10px";
+          nextSeedBtn.style.padding = "2px 6px";
+
+          // Use the actual CONTROL_DEFS max rather than a duplicated constant
+          var seedDef = CONTROL_DEFS.seed;
+          var seedSchemaMax = (seedDef && seedDef.max != null) ? seedDef.max : 2147483647;
+
+          nextSeedBtn.addEventListener("click", function () {
+            var currentVals = collectValues();
+            // Find the maximum finite numeric seed among current values
+            var maxSeed = -1;
+            var hasPositive = false;
+            for (var si = 0; si < currentVals.length; si++) {
+              var num = Number(currentVals[si]);
+              if (!isNaN(num) && isFinite(num) && num >= 0) {
+                if (num > maxSeed) {
+                  maxSeed = num;
+                  hasPositive = true;
+                }
+              }
+            }
+            // If no positive seed found, start from 0
+            if (!hasPositive) maxSeed = -1;
+            var nextSeed = maxSeed + 1;
+            // Respect schema max — cap at max, never overflow
+            if (nextSeed > seedSchemaMax) nextSeed = seedSchemaMax;
+            // Prevent duplicates (compare as string to match axis value storage)
+            if (!currentVals.includes(String(nextSeed))) {
+              currentVals.push(String(nextSeed));
+              if (actions && actions.updateExperimentAxisValues) {
+                actions.updateExperimentAxisValues(controlId, currentVals);
+              }
+              _renderRepeatedValues();
+            }
+          });
+          quickRow.appendChild(nextSeedBtn);
+        }
+
+        if (controlId === "steps") {
+          // ── Steps: Use Recommended button ───────────────────────
+          // Reads the workflow-captured recommended steps from
+          // _runningExperimentConfig only.  Never falls back to preset
+          // defaults or static values — the recommendation must come
+          // from an actual captured workflow run.
+          var recommendedSteps = null;
+          var config = state.playground && state.playground._runningExperimentConfig;
+          if (config && config.controls && config.controls.steps != null) {
+            var cfgSteps = Number(config.controls.steps);
+            if (!isNaN(cfgSteps) && cfgSteps > 0 && isFinite(cfgSteps)) {
+              recommendedSteps = cfgSteps;
+            }
+          }
+
+          if (recommendedSteps != null) {
+            var recBtn = document.createElement("button");
+            recBtn.className = "comfymodal-secondary-btn";
+            recBtn.textContent = "Use recommended (" + recommendedSteps + ")";
+            recBtn.title = "From captured workflow";
+            recBtn.style.fontSize = "10px";
+            recBtn.style.padding = "2px 6px";
+            recBtn.addEventListener("click", function () {
+              var currentVals = collectValues();
+              // Set the first value to recommendedSteps, preserving any
+              // additional comparison values beyond index 0.
+              if (currentVals.length === 0) {
+                currentVals.push(String(recommendedSteps));
+              } else {
+                currentVals[0] = String(recommendedSteps);
+                // Remove any duplicate of the recommended value elsewhere
+                // in the array (skip index 0, check from 1 onward).
+                for (var _ri = currentVals.length - 1; _ri >= 1; _ri--) {
+                  if (currentVals[_ri] === String(recommendedSteps)) {
+                    currentVals.splice(_ri, 1);
+                  }
+                }
+              }
+              if (actions && actions.updateExperimentAxisValues) {
+                actions.updateExperimentAxisValues(controlId, currentVals);
+              }
+              _renderRepeatedValues();
+            });
+            quickRow.appendChild(recBtn);
+          }
+        }
+
+        // Standard quick values for steps and guidance (preserving existing behavior)
+        var quickValues = [];
         if (controlId === "steps") quickValues = [10, 20, 30, 50];
         else if (controlId === "guidance") quickValues = [5, 7, 10, 15];
 
-        if (quickValues.length > 0) {
-          const quickRow = document.createElement("div");
-          quickRow.style.marginTop = "4px";
-          quickRow.style.display = "flex";
-          quickRow.style.gap = "4px";
-          quickValues.forEach(function (v) {
-            const btn = document.createElement("button");
-            btn.className = "comfymodal-secondary-btn";
-            btn.textContent = String(v);
-            btn.style.fontSize = "10px";
-            btn.style.padding = "2px 6px";
-            btn.addEventListener("click", function () {
-              const currentVals = collectValues();
-              if (!currentVals.includes(String(v))) {
-                currentVals.push(String(v));
-                if (actions && actions.updateExperimentAxisValues) {
-                  actions.updateExperimentAxisValues(controlId, currentVals);
-                }
-                _renderRepeatedValues();
+        quickValues.forEach(function (v) {
+          var btn = document.createElement("button");
+          btn.className = "comfymodal-secondary-btn";
+          btn.textContent = String(v);
+          btn.style.fontSize = "10px";
+          btn.style.padding = "2px 6px";
+          btn.addEventListener("click", function () {
+            var currentVals = collectValues();
+            if (!currentVals.includes(String(v))) {
+              currentVals.push(String(v));
+              if (actions && actions.updateExperimentAxisValues) {
+                actions.updateExperimentAxisValues(controlId, currentVals);
               }
-            });
-            quickRow.appendChild(btn);
+              _renderRepeatedValues();
+            }
           });
+          quickRow.appendChild(btn);
+        });
+
+        if (quickRow.childNodes.length > 0) {
           valuesArea.appendChild(quickRow);
         }
       }

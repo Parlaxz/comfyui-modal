@@ -12,7 +12,7 @@ import {
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioPreset, getStudioRunStatus, stopExperiment } from "./studio-backend-api.js";
+import { runStudioPreset, getStudioRunStatus, stopExperiment, getModalConfig } from "./studio-backend-api.js";
 
 import {
   getVisibleControlsForPreset,
@@ -36,8 +36,26 @@ import {
   setCarouselCleared,
   isCarouselCleared,
 } from "./studio-playground-state.js";
-import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
+import { createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
+
+async function buildStudioModalOptions(apiBase) {
+  const config = await getModalConfig(apiBase);
+  const saved = window._comfyModalOutputOptions || {};
+  const mode = (config && config.execution_mode) || window._comfyModalExecutionMode || "v2";
+  window._comfyModalExecutionMode = mode;
+  return {
+    execution_mode: mode,
+    output_format: config && config.output_format !== undefined ? config.output_format : (saved.output_format || "original"),
+    quality: config && config.quality !== undefined ? config.quality : (saved.quality || 75),
+    webp_lossless_compression: config && config.webp_lossless_compression !== undefined
+      ? config.webp_lossless_compression : (saved.webp_lossless_compression || "balanced"),
+    auto_save_local: config && config.auto_save_local !== undefined ? !!config.auto_save_local : !!saved.auto_save_local,
+    save_folder: config && config.save_folder !== undefined ? config.save_folder : (saved.save_folder || ""),
+    save_metadata_sidecar: config && config.save_metadata_sidecar !== undefined
+      ? config.save_metadata_sidecar !== false : saved.save_metadata_sidecar !== false,
+  };
+}
 import { el, createZoomableImageEl, createImagePreviewOverlay } from "./studio-ui.js";
 
 // ── Polling helper for experiment status ──────────────────────────────────
@@ -620,9 +638,9 @@ export function renderPlayground(state, context) {
   // experiment run handlers, then disposed on terminal states.
   // The _scopedTracker reference in state.playground is managed there.
   //
-  // getSharedTracker() is still imported for potential secondary uses
-  // (e.g., capturing execState bridge values) but is NOT subscribed to
-  // for progress UI updates.
+  // Not subscribed for progress UI updates — only scoped trackers drive
+  // the Studio progress panel to avoid unrelated ComfyUI executions
+  // interfering.
 
   const leftPanel = renderControlPanel(state, context);
   const resizeHandle = _createResizeHandle(leftPanel);
@@ -1586,6 +1604,40 @@ function renderControl(def, state, actions, preset) {
   }
 
   if (input) group.appendChild(input);
+
+  // ── Steps: Use Recommended (N) button ──────────────────────────────
+  // Adds a compact "Use recommended (N)" button beside the Steps control
+  // when a positive workflow-derived recommendation is available.
+    if (def.id === "steps") {
+      // Workflow-captured only: reads from _runningExperimentConfig which
+      // is set at experiment submit time.  Never falls back to preset
+      // defaults or static values.
+      var recommendedSteps = null;
+      var rsConfig = state.playground && state.playground._runningExperimentConfig;
+      if (rsConfig && rsConfig.controls && rsConfig.controls.steps != null) {
+        var cfgSteps = Number(rsConfig.controls.steps);
+        if (!isNaN(cfgSteps) && cfgSteps > 0 && isFinite(cfgSteps)) {
+          recommendedSteps = cfgSteps;
+        }
+      }
+
+      if (recommendedSteps != null) {
+      var recBtn = document.createElement("button");
+      recBtn.type = "button";
+      recBtn.className = "comfymodal-secondary-btn";
+      recBtn.style.cssText = "font-size:9px;padding:1px 6px;margin-top:2px;display:inline-block;";
+      recBtn.textContent = "Use recommended (" + recommendedSteps + ")";
+      recBtn.title = "From captured workflow";
+      recBtn.setAttribute("data-testid", "steps-recommended-btn");
+      recBtn.addEventListener("click", function () {
+        if (actions && actions.setControl) {
+          actions.setControl("steps", recommendedSteps);
+        }
+      });
+      group.appendChild(recBtn);
+    }
+  }
+
   return group;
 }
 
@@ -1872,6 +1924,7 @@ async function doRunSubmit(state, context, actions) {
     }
     return;
   }
+  const modalOptions = await buildStudioModalOptions(apiBase);
 
   // Clear previous output so canvas shows live progress immediately
   if (state.playground) {
@@ -1896,6 +1949,7 @@ async function doRunSubmit(state, context, actions) {
     presetId: preset.id || selectedId,
     featureId: currentFeatureId,
     controls: controls,
+    modal_options: modalOptions,
     request_origin: requestOriginInfo,
     metadata: {
       source: "studio_playground",
@@ -2232,6 +2286,7 @@ function renderRunButton(state, context, actions) {
           }
           return;
         }
+        const modalOptions = await buildStudioModalOptions(apiBase);
 
         // Capture client-side timestamps at press time (top-level `trace` for server)
         var t0_perf_ms = performance.now();
@@ -2241,6 +2296,7 @@ function renderRunButton(state, context, actions) {
           presetId: preset.id || selectedId,
           featureId: currentFeatureId,
           controls: controls,
+          modal_options: modalOptions,
           metadata: {
             source: "studio_playground",
           },
@@ -2710,9 +2766,17 @@ function renderExperimentGridViewport(state, context) {
       }
     }
     if (detailEntry) {
-      viewport.appendChild(_renderCellDetailOverlay(detailEntry, apiBase, state, context, varyingAxes));
+      viewport.appendChild(_renderCellDetailOverlay(detailEntry, entries, apiBase, state, context, varyingAxes));
     }
   }
+
+  // Enable spatial arrow navigation after the grid has rendered
+  // Schedule after browser paint so all elements have their final positions
+  setTimeout(function () {
+    var cleanup = _enableGridArrowNavigation(viewport);
+    // Store cleanup on viewport for future cleanup if needed
+    viewport._arrowNavCleanup = cleanup;
+  }, 0);
 
   return viewport;
 }
@@ -3341,6 +3405,7 @@ function _renderExperimentCell(entry, apiBase, state, context, index) {
     "data-testid": "experiment-cell-" + ck,
     "data-cell-key": ck,
     "data-cell-status": status,
+    tabindex: isSelected ? "0" : "-1", // Roving tabindex for arrow navigation
   });
 
   var card = el("div", { class: "cm-exp-cell-card" });
@@ -3403,7 +3468,145 @@ function _renderExperimentCell(entry, apiBase, state, context, index) {
     }
   });
 
+  // Focus handler — maintain roving tabindex (the focused cell gets tabindex 0)
+  cell.addEventListener("focus", function () {
+    var allCells = cell.closest("[data-testid='experiment-grid-viewport']")
+      ? cell.closest("[data-testid='experiment-grid-viewport']").querySelectorAll(".comfymodal-studio-experiment-grid-cell")
+      : [];
+    for (var ci = 0; ci < allCells.length; ci++) {
+      allCells[ci].setAttribute("tabindex", allCells[ci] === cell ? "0" : "-1");
+    }
+  });
+
   return cell;
+}
+
+// ── Spatial Arrow Navigation for Experiment Grid ──────────────────────────
+//
+// Attaches an arrow-key handler to the experiment grid viewport that navigates
+// between cells using actual rendered DOM geometry (getBoundingClientRect).
+// Directional distance with perpendicular tie-break, deterministic no wrap.
+// Keeps text/numeric/control inputs from intercepting keys.
+//
+// Call once after the grid renders. Returns a cleanup function.
+
+function _enableGridArrowNavigation(gridViewport) {
+  if (!gridViewport) return function () {};
+
+  function _onGridKeydown(e) {
+    // Only handle Arrow keys
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown" && e.key !== "ArrowLeft" && e.key !== "ArrowRight") {
+      return;
+    }
+
+    // If an editable control has focus, do NOT intercept (let the control handle it)
+    var active = document.activeElement;
+    if (active) {
+      var tag = active.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || active.isContentEditable) {
+        // For number inputs, allow up/down for step adjustment
+        if ((e.key === "ArrowUp" || e.key === "ArrowDown") && tag === "INPUT" && active.type === "number") {
+          return; // Let the native input handle step
+        }
+        // For text inputs, left/right should move cursor
+        if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && (tag === "INPUT" || tag === "TEXTAREA")) {
+          return; // Let the native input handle cursor movement
+        }
+        // For all other editable controls with arrow keys, do not intercept
+        // unless the focus is specifically on a grid cell
+      }
+    }
+
+    // Only navigate if the active element (or the viewport itself) is within our grid
+    var gridCells = gridViewport.querySelectorAll(".comfymodal-studio-experiment-grid-cell");
+    if (gridCells.length === 0) return;
+
+    var currentCell = null;
+    if (active && active.classList && active.classList.contains("comfymodal-studio-experiment-grid-cell")) {
+      currentCell = active;
+    } else {
+      // If no cell is focused, focus the first cell (or the last selected one)
+      var selected = gridViewport.querySelector('.comfymodal-studio-experiment-grid-cell.selected');
+      currentCell = selected || gridCells[0];
+      if (currentCell) {
+        e.preventDefault();
+        currentCell.focus();
+        currentCell.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+      return;
+    }
+
+    e.preventDefault();
+
+    // Get geometry of the current cell
+    var currentRect = currentCell.getBoundingClientRect();
+    var cx = currentRect.left + currentRect.width / 2;
+    var cy = currentRect.top + currentRect.height / 2;
+
+    // Define directional search: for each candidate cell, compute distance
+    // weighted by direction. The best candidate is the one with minimal
+    // effective distance in the given direction.
+    var bestCell = null;
+    var bestDist = Infinity;
+    var bestPerpDist = Infinity;
+
+    for (var i = 0; i < gridCells.length; i++) {
+      var candidate = gridCells[i];
+      if (candidate === currentCell || candidate.disabled) continue;
+
+      var cr = candidate.getBoundingClientRect();
+      var ccx = cr.left + cr.width / 2;
+      var ccy = cr.top + cr.height / 2;
+
+      var dx = ccx - cx;
+      var dy = ccy - cy;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var perpDist = 0;
+
+      switch (e.key) {
+        case "ArrowUp":
+          if (dy >= 0) continue; // Only cells above
+          perpDist = Math.abs(dx);
+          break;
+        case "ArrowDown":
+          if (dy <= 0) continue; // Only cells below
+          perpDist = Math.abs(dx);
+          break;
+        case "ArrowLeft":
+          if (dx >= 0) continue; // Only cells to the left
+          perpDist = Math.abs(dy);
+          break;
+        case "ArrowRight":
+          if (dx <= 0) continue; // Only cells to the right
+          perpDist = Math.abs(dy);
+          break;
+      }
+
+      // Primary: directional distance (closest in the pressed direction);
+      // tie-break: perpendicular distance (same row/column alignment)
+      if (dist < bestDist || (dist === bestDist && perpDist < bestPerpDist)) {
+        bestCell = candidate;
+        bestDist = dist;
+        bestPerpDist = perpDist;
+      }
+    }
+
+    if (bestCell) {
+      // Update roving tabindex
+      for (var j = 0; j < gridCells.length; j++) {
+        gridCells[j].setAttribute("tabindex", gridCells[j] === bestCell ? "0" : "-1");
+      }
+      bestCell.focus();
+      bestCell.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }
+
+  // Capture phase to intercept before editable controls
+  gridViewport.addEventListener("keydown", _onGridKeydown);
+
+  return function () {
+    gridViewport.removeEventListener("keydown", _onGridKeydown);
+  };
 }
 
 function _renderExperimentProgressBars(runState, state) {
@@ -3502,13 +3705,65 @@ function _renderExperimentProgressBars(runState, state) {
   return container;
 }
 
-function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
+function _renderCellDetailOverlay(entry, entries, apiBase, state, context, varyingAxes) {
   varyingAxes = varyingAxes || [];
+  entries = entries || [];
 
   function _close() {
     if (state.playground) state.playground._selectedCellKey = null;
     if (context && context.setPage) context.setPage("playground");
   }
+
+  // ── Arrow-key cell navigation through the grid ───────────────────
+  // Uses spatial geometry: for each arrow direction, query all rendered
+  // grid cell DOM nodes, compute distances from the current cell center,
+  // and pick the closest candidate in the pressed direction.  No wrapping
+  // at edges.  On selection, updates _selectedCellKey and re-renders.
+  var onKeyDown = function (e) {
+    var key = e.key;
+    if (key !== "ArrowUp" && key !== "ArrowDown" && key !== "ArrowLeft" && key !== "ArrowRight") return false;
+    var currentKey = state.playground && state.playground._selectedCellKey;
+    if (!currentKey) return false;
+    var viewport = document.querySelector('[data-testid="experiment-grid-viewport"]');
+    if (!viewport) return false;
+    var allCells = viewport.querySelectorAll(".comfymodal-studio-experiment-grid-cell");
+    if (allCells.length === 0) return false;
+    var currentCell = null;
+    for (var _ci = 0; _ci < allCells.length; _ci++) {
+      if (allCells[_ci].getAttribute("data-cell-key") === currentKey) { currentCell = allCells[_ci]; break; }
+    }
+    if (!currentCell) return false;
+    var cr = currentCell.getBoundingClientRect();
+    var cx = cr.left + cr.width / 2;
+    var cy = cr.top + cr.height / 2;
+    var bestCell = null, bestDist = Infinity, bestPerp = Infinity;
+    for (var _cj = 0; _cj < allCells.length; _cj++) {
+      if (allCells[_cj] === currentCell) continue;
+      var nr = allCells[_cj].getBoundingClientRect();
+      var ncx = nr.left + nr.width / 2;
+      var ncy = nr.top + nr.height / 2;
+      var dx = ncx - cx, dy = ncy - cy;
+      if (key === "ArrowUp" && dy >= 0) continue;
+      if (key === "ArrowDown" && dy <= 0) continue;
+      if (key === "ArrowLeft" && dx >= 0) continue;
+      if (key === "ArrowRight" && dx <= 0) continue;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var perp = (key === "ArrowUp" || key === "ArrowDown") ? Math.abs(dx) : Math.abs(dy);
+      // Primary: directional distance; tie-break: perpendicular distance
+      if (dist < bestDist || (dist === bestDist && perp < bestPerp)) {
+        bestDist = dist; bestPerp = perp; bestCell = allCells[_cj];
+      }
+    }
+    if (bestCell) {
+      var newKey = bestCell.getAttribute("data-cell-key");
+      if (newKey && state.playground) {
+        state.playground._selectedCellKey = newKey;
+        if (context && context.setPage) { e.preventDefault(); context.setPage("playground"); }
+        return true;
+      }
+    }
+    return false;
+  };
 
   var sections = [];
 
@@ -3613,6 +3868,7 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
     imageUrl: entry.outputUrl || null,
     alt: "Cell output",
     onClose: _close,
+    onKeyDown: onKeyDown,
     sections: sections,
   });
 
