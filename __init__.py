@@ -138,6 +138,17 @@ from comparison import (
     get_profile_workflow,
 )
 
+from execution_runtime import (
+    MODE_V1,
+    MODE_V2,
+    MODE_SHADOW,
+    resolve_execution_mode,
+    normalize_mode,
+    capture_execution_mode,
+    validate_config_payload,
+    AVAILABLE_EXECUTION_MODES as _AVAILABLE_EXECUTION_MODES,
+)
+
 import model_manifest as _model_manifest
 import modal_workspaces as _workspace_store
 
@@ -889,6 +900,8 @@ def _default_modal_settings() -> dict:
         "auto_save_local": _SAVER_DEFAULTS["auto_save_local"],
         "save_folder": _SAVER_DEFAULTS["save_folder"],
         "save_metadata_sidecar": _SAVER_DEFAULTS["save_metadata_sidecar"],
+        # ── Phase 8: execution mode ──
+        "execution_mode": MODE_V2,
     }
 
 _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {
@@ -1048,6 +1061,12 @@ def _load_modal_settings() -> dict:
             for key in defaults:
                 if key in saved and isinstance(saved[key], type(defaults[key])):
                     merged[key] = saved[key]
+            # Settings are user-facing and may only select V1/V2.  Treat old
+            # or hand-edited values as the safe V2 default; shadow is an
+            # internal comparison mode and never a persisted UI setting.
+            _saved_mode = normalize_mode(merged.get("execution_mode"))
+            if _saved_mode not in (MODE_V1, MODE_V2):
+                merged["execution_mode"] = MODE_V2
             _modal_settings_cache = merged
             return dict(merged)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -1064,6 +1083,9 @@ def _save_modal_settings(settings: dict) -> dict:
     for key in defaults:
         if key in settings and isinstance(settings[key], type(defaults[key])):
             merged[key] = settings[key]
+    _saved_mode = normalize_mode(merged.get("execution_mode"))
+    if _saved_mode not in (MODE_V1, MODE_V2):
+        merged["execution_mode"] = MODE_V2
     tmp_path = f"{_MODAL_SETTINGS_FILE}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
@@ -1760,8 +1782,9 @@ _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
 
 def _runtime_mode() -> str:
-    mode = os.environ.get("COMFYMODAL_RUNTIME", "legacy").strip().lower()
-    return mode if mode in {"legacy", "v2", "shadow"} else "legacy"
+    """Legacy compatibility wrapper. Use execution_runtime.resolve_execution_mode instead."""
+    resolved = resolve_execution_mode(modal_settings=_load_modal_settings())
+    return resolved["mode"]
 
 _MODAL_TOML_PATH = os.path.expanduser("~/.modal.toml")
 _HF_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".hf_token")
@@ -2354,7 +2377,13 @@ async def _execute_job(item: tuple, item_id: int):
         # collection, profile preparation, run-prompt-options construction,
         # and the run_prompt_stream call with event forwarding.
         # This is the single canonical call — no second compile/hash path.
-        _mode = _runtime_mode()
+        # Phase 8: use captured mode from submission (immutable), fall back to resolver.
+        _mode_resolution = resolve_execution_mode(
+            modal_options=extra_data.get("modal_options"),
+            extra=extra_data,
+            modal_settings=_load_modal_settings(),
+        )
+        _mode = _mode_resolution["mode"]
         _v2_plan = None
         _v2_trace = None
         if _mode in {"v2", "shadow"}:
@@ -2401,6 +2430,8 @@ async def _execute_job(item: tuple, item_id: int):
                 workspace_id=_v2_plan.request_metadata.get("workspace_id", ""),
             )
             _run_trace.set_meta(
+                execution_mode=_mode,
+                execution_mode_source=_mode_resolution["source"],
                 v2_runtime_mode=_mode,
                 v2_plan_hash=_v2_plan.workflow_hash,
                 v2_source_workflow_hash=_v2_plan.source_workflow_hash,
@@ -2422,6 +2453,10 @@ async def _execute_job(item: tuple, item_id: int):
                 event_sink=_event_sink,
             )
         else:
+            _run_trace.set_meta(
+                execution_mode=_mode,
+                execution_mode_source=_mode_resolution["source"],
+            )
             result = await execute_modal_prompt(
                 execution_workflow,
                 prompt_id=prompt_id,
@@ -3907,6 +3942,15 @@ if _server:
             _queue_execution_workflow = copy.deepcopy(execution_workflow)
             _trace_with_origin = {**trace.fields(), "prompt_id": prompt_id}
             _trace_with_origin["request_origin_info"] = _prompt_request_origin
+            # ── Phase 8: capture immutable execution mode at submission ──
+            _captured_mode = capture_execution_mode(
+                modal_options=modal_options, modal_settings=_load_modal_settings(),
+            )
+            # Freeze the selected engine in the queued request. Downstream
+            # workers must not re-read mutable settings after submission.
+            modal_options = dict(modal_options or {})
+            modal_options["execution_mode"] = _captured_mode
+
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -3918,6 +3962,8 @@ if _server:
                 "result_route": _result_route_mode,
                 "execution_workflow": _queue_execution_workflow,
                 "production_options": production_options,
+                # Phase 8: captured execution mode (immutable for this request)
+                "execution_mode": _captured_mode,
                 # Compact production diagnostics for request identity tracking.
                 # Carried through queue/scheduler/adapter so the runner can use them.
                 # Use browser _production_trace as authoritative fallback when present,
@@ -4452,6 +4498,17 @@ if _server:
     @_server.routes.get("/comfymodal/config")
     async def modal_get_config(request: web.Request) -> web.Response:
         settings = _load_modal_settings()
+        resolved = resolve_execution_mode(modal_settings=settings)
+        _v1_app = get_modal_app_name() or "comfyui"
+        _v2_app = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
+        _readiness = {
+            "v1": {"status": "unknown", "app": _v1_app},
+            "v2": {
+                "status": "unknown",
+                "app": _v2_app,
+                "class": os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2"),
+            },
+        }
         return web.json_response({
             "gpu": get_gpu(),
             "default_gpu": get_default_gpu(),
@@ -4462,6 +4519,12 @@ if _server:
             "auto_save_local": settings.get("auto_save_local", False),
             "save_folder": settings.get("save_folder", ""),
             "save_metadata_sidecar": settings.get("save_metadata_sidecar", True),
+            # ── Phase 8: execution mode ──
+            "execution_mode": resolved["mode"],
+            "execution_mode_source": resolved["source"],
+            "execution_mode_locked": resolved["locked"],
+            "available_execution_modes": _AVAILABLE_EXECUTION_MODES,
+            "execution_readiness": _readiness,
         })
 
     @_server.routes.post("/comfymodal/config")
@@ -4511,6 +4574,25 @@ if _server:
                     {"status": "error", "message": f"invalid value for {_err_key}"}, status=400
                 )
             _save_modal_settings(_settings_update)
+
+        # ── Phase 8: execution mode (only v1/v2 accepted, not shadow) ──
+        if "execution_mode" in body:
+            err = validate_config_payload(body)
+            if err:
+                return web.json_response({"status": "error", "message": err}, status=400)
+            _env_mode = os.environ.get("COMFYMODAL_RUNTIME", "").strip().lower()
+            _env_normalized = normalize_mode(_env_mode)
+            _requested_mode = str(body.get("execution_mode", "")).strip().lower()
+            if _env_normalized and _requested_mode != _env_normalized:
+                return web.json_response({
+                    "status": "error",
+                    "message": "Execution engine is managed by COMFYMODAL_RUNTIME.",
+                    "execution_mode_locked": True,
+                }, status=409)
+            new_mode = normalize_mode(body["execution_mode"])
+            if new_mode:
+                _save_modal_settings({"execution_mode": new_mode})
+                response_data["execution_mode"] = new_mode
 
         return web.json_response(response_data)
 
@@ -7105,4 +7187,109 @@ if _server:
         state.invalidate()
         return web.json_response({"status": "ok", "state": state.snapshot()})
 
-    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*")
+    # ── Phase 7: Unified history endpoint ─────────────────────────────────
+    # One paginated GET endpoint that runs filter/sort/pagination in SQLite.
+    # Returns only summary fields from the index (timing_summary is already
+    # embedded in each item via _row_to_dict).  No N+1 source-file hydration.
+    # Existing /comfymodal/run-history and experiment detail endpoints remain
+    # functional for existing callers.
+    #
+    # The ``include_timing`` parameter is accepted for compatibility but is a
+    # no-op: summary rows already contain the timing data needed by cards.
+    # Callers that need full detail timing should use the standalone
+    # ``/run-history/{run_id}/timing`` endpoint.
+
+    @_server.routes.get("/comfymodal/history")
+    async def unified_history_list(request: web.Request) -> web.Response:
+        from experiment_service import _get_history_index, _PhaseTimer
+        _pt = _PhaseTimer()
+        _pt.mark("request_received")
+
+        page = int(request.query.get("page", "1"))
+        page_size = int(request.query.get("page_size", "50"))
+        if page < 1:
+            page = 1
+        if page_size < 1:
+            page_size = 1
+        if page_size > 200:
+            page_size = 200
+
+        search = request.query.get("search", None) or None
+        kind = request.query.get("kind", None) or request.query.get("type", None) or None
+        status = request.query.get("status", None) or None
+        fav_q = request.query.get("favorite", "").lower() in ("1", "true")
+        fav_only_q = request.query.get("favorite_only", "").lower() in ("1", "true")
+        favorite_only = fav_q or fav_only_q
+        sort = request.query.get("sort", "newest")
+        feature = request.query.get("feature", None) or None
+        preset = request.query.get("preset", None) or None
+        date_from = request.query.get("date_from", None) or None
+        date_to = request.query.get("date_to", None) or None
+        has_image_raw = request.query.get("has_image", None)
+        has_image: Optional[bool] = None
+        if has_image_raw is not None:
+            has_image = has_image_raw.lower() in ("1", "true")
+        # include_timing accepted for compatibility but is a no-op:
+        # timing_summary is already embedded in each index row.
+        # request.query.get("include_timing", "0")
+
+        _pt.mark("index_open")
+        idx = _get_history_index(run_history_root())
+
+        try:
+            # Try to ensure index; if corrupt/absent, trigger rebuild
+            try:
+                idx.ensure()
+            except Exception:
+                # Fallback: rebuild from scratch
+                try:
+                    idx.rebuild()
+                except Exception:
+                    pass
+            _pt.mark("query_built")
+
+            query_result = idx.query(
+                page=page,
+                page_size=page_size,
+                search=search,
+                kind=kind,
+                status=status,
+                favorite_only=favorite_only,
+                sort=sort,
+                feature=feature,
+                preset=preset,
+                date_from=date_from,
+                date_to=date_to,
+                has_image=has_image,
+            )
+        finally:
+            # Release the SQLite handle after each request so Windows can
+            # rotate/clean workspace roots and temporary test databases.
+            idx.close()
+        _pt.mark("query_executed")
+
+        items = query_result["items"]
+
+        # No N+1 source-file hydration: timing_summary is already in items
+        # via _row_to_dict which parses timing_summary_json.
+        _pt.mark("rows_fetched")
+
+        response_data = {
+            "status": "ok",
+            "items": items,
+            "page": query_result["page"],
+            "page_size": query_result["page_size"],
+            "total": query_result["total"],
+            "has_more": query_result["has_more"],
+        }
+
+        # Attach safe timing metadata if query param present
+        if request.query.get("_timing", "") == "1":
+            _pt.mark("response_serialized")
+            _pt.mark("total")
+            response_data["_diagnostic_timing_ms"] = _pt.summary()
+
+        _pt.mark("total")
+        return web.json_response(response_data)
+
+    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*")

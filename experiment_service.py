@@ -534,6 +534,78 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 # ── Run-history service ─────────────────────────────────────────────────
 
+# One derived index per authoritative run-history root.  A single global
+# instance is incorrect for tests, workspaces, and temporary roots: it keeps
+# the first root's SQLite handle open and routes later services to that DB.
+_RUN_HISTORY_INDICES: dict[str, "HistoryIndex"] = {}
+_RUN_HISTORY_INDEX_LOCK = threading.Lock()
+
+
+def _get_history_index(root: Path) -> "HistoryIndex":
+    """Get or create the run-history index for this authoritative root."""
+    from history_index import HistoryIndex
+    root_key = str(Path(root).resolve())
+    with _RUN_HISTORY_INDEX_LOCK:
+        index = _RUN_HISTORY_INDICES.get(root_key)
+        if index is None:
+            index = HistoryIndex(Path(root_key))
+            index.ensure()
+            # Do not retain an open SQLite handle just because the derived
+            # index object is cached.  Callers reopen it for the operation and
+            # close it afterward; this is important on Windows where an open
+            # handle prevents temporary/workspace cleanup.
+            index.close()
+            _RUN_HISTORY_INDICES[root_key] = index
+        return index
+
+
+# ── Phase timing measurement helper ───────────────────────────────────
+
+
+class _PhaseTimer:
+    """Simple monotonic phase timer for endpoint measurement.
+
+    Records labeled timestamps and exposes them as a safe timing dict
+    (no payload, tokens, or credentials).
+    """
+
+    def __init__(self) -> None:
+        self._marks: dict[str, float] = {}
+
+    def mark(self, label: str) -> None:
+        self._marks[label] = time.monotonic()
+
+    def elapsed_ms(self, since: str, until: str) -> float:
+        a = self._marks.get(since)
+        b = self._marks.get(until)
+        if a is not None and b is not None:
+            return round((b - a) * 1000, 3)
+        return 0.0
+
+    def summary(self) -> dict[str, float]:
+        """Return a flat dict of phase durations in ms.
+
+        Safe for external exposure: contains only timing labels and
+        millisecond values, never payload, tokens, or credentials.
+        """
+        result: dict[str, float] = {}
+        phase_pairs = [
+            ("request_received", "index_open"),
+            ("index_open", "query_built"),
+            ("query_built", "query_executed"),
+            ("query_executed", "rows_fetched"),
+            ("rows_fetched", "response_serialized"),
+            ("response_serialized", "total"),
+        ]
+        for since, until in phase_pairs:
+            ms = self.elapsed_ms(since, until)
+            if ms > 0 or (since in self._marks and until in self._marks):
+                result[f"phase_{since}_to_{until}"] = ms
+        total = self.elapsed_ms("request_received", "total")
+        if total or "request_received" in self._marks:
+            result["phase_total_ms"] = total
+        return result
+
 
 # ── Default annotations ──────────────────────────────────────────────
 
@@ -668,6 +740,44 @@ class RunHistoryService:
     def __init__(self, root: Path) -> None:
         self._root = root
         self._run_locks = _PerRunLock()
+        # Lazy index reference; created on first use
+        self._index: Optional["HistoryIndex"] = None
+
+    def _get_index(self) -> "HistoryIndex":
+        """Lazy-init and cache the process-wide history index."""
+        if self._index is None:
+            self._index = _get_history_index(self._root)
+        return self._index
+
+    def _index_try_upsert(self, meta_obj: dict, source_path: str = "") -> None:
+        """Try to upsert into the index; silently survive failures."""
+        index = self._get_index()
+        try:
+            index.upsert_from_meta(meta_obj, source_path)
+        except Exception:
+            pass
+        finally:
+            index.close()
+
+    def _index_try_remove(self, run_id: str) -> None:
+        """Try to remove from the index; silently survive failures."""
+        index = self._get_index()
+        try:
+            index.remove(run_id)
+        except Exception:
+            pass
+        finally:
+            index.close()
+
+    def _index_try_rebuild(self) -> None:
+        """Try a full rebuild; silently survive failures."""
+        index = self._get_index()
+        try:
+            index.rebuild()
+        except Exception:
+            pass
+        finally:
+            index.close()
 
     def _lock_for(self, run_id: str) -> threading.Lock:
         return self._run_locks.acquire(run_id)
@@ -717,6 +827,8 @@ class RunHistoryService:
             _atomic_write_text(log_path, log_text)
         if timings:
             _atomic_write_json(timing_path, timings)
+        # Phase 7: upsert into summary index (best-effort, never blocks caller)
+        self._index_try_upsert(meta_obj, str(meta_path))
         return meta_obj
 
     def update_run(
@@ -798,6 +910,8 @@ class RunHistoryService:
                 existing_timing.update(timings)
                 _atomic_write_json(timing_path, existing_timing)
 
+        # Phase 7: upsert into summary index (best-effort, never blocks caller)
+        self._index_try_upsert(meta_obj, str(meta_path))
         return meta_obj
 
     def _merge_timing_summary(self, run_dir: Path, meta_obj: dict) -> dict:
