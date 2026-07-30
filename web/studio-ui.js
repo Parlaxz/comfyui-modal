@@ -1,7 +1,222 @@
 // Modal Studio — Shared UI Helpers
 //
-// Element builder, status badges, and legacy empty state renderer shared
-// across Backend page modules.
+// Element builder, status badges, keyboard registry, zoomable image preview,
+// image preview overlay, download button, and legacy empty state renderer
+// shared across Backend page modules.
+
+// ── Layer-aware Keyboard Registry ─────────────────────────────────────────
+//
+// Shared document-level keyboard listener with deterministic priority layers.
+// Layers (highest to lowest):
+//   5 — Native fullscreen (Escape exits fullscreen first)
+//   4 — Enlarged zoom (Escape reduces zoom)
+//   3 — Preview overlay (Escape closes preview)
+//   2 — Nested dialog / shell (Escape closes dialog)
+//   1 — Zoom controls (NumpadAdd / NumpadSubtract on the highest active preview)
+//
+// Register a handler with a layer number. Higher-numbered layers get first
+// refusal via e.stopPropagation(). Escape is consumed by the highest layer
+// that wants it. Layers can also handle NumpadAdd/NumpadSubtract for zoom.
+//
+// Usage:
+//   const unreg = registerLayerHandler(3, {
+//     escape: () => { closePreview(); return true; },
+//     numpadAdd: () => { zoomIn(); return true; },
+//     numpadSubtract: () => { zoomOut(); return true; },
+//   });
+//   // Later: unreg();
+//
+// Multiple registrations at the same layer are allowed; they are tried in
+// registration order. The first handler that returns true consumes the event.
+
+let _layerHandlers = []; // Array of { layer, id, handlers: { escape?, numpadAdd?, numpadSubtract?, onKeyDown? } }
+let _layerListenerAttached = false;
+let _layerIdCounter = 0;
+
+// Track fullscreen exit so the next Escape after exiting fullscreen
+// routes through normal layers instead of being absorbed by a stale
+// fullscreenElement check during the exit transition.
+let _fullscreenExitPending = false;
+
+function _isEditableElement(el) {
+  return el && (
+    el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" ||
+    el.isContentEditable
+  );
+}
+
+function _dispatchLayerEvent(key, event) {
+  // Sort by layer descending, then newest-first at equal priority
+  // so the most recently registered handler at a given layer wins.
+  var sorted = _layerHandlers.slice().sort(function (a, b) {
+    if (b.layer !== a.layer) return b.layer - a.layer;
+    return b._order - a._order;
+  });
+  for (var i = 0; i < sorted.length; i++) {
+    var entry = sorted[i];
+    var fn = entry.handlers[key];
+    if (typeof fn === "function") {
+      try {
+        var consumed = fn(event);
+        if (consumed === true) {
+          event.preventDefault();
+          event.stopPropagation();
+          return true;
+        }
+      } catch (e) {
+        // Handler error — continue to next
+      }
+    }
+  }
+  return false;
+}
+
+function _onLayerKeydown(event) {
+  // Never consume keyboard events when an editable element is focused.
+  // This allows normal typing in inputs, textareas, selects, etc.
+  if (_isEditableElement(document.activeElement)) return;
+
+  var key = event.key;
+
+  // Escape chain: native fullscreen → zoom → preview → dialog → default
+  if (key === "Escape") {
+    // Layer 5: Native fullscreen — let the browser handle it first.
+    // Use _fullscreenExitPending to distinguish the first Escape while
+    // fullscreen (which should exit fullscreen) from a subsequent Escape
+    // after fullscreen has already exited.
+    if (document.fullscreenElement && !_fullscreenExitPending) {
+      // Set flag so the next Escape (after fullscreenchange) will be
+      // dispatched through normal layers instead of being skipped.
+      _fullscreenExitPending = true;
+      // Don't consume — let browser's native handler exit fullscreen.
+      // The fullscreenchange event will clear _fullscreenExitPending.
+      return;
+    }
+    _fullscreenExitPending = false;
+    _dispatchLayerEvent("escape", event);
+    return;
+  }
+
+  // NumpadAdd / NumpadSubtract: only exact event.code === "NumpadAdd" / "NumpadSubtract".
+  // Do NOT consume ordinary +/-/= keys to avoid interfering with text input
+  // (the editable-element check above already guards this, but the narrower
+  // code check prevents false positives from keyboard layouts where +/- are
+  // on shifted keys).
+  if (event.code === "NumpadAdd") {
+    _dispatchLayerEvent("numpadAdd", event);
+    return;
+  }
+
+  if (event.code === "NumpadSubtract") {
+    _dispatchLayerEvent("numpadSubtract", event);
+    return;
+  }
+
+  // Arrow keys: dispatched via onKeyDown callback on each layer handler
+  // (newest layer first, then registration order).  Used by preview overlays
+  // and experiment grid navigation.
+  if (key === "ArrowUp" || key === "ArrowDown" || key === "ArrowLeft" || key === "ArrowRight") {
+    var sorted = _layerHandlers.slice().sort(function (a, b) {
+      if (b.layer !== a.layer) return b.layer - a.layer;
+      return b._order - a._order;
+    });
+    for (var i = 0; i < sorted.length; i++) {
+      var entry = sorted[i];
+      var fn = entry.handlers.onKeyDown;
+      if (typeof fn === "function") {
+        try {
+          var consumed = fn(event);
+          if (consumed === true) {
+            event.preventDefault();
+            event.stopPropagation();
+            return true;
+          }
+        } catch (e) {
+          // Handler error — continue to next
+        }
+      }
+    }
+  }
+}
+
+function _ensureLayerListener() {
+  if (_layerListenerAttached) return;
+  document.addEventListener("keydown", _onLayerKeydown, true); // capture phase
+  document.addEventListener("fullscreenchange", _onFullscreenChangeGlobal);
+  _layerListenerAttached = true;
+}
+
+function _removeLayerListenerIfEmpty() {
+  if (_layerHandlers.length === 0 && _layerListenerAttached) {
+    document.removeEventListener("keydown", _onLayerKeydown, true);
+    document.removeEventListener("fullscreenchange", _onFullscreenChangeGlobal);
+    _layerListenerAttached = false;
+    _fullscreenExitPending = false;
+  }
+}
+
+function _onFullscreenChangeGlobal() {
+  // Clear the pending flag when fullscreen exits so the next Escape
+  // keydown goes through normal layer dispatch.
+  if (!document.fullscreenElement) {
+    _fullscreenExitPending = false;
+  }
+}
+
+/**
+ * Register a keyboard handler at a given layer.
+ * @param {number} layer - Priority layer (5=fullscreen, 4=zoom, 3=preview, 2=dialog, 1=base)
+ * @param {object} handlers - { escape?, numpadAdd?, numpadSubtract?, onKeyDown? }
+ *        Each handler receives the KeyboardEvent and should return true to consume.
+ *        onKeyDown receives ALL keydown events (after Escape/numpad checks) and is
+ *        used for arrow key navigation in preview overlays and experiment grids.
+ * @returns {function} Unregister function
+ */
+export function registerLayerHandler(layer, handlers) {
+  _ensureLayerListener();
+  var id = ++_layerIdCounter;
+  var entry = {
+    layer: layer,
+    id: id,
+    _order: _layerHandlers.length,
+    handlers: {
+      escape: typeof handlers.escape === "function" ? handlers.escape : null,
+      numpadAdd: typeof handlers.numpadAdd === "function" ? handlers.numpadAdd : null,
+      numpadSubtract: typeof handlers.numpadSubtract === "function" ? handlers.numpadSubtract : null,
+      onKeyDown: typeof handlers.onKeyDown === "function" ? handlers.onKeyDown : null,
+    },
+  };
+  _layerHandlers.push(entry);
+  return function unregister() {
+    _layerHandlers = _layerHandlers.filter(function (e) { return e.id !== id; });
+    // Remove the global document listener when the last handler unregisters
+    _removeLayerListenerIfEmpty();
+  };
+}
+
+/**
+ * Remove all layer handlers (cleanup on destroy).
+ */
+export function clearAllLayerHandlers() {
+  _layerHandlers = [];
+  _removeLayerListenerIfEmpty();
+}
+
+/**
+ * Get the current highest-layer escape handler that would fire (for testing).
+ * @returns {number|null} The layer number that would handle Escape, or null.
+ */
+export function getActiveEscapeLayer() {
+  if (document.fullscreenElement) return 5;
+  var sorted = _layerHandlers.slice().sort(function (a, b) {
+    if (b.layer !== a.layer) return b.layer - a.layer;
+    return b._order - a._order;
+  });
+  for (var i = 0; i < sorted.length; i++) {
+    if (typeof sorted[i].handlers.escape === "function") return sorted[i].layer;
+  }
+  return null;
+}
 
 // ── Element helper ────────────────────────────────────────────────────────
 
@@ -58,6 +273,8 @@ export function createZoomableImageEl(imageUrl, alt) {
   var zoomLevel = 1;
   var fitMode = true;
   var isFullscreen = false;
+  var _layerUnreg = null;
+  var _destroyed = false;
 
   var container = document.createElement("div");
   container.className = "comfymodal-studio-zoom-wrap";
@@ -125,6 +342,7 @@ export function createZoomableImageEl(imageUrl, alt) {
   }
 
   function _onFullscreenChange() {
+    if (_destroyed) return;
     isFullscreen = !!document.fullscreenElement;
     if (isFullscreen) {
       fullscreenBtn.textContent = "\u292b";
@@ -140,6 +358,26 @@ export function createZoomableImageEl(imageUrl, alt) {
       _applyZoom();
     }
   }
+
+  // Layer 4: zoom control
+  _layerUnreg = registerLayerHandler(4, {
+    escape: function () {
+      // If zoomed in (not fit mode), reset to fit
+      if (!fitMode) {
+        _zoomReset();
+        return true;
+      }
+      return false; // let preview/dialog handle it
+    },
+    numpadAdd: function () {
+      _zoomIn();
+      return true;
+    },
+    numpadSubtract: function () {
+      _zoomOut();
+      return true;
+    },
+  });
 
   document.addEventListener("fullscreenchange", _onFullscreenChange);
 
@@ -186,7 +424,7 @@ export function createZoomableImageEl(imageUrl, alt) {
   container.appendChild(imgContainer);
   container.appendChild(controls);
 
-  // Keyboard support on the image container
+  // Keyboard support on the image container (Ctrl shortcuts, fullscreen toggle)
   imgContainer.addEventListener("keydown", function (e) {
     // Ctrl++ / Ctrl+= zoom in
     if ((e.ctrlKey || e.metaKey) && (e.key === "=" || e.key === "+")) {
@@ -226,6 +464,18 @@ export function createZoomableImageEl(imageUrl, alt) {
   // are reachable via Tab. Escape and Tab-cycle still bubble to the preview overlay.
   imgContainer.setAttribute("tabindex", "0");
 
+  /**
+   * Destroy: clean up layer registry and fullscreenchange listener.
+   */
+  function _destroy() {
+    _destroyed = true;
+    if (_layerUnreg) {
+      _layerUnreg();
+      _layerUnreg = null;
+    }
+    document.removeEventListener("fullscreenchange", _onFullscreenChange);
+  }
+
   return {
     container: container,
     updateZoom: function (z) {
@@ -237,6 +487,7 @@ export function createZoomableImageEl(imageUrl, alt) {
         _applyZoom();
       }
     },
+    destroy: _destroy,
   };
 }
 
@@ -249,6 +500,7 @@ export function createZoomableImageEl(imageUrl, alt) {
  * @param {string|null}  opts.imageUrl      - Image URL or null for no-image state
  * @param {string}       opts.alt           - Alt text for the image
  * @param {function}     opts.onClose       - Called when overlay should close
+ * @param {function}     [opts.onKeyDown]   - Called for every keydown (after Escape/numpad checks), receives KeyboardEvent, return true to consume
  * @param {Array<HTMLElement>} [opts.sections] - DOM elements rendered below the image
  * @param {boolean}      [opts.focusTrap]   - Enable Tab/Shift+Tab focus trap
  * @returns {{ overlay: HTMLElement, close: function, contentEl: HTMLElement }}
@@ -260,6 +512,10 @@ export function createImagePreviewOverlay(opts) {
   overlay.setAttribute("aria-modal", "true");
   overlay.setAttribute("aria-label", opts.alt || "Image preview");
 
+  var _layerUnreg = null;
+  var _zoomObj = null;
+  var _closed = false;
+
   // Backdrop — click to close
   var backdrop = document.createElement("div");
   backdrop.className = "comfymodal-studio-preview-overlay-backdrop";
@@ -269,21 +525,99 @@ export function createImagePreviewOverlay(opts) {
   var content = document.createElement("div");
   content.className = "comfymodal-studio-preview-overlay-content";
 
+  // ── Top toolbar: close + download ──────────────────────────────────
+  var toolbar = document.createElement("div");
+  toolbar.className = "comfymodal-studio-preview-toolbar";
+  toolbar.style.cssText = "display:flex;align-items:center;gap:6px;justify-content:flex-end;padding:4px 8px;flex-shrink:0;";
+
   // Close button
   var closeBtn = document.createElement("button");
   closeBtn.className = "comfymodal-studio-preview-overlay-close";
   closeBtn.setAttribute("aria-label", "Close preview");
   closeBtn.textContent = "\u00d7";
+  closeBtn.style.cssText = "background:transparent;border:none;color:#aaa;font-size:20px;cursor:pointer;line-height:1;padding:2px 6px;";
   closeBtn.addEventListener("click", function (e) {
     e.stopPropagation();
-    opts.onClose();
+    close();
   });
-  content.appendChild(closeBtn);
+  toolbar.appendChild(closeBtn);
+
+  // Download button (only when image URL is present)
+  if (opts.imageUrl) {
+    (function () {
+      var dlBtn = document.createElement("button");
+      dlBtn.className = "comfymodal-studio-download-btn";
+      dlBtn.setAttribute("aria-label", "Download image");
+      dlBtn.textContent = "\u2b07";
+      dlBtn.title = "Download image";
+      dlBtn.style.cssText = "background:transparent;border:none;color:#aaa;font-size:16px;cursor:pointer;line-height:1;padding:2px 6px;";
+
+      // Sanitize filename from available metadata
+      function _getFilename() {
+        var meta = opts.metadata || {};
+        var candidates = [
+          meta.filename,
+          meta.output_path,
+          meta.primary_asset_id,
+          meta.prompt,
+          opts.alt,
+        ];
+        for (var i = 0; i < candidates.length; i++) {
+          if (candidates[i] && typeof candidates[i] === "string" && candidates[i].length > 0) {
+            // Extract basename, strip extension, sanitize
+            var base = candidates[i].split("/").pop().split("\\").pop();
+            base = base.replace(/\.[^.]+$/, ""); // remove extension
+            // Keep only alphanumeric, dash, underscore, dot
+            base = base.replace(/[^a-zA-Z0-9_-]/g, "_").substring(0, 100);
+            if (base.length > 0) return base;
+          }
+        }
+        return "modal-image";
+      }
+
+      dlBtn.addEventListener("click", async function (e) {
+        e.stopPropagation();
+        dlBtn.disabled = true;
+        dlBtn.textContent = "\u23f3";
+        try {
+          var resp = await fetch(opts.imageUrl);
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          var blob = await resp.blob();
+          var ext = (blob.type.split("/")[1] || "png").replace(/[^a-zA-Z0-9]/g, "");
+          var filename = _getFilename() + "." + ext;
+          var objUrl = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = objUrl;
+          a.download = filename;
+          // Safe anchor download: no navigation, revoke after triggering
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function () {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            URL.revokeObjectURL(objUrl);
+          }, 100);
+        } catch (err) {
+          var errEl = document.createElement("span");
+          errEl.textContent = "Download failed";
+          errEl.style.cssText = "color:#f87171;font-size:11px;margin-left:4px;";
+          toolbar.appendChild(errEl);
+          setTimeout(function () { if (errEl.parentNode) errEl.remove(); }, 3000);
+        } finally {
+          dlBtn.disabled = false;
+          dlBtn.textContent = "\u2b07";
+        }
+      });
+
+      toolbar.appendChild(dlBtn);
+    })();
+  }
+
+  content.appendChild(toolbar);
 
   // Zoomable image or no-image placeholder
   if (opts.imageUrl) {
-    var zoomImg = createZoomableImageEl(opts.imageUrl, opts.alt);
-    content.appendChild(zoomImg.container);
+    _zoomObj = createZoomableImageEl(opts.imageUrl, opts.alt);
+    content.appendChild(_zoomObj.container);
   } else {
     var noImg = document.createElement("div");
     noImg.className = "comfymodal-studio-preview-overlay-noimage";
@@ -303,19 +637,22 @@ export function createImagePreviewOverlay(opts) {
 
   overlay.appendChild(content);
 
-  // Backdrop click to close
-  backdrop.addEventListener("click", function () {
-    opts.onClose();
+  // Layer 3: preview overlay Escape + arrow-navigation handler
+  _layerUnreg = registerLayerHandler(3, {
+    escape: function () {
+      close();
+      return true;
+    },
+    onKeyDown: typeof opts.onKeyDown === "function" ? opts.onKeyDown : null,
   });
 
-  // Escape to close (does not conflict with zoom shortcuts which use Ctrl+)
+  // Backdrop click to close
+  backdrop.addEventListener("click", function () {
+    close();
+  });
+
+  // Focus trap: Tab/Shift+Tab cycle within the overlay (on overlay keydown)
   overlay.addEventListener("keydown", function (e) {
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      opts.onClose();
-      return;
-    }
-    // Focus trap: Tab/Shift+Tab cycle within the overlay
     if (opts.focusTrap && e.key === "Tab") {
       var focusable = overlay.querySelectorAll(
         'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
@@ -338,8 +675,30 @@ export function createImagePreviewOverlay(opts) {
   });
 
   function close() {
+    // Idempotent: only run once.  All internal paths (Escape handler,
+    // backdrop click, close button) call close(), and external callers
+    // may also call preview.close().  The _closed guard ensures exactly
+    // one execution of cleanup and the onClose callback.
+    if (_closed) return;
+    _closed = true;
+
+    // Clean up layer handler (removes from registry)
+    if (_layerUnreg) {
+      _layerUnreg();
+      _layerUnreg = null;
+    }
+    // Clean up zoomable image (removes fullscreenchange listener, layer handler)
+    if (_zoomObj && typeof _zoomObj.destroy === "function") {
+      _zoomObj.destroy();
+      _zoomObj = null;
+    }
     if (overlay.parentNode) {
       overlay.remove();
+    }
+    // Notify the caller after cleanup so the callback can safely
+    // re-render or restore focus without stale layer entries.
+    if (typeof opts.onClose === "function") {
+      opts.onClose();
     }
   }
 

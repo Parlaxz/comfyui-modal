@@ -6,7 +6,7 @@ import { createDefaultDraft, createPreviewState, normalizeDraft } from "./testin
 import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
 import { mountLegacyTab, stopLegacyController } from "./studio-legacy.js";
-import { el } from "./studio-ui.js";
+import { el, registerLayerHandler } from "./studio-ui.js";
 
 // Backward-compat flag preserved for external scripts/custom nodes that may
 // still read it. Legacy sidebar tabs are now controlled by an explicit opt-in.
@@ -253,13 +253,17 @@ export function open_testing_modal(tabName) {
 
   if (_shellCache && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "flex";
-    if (!_shellCache._escHandler) {
-      const escHandler = (e) => {
-        if (e.key === "Escape") close_testing_modal();
-        else _trapTab(e, _shellCache.overlay);
-      };
-      document.addEventListener("keydown", escHandler);
-      _shellCache._escHandler = escHandler;
+    if (!_shellCache._escHandler && !_shellCache._layerBased) {
+      if (!_shellCache._destroyed) {
+        _shellCache._escHandler = registerLayerHandler(2, {
+          escape: function () {
+            if (_shellCache && _shellCache._destroyed) return false;
+            close_testing_modal();
+            return true;
+          },
+        });
+        _shellCache._layerBased = true;
+      }
     }
     _isOpen = true;
     updateDiag("modalOpen", true);
@@ -290,13 +294,15 @@ export function open_testing_modal(tabName) {
     if (e.target === shell.overlay) close_testing_modal();
   });
 
-  // Escape handler + Tab trap — store reference for cleanup
-  const escHandler = (e) => {
-    if (e.key === "Escape") close_testing_modal();
-    else _trapTab(e, shell.overlay);
-  };
-  document.addEventListener("keydown", escHandler);
-  shell._escHandler = escHandler;
+  // Layer-based Escape handler (layer 2 = dialog/shell) + Tab trap
+  shell._escHandler = registerLayerHandler(2, {
+    escape: function () {
+      if (shell._destroyed) return false;
+      close_testing_modal();
+      return true;
+    },
+  });
+  shell._layerBased = true;
 
   // Mount the Studio shell (replaces old 6-tab nav)
   // Build context with apiBase, comfyApi, mountLegacyTab, and draft callbacks.
@@ -365,10 +371,13 @@ function close_testing_modal() {
   stopLegacyController();
   if (_shellCache && _hostEl && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "none";
-    if (_shellCache._escHandler) {
-      document.removeEventListener("keydown", _shellCache._escHandler);
-      _shellCache._escHandler = null;
+    // Clean up layer keyboard handler (idempotent)
+    if (typeof _shellCache._escHandler === "function") {
+      _shellCache._escHandler(); // unregister layer handler
     }
+    _shellCache._escHandler = null;
+    _shellCache._layerBased = false;
+    _shellCache._destroyed = true;
   }
   _isOpen = false;
   updateDiag("modalOpen", false);

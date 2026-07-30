@@ -138,6 +138,11 @@ export async function runStudioExperiment(apiBase, payload) {
   });
 }
 
+export async function getModalConfig(apiBase) {
+  const data = await apiFetch(apiBase, "/config");
+  return data && typeof data === "object" ? data : null;
+}
+
 export async function getStudioRunStatus(apiBase, id) {
   return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
 }
@@ -210,6 +215,59 @@ export async function listRunHistory(apiBase, params) {
   }
   const qs = query.toString();
   return apiFetch(apiBase, "/run-history" + (qs ? "?" + qs : ""));
+}
+
+// ── Phase 7: Unified History API ─────────────────────────────────────────
+
+/**
+ * Fetch paginated history from the unified /comfymodal/history endpoint.
+ * Supports AbortController for request cancellation.
+ *
+ * @param {string} apiBase
+ * @param {object} params - Query parameters (page, page_size, search, kind, status, etc.)
+ * @param {AbortSignal} [signal] - Optional AbortSignal to cancel the request.
+ * @returns {Promise<{items: Array, page: number, page_size: number, total: number, has_more: boolean}|null>}
+ */
+export async function listUnifiedHistory(apiBase, params, signal) {
+  const query = new URLSearchParams();
+  if (params) {
+    if (params.page != null) query.set("page", String(params.page));
+    if (params.page_size != null) query.set("page_size", String(params.page_size));
+    if (params.search) query.set("search", params.search);
+    if (params.kind) query.set("kind", params.kind);
+    else if (params.type) query.set("kind", params.type);
+    if (params.status) query.set("status", params.status);
+    if (params.favorite_only) query.set("favorite_only", "true");
+    else if (params.favorite) query.set("favorite_only", "true");
+    if (params.preset) query.set("preset", params.preset);
+    if (params.feature) query.set("feature", params.feature);
+    if (params.date_from) query.set("date_from", params.date_from);
+    if (params.date_to) query.set("date_to", params.date_to);
+    if (params.has_image) query.set("has_image", "true");
+    if (params.sort) query.set("sort", params.sort);
+  } else {
+    query.set("page", "1");
+    query.set("page_size", "50");
+  }
+  const qs = query.toString();
+  try {
+    const res = await fetch(apiBase + "/history" + (qs ? "?" + qs : ""), { signal: signal || null });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.status === "ok") {
+      return {
+        items: data.items || [],
+        page: data.page || 1,
+        page_size: data.page_size || 50,
+        total: data.total || 0,
+        has_more: !!data.has_more,
+      };
+    }
+    return data || null;
+  } catch (err) {
+    if (err && err.name === "AbortError") return null;
+    return null;
+  }
 }
 
 // ── Run Annotation API ───────────────────────────────────────────────────

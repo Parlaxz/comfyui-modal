@@ -193,6 +193,82 @@ export function renderSettings(state, context) {
     runtimeRow.appendChild(settingsRow("GPU", settingsValue("Unknown")));
   });
 
+  // Execution engine is persisted by the backend and applies only to future
+  // submissions.  A config GET is safe here: it never deploys or starts a run.
+  const engineRow = el("div", { style: "margin-top:8px;" });
+  const engineSelect = document.createElement("select");
+  engineSelect.className = "comfymodal-input";
+  engineSelect.style.cssText = "width:100%;font-size:11px;padding:3px 6px;";
+  const engineStatus = el("div", { style: "font-size:10px;color:#888;margin-top:3px;" });
+  const engineReadiness = el("div", { style: "font-size:10px;color:#888;margin-top:2px;" });
+  engineRow.appendChild(settingsRow("Execution Engine", engineSelect));
+  engineRow.appendChild(engineStatus);
+  engineRow.appendChild(engineReadiness);
+  runtimeSection.appendChild(engineRow);
+
+  function renderEngineConfig(cfg) {
+    const modes = Array.isArray(cfg && cfg.available_execution_modes)
+      ? cfg.available_execution_modes : [
+        { value: "v2", label: "V2 - Recommended" },
+        { value: "v1", label: "V1 - Legacy fallback" },
+      ];
+    while (engineSelect.firstChild) engineSelect.removeChild(engineSelect.firstChild);
+    modes.forEach((mode) => {
+      const option = document.createElement("option");
+      option.value = mode.value;
+      option.textContent = mode.label;
+      engineSelect.appendChild(option);
+    });
+    const current = cfg && cfg.execution_mode ? cfg.execution_mode : "v2";
+    engineSelect.value = current;
+    window._comfyModalExecutionMode = current;
+    const locked = !!(cfg && cfg.execution_mode_locked);
+    engineSelect.disabled = locked;
+    engineStatus.textContent = locked
+      ? "Managed by COMFYMODAL_RUNTIME"
+      : "Current engine: " + String(current).toUpperCase() + " - Applies to future runs only";
+    if (locked) engineStatus.style.color = "#fbbf24";
+    const readiness = cfg && cfg.execution_readiness;
+    if (readiness) {
+      const v1 = readiness.v1 && readiness.v1.status ? readiness.v1.status : "unknown";
+      const v2 = readiness.v2 && readiness.v2.status ? readiness.v2.status : "unknown";
+      engineReadiness.textContent = "V1 deployment: " + v1 + "  V2 deployment: " + v2;
+      engineReadiness.style.color = v2 === "unavailable" ? "#f87171" : "#888";
+    }
+  }
+
+  fetch(`${apiBase}/config`).then((response) => response.json()).then(renderEngineConfig).catch(() => {
+    renderEngineConfig({ execution_mode: "v2", execution_mode_locked: false });
+    engineStatus.textContent = "Current engine: V2 - Applies to future runs only - server status unknown";
+  });
+
+  engineSelect.addEventListener("change", async () => {
+    const selected = engineSelect.value;
+    engineSelect.disabled = true;
+    try {
+      const response = await fetch(`${apiBase}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ execution_mode: selected }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.status === "error") throw new Error(data.message || "Could not save execution engine");
+      window._comfyModalExecutionMode = selected;
+      window.dispatchEvent(new CustomEvent("comfymodal:execution-mode-changed", { detail: data }));
+      engineStatus.textContent = "Current engine: " + selected.toUpperCase() + " - Applies to future runs only";
+    } catch (error) {
+      engineStatus.textContent = error.message || "Could not save execution engine";
+      engineStatus.style.color = "#f87171";
+    } finally {
+      engineSelect.disabled = false;
+    }
+  });
+  const engineChangeHandler = (event) => {
+    const detail = event && event.detail;
+    if (detail && detail.execution_mode) renderEngineConfig(detail);
+  };
+  window.addEventListener("comfymodal:execution-mode-changed", engineChangeHandler);
+
   container.appendChild(runtimeSection);
 
   // ── 4. Features section ──────────────────────────────────────────────
@@ -225,7 +301,106 @@ export function renderSettings(state, context) {
 
   container.appendChild(featuresSection);
 
-  // ── 5. Legacy section ─────────────────────────────────────────────────
+  // ── 5. Outputs section ────────────────────────────────────────────────
+  const outputsSection = el("div", { class: "comfymodal-studio-settings-section", "data-section": "outputs" });
+  const outputsHeadingRow = el("div", { style: "display:flex;align-items:center;gap:6px;margin-bottom:8px;" });
+  outputsHeadingRow.appendChild(el("h3", { text: "Outputs", style: "margin:0;font-size:12px;font-weight:600;color:#d0d0d0;" }));
+  outputsHeadingRow.appendChild(createInfoHint("Output format, auto-save, and folder settings for generated images."));
+  outputsSection.appendChild(outputsHeadingRow);
+
+  // Shared output preferences
+  const outputPrefsEl = el("div", { style: "margin-bottom:8px;" });
+  outputsSection.appendChild(outputPrefsEl);
+
+  // Async-load + render output preferences
+  // Use a stable listener keyed on the container to avoid adding repeated
+  // global event listeners on every settings re-render.
+  (function renderOutputPrefs() {
+    import("./studio-output-preferences.js").then(function (m) {
+      return m.syncOutputConfigFromServer().then(function () {
+        while (outputPrefsEl.firstChild) outputPrefsEl.removeChild(outputPrefsEl.firstChild);
+        var prefs = m.getOutputPreferences();
+
+      // Auto-save toggle
+      var autoRow = el("div", { class: "comfymodal-studio-settings-row" }, [
+        el("span", { class: "comfymodal-studio-settings-row-label", text: "Auto-save outputs locally" }),
+      ]);
+      var autoToggle = el("input", {
+        type: "checkbox",
+        checked: prefs.auto_save_local,
+        style: "width:16px;height:16px;accent-color:#3a6fcc;",
+      });
+      autoToggle.addEventListener("change", function () {
+        m.setAutoSaveEnabled(autoToggle.checked).catch(function () {
+          autoToggle.checked = !autoToggle.checked;
+        });
+      });
+      autoRow.appendChild(autoToggle);
+      outputPrefsEl.appendChild(autoRow);
+
+      // Save folder
+      var folderRow = el("div", { class: "comfymodal-studio-settings-row" }, [
+        el("span", { class: "comfymodal-studio-settings-row-label", text: "Save folder" }),
+      ]);
+      var folderInput = el("input", {
+        type: "text",
+        class: "comfymodal-input",
+        value: prefs.save_folder,
+        style: "width:100%;font-size:11px;padding:3px 6px;box-sizing:border-box;",
+      });
+      folderInput.addEventListener("change", function () {
+        var normalized = m.normalizeOutputSaveFolder(folderInput.value);
+        folderInput.value = normalized;
+        m.setOutputPreferences({ save_folder: normalized }).catch(function () {});
+      });
+      folderRow.appendChild(folderInput);
+      outputPrefsEl.appendChild(folderRow);
+
+      // Metadata sidecar toggle
+      var sidecarRow = el("div", { class: "comfymodal-studio-settings-row" }, [
+        el("span", { class: "comfymodal-studio-settings-row-label", text: "Save metadata JSON sidecar" }),
+      ]);
+      var sidecarToggle = el("input", {
+        type: "checkbox",
+        checked: prefs.save_metadata_sidecar,
+        style: "width:16px;height:16px;accent-color:#3a6fcc;",
+      });
+      sidecarToggle.addEventListener("change", function () {
+        m.setOutputPreferences({ save_metadata_sidecar: sidecarToggle.checked }).catch(function () {
+          sidecarToggle.checked = !sidecarToggle.checked;
+        });
+      });
+      sidecarRow.appendChild(sidecarToggle);
+      outputPrefsEl.appendChild(sidecarRow);
+
+      // Stable listener: use a named function stored on the outputPrefsEl
+      // so re-renders remove the old listener before adding the new one.
+      var _listenerKey = "_outputPrefsChangeHandler";
+      var oldHandler = outputPrefsEl[_listenerKey];
+      if (oldHandler) {
+        window.removeEventListener("comfymodal:output-preferences-changed", oldHandler);
+      }
+      var newHandler = function () {
+        var fresh = m.getOutputPreferences();
+        autoToggle.checked = fresh.auto_save_local;
+        folderInput.value = fresh.save_folder;
+        sidecarToggle.checked = fresh.save_metadata_sidecar;
+      };
+      outputPrefsEl[_listenerKey] = newHandler;
+        window.addEventListener("comfymodal:output-preferences-changed", newHandler);
+      });
+    }).catch(function () {
+      outputPrefsEl.appendChild(el("p", {
+        style: "font-size:10px;color:#888;",
+        text: "Output preferences unavailable.",
+      }));
+    });
+  })();
+
+  container.appendChild(outputsSection);
+
+  // ── 6. Legacy section ─────────────────────────────────────────────────
+
   const legacySection = el("div", { class: "comfymodal-studio-settings-section", "data-section": "legacy" });
   const legacyHeadingRow = el("div", { style: "display:flex;align-items:center;gap:6px;margin-bottom:8px;" });
   legacyHeadingRow.appendChild(el("h3", { text: "Legacy", style: "margin:0;font-size:12px;font-weight:600;color:#d0d0d0;" }));

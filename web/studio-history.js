@@ -20,9 +20,9 @@
 //   3. run.output_path         → /studio/outputs/<path>
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
-import { listRunHistory, updateRunAnnotation } from "./studio-backend-api.js";
+import { listUnifiedHistory, updateRunAnnotation } from "./studio-backend-api.js";
 import { loadExperimentIntoPlayground } from "./studio-playground.js";
-import { el, createImagePreviewOverlay } from "./studio-ui.js";
+import { el, createImagePreviewOverlay, registerLayerHandler } from "./studio-ui.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -414,8 +414,8 @@ export function renderHistory(state, context) {
 
   // ── Internal state ──────────────────────────────────────────────────
   var queryParams = {
-    limit: 50,
-    offset: 0,
+    page: 1,
+    page_size: 50,
     search: "",
     type: "",
     status: "",
@@ -433,6 +433,14 @@ export function renderHistory(state, context) {
   var _COLUMNS_KEY = "comfymodal-studio-history-columns";
   var columnCount = parseInt(localStorage.getItem(_COLUMNS_KEY), 10) || 6;
   if (columnCount < 2 || columnCount > 12) columnCount = 6;
+
+  // ── Request dedup + cancellation ────────────────────────────────────
+  var _abortController = null;
+  var _lastRequestEpoch = 0;
+  /** Cache key for identical page queries (page, page_size, search, type, status, sort, favorite) */
+  var _queryCache = {};
+  var _QUERY_CACHE_TTL = 2000; // 2s
+  var _QUERY_CACHE_MAX = 50;   // max entries before pruning
 
   // ── Debounce helper ─────────────────────────────────────────────────
   var _searchTimer = null;
@@ -664,10 +672,10 @@ export function renderHistory(state, context) {
       "data-testid": "history-prev",
       text: "\u2190 Prev",
       style: "font-size:10px;padding:2px 8px;",
-      disabled: queryParams.offset <= 0,
+      disabled: queryParams.page <= 1,
       onclick: function () {
-        if (queryParams.offset > 0) {
-          queryParams.offset = Math.max(0, queryParams.offset - queryParams.limit);
+        if (queryParams.page > 1) {
+          queryParams.page -= 1;
           fetchAndRender();
         }
       },
@@ -678,9 +686,9 @@ export function renderHistory(state, context) {
       "data-testid": "history-next",
       text: "Next \u2192",
       style: "font-size:10px;padding:2px 8px;",
-      disabled: queryParams.offset + queryParams.limit >= totalCount,
+      disabled: !_hasMore,
       onclick: function () {
-        queryParams.offset += queryParams.limit;
+        queryParams.page += 1;
         fetchAndRender();
       },
     });
@@ -701,8 +709,8 @@ export function renderHistory(state, context) {
     bar.appendChild(nextBtn);
     bar.appendChild(pageInfo);
 
-    // Update page info via shared pure helper
-    var meta = formatPageMetadata(queryParams.offset, queryParams.limit, totalCount);
+    // Update page info via shared pure helper (using server total)
+    var meta = formatPageMetadata((queryParams.page - 1) * queryParams.page_size, queryParams.page_size, totalCount);
     pageInfo.textContent = meta.label;
 
     return bar;
@@ -759,8 +767,8 @@ export function renderHistory(state, context) {
 
     function closePreview() {
       previewRun = null;
-      var existingOverlay = container.querySelector(".comfymodal-studio-preview-overlay");
-      if (existingOverlay) existingOverlay.remove();
+      // Cleanup (layer handler, zoom, DOM removal) is handled by the
+      // overlay's internal close() which calls this callback after cleanup.
       if (triggerCard && typeof triggerCard.focus === "function") {
         triggerCard.focus();
       }
@@ -822,7 +830,70 @@ export function renderHistory(state, context) {
   }
 
   // ── Fetch and render ─────────────────────────────────────────────────
+  var _hasMore = false;
+
+  function buildCacheKey() {
+    return JSON.stringify({
+      page: queryParams.page,
+      page_size: queryParams.page_size,
+      search: queryParams.search,
+      type: queryParams.type,
+      status: queryParams.status,
+      favorite: queryParams.favorite,
+      preset: queryParams.preset,
+      feature: queryParams.feature,
+      date_from: queryParams.date_from,
+      date_to: queryParams.date_to,
+      has_image: queryParams.has_image,
+      sort: queryParams.sort,
+    });
+  }
+
   function fetchAndRender() {
+    // Abort any in-flight request
+    if (_abortController) {
+      _abortController.abort();
+    }
+    _abortController = new AbortController();
+    var signal = _abortController.signal;
+    var thisEpoch = ++_lastRequestEpoch;
+
+    // Clear previous performance marks/measures to avoid accumulation
+    if (typeof performance !== "undefined" && performance.clearMarks) {
+      performance.clearMarks("history-request-start");
+      performance.clearMarks("history-response-received");
+      performance.clearMarks("history-normalize-start");
+      performance.clearMarks("history-dom-start");
+      performance.clearMarks("history-first-card");
+      performance.clearMarks("history-image-decode-start");
+      performance.clearMarks("history-image-decode-end");
+    }
+    if (typeof performance !== "undefined" && performance.clearMeasures) {
+      performance.clearMeasures("history-cached");
+      performance.clearMeasures("history-request");
+      performance.clearMeasures("history-normalize");
+      performance.clearMeasures("history-dom-creation");
+      performance.clearMeasures("history-first-card-render");
+      performance.clearMeasures("history-image-decode");
+    }
+
+    // Performance mark: request start
+    if (typeof performance !== "undefined" && performance.mark) {
+      performance.mark("history-request-start");
+    }
+
+    // Check cache for identical recent query
+    var cacheKey = buildCacheKey();
+    var cached = _queryCache[cacheKey];
+    if (cached && (Date.now() - cached.ts) < _QUERY_CACHE_TTL) {
+      if (typeof performance !== "undefined" && performance.measure) {
+        try { performance.measure("history-cached", "history-request-start"); } catch (e) {}
+      }
+      renderItems(cached.data);
+      _abortController = null;
+      return;
+    }
+
     // Clear (safe helper tolerates re-entrant blur/change during removal)
     _removeAllChildren(container);
 
@@ -835,10 +906,10 @@ export function renderHistory(state, context) {
       text: "Loading history...",
     }));
 
-    // Build query params for API
+    // Build query params for API — use page/page_size
     var apiParams = {
-      limit: queryParams.limit,
-      offset: queryParams.offset,
+      page: queryParams.page,
+      page_size: queryParams.page_size,
     };
     if (queryParams.search) apiParams.search = queryParams.search;
     if (queryParams.type) apiParams.type = queryParams.type;
@@ -851,209 +922,60 @@ export function renderHistory(state, context) {
     if (queryParams.has_image) apiParams.has_image = true;
     if (queryParams.sort) apiParams.sort = queryParams.sort;
 
-    // Fetch experiments in parallel with run history
-    var expPromise = fetch(apiBase + "/experiments").then(function (expResp) {
-      if (!expResp.ok) return [];
-      return expResp.json().then(function (expData) {
-        return (expData && expData.experiments) || [];
-      });
-    }).catch(function () { return []; });
-
-    listRunHistory(apiBase, apiParams).then(async function (data) {
-      // Remove loading (safe helper)
-      _removeAllChildren(container);
-
-      // Resolve runs and totalCount for ALL paths (error, empty, success)
-      // so that the filter bar's page info always reflects the response.
-      // This must happen BEFORE any filter-bar re-render call.
-      var r = data && (data.runs || data.run_history || (Array.isArray(data) ? data : null));
-      totalCount = resolveTotalCount(data, r);
-
-      // Error state: show filter bar (totalCount is 0 for absent data),
-      // then error card, then return.
-      if (!data) {
-        container.appendChild(renderFilterBar());
-        container.appendChild(el("div", {
-          class: "comfymodal-studio-card",
-          style: "color:var(--color-danger)",
-          text: "Failed to load history.",
-        }));
+    listUnifiedHistory(apiBase, apiParams, signal).then(function (result) {
+      // Ignore out-of-order responses
+      if (thisEpoch !== _lastRequestEpoch) return;
+      if (!result || signal.aborted) {
+        if (!signal.aborted) {
+          _removeAllChildren(container);
+          container.appendChild(renderFilterBar());
+          container.appendChild(el("div", {
+            class: "comfymodal-studio-card",
+            style: "color:var(--color-danger)",
+            text: "Failed to load history.",
+          }));
+        }
         return;
       }
 
-      // Empty state: show filter bar (totalCount is 0 from resolveTotalCount),
-      // then empty message.
-      if (!r || (Array.isArray(r) && r.length === 0)) {
-        container.appendChild(renderFilterBar());
-        container.appendChild(el("div", {
-          class: "comfymodal-studio-card",
-          text: "No run history yet. Runs will appear here once you create experiments.",
-        }));
-        return;
+      // Performance mark: response received
+      if (typeof performance !== "undefined" && performance.mark) {
+        performance.mark("history-response-received");
       }
 
-      // Success: render filter bar with fresh totalCount, then gallery
-      container.appendChild(renderFilterBar());
-
-      var runList = Array.isArray(r) ? r : [];
-
-      // Normalize all runs for consistent field access
-      var normalizedRuns = runList.map(function (run) {
-        return normalizeStudioRun(run, apiBase);
-      }).filter(Boolean);
-
-      // Fetch and merge true Studio aggregate experiments
-      var experiments = await expPromise;
-      var expItems = [];
-      experiments.forEach(function (e) {
-        var def = e.definition || {};
-        var snap = e.snapshot || {};
-        var studioMeta = def.studio_meta || {};
-        if (typeof def.name !== "string" || def.name.indexOf("Studio Experiment:") !== 0) return;
-        if (!studioMeta.studio_preset_ids || studioMeta.studio_preset_ids.length === 0) return;
-        if (!snap || snap.total_cells <= 1) return;
-        var expId = e.experiment_id || "";
-        var counters = snap.counters || {};
-        expItems.push({
-          kind: "studio_experiment",
-          experimentId: expId,
-          id: expId,
-          prompt: def.name || "Studio Experiment",
-          promptId: "studio_" + expId,
-          presetId: (studioMeta.studio_preset_ids || [])[0] || "",
-          presetLabel: null,
-          featureId: "txt2img",
-          status: snap.overall_status || snap.status || "completed",
-          imageUrl: null,
-          startedAt: def.created_at || def.createdAt || snap.created_at || "",
-          completedAt: snap.updated_at || snap.updatedAt || "",
-          durationMs: null,
-          favorite: false,
-          totalCells: snap.total_cells || 0,
-          completedCells: counters.completed || 0,
-          failedCells: counters.failed || 0,
-          _experimentData: e,
-        });
-      });
-
-      // Merge experiments into normalized runs, sorted by time (newest first)
-      var allItems = normalizedRuns.concat(expItems);
-      allItems.sort(function (a, b) {
-        var aTime = a.completedAt || a.startedAt || "";
-        var bTime = b.completedAt || b.startedAt || "";
-        return bTime.localeCompare(aTime);
-      });
-      // Deduplicate by ID
-      var seen = {};
-      allItems = allItems.filter(function (item) {
-        var key = item.experimentId || item.id;
-        if (!key) return true;
-        if (seen[key]) return false;
-        seen[key] = true;
-        return true;
-      });
-      totalCount = allItems.length;
-
-      if (groupExperiments) {
-        // Group by experiment_id
-        var grouped = {};
-        var ungrouped = [];
-        allItems.forEach(function (nr) {
-          var expId = nr.experimentId || null;
-          if (expId && expId !== "" && nr.kind === "experiment_cell") {
-            if (!grouped[expId]) grouped[expId] = [];
-            grouped[expId].push(nr);
-          } else {
-            ungrouped.push(nr);
-          }
-        });
-
-        // Render each group
-        Object.entries(grouped).forEach(function (_ref) {
-          var expId = _ref[0];
-          var groupRuns = _ref[1];
-          var groupEl = renderGroup(expId, groupRuns, apiBase, openPreview, columnCount);
-          container.appendChild(groupEl);
-        });
-
-        // Render ungrouped (includes studio_experiment items)
-        if (ungrouped.length > 0) {
-          var fallbackId = "ungrouped_" + Date.now();
-          var groupEl = renderGroup(fallbackId, ungrouped, apiBase, openPreview, columnCount);
-          container.appendChild(groupEl);
+      // Cache the result with bounded size
+      _queryCache[cacheKey] = { data: result, ts: Date.now() };
+      var now = Date.now();
+      var keys = Object.keys(_queryCache);
+      // Prune stale entries
+      keys.forEach(function (k) {
+        if (now - _queryCache[k].ts > _QUERY_CACHE_TTL * 2) {
+          delete _queryCache[k];
         }
-      } else {
-        // Default (ungrouped) view: studio_experiment items get a tile,
-        // experiment_cell runs sharing an experimentId are collapsed into
-        // one experiment tile, ordinary runs are history cards.
-        var expGroups = {};
-        allItems.forEach(function (nr) {
-          if (nr.kind === "studio_experiment") return; // handled separately
-          if (nr.kind !== "experiment_cell") return;   // only cell runs form experiment groups
-          var eId = nr.experimentId || null;
-          if (eId) {
-            if (!expGroups[eId]) expGroups[eId] = [];
-            expGroups[eId].push(nr);
-          }
+      });
+      // Enforce max cache size (evict oldest if over limit)
+      if (keys.length > _QUERY_CACHE_MAX) {
+        var sorted = keys.slice().sort(function (a, b) {
+          return _queryCache[a].ts - _queryCache[b].ts;
         });
-        var hasExpOrCell = allItems.some(function (nr) {
-          return nr.kind === "studio_experiment" || nr.kind === "experiment_cell";
-        });
-        if (!hasExpOrCell) {
-          container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));
-          container.querySelector('[data-testid="history-gallery"]').style.setProperty("--columns", columnCount);
-        } else {
-          var gallery = el("div", {
-            class: "comfymodal-studio-history-gallery",
-            style: "--columns:" + columnCount + ";",
-            "data-testid": "history-gallery",
-          });
-          var seenExpIds = {};
-          allItems.forEach(function (nr) {
-            if (nr.kind === "studio_experiment") {
-              // Render true experiment as an experiment tile (loads grid on click)
-              var groupRuns = expGroups[nr.experimentId];
-              if (groupRuns && groupRuns.length > 0) {
-                if (!seenExpIds[nr.experimentId]) {
-                  seenExpIds[nr.experimentId] = true;
-                  gallery.appendChild(renderExperimentTile(nr.experimentId, groupRuns, apiBase, context, state));
-                }
-              } else {
-                // Standalone experiment tile (no cell runs yet)
-                if (!seenExpIds[nr.experimentId]) {
-                  seenExpIds[nr.experimentId] = true;
-                  gallery.appendChild(_renderStandaloneExperimentTile(nr, apiBase, context, state));
-                }
-              }
-            } else if (nr.kind === "experiment_cell") {
-              var eId = nr.experimentId || null;
-              if (eId) {
-                if (!seenExpIds[eId]) {
-                  seenExpIds[eId] = true;
-                  gallery.appendChild(renderExperimentTile(eId, expGroups[eId], apiBase, context, state));
-                }
-              }
-            } else {
-              gallery.appendChild(renderHistoryCard(nr, apiBase, openPreview));
-            }
-          });
-          container.appendChild(gallery);
+        while (Object.keys(_queryCache).length > _QUERY_CACHE_MAX) {
+          delete _queryCache[sorted.shift()];
         }
       }
 
-      // Update page info after merging
-      var pageInfoEl = container.querySelector('[data-testid="history-page-info"]');
-      if (pageInfoEl) {
-        var meta = formatPageMetadata(queryParams.offset, queryParams.limit, totalCount);
-        pageInfoEl.textContent = meta.label;
-      }
+      totalCount = result.total || 0;
+      _hasMore = result.has_more || false;
+
+      renderItems(result);
     }).catch(function (err) {
+      if (err && err.name === "AbortError") return;
+      if (thisEpoch !== _lastRequestEpoch) return;
       _removeAllChildren(container);
       container.appendChild(renderFilterBar());
       var errorCard = el("div", { class: "comfymodal-studio-card" });
       errorCard.appendChild(el("p", {
         style: "color:var(--color-danger)",
-        text: "Failed to load history: " + err.message,
+        text: "Failed to load history: " + (err && err.message ? err.message : "unknown error"),
       }));
       errorCard.appendChild(el("button", {
         class: "comfymodal-secondary-btn",
@@ -1063,6 +985,148 @@ export function renderHistory(state, context) {
       }));
       container.appendChild(errorCard);
     });
+  }
+
+  // ── Render items helper (called by fetchAndRender) ──────────────────────
+  function renderItems(result) {
+    // Performance mark: normalization start
+    if (typeof performance !== "undefined" && performance.mark) {
+      performance.mark("history-normalize-start");
+    }
+
+    _removeAllChildren(container);
+    container.appendChild(renderFilterBar());
+
+    var items = result.items || [];
+    if (items.length === 0) {
+      container.appendChild(el("div", {
+        class: "comfymodal-studio-card",
+        text: "No run history yet. Runs will appear here once you create experiments.",
+      }));
+      return;
+    }
+
+    // Normalize all items for consistent field access
+    var normalizedItems = items.map(function (item) {
+      return normalizeStudioRun(item, apiBase);
+    }).filter(Boolean);
+
+    // Performance mark: DOM creation start
+    if (typeof performance !== "undefined" && performance.mark) {
+      performance.mark("history-dom-start");
+    }
+
+    // Use DocumentFragment for batch DOM insertion
+    var fragment = document.createDocumentFragment();
+    var gallery = el("div", {
+      class: "comfymodal-studio-history-gallery",
+      style: "--columns:" + columnCount + ";",
+      "data-testid": "history-gallery",
+    });
+    fragment.appendChild(gallery);
+
+    // Render cards into gallery (with optional experiment grouping)
+    if (groupExperiments) {
+      // Group by stable experiment_id (empty/none stays individual)
+      var groups = {};
+      normalizedItems.forEach(function (nr) {
+        var eid = nr.experimentId || "";
+        if (!groups[eid]) groups[eid] = [];
+        groups[eid].push(nr);
+      });
+      var groupIds = Object.keys(groups).sort();
+      var cardIndex = 0;
+      groupIds.forEach(function (eid) {
+        var members = groups[eid];
+        if (eid && members.length > 1) {
+          // Multi-run experiment: render as grouped tile
+          var groupCard = renderGroup(eid, members, apiBase, openPreview, columnCount);
+          gallery.appendChild(groupCard);
+          if (cardIndex === 0 && typeof performance !== "undefined" && performance.mark) {
+            performance.mark("history-first-card");
+          }
+          cardIndex += members.length;
+        } else {
+          // Single run or no experiment: render individual card
+          members.forEach(function (nr) {
+            var card = renderHistoryCard(nr, apiBase, openPreview);
+            gallery.appendChild(card);
+            if (cardIndex === 0 && typeof performance !== "undefined" && performance.mark) {
+              performance.mark("history-first-card");
+            }
+            cardIndex++;
+          });
+        }
+      });
+    } else {
+      // Default: all individual cards (ungrouped)
+      normalizedItems.forEach(function (nr, index) {
+        var card = renderHistoryCard(nr, apiBase, openPreview);
+        gallery.appendChild(card);
+
+        // Performance mark: first card rendered
+        if (index === 0 && typeof performance !== "undefined" && performance.mark) {
+          performance.mark("history-first-card");
+        }
+      });
+    }
+
+    // Performance mark: image decode start (lazy, async)
+    if (typeof performance !== "undefined" && performance.mark) {
+      performance.mark("history-image-decode-start");
+    }
+
+    // Async image decode for thumbnails via requestIdleCallback or setTimeout
+    var decodeFn = function () {
+      var imgs = gallery.querySelectorAll("img");
+      var imgArray = Array.from(imgs);
+      var decodeNext = function (idx) {
+        if (idx >= imgArray.length) {
+          if (typeof performance !== "undefined" && performance.mark) {
+            performance.mark("history-image-decode-end");
+          }
+          if (typeof performance !== "undefined" && performance.measure) {
+            try { performance.measure("history-image-decode", "history-image-decode-start", "history-image-decode-end"); } catch (e) {}
+          }
+          return;
+        }
+        var img = imgArray[idx];
+        if (img && typeof img.decode === "function") {
+          img.decode().then(function () {
+            setTimeout(function () { decodeNext(idx + 1); }, 0);
+          }).catch(function () {
+            setTimeout(function () { decodeNext(idx + 1); }, 0);
+          });
+        } else {
+          setTimeout(function () { decodeNext(idx + 1); }, 0);
+        }
+      };
+      decodeNext(0);
+    };
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(decodeFn, { timeout: 1000 });
+    } else {
+      setTimeout(decodeFn, 50);
+    }
+
+    // Update page info
+    var pageInfoEl = container.querySelector('[data-testid="history-page-info"]');
+    if (pageInfoEl) {
+      var meta = formatPageMetadata((queryParams.page - 1) * queryParams.page_size, queryParams.page_size, totalCount);
+      pageInfoEl.textContent = meta.label;
+    }
+
+    container.appendChild(fragment);
+
+    // Performance measures
+    if (typeof performance !== "undefined" && performance.measure) {
+      try {
+        performance.measure("history-request", "history-request-start", "history-response-received");
+        performance.measure("history-normalize", "history-response-received", "history-normalize-start");
+        performance.measure("history-dom-creation", "history-dom-start");
+        performance.measure("history-first-card-render", "history-request-start", "history-first-card");
+      } catch (e) {}
+    }
   }
 
   fetchAndRender();
