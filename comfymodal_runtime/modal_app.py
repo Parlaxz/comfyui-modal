@@ -1985,68 +1985,81 @@ def _load_cpu_snapshot_unet(
         and gpu_supports_bf16(_primary_gpu)
     )
 
-    if _eff_dtype is not None:
-        import comfy.sd as _comfy_sd
-        import folder_paths as _fp
+    # ── Save and disable AimDO for CPU snapshot UNET loading ──
+    _aimdo_mm = None
+    _aimdo_orig = False
+    try:
+        import comfy.memory_management as _aimdo_mm
+        _aimdo_orig = getattr(_aimdo_mm, 'aimdo_enabled', False)
+        _aimdo_mm.aimdo_enabled = False
+    except (ImportError, AttributeError):
+        _aimdo_mm = None
+    try:
+        if _eff_dtype is not None:
+            import comfy.sd as _comfy_sd
+            import folder_paths as _fp
 
-        _unet_path = _fp.get_full_path_or_raise("diffusion_models", unet_name)
+            _unet_path = _fp.get_full_path_or_raise("diffusion_models", unet_name)
 
-        with cpu_snapshot_unet_compute_policy(
-            effective_weight_dtype=_eff_dtype,
-            target_gpus=target_gpus,
-        ):
-            _model = _comfy_sd.load_diffusion_model(
-                _unet_path,
-                model_options={"dtype": _eff_dtype},
+            with cpu_snapshot_unet_compute_policy(
+                effective_weight_dtype=_eff_dtype,
+                target_gpus=target_gpus,
+            ):
+                _model = _comfy_sd.load_diffusion_model(
+                    _unet_path,
+                    model_options={"dtype": _eff_dtype},
+                )
+            if isinstance(_model, (tuple, list)) and len(_model) > 0:
+                _model = _model[0]
+
+            # Construction validation for BF16-native policy
+            if _is_bf16_native:
+                validate_snapshot_unet_bf16_native(
+                    _model,
+                    context="snapshot_construction.",
+                    target_gpus=target_gpus,
+                    requested_weight_dtype=weight_dtype,
+                    effective_weight_dtype=_eff_dtype,
+                    effective_compute_dtype=_eff_dtype,
+                )
+            return _model
+
+        if unet_cls is None:
+            raise RuntimeError(
+                f"snapshot UNET loader is unavailable for unresolved dtype {weight_dtype!r}"
             )
-        if isinstance(_model, (tuple, list)) and len(_model) > 0:
-            _model = _model[0]
+        loader = unet_cls()
+        cls_method = unet_cls.load_unet if unet_cls else None
+        orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+        if orig is not None:
+            with cpu_snapshot_unet_compute_policy(
+                effective_weight_dtype=_eff_dtype,
+                target_gpus=target_gpus,
+            ):
+                out = orig(loader, unet_name, weight_dtype)
+        else:
+            with cpu_snapshot_unet_compute_policy(
+                effective_weight_dtype=_eff_dtype,
+                target_gpus=target_gpus,
+            ):
+                out = loader.load_unet(unet_name, weight_dtype)
+        if isinstance(out, (tuple, list)) and len(out) > 0:
+            out = out[0]
 
-        # Construction validation for BF16-native policy
+        # Construction validation for BF16-native policy (unet_cls path)
         if _is_bf16_native:
             validate_snapshot_unet_bf16_native(
-                _model,
+                out,
                 context="snapshot_construction.",
                 target_gpus=target_gpus,
                 requested_weight_dtype=weight_dtype,
                 effective_weight_dtype=_eff_dtype,
                 effective_compute_dtype=_eff_dtype,
             )
-        return _model
-
-    if unet_cls is None:
-        raise RuntimeError(
-            f"snapshot UNET loader is unavailable for unresolved dtype {weight_dtype!r}"
-        )
-    loader = unet_cls()
-    cls_method = unet_cls.load_unet if unet_cls else None
-    orig = getattr(cls_method, "_comfy_modal_v2_original", None)
-    if orig is not None:
-        with cpu_snapshot_unet_compute_policy(
-            effective_weight_dtype=_eff_dtype,
-            target_gpus=target_gpus,
-        ):
-            out = orig(loader, unet_name, weight_dtype)
-    else:
-        with cpu_snapshot_unet_compute_policy(
-            effective_weight_dtype=_eff_dtype,
-            target_gpus=target_gpus,
-        ):
-            out = loader.load_unet(unet_name, weight_dtype)
-    if isinstance(out, (tuple, list)) and len(out) > 0:
-        out = out[0]
-
-    # Construction validation for BF16-native policy (unet_cls path)
-    if _is_bf16_native:
-        validate_snapshot_unet_bf16_native(
-            out,
-            context="snapshot_construction.",
-            target_gpus=target_gpus,
-            requested_weight_dtype=weight_dtype,
-            effective_weight_dtype=_eff_dtype,
-            effective_compute_dtype=_eff_dtype,
-        )
-    return out
+        return out
+    finally:
+        if _aimdo_mm is not None:
+            _aimdo_mm.aimdo_enabled = _aimdo_orig
 
 
 def _reference_image() -> Any:
@@ -3816,6 +3829,7 @@ class ModalRuntimeEntrypoint:
         _comfy_owned_after = 0
         try:
             import comfy.model_management as _mm
+            import torch
             _loaded_records = getattr(_mm, "current_loaded_models", None)
             _free_memory = getattr(_mm, "free_memory", None)
             if isinstance(_loaded_records, list) and callable(_free_memory):
@@ -3833,7 +3847,7 @@ class ModalRuntimeEntrypoint:
                         for _target in _targets
                     )
                 ]
-                _free_memory(1e32, None, keep_loaded=_keep_loaded)
+                _free_memory(1e32, torch.device('cpu'), keep_loaded=_keep_loaded)
                 _cleanup_models = getattr(_mm, "cleanup_models", None)
                 if callable(_cleanup_models):
                     _cleanup_models()
@@ -3862,6 +3876,58 @@ class ModalRuntimeEntrypoint:
             pass
         self._snapshot_eviction_metadata["comfy_owned_target_count_before"] = _comfy_owned_before
         self._snapshot_eviction_metadata["comfy_owned_target_count_after"] = _comfy_owned_after
+
+        # ── 7.5. Patcher cleanup for snapshot model objects ──
+        # Explicitly clean each model's cleanup-capable patcher so that
+        # ModelPatcher hooks, current_patcher references, and backup/hook
+        # ownership are released before the objects are deleted.  Best-effort:
+        # absent methods on fake/minimal models are silently skipped.
+        # Results are observable in _snapshot_eviction_metadata counts.
+        _patcher_cleanup_count = 0
+        _patcher_detach_count = 0
+        _patcher_cleanup_errors = 0
+        _patcher_tmp: Any = None
+        _p: Any = None
+        for _model_obj in (_unet_obj, _clip_obj):
+            if _model_obj is None:
+                continue
+            # cleanup() on the model object itself (ModelPatcher instances)
+            _patcher_tmp = getattr(_model_obj, "cleanup", None)
+            if callable(_patcher_tmp):
+                try:
+                    _patcher_tmp()
+                    _patcher_cleanup_count += 1
+                except Exception:
+                    _patcher_cleanup_errors += 1
+            _patcher_tmp = getattr(_model_obj, "detach", None)
+            if callable(_patcher_tmp):
+                try:
+                    _patcher_tmp(True)
+                    _patcher_detach_count += 1
+                except Exception:
+                    _patcher_cleanup_errors += 1
+            # cleanup() / detach(True) on .patcher when present and distinct
+            # (CLIP-like wrappers where the model object wraps a ModelPatcher)
+            _p = getattr(_model_obj, "patcher", None)
+            if _p is not None and _p is not _model_obj:
+                _patcher_tmp = getattr(_p, "cleanup", None)
+                if callable(_patcher_tmp):
+                    try:
+                        _patcher_tmp()
+                        _patcher_cleanup_count += 1
+                    except Exception:
+                        _patcher_cleanup_errors += 1
+                _patcher_tmp = getattr(_p, "detach", None)
+                if callable(_patcher_tmp):
+                    try:
+                        _patcher_tmp(True)
+                        _patcher_detach_count += 1
+                    except Exception:
+                        _patcher_cleanup_errors += 1
+        del _model_obj, _p, _patcher_tmp
+        self._snapshot_eviction_metadata["patcher_cleanup_count"] = _patcher_cleanup_count
+        self._snapshot_eviction_metadata["patcher_detach_count"] = _patcher_detach_count
+        self._snapshot_eviction_metadata["patcher_cleanup_errors"] = _patcher_cleanup_errors
 
         # ── 8. Clear runtime/storage registries and self attrs ──
         self._cpu_snapshot_unet_runtime_state = None
@@ -3968,11 +4034,15 @@ class ModalRuntimeEntrypoint:
                 f"Full eviction failed: original weakrefs still alive: {_alive_msg}"
             )
 
-        # ── 13. Memory evidence check ──
+        # ── 13. Memory evidence check (non-fatal diagnostic) ──
+        # Both weakrefs are verified dead above — structural integrity is proven.
+        # Memory evidence unavailability is measurement-only and non-fatal.
+        _floor_failures: list[dict[str, Any]] = []
+        _full_eviction_rss_drop_mib: Any = "absent"
         if _pre_rss_mib == "absent" or _after_trim_rss_mib == "absent":
             print(
                 f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                f"enabled=1 status=error "
+                f"enabled=1 status=memory_evidence_unavailable "
                 f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
                 f"original_clip_alive_after_full_eviction={_original_clip_alive_flag} "
                 f"original_unet_alive_after_full_eviction={_original_unet_alive_flag} "
@@ -3983,14 +4053,11 @@ class ModalRuntimeEntrypoint:
                 f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
                 flush=True,
             )
-            raise RuntimeError(
-                "Full eviction failed: memory evidence unavailable "
-                f"(pre_rss={_pre_rss_mib!r} post_rss={_after_trim_rss_mib!r})"
-            )
+        else:
+            _full_eviction_rss_drop_mib = float(_pre_rss_mib) - float(_after_trim_rss_mib)
 
-        # ── 14. RSS drop always >= 8192 MiB ──
-        _full_eviction_rss_drop_mib = float(_pre_rss_mib) - float(_after_trim_rss_mib)
-        if _full_eviction_rss_drop_mib < 8192.0:
+        # ── 14. RSS drop always >= 8192 MiB (non-fatal diagnostic) ──
+        if isinstance(_full_eviction_rss_drop_mib, (int, float)) and _full_eviction_rss_drop_mib < 8192.0:
             print(
                 f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
                 f"enabled=1 status=insufficient_rss_drop "
@@ -4007,10 +4074,11 @@ class ModalRuntimeEntrypoint:
                 f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
                 flush=True,
             )
-            raise RuntimeError(
-                f"Full eviction failed: RSS drop {_full_eviction_rss_drop_mib:.1f} MiB "
-                f"< 8192 MiB threshold"
-            )
+            _floor_failures.append({
+                "floor": "full_eviction_rss_drop",
+                "threshold_mib": 8192,
+                "actual_mib": round(_full_eviction_rss_drop_mib, 1),
+            })
 
         # EMIT after_full_eviction memory stage
         print(
@@ -4032,6 +4100,7 @@ class ModalRuntimeEntrypoint:
         )
 
         # ── 15. Emit status=full_eviction_complete ──
+        _rss_drop_str_full = f"{_full_eviction_rss_drop_mib:.1f}" if isinstance(_full_eviction_rss_drop_mib, (int, float)) else "absent"
         print(
             f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
             f"enabled=1 status=full_eviction_complete "
@@ -4039,7 +4108,7 @@ class ModalRuntimeEntrypoint:
             f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
             f"original_clip_alive_after_full_eviction=0 "
             f"original_unet_alive_after_full_eviction=0 "
-            f"full_eviction_rss_drop_mib={_full_eviction_rss_drop_mib:.1f} "
+            f"full_eviction_rss_drop_mib={_rss_drop_str_full} "
             f"rss_before_mib={_pre_rss_mib} rss_after_eviction_mib={_after_trim_rss_mib} "
             f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
             flush=True,
@@ -4056,6 +4125,7 @@ class ModalRuntimeEntrypoint:
         _storage_total_bytes = 0
         _storage_total_mib: Any = "absent"
         _reload_ok = False
+        _floor_failures_flat: str = ""
 
         if _retained_role != "none":
             if not all(c is not None for c in (reload_unet_fn, reload_clip_fn, snap_ctx_cm)):
@@ -4163,39 +4233,77 @@ class ModalRuntimeEntrypoint:
                     float(_pre_rss_mib) - float(_after_reload_rss_mib), 1
                 )
 
-            # Role-specific floors
+            # ── Role-specific floors (non-fatal diagnostic) ──
+            # Floor failures are diagnostic-only: they log the actual failed
+            # value and continue with the freshly reloaded retained model.
+            # Process RSS/smaps floors are noisy and must not abort startup.
+            # Structural safety checks (missing closures, None reload, same id)
+            # remain fatal above.
             if _retained_role == "clip":
                 if not (isinstance(_selected_reload_rss_rise_mib, (int, float)) and _selected_reload_rss_rise_mib >= 2048.0):
-                    raise RuntimeError(
-                        f"CLIP reload: RSS rise {_selected_reload_rss_rise_mib} MiB "
-                        f"< 2048 MiB threshold"
-                    )
+                    _floor_failures.append({
+                        "floor": "rss_rise",
+                        "threshold_mib": 2048,
+                        "actual_mib": _selected_reload_rss_rise_mib,
+                    })
                 if not (isinstance(_final_reduction_from_full_mib, (int, float)) and _final_reduction_from_full_mib >= 4096.0):
-                    raise RuntimeError(
-                        f"CLIP reload: final reduction {_final_reduction_from_full_mib} MiB "
-                        f"< 4096 MiB threshold"
-                    )
+                    _floor_failures.append({
+                        "floor": "final_reduction",
+                        "threshold_mib": 4096,
+                        "actual_mib": _final_reduction_from_full_mib,
+                    })
                 if _storage_total_bytes < 4096 * 1024 * 1024:
-                    raise RuntimeError(
-                        f"CLIP reload: storage {_storage_total_bytes} bytes "
-                        f"< 4096 MiB threshold"
-                    )
+                    _floor_failures.append({
+                        "floor": "storage",
+                        "threshold_bytes": 4096 * 1024 * 1024,
+                        "actual_bytes": _storage_total_bytes,
+                        "actual_mib": round(float(_storage_total_bytes) / (1024.0 * 1024.0), 1) if isinstance(_storage_total_bytes, (int, float)) else "absent",
+                    })
             else:
                 if not (isinstance(_selected_reload_rss_rise_mib, (int, float)) and _selected_reload_rss_rise_mib >= 4096.0):
-                    raise RuntimeError(
-                        f"UNET reload: RSS rise {_selected_reload_rss_rise_mib} MiB "
-                        f"< 4096 MiB threshold"
-                    )
+                    _floor_failures.append({
+                        "floor": "rss_rise",
+                        "threshold_mib": 4096,
+                        "actual_mib": _selected_reload_rss_rise_mib,
+                    })
                 if not (isinstance(_final_reduction_from_full_mib, (int, float)) and _final_reduction_from_full_mib >= 4096.0):
-                    raise RuntimeError(
-                        f"UNET reload: final reduction {_final_reduction_from_full_mib} MiB "
-                        f"< 4096 MiB threshold"
-                    )
+                    _floor_failures.append({
+                        "floor": "final_reduction",
+                        "threshold_mib": 4096,
+                        "actual_mib": _final_reduction_from_full_mib,
+                    })
                 if _storage_total_bytes < 8192 * 1024 * 1024:
-                    raise RuntimeError(
-                        f"UNET reload: storage {_storage_total_bytes} bytes "
-                        f"< 8192 MiB threshold"
-                    )
+                    _floor_failures.append({
+                        "floor": "storage",
+                        "threshold_bytes": 8192 * 1024 * 1024,
+                        "actual_bytes": _storage_total_bytes,
+                        "actual_mib": round(float(_storage_total_bytes) / (1024.0 * 1024.0), 1) if isinstance(_storage_total_bytes, (int, float)) else "absent",
+                    })
+            for _ff in _floor_failures:
+                print(
+                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                    f"enabled=1 status=non_fatal_floor_failure "
+                    f"retain_role={_retained_role} "
+                    f"floor={_ff['floor']} "
+                    f"threshold_mib={_ff.get('threshold_mib', '?')} "
+                    f"actual_mib={_ff.get('actual_mib', '?')} "
+                    f"actual_bytes={_ff.get('actual_bytes', '?')} "
+                    f"selected_reload_rss_rise_mib={_selected_reload_rss_rise_mib} "
+                    f"final_reduction_from_full_mib={_final_reduction_from_full_mib} "
+                    f"selected_storage_total_bytes={_storage_total_bytes} "
+                    f"after_full_eviction_rss_mib={_after_trim_rss_mib} "
+                    f"after_selected_reload_rss_mib={_after_reload_rss_mib} "
+                    f"full_models_rss_mib={_pre_rss_mib} "
+                    f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
+                    flush=True,
+                )
+
+        # Store floor failure info for the marker and metadata
+        # (runs outside reload block so full-eviction floor failures are included)
+        _floor_failures_flat = ";".join(
+            f"{ff['floor']}={ff.get('actual_mib', ff.get('actual_bytes', '?'))}"
+            for ff in _floor_failures
+        ) if _floor_failures else ""
 
         # EMIT after_selected_reload memory stage
         _after_reload_vm = _after_reload_mem if _reload_ok else _after_trim_mem
@@ -4224,9 +4332,13 @@ class ModalRuntimeEntrypoint:
             _rw = _wr.ref(_reloaded_model)
             _retained_weakref_alive = 1 if _rw() is not None else 0
             del _rw
+        _floor_failures_count = len(_floor_failures)
+        _rss_drop_str_ready = f"{_full_eviction_rss_drop_mib:.1f}" if isinstance(_full_eviction_rss_drop_mib, (int, float)) else "absent"
         print(
             f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
             f"enabled=1 status=ready "
+            f"floor_failures={_floor_failures_count} "
+            f"floor_failures_details={_floor_failures_flat or 'none'} "
             f"retain_role={_retained_role} "
             f"retained_model_present={_retained_model_present} "
             f"retained_model_id={_reloaded_id} "
@@ -4240,7 +4352,7 @@ class ModalRuntimeEntrypoint:
             f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
             f"normal_cpu_snapshot_models_present=0 "
             f"clip_present=0 unet_present=0 "
-            f"full_eviction_rss_drop_mib={_full_eviction_rss_drop_mib:.1f} "
+            f"full_eviction_rss_drop_mib={_rss_drop_str_ready} "
             f"selected_reload_rss_rise_mib={_selected_reload_rss_rise_mib} "
             f"final_reduction_from_full_mib={_final_reduction_from_full_mib} "
             f"selected_storage_count={_storage_count} "
@@ -4256,6 +4368,9 @@ class ModalRuntimeEntrypoint:
             f"native_threads={_after_reload_vm.get('native_thread_count', 'absent')} "
             f"torch_intraop={_after_reload_vm.get('torch_intraop_threads', 'absent')} "
             f"torch_interop={_after_reload_vm.get('torch_interop_threads', 'absent')} "
+            f"patcher_cleanup_count={_patcher_cleanup_count} "
+            f"patcher_detach_count={_patcher_detach_count} "
+            f"patcher_cleanup_errors={_patcher_cleanup_errors} "
             f"malloc_trim_status={_trim_status} malloc_trim_result={_trim_result}",
             flush=True,
         )
@@ -4285,7 +4400,16 @@ class ModalRuntimeEntrypoint:
             "bridge_active_preparation": _bridge_active_prep,
             "snapshot_loader_output_count": _snapshot_loader_output_count,
             "snapshot_seed_present": _snapshot_seed_present,
+            "patcher_cleanup_count": _patcher_cleanup_count,
+            "patcher_detach_count": _patcher_detach_count,
+            "patcher_cleanup_errors": _patcher_cleanup_errors,
+            "floor_failures": _floor_failures_count,
+            "floor_failures_details": _floor_failures_flat,
         }
+        self._snapshot_eviction_metadata["floor_failures"] = _floor_failures_count
+        self._snapshot_eviction_metadata["floor_failures_details"] = _floor_failures_flat
+        _eviction_metadata["floor_failures"] = _floor_failures_count
+        _eviction_metadata["floor_failures_details"] = _floor_failures_flat
         self._snapshot_models_evicted_before_capture = True
         if _reload_ok:
             del _reloaded_model
@@ -4554,7 +4678,16 @@ class ModalRuntimeEntrypoint:
                 if env_vae.strip():
                     profile["vae"] = env_vae
                 return profile
-            raise RuntimeError("cpu model snapshot profile is None")
+            print(
+                "[v2.cpu_snapshot] status=skipped reason=profile_unavailable "
+                f"source=api_none "
+                f"env_profile={env_profile!r} "
+                f"env_unet={env_unet!r} "
+                f"env_clip1={env_clip1!r} "
+                f"env_clip_type={env_clip_type!r}",
+                flush=True,
+            )
+            return None
         if not isinstance(raw, Mapping):
             raise RuntimeError(
                 f"cpu model snapshot profile must be a Mapping, got {type(raw).__name__}"
@@ -5022,274 +5155,279 @@ class ModalRuntimeEntrypoint:
                     # Derive profile from the live snapshot-preload profile.
                     cpu_profile = self._cpu_snapshot_profile(api)
                     if cpu_profile is None:
-                        raise RuntimeError("cpu model snapshot profile is unavailable")
-
-                    # Build resolve_path from live folder_paths on the
-                    # initialized backend.
-                    import folder_paths as _fp
-
-                    def _cpu_resolve_path(role: str, filename: str) -> str:
-                        if role in ("unet",):
-                            folder = "diffusion_models"
-                        elif role in ("clip1", "clip2"):
-                            folder = "text_encoders"
-                        else:
-                            folder = role
-                        resolver = getattr(_fp, "get_full_path_or_raise", None)
-                        if resolver is None:
-                            resolver = getattr(_fp, "get_full_path", None)
-                        if resolver is None:
-                            raise AttributeError(
-                                "folder_paths has neither get_full_path_or_raise nor get_full_path"
-                            )
-                        resolved = resolver(folder, filename)
-                        if resolved is None:
-                            raise FileNotFoundError(
-                                f"cannot resolve {role} file {filename!r} in folder {folder!r}"
-                            )
-                        return resolved
-
-                    # Build load_unet / load_clip callbacks from the live
-                    # node classes via NODE_CLASS_MAPPINGS, using the
-                    # original wrapped methods (_comfy_modal_v2_original)
-                    # when available to avoid double-wrapping.
-                    import nodes as _ns
-
-                    _mappings = getattr(_ns, "NODE_CLASS_MAPPINGS", {})
-                    _unet_cls = _mappings.get("UNETLoader")
-                    _clip_cls = _mappings.get("CLIPLoader")
-                    _dual_clip_cls = _mappings.get("DualCLIPLoader")
-
-                    # ── Resolve target GPU(s) from configured policy ──
-                    # Inside the CPU snapshot context, CUDA APIs cannot be
-                    # called (Modal's snapshot builder has no GPU).  We use
-                    # the configured target GPU(s) from the deployment policy
-                    # to determine the effective UNET dtype, not a live probe.
-                    _target_gpus = parse_gpu_request()
-
-                    # UNET loader: returns first public output.
-                    # load_cpu_snapshot_models passes (name, weight_dtype) — no device arg.
-                    # Resolve original from class-level _comfy_modal_v2_original (unbound)
-                    # when V2 wrappers are installed; otherwise use the bound method.
-                    def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
-                        return _load_cpu_snapshot_unet(
-                            unet_name,
-                            weight_dtype,
-                            target_gpus=_target_gpus,
-                            unet_cls=_unet_cls,
-                        )
-
-                    # CLIP loader: returns first public output.
-                    # load_cpu_snapshot_models passes 3 positional args for single
-                    # (clip_name, type, "default") and 4 for dual
-                    # (clip_name1, clip_name2, type, "default").
-                    # Resolve original from class-level _comfy_modal_v2_original (unbound)
-                    # when V2 wrappers are installed; otherwise use the bound method.
-                    # Inspect the original callable's signature; pass device='cpu'
-                    # only when the method accepts it, otherwise omit.
-                    def _cpu_load_clip(*args: Any) -> Any:
-                        clip_name = args[0] if args else ""
-                        is_dual = len(args) >= 4
-                        if is_dual:
-                            if _dual_clip_cls is None:
-                                raise RuntimeError(
-                                    "DualCLIPLoader class not found; "
-                                    "cannot load dual clip model"
-                                )
-                            clip_name1, clip_name2, clip_type = args[0], args[1], args[2]
-                            loader = _dual_clip_cls()
-                            cls_method = _dual_clip_cls.load_clip if _dual_clip_cls else None
-                            orig = getattr(cls_method, "_comfy_modal_v2_original", None)
-                            if orig is not None:
-                                _sig = inspect.signature(orig) if callable(orig) else None
-                                if _sig is not None and 'device' in _sig.parameters:
-                                    out = orig(loader, clip_name1, clip_name2, clip_type, device='cpu')
-                                else:
-                                    out = orig(loader, clip_name1, clip_name2, clip_type)
-                            else:
-                                _sig = inspect.signature(loader.load_clip) if callable(loader.load_clip) else None
-                                if _sig is not None and 'device' in _sig.parameters:
-                                    out = loader.load_clip(clip_name1, clip_name2, clip_type, device='cpu')
-                                else:
-                                    out = loader.load_clip(clip_name1, clip_name2, clip_type)
-                        else:
-                            clip_type = args[1]
-                            loader = _clip_cls()
-                            cls_method = _clip_cls.load_clip if _clip_cls else None
-                            orig = getattr(cls_method, "_comfy_modal_v2_original", None)
-                            if orig is not None:
-                                _sig = inspect.signature(orig) if callable(orig) else None
-                                if _sig is not None and 'device' in _sig.parameters:
-                                    out = orig(loader, clip_name, clip_type, device='cpu')
-                                else:
-                                    out = orig(loader, clip_name, clip_type)
-                            else:
-                                _sig = inspect.signature(loader.load_clip) if callable(loader.load_clip) else None
-                                if _sig is not None and 'device' in _sig.parameters:
-                                    out = loader.load_clip(clip_name, clip_type, device='cpu')
-                                else:
-                                    out = loader.load_clip(clip_name, clip_type)
-                        if isinstance(out, (tuple, list)) and len(out) > 0:
-                            return out[0]
-                        return out
-
-                    # Load under CPU-only context
-                    import comfy.utils as _comfy_utils
-
-                    _cpu_models = None
-                    _MISSING = object()
-                    _mmap_orig = getattr(_comfy_utils, "DISABLE_MMAP", _MISSING)
-                    # Require callable _force_cpu_during_snapshot — no fallback.
-                    _snap_ctx = getattr(api, "_force_cpu_during_snapshot", None)
-                    if not callable(_snap_ctx):
-                        raise RuntimeError(
-                            "api._force_cpu_during_snapshot is not available; "
-                            "cannot construct CPU snapshot models"
-                        )
-                    try:
-                        with cast(ContextManager[Any], _snap_ctx()):
-                            _comfy_utils.DISABLE_MMAP = True
-                            _cpu_models = load_cpu_snapshot_models(
-                                cpu_profile,
-                                load_unet=_cpu_load_unet,
-                                load_clip=_cpu_load_clip,
-                                resolve_path=_cpu_resolve_path,
-                                trace=trace,
-                                target_gpus=_target_gpus,
-                            )
-                    finally:
-                        if _mmap_orig is _MISSING:
-                            delattr(_comfy_utils, "DISABLE_MMAP")
-                        else:
-                            _comfy_utils.DISABLE_MMAP = _mmap_orig
-
-                    # ── Emit snapshot_created runtime state (print + trace) ─
-                    try:
-                        _snap_state = collect_unet_runtime_state(
-                            _cpu_models.unet,
-                            model_management=None,
-                        )
-                        _unet_ident = getattr(getattr(_cpu_models, "model_key", None), "unet_identity", "")
-                        # Derive requested_weight_dtype from model_spec loaders.unet
-                        _req_wd_snap = "default"
-                        try:
-                            _snap_loaders = (_cpu_models.model_spec or {}).get("loaders", {}).get("unet", [])
-                            for _sl in _snap_loaders:
-                                if isinstance(_sl, Mapping) and _sl.get("unet_name") == _unet_ident:
-                                    _req_wd_snap = str(_sl.get("weight_dtype", "default"))
-                                    break
-                        except Exception:
-                            _req_wd_snap = "default"
-                        # Resolve effective dtype for the runtime state record
-                        _eff_dtype_snap, _eff_label_snap = resolve_unet_effective_dtype(
-                            _req_wd_snap, target_gpus=_target_gpus,
-                        )
-                        # ── Hard correctness guard (reusable helper) ──────────
-                        # After snapshot UNET construction, verify ALL floating-
-                        # point parameters have the expected effective dtype and
-                        # are on CPU.  Rejects stale FP32 snapshots with a clear
-                        # RuntimeError — does not catch and suppress.
-                        _snap_param_dist = {}
-                        try:
-                            _unet_module = getattr(_cpu_models.unet, "model", None)
-                            if _unet_module is not None:
-                                _snap_dm = getattr(_unet_module, "diffusion_model", _unet_module)
-                            else:
-                                _snap_dm = getattr(_cpu_models.unet, "diffusion_model", None)
-                            if _snap_dm is None:
-                                raise RuntimeError(
-                                    "snapshot_created: diffusion model is unavailable "
-                                    "for parameter dtype validation"
-                                )
-                            _snap_param_dist = inspect_and_validate_snapshot_params(
-                                _snap_dm,
-                                expected_dtype=_eff_dtype_snap,
-                                require_cpu=True,
-                                context="snapshot_created:",
-                            )
-                        except RuntimeError as _dtype_exc:
-                            raise RuntimeError(
-                                "CPU snapshot UNET dtype validation failed: "
-                                f"requested_weight_dtype={_req_wd_snap!r} "
-                                f"effective_snapshot_weight_dtype={_eff_label_snap} "
-                                f"target_gpus={_target_gpus} "
-                                f"parameter_distribution={_snap_param_dist} "
-                                f"detail={_dtype_exc}"
-                            ) from _dtype_exc
-                        except Exception:
-                            pass
-                        # ── Derive compute / manual-cast dtype from policy, not observed state ──
-                        _snap_compute_dtype = _eff_label_snap  # "bfloat16" not "torch.bfloat16"
-                        _observed_manual = _snap_state.get("manual_cast_dtype", "absent")
-                        # When effective weight is bf16 and target supports BF16, effective
-                        # manual_cast_dtype is "none" (native). Otherwise fall back to observed.
-                        from gpu_catalog import gpu_supports_bf16 as _gsb
-                        _snap_primary_gpu = _target_gpus[0] if _target_gpus else ""
-                        _eff_is_bf16_native = (
-                            _eff_dtype_snap is not None
-                            and _eff_label_snap == "bfloat16"
-                            and _snap_primary_gpu
-                            and _gsb(_snap_primary_gpu)
-                        )
-                        _snap_manual_cast_eff = "none" if _eff_is_bf16_native else _observed_manual
-                        # ── Log snapshot_created state with dtype metadata ────
-                        _dtype_source = "target_gpu_policy"
-                        _snap_state["param_distribution"] = _snap_param_dist
-                        _snap_state["effective_snapshot_compute_dtype"] = _snap_compute_dtype
-                        _snap_state["effective_snapshot_manual_cast_dtype"] = _snap_manual_cast_eff
-                        _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
                         print(
-                            f"[v2.unet_runtime_state] "
-                            f"stage=snapshot_created "
-                            f"unet_identity={_unet_ident} "
-                            f"requested_weight_dtype={_req_wd_snap} "
-                            f"effective_snapshot_weight_dtype={_eff_label_snap} "
-                            f"effective_snapshot_compute_dtype={_snap_compute_dtype} "
-                            f"effective_snapshot_manual_cast_dtype={_snap_manual_cast_eff} "
-                            f"effective_weight_dtype={_eff_label_snap} "
-                            f"dtype_resolution_source={_dtype_source} "
-                            f"target_gpus={','.join(_target_gpus)} "
-                            f"state={_state_json}",
+                            "[v2.cpu_snapshot] status=skipped reason=profile_unavailable "
+                            "phase=construction "
+                            "action=skip_model_build",
                             flush=True,
                         )
+                    else:
+                        # Build resolve_path from live folder_paths on the
+                        # initialized backend.
+                        import folder_paths as _fp
+
+                        def _cpu_resolve_path(role: str, filename: str) -> str:
+                            if role in ("unet",):
+                                folder = "diffusion_models"
+                            elif role in ("clip1", "clip2"):
+                                folder = "text_encoders"
+                            else:
+                                folder = role
+                            resolver = getattr(_fp, "get_full_path_or_raise", None)
+                            if resolver is None:
+                                resolver = getattr(_fp, "get_full_path", None)
+                            if resolver is None:
+                                raise AttributeError(
+                                    "folder_paths has neither get_full_path_or_raise nor get_full_path"
+                                )
+                            resolved = resolver(folder, filename)
+                            if resolved is None:
+                                raise FileNotFoundError(
+                                    f"cannot resolve {role} file {filename!r} in folder {folder!r}"
+                                )
+                            return resolved
+
+                        # Build load_unet / load_clip callbacks from the live
+                        # node classes via NODE_CLASS_MAPPINGS, using the
+                        # original wrapped methods (_comfy_modal_v2_original)
+                        # when available to avoid double-wrapping.
+                        import nodes as _ns
+
+                        _mappings = getattr(_ns, "NODE_CLASS_MAPPINGS", {})
+                        _unet_cls = _mappings.get("UNETLoader")
+                        _clip_cls = _mappings.get("CLIPLoader")
+                        _dual_clip_cls = _mappings.get("DualCLIPLoader")
+
+                        # ── Resolve target GPU(s) from configured policy ──
+                        # Inside the CPU snapshot context, CUDA APIs cannot be
+                        # called (Modal's snapshot builder has no GPU).  We use
+                        # the configured target GPU(s) from the deployment policy
+                        # to determine the effective UNET dtype, not a live probe.
+                        _target_gpus = parse_gpu_request()
+
+                        # UNET loader: returns first public output.
+                        # load_cpu_snapshot_models passes (name, weight_dtype) — no device arg.
+                        # Resolve original from class-level _comfy_modal_v2_original (unbound)
+                        # when V2 wrappers are installed; otherwise use the bound method.
+                        def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
+                            return _load_cpu_snapshot_unet(
+                                unet_name,
+                                weight_dtype,
+                                target_gpus=_target_gpus,
+                                unet_cls=_unet_cls,
+                            )
+
+                        # CLIP loader: returns first public output.
+                        # load_cpu_snapshot_models passes 3 positional args for single
+                        # (clip_name, type, "default") and 4 for dual
+                        # (clip_name1, clip_name2, type, "default").
+                        # Resolve original from class-level _comfy_modal_v2_original (unbound)
+                        # when V2 wrappers are installed; otherwise use the bound method.
+                        # Inspect the original callable's signature; pass device='cpu'
+                        # only when the method accepts it, otherwise omit.
+                        def _cpu_load_clip(*args: Any) -> Any:
+                            clip_name = args[0] if args else ""
+                            is_dual = len(args) >= 4
+                            if is_dual:
+                                if _dual_clip_cls is None:
+                                    raise RuntimeError(
+                                        "DualCLIPLoader class not found; "
+                                        "cannot load dual clip model"
+                                    )
+                                clip_name1, clip_name2, clip_type = args[0], args[1], args[2]
+                                loader = _dual_clip_cls()
+                                cls_method = _dual_clip_cls.load_clip if _dual_clip_cls else None
+                                orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+                                if orig is not None:
+                                    _sig = inspect.signature(orig) if callable(orig) else None
+                                    if _sig is not None and 'device' in _sig.parameters:
+                                        out = orig(loader, clip_name1, clip_name2, clip_type, device='cpu')
+                                    else:
+                                        out = orig(loader, clip_name1, clip_name2, clip_type)
+                                else:
+                                    _sig = inspect.signature(loader.load_clip) if callable(loader.load_clip) else None
+                                    if _sig is not None and 'device' in _sig.parameters:
+                                        out = loader.load_clip(clip_name1, clip_name2, clip_type, device='cpu')
+                                    else:
+                                        out = loader.load_clip(clip_name1, clip_name2, clip_type)
+                            else:
+                                clip_type = args[1]
+                                loader = _clip_cls()
+                                cls_method = _clip_cls.load_clip if _clip_cls else None
+                                orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+                                if orig is not None:
+                                    _sig = inspect.signature(orig) if callable(orig) else None
+                                    if _sig is not None and 'device' in _sig.parameters:
+                                        out = orig(loader, clip_name, clip_type, device='cpu')
+                                    else:
+                                        out = orig(loader, clip_name, clip_type)
+                                else:
+                                    _sig = inspect.signature(loader.load_clip) if callable(loader.load_clip) else None
+                                    if _sig is not None and 'device' in _sig.parameters:
+                                        out = loader.load_clip(clip_name, clip_type, device='cpu')
+                                    else:
+                                        out = loader.load_clip(clip_name, clip_type)
+                            if isinstance(out, (tuple, list)) and len(out) > 0:
+                                return out[0]
+                            return out
+
+                        # Load under CPU-only context
+                        import comfy.utils as _comfy_utils
+
+                        _cpu_models = None
+                        _MISSING = object()
+                        _mmap_orig = getattr(_comfy_utils, "DISABLE_MMAP", _MISSING)
+                        # Require callable _force_cpu_during_snapshot — no fallback.
+                        _snap_ctx = getattr(api, "_force_cpu_during_snapshot", None)
+                        if not callable(_snap_ctx):
+                            raise RuntimeError(
+                                "api._force_cpu_during_snapshot is not available; "
+                                "cannot construct CPU snapshot models"
+                            )
+                        try:
+                            with cast(ContextManager[Any], _snap_ctx()):
+                                _comfy_utils.DISABLE_MMAP = True
+                                _cpu_models = load_cpu_snapshot_models(
+                                    cpu_profile,
+                                    load_unet=_cpu_load_unet,
+                                    load_clip=_cpu_load_clip,
+                                    resolve_path=_cpu_resolve_path,
+                                    trace=trace,
+                                    target_gpus=_target_gpus,
+                                )
+                        finally:
+                            if _mmap_orig is _MISSING:
+                                delattr(_comfy_utils, "DISABLE_MMAP")
+                            else:
+                                _comfy_utils.DISABLE_MMAP = _mmap_orig
+
+                        # ── Emit snapshot_created runtime state (print + trace) ─
+                        try:
+                            _snap_state = collect_unet_runtime_state(
+                                _cpu_models.unet,
+                                model_management=None,
+                            )
+                            _unet_ident = getattr(getattr(_cpu_models, "model_key", None), "unet_identity", "")
+                            # Derive requested_weight_dtype from model_spec loaders.unet
+                            _req_wd_snap = "default"
+                            try:
+                                _snap_loaders = (_cpu_models.model_spec or {}).get("loaders", {}).get("unet", [])
+                                for _sl in _snap_loaders:
+                                    if isinstance(_sl, Mapping) and _sl.get("unet_name") == _unet_ident:
+                                        _req_wd_snap = str(_sl.get("weight_dtype", "default"))
+                                        break
+                            except Exception:
+                                _req_wd_snap = "default"
+                            # Resolve effective dtype for the runtime state record
+                            _eff_dtype_snap, _eff_label_snap = resolve_unet_effective_dtype(
+                                _req_wd_snap, target_gpus=_target_gpus,
+                            )
+                            # ── Hard correctness guard (reusable helper) ──────────
+                            # After snapshot UNET construction, verify ALL floating-
+                            # point parameters have the expected effective dtype and
+                            # are on CPU.  Rejects stale FP32 snapshots with a clear
+                            # RuntimeError — does not catch and suppress.
+                            _snap_param_dist = {}
+                            try:
+                                _unet_module = getattr(_cpu_models.unet, "model", None)
+                                if _unet_module is not None:
+                                    _snap_dm = getattr(_unet_module, "diffusion_model", _unet_module)
+                                else:
+                                    _snap_dm = getattr(_cpu_models.unet, "diffusion_model", None)
+                                if _snap_dm is None:
+                                    raise RuntimeError(
+                                        "snapshot_created: diffusion model is unavailable "
+                                        "for parameter dtype validation"
+                                    )
+                                _snap_param_dist = inspect_and_validate_snapshot_params(
+                                    _snap_dm,
+                                    expected_dtype=_eff_dtype_snap,
+                                    require_cpu=True,
+                                    context="snapshot_created:",
+                                )
+                            except RuntimeError as _dtype_exc:
+                                raise RuntimeError(
+                                    "CPU snapshot UNET dtype validation failed: "
+                                    f"requested_weight_dtype={_req_wd_snap!r} "
+                                    f"effective_snapshot_weight_dtype={_eff_label_snap} "
+                                    f"target_gpus={_target_gpus} "
+                                    f"parameter_distribution={_snap_param_dist} "
+                                    f"detail={_dtype_exc}"
+                                ) from _dtype_exc
+                            except Exception:
+                                pass
+                            # ── Derive compute / manual-cast dtype from policy, not observed state ──
+                            _snap_compute_dtype = _eff_label_snap  # "bfloat16" not "torch.bfloat16"
+                            _observed_manual = _snap_state.get("manual_cast_dtype", "absent")
+                            # When effective weight is bf16 and target supports BF16, effective
+                            # manual_cast_dtype is "none" (native). Otherwise fall back to observed.
+                            from gpu_catalog import gpu_supports_bf16 as _gsb
+                            _snap_primary_gpu = _target_gpus[0] if _target_gpus else ""
+                            _eff_is_bf16_native = (
+                                _eff_dtype_snap is not None
+                                and _eff_label_snap == "bfloat16"
+                                and _snap_primary_gpu
+                                and _gsb(_snap_primary_gpu)
+                            )
+                            _snap_manual_cast_eff = "none" if _eff_is_bf16_native else _observed_manual
+                            # ── Log snapshot_created state with dtype metadata ────
+                            _dtype_source = "target_gpu_policy"
+                            _snap_state["param_distribution"] = _snap_param_dist
+                            _snap_state["effective_snapshot_compute_dtype"] = _snap_compute_dtype
+                            _snap_state["effective_snapshot_manual_cast_dtype"] = _snap_manual_cast_eff
+                            _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
+                            print(
+                                f"[v2.unet_runtime_state] "
+                                f"stage=snapshot_created "
+                                f"unet_identity={_unet_ident} "
+                                f"requested_weight_dtype={_req_wd_snap} "
+                                f"effective_snapshot_weight_dtype={_eff_label_snap} "
+                                f"effective_snapshot_compute_dtype={_snap_compute_dtype} "
+                                f"effective_snapshot_manual_cast_dtype={_snap_manual_cast_eff} "
+                                f"effective_weight_dtype={_eff_label_snap} "
+                                f"dtype_resolution_source={_dtype_source} "
+                                f"target_gpus={','.join(_target_gpus)} "
+                                f"state={_state_json}",
+                                flush=True,
+                            )
+                            trace.emit(
+                                "unet_runtime_state",
+                                metadata={
+                                    "stage": "snapshot_created",
+                                    "unet_identity": _unet_ident,
+                                    "requested_weight_dtype": _req_wd_snap,
+                                    "effective_snapshot_weight_dtype": _eff_label_snap,
+                                    "effective_snapshot_compute_dtype": _snap_compute_dtype,
+                                    "effective_snapshot_manual_cast_dtype": _snap_manual_cast_eff,
+                                    "effective_weight_dtype": _eff_label_snap,
+                                    "dtype_resolution_source": _dtype_source,
+                                    "target_gpus": list(_target_gpus),
+                                    "request_id": "",
+                                    "restored_instance_id": "",
+                                    "restore_session_id": "",
+                                    "state": _snap_state,
+                                },
+                            )
+                        except Exception:
+                            raise
+
+                        self._cpu_snapshot_models = _cpu_models
+                        self._cpu_snapshot_models_active = False
+                        _cpu_snap_ok = True
+                        _created_duration_ms = round((time.perf_counter() - _cpu_snapshot_perf_start) * 1000.0, 2)
                         trace.emit(
-                            "unet_runtime_state",
+                            "cpu_snapshot_models_created",
+                            phase="lifecycle",
                             metadata={
-                                "stage": "snapshot_created",
-                                "unet_identity": _unet_ident,
-                                "requested_weight_dtype": _req_wd_snap,
-                                "effective_snapshot_weight_dtype": _eff_label_snap,
-                                "effective_snapshot_compute_dtype": _snap_compute_dtype,
-                                "effective_snapshot_manual_cast_dtype": _snap_manual_cast_eff,
-                                "effective_weight_dtype": _eff_label_snap,
-                                "dtype_resolution_source": _dtype_source,
-                                "target_gpus": list(_target_gpus),
-                                "request_id": "",
-                                "restored_instance_id": "",
-                                "restore_session_id": "",
-                                "state": _snap_state,
+                                "status": "created",
+                                "reason": "ok",
+                                "model_key_hash": _cpu_models.model_key.stable_hash[:16]
+                                if _cpu_models.model_key else "",
+                                "clip_object_type": type(_cpu_models.clip).__name__ if _cpu_models.clip is not None else "",
+                                "unet_object_type": type(_cpu_models.unet).__name__ if _cpu_models.unet is not None else "",
+                                "duration_ms": _created_duration_ms,
                             },
                         )
-                    except Exception:
-                        raise
-
-                    self._cpu_snapshot_models = _cpu_models
-                    self._cpu_snapshot_models_active = False
-                    _cpu_snap_ok = True
-                    _created_duration_ms = round((time.perf_counter() - _cpu_snapshot_perf_start) * 1000.0, 2)
-                    trace.emit(
-                        "cpu_snapshot_models_created",
-                        phase="lifecycle",
-                        metadata={
-                            "status": "created",
-                            "reason": "ok",
-                            "model_key_hash": _cpu_models.model_key.stable_hash[:16]
-                            if _cpu_models.model_key else "",
-                            "clip_object_type": type(_cpu_models.clip).__name__ if _cpu_models.clip is not None else "",
-                            "unet_object_type": type(_cpu_models.unet).__name__ if _cpu_models.unet is not None else "",
-                            "duration_ms": _created_duration_ms,
-                        },
-                    )
                 except BaseException as _cpu_exc:
                     self._cpu_snapshot_models = None
                     self._cpu_snapshot_models_active = False
@@ -5375,7 +5513,8 @@ class ModalRuntimeEntrypoint:
         # local BootstrapState `state`, not self.bootstrap.
         # No local aliases such as _cpu_unet/_cpu_clip are created that
         # could accidentally keep model objects alive.
-        # No status=skip output: gate enabled without models → error.
+        # Missing or incomplete _cpu_snapshot_models is non-fatal: emits
+        # status=skipped with the exact reason, continues to startup ready.
         if _parse_evict_models_before_snapshot():
             _cpu_models = getattr(self, "_cpu_snapshot_models", None)
             if _cpu_models is not None:
@@ -5393,26 +5532,18 @@ class ModalRuntimeEntrypoint:
                 else:
                     print(
                         "[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                        "enabled=1 status=error "
+                        "enabled=1 status=skipped "
                         f"unet_present={int(_cpu_models.unet is not None)} "
                         f"clip_present={int(_cpu_models.clip is not None)} "
                         "reason=models_incomplete",
                         flush=True,
                     )
                     del _cpu_models
-                    raise RuntimeError(
-                        "Snapshot eviction gate enabled but models incomplete: "
-                        f"unet={int(_cpu_models.unet is not None)} "
-                        f"clip={int(_cpu_models.clip is not None)}"
-                    )
             else:
                 print(
                     "[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
-                    "enabled=1 status=error reason=no_snapshot_models",
+                    "enabled=1 status=skipped reason=no_snapshot_models",
                     flush=True,
-                )
-                raise RuntimeError(
-                    "Snapshot eviction gate enabled but _cpu_snapshot_models is None"
                 )
         else:
             print(

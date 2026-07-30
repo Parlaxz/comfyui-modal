@@ -230,12 +230,13 @@ class CpuSnapshotProfileTests(unittest.TestCase):
         result = entrypoint._cpu_snapshot_profile(api)
         self.assertEqual(result.get("clip2"), "clip_g.safetensors")
 
-    def test_rejects_none_profile(self):
+    def test_returns_none_when_profile_none_and_no_env(self):
+        """None API profile with no valid env vars returns None (non-fatal)."""
         entrypoint = ModalRuntimeEntrypoint()
         api = self._make_api(None)
-        with self.assertRaises(RuntimeError) as ctx:
-            entrypoint._cpu_snapshot_profile(api)
-        self.assertIn("None", str(ctx.exception))
+        with patch.dict(os.environ, {}, clear=True):
+            result = entrypoint._cpu_snapshot_profile(api)
+        self.assertIsNone(result)
 
     def test_rejects_non_mapping_profile(self):
         entrypoint = ModalRuntimeEntrypoint()
@@ -287,15 +288,14 @@ class CpuSnapshotProfileTests(unittest.TestCase):
         self.assertEqual(result.get("clip_type"), "flux")
         self.assertNotIn("clip2", result)
 
-    def test_still_rejects_none_profile_when_no_env(self):
-        """Without valid COMFYMODAL_WARMUP_* env vars, None API profile still
-        raises RuntimeError (existing behavior preserved)."""
+    def test_returns_none_when_none_profile_and_no_env_still(self):
+        """Without valid COMFYMODAL_WARMUP_* env vars, None API profile returns
+        None with a diagnostic (non-fatal skip, not a crash)."""
         entrypoint = ModalRuntimeEntrypoint()
         api = self._make_api(None)
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(RuntimeError) as ctx:
-                entrypoint._cpu_snapshot_profile(api)
-        self.assertIn("None", str(ctx.exception))
+            result = entrypoint._cpu_snapshot_profile(api)
+        self.assertIsNone(result)
 
 
 # ── Bridge activation tests ──────────────────────────────────────────────

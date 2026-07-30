@@ -2168,6 +2168,125 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
         self.assertIn("dtype mismatch", str(ctx.exception).lower())
 
 
+# ── AimDO disablement regression tests ────────────────────────────────
+
+
+class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
+    """comfy.memory_management.aimdo_enabled must be False during snapshot
+    UNET load and restored after success/exception."""
+
+    def _make_fake_memory_management(self):
+        import types
+        mm = types.ModuleType("comfy.memory_management")
+        mm.aimdo_enabled = True
+        return mm
+
+    def _make_fake_sd_and_folder_paths(self):
+        import types
+        import torch
+        fake_sd = types.ModuleType("comfy.sd")
+        fake_fp = types.ModuleType("folder_paths")
+
+        class _ValidPatcher:
+            def __init__(self):
+                self.model = _FakeManualCastModule(
+                    manual_cast_dtype=None, params_dtype="torch.bfloat16"
+                )
+                self.load_device = "cpu"
+                self.offload_device = "cpu"
+            def model_dtype(self):
+                return torch.bfloat16
+            def parameters(self, recurse=True):
+                return self.model.parameters(recurse)
+            def named_parameters(self, recurse=True):
+                return iter([])
+            def named_buffers(self, recurse=True):
+                return iter([])
+
+        fake_sd.load_diffusion_model = lambda path, *, model_options: _ValidPatcher()
+        fake_fp.get_full_path_or_raise = lambda category, name: f"/models/{category}/{name}"
+        return fake_sd, fake_fp
+
+    def test_aimdo_disabled_during_load_and_restored_after_success(self):
+        """AimDO flag is False during snapshot UNET load and restored after success."""
+        import sys
+        from unittest.mock import patch
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        mm = self._make_fake_memory_management()
+        fake_sd, fake_fp = self._make_fake_sd_and_folder_paths()
+        aimdo_values = []
+        original_load = fake_sd.load_diffusion_model
+        def tracking_load(path, *, model_options):
+            aimdo_values.append(mm.aimdo_enabled)
+            return original_load(path, model_options=model_options)
+        fake_sd.load_diffusion_model = tracking_load
+
+        with patch.dict(sys.modules, {
+            "comfy.memory_management": mm,
+            "comfy.sd": fake_sd,
+            "folder_paths": fake_fp,
+        }):
+            self.assertTrue(mm.aimdo_enabled)
+            result = _load_cpu_snapshot_unet(
+                "model.safetensors", "default",
+                target_gpus=("T4",), unet_cls=None,
+            )
+            self.assertIsNotNone(result)
+            self.assertFalse(aimdo_values[0], "aimdo_enabled must be False during UNET load")
+            self.assertTrue(mm.aimdo_enabled, "aimdo_enabled must be restored after load")
+
+    def test_aimdo_restored_after_exception(self):
+        """AimDO flag is restored to original value even after exception."""
+        import sys
+        from unittest.mock import patch
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        mm = self._make_fake_memory_management()
+        fake_sd, fake_fp = self._make_fake_sd_and_folder_paths()
+        fake_sd.load_diffusion_model = lambda path, *, model_options: (
+            (_ for _ in ()).throw(RuntimeError("load failed"))
+        )
+
+        with patch.dict(sys.modules, {
+            "comfy.memory_management": mm,
+            "comfy.sd": fake_sd,
+            "folder_paths": fake_fp,
+        }):
+            self.assertTrue(mm.aimdo_enabled)
+            with self.assertRaises(RuntimeError):
+                _load_cpu_snapshot_unet(
+                    "model.safetensors", "default",
+                    target_gpus=("T4",), unet_cls=None,
+                )
+            self.assertTrue(mm.aimdo_enabled,
+                            "aimdo_enabled must be restored after exception")
+
+    def test_aimdo_original_value_not_tampered(self):
+        """AimDO original value is not permanently changed."""
+        import sys
+        from unittest.mock import patch
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        mm = self._make_fake_memory_management()
+        mm.aimdo_enabled = "custom_value"
+        fake_sd, fake_fp = self._make_fake_sd_and_folder_paths()
+
+        with patch.dict(sys.modules, {
+            "comfy.memory_management": mm,
+            "comfy.sd": fake_sd,
+            "folder_paths": fake_fp,
+        }):
+            self.assertEqual(mm.aimdo_enabled, "custom_value")
+            result = _load_cpu_snapshot_unet(
+                "model.safetensors", "default",
+                target_gpus=("T4",), unet_cls=None,
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(mm.aimdo_enabled, "custom_value",
+                             "non-bool aimdo value must be preserved")
+
+
 # ── BF16-native validation tests ──────────────────────────────────────
 
 
