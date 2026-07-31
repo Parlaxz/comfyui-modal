@@ -87,13 +87,11 @@ class ModalTransport:
         *,
         prompt_stream_fn: Callable[..., Any] | None = None,
         checkpoint_stream_fn: Callable[..., Any] | None = None,
-        restore_plan_fn: Callable[..., Any] | None = None,
         v2_handle_factory: Callable[..., Any] | None = None,
         handle_cache: HandleCache | None = None,
     ) -> None:
         self.prompt_stream_fn = prompt_stream_fn
         self.checkpoint_stream_fn = checkpoint_stream_fn
-        self.restore_plan_fn = restore_plan_fn
         self.v2_handle_factory = v2_handle_factory
         self.handle_cache = handle_cache or _SHARED_HANDLE_CACHE
 
@@ -124,30 +122,6 @@ class ModalTransport:
         if env:
             return env.strip()
         return ""
-
-    async def _call_publish_with_spawn(
-        self, target: Any, payload: dict[str, Any],
-    ) -> Any:
-        """Shared async helper: spawn the Modal call, wait with bounded timeout.
-
-        Uses ``target.spawn.aio(payload)`` then ``call.get.aio(timeout=180)``.
-        On ``asyncio.TimeoutError`` cancels the Modal container and raises
-        ``TransportError``.  On ``asyncio.CancelledError`` cancels the Modal
-        container then re-raises.  Other exceptions are wrapped in
-        ``TransportError``.  Never logs payload contents or credentials.
-        """
-        _PUBLISH_TIMEOUT = 180
-        call = await target.spawn.aio(payload)
-        try:
-            return await call.get.aio(timeout=_PUBLISH_TIMEOUT)
-        except asyncio.TimeoutError:
-            await call.cancel.aio(terminate_containers=True)
-            raise TransportError("v2 RestorePlan publication timed out after 180s")
-        except asyncio.CancelledError:
-            await call.cancel.aio(terminate_containers=True)
-            raise
-        except Exception as exc:
-            raise TransportError(f"v2 RestorePlan publication failed: {exc}") from exc
 
     @staticmethod
     def _gpu_cache_key(gpu: Any) -> tuple[str, ...]:
@@ -610,71 +584,3 @@ class ModalTransport:
             result = await stream if inspect.isawaitable(stream) else stream
             if isinstance(result, dict):
                 yield {"type": "result", "data": result}
-
-    async def publish_restore_plan(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        workspace: dict[str, Any] | None = None,
-        runtime_trace: RuntimeTrace | None = None,
-    ) -> Any:
-        fn = self.restore_plan_fn
-        if fn is not None:
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_custom_fn", phase="local")
-            result = fn(dict(payload), workspace=workspace)
-            return await result if inspect.isawaitable(result) else result
-        if self.v2_handle_factory is not None:
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_lookup_start", phase="local",
-                                   metadata={"method": "v2_handle_factory"})
-            handle = self._v2_handle(workspace=workspace, gpu=None)
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_lookup_end", phase="local")
-                runtime_trace.emit("restore_publish_call_start", phase="local")
-            pub_result = await self._call_publish_with_spawn(
-                handle.publish_restore_plan, dict(payload),
-            )
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_call_end", phase="local",
-                                   metadata={"generation": str(pub_result)})
-            return pub_result
-        if _modal is None:
-            raise TransportError("Modal SDK is unavailable for the v2 transport")
-        if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
-            raise TransportError("v2 transport requires an active Modal workspace with credentials")
-        app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
-        workspace_id = str(workspace.get("id", "default"))
-        environment = self._resolve_environment()
-        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", environment=environment)
-        function = self.handle_cache.get(key)
-        if function is None:
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_lookup_start", phase="local",
-                                   metadata={"method": "direct_sdk"})
-            try:
-                def _do_lookup():
-                    c = _modal.Client.from_credentials(
-                        workspace["token_id"], workspace["token_secret"],
-                    )
-                    return _modal.Function.from_name(
-                        app_name, "publish_restore_plan_remote", client=c,
-                        environment_name=environment or None,
-                    )
-                function = await asyncio.to_thread(_do_lookup)
-            except Exception as exc:
-                raise TransportError(f"v2 RestorePlan publisher lookup failed: {exc}") from exc
-            self.handle_cache.put(key, function)
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_lookup_end", phase="local")
-        else:
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_cache_hit", phase="local")
-        if runtime_trace is not None:
-            runtime_trace.emit("restore_publish_call_start", phase="local",
-                               metadata={"payload_bytes": len(str(payload))})
-        pub_result = await self._call_publish_with_spawn(function, dict(payload))
-        if runtime_trace is not None:
-            runtime_trace.emit("restore_publish_call_end", phase="local",
-                               metadata={"generation": str(pub_result)})
-        return pub_result

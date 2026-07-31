@@ -31,7 +31,7 @@ from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU
 
 from .contracts import DeploymentIdentity, ExecutionPlan, ModelRestoreKey, RestorePlan, _thaw, stable_hash
 from .deployment_spec import build_deployment_identity
-from .restore_plan import RestorePlanPublisher, build_restore_model_spec, derive_model_key, derive_prefill_key
+from .restore_plan import build_restore_model_spec, derive_model_key, derive_prefill_key
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import (
     ExecutionContext,
@@ -197,12 +197,10 @@ RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "c
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
-V2_RESTORE_STATE_FILE = "v2_restore_plan.json"
 PROFILE_VOLUME_NAME = os.environ.get("COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles")
 PROFILE_PATH = "/mnt/comfymodal_profiles"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
-_PUBLISHER_MARKER = "COMFYMODAL_PUBLISHER_CONTAINER"
 CLASS_NAME = "ModalRuntimeEntrypoint"
 # Process-local restore-stage timer accumulator.
 # Populated by _wrap_restore_stage wrappers in _configure_runtime, consumed by
@@ -1763,7 +1761,6 @@ def _snapshot_target_fingerprint(
         "restore": {"enter": True, "snap": False},
         "run_plan_stream": {"method": True, "is_generator": True},
         "run_prompt_stream": {"method": True, "is_generator": True},
-        "publish_restore_plan": {"method": True, "is_generator": False},
         "read_output_asset": {"method": True, "is_generator": False},
         "run_checkpoint_stream": {"method": True, "is_generator": True},
     }
@@ -2108,21 +2105,6 @@ def _reference_image() -> Any:
 def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     """Build the actual v2 app, image, Volumes, and source identity."""
     runtime_spec = spec or ModalRuntimeSpec()
-    # Lightweight container path: standalone publisher never needs
-    # custom_nodes_root, deployment identity, reference image, or
-    # Modal volume/app handles.  Return null resources immediately.
-    if os.environ.get(_PUBLISHER_MARKER) == "1":
-        print("[comfymodal] publisher_container=1 skipping heavyweight resource construction", flush=True)
-        return {
-            "app": None,
-            "image": None,
-            "models_volume": None,
-            "custom_nodes_volume": None,
-            "runtime_state_volume": None,
-            "profile_volume": None,
-            "source_identity": None,
-            "spec": runtime_spec,
-        }
     runtime_root = Path(__file__).resolve().parent
     custom_root = _local_custom_nodes_root()
     identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
@@ -3439,7 +3421,6 @@ class ModalRuntimeEntrypoint:
         self._legacy_api: Any | None = None
         self._runtime_configured = False
         self._restore_plan: RestorePlan | None = None
-        self._restore_publisher: RestorePlanPublisher | None = None
         self._preload_bridge = V2LoaderBridge()
         self._lifecycle_trace: RuntimeTrace | None = None
         # Stable module-level identity so snapshot boundaries cannot erase identity.
@@ -3497,18 +3478,6 @@ class ModalRuntimeEntrypoint:
             self._lifecycle_trace = trace
         elif self._lifecycle_trace is not trace:
             self._lifecycle_trace.extend(trace.events)
-
-    def _get_remote_restore_publisher(self) -> RestorePlanPublisher:
-        if self._restore_publisher is not None:
-            return self._restore_publisher
-        resources = globals().get("_MODAL_RESOURCES", {})
-        modal_volume = resources.get("runtime_state_volume")
-        if modal_volume is None:
-            raise RuntimeError("v2 runtime-state Modal Volume is not mounted")
-        volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
-        coordinator = CommitCoordinator(volume, state_path=V2_RESTORE_STATE_FILE)
-        self._restore_publisher = RestorePlanPublisher(coordinator)
-        return self._restore_publisher
 
     def _join_legacy_background_threads(self, api: Any, *, join_timeout: float = 30.0) -> int:
         """Join remaining alive threads in the legacy API's ``_actual_load_futures``.
@@ -5061,87 +5030,9 @@ class ModalRuntimeEntrypoint:
                     self._legacy_api,
                 )
 
-            # ── V2 snapshot certificate: build from RestorePlan ──
-            # Reads snapshot_plan via read_current_plan(), requires nonempty
-            # snapshot_plan.workflow_hash, derives repair mode from the exact
-            # production execution options in the plan, gets custom_nodes_generation
-            # via _get_preflight_context, computes identity via
-            # _compute_v2_cert_identity, runs real api preflight then
-            # execution.validate_prompt via one-shot sync coroutine helper.
-            # Stores exact certificate on bootstrap state, valid true.
-            snapshot_plan = None
-            try:
-                snapshot_plan = self._get_remote_restore_publisher().read_current_plan()
-            except Exception:
-                pass
-            # Exact guard: if snapshot_plan has workflow_hash but no workflow,
-            # the plan is corrupt and cannot build a certificate.  This guard
-            # is OUTSIDE the cert try/except so RuntimeError escapes startup
-            # and snapshot creation stops.
-            if snapshot_plan is not None and snapshot_plan.workflow_hash and not snapshot_plan.workflow:
-                raise RuntimeError("restore plan contains workflow_hash but no workflow")
-            try:
-                if snapshot_plan is not None and snapshot_plan.workflow_hash:
-                    _sp_wf = _thaw(snapshot_plan.workflow)
-                    _sp_wf_hash = snapshot_plan.workflow_hash
-                    _sp_api = self._load_legacy_runtime()
-                    # Derive repair_mode from the SAME _get_preflight_context
-                    # helper used by _execute_v2_prompt_executor — not from
-                    # plan fields (which request execution does not use).
-                    _sp_repair_mode, _sp_cn_gen, _sp_cn_src = _get_preflight_context(
-                        _sp_api, self._legacy_module,
-                    )
-                    _sp_identity, _sp_components = _compute_v2_cert_identity(
-                        _sp_wf_hash,
-                        repair_mode=_sp_repair_mode,
-                        custom_nodes_generation=_sp_cn_gen,
-                    )
-                    import execution as _exec_mod
-
-                    async def _build_startup_cert():
-                        _pf_fn = getattr(_sp_api, "_preflight_before_prompt_execution", None)
-                        if callable(_pf_fn):
-                            await asyncio.to_thread(_pf_fn, _sp_wf if _sp_wf else {})
-                        return await _exec_mod.validate_prompt(
-                            f"startup-cert-{uuid.uuid4().hex[:12]}",
-                            _sp_wf if _sp_wf else {},
-                            None,
-                        )
-
-                    _sp_valid, _sp_error, _sp_outputs, _sp_errors = asyncio.run(
-                        _build_startup_cert()
-                    )
-                    if (
-                        _sp_valid
-                        and isinstance(_sp_outputs, list)
-                        and len(_sp_outputs) > 0
-                        and all(isinstance(o, str) for o in _sp_outputs)
-                        and len(set(_sp_outputs)) == len(_sp_outputs)
-                        and isinstance(_sp_errors, dict)
-                    ):
-                        _sp_payload = {
-                            "schema_version": _V2_CERT_SCHEMA_VERSION,
-                            "identity": _sp_identity,
-                            "identity_components": dict(_sp_components),
-                            "cert_identity": _sp_identity,
-                            "outputs_to_execute": list(_sp_outputs),
-                            "node_errors": dict(_sp_errors),
-                            "preflight_ok": True,
-                            "runtime_generation": state.runtime_generation,
-                            "custom_nodes_generation": _sp_cn_gen,
-                            "cert_hash": _sp_identity[:32],
-                            "deployment_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
-                            "created_at": time.time(),
-                        }
-                        state.set_snapshot_certificate(_sp_payload)
-                        print(
-                            f"[v2.cert] startup cert v2 valid=1 "
-                            f"identity={_sp_identity[:16]} "
-                            f"outputs={len(_sp_outputs)}",
-                            flush=True,
-                        )
-            except Exception as _sp_exc:
-                print(f"[v2.cert] startup cert build skipped: {_sp_exc}", flush=True)
+            # Request-specific startup certificates are no longer built from a
+            # shared current plan.  The actual request validates its workflow
+            # inside run_plan_stream with the submitted ExecutionPlan.
 
             # Plan C: CPU model snapshot construction
             if _cpu_model_snapshot_enabled():
@@ -5929,23 +5820,10 @@ class ModalRuntimeEntrypoint:
                 metadata=_resource_identity(),
             )
             trace.emit("remote_lifecycle_start", phase="restore", metadata={"snapshot": "False"})
-            trace.emit("restore_plan_read_start", phase="restore")
-            try:
-                self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
-                trace.emit(
-                    "restore_plan_read_end",
-                    phase="restore",
-                    metadata={
-                        "status": "found" if self._restore_plan else "absent",
-                        "generation": str(self._restore_plan.generation if self._restore_plan else ""),
-                    },
-                )
-            except Exception as exc:
-                trace.emit(
-                    "restore_plan_read_end",
-                    phase="restore",
-                    metadata={"status": "error", "error": str(exc)[:200]},
-                )
+            # Request-specific model, workflow, prefill, and output decisions
+            # arrive with run_plan_stream.  Restore is snapshot/lifecycle-only;
+            # it never reads a globally shared current plan.
+            self._restore_plan = None
             _lifecycle_error: str | None = None
             try:
                 # Clear process-local caches from previous restore cycle
@@ -10330,16 +10208,6 @@ class ModalRuntimeEntrypoint:
         async for event in self.run_plan_stream(plan_dict):
             yield event
 
-    async def publish_restore_plan(self, plan_payload: Mapping[str, Any]) -> dict[str, Any]:
-        identity = _capture_remote_identity()
-        plan = RestorePlan.from_dict(plan_payload)
-        # Use async commit path in async context
-        result = await _publish_restore_plan_impl_async(plan)
-        authoritative = await self._get_remote_restore_publisher().read_current_plan_async()
-        self._restore_plan = authoritative or plan
-        result.setdefault("identity", {}).update(identity)
-        return result
-
     async def run_checkpoint_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
         if self.checkpoint_runner is None:
             yield {"type": "error", "message": "checkpoint compatibility runner is not configured"}
@@ -10397,7 +10265,6 @@ def _build_decorated_v2_class() -> type:
         self._legacy_api = None
         self._runtime_configured = False
         self._restore_plan = None
-        self._restore_publisher = None
         self._preload_bridge = V2LoaderBridge()
         self._lifecycle_trace = None
         self.container_session_id = _V2_CONTAINER_SESSION_ID
@@ -10422,7 +10289,7 @@ def _build_decorated_v2_class() -> type:
     _METHODS_TO_WRAP = (
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
-        "publish_restore_plan", "read_output_asset", "run_checkpoint_stream",
+        "read_output_asset", "run_checkpoint_stream",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -10455,7 +10322,6 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "restore", _modal.enter(snap=False)(cls.restore))
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
-    setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     return cls
@@ -10615,7 +10481,7 @@ async def _publish_restore_plan_impl_async(plan: RestorePlan) -> dict[str, Any]:
     return result
 
 
-def publish_restore_plan_remote(plan_payload: Mapping[str, Any]) -> dict[str, Any]:
+def _removed_publish_restore_plan_remote(plan_payload: Mapping[str, Any]) -> dict[str, Any]:
     """Publish before GPU class lookup so the next snap=False sees the plan."""
     _t0 = time.perf_counter()
     print("[publish_restore_plan] entry", flush=True)
@@ -10678,19 +10544,3 @@ ModalRuntimeEntrypointRemote = _register_remote_entrypoint(
     _MODAL_RESOURCES,
     _MODAL_RESOURCES["spec"],
 )
-if _modal is not None and _MODAL_RESOURCES.get("app") is not None:
-    publish_restore_plan_remote = _MODAL_RESOURCES["app"].function(
-        image=_MODAL_RESOURCES["image"],
-        cpu=2,
-        memory=4096,
-        timeout=300,
-        startup_timeout=120,
-        retries=0,
-        env={_PUBLISHER_MARKER: "1"},
-        min_containers=MIN_CONTAINERS,
-        max_containers=1,
-        scaledown_window=SCALEDOWN_WINDOW,
-        volumes={
-            _MODAL_RESOURCES["spec"].runtime_state_path: _MODAL_RESOURCES["runtime_state_volume"],
-        },
-    )(publish_restore_plan_remote)
