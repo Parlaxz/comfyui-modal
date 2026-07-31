@@ -441,7 +441,7 @@ export function renderHistory(state, context) {
   };
   var previewRun = null;
   var previewController = null;
-  var groupExperiments = false;
+  var groupExperiments = true;
   var totalCount = 0;
   var _COLUMNS_KEY = "comfymodal-studio-history-columns";
   var columnCount = parseInt(localStorage.getItem(_COLUMNS_KEY), 10) || 6;
@@ -1067,7 +1067,10 @@ export function renderHistory(state, context) {
     fragment.appendChild(gallery);
 
     // Render cards into gallery (with optional experiment grouping)
-    if (groupExperiments) {
+    const hasMultiCellExperiment = normalizedItems.some(function (nr) {
+      return !!nr.experimentId;
+    });
+    if (groupExperiments || hasMultiCellExperiment) {
       // Group by stable experiment_id (empty/none stays individual)
       var groups = {};
       normalizedItems.forEach(function (nr) {
@@ -1080,8 +1083,7 @@ export function renderHistory(state, context) {
       groupIds.forEach(function (eid) {
         var members = groups[eid];
         if (eid && members.length > 1) {
-          // Multi-run experiment: render as grouped tile
-          var groupCard = renderGroup(eid, members, apiBase, openPreview, columnCount);
+          var groupCard = renderExperimentTile(eid, members, apiBase, context, state);
           gallery.appendChild(groupCard);
           if (cardIndex === 0 && typeof performance !== "undefined" && performance.mark) {
             performance.mark("history-first-card");
