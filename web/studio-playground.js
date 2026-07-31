@@ -409,9 +409,10 @@ let _recentRunsCacheKey = "";
 export async function refreshRecentRuns(apiBase) {
   try {
     // Fetch ordinary runs AND true Studio aggregate experiments in parallel
-    var [runResp, expResp] = await Promise.all([
+    var [runResp, expResp, unifiedResp] = await Promise.all([
       fetch(apiBase + "/run-history?limit=50"),
       fetch(apiBase + "/experiments"),
+      fetch(apiBase + "/history?page=1&page_size=50"),
     ]);
 
     // ── Process ordinary runs ───────────────────────────────────────────
@@ -419,6 +420,10 @@ export async function refreshRecentRuns(apiBase) {
     if (runResp && runResp.ok) {
       var data = await runResp.json();
       var entries = (data && data.runs) || [];
+      if (unifiedResp && unifiedResp.ok) {
+        var unifiedData = await unifiedResp.json();
+        entries = entries.concat((unifiedData && unifiedData.items) || []);
+      }
       // Filter to Studio runs
       var studioRuns = entries.filter(function (r) {
         var extra = (r && r.extra) || {};
@@ -431,7 +436,9 @@ export async function refreshRecentRuns(apiBase) {
       normalRuns = studioRuns.map(function (r) {
         return normalizeStudioRun(r, apiBase);
       }).filter(function (nr) {
-        return nr && (nr.status === "completed" || nr.status === "success" || nr.status === "done") && nr.imageUrl;
+        return nr
+          && (nr.status === "completed" || nr.status === "success" || nr.status === "done")
+          && (nr.imageUrl || nr.experimentId);
       });
     }
 
@@ -585,28 +592,27 @@ export async function hydratePlayground(state, context) {
   if (persistedRun) {
     state.playground._selectedRun = persistedRun;
     state.playground.lastRunOutput = persistedRun.imageUrl || null;
-  } else if (targetPresetId && !isCarouselCleared()) {
-    // 6b. Fallback: fetch server-side recent runs and find latest matching.
-    //     Skip if the carousel was explicitly cleared — the clear should
-    //     persist across refreshes until a new run completes.
+  } else if (!isCarouselCleared()) {
     await refreshRecentRuns(apiBase);
-    const matchingCompleted = getRecentRuns().filter(function (nr) {
-      return nr.presetId === targetPresetId && nr.featureId === featureId;
-    });
-    if (matchingCompleted.length > 0) {
-      // Sort by completedAt descending (then startedAt as tiebreaker)
-      // to ensure we get the newest matching run
-      matchingCompleted.sort(function (a, b) {
-        const aTime = (a.completedAt || a.startedAt || "");
-        const bTime = (b.completedAt || b.startedAt || "");
-        return bTime.localeCompare(aTime);
+    if (targetPresetId) {
+      const matchingCompleted = getRecentRuns().filter(function (nr) {
+        return nr.presetId === targetPresetId && nr.featureId === featureId;
       });
-      const latest = matchingCompleted[0];
-      if (latest && latest.imageUrl) {
-        state.playground.lastRunOutput = latest.imageUrl;
-        state.playground._selectedRun = latest;
-        // Persist to localStorage for next reload
-        saveRunResult(targetPresetId, featureId, latest);
+      if (matchingCompleted.length > 0) {
+        // Sort by completedAt descending (then startedAt as tiebreaker)
+        // to ensure we get the newest matching run
+        matchingCompleted.sort(function (a, b) {
+          const aTime = (a.completedAt || a.startedAt || "");
+          const bTime = (b.completedAt || b.startedAt || "");
+          return bTime.localeCompare(aTime);
+        });
+        const latest = matchingCompleted[0];
+        if (latest && latest.imageUrl) {
+          state.playground.lastRunOutput = latest.imageUrl;
+          state.playground._selectedRun = latest;
+          // Persist to localStorage for next reload
+          saveRunResult(targetPresetId, featureId, latest);
+        }
       }
     }
   }
@@ -4794,7 +4800,7 @@ function renderFilmstrip(state, context) {
     recentRuns.forEach(function (nr) {
       const imageUrl = nr.imageUrl;
       const label = nr.presetLabel || nr.presetId || nr.featureId || "Run";
-      const isExperiment = nr.kind === "studio_experiment";
+      const isExperiment = Boolean(nr.experimentId);
       const ariaLabel = label + " - " + (nr.status || "") + (imageUrl ? " - Click to view" : " - No image")
         + (isExperiment ? " (experiment)" : "");
 

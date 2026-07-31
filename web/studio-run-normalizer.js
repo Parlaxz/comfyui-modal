@@ -705,7 +705,11 @@ export function normalizeStudioRun(rawRun, apiBase) {
 
   // Core identifiers — handle aliases
   const id = run.id || run.run_id || extra.experiment_id || "";
-  const experimentId = run.experiment_id || run.experimentId || extra.experiment_id || "";
+  const kind = run.kind || run.type || extra.kind || "";
+  const cellExperimentId = typeof id === "string" && id.indexOf("cell_") === 0
+    ? id.slice(5, Math.max(5, id.lastIndexOf("_")))
+    : "";
+  const experimentId = run.experiment_id || run.experimentId || extra.experiment_id || cellExperimentId;
   const status = run.status || run.state || "unknown";
   const imageUrl = resolveRunImageUrl(run, apiBase);
   const outputPath = run.output_path || extra.output_path || "";
@@ -805,6 +809,7 @@ export function normalizeStudioRun(rawRun, apiBase) {
 
   return {
     id: id,
+    kind: kind,
     experimentId: experimentId,
     status: status,
     imageUrl: imageUrl,
