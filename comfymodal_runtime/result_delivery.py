@@ -155,8 +155,8 @@ def build_materialized_output_entry(
     return {
         "filename": local_filename,
         "path": local_path,
-        "subfolder": "",
-        "type": "output",
+        "subfolder": str(remote_entry.get("subfolder", "") or ""),
+        "type": str(remote_entry.get("type", "output") or "output"),
         "node_id": str(node_id),
         "output_key": output_key,
         "comparison_side": remote_entry.get("comparison_side", ""),
@@ -231,19 +231,38 @@ def select_primary_output(per_node_outputs: dict, node_id: str) -> dict | None:
     return None
 
 
-def select_primary_result_entry(result: dict) -> dict | None:
+def _normalize_output_node_id(value: Any) -> str:
+    """Normalize ComfyUI node IDs without conflating prompt/run metadata."""
+    if isinstance(value, bool) or value is None:
+        return ""
+    text = str(value).strip()
+    return str(int(text)) if text.isdigit() else text
+
+
+def select_primary_result_entry(
+    result: dict,
+    expected_output_node_ids: tuple[str, ...] | list[str] | None = None,
+) -> dict | None:
     """Select the primary result entry from a full result dict.
 
     Iterates structured outputs first, then falls back to flat images.
     """
+    expected = {
+        _normalize_output_node_id(value)
+        for value in (expected_output_node_ids or ())
+        if _normalize_output_node_id(value)
+    }
     outputs = result.get("outputs", {}) if isinstance(result, dict) else {}
     if isinstance(outputs, dict):
         for node_id in outputs:
+            normalized_node_id = _normalize_output_node_id(node_id)
+            if expected and normalized_node_id not in expected:
+                continue
             entry = select_primary_output(outputs, node_id)
             if not isinstance(entry, dict):
                 continue
             resolved = dict(entry)
-            resolved.setdefault("node_id", str(node_id))
+            resolved.setdefault("node_id", normalized_node_id)
             if not resolved.get("output_key"):
                 for output_key, entries in outputs.get(node_id, {}).items():
                     if isinstance(entries, list) and entry in entries:
@@ -255,7 +274,9 @@ def select_primary_result_entry(result: dict) -> dict | None:
         if not isinstance(entry, dict):
             continue
         resolved = dict(entry)
-        resolved.setdefault("node_id", str(entry.get("node_id", "")))
+        resolved.setdefault("node_id", _normalize_output_node_id(entry.get("node_id", "")))
+        if expected and resolved["node_id"] not in expected:
+            continue
         resolved.setdefault("output_key", entry.get("output_key") or "images")
         resolved.setdefault("output_index", entry.get("output_index", index))
         return resolved
@@ -463,6 +484,8 @@ def materialize_modal_result(
     converter_fn: Callable | None = None,
     output_format: str = "original",
     require_output: bool = False,
+    expected_output_node_ids: tuple[str, ...] | list[str] | None = None,
+    selected_output_node_id: str | int | None = None,
     remote_fetch_fn: Callable[[str, str], bytes] | None = None,
 ) -> dict:
     """Materialise a Modal result dict to the local filesystem.
@@ -493,8 +516,18 @@ def materialize_modal_result(
     if send_event is None:
         send_event = lambda _event, _payload: None
 
+    expected_ids = tuple(
+        _normalize_output_node_id(value)
+        for value in (expected_output_node_ids or ())
+        if _normalize_output_node_id(value)
+    )
+
     # Adapt legacy payload
     adapted = adapt_legacy_result_payload(result)
+    if not adapted.get("outputs") and isinstance(adapted.get("history"), dict):
+        history_entry = adapted["history"].get(prompt_id)
+        if isinstance(history_entry, dict):
+            adapted["outputs"] = history_entry.get("outputs", {}) or {}
 
     def _store_entry(
         node_id: str,
@@ -531,7 +564,11 @@ def materialize_modal_result(
         else:
             image_count += 1
 
-        native_entry = build_native_output_descriptor(local_filename)
+        native_entry = build_native_output_descriptor(
+            local_filename,
+            subfolder=str(entry.get("subfolder", "") or ""),
+            type_=str(entry.get("type", "output") or "output"),
+        )
         internal_entry = build_materialized_output_entry(
             entry,
             node_id=str(node_id),
@@ -597,9 +634,40 @@ def materialize_modal_result(
             continue
         _store_entry(node_id, output_key, vid, index)
 
-    if require_output and not written_files:
+    selected_node = _normalize_output_node_id(selected_output_node_id)
+    selected_ids = (selected_node,) if selected_node else expected_ids
+    selected_primary = select_primary_result_entry(
+        {"outputs": materialized_outputs, "images": []},
+        selected_ids or None,
+    )
+    if require_output and (
+        selected_primary is None if selected_ids else not written_files
+    ):
+        available_nodes = sorted(
+            _normalize_output_node_id(node_id)
+            for node_id in materialized_outputs
+            if _normalize_output_node_id(node_id)
+        )
+        execution_id = str(
+            result.get("execution_id")
+            or result.get("run_id")
+            or result.get("id")
+            or "<unknown>"
+        )
+        completed = bool(
+            result.get(
+                "execution_completed",
+                result.get("completed", result.get("status") in {"completed", "success"}),
+            )
+        )
+        image_records = len(adapted.get("images", []) or [])
+        expected_display = ", ".join(selected_ids or expected_ids) or "<none>"
         raise OutputMaterializationError(
-            f"required output missing for prompt {prompt_id or '<unknown>'}"
+            "required output missing; "
+            f"execution_id={execution_id}; prompt_id={prompt_id or '<unknown>'}; "
+            f"expected_output_node={expected_display}; available_output_nodes={available_nodes}; "
+            f"selected_output_binding={selected_node or (expected_ids[0] if expected_ids else '<unbound>')}; "
+            f"execution_completed={completed}; image_records_returned={image_records}"
         )
 
     # Build history outputs (alias b_images -> images for standard consumers)
@@ -621,7 +689,10 @@ def materialize_modal_result(
 
     # Determine primary output
     primary_output = None
-    primary_entry = select_primary_result_entry({"outputs": materialized_outputs, "images": []})
+    primary_entry = selected_primary or select_primary_result_entry(
+        {"outputs": materialized_outputs, "images": []},
+        expected_ids or None,
+    )
     if isinstance(primary_entry, dict):
         primary_output = {
             "node_id": str(primary_entry.get("node_id", "")),
