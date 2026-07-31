@@ -10,7 +10,7 @@
 // Axis editing is attached to each control in-place, not via a separate
 // master list page. Run Experiment may be disabled with a precise reason.
 
-import { CONTROL_DEFS } from "./studio-feature-registry.js";
+import { CONTROL_DEFS, getRecommendedSteps, getRecommendedStepsStatus, getLastFiniteSeed, cryptoRandomSeed } from "./studio-feature-registry.js";
 import { getRuntimePresets } from "./studio-backend.js";
 import { runStudioExperiment, stopExperiment } from "./studio-backend-api.js";
 import { getAxisEligibilityForPresets } from "./studio-preset-capabilities.js";
@@ -672,7 +672,9 @@ export function renderAxisEditor(controlId, state, actions) {
         valuesArea.appendChild(row);
       });
 
-      // Plus button — appends a new empty value
+      // Plus button — appends a new value.  For seed axes the insertion
+      // mode is chosen from a dropdown; all other axes keep the plain
+      // empty-value append.
       const addBtn = document.createElement("button");
       addBtn.textContent = "+";
       addBtn.className = "comfymodal-secondary-btn";
@@ -680,110 +682,131 @@ export function renderAxisEditor(controlId, state, actions) {
       addBtn.style.padding = "2px 8px";
       addBtn.setAttribute("data-testid", "axis-add-value-" + controlId);
       addBtn.setAttribute("aria-label", "Add value");
-      addBtn.addEventListener("click", function () {
-        const currentVals = collectValues();
-        currentVals.push("");
-        if (actions && actions.updateExperimentAxisValues) {
-          actions.updateExperimentAxisValues(controlId, currentVals);
-        }
-        _renderRepeatedValues();
-      });
-      valuesArea.appendChild(addBtn);
 
-      // Quick-add buttons for common steps/guidance values (preserving existing behavior)
-      if (def.type === "number") {
-        var quickRow = document.createElement("div");
-        quickRow.style.marginTop = "4px";
-        quickRow.style.display = "flex";
-        quickRow.style.gap = "4px";
-        quickRow.style.flexWrap = "wrap";
+      if (controlId === "seed") {
+        // ── Seed: insertion dropdown adjacent to + ──────────────────
+        // Modes: Increment (default), Decrement, Random (CSPRNG), Empty.
+        // Increment/Decrement operate on the LAST finite seed in the list.
+        // The selected mode is stored on the axis state so it persists
+        // while the editor is mounted (survives value-list rebuilds and
+        // page re-renders).
+        const seedDef = CONTROL_DEFS.seed;
+        const seedSchemaMax = (seedDef && seedDef.max != null) ? seedDef.max : 2147483647;
+        const axData2 = (state.playground && state.playground.experimentAxes && state.playground.experimentAxes[controlId]) || {};
+        var insertMode = axData2.insertMode || "increment";
 
-        if (controlId === "seed") {
-          // ── Seed: Next seed button ──────────────────────────────
-          // Compute the next finite numeric seed: find the max finite
-          // value among current axis values, then append max+1.
-          // Uses CONTROL_DEFS.seed.max as the authoritative schema max
-          // (not a duplicated hardcoded constant).  Handles:
-          //   [100]       → appends 101
-          //   [100,101]   → appends 102 (no duplicate)
-          //   [-1]        → appends 0
-          //   blank + 50  → appends 51 (blanks are ignored as NaN)
-          var nextSeedBtn = document.createElement("button");
-          nextSeedBtn.className = "comfymodal-secondary-btn";
-          nextSeedBtn.textContent = "Next seed";
-          nextSeedBtn.title = "Append the next finite seed value";
-          nextSeedBtn.style.fontSize = "10px";
-          nextSeedBtn.style.padding = "2px 6px";
+        var seedRow = document.createElement("div");
+        seedRow.style.cssText = "display:flex;align-items:center;gap:4px;margin-top:4px;";
 
-          // Use the actual CONTROL_DEFS max rather than a duplicated constant
-          var seedDef = CONTROL_DEFS.seed;
-          var seedSchemaMax = (seedDef && seedDef.max != null) ? seedDef.max : 2147483647;
-
-          nextSeedBtn.addEventListener("click", function () {
-            var currentVals = collectValues();
-            // Find the maximum finite numeric seed among current values
-            var maxSeed = -1;
-            var hasPositive = false;
-            for (var si = 0; si < currentVals.length; si++) {
-              var num = Number(currentVals[si]);
-              if (!isNaN(num) && isFinite(num) && num >= 0) {
-                if (num > maxSeed) {
-                  maxSeed = num;
-                  hasPositive = true;
-                }
-              }
-            }
-            // If no positive seed found, start from 0
-            if (!hasPositive) maxSeed = -1;
-            var nextSeed = maxSeed + 1;
-            // Respect schema max — cap at max, never overflow
-            if (nextSeed > seedSchemaMax) nextSeed = seedSchemaMax;
-            // Prevent duplicates (compare as string to match axis value storage)
-            if (!currentVals.includes(String(nextSeed))) {
-              currentVals.push(String(nextSeed));
-              if (actions && actions.updateExperimentAxisValues) {
-                actions.updateExperimentAxisValues(controlId, currentVals);
-              }
-              _renderRepeatedValues();
-            }
-          });
-          quickRow.appendChild(nextSeedBtn);
-        }
-
-        if (controlId === "steps") {
-          // ── Steps: Use Recommended button ───────────────────────
-          // Reads the workflow-captured recommended steps from
-          // _runningExperimentConfig only.  Never falls back to preset
-          // defaults or static values — the recommendation must come
-          // from an actual captured workflow run.
-          var recommendedSteps = null;
-          var config = state.playground && state.playground._runningExperimentConfig;
-          if (config && config.controls && config.controls.steps != null) {
-            var cfgSteps = Number(config.controls.steps);
-            if (!isNaN(cfgSteps) && cfgSteps > 0 && isFinite(cfgSteps)) {
-              recommendedSteps = cfgSteps;
-            }
+        var modeSelect = document.createElement("select");
+        modeSelect.className = "comfymodal-input comfymodal-studio-select";
+        modeSelect.style.cssText = "font-size:10px;padding:2px 4px;flex:0 0 auto;";
+        modeSelect.setAttribute("data-testid", "seed-insert-mode");
+        modeSelect.setAttribute("aria-label", "Seed insertion mode");
+        var modes = [
+          { value: "increment", label: "Increment" },
+          { value: "decrement", label: "Decrement" },
+          { value: "random", label: "Random" },
+          { value: "empty", label: "Empty" },
+        ];
+        modes.forEach(function (m) {
+          var opt = document.createElement("option");
+          opt.value = m.value;
+          opt.textContent = m.label;
+          modeSelect.appendChild(opt);
+        });
+        modeSelect.value = insertMode;
+        modeSelect.addEventListener("change", function () {
+          if (state.playground && state.playground.experimentAxes && state.playground.experimentAxes[controlId]) {
+            state.playground.experimentAxes[controlId].insertMode = modeSelect.value;
           }
+          _renderRepeatedValues();
+        });
+        seedRow.appendChild(modeSelect);
 
-          if (recommendedSteps != null) {
-            var recBtn = document.createElement("button");
-            recBtn.className = "comfymodal-secondary-btn";
-            recBtn.textContent = "Use recommended (" + recommendedSteps + ")";
-            recBtn.title = "From captured workflow";
-            recBtn.style.fontSize = "10px";
-            recBtn.style.padding = "2px 6px";
+        var lastFinite = getLastFiniteSeed(vals);
+        var boundaryMessage = "";
+        if (insertMode === "increment" && lastFinite != null && lastFinite >= seedSchemaMax) {
+          boundaryMessage = "Maximum seed reached";
+        } else if (insertMode === "decrement" && (lastFinite == null || lastFinite <= 0)) {
+          boundaryMessage = lastFinite == null ? "No finite seed to decrement" : "Minimum finite seed reached";
+        }
+
+        if (boundaryMessage) {
+          var boundaryNote = document.createElement("span");
+          boundaryNote.textContent = boundaryMessage;
+          boundaryNote.style.cssText = "font-size:9px;color:var(--color-warning, #fbbf24);";
+          boundaryNote.setAttribute("data-testid", "seed-insert-boundary");
+          seedRow.appendChild(boundaryNote);
+        }
+
+        addBtn.disabled = !!boundaryMessage;
+        addBtn.addEventListener("click", function () {
+          var currentVals = collectValues();
+          var last = getLastFiniteSeed(currentVals);
+          var next;
+          if (insertMode === "increment") {
+            next = String((last == null ? -1 : last) + 1);
+            if (Number(next) > seedSchemaMax) return;
+          } else if (insertMode === "decrement") {
+            if (last == null || last <= 0) return;
+            next = String(last - 1);
+          } else if (insertMode === "random") {
+            next = String(cryptoRandomSeed(seedSchemaMax));
+          } else {
+            next = "";
+          }
+          if (!currentVals.includes(next)) {
+            currentVals.push(next);
+            if (actions && actions.updateExperimentAxisValues) {
+              actions.updateExperimentAxisValues(controlId, currentVals);
+            }
+            _renderRepeatedValues();
+          }
+        });
+
+        seedRow.appendChild(addBtn);
+        valuesArea.appendChild(seedRow);
+      } else {
+        addBtn.addEventListener("click", function () {
+          const currentVals = collectValues();
+          currentVals.push("");
+          if (actions && actions.updateExperimentAxisValues) {
+            actions.updateExperimentAxisValues(controlId, currentVals);
+          }
+          _renderRepeatedValues();
+        });
+        valuesArea.appendChild(addBtn);
+      }
+
+      // ── Steps: recommended action (preset/workflow-backed) ─────────
+      // Same shared source as the main control; hidden when no
+      // trustworthy recommendation exists, disabled when it would be a
+      // no-op for the current values.
+      if (controlId === "steps") {
+        var recStatus = getRecommendedStepsStatus(state, vals);
+        if (recStatus.value != null) {
+          var recRow = document.createElement("div");
+          recRow.style.cssText = "display:flex;align-items:center;gap:4px;margin-top:4px;";
+          var recBtn = document.createElement("button");
+          recBtn.className = "comfymodal-secondary-btn";
+          recBtn.textContent = "Use recommended (" + recStatus.value + ")";
+          recBtn.style.fontSize = "10px";
+          recBtn.style.padding = "2px 6px";
+          recBtn.setAttribute("data-testid", "axis-steps-recommended-btn");
+          if (recStatus.reason) {
+            recBtn.disabled = true;
+            recBtn.title = recStatus.reason;
+          } else {
+            recBtn.title = "From selected preset workflow capture";
             recBtn.addEventListener("click", function () {
               var currentVals = collectValues();
-              // Set the first value to recommendedSteps, preserving any
-              // additional comparison values beyond index 0.
               if (currentVals.length === 0) {
-                currentVals.push(String(recommendedSteps));
+                currentVals.push(String(recStatus.value));
               } else {
-                currentVals[0] = String(recommendedSteps);
-                // Remove any duplicate of the recommended value elsewhere
-                // in the array (skip index 0, check from 1 onward).
+                currentVals[0] = String(recStatus.value);
                 for (var _ri = currentVals.length - 1; _ri >= 1; _ri--) {
-                  if (currentVals[_ri] === String(recommendedSteps)) {
+                  if (currentVals[_ri] === String(recStatus.value)) {
                     currentVals.splice(_ri, 1);
                   }
                 }
@@ -793,36 +816,16 @@ export function renderAxisEditor(controlId, state, actions) {
               }
               _renderRepeatedValues();
             });
-            quickRow.appendChild(recBtn);
           }
-        }
-
-        // Standard quick values for steps and guidance (preserving existing behavior)
-        var quickValues = [];
-        if (controlId === "steps") quickValues = [10, 20, 30, 50];
-        else if (controlId === "guidance") quickValues = [5, 7, 10, 15];
-
-        quickValues.forEach(function (v) {
-          var btn = document.createElement("button");
-          btn.className = "comfymodal-secondary-btn";
-          btn.textContent = String(v);
-          btn.style.fontSize = "10px";
-          btn.style.padding = "2px 6px";
-          btn.addEventListener("click", function () {
-            var currentVals = collectValues();
-            if (!currentVals.includes(String(v))) {
-              currentVals.push(String(v));
-              if (actions && actions.updateExperimentAxisValues) {
-                actions.updateExperimentAxisValues(controlId, currentVals);
-              }
-              _renderRepeatedValues();
-            }
-          });
-          quickRow.appendChild(btn);
-        });
-
-        if (quickRow.childNodes.length > 0) {
-          valuesArea.appendChild(quickRow);
+          recRow.appendChild(recBtn);
+          if (recStatus.reason) {
+            var recNote = document.createElement("span");
+            recNote.textContent = recStatus.reason;
+            recNote.style.cssText = "font-size:9px;color:var(--color-text-muted);";
+            recNote.setAttribute("data-testid", "steps-recommended-note");
+            recRow.appendChild(recNote);
+          }
+          valuesArea.appendChild(recRow);
         }
       }
     }
@@ -1243,12 +1246,15 @@ export async function executeExperimentRun(state, context) {
   Object.entries(axes).forEach(([ctrlId, def]) => {
     if (def && def.enabled && def.values && def.values.length > 0 && eligibleAxes.includes(ctrlId)) {
       var parsedValues = def.values.map(function (v) {
+        if (ctrlId === "seed" && typeof v === "string" && v.trim() === "") return null;
         // Parse numeric strings so the backend schema validation
         // (which checks isinstance(value, int)) accepts them.
         if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
         return v;
-      });
-      experimentDef.axes[ctrlId] = { enabled: true, values: parsedValues };
+      }).filter(function (v) { return v !== null; });
+      if (parsedValues.length > 0) {
+        experimentDef.axes[ctrlId] = { enabled: true, values: parsedValues };
+      }
     }
   });
 
