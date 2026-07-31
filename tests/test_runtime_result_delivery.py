@@ -227,6 +227,16 @@ class TestSelectPrimaryResultEntry:
     def test_empty_result(self):
         assert select_primary_result_entry({}) is None
 
+    def test_expected_node_binding_skips_unrelated_outputs(self):
+        unrelated = _remote_entry("preview.png", b"preview", node_id="12")
+        bound = _remote_entry("final.png", b"final", node_id="107")
+        entry = select_primary_result_entry(
+            {"outputs": {"12": {"images": [unrelated]}, "107": {"images": [bound]}}},
+            expected_output_node_ids=("107",),
+        )
+        assert entry is not None
+        assert entry["node_id"] == "107"
+
 
 # ---------------------------------------------------------------------------
 # Conversion batch tests
@@ -364,6 +374,46 @@ class TestMaterializeModalResult:
             assert summary["image_count"] == 0
             assert summary["video_count"] == 0
             assert summary["written_files"] == []
+
+    def test_required_output_uses_expected_node_binding(self):
+        unrelated = _remote_entry("preview.png", _png_bytes(1, 2, 3), node_id="12")
+        bound = _remote_entry("final.png", _png_bytes(4, 5, 6), node_id="107")
+        result = {
+            "execution_id": "exec-107",
+            "outputs": {
+                "12": {"images": [unrelated]},
+                "107": {"images": [bound]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result,
+                output_dir=tmp,
+                prompt_id="p1",
+                require_output=True,
+                expected_output_node_ids=("107",),
+            )
+            assert summary["primary_output"]["node_id"] == "107"
+            assert summary["primary_output"]["filename"] == "final.png"
+
+    def test_required_output_error_identifies_missing_binding(self):
+        result = {
+            "execution_id": "exec-missing",
+            "status": "completed",
+            "outputs": {"12": {"images": [_remote_entry("preview.png", b"preview", node_id="12")]}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(
+                RuntimeError,
+                match=r"execution_id=exec-missing.*expected_output_node=107.*available_output_nodes=\['12'\]",
+            ):
+                materialize_modal_result(
+                    result,
+                    output_dir=tmp,
+                    prompt_id="p1",
+                    require_output=True,
+                    expected_output_node_ids=("107",),
+                )
 
     def test_multi_output_nodes(self):
         a = _remote_entry("a.png", b"data-a", node_id="7", output_key="images")
