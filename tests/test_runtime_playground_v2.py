@@ -1767,9 +1767,7 @@ class TestDefaultMaterializerOffload(unittest.TestCase):
 
 
 class TestDefaultExecutorDelegation(unittest.TestCase):
-    """_default_execute_plan delegates to canonical execute_plan with
-    the shared restore publisher, a RuntimeTrace, and an injected transport
-    when run_prompt_stream_fn is provided."""
+    """_default_execute_plan delegates with a trace and injected transport."""
 
     def setUp(self):
         self.mod = _load_playground_module()
@@ -1777,7 +1775,7 @@ class TestDefaultExecutorDelegation(unittest.TestCase):
 
     def test_calls_execute_plan_with_expected_args(self):
         """_default_execute_plan calls canonical_execution.execute_plan
-        with publisher, trace, and the correct plan."""
+        without the removed shared publisher stage."""
         observed_kwargs = {}
 
         async def fake_execute_plan(plan, **kw):
@@ -1796,16 +1794,10 @@ class TestDefaultExecutorDelegation(unittest.TestCase):
 
             asyncio.run(_test())
 
-        # Should have received a RuntimeTrace and restore_publisher
+        # Should have received a RuntimeTrace and no restore publisher.
         self.assertIn("trace", observed_kwargs)
-        self.assertIsNotNone(observed_kwargs.get("restore_publisher"),
-                             "restore_publisher must be provided")
+        self.assertIsNone(observed_kwargs.get("restore_publisher"))
         self.assertIn("gpu", observed_kwargs)
-        # Production v2 must publish through the remote runtime-state method.
-        pub = observed_kwargs.get("restore_publisher")
-        self.assertIsNotNone(pub, "restore_publisher must be provided")
-        self.assertEqual(type(pub).__name__, "RemoteRestorePlanPublisher",
-                         "v2 must use the remote RestorePlan publisher")
 
     def test_injected_transport_when_run_prompt_stream_fn_provided(self):
         """When run_prompt_stream_fn is supplied, a ModalTransport is
