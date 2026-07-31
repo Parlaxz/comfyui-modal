@@ -2020,6 +2020,433 @@ def playground_adapter_sync_run(
         return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
 
 
+# ── Run-history single-output save ─────────────────────────────────────────
+# Backend implementation for ``POST /comfymodal/run-history/{run_id}/save``.
+# Saves ONE known, already-materialized Studio output from a run-history
+# record into the configured auto-save folder by reusing the authoritative
+# local save pipeline (``output_saver.save_output_image``) and the
+# configured folder/format/quality/WebP/sidecar options.  The browser only
+# ever selects an ``output_index`` — never a filesystem path — so no
+# arbitrary browser filesystem access is possible.
+
+# Recognised image extensions for validating a run output path before reading.
+_SAVEABLE_OUTPUT_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+
+# Extension → MIME map used when no format conversion is applied.
+_EXT_TO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
+
+
+def _run_extra(run_meta: dict) -> dict:
+    """Return the ``extra`` dict of a run-history meta record (safe)."""
+    if not isinstance(run_meta, dict):
+        return {}
+    extra = run_meta.get("extra", {})
+    return extra if isinstance(extra, dict) else {}
+
+
+def resolve_run_output_path(
+    run_meta: dict,
+    output_index: int,
+    asset_resolver_fn: Callable[[str], dict | None] | None = None,
+) -> tuple[str, str | None]:
+    """Resolve the materialised output path for a run-history record + index.
+
+    Returns ``(path, None)`` on success or ``("", error_message)``.
+
+    Selection precedence (never accepts a browser-supplied path):
+      1. ``extra.output_paths`` (list) indexed by *output_index*.
+      2. Top-level ``output_path`` when *output_index* is 0.
+      3. Legacy ``extra.output_path`` when *output_index* is 0.
+      4. Asset registry (experiment-cell records carry asset IDs, not paths):
+         - index 0 → ``extra.primary_asset_id``
+         - other indexes → ``extra.asset_ids[output_index]``
+         Thumbnail assets are re-pointed at their parent original.
+
+    *asset_resolver_fn* maps an asset ID to its registry record (e.g.
+    ``REGISTRY.leases().resolve_asset``).  The resolved record's ``path``
+    must be a real local file; remote-only ``modal://`` paths are rejected.
+    """
+    extra = _run_extra(run_meta)
+    output_paths = extra.get("output_paths")
+    if isinstance(output_paths, (list, tuple)) and output_paths:
+        if 0 <= output_index < len(output_paths):
+            path = str(output_paths[output_index]).strip()
+            if path:
+                return path, None
+        return "", (
+            f"output_index {output_index} is out of range "
+            f"(run has {len(output_paths)} output(s))"
+        )
+    if output_index == 0:
+        path = str(run_meta.get("output_path", "") or "").strip()
+        if path:
+            return path, None
+        legacy = str(extra.get("output_path", "") or "").strip()
+        if legacy:
+            return legacy, None
+
+    # ── Asset-registry fallback (experiment-cell records) ────────────────
+    asset_id = ""
+    asset_ids = extra.get("asset_ids")
+    if isinstance(asset_ids, (list, tuple)) and asset_ids:
+        if 0 <= output_index < len(asset_ids):
+            asset_id = str(asset_ids[output_index]).strip()
+    elif output_index == 0:
+        asset_id = str(extra.get("primary_asset_id", "") or "").strip()
+    if asset_id:
+        if asset_resolver_fn is None:
+            return "", (
+                f"run has no local output path at index {output_index}; "
+                f"asset resolution is unavailable"
+            )
+        try:
+            record = asset_resolver_fn(asset_id)
+        except Exception:
+            record = None
+        # A thumbnail record points at its parent original.
+        if isinstance(record, dict) and record.get("variant") == "thumbnail":
+            parent_id = str(record.get("parent_asset_id", "") or "")
+            if parent_id:
+                try:
+                    parent = asset_resolver_fn(parent_id)
+                except Exception:
+                    parent = None
+                if isinstance(parent, dict):
+                    record = parent
+        if isinstance(record, dict):
+            path = str(record.get("path", "") or "").strip()
+            if path:
+                if path.startswith("modal://"):
+                    return "", (
+                        f"output at index {output_index} has no materialized "
+                        f"local path (remote-only asset)"
+                    )
+                return path, None
+        return "", (
+            f"output at index {output_index} has no materialized local path"
+        )
+    return "", f"run has no output at index {output_index}"
+
+
+def save_run_history_output(
+    run_meta: dict,
+    *,
+    output_index: int = 0,
+    output_format: str = "original",
+    quality: int = 75,
+    webp_lossless_compression: str = "balanced",
+    save_folder: str = "",
+    save_metadata_sidecar: bool = True,
+    comfyui_root: str = "",
+    persist_state_fn: Callable[[dict], None] | None = None,
+    asset_resolver_fn: Callable[[str], dict | None] | None = None,
+) -> dict:
+    """Save ONE materialised Studio output from a run-history record.
+
+    Reuses the authoritative automatic local save pipeline
+    (``output_saver.save_output_image``) with the configured
+    folder/format/quality/WebP/sidecar options.  When a non-``original``
+    output format is configured, bytes are first run through the
+    authoritative conversion pipeline (``output_converter.convert_image_bytes``)
+    — exactly like the normal materialization path.
+
+    **Idempotent retries**: when *run_meta* already records a successful
+    save for the same ``output_index`` (``extra.output_saved`` +
+    ``extra.output_saved_index``) and the recorded file still exists, no
+    new file is written and the previously recorded path is returned.
+
+    *persist_state_fn*, when provided, is called with a state dict after a
+    new file is written so the caller can persist per-output saved state
+    into the authoritative run meta (which the existing history-index
+    upsert then propagates).
+
+    *asset_resolver_fn* maps an asset ID to its registry record and is used
+    for experiment-cell records that carry ``asset_ids`` / ``primary_asset_id``
+    instead of local paths.
+
+    Returns a structured dict:
+
+    - success: ``{"status": "ok", "saved": True, "already_saved": bool,
+      "path", "metadata_path", "output_index", "output_format", "quality",
+      "webp_lossless_compression", "mime_type", "file_ext", "byte_count",
+      "source_path"}``
+    - failure: ``{"status": "error", "message", "reason"}``
+
+    Never fabricates image bytes and never touches the browser filesystem.
+    """
+    result: dict = {
+        "status": "ok",
+        "saved": False,
+        "already_saved": False,
+        "path": "",
+        "metadata_path": "",
+        "output_index": int(output_index),
+        "output_format": output_format,
+        "quality": None,
+        "webp_lossless_compression": None,
+        "mime_type": "",
+        "file_ext": "",
+        "byte_count": 0,
+        "source_path": "",
+    }
+
+    if not isinstance(run_meta, dict) or not run_meta.get("run_id"):
+        return {
+            "status": "error",
+            "message": "run metadata is missing run_id",
+            "reason": "invalid_run_meta",
+        }
+
+    # ── Idempotency gate: a prior successful save wins ─────────────────
+    extra = _run_extra(run_meta)
+    if (
+        extra.get("output_saved") is True
+        and extra.get("output_saved_index") == int(output_index)
+    ):
+        prev_path = str(extra.get("output_saved_path", "") or "")
+        if prev_path and os.path.isfile(prev_path):
+            return {
+                "status": "ok",
+                "saved": True,
+                "already_saved": True,
+                "path": prev_path,
+                "metadata_path": str(extra.get("output_saved_metadata_path", "") or ""),
+                "output_index": int(output_index),
+                "output_format": extra.get("output_saved_format", output_format),
+                "quality": extra.get("output_saved_quality"),
+                "webp_lossless_compression": extra.get("output_saved_webp_lossless"),
+                "mime_type": str(extra.get("output_saved_mime", "") or ""),
+                "file_ext": str(extra.get("output_saved_file_ext", "") or ""),
+                "byte_count": int(extra.get("output_saved_byte_count", 0) or 0),
+                "source_path": str(extra.get("output_saved_source_path", "") or ""),
+            }
+
+    # ── Resolve the known Studio output (selected output only) ─────────
+    source_path, resolve_error = resolve_run_output_path(
+        run_meta, output_index, asset_resolver_fn=asset_resolver_fn
+    )
+    if resolve_error:
+        return {
+            "status": "error",
+            "message": resolve_error,
+            "reason": "output_unresolved",
+        }
+    if not os.path.isfile(source_path):
+        return {
+            "status": "error",
+            "message": f"output file missing on disk: {source_path}",
+            "reason": "output_missing",
+        }
+    if os.path.splitext(source_path)[1].lower() not in _SAVEABLE_OUTPUT_EXTS:
+        return {
+            "status": "error",
+            "message": f"output is not a saveable image: {source_path}",
+            "reason": "unsupported_output_type",
+        }
+
+    # ── Read the real bytes (no invented payloads) ─────────────────────
+    try:
+        with open(source_path, "rb") as f:
+            image_bytes = f.read()
+    except OSError as exc:
+        return {
+            "status": "error",
+            "message": f"output file unreadable: {exc}",
+            "reason": "output_unreadable",
+        }
+    if not image_bytes:
+        return {
+            "status": "error",
+            "message": "output file is empty",
+            "reason": "output_empty",
+        }
+
+    # ── Apply the configured conversion when needed ────────────────────
+    src_ext = os.path.splitext(source_path)[1].lower() or ".png"
+    mime_type = _EXT_TO_MIME.get(src_ext, "image/png")
+    file_ext = src_ext
+    converted_bytes = image_bytes
+    effective_quality: int | None = None
+    effective_webp: str | None = None
+
+    if output_format and output_format != "original":
+        try:
+            from output_converter import convert_image_bytes
+            conv = convert_image_bytes(
+                image_bytes,
+                output_format=output_format,
+                quality=int(quality or 75),
+                webp_lossless_compression=webp_lossless_compression or "balanced",
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": f"output conversion failed: {exc}",
+                "reason": "conversion_failed",
+            }
+        converted_bytes = conv.get("bytes", image_bytes)
+        mime_type = conv.get("mime_type", mime_type)
+        file_ext = conv.get("file_ext", file_ext)
+        effective_quality = conv.get("quality")
+        effective_webp = conv.get("webp_lossless_compression")
+    else:
+        # Mirror the conversion pipeline's "original" metadata semantics.
+        effective_quality = None
+        effective_webp = None
+
+    # ── Reuse the authoritative automatic local save pipeline ──────────
+    try:
+        from output_saver import save_output_image
+    except ImportError:
+        return {
+            "status": "error",
+            "message": "output_saver is not available",
+            "reason": "saver_unavailable",
+        }
+
+    workflow_hash = str(
+        run_meta.get("workflow_hash", "")
+        or extra.get("workflow_hash", "")
+        or ""
+    )
+    preset_label = str(
+        extra.get("preset_label", "")
+        or extra.get("studio_preset_id", "")
+        or ""
+    )
+    workflow_name = str(
+        run_meta.get("workflow_name", "")
+        or preset_label
+        or f"run_{run_meta.get('run_id', '')}"
+    )
+    resolved_controls = extra.get("resolved_controls")
+    if not isinstance(resolved_controls, dict):
+        resolved_controls = {}
+    primary_output = extra.get("primary_output")
+    if not isinstance(primary_output, dict):
+        primary_output = {}
+    seed = resolved_controls.get("seed")
+    if seed is None:
+        seed = run_meta.get("seed", 0)
+    width = resolved_controls.get("width") or primary_output.get("width") or 0
+    height = resolved_controls.get("height") or primary_output.get("height") or 0
+
+    extra_meta: dict = {
+        "run_id": str(run_meta.get("run_id", "")),
+        "kind": str(run_meta.get("kind", "")),
+        "output_index": int(output_index),
+        "source_path": source_path,
+        "saved_via": "run_history_save",
+    }
+    for key in ("node_id", "output_key", "comparison_side", "source_filename"):
+        val = primary_output.get(key) or extra.get(key)
+        if val:
+            extra_meta[key] = str(val)
+
+    try:
+        save_result = save_output_image(
+            converted_bytes,
+            output_format=output_format,
+            file_ext=file_ext,
+            mime_type=mime_type,
+            quality=effective_quality,
+            webp_lossless_compression=effective_webp,
+            original_size_bytes=len(image_bytes),
+            conversion_time_ms=0,
+            save_folder=save_folder,
+            save_metadata_sidecar=save_metadata_sidecar,
+            workflow_hash=workflow_hash,
+            workflow_name=workflow_name,
+            seed=str(seed or "0"),
+            width=int(width or 0),
+            height=int(height or 0),
+            index=0,
+            comfyui_root=comfyui_root,
+            extra_meta=extra_meta,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"save failed: {exc}",
+            "reason": "save_exception",
+        }
+
+    if not save_result.get("saved"):
+        return {
+            "status": "error",
+            "message": save_result.get("error") or "save failed",
+            "reason": "save_failed",
+        }
+
+    saved_path = str(save_result.get("path", "") or "")
+    saved_metadata_path = str(save_result.get("metadata_path", "") or "")
+    saved_byte_count = len(converted_bytes)
+
+    result.update({
+        "saved": True,
+        "already_saved": False,
+        "path": saved_path,
+        "metadata_path": saved_metadata_path,
+        "output_index": int(output_index),
+        "output_format": output_format,
+        "quality": effective_quality,
+        "webp_lossless_compression": effective_webp,
+        "mime_type": mime_type,
+        "file_ext": file_ext,
+        "byte_count": saved_byte_count,
+        "source_path": source_path,
+    })
+
+    # ── Persist per-output saved state in the authoritative source meta ─
+    # The existing history-index upsert (triggered by the caller's
+    # update_run) propagates these fields to the summary index.
+    if persist_state_fn is not None:
+        from datetime import datetime, timezone
+        state = {
+            "output_saved": True,
+            "output_saved_index": int(output_index),
+            "output_saved_path": saved_path,
+            "output_saved_metadata_path": saved_metadata_path,
+            "output_saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "output_saved_format": output_format,
+            "output_saved_quality": effective_quality,
+            "output_saved_webp_lossless": effective_webp,
+            "output_saved_mime": mime_type,
+            "output_saved_file_ext": file_ext,
+            "output_saved_byte_count": saved_byte_count,
+            "output_saved_source_path": source_path,
+        }
+        try:
+            persist_state_fn(state)
+            result["persisted_state"] = True
+        except Exception:
+            # File is written; a persistence failure means a retry cannot
+            # rely on the meta gate.  Surface it as a hard error so the
+            # caller can retry without leaving an untracked duplicate file.
+            for written_path in (saved_path, saved_metadata_path):
+                if written_path:
+                    try:
+                        os.unlink(written_path)
+                    except OSError:
+                        pass
+            result["status"] = "error"
+            result["reason"] = "state_persist_failed"
+            result["message"] = (
+                "run meta state persistence failed; the output was not "
+                "marked saved"
+            )
+            return result
+
+    return result
+
+
 # ── Async scheduler helpers ────────────────────────────────────────────────
 
 
