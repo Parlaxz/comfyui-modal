@@ -37,6 +37,7 @@ let _layerIdCounter = 0;
 // routes through normal layers instead of being absorbed by a stale
 // fullscreenElement check during the exit transition.
 let _fullscreenExitPending = false;
+let _fullscreenExitFallbackTimer = null;
 
 function _isEditableElement(el) {
   return el && (
@@ -88,11 +89,26 @@ function _onLayerKeydown(event) {
       // Set flag so the next Escape (after fullscreenchange) will be
       // dispatched through normal layers instead of being skipped.
       _fullscreenExitPending = true;
+      if (_fullscreenExitFallbackTimer) clearTimeout(_fullscreenExitFallbackTimer);
+      _fullscreenExitFallbackTimer = setTimeout(function () {
+        _fullscreenExitFallbackTimer = null;
+        if (_fullscreenExitPending && document.fullscreenElement) {
+          _fullscreenExitPending = false;
+          _dispatchLayerEvent("escape", {
+            preventDefault: function () {},
+            stopPropagation: function () {},
+          });
+        }
+      }, 300);
       // Don't consume — let browser's native handler exit fullscreen.
       // The fullscreenchange event will clear _fullscreenExitPending.
       return;
     }
     _fullscreenExitPending = false;
+    if (_fullscreenExitFallbackTimer) {
+      clearTimeout(_fullscreenExitFallbackTimer);
+      _fullscreenExitFallbackTimer = null;
+    }
     _dispatchLayerEvent("escape", event);
     return;
   }
@@ -152,6 +168,10 @@ function _removeLayerListenerIfEmpty() {
     document.removeEventListener("fullscreenchange", _onFullscreenChangeGlobal);
     _layerListenerAttached = false;
     _fullscreenExitPending = false;
+    if (_fullscreenExitFallbackTimer) {
+      clearTimeout(_fullscreenExitFallbackTimer);
+      _fullscreenExitFallbackTimer = null;
+    }
   }
 }
 
@@ -160,6 +180,10 @@ function _onFullscreenChangeGlobal() {
   // keydown goes through normal layer dispatch.
   if (!document.fullscreenElement) {
     _fullscreenExitPending = false;
+    if (_fullscreenExitFallbackTimer) {
+      clearTimeout(_fullscreenExitFallbackTimer);
+      _fullscreenExitFallbackTimer = null;
+    }
   }
 }
 
@@ -263,18 +287,39 @@ export function statusBadge(text, kind) {
 // backend module.
 
 /**
- * Create a zoomable image element with accessible zoom controls
- * and fullscreen support.
- * Returns a { container, updateZoom } object.
- * - container: DOM element wrapping the image + zoom toolbar
+ * Create a zoomable image element with pointer-based pan, pointer-centered
+ * wheel zoom, accessible zoom controls, and fullscreen support.
+ * Returns a { container, updateZoom, destroy } object.
+ * - container: DOM element wrapping the image + toolbar (below the image)
  * - updateZoom: function(newZoom) to programmatically set zoom
+ *
+ * @param {string} imageUrl
+ * @param {string} [alt]
+ * @param {object} [opts]
+ * @param {Array<HTMLElement>} [opts.extraControls] - buttons prepended to
+ *   the toolbar row (e.g. close / save), rendered below the image.
  */
-export function createZoomableImageEl(imageUrl, alt) {
+export function createZoomableImageEl(imageUrl, alt, opts) {
+  opts = opts || {};
   var zoomLevel = 1;
   var fitMode = true;
+  var panX = 0;
+  var panY = 0;
   var isFullscreen = false;
   var _layerUnreg = null;
   var _destroyed = false;
+
+  // Drag state
+  var _dragging = false;
+  var _dragPointerId = null;
+  var _dragStartX = 0;
+  var _dragStartY = 0;
+  var _dragPanX = 0;
+  var _dragPanY = 0;
+
+  // Fit-box size (image's untransformed rendered size)
+  var _fitW = 0;
+  var _fitH = 0;
 
   var container = document.createElement("div");
   container.className = "comfymodal-studio-zoom-wrap";
@@ -282,11 +327,15 @@ export function createZoomableImageEl(imageUrl, alt) {
 
   var imgContainer = document.createElement("div");
   imgContainer.className = "comfymodal-studio-zoom-image-container";
+  imgContainer.style.cssText = "user-select:none;touch-action:none;cursor:default;";
 
   var img = document.createElement("img");
   img.src = imageUrl;
   img.alt = alt || "Zoomable image";
   img.draggable = false;
+  // Transform transitions are disabled so pointer-drag panning and rapid
+  // wheel zoom track the pointer without lag.
+  img.style.transition = "none";
   imgContainer.appendChild(img);
 
   var controls = document.createElement("div");
@@ -294,38 +343,96 @@ export function createZoomableImageEl(imageUrl, alt) {
   controls.setAttribute("role", "toolbar");
   controls.setAttribute("aria-label", "Image zoom controls");
 
-  function _zoomIn() {
-    fitMode = false;
-    zoomLevel = Math.min(8, zoomLevel + 0.25);
-    _applyZoom();
+  function _viewerCenter() {
+    var r = imgContainer.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
   }
 
-  function _zoomOut() {
-    fitMode = false;
-    zoomLevel = Math.max(0.25, zoomLevel - 0.25);
-    _applyZoom();
+  function _refreshFitSize() {
+    var prev = img.style.transform;
+    img.style.transform = "";
+    var r = img.getBoundingClientRect();
+    img.style.transform = prev;
+    _fitW = r.width || 0;
+    _fitH = r.height || 0;
   }
 
-  function _zoomReset() {
-    fitMode = true;
-    zoomLevel = 1;
-    _applyZoom();
+  function _clampPan() {
+    if (fitMode) {
+      panX = 0;
+      panY = 0;
+      return;
+    }
+    var maxX = Math.max(0, (zoomLevel - 1) * _fitW / 2);
+    var maxY = Math.max(0, (zoomLevel - 1) * _fitH / 2);
+    panX = Math.max(-maxX, Math.min(maxX, panX));
+    panY = Math.max(-maxY, Math.min(maxY, panY));
   }
 
   function _applyZoom() {
     if (fitMode) {
+      panX = 0;
+      panY = 0;
       img.style.transform = "";
       img.style.maxWidth = "100%";
       img.style.maxHeight = "80vh";
       zoomLabel.textContent = "Fit";
       fitBtn.classList.add("fit-active");
-    } else {
-      img.style.transform = "scale(" + zoomLevel + ")";
-      img.style.maxWidth = "none";
-      img.style.maxHeight = "none";
-      zoomLabel.textContent = Math.round(zoomLevel * 100) + "%";
-      fitBtn.classList.remove("fit-active");
+      imgContainer.style.cursor = "default";
+      return;
     }
+    img.style.maxWidth = "100%";
+    img.style.maxHeight = "80vh";
+    img.style.transform = "translate(" + panX + "px," + panY + "px) scale(" + zoomLevel + ")";
+    zoomLabel.textContent = Math.round(zoomLevel * 100) + "%";
+    fitBtn.classList.remove("fit-active");
+    imgContainer.style.cursor = _dragging ? "grabbing" : "grab";
+  }
+
+  function _setZoom(newLevel, clientX, clientY) {
+    var target = Math.max(1, Math.min(8, newLevel));
+    if (target <= 1.0001) {
+      _zoomReset();
+      return;
+    }
+    var oldLevel = fitMode ? 1 : zoomLevel;
+    var wasFit = fitMode;
+    fitMode = false;
+    if (wasFit) {
+      panX = 0;
+      panY = 0;
+    }
+    if (clientX != null && clientY != null) {
+      // Keep the image point under the pointer fixed.
+      var vc = _viewerCenter();
+      var ux = (clientX - vc.x - panX) / oldLevel;
+      var uy = (clientY - vc.y - panY) / oldLevel;
+      zoomLevel = target;
+      panX = clientX - vc.x - target * ux;
+      panY = clientY - vc.y - target * uy;
+    } else {
+      zoomLevel = target;
+    }
+    _clampPan();
+    _applyZoom();
+  }
+
+  function _zoomIn() {
+    _refreshFitSize();
+    _setZoom((fitMode ? 1 : zoomLevel) + 0.25, null, null);
+  }
+
+  function _zoomOut() {
+    _refreshFitSize();
+    _setZoom((fitMode ? 1 : zoomLevel) - 0.25, null, null);
+  }
+
+  function _zoomReset() {
+    fitMode = true;
+    zoomLevel = 1;
+    panX = 0;
+    panY = 0;
+    _applyZoom();
   }
 
   function _toggleFullscreen() {
@@ -348,13 +455,13 @@ export function createZoomableImageEl(imageUrl, alt) {
       fullscreenBtn.textContent = "\u292b";
       fullscreenBtn.setAttribute("aria-label", "Exit fullscreen");
       fullscreenBtn.classList.add("fullscreen-active");
-      // Re-apply zoom in fullscreen context
+      _refreshFitSize();
       _applyZoom();
     } else {
       fullscreenBtn.textContent = "\u26f6";
       fullscreenBtn.setAttribute("aria-label", "Fullscreen");
       fullscreenBtn.classList.remove("fullscreen-active");
-      // Restore normal zoom
+      _refreshFitSize();
       _applyZoom();
     }
   }
@@ -380,6 +487,55 @@ export function createZoomableImageEl(imageUrl, alt) {
   });
 
   document.addEventListener("fullscreenchange", _onFullscreenChange);
+
+  // ── Pointer pan (only when zoomed in) ────────────────────────────────
+  function _onPointerDown(e) {
+    if (fitMode) return;
+    _dragging = true;
+    _dragPointerId = e.pointerId;
+    _dragStartX = e.clientX;
+    _dragStartY = e.clientY;
+    _dragPanX = panX;
+    _dragPanY = panY;
+    imgContainer.style.cursor = "grabbing";
+    try {
+      imgContainer.setPointerCapture(e.pointerId);
+    } catch (err) { /* capture unsupported — drag still works within viewer */ }
+  }
+
+  function _onPointerMove(e) {
+    if (!_dragging || e.pointerId !== _dragPointerId) return;
+    panX = _dragPanX + (e.clientX - _dragStartX);
+    panY = _dragPanY + (e.clientY - _dragStartY);
+    _clampPan();
+    _applyZoom();
+  }
+
+  function _onPointerUp(e) {
+    if (!_dragging || e.pointerId !== _dragPointerId) return;
+    _dragging = false;
+    _dragPointerId = null;
+    try {
+      imgContainer.releasePointerCapture(e.pointerId);
+    } catch (err) { /* already released */ }
+    imgContainer.style.cursor = "grab";
+  }
+
+  imgContainer.addEventListener("pointerdown", _onPointerDown);
+  imgContainer.addEventListener("pointermove", _onPointerMove);
+  imgContainer.addEventListener("pointerup", _onPointerUp);
+  imgContainer.addEventListener("pointercancel", _onPointerUp);
+
+  // ── Wheel: pointer-centered zoom, page scroll prevented only over viewer
+  function _onWheel(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    _refreshFitSize();
+    var factor = Math.pow(1.12, -e.deltaY / 100);
+    _setZoom((fitMode ? 1 : zoomLevel) * factor, e.clientX, e.clientY);
+  }
+
+  imgContainer.addEventListener("wheel", _onWheel, { passive: false });
 
   var zoomOutBtn = document.createElement("button");
   zoomOutBtn.className = "comfymodal-studio-zoom-btn";
@@ -416,6 +572,11 @@ export function createZoomableImageEl(imageUrl, alt) {
   zoomLabel.setAttribute("data-testid", "zoom-label");
   zoomLabel.setAttribute("aria-live", "polite");
 
+  // Extra toolbar controls (close / save / download) go BEFORE the zoom
+  // buttons so the row reads: [close] [save] [-] [+] [fit] [fullscreen].
+  (opts.extraControls || []).forEach(function (btn) {
+    if (btn) controls.appendChild(btn);
+  });
   controls.appendChild(zoomOutBtn);
   controls.appendChild(zoomInBtn);
   controls.appendChild(fitBtn);
@@ -464,11 +625,20 @@ export function createZoomableImageEl(imageUrl, alt) {
   // are reachable via Tab. Escape and Tab-cycle still bubble to the preview overlay.
   imgContainer.setAttribute("tabindex", "0");
 
+  img.addEventListener("load", function () {
+    if (_destroyed) return;
+    _refreshFitSize();
+  });
+
   /**
-   * Destroy: clean up layer registry and fullscreenchange listener.
+   * Destroy: clean up layer registry, listeners, and pointer capture.
    */
   function _destroy() {
     _destroyed = true;
+    if (_dragging && _dragPointerId != null) {
+      try { imgContainer.releasePointerCapture(_dragPointerId); } catch (err) {}
+      _dragging = false;
+    }
     if (_layerUnreg) {
       _layerUnreg();
       _layerUnreg = null;
@@ -482,9 +652,8 @@ export function createZoomableImageEl(imageUrl, alt) {
       if (z == null || z === "fit") {
         _zoomReset();
       } else {
-        fitMode = false;
-        zoomLevel = Math.max(0.25, Math.min(8, Number(z) || 1));
-        _applyZoom();
+        _refreshFitSize();
+        _setZoom(Number(z) || 1, null, null);
       }
     },
     destroy: _destroy,
@@ -496,12 +665,19 @@ export function createZoomableImageEl(imageUrl, alt) {
  * configurable info sections. Used by both experiment cell detail
  * and history preview to provide a consistent viewing experience.
  *
+ * Toolbar (close / save / download + zoom controls) renders BELOW the
+ * image. Save comes before fullscreen in the row order.
+ *
  * @param {object} opts
  * @param {string|null}  opts.imageUrl      - Image URL or null for no-image state
  * @param {string}       opts.alt           - Alt text for the image
  * @param {function}     opts.onClose       - Called when overlay should close
  * @param {function}     [opts.onKeyDown]   - Called for every keydown (after Escape/numpad checks), receives KeyboardEvent, return true to consume
  * @param {Array<HTMLElement>} [opts.sections] - DOM elements rendered below the image
+ * @param {HTMLElement}  [opts.sideColumn]  - DOM element rendered as a right-side
+ *   vertical column overlaying the image edge (does not shift the centered image)
+ * @param {object}       [opts.saveOutput]  - { saved, onSave, errorMessage } —
+ *   renders a Save button when provided; hidden when the record is already saved
  * @param {boolean}      [opts.focusTrap]   - Enable Tab/Shift+Tab focus trap
  * @returns {{ overlay: HTMLElement, close: function, contentEl: HTMLElement }}
  */
@@ -525,104 +701,91 @@ export function createImagePreviewOverlay(opts) {
   var content = document.createElement("div");
   content.className = "comfymodal-studio-preview-overlay-content";
 
-  // ── Top toolbar: close + download ──────────────────────────────────
-  var toolbar = document.createElement("div");
-  toolbar.className = "comfymodal-studio-preview-toolbar";
-  toolbar.style.cssText = "display:flex;align-items:center;gap:6px;justify-content:flex-end;padding:4px 8px;flex-shrink:0;";
-
-  // Close button
+  // ── Toolbar buttons (rendered below the image in the zoom controls) ──
   var closeBtn = document.createElement("button");
   closeBtn.className = "comfymodal-studio-preview-overlay-close";
   closeBtn.setAttribute("aria-label", "Close preview");
   closeBtn.textContent = "\u00d7";
-  closeBtn.style.cssText = "background:transparent;border:none;color:#aaa;font-size:20px;cursor:pointer;line-height:1;padding:2px 6px;";
+  closeBtn.style.cssText = "background:transparent;border:none;color:#ccc;font-size:18px;cursor:pointer;line-height:1;padding:2px 6px;position:static;top:auto;right:auto;z-index:auto;";
   closeBtn.addEventListener("click", function (e) {
     e.stopPropagation();
     close();
   });
-  toolbar.appendChild(closeBtn);
 
-  // Download button (only when image URL is present)
-  if (opts.imageUrl) {
-    (function () {
-      var dlBtn = document.createElement("button");
-      dlBtn.className = "comfymodal-studio-download-btn";
-      dlBtn.setAttribute("aria-label", "Download image");
-      dlBtn.textContent = "\u2b07";
-      dlBtn.title = "Download image";
-      dlBtn.style.cssText = "background:transparent;border:none;color:#aaa;font-size:16px;cursor:pointer;line-height:1;padding:2px 6px;";
+  var extraControls = [closeBtn];
 
-      // Sanitize filename from available metadata
-      function _getFilename() {
-        var meta = opts.metadata || {};
-        var candidates = [
-          meta.filename,
-          meta.output_path,
-          meta.primary_asset_id,
-          meta.prompt,
-          opts.alt,
-        ];
-        for (var i = 0; i < candidates.length; i++) {
-          if (candidates[i] && typeof candidates[i] === "string" && candidates[i].length > 0) {
-            // Extract basename, strip extension, sanitize
-            var base = candidates[i].split("/").pop().split("\\").pop();
-            base = base.replace(/\.[^.]+$/, ""); // remove extension
-            // Keep only alphanumeric, dash, underscore, dot
-            base = base.replace(/[^a-zA-Z0-9_-]/g, "_").substring(0, 100);
-            if (base.length > 0) return base;
-          }
+  // Save-output button (single-output backend action).  Visibility is
+  // driven by the caller via opts.saveOutput: the button is only rendered
+  // for unsaved records.
+  var saveError = null;
+  if (opts.saveOutput) {
+    var saveBtn = document.createElement("button");
+    saveBtn.className = "comfymodal-studio-save-btn";
+    saveBtn.setAttribute("data-testid", "save-output-btn");
+    saveBtn.setAttribute("aria-label", "Save output");
+    saveBtn.textContent = "Save";
+    saveBtn.title = "Save output to the local outputs folder";
+    saveBtn.style.cssText = "background:transparent;border:none;color:#ccc;font-size:11px;cursor:pointer;line-height:1;padding:2px 6px;";
+    saveBtn.addEventListener("click", async function (e) {
+      e.stopPropagation();
+      if (saveBtn.disabled) return;
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving\u2026";
+      if (saveError) saveError.style.display = "none";
+      try {
+        var ok = await opts.saveOutput.onSave();
+        if (ok === false) throw new Error("save failed");
+        saveBtn.style.display = "none";
+      } catch (err) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save";
+        if (saveError) {
+          saveError.textContent = (opts.saveOutput.errorMessage || "Save failed")
+            + (err && err.message ? ": " + err.message : "");
+          saveError.style.display = "block";
         }
-        return "modal-image";
       }
-
-      dlBtn.addEventListener("click", async function (e) {
-        e.stopPropagation();
-        dlBtn.disabled = true;
-        dlBtn.textContent = "\u23f3";
-        try {
-          var resp = await fetch(opts.imageUrl);
-          if (!resp.ok) throw new Error("HTTP " + resp.status);
-          var blob = await resp.blob();
-          var ext = (blob.type.split("/")[1] || "png").replace(/[^a-zA-Z0-9]/g, "");
-          var filename = _getFilename() + "." + ext;
-          var objUrl = URL.createObjectURL(blob);
-          var a = document.createElement("a");
-          a.href = objUrl;
-          a.download = filename;
-          // Safe anchor download: no navigation, revoke after triggering
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(function () {
-            if (a.parentNode) a.parentNode.removeChild(a);
-            URL.revokeObjectURL(objUrl);
-          }, 100);
-        } catch (err) {
-          var errEl = document.createElement("span");
-          errEl.textContent = "Download failed";
-          errEl.style.cssText = "color:#f87171;font-size:11px;margin-left:4px;";
-          toolbar.appendChild(errEl);
-          setTimeout(function () { if (errEl.parentNode) errEl.remove(); }, 3000);
-        } finally {
-          dlBtn.disabled = false;
-          dlBtn.textContent = "\u2b07";
-        }
-      });
-
-      toolbar.appendChild(dlBtn);
-    })();
+    });
+    extraControls.push(saveBtn);
   }
 
-  content.appendChild(toolbar);
+  // Download button (only when image URL is present).  No transient
+  // status text in the toolbar — failures surface via the button title.
+  if (opts.imageUrl) {
+    extraControls.push(_buildDownloadButton(opts));
+  }
 
   // Zoomable image or no-image placeholder
   if (opts.imageUrl) {
-    _zoomObj = createZoomableImageEl(opts.imageUrl, opts.alt);
+    _zoomObj = createZoomableImageEl(opts.imageUrl, opts.alt, {
+      extraControls: extraControls,
+    });
     content.appendChild(_zoomObj.container);
   } else {
     var noImg = document.createElement("div");
     noImg.className = "comfymodal-studio-preview-overlay-noimage";
     noImg.textContent = "No image available";
     content.appendChild(noImg);
+  }
+
+  // Save error line (below the image, hidden until a failure occurs)
+  if (opts.saveOutput) {
+    saveError = document.createElement("div");
+    saveError.className = "comfymodal-studio-save-error";
+    saveError.style.cssText = "display:none;font-size:11px;color:var(--color-danger, #f87171);max-width:100%;";
+    saveError.setAttribute("data-testid", "save-output-error");
+    content.appendChild(saveError);
+  }
+
+  // Right-side vertical axis column — overlays the image's right edge so
+  // the centered image is not shifted.  Width is capped for narrow layouts.
+  if (opts.sideColumn) {
+    var sideCol = opts.sideColumn;
+    sideCol.style.cssText = (sideCol.style.cssText || "")
+      + ";position:absolute;top:0;right:0;bottom:0;width:min(230px,38vw);max-width:100%;"
+      + "overflow-y:auto;background:rgba(8,8,10,0.9);border-left:1px solid #2a2a2a;"
+      + "padding:10px;box-sizing:border-box;z-index:2;";
+    content.appendChild(sideCol);
   }
 
   // Custom sections below the image
@@ -674,7 +837,7 @@ export function createImagePreviewOverlay(opts) {
     }
   });
 
-  function close() {
+  function close(notify = true) {
     // Idempotent: only run once.  All internal paths (Escape handler,
     // backdrop click, close button) call close(), and external callers
     // may also call preview.close().  The _closed guard ensures exactly
@@ -697,12 +860,80 @@ export function createImagePreviewOverlay(opts) {
     }
     // Notify the caller after cleanup so the callback can safely
     // re-render or restore focus without stale layer entries.
-    if (typeof opts.onClose === "function") {
+    if (notify && typeof opts.onClose === "function") {
       opts.onClose();
     }
   }
 
   return { overlay: overlay, close: close, contentEl: content };
+}
+
+/**
+ * Build the download button for the preview toolbar.  Failures are
+ * surfaced via the button title/aria-label (no transient status text).
+ */
+function _buildDownloadButton(opts) {
+  var dlBtn = document.createElement("button");
+  dlBtn.className = "comfymodal-studio-download-btn";
+  dlBtn.setAttribute("aria-label", "Download image");
+  dlBtn.textContent = "\u2b07";
+  dlBtn.title = "Download image";
+  dlBtn.style.cssText = "background:transparent;border:none;color:#ccc;font-size:15px;cursor:pointer;line-height:1;padding:2px 6px;";
+
+  // Sanitize filename from available metadata
+  function _getFilename() {
+    var meta = opts.metadata || {};
+    var candidates = [
+      meta.filename,
+      meta.output_path,
+      meta.primary_asset_id,
+      meta.prompt,
+      opts.alt,
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i] && typeof candidates[i] === "string" && candidates[i].length > 0) {
+        // Extract basename, strip extension, sanitize
+        var base = candidates[i].split("/").pop().split("\\").pop();
+        base = base.replace(/\.[^.]+$/, ""); // remove extension
+        // Keep only alphanumeric, dash, underscore, dot
+        base = base.replace(/[^a-zA-Z0-9_-]/g, "_").substring(0, 100);
+        if (base.length > 0) return base;
+      }
+    }
+    return "modal-image";
+  }
+
+  dlBtn.addEventListener("click", async function (e) {
+    e.stopPropagation();
+    dlBtn.disabled = true;
+    dlBtn.textContent = "\u23f3";
+    try {
+      var resp = await fetch(opts.imageUrl);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      var blob = await resp.blob();
+      var ext = (blob.type.split("/")[1] || "png").replace(/[^a-zA-Z0-9]/g, "");
+      var filename = _getFilename() + "." + ext;
+      var objUrl = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = objUrl;
+      a.download = filename;
+      // Safe anchor download: no navigation, revoke after triggering
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () {
+        if (a.parentNode) a.parentNode.removeChild(a);
+        URL.revokeObjectURL(objUrl);
+      }, 100);
+    } catch (err) {
+      dlBtn.title = "Download failed \u2014 try again";
+      dlBtn.setAttribute("aria-label", "Download failed, try again");
+    } finally {
+      dlBtn.disabled = false;
+      dlBtn.textContent = "\u2b07";
+    }
+  });
+
+  return dlBtn;
 }
 
 export function renderEmptyState(listContent, detailPanel, context, state) {
