@@ -1,8 +1,9 @@
 {
-  "auto_save_local": true,
-  "output_format": "webp_lossy",
-  "quality": 40,
-  "save_folder": "output/modal",
+  "auto_save_local": false,
+  "execution_mode": "v1",
+  "output_format": "original",
+  "quality": 75,
+  "save_folder": "",
   "save_metadata_sidecar": true,
   "webp_lossless_compression": "balanced"
 }
