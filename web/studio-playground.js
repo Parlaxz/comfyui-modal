@@ -5,7 +5,7 @@
 // Uses the feature registry for all control rendering.
 // Experiment mode is an overlay on controls, not a separate page.
 
-import { FEATURE_SPECS, CONTROL_DEFS } from "./studio-feature-registry.js";
+import { FEATURE_SPECS, CONTROL_DEFS, getRecommendedStepsStatus } from "./studio-feature-registry.js";
 import {
   renderExperimentToggle,
   renderExperimentMode,
@@ -37,7 +37,7 @@ import {
   isCarouselCleared,
 } from "./studio-playground-state.js";
 import { createScopedTracker } from "./comfymodal-progress.js";
-import { updateRunAnnotation } from "./studio-backend-api.js";
+import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 
 async function buildStudioModalOptions(apiBase) {
   const config = await getModalConfig(apiBase);
@@ -1598,7 +1598,8 @@ function renderControl(def, state, actions, preset) {
         "data-testid": `input-${def.id}`,
       });
       input.addEventListener("input", () => {
-        if (actions.setControl) actions.setControl(def.id, parseFloat(input.value) || input.value);
+        const parsed = parseFloat(input.value);
+        if (actions.setControl) actions.setControl(def.id, Number.isFinite(parsed) ? parsed : input.value);
       });
     }
   }
@@ -1606,35 +1607,39 @@ function renderControl(def, state, actions, preset) {
   if (input) group.appendChild(input);
 
   // ── Steps: Use Recommended (N) button ──────────────────────────────
-  // Adds a compact "Use recommended (N)" button beside the Steps control
-  // when a positive workflow-derived recommendation is available.
-    if (def.id === "steps") {
-      // Workflow-captured only: reads from _runningExperimentConfig which
-      // is set at experiment submit time.  Never falls back to preset
-      // defaults or static values.
-      var recommendedSteps = null;
-      var rsConfig = state.playground && state.playground._runningExperimentConfig;
-      if (rsConfig && rsConfig.controls && rsConfig.controls.steps != null) {
-        var cfgSteps = Number(rsConfig.controls.steps);
-        if (!isNaN(cfgSteps) && cfgSteps > 0 && isFinite(cfgSteps)) {
-          recommendedSteps = cfgSteps;
+  // Preset/workflow-backed recommendation (shared with the Steps axis
+  // editor).  Hidden when no trustworthy source exists; disabled when
+  // the current value already matches the recommendation.
+  if (def.id === "steps") {
+    const pg = state.playground;
+    const stepsAxisActive = !!(pg && pg.experimentMode
+      && pg.experimentAxes && pg.experimentAxes.steps && pg.experimentAxes.steps.enabled);
+    if (!stepsAxisActive) {
+      const recStatus = getRecommendedStepsStatus(state, [value]);
+      if (recStatus.value != null) {
+        const recBtn = document.createElement("button");
+        recBtn.type = "button";
+        recBtn.className = "comfymodal-secondary-btn";
+        recBtn.style.cssText = "font-size:9px;padding:1px 6px;margin-top:2px;display:inline-block;";
+        recBtn.textContent = "Use recommended (" + recStatus.value + ")";
+        recBtn.setAttribute("data-testid", "steps-recommended-btn");
+        if (recStatus.reason) {
+          recBtn.disabled = true;
+          recBtn.title = recStatus.reason;
+        } else {
+          recBtn.title = "From selected preset workflow capture";
+          recBtn.addEventListener("click", function () {
+            if (actions && actions.setControl) {
+              actions.setControl("steps", recStatus.value);
+            }
+            const stepsInput = group.querySelector('[data-testid="input-steps"]');
+            if (stepsInput) stepsInput.value = String(recStatus.value);
+            recBtn.disabled = true;
+            recBtn.title = "Already applied";
+          });
         }
+        group.appendChild(recBtn);
       }
-
-      if (recommendedSteps != null) {
-      var recBtn = document.createElement("button");
-      recBtn.type = "button";
-      recBtn.className = "comfymodal-secondary-btn";
-      recBtn.style.cssText = "font-size:9px;padding:1px 6px;margin-top:2px;display:inline-block;";
-      recBtn.textContent = "Use recommended (" + recommendedSteps + ")";
-      recBtn.title = "From captured workflow";
-      recBtn.setAttribute("data-testid", "steps-recommended-btn");
-      recBtn.addEventListener("click", function () {
-        if (actions && actions.setControl) {
-          actions.setControl("steps", recommendedSteps);
-        }
-      });
-      group.appendChild(recBtn);
     }
   }
 
@@ -3709,8 +3714,15 @@ function _renderCellDetailOverlay(entry, entries, apiBase, state, context, varyi
   varyingAxes = varyingAxes || [];
   entries = entries || [];
 
+  var previousPreview = state.playground && state.playground._cellPreviewController;
+  if (previousPreview && typeof previousPreview.close === "function") {
+    previousPreview.close(false);
+  }
+  if (state.playground) state.playground._cellPreviewController = null;
+
   function _close() {
     if (state.playground) state.playground._selectedCellKey = null;
+    if (state.playground) state.playground._cellPreviewController = null;
     if (context && context.setPage) context.setPage("playground");
   }
 
@@ -3758,7 +3770,14 @@ function _renderCellDetailOverlay(entry, entries, apiBase, state, context, varyi
       var newKey = bestCell.getAttribute("data-cell-key");
       if (newKey && state.playground) {
         state.playground._selectedCellKey = newKey;
-        if (context && context.setPage) { e.preventDefault(); context.setPage("playground"); }
+        if (context && context.setPage) {
+          e.preventDefault();
+          if (state.playground._cellPreviewController) {
+            state.playground._cellPreviewController.close(false);
+            state.playground._cellPreviewController = null;
+          }
+          context.setPage("playground");
+        }
         return true;
       }
     }
@@ -3853,7 +3872,9 @@ function _renderCellDetailOverlay(entry, entries, apiBase, state, context, varyi
       axisSection.appendChild(nvContent);
     }
 
-    sections.push(axisSection);
+    // The axis section renders as a right-side vertical column beside the
+    // image (sideColumn) so it never shifts the centered image.
+    axisSection.style.cssText = "border-top:none;padding-top:0;min-width:180px;";
   }
 
   // Preset / backend info
@@ -3864,13 +3885,42 @@ function _renderCellDetailOverlay(entry, entries, apiBase, state, context, varyi
     }));
   }
 
+  // Save-output support (single-output backend action).  The button is
+  // only offered when the cell carries a run id, has an output, and the
+  // record is not already saved.
+  var saveOutput = null;
+  var cellRunId = entry.attempt.run_id || entry.attempt.attempt_id || "";
+  var cellSaved = !!(entry.attempt.output_saved === true || (entry.attempt.extra && entry.attempt.extra.output_saved === true));
+  if (entry.outputUrl && cellRunId && !cellSaved) {
+    saveOutput = {
+      saved: false,
+      onSave: async function () {
+        var res = await saveRunOutput(apiBase, cellRunId, { output_index: 0 });
+        if (!res || res.status !== "ok") {
+          throw new Error((res && res.message) || "Save request failed");
+        }
+        entry.attempt.output_saved = true;
+        if (state.playground && state.playground._cellPreviewController) {
+          state.playground._cellPreviewController.close(false);
+          state.playground._cellPreviewController = null;
+        }
+        if (context && context.setPage) context.setPage("playground");
+        return true;
+      },
+    };
+  }
+
   var preview = createImagePreviewOverlay({
     imageUrl: entry.outputUrl || null,
     alt: "Cell output",
     onClose: _close,
     onKeyDown: onKeyDown,
     sections: sections,
+    sideColumn: hasAnyAxes ? axisSection : null,
+    saveOutput: saveOutput,
   });
+
+  if (state.playground) state.playground._cellPreviewController = preview;
 
   return preview.overlay;
 }
@@ -4323,6 +4373,49 @@ function renderMetadataSection(state, context) {
   }
 
   section.appendChild(summary);
+
+  // ── Save Output (single-output backend action) ────────────────────
+  // Button visibility follows the record's saved state; the request
+  // targets only the selected (primary) output.
+  var rawRun = nr.raw || {};
+  var rawExtra = rawRun.extra || {};
+  var recordSaved = rawRun.output_saved === true || rawExtra.output_saved === true;
+  if (nr.id && nr.imageUrl && !recordSaved) {
+    var saveRow = el("div", { style: "display:flex;align-items:center;gap:6px;margin-top:6px;" });
+    var saveBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "save-output-btn",
+      text: "Save output",
+      style: "font-size:10px;padding:2px 10px;",
+    });
+    var saveErrorEl = el("span", {
+      "data-testid": "save-output-error",
+      style: "display:none;font-size:10px;color:var(--color-danger, #f87171);",
+    });
+    saveBtn.addEventListener("click", async function () {
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving\u2026";
+      saveErrorEl.style.display = "none";
+      try {
+        var res = await saveRunOutput(apiBase, nr.id, { output_index: 0 });
+        if (!res || res.status !== "ok") {
+          throw new Error((res && res.message) || "Save request failed");
+        }
+        if (rawRun) rawRun.output_saved = true;
+        nr.outputSaved = true;
+        if (context && context.setPage) context.setPage("playground");
+      } catch (err) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save output";
+        saveErrorEl.textContent = (err && err.message) || "Save failed";
+        saveErrorEl.style.display = "inline";
+      }
+    });
+    saveRow.appendChild(saveBtn);
+    saveRow.appendChild(saveErrorEl);
+    section.appendChild(saveRow);
+  }
 
   // ── Timing Summary Card ────────────────────────────────────────────
   if (nr.timingStages && nr.timingStages.length > 0) {

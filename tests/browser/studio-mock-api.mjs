@@ -91,6 +91,7 @@ export async function installStudioMockApi(page, options = {}) {
     calls: [],
     unhandledCalls: [], // {method, pathname} from catch-all only
     pollCounts: new Map(), // expId → integer
+    saveRequests: [], // { run_id, output_index } from POST /run-history/:id/save
   };
 
   let lastRunRequest = null;
@@ -792,11 +793,76 @@ export async function installStudioMockApi(page, options = {}) {
       status: "ok",
       runs: runs.map((r) => ({
         ...r,
+        output_saved: r.output_saved === true || r.extra?.output_saved === true || false,
         annotations: r.annotations || { favorite: false, note: "" },
       })),
       total,
       limit,
       offset,
+    });
+  }
+
+  /** GET /comfymodal/history — unified paginated history */
+  async function listUnifiedHistory(route, url) {
+    const page = parseInt(url.searchParams.get("page") || "1", 10);
+    const pageSize = parseInt(url.searchParams.get("page_size") || "50", 10);
+    const kindFilter = url.searchParams.get("kind") || url.searchParams.get("type") || null;
+    const statusFilter = url.searchParams.get("status") || null;
+    const sort = url.searchParams.get("sort") || "newest";
+    const search = url.searchParams.get("search") || null;
+
+    let filtered = [...state.history];
+    if (kindFilter) {
+      filtered = filtered.filter((r) => r.kind === kindFilter);
+    }
+    if (statusFilter) {
+      filtered = filtered.filter((r) => r.status === statusFilter);
+    }
+    if (search) {
+      const lower = search.toLowerCase();
+      filtered = filtered.filter(
+        (r) =>
+          (r.prompt || "").toLowerCase().includes(lower) ||
+          (r.run_id || "").toLowerCase().includes(lower)
+      );
+    }
+    if (sort === "oldest") filtered.reverse();
+
+    const total = filtered.length;
+    const items = filtered.slice((page - 1) * pageSize, page * pageSize);
+
+    return _json({
+      status: "ok",
+      items: items.map((r) => ({
+        ...r,
+        output_saved: r.output_saved === true || r.extra?.output_saved === true || false,
+        annotations: r.annotations || { favorite: false, note: "" },
+      })),
+      page,
+      page_size: pageSize,
+      total,
+      has_more: page * pageSize < total,
+    });
+  }
+
+  /** POST /comfymodal/run-history/:run_id/save — single-output save */
+  async function saveRunOutput(route, url, body, params) {
+    const run = state.history.find((r) => r.run_id === params.run_id);
+    if (!run) return _error("not found", 404);
+
+    const outputIndex = body?.output_index != null ? body.output_index : 0;
+    run.output_saved = true;
+    if (!run.extra) run.extra = {};
+    run.extra.output_saved = true;
+    run.extra.output_saved_at = _now();
+
+    state.saveRequests.push({ run_id: run.run_id, output_index: outputIndex });
+
+    return _json({
+      status: "ok",
+      saved: true,
+      run_id: run.run_id,
+      output_index: outputIndex,
     });
   }
 
@@ -896,7 +962,9 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Run history
     ["GET", "/comfymodal/run-history", listRunHistory],
+    ["GET", "/comfymodal/history", listUnifiedHistory],
     ["PATCH", "/comfymodal/run-history/:run_id/annotations", patchRunAnnotations],
+    ["POST", "/comfymodal/run-history/:run_id/save", saveRunOutput],
 
     // Asset & output serving (1-pixel PNG)
     ["GET", "/comfymodal/assets/:asset_id", serveAsset],
@@ -908,6 +976,8 @@ export async function installStudioMockApi(page, options = {}) {
     // ComfyUI config endpoint — called during extension setup
     ["GET", "/api/comfymodal/config", serveConfig],
     ["POST", "/api/comfymodal/config", serveConfig],
+    ["GET", "/comfymodal/config", serveConfig],
+    ["POST", "/comfymodal/config", serveConfig],
   ];
 
   // Compile routes
@@ -1021,6 +1091,7 @@ export async function installStudioMockApi(page, options = {}) {
       state.calls.length = 0;
       state.unhandledCalls.length = 0;
       state.pollCounts.clear();
+      state.saveRequests.length = 0;
       lastRunRequest = null;
       lastExperimentRequest = null;
       failQueue.length = 0;

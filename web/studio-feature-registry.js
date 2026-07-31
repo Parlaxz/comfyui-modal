@@ -203,3 +203,81 @@ export const CONTROL_DEFS = {
     applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
 };
+
+// ── Shared Steps recommendation ──────────────────────────────────────────
+//
+// Workflow/preset-backed "recommended steps" available before runs.
+// Sources, most trustworthy first:
+//   1. A freshly captured workflow run config for the CURRENT selection
+//      (state.playground._runningExperimentConfig) — only trusted when the
+//      captured preset/feature match the current selection.
+//   2. The selected preset's workflow-captured default
+//      (state.playground._currentPreset.defaults.steps).
+// Values outside the steps schema range are never trusted.  Returns null
+// when no trustworthy source exists so callers can hide the action.
+
+export function getRecommendedSteps(state) {
+  const pg = state && state.playground;
+  if (!pg) return null;
+  const def = CONTROL_DEFS.steps;
+  const min = def && def.min != null ? def.min : 1;
+  const max = def && def.max != null ? def.max : 150;
+  function _valid(v) {
+    const n = Number(v);
+    return !isNaN(n) && isFinite(n) && n >= min && n <= max;
+  }
+
+  const cfg = pg._runningExperimentConfig;
+  if (cfg && cfg.controls && cfg.controls.steps != null && _valid(cfg.controls.steps)) {
+    const cfgPresetId = Array.isArray(cfg.presetIds) && cfg.presetIds.length > 0 ? cfg.presetIds[0] : null;
+    const presetMatches = !cfgPresetId || cfgPresetId === pg.selectedBackendId;
+    const featureMatches = !cfg.featureId || cfg.featureId === (pg.featureId || "txt2img");
+    if (presetMatches && featureMatches) return Number(cfg.controls.steps);
+  }
+
+  const preset = pg._currentPreset;
+  if (preset && preset.defaults && preset.defaults.steps != null && _valid(preset.defaults.steps)) {
+    return Number(preset.defaults.steps);
+  }
+  return null;
+}
+
+/**
+ * Status for the recommended-steps action.
+ * @returns {{value:number|null, reason:string}} reason is non-empty when
+ *   the action should be disabled (applying would change nothing).
+ */
+export function getRecommendedStepsStatus(state, currentValues) {
+  const value = getRecommendedSteps(state);
+  if (value == null) return { value: null, reason: "" };
+  if (Array.isArray(currentValues) && currentValues.length > 0) {
+    const allEqual = currentValues.every(function (v) {
+      return String(v) === String(value);
+    });
+    if (allEqual) return { value: value, reason: "Already applied" };
+  }
+  return { value: value, reason: "" };
+}
+
+// ── Seed insertion helpers ───────────────────────────────────────────────
+
+/** Last finite numeric value in the list (scanning from the end), or null. */
+export function getLastFiniteSeed(values) {
+  if (!Array.isArray(values)) return null;
+  for (var i = values.length - 1; i >= 0; i--) {
+    if (values[i] === "" || values[i] == null) continue;
+    var n = Number(values[i]);
+    if (!isNaN(n) && isFinite(n)) return n;
+  }
+  return null;
+}
+
+/** CSPRNG integer in [0, max] via crypto.getRandomValues. */
+export function cryptoRandomSeed(max) {
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    var buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    return Math.floor((buf[0] / 4294967296) * (max + 1));
+  }
+  return Math.floor(Math.random() * (max + 1));
+}

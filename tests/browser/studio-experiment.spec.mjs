@@ -85,19 +85,24 @@ async function enableStepsAxis(page) {
 }
 
 async function setStepsAxisValues(page, values) {
-  // The axis editor should be visible after enabling the axis
+  // The axis editor starts with the default value at index 0.  Each
+  // requested value is appended (via +) and filled, skipping values that
+  // are already present (mirrors the old quick-add dedupe semantics).
   const editor = page.locator('[data-testid="axis-editor-steps"]');
   await editor.waitFor({ state: "visible", timeout: 5000 });
-
-  // Use quick-add buttons if available
+  await editor.locator('[data-testid="axis-value-steps-0"]').waitFor({ state: "visible", timeout: 5000 });
+  const current = await editor.evaluate((root) => {
+    return Array.from(root.querySelectorAll('[data-testid^="axis-value-steps-"]')).map((el) => el.value);
+  });
   for (const v of values) {
-    const btn = editor.locator(`button:has-text("${v}")`);
-    const btnCount = await btn.count();
-    if (btnCount > 0) {
-      await btn.first().click();
-      // brief pause deliberately creates a race-like rapid-add sequence
-      await page.waitForTimeout(50);
-    }
+    if (current.includes(String(v))) continue;
+    await editor.locator('[data-testid="axis-add-value-steps"]').click();
+    // brief pause deliberately creates a race-like rapid-add sequence
+    await page.waitForTimeout(50);
+    const inputs = editor.locator('[data-testid^="axis-value-steps-"]');
+    const n = await inputs.count();
+    await inputs.nth(n - 1).fill(String(v));
+    current.push(String(v));
   }
 }
 
