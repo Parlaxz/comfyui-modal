@@ -13,7 +13,7 @@ class ComfyAppPackagingTests(unittest.TestCase):
         self.assertNotIn("from custom_node_sync import", source)
 
     def test_comfyapp_does_not_top_level_import_httpx(self):
-        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8"))
+        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8-sig"))
         imported = set()
         for node in tree.body:
             if isinstance(node, ast.Import):
@@ -26,13 +26,31 @@ class ComfyAppPackagingTests(unittest.TestCase):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         # gpu_catalog is added via the loop in _add_comfymodal_local_python_sources
         self.assertIn('"gpu_catalog"', source)
-        self.assertIn('_COMFYMODAL_LOCAL_PYTHON_SOURCES', source)
+        self.assertIn('_GPU_COMFYMODAL_PYTHON_SOURCES', source)
+        self.assertIn('_CPU_COMFYMODAL_PYTHON_SOURCES', source)
 
     def test_all_modal_images_include_timing_trace_source(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         # timing_trace is added via the loop in _add_comfymodal_local_python_sources
         self.assertIn('"timing_trace"', source)
-        self.assertIn('_COMFYMODAL_LOCAL_PYTHON_SOURCES', source)
+        self.assertIn('_GPU_COMFYMODAL_PYTHON_SOURCES', source)
+        self.assertIn('_CPU_COMFYMODAL_PYTHON_SOURCES', source)
+
+    def test_warmup_profile_image_helpers_include_comfyapp(self):
+        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8-sig"))
+        helper_names = {"_add_gpu_python_sources", "_add_cpu_python_sources"}
+        found = {name: False for name in helper_names}
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name not in helper_names:
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                    continue
+                if call.func.attr != "add_local_python_source" or not call.args:
+                    continue
+                if isinstance(call.args[0], ast.Constant) and call.args[0].value == "comfyapp":
+                    found[node.name] = True
+        self.assertEqual(found, {name: True for name in helper_names})
 
     def test_image_pins_sageattention_220(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
