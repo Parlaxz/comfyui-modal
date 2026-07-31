@@ -751,33 +751,48 @@ class RunHistoryService:
 
     def _index_try_upsert(self, meta_obj: dict, source_path: str = "") -> None:
         """Try to upsert into the index; silently survive failures."""
-        index = self._get_index()
+        index = None
         try:
+            index = self._get_index()
             index.upsert_from_meta(meta_obj, source_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                f"[comfyui-modal.history-index] upsert failed for "
+                f"{meta_obj.get('run_id', '?')}: {type(exc).__name__}: {exc}"
+            )
         finally:
-            index.close()
+            if index is not None:
+                index.close()
 
     def _index_try_remove(self, run_id: str) -> None:
         """Try to remove from the index; silently survive failures."""
-        index = self._get_index()
+        index = None
         try:
+            index = self._get_index()
             index.remove(run_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                f"[comfyui-modal.history-index] remove failed for {run_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
         finally:
-            index.close()
+            if index is not None:
+                index.close()
 
     def _index_try_rebuild(self) -> None:
-        """Try a full rebuild; silently survive failures."""
-        index = self._get_index()
+        """Try a full rebuild without blocking source writes."""
+        index = None
         try:
+            index = self._get_index()
             index.rebuild()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                f"[comfyui-modal.history-index] rebuild failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
         finally:
-            index.close()
+            if index is not None:
+                index.close()
 
     def _lock_for(self, run_id: str) -> threading.Lock:
         return self._run_locks.acquire(run_id)

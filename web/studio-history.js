@@ -20,7 +20,7 @@
 //   3. run.output_path         → /studio/outputs/<path>
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
-import { listUnifiedHistory, updateRunAnnotation } from "./studio-backend-api.js";
+import { listUnifiedHistory, updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 import { loadExperimentIntoPlayground } from "./studio-playground.js";
 import { el, createImagePreviewOverlay, registerLayerHandler } from "./studio-ui.js";
 
@@ -28,6 +28,18 @@ import { el, createImagePreviewOverlay, registerLayerHandler } from "./studio-ui
 
 function getRunExtra(run) {
   return (run && run.extra) || {};
+}
+
+/**
+ * True when the record's output is already saved.  Reads the backend's
+ * per-record saved state (defensively; absent state means not saved).
+ */
+function _isRecordOutputSaved(nr) {
+  const raw = nr && nr.raw;
+  if (!raw) return false;
+  if (raw.output_saved === true) return true;
+  if (raw.extra && raw.extra.output_saved === true) return true;
+  return false;
 }
 
 function getRunStatus(run) {
@@ -428,6 +440,7 @@ export function renderHistory(state, context) {
     sort: "newest",
   };
   var previewRun = null;
+  var previewController = null;
   var groupExperiments = false;
   var totalCount = 0;
   var _COLUMNS_KEY = "comfymodal-studio-history-columns";
@@ -719,7 +732,12 @@ export function renderHistory(state, context) {
   // ── Preview Overlay ──────────────────────────────────────────────────
   function renderPreviewOverlay() {
     const existing = container.querySelector(".comfymodal-studio-preview-overlay");
-    if (existing) existing.remove();
+    if (previewController) {
+      previewController.close(false);
+      previewController = null;
+    } else if (existing) {
+      existing.remove();
+    }
     if (!previewRun) return;
 
     const nr = previewRun;
@@ -802,13 +820,36 @@ export function renderHistory(state, context) {
     // Note editor
     sections.push(renderNoteEditor(nr, apiBase));
 
+    // Save-output action (single-output backend save).  Button visibility
+    // follows the record saved state; the request targets only the
+    // selected (primary) output.
+    var saveConfig = null;
+    if (imageUrl && nr.id && !_isRecordOutputSaved(nr)) {
+      saveConfig = {
+        saved: false,
+        onSave: async function () {
+          const res = await saveRunOutput(apiBase, rid, { output_index: 0 });
+          if (!res || res.status !== "ok") {
+            throw new Error((res && res.message) || "Save request failed");
+          }
+          if (nr.raw) nr.raw.output_saved = true;
+          if (nr.raw && nr.raw.extra) nr.raw.extra.output_saved = true;
+          nr.outputSaved = true;
+          renderPreviewOverlay();
+          return true;
+        },
+      };
+    }
+
     var preview = createImagePreviewOverlay({
       imageUrl: imageUrl,
       alt: promptText,
       onClose: closePreview,
       sections: sections,
       focusTrap: true,
+      saveOutput: saveConfig,
     });
+    previewController = preview;
 
     container.appendChild(preview.overlay);
 

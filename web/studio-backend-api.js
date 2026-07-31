@@ -251,9 +251,28 @@ export async function listUnifiedHistory(apiBase, params, signal) {
   }
   const qs = query.toString();
   try {
-    const res = await fetch(apiBase + "/history" + (qs ? "?" + qs : ""), { signal: signal || null });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const url = apiBase + "/history" + (qs ? "?" + qs : "");
+    const res = await fetch(url, { signal: signal || null });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (parseError) {
+      data = { status: "error", message: "History endpoint returned an invalid response" };
+    }
+    if (!res.ok) {
+      const message = data && data.message ? data.message : "History request failed";
+      const error = new Error(message);
+      error.status = res.status;
+      error.errorCode = data && data.error_code ? data.error_code : "history_request_failed";
+      error.detail = data && data.detail ? data.detail : "";
+      error.responseBody = data;
+      console.error("[Studio History] history request failed", {
+        url: url,
+        status: res.status,
+        body: data,
+      });
+      throw error;
+    }
     if (data && data.status === "ok") {
       return {
         items: data.items || [],
@@ -266,7 +285,8 @@ export async function listUnifiedHistory(apiBase, params, signal) {
     return data || null;
   } catch (err) {
     if (err && err.name === "AbortError") return null;
-    return null;
+    console.error("[Studio History] history request error", err);
+    throw err;
   }
 }
 
@@ -284,6 +304,26 @@ export async function updateRunAnnotation(apiBase, runId, payload) {
   if (!runId) return null;
   return apiFetch(apiBase, `/run-history/${encodeURIComponent(runId)}/annotations`, {
     method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// ── Single-Output Save API ──────────────────────────────────────────────
+
+/**
+ * Save a single output of a run to the local outputs folder.
+ * The request targets only the selected output (output_index), never
+ * saving all outputs of a multi-output record.
+ * @param {string} apiBase
+ * @param {string} runId
+ * @param {object} payload - { output_index: number }
+ * @returns {Promise<object|null>}
+ */
+export async function saveRunOutput(apiBase, runId, payload) {
+  if (!runId) return null;
+  return apiFetch(apiBase, `/run-history/${encodeURIComponent(runId)}/save`, {
+    method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
