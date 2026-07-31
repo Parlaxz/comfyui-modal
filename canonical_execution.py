@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import copy
-import inspect
 import json
 import os
 import sys
@@ -41,18 +40,9 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
-from comfymodal_runtime.contracts import (
-    ExecutionOptions,
-    ExecutionPlan,
-    RestorePlan,
-    stable_hash,
-)
+from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, stable_hash
 from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.restore_plan import (
-    build_restore_model_spec,
-    derive_model_key,
-    derive_prefill_key,
-)
+from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key
 from comfymodal_runtime.trace import (
     RuntimeTrace,
     _build_local_submission_breakdown,
@@ -484,7 +474,6 @@ def _evict_profile_prep_cache() -> None:
 # _RESTORE_PUBLISH_CACHE, _RESTORE_PUBLISH_CACHE_LOCK, _evict_profile_prep_cache,
 # and _evict_restore_publish_cache are all defined.
 _populate_profile_cache_from_disk()
-_populate_restore_cache_from_disk()
 
 
 def _reset_all_cache_counters() -> None:
@@ -500,7 +489,6 @@ def _reset_all_cache_counters() -> None:
     Test / teardown only.
     """
     _reset_profile_prep_cache()
-    _reset_restore_publish_cache()
     _reset_disk_caches()
     from warmup_profile import _reset_last_stable_profile_cache as _wp_reset
     _wp_reset()
@@ -1218,9 +1206,26 @@ async def execute_plan(
 
     active_transport = transport or ModalTransport()
 
-    # ── Restore publication ──
-    runtime_trace.emit("restore_plan_build_start", phase="local")
-    if restore_publisher is not None:
+    # Request-scoped identity travels with the exact execution payload.  It is
+    # metadata for validation/diagnostics only; no shared current-plan state is
+    # written or read.
+    try:
+        _request_model_key = derive_model_key(_canonical_workflow)
+        _request_prefill_key = derive_prefill_key(_request_model_key, _canonical_workflow)
+        _request_metadata = dict(_canonical_dict.get("request_metadata", {}))
+        _request_metadata["model_identity"] = _request_model_key.to_dict()
+        _request_metadata["prefill_identity"] = _request_prefill_key.to_dict()
+        _canonical_dict["request_metadata"] = _request_metadata
+        runtime_trace.set_metadata(
+            request_model_identity_hash=_request_model_key.stable_hash,
+            request_prefill_identity_hash=_request_prefill_key.stable_hash,
+        )
+    except Exception as _identity_exc:
+        runtime_trace.set_metadata(request_identity_error=f"{type(_identity_exc).__name__}: {_identity_exc}")
+
+    # No remote publication stage exists.  Keep the legacy argument temporarily
+    # accepted for local compatibility, but never inspect or invoke it.
+    if False:
         runtime_trace.emit("plan_serialization_start", phase="local",
                            metadata={"purpose": "restore_publication"})
         workflow = _canonical_workflow  # reuse canonical payload
@@ -1390,11 +1395,9 @@ async def execute_plan(
 
         runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
-        runtime_trace.emit("restore_plan_build_end", phase="local", metadata={"status": "not_configured"})
-        runtime_trace.emit("restore_plan_publish_start", phase="local", metadata={"status": "not_configured"})
-        runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"status": "not_configured"})
+        pass
 
-    # ── Modal submission ──
+    # ── Direct Modal submission ──
     runtime_trace.emit("modal_submit_start", phase="local",
                        metadata={"request_id": runtime_trace.request_id})
     runtime_trace.emit("gpu_invocation_submit", phase="local")
@@ -1477,8 +1480,6 @@ async def execute_plan(
         "queue_wait_before_worker_ms": _origin.get("queue_wait_before_worker_ms"),
         "plan_build_ms": _event_span_ms(runtime_trace, "plan_build_start", "plan_build_end"),
         "active_profile_ms": _event_span_ms(runtime_trace, "active_profile_prepare_start", "active_profile_prepare_end"),
-        "restore_plan_build_ms": _event_span_ms(runtime_trace, "restore_plan_build_start", "restore_plan_build_end"),
-        "restore_publish_ms": _event_span_ms(runtime_trace, "restore_plan_publish_start", "restore_plan_publish_end"),
         "handle_lookup_ms": _event_span_ms(runtime_trace, "modal_handle_lookup_start", "modal_handle_lookup_end"),
         "payload_serialize_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "modal_payload_serialize_end"),
         "payload_materialization_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "payload_measure_size_start"),
@@ -1487,9 +1488,7 @@ async def execute_plan(
     }
     _t1_to_submission_ms = _transport_meta.get("local_receive_to_actual_submission_ms")
     if isinstance(_t1_to_submission_ms, (int, float)):
-        # Use non-overlapping transport intervals when available to avoid
-        # summing overlapping stage spans (route/plan/profile/restore/
-        # handle/payload/generator-create all overlap).
+        # Use non-overlapping transport intervals when available.
         _gen_create = _transport_meta.get("local_receive_to_generator_create_ms")
         _gen_ms = _transport_meta.get("generator_create_ms")
         _gen_to_first = _transport_meta.get("generator_create_to_first_iteration_ms")
@@ -1499,7 +1498,7 @@ async def execute_plan(
         else:
             # Fallback: sum only a demonstrably disjoint set using
             # local_receive_to_enqueue_ms as the pre-worker prefix, queue_wait,
-            # and sequential plan/profile/restore/handle/payload spans.
+            # and sequential plan/profile/handle/payload spans.
             # All must be known; otherwise return None rather than hiding
             # a missing major span.
             _enqueue_prefix = _origin.get("local_receive_to_enqueue_ms")
@@ -1508,7 +1507,6 @@ async def execute_plan(
                 _disjoint_total = float(_enqueue_prefix) + float(_queue_wait)
                 _all_known = True
                 for _sk in ("plan_build_ms", "active_profile_ms",
-                            "restore_plan_build_ms", "restore_publish_ms",
                             "handle_lookup_ms", "payload_serialize_ms"):
                     _sv = _local_stages.get(_sk)
                     if isinstance(_sv, (int, float)):
@@ -1813,8 +1811,8 @@ async def execute_plan(
             else:
                 _all_worker_known = False
                 _missing_stages.append("queue_wait_before_worker_ms")
-            for _wk in ("plan_build_ms", "active_profile_ms", "restore_plan_build_ms",
-                        "restore_publish_ms", "handle_lookup_ms", "payload_serialize_ms"):
+            for _wk in ("plan_build_ms", "active_profile_ms",
+                        "handle_lookup_ms", "payload_serialize_ms"):
                 _wv = _local_stages.get(_wk)
                 if isinstance(_wv, (int, float)):
                     _worker_leaf_vals.append(float(_wv))
@@ -1919,7 +1917,7 @@ async def execute_plan(
         f"local_receive_to_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
         f"queue_wait_before_worker_ms={_origin.get('queue_wait_before_worker_ms')} "
         f"plan_build_ms={_local_stages['plan_build_ms']} active_profile_ms={_local_stages['active_profile_ms']} "
-        f"restore_publish_ms={_local_stages['restore_publish_ms']} handle_lookup_ms={_local_stages['handle_lookup_ms']} "
+        f"handle_lookup_ms={_local_stages['handle_lookup_ms']} "
         f"payload_serialize_ms={_local_stages['payload_serialize_ms']} local_residual_ms={_local_residual_ms} "
         f"clock_reconciliation_residual_ms={_clock_reconciliation_residual_ms} "
         f"route_unattributed_ms={_stage_attribution_residual_ms.get('route_unattributed_ms')} "
@@ -2011,8 +2009,7 @@ async def execute_plan(
     _BREAKDOWN_REQUIRED_FIELDS = (
         "request_id", "local_receive_to_worker_start_ms",
         "worker_start_to_plan_build_ms", "plan_build_ms", "active_profile_ms",
-        "restore_plan_build_ms", "restore_publish_ms",
-        "restore_publish_to_transport_entry_ms", "transport_entry_to_handle_lookup_ms",
+        "transport_entry_to_handle_lookup_ms",
         "handle_lookup_ms", "payload_materialization_ms", "payload_size_measurement_ms",
         "payload_ready_to_generator_create_ms", "generator_create_ms",
         "generator_created_to_first_iteration_ms", "local_receive_to_actual_submission_ms",
@@ -2020,7 +2017,7 @@ async def execute_plan(
         # Metadata fields inspected by source-inspection tests
         "handle_lookup_app_name", "handle_lookup_class_name", "handle_lookup_gpu",
         "payload_serialized_bytes", "workflow_hash_prefix", "input_image_count",
-        "restore_publish_generation", "handle_cache_action",
+        "handle_cache_action",
         "active_profile_remote_call_count",
     )
     _EMPTY_FIELDS_CHECK = _BREAKDOWN_REQUIRED_FIELDS  # ensure used

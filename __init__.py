@@ -110,11 +110,9 @@ from canonical_execution import (
     execute_modal_prompt,
     execute_plan,
     prepare_modal_execution,
-    _reset_restore_publish_cache,
     _reset_profile_prep_cache,
 )
 from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.result_delivery import materialize_modal_result as _materialize_v2_result
 from comfymodal_runtime.trace import RuntimeTrace
 from comparison import (
@@ -2442,11 +2440,9 @@ async def _execute_job(item: tuple, item_id: int):
 
         if _mode == "v2" and _v2_plan is not None:
             _v2_transport = ModalTransport()
-            _v2_publisher = RemoteRestorePlanPublisher(_v2_transport, _request_workspace or None)
             result = await execute_plan(
                 _v2_plan,
                 transport=_v2_transport,
-                restore_publisher=_v2_publisher,
                 profile_setter=None,
                 gpu=extra_data.get("gpu"),
                 workspace=_request_workspace or None,
@@ -4930,9 +4926,7 @@ if _server:
         if scope not in ("models", "custom_nodes", "all"):
             return web.json_response({"status": "error", "message": "scope must be 'models', 'custom_nodes', or 'all'"}, status=400)
         try:
-            # ── Clear local caches before triggering remote resync ──
-            # Canonical restore-publish cache and profile-prep cache.
-            _reset_restore_publish_cache()
+            # Clear the local profile-preparation cache before remote resync.
             _reset_profile_prep_cache()
             # Warmup-profile process-local dedup cache and identity state.
             from warmup_profile import _reset_last_stable_profile_cache

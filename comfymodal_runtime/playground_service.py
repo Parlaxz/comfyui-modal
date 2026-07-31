@@ -345,10 +345,6 @@ async def _default_execute_plan(
     """
     from canonical_execution import execute_plan
     from comfymodal_runtime.modal_transport import ModalTransport
-    from comfymodal_runtime.restore_plan import (
-        RemoteRestorePlanPublisher,
-        get_default_restore_publisher,
-    )
     from comfymodal_runtime.trace import RuntimeTrace
 
     _request_id = str(uuid.uuid4().hex[:16])
@@ -364,16 +360,9 @@ async def _default_execute_plan(
         runtime_trace.set_metadata(**trace_payload)
 
     transport = ModalTransport(prompt_stream_fn=run_prompt_stream_fn) if run_prompt_stream_fn else ModalTransport()
-    restore_publisher = (
-        get_default_restore_publisher()
-        if run_prompt_stream_fn
-        else RemoteRestorePlanPublisher(transport, workspace)
-    )
-
     return await execute_plan(
         plan,
         transport=transport,
-        restore_publisher=restore_publisher,
         profile_setter=None,
         gpu=gpu,
         workspace=workspace,

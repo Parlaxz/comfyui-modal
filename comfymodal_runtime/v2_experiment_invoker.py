@@ -2,7 +2,7 @@
 
 For each cell, builds a canonical ``ExecutionPlan`` preserving the resolved
 workflow, cell controls, input images, production options, GPU, and workspace,
-then publishes the restore plan and executes via ``ModalTransport.execute_plan``.
+then submits the complete request directly via ``ModalTransport.execute_plan``.
 
 Events are streamed through a shared event sink that the scheduler translates
 to journal entries.
@@ -107,7 +107,6 @@ class V2ExperimentInvoker:
         # Lazy-import expensive v2 modules
         from canonical_execution import build_execution_plan, execute_plan
         from comfymodal_runtime.modal_transport import ModalTransport
-        from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
         from comfymodal_runtime.trace import RuntimeTrace
 
         # Determine output node IDs from cell production_options
@@ -139,11 +138,9 @@ class V2ExperimentInvoker:
         # Execute via V2 pipeline
         try:
             transport = ModalTransport()
-            publisher = RemoteRestorePlanPublisher(transport, self._workspace)
             result = await execute_plan(
                 plan,
                 transport=transport,
-                restore_publisher=publisher,
                 profile_setter=None,
                 gpu=str(self._gpu or "") if self._gpu else "",
                 workspace=self._workspace,
@@ -189,6 +186,7 @@ class V2ExperimentInvoker:
                 save_folder=str(self._modal_options.get("save_folder", "") or ""),
                 save_metadata_sidecar=self._modal_options.get("save_metadata_sidecar", True) is not False,
                 output_format=str(self._modal_options.get("output_format", "original") or "original"),
+                expected_output_node_ids=tuple(plan.output_node_ids),
             )
             written_files = materialized.get("written_files", [])
             output_paths = [
