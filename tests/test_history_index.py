@@ -14,6 +14,7 @@ Coverage:
 
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -532,13 +533,185 @@ class TestHistoryIndexConcurrency(unittest.TestCase):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             futs = [ex.submit(_upsert, i) for i in range(20)]
-            concurrent.futures.wait(futs)
+            # Surface any worker exception (e.g. a transient write-lock
+            # failure) as the test failure instead of a silent missing row.
+            for fut in concurrent.futures.as_completed(futs):
+                self.assertIsNone(fut.exception(), f"worker failed: {fut.exception()}")
 
         for i in range(20):
             rid = f"r_conc_{i:04d}"
             row = self.idx.get(rid)
             self.assertIsNotNone(row, f"Missing record: {rid}")
             self.assertEqual(row["status"], "completed")
+
+
+class TestHistoryIndexRecoveryAndStaleness(TestHistoryIndex):
+    """Bounded recovery and staleness handling for indexed history.
+
+    Root-cause coverage for /comfymodal/history:
+    - rebuild only for missing/corrupt/incompatible/demonstrably stale
+    - no rebuild on every request (rate-limited validation + probe)
+    - fingerprint is maintained by plugin-owned upserts/removes so they do
+      not false-positive as stale
+    - restart-safe (a fresh HistoryIndex on the same root reuses the index)
+    - flat/incompletely-built schema recovers on the first request
+    """
+
+    def test_stale_detects_externally_added_run(self):
+        """A source run written outside the plugin is picked up once."""
+        self._write_meta("r_known")
+        self.idx.rebuild()
+        self.assertIsNotNone(self.idx.get("r_known"))
+        # Simulate a run created by another process after the index build.
+        time.sleep(0.01)
+        self._write_meta("r_external")
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertTrue(result["rebuilt"], result)
+        self.assertEqual(result["record_count"], 2)
+        self.assertIsNotNone(self.idx.get("r_external"))
+
+    def test_stale_detects_removed_run(self):
+        """Removing a source run dir prunes the index on the next probe."""
+        self._write_meta("r_keep")
+        self._write_meta("r_gone")
+        self.idx.rebuild()
+        shutil.rmtree(self.root / "r_gone")
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertTrue(result["rebuilt"], result)
+        self.assertIsNone(self.idx.get("r_gone"))
+        self.assertIsNotNone(self.idx.get("r_keep"))
+
+    def test_refresh_is_rate_limited(self):
+        """Repeated refresh calls within the interval do not rescan/rebuild."""
+        self._write_meta("r_a")
+        self.idx.rebuild()
+        first = self.idx.refresh_if_stale(force=True)
+        self.assertFalse(first["rebuilt"])  # fingerprint present and fresh
+        second = self.idx.refresh_if_stale()
+        self.assertFalse(second["rebuilt"])
+        self.assertEqual(second["reason"], "rate_limited")
+
+    def test_upsert_does_not_false_positive_as_stale(self):
+        """Plugin-owned writes keep the fingerprint in sync (no rebuild)."""
+        self._write_meta("r_base")
+        self.idx.rebuild()
+        # Plugin path: write meta.json then upsert with source_path.
+        meta = {
+            "run_id": "r_new",
+            "kind": "ordinary",
+            "status": "completed",
+            "started_at": "2026-07-20T12:00:00Z",
+            "annotations": {"favorite": False, "note": ""},
+        }
+        meta_path = self.root / "r_new" / "meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        self.idx.upsert_from_meta(meta, str(meta_path))
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertFalse(result["rebuilt"], result)
+        self.assertEqual(result["reason"], "fresh")
+        # And the row is queryable without any rebuild.
+        self.assertIsNotNone(self.idx.get("r_new"))
+
+    def test_remove_does_not_false_positive_as_stale(self):
+        """remove() with the source gone keeps the fingerprint in sync."""
+        self._write_meta("r_del")
+        self.idx.rebuild()
+        # Deletion removes both the authoritative source and the index row.
+        shutil.rmtree(self.root / "r_del")
+        self.idx.remove("r_del")
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertFalse(result["rebuilt"], result)
+        self.assertEqual(result["reason"], "fresh")
+        self.assertIsNone(self.idx.get("r_del"))
+
+    def test_remove_with_source_still_present_is_self_healing(self):
+        """An index-only remove with the source still present is corrected."""
+        self._write_meta("r_keep")
+        self.idx.rebuild()
+        # Index row removed but source dir left behind: source is
+        # authoritative, so the next probe restores the row.
+        self.idx.remove("r_keep")
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertTrue(result["rebuilt"], result)
+        self.assertIsNotNone(self.idx.get("r_keep"))
+
+    def test_flat_metadata_index_recovers(self):
+        """A schema-only (flat) index with zero entries rebuilds on demand."""
+        self._write_meta("r_flat")
+        conn = sqlite3.connect(self.idx._db_path)
+        conn.execute("CREATE TABLE meta (schema_version INTEGER NOT NULL DEFAULT 1)")
+        conn.execute("INSERT INTO meta (schema_version) VALUES (1)")
+        conn.execute("CREATE TABLE index_entries (run_id TEXT PRIMARY KEY NOT NULL)")
+        conn.commit()
+        conn.close()
+        self.idx._schema_initialised = False
+        # ensure() accepts the schema-versioned but flat DB...
+        ok = self.idx.ensure()
+        self.assertTrue(ok)
+        # ...but the staleness probe detects the missing fingerprint and
+        # rebuilds so history is no longer empty.
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertTrue(result["rebuilt"], result)
+        self.assertIsNotNone(self.idx.get("r_flat"))
+
+    def test_restart_reuses_existing_index(self):
+        """A fresh index instance (restart) reuses a healthy index."""
+        self._write_meta("r_before")
+        self.idx.rebuild()
+        self.idx.close()
+        # New instance on the same root == ComfyUI restart.
+        idx2 = self.mod.HistoryIndex(self.root)
+        try:
+            ok = idx2.ensure()
+            self.assertTrue(ok, "restart should not trigger a rebuild")
+            self.assertIsNotNone(idx2.get("r_before"))
+            refresh = idx2.refresh_if_stale(force=True)
+            self.assertFalse(refresh["rebuilt"], refresh)
+            self.assertEqual(refresh["reason"], "fresh")
+        finally:
+            idx2.close()
+
+    def test_restart_picks_up_external_run(self):
+        """A run written between restarts is indexed on the first probe."""
+        self._write_meta("r_old")
+        self.idx.rebuild()
+        self.idx.close()
+        time.sleep(0.01)
+        self._write_meta("r_after_restart")
+        idx2 = self.mod.HistoryIndex(self.root)
+        try:
+            ok = idx2.ensure()
+            self.assertTrue(ok)
+            refresh = idx2.refresh_if_stale(force=True)
+            self.assertTrue(refresh["rebuilt"], refresh)
+            self.assertIsNotNone(idx2.get("r_after_restart"))
+        finally:
+            idx2.close()
+
+    def test_ensure_force_recovers_corruption(self):
+        """ensure(force=True) rebuilds a database corrupted mid-session."""
+        self._write_meta("r_ok")
+        self.idx.rebuild()
+        self.idx.close()
+        with open(self.idx._db_path, "wb") as f:
+            f.write(b"NOT A SQLITE DATABASE")
+        self.idx._schema_initialised = False
+        ok = self.idx.ensure(force=True)
+        self.assertFalse(ok, "corrupt index should trigger a rebuild")
+        self.assertIsNotNone(self.idx.get("r_ok"))
+
+    def test_ensure_is_cheap_after_validation(self):
+        """Repeated ensure() on a healthy index stays cheap (no revalidation)."""
+        self._write_meta("r_valid")
+        self.idx.ensure()
+        validated = self.idx._validated_at
+        self.assertIsNotNone(validated)
+        # Immediately repeated calls return the cached validation result.
+        self.assertTrue(self.idx.ensure())
+        self.assertEqual(self.idx._validated_at, validated)
+        self.assertTrue(self.idx.ensure())
+        self.assertEqual(self.idx._validated_at, validated)
 
 
 class TestHistoryIndexBenchmark(unittest.TestCase):

@@ -549,6 +549,13 @@ export function normalizeAnnotations(run) {
   // Prefer top-level run.annotations (backend stores annotations at this level),
   // then fall back to legacy extra.annotations / extra.metadata.annotations.
   var annotations = run.annotations || extra.annotations || extra.metadata?.annotations || {};
+  if (!run.annotations && !extra.annotations && !extra.metadata?.annotations) {
+    annotations = {
+      favorite: run.favorite,
+      note: run.note,
+      updated_at: run.note_updated_at || run.noteUpdatedAt,
+    };
+  }
 
   return {
     favorite: nilTo(annotations.favorite, false),
@@ -582,9 +589,16 @@ export function resolveRunImageUrl(run, apiBase) {
   }
 
   // 3. output_path (fallback for older runs without asset registration)
-  const outputPath = run.output_path || extra.output_path || "";
+  const outputPath = run.output_path || extra.output_path || run.primary_image_path || "";
   if (outputPath) {
-    return apiBase + "/studio/outputs/" + encodeURIComponent(outputPath);
+    const normalizedPath = String(outputPath).replace(/\\/g, "/");
+    const filename = normalizedPath.split("/").pop();
+    if (filename) {
+      if (/\/output\//i.test(normalizedPath)) {
+        return "/view?filename=" + encodeURIComponent(filename) + "&type=output";
+      }
+      return apiBase + "/studio/outputs/" + encodeURIComponent(filename);
+    }
   }
 
   return null;
@@ -712,8 +726,17 @@ export function normalizeStudioRun(rawRun, apiBase) {
   const negativePrompt = nilTo(extra.negative_prompt, nilTo(run.negative_prompt, ""));
 
   // Controls
-  const resolvedControls = extra.resolved_controls || run.resolved_controls || {};
-  const requestedControls = extra.requested_controls || extra.controls || run.controls || {};
+  const flatControls = {
+    prompt: run.prompt,
+    negative_prompt: run.negative_prompt,
+    seed: run.seed,
+    steps: run.steps,
+    guidance: run.guidance,
+    sampler: run.sampler,
+    scheduler: run.scheduler,
+  };
+  const resolvedControls = extra.resolved_controls || run.resolved_controls || flatControls;
+  const requestedControls = extra.requested_controls || extra.controls || run.controls || flatControls;
 
   // Timestamps
   const startedAt = run.started_at || run.created_at || run.timestamp || run.created || "";

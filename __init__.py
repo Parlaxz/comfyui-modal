@@ -11,6 +11,7 @@ import threading
 import logging
 import subprocess
 import time
+import sqlite3
 from collections import namedtuple
 from pathlib import Path
 import traceback as _traceback
@@ -5893,7 +5894,7 @@ if _server:
     except Exception:
         pass
 
-    def _record_experiment_cell_history(exp_id: str, data: dict, payload: dict, event_type: str) -> None:
+    def _record_experiment_cell_history(exp_id: str, data: dict, payload: dict, event_type: str) -> str:
         """Record a cell event into run history with complete resolved metadata.
 
         B7: Includes deployment_generation, experiment_revision, and output_policy.
@@ -5930,7 +5931,7 @@ if _server:
                 "studio_meta": data.get("studio_meta", {}),
                 "total_cells": data.get("total_cells", 0),
             }
-            REGISTRY.history().record_run(
+            record = REGISTRY.history().record_run(
                 kind="experiment_cell",
                 prompt_id=data.get("cell_key", ""),
                 workflow_hash=data.get("workflow_hash", ""),
@@ -5938,8 +5939,9 @@ if _server:
                 meta=history_data,
                 log_text=str(data.get("error", "")),
             )
+            return str(record.get("run_id", ""))
         except Exception:
-            pass
+            return ""
 
     async def _on_remote_event(exp_id: str, ev: dict) -> None:
         """Forward a single streamed cell event to the journal and to
@@ -6114,19 +6116,23 @@ if _server:
                             # B2: on failure, persist cell.failed instead of cell.completed
                             materialization_ok = False
                             payload["error"] = f"output_materialization_failed: {mat_exc}"
-                            _record_experiment_cell_history(exp_id, data, payload, "cell.failed")
+                            cell_run_id = _record_experiment_cell_history(exp_id, data, payload, "cell.failed")
+                            if cell_run_id:
+                                payload["run_id"] = cell_run_id
                             store.append_event({
                                 "type": "cell.failed",
                                 "payload": payload,
                             })
                             return  # exit early — do NOT persist cell.completed
                 if materialization_ok:
+                    # Auto-record the cell attempt into run history with full metadata.
+                    cell_run_id = _record_experiment_cell_history(exp_id, data, payload, et)
+                    if cell_run_id:
+                        payload["run_id"] = cell_run_id
                     store.append_event({
                         "type": et,
                         "payload": payload,
                     })
-                    # Auto-record the cell attempt into run history with full metadata.
-                    _record_experiment_cell_history(exp_id, data, payload, et)
                     if et == "cell.completed" and result_data:
                         try:
                             _cert_candidate = result_data.get("_certificate_candidate")
@@ -6763,6 +6769,124 @@ if _server:
             "annotations": merged,
         })
 
+    # Per-run locks serialize save requests so concurrent double-clicks
+    # cannot both pass the idempotency gate and write duplicate files.
+    _run_history_save_locks: dict[str, threading.Lock] = {}
+    _run_history_save_locks_guard = threading.Lock()
+
+    def _run_history_save_lock(run_id: str) -> threading.Lock:
+        with _run_history_save_locks_guard:
+            lock = _run_history_save_locks.get(run_id)
+            if lock is None:
+                lock = threading.Lock()
+                _run_history_save_locks[run_id] = lock
+            return lock
+
+    @_server.routes.post("/comfymodal/run-history/{run_id}/save")
+    async def run_history_save(request: web.Request) -> web.Response:
+        """Save ONE known materialized Studio output to the configured folder.
+
+        Body (JSON): ``{"output_index": 0}`` (defaults to ``0``).
+
+        Reuses the authoritative automatic local save pipeline
+        (``output_saver.save_output_image``) and the configured
+        folder/format/quality/WebP/sidecar options from modal settings.
+        The browser only selects an ``output_index`` — no arbitrary
+        browser filesystem access.  Idempotent: re-saving the same
+        ``output_index`` returns the previously recorded path without
+        writing a second file.  Per-output saved state is persisted into
+        the authoritative run meta (``extra.output_saved`` + friends) so
+        the existing history-index upsert propagates it.
+        """
+        run_id = request.match_info.get("run_id", "")
+        if not run_id:
+            return web.json_response({"status": "error", "message": "missing run_id"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"status": "error", "message": "body must be a JSON object"}, status=400)
+        raw_index = body.get("output_index", 0)
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            return web.json_response(
+                {"status": "error", "message": "output_index must be a non-negative integer"},
+                status=400,
+            )
+        output_index = int(raw_index)
+        if output_index < 0:
+            return web.json_response(
+                {"status": "error", "message": "output_index must be a non-negative integer"},
+                status=400,
+            )
+
+        history = REGISTRY.history()
+        meta = history.get_run(run_id)
+        if meta is None:
+            return web.json_response({"status": "error", "message": "run not found"}, status=404)
+
+        settings = _load_modal_settings()
+        lock = _run_history_save_lock(run_id)
+        with lock:
+            # Re-read under the lock so a concurrent save's state is visible
+            # to the idempotency gate.
+            meta = history.get_run(run_id)
+            if meta is None:
+                return web.json_response({"status": "error", "message": "run not found"}, status=404)
+
+            def _persist_saved_state(state: dict) -> None:
+                history.update_run(run_id, meta=state)
+
+            try:
+                from studio_run_adapter import save_run_history_output
+            except ImportError:
+                return web.json_response(
+                    {"status": "error", "message": "save backend is not available"},
+                    status=500,
+                )
+            result = save_run_history_output(
+                meta,
+                output_index=output_index,
+                output_format=settings.get("output_format", "original"),
+                quality=settings.get("quality", 75),
+                webp_lossless_compression=settings.get("webp_lossless_compression", "balanced"),
+                save_folder=settings.get("save_folder", ""),
+                save_metadata_sidecar=bool(settings.get("save_metadata_sidecar", True)),
+                comfyui_root=_COMFYUI_ROOT,
+                persist_state_fn=_persist_saved_state,
+                asset_resolver_fn=REGISTRY.leases().resolve_asset,
+            )
+
+        if result.get("status") != "ok":
+            reason = str(result.get("reason", ""))
+            if reason in ("output_unresolved", "output_empty"):
+                status_code = 400
+            elif reason == "output_missing":
+                status_code = 404
+            else:
+                status_code = 500
+            return web.json_response({
+                "status": "error",
+                "message": str(result.get("message", "Save failed")),
+                "reason": reason,
+            }, status=status_code)
+
+        return web.json_response({
+            "status": "ok",
+            "saved": True,
+            "already_saved": bool(result.get("already_saved", False)),
+            "path": result.get("path", ""),
+            "metadata_path": result.get("metadata_path", ""),
+            "output_index": result.get("output_index", output_index),
+            "output_format": result.get("output_format", ""),
+            "quality": result.get("quality"),
+            "webp_lossless_compression": result.get("webp_lossless_compression"),
+            "mime_type": result.get("mime_type", ""),
+            "file_ext": result.get("file_ext", ""),
+            "byte_count": result.get("byte_count", 0),
+            "source_path": result.get("source_path", ""),
+        })
+
     # ── Studio Snapshots & Backend Presets ──────────────────────────
     # Workflow snapshots and backend preset persistence (extracted to
     # studio_store.py / studio_models.py / studio_routes.py).
@@ -7205,8 +7329,18 @@ if _server:
         _pt = _PhaseTimer()
         _pt.mark("request_received")
 
-        page = int(request.query.get("page", "1"))
-        page_size = int(request.query.get("page_size", "50"))
+        try:
+            page = int(request.query.get("page", "1"))
+            page_size = int(request.query.get("page_size", "50"))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_code": "invalid_history_pagination",
+                    "message": "page and page_size must be integers",
+                },
+                status=400,
+            )
         if page < 1:
             page = 1
         if page_size < 1:
@@ -7234,38 +7368,134 @@ if _server:
         # request.query.get("include_timing", "0")
 
         _pt.mark("index_open")
-        idx = _get_history_index(run_history_root())
+        idx = None
+        try:
+            idx = _get_history_index(run_history_root())
+        except Exception as exc:
+            print(
+                f"[comfyui-modal.history] history index unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_code": "history_index_unavailable",
+                    "message": "run-history index is unavailable",
+                    "detail": "Source run history is preserved; the derived index could not be opened.",
+                },
+                status=503,
+            )
 
         try:
-            # Try to ensure index; if corrupt/absent, trigger rebuild
+            # Ensure the index exists and is usable.  Cheap for a healthy
+            # index (validated at most once per interval per process) and
+            # rebuilds ONLY for a missing, corrupt, or schema-incompatible
+            # database.  There is deliberately no unbounded fallback here:
+            # a failure surfaces as a structured error, never a silent
+            # rescan or an empty page.
             try:
                 idx.ensure()
-            except Exception:
-                # Fallback: rebuild from scratch
-                try:
-                    idx.rebuild()
-                except Exception:
-                    pass
+            except Exception as exc:
+                print(
+                    f"[comfyui-modal.history] history index unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error_code": "history_index_unavailable",
+                        "message": f"run-history index is unavailable: {exc}",
+                        "detail": (
+                            "The index is rebuilt automatically from the "
+                            "authoritative run-history source on the next "
+                            "successful request or ComfyUI restart.  Source "
+                            "run data is preserved."
+                        ),
+                    },
+                    status=503,
+                )
+
+            # Detect a demonstrably stale index (new/modified/removed source
+            # runs not yet reflected in the index) and rebuild it once.
+            # Rate-limited per process; a rebuild failure keeps serving the
+            # existing (stale but usable) index and is surfaced as a warning.
+            refresh = {"rebuilt": False, "reason": "fresh", "record_count": -1}
+            try:
+                refresh = idx.refresh_if_stale()
+            except Exception as exc:
+                print(
+                    f"[comfyui-modal.history] staleness check failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                refresh = {
+                    "rebuilt": False,
+                    "reason": f"error: {exc}",
+                    "record_count": -1,
+                }
+            if refresh.get("rebuilt"):
+                print(
+                    f"[comfyui-modal.history] index was stale "
+                    f"({refresh.get('reason', '?')}); rebuilt "
+                    f"{refresh.get('record_count', -1)} records"
+                )
+
             _pt.mark("query_built")
 
-            query_result = idx.query(
-                page=page,
-                page_size=page_size,
-                search=search,
-                kind=kind,
-                status=status,
-                favorite_only=favorite_only,
-                sort=sort,
-                feature=feature,
-                preset=preset,
-                date_from=date_from,
-                date_to=date_to,
-                has_image=has_image,
-            )
+            def _run_query() -> dict:
+                return idx.query(
+                    page=page,
+                    page_size=page_size,
+                    search=search,
+                    kind=kind,
+                    status=status,
+                    favorite_only=favorite_only,
+                    sort=sort,
+                    feature=feature,
+                    preset=preset,
+                    date_from=date_from,
+                    date_to=date_to,
+                    has_image=has_image,
+                )
+
+            try:
+                query_result = _run_query()
+            except sqlite3.Error as exc:
+                # One bounded self-heal attempt: force revalidation (this
+                # may rebuild a corrupted index), then retry the query once.
+                print(
+                    f"[comfyui-modal.history] query failed "
+                    f"({type(exc).__name__}: {exc}); attempting one bounded "
+                    f"recovery"
+                )
+                try:
+                    idx.ensure(force=True)
+                    query_result = _run_query()
+                except Exception as exc2:
+                    print(
+                        f"[comfyui-modal.history] query failed after "
+                        f"recovery ({type(exc2).__name__}: {exc2})"
+                    )
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error_code": "history_index_query_failed",
+                            "message": (
+                                "run-history index query failed and could "
+                                f"not be recovered: {exc2}"
+                            ),
+                            "detail": (
+                                "Source run history is preserved; deleting "
+                                "the local .history_index.db forces a full "
+                                "rebuild on the next request."
+                            ),
+                        },
+                        status=500,
+                    )
         finally:
             # Release the SQLite handle after each request so Windows can
             # rotate/clean workspace roots and temporary test databases.
-            idx.close()
+            if idx is not None:
+                idx.close()
         _pt.mark("query_executed")
 
         items = query_result["items"]
@@ -7282,6 +7512,15 @@ if _server:
             "total": query_result["total"],
             "has_more": query_result["has_more"],
         }
+
+        # Surface recovery/staleness diagnostics without changing the
+        # success contract consumed by the UI.
+        if refresh.get("rebuilt"):
+            response_data["index_rebuilt"] = True
+            response_data["index_rebuilt_reason"] = refresh.get("reason", "")
+            response_data["index_rebuilt_records"] = refresh.get("record_count", -1)
+        elif refresh.get("reason") not in ("fresh", "rate_limited"):
+            response_data["index_warning"] = refresh.get("reason", "")
 
         # Attach safe timing metadata if query param present
         if request.query.get("_timing", "") == "1":
