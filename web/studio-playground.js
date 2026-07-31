@@ -2002,6 +2002,12 @@ async function doRunSubmit(state, context, actions) {
     );
   } else {
     const errMsg = (result && result.message) || "Run failed.";
+    if (result && result.error_code) {
+      console.error("[Studio run] execution failed", {
+        error_code: result.error_code,
+        error: result.error || null,
+      });
+    }
     if (actions && actions.setRunState) {
       actions.setRunState({ status: "error", message: errMsg });
     }

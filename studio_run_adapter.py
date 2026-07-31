@@ -87,7 +87,35 @@ _log = logging.getLogger(__name__)
 _IMAGE_INPUT_FEATURES_UNIMPLEMENTED: set[str] = {"object_remove", "object_replace"}
 
 # Stable error message (no raw exceptions leaked to clients).
-_STABLE_INTERNAL_ERROR = "Internal error processing request"
+_STUDIO_EXECUTION_ERROR_CODE = "STUDIO_EXECUTION_ERROR"
+_STABLE_INTERNAL_ERROR = "Internal error processing Studio execution. Retry or inspect the run details."
+
+
+def _execution_error_response(exc: BaseException, *, operation: str, run_id: str = "") -> dict[str, Any]:
+    detail = f"{type(exc).__name__}: {exc}"
+    _log.error(
+        "Studio execution backend failure",
+        extra={
+            "error_code": _STUDIO_EXECUTION_ERROR_CODE,
+            "operation": operation,
+            "run_id": run_id,
+            "exception_type": type(exc).__name__,
+            "backend_detail": str(exc),
+        },
+        exc_info=True,
+    )
+    return {
+        "status": "error",
+        "message": _STABLE_INTERNAL_ERROR,
+        "error_code": _STUDIO_EXECUTION_ERROR_CODE,
+        "error": {
+            "code": _STUDIO_EXECUTION_ERROR_CODE,
+            "operation": operation,
+            "run_id": run_id,
+            "type": type(exc).__name__,
+            "detail": detail,
+        },
+    }
 
 # ── Control Schema Helpers ──────────────────────────────────────────────────
 # Known ComfyUI sampler names (for enum schema derivation).
@@ -3402,6 +3430,15 @@ async def direct_studio_run_completion(
             output_dir=str(_studio_output_dir),
             prompt_id=exp_id,
             require_output=True,
+            expected_output_node_ids=tuple(
+                str(value)
+                for value in (
+                    (_prod_opts or {}).get("output_node_ids", [])
+                    if isinstance(_prod_opts, dict)
+                    else ((_prod_report or {}).get("output_node_ids", [])
+                          if isinstance(_prod_report, dict) else [])
+                )
+            ),
         )
         _materialized_paths = [
             Path(path).name for path in _materialized.get("written_files", [])
@@ -3629,7 +3666,7 @@ async def direct_studio_run_completion(
         }
 
     except Exception as exc:
-        _log.error("Studio direct run failed for %s: %s", exp_id, exc)
+        _log.error("Studio direct run failed for %s", exp_id, exc_info=True)
         try:
             from experiment_service import REGISTRY
             from datetime import datetime, timezone
@@ -3638,11 +3675,15 @@ async def direct_studio_run_completion(
                 run_history_id,
                 status="error",
                 completed_at=fail_ts,
-                meta={"error": _STABLE_INTERNAL_ERROR, "_error_detail": str(exc)[:500]},
+                meta={
+                    "error": _STABLE_INTERNAL_ERROR,
+                    "error_code": _STUDIO_EXECUTION_ERROR_CODE,
+                    "_error_detail": str(exc)[:500],
+                },
             )
         except Exception:
             pass
-        return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+        return _execution_error_response(exc, operation="direct_studio_run", run_id=exp_id)
     finally:
         if _run_trace is not None:
             _run_trace.end("direct_studio_run_completion")
@@ -3925,14 +3966,17 @@ def handle_studio_run(
         t.start()
         t.join(timeout=600)
         if not _result_holder:
-            return {"status": "error", "message": "Direct run timed out"}
+            return _execution_error_response(
+                TimeoutError("Studio run worker exceeded the 600 second limit"),
+                operation="studio_run_timeout",
+                run_id=preset_id,
+            )
         return _result_holder[0]
 
     try:
         return asyncio.run(_run())
-    except Exception:
-        _log.exception("Direct studio run failed for %s", preset_id)
-        return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+    except Exception as exc:
+        return _execution_error_response(exc, operation="studio_run", run_id=preset_id)
 
 
 def handle_studio_experiment(
