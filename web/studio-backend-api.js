@@ -123,11 +123,21 @@ export async function deletePreset(apiBase, id) {
 // ── Studio Run / Experiment API ──────────────────────────────────────────
 
 export async function runStudioPreset(apiBase, payload) {
-  return apiFetch(apiBase, "/studio/run", {
+  const data = await apiFetch(apiBase, "/studio/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (data && data.status === "error") {
+    console.error("[Studio run] backend execution failure", {
+      error_code: data.error_code || data.error?.code || "STUDIO_EXECUTION_ERROR",
+      operation: data.error?.operation || "studio_run",
+      detail: data.error?.detail || data._error_detail || data.message || "",
+      backend_error: data.error || null,
+      http_status: data._httpStatus || null,
+    });
+  }
+  return data;
 }
 
 export async function runStudioExperiment(apiBase, payload) {

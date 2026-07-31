@@ -7153,9 +7153,22 @@ if _server:
             )
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)
-        except Exception:
+        except Exception as exc:
             _log.exception("Studio run error")
-            return web.json_response({"status": "error", "message": "Internal error processing run"}, status=500)
+            try:
+                from studio_run_adapter import _execution_error_response
+                error_payload = _execution_error_response(
+                    exc,
+                    operation="studio_run_route",
+                    run_id=preset_id,
+                )
+            except Exception:
+                error_payload = {
+                    "status": "error",
+                    "message": "Internal error processing Studio execution. Retry or inspect the run details.",
+                    "error_code": "STUDIO_EXECUTION_ERROR",
+                }
+            return web.json_response(error_payload, status=500)
 
     @_server.routes.post("/comfymodal/studio/experiment")
     async def studio_experiment(request: web.Request) -> web.Response:
