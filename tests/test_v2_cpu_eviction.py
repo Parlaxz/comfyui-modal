@@ -203,7 +203,7 @@ def _fake_process_memory(
 
 
 class ParseEvictModelsBeforeSnapshotTests(unittest.TestCase):
-    """_parse_evict_models_before_snapshot strict parsing."""
+    """_parse_evict_models_before_snapshot uses the shared V2 flag parser."""
 
     def setUp(self):
         _clean_env()
@@ -223,12 +223,17 @@ class ParseEvictModelsBeforeSnapshotTests(unittest.TestCase):
         os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = "1"
         self.assertTrue(_parse_evict_models_before_snapshot())
 
-    def test_other_nonempty_raises(self):
-        for val in ("2", "true", "yes", "on", "false", " -1"):
+    def test_explicit_true_words_enabled(self):
+        for val in ("true", "yes", "on", " TRUE "):
             with self.subTest(val=val):
                 os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = val
-                with self.assertRaises(RuntimeError):
-                    _parse_evict_models_before_snapshot()
+                self.assertTrue(_parse_evict_models_before_snapshot())
+
+    def test_other_nonempty_values_disabled(self):
+        for val in ("2", "false", " -1"):
+            with self.subTest(val=val):
+                os.environ["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"] = val
+                self.assertFalse(_parse_evict_models_before_snapshot())
 
 
 class ParseEvictRestoreIdleSecondsTests(unittest.TestCase):

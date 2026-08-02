@@ -640,9 +640,7 @@ def materialize_modal_result(
         {"outputs": materialized_outputs, "images": []},
         selected_ids or None,
     )
-    if require_output and (
-        selected_primary is None if selected_ids else not written_files
-    ):
+    if require_output and selected_primary is None:
         available_nodes = sorted(
             _normalize_output_node_id(node_id)
             for node_id in materialized_outputs

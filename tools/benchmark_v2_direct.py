@@ -23,6 +23,12 @@ from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.trace import RuntimeTrace
 from production_workflow import normalize_production_options
+from tools.v2_waterfall import (
+    build_waterfall,
+    render_comparison,
+    render_waterfall,
+    waterfall_to_dict,
+)
 
 
 WORKFLOW_PATH = ROOT / "latest_benchmark_workflow.json"
@@ -135,6 +141,9 @@ def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
         "sampler_ms": derived.get("sampler_ms", sampler_ms),
         "vae_decode_ms": derived.get("vae_decode_ms", deltas.get("vae_decode_ms", vae_decode_ms)),
         "output_collection_ms": deltas.get("output_collection_total_ms", output_collection_ms),
+        "snapshot_callback_age_at_restore_ms": restore.get("snapshot_callback_age_at_restore_ms") if isinstance(restore, dict) else result.get("snapshot_callback_age_at_restore_ms"),
+        "snapshot_callback_to_command_start_ms": result.get("snapshot_callback_to_command_start_ms"),
+        "command_start_to_restore_start_ms": result.get("command_start_to_restore_start_ms"),
         "local_timing": _local_timing,
     }
 
@@ -387,6 +396,7 @@ async def _run_one(
     transport: ModalTransport,
     output_dir: Path,
     bypass_cpu_snapshot_unet: bool = False,
+    _defer_waterfall: bool = False,
     # Test overrides (injected helpers, not used in production)
     _test_restore_publisher: Any = None,
     _test_profile_setter: Any = None,
@@ -396,6 +406,10 @@ async def _run_one(
     # T0: benchmark iteration origin (literal first line)
     _req_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
     _t0_wall_ms = int(time.time() * 1000)
+    try:
+        _command_start_for_origin = int(os.environ.get("COMFYMODAL_COMMAND_START_UNIX_MS", ""))
+    except (TypeError, ValueError):
+        _command_start_for_origin = _t0_wall_ms
     _t0_perf = time.perf_counter()
     # T1: local receive (this runner is itself the local receiver)
     _t1_wall_ns, _t1_mono_ns = _capture_ts()
@@ -403,6 +417,7 @@ async def _run_one(
         "request_id": _req_id,
         "trigger_source": "benchmark",
         "ui_run_triggered_wall_unix_ms": _t0_wall_ms,
+        "command_start_unix_ms": _command_start_for_origin,
         "benchmark_run_index": index,
         "local_receive_wall_ns": _t1_wall_ns,
         "local_receive_mono_ns": _t1_mono_ns,
@@ -517,6 +532,7 @@ async def _run_one(
         workspace=workspace,
         trace=runtime_trace,
     )
+    _response_wall_ns, _response_mono_ns = _capture_ts()
     wall_ms = (time.perf_counter() - started) * 1000.0
     identity = _identity(result)
     if identity.get("app_name") and identity.get("app_name") != APP_NAME:
@@ -530,6 +546,23 @@ async def _run_one(
         "timing": _timing(result, wall_ms),
         "result": result,
     }
+    _command_start_ms: int | None = None
+    if index == 0:
+        try:
+            _command_start_ms = int(os.environ.get("COMFYMODAL_COMMAND_START_UNIX_MS", ""))
+        except (TypeError, ValueError):
+            _command_start_ms = None
+    if _command_start_ms is None:
+        _command_start_ms = _t0_wall_ms
+    _waterfall = build_waterfall(
+        result=result,
+        timing=artifact["timing"],
+        wall_ms=wall_ms,
+        command_start_unix_ms=_command_start_ms,
+        response_received_unix_ns=_response_wall_ns,
+        run_label=f"run {index + 1}",
+    )
+    artifact["waterfall"] = waterfall_to_dict(_waterfall)
     (output_dir / f"run_{index}.json").write_text(
         json.dumps(artifact, default=str, indent=2), encoding="utf-8"
     )
@@ -556,6 +589,8 @@ async def _run_one(
         )
 
     print(json.dumps({"run_index": index, "identity": identity, "timing": artifact["timing"]}, default=str))
+    if not _defer_waterfall:
+        print(render_waterfall(_waterfall), flush=True)
     return artifact
 
 
@@ -840,6 +875,13 @@ def _extract_acceptance_timing(
         "sampling_ms": None,
         "vae_decode_ms": None,
         "output_encode_ms": None,
+        "snapshot_callback_age_at_restore_ms": None,
+        "snapshot_callback_to_command_start_ms": None,
+        "command_start_to_restore_start_ms": None,
+        "sampler_node_id": None,
+        "sampler_class_type": None,
+        "sampler_identification_source": "unavailable",
+        "sampler_node_to_sampling_start_ms": None,
     }
 
     # restore_total_ms
@@ -884,6 +926,24 @@ def _extract_acceptance_timing(
         val = _ps_meta.get("sampler_node_to_sampler_start_ms")
         if isinstance(val, (int, float)):
             timing["sampler_node_to_sampler_start_ms"] = round(float(val), 3)
+        timing["sampler_node_id"] = _ps_meta.get("sampler_node_id") or None
+        timing["sampler_class_type"] = _ps_meta.get("sampler_class_type") or None
+        timing["sampler_identification_source"] = _ps_meta.get(
+            "sampler_identification_source", "unavailable"
+        )
+        timing["sampler_node_to_sampling_start_ms"] = timing.get(
+            "sampler_node_to_sampler_start_ms"
+        )
+
+    _restore_age = restore_timing.get("snapshot_callback_age_at_restore_ms")
+    timing["snapshot_callback_age_at_restore_ms"] = _restore_age
+    _trace_meta = result.get("trace", {}).get("metadata", {}) if isinstance(result.get("trace"), dict) else {}
+    timing["snapshot_callback_to_command_start_ms"] = result.get(
+        "snapshot_callback_to_command_start_ms", _trace_meta.get("snapshot_callback_to_command_start_ms")
+    )
+    timing["command_start_to_restore_start_ms"] = result.get(
+        "command_start_to_restore_start_ms", _trace_meta.get("command_start_to_restore_start_ms")
+    )
 
     # sampling_ms
     _ss = _event_mono_ns(result, "sampling_start")
@@ -1403,6 +1463,13 @@ def _extract_acceptance_timing_scoped(
         "unet_demand_to_first_forward_ms": _ABSENT_STR,
         "demand_start_present": 0,
         "asset_fetch_ms": None,
+        "snapshot_callback_age_at_restore_ms": restore_timing.get("snapshot_callback_age_at_restore_ms"),
+        "snapshot_callback_to_command_start_ms": result.get("snapshot_callback_to_command_start_ms"),
+        "command_start_to_restore_start_ms": result.get("command_start_to_restore_start_ms"),
+        "sampler_node_id": None,
+        "sampler_class_type": None,
+        "sampler_identification_source": "unavailable",
+        "sampler_node_to_sampling_start_ms": None,
     }
 
     # restore_total_ms
@@ -1457,6 +1524,14 @@ def _extract_acceptance_timing_scoped(
                 val = meta.get("sampler_node_to_sampler_start_ms")
                 if isinstance(val, (int, float)) and val >= 0:
                     timing["sampler_node_to_sampler_start_ms"] = round(float(val), 3)
+                timing["sampler_node_id"] = meta.get("sampler_node_id") or None
+                timing["sampler_class_type"] = meta.get("sampler_class_type") or None
+                timing["sampler_identification_source"] = meta.get(
+                    "sampler_identification_source", "unavailable"
+                )
+                timing["sampler_node_to_sampling_start_ms"] = timing.get(
+                    "sampler_node_to_sampler_start_ms"
+                )
 
     # unet_demand_to_first_forward_ms from unet_first_cuda_op
     for ev in events:
@@ -1552,11 +1627,16 @@ async def _run_acceptance_sequence(
     ) -> tuple[dict[str, Any], str]:
         _req_id = f"v2-accept-{label}-{uuid.uuid4().hex[:12]}"
         _t0_wall_ms = int(time.time() * 1000)
+        try:
+            _command_start_for_origin = int(os.environ.get("COMFYMODAL_COMMAND_START_UNIX_MS", ""))
+        except (TypeError, ValueError):
+            _command_start_for_origin = _t0_wall_ms
         _t1_wall_ns, _t1_mono_ns = (int(time.time() * 1_000_000_000), time.monotonic_ns())
         request_origin_info = {
             "request_id": _req_id,
             "trigger_source": "acceptance_benchmark",
             "ui_run_triggered_wall_unix_ms": _t0_wall_ms,
+            "command_start_unix_ms": _command_start_for_origin,
             "benchmark_run_index": index,
             "local_receive_wall_ns": _t1_wall_ns,
             "local_receive_mono_ns": _t1_mono_ns,
@@ -1619,6 +1699,7 @@ async def _run_acceptance_sequence(
             profile_checker=check_active_warmup_profile,
             gpu=_GPU, workspace=workspace, trace=runtime_trace,
         )
+        _response_wall_ns, _response_mono_ns = _capture_ts()
         wall_ms = (time.perf_counter() - started) * 1000.0
 
         # Extract identity from REQUEST-SCOPED trace events
@@ -1680,9 +1761,19 @@ async def _run_acceptance_sequence(
             "wall_ms": round(wall_ms, 1),
             "result": result,  # Include full remote result for event inspection
         }
+        _waterfall = build_waterfall(
+            result=result,
+            timing=timing,
+            wall_ms=wall_ms,
+            command_start_unix_ms=_t0_wall_ms,
+            response_received_unix_ns=_response_wall_ns,
+            run_label=f"run {label}",
+        )
+        artifact["waterfall"] = waterfall_to_dict(_waterfall)
         (output_dir / f"run_{label}.json").write_text(
             json.dumps(artifact, default=str, indent=2), encoding="utf-8"
         )
+        print(render_waterfall(_waterfall), flush=True)
         return artifact, _req_id
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1793,6 +1884,7 @@ async def _run_acceptance_sequence(
             "label": r["label"],
             "identity": r["identity"],
             "timing": r["timing"],
+            "waterfall": r.get("waterfall", {}),
             "asset_proofs": r["asset_proofs"],
             "acceptance_checks": r.get("acceptance_checks", {}),
         }
@@ -1803,7 +1895,10 @@ async def _run_acceptance_sequence(
     (output_dir / "acceptance_summary.json").write_text(
         json.dumps(summary, default=str, indent=2), encoding="utf-8"
     )
+    _acceptance_reports = [r["waterfall"] for r in runs if r.get("waterfall")]
     print(json.dumps(summary, default=str, indent=2), flush=True)
+    if len(_acceptance_reports) > 1:
+        print(render_comparison(_acceptance_reports), flush=True)
 
     if ACCEPTANCE_FAILED:
         raise RuntimeError("acceptance mode: one or more checks failed")
@@ -1846,6 +1941,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             transport=transport,
             output_dir=output_dir,
             bypass_cpu_snapshot_unet=bypass_cpu_snapshot_unet,
+            _defer_waterfall=(RUN_COUNT == 1),
         ))
         if index + 1 < RUN_COUNT:
             await asyncio.sleep(GAP_SECONDS)
@@ -1857,10 +1953,16 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         "run_count": len(artifacts),
         "gap_seconds": GAP_SECONDS,
         "trace_handoff_errors": len(trace_errors),
+        "waterfall_runs": sum(1 for item in artifacts if item.get("waterfall")),
         "runs": [{"run_index": item["run_index"], "identity": item["identity"], "timing": item["timing"]} for item in artifacts],
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, default=str, indent=2), encoding="utf-8")
+    _reports = [item["waterfall"] for item in artifacts if item.get("waterfall")]
     print(json.dumps({"output_dir": str(output_dir), **summary}, default=str, indent=2))
+    if len(_reports) == 1:
+        print(render_waterfall(_reports[0]), flush=True)
+    elif len(_reports) > 1:
+        print(render_comparison(_reports), flush=True)
 
     # Signal failure if any trace handoff failed (run files are preserved)
     if trace_errors:

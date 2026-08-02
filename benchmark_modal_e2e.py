@@ -26,6 +26,7 @@ from pathlib import Path
 from urllib import error as urllib_error, request as urllib_request
 
 from gpu_catalog import DEFAULT_GPU, GPU_BY_VALUE, normalize_gpu_value
+from comfymodal_runtime.env import env_flag
 
 BENCHMARK_VERSION = "4.2.0"
 LOCAL_BASE_URL = os.environ.get("COMFYMODAL_BENCHMARK_URL", "http://127.0.0.1:8188")
@@ -382,7 +383,7 @@ def build_invocation_selftest_snapshot(node_dir: Path = REPO_ROOT) -> dict:
     current_version = _read_python_string_constant(comfyapp_source, "COMFYAPP_VERSION", "unknown")
     app_name = _read_python_string_constant(comfyapp_source, "APP_NAME", "comfyui") or "comfyui"
     run_mode = os.environ.get("COMFYMODAL_RUN_MODE", "production").strip().lower() or "production"
-    auto_deploy_enabled = os.environ.get("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0").strip().lower() in {"1", "true", "yes", "on"}
+    auto_deploy_enabled = env_flag("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY")
     current_fp, fingerprint_error = _build_custom_nodes_fingerprint_local(node_dir.parent)
     deployed_fp = deploy_state.get("custom_nodes_fingerprint", "")
     version_changed = current_version != deploy_state.get("comfyapp_version", "")

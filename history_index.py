@@ -639,6 +639,7 @@ class HistoryIndex:
                     "schema_version": str(SCHEMA_VERSION),
                     "source_dir_count": str(src_count),
                     "source_max_mtime": repr(src_max_mtime),
+                    "source_record_count": str(len(entries)),
                     "built_at": repr(time.time()),
                 })
                 conn.execute("COMMIT")
@@ -866,6 +867,28 @@ class HistoryIndex:
             }
 
         conn = self._conn()
+        stored_record_count = self._index_meta_int(conn, "source_record_count", -1)
+        if stored_record_count < 0:
+            return {
+                "stale": True,
+                "reason": "record_count_missing",
+                "count": cur_count,
+                "max_mtime": cur_max_mtime,
+            }
+        indexed_count_row = conn.execute(
+            "SELECT COUNT(*) FROM index_entries"
+        ).fetchone()
+        indexed_count = int(indexed_count_row[0]) if indexed_count_row else 0
+        if indexed_count != stored_record_count:
+            return {
+                "stale": True,
+                "reason": (
+                    f"index record count {indexed_count} -> "
+                    f"{stored_record_count}"
+                ),
+                "count": cur_count,
+                "max_mtime": cur_max_mtime,
+            }
         stored_count = self._index_meta_int(conn, "source_dir_count", -1)
         stored_max = self._index_meta_float(conn, "source_max_mtime", -1.0)
         if stored_count < 0 or stored_max < 0:
@@ -980,10 +1003,22 @@ class HistoryIndex:
             count = max(0, count - 1)
         if dir_mtime and dir_mtime > max_mtime:
             max_mtime = dir_mtime
-        self._write_index_meta(conn, {
+        values = {
             "source_dir_count": str(count),
             "source_max_mtime": repr(max_mtime),
-        })
+        }
+        stored_record_count = self._read_index_meta(conn, "source_record_count")
+        if stored_record_count is not None:
+            try:
+                record_count = int(stored_record_count)
+            except (TypeError, ValueError):
+                record_count = 0
+            if added:
+                record_count += 1
+            if removed:
+                record_count = max(0, record_count - 1)
+            values["source_record_count"] = str(record_count)
+        self._write_index_meta(conn, values)
 
     @staticmethod
     def _source_dir_mtime(source_path: str) -> float:

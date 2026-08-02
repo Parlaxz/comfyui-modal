@@ -21,7 +21,9 @@ _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
 
-_local_exact_prefill = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+from comfymodal_runtime.env import env_flag
+
+_local_exact_prefill = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
 
 _log = logging.getLogger(__name__)
@@ -911,6 +913,10 @@ _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {
     ".comfymodal_experiments", ".custom_node_requirements", ".baked_custom_node_deps",
     ".presets", ".preset_blobs",
 }
+_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
+    r"^comfyui-modal-(?:agent(?:\d+|[-_].*)|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
+    re.IGNORECASE,
+)
 _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS = {".pyc", ".pyo"}
 
 _pip_install_error = ""
@@ -1104,7 +1110,11 @@ def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
         node_path = os.path.join(cn_root, node_dir)
         if not os.path.isdir(node_path):
             continue
-        if node_dir.startswith(".") or node_dir in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+        if (
+            node_dir.startswith(".")
+            or node_dir in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS
+            or _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_dir)
+        ):
             continue
         names.append(node_dir)
     return sorted(names)
@@ -1169,7 +1179,7 @@ def _get_deployed_custom_nodes_fingerprint():
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+    return env_flag(name, default=default == "1")
 
 
 def _read_deploy_state_details() -> dict:
@@ -1677,7 +1687,7 @@ def _ensure_modal_deploy_current(workspace: dict, custom_nodes_fingerprint: str 
 
 
 def _maybe_auto_deploy():
-    if os.environ.get("COMFYMODAL_RUNTIME") == "1":
+    if env_flag("COMFYMODAL_RUNTIME"):
         return
     if not _env_flag("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0"):
         _deploy_status["state"] = "ready"
@@ -2864,7 +2874,7 @@ async def _execute_job(item: tuple, item_id: int):
         # Modal function.  Failure of persistence never fails the
         # prompt.
         try:
-            if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+            if env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
                 _clip_candidate = result.get("_clip_cache_candidate") if isinstance(result, dict) else None
                 _clip_fingerprint = result.get("_clip_cache_fingerprint") if isinstance(result, dict) else None
                 _bundle = _clip_candidate.get("bundle") if isinstance(_clip_candidate, dict) else None
@@ -3085,6 +3095,24 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        allowed = set(_iter_syncable_custom_node_dirs(cn_root))
+        for node_dir in (sorted(os.listdir(cn_root)) if os.path.isdir(cn_root) else []):
+            node_path = os.path.join(cn_root, node_dir)
+            if not os.path.isdir(node_path):
+                continue
+            if node_dir in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+                reason = "generated_or_environment_directory"
+            elif node_dir.startswith("."):
+                reason = "hidden_directory"
+            elif _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_dir):
+                reason = "local_agent_or_worktree_clone"
+            else:
+                reason = "production_custom_node"
+            print(
+                f"[comfyui-modal.custom_node_filter] action={'allow' if node_dir in allowed else 'deny'} "
+                f"name={node_dir} reason={reason}",
+                flush=True,
+            )
         for node_dir in _iter_syncable_custom_node_dirs(cn_root):
             tar.add(os.path.join(cn_root, node_dir), arcname=node_dir, filter=tar_filter)
     return buf.getvalue()
@@ -3609,7 +3637,7 @@ def _classify_active_read_dimensions(entry: dict) -> dict[str, str]:
 
     _before_tid: int | None = entry.get("native_tid")
     _after_tid: int | None = entry.get("complete_native_tid")
-    _deep_diag: bool = os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1"
+    _deep_diag: bool = env_flag("COMFYMODAL_V2_DEEP_MODEL_DIAG")
     _has_thread_cpu: bool = entry.get("start_thread_time_ns") is not None
     _has_process_cpu: bool = entry.get("start_process_time_ns") is not None
     _has_rusage: bool = entry.get("before_rusage") is not None
@@ -7144,12 +7172,16 @@ if _server:
             _studio_ws = _active_workspace() or {}
             _studio_gpu = (body or {}).get("gpu")
             _studio_mo = (body or {}).get("modal_options")
-            result = await handle_studio_run_async(
-                preset_id, feature_id, controls, _NODE_DIR,
-                trace_ctx=browser_trace,
-                gpu=_studio_gpu,
-                modal_options=_studio_mo,
-                workspace=_studio_ws,
+            import asyncio as _studio_asyncio
+            result = await _studio_asyncio.wait_for(
+                handle_studio_run_async(
+                    preset_id, feature_id, controls, _NODE_DIR,
+                    trace_ctx=browser_trace,
+                    gpu=_studio_gpu,
+                    modal_options=_studio_mo,
+                    workspace=_studio_ws,
+                ),
+                timeout=600.0,
             )
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)

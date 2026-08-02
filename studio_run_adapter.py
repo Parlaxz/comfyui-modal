@@ -443,6 +443,39 @@ def _get_executable_workflow(api_prompt_json: Any) -> dict[str, Any]:
     return api_prompt_json
 
 
+def _derive_output_node_ids(
+    snapshot: dict[str, Any] | None,
+    caller_output_node_ids: Any = None,
+) -> list[str]:
+    """Resolve the output binding without inventing a workflow node."""
+    candidates = caller_output_node_ids
+    if isinstance(candidates, dict):
+        candidates = candidates.get("output_node_ids", [])
+    if isinstance(candidates, (str, int)) and not isinstance(candidates, bool):
+        candidates = [candidates]
+    if isinstance(candidates, (list, tuple, set, frozenset)):
+        resolved: list[str] = []
+        for value in candidates:
+            value = str(value).strip()
+            if value and value not in resolved:
+                resolved.append(value)
+        if resolved:
+            return resolved
+
+    if not isinstance(snapshot, dict):
+        return []
+    output_node_id = str(snapshot.get("outputNodeId", "") or "").strip()
+    if output_node_id:
+        return [output_node_id]
+    for binding in (snapshot.get("nodeBindings", {}) or {}).values():
+        if not isinstance(binding, dict) or binding.get("kind") != "output":
+            continue
+        node_id = str(binding.get("nodeId", "") or "").strip()
+        if node_id:
+            return [node_id]
+    return []
+
+
 def _repair_missing_clip_inputs(workflow: dict[str, Any]) -> None:
     """Inject a CLIP loader link for CLIPTextEncode when one unique loader exists."""
     if not isinstance(workflow, dict):
@@ -1815,21 +1848,7 @@ def build_experiment_spec(
             _ck_prod_options = dict(_prod_options)
             _caller_ids = _ck_prod_options.get("output_node_ids", [])
             _snapshot = _profile_to_snapshot.get(pf, {})
-            _snap_output = (_snapshot.get("outputNodeId") or "") if isinstance(_snapshot, dict) else ""
-            _derived_ids = []
-
-            if _caller_ids:
-                _derived_ids = list(_caller_ids)
-            elif _snap_output:
-                _derived_ids = [str(_snap_output).strip()]
-            else:
-                # Check nodeBindings for kind=="output"
-                for _bk, _bv in (_snapshot.get("nodeBindings", {}) or {}).items():
-                    if isinstance(_bv, dict) and _bv.get("kind") == "output":
-                        _nid = str(_bv.get("nodeId", "")).strip()
-                        if _nid:
-                            _derived_ids = [_nid]
-                            break
+            _derived_ids = _derive_output_node_ids(_snapshot, _caller_ids)
 
             if not _derived_ids:
                 return {"error": (

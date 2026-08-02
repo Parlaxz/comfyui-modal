@@ -176,6 +176,7 @@ def _default_build_execution_plan(
         _CONTROL_WIDGET_ALIASES,
         _apply_controls_to_workflow,
         _augment_slots_with_auto_derive,
+        _derive_output_node_ids,
         _get_executable_workflow,
         _repair_missing_clip_inputs,
         _repair_missing_vae_inputs,
@@ -248,25 +249,17 @@ def _default_build_execution_plan(
     _production_options = normalize_production_options(modal_options)
     _production_enabled = _production_options.get("enabled", False)
 
+    output_node_ids = _derive_output_node_ids(
+        snapshot,
+        _production_options.get("output_node_ids", []),
+    )
+
     if _production_enabled:
         from canonical_execution import build_execution_plan as canonical_build_plan
 
         production_options = _production_options
         # Derive output_node_ids from caller, snapshot output binding, or nodeBindings
-        derived_output_ids: list[str] = []
-        caller_ids = production_options.get("output_node_ids", [])
-        snap_output = (snapshot.get("outputNodeId") or "").strip()
-        if caller_ids:
-            derived_output_ids = list(caller_ids)
-        elif snap_output:
-            derived_output_ids = [snap_output]
-        else:
-            for _bk, _bv in (snapshot.get("nodeBindings", {}) or {}).items():
-                if isinstance(_bv, dict) and _bv.get("kind") == "output":
-                    _nid = str(_bv.get("nodeId", "")).strip()
-                    if _nid:
-                        derived_output_ids = [_nid]
-                        break
+        derived_output_ids = list(output_node_ids)
         if not derived_output_ids:
             return None, (
                 "Production is enabled but no output node ID could be derived. "
@@ -315,6 +308,7 @@ def _default_build_execution_plan(
             workflow_hash=prompt_sha256(workflow),
             model_stack=model_stack,
             prompt_bundle=custom_prompt_bundle,
+            output_node_ids=tuple(output_node_ids),
             execution_options=exec_options,
             request_metadata=studio_meta,
         )
@@ -455,21 +449,24 @@ async def _default_save_history(
         meta["experiment_id"] = run_history_id
         meta["workflow_hash"] = plan.workflow_hash
 
+        primary_asset_id = ""
+        if isinstance(result, dict):
+            primary_asset_id = str(result.get("primary_asset_id", "") or "")
+        if primary_asset_id:
+            meta["primary_asset_id"] = primary_asset_id
+
         # Extract output paths from result — prefer pre-materialized paths
         # when available (passed by the PlaygroundService after materialization).
         output_paths: list[str] = list(materialized_paths) if materialized_paths else []
         if not output_paths and isinstance(result, dict):
             primary = result.get("primary_output") or result.get("_local_primary_output")
-            if isinstance(primary, dict) and primary.get("path"):
-                output_paths = [primary["path"]]
-            elif result.get("outputs"):
-                for _nid, _nouts in result["outputs"].items():
-                    if isinstance(_nouts, dict):
-                        for _entries in _nouts.values():
-                            if isinstance(_entries, list):
-                                for _e in _entries:
-                                    if isinstance(_e, dict) and _e.get("filename"):
-                                        output_paths.append(_e["filename"])
+            if (
+                isinstance(primary, dict)
+                and primary.get("path")
+                and not primary_asset_id
+                and Path(str(primary["path"])).is_file()
+            ):
+                output_paths = [Path(str(primary["path"])).name]
         if output_paths:
             meta["output_paths"] = list(output_paths)
 
@@ -496,6 +493,8 @@ async def _default_save_history(
         }
         if top_level_output_path:
             update_kwargs["output_path"] = top_level_output_path
+        if primary_asset_id:
+            update_kwargs["primary_asset_id"] = primary_asset_id
         REGISTRY.history().update_run(actual_run_id, **update_kwargs)
     except Exception:
         _log.warning("Failed to save history for run %s", run_history_id)
@@ -506,6 +505,9 @@ def _sync_materialize(
     experiment_id: str,
     studio_output_dir: str | os.PathLike | None = None,
     require_output: bool = False,
+    expected_output_node_ids: tuple[str, ...] | list[str] | None = None,
+    workspace: dict[str, Any] | None = None,
+    gpu: Any = None,
 ) -> list[str]:
     """Synchronous materialization body — offloaded to thread by
     ``_default_materialize``.
@@ -531,10 +533,45 @@ def _sync_materialize(
         output_dir=out_dir,
         prompt_id=experiment_id,
         require_output=require_output,
+        expected_output_node_ids=expected_output_node_ids,
     )
-    # Return URL-safe filenames (basenames), matching the shape from
-    # the adapter response (output_paths).
-    return [str(Path(p).name) for p in mat.get("written_files", [])]
+    paths = [str(Path(p).name) for p in mat.get("written_files", [])]
+    primary = mat.get("primary_output") if isinstance(mat, dict) else None
+    if not paths and isinstance(primary, dict):
+        result["primary_asset_id"] = primary.get("asset_id", "")
+        result["_local_primary_output"] = primary
+    descriptors = result.get("asset_descriptors", []) if isinstance(result, dict) else []
+    workspace_id = str((workspace or {}).get("id", ""))
+    if isinstance(descriptors, list) and workspace_id:
+        try:
+            from experiment_service import REGISTRY
+            leases = REGISTRY.leases()
+            for descriptor in descriptors:
+                if not isinstance(descriptor, dict):
+                    continue
+                asset_id = str(descriptor.get("asset_id", "") or "")
+                backend_path = str(descriptor.get("backend_path") or descriptor.get("path") or "")
+                if not asset_id or not backend_path:
+                    continue
+                leases.register_asset(
+                    asset_id=asset_id,
+                    experiment_id="",
+                    cell_key=experiment_id,
+                    variant="original",
+                    path=f"modal://{workspace_id}|{str(gpu or '')}|{backend_path}",
+                    mime_type=str(descriptor.get("mime_type") or "application/octet-stream"),
+                    byte_size=int(descriptor.get("byte_count", 0) or 0),
+                    content_hash=asset_id,
+                    node_id=str(descriptor.get("node_id", "")),
+                    output_key=str(descriptor.get("output_key", "")),
+                    output_index=int(descriptor.get("output_index", 0) or 0),
+                    comparison_side=str(descriptor.get("comparison_side", "")),
+                    width=int(descriptor.get("width", 0) or 0),
+                    height=int(descriptor.get("height", 0) or 0),
+                )
+        except Exception:
+            _log.warning("Failed to register Playground output assets")
+    return paths
 
 
 async def _default_materialize(
@@ -543,6 +580,9 @@ async def _default_materialize(
     cell_key: str = "",
     studio_output_dir: str | os.PathLike | None = None,
     require_output: bool = False,
+    expected_output_node_ids: tuple[str, ...] | list[str] | None = None,
+    workspace: dict[str, Any] | None = None,
+    gpu: Any = None,
 ) -> list[str]:
     """Save output images to disk and return URL-safe filenames.
 
@@ -559,7 +599,14 @@ async def _default_materialize(
     scheduler, leases, journals, or worker pool.
     """
     return await asyncio.to_thread(
-        _sync_materialize, result, experiment_id, studio_output_dir, require_output,
+        _sync_materialize,
+        result,
+        experiment_id,
+        studio_output_dir,
+        require_output,
+        expected_output_node_ids,
+        workspace,
+        gpu,
     )
 
 
@@ -698,6 +745,7 @@ class PlaygroundService:
         # ── Stage 5: Materialize outputs ─────────────────────────────
         output_paths: list[str] = []
         requires_output = bool(plan.execution_options.production_enabled)
+        output_required = requires_output or bool(plan.output_node_ids)
         has_remote_output = bool(
             isinstance(result, dict)
             and (
@@ -707,7 +755,7 @@ class PlaygroundService:
                 or result.get("primary_output")
             )
         )
-        if requires_output and not has_remote_output:
+        if output_required and not has_remote_output:
             return {"status": "error", "message": "v2 execution returned no output"}
         try:
             if has_remote_output:
@@ -717,15 +765,18 @@ class PlaygroundService:
                     experiment_id=exp_id,
                     cell_key="playground",
                     studio_output_dir=studio_output_dir,
-                    require_output=requires_output,
+                    require_output=output_required,
+                    expected_output_node_ids=tuple(plan.output_node_ids),
+                    workspace=workspace,
+                    gpu=gpu,
                 )
         except Exception as exc:
-            if requires_output:
+            if output_required:
                 _log.error("Playground output materialization failed: %s", exc)
                 return {"status": "error", "message": str(exc)[:500]}
             _log.warning("Playground output materialization failed (non-fatal)")
 
-        if requires_output and not output_paths:
+        if output_required and not output_paths and not (isinstance(result, dict) and result.get("primary_asset_id")):
             return {"status": "error", "message": "v2 output materialization produced no files"}
 
         # ── Stage 6: Build timings ────────────────────────────────────
@@ -808,6 +859,8 @@ class PlaygroundService:
         meta["workflow_hash"] = plan.workflow_hash
         meta["output_count"] = len(output_paths)
         meta["production_plan_used"] = "yes" if plan.execution_options.production_enabled else "no"
+        if isinstance(result, dict) and result.get("primary_asset_id"):
+            meta["primary_asset_id"] = result["primary_asset_id"]
         if output_paths:
             meta["output_paths"] = list(output_paths)
 
@@ -832,6 +885,7 @@ class PlaygroundService:
             "completed_at": completed_at,
             "output_paths": output_paths,
             "output_path": output_paths[0] if output_paths else "",
+            "primary_asset_id": meta.get("primary_asset_id", ""),
             "timings": timings,
             "trace": copy.deepcopy(result.get("trace", {})) if isinstance(result, dict) else {},
             "meta": meta,

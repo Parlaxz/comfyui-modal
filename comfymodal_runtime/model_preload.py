@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from typing import Any, Callable, Iterator
 
 from .contracts import ModelRestoreKey, PrefillKey, stable_hash
+from .env import env_flag
 from .cpu_snapshot_models import (
     collect_unet_runtime_state,
 )
@@ -57,9 +58,7 @@ _PREFILL_CRITICAL_ROLES: frozenset[str] = frozenset({"positive", "negative"})
 # Deliberately wraps the OUTERMOST invocation of each operation so
 # inner nested calls do not double-count.
 
-_PAGEFAULT_TRACKING: bool = (
-    os.environ.get("COMFYMODAL_V2_PAGEFAULT_TRACKING", "1") == "1"
-)
+_PAGEFAULT_TRACKING: bool = env_flag("COMFYMODAL_V2_PAGEFAULT_TRACKING", default=True)
 
 
 @dataclass
@@ -98,9 +97,7 @@ def _pagefault_delta(before: _PageFaultSnapshot, after: _PageFaultSnapshot) -> d
 # Set to ``1`` / ``true`` / ``yes`` to restore the old barrier that
 # waits for UNET *before* CLIP, putting 5.7-6.3s Qwen-encode on the
 # critical path (useful for debugging or regression isolation).
-_V2_PREFILL_WAIT_FOR_UNET: bool = os.environ.get(
-    "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET", ""
-).strip().lower() in ("1", "true", "yes")
+_V2_PREFILL_WAIT_FOR_UNET: bool = env_flag("COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET")
 
 
 # ── Canonical lane vocabulary ─────────────────────────────────────────
@@ -125,9 +122,7 @@ _LATEST_RESTORE_RETURN_MARKER: dict[str, Any] | None = None
 both restore IDs, MODAL_TASK_ID, and PID.  Read by ``run_plan_stream`` method
 entry for method-entry-gap computation."""
 
-_DIAGNOSTIC_FLAG: bool = (
-    os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1"
-)
+_DIAGNOSTIC_FLAG: bool = env_flag("COMFYMODAL_V2_DEEP_MODEL_DIAG")
 """Controls deep diagnostics (proc/pagefault/open/mmap/safetensors detail).
 ``False`` by default — when disabled, only lightweight identity, restore
 total, CLIP read/ready, background submitted/ready, graph demand/wait,

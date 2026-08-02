@@ -1829,9 +1829,12 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const outputPaths = result.output_paths || [];
+  const primaryAssetId = result.primary_asset_id || (result.meta && result.meta.primary_asset_id) || "";
   var primaryOutput = null;
   if (outputPaths.length > 0) {
     primaryOutput = apiBase + "/studio/outputs/" + encodeURIComponent(outputPaths[0]);
+  } else if (primaryAssetId) {
+    primaryOutput = apiBase + "/assets/" + encodeURIComponent(primaryAssetId);
   }
 
   // Build the normalized run before the terminal state update.  setRunState
@@ -1844,6 +1847,7 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
     experiment_id: result.experimentId || meta.experiment_id || "",
     status: "completed",
     output_path: result.output_path || (outputPaths.length > 0 ? outputPaths[0] : ""),
+    primary_asset_id: primaryAssetId,
     started_at: null,
     completed_at: result.completed_at || null,
     duration_ms: null,
@@ -1859,6 +1863,7 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
       resolved_controls: meta.resolved_controls || {},
       requested_controls: meta.requested_controls || {},
       output_paths: outputPaths,
+      primary_asset_id: primaryAssetId,
       timings: timings,
       output_count: meta.output_count || 0,
       production_plan_used: meta.production_plan_used || "no",

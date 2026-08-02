@@ -31,6 +31,7 @@ atomic under a single lock.
 from __future__ import annotations
 
 import copy
+import importlib
 import json
 import logging
 import os
@@ -108,6 +109,24 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike, studio_outp
     _node_dir = Path(node_dir)
     _snapshots_store = StudioJsonStore(_node_dir / ".studio_snapshots.json")
     _presets_store = StudioJsonStore(_node_dir / ".studio_presets.json")
+
+    # Older ComfyUI runs may have written their output basename to History
+    # without moving the file into the dedicated Studio output directory.
+    # Keep that legacy directory as a read-only fallback for the image route.
+    _legacy_output_dir = _node_dir.resolve().parent.parent / "output"
+
+    def _legacy_output_dirs() -> list[Path]:
+        directories: list[Path] = []
+        try:
+            folder_paths = importlib.import_module("folder_paths")
+            configured = folder_paths.get_output_directory()
+            if configured:
+                directories.append(Path(configured).resolve())
+        except Exception:
+            pass
+        if _legacy_output_dir not in directories:
+            directories.append(_legacy_output_dir)
+        return directories
 
     # ── Snapshots ──────────────────────────────────────────────────────
 
@@ -497,13 +516,19 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike, studio_outp
     async def studio_outputs_serve(request: web.Request) -> web.Response:
         """Serve Studio-generated output images."""
         filename = request.match_info.get("filename", "")
-        if not filename or ".." in filename or "/" in filename:
+        if not filename or ".." in filename or "/" in filename or "\\" in filename:
             return _json_error(404, "Not found")
         if studio_output_dir is not None:
             output_dir = Path(studio_output_dir)
         else:
             output_dir = _node_dir / "output" / "studio"
         filepath = output_dir / filename
+        if not filepath.exists() or not filepath.is_file():
+            for legacy_dir in _legacy_output_dirs():
+                candidate = legacy_dir / filename
+                if candidate.exists() and candidate.is_file():
+                    filepath = candidate
+                    break
         if not filepath.exists() or not filepath.is_file():
             return _json_error(404, "File not found")
         ext = filepath.suffix.lower()

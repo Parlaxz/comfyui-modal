@@ -26,6 +26,19 @@ class RedeployBatchTests(unittest.TestCase):
         source = BATCH_PATH.read_text(encoding="utf-8")
         self.assertIn("COMFYMODAL_HIDE_GPUS=t4,l4,l40s", source)
 
+    def test_batch_deploys_with_active_workspace_credentials(self):
+        source = BATCH_PATH.read_text(encoding="utf-8")
+        self.assertIn(".modal_workspaces.json", source)
+        self.assertIn("active_workspace_id", source)
+        self.assertIn("MODAL_TOKEN_ID", source)
+        self.assertIn("MODAL_TOKEN_SECRET", source)
+        self.assertIn("Could not load the active Modal workspace credentials.", source)
+        self.assertLess(
+            source.index("MODAL_TOKEN_SECRET"),
+            source.index("modal deploy"),
+            "Modal must receive the active workspace credentials before deploy",
+        )
+
     def test_ps_checker_contents(self):
         source = PS_CHECKER_PATH.read_text(encoding="utf-8")
         self.assertIn("Get-CimInstance Win32_Process", source)

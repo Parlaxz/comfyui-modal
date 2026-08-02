@@ -455,6 +455,7 @@ class TestEmitDependencyValidationV2:
             baked_manifest_read_ms=3.0,
             custom_node_generation_read_ms=1.5,
             manifest_load_ms=5.0,
+            cheap_check_ms=2.5,
             manifest_identity_check_ms=2.0,
             fallback_validation_called=False,
             fallback_fingerprint_ms=0.0,
@@ -477,6 +478,7 @@ class TestEmitDependencyValidationV2:
         assert "baked_manifest_read_ms=3.0" in captured.out
         assert "custom_node_generation_read_ms=1.5" in captured.out
         assert "manifest_load_ms=5.0" in captured.out
+        assert "cheap_check_ms=2.5" in captured.out
         assert "manifest_identity_check_ms=2.0" in captured.out
         assert "fallback_validation_called=0" in captured.out
         assert "fallback_fingerprint_ms=0.0" in captured.out
