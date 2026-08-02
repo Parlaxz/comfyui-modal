@@ -1130,6 +1130,106 @@ class TestPreDispatchBreakdown(unittest.TestCase):
 
 
 # =========================================================================
+# Test: Request env-profile propagation
+# =========================================================================
+
+
+class TestEnvProfilePropagation(unittest.TestCase):
+    """The submitting process's COMFYMODAL_V2_ENV_PROFILE is injected into
+    ``__request_origin_info__.env_profile`` so the remote request/runtime can
+    apply it without hardcoding a profile value locally."""
+
+    def _capture(self, *, local_profile: str | None):
+        captured_plan_dicts = []
+
+        class _FakeGen:
+            def __init__(self):
+                self._events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
+                self._index = 0
+                self.input_id = "profile-id"
+                self.input_created_at = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._events):
+                    raise StopAsyncIteration
+                e = self._events[self._index]
+                self._index += 1
+                return e
+
+        def _capture_aio(pd, **kw):
+            captured_plan_dicts.append(pd)
+            return _FakeGen()
+
+        def _factory(**kw):
+            return SimpleNamespace(
+                run_plan_stream=SimpleNamespace(
+                    remote_gen=SimpleNamespace(aio=_capture_aio),
+                ),
+            )
+
+        saved = None
+        if local_profile is None:
+            saved = __import__("os").environ.pop("COMFYMODAL_V2_ENV_PROFILE", None)
+        else:
+            saved = __import__("os").environ.get("COMFYMODAL_V2_ENV_PROFILE")
+            __import__("os").environ["COMFYMODAL_V2_ENV_PROFILE"] = local_profile
+        try:
+            async def run():
+                plan = build_execution_plan(
+                    {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                    prompt_id="env-profile-req", validate=False,
+                )
+                plan_dict = plan.to_dict()
+                rt = RuntimeTrace(request_id="env-profile-req", process="local")
+                transport = ModalTransport(v2_handle_factory=_factory)
+                async for _ in transport.run_plan_stream(
+                    plan, gpu="rtx-pro-6000", workspace={"id": "ws_profile"},
+                    trace={"prompt_id": "env-profile-req"}, plan_dict=plan_dict,
+                    runtime_trace=rt,
+                ):
+                    pass
+            asyncio.run(run())
+        finally:
+            if saved is None:
+                __import__("os").environ.pop("COMFYMODAL_V2_ENV_PROFILE", None)
+            else:
+                __import__("os").environ["COMFYMODAL_V2_ENV_PROFILE"] = saved
+        return captured_plan_dicts
+
+    def test_production_profile_reaches_remote_request_payload(self):
+        """COMFYMODAL_V2_ENV_PROFILE=production is carried into the remote
+        request as __request_origin_info__.env_profile."""
+        captured = self._capture(local_profile="production")
+        self.assertEqual(len(captured), 1, "Exactly one plan_dict captured")
+        origin_info = captured[0].get("__request_origin_info__", {})
+        if not isinstance(origin_info, dict):
+            origin_info = {}
+        self.assertEqual(origin_info.get("env_profile"), "production",
+                         "Local env profile must reach the remote request payload")
+
+    def test_diagnostic_profile_reaches_remote_request_payload(self):
+        """COMFYMODAL_V2_ENV_PROFILE=diagnostic is carried into the remote
+        request as __request_origin_info__.env_profile."""
+        captured = self._capture(local_profile="diagnostic")
+        origin_info = captured[0].get("__request_origin_info__", {})
+        if not isinstance(origin_info, dict):
+            origin_info = {}
+        self.assertEqual(origin_info.get("env_profile"), "diagnostic")
+
+    def test_absent_local_profile_does_not_inject_env_profile(self):
+        """No COMFYMODAL_V2_ENV_PROFILE locally -> no env_profile key is
+        invented (no hardcoded default in the request)."""
+        captured = self._capture(local_profile=None)
+        origin_info = captured[0].get("__request_origin_info__", {})
+        if not isinstance(origin_info, dict):
+            origin_info = {}
+        self.assertNotIn("env_profile", origin_info)
+
+
+# =========================================================================
 # Test 11: Missing / absent / invalid_negative values
 # =========================================================================
 

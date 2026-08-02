@@ -4825,6 +4825,46 @@ class ModalRuntimeEntrypoint:
             self._cpu_snapshot_unet_runtime_state = None
             raise
 
+    def _retarget_cpu_snapshot_models_for_request(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        model_management: Any = None,
+    ) -> None:
+        """Retarget retained snapshot models to the live device policy at
+        request time (cold-run path).
+
+        Snapshot models are built on CPU under ``_force_cpu_during_snapshot``.
+        Restore-time activation normally retargets them, but on a cold run it
+        is skipped because ``restore()`` has no plan.  The first request must
+        therefore retarget before the exact objects are published on the
+        bridge so graph-time loaders serve device-correct patchers.
+
+        Uses the same ``retarget_cpu_snapshot_models`` helper as restore-time
+        activation.  Raises RuntimeError when the live
+        ``comfy.model_management`` module is unavailable or retargeting fails
+        — the production path fails closed rather than serving an
+        un-retargeted CPU patcher.
+        """
+        models = self._cpu_snapshot_models
+        if models is None:
+            return
+        if model_management is None:
+            import comfy.model_management as model_management
+        _ok, _reason = retarget_cpu_snapshot_models(
+            models, model_management=model_management,
+        )
+        if not _ok:
+            raise RuntimeError(
+                f"request-time CPU snapshot retarget failed: {_reason}"
+            )
+        if trace is not None:
+            trace.emit(
+                "cpu_snapshot_models_retargeted",
+                phase="execution",
+                metadata={"stage": "request_time", "reason": _reason},
+            )
+
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
             return self._legacy_api
@@ -7491,11 +7531,19 @@ class ModalRuntimeEntrypoint:
             f"cpu_snapshot_active={int(bool(self._cpu_snapshot_models_active))}",
             flush=True,
         )
-        # ── Present-but-inactive guard (bounded runtime fix) ─────────────
-        # The request-time path must NEVER serve CPU patchers that were never
-        # activated (validated + retargeted + published on the bridge).  When
-        # the container holds models but activation did not complete, fail
-        # closed for production and clear the bridge for diagnostic profiles.
+        # ── Present-but-inactive → request-time activation ──────────────
+        # On a cold run, restore() executes without a plan, so the
+        # restore-time activation (validate + retarget + publish the retained
+        # CLIP/UNET on the bridge) is skipped and the container reaches the
+        # first request with models PRESENT but INACTIVE.  When BOTH models
+        # are present we now activate them at request time — retargeting to
+        # the live device policy and publishing the exact retained objects on
+        # the bridge — so the first request is served exactly like a
+        # restore-activated container.  A partial container keeps the
+        # previous fallback (clear the bridge; the normal loader path serves
+        # the request).  Identity mismatch or activation failure still fails
+        # closed for production.
+        _request_time_activation_required = False
         if (
             self._cpu_snapshot_models is not None
             and not self._cpu_snapshot_models_active
@@ -7503,30 +7551,31 @@ class ModalRuntimeEntrypoint:
             _inactive_models = self._cpu_snapshot_models
             _inactive_clip = bool(getattr(_inactive_models, "clip", None) is not None)
             _inactive_unet = bool(getattr(_inactive_models, "unet", None) is not None)
-            print(
-                "[v2.cpu_snapshot_request] status=present_but_inactive "
-                f"clip_present={int(_inactive_clip)} unet_present={int(_inactive_unet)} "
-                "action=never_serve_inactive_patchers",
-                flush=True,
-            )
-            if (
-                _is_production_profile()
-                and _inactive_clip
-                and _inactive_unet
-            ):
-                raise RuntimeError(
-                    "Production CPU snapshot models are present but INACTIVE "
-                    "(activation did not complete at restore time); refusing "
-                    "to serve present-but-inactive CPU patchers to the sampler"
+            if _inactive_clip and _inactive_unet:
+                _request_time_activation_required = True
+                print(
+                    "[v2.cpu_snapshot_request] status=present_but_inactive "
+                    f"clip_present={int(_inactive_clip)} unet_present={int(_inactive_unet)} "
+                    "action=request_time_activation",
+                    flush=True,
                 )
-            self._preload_bridge.clear()
-            self._cpu_snapshot_unet_runtime_state = None
+            else:
+                print(
+                    "[v2.cpu_snapshot_request] status=present_but_inactive "
+                    f"clip_present={int(_inactive_clip)} unet_present={int(_inactive_unet)} "
+                    "action=never_serve_inactive_patchers",
+                    flush=True,
+                )
+                self._preload_bridge.clear()
+                self._cpu_snapshot_unet_runtime_state = None
         # Hoisted request-scope flags: the diagnostic UNET bypass and the
         # production CPU-snapshot binding decision are both needed later
         # (identity assertion + fail-closed residency enforcement).
         _bypass_snapshot_unet = False
         _request_bound_to_production_snapshot = False
-        if self._cpu_snapshot_models is not None and self._cpu_snapshot_models_active:
+        if self._cpu_snapshot_models is not None and (
+            self._cpu_snapshot_models_active or _request_time_activation_required
+        ):
             try:
                 workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
                 model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
@@ -7543,6 +7592,8 @@ class ModalRuntimeEntrypoint:
                     _flags = plan.execution_options.compatibility_flags
                     _bypass_snapshot_unet = isinstance(_flags, Mapping) and _flags.get("diagnostic_bypass_cpu_snapshot_unet") is True
                     if _bypass_snapshot_unet:
+                        if _request_time_activation_required:
+                            self._retarget_cpu_snapshot_models_for_request(trace=trace)
                         self._preload_bridge.use_ready_clip(
                             model_key=request_model_key,
                             prefill_key=request_prefill_key,
@@ -7556,7 +7607,14 @@ class ModalRuntimeEntrypoint:
                         _unet_source = "normal_loader"
                         _clip_source = "cpu_snapshot"
                         _reason = "diagnostic_unet_bypass"
+                        if _request_time_activation_required:
+                            # CLIP-only bind still publishes the retained CLIP;
+                            # the snapshot is now usable by this and later
+                            # requests (UNET comes from the normal loader).
+                            self._cpu_snapshot_models_active = True
                     else:
+                        if _request_time_activation_required:
+                            self._retarget_cpu_snapshot_models_for_request(trace=trace)
                         self._use_cpu_snapshot_models_on_bridge(
                             request_model_key,
                             request_prefill_key,
@@ -7573,6 +7631,76 @@ class ModalRuntimeEntrypoint:
                         )
                         if _is_production_profile():
                             _request_bound_to_production_snapshot = True
+                        if _request_time_activation_required:
+                            # Request-time activation completed: the bridge
+                            # serves the exact retained objects.  Mark the
+                            # snapshot active so the invariant and request
+                            # markers reflect the activated state for this and
+                            # all subsequent requests in the container.
+                            from comfymodal_runtime.model_preload import (
+                                record_retained_unet_identity,
+                            )
+                            record_retained_unet_identity(
+                                "activation",
+                                self._cpu_snapshot_models.unet,
+                                request_id=str(trace.request_id if trace else ""),
+                            )
+                            self._cpu_snapshot_models_active = True
+                            # ── Populate snapshot loader outputs / identities ──
+                            # Mirror the restore-time activation step so the
+                            # executor seed hook (installed per request by
+                            # _install_snapshot_executor_seed_hook) emits the
+                            # same executor_loader_cache_seed_end evidence for a
+                            # request-activated container as for a
+                            # restore-activated one (unet=seeded, clip=seeded,
+                            # vae=missing_snapshot_output).
+                            _rt_state = getattr(
+                                getattr(self, "bootstrap", None), "state", None
+                            )
+                            if _rt_state is not None:
+                                _rt_state.snapshot_loader_outputs = {
+                                    "unet": self._cpu_snapshot_models.unet,
+                                    "clip": self._cpu_snapshot_models.clip,
+                                }
+                                _rt_state.snapshot_model_identities = {
+                                    "unet": str(
+                                        getattr(request_model_key, "unet_identity", "") or ""
+                                    ),
+                                    "clip": str(
+                                        getattr(request_model_key, "clip_identity", "") or ""
+                                    ),
+                                }
+                                # A cold run never built the deterministic
+                                # SnapshotExecutionSeed (restore() had no plan);
+                                # build a minimal one mirroring the restore-time
+                                # seed builder so the seed hook can emit seeded
+                                # decisions.  Only identity fields, never outputs.
+                                if not getattr(_rt_state, "snapshot_seed_built", False):
+                                    _rt_loader_sigs: list[dict[str, Any]] = []
+                                    _rt_unet_ident = str(
+                                        getattr(request_model_key, "unet_identity", "") or ""
+                                    )
+                                    _rt_clip_ident = str(
+                                        getattr(request_model_key, "clip_identity", "") or ""
+                                    )
+                                    if _rt_unet_ident:
+                                        _rt_loader_sigs.append(
+                                            {"node_id": "unet", "signature": _rt_unet_ident}
+                                        )
+                                    if _rt_clip_ident:
+                                        _rt_loader_sigs.append(
+                                            {"node_id": "clip", "signature": _rt_clip_ident}
+                                        )
+                                    _rt_state.build_snapshot_execution_seed(
+                                        workflow_hash=str(getattr(plan, "workflow_hash", "") or ""),
+                                        custom_node_generation=str(
+                                            getattr(_rt_state, "snapshot_custom_node_generation", "") or ""
+                                        ),
+                                        deployment_combined_hash=str(
+                                            getattr(_rt_state, "deployment_combined_hash", "") or ""
+                                        ),
+                                        loader_cache_signatures=_rt_loader_sigs,
+                                    )
                     if _bypass_snapshot_unet:
                         print(
                             "[v2.cpu_snapshot_request] status=partial_bypass "
@@ -7715,27 +7843,28 @@ class ModalRuntimeEntrypoint:
             request_id=str(context.request_id),
             trace=trace,
         )
-        # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Schedule prefill immediately after graph start so it runs
-        # concurrently with execution setup.  The callback waits for both
-        # UNET and CLIP preparation futures before encoding, preventing
-        # GPU model-load/encode overlap.  Idempotent and thread-safe.
         _cpu_snapshot_active = bool(self._cpu_snapshot_models_active)
         _activation_diagnostic_state: dict[str, Any] = {
             "request_id": str(context.request_id),
             "clip_encode_calls": [],
         }
 
-        if _cpu_snapshot_active:
-            _execution_prefill_scheduled = False
-        else:
-            _execution_prefill_scheduled = bool(
-                self._preload_bridge.schedule_execution_prefill(
-                    trace=trace,
-                    request_id=str(context.request_id),
-                    activation_diagnostic_state=_activation_diagnostic_state,
-                )
+        # ── Execution-phase CLIP prefill single-flight ──────────────────
+        # Schedule immediately after graph start so it runs concurrently
+        # with execution setup.  Works for BOTH paths: the retained
+        # CPU-snapshot CLIP/UNET (published on the bridge with COMPLETED
+        # preparation futures) and the normal restore path — so graph-time
+        # CLIPTextEncode consumers serve the cached encodings instead of
+        # falling back to the original loader.  schedule_execution_prefill
+        # is idempotent (a second call is a no-op), so no duplicate
+        # construction happens when a restore already scheduled prefill.
+        _execution_prefill_scheduled = bool(
+            self._preload_bridge.schedule_execution_prefill(
+                trace=trace,
+                request_id=str(context.request_id),
+                activation_diagnostic_state=_activation_diagnostic_state,
             )
+        )
 
         print(
             "[v2.execution_prefill] "
@@ -9126,27 +9255,15 @@ class ModalRuntimeEntrypoint:
                 _first_prompt_executor_started = _v2_startup_stage(
                     "first_prompt_executor_invocation", "start", trace=trace, phase="request"
                 )
-            # ── Arm the one-shot sampler-stall watchdog (before PromptExecutor) ──
-            # Non-destructive: observes first UNET forward (5s) and first
-            # completed sampler step (15s).  Canceled on normal completion.
+            # ── Sampler-stall watchdog: armed at the sampling_start boundary ──
+            # Production arming now lives in runtime_executor._build_sampling_wrapper
+            # (the actual sampling_start boundary) so the 5s first-UNET-forward
+            # and 15s first-step deadlines are measured from sampling start, NOT
+            # from PromptExecutor start (model loading / CLIP encode no longer
+            # count toward the deadlines).  Only the request key is derived
+            # here; the watchdog is canceled in the finally below (idempotent
+            # no-op when no sampler ever ran).
             _watchdog_request_id = str(context.request_id)
-            _watchdog_unet_id = ""
-            try:
-                if self._cpu_snapshot_models_active and self._cpu_snapshot_models is not None:
-                    _wu = self._cpu_snapshot_models.unet
-                    if _wu is not None:
-                        _watchdog_unet_id = str(id(_wu))
-            except Exception:
-                pass
-            from comfymodal_runtime.model_preload import (
-                start_sampler_stall_watchdog,
-                cancel_sampler_stall_watchdog,
-            )
-            _watchdog_armed = start_sampler_stall_watchdog(
-                request_id=_watchdog_request_id,
-                restored_instance_id=_LATEST_RESTORED_INSTANCE_ID,
-                unet_object_id=_watchdog_unet_id,
-            )
             # ── Production CPU-snapshot request marker ──
             # Set only for the production snapshot (non-bypass) bind.  Gates
             # fail-closed CPU-residency enforcement in the sampler wrapper to
@@ -9172,11 +9289,15 @@ class ModalRuntimeEntrypoint:
             finally:
                 # Finish the watchdog on normal completion (also on error) so
                 # nothing keeps the event loop or a thread alive afterward.
-                if _watchdog_armed:
-                    try:
-                        cancel_sampler_stall_watchdog(_watchdog_request_id)
-                    except Exception:
-                        pass
+                # The watchdog is armed at the sampling_start boundary by
+                # runtime_executor._build_sampling_wrapper; cancel here is
+                # idempotent — a no-op when no sampler ever ran (nothing
+                # armed) or the watchdog already self-cleaned.
+                try:
+                    from comfymodal_runtime.model_preload import cancel_sampler_stall_watchdog
+                    cancel_sampler_stall_watchdog(_watchdog_request_id)
+                except Exception:
+                    pass
                 from comfymodal_runtime.model_preload import clear_retained_unet_identity_chain
                 clear_retained_unet_identity_chain(_watchdog_request_id)
                 if _production_snapshot_marked:
@@ -10269,17 +10390,6 @@ class ModalRuntimeEntrypoint:
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
         _v2_startup_stage("first_remote_method_entry", "entry", phase="request")
-        _callback_return = dict(_V2_STARTUP_CALLBACK_RETURN)
-        if _callback_return.get("monotonic_ns") and _callback_return.get("pid") == _method_first_line_pid:
-            _method_gap_ms = round(
-                (_method_first_line_ns - int(_callback_return["monotonic_ns"])) / 1_000_000,
-                3,
-            )
-            print(
-                f"[v2.platform_snapshot_capture_or_resume_gap] status=measured "
-                f"gap_ms={max(0.0, _method_gap_ms)} source=snapshot_callback_return_to_first_method_entry",
-                flush=True,
-            )
         # Consistent field-name aliases for method-entry timestamps
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
@@ -10296,6 +10406,36 @@ class ModalRuntimeEntrypoint:
         if isinstance(_safe_payload, dict):
             _request_origin_info = dict(_safe_payload.pop("__request_origin_info__", {}) or {})
         _t4_request_id = str(_request_origin_info.get("request_id", request_id or ""))
+
+        # ── Request-carried V2 env profile propagation ────────────────────
+        # The container's env profile is normally baked at deploy time via
+        # ``_runtime_env()``.  The submitting process may also carry the
+        # profile it selected (``__request_origin_info__.env_profile``).  When
+        # the container is still on the deploy default (``inherit``/absent)
+        # the request profile is applied here WITHOUT hardcoding so the
+        # production/diagnostic request-time semantics match the submitting
+        # process.  A container explicitly deployed with a non-default
+        # profile is never downgraded by a request.
+        _request_env_profile = str(
+            _request_origin_info.get("env_profile", "") or ""
+        ).strip().lower()
+        _profile_override_applied = False
+        if _request_env_profile:
+            _container_profile = os.environ.get(
+                "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+            ).strip().lower()
+            if _request_env_profile != _container_profile and _container_profile in ("", "inherit"):
+                os.environ["COMFYMODAL_V2_ENV_PROFILE"] = _request_env_profile
+                _container_profile = _request_env_profile
+                _profile_override_applied = True
+            print(
+                f"[v2.env_profile] profile={_container_profile} "
+                f"request_profile={_request_env_profile} "
+                f"applied={int(_profile_override_applied)} "
+                f"source={'request-override' if _profile_override_applied else 'container'}",
+                flush=True,
+            )
+            _request_origin_info["env_profile"] = _container_profile
 
         _restore_timing_for_age = self._restore_timing or _LATEST_LIFECYCLE_TIMING or {}
         _callback_wall_for_age = _restore_timing_for_age.get(

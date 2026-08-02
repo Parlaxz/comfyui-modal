@@ -231,8 +231,12 @@ def test_request_origin_and_residual_close_accounting_gap():
     )
     residual_stages = {stage.key: stage for stage in residual_report.stages}
     assert residual_stages["captured_timeline_gap"].duration_ms == 29000.0
-    assert residual_report.accounted_ms == residual_report.total_ms
-    assert residual_report.reconciliation_ms == 0.0
+    # The generic residual is the UNATTRIBUTED gap, not a measured stage:
+    # it must NOT be folded into the accounted total or fabricated into a
+    # perfect reconciliation (accounted == total, reconciliation == 0).
+    assert residual_report.accounted_ms != residual_report.total_ms
+    assert residual_report.reconciliation_ms != 0.0
+    assert any("reconciliation" in warning or "unaccounted" in warning for warning in residual_report.warnings)
 
 
 def test_structured_diagnostics_are_rendered_as_nested_detail_rows():
@@ -258,3 +262,80 @@ def test_rendered_waterfall_is_plain_ascii():
     )
     rendered = render_waterfall(report, terminal_columns=132)
     assert all(ord(character) < 128 for character in rendered)
+
+
+def test_submission_and_scheduling_populated_from_timing_fields_with_source_fields_and_no_overlap():
+    result = {
+        "request_id": "request-timing-fields",
+        "trace": {"events": []},
+        "local_timing": {
+            "local_receive_to_actual_submission_ms": 42.0,
+            "handle_lookup_ms": 20.0,
+            "payload_serialize_ms": 12.0,
+        },
+        "dispatch_to_modal_entry_ms": 3120.0,
+        "restore_total_ms": 1000.0,
+        "restore_end_to_modal_method_ms": 100.0,
+    }
+    report = build_waterfall(result=result, timing={}, wall_ms=5000)
+    stages = {stage.key: stage for stage in report.stages}
+    submission = stages["modal_handle_submission"]
+    assert submission.duration_ms == 42.0
+    assert submission.status == "derived"
+    assert submission.source_fields == ("local_receive_to_actual_submission_ms",)
+    scheduling = stages["modal_scheduling"]
+    assert scheduling.duration_ms == 2020.0
+    assert scheduling.source_fields == (
+        "dispatch_to_modal_entry_ms",
+        "restore_total_ms",
+        "restore_end_to_modal_method_ms",
+    )
+    # Non-overlapping top-level rows: none may flag another row.
+    assert all(not stage.overlaps for stage in report.stages)
+
+
+def test_negative_derived_stage_is_rejected():
+    result = {
+        "trace": {"events": []},
+        "dispatch_to_modal_entry_ms": 500.0,
+        "restore_total_ms": 800.0,
+        "restore_end_to_modal_method_ms": 50.0,
+    }
+    report = build_waterfall(result=result, timing={}, wall_ms=1000)
+    stage = next(item for item in report.stages if item.key == "modal_scheduling")
+    assert stage.status == "invalid"
+    assert stage.duration_ms is None
+    assert any("negative" in warning for warning in report.warnings)
+    # The rejected derived stage must not fabricate accounted time.
+    assert report.reconciliation_ms is not None
+
+
+def test_generic_residual_reflects_real_gap_not_perfect_reconciliation():
+    result = {
+        "trace": {"events": []},
+        "local_timing": {"local_receive_to_actual_submission_ms": 40.0},
+        "restore_total_ms": 1000.0,
+        "sampler_ms": 2000.0,
+    }
+    report = build_waterfall(
+        result=result,
+        timing={},
+        wall_ms=10000,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=11000 * 1_000_000,
+    )
+    assert report.total_ms == 10000.0
+    stages = {stage.key: stage for stage in report.stages}
+    assert stages["captured_timeline_gap"].duration_ms is not None
+    assert report.accounted_ms is not None
+    assert report.accounted_ms != report.total_ms
+    assert report.reconciliation_ms is not None
+    accounted_ms = report.accounted_ms
+    total_ms = report.total_ms
+    reconciliation_ms = report.reconciliation_ms
+    assert isinstance(accounted_ms, float)
+    assert isinstance(total_ms, float)
+    assert isinstance(reconciliation_ms, float)
+    assert abs(reconciliation_ms - stages["captured_timeline_gap"].duration_ms) < 1e-6
+    assert abs(reconciliation_ms - (total_ms - accounted_ms)) < 1e-6
+    assert any("reconciliation exceeds tolerance" in warning for warning in report.warnings)

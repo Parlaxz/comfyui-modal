@@ -936,6 +936,31 @@ class TestRestoreReturnInRunPlanStream(unittest.TestCase):
         self.assertNotIn("_LATEST_RESTORE_RETURN_MARKER", source)
 
 
+class TestObsoletePlatformGapMarkerRemoved(unittest.TestCase):
+    """The obsolete [v2.platform_snapshot_capture_or_resume_gap] marker is gone.
+
+    The scheduling window is attributed by the V2 waterfall from
+    dispatch_to_modal_entry_ms / restore_total_ms /
+    restore_end_to_modal_method_ms (and the request-origin boundaries), so the
+    one-off print in _run_plan_stream_impl must not resurface.
+    """
+
+    def test_platform_snapshot_capture_or_resume_gap_marker_absent(self):
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint._run_plan_stream_impl)
+        self.assertNotIn("platform_snapshot_capture_or_resume_gap", source)
+        self.assertNotIn("snapshot_callback_return_to_first_method_entry", source)
+
+    def test_method_first_line_capture_still_present(self):
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint._run_plan_stream_impl)
+        self.assertIn("_method_first_line_ns", source)
+        self.assertIn("modal_method_entry_mono_ns: int = _method_first_line_ns", source)
+        self.assertIn("get_restore_return_marker()", source)
+
+
 class TestCompactSummaries(unittest.TestCase):
     """Compact summary lines are emitted with correct prefixes."""
 

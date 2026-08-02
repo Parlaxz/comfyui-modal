@@ -19,6 +19,15 @@ from types import SimpleNamespace, MappingProxyType
 from typing import Any
 from collections.abc import Mapping
 
+# Import torch before any request-time activation / probe runs.  The first
+# ``import torch`` inside ``register_unet_forward_probe`` can fail on Windows
+# with "function '_has_torch_function' already has a docstring" when
+# ``torch.overrides`` re-executes against an already-initialized ``torch._C``,
+# leaving torch partially imported and poisoning later tests.  The real
+# ComfyUI container always has torch imported at process start, so a module-
+# load import reproduces that environment.
+import torch  # noqa: F401
+
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
 from comfymodal_runtime.model_preload import V2LoaderBridge, RestorePreparation
 from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key, build_restore_model_spec
@@ -2841,8 +2850,13 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
         self.entrypoint._legacy_module = SimpleNamespace()
 
     @staticmethod
-    async def _execute_stub(_plan, _context, _api, _trace, *, activation_diagnostic_state=None):
-        """Minimal _execute_v2_prompt_executor replacement."""
+    async def _execute_stub(_plan, _context, _api, _trace, *, activation_diagnostic_state=None, **kwargs):
+        """Minimal _execute_v2_prompt_executor replacement.
+
+        ``_run_in_process`` passes ``request_bound_to_production_snapshot``
+        as an extra keyword; the stub must accept it (via **kwargs) so the
+        guard test exercises the real call site signature.
+        """
         return {"images": [], "videos": [], "outputs": {}}
 
     def _run_scenario(self, *, snapshot_active: bool, simulate_exact_hit: bool):
@@ -2902,8 +2916,13 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
         return len(prefill_called), prefill_diag_lines
 
     def test_prefill_guard_with_snapshot_state(self):
+        # schedule_execution_prefill is now invoked on EVERY request path
+        # (snapshot active or not) so the retained CLIP's prefill future is
+        # always offered to graph loaders.  The minimal KSampler-only workflow
+        # has no eligible encode entries, so the call happens but returns
+        # False -> the diagnostic still reports scheduled=0 in this harness.
         for label, snapshot_active, simulate_exact_hit, expected_calls in [
-            ("exact_hit",          True,  True,  0),
+            ("exact_hit",          True,  True,  1),
             ("mismatch_fallback",  True,  False, 1),
             ("no_snapshot",        False, False, 1),
         ]:
@@ -2918,8 +2937,8 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
                     f"expected {expected_calls}",
                 )
                 # Assert the execution-prefill diagnostic line is emitted exactly once
-                # with the correct scheduled= value (0 when snapshot is active, 0 when
-                # prefill returns False in test setup, never 1 in this harness).
+                # with the correct scheduled= value (0 when prefill returns False in
+                # test setup because the workflow has no eligible encode entries).
                 self.assertEqual(
                     len(diag_lines), 1,
                     f"[{label}] expected exactly 1 [v2.execution_prefill] line, "
@@ -2931,5 +2950,493 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
                 )
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Request-time activation for the present-but-inactive cold-run path
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _FakeDM2:
+    """Diffusion-model stub that accepts forward hook registration (probe)."""
+
+    def __init__(self):
+        self._hooks = []
+
+    def register_forward_pre_hook(self, hook, **kwargs):
+        self._hooks.append(hook)
+        return hook
+
+    def register_forward_hook(self, hook, **kwargs):
+        self._hooks.append(hook)
+        return hook
+
+    def parameters(self):
+        return iter([])
+
+
+class _FakeUnetPatcher:
+    """ModelPatcher-ish retained UNET with a resolvable diffusion model."""
+
+    def __init__(self, name="sd3.5_large.safetensors"):
+        self._name = name
+        self.model = SimpleNamespace(diffusion_model=_FakeDM2())
+        self.load_device = "cpu"
+        self.offload_device = "cpu"
+
+    def named_parameters(self, recurse=True):
+        return iter([])
+
+    def named_buffers(self, recurse=True):
+        return iter([])
+
+
+def _make_retained_snapshot(unet=None, clip=None):
+    """Build a CpuSnapshotModels with patcher-shaped retained objects that
+    resolve to a diffusion model (required by the identity chain verify)."""
+    unet = unet if unet is not None else _FakeUnetPatcher()
+    clip = clip if clip is not None else _FakeClip()
+    return CpuSnapshotModels(
+        model_key=ModelRestoreKey(
+            unet_identity="sd3.5_large.safetensors",
+            clip_identity="t5xxl_fp16.safetensors",
+            clip_type="sd3",
+        ),
+        model_spec={
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "sd3.5_large.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "t5xxl_fp16.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        },
+        normalized_profile={
+            "mode": "split",
+            "unet": "sd3.5_large.safetensors",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip_type": "sd3",
+        },
+        file_facts=(),
+        unet=unet,
+        clip=clip,
+        load_timings_ms={},
+    )
+
+
+def _cold_run_plan(compat_flags=None, unet_name="sd3.5_large.safetensors"):
+    """Build a request plan whose model identity matches the retained
+    snapshot (UNET + CLIP)."""
+    return ExecutionPlan(
+        workflow={
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "t5xxl_fp16.safetensors", "type": "sd3"}},
+        },
+        execution_options=ExecutionOptions(compatibility_flags=compat_flags or {}),
+    )
+
+
+class _FakeSeedExecutor:
+    """Minimal executor with an outputs cache whose set_prompt the executor
+    seed hook can wrap (used to prove executor_loader_cache_seed_end evidence
+    is emitted after request-time activation populates snapshot_loader_outputs)."""
+
+    def __init__(self):
+        async def _set_prompt(*args: Any, **kwargs: Any) -> Any:
+            return None
+
+        outputs = SimpleNamespace(set_prompt=_set_prompt)
+        self.caches = SimpleNamespace(outputs=outputs)
+
+
+def _fake_comfy_modules():
+    """Register importable fake ``comfy`` / ``comfy.model_management`` modules
+    so ``_retarget_cpu_snapshot_models_for_request`` can import the live module
+    name even when ComfyUI is not installed.  The retarget itself is mocked in
+    these tests, so the fake functions are never called."""
+    import types as _types
+    _comfy = _types.ModuleType("comfy")
+    _comfy.__path__ = []  # mark as package
+    _mm = _types.ModuleType("comfy.model_management")
+    for _fn in ("get_torch_device", "unet_offload_device", "text_encoder_device", "text_encoder_offload_device"):
+        setattr(_mm, _fn, staticmethod(lambda: "cuda:0"))
+    _comfy.model_management = _mm
+    return {"comfy": _comfy, "comfy.model_management": _mm}
+
+
+
+class CpuSnapshotRequestTimeActivationTests(unittest.TestCase):
+    """Focused regression tests for the ACTUAL present-but-inactive cold-run
+    path in ``_run_in_process`` (production profile).
+
+    A cold run reaches the first request with the retained CLIP/UNET PRESENT
+    but INACTIVE because ``restore()`` has no plan and never runs the
+    restore-time activation.  The request-time path must activate them —
+    retarget to the live device policy and publish the exact retained objects
+    on the bridge — instead of raising the "present but INACTIVE"
+    RuntimeError.
+    """
+
+    _RETARGET_PATCH = "comfymodal_runtime.modal_app.retarget_cpu_snapshot_models"
+
+    def setUp(self):
+        _clean_env()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        os.environ["COMFYMODAL_V2_ENV_PROFILE"] = "production"
+        os.environ.pop("COMFYMODAL_ENABLE_GPU_SNAPSHOT", None)
+        # Make `import comfy.model_management` resolvable without a ComfyUI
+        # install (the retarget itself is mocked per-test).
+        self._comfy_modules = patch.dict(sys.modules, _fake_comfy_modules())
+        self._comfy_modules.start()
+        self.addCleanup(self._comfy_modules.stop)
+        self.entrypoint = ModalRuntimeEntrypoint()
+        self.entrypoint._lazy_init_snapshot_state()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.entrypoint._runtime_configured = True
+        self.entrypoint._legacy_api = SimpleNamespace(
+            _executor=SimpleNamespace(success=True, history_result={}),
+        )
+        self.entrypoint._legacy_module = SimpleNamespace()
+
+    def tearDown(self):
+        os.environ.pop("COMFYMODAL_V2_ENV_PROFILE", None)
+        _clean_env()
+        self.entrypoint._cpu_snapshot_models = None
+        self.entrypoint._cpu_snapshot_models_active = False
+        self.entrypoint._preload_bridge.clear()
+
+    def _run_cold_request(self, *, unet_name="sd3.5_large.safetensors"):
+        """Run ``_run_in_process`` for a production present-but-inactive
+        container.
+
+        Returns ``(result, retarget_calls, bound_flags, lines)`` where
+        *retarget_calls* is the number of request-time retarget invocations,
+        *bound_flags* the ``request_bound_to_production_snapshot`` values seen
+        by the executor stub, and *lines* the captured ``[v2.*]`` diagnostics.
+        """
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+        retarget_calls: list[int] = []
+        bound_flags: list[bool] = []
+        lines: list[str] = []
+        _real_print = print
+
+        async def _stub_execute(_plan, _context, _api, _trace, *,
+                                activation_diagnostic_state=None,
+                                request_bound_to_production_snapshot=False,
+                                **kwargs):
+            bound_flags.append(bool(request_bound_to_production_snapshot))
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+
+        def _fake_retarget(models, *, model_management=None):
+            retarget_calls.append(id(models))
+            return (True, "ok")
+
+        def _capture_print(*args, **kwargs):
+            msg = str(args[0]) if args else ""
+            if msg.startswith("[v2."):
+                lines.append(msg)
+            _real_print(*args, file=sys.stderr, **kwargs)
+
+        plan = _cold_run_plan(unet_name=unet_name)
+        context = ExecutionContext(request_id="cold-run-prod-001")
+        with patch(self._RETARGET_PATCH, side_effect=_fake_retarget):
+            with patch("builtins.print", side_effect=_capture_print):
+                result = asyncio.run(self.entrypoint._run_in_process(plan, context))
+        return result, retarget_calls, bound_flags, lines
+
+    # ── Test 1: production cold run activates instead of raising ──────
+
+    def test_production_cold_run_activates_inactive_models(self):
+        """Present-but-inactive + matching request activates at request time:
+        no RuntimeError, active=True, exact objects on the bridge, retarget
+        ran once, production binding flag propagated."""
+        result, retarget_calls, bound_flags, lines = self._run_cold_request()
+
+        # Activation completed.
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+        self.assertEqual(len(retarget_calls), 1, "request-time retarget must run exactly once")
+
+        # Bridge holds the exact retained objects.
+        prep = self.entrypoint._preload_bridge._preparation
+        self.assertIsNotNone(prep)
+        self.assertIs(prep.unet_future.result(), self.entrypoint._cpu_snapshot_models.unet)
+        self.assertIs(prep.clip_future.result(), self.entrypoint._cpu_snapshot_models.clip)
+
+        # Production binding flag propagated to the executor.
+        self.assertEqual(bound_flags, [True])
+
+        # Request + invariant markers pass.
+        self.assertTrue(
+            any("status=present_but_inactive" in line and "action=request_time_activation" in line for line in lines),
+            "present_but_inactive + request_time_activation marker missing",
+        )
+        self.assertTrue(
+            any(line == "[v2.cpu_snapshot_request] status=reused reason=ok" for line in lines),
+            "status=reused marker missing",
+        )
+        invariant = next(line for line in lines if line.startswith("[v2.snapshot_activation_invariant]"))
+        self.assertIn("status=pass", invariant)
+        self.assertIn("reason=ok", invariant)
+        self.assertIn("cpu_snapshot_active=1", invariant)
+        prefill = next(line for line in lines if line.startswith("[v2.execution_prefill]"))
+        self.assertIn("snapshot_active=1", prefill)
+        self.assertIn("scheduled=0", prefill)
+
+    # ── Test 2: exact objects are served at graph time ────────────────
+
+    def test_request_time_activation_serves_exact_objects_at_graph_time(self):
+        """After request-time activation, the bridge consumers return the
+        exact retained objects — the same ones the graph loaders would get."""
+        _result, _retarget_calls, _bound_flags, _lines = self._run_cold_request()
+        unet = self.entrypoint._cpu_snapshot_models.unet
+        clip = self.entrypoint._cpu_snapshot_models.clip
+        bridge = self.entrypoint._preload_bridge
+        prep = bridge._preparation
+        self.assertIsNotNone(prep)
+        with bridge.request_scope():
+            served_unet = bridge.coordinator.wait_unet(
+                prep, trace=RuntimeTrace(request_id="cold-graph", process="test")
+            )
+            served_clip = bridge.coordinator.wait_clip(
+                prep, trace=RuntimeTrace(request_id="cold-graph", process="test")
+            )
+        self.assertIs(served_unet, unet)
+        self.assertIs(served_clip, clip)
+
+    # ── Test 3: identity mismatch still fails closed for production ───
+
+    def test_production_cold_run_identity_mismatch_fails_closed(self):
+        """A request for a DIFFERENT model must not be served from the
+        retained snapshot — production raises identity mismatch and the
+        snapshot stays inactive."""
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+
+        async def _stub_execute(*_a, **_kw):
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+        plan = _cold_run_plan(unet_name="different.safetensors")
+        context = ExecutionContext(request_id="cold-run-mismatch")
+        with patch(self._RETARGET_PATCH, return_value=(True, "ok")):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertIn("identity mismatch", str(ctx.exception).lower())
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+        self.assertIsNone(self.entrypoint._preload_bridge._preparation)
+
+    # ── Test 4: retarget failure fails closed for production ──────────
+
+    def test_production_cold_run_retarget_failure_fails_closed(self):
+        """When request-time retargeting fails, the production path raises
+        instead of publishing an un-retargeted CPU patcher."""
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+
+        async def _stub_execute(*_a, **_kw):
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+        plan = _cold_run_plan()
+        context = ExecutionContext(request_id="cold-run-retarget-fail")
+        with patch(self._RETARGET_PATCH, return_value=(False, "no_device_policy")):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertIn("retarget failed", str(ctx.exception).lower())
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+
+    # ── Test 5: non-production mismatch falls back, does not raise ─────
+
+    def test_non_production_cold_run_mismatch_falls_back(self):
+        """Diagnostic/inherit profile + present-but-inactive + mismatch keeps
+        the fallback: no raise, bridge cleared, inactive, executor runs."""
+        os.environ["COMFYMODAL_V2_ENV_PROFILE"] = "diagnostic"
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+        executor_called: list[bool] = []
+
+        async def _stub_execute(*_a, **_kw):
+            executor_called.append(True)
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+        plan = _cold_run_plan(unet_name="different.safetensors")
+        context = ExecutionContext(request_id="cold-run-diag-mismatch")
+        with patch(self._RETARGET_PATCH, return_value=(True, "ok")):
+            result = asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertEqual(executor_called, [True])
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+        self.assertIsNone(self.entrypoint._preload_bridge._preparation)
+        self.assertIsInstance(result, dict)
+
+    # ── Test 6: subsequent requests stay activated (no re-retarget) ───
+
+    def test_warm_request_after_cold_activation_skips_retarget(self):
+        """After request-time activation marks the snapshot active, the next
+        request takes the normal binding path and does NOT retarget again."""
+        _result, retarget_calls, _bound_flags, _lines = self._run_cold_request()
+        self.assertEqual(len(retarget_calls), 1)
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+
+        # Second request: snapshot already active -> normal binding, no retarget.
+        retarget_calls2: list[int] = []
+        bound_flags2: list[bool] = []
+
+        async def _stub_execute2(_plan, _context, _api, _trace, *,
+                                 activation_diagnostic_state=None,
+                                 request_bound_to_production_snapshot=False,
+                                 **kwargs):
+            bound_flags2.append(bool(request_bound_to_production_snapshot))
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute2  # type: ignore[assignment]
+
+        def _fake_retarget2(models, *, model_management=None):
+            retarget_calls2.append(id(models))
+            return (True, "ok")
+
+        plan = _cold_run_plan()
+        context = ExecutionContext(request_id="cold-run-prod-002")
+        with patch(self._RETARGET_PATCH, side_effect=_fake_retarget2):
+            asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertEqual(retarget_calls2, [], "warm request must NOT retarget")
+        self.assertEqual(bound_flags2, [True], "warm production request still bound")
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+
+    # ── Test 7: request-time activation mirrors restore seed evidence ──
+
+    def test_request_time_activation_populates_seed_evidence(self):
+        """Request-time activation populates snapshot_loader_outputs /
+        snapshot_model_identities / snapshot_execution_seed exactly like the
+        restore-time activation step, so the executor seed hook emits
+        executor_loader_cache_seed_end evidence (unet=seeded, clip=seeded,
+        vae=missing_snapshot_output) for a request-activated container."""
+        _result, retarget_calls, _bound_flags, _lines = self._run_cold_request()
+        self.assertEqual(len(retarget_calls), 1)
+        state = self.entrypoint.bootstrap.state
+        retained = self.entrypoint._cpu_snapshot_models
+        # Loader outputs hold the EXACT retained objects (mirrors restore).
+        self.assertIs(state.snapshot_loader_outputs.get("unet"), retained.unet)
+        self.assertIs(state.snapshot_loader_outputs.get("clip"), retained.clip)
+        # Identities mirror the request/snapshot model key.
+        self.assertEqual(
+            state.snapshot_model_identities.get("unet"), "sd3.5_large.safetensors"
+        )
+        self.assertEqual(
+            state.snapshot_model_identities.get("clip"), "t5xxl_fp16.safetensors"
+        )
+        # The deterministic execution seed is built (cold runs never built it).
+        self.assertTrue(state.snapshot_seed_built)
+        self.assertIsNotNone(state.snapshot_execution_seed)
+        self.assertEqual(
+            state.snapshot_execution_seed.loader_cache_signatures[0].get("node_id"),
+            "unet",
+        )
+
+        # The executor seed hook is now installable and emits the evidence.
+        seed_trace = RuntimeTrace(request_id="rt-seed-hook", process="test")
+        plan = _cold_run_plan()
+        fake_executor = _FakeSeedExecutor()
+        restore_hook = self.entrypoint._install_snapshot_executor_seed_hook(
+            fake_executor, plan.workflow, plan, seed_trace,
+        )
+        self.assertIsNotNone(
+            restore_hook,
+            "snapshot_loader_outputs populated -> seed hook must install",
+        )
+        # The seeded set_prompt wrapper is installed on the executor's outputs
+        # cache; invoking it emits the executor_loader_cache_seed_end evidence.
+        asyncio.run(fake_executor.caches.outputs.set_prompt())
+        event_names = [e.name for e in seed_trace.events]
+        self.assertIn("executor_seed_apply_start", event_names)
+        self.assertIn("executor_loader_cache_seed_end", event_names)
+        seed_ev = next(
+            e for e in seed_trace.events if e.name == "executor_loader_cache_seed_end"
+        )
+        self.assertIn("diagnostics", seed_ev.metadata)
+        # Restoring the original set_prompt is the returned hook's job.
+        restore_hook()
+        self.assertIsNotNone(fake_executor.caches.outputs.set_prompt)
+
+    # ── Test 8: request-time prefill future is consumed by graph loaders ──
+
+    def test_request_time_prefill_consumed_by_graph_loaders(self):
+        """After request-time activation the retained CLIP/UNET have COMPLETED
+        preparation futures; the execution prefill is scheduled from them and
+        the graph CLIPTextEncode consumer serves the cached encoding (no
+        duplicate construction of the retained objects)."""
+        from comfymodal_runtime.contracts import PrefillKey
+
+        bridge = V2LoaderBridge()
+        _ensure_bridge_has_fake_nodes(bridge)
+        trace = RuntimeTrace(request_id="rt-prefill", process="test")
+        model_key = ModelRestoreKey(
+            unet_identity="sd3.5_large.safetensors",
+            clip_identity="t5xxl_fp16.safetensors",
+            clip_type="sd3",
+        )
+        prefill_key = PrefillKey(
+            model_key=model_key,
+            prompt_bundle_hash="bundle-hash",
+            encode_options={
+                "eligible": True,
+                "encodes": [
+                    {"node_id": "pos", "role": "positive", "text": "a cat"},
+                    {"node_id": "neg", "role": "negative", "text": "blurry"},
+                ],
+            },
+        )
+        retained_clip = _FakeClip()
+        retained_unet = _FakeUnetPatcher()
+        prep = bridge.use_ready_models(
+            model_key=model_key,
+            prefill_key=prefill_key,
+            model_spec={},
+            unet=retained_unet,
+            clip=retained_clip,
+            trace=trace,
+        )
+        # Completed preparation futures: graph loaders never wait/construct.
+        self.assertTrue(prep.clip_future.done())
+        self.assertTrue(prep.unet_future.done())
+        self.assertIs(prep.clip_future.result(), retained_clip)
+        self.assertIs(prep.unet_future.result(), retained_unet)
+
+        # Execution prefill is scheduled from the retained CLIP.
+        self.assertTrue(
+            bridge.schedule_execution_prefill(
+                trace=trace, request_id="rt-prefill",
+            ),
+            "execution prefill must schedule from the completed retained CLIP",
+        )
+        prep.prefill_future.result(timeout=30)
+
+        # Graph CLIPTextEncode consumer serves the prefill result.
+        with bridge.request_scope():
+            served = bridge._consume_prefill((retained_clip, "a cat"), {})
+        self.assertEqual(served, ("conditioning:a cat",))
+        graph_prefill_ok = [
+            e for e in trace.events if e.name == "graph_prefill_consumed"
+        ]
+        self.assertEqual(len(graph_prefill_ok), 1)
+        self.assertEqual(graph_prefill_ok[0].metadata.get("status"), "prepared")
+        # No prefill fallback event: the cached encoding was served.
+        self.assertEqual(
+            [e for e in trace.events if e.name == "original_loader_fallback"
+             and e.metadata.get("lane") == "prefill"],
+            [],
+        )
+        # Exactly one preparation exists on the bridge (no duplicate
+        # construction), and VAE still falls back (no snapshot VAE).
+        self.assertIs(bridge._preparation, prep)
+        with bridge.request_scope():
+            bridge._consume_vae(("vae.safetensors",), {})
+        vae_fallback = [
+            e for e in trace.events
+            if e.name == "original_loader_fallback" and e.metadata.get("lane") == "VAE"
+        ]
+        self.assertEqual(len(vae_fallback), 1, "VAE must fall back to the original loader")
+
+
 if __name__ == "__main__":
+
     unittest.main()

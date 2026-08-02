@@ -64,6 +64,17 @@ class TestSamplerWrapperIntegration(unittest.TestCase):
         from comfymodal_runtime.runtime_executor import _sampler_wrapper_dedup
         _sampler_wrapper_dedup.clear()
         self._trace = RuntimeTrace(request_id="test_int", process="test")
+        # The production wrapper now arms the one-shot sampler-stall watchdog
+        # at the sampling_start boundary; cancel any armed watchdog so no
+        # daemon thread outlives the test.
+        self.addCleanup(self._cleanup_watchdogs)
+
+    def _cleanup_watchdogs(self):
+        from comfymodal_runtime import model_preload as mp
+        with mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            for wd in list(mp._SAMPLER_STALL_WATCHDOGS.values()):
+                wd.cancel()
+            mp._SAMPLER_STALL_WATCHDOGS.clear()
 
     def _set_trace(self):
         from comfymodal_runtime.model_preload import _ACTIVE_REQUEST_TRACE

@@ -291,6 +291,38 @@ class SamplerBoundaryDiagnosticsTests(unittest.TestCase):
             )
             self.mp.cancel_sampler_stall_watchdog("samp-boundary")
 
+    def test_wrapper_arms_watchdog_at_sampling_start(self):
+        """Production arming lives at the sampling_start boundary: running the
+        sampler wrapper (without any pre-arming) must arm the one-shot
+        watchdog with the sampler identity and request key."""
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            self.assertNotIn("samp-boundary", self.mp._SAMPLER_STALL_WATCHDOGS)
+        patcher = _FakePatcher()
+        guider = self._make_guider(patcher=patcher, node_id="n-6", node_class="KSampler")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._run_wrapper(
+                guider,
+                callback=lambda *a: "step",
+                step_count=2,
+            )
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            watchdog = self.mp._SAMPLER_STALL_WATCHDOGS.get("samp-boundary")
+        self.assertIsNotNone(
+            watchdog, "the wrapper must arm the watchdog at sampling_start"
+        )
+        # Armed with the sampler/node identity captured at the boundary.
+        self.assertEqual(watchdog.request_id, "samp-boundary")
+        self.assertEqual(watchdog.sampler_node_id, "n-6")
+        self.assertEqual(watchdog.sampler_class, "KSampler")
+        self.assertEqual(
+            watchdog.diffusion_model_object_id,
+            str(id(patcher.model.diffusion_model)),
+        )
+        # The armed boundary line is emitted by the wrapper path.
+        self.assertIn("[v2.sampler_stall_watchdog] stage=armed", buf.getvalue())
+        self.mp.cancel_sampler_stall_watchdog("samp-boundary")
+
     def test_gpu_residency_evidence_emitted_no_raise_for_stub(self):
         """[v2.unet_gpu_residency] is emitted at sampling_start; no-parameter
         stubs do not raise (diagnostic mode preserved)."""

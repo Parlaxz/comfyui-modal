@@ -71,6 +71,19 @@ class TestInstrumentationWrappers(unittest.TestCase):
     VAE and output events are emitted through a send_sync-like simulation.
     """
 
+    def setUp(self):
+        # The production wrapper now arms the one-shot sampler-stall watchdog
+        # at the sampling_start boundary; cancel any armed watchdog so no
+        # daemon thread outlives the test or prints into a later capture.
+        self.addCleanup(self._cleanup_watchdogs)
+
+    def _cleanup_watchdogs(self):
+        from comfymodal_runtime import model_preload as mp
+        with mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            for wd in list(mp._SAMPLER_STALL_WATCHDOGS.values()):
+                wd.cancel()
+            mp._SAMPLER_STALL_WATCHDOGS.clear()
+
     def _emit_vae_decode_events(self, trace: RuntimeTrace, delay_s: float = 0.015) -> None:
         """Emit VAE decode events (simulating send_sync milestone detection)."""
         trace.emit("vae_decode_start", phase="execution", metadata={

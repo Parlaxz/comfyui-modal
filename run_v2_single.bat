@@ -84,9 +84,18 @@ echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
 echo restore_torch_threads=!V2_PROFILE_THREADS!
 
 set "COMFYMODAL_COMMAND_START_UNIX_MS=!COMMAND_START_MS!"
-echo === Running one V2 benchmark trial against the existing deployment ===
-echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
-python tools\benchmark_v2_direct.py
+REM -- Benchmark invocation ------------------------------------------
+REM Default: V2_BENCHMARK_RUNS=1 -> exactly one run.  The acceptance
+REM sequence (A/B/C, ~3+ requests) runs ONLY via the explicit opt-in env
+REM V2_BENCHMARK_MODE=acceptance.
+if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
+    echo === Running V2 acceptance benchmark - explicit opt-in ===
+    python tools\benchmark_v2_direct.py --acceptance
+) else (
+    echo === Running one V2 benchmark trial against the existing deployment ===
+    echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
+    python tools\benchmark_v2_direct.py
+)
 set "BENCHMARK_EXIT_CODE=!errorlevel!"
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_END_MS=%%a"
 for /f %%a in ('powershell -NoProfile -Command "(([long]!COMMAND_END_MS! - [long]!COMMAND_START_MS!) / 1000.0).ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)"') do set "COMMAND_ELAPSED_SECONDS=%%a"
