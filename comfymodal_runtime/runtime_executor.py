@@ -2379,6 +2379,13 @@ def _build_sampling_wrapper() -> Callable:
     sampler identity (guider patcher / diffusion model) is captured and the
     retained-UNET object identity is verified against the bridge.
 
+    This is also where the one-shot sampler-stall watchdog is PRODUCTION-armed
+    (at the actual sampling_start boundary): its 5s first-UNET-forward and 15s
+    first-step deadlines are measured from sampling start, NOT from
+    PromptExecutor start (model loading / CLIP encode before the sampler must
+    not count toward them).  The watchdog is canceled by the request owner
+    (modal_app's finally) on normal/error completion.
+
     Deduplication is per ``(request_id, id(executor))`` to ensure exactly one
     start/end pair per sampler invocation, even if the wrapper is registered
     on multiple model options (snapshot, normal, alternate).
@@ -2562,6 +2569,35 @@ def _build_sampling_wrapper() -> Callable:
         except Exception as _residency_exc:
             if "CPU-resident" in str(_residency_exc):
                 raise
+            pass
+
+        # ── Arm the one-shot sampler-stall watchdog at the sampling_start
+        # boundary ──
+        # Production arming moved here (from modal_app's PromptExecutor start)
+        # so the exact deadlines are measured from actual sampling start:
+        #   - 5s  waiting for the first UNET forward
+        #   - 15s waiting for the first completed sampler step (NOT 5s + 15s)
+        # Modal loading / CLIP encode before the sampler no longer count
+        # against these deadlines.  Non-destructive; idempotent per request
+        # (a second sampler in the same request does not re-arm).  Canceled by
+        # the request owner (modal_app finally) on normal/error completion.
+        try:
+            from comfymodal_runtime.model_preload import start_sampler_stall_watchdog
+            start_sampler_stall_watchdog(
+                request_id=str(trace.request_id),
+                restored_instance_id=start_meta.get("restored_instance_id", ""),
+                sampler_node_id=node_id,
+                sampler_class=node_class,
+                patcher_object_id=start_meta.get("patcher_object_id", ""),
+                diffusion_model_object_id=start_meta.get("diffusion_model_object_id", ""),
+                # unet_object_id is the retained UNET *patcher* object being
+                # sampled (the bridge-served snapshot object or its CacheDiT
+                # replacement) — the same logical identity the identity chain
+                # records.  The resolved diffusion model id is reported
+                # separately as diffusion_model_object_id.
+                unet_object_id=start_meta.get("patcher_object_id", ""),
+            )
+        except Exception:
             pass
 
         # ── Enrich the one-shot stall watchdog with sampler identity ──

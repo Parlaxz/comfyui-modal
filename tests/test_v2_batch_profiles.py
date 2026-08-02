@@ -33,11 +33,34 @@ def test_default_snapshot_and_caller_benchmark_values_are_preserved():
         assert "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1" in source
 
 
+def test_acceptance_is_opt_in_env_only_in_both_batches():
+    """V2_BENCHMARK_RUNS=1 must perform exactly one run by default; the
+    acceptance A/B/C sequence runs ONLY via the explicit opt-in env
+    V2_BENCHMARK_MODE=acceptance in both single-run launchers."""
+    for source in (DEPLOY, RUN):
+        assert 'if /i "!V2_BENCHMARK_MODE!"=="acceptance" (' in source
+        # Default branch must run the plain benchmark (honours V2_BENCHMARK_RUNS).
+        assert "python tools\\benchmark_v2_direct.py" in source
+        # The opt-in branch runs --acceptance; the default branch runs the
+        # plain benchmark (which honours V2_BENCHMARK_RUNS=1).
+        _optin = source.index('if /i "!V2_BENCHMARK_MODE!"=="acceptance" (')
+        _accept_line = source.index("--acceptance")
+        _plain = source.index("python tools\\benchmark_v2_direct.py", _accept_line)
+        assert _optin < _accept_line < _plain
+        assert ") else (" in source[_optin:_plain]
+    # Single-run contract: both launchers default V2_BENCHMARK_RUNS to 1 when
+    # the caller did not set it (caller override preserved).
+    for source in (DEPLOY, RUN):
+        assert 'if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=1"' in source
+
+
 def test_deploy_only_is_after_deploy_verification_and_before_acceptance():
     guard = 'if /i "!COMFYMODAL_DEPLOY_ONLY!"=="1"'
     assert guard in DEPLOY
     assert DEPLOY.index(guard) > DEPLOY.index("=== V2 deploy verified OK ===")
-    assert DEPLOY.index(guard) < DEPLOY.index("=== Running V2 acceptance benchmark ===")
+    # The opt-in acceptance branch still carries the canonical marker.
+    assert DEPLOY.index(guard) < DEPLOY.index("=== Running V2 acceptance benchmark - explicit opt-in ===")
+    assert "=== V2 acceptance benchmark completed ===" in DEPLOY
     assert "Deploy-only requested; acceptance benchmark skipped" in DEPLOY
 
 

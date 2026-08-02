@@ -210,6 +210,7 @@ def _first_value(result: Mapping[str, Any], keys: Sequence[str]) -> Any:
         timing,
         restore,
         structured,
+        _as_mapping(root.get("local_timing")),
         _as_mapping(trace.get("metadata")),
         _request_origin(result),
         _as_mapping(trace.get("stages")),
@@ -375,7 +376,20 @@ def _stage_candidate(result: Mapping[str, Any], key: str) -> _Candidate:
     if key == "modal_handle_submission":
         start = origin("local_receive_wall_ns") or event(("modal_handle_lookup_start", "transport_entry"), process="local")
         end = origin("modal_submission_attempt_wall_unix_ns") or event(("modal_submission_attempt", "modal_first_iteration_start"), process="local")
-        return _candidate(result, start, end, duration_keys=("handle_lookup_ms", "local_submission_ms"))
+        # Prefer the authoritative local submission span from local_timing;
+        # handle lookup and payload serialization are its non-overlapping
+        # sub-segments.  The first field found becomes the source_fields entry.
+        return _candidate(
+            result,
+            start,
+            end,
+            duration_keys=(
+                "local_receive_to_actual_submission_ms",
+                "handle_lookup_ms",
+                "payload_serialize_ms",
+                "local_submission_ms",
+            ),
+        )
     if key == "modal_scheduling":
         dispatch = _first_value(result, ("dispatch_to_modal_entry_ms",))
         restore = _first_value(result, ("restore_total_ms",))
@@ -718,6 +732,11 @@ def build_waterfall(
     accounted_before_residual = sum(accounted_values)
     residual = total - accounted_before_residual if total is not None and accounted_before_residual is not None else None
     if residual is not None and residual > 0.0005:
+        # The catch-all residual is the UNATTRIBUTED gap, not a measured
+        # stage.  Keep it visible in the report but exclude it from the
+        # accounted total so reconciliation reflects the real unexplained
+        # gap instead of fabricating a perfect reconcile (accounted == total
+        # with reconciliation == 0) by construction.
         stages.append(WaterfallStage(
             key="captured_timeline_gap",
             label="Captured timeline gaps / residual",
@@ -729,11 +748,11 @@ def build_waterfall(
             percentage=(residual / total * 100.0 if total and total > 0 else None),
             source="accounting",
             status=DERIVED,
-            included_in_total=True,
+            included_in_total=False,
             clock_scope="wall",
-            source_fields=("command_to_response_ms", "known_stage_durations_ms"),
+            source_fields=("command_to_response_ms", "known_stage_durations_ms", "unaccounted"),
         ))
-        warnings.append(f"captured residual assigned: {residual:.3f}ms")
+        warnings.append(f"captured residual excluded from accounted: {residual:.3f}ms unaccounted")
 
     cumulative = 0.0
     completed: list[WaterfallStage] = []

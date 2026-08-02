@@ -293,13 +293,27 @@ if /i "!COMFYMODAL_DEPLOY_ONLY!"=="1" (
     exit /b 0
 )
 
-REM -- Acceptance benchmark (unchanged) -----------------------------
+REM -- Benchmark invocation ------------------------------------------
+REM Default: V2_BENCHMARK_RUNS=1 -> exactly one run.  The acceptance
+REM sequence (A fresh / B reused / C fresh, ~3+ requests) runs ONLY via
+REM the explicit opt-in env V2_BENCHMARK_MODE=acceptance so the single-run
+REM contract of this script is never silently exceeded.
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMFYMODAL_COMMAND_START_UNIX_MS=%%a"
-echo === Running V2 acceptance benchmark ===
-python tools\benchmark_v2_direct.py --acceptance
-if errorlevel 1 (
-    echo === ERROR: Acceptance benchmark failed ===
-    exit /b 1
+if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
+    echo === Running V2 acceptance benchmark - explicit opt-in ===
+    python tools\benchmark_v2_direct.py --acceptance
+    if errorlevel 1 (
+        echo === ERROR: Acceptance benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 acceptance benchmark completed ===
+) else (
+    echo === Running V2 benchmark - single run by default ===
+    python tools\benchmark_v2_direct.py
+    if errorlevel 1 (
+        echo === ERROR: Benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 benchmark completed ===
 )
-echo === V2 acceptance benchmark completed ===
 exit /b 0

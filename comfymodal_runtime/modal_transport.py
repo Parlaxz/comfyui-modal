@@ -324,6 +324,17 @@ class ModalTransport:
                     if isinstance(_trace_meta, dict):
                         _origin_from_meta = dict(_trace_meta.get("request_origin_info", {}))
                 request_id = str(_origin_from_meta.get("request_id") or request_id)
+                # Propagate the submitting process's V2 env profile into the
+                # remote request payload (read from os.environ — never
+                # hardcoded).  The remote applies it when the container still
+                # runs the deploy default so production/diagnostic semantics
+                # match the submitting process.
+                if isinstance(_origin_from_meta, dict):
+                    _local_env_profile = os.environ.get(
+                        "COMFYMODAL_V2_ENV_PROFILE", ""
+                    ).strip().lower()
+                    if _local_env_profile:
+                        _origin_from_meta["env_profile"] = _local_env_profile
                 if _origin_from_meta:
                     plan_dict["__request_origin_info__"] = _origin_from_meta
                 if runtime_trace is not None:

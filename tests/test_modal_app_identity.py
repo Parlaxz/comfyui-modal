@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import io
 import os
 import tempfile
 import unittest
@@ -488,6 +489,90 @@ class TestRunPlanStreamIdentity(unittest.TestCase):
 
         import asyncio
         asyncio.run(run())
+
+
+class TestRequestEnvProfilePropagation(unittest.TestCase):
+    """COMFYMODAL_V2_ENV_PROFILE carried by the request reaches the remote
+    request/runtime and is applied without hardcoding a profile locally."""
+
+    def setUp(self):
+        self._saved_env = dict(os.environ)
+        # Container default: deploy-time default (inherit) unless the test
+        # overrides it explicitly.
+        os.environ.pop("COMFYMODAL_V2_ENV_PROFILE", None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self._saved_env)
+
+    def _run_request(self, plan_payload: dict, request_id: str = "req-profile"):
+        captured = io.StringIO()
+        async def run():
+            entrypoint = modal_app.ModalRuntimeEntrypoint(
+                executor=RuntimeExecutor(in_process_runner=lambda plan, ctx: {"ok": True}),
+            )
+            entrypoint._lifecycle_trace = None
+            with patch("builtins.print", side_effect=lambda *a, **kw: captured.write(str(a[0]) + "\n")):
+                messages = [
+                    msg async for msg in entrypoint.run_plan_stream(
+                        plan_payload, request_id=request_id,
+                    )
+                ]
+            return messages
+        return asyncio.run(run()), captured
+
+    def _plan_payload(self, env_profile: str | None = None) -> dict:
+        plan = ExecutionPlan(
+            workflow={"1": {"class_type": "KSampler"}},
+            execution_options=ExecutionOptions(production_enabled=False),
+        )
+        payload = plan.to_dict()
+        if env_profile is not None:
+            payload["__request_origin_info__"] = {"env_profile": env_profile, "request_id": "req-profile"}
+        return payload
+
+    def test_production_request_profile_applied_on_default_container(self):
+        """A production request overrides the container's deploy-default
+        (inherit) env profile so request-time semantics match the submitter."""
+        self.assertEqual(
+            os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit"), "inherit",
+        )
+        _, captured = self._run_request(self._plan_payload(env_profile="production"))
+        self.assertEqual(
+            os.environ.get("COMFYMODAL_V2_ENV_PROFILE", ""), "production",
+            "request-carried profile must reach the remote runtime env",
+        )
+        line = captured.getvalue()
+        self.assertIn("[v2.env_profile]", line)
+        self.assertIn("profile=production", line)
+        self.assertIn("request_profile=production", line)
+        self.assertIn("applied=1", line)
+
+    def test_diagnostic_request_profile_applied_on_default_container(self):
+        """A diagnostic request overrides the container default the same way."""
+        _, captured = self._run_request(self._plan_payload(env_profile="diagnostic"))
+        self.assertEqual(os.environ.get("COMFYMODAL_V2_ENV_PROFILE", ""), "diagnostic")
+        self.assertIn("profile=diagnostic", captured.getvalue())
+
+    def test_container_profile_not_downgraded_by_request(self):
+        """A container explicitly deployed with production is never downgraded
+        by a request carrying a different (e.g. inherit) profile."""
+        os.environ["COMFYMODAL_V2_ENV_PROFILE"] = "production"
+        _, captured = self._run_request(self._plan_payload(env_profile="inherit"))
+        self.assertEqual(os.environ.get("COMFYMODAL_V2_ENV_PROFILE", ""), "production")
+        line = captured.getvalue()
+        self.assertIn("profile=production", line)
+        self.assertIn("applied=0", line)
+
+    def test_no_request_profile_keeps_container_env(self):
+        """No env_profile in the request payload -> container env is left
+        untouched (no invented default)."""
+        _, captured = self._run_request(self._plan_payload(env_profile=None))
+        self.assertEqual(
+            os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit"), "inherit",
+        )
+        self.assertNotIn("[v2.env_profile]", captured.getvalue())
 
 
 class TestPublishRestorePlanIdentity(unittest.TestCase):
