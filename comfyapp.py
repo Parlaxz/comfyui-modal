@@ -373,6 +373,12 @@ if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
 # entrypoint_name, exception_type, exception_message, traceback, timestamp.
 _CUSTOM_NODE_IMPORT_FAILURES: list[dict] = []
 
+# True while _force_cpu_during_snapshot() / _force_triton_during_snapshot()
+# are active (snap=True).  Custom nodes that depend on CUDA C extensions or
+# GPU detection can legitimately fail during this window; those failures are
+# deferred and retried after GPU warmup on the normal CUDA runtime.
+_IN_CPU_SNAPSHOT = False
+
 # Module paths of custom nodes whose entrypoint/schema failed during CPU snapshot.
 # Retried after GPU warmup so schema generation has real device availability.
 _CUSTOM_NODE_REGISTRATION_PENDING_RETRY: set[str] = set()
@@ -3350,9 +3356,33 @@ def _safe_listdir(path: str) -> list[str]:
     return sorted(os.listdir(path))
 
 
+# Shared hash-input filters for the custom-node source generation.  Generated
+# and environment files/directories must never change the persisted
+# generation, so identical baked/runtime canonical content produces an
+# identical generation regardless of mtime or build artifacts.
+_CUSTOM_NODE_GENERATED_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".ipynb_checkpoints", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".eggs", ".cache", "wheelhouse", "wheels", "build", "dist",
+    "tests", "test", "examples", "benchmarks", "benchmark", "traces",
+    "logs", "scripts", ".github",
+})
+_CUSTOM_NODE_GENERATED_FILE_SUFFIXES = (
+    ".log", ".tmp", ".trace", ".jsonl", ".whl",
+)
+_CUSTOM_NODE_GENERATED_FILE_PREFIXES = ("benchmark_", "trace_")
+
+
 def custom_node_source_fingerprint(source_root: str) -> dict:
     """Return a fingerprint of the top-level custom-node directory structure
-    including file content hashes (not just topology)."""
+    including file content hashes (not just topology).
+
+    The walk is deterministic (sorted dirs/files), hashes are normalized for
+    line endings (``_canonical_dependency_bytes``), and generated/environment
+    files and directories are excluded so identical baked/runtime canonical
+    content produces an identical generation regardless of mtime or build
+    artifacts.
+    """
     nodes = []
     for name in _iter_syncable_custom_node_dirs(source_root):
         node_path = os.path.join(source_root, name)
@@ -3364,15 +3394,21 @@ def custom_node_source_fingerprint(source_root: str) -> dict:
         _tracked_files = {"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"}
         try:
             for _dirpath, _dirnames, _filenames in os.walk(node_path):
-                _dirnames[:] = [d for d in _dirnames if d not in (".git", "__pycache__", "node_modules", ".venv", "venv")]
+                _dirnames[:] = sorted(
+                    d for d in _dirnames if d not in _CUSTOM_NODE_GENERATED_DIRS
+                )
                 for _fn in sorted(_filenames):
                     _ext = os.path.splitext(_fn)[1].lower()
                     if _ext in _tracked_exts or _fn in _tracked_files:
+                        if _fn.lower().endswith(_CUSTOM_NODE_GENERATED_FILE_SUFFIXES):
+                            continue
+                        if _fn.lower().startswith(_CUSTOM_NODE_GENERATED_FILE_PREFIXES):
+                            continue
                         _fp = os.path.join(_dirpath, _fn)
                         _rel = os.path.relpath(_fp, node_path).replace("\\", "/")
                         _hasher.update(f"{_rel}:".encode())
                         try:
-                            _hasher.update(Path(_fp).read_bytes())
+                            _hasher.update(_canonical_dependency_bytes(_fp))
                         except OSError:
                             pass
         except Exception:
@@ -3574,16 +3610,10 @@ def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
                     ".webm", ".md", ".rst", ".ipynb", ".gz", ".zip",
                     ".tar", ".pyc", ".pyo", ".safetensors", ".ckpt",
                     ".pt", ".pth", ".bin"}
-    _IGNORE_DIRS = {
-        ".git", "__pycache__", "node_modules", ".venv", "venv",
-        ".ipynb_checkpoints", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-        ".tox", ".eggs", ".cache", "wheelhouse", "wheels", "build", "dist",
-        "tests", "test", "examples", "benchmarks", "benchmark", "traces",
-        "logs", "scripts", ".github",
-    }
-    _IGNORE_GENERATED_SUFFIXES = (
-        ".log", ".tmp", ".trace", ".jsonl", ".whl",
-    )
+    # Shared with custom_node_source_fingerprint so the dependency context
+    # and the persisted generation hash exactly the same canonical inputs.
+    _IGNORE_DIRS = _CUSTOM_NODE_GENERATED_DIRS
+    _IGNORE_GENERATED_SUFFIXES = _CUSTOM_NODE_GENERATED_FILE_SUFFIXES
 
     files: dict[str, str] = {}
     _seen_real: set[str] = set()
@@ -5747,11 +5777,31 @@ def save_runtime_metadata(data: dict) -> None:
 
 
 def set_manager_network_mode_offline() -> list[str]:
-    """Force ComfyUI-Manager into offline mode for runtime containers."""
+    """Force ComfyUI-Manager into offline mode for runtime containers.
+
+    Writes ``network_mode = offline`` to the *one* config path ComfyUI-Manager
+    actually reads at import time (``<user_dir>/__manager/config.ini`` where
+    ``user_dir`` is ``folder_paths.get_user_directory()``, i.e.
+    ``/root/comfy/ComfyUI/user`` on the runtime container), plus env-var hints.
+
+    Deliberately does **not** write the legacy
+    ``user/default/ComfyUI-Manager/config.ini``: writing both the legacy and
+    the new config makes ComfyUI-Manager's import-time migration
+    (``manager_migration.migrate_legacy_config``) take the "first update
+    after ComfyUI upgrade" branch, which runs ``pip install -r
+    <ComfyUI>/requirements.txt`` and moves the legacy directory into
+    ``__manager/.legacy-manager-backup`` — a real package installation and
+    filesystem migration during snap=True that ``network_mode=offline`` does
+    not gate.  The config file alone is therefore *not* sufficient to make
+    snapshot startup read-only; the import-time migration is additionally
+    suppressed by ``_readonly_comfyui_manager_during_snapshot()`` around the
+    snapshot backend start.
+    """
     config_paths = [
-        "/root/comfy/ComfyUI/user/default/__manager/config.ini",
-        "/root/comfy/ComfyUI/user/default/ComfyUI-Manager/config.ini",
+        "/root/comfy/ComfyUI/user/__manager/config.ini",
     ]
+    os.environ.setdefault("COMFYUI_MANAGER_MODE", "offline")
+    os.environ.setdefault("COMFYUI_MANAGER_NETWORK_MODE", "offline")
     written = []
     for config_path in config_paths:
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -5759,6 +5809,94 @@ def set_manager_network_mode_offline() -> list[str]:
             f.write("[default]\nnetwork_mode = offline\n")
         written.append(config_path)
     return written
+
+
+@contextlib.contextmanager
+def _readonly_comfyui_manager_during_snapshot():
+    """Neutralize ComfyUI-Manager's import-time migration during snap=True.
+
+    ComfyUI-Manager performs filesystem work at custom-node import time:
+    ``manager_core.update_user_directory`` calls
+    ``manager_migration.run_migration_checks``, and when both the legacy
+    ``user/default/ComfyUI-Manager/config.ini`` and the new
+    ``user/__manager/config.ini`` exist, ``migrate_legacy_config`` takes the
+    "first update after upgrade" path and runs
+    ``subprocess.run([sys.executable, '-m', 'pip', 'install', '-r',
+    <ComfyUI>/requirements.txt])`` plus moves the legacy directory into
+    ``__manager/.legacy-manager-backup``.  ``network_mode=offline`` does NOT
+    gate that path, so a config/env hint alone is insufficient.
+
+    This guard installs a ``sys.meta_path`` finder (the same mechanism the
+    CUDA snapshot blocker already uses) that, the moment ``manager_migration``
+    is imported, swaps ``run_migration_checks`` for a read-only no-op — and it
+    also patches the module immediately if it was already imported.  The
+    finder and the patch are removed when the window closes, so the normal UI
+    runtime keeps the real migration behavior.
+    """
+    import importlib.util as _importlib_util
+
+    _state = {"patched_module": None, "original": None}
+
+    def _patch(module):
+        if _state["patched_module"] is not None:
+            return
+        _original = getattr(module, "run_migration_checks", None)
+        if _original is None:
+            return
+
+        def _readonly_run_migration_checks(user_dir, manager_files_path):
+            print(
+                "[comfyapp] snapshot: ComfyUI-Manager migration/install "
+                "suppressed during snap=True (read-only manager window)"
+            )
+            return None
+
+        _state["patched_module"] = module
+        _state["original"] = _original
+        module.run_migration_checks = _readonly_run_migration_checks
+
+    class _ReadonlyMigrationFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname != "manager_migration" or _state["patched_module"] is not None:
+                return None
+            if fullname in sys.modules:
+                _patch(sys.modules[fullname])
+                return None
+            spec = _importlib_util.find_spec(fullname)
+            if spec is None or spec.loader is None:
+                return None
+            inner = spec.loader
+
+            class _WrappedLoader:
+                def create_module(self, spec):
+                    if hasattr(inner, "create_module"):
+                        return inner.create_module(spec)
+                    return None
+
+                def exec_module(self, module):
+                    inner.exec_module(module)
+                    _patch(module)
+
+            spec.loader = _WrappedLoader()
+            return spec
+
+    # Patch immediately if the module is already loaded (defensive; the
+    # manager is normally first imported inside the guarded window).
+    _already = sys.modules.get("manager_migration")
+    if _already is not None:
+        _patch(_already)
+
+    finder = _ReadonlyMigrationFinder()
+    sys.meta_path.insert(0, finder)
+    try:
+        yield
+    finally:
+        try:
+            sys.meta_path.remove(finder)
+        except ValueError:
+            pass
+        if _state["patched_module"] is not None and _state["original"] is not None:
+            _state["patched_module"].run_migration_checks = _state["original"]
 
 
 def _get_system_ram_gb() -> float:
@@ -7928,8 +8066,19 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     # so the custom-node contents AND the generation record are part
     # of the same volume commit.
     try:
+        # Deterministic content-derived generation: identical archive
+        # content must converge on the same persisted value so that
+        # snapshot_exact_skip identity (baked vs volume) can match.  A
+        # random UUID here would break that identity after every local
+        # archive sync even when nothing changed.
+        _cn_gen_value = ""
+        try:
+            _cn_gen_value = custom_node_source_generation(CUSTOM_NODES_PATH)
+        except Exception as _gen_exc:
+            print(f"[comfyapp.sync_custom_nodes_to_volume] generation compute failed: {_gen_exc!r}")
         _cn_gen = _write_custom_nodes_generation_record_no_commit(
-            reason="post_sync_custom_nodes_to_volume"
+            reason="post_sync_custom_nodes_to_volume",
+            generation=_cn_gen_value or None,
         )
         print(
             f"[comfyapp.sync_custom_nodes_to_volume] advanced custom_nodes_generation="
@@ -15495,6 +15644,15 @@ class _ComfyAPIMixin:
                 except ValueError:
                     pass
         _failures = list(_CUSTOM_NODE_IMPORT_FAILURES)
+        # Failures caused by the CPU snapshot (CUDA hidden / C extensions
+        # blocked, e.g. SeedVR2) are expected deferrals, not persistent
+        # import failures.  They are retried after GPU warmup on the normal
+        # CUDA runtime, so only count them when they remain unresolved.
+        _persistent_failures = [
+            _f for _f in _failures
+            if not _f.get("snapshot_deferred")
+        ]
+        _deferred_count = len(_failures) - len(_persistent_failures)
         result = {
             "registered_node_classes": registered_count,
             "volume_syncable_custom_node_count": len(volume_dirs),
@@ -15502,22 +15660,33 @@ class _ComfyAPIMixin:
             "comfy_custom_node_entry_count": len(comfy_entries),
             "comfy_volume_symlink_count": len(symlink_dirs),
             "comfy_volume_symlink_dirs": symlink_dirs,
-            "import_failure_count": len(_failures),
-            "import_failures": _failures,
+            "import_failure_count": len(_persistent_failures),
+            "import_failures": _persistent_failures,
+            "import_snapshot_deferred_count": _deferred_count,
+            "import_snapshot_deferred": [
+                _f for _f in _failures if _f.get("snapshot_deferred")
+            ],
         }
         print(f"[comfyapp] custom_node_import_health: "
               f"registered={registered_count} "
               f"volume_syncable={len(volume_dirs)} "
               f"comfy_entries={len(comfy_entries)} "
               f"comfy_symlinks={len(symlink_dirs)} "
-              f"failures={len(_failures)}")
-        for _f in _failures:
+              f"failures={len(_persistent_failures)} "
+              f"snapshot_deferred={_deferred_count}")
+        for _f in _persistent_failures:
             print(f"[comfyapp] custom_node_import_failure: "
                   f"name={os.path.basename(_f.get('custom_node_path', '?'))} "
                   f"phase={_f.get('phase', '?')} "
                   f"exception_type={_f.get('exception_type', '?')} "
                   f"message={_f.get('exception_message', '?')[:200]} "
                   f"traceback_available={'yes' if _f.get('traceback') else 'no'}")
+        for _f in _failures:
+            if _f.get("snapshot_deferred"):
+                print(f"[comfyapp] custom_node_import_deferred: "
+                      f"name={os.path.basename(_f.get('custom_node_path', '?'))} "
+                      f"exception_type={_f.get('exception_type', '?')} "
+                      f"reason=cpu_snapshot_cuda_hidden")
         if volume_dirs:
             print(f"[comfyapp] custom_node_import_health: volume_dirs={volume_dirs}")
         if symlink_dirs:
@@ -17252,9 +17421,13 @@ class _ComfyAPIMixin:
         blocker = _BlockCudaModuleImport()
         sys.meta_path.insert(0, blocker)
 
+        global _IN_CPU_SNAPSHOT
+        _prev_in_cpu_snapshot = _IN_CPU_SNAPSHOT
+        _IN_CPU_SNAPSHOT = True
         try:
             yield
         finally:
+            _IN_CPU_SNAPSHOT = _prev_in_cpu_snapshot
             try:
                 sys.meta_path.remove(blocker)
             except ValueError:
@@ -17328,8 +17501,12 @@ class _ComfyAPIMixin:
         comfy.cli_args.args.cpu = False
 
         try:
+            global _IN_CPU_SNAPSHOT
+            _prev_in_cpu_snapshot = _IN_CPU_SNAPSHOT
+            _IN_CPU_SNAPSHOT = True
             yield
         finally:
+            _IN_CPU_SNAPSHOT = _prev_in_cpu_snapshot
             try:
                 sys.meta_path.remove(blocker)
             except ValueError:
@@ -17404,6 +17581,11 @@ class _ComfyAPIMixin:
                         except Exception:
                             _module_path = "?"
                         global _CUSTOM_NODE_IMPORT_FAILURES, _CUSTOM_NODE_RETRY_REGISTRY
+                        _retryable = bool(
+                            _IN_CPU_SNAPSHOT
+                            or "CUDA" in _exception_msg
+                            or "device" in _exception_msg.lower()
+                        )
                         _CUSTOM_NODE_IMPORT_FAILURES.append({
                             "phase": "entrypoint",
                             "custom_node_path": _module_path,
@@ -17411,6 +17593,8 @@ class _ComfyAPIMixin:
                             "exception_message": _exception_msg,
                             "traceback": _tb_text,
                             "timestamp": time.time(),
+                            "retryable": _retryable,
+                            "snapshot_deferred": bool(_IN_CPU_SNAPSHOT),
                         })
                         # Record for post-GPU-warmup retry (schema failures caused
                         # by CPU-only snapshot where device lists are empty).
@@ -17422,7 +17606,7 @@ class _ComfyAPIMixin:
                                 exc_type=_exception_type,
                                 exc_msg=_exception_msg,
                                 tb=_tb_text,
-                                retryable_reason="cpu_snapshot_schema" if "CUDA" in _exception_msg or "device" in _exception_msg.lower() else "",
+                                retryable_reason="cpu_snapshot_schema" if _retryable else "",
                             )
                 return result
             _comfy_logging.Logger.warning = _patched_logger_warning
@@ -17910,8 +18094,18 @@ class _ComfyAPIMixin:
         # Ensure generation record exists for the synced tree.
         _cn_gen_rec_su = _read_custom_nodes_generation_record()
         if _cn_gen_rec_su is None:
+            # Deterministic content-derived generation so the persisted
+            # record converges on the image-baked production generation when
+            # the synced tree matches baked content — snapshot_exact_skip
+            # identity depends on this (a UUID here would never match).
+            _cn_init_generation = ""
+            try:
+                _cn_init_generation = custom_node_source_generation(CUSTOM_NODES_PATH)
+            except Exception as _cn_init_gen_exc:
+                print(f"[dep_manifest] generation compute failed during init: {_cn_init_gen_exc!r}")
             _cn_gen_rec_su = _write_custom_nodes_generation_record_no_commit(
-                reason="startup_init_generation_record"
+                reason="startup_init_generation_record",
+                generation=_cn_init_generation or None,
             )
             # Commit the generation record so the manifest persists it atomically.
             # The manifest write below will be in a separate commit cycle.
@@ -18001,16 +18195,22 @@ class _ComfyAPIMixin:
             if ENABLE_GPU_SNAPSHOT:
                 stage_started = time.time()
                 with self._force_triton_during_snapshot():
-                    self._start_backend()
+                    # ComfyUI-Manager imports during custom-node load and can
+                    # pip-install/migrate at import time; keep it read-only
+                    # for the whole snapshot backend-start window.
+                    with _readonly_comfyui_manager_during_snapshot():
+                        self._start_backend()
                 self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
             else:
                 stage_started = time.time()
                 with self._force_cpu_during_snapshot():
-                    self._start_backend()
+                    with _readonly_comfyui_manager_during_snapshot():
+                        self._start_backend()
                 self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
         elif _need_backend:
             stage_started = time.time()
-            self._start_backend()
+            with _readonly_comfyui_manager_during_snapshot():
+                self._start_backend()
             self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
             # Skip the GPU warmup preload during snap=True GÃ‡Ã¶ loading ~9GB
             # of Flux/Qwen weights into the subprocess's GPU memory would

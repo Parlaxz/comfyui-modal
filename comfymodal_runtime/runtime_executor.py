@@ -2373,14 +2373,83 @@ def _build_sampling_wrapper() -> Callable:
     ``sampling_end`` in a ``finally`` block immediately after, computes duration
     via ``time.monotonic_ns()``, and reads step count from the sigma argument.
 
+    Also emits authoritative ``[v2.sampler_boundary]`` one-lines and the
+    ``first_sampler_step`` trace event (via a callback wrapper) so the one-shot
+    stall watchdog can observe the first completed sampler step.  The first
+    sampler identity (guider patcher / diffusion model) is captured and the
+    retained-UNET object identity is verified against the bridge.
+
     Deduplication is per ``(request_id, id(executor))`` to ensure exactly one
     start/end pair per sampler invocation, even if the wrapper is registered
     on multiple model options (snapshot, normal, alternate).
 
     Does NOT copy ``CFGGuider.inner_sample`` or any other sampler internals.
-    Preserves all model options and wrapper chains.
+    Preserves all model options, wrapper chains, and per-step callbacks.
     """
     from comfymodal_runtime.model_preload import _ACTIVE_REQUEST_TRACE
+
+    def _sampler_boundary_meta(
+        trace: Any,
+        guider: Any,
+        *,
+        steps: int,
+        include_memory: bool = True,
+    ) -> dict[str, Any]:
+        """Collect sampler/node/patcher/diffusion-model identity metadata."""
+        from comfymodal_runtime.unet_forward_probe import resolve_diffusion_model
+        meta: dict[str, Any] = {
+            "request_id": str(trace.request_id) if trace is not None else "",
+        }
+        try:
+            from comfymodal_runtime.model_preload import _LATEST_RESTORED_INSTANCE_ID
+            meta["restored_instance_id"] = _LATEST_RESTORED_INSTANCE_ID or ""
+        except Exception:
+            pass
+        meta["node_id"] = str(getattr(guider, "_node_id", getattr(guider, "node_id", "")))
+        meta["node_class"] = str(getattr(guider, "_class_type", getattr(guider, "class_type", "")))
+        meta["steps"] = steps
+        patcher = getattr(guider, "model_patcher", None)
+        if patcher is None:
+            patcher = getattr(guider, "model", None)
+        patcher_id = str(id(patcher)) if patcher is not None else ""
+        meta["patcher_object_id"] = patcher_id
+        dm_obj_id = ""
+        dm_device = ""
+        dm_current_device = ""
+        if patcher is not None:
+            try:
+                _p, dm = resolve_diffusion_model(patcher)
+                if dm is not None:
+                    dm_obj_id = str(id(dm))
+                    try:
+                        dm_device = str(getattr(dm, "device", ""))
+                    except Exception:
+                        pass
+                    try:
+                        dm_current_device = str(getattr(dm, "current_device", ""))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        meta["diffusion_model_object_id"] = dm_obj_id
+        meta["diffusion_model_device"] = dm_device
+        meta["diffusion_model_current_device"] = dm_current_device
+        if include_memory:
+            try:
+                import torch as _torch_mem
+                if _torch_mem.cuda.is_available():
+                    meta["gpu_allocated_bytes"] = int(_torch_mem.cuda.memory_allocated())
+                    meta["gpu_reserved_bytes"] = int(_torch_mem.cuda.memory_reserved())
+            except Exception:
+                pass
+        return meta
+
+    def _sampler_boundary_line(event: str, meta: dict[str, Any]) -> None:
+        print(
+            f"[v2.sampler_boundary] event={event} "
+            + " ".join(f"{k}={v if v not in (None, '') else 'absent'}" for k, v in meta.items()),
+            flush=True,
+        )
 
     def _wrapper(executor: Any, *args: Any, **kwargs: Any) -> Any:
         trace = _ACTIVE_REQUEST_TRACE.get()
@@ -2405,12 +2474,119 @@ def _build_sampling_wrapper() -> Callable:
         node_id = str(getattr(sampler_self, "_node_id", getattr(sampler_self, "node_id", "")))
         node_class = str(getattr(sampler_self, "_class_type", getattr(sampler_self, "class_type", "")))
 
+        start_meta = _sampler_boundary_meta(trace, sampler_self, steps=steps)
+
+        # ── Snapshot/bridge context ──
+        # The bridge-served UNET (published retained snapshot object, or its
+        # CacheDiT-patched replacement) is compared against the sampler
+        # patcher.  A not-yet-done bridge UNET future means no published
+        # retained object yet — both the identity check and the fail-closed
+        # residency enforcement are skipped for that call.
+        _patch = getattr(sampler_self, "model_patcher", None)
+        if _patch is None:
+            _patch = getattr(sampler_self, "model", None)
+        _bridge = None
+        _served = None
+        _bridge_future_done = False
+        try:
+            from comfymodal_runtime.model_preload import current_v2_loader_bridge
+            _bridge = current_v2_loader_bridge()
+            if _bridge is not None and _bridge._preparation is not None and _bridge._preparation.unet_future is not None:
+                _uf = _bridge._preparation.unet_future
+                _bridge_future_done = bool(_uf.done())
+                if _bridge_future_done:
+                    try:
+                        _served = _uf.result()
+                    except Exception:
+                        _served = None
+        except Exception:
+            _bridge = None
+
+        # ── Retained-UNET logical identity: sampler vs bridge ──
+        # The sampler must run the exact retained logical UNET.  Identity is
+        # the resolved diffusion-model object, so ComfyUI's dynamic
+        # ModelPatcher delegates and CacheDiT wrapper/re-attach (which wrap
+        # the SAME diffusion model) are accepted.  A different resolved
+        # diffusion object (or a missing one on either side) fails closed
+        # before the sampler runs.
+        if _bridge_future_done and _served is not None and _patch is not None:
+            try:
+                from comfymodal_runtime.model_preload import verify_retained_unet_identity
+                verify_retained_unet_identity(
+                    stage_a="bridge",
+                    unet_a=_served,
+                    stage_b="sampler",
+                    unet_b=_patch,
+                    request_id=str(trace.request_id),
+                )
+            except RuntimeError:
+                raise
+            except Exception:
+                # Unrelated bridge/verification errors (non-snapshot paths)
+                # must never break the sampler.
+                pass
+
+        # ── Prove GPU activation with post-load evidence (no tensor contents) ──
+        # Enforcement (raise on CPU-resident) is gated to the PRODUCTION
+        # CPU-snapshot path AND the exact retained snapshot/bridge model being
+        # sampled (logical diffusion-model identity match).  Normal
+        # non-snapshot, CPU-only, dynamic/offload, meta/unknown, and bypass
+        # paths report diagnostic status instead of raising.
+        _enforce_residency = False
+        try:
+            from comfymodal_runtime.model_preload import is_production_cpu_snapshot_request
+            from comfymodal_runtime.unet_forward_probe import resolve_diffusion_model
+            if (
+                is_production_cpu_snapshot_request(str(trace.request_id))
+                and _served is not None
+                and _patch is not None
+            ):
+                _dm_served = resolve_diffusion_model(_served)[1]
+                _dm_patch = resolve_diffusion_model(_patch)[1]
+                if (
+                    _dm_served is not None
+                    and _dm_patch is not None
+                    and id(_dm_served) == id(_dm_patch)
+                ):
+                    _enforce_residency = True
+        except Exception:
+            _enforce_residency = False
+        try:
+            from comfymodal_runtime.cpu_snapshot_models import verify_unet_gpu_residency
+            verify_unet_gpu_residency(
+                _patch,
+                request_id=str(trace.request_id),
+                context="sampler_wrapper_before_sample",
+                enforce=_enforce_residency,
+            )
+        except Exception as _residency_exc:
+            if "CPU-resident" in str(_residency_exc):
+                raise
+            pass
+
+        # ── Enrich the one-shot stall watchdog with sampler identity ──
+        try:
+            from comfymodal_runtime.model_preload import update_sampler_stall_watchdog_identity
+            update_sampler_stall_watchdog_identity(
+                str(trace.request_id),
+                sampler_node_id=node_id,
+                sampler_class=node_class,
+                patcher_object_id=start_meta.get("patcher_object_id", ""),
+                diffusion_model_object_id=start_meta.get("diffusion_model_object_id", ""),
+            )
+        except Exception:
+            pass
+
         t0 = time.monotonic_ns()
         trace.emit("sampling_start", phase="execution", metadata={
             "node_id": node_id,
             "node_class": node_class,
             "steps": steps,
+            "patcher_object_id": start_meta.get("patcher_object_id", ""),
+            "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
+            "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
+        _sampler_boundary_line("sampling_start", start_meta)
         # Set the authoritative pre-sampler hard cutoff: every node-wall
         # measurement is clipped at this perf_counter_ns timestamp so that
         # no sampler/VAE/output wall time leaks into pre-sampler metrics.
@@ -2422,6 +2598,44 @@ def _build_sampling_wrapper() -> Callable:
             # Signal all active CPU-owner timers to freeze measurements at cutoff
             _signal_cpu_timers(_cutoff_ns)
 
+        # ── First completed sampler step: wrap the per-step callback ──
+        # SAMPLER_SAMPLE args: (guider, sigmas, extra_args, callback, noise,
+        # latent_image, denoise_mask, disable_pbar).  The callback fires once
+        # per completed step.  The first invocation emits first_sampler_step.
+        _first_step_fired = False
+
+        def _step_callback(*cb_args: Any, **cb_kwargs: Any) -> Any:
+            nonlocal _first_step_fired
+            if not _first_step_fired:
+                _first_step_fired = True
+                try:
+                    trace.emit("first_sampler_step", phase="execution", metadata={
+                        "node_id": node_id,
+                        "node_class": node_class,
+                        "steps": steps,
+                        "patcher_object_id": start_meta.get("patcher_object_id", ""),
+                        "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
+                    })
+                    _sampler_boundary_line("first_sampler_step", dict(start_meta))
+                    from comfymodal_runtime.model_preload import mark_first_sampler_step
+                    mark_first_sampler_step(str(trace.request_id))
+                except Exception:
+                    pass
+            if _orig_callback is not None:
+                return _orig_callback(*cb_args, **cb_kwargs)
+            return None
+
+        _orig_callback = kwargs.get("callback") if "callback" in kwargs else (
+            args[3] if len(args) > 3 else None
+        )
+        # Only wrap real callables; preserve None fast path.
+        if callable(_orig_callback):
+            if "callback" in kwargs:
+                kwargs = dict(kwargs)
+                kwargs["callback"] = _step_callback
+            else:
+                args = args[:3] + (_step_callback,) + args[4:]
+
         try:
             return executor(*args, **kwargs)
         finally:
@@ -2432,7 +2646,12 @@ def _build_sampling_wrapper() -> Callable:
                 "duration_ms": duration_ms,
                 "steps": steps,
                 "source": "sampler_sample_wrapper",
+                "patcher_object_id": start_meta.get("patcher_object_id", ""),
+                "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
             })
+            _end_meta = dict(start_meta)
+            _end_meta["duration_ms"] = duration_ms
+            _sampler_boundary_line("sampling_end", _end_meta)
 
     return _wrapper
 

@@ -37,6 +37,15 @@ def all_config_paths(root: Path) -> list[Path]:
     return [root / p for p in _MANAGER_CONFIG_PATHS]
 
 
+# Legacy ComfyUI-Manager config locations.  Bootstrap must NEVER create these:
+# their presence triggers the manager's import-time migration branch which
+# pip-installs ComfyUI requirements (not gated by network_mode=offline).
+LEGACY_MANAGER_CONFIG_PATHS: tuple[str, ...] = (
+    "user/default/__manager/config.ini",
+    "user/default/ComfyUI-Manager/config.ini",
+)
+
+
 def read_config_ini(path: Path) -> configparser.ConfigParser:
     p = configparser.ConfigParser(strict=False)
     p.read([str(path)], encoding="utf-8")
@@ -49,14 +58,12 @@ def read_config_ini(path: Path) -> configparser.ConfigParser:
 
 
 class TestManagerConfigPaths:
-    """Canonical tuple — never edit without updating deploy expectations."""
+    """Canonical-only tuple — never edit without updating deploy expectations."""
 
     def test_exact_paths(self) -> None:
         assert _MANAGER_CONFIG_PATHS == (
             "user/__manager/config.ini",
-            "user/default/__manager/config.ini",
-            "user/default/ComfyUI-Manager/config.ini",
-        ), "deploy relies on these exact relative paths"
+        ), "bootstrap must write only the canonical manager config path"
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +141,17 @@ class TestWriteManagerConfigIni:
 
 
 # ---------------------------------------------------------------------------
-# configure_manager_offline — all three files exist; environ setdefault
+# configure_manager_offline — canonical config.ini only; environ setdefault
 # ---------------------------------------------------------------------------
 
 
 class TestConfigureManagerOffline:
-    def test_all_three_files_created(self, comfyui_root: Path) -> None:
+    """``configure_manager_offline`` writes ONLY the canonical config.ini
+    (``user/__manager/config.ini``) plus env hints — never the legacy paths."""
+
+    def test_canonical_only_config_created(self, comfyui_root: Path) -> None:
         paths = all_config_paths(comfyui_root)
+        assert paths == [comfyui_root / "user" / "__manager" / "config.ini"]
         for p in paths:
             assert not p.exists()
         configure_manager_offline(str(comfyui_root))
@@ -149,30 +160,36 @@ class TestConfigureManagerOffline:
             cp = read_config_ini(p)
             assert cp.get("default", "network_mode") == "offline"
 
-    def test_existing_settings_preserved(self, comfyui_root: Path) -> None:
-        paths = all_config_paths(comfyui_root)
-        for i, p in enumerate(paths):
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                f"[default]\ncat = meow{i}\n[extra]\nkey = val{i}\n",
-                encoding="utf-8",
-            )
+    def test_legacy_paths_never_created(self, comfyui_root: Path) -> None:
+        """Legacy manager config paths would trigger ComfyUI-Manager's
+        import-time migration (pip-install of ComfyUI requirements), which
+        ``network_mode = offline`` does NOT gate."""
         configure_manager_offline(str(comfyui_root))
-        for i, p in enumerate(paths):
-            cp = read_config_ini(p)
-            assert cp.get("default", "network_mode") == "offline"
-            assert cp.get("default", "cat") == f"meow{i}"
-            assert cp.get("extra", "key") == f"val{i}"
+        for rel in LEGACY_MANAGER_CONFIG_PATHS:
+            assert not (comfyui_root / rel).exists(), (
+                f"{rel} must never be created by snapshot/runtime bootstrap"
+            )
+
+    def test_existing_settings_preserved(self, comfyui_root: Path) -> None:
+        canonical = comfyui_root / "user" / "__manager" / "config.ini"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(
+            "[default]\ncat = meow\n[extra]\nkey = val\n",
+            encoding="utf-8",
+        )
+        configure_manager_offline(str(comfyui_root))
+        cp = read_config_ini(canonical)
+        assert cp.get("default", "network_mode") == "offline"
+        assert cp.get("default", "cat") == "meow"
+        assert cp.get("extra", "key") == "val"
 
     def test_existing_network_mode_overwritten(self, comfyui_root: Path) -> None:
-        paths = all_config_paths(comfyui_root)
-        for p in paths:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("[default]\nnetwork_mode = remote\n", encoding="utf-8")
+        canonical = comfyui_root / "user" / "__manager" / "config.ini"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text("[default]\nnetwork_mode = remote\n", encoding="utf-8")
         configure_manager_offline(str(comfyui_root))
-        for p in paths:
-            cp = read_config_ini(p)
-            assert cp.get("default", "network_mode") == "offline"
+        cp = read_config_ini(canonical)
+        assert cp.get("default", "network_mode") == "offline"
 
     def test_environ_setdefault_respects_caller_overrides(
         self, comfyui_root: Path,

@@ -6279,6 +6279,15 @@ class ModalRuntimeEntrypoint:
             models = self._cpu_snapshot_models
             if models is None:
                 raise RuntimeError("cpu snapshot models disappeared before activation")
+            # ── Authoritative activation boundary: requested ──
+            from comfymodal_runtime.model_preload import emit_unet_activation_diagnostic
+            emit_unet_activation_diagnostic(
+                stage="requested",
+                request_id=str(trace.request_id if trace else ""),
+                restored_instance_id=restored_instance_id,
+                unet_object_id=str(id(models.unet)) if models.unet is not None else "",
+                unet_identity=str(getattr(getattr(models, "model_key", None), "unet_identity", "") or ""),
+            )
             # Pre-compute hashes for diagnostics (used in except block).
             _snapshot_key_hash: str = models.model_key.stable_hash[:16] if models.model_key else ""
             _snapshot_spec_hash: str = stable_hash(models.model_spec)[:16] if models.model_spec else ""
@@ -6657,8 +6666,26 @@ class ModalRuntimeEntrypoint:
                     _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = round(
                         (time.monotonic_ns() - _retarget_start_ns) / 1_000_000, 3
                     )
-                    self._cpu_snapshot_models_active = True
-                    _cpu_snapshot_activated = True
+                    # ── Authoritative activation boundaries (restore-time) ──
+                    # Active state is set only AFTER validation, retarget, and
+                    # bridge publication (plus the optional CacheDiT re-patch
+                    # below) all succeed.  Identity is recorded per stage with
+                    # the actual request_id when one exists; the empty key is
+                    # never used (records under "" are skipped by the helper).
+                    from comfymodal_runtime.model_preload import (
+                        record_retained_unet_identity,
+                        emit_unet_activation_diagnostic,
+                    )
+                    emit_unet_activation_diagnostic(
+                        stage="started",
+                        request_id=str(trace.request_id if trace else ""),
+                        restored_instance_id=restored_instance_id,
+                        unet_object_id=str(id(models.unet)),
+                        unet_identity=str(getattr(plan.model_key, "unet_identity", "") or ""),
+                    )
+                    _restore_chain_request_id = str(trace.request_id if trace else "")
+                    record_retained_unet_identity("snapshot", models.unet, request_id=_restore_chain_request_id)
+                    record_retained_unet_identity("activation", models.unet, request_id=_restore_chain_request_id)
                     state.snapshot_loader_outputs = {
                         "unet": models.unet,
                         "clip": models.clip,
@@ -6726,6 +6753,25 @@ class ModalRuntimeEntrypoint:
                                             f"unet_match=1",
                                             flush=True,
                                         )
+                                        # ── Authoritative CacheDiT boundary ──
+                                        # Exact retained-UNET identity before/after
+                                        # patch, plus patch count (1 per request).
+                                        from comfymodal_runtime.model_preload import (
+                                            verify_retained_unet_identity,
+                                            record_retained_unet_identity,
+                                        )
+                                        print(
+                                            f"[v2.cachedit_boundary] event=cachedit_patch_applied "
+                                            f"node_id={_cd_restore_node_id} "
+                                            f"request_id={str(trace.request_id if trace else '')} "
+                                            f"restored_instance_id={restored_instance_id} "
+                                            f"unet_object_id_before={id(models.unet)} "
+                                            f"unet_object_id_after={id(_patched_model)} "
+                                            f"patch_count=1 "
+                                            f"workflow_hash={str(getattr(plan, 'workflow_hash', ''))[:16] if getattr(plan, 'workflow_hash', '') else 'absent'}",
+                                            flush=True,
+                                        )
+                                        record_retained_unet_identity("cachedit", _patched_model, request_id=_restore_chain_request_id)
                         except Exception as _cd_exc:
                             print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
 
@@ -6741,6 +6787,40 @@ class ModalRuntimeEntrypoint:
                             trace=trace,
                             phase="restore",
                         )
+                    # ── 9b. Active state set ONLY after validation/retarget/
+                    #     bridge publication and the optional CacheDiT re-patch. ──
+                    _final_active_unet = (
+                        _patched_model if _patched_model is not None else models.unet
+                    )
+                    if _final_active_unet is not None:
+                        _final_prep_unet = None
+                        _final_prep = getattr(self._preload_bridge, "_preparation", None)
+                        if _final_prep is not None and getattr(_final_prep, "unet_future", None) is not None:
+                            _final_uf = _final_prep.unet_future
+                            if _final_uf.done():
+                                try:
+                                    _final_prep_unet = _final_uf.result()
+                                except Exception:
+                                    _final_prep_unet = None
+                        verify_retained_unet_identity(
+                            stage_a="activation",
+                            unet_a=_final_active_unet,
+                            stage_b="bridge",
+                            unet_b=_final_prep_unet,
+                            request_id=str(trace.request_id if trace else ""),
+                        )
+                    record_retained_unet_identity("bridge", _final_active_unet, request_id=_restore_chain_request_id)
+                    self._cpu_snapshot_models_active = True
+                    _cpu_snapshot_activated = True
+                    emit_unet_activation_diagnostic(
+                        stage="completed",
+                        request_id=str(trace.request_id if trace else ""),
+                        restored_instance_id=restored_instance_id,
+                        unet_object_id=str(id(_final_active_unet)) if _final_active_unet is not None else "",
+                        unet_identity=str(getattr(plan.model_key, "unet_identity", "") or ""),
+                        status="activated",
+                        reason="ok",
+                    )
                     # ── Build CPU storage registries after final CacheDiT-patched UNET ──
                     self._cpu_snapshot_unet_storage_registry = None
                     self._cpu_snapshot_clip_storage_registry = None
@@ -7411,7 +7491,42 @@ class ModalRuntimeEntrypoint:
             f"cpu_snapshot_active={int(bool(self._cpu_snapshot_models_active))}",
             flush=True,
         )
-        if self._cpu_snapshot_models is not None:
+        # ── Present-but-inactive guard (bounded runtime fix) ─────────────
+        # The request-time path must NEVER serve CPU patchers that were never
+        # activated (validated + retargeted + published on the bridge).  When
+        # the container holds models but activation did not complete, fail
+        # closed for production and clear the bridge for diagnostic profiles.
+        if (
+            self._cpu_snapshot_models is not None
+            and not self._cpu_snapshot_models_active
+        ):
+            _inactive_models = self._cpu_snapshot_models
+            _inactive_clip = bool(getattr(_inactive_models, "clip", None) is not None)
+            _inactive_unet = bool(getattr(_inactive_models, "unet", None) is not None)
+            print(
+                "[v2.cpu_snapshot_request] status=present_but_inactive "
+                f"clip_present={int(_inactive_clip)} unet_present={int(_inactive_unet)} "
+                "action=never_serve_inactive_patchers",
+                flush=True,
+            )
+            if (
+                _is_production_profile()
+                and _inactive_clip
+                and _inactive_unet
+            ):
+                raise RuntimeError(
+                    "Production CPU snapshot models are present but INACTIVE "
+                    "(activation did not complete at restore time); refusing "
+                    "to serve present-but-inactive CPU patchers to the sampler"
+                )
+            self._preload_bridge.clear()
+            self._cpu_snapshot_unet_runtime_state = None
+        # Hoisted request-scope flags: the diagnostic UNET bypass and the
+        # production CPU-snapshot binding decision are both needed later
+        # (identity assertion + fail-closed residency enforcement).
+        _bypass_snapshot_unet = False
+        _request_bound_to_production_snapshot = False
+        if self._cpu_snapshot_models is not None and self._cpu_snapshot_models_active:
             try:
                 workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
                 model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
@@ -7456,6 +7571,8 @@ class ModalRuntimeEntrypoint:
                         self._maybe_propagate_cpu_snapshot_unet_state(
                             request_model_key, request_model_spec, trace,
                         )
+                        if _is_production_profile():
+                            _request_bound_to_production_snapshot = True
                     if _bypass_snapshot_unet:
                         print(
                             "[v2.cpu_snapshot_request] status=partial_bypass "
@@ -7541,7 +7658,64 @@ class ModalRuntimeEntrypoint:
                         "Production CPU snapshot activation failed; "
                         "refusing graph-loader fallback: " + str(_bind_exc)
                     ) from _bind_exc
-        # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Record + verify exact retained UNET identity (request-time) ──
+        # The bridge-served UNET must be the exact snapshot/activation object
+        # (or its CacheDiT-patched replacement).  The identity chain stages
+        # are recorded under the ACTUAL request_id (never the empty key) so
+        # request-end cleanup removes exactly this key.  The retained-snapshot
+        # assertion is SKIPPED for the diagnostic bypass / normal-loader path
+        # (the bridge UNET there is a background normal-loader future, not a
+        # published retained snapshot) and whenever the bridge UNET future is
+        # not yet done.  The production normal snapshot path still fails
+        # closed on missing/mismatched identity before sampling.
+        try:
+            if self._cpu_snapshot_models_active and self._cpu_snapshot_models is not None:
+                from comfymodal_runtime.model_preload import (
+                    record_retained_unet_identity,
+                    verify_retained_unet_identity,
+                )
+                _req_chain_id = str(context.request_id)
+                record_retained_unet_identity(
+                    "snapshot", self._cpu_snapshot_models.unet,
+                    request_id=_req_chain_id,
+                )
+                _served_req = None
+                _prep_req = getattr(self._preload_bridge, "_preparation", None)
+                _uf_req = (
+                    getattr(_prep_req, "unet_future", None)
+                    if _prep_req is not None else None
+                )
+                _uf_req_done = bool(_uf_req is not None and _uf_req.done())
+                if _uf_req_done:
+                    try:
+                        _served_req = _uf_req.result()
+                    except Exception:
+                        _served_req = None
+                record_retained_unet_identity(
+                    "bridge", _served_req, request_id=_req_chain_id,
+                )
+                if not _bypass_snapshot_unet and _uf_req_done:
+                    verify_retained_unet_identity(
+                        stage_a="snapshot",
+                        unet_a=self._cpu_snapshot_models.unet,
+                        stage_b="bridge",
+                        unet_b=_served_req,
+                        request_id=_req_chain_id,
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        # ── Production snapshot activation invariant (before sampler) ──
+        # Emits exactly [v2.snapshot_activation_invariant] with the required
+        # fields and fails clearly when production has both models but the
+        # snapshot is inactive.  Diagnostic no-model/CLIP-only/UNET-only
+        # modes remain allowed.
+        self._enforce_snapshot_activation_invariant(
+            request_id=str(context.request_id),
+            trace=trace,
+        )
+        # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Schedule prefill immediately after graph start so it runs
         # concurrently with execution setup.  The callback waits for both
         # UNET and CLIP preparation futures before encoding, preventing
@@ -7584,6 +7758,7 @@ class ModalRuntimeEntrypoint:
                         api,
                         trace,
                         activation_diagnostic_state=_activation_diagnostic_state,
+                        request_bound_to_production_snapshot=_request_bound_to_production_snapshot,
                     )
                 _gpu_summary = gpu_not_observed_summary()
                 trace.set_metadata(gpu_observation_summary=_gpu_summary)
@@ -7765,6 +7940,111 @@ class ModalRuntimeEntrypoint:
                 pass
             raise
 
+    def _enforce_snapshot_activation_invariant(
+        self,
+        *,
+        request_id: str,
+        trace: RuntimeTrace | None = None,
+    ) -> dict[str, Any]:
+        """Validate and report the production snapshot activation contract
+        immediately before the sampler runs.
+
+        Emits exactly one ``[v2.snapshot_activation_invariant]`` line with the
+        fields: profile, models_container_present, clip_present, unet_present,
+        snapshot_enabled_by_config, cpu_snapshot_active, loader_bridge_active,
+        execution_prefill_allowed, status, reason.
+
+        Fails clearly (RuntimeError) when the production profile has BOTH
+        models present in the snapshot container but the snapshot is NOT
+        active — the request-time path must never serve present-but-inactive
+        CPU patchers.  Diagnostic no-model / CLIP-only / UNET-only modes
+        remain allowed.
+        """
+        profile = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
+        models = getattr(self, "_cpu_snapshot_models", None)
+        models_container_present = bool(models is not None)
+        clip_present = bool(models is not None and getattr(models, "clip", None) is not None)
+        unet_present = bool(models is not None and getattr(models, "unet", None) is not None)
+        snapshot_enabled_by_config = False
+        try:
+            snapshot_enabled_by_config = _cpu_model_snapshot_enabled()
+        except Exception:
+            snapshot_enabled_by_config = False
+        cpu_snapshot_active = bool(getattr(self, "_cpu_snapshot_models_active", False))
+        _bridge = getattr(self, "_preload_bridge", None)
+        loader_bridge_active = bool(
+            _bridge is not None
+            and getattr(_bridge, "_preparation", None) is not None
+        )
+        execution_prefill_allowed = not cpu_snapshot_active
+        status = "pass"
+        reason = "ok"
+        if (
+            profile == "production"
+            and models_container_present
+            and clip_present
+            and unet_present
+            and not cpu_snapshot_active
+        ):
+            status = "fail"
+            reason = "production_models_present_but_inactive"
+            _fields = (
+                f"profile={profile} "
+                f"models_container_present={int(models_container_present)} "
+                f"clip_present={int(clip_present)} "
+                f"unet_present={int(unet_present)} "
+                f"snapshot_enabled_by_config={int(snapshot_enabled_by_config)} "
+                f"cpu_snapshot_active={int(cpu_snapshot_active)} "
+                f"loader_bridge_active={int(loader_bridge_active)} "
+                f"execution_prefill_allowed={int(execution_prefill_allowed)} "
+                f"status={status} "
+                f"reason={reason}"
+            )
+            print(f"[v2.snapshot_activation_invariant] {_fields}", flush=True)
+            raise RuntimeError(
+                "Production CPU snapshot has both models present but is "
+                "INACTIVE; refusing to serve inactive CPU patchers to the "
+                "sampler (reason=production_models_present_but_inactive)"
+            )
+        _fields_ok = (
+            f"profile={profile} "
+            f"models_container_present={int(models_container_present)} "
+            f"clip_present={int(clip_present)} "
+            f"unet_present={int(unet_present)} "
+            f"snapshot_enabled_by_config={int(snapshot_enabled_by_config)} "
+            f"cpu_snapshot_active={int(cpu_snapshot_active)} "
+            f"loader_bridge_active={int(loader_bridge_active)} "
+            f"execution_prefill_allowed={int(execution_prefill_allowed)} "
+            f"status={status} "
+            f"reason={reason}"
+        )
+        print(f"[v2.snapshot_activation_invariant] {_fields_ok}", flush=True)
+        if trace is not None:
+            trace.emit("snapshot_activation_invariant", phase="execution", metadata={
+                "profile": profile,
+                "models_container_present": int(models_container_present),
+                "clip_present": int(clip_present),
+                "unet_present": int(unet_present),
+                "snapshot_enabled_by_config": int(snapshot_enabled_by_config),
+                "cpu_snapshot_active": int(cpu_snapshot_active),
+                "loader_bridge_active": int(loader_bridge_active),
+                "execution_prefill_allowed": int(execution_prefill_allowed),
+                "status": status,
+                "reason": reason,
+            })
+        return {
+            "profile": profile,
+            "models_container_present": int(models_container_present),
+            "clip_present": int(clip_present),
+            "unet_present": int(unet_present),
+            "snapshot_enabled_by_config": int(snapshot_enabled_by_config),
+            "cpu_snapshot_active": int(cpu_snapshot_active),
+            "loader_bridge_active": int(loader_bridge_active),
+            "execution_prefill_allowed": int(execution_prefill_allowed),
+            "status": status,
+            "reason": reason,
+        }
+
     def _maybe_propagate_cpu_snapshot_unet_state(
         self,
         request_model_key: Any,
@@ -7907,6 +8187,7 @@ class ModalRuntimeEntrypoint:
         trace: RuntimeTrace,
         *,
         activation_diagnostic_state: dict[str, Any] | None = None,
+        request_bound_to_production_snapshot: bool = False,
     ) -> dict[str, Any]:
         """Run the live ComfyUI PromptExecutor without the legacy wrapper.
 
@@ -8721,6 +9002,14 @@ class ModalRuntimeEntrypoint:
                                     if _lane is not None and not _lane_acquired[0]:
                                         _blocking_owner = _lane.owner or ""
                                         _lane_wait_start_ns = time.monotonic_ns()
+                                        # ── Authoritative sampler-lane boundaries ──
+                                        print(
+                                            f"[v2.sampler_boundary] event=sampler_lane_requested "
+                                            f"sampler_node_id={_node_str} "
+                                            f"sampler_node_class={_class_node} "
+                                            f"blocking_owner={_blocking_owner or 'absent'}",
+                                            flush=True,
+                                        )
                                         trace.emit("sampler_lane_wait_start", phase="execution", metadata={
                                             "sampler_node_id": _node_str,
                                             "sampler_node_class": _class_node,
@@ -8729,6 +9018,14 @@ class ModalRuntimeEntrypoint:
                                         _lane.acquire("sampler")
                                         _milestones["_lane_acquired_mono_ns"] = time.monotonic_ns()
                                         _lane_wait_ms = round((_milestones["_lane_acquired_mono_ns"] - _lane_wait_start_ns) / 1_000_000, 3)
+                                        print(
+                                            f"[v2.sampler_boundary] event=sampler_lane_acquired "
+                                            f"sampler_node_id={_node_str} "
+                                            f"sampler_node_class={_class_node} "
+                                            f"wait_ms={_lane_wait_ms} "
+                                            f"blocking_owner={_blocking_owner or 'absent'}",
+                                            flush=True,
+                                        )
                                         trace.emit("sampler_lane_wait_end", phase="execution", metadata={
                                             "sampler_node_id": _node_str,
                                             "sampler_node_class": _class_node,
@@ -8829,6 +9126,41 @@ class ModalRuntimeEntrypoint:
                 _first_prompt_executor_started = _v2_startup_stage(
                     "first_prompt_executor_invocation", "start", trace=trace, phase="request"
                 )
+            # ── Arm the one-shot sampler-stall watchdog (before PromptExecutor) ──
+            # Non-destructive: observes first UNET forward (5s) and first
+            # completed sampler step (15s).  Canceled on normal completion.
+            _watchdog_request_id = str(context.request_id)
+            _watchdog_unet_id = ""
+            try:
+                if self._cpu_snapshot_models_active and self._cpu_snapshot_models is not None:
+                    _wu = self._cpu_snapshot_models.unet
+                    if _wu is not None:
+                        _watchdog_unet_id = str(id(_wu))
+            except Exception:
+                pass
+            from comfymodal_runtime.model_preload import (
+                start_sampler_stall_watchdog,
+                cancel_sampler_stall_watchdog,
+            )
+            _watchdog_armed = start_sampler_stall_watchdog(
+                request_id=_watchdog_request_id,
+                restored_instance_id=_LATEST_RESTORED_INSTANCE_ID,
+                unet_object_id=_watchdog_unet_id,
+            )
+            # ── Production CPU-snapshot request marker ──
+            # Set only for the production snapshot (non-bypass) bind.  Gates
+            # fail-closed CPU-residency enforcement in the sampler wrapper to
+            # the exact retained snapshot/bridge object being sampled; all
+            # other paths stay diagnostic.  Unmarked in the finally below so
+            # the request key is always cleaned up.
+            _production_snapshot_marked = False
+            if request_bound_to_production_snapshot:
+                try:
+                    from comfymodal_runtime.model_preload import mark_production_cpu_snapshot_request
+                    mark_production_cpu_snapshot_request(_watchdog_request_id)
+                    _production_snapshot_marked = True
+                except Exception:
+                    _production_snapshot_marked = False
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -8838,6 +9170,21 @@ class ModalRuntimeEntrypoint:
                     else:
                         executor.execute(**execute_kwargs)
             finally:
+                # Finish the watchdog on normal completion (also on error) so
+                # nothing keeps the event loop or a thread alive afterward.
+                if _watchdog_armed:
+                    try:
+                        cancel_sampler_stall_watchdog(_watchdog_request_id)
+                    except Exception:
+                        pass
+                from comfymodal_runtime.model_preload import clear_retained_unet_identity_chain
+                clear_retained_unet_identity_chain(_watchdog_request_id)
+                if _production_snapshot_marked:
+                    try:
+                        from comfymodal_runtime.model_preload import unmark_production_cpu_snapshot_request
+                        unmark_production_cpu_snapshot_request(_watchdog_request_id)
+                    except Exception:
+                        pass
                 if _first_prompt_executor_started is not None:
                     _v2_startup_stage(
                         "first_prompt_executor_invocation", "end",
