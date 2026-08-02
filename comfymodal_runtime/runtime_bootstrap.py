@@ -26,6 +26,38 @@ from .trace import RuntimeTrace
 
 _log = logging.getLogger(__name__)
 
+
+def _emit_startup_stage(
+    stage: str,
+    event: str,
+    *,
+    started: tuple[int, int] | None = None,
+    trace: RuntimeTrace | None = None,
+    phase: str = "startup",
+) -> tuple[int, int] | None:
+    wall_ns = time.time_ns()
+    mono_ns = time.monotonic_ns()
+    fields = {
+        "stage": stage,
+        "event": event,
+        "wall_unix_ns": wall_ns,
+        "monotonic_ns": mono_ns,
+    }
+    if started is not None:
+        fields["duration_ms"] = round((mono_ns - started[1]) / 1_000_000, 3)
+    print(
+        "[v2.startup_stage] "
+        + " ".join(f"{key}={value}" for key, value in fields.items()),
+        flush=True,
+    )
+    if trace is not None:
+        trace.emit(
+            f"v2_startup_{stage}_{event}",
+            phase=phase,
+            metadata={key: value for key, value in fields.items() if key not in ("stage", "event")},
+        )
+    return (wall_ns, mono_ns) if event == "start" else None
+
 # ── Sage snapshot identity constants ────────────────────────────────────
 COMFYMODAL_SAGE_PATCH_VERSION: str = "comfymodal-sage-v1"
 """Repository-owned sentinel for Sage Python monkeypatch identification.
@@ -1039,8 +1071,10 @@ class RuntimeBootstrap:
 
             if trace:
                 trace.emit("sync_custom_nodes_start", phase="startup")
+            _custom_node_copy_started = _emit_startup_stage("custom_node_source_copy", "start", trace=trace)
             if self.sync_custom_nodes:
                 self.sync_custom_nodes()
+            _emit_startup_stage("custom_node_source_copy", "end", started=_custom_node_copy_started, trace=trace)
             if trace:
                 trace.emit("sync_custom_nodes_end", phase="startup")
 
@@ -1053,16 +1087,20 @@ class RuntimeBootstrap:
 
             if trace:
                 trace.emit("comfyui_path_setup_start", phase="startup")
+            _path_started = _emit_startup_stage("comfyui_path_startup", "start", trace=trace)
             self._import_comfyui_path()
+            _emit_startup_stage("comfyui_path_startup", "end", started=_path_started, trace=trace)
             if trace:
                 trace.emit("comfyui_path_setup_end", phase="startup")
 
             if trace:
                 trace.emit("backend_startup_start", phase="startup")
+            _backend_started = _emit_startup_stage("backend_startup", "start", trace=trace)
             if self.start_backend and not self._backend_started:
                 backend = self.start_backend()
                 self.state.backend = str(backend or "in_process")
                 self._backend_started = True
+            _emit_startup_stage("backend_startup", "end", started=_backend_started, trace=trace)
             if trace:
                 trace.emit("backend_startup_end", phase="startup")
 
@@ -1504,12 +1542,14 @@ class RuntimeBootstrap:
                 _loader_sigs.append({"node_id": "unet", "signature": _unet_id})
             if _clip_id:
                 _loader_sigs.append({"node_id": "clip", "signature": _clip_id})
+            _seed_started = _emit_startup_stage("snapshot_execution_seed", "start", trace=trace, phase="restore")
             self.state.build_snapshot_execution_seed(
                 workflow_hash=self.state.snapshot_certificate.get("identity_components", {}).get("workflow_hash", ""),
                 custom_node_generation=self.state.snapshot_custom_node_generation,
                 deployment_combined_hash=self.state.deployment_combined_hash,
                 loader_cache_signatures=_loader_sigs,
             )
+            _emit_startup_stage("snapshot_execution_seed", "end", started=_seed_started, trace=trace, phase="restore")
             if trace and self.state.snapshot_seed_built:
                 trace.emit(
                     "snapshot_execution_seed_built",

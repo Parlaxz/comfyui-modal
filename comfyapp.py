@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import modal
 from comfymodal_runtime.contracts import stable_hash
+from comfymodal_runtime.env import env_flag
 
 # Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
 # Imported lazily with a guarded fallback so a missing/import-error in
@@ -166,7 +167,7 @@ _container_restore_count: int = 0
 _container_request_count: int = 0
 
 # Exact-prompt CLIP prefill flag diagnostic (remote container startup)
-_remote_ep = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+_remote_ep = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.remote] enabled={int(_remote_ep)} source=env")
 
 from api_prompt_validator import assert_valid_api_prompt_structure
@@ -340,7 +341,7 @@ def _convert_image_bytes(
     return meta
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 12: Silent exception logging helper GÃ¶Ã‡GÃ¶Ã‡
-_SILENT_EXCEPTION_DEBUG = os.getenv("COMFYMODAL_SILENT_EXCEPTION_DEBUG", "0") == "1"
+_SILENT_EXCEPTION_DEBUG = env_flag("COMFYMODAL_SILENT_EXCEPTION_DEBUG")
 
 
 def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> None:
@@ -355,11 +356,11 @@ def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> Non
         print(f"[comfyapp.silent] context={context} error={exc}{detail_str}")
 
 
-PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
+PROFILING_ENABLED = env_flag("COMFYMODAL_PROFILING")
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
-ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
-ENABLE_TORCH_COMPILE = os.getenv("COMFYMODAL_ENABLE_TORCH_COMPILE", "0") == "1"
-ENABLE_GPU_SNAPSHOT = os.getenv("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+ENABLE_WARMUP = env_flag("COMFYMODAL_ENABLE_WARMUP", default=True)
+ENABLE_TORCH_COMPILE = env_flag("COMFYMODAL_ENABLE_TORCH_COMPILE")
+ENABLE_GPU_SNAPSHOT = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
 CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
 CUSTOM_NODE_COPY_MODE = os.getenv("COMFYMODAL_CUSTOM_NODE_COPY_MODE", "combined").strip().lower()
 if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
@@ -917,7 +918,7 @@ _CUSTOM_NODE_RETRY_REGISTRY = CustomNodeRetryRegistry()
 # GÃ¶Ã‡GÃ¶Ã‡ PART 3: Preload guardrails GÃ¶Ã‡GÃ¶Ã‡
 # Controls whether unknown (never-seen-before) workflow profiles get
 # expensive CPU preload.  Set to 1 to always preload regardless.
-PRELOAD_UNKNOWN_PROFILES = os.getenv("COMFYMODAL_PRELOAD_UNKNOWN_PROFILES", "0") == "1"
+PRELOAD_UNKNOWN_PROFILES = env_flag("COMFYMODAL_PRELOAD_UNKNOWN_PROFILES")
 # Maximum total preload size in GB across all files.
 PRELOAD_MAX_TOTAL_GB = float(os.getenv("COMFYMODAL_PRELOAD_MAX_TOTAL_GB", "12"))
 # Maximum single-file preload size in GB.
@@ -944,7 +945,7 @@ _FAIL_FAST_REQ_MSG = (
 )
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 7: Remote background deploy gating GÃ¶Ã‡GÃ¶Ã‡
-ENABLE_REMOTE_BACKGROUND_DEPLOY = os.getenv("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0") == "1"
+ENABLE_REMOTE_BACKGROUND_DEPLOY = env_flag("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY")
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
 WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
 WARMUP_UNET = os.getenv("COMFYMODAL_WARMUP_UNET", "").strip()
@@ -971,33 +972,33 @@ _CUSTOM_NODE_SET_MISMATCH_IGNORE_ENV = os.getenv("COMFYMODAL_CUSTOM_NODE_SET_MIS
 #   async_no_wait  GÃ‡Ã¶ fire preload in background thread, don't block restore
 #   budgeted_1500ms GÃ‡Ã¶ preload with 1500ms time budget, stop when exceeded
 PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "off").strip().lower()
-PROMPT_ASYNC_PRELOAD = os.getenv("PROMPT_ASYNC_PRELOAD", "0") == "1"
+PROMPT_ASYNC_PRELOAD = env_flag("PROMPT_ASYNC_PRELOAD")
 PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
-PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
-PROMPT_ASYNC_ACTUAL_LOAD_UNET = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD_UNET", "0") == "1"
+PROMPT_ASYNC_ACTUAL_LOAD = env_flag("PROMPT_ASYNC_ACTUAL_LOAD")
+PROMPT_ASYNC_ACTUAL_LOAD_UNET = env_flag("PROMPT_ASYNC_ACTUAL_LOAD_UNET")
 # NOTE: CacheDiT dashboard may report zero steps incorrectly.
 # Do not auto-disable CacheDiT based on dashboard zero-step output.
 # User observed disabling CacheDiT increased generation time.
-DISABLE_CACHEDIT_FOR_Z_IMAGE = os.getenv("DISABLE_CACHEDIT_FOR_Z_IMAGE", "0") == "1"
-_DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
+DISABLE_CACHEDIT_FOR_Z_IMAGE = env_flag("DISABLE_CACHEDIT_FOR_Z_IMAGE")
+_DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = env_flag("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE")
 
 # GÃ¶Ã‡GÃ¶Ã‡ Cold UNET early load (opt-in, default 0) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # NOTE: Cold UNET early load performs speculative independent model file reads
 # that are NOT joined by the graph loader. This causes duplicate physical I/O
 # on cold start and makes performance worse. Disabled by default.
 # Requires COMFYMODAL_ALLOW_SPECULATIVE_LOAD=1 debug escape hatch to override.
-_GENERIC_SPECULATIVE_LOAD_ALLOWED = os.environ.get("COMFYMODAL_ALLOW_SPECULATIVE_LOAD", "0") == "1"
-COLD_UNET_EARLY_LOAD = os.getenv("COMFYMODAL_COLD_UNET_EARLY_LOAD", "0") == "1"
+_GENERIC_SPECULATIVE_LOAD_ALLOWED = env_flag("COMFYMODAL_ALLOW_SPECULATIVE_LOAD")
+COLD_UNET_EARLY_LOAD = env_flag("COMFYMODAL_COLD_UNET_EARLY_LOAD")
 if COLD_UNET_EARLY_LOAD and not _GENERIC_SPECULATIVE_LOAD_ALLOWED:
     COLD_UNET_EARLY_LOAD = False
 COLD_UNET_EARLY_LOAD_MODE = os.getenv("COMFYMODAL_COLD_UNET_EARLY_LOAD_MODE", "actual_load").strip().lower()
 COLD_UNET_EARLY_LOAD_BUDGET_MS = int(os.getenv("COMFYMODAL_COLD_UNET_EARLY_LOAD_BUDGET_MS", "0"))
-COLD_UNET_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_COLD_UNET_REQUIRE_CPU_CACHE_HIT", "0") == "1"
+COLD_UNET_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_COLD_UNET_REQUIRE_CPU_CACHE_HIT")
 if COLD_UNET_EARLY_LOAD_MODE == "restore_direct":
-    COLD_UNET_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_COLD_UNET_REQUIRE_CPU_CACHE_HIT", "1") == "1"
+    COLD_UNET_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_COLD_UNET_REQUIRE_CPU_CACHE_HIT", default=True)
 COLD_UNET_MAX_FILE_GB = float(os.getenv("COMFYMODAL_COLD_UNET_MAX_FILE_GB", "12"))
-COLD_UNET_DISABLE_ON_VOLUME_STALL = os.getenv("COMFYMODAL_COLD_UNET_DISABLE_ON_VOLUME_STALL", "1") == "1"
-COLD_UNET_DEBUG = os.getenv("COMFYMODAL_COLD_UNET_DEBUG", "0") == "1"
+COLD_UNET_DISABLE_ON_VOLUME_STALL = env_flag("COMFYMODAL_COLD_UNET_DISABLE_ON_VOLUME_STALL", default=True)
+COLD_UNET_DEBUG = env_flag("COMFYMODAL_COLD_UNET_DEBUG")
 
 
 def _resolve_disable_restore_warmup_for_z_image() -> bool:
@@ -1046,14 +1047,14 @@ if ACTUAL_LOAD_MODE not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"
 # during direct warmup at all.  Default both to 0 so that synchronous
 # model reads during restore (16+ GB) are opt-in rather than the default.
 # DIRECT_WARMUP_CLIP_ENCODE gates the dummy CLIPTextEncode forward pass.
-DIRECT_WARMUP_LOAD_UNET = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "0") == "1"
-DIRECT_WARMUP_LOAD_CLIP = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "0") == "1"
-DIRECT_WARMUP_CLIP_ENCODE = os.getenv("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0") == "1"
+DIRECT_WARMUP_LOAD_UNET = env_flag("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET")
+DIRECT_WARMUP_LOAD_CLIP = env_flag("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP")
+DIRECT_WARMUP_CLIP_ENCODE = env_flag("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE")
 # When enabled, direct warmup only loads a model file if it is already
 # present in the CPU cache (populated by CPU preload).  This prevents
 # direct warmup from becoming a synchronous 16.85 GB volume read when
 # CPU preload is disabled or async.
-DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1") == "1"
+DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", default=True)
 
 # P2 GÃ‡Ã¶ Sage runtime policy.
 #   auto           GÃ‡Ã¶ (default) probe and select automatically
@@ -1074,19 +1075,19 @@ if RESTORE_DIRECT_CLIP_POLICY not in ("auto", "off", "load_only", "load_and_enco
 # P4 GÃ‡Ã¶ VAE decode warmup.
 #   0 GÃ‡Ã¶ (default) disabled
 #   1 GÃ‡Ã¶ opt-in: run a dummy VAE decode during restore to warm the decoder
-VAE_DECODE_WARMUP_ENABLED = os.getenv("COMFYMODAL_VAE_DECODE_WARMUP", "0") == "1"
+VAE_DECODE_WARMUP_ENABLED = env_flag("COMFYMODAL_VAE_DECODE_WARMUP")
 
 # P4b GÃ‡Ã¶ Restore background UNET.
 #   0 GÃ‡Ã¶ (default) disabled
 #   1 GÃ‡Ã¶ opt-in: after CLIP preload join, start the exact selected UNET load in
 #        the existing future registry so prompt UNET attach/wait can reuse it.
-RESTORE_BACKGROUND_UNET_ENABLED = os.getenv("COMFYMODAL_RESTORE_BACKGROUND_UNET", "0") == "1"
+RESTORE_BACKGROUND_UNET_ENABLED = env_flag("COMFYMODAL_RESTORE_BACKGROUND_UNET")
 
 # P4c GÃ‡Ã¶ Hard rollback gate for ALL restore-background UNET code paths.
 # When 0 (default), no restore-background code runs GÃ‡Ã¶ the patch is
 # invisible.  When 1, the gated feature can be enabled via
 # COMFYMODAL_RESTORE_BACKGROUND_UNET=1.
-EXPERIMENTAL_RESTORE_BACKGROUND_CODE = os.getenv("COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE", "0") == "1"
+EXPERIMENTAL_RESTORE_BACKGROUND_CODE = env_flag("COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE")
 
 # P5 GÃ‡Ã¶ Safetensors read mode.
 #   auto         GÃ‡Ã¶ explicit opt-in: use read_bytes for large .safetensors CPU loads on model paths
@@ -1097,16 +1098,16 @@ if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_SAFETENSORS_READ_MODE={SAFETENSORS_READ_MODE!r}, falling back to 'normal'")
     SAFETENSORS_READ_MODE = "normal"
 SAFETENSORS_READ_BYTES_MIN_MB = int(os.getenv("COMFYMODAL_SAFETENSORS_READ_BYTES_MIN_MB", "512"))
-SAFETENSORS_STRICT = os.getenv("COMFYMODAL_SAFETENSORS_STRICT", "0") == "1"
+SAFETENSORS_STRICT = env_flag("COMFYMODAL_SAFETENSORS_STRICT")
 
 # â”€â”€ v2.16.21 combined cold-start fast path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Master toggle: when 0, all v2.16.21 features are disabled and v2.16.20
 # behavior is restored without redeployment.
 # Each sub-feature can be independently disabled when the master is 1.
-FASTPATH_V21621 = os.getenv("COMFYMODAL_FASTPATH_V21621", "1") == "1"
-FASTPATH_V21621_BACKGROUND_UNET = os.getenv("COMFYMODAL_FASTPATH_V21621_BACKGROUND_UNET", "1") == "1"
-FASTPATH_V21621_CLIP_LOAD_ONLY = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_LOAD_ONLY", "1") == "1"
-FASTPATH_V21621_CLIP_READ_BYTES = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_READ_BYTES", "1") == "1"
+FASTPATH_V21621 = env_flag("COMFYMODAL_FASTPATH_V21621", default=True)
+FASTPATH_V21621_BACKGROUND_UNET = env_flag("COMFYMODAL_FASTPATH_V21621_BACKGROUND_UNET", default=True)
+FASTPATH_V21621_CLIP_LOAD_ONLY = env_flag("COMFYMODAL_FASTPATH_V21621_CLIP_LOAD_ONLY", default=True)
+FASTPATH_V21621_CLIP_READ_BYTES = env_flag("COMFYMODAL_FASTPATH_V21621_CLIP_READ_BYTES", default=True)
 
 
 def _resolve_fastpath_v21621() -> dict:
@@ -1142,7 +1143,7 @@ def _resolve_production_stable_path_effective(profile: dict | None = None) -> bo
 # P6 GÃ‡Ã¶ FUSE / Modal Volume large-read governor.
 # Disabled by default to preserve the recovered 26-29s shape until paid A/B
 # confirms the concurrency gate is a net win on current Modal volume behavior.
-FUSE_READ_GOVERNOR_ENABLED = os.getenv("COMFYMODAL_FUSE_READ_GOVERNOR", "0").strip().lower() in {"1", "true", "yes", "on"}
+FUSE_READ_GOVERNOR_ENABLED = env_flag("COMFYMODAL_FUSE_READ_GOVERNOR")
 try:
     FUSE_LARGE_READ_CONCURRENCY = max(1, int(os.getenv("COMFYMODAL_FUSE_LARGE_READ_CONCURRENCY", "1")))
 except (TypeError, ValueError):
@@ -1155,13 +1156,13 @@ except (TypeError, ValueError):
 # GÃ¶Ã‡GÃ¶Ã‡ Telemetry: per-stack metrics persistence (default off) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # When 0 (default), metrics are computed in-memory only with no volume write.
 # When 1, metrics are persisted to the model volume (may perturb cold reads).
-PERSIST_PER_STACK_METRICS = os.getenv("COMFYMODAL_PERSIST_PER_STACK_METRICS", "0") == "1"
+PERSIST_PER_STACK_METRICS = env_flag("COMFYMODAL_PERSIST_PER_STACK_METRICS")
 
 # GÃ¶Ã‡GÃ¶Ã‡ VAE actual-load defer during restore-background UNET read GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # When 1 (default), skip VAE actual-load if a restore_background_unet
 # active read is still queued/running, to avoid adding small reads during
 # a large-volume-read window.
-DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = os.getenv("COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", "1") == "1"
+DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = env_flag("COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", default=True)
 
 # P1 (corrected): the unconditional removal of the `production_stable`
 # exception in the VAE deferral block was a behavioral change that
@@ -1176,7 +1177,7 @@ DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = os.getenv("COMFYMODAL_DEFER_VAE_ACTUAL_L
 #       Production UNETs also defer VAE via the deferred-future
 #       path; this is the corrected P1 behavior and is required to
 #       actually prevent the model-read collapse in bad runs.
-DEFER_VAE_INCLUDING_PRODUCTION_UNET = os.getenv("COMFYMODAL_DEFER_VAE_INCLUDING_PRODUCTION_UNET", "0") == "1"
+DEFER_VAE_INCLUDING_PRODUCTION_UNET = env_flag("COMFYMODAL_DEFER_VAE_INCLUDING_PRODUCTION_UNET")
 
 # ---- Narrow UNET->VAE serialization coordinator ----
 # Per-key completion-based UNET/VAE coordinator.
@@ -1188,7 +1189,7 @@ DEFER_VAE_INCLUDING_PRODUCTION_UNET = os.getenv("COMFYMODAL_DEFER_VAE_INCLUDING_
 _PRODUCTION_UNET_GATE_LOCK = threading.Lock()
 _PRODUCTION_UNET_GATE: dict[str, dict] = {}
 # Each entry: {canonical_key} -> {"event": Event, "generation": str, "join_context": str, "owner": str}
-_PRODUCTION_UNET_VAE_DIAG = os.environ.get("COMFYMODAL_PRODUCTION_UNET_VAE_DIAG", "0") == "1"
+_PRODUCTION_UNET_VAE_DIAG = env_flag("COMFYMODAL_PRODUCTION_UNET_VAE_DIAG")
 
 
 def _canonical_path_digest(path: str) -> str:
@@ -1376,7 +1377,7 @@ VOLUME_STALL_EXEC_MODEL_IO_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_EXEC_MODE
 
 # When 0, skip the Sage CUDA extension smoke test during restore.
 # Use the persistent volume cache if available, or SAGE_RUNTIME_MODE default.
-SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
+SAGE_RUNTIME_PROBE_ON_RESTORE = env_flag("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", default=True)
 
 # ── Cross-GPU: runtime compute capability ───────────────────────────
 # Used to prevent Blackwell-only compiled artifacts from being placed in
@@ -1691,7 +1692,7 @@ _PLATFORM_DIAG_CACHE: dict | None = None
 
 def _collect_platform_diagnostics(class_name: str = "") -> dict:
     global _PLATFORM_DIAG_CACHE
-    if os.environ.get("COMFYMODAL_DISABLE_PLATFORM_DIAG", "0") == "1":
+    if env_flag("COMFYMODAL_DISABLE_PLATFORM_DIAG"):
         return {"region": "", "cloud_provider": "", "task_id": "",
                 "function_id": "", "environment": "",
                 "class_name": class_name or "", "gpu_value": ""}
@@ -1719,7 +1720,7 @@ _WATERFALL_GLYPH = {"ok": "OK", "miss": "--", "na": "  "}
 
 
 def _log_cold_start_waterfall(s, label=""):
-    if os.environ.get("COMFYMODAL_DISABLE_WATERFALL", "0") == "1":
+    if env_flag("COMFYMODAL_DISABLE_WATERFALL"):
         return
     if not isinstance(s, dict):
         return
@@ -2241,10 +2242,14 @@ def _emit_dependency_validation_v2(
     baked_manifest_read_ms: float = 0.0,
     custom_node_generation_read_ms: float = 0.0,
     manifest_load_ms: float = 0.0,
+    cheap_check_ms: float | None = None,
     manifest_identity_check_ms: float = 0.0,
     fallback_validation_called: bool = False,
     fallback_fingerprint_ms: float = 0.0,
     fallback_validation_ms: float = 0.0,
+    fingerprint_ms: float | None = None,
+    full_validation_ms: float | None = None,
+    refresh_performed: bool | None = None,
     preflight_total_ms: float = 0.0,
     deployment_hash: str = "",
     baked_dependency_hash: str = "",
@@ -2262,6 +2267,14 @@ def _emit_dependency_validation_v2(
     Empty string on identity hit, "manifest_missing" on missing manifest,
     or comma-separated component names on mismatch.
     """
+    if cheap_check_ms is None:
+        cheap_check_ms = manifest_identity_check_ms
+    if fingerprint_ms is None:
+        fingerprint_ms = fallback_fingerprint_ms
+    if full_validation_ms is None:
+        full_validation_ms = fallback_validation_ms
+    if refresh_performed is None:
+        refresh_performed = False
     print(
         f"[v2.dependency_validation] "
         f"source={source} "
@@ -2271,10 +2284,14 @@ def _emit_dependency_validation_v2(
         f"baked_manifest_read_ms={baked_manifest_read_ms} "
         f"custom_node_generation_read_ms={custom_node_generation_read_ms} "
         f"manifest_load_ms={manifest_load_ms} "
+        f"cheap_check_ms={cheap_check_ms} "
         f"manifest_identity_check_ms={manifest_identity_check_ms} "
         f"fallback_validation_called={int(fallback_validation_called)} "
         f"fallback_fingerprint_ms={fallback_fingerprint_ms} "
         f"fallback_validation_ms={fallback_validation_ms} "
+        f"fingerprint_ms={fingerprint_ms} "
+        f"full_validation_ms={full_validation_ms} "
+        f"refresh_performed={int(refresh_performed)} "
         f"preflight_total_ms={preflight_total_ms} "
         f"deployment_hash={deployment_hash} "
         f"baked_dependency_hash={baked_dependency_hash} "
@@ -3369,6 +3386,26 @@ def custom_node_source_fingerprint(source_root: str) -> dict:
     }
 
 
+def custom_node_source_generation(
+    source_root: str,
+    *,
+    fingerprint: dict | None = None,
+) -> str:
+    """Return a deterministic source generation independent of mount paths.
+
+    ``custom_node_source_fingerprint`` retains ``source_root`` for diagnostics
+    and same-process comparisons.  The persisted generation must not include
+    that path because the build context and Modal volume use different roots.
+    """
+    fingerprint = fingerprint or custom_node_source_fingerprint(source_root)
+    stable_fingerprint = {
+        key: value for key, value in fingerprint.items() if key != "source_root"
+    }
+    return hashlib.md5(
+        json.dumps(stable_fingerprint, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 # Alias for backward compatibility
 custom_node_topology_fingerprint = custom_node_source_fingerprint
 
@@ -3444,9 +3481,35 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str,
             # This handles the case where a previous image or snapshot
             # installed the node as a real directory.
             if os.path.isdir(dst) and not os.path.islink(dst):
-                import shutil
-                shutil.rmtree(dst)
-                print(f"[comfyapp] sync: replaced real directory with volume symlink name={name}")
+                # Renaming a directory is O(1) on the container filesystem;
+                # recursively deleting large image-baked nodes here added
+                # tens of seconds to every fresh snapshot startup. Keep the
+                # old tree outside ComfyUI's custom-node scan root. It is
+                # disposable container state and can be reclaimed later.
+                stale_root = os.path.join(
+                    os.path.dirname(comfy_custom_nodes_root),
+                    ".comfymodal_stale_custom_nodes",
+                )
+                os.makedirs(stale_root, exist_ok=True)
+                stale_dst = os.path.join(
+                    stale_root,
+                    f"{name}.{os.getpid()}.{time.time_ns()}",
+                )
+                try:
+                    os.replace(dst, stale_dst)
+                    print(
+                        "[comfyapp] sync: staged real directory for deferred cleanup "
+                        f"name={name} stale_path={stale_dst}"
+                    )
+                except OSError as _stage_exc:
+                    # Cross-filesystem mounts are unusual here, but preserve
+                    # the previous safe behavior if an atomic rename fails.
+                    import shutil
+                    shutil.rmtree(dst)
+                    print(
+                        "[comfyapp] sync: recursive cleanup fallback "
+                        f"name={name} reason={type(_stage_exc).__name__}"
+                    )
             else:
                 os.unlink(dst)
         os.symlink(src, dst)
@@ -3474,6 +3537,19 @@ def requirements_file_hash(path: str) -> str | None:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+_DEPENDENCY_TEXT_SUFFIXES = frozenset({
+    ".cfg", ".in", ".pip", ".py", ".toml", ".txt", ".yaml", ".yml",
+})
+
+
+def _canonical_dependency_bytes(path: str | os.PathLike[str]) -> bytes:
+    """Return dependency input bytes with stable text line endings."""
+    data = Path(path).read_bytes()
+    if Path(path).suffix.lower() in _DEPENDENCY_TEXT_SUFFIXES:
+        return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return data
+
+
 def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
     """Collect dependency-relevant file paths under *node_path*.
 
@@ -3498,8 +3574,16 @@ def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
                     ".webm", ".md", ".rst", ".ipynb", ".gz", ".zip",
                     ".tar", ".pyc", ".pyo", ".safetensors", ".ckpt",
                     ".pt", ".pth", ".bin"}
-    _IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv",
-                    ".ipynb_checkpoints"}
+    _IGNORE_DIRS = {
+        ".git", "__pycache__", "node_modules", ".venv", "venv",
+        ".ipynb_checkpoints", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        ".tox", ".eggs", ".cache", "wheelhouse", "wheels", "build", "dist",
+        "tests", "test", "examples", "benchmarks", "benchmark", "traces",
+        "logs", "scripts", ".github",
+    }
+    _IGNORE_GENERATED_SUFFIXES = (
+        ".log", ".tmp", ".trace", ".jsonl", ".whl",
+    )
 
     files: dict[str, str] = {}
     _seen_real: set[str] = set()
@@ -3512,7 +3596,7 @@ def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
             return
         _seen_real.add(real)
         rel = _safe_dependency_relpath(filepath, node_root)
-        files[rel] = hashlib.sha256(Path(filepath).read_bytes()).hexdigest()
+        files[rel] = hashlib.sha256(_canonical_dependency_bytes(filepath)).hexdigest()
 
     def _scan_requirements(req_path: str, node_root: str, seen_req: set[str]) -> None:
         req_path = os.path.abspath(req_path)
@@ -3559,13 +3643,16 @@ def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
         _seen_real.add(real)
         if os.path.isfile(path):
             rel = _safe_dependency_relpath(path, node_root)
-            files[rel] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            files[rel] = hashlib.sha256(_canonical_dependency_bytes(path)).hexdigest()
         elif os.path.isdir(path):
             for dirpath, dirnames, filenames in os.walk(path):
-                dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
-                for fn in filenames:
+                dirnames[:] = sorted(d for d in dirnames if d not in _IGNORE_DIRS)
+                for fn in sorted(filenames):
                     ext = os.path.splitext(fn)[1].lower()
-                    if ext in _IGNORE_EXTS:
+                    lower_name = fn.lower()
+                    if ext in _IGNORE_EXTS or lower_name.endswith(_IGNORE_GENERATED_SUFFIXES):
+                        continue
+                    if lower_name.startswith("benchmark_") or lower_name.startswith("trace_"):
                         continue
                     fp = os.path.join(dirpath, fn)
                     _add_file(fp, node_root)
@@ -3874,8 +3961,18 @@ def validate_custom_node_dependencies_prepared() -> dict:
     baked_hash = baked.get("overall_dependency_hash", "")
     current_hash = current.get("overall_dependency_hash", "")
 
-    baked_node_names = set(baked.get("syncable_node_names", baked.get("nodes", {}).keys()) or [])
-    current_node_names = set(current.get("syncable_node_names", current.get("nodes", {}).keys()) or [])
+    def _dependency_node_names(manifest: dict) -> set[str]:
+        explicit = manifest.get("dependency_nodes")
+        if explicit is not None:
+            return set(explicit or [])
+        return {
+            name
+            for name, data in (manifest.get("nodes", {}) or {}).items()
+            if isinstance(data, dict) and data.get("dependency_files")
+        }
+
+    baked_node_names = _dependency_node_names(baked)
+    current_node_names = _dependency_node_names(current)
 
     # Node set mismatch detection: if baked manifest has no nodes but current does
     if current_node_names and not baked_node_names:
@@ -4522,6 +4619,7 @@ def _volume_telemetry_snapshot() -> dict:
 #   result_available (bool), error (str), completed_at (float)
 _ACTIVE_MODEL_READS: dict[str, dict] = {}
 _ACTIVE_MODEL_READS_LOCK = _threading.RLock()
+_COMPLETED_ACTIVE_READS: list[dict] = []
 _FUSE_LARGE_READS_COND = _threading.Condition(_ACTIVE_MODEL_READS_LOCK)
 _FUSE_LARGE_READS_IN_PROGRESS = 0
 _FUSE_LARGE_READS_ACTIVE: dict[str, dict] = {}
@@ -4659,7 +4757,7 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
             _before_io = _capture_proc_self_io()
         except Exception:
             pass
-    _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
+    _deep_diag_here = env_flag("COMFYMODAL_V2_DEEP_MODEL_DIAG")
     with _ACTIVE_MODEL_READS_LOCK:
         existing = _ACTIVE_MODEL_READS.get(canonical_key)
         if existing and existing["status"] in ("queued", "running"):
@@ -4853,7 +4951,7 @@ def _complete_active_model_read(canonical_key: str) -> None:
         _complete_tid = threading.get_native_id()
     except Exception:
         pass
-    _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
+    _deep_diag_here = env_flag("COMFYMODAL_V2_DEEP_MODEL_DIAG")
     with _ACTIVE_MODEL_READS_LOCK:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
         if entry is None:
@@ -4957,6 +5055,20 @@ def _complete_active_model_read(canonical_key: str) -> None:
         # Legacy counter_status kept for parsers that depend on it.
         ev = entry.get("event")
         _ACTIVE_MODEL_READS.pop(canonical_key, None)
+        _COMPLETED_ACTIVE_READS.append({
+            "active_read_id": _arid,
+            "owner": entry.get("owner", ""),
+            "loader_type": entry.get("loader_type", ""),
+            "phase": entry.get("phase", ""),
+            "request_id": entry.get("request_id", ""),
+            "path_hash": entry.get("active_read_path_hash", ""),
+            "file_size": entry.get("active_read_file_size"),
+            "wall_ms": entry.get("active_read_wall_ms"),
+            "thread_cpu_ms": entry.get("active_read_thread_cpu_ms"),
+            "process_cpu_ms": entry.get("active_read_process_cpu_ms"),
+        })
+        if len(_COMPLETED_ACTIVE_READS) > 256:
+            del _COMPLETED_ACTIVE_READS[:-256]
     if ev is not None:
         ev.set()
     print(f"[active_read] completed owner={entry['owner']} key={canonical_key[:80]} "
@@ -5909,7 +6021,7 @@ def stack_to_profile(stack: dict) -> dict:
 #   off       GÃ‡Ã¶ Never download model files during request execution.
 #   explicit  GÃ‡Ã¶ Only download via explicit preinstall/precache functions.
 #   dev       GÃ‡Ã¶ Allow runtime model downloads (current default for dev).
-COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS = os.getenv("COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS", "0") == "1"
+COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS = env_flag("COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS")
 COMFYMODAL_MODEL_DOWNLOAD_MODE = os.getenv("COMFYMODAL_MODEL_DOWNLOAD_MODE", "dev").strip().lower()
 
 
@@ -5957,7 +6069,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.26"
+COMFYAPP_VERSION = "2.16.30"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -6016,7 +6128,7 @@ def _resolve_local_custom_nodes_root() -> str:
         candidate = os.path.abspath(candidate)
         if _looks_like_custom_nodes_source_root(candidate):
             return candidate
-    if os.environ.get("COMFYMODAL_RUNTIME") == "1":
+    if env_flag("COMFYMODAL_RUNTIME"):
         return "/root/comfy/ComfyUI/custom_nodes"
     if os.path.isdir("/root/comfy/ComfyUI/custom_nodes"):
         # Runtime fallback: even without COMFYMODAL_RUNTIME, if the ComfyUI
@@ -6075,6 +6187,10 @@ _CACHEDIT_LOCK_DST = "/opt/comfymodal/cachedit_dependency_lock.txt"
 """In-image destination for the lock file (used at build and runtime)."""
 
 _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints"}
+_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
+    r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
+    re.IGNORECASE,
+)
 _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
     ".git/",
     "__pycache__/",
@@ -6127,6 +6243,7 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/.deployed_state.json",
     "comfyui-modal/.deployed_version",
     "comfyui-modal/.modal_settings.json",
+    "comfyui-modal/.last_v2_dependency_cache_identity.json",
     "comfyui-modal/.last_custom_node_context_manifest.json",
     "comfyui-modal/.comfymodal_experiments/",
     "comfyui-modal/.comfymodal_experiments/*",
@@ -6140,6 +6257,10 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/apply_experiment_preset.py",
     "comfyui-modal/run_experiment_stage.py",
     "comfyui-modal/BENCHMARK_WORKFLOW.md",
+    "comfyui-modal-agent*/",
+    "comfyui-modal-worktree*/",
+    "comfyui-modal-wt*/",
+    "comfyui-modal-dc*/",
 ]
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
@@ -6174,6 +6295,20 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
 )
 
 
+def _custom_node_filter_reason(node_name: str, node_path: str) -> str | None:
+    if not os.path.isdir(node_path):
+        return "not_directory"
+    if os.path.islink(node_path):
+        return "symlink"
+    if node_name.startswith("."):
+        return "hidden_directory"
+    if node_name in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+        return "generated_or_environment_directory"
+    if _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_name):
+        return "local_agent_or_worktree_clone"
+    return None
+
+
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
     """Return sorted, filtered list of top-level custom node directory names.
 
@@ -6188,14 +6323,26 @@ def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
     names = []
     for node_name in sorted(os.listdir(cn_root)):
         node_path = os.path.join(cn_root, node_name)
-        if not os.path.isdir(node_path):
-            continue
-        if os.path.islink(node_path):
-            continue
-        if node_name.startswith(".") or node_name in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+        if _custom_node_filter_reason(node_name, node_path) is not None:
             continue
         names.append(node_name)
     return names
+
+
+def _diagnose_custom_node_selection(cn_root: str) -> None:
+    """Print the deterministic production allow/deny decision for each directory."""
+    print("[comfyapp.custom_node_filter] begin")
+    if not os.path.isdir(cn_root):
+        print(f"[comfyapp.custom_node_filter] action=deny name=<root> reason=missing_root path={cn_root}")
+        return
+    for node_name in sorted(os.listdir(cn_root)):
+        node_path = os.path.join(cn_root, node_name)
+        reason = _custom_node_filter_reason(node_name, node_path)
+        if reason is None:
+            print(f"[comfyapp.custom_node_filter] action=allow name={node_name} reason=production_custom_node")
+        elif os.path.isdir(node_path):
+            print(f"[comfyapp.custom_node_filter] action=deny name={node_name} reason={reason}")
+    print("[comfyapp.custom_node_filter] end")
 
 
 def _custom_node_image_ignore_patterns(node_name: str) -> list[str]:
@@ -6422,11 +6569,12 @@ def _build_requirements_context_manifest(root: str) -> dict[str, str]:
     manifest = {}
     if not os.path.isdir(root):
         return manifest
-    for dirpath, _, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(dirnames)
         for filename in sorted(filenames):
             path = os.path.join(dirpath, filename)
             rel_path = os.path.relpath(path, root).replace("\\", "/")
-            manifest[rel_path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            manifest[rel_path] = hashlib.sha256(_canonical_dependency_bytes(path)).hexdigest()
     return manifest
 
 
@@ -6447,7 +6595,14 @@ def _compute_deterministic_context_hash(requirements_dir: str) -> dict:
     file_sizes: list[tuple[int, str]] = []
     total_bytes = 0
     node_dirs = set()
-    for dirpath, _, filenames in os.walk(requirements_dir):
+    for dirpath, dirnames, filenames in os.walk(requirements_dir):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in {
+                ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                ".tox", ".eggs", "build", "dist", "logs",
+            }
+        )
         rel_dir = os.path.relpath(dirpath, requirements_dir).replace("\\", "/")
         if rel_dir != ".":
             node_dirs.add(rel_dir.split("/")[0])
@@ -6456,13 +6611,18 @@ def _compute_deterministic_context_hash(requirements_dir: str) -> dict:
             rel_path = os.path.relpath(path, requirements_dir).replace("\\", "/")
             if rel_path.replace("\\", "/") == LAST_CONTEXT_MANIFEST_FILENAME:
                 continue
+            if filename.endswith((".jsonl", ".log", ".tmp")):
+                continue
             try:
-                data = Path(path).read_bytes()
+                data = _canonical_dependency_bytes(path)
             except OSError:
                 data = b""
             h = hashlib.sha256(data).hexdigest()
             file_hashes[rel_path] = h
-            hasher.update(f"{rel_path}:{h}".encode())
+            hasher.update(rel_path.encode("utf-8"))
+            hasher.update(b"\0")
+            hasher.update(h.encode("ascii"))
+            hasher.update(b"\n")
             size = len(data)
             total_bytes += size
             file_sizes.append((size, rel_path))
@@ -6488,6 +6648,134 @@ def _save_last_context_manifest(manifest: dict) -> None:
         os.replace(tmp, _LAST_CONTEXT_MANIFEST_PATH)
     except Exception as exc:
         print(f"[comfyapp] WARNING: failed to save context manifest: {exc}")
+
+
+_V2_DEPENDENCY_CACHE_IDENTITY_FILENAME = ".last_v2_dependency_cache_identity.json"
+_V2_DEPENDENCY_CACHE_IDENTITY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    _V2_DEPENDENCY_CACHE_IDENTITY_FILENAME,
+)
+_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-loop-v2"
+_V2_DEPENDENCY_BASE_INPUTS = {
+    "image": "nvidia/cuda:13.0.0-devel-ubuntu24.04",
+    "python": "3.11",
+    "pytorch_cuda": "cu130",
+    "torch_install": "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130",
+    "dependency_build_schema": "stable-dependency-boundary-v2",
+}
+
+
+def _sha256_file_canonical(path: str) -> str:
+    if not os.path.isfile(path):
+        return ""
+    return hashlib.sha256(_canonical_dependency_bytes(path)).hexdigest()
+
+
+def _build_v2_dependency_cache_identity(requirements_key: str = "") -> dict[str, str]:
+    """Build the repository-owned identity for the stable dependency image."""
+    base_key = stable_hash(_V2_DEPENDENCY_BASE_INPUTS)
+    lock_key = _sha256_file_canonical(_CACHEDIT_LOCK_SRC)
+    installer_key = stable_hash({
+        "version": _V2_DEPENDENCY_INSTALLER_VERSION,
+        "script": "requirements-context-v2; pip-loop-fail-fast; cachedit-lock-ensure",
+    })
+    dependency_key = stable_hash({
+        "base_key": base_key,
+        "requirements_key": requirements_key,
+        "cachedit_lock_key": lock_key,
+        "installer_key": installer_key,
+    })
+    return {
+        "dependency_key": dependency_key,
+        "base_key": base_key,
+        "requirements_key": requirements_key,
+        "cachedit_lock_key": lock_key,
+        "installer_key": installer_key,
+        "runtime_revision": str(globals().get("_V2_RUNTIME_REVISION", "")),
+    }
+
+
+def _drain_completed_active_read_diagnostics(request_id: str = "") -> list[dict]:
+    if not request_id:
+        return []
+    with _ACTIVE_MODEL_READS_LOCK:
+        matched = [
+            dict(record)
+            for record in _COMPLETED_ACTIVE_READS
+            if record.get("request_id") == request_id
+        ]
+        if matched:
+            _COMPLETED_ACTIVE_READS[:] = [
+                record
+                for record in _COMPLETED_ACTIVE_READS
+                if record.get("request_id") != request_id
+            ]
+        return matched
+
+
+def _load_v2_dependency_cache_identity() -> dict[str, str]:
+    try:
+        with open(_V2_DEPENDENCY_CACHE_IDENTITY_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return dict(data) if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def _save_v2_dependency_cache_identity(identity: dict[str, str]) -> None:
+    try:
+        serialized = json.dumps(
+            {key: identity.get(key, "") for key in (
+                "dependency_key", "base_key", "requirements_key",
+                "cachedit_lock_key", "installer_key",
+            )},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if os.path.isfile(_V2_DEPENDENCY_CACHE_IDENTITY_PATH):
+            if Path(_V2_DEPENDENCY_CACHE_IDENTITY_PATH).read_text(encoding="utf-8") == serialized:
+                return
+        Path(_V2_DEPENDENCY_CACHE_IDENTITY_PATH).write_text(serialized, encoding="utf-8")
+    except OSError as exc:
+        print(f"[comfyapp] WARNING: failed to save dependency cache identity: {exc}")
+
+
+def _diagnose_v2_dependency_cache(
+    requirements_dir: str,
+    *,
+    requirements_key: str | None = None,
+) -> dict[str, str]:
+    current_context = (
+        _compute_deterministic_context_hash(requirements_dir)
+        if requirements_key is None else {"context_hash": requirements_key}
+    )
+    identity = _build_v2_dependency_cache_identity(current_context.get("context_hash", ""))
+    previous = _load_v2_dependency_cache_identity()
+    if not previous:
+        decision = "expected_rebuild"
+        reason = "no_previous_local_build_input"
+    elif previous.get("dependency_key") == identity["dependency_key"]:
+        decision = "expected_hit"
+        reason = "dependency_inputs_unchanged"
+    else:
+        changed = [
+            key for key in ("base_key", "requirements_key", "cachedit_lock_key", "installer_key")
+            if previous.get(key, "") != identity.get(key, "")
+        ]
+        decision = "expected_rebuild"
+        reason = "changed=" + ("+".join(changed) if changed else "dependency_key")
+    print("[v2.dependency_cache]")
+    print(f"dependency_key={identity['dependency_key']}")
+    print(f"base_key={identity['base_key']}")
+    print(f"requirements_key={identity['requirements_key']}")
+    print(f"cachedit_lock_key={identity['cachedit_lock_key']}")
+    print(f"installer_key={identity['installer_key']}")
+    print(f"runtime_revision={identity['runtime_revision']}")
+    print("runtime_revision_part_of_dependency_key=0")
+    print(f"decision={decision}")
+    print(f"reason={reason}")
+    _save_v2_dependency_cache_identity(identity)
+    return identity
 
 
 def _load_last_context_manifest() -> dict:
@@ -6572,7 +6860,14 @@ def _scan_local_editable_dependencies(source_root: str) -> list[dict]:
                     total_bytes = 0
                     if os.path.isdir(resolved):
                         for dp, dn, fn in os.walk(resolved):
-                            dn[:] = [d for d in dn if d not in (".git", "__pycache__", "node_modules", ".venv", "venv")]
+                            dn[:] = [
+                                d for d in dn
+                                if d not in {
+                                    ".git", "__pycache__", "node_modules", ".venv", "venv",
+                                    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".eggs",
+                                    "build", "dist", "tests", "test", "examples", "scripts", ".github",
+                                }
+                            ]
                             file_count += len(fn)
                             for f in fn:
                                 try:
@@ -6639,6 +6934,7 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"[comfyapp] MODAL_FORCE_BUILD={modal_force_build!r}")
     print(f"[comfyapp] MODAL_IGNORE_CACHE={modal_ignore_cache!r}")
     print(f"[comfyapp] FORCE_BUILD={force_build_env!r}")
+    _diagnose_custom_node_selection(source_root)
 
     _scan_ignore_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".ipynb_checkpoints", ".custom_node_requirements"}
     _node_sizes: list[tuple[int, str]] = []
@@ -6671,6 +6967,10 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
         for entry in current["top_20_largest"]:
             print(f"  {entry['path']}: {entry['bytes']} bytes")
     print(f"[comfyapp] dependency_manifest_hash={dep_hash[:16] if dep_hash else '<none>'}...")
+    _diagnose_v2_dependency_cache(
+        requirements_dir,
+        requirements_key=current.get("context_hash", ""),
+    )
 
     # Task 2: Context diff
     if previous.get("context_hash"):
@@ -6894,7 +7194,7 @@ def _sync_custom_node_dependency_files(node_path: str, dst_node_dir: str) -> Non
                     f"directory. Aborting copy for {node_path}."
                 )
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(src, dst)
+            Path(dst).write_bytes(_canonical_dependency_bytes(src))
             os.chmod(dst, 0o644)
             os.utime(dst, (_REQUIREMENTS_CONTEXT_MTIME, _REQUIREMENTS_CONTEXT_MTIME))
         if _build_requirements_context_manifest(staged_dir) == _build_requirements_context_manifest(dst_node_dir):
@@ -7027,49 +7327,48 @@ _image_base = (
         "python -X utf8 -c \"import sageattention._fused; print('sageattention._fused ok')\"",
         gpu="a10g",
     )
-    .env(
-        {
-            "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime_state/.inductor-cache",
-            "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
-            "TRITON_CACHE_DIR": "/tmp/triton_cache",
-            "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
-            "TORCHINDUCTOR_COMPILE_THREADS": "1",
-            "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
-            "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
-            "COMFYMODAL_WARMUP_TEXT": "warmup",
-            # Restore latency fix GÃ‡Ã¶ default production profile (Config D)
-            "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
-            "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-            "COMFYMODAL_PRELOAD_MODE": "clip_only",
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
-            "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
-            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
-            "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
-            "COMFYMODAL_RUNTIME": "1",
-            "PROMPT_ASYNC_PRELOAD": "0",
-            "PROMPT_PRELOAD_WORKERS": "2",
-            "PROMPT_ASYNC_ACTUAL_LOAD": "1",
-            "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1",
-            "ACTUAL_LOAD_MODE": "unet_vae_only",
-            "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
-            "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "0",
-            # Production guardrails (PART 3, 4, 7)
-            "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
-            "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
-            "COMFYMODAL_PRELOAD_MAX_TOTAL_GB": "12",
-            "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
-            "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
-            "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
-                        "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
-            "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
-            "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
-            "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
-            "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
-        }
-    )
 )
+
+# Runtime/source-only environment belongs to the child image, after the
+# stable dependency boundary.  It must not be an ancestor of the pip layer.
+_V2_RUNTIME_ENV = {
+    "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime_state/.inductor-cache",
+    "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
+    "TRITON_CACHE_DIR": "/tmp/triton_cache",
+    "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
+    "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
+    "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
+    "COMFYMODAL_WARMUP_TEXT": "warmup",
+    "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+    "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
+    "COMFYMODAL_PRELOAD_MODE": "clip_only",
+    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
+    "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+    "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
+    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
+    "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
+    "COMFYMODAL_RUNTIME": "1",
+    "PROMPT_ASYNC_PRELOAD": "0",
+    "PROMPT_PRELOAD_WORKERS": "2",
+    "PROMPT_ASYNC_ACTUAL_LOAD": "1",
+    "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1",
+    "ACTUAL_LOAD_MODE": "unet_vae_only",
+    "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
+    "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "0",
+    "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
+    "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
+    "COMFYMODAL_PRELOAD_MAX_TOTAL_GB": "12",
+    "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
+    "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
+    "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
+    "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
+    "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
+    "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
+    "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
+    "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
+}
 
 # Combined requirements layer: one COPY + one pip loop (single cache unit).
 # When no requirements.txt changes, the layer is cached (~5s deploy).
@@ -7166,6 +7465,9 @@ if not _INSIDE_MODAL_CONTAINER:
         'PYEOF\n'
     )
 
+_STABLE_DEPENDENCY_IMAGE = _image_base
+_image_base = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
+
 # GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
 # Only runs during local deploy/image build.  Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
@@ -7220,6 +7522,8 @@ if not _INSIDE_MODAL_CONTAINER:
 
     try:
         _baked_manifest = build_custom_node_dependency_manifest(_LOCAL_CUSTOM_NODES)
+        _source_generation = custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        _baked_manifest["production_custom_node_generation"] = _source_generation
         _maybe_write_baked_manifest(_BAKED_MANIFEST_TEMP, _baked_manifest)
         _baked_nodes = _baked_manifest.get("nodes", {})
         _baked_node_names = sorted(_baked_nodes.keys())
@@ -7307,6 +7611,7 @@ _APP_SOURCE_BYTES = os.path.getsize(__file__)
 
 def _add_gpu_python_sources(img):
     img = img.add_local_python_source("comfyapp", copy=True)
+    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
     for _module_name in _GPU_COMFYMODAL_PYTHON_SOURCES:
         img = img.add_local_python_source(_module_name, copy=True)
     return img
@@ -7314,6 +7619,7 @@ def _add_gpu_python_sources(img):
 
 def _add_cpu_python_sources(img):
     img = img.add_local_python_source("comfyapp", copy=True)
+    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
     for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
         img = img.add_local_python_source(_module_name, copy=True)
     return img
@@ -7370,7 +7676,7 @@ def _build_gpu_volumes() -> dict:
         CUSTOM_NODES_PATH: custom_nodes_vol,
         RUNTIME_CONFIG_PATH: runtime_config_vol,
     }
-    if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+    if env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
         base[PROMPT_CACHE_VOLUME_PATH] = prompt_cache_vol
     return base
 custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
@@ -9003,6 +9309,31 @@ class _ComfyAPIMixin:
     def _profile_ms(self, started_at: float) -> float:
         return round((time.time() - started_at) * 1000, 1)
 
+    @modal.method()
+    def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
+        """Read a generated asset from the shared runtime-state volume."""
+        reload_volume = getattr(runtime_config_vol, "reload", None)
+        if callable(reload_volume):
+            reload_volume()
+        root = Path(RUNTIME_CONFIG_PATH, "output_assets").resolve()
+        candidate = Path(RUNTIME_CONFIG_PATH, str(backend_path or "")).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("invalid output asset path") from exc
+        if not candidate.is_file():
+            raise FileNotFoundError("output asset not found")
+        data = candidate.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_sha256 and digest != expected_sha256:
+            raise ValueError("output asset identity mismatch")
+        return {
+            "data": data,
+            "byte_count": len(data),
+            "sha256": digest,
+            "filename": candidate.name,
+        }
+
     def _log_profile(self, stage: str, **fields) -> None:
         if not PROFILING_ENABLED:
             return
@@ -9383,6 +9714,9 @@ class _ComfyAPIMixin:
                     manifest_identity_check_ms=_cheap_check_ms,
                     fallback_fingerprint_ms=0.0,
                     fallback_validation_ms=0.0,
+                    fingerprint_ms=0.0,
+                    full_validation_ms=0.0,
+                    refresh_performed=False,
                     preflight_total_ms=_v2_total,
                     fallback_validation_called=False,
                     reason="manifest_identity_match",
@@ -9424,6 +9758,9 @@ class _ComfyAPIMixin:
                     manifest_identity_check_ms=_cheap_check_ms,
                     fallback_fingerprint_ms=_fingerprint_ms,
                     fallback_validation_ms=_full_val_ms,
+                    fingerprint_ms=_fingerprint_ms,
+                    full_validation_ms=_full_val_ms,
+                    refresh_performed=_refresh_performed,
                     preflight_total_ms=_v2_total,
                     fallback_validation_called=True,
                     reason=_identity_check.get("reason", "manifest_mismatch"),
@@ -9598,6 +9935,9 @@ class _ComfyAPIMixin:
                     fallback_validation_called=False,
                     fallback_fingerprint_ms=0.0,
                     fallback_validation_ms=0.0,
+                    fingerprint_ms=0.0,
+                    full_validation_ms=0.0,
+                    refresh_performed=False,
                     preflight_total_ms=_preflight_total_ms,
                     deployment_hash=_deployment_hash_short,
                     baked_dependency_hash=_baked_dep_hash_short,
@@ -9652,6 +9992,9 @@ class _ComfyAPIMixin:
                     fallback_validation_called=_fallback_validation_called,
                     fallback_fingerprint_ms=_fallback_fingerprint_ms,
                     fallback_validation_ms=_fallback_validation_ms,
+                    fingerprint_ms=_fallback_fingerprint_ms,
+                    full_validation_ms=_fallback_validation_ms,
+                    refresh_performed=_refresh_performed,
                     preflight_total_ms=_preflight_total_ms,
                     deployment_hash=_deployment_hash_short,
                     baked_dependency_hash=_baked_dep_hash_short,
@@ -10134,7 +10477,9 @@ class _ComfyAPIMixin:
 
         # Step 2: Volume state changed GÃ‡Ã¶ compute full content fingerprint
         current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
-        current_fp_hash = hashlib.md5(json.dumps(current_fp, sort_keys=True).encode()).hexdigest()
+        current_fp_hash = custom_node_source_generation(
+            CUSTOM_NODES_PATH, fingerprint=current_fp
+        )
         last_fp = getattr(self, "_last_custom_node_source_fingerprint", None)
 
         if last_fp is not None and last_fp == current_fp:
@@ -10194,7 +10539,8 @@ class _ComfyAPIMixin:
             _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
             if not _gen_now:
                 _gen_rec = _write_custom_nodes_generation_record_no_commit(
-                    reason="actual_sync_created", generation=current_fp_hash,
+                    reason="actual_sync_created",
+                    generation=current_fp_hash,
                 )
                 custom_nodes_vol.commit()
                 _gen_now = current_fp_hash
@@ -15513,7 +15859,7 @@ class _ComfyAPIMixin:
             # Per audit round 7: persistent validation certificate (enabled by default).
             # Check before calling the expensive execution.validate_prompt().
             _cert_eligible = (
-                os.environ.get("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", "1") == "1"
+                env_flag("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", default=True)
                 and _production_enabled
                 and bool(_cert_identity)
                 and bool(_cert_identity_components)
@@ -16029,6 +16375,10 @@ class _ComfyAPIMixin:
                 "clip_to_sampler_class_type": "",
                 "sampler_start_node_id": "",
                 "sampler_start_class_type": "",
+                "sampler_node_id": "",
+                "sampler_class_type": "",
+                "sampler_identification_source": "unavailable",
+                "sampler_node_to_sampling_start_ms": None,
                 "cache_hit": False,
                 "exec_start_to_cached_ms": 0.0,
                 "cached_to_first_executing_ms": 0.0,
@@ -16088,16 +16438,32 @@ class _ComfyAPIMixin:
                 _exec_history = getattr(self._executor, "execution_history_trace", None) or getattr(self._executor, "history", None)
                 if _exec_history and isinstance(_exec_history, dict):
                     _exec_keys = list(_exec_history.keys())
-                    if len(_exec_keys) >= 2:
+                    if len(_exec_keys) >= 1:
                         _clip_node_id = _exec_keys[0] if len(_exec_keys) > 0 else ""
-                        _sampler_node_id = _exec_keys[-1] if len(_exec_keys) > 0 else ""
+                        _sampler_candidates = [
+                            str(_nid) for _nid, _candidate_node in workflow.items()
+                            if isinstance(_candidate_node, dict)
+                            and (
+                                "Sampler" in str(_candidate_node.get("class_type", ""))
+                                or "KSampler" in str(_candidate_node.get("class_type", ""))
+                            )
+                        ] if isinstance(workflow, dict) else []
+                        _sampler_node_id = next(
+                            (str(_nid) for _nid in reversed(_exec_keys) if str(_nid) in _sampler_candidates),
+                            "",
+                        )
                         if isinstance(workflow, dict):
                             _clip_n = workflow.get(_clip_node_id, {})
                             _sampler_n = workflow.get(_sampler_node_id, {})
                             _pre_sampler_info["first_node_to_clip_node_id"] = _clip_node_id
                             _pre_sampler_info["first_node_to_clip_class_type"] = str(_clip_n.get("class_type", ""))
-                            _pre_sampler_info["clip_to_sampler_node_id"] = _sampler_node_id
-                            _pre_sampler_info["clip_to_sampler_class_type"] = str(_sampler_n.get("class_type", ""))
+                            _pre_sampler_info["clip_to_sampler_node_id"] = _sampler_node_id or "unavailable"
+                            _pre_sampler_info["clip_to_sampler_class_type"] = str(_sampler_n.get("class_type", "")) or "unavailable"
+                            _pre_sampler_info["sampler_node_id"] = _sampler_node_id
+                            _pre_sampler_info["sampler_class_type"] = str(_sampler_n.get("class_type", ""))
+                            _pre_sampler_info["sampler_identification_source"] = (
+                                "execution_plan_sampler_class_type" if _sampler_node_id else "unavailable"
+                            )
             except Exception:
                 pass
             _pre_sampler_total = sum(v for k, v in _pre_sampler_info.items() if k.endswith("_ms") and isinstance(v, (int, float)))
@@ -17215,7 +17581,22 @@ class _ComfyAPIMixin:
         comfy.utils.set_progress_bar_global_hook(_progress_hook)
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
+        _custom_import_wall_ns = time.time_ns()
+        _custom_import_mono_ns = time.monotonic_ns()
+        print(
+            f"[v2.startup_stage] stage=custom_node_import event=start "
+            f"wall_unix_ns={_custom_import_wall_ns} monotonic_ns={_custom_import_mono_ns}",
+            flush=True,
+        )
         self._event_loop.run_until_complete(nodes.init_extra_nodes())
+        _custom_import_end_mono_ns = time.monotonic_ns()
+        print(
+            f"[v2.startup_stage] stage=custom_node_import event=end "
+            f"wall_unix_ns={time.time_ns()} monotonic_ns={_custom_import_end_mono_ns} "
+            f"duration_ms={round((_custom_import_end_mono_ns - _custom_import_mono_ns) / 1_000_000, 3)} "
+            "slow_import_summary_source=comfyui.nodes.init_external_custom_nodes",
+            flush=True,
+        )
         self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
 
@@ -19547,7 +19928,7 @@ class _ComfyAPIMixin:
                 self._patch_clip_text_encode_cache()
             except Exception as _early_patch_exc:
                 print(f"[comfyapp] early clip_cache patch failed: {_early_patch_exc}")
-            if _OPTIMIZATIONS_AVAILABLE and os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+            if _OPTIMIZATIONS_AVAILABLE and env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
                 _bundle = (_raw_active or {}).get("prompt_bundle") if isinstance(_raw_active, dict) else None
                 if isinstance(_bundle, dict) and _bundle.get("bundle_hash"):
                     try:
@@ -20789,7 +21170,7 @@ class _ComfyAPIMixin:
                         "exact_prefill_grouping_start",
                         extra={"profile_clip": str(profile.get("clip1", ""))[:32]},
                     )
-                    if os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1":
+                    if env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True):
                         __stages["exact_prefill_requested"] = 1
                         try:
                             if isinstance(_raw_active, dict):
@@ -21768,7 +22149,7 @@ class _ComfyAPIMixin:
                     # The candidate is consumed by the local
                     # post-delivery dispatcher.
                     if (
-                        os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
+                        env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE")
                         and _OPTIMIZATIONS_AVAILABLE
                     ):
                         try:
@@ -22445,7 +22826,7 @@ class _ComfyAPIMixin:
                 # ── Snapshot flags ──────────────────────────────────
                 "snapshot_enabled": "True",
                 "gpu_snapshot_enabled": str(
-                    os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+                    env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
                 ),
                 # ── Volume names (from module-level constants) ──────
                 "models_volume": VOLUME_NAME,
@@ -22796,7 +23177,7 @@ class _ComfyAPIMixin:
                         _CR_PATH_RECORDER_TLS.recorder = _wrec
                     if not (
                         _OPTIMIZATIONS_AVAILABLE
-                        and os.environ.get("COMFYMODAL_THIRD_PARTY_LOG_SUPPRESSION", "0") == "1"
+                        and env_flag("COMFYMODAL_THIRD_PARTY_LOG_SUPPRESSION")
                     ):
                         return _exec()
                     # The suppression is enabled but the safe pass-through

@@ -31,6 +31,7 @@ from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU
 
 from .contracts import DeploymentIdentity, ExecutionPlan, ModelRestoreKey, RestorePlan, _thaw, stable_hash
 from .deployment_spec import build_deployment_identity
+from .env import env_flag
 from .restore_plan import build_restore_model_spec, derive_model_key, derive_prefill_key
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import (
@@ -88,6 +89,7 @@ from .output_delivery import (
 )
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
+from .v2_waterfall import build_waterfall, render_waterfall
 
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
@@ -222,6 +224,52 @@ cycle while the container session persists across lifecycle."""
 _V2_CONTAINER_SESSION_ID: str = uuid.uuid4().hex[:16]
 _V2_CONTAINER_IMPORT_UNIX_S: float = time.time()
 _v2_container_restore_count: int = 0
+_V2_IMPORT_START_WALL_NS: int = time.time_ns()
+_V2_IMPORT_START_MONO_NS: int = time.monotonic_ns()
+_V2_STARTUP_CALLBACK_RETURN: dict[str, Any] = {}
+
+
+def _v2_startup_stage(
+    stage: str,
+    event: str,
+    *,
+    started: tuple[int, int] | None = None,
+    trace: RuntimeTrace | None = None,
+    phase: str = "startup",
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[int, int] | None:
+    """Emit paired wall/monotonic lifecycle markers without request identity."""
+    wall_ns = time.time_ns()
+    mono_ns = time.monotonic_ns()
+    fields = {
+        "stage": stage,
+        "event": event,
+        "wall_unix_ns": wall_ns,
+        "monotonic_ns": mono_ns,
+    }
+    if started is not None:
+        fields["duration_ms"] = round((mono_ns - started[1]) / 1_000_000, 3)
+    if metadata:
+        fields.update({str(k): v for k, v in metadata.items()})
+    print(
+        "[v2.startup_stage] "
+        + " ".join(f"{key}={value}" for key, value in fields.items()),
+        flush=True,
+    )
+    if trace is not None:
+        trace.emit(
+            f"v2_startup_{stage}_{event}",
+            phase=phase,
+            metadata={key: value for key, value in fields.items() if key not in ("stage", "event")},
+        )
+    return (wall_ns, mono_ns) if event == "start" else None
+
+
+print(
+    f"[v2.startup_stage] stage=container_python_import event=start "
+    f"wall_unix_ns={_V2_IMPORT_START_WALL_NS} monotonic_ns={_V2_IMPORT_START_MONO_NS}",
+    flush=True,
+)
 
 # All local Python modules that comfyapp.py imports at the top level
 # and that must be available in the remote V2 shadow container.
@@ -249,9 +297,7 @@ V2_SOURCE_MODULES = (
 # Enabled by default.  Set COMFYMODAL_V2_VALIDATION_CERT=0 to disable.
 # Certificates are stored on the runtime-state Volume keyed by a stable
 # identity that includes workflow struct hash and deployment identity.
-_V2_VALIDATION_CERT_ENABLED: bool = (
-    os.environ.get("COMFYMODAL_V2_VALIDATION_CERT", "1") == "1"
-)
+_V2_VALIDATION_CERT_ENABLED: bool = env_flag("COMFYMODAL_V2_VALIDATION_CERT", default=True)
 _V2_CERT_SCHEMA_VERSION: int = 2
 _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 
@@ -289,16 +335,12 @@ _V2_WORKFLOW_HASH: ContextVar[str] = ContextVar("_v2_workflow_hash", default="")
 # When False, _sample_snapshot_residency and all UNET/CLIP storage
 # registries are disabled; no [v2.snapshot_residency] lines are printed.
 # Set COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS=1 to enable.
-_RESIDENCY_DIAGNOSTICS_ENABLED: bool = (
-    os.environ.get("COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "0") == "1"
-)
+_RESIDENCY_DIAGNOSTICS_ENABLED: bool = env_flag("COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS")
 
 # ── V2 full-trace lifecycle gate ──────────────────────────────────────
 # Inert when COMFYMODAL_V2_FULL_TRACE != '1'.  The full-trace session
 # is created at restore entry and finalized after the first request.
-_V2_FULL_TRACE_ENABLED: bool = (
-    os.environ.get("COMFYMODAL_V2_FULL_TRACE", "") == "1"
-)
+_V2_FULL_TRACE_ENABLED: bool = env_flag("COMFYMODAL_V2_FULL_TRACE")
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
@@ -669,15 +711,71 @@ def _cpu_model_snapshot_enabled() -> bool:
     Rejects the combination with COMFYMODAL_ENABLE_GPU_SNAPSHOT == '1'
     with a clear RuntimeError.
     """
-    enabled = os.environ.get("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0") == "1"
+    profile = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
+    enabled = env_flag("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT")
+    if profile == "production" and not enabled:
+        raise RuntimeError(
+            "COMFYMODAL_V2_ENV_PROFILE=production requires "
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+        )
     if not enabled:
         return False
-    if os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1":
+    if env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT"):
         raise RuntimeError(
             "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1 is incompatible with "
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT=1"
         )
     return enabled
+
+
+def _is_production_profile() -> bool:
+    return os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower() == "production"
+
+
+def _safe_snapshot_identity(value: Any, role: str) -> str:
+    if value is None:
+        return "absent"
+    identity = str(value)
+    return f"{role}:{stable_hash(identity)[:16]}"
+
+
+def production_snapshot_invariant(
+    models: Any,
+    *,
+    phase: str,
+    profile: str | None = None,
+) -> dict[str, Any]:
+    """Validate and report the production CLIP/UNET snapshot contract."""
+    profile_name = (profile or os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit")).strip().lower()
+    clip = getattr(models, "clip", None) if models is not None else None
+    unet = getattr(models, "unet", None) if models is not None else None
+    actual_clip = int(clip is not None)
+    actual_unet = int(unet is not None)
+    status = "pass" if profile_name != "production" or (actual_clip and actual_unet) else "fail"
+    reason = "models_present" if status == "pass" else f"missing_clip={1 - actual_clip};missing_unet={1 - actual_unet}"
+    result = {
+        "profile": profile_name,
+        "expected_clip": 1,
+        "expected_unet": 1,
+        "actual_clip": actual_clip,
+        "actual_unet": actual_unet,
+        "clip_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "clip_identity", None), "clip"),
+        "unet_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "unet_identity", None), "unet"),
+        "status": status,
+        "reason": reason,
+        "phase": phase,
+    }
+    if profile_name == "production":
+        print(
+            "[v2.production_snapshot_invariant] "
+            + " ".join(f"{key}={value}" for key, value in result.items()),
+            flush=True,
+        )
+        if status == "fail":
+            raise RuntimeError(
+                f"Production CPU snapshot invariant failed during {phase}: {reason}"
+            )
+    return result
 
 
 def _get_preflight_context(api: Any, module: Any) -> tuple[str, str, str]:
@@ -1620,9 +1718,7 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "max_inputs": actual.max_inputs,
         # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "snapshot_enabled": str(actual.enable_memory_snapshot),
-        "gpu_snapshot_enabled": str(
-            os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
-        ),
+        "gpu_snapshot_enabled": str(env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")),
         # â”€â”€ Volume names and mount paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "models_volume": actual.models_volume_name,
         "runtime_state_volume": actual.runtime_state_volume_name,
@@ -1659,23 +1755,8 @@ def _parse_memory_mb() -> int:
 
 
 def _parse_evict_models_before_snapshot() -> bool:
-    """Strict parse COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT.
-
-    Absent, empty, or ``"0"`` → disabled (False).
-    ``"1"`` → enabled (True).
-    Any other nonempty value → RuntimeError.
-    """
-    raw = os.environ.get("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT", "")
-    if not raw:
-        return False
-    if raw == "1":
-        return True
-    if raw == "0":
-        return False
-    raise RuntimeError(
-        f"COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT={raw!r} is invalid; "
-        f"expected absent, empty, '0', or '1'"
-    )
+    """Parse the model-eviction feature flag using the shared V2 parser."""
+    return env_flag("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT")
 
 
 def _parse_evict_retain_role() -> str:
@@ -1769,7 +1850,7 @@ def _snapshot_target_fingerprint(
     _env = _runtime_env()
 
     # Experimental_options GPU snapshot flag
-    _enable_gpu_snapshot = os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+    _enable_gpu_snapshot = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
 
     # Volume name + mount path identities
     _vol_mount_paths: dict[str, str] = {
@@ -1899,6 +1980,9 @@ def _runtime_env() -> dict[str, str]:
     ``image.env()`` precede ``add_local_python_source`` does not apply.
     """
     env = {
+        "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
+            "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ),
         "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0"
         ),
@@ -1907,6 +1991,33 @@ def _runtime_env() -> dict[str, str]:
         ),
         "COMFYMODAL_V2_UNET_FORWARD_DIAG": os.environ.get(
             "COMFYMODAL_V2_UNET_FORWARD_DIAG", "0"
+        ),
+        "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "0"
+        ),
+        "COMFYMODAL_V2_DEEP_MODEL_DIAG": os.environ.get(
+            "COMFYMODAL_V2_DEEP_MODEL_DIAG", "0"
+        ),
+        "COMFYMODAL_V2_PAGEFAULT_TRACKING": os.environ.get(
+            "COMFYMODAL_V2_PAGEFAULT_TRACKING", "1"
+        ),
+        "COMFYMODAL_V2_PREFILL_LANES": os.environ.get(
+            "COMFYMODAL_V2_PREFILL_LANES", "critical"
+        ),
+        "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": os.environ.get(
+            "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET", ""
+        ),
+        "COMFYMODAL_PRELOAD_MODE": os.environ.get(
+            "COMFYMODAL_PRELOAD_MODE", "clip_only"
+        ),
+        "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": os.environ.get(
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "0"
+        ),
+        "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": os.environ.get(
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "1"
+        ),
+        "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": os.environ.get(
+            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "1"
         ),
         # Full-trace and profile env keys (always present with defaults)
         "COMFYMODAL_V2_FULL_TRACE": os.environ.get(
@@ -3292,7 +3403,9 @@ def _persist_v2_dependency_manifest(
     _t0 = time.time()
 
     # 1. Load baked custom-node dependency manifest (no I/O beyond file read)
+    _baked_read_started = _v2_startup_stage("baked_manifest_read", "start")
     _baked_mft = legacy_module.load_baked_custom_node_dependency_manifest()
+    _v2_startup_stage("baked_manifest_read", "end", started=_baked_read_started)
     _baked_ok = bool(_baked_mft and _baked_mft.get("overall_dependency_hash"))
 
     # 2. Resolve repair mode via the legacy API
@@ -4402,11 +4515,14 @@ class ModalRuntimeEntrypoint:
         _ev_marker = getattr(self, "_eviction_marker", None)
         if _marker_present == 0 and _ev_marker is not None:
             _marker_present = 1
-        _cpu_snap_models_present = 1 if getattr(self, "_cpu_snapshot_models", None) is not None else 0
-        # clip_present/unet_present are ALWAYS 0 — the retained model
-        # is tracked via retain_role / retained_model_id / retained_model_type.
-        _clip_present_flag = 0
-        _unet_present_flag = 0
+        _cpu_snap_models = getattr(self, "_cpu_snapshot_models", None)
+        _cpu_snap_models_present = 1 if _cpu_snap_models is not None else 0
+        _clip_present_flag = int(
+            _cpu_snap_models is not None and getattr(_cpu_snap_models, "clip", None) is not None
+        )
+        _unet_present_flag = int(
+            _cpu_snap_models is not None and getattr(_cpu_snap_models, "unet", None) is not None
+        )
         # Retained model state
         _retained_role: str = getattr(self, "_snapshot_eviction_retained_role", "none")
         _retained_id: int = getattr(self, "_snapshot_eviction_retained_model_id", 0)
@@ -4422,8 +4538,7 @@ class ModalRuntimeEntrypoint:
         _native_count = _restore_obs_mem.get("native_thread_count", "absent")
         _torch_intraop = _restore_obs_mem.get("torch_intraop_threads", "absent")
         _torch_interop = _restore_obs_mem.get("torch_interop_threads", "absent")
-        # Emit restore_observed with retained fields; clip_present/unet_present
-        # are always 0 as required.
+        # Emit restore_observed with the actual snapshotted role presence.
         _obs_wall_ns = time.time_ns()
         print(
             f"[v2.snapshot_model_eviction] stage=restore_observed "
@@ -4773,6 +4888,69 @@ class ModalRuntimeEntrypoint:
                 volume.reload()
 
         def sync_custom_nodes() -> Any:
+            # The image already contains the production custom nodes.  Avoid
+            # copying the volume over them when the persisted generation is an
+            # exact match for the image-baked source.  This decision is
+            # intentionally O(1): it reads only the baked manifest and the
+            # existing generation record, never walks or hashes node files.
+            _baked_generation = ""
+            _current_generation = ""
+            _current_source = "unavailable"
+            _fallback_reason = "identity_unavailable"
+            try:
+                _baked_manifest = module.load_baked_custom_node_dependency_manifest()
+                _baked_generation = str(
+                    (_baked_manifest or {}).get(
+                        "production_custom_node_generation", ""
+                    )
+                    or ""
+                )
+                _custom_nodes_volume = getattr(module, "custom_nodes_vol", None)
+                if _custom_nodes_volume is not None:
+                    _reload = getattr(_custom_nodes_volume, "reload", None)
+                    if callable(_reload):
+                        _reload()
+                _current_generation, _current_source = (
+                    module._resolve_custom_nodes_generation(
+                        api=api, authoritative_only=True
+                    )
+                )
+                _current_generation = str(_current_generation or "")
+                if _baked_generation and _current_generation:
+                    if _baked_generation == _current_generation:
+                        print(
+                            "[v2.custom_node_startup] "
+                            "decision=snapshot_exact_skip callback_called=0 "
+                            f"source={_current_source} "
+                            f"generation={_current_generation[:16]}",
+                            flush=True,
+                        )
+                        return (
+                            {
+                                "created": [],
+                                "removed": [],
+                                "kept": [],
+                                "blocked": [],
+                                "skipped": True,
+                                "skip_reason": "snapshot_exact_generation",
+                            },
+                            getattr(api, "_custom_nodes_state", ()),
+                        )
+                    _fallback_reason = "generation_mismatch"
+                elif not _baked_generation:
+                    _fallback_reason = "baked_generation_missing"
+                elif not _current_generation:
+                    _fallback_reason = "current_generation_missing"
+            except Exception as _startup_identity_exc:
+                _fallback_reason = type(_startup_identity_exc).__name__
+            print(
+                "[v2.custom_node_startup] decision=fallback_full_sync "
+                "callback_called=1 "
+                f"reason={_fallback_reason} "
+                f"baked_generation={_baked_generation[:16]} "
+                f"current_generation={_current_generation[:16]}",
+                flush=True,
+            )
             return api._sync_custom_nodes_from_volume()
 
         def install_requirements() -> Any:
@@ -4934,6 +5112,12 @@ class ModalRuntimeEntrypoint:
 
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
+        _snap_enter_started = _v2_startup_stage("snap_true_enter", "start")
+        _v2_startup_stage(
+            "container_python_import",
+            "end",
+            started=(_V2_IMPORT_START_WALL_NS, _V2_IMPORT_START_MONO_NS),
+        )
         _report_host_memory("restore_start")
         _startup_perf = time.perf_counter()
         identity = _capture_remote_identity()
@@ -4964,6 +5148,7 @@ class ModalRuntimeEntrypoint:
             metadata=_resource_identity(),
         )
         trace.emit("remote_lifecycle_start", phase="lifecycle", metadata={"snapshot": "True"})
+        _v2_startup_stage("snap_true_enter", "end", started=_snap_enter_started, trace=trace)
         _fp = _snapshot_target_fingerprint()
         _spec = _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
         _gpu_str = ",".join(_spec.gpu) if _spec.gpu else "none"
@@ -5024,11 +5209,19 @@ class ModalRuntimeEntrypoint:
             # manifest_missing preflight failures when no V1 snapshot
             # had created the shared manifest.
             if self._legacy_module is not None and self._legacy_api is not None:
-                _persist_v2_dependency_manifest(
-                    state,
-                    self._legacy_module,
-                    self._legacy_api,
-                )
+                _dependency_started = _v2_startup_stage("dependency_validation", "start", trace=trace)
+                try:
+                    _persist_v2_dependency_manifest(
+                        state,
+                        self._legacy_module,
+                        self._legacy_api,
+                    )
+                finally:
+                    _v2_startup_stage(
+                        "dependency_validation", "end",
+                        started=_dependency_started,
+                        trace=trace,
+                    )
 
             # Request-specific startup certificates are no longer built from a
             # shared current plan.  The actual request validates its workflow
@@ -5046,6 +5239,11 @@ class ModalRuntimeEntrypoint:
                     # Derive profile from the live snapshot-preload profile.
                     cpu_profile = self._cpu_snapshot_profile(api)
                     if cpu_profile is None:
+                        if _is_production_profile():
+                            raise RuntimeError(
+                                "Production CPU snapshot profile is unavailable; "
+                                "CLIP and UNET cannot be retained"
+                            )
                         print(
                             "[v2.cpu_snapshot] status=skipped reason=profile_unavailable "
                             "phase=construction "
@@ -5101,12 +5299,16 @@ class ModalRuntimeEntrypoint:
                         # Resolve original from class-level _comfy_modal_v2_original (unbound)
                         # when V2 wrappers are installed; otherwise use the bound method.
                         def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
-                            return _load_cpu_snapshot_unet(
-                                unet_name,
-                                weight_dtype,
-                                target_gpus=_target_gpus,
-                                unet_cls=_unet_cls,
-                            )
+                            _started = _v2_startup_stage("unet_snapshot_load", "start", trace=trace)
+                            try:
+                                return _load_cpu_snapshot_unet(
+                                    unet_name,
+                                    weight_dtype,
+                                    target_gpus=_target_gpus,
+                                    unet_cls=_unet_cls,
+                                )
+                            finally:
+                                _v2_startup_stage("unet_snapshot_load", "end", started=_started, trace=trace)
 
                         # CLIP loader: returns first public output.
                         # load_cpu_snapshot_models passes 3 positional args for single
@@ -5117,6 +5319,13 @@ class ModalRuntimeEntrypoint:
                         # Inspect the original callable's signature; pass device='cpu'
                         # only when the method accepts it, otherwise omit.
                         def _cpu_load_clip(*args: Any) -> Any:
+                            _started = _v2_startup_stage("clip_snapshot_load", "start", trace=trace)
+                            try:
+                                return _cpu_load_clip_impl(*args)
+                            finally:
+                                _v2_startup_stage("clip_snapshot_load", "end", started=_started, trace=trace)
+
+                        def _cpu_load_clip_impl(*args: Any) -> Any:
                             clip_name = args[0] if args else ""
                             is_dual = len(args) >= 4
                             if is_dual:
@@ -5185,6 +5394,10 @@ class ModalRuntimeEntrypoint:
                                     resolve_path=_cpu_resolve_path,
                                     trace=trace,
                                     target_gpus=_target_gpus,
+                                )
+                                production_snapshot_invariant(
+                                    _cpu_models,
+                                    phase="startup",
                                 )
                         finally:
                             if _mmap_orig is _MISSING:
@@ -5378,7 +5591,11 @@ class ModalRuntimeEntrypoint:
         # Pre-import transformers, diffusers, cache_dit in snapshot-safe mode.
         # Resolves only safe immutable metadata/classes/config validation;
         # does NOT create prompt/timestep/cache/latent/CUDA/session state.
-        _cd_preimport = preimport_cachedit_family()
+        _cachedit_started = _v2_startup_stage("cachedit_preparation", "start", trace=trace)
+        try:
+            _cd_preimport = preimport_cachedit_family()
+        finally:
+            _v2_startup_stage("cachedit_preparation", "end", started=_cachedit_started, trace=trace)
         if not _cd_preimport["ok"]:
             _cd_errors = "; ".join(_cd_preimport["errors"])
             raise RuntimeError(
@@ -5443,6 +5660,28 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
 
+        _v2_startup_stage(
+            "vae_preparation", "start", trace=trace,
+            metadata={"status": "skipped", "reason": "vae_not_part_of_cpu_snapshot"},
+        )
+        _v2_startup_stage(
+            "vae_preparation", "end", trace=trace,
+            metadata={"status": "skipped", "reason": "vae_not_part_of_cpu_snapshot", "duration_ms": 0.0},
+        )
+
+        _startup_return_wall_ns = time.time_ns()
+        _startup_return_mono_ns = time.monotonic_ns()
+        _V2_STARTUP_CALLBACK_RETURN.update({
+            "wall_unix_ns": _startup_return_wall_ns,
+            "monotonic_ns": _startup_return_mono_ns,
+            "pid": os.getpid(),
+        })
+        _v2_startup_stage(
+            "snapshot_startup_callback", "return", trace=trace,
+            metadata={"status": "ready"},
+        )
+        _restore_timing["snapshot_startup_callback_return_wall_unix_ns"] = _startup_return_wall_ns
+        _restore_timing["snapshot_startup_callback_return_mono_ns"] = _startup_return_mono_ns
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -5661,6 +5900,31 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        _restore_stage_started = _v2_startup_stage("post_snapshot_restore", "start")
+        _callback_return = dict(_V2_STARTUP_CALLBACK_RETURN)
+        _snapshot_callback_age_at_restore_ms: float | None = None
+        if _callback_return.get("monotonic_ns") and _callback_return.get("pid") == os.getpid():
+            _snapshot_callback_age_at_restore_ms = round(
+                (time.monotonic_ns() - int(_callback_return["monotonic_ns"])) / 1_000_000,
+                3,
+            )
+            print(
+                f"[v2.snapshot_timing] "
+                f"snapshot_callback_age_at_restore_ms={max(0.0, _snapshot_callback_age_at_restore_ms)} "
+                f"snapshot_callback_to_command_start_ms=unavailable "
+                f"command_start_to_restore_start_ms=unavailable "
+                f"request_latency_included=0 source=snapshot_callback_return_to_restore_start",
+                flush=True,
+            )
+        else:
+            print(
+                "[v2.snapshot_timing] "
+                "snapshot_callback_age_at_restore_ms=unavailable "
+                "snapshot_callback_to_command_start_ms=unavailable "
+                "command_start_to_restore_start_ms=unavailable "
+                "request_latency_included=0 reason=callback_marker_unavailable_or_cross_process",
+                flush=True,
+            )
 
         # ── Eviction restore: inspect marker and apply idle ──────────────
         # FIRST executable ordering: marker inspection and idle delay
@@ -5671,6 +5935,11 @@ class ModalRuntimeEntrypoint:
         # before lazy_init on older unpickled instances.
         self._restore_eviction_boundary()
         self._lazy_init_snapshot_state()
+        if _is_production_profile():
+            production_snapshot_invariant(
+                getattr(self, "_cpu_snapshot_models", None),
+                phase="restore",
+            )
 
         # ── Torch thread limit: earliest executable point ─────────────────
         # Applied before normal restore work, _configure_runtime, plan
@@ -6460,7 +6729,18 @@ class ModalRuntimeEntrypoint:
                         except Exception as _cd_exc:
                             print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
 
-                    _do_cachedit_restore_prepare()
+                    _cachedit_restore_started = _v2_startup_stage(
+                        "cachedit_preparation", "start", trace=trace, phase="restore"
+                    )
+                    try:
+                        _do_cachedit_restore_prepare()
+                    finally:
+                        _v2_startup_stage(
+                            "cachedit_preparation", "end",
+                            started=_cachedit_restore_started,
+                            trace=trace,
+                            phase="restore",
+                        )
                     # ── Build CPU storage registries after final CacheDiT-patched UNET ──
                     self._cpu_snapshot_unet_storage_registry = None
                     self._cpu_snapshot_clip_storage_registry = None
@@ -6534,7 +6814,18 @@ class ModalRuntimeEntrypoint:
                         except Exception as _r4_exc:
                             print(f"[v2.res4lyf_restore] error={_r4_exc}", flush=True)
 
-                    _do_res4lyf_restore_prepare()
+                    _res4lyf_started = _v2_startup_stage(
+                        "res4lyf_preparation", "start", trace=trace, phase="restore"
+                    )
+                    try:
+                        _do_res4lyf_restore_prepare()
+                    finally:
+                        _v2_startup_stage(
+                            "res4lyf_preparation", "end",
+                            started=_res4lyf_started,
+                            trace=trace,
+                            phase="restore",
+                        )
                     _activation_duration_ms = round(
                         (time.perf_counter() - _activation_perf_start) * 1000.0,
                         3,
@@ -6867,6 +7158,9 @@ class ModalRuntimeEntrypoint:
                     "restore_method_end_wall_unix_ns": restore_end_wall_ns_local,
                     "restore_method_end_mono_ns": restore_end_mono_ns_local,
                     "restore_method_status": "success",
+                    "snapshot_callback_age_at_restore_ms": _snapshot_callback_age_at_restore_ms,
+                    "snapshot_startup_callback_return_wall_unix_ns": _callback_return.get("wall_unix_ns"),
+                    "snapshot_startup_callback_return_mono_ns": _callback_return.get("monotonic_ns"),
                 }
                 if state.stage_durations:
                     for _stage, _dur_ms in state.stage_durations.items():
@@ -7023,6 +7317,12 @@ class ModalRuntimeEntrypoint:
             )
             return _restore_result
         finally:
+            _v2_startup_stage(
+                "post_snapshot_restore", "end",
+                started=_restore_stage_started,
+                trace=locals().get("trace"),
+                phase="restore",
+            )
             # Clear process-global restore-stage timers to prevent stale
             # accumulation on the next restore.  This finally runs regardless
             # of success or cancellation.
@@ -7102,7 +7402,16 @@ class ModalRuntimeEntrypoint:
         # the bridge and deactivate without rebuilding the snapshot.
         self._lazy_init_snapshot_state()
         _bind_perf = time.perf_counter()
-        if self._cpu_snapshot_models_active and self._cpu_snapshot_models is not None:
+        _snapshot_models_for_request = getattr(self, "_cpu_snapshot_models", None)
+        print(
+            "[v2.cpu_snapshot_models] "
+            f"cpu_snapshot_models_present={int(_snapshot_models_for_request is not None)} "
+            f"clip_present={int(_snapshot_models_for_request is not None and getattr(_snapshot_models_for_request, 'clip', None) is not None)} "
+            f"unet_present={int(_snapshot_models_for_request is not None and getattr(_snapshot_models_for_request, 'unet', None) is not None)} "
+            f"cpu_snapshot_active={int(bool(self._cpu_snapshot_models_active))}",
+            flush=True,
+        )
+        if self._cpu_snapshot_models is not None:
             try:
                 workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
                 model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
@@ -7178,6 +7487,11 @@ class ModalRuntimeEntrypoint:
                     )
                 else:
                     # Model identity differs — clear bridge and deactivate.
+                    if _is_production_profile():
+                        raise RuntimeError(
+                            "Production CPU snapshot model/spec identity mismatch; "
+                            "refusing graph-loader fallback"
+                        )
                     self._preload_bridge.clear()
                     self._cpu_snapshot_models_active = False
                     self._cpu_snapshot_unet_runtime_state = None
@@ -7222,6 +7536,11 @@ class ModalRuntimeEntrypoint:
                     f"reason=error:{str(_bind_exc)[:80]}",
                     flush=True,
                 )
+                if _is_production_profile():
+                    raise RuntimeError(
+                        "Production CPU snapshot activation failed; "
+                        "refusing graph-loader fallback: " + str(_bind_exc)
+                    ) from _bind_exc
         # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€
         # Schedule prefill immediately after graph start so it runs
         # concurrently with execution setup.  The callback waits for both
@@ -8428,6 +8747,9 @@ class ModalRuntimeEntrypoint:
                         if "sampler_first_progress_ns" not in _milestones:
                             _milestones["sampler_first_progress_ns"] = time.monotonic_ns()
                             _milestones["sampler_first_progress_event"] = event
+                        if event != "progress" and "sampler_first_stage_ns" not in _milestones:
+                            _milestones["sampler_first_stage_ns"] = _milestones["sampler_first_progress_ns"]
+                            _milestones["sampler_first_stage_event"] = event
                     return _orig_send_sync(*args, **kwargs)
                 setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
                 _server.send_sync = _send_sync_wrapper
@@ -8501,6 +8823,12 @@ class ModalRuntimeEntrypoint:
                     flush=True,
                 )
 
+            _first_prompt_executor_started = None
+            if not getattr(self, "_v2_first_prompt_executor_seen", False):
+                self._v2_first_prompt_executor_seen = True
+                _first_prompt_executor_started = _v2_startup_stage(
+                    "first_prompt_executor_invocation", "start", trace=trace, phase="request"
+                )
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -8510,6 +8838,13 @@ class ModalRuntimeEntrypoint:
                     else:
                         executor.execute(**execute_kwargs)
             finally:
+                if _first_prompt_executor_started is not None:
+                    _v2_startup_stage(
+                        "first_prompt_executor_invocation", "end",
+                        started=_first_prompt_executor_started,
+                        trace=trace,
+                        phase="request",
+                    )
                 # ── Torch profiler: stop on SAME PromptExecutor thread ──
                 if _ft_torch_started:
                     try:
@@ -8561,10 +8896,27 @@ class ModalRuntimeEntrypoint:
             _first_sampler_ns = _milestones.get("first_sampler_node_ns") if _milestones else None
             # Fix 3: authoritative sampling_start from SAMPLER_SAMPLE wrapper (not progress).
             _sampling_start_ns: int | None = None
+            _sampler_node_id = ""
+            _sampler_class_type = ""
+            _sampler_identification_source = "unavailable"
             for _ev in trace.events:
                 if _ev.name == "sampling_start":
                     _sampling_start_ns = _ev.monotonic_ns
+                    _sampling_meta = _ev.metadata if isinstance(_ev.metadata, Mapping) else {}
+                    _sampler_node_id = str(_sampling_meta.get("node_id") or "")
+                    _sampler_class_type = str(_sampling_meta.get("node_class") or "")
+                    if _sampler_node_id and _sampler_class_type:
+                        _sampler_identification_source = "sampling_start_instrumentation"
                     break
+            if _sampling_start_ns is None:
+                _sampling_start_ns = _milestones.get("sampler_first_stage_ns") if _milestones else None
+            if not _sampler_node_id and _first_sampler_node_id:
+                _sampler_node_id = str(_first_sampler_node_id)
+                _sampler_class_type = str(
+                    _milestones.get("first_sampler_node_class", "") if _milestones else ""
+                )
+                if _sampler_node_id and _sampler_class_type:
+                    _sampler_identification_source = "execution_plan_sampler_class_type"
             # â”€â”€ Full-trace: sampling_start milestone when detected â”€â”€
             if _sampling_start_ns is not None:
                 try:
@@ -8574,6 +8926,7 @@ class ModalRuntimeEntrypoint:
                 except Exception:
                     pass
             _first_sampler_stage_event = _milestones.get("sampler_first_progress_event", "") if _milestones else ""
+            _first_sampler_stage_ns = _milestones.get("sampler_first_progress_ns") if _milestones else None
             _exec_st_val = round((_exec_st_ns - _execute_call_ns) / 1_000_000, 3) if _exec_st_ns else None
             _exec_to_cache = round((_cached_ns - _exec_st_ns) / 1_000_000, 3) if _exec_st_ns and _cached_ns else None
             _cache_to_node = round((_first_ns - _cached_ns) / 1_000_000, 3) if _cached_ns and _first_ns else None
@@ -8602,8 +8955,13 @@ class ModalRuntimeEntrypoint:
                     # Loader/CLIP/sampler node classification (B)
                     "first_loader_node_id": _first_loader_node_id,
                     "first_clip_encode_node_id": _first_clip_encode_node_id,
-                    "first_sampler_node_id": _first_sampler_node_id,
+                    "first_sampler_node_id": _sampler_node_id,
                     "first_sampler_stage_event": _first_sampler_stage_event,
+                    "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
+                    "sampler_node_id": _sampler_node_id or "unavailable",
+                    "sampler_class_type": _sampler_class_type or "unavailable",
+                    "sampler_identification_source": _sampler_identification_source,
+                    "sampler_node_to_sampling_start_ms": _sampler_node_to_sampler_start_ms,
                     # Node-to-node intervals (B)
                     "first_node_to_clip_ms": _first_node_to_clip_ms,
                     "clip_to_sampler_node_ms": _clip_to_sampler_node_ms,
@@ -8616,23 +8974,16 @@ class ModalRuntimeEntrypoint:
                     "sampling_start_monotonic_ns": _sampling_start_ns,
                 })
 
-            # â”€â”€ Classify sampler stage from first executing node â”€â”€
+            # â”€â”€ Classify sampler stage from authoritative sampler evidence â”€â”€
             _sampler_stage_status: str = "awaiting_classification"
-            if _first_exec_node_class:
-                if "Sampler" in _first_exec_node_class or "KSampler" in _first_exec_node_class:
-                    _sampler_stage_status = "sampler_active"
-                elif "CLIPTextEncode" in _first_exec_node_class or "TextEncode" in _first_exec_node_class:
-                    _sampler_stage_status = "text_encoding"
-                elif "CLIP" in _first_exec_node_class:
-                    _sampler_stage_status = "clip_loading"
-                elif "VAE" in _first_exec_node_class:
-                    _sampler_stage_status = "vae_loading"
-                elif "UNET" in _first_exec_node_class or "UNet" in _first_exec_node_class:
-                    _sampler_stage_status = "unet_loading"
-                elif "Load" in _first_exec_node_class:
-                    _sampler_stage_status = f"loading:{_first_exec_node_class}"
-                else:
-                    _sampler_stage_status = f"other:{_first_exec_node_class}"
+            if _sampling_start_ns is not None:
+                _sampler_stage_status = "sampler_active"
+            elif "TextEncode" in _first_exec_node_class or "CLIP" in _first_exec_node_class:
+                _sampler_stage_status = "text_encoding"
+            elif "Sampler" in _first_exec_node_class or "KSampler" in _first_exec_node_class:
+                _sampler_stage_status = "sampler_active"
+            elif _first_exec_node_class:
+                _sampler_stage_status = "unavailable"
 
             # â”€â”€ Compute setup intervals from existing trace events â”€â”€â”€â”€â”€â”€â”€
             _cert_ms = self._interval_from_trace(trace, "certificate_reload_start", "certificate_reload_end")
@@ -8796,7 +9147,12 @@ class ModalRuntimeEntrypoint:
                 "first_clip_encode_node_class": _milestones.get("first_clip_encode_node_class", "") if _milestones else "",
                 "first_sampler_node_id": _first_sampler_node_id,
                 "first_sampler_node_class": _milestones.get("first_sampler_node_class", "") if _milestones else "",
+                "sampler_node_id": _sampler_node_id or "unavailable",
+                "sampler_class_type": _sampler_class_type or "unavailable",
+                "sampler_identification_source": _sampler_identification_source,
+                "sampler_node_to_sampling_start_ms": _sampler_node_to_sampler_start_ms,
                 "first_sampler_stage_event": _first_sampler_stage_event,
+                "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
                 # Raw monotonic-ns timestamps
                 "first_executing_node_monotonic_ns": _first_exec_node_ns,
                 "first_loader_node_monotonic_ns": _first_loader_node_ns,
@@ -9040,6 +9396,12 @@ class ModalRuntimeEntrypoint:
             if _asset_commit_task is not None:
                 _asset_commit_diag = await _asset_commit_task
                 _asset_diag.update(_asset_commit_diag)
+            if not getattr(self, "_v2_first_durable_result_seen", False):
+                self._v2_first_durable_result_seen = True
+                _v2_startup_stage(
+                    "first_durable_result", "ready", phase="request",
+                    metadata={"output_persisted": 1},
+                )
             # Compute overlap between commit and descriptor build intervals
             _commit_start = _asset_diag.get("commit_start_mono_ns", 0)
             _commit_end = _asset_diag.get("commit_end_mono_ns", 0)
@@ -9134,7 +9496,7 @@ class ModalRuntimeEntrypoint:
                 "pre_sampler_unattributed_ms": _pre_sampler_state.get("pre_sampler_unattributed_ms"),
                 "sampler_node_to_sampler_start_ms": _pre_sampler_state.get("sampler_node_to_sampler_start_ms"),
             }
-            # Structured pre-sampler report removed — use _v2_critical_path_data instead
+            _attach_structured_report(result, _pre_sampler_state)
 
             # â”€â”€ Write validation certificate after successful execution â”€â”€
             # Schema v2 certs include preflight_ok=True to attest that
@@ -9559,6 +9921,18 @@ class ModalRuntimeEntrypoint:
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
+        _v2_startup_stage("first_remote_method_entry", "entry", phase="request")
+        _callback_return = dict(_V2_STARTUP_CALLBACK_RETURN)
+        if _callback_return.get("monotonic_ns") and _callback_return.get("pid") == _method_first_line_pid:
+            _method_gap_ms = round(
+                (_method_first_line_ns - int(_callback_return["monotonic_ns"])) / 1_000_000,
+                3,
+            )
+            print(
+                f"[v2.platform_snapshot_capture_or_resume_gap] status=measured "
+                f"gap_ms={max(0.0, _method_gap_ms)} source=snapshot_callback_return_to_first_method_entry",
+                flush=True,
+            )
         # Consistent field-name aliases for method-entry timestamps
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
@@ -9575,6 +9949,37 @@ class ModalRuntimeEntrypoint:
         if isinstance(_safe_payload, dict):
             _request_origin_info = dict(_safe_payload.pop("__request_origin_info__", {}) or {})
         _t4_request_id = str(_request_origin_info.get("request_id", request_id or ""))
+
+        _restore_timing_for_age = self._restore_timing or _LATEST_LIFECYCLE_TIMING or {}
+        _callback_wall_for_age = _restore_timing_for_age.get(
+            "snapshot_startup_callback_return_wall_unix_ns"
+        )
+        if _callback_wall_for_age is None:
+            _callback_wall_for_age = _restore_timing_for_age.get(
+                "snapshot_callback_return_wall_unix_ns"
+            )
+        _restore_start_wall_for_age = _restore_timing_for_age.get(
+            "remote_python_resume_wall_unix_ns"
+        )
+        _command_start_ms_for_age = _request_origin_info.get("command_start_unix_ms")
+        if _command_start_ms_for_age is None:
+            _command_start_ms_for_age = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
+        _snapshot_callback_to_command_start_ms: float | None = None
+        _command_start_to_restore_start_ms: float | None = None
+        if isinstance(_callback_wall_for_age, (int, float)) and isinstance(_command_start_ms_for_age, (int, float)):
+            _value = float(_command_start_ms_for_age) * 1_000_000.0 - float(_callback_wall_for_age)
+            if _value >= 0:
+                _snapshot_callback_to_command_start_ms = round(_value / 1_000_000.0, 3)
+        if isinstance(_restore_start_wall_for_age, (int, float)) and isinstance(_command_start_ms_for_age, (int, float)):
+            _value = float(_restore_start_wall_for_age) - float(_command_start_ms_for_age) * 1_000_000.0
+            if _value >= 0:
+                _command_start_to_restore_start_ms = round(_value / 1_000_000.0, 3)
+        _snapshot_age_at_restore = _restore_timing_for_age.get("snapshot_callback_age_at_restore_ms")
+        context_snapshot_age = {
+            "snapshot_callback_age_at_restore_ms": _snapshot_age_at_restore,
+            "snapshot_callback_to_command_start_ms": _snapshot_callback_to_command_start_ms,
+            "command_start_to_restore_start_ms": _command_start_to_restore_start_ms,
+        }
 
         # â”€â”€ Re-emit local submission breakdown from client â”€â”€â”€â”€â”€â”€
         _local_submission_breakdown = _request_origin_info.pop("local_submission_breakdown", None)
@@ -9659,6 +10064,7 @@ class ModalRuntimeEntrypoint:
             **_entry_host,
             **_resource_identity(),
         )
+        context.trace.set_metadata(**context_snapshot_age)
         if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
             _cgroup_sampler.set_phase_source(
                 lambda: (
@@ -9762,6 +10168,12 @@ class ModalRuntimeEntrypoint:
             f"restore_method_end_wall_unix_ns={_restore_end_wall_from_timing} "
             f"modal_method_entry_wall_unix_ns={_method_first_line_wall_ns} "
             f"restore_end_to_modal_method_ms={_restore_end_to_modal_ms}",
+            flush=True,
+        )
+        print(
+            "[v2.snapshot_timing] "
+            + " ".join(f"{key}={value if value is not None else 'unavailable'}" for key, value in context_snapshot_age.items())
+            + " request_latency_included=0_for_callback_age",
             flush=True,
         )
 
@@ -9967,6 +10379,15 @@ class ModalRuntimeEntrypoint:
                 data["trace"] = merged.to_dict()
                 data["trace"]["stages"] = _legacy_stages
                 data["phase_durations_ms"] = merged.export_phase_durations()
+                data.update(context_snapshot_age)
+                _legacy_read_drain = getattr(self._legacy_module, "_drain_completed_active_read_diagnostics", None)
+                if callable(_legacy_read_drain):
+                    _active_read_records = _legacy_read_drain(_t4_request_id or request_id)
+                    if _active_read_records:
+                        _structured_report = data.get("pre_sampler_structured_report")
+                        _structured_report = dict(_structured_report) if isinstance(_structured_report, Mapping) else {}
+                        _structured_report["active_read_records"] = _active_read_records
+                        data["pre_sampler_structured_report"] = _structured_report
                 _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
                 if _rt is not None and "_restore_timing" not in data:
                     data["_restore_timing"] = dict(_rt)
@@ -10175,6 +10596,32 @@ class ModalRuntimeEntrypoint:
                     _cgroup_sampler.report()
                     self._cgroup_sampler = None
                     _cgroup_sampler = None
+                if str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}:
+                    try:
+                        _benchmark_run_index = _request_origin_info.get("benchmark_run_index", 0)
+                        try:
+                            _benchmark_run_number = int(_benchmark_run_index) + 1
+                        except (TypeError, ValueError):
+                            _benchmark_run_number = 1
+                        _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
+                        if not isinstance(_command_start_ms, (int, float)) or isinstance(_command_start_ms, bool):
+                            _command_start_ms = None
+                        _waterfall_started_ms = (time.monotonic_ns() - _method_first_line_ns) / 1_000_000
+                        _waterfall_now_ns = time.time_ns()
+                        _waterfall = build_waterfall(
+                            result=data,
+                            timing=data.get("timing", {}) if isinstance(data.get("timing"), Mapping) else {},
+                            wall_ms=_waterfall_started_ms,
+                            command_start_unix_ms=int(_command_start_ms) if _command_start_ms is not None else None,
+                            response_received_unix_ns=_waterfall_now_ns,
+                            run_label=f"remote benchmark run {_benchmark_run_number}",
+                        )
+                        print(render_waterfall(_waterfall), flush=True)
+                    except Exception as _waterfall_exc:
+                        print(
+                            f"[v2.waterfall] status=error error_type={type(_waterfall_exc).__name__}",
+                            flush=True,
+                        )
             yield event
 
     async def run_prompt_stream(
@@ -10349,7 +10796,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         target_inputs=spec.target_inputs,
         max_inputs=spec.max_inputs,
     )(remote_class)
-    _enable_gpu_snapshot = os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+    _enable_gpu_snapshot = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
     # Pass ordered GPU list for Modal's native ordered-GPU fallback.
     _gpu_arg: str | list[str] = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
     _volumes: dict[str, Any] = {

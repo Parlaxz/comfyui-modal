@@ -238,6 +238,18 @@ class StudioDirectRunPreparationTests(unittest.TestCase):
             self.assertIn("profile_preparer", ctx)
             self.assertTrue(callable(ctx["profile_preparer"]))
 
+    def test_output_binding_is_available_when_production_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_basic_snapshot()
+            preset = _make_basic_preset()
+            _write_store_files(tmp, [snap], [preset])
+            ctx = self.mod._prepare_studio_run_context(
+                "preset_test", "txt2img", {"prompt": "hello"}, tmp,
+                modal_options={"production": {"enabled": False}},
+            )
+            self.assertEqual(ctx["status"], "ok")
+            self.assertEqual(self.mod._derive_output_node_ids(ctx["snapshot"]), ["107"])
+
     def test_prepare_missing_preset(self):
         """Preparation fails for missing preset."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -974,7 +986,12 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
             nonlocal _checker_called
             with patch("studio_run_adapter.execute_modal_prompt") as mock_exec:
                 mock_exec.return_value = {
-                    "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
+                    "outputs": {"107": {"images": [{"filename": "test.png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}]}},
+                    "_certificate_candidate": {
+                        "identity": "a" * 64,
+                        "outputs_to_execute": ["107"],
+                        "node_errors": {},
+                    },
                     "trace": {"stages": {}, "deltas_ms": {}, "derived_ms": {},
                               "trace_version": 3},
                 }

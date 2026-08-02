@@ -1097,7 +1097,7 @@ class AutoWarmupASTTests(unittest.TestCase):
 
     def test_enable_warmup_defaults_to_one(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
-        self.assertIn('ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"', source)
+        self.assertIn('ENABLE_WARMUP = env_flag("COMFYMODAL_ENABLE_WARMUP", default=True)', source)
 
     def test_restore_gpu_state_recomputes_total_vram(self):
         source = self._get_method_source("_restore_in_process_gpu_state")

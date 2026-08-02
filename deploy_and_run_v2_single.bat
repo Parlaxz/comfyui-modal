@@ -7,12 +7,27 @@ REM -- Pin environment variables ------------------------------------
 set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
-set "COMFYMODAL_V2_DEEP_MODEL_DIAG=1"
+if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
+    set "COMFYMODAL_V2_FULL_TRACE=0"
+    set "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS=0"
+    set "COMFYMODAL_V2_DEEP_MODEL_DIAG=0"
+    set "COMFYMODAL_V2_PAGEFAULT_TRACKING=0"
+    set "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=0"
+    set "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS=0"
+    set "COMFYMODAL_V2_EVICT_RETAIN_ROLE="
+    set "COMFYMODAL_V2_PREFILL_LANES=critical"
+    set "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET=0"
+    set "COMFYMODAL_V2_RESTORE_TORCH_THREADS="
+)
+if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="diagnostic" if not defined COMFYMODAL_V2_DEEP_MODEL_DIAG set "COMFYMODAL_V2_DEEP_MODEL_DIAG=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
-set "V2_BENCHMARK_RUNS=1"
-set "V2_BENCHMARK_GAP_SECONDS=0"
-set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=1"
+if not defined V2_BENCHMARK_GAP_SECONDS set "V2_BENCHMARK_GAP_SECONDS=0"
+if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
+    set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+) else if not defined COMFYMODAL_V2_CPU_MODEL_SNAPSHOT set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
 if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
 
 set "REPO_ROOT=%~dp0"
@@ -48,6 +63,45 @@ if errorlevel 1 (
 for /f "usebackq delims=" %%a in ("%WARMUP_FILE%") do set "%%a"
 if defined WARMUP_FILE if exist "%WARMUP_FILE%" del /q "%WARMUP_FILE%"
 echo === Warmup profile loaded ===
+
+REM -- Sanitized environment profile summary ------------------------
+set "V2_PROFILE_FULL_TRACE=0"
+if defined COMFYMODAL_V2_FULL_TRACE set "V2_PROFILE_FULL_TRACE=!COMFYMODAL_V2_FULL_TRACE!"
+set "V2_PROFILE_RESIDENCY=0"
+if defined COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS set "V2_PROFILE_RESIDENCY=!COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS!"
+set "V2_PROFILE_DEEP_DIAG=0"
+if defined COMFYMODAL_V2_DEEP_MODEL_DIAG set "V2_PROFILE_DEEP_DIAG=!COMFYMODAL_V2_DEEP_MODEL_DIAG!"
+set "V2_PROFILE_PAGEFAULT=0"
+if defined COMFYMODAL_V2_PAGEFAULT_TRACKING set "V2_PROFILE_PAGEFAULT=!COMFYMODAL_V2_PAGEFAULT_TRACKING!"
+set "V2_PROFILE_EVICTION=0"
+if defined COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT set "V2_PROFILE_EVICTION=!COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT!"
+set "V2_PROFILE_EVICT_IDLE=0"
+if defined COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS set "V2_PROFILE_EVICT_IDLE=!COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS!"
+set "V2_PROFILE_EVICT_ROLE=none"
+if defined COMFYMODAL_V2_EVICT_RETAIN_ROLE (
+    set "V2_PROFILE_EVICT_ROLE=!COMFYMODAL_V2_EVICT_RETAIN_ROLE!"
+)
+set "V2_PROFILE_PREFILL=critical"
+if defined COMFYMODAL_V2_PREFILL_LANES set "V2_PROFILE_PREFILL=!COMFYMODAL_V2_PREFILL_LANES!"
+set "V2_PROFILE_PREFILL_WAIT=0"
+if defined COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET set "V2_PROFILE_PREFILL_WAIT=!COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET!"
+set "V2_PROFILE_THREADS=none"
+if defined COMFYMODAL_V2_RESTORE_TORCH_THREADS (
+    set "V2_PROFILE_THREADS=!COMFYMODAL_V2_RESTORE_TORCH_THREADS!"
+)
+echo [v2.env_profile]
+echo profile=!COMFYMODAL_V2_ENV_PROFILE!
+echo cpu_model_snapshot=!COMFYMODAL_V2_CPU_MODEL_SNAPSHOT!
+echo full_trace=!V2_PROFILE_FULL_TRACE!
+echo residency_diagnostics=!V2_PROFILE_RESIDENCY!
+echo deep_model_diag=!V2_PROFILE_DEEP_DIAG!
+echo pagefault_tracking=!V2_PROFILE_PAGEFAULT!
+echo eviction_enabled=!V2_PROFILE_EVICTION!
+echo eviction_role=!V2_PROFILE_EVICT_ROLE!
+echo eviction_idle_seconds=!V2_PROFILE_EVICT_IDLE!
+echo prefill_lanes=!V2_PROFILE_PREFILL!
+echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
+echo restore_torch_threads=!V2_PROFILE_THREADS!
 
 REM -- Modal CLI detection -----------------------------------------
 where modal >nul 2>nul
@@ -234,7 +288,13 @@ if "!V1_EXISTS!"=="1" (
     echo === V1 and V2 deploys both verified OK ===
 )
 
+if /i "!COMFYMODAL_DEPLOY_ONLY!"=="1" (
+    echo === Deploy-only requested; acceptance benchmark skipped ===
+    exit /b 0
+)
+
 REM -- Acceptance benchmark (unchanged) -----------------------------
+for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMFYMODAL_COMMAND_START_UNIX_MS=%%a"
 echo === Running V2 acceptance benchmark ===
 python tools\benchmark_v2_direct.py --acceptance
 if errorlevel 1 (

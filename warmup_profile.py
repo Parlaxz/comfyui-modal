@@ -20,6 +20,7 @@ import uuid
 
 from workflow_metadata import extract_warmup_stack, stack_to_warmup_profile
 from production_workflow import HASH_SCHEMA_VERSION, COMPILER_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION
+from comfymodal_runtime.env import env_flag
 
 # ── Module-global dedup cache ──────────────────────────────────────────
 # Keyed by (app_identity, workspace_id, stable_key) → record.
@@ -172,12 +173,12 @@ def _exact_prefill_enabled() -> bool:
     so that prompt-text changes by default produce a different restore identity
     and trigger a new warmup publication.
     """
-    return os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+    return env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 
 
 def _persistent_cache_enabled() -> bool:
     """True when persistent CLIP cache is enabled."""
-    return os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
+    return env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE")
 
 
 def _emit_publish_log(decision: str, stable_key_short: str) -> None:
@@ -343,8 +344,8 @@ def _build_activation_payload(
             payload["prompt_bundle"] = bundle_res["bundle"]
     else:
         _exact_or_persistent = (
-            os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
-            or os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
+            _exact_prefill_enabled()
+            or _persistent_cache_enabled()
         )
         if _exact_or_persistent:
             try:

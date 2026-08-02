@@ -20,7 +20,7 @@
 //   3. run.output_path         → /studio/outputs/<path>
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
-import { listUnifiedHistory, updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
+import { listUnifiedHistory, listExperiments, updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 import { loadExperimentIntoPlayground } from "./studio-playground.js";
 import { el, createImagePreviewOverlay, registerLayerHandler } from "./studio-ui.js";
 
@@ -54,6 +54,42 @@ function isCompleted(run) {
 function isFailed(run) {
   const s = getRunStatus(run);
   return s === "failed" || s === "error";
+}
+
+function normalizeAggregateExperiment(rawExperiment) {
+  if (!rawExperiment) return null;
+  var definition = rawExperiment.definition || {};
+  var snapshot = rawExperiment.snapshot || {};
+  var studioMeta = definition.studio_meta || {};
+  var experimentId = rawExperiment.experiment_id || definition.experiment_id || "";
+  var totalCells = Number(snapshot.totalCells || snapshot["total" + "_cells"] || 0);
+  if (!experimentId || !String(definition.name || "").startsWith("Studio Experiment:")
+      || !Array.isArray(studioMeta.studio_preset_ids)
+      || studioMeta.studio_preset_ids.length === 0 || totalCells < 2) {
+    return null;
+  }
+
+  var counters = snapshot.counters || {};
+  var completedCount = Number(counters.completed || 0);
+  var failedCount = Number(counters.failed || 0);
+  var status = snapshot.overall_status || snapshot.status || "completed";
+  if (failedCount > 0 && completedCount === 0) status = "failed";
+  else if (failedCount > 0 && completedCount > 0) status = "partial";
+  else if (completedCount >= totalCells) status = "completed";
+
+  return {
+    id: experimentId,
+    experimentId: experimentId,
+    kind: "studio_experiment",
+    status: status,
+    totalCells: totalCells,
+    prompt: definition.name || "Studio Experiment",
+    startedAt: definition.created_at || definition.createdAt || "",
+    completedAt: snapshot.updated_at || snapshot.updatedAt || "",
+    presetId: studioMeta.studio_preset_ids[0] || "",
+    featureId: "txt2img",
+    raw: rawExperiment,
+  };
 }
 
 function _formatDuration(ms) {
@@ -454,6 +490,7 @@ export function renderHistory(state, context) {
   var _queryCache = {};
   var _QUERY_CACHE_TTL = 2000; // 2s
   var _QUERY_CACHE_MAX = 50;   // max entries before pruning
+  var _aggregateExperiments = null;
 
   // ── Debounce helper ─────────────────────────────────────────────────
   var _searchTimer = null;
@@ -890,6 +927,19 @@ export function renderHistory(state, context) {
     });
   }
 
+  function getAggregateExperiments() {
+    if (_aggregateExperiments !== null) {
+      return Promise.resolve(_aggregateExperiments);
+    }
+    return listExperiments(apiBase).then(function (experiments) {
+      _aggregateExperiments = Array.isArray(experiments) ? experiments : [];
+      return _aggregateExperiments;
+    }).catch(function () {
+      _aggregateExperiments = [];
+      return _aggregateExperiments;
+    });
+  }
+
   function fetchAndRender() {
     // Abort any in-flight request
     if (_abortController) {
@@ -963,7 +1013,11 @@ export function renderHistory(state, context) {
     if (queryParams.has_image) apiParams.has_image = true;
     if (queryParams.sort) apiParams.sort = queryParams.sort;
 
-    listUnifiedHistory(apiBase, apiParams, signal).then(function (result) {
+    Promise.all([
+      listUnifiedHistory(apiBase, apiParams, signal),
+      getAggregateExperiments(),
+    ]).then(function (responses) {
+      var result = responses[0];
       // Ignore out-of-order responses
       if (thisEpoch !== _lastRequestEpoch) return;
       if (!result || signal.aborted) {
@@ -978,6 +1032,7 @@ export function renderHistory(state, context) {
         }
         return;
       }
+      result.aggregateExperiments = responses[1] || [];
 
       // Performance mark: response received
       if (typeof performance !== "undefined" && performance.mark) {
@@ -1039,7 +1094,24 @@ export function renderHistory(state, context) {
     container.appendChild(renderFilterBar());
 
     var items = result.items || [];
-    if (items.length === 0) {
+    var aggregateItems = [];
+    var showAggregates = queryParams.page === 1
+      && (!queryParams.type || queryParams.type === "experiment")
+      && !queryParams.has_image;
+    if (showAggregates) {
+      aggregateItems = (result.aggregateExperiments || []).map(function (item) {
+        return normalizeAggregateExperiment(item);
+      }).filter(function (nr) {
+        if (!nr) return false;
+        if (queryParams.search) {
+          var haystack = (nr.experimentId + " " + nr.prompt).toLowerCase();
+          if (haystack.indexOf(queryParams.search.toLowerCase()) === -1) return false;
+        }
+        if (queryParams.status && nr.status !== queryParams.status) return false;
+        return true;
+      });
+    }
+    if (items.length === 0 && aggregateItems.length === 0) {
       container.appendChild(el("div", {
         class: "comfymodal-studio-card",
         text: "No run history yet. Runs will appear here once you create experiments.",
@@ -1051,6 +1123,9 @@ export function renderHistory(state, context) {
     var normalizedItems = items.map(function (item) {
       return normalizeStudioRun(item, apiBase);
     }).filter(Boolean);
+    totalCount = queryParams.type === "experiment"
+      ? aggregateItems.length
+      : (result.total || 0);
 
     // Performance mark: DOM creation start
     if (typeof performance !== "undefined" && performance.mark) {
@@ -1067,6 +1142,7 @@ export function renderHistory(state, context) {
     fragment.appendChild(gallery);
 
     // Render cards into gallery (with optional experiment grouping)
+    var cardIndex = 0;
     const hasMultiCellExperiment = normalizedItems.some(function (nr) {
       return !!nr.experimentId;
     });
@@ -1079,7 +1155,6 @@ export function renderHistory(state, context) {
         groups[eid].push(nr);
       });
       var groupIds = Object.keys(groups).sort();
-      var cardIndex = 0;
       groupIds.forEach(function (eid) {
         var members = groups[eid];
         if (eid && members.length > 1) {
@@ -1113,6 +1188,14 @@ export function renderHistory(state, context) {
         }
       });
     }
+
+    aggregateItems.forEach(function (nr) {
+      gallery.appendChild(_renderStandaloneExperimentTile(nr, apiBase, context, state));
+      if (cardIndex === 0 && typeof performance !== "undefined" && performance.mark) {
+        performance.mark("history-first-card");
+      }
+      cardIndex++;
+    });
 
     // Performance mark: image decode start (lazy, async)
     if (typeof performance !== "undefined" && performance.mark) {

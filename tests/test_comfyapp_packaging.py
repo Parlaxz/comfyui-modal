@@ -52,6 +52,23 @@ class ComfyAppPackagingTests(unittest.TestCase):
                     found[node.name] = True
         self.assertEqual(found, {name: True for name in helper_names})
 
+    def test_image_helpers_explicitly_mount_comfyapp_module(self):
+        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8-sig"))
+        helper_names = {"_add_gpu_python_sources", "_add_cpu_python_sources"}
+        found = {name: False for name in helper_names}
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name not in helper_names:
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                    continue
+                if call.func.attr != "add_local_file" or len(call.args) < 2:
+                    continue
+                remote_path = call.args[1]
+                if isinstance(remote_path, ast.Constant) and remote_path.value == "/root/comfyapp.py":
+                    found[node.name] = True
+        self.assertEqual(found, {name: True for name in helper_names})
+
     def test_image_pins_sageattention_220(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("git+https://github.com/thu-ml/SageAttention.git@v2.2.0", source)

@@ -22,6 +22,7 @@ from gpu_catalog import (
 # Delegate canonical hashing to the shared production_workflow module so
 # there is one source of truth.
 from production_workflow import _canonical_workflow_hash, COMPILER_SCHEMA_VERSION, HASH_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION
+from comfymodal_runtime.env import env_flag
 
 
 def _short_hash(h: str) -> str:
@@ -291,7 +292,7 @@ def _capture_v1_deployment_identity(workspace: dict, gpu: str | None = None) -> 
         "cloud": os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip() or "auto",
         "region": os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip() or "auto",
         "snapshot_enabled": True,  # V1 always has enable_memory_snapshot=True
-        "gpu_snapshot_enabled": os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1",
+        "gpu_snapshot_enabled": env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT"),
     }
     global _V1_DEPLOYMENT_METADATA
     _V1_DEPLOYMENT_METADATA = dict(identity)

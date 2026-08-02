@@ -1144,6 +1144,81 @@ class StudioRouteBehaviourTests(unittest.TestCase):
             self.assertNotEqual(dup.get("id"), "preset_src")
             self.assertIn("(Copy)", dup.get("label", ""))
 
+    def test_studio_output_serves_legacy_comfyui_output_file(self):
+        """History images may still live in ComfyUI's standard output dir."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node_dir = Path(tmpdir) / "ComfyUI" / "custom_nodes" / "comfyui-modal"
+            output_dir = node_dir.parent.parent / "output"
+            output_dir.mkdir(parents=True)
+            image_path = output_dir / "production_test.png"
+            image_bytes = b"not-a-real-png-but-valid-route-data"
+            image_path.write_bytes(image_bytes)
+
+            stub = _StubServer()
+            self.routes_mod.register_studio_routes(stub, node_dir=node_dir)
+            handler = _handler_for(
+                type("StudioModule", (), {"_server": stub}),
+                "GET",
+                "/comfymodal/studio/outputs/{filename:.*}",
+            )
+            response = _run(handler(_MockRequest(
+                match_info={"filename": image_path.name},
+            )))
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.body, image_bytes)
+            self.assertEqual(response.content_type, "image/png")
+
+    def test_studio_output_serves_configured_comfyui_output_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node_dir = Path(tmpdir) / "ComfyUI" / "custom_nodes" / "comfyui-modal"
+            configured_output = Path(tmpdir) / "configured-output"
+            configured_output.mkdir(parents=True)
+            image_path = configured_output / "production_configured.png"
+            image_bytes = b"configured-output"
+            image_path.write_bytes(image_bytes)
+
+            folder_paths_stub = type(sys)("folder_paths")
+            folder_paths_stub.get_output_directory = lambda: str(configured_output)
+            previous = sys.modules.get("folder_paths")
+            sys.modules["folder_paths"] = folder_paths_stub
+            try:
+                stub = _StubServer()
+                self.routes_mod.register_studio_routes(stub, node_dir=node_dir)
+                handler = _handler_for(
+                    type("StudioModule", (), {"_server": stub}),
+                    "GET",
+                    "/comfymodal/studio/outputs/{filename:.*}",
+                )
+                response = _run(handler(_MockRequest(
+                    match_info={"filename": image_path.name},
+                )))
+            finally:
+                if previous is None:
+                    sys.modules.pop("folder_paths", None)
+                else:
+                    sys.modules["folder_paths"] = previous
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.body, image_bytes)
+            self.assertEqual(response.content_type, "image/png")
+
+    def test_studio_output_rejects_path_traversal(self):
+        """The output route accepts basenames only, never path traversal."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stub = _StubServer()
+            self.routes_mod.register_studio_routes(stub, node_dir=tmpdir)
+            handler = _handler_for(
+                type("StudioModule", (), {"_server": stub}),
+                "GET",
+                "/comfymodal/studio/outputs/{filename:.*}",
+            )
+            response = _run(handler(_MockRequest(
+                match_info={"filename": "..\\outside.png"},
+            )))
+
+            self.assertEqual(response.status, 404)
+
     def test_storage_error_returns_stable_message(self):
         """Storage errors return stable messages, not raw exceptions."""
         with tempfile.TemporaryDirectory() as tmpdir:

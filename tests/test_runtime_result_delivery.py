@@ -396,6 +396,35 @@ class TestMaterializeModalResult:
             assert summary["primary_output"]["node_id"] == "107"
             assert summary["primary_output"]["filename"] == "final.png"
 
+    def test_required_descriptor_output_is_valid_without_local_write(self):
+        descriptor = {
+            "filename": "final.png",
+            "asset_id": "asset-final",
+            "identity": "sha256:asset-final",
+            "path": "modal://workspace|A100|outputs/final.png",
+            "backend_path": "outputs/final.png",
+            "node_id": "107",
+            "output_key": "images",
+            "byte_count": 128,
+            "mime_type": "image/png",
+            "file_ext": ".png",
+        }
+        result = {
+            "outputs": {"107": {"images": [{"filename": "final.png"}]}},
+            "images": [descriptor],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result,
+                output_dir=tmp,
+                prompt_id="p1",
+                require_output=True,
+                expected_output_node_ids=("107",),
+            )
+            assert summary["primary_output"]["node_id"] == "107"
+            assert summary["primary_output"]["asset_id"] == "asset-final"
+            assert summary["written_files"] == []
+
     def test_required_output_error_identifies_missing_binding(self):
         result = {
             "execution_id": "exec-missing",

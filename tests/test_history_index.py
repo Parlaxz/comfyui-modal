@@ -636,6 +636,33 @@ class TestHistoryIndexRecoveryAndStaleness(TestHistoryIndex):
         self.assertTrue(result["rebuilt"], result)
         self.assertIsNotNone(self.idx.get("r_keep"))
 
+    def test_partial_index_with_matching_source_fingerprint_rebuilds(self):
+        """A partial derived index is rebuilt even when source dirs are unchanged."""
+        self._write_meta("r_keep")
+        self._write_meta("r_missing")
+        self.idx.rebuild()
+
+        conn = self.idx._cursor().connection
+        conn.execute("DELETE FROM index_entries WHERE run_id = ?", ("r_missing",))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM index_entries").fetchone()[0], 1)
+
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertTrue(result["rebuilt"], result)
+        self.assertEqual(result["record_count"], 2)
+        self.assertIsNotNone(self.idx.get("r_missing"))
+
+    def test_legacy_index_without_record_count_rebuilds(self):
+        """Indexes from before the completeness fingerprint are rebuilt once."""
+        self._write_meta("r_legacy")
+        self.idx.rebuild()
+        conn = self.idx._cursor().connection
+        conn.execute("DELETE FROM index_meta WHERE key = ?", ("source_record_count",))
+
+        result = self.idx.refresh_if_stale(force=True)
+        self.assertTrue(result["rebuilt"], result)
+        self.assertEqual(result["record_count"], 1)
+        self.assertIsNotNone(self.idx.get("r_legacy"))
+
     def test_flat_metadata_index_recovers(self):
         """A schema-only (flat) index with zero entries rebuilds on demand."""
         self._write_meta("r_flat")

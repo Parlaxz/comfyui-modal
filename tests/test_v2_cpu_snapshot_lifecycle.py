@@ -181,9 +181,9 @@ class CpuSnapshotEnabledTests(unittest.TestCase):
         os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = ""
         self.assertFalse(_cpu_model_snapshot_enabled())
 
-    def test_disabled_when_arbitrary(self):
+    def test_enabled_for_explicit_true_words(self):
         os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "yes"
-        self.assertFalse(_cpu_model_snapshot_enabled())
+        self.assertTrue(_cpu_model_snapshot_enabled())
 
     def test_rejects_gpu_snapshot_combination(self):
         os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"

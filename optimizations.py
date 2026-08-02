@@ -33,12 +33,14 @@ import traceback as _traceback
 from collections import OrderedDict, deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+from comfymodal_runtime.env import env_flag
+
 
 # ── Flag helpers (opt-in by default; EXACT_CLIP_PREFILL defaults to on) ────
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+    return env_flag(name, default=default == "1")
 
 
 def _env_int(name: str, default: int) -> int:

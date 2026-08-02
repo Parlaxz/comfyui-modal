@@ -504,6 +504,7 @@ class ExecutionPlanContractTests(unittest.TestCase):
             )
             self.assertFalse(plan_disabled.execution_options.production_enabled,
                              "explicit production.enabled=False must disable production")
+            self.assertEqual(plan_disabled.output_node_ids, ("107",))
 
     def test_plan_execution_options_production_enabled_with_modal_options(self):
         """When modal_options specify production, plan carries production config."""
@@ -1103,6 +1104,40 @@ class HistoryAndOutputMetadataTests(unittest.TestCase):
                 "studio_out.png",
                 "Top-level output_path must be the first materialized basename",
             )
+        finally:
+            exp_svc.REGISTRY = original_registry
+
+    def test_descriptor_outputs_do_not_become_local_history_paths(self):
+        import experiment_service as exp_svc
+
+        fake_history = FakeRunHistory()
+        fake_registry = MagicMock()
+        fake_registry.history.return_value = fake_history
+        original_registry = exp_svc.REGISTRY
+        exp_svc.REGISTRY = fake_registry
+        try:
+            plan = MagicMock(spec=[])
+            plan.request_metadata = {"studio_preset_id": "test"}
+            plan.prompt_bundle = {"prompt": "hello"}
+            plan.workflow_hash = "wf_abc"
+            result = {
+                "primary_asset_id": "asset_descriptor_only",
+                "outputs": {"107": {"images": [{"filename": "remote.png"}]}},
+            }
+
+            async def _test():
+                await self.mod._default_save_history(
+                    plan, result, "rh_descriptor_test",
+                )
+
+            asyncio.run(_test())
+
+            run = fake_history.get_run("r_1")
+            self.assertIsNotNone(run)
+            self.assertEqual(run.get("primary_asset_id"), "asset_descriptor_only")
+            self.assertEqual(run.get("meta", {}).get("primary_asset_id"), "asset_descriptor_only")
+            self.assertNotIn("output_path", run)
+            self.assertNotIn("output_paths", run.get("meta", {}))
         finally:
             exp_svc.REGISTRY = original_registry
 

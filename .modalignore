@@ -31,4 +31,8 @@ docs/
 reference/
 web/node_modules/
 .runtime_state/
+comfyui-modal-agent*/
+comfyui-modal-worktree*/
+comfyui-modal-wt*/
+comfyui-modal-dc*/
 

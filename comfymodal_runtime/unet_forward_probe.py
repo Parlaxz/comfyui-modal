@@ -22,6 +22,8 @@ import os
 import threading
 import time
 import weakref
+
+from .env import env_flag
 from contextvars import ContextVar
 from typing import Any
 
@@ -93,7 +95,7 @@ def _is_enabled() -> bool:
     Checked at call time so test files can set the env var between
     test file imports.
     """
-    return os.environ.get(_DIAG_ENV_KEY, "") == "1"
+    return env_flag(_DIAG_ENV_KEY)
 
 # ── Lazy-resolved ContextVar references ──────────────────────────────────────
 # Resolved at first use (not at import) to avoid circular imports.

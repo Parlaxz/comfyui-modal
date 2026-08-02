@@ -2409,3 +2409,25 @@ class TestV2ManifestPersistence:
         assert "repair_mode=fail_fast" in captured.out
         assert "baked_ok=1" in captured.out
         assert "ident_ok=1" in captured.out
+
+
+def test_dependency_validation_ignores_no_dependency_node_set_drift(monkeypatch):
+    import comfyapp
+
+    baked = {
+        "overall_dependency_hash": "same-hash",
+        "syncable_node_names": ["dep-node", "no-dependency-node"],
+        "dependency_nodes": ["dep-node"],
+    }
+    current = {
+        "overall_dependency_hash": "same-hash",
+        "syncable_node_names": ["dep-node"],
+        "dependency_nodes": ["dep-node"],
+    }
+    monkeypatch.setattr(comfyapp, "load_baked_custom_node_dependency_manifest", lambda: baked)
+    monkeypatch.setattr(comfyapp, "build_current_custom_node_dependency_manifest_cached", lambda: current)
+
+    result = comfyapp.validate_custom_node_dependencies_prepared()
+
+    assert result["prepared"] is True
+    assert result["reason"] == "hash_match"
