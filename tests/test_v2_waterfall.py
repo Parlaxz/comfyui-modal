@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+from tests.v2_baseline_fixtures import BASELINE_ROWS
 from tools.v2_waterfall import (
     build_waterfall,
     render_comparison,
@@ -339,3 +340,101 @@ def test_generic_residual_reflects_real_gap_not_perfect_reconciliation():
     assert abs(reconciliation_ms - stages["captured_timeline_gap"].duration_ms) < 1e-6
     assert abs(reconciliation_ms - (total_ms - accounted_ms)) < 1e-6
     assert any("reconciliation exceeds tolerance" in warning for warning in report.warnings)
+
+
+def _build_baseline_report(row: dict):
+    result = {key: value for key, value in row.items() if key not in {
+        "command_start_unix_ms", "response_received_unix_ns",
+    }}
+    return build_waterfall(
+        result=result,
+        timing={},
+        wall_ms=None,
+        command_start_unix_ms=row["command_start_unix_ms"],
+        response_received_unix_ns=row["response_received_unix_ns"],
+        run_label=row["request_id"],
+    )
+
+
+def test_three_baseline_rows_reconcile_within_tolerance():
+    """Each sanitized baseline row reconciles within max(50ms, 0.5% total) with
+    the platform row populated, restore counted exactly once, and restore-to-
+    method-entry separate."""
+    for row in BASELINE_ROWS:
+        dispatch = row["dispatch_to_modal_entry_ms"]
+        restore_total = row["restore_total_ms"]
+        restore_to_method = row["restore_end_to_modal_method_ms"]
+        expected_platform = dispatch - restore_total - restore_to_method
+        assert expected_platform > 0, "fixture platform duration must be positive"
+
+        report = _build_baseline_report(row)
+        stages = {stage.key: stage for stage in report.stages}
+
+        # Total from the local command->response span.
+        assert report.total_ms is not None
+        assert report.total_ms > 0
+        # Each row reconciles within tolerance (platform is accounted, not
+        # leaked into the generic residual).
+        assert report.reconciliation_ms is not None
+        assert abs(report.reconciliation_ms) <= max(50.0, report.total_ms * 0.005), (
+            f"{row['request_id']}: reconciliation {report.reconciliation_ms}ms "
+            f"exceeds tolerance for total {report.total_ms}ms"
+        )
+
+        # Platform row: request-matched, derived exactly, group=platform.
+        platform = stages["modal_scheduling"]
+        assert platform.duration_ms is not None
+        assert abs(platform.duration_ms - expected_platform) < 1e-9
+        assert platform.status == "derived"
+        assert platform.group == "platform"
+        assert platform.source_fields == (
+            "dispatch_to_modal_entry_ms",
+            "restore_total_ms",
+            "restore_end_to_modal_method_ms",
+        )
+        assert platform.included_in_total is True
+
+        # Application restore is accounted exactly once: the restore stage is a
+        # single row whose duration equals restore_total_ms.  The platform row
+        # lists restore_total_ms among its source_fields (it is one of the
+        # three derivation inputs) but SUBTRACTS it — restore is never
+        # double-counted, which the within-tolerance reconciliation proves.
+        restore_stages = [s for s in report.stages if s.key == "application_restore"]
+        assert len(restore_stages) == 1, (
+            f"{row['request_id']}: application_restore must be a single row, "
+            f"got {len(restore_stages)}"
+        )
+        assert abs(restore_stages[0].duration_ms - restore_total) < 1e-9
+        assert stages["restore_to_method_entry"].duration_ms is not None
+        assert abs(stages["restore_to_method_entry"].duration_ms - restore_to_method) < 1e-9
+
+        # Local handle lookup stays a separate row from the platform row.
+        assert stages["modal_handle_submission"].duration_ms is not None
+        assert stages["modal_handle_submission"].duration_ms > 0
+        assert "dispatch_to_modal_entry_ms" not in stages["modal_handle_submission"].source_fields
+
+        # Known platform time is never assigned to the generic residual.
+        residual = stages.get("captured_timeline_gap")
+        if residual is not None and residual.duration_ms is not None:
+            assert abs(residual.duration_ms - expected_platform) > 1e-9
+
+
+def test_baseline_negative_derived_platform_rejected():
+    """A baseline row whose derived platform duration is negative is rejected
+    explicitly (status=invalid + warning), never fabricated into a value or
+    into the generic residual."""
+    row = dict(BASELINE_ROWS[0])
+    row["dispatch_to_modal_entry_ms"] = 27096.038
+    row["restore_total_ms"] = 30000.0  # makes dispatch - restore - method < 0
+    row["restore_end_to_modal_method_ms"] = 104.897
+    report = _build_baseline_report(row)
+    stage = next(item for item in report.stages if item.key == "modal_scheduling")
+    assert stage.status == "invalid"
+    assert stage.duration_ms is None
+    assert any("negative" in warning for warning in report.warnings)
+    # The rejected value is not re-used as a fabricated positive value anywhere.
+    assert all(
+        abs(s.duration_ms - (row["dispatch_to_modal_entry_ms"] - row["restore_total_ms"] - row["restore_end_to_modal_method_ms"])) > 1e-9
+        for s in report.stages
+        if s.duration_ms is not None
+    )
