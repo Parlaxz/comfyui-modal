@@ -545,15 +545,19 @@ class TestRequestEnvProfilePropagation(unittest.TestCase):
         )
         line = captured.getvalue()
         self.assertIn("[v2.env_profile]", line)
-        self.assertIn("profile=production", line)
-        self.assertIn("request_profile=production", line)
-        self.assertIn("applied=1", line)
+        self.assertIn("effective_profile=production", line)
+        self.assertIn("container_profile=inherit", line)
+        self.assertIn("request_override=production", line)
+        self.assertIn("request_override_applied=1", line)
+        self.assertIn("source=request-override", line)
 
     def test_diagnostic_request_profile_applied_on_default_container(self):
         """A diagnostic request overrides the container default the same way."""
         _, captured = self._run_request(self._plan_payload(env_profile="diagnostic"))
         self.assertEqual(os.environ.get("COMFYMODAL_V2_ENV_PROFILE", ""), "diagnostic")
-        self.assertIn("profile=diagnostic", captured.getvalue())
+        self.assertIn("effective_profile=diagnostic", captured.getvalue())
+        self.assertIn("request_override=diagnostic", captured.getvalue())
+        self.assertIn("request_override_applied=1", captured.getvalue())
 
     def test_container_profile_not_downgraded_by_request(self):
         """A container explicitly deployed with production is never downgraded
@@ -562,8 +566,30 @@ class TestRequestEnvProfilePropagation(unittest.TestCase):
         _, captured = self._run_request(self._plan_payload(env_profile="inherit"))
         self.assertEqual(os.environ.get("COMFYMODAL_V2_ENV_PROFILE", ""), "production")
         line = captured.getvalue()
-        self.assertIn("profile=production", line)
-        self.assertIn("applied=0", line)
+        self.assertIn("effective_profile=production", line)
+        self.assertIn("container_profile=production", line)
+        self.assertIn("request_override=inherit", line)
+        self.assertIn("request_override_applied=0", line)
+        self.assertIn("source=request-inherit-noop", line)
+
+    def test_inherit_request_profile_is_noop_on_default_container(self):
+        """``inherit`` carried by the request is a no-op override even on a
+        default container: it must not be written into the env or reported as
+        applied."""
+        self.assertEqual(
+            os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit"), "inherit",
+        )
+        _, captured = self._run_request(self._plan_payload(env_profile="inherit"))
+        self.assertEqual(
+            os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit"), "inherit",
+            "inherit request override must not mutate the container env",
+        )
+        line = captured.getvalue()
+        self.assertIn("effective_profile=inherit", line)
+        self.assertIn("container_profile=inherit", line)
+        self.assertIn("request_override=inherit", line)
+        self.assertIn("request_override_applied=0", line)
+        self.assertIn("source=request-inherit-noop", line)
 
     def test_no_request_profile_keeps_container_env(self):
         """No env_profile in the request payload -> container env is left

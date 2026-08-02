@@ -10419,23 +10419,37 @@ class ModalRuntimeEntrypoint:
         _request_env_profile = str(
             _request_origin_info.get("env_profile", "") or ""
         ).strip().lower()
+        # Container env profile is the deploy-time baked profile.  The request
+        # may carry the profile its submitter selected; it is applied ONLY when
+        # the container is still on the deploy default (``inherit``/absent)
+        # AND the request names a concrete profile.  ``inherit`` is a no-op
+        # request override: it must never flip an explicit container profile
+        # and must never be written into the env as a value.
+        _container_profile = os.environ.get(
+            "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ).strip().lower()
         _profile_override_applied = False
-        if _request_env_profile:
-            _container_profile = os.environ.get(
-                "COMFYMODAL_V2_ENV_PROFILE", "inherit"
-            ).strip().lower()
+        if _request_env_profile and _request_env_profile != "inherit":
             if _request_env_profile != _container_profile and _container_profile in ("", "inherit"):
                 os.environ["COMFYMODAL_V2_ENV_PROFILE"] = _request_env_profile
-                _container_profile = _request_env_profile
                 _profile_override_applied = True
+        _effective_profile = _request_env_profile if _profile_override_applied else _container_profile
+        if _request_env_profile:
+            _profile_source = (
+                "request-override"
+                if _profile_override_applied
+                else "request-inherit-noop" if _request_env_profile == "inherit" else "container"
+            )
             print(
-                f"[v2.env_profile] profile={_container_profile} "
-                f"request_profile={_request_env_profile} "
-                f"applied={int(_profile_override_applied)} "
-                f"source={'request-override' if _profile_override_applied else 'container'}",
+                f"[v2.env_profile] "
+                f"effective_profile={_effective_profile} "
+                f"container_profile={_container_profile} "
+                f"request_override={_request_env_profile} "
+                f"request_override_applied={int(_profile_override_applied)} "
+                f"source={_profile_source}",
                 flush=True,
             )
-            _request_origin_info["env_profile"] = _container_profile
+            _request_origin_info["env_profile"] = _effective_profile
 
         _restore_timing_for_age = self._restore_timing or _LATEST_LIFECYCLE_TIMING or {}
         _callback_wall_for_age = _restore_timing_for_age.get(

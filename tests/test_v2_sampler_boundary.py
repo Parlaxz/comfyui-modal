@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import io
 import os
+import time
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from comfymodal_runtime import runtime_executor as runtime_exec
 from comfymodal_runtime.contracts import ModelRestoreKey, PrefillKey
 from comfymodal_runtime.model_preload import V2LoaderBridge
 from comfymodal_runtime.runtime_executor import (
@@ -625,6 +627,179 @@ class SamplerResidencyEnforcementTests(unittest.TestCase):
             self.assertIn("status=unknown", buf.getvalue())
         finally:
             self.mp._ACTIVE_V2_LOADER_BRIDGE.reset(token)
+
+
+class SamplerNodeContextAndCleanupTests(unittest.TestCase):
+    """Authoritative sampler node context (node id 1242 / ClownsharKSampler_Beta
+    when present) reaches the watchdog arm, sampling_start, first_unet_forward,
+    first_sampler_step and sampling_end markers; successful completion and
+    failure both finish the single watchdog with no timeout records."""
+
+    def setUp(self):
+        _sampler_wrapper_dedup.clear()
+        from comfymodal_runtime import model_preload as mp
+        self.mp = mp
+        with mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            for wd in list(mp._SAMPLER_STALL_WATCHDOGS.values()):
+                wd.cancel()
+            mp._SAMPLER_STALL_WATCHDOGS.clear()
+        self.addCleanup(self._cleanup)
+        self.trace = RuntimeTrace(request_id="samp-ctx", process="test")
+        self._token = self.mp._ACTIVE_REQUEST_TRACE.set(self.trace)
+        self._ctx_token = None
+
+    def _cleanup(self):
+        try:
+            if self._ctx_token is not None:
+                runtime_exec._current_node_context.reset(self._ctx_token)
+        except Exception:
+            pass
+        try:
+            self.mp._ACTIVE_REQUEST_TRACE.reset(self._token)
+        except Exception:
+            pass
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            for wd in list(self.mp._SAMPLER_STALL_WATCHDOGS.values()):
+                wd.cancel()
+            self.mp._SAMPLER_STALL_WATCHDOGS.clear()
+
+    def _guider_without_node_attrs(self, patcher=None):
+        """A plain guider that does NOT carry _node_id / _class_type (stock
+        ComfyUI guider): the authoritative node context must come from the
+        active ``_current_node_context`` ContextVar instead."""
+        guider = SimpleNamespace()
+        if patcher is not None:
+            guider.model_patcher = patcher
+        return guider
+
+    def _run_wrapper(self, guider, callback, original=None, step_count=0):
+        if original is None:
+            def original(*args, **kwargs):
+                cb = args[3] if len(args) > 3 else None
+                if callable(cb):
+                    for _i in range(step_count):
+                        cb(_i, "denoised", "x", 8)
+                return {"latent": "ok"}
+        executor = _make_faithful_wrapper_executor(original, [_COMFYMODAL_V2_SAMPLING_WRAPPER])
+        return executor.execute(
+            guider,
+            type("S", (), {"__len__": lambda self: 9})(),  # 8 steps
+            {}, callback, None, None, None, None,
+        )
+
+    def _armed_watchdog(self):
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            return self.mp._SAMPLER_STALL_WATCHDOGS.get("samp-ctx")
+
+    def test_node_context_fallback_reaches_all_sampler_markers(self):
+        """With no guider attributes, the active _current_node_context
+        (node id 1242 / ClownsharKSampler_Beta) reaches the watchdog arm,
+        sampling_start, first_unet_forward, first_sampler_step and
+        sampling_end."""
+        patcher = _FakePatcher()
+        guider = self._guider_without_node_attrs(patcher)
+        self._ctx_token = runtime_exec._current_node_context.set(
+            ("1242", "ClownsharKSampler_Beta")
+        )
+        buf = io.StringIO()
+        with patch.object(self.mp, "_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S", 2.0), \
+             patch.object(self.mp, "_SAMPLER_STALL_FIRST_STEP_TIMEOUT_S", 2.0), \
+             redirect_stdout(buf):
+            self._run_wrapper(guider, callback=lambda *a: "step", step_count=2)
+        # Watchdog arm carries the authoritative node context.
+        watchdog = self._armed_watchdog()
+        self.assertIsNotNone(watchdog)
+        self.assertEqual(watchdog.sampler_node_id, "1242")
+        self.assertEqual(watchdog.sampler_class, "ClownsharKSampler_Beta")
+        # first_unet_forward reaches the watchdog carrying that context.
+        self.mp.mark_first_unet_forward("samp-ctx")
+        self.assertTrue(watchdog._forward_seen)
+        self.assertIsNotNone(watchdog._forward_latency_ms)
+        # sampling_start / first_sampler_step / sampling_end trace events.
+        events = {e.name: e for e in self.trace.events}
+        for marker in ("sampling_start", "first_sampler_step", "sampling_end"):
+            self.assertIn(marker, events)
+            self.assertEqual(events[marker].metadata.get("node_id"), "1242")
+            self.assertEqual(events[marker].metadata.get("node_class"), "ClownsharKSampler_Beta")
+        # One-lines carry it too.
+        lines = buf.getvalue()
+        for event in ("sampling_start", "first_sampler_step", "sampling_end"):
+            event_lines = [l for l in lines.splitlines() if f"event={event}" in l]
+            self.assertTrue(event_lines, f"{event} one-line missing")
+            self.assertIn("node_id=1242", event_lines[0])
+            self.assertIn("node_class=ClownsharKSampler_Beta", event_lines[0])
+        # Owner cleanup: single watchdog finished, no timeout records.
+        self.mp.cancel_sampler_stall_watchdog("samp-ctx")
+        time.sleep(0.3)
+        self.assertNotIn("status=timeout", buf.getvalue())
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            self.assertNotIn("samp-ctx", self.mp._SAMPLER_STALL_WATCHDOGS)
+
+    def test_guider_attributes_win_over_context_fallback(self):
+        """Guider-owned _node_id/_class_type stay authoritative even when the
+        node-context ContextVar names a different node."""
+        patcher = _FakePatcher()
+        guider = SimpleNamespace(_node_id="n-1", _class_type="KSampler", model_patcher=patcher)
+        self._ctx_token = runtime_exec._current_node_context.set(
+            ("1242", "ClownsharKSampler_Beta")
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._run_wrapper(guider, callback=lambda *a: "step", step_count=1)
+        watchdog = self._armed_watchdog()
+        self.assertIsNotNone(watchdog)
+        self.assertEqual(watchdog.sampler_node_id, "n-1")
+        self.assertEqual(watchdog.sampler_class, "KSampler")
+        start_events = [e for e in self.trace.events if e.name == "sampling_start"]
+        self.assertEqual(start_events[0].metadata.get("node_id"), "n-1")
+        self.mp.cancel_sampler_stall_watchdog("samp-ctx")
+
+    def test_successful_completion_cleanup_no_timeout(self):
+        """Successful completion marks the watchdog; the owner cleanup path
+        finishes it and no timeout records are emitted."""
+        patcher = _FakePatcher()
+        guider = self._guider_without_node_attrs(patcher)
+        buf = io.StringIO()
+        with patch.object(self.mp, "_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S", 2.0), \
+             patch.object(self.mp, "_SAMPLER_STALL_FIRST_STEP_TIMEOUT_S", 2.0), \
+             redirect_stdout(buf):
+            self._run_wrapper(guider, callback=lambda *a: "step", step_count=2)
+        watchdog = self._armed_watchdog()
+        self.assertIsNotNone(watchdog)
+        # first_sampler_step fired during the run; mark the forward too.
+        self.assertTrue(watchdog._step_seen)
+        self.mp.mark_first_unet_forward("samp-ctx")
+        self.assertTrue(watchdog._forward_seen)
+        # Owner cleanup path (modal_app finally equivalent).
+        self.mp.cancel_sampler_stall_watchdog("samp-ctx")
+        time.sleep(0.3)
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            self.assertNotIn("samp-ctx", self.mp._SAMPLER_STALL_WATCHDOGS)
+        self.assertNotIn("status=timeout", buf.getvalue())
+
+    def test_failure_cleanup_no_timeout(self):
+        """If the inner executor raises, sampling_end is still emitted and the
+        single watchdog is finished by the cleanup path with no timeout."""
+        patcher = _FakePatcher()
+        guider = self._guider_without_node_attrs(patcher)
+
+        def failing(*args, **kwargs):
+            raise RuntimeError("sampler boom")
+
+        buf = io.StringIO()
+        with patch.object(self.mp, "_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S", 2.0), \
+             patch.object(self.mp, "_SAMPLER_STALL_FIRST_STEP_TIMEOUT_S", 2.0), \
+             redirect_stdout(buf), self.assertRaises(RuntimeError):
+            self._run_wrapper(guider, callback=None, original=failing)
+        # sampling_end still emitted by the finally block.
+        self.assertIn("[v2.sampler_boundary] event=sampling_end", buf.getvalue())
+        self.assertIn("event=sampling_start", buf.getvalue())
+        # Owner cleanup path removes the watchdog; failure does not time out.
+        self.mp.cancel_sampler_stall_watchdog("samp-ctx")
+        time.sleep(0.3)
+        with self.mp._SAMPLER_STALL_WATCHDOG_LOCK:
+            self.assertNotIn("samp-ctx", self.mp._SAMPLER_STALL_WATCHDOGS)
+        self.assertNotIn("status=timeout", buf.getvalue())
 
 
 if __name__ == "__main__":
