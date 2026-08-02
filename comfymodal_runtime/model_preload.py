@@ -13,13 +13,14 @@ import functools
 import math
 import os
 import platform
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Condition, RLock
+from threading import Condition, Event, RLock, Thread
 from collections.abc import Mapping
 from typing import Any, Callable, Iterator
 
@@ -352,6 +353,454 @@ def set_residency_sampler_callback(cb: Any) -> None:
 
 def clear_residency_sampler_callback() -> None:
     _RESIDENCY_SAMPLER_CALLBACK.set(None)
+
+# ── Sampler stall watchdog (one-shot, non-destructive) ─────────────────────
+# Reads request-time boundaries only (first UNET forward, first completed
+# sampler step).  Never blocks, cancels, or mutates sampler execution, and
+# never disables CacheDiT.  Each request arms one daemon thread that emits a
+# ``[v2.sampler_stall_watchdog]`` diagnostic ONLY when a threshold is missed
+# (timeout); normal completion and cancel are silent.  ``cancel()`` finishes
+# it on normal completion so nothing keeps the event loop alive.
+#
+# Exact deadlines (both measured from watchdog arm / sampling start):
+#   - 5s  waiting for the first UNET forward
+#   - 15s waiting for the first completed sampler step (NOT 5s + 15s)
+
+_SAMPLER_STALL_WATCHDOGS: dict[str, "_SamplerStallWatchdog"] = {}
+_SAMPLER_STALL_WATCHDOG_LOCK: RLock = RLock()
+
+# Bounded one-shot stage deadlines: 5s for the first UNET forward, 15s for
+# the first completed sampler step (from arm / sampling start).
+_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S: float = 5.0
+_SAMPLER_STALL_FIRST_STEP_TIMEOUT_S: float = 15.0
+
+
+class _SamplerStallWatchdog:
+    """One-shot per-request stall watchdog for first UNET forward + first step.
+
+    ``mark_*`` methods are callable from any thread (forward hooks, sampler
+    wrapper).  The daemon thread emits ``[v2.sampler_stall_watchdog]`` only
+    when a threshold is missed (status=timeout) and exits; ``cancel()`` wakes
+    it promptly on normal completion and is silent.  Non-destructive: no
+    sampler/model mutation.
+    """
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        restored_instance_id: str = "",
+        sampler_node_id: str = "",
+        sampler_class: str = "",
+        patcher_object_id: str = "",
+        diffusion_model_object_id: str = "",
+        unet_object_id: str = "",
+    ) -> None:
+        self.request_id = request_id
+        self.restored_instance_id = restored_instance_id
+        self.sampler_node_id = sampler_node_id
+        self.sampler_class = sampler_class
+        self.patcher_object_id = patcher_object_id
+        self.diffusion_model_object_id = diffusion_model_object_id
+        self.unet_object_id = unet_object_id
+        self._unet_forward_event = Event()
+        self._sampler_step_event = Event()
+        self._forward_seen = False
+        self._step_seen = False
+        self._done = False
+        self._thread: Thread | None = None
+        self._start_mono_ns = time.monotonic_ns()
+        self._forward_latency_ms: float | None = None
+        self._step_latency_ms: float | None = None
+
+    def _ctx(self) -> str:
+        return (
+            f"request_id={self.request_id} "
+            f"restored_instance_id={self.restored_instance_id or 'absent'} "
+            f"sampler_node_id={self.sampler_node_id or 'absent'} "
+            f"sampler_class={self.sampler_class or 'absent'} "
+            f"patcher_object_id={self.patcher_object_id or 'absent'} "
+            f"diffusion_model_object_id={self.diffusion_model_object_id or 'absent'} "
+            f"unet_object_id={self.unet_object_id or 'absent'}"
+        )
+
+    def update_sampler_identity(
+        self,
+        *,
+        sampler_node_id: str = "",
+        sampler_class: str = "",
+        patcher_object_id: str = "",
+        diffusion_model_object_id: str = "",
+    ) -> None:
+        """Enrich the watchdog with sampler/node/patcher identity once known
+        (typically at sampling_start).  Empty values are ignored."""
+        if sampler_node_id:
+            self.sampler_node_id = str(sampler_node_id)
+        if sampler_class:
+            self.sampler_class = str(sampler_class)
+        if patcher_object_id:
+            self.patcher_object_id = str(patcher_object_id)
+        if diffusion_model_object_id:
+            self.diffusion_model_object_id = str(diffusion_model_object_id)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        print(
+            f"[v2.sampler_stall_watchdog] stage=armed "
+            f"{self._ctx()} "
+            f"first_forward_timeout_s={_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S} "
+            f"first_step_timeout_s={_SAMPLER_STALL_FIRST_STEP_TIMEOUT_S}",
+            flush=True,
+        )
+        self._thread = Thread(
+            target=self._run,
+            name=f"comfymodal-stall-watchdog-{self.request_id[:16]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def mark_first_unet_forward(self) -> None:
+        if self._forward_seen:
+            return
+        self._forward_seen = True
+        self._forward_latency_ms = round(
+            (time.monotonic_ns() - self._start_mono_ns) / 1_000_000, 3
+        )
+        self._unet_forward_event.set()
+
+    def mark_first_sampler_step(self) -> None:
+        if self._step_seen:
+            return
+        self._step_seen = True
+        self._step_latency_ms = round(
+            (time.monotonic_ns() - self._start_mono_ns) / 1_000_000, 3
+        )
+        self._sampler_step_event.set()
+
+    def cancel(self) -> None:
+        """Finish the watchdog on normal completion.  Wakes the daemon thread
+        immediately; joins briefly.  Never blocks the caller for long."""
+        self._unet_forward_event.set()
+        self._sampler_step_event.set()
+        self._done = True
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        try:
+            # First UNET forward: wait up to exactly 5s from arm.
+            got_forward = self._unet_forward_event.wait(
+                timeout=_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S
+            )
+            if not got_forward:
+                # Threshold missed -> emit exactly one diagnostic record.
+                print(
+                    f"[v2.sampler_stall_watchdog] stage=first_unet_forward "
+                    f"status=timeout {self._ctx()} "
+                    f"timeout_s={_SAMPLER_STALL_FIRST_FORWARD_TIMEOUT_S}",
+                    flush=True,
+                )
+            # First completed sampler step: the deadline is exactly 15s from
+            # watchdog arm / sampling start — NOT cumulative 5s + 15s.  The
+            # remaining budget is recomputed from arm time, so a slow forward
+            # stage cannot extend the step deadline.
+            _elapsed_s = (time.monotonic_ns() - self._start_mono_ns) / 1_000_000_000.0
+            _step_timeout = max(
+                0.0, _SAMPLER_STALL_FIRST_STEP_TIMEOUT_S - _elapsed_s
+            )
+            got_step = self._sampler_step_event.wait(timeout=_step_timeout)
+            if not got_step:
+                print(
+                    f"[v2.sampler_stall_watchdog] stage=first_sampler_step "
+                    f"status=timeout {self._ctx()} "
+                    f"timeout_s={_SAMPLER_STALL_FIRST_STEP_TIMEOUT_S}",
+                    flush=True,
+                )
+            # Normal completion and cancel are SILENT: no status=ok or
+            # status=cancelled records — only missed thresholds diagnose.
+        finally:
+            with _SAMPLER_STALL_WATCHDOG_LOCK:
+                _SAMPLER_STALL_WATCHDOGS.pop(self.request_id, None)
+
+
+def start_sampler_stall_watchdog(
+    *,
+    request_id: str,
+    restored_instance_id: str = "",
+    sampler_node_id: str = "",
+    sampler_class: str = "",
+    patcher_object_id: str = "",
+    diffusion_model_object_id: str = "",
+    unet_object_id: str = "",
+) -> bool:
+    """Arm the one-shot stall watchdog for *request_id*.
+
+    Idempotent per request_id: a second call for the same request returns
+    False without arming a duplicate.  Returns True when a new watchdog was
+    armed.  Never raises; always spawns a daemon thread that self-terminates.
+    """
+    try:
+        with _SAMPLER_STALL_WATCHDOG_LOCK:
+            existing = _SAMPLER_STALL_WATCHDOGS.get(request_id)
+            if existing is not None:
+                return False
+            watchdog = _SamplerStallWatchdog(
+                request_id=request_id,
+                restored_instance_id=restored_instance_id,
+                sampler_node_id=sampler_node_id,
+                sampler_class=sampler_class,
+                patcher_object_id=patcher_object_id,
+                diffusion_model_object_id=diffusion_model_object_id,
+                unet_object_id=unet_object_id,
+            )
+            _SAMPLER_STALL_WATCHDOGS[request_id] = watchdog
+        watchdog.start()
+        return True
+    except Exception:
+        return False
+
+
+def update_sampler_stall_watchdog_identity(
+    request_id: str,
+    *,
+    sampler_node_id: str = "",
+    sampler_class: str = "",
+    patcher_object_id: str = "",
+    diffusion_model_object_id: str = "",
+) -> None:
+    """Enrich an armed watchdog with sampler/node/patcher identity."""
+    with _SAMPLER_STALL_WATCHDOG_LOCK:
+        watchdog = _SAMPLER_STALL_WATCHDOGS.get(request_id)
+    if watchdog is not None:
+        watchdog.update_sampler_identity(
+            sampler_node_id=sampler_node_id,
+            sampler_class=sampler_class,
+            patcher_object_id=patcher_object_id,
+            diffusion_model_object_id=diffusion_model_object_id,
+        )
+
+
+def mark_first_unet_forward(request_id: str) -> None:
+    """Called by the UNET forward probe on the first CUDA forward."""
+    with _SAMPLER_STALL_WATCHDOG_LOCK:
+        watchdog = _SAMPLER_STALL_WATCHDOGS.get(request_id)
+    if watchdog is not None:
+        watchdog.mark_first_unet_forward()
+
+
+def mark_first_sampler_step(request_id: str) -> None:
+    """Called by the SAMPLER_SAMPLE wrapper on the first completed step."""
+    with _SAMPLER_STALL_WATCHDOG_LOCK:
+        watchdog = _SAMPLER_STALL_WATCHDOGS.get(request_id)
+    if watchdog is not None:
+        watchdog.mark_first_sampler_step()
+
+
+def cancel_sampler_stall_watchdog(request_id: str) -> None:
+    """Cancel (finish) the watchdog on normal completion.
+
+    Removes the request from the registry and wakes the daemon thread so it
+    exits promptly.  Non-blocking to the caller (brief bounded join)."""
+    with _SAMPLER_STALL_WATCHDOG_LOCK:
+        watchdog = _SAMPLER_STALL_WATCHDOGS.pop(request_id, None)
+    if watchdog is not None:
+        watchdog.cancel()
+
+
+# ── Retained UNET object-identity chain ─────────────────────────────────────
+# Per-request registry of the exact retained UNET object id at each lifecycle
+# stage: snapshot -> bridge -> activation -> cachedit -> sampler.  The LOGICAL
+# identity is the resolved diffusion-model object, so ComfyUI's dynamic
+# ModelPatcher delegates (re-attach / CacheDiT wrapper re-patches) that wrap
+# the SAME diffusion model are still accepted.  A different resolved diffusion
+# object (or a missing one on either side) fails closed.
+
+_SNAPSHOT_UNET_CHAIN: dict[str, dict[str, int]] = {}
+_SNAPSHOT_UNET_CHAIN_LOCK: RLock = RLock()
+
+
+def _resolve_logical_unet_identity(unet: Any) -> tuple[int, Any]:
+    """Resolve *unet* to ``(patcher_object_id, diffusion_model)``.
+
+    The diffusion model is the stable logical identity across ModelPatcher
+    delegates and CacheDiT wrapper/re-attach.  Never raises; falls back to a
+    ``(object_id, None)`` pair when the object cannot be resolved.
+    """
+    obj_id = int(id(unet)) if unet is not None else 0
+    dm = None
+    if unet is not None:
+        try:
+            from .unet_forward_probe import resolve_diffusion_model
+            _, dm = resolve_diffusion_model(unet)
+        except Exception:
+            dm = None
+    return obj_id, dm
+
+
+def record_retained_unet_identity(stage: str, unet: Any, request_id: str = "") -> int:
+    """Record ``id(unet)`` at *stage* for *request_id*.
+
+    Emits ``[v2.unet_identity_chain]``.  Returns the recorded object id
+    (0 when *unet* is None).  Never stores a record under an empty
+    request_id — the empty key is never left behind and cleanup always
+    removes the actual request key.  Never raises.
+    """
+    obj_id = int(id(unet)) if unet is not None else 0
+    try:
+        with _SNAPSHOT_UNET_CHAIN_LOCK:
+            if request_id:
+                chain = _SNAPSHOT_UNET_CHAIN.setdefault(request_id, {})
+                chain[stage] = obj_id
+        print(
+            f"[v2.unet_identity_chain] stage={stage} "
+            f"request_id={request_id or 'absent'} unet_object_id={obj_id}",
+            flush=True,
+        )
+    except Exception:
+        pass
+    return obj_id
+
+
+def clear_retained_unet_identity_chain(request_id: str) -> None:
+    """Drop the identity chain for *request_id* (end of request).
+
+    An empty request_id is a no-op — it never clears unrelated keys."""
+    if not request_id:
+        return
+    try:
+        with _SNAPSHOT_UNET_CHAIN_LOCK:
+            _SNAPSHOT_UNET_CHAIN.pop(request_id, "")
+    except Exception:
+        pass
+
+
+def verify_retained_unet_identity(
+    *,
+    stage_a: str,
+    unet_a: Any,
+    stage_b: str,
+    unet_b: Any,
+    request_id: str = "",
+) -> tuple[bool, str]:
+    """Verify the exact LOGICAL retained UNET identity between two stages.
+
+    The logical identity is the resolved diffusion-model object, so
+    ModelPatcher delegates and CacheDiT wrapper/re-attach that wrap the SAME
+    diffusion model are accepted.  Returns ``(True, "ok")`` when both sides
+    resolve to the same non-None diffusion model.  Emits
+    ``[v2.unet_identity_chain]`` (patcher + diffusion ids on both sides) and
+    raises RuntimeError on any mismatch or missing object — the sampler must
+    never receive a different UNET than the one validated, retargeted,
+    published, and (optionally) CacheDiT-patched.
+    """
+    obj_id_a, dm_a = _resolve_logical_unet_identity(unet_a)
+    obj_id_b, dm_b = _resolve_logical_unet_identity(unet_b)
+    id_a = int(id(dm_a)) if dm_a is not None else 0
+    id_b = int(id(dm_b)) if dm_b is not None else 0
+    ok = id_a != 0 and id_b != 0 and id_a == id_b
+    reason = "ok"
+    if not ok:
+        if id_a == 0 or id_b == 0:
+            reason = "unet_missing"
+        else:
+            reason = f"identity_mismatch:{id_a}!={id_b}"
+    print(
+        f"[v2.unet_identity_chain] check=stage_pair stage_a={stage_a} stage_b={stage_b} "
+        f"request_id={request_id or 'absent'} "
+        f"patcher_a_object_id={obj_id_a} diffusion_a_object_id={id_a} "
+        f"patcher_b_object_id={obj_id_b} diffusion_b_object_id={id_b} "
+        f"ok={int(ok)} reason={reason}",
+        flush=True,
+    )
+    if not ok:
+        raise RuntimeError(
+            f"Retained UNET identity mismatch between {stage_a} and {stage_b}: {reason}"
+        )
+    return (True, "ok")
+
+
+# ── Production CPU-snapshot request marker ─────────────────────────────────
+# Per-request marker set only when a production request binds the CPU
+# snapshot WITHOUT the diagnostic UNET bypass.  Used by the sampler wrapper
+# to gate fail-closed CPU-residency enforcement to the exact retained
+# snapshot/bridge object being sampled.  Normal, CPU-only, dynamic/offload,
+# meta/unknown, and bypass paths never set it, so they stay diagnostic-only.
+
+_PRODUCTION_CPU_SNAPSHOT_REQUESTS: set[str] = set()
+_PRODUCTION_CPU_SNAPSHOT_REQUESTS_LOCK: RLock = RLock()
+
+
+def mark_production_cpu_snapshot_request(request_id: str) -> None:
+    """Mark *request_id* as bound to the production CPU-snapshot path."""
+    if not request_id:
+        return
+    with _PRODUCTION_CPU_SNAPSHOT_REQUESTS_LOCK:
+        _PRODUCTION_CPU_SNAPSHOT_REQUESTS.add(request_id)
+
+
+def unmark_production_cpu_snapshot_request(request_id: str) -> None:
+    """Clear the production CPU-snapshot marker for *request_id*."""
+    if not request_id:
+        return
+    with _PRODUCTION_CPU_SNAPSHOT_REQUESTS_LOCK:
+        _PRODUCTION_CPU_SNAPSHOT_REQUESTS.discard(request_id)
+
+
+def is_production_cpu_snapshot_request(request_id: str) -> bool:
+    """True when *request_id* is marked as the production CPU-snapshot path."""
+    if not request_id:
+        return False
+    with _PRODUCTION_CPU_SNAPSHOT_REQUESTS_LOCK:
+        return request_id in _PRODUCTION_CPU_SNAPSHOT_REQUESTS
+
+
+# ── UNET activation boundary diagnostics ───────────────────────────────────
+# Authoritative [v2.unet_activation] lines: requested / started / completed /
+# failed.  Identifies the retained UNET by object id + model-key identity;
+# no tensor contents.
+
+
+def emit_unet_activation_diagnostic(
+    *,
+    stage: str,
+    request_id: str = "",
+    restored_instance_id: str = "",
+    unet_object_id: str = "",
+    unet_identity: str = "",
+    status: str = "",
+    reason: str = "",
+) -> None:
+    """Emit one authoritative ``[v2.unet_activation]`` boundary line."""
+    print(
+        f"[v2.unet_activation] stage={stage} "
+        f"request_id={request_id or 'absent'} "
+        f"restored_instance_id={restored_instance_id or 'absent'} "
+        f"unet_object_id={unet_object_id or 'absent'} "
+        f"unet_identity={unet_identity or 'absent'} "
+        f"status={status or 'absent'} "
+        f"reason={reason or 'ok'}",
+        flush=True,
+    )
+
+
+def _resolve_model_role_for_boundary(model: Any) -> str:
+    """Classify a model patcher as UNET / CLIP / VAE / other for boundary
+    diagnostics.  Never raises; falls back to the type name."""
+    try:
+        from .unet_forward_probe import resolve_diffusion_model
+        _, dm = resolve_diffusion_model(model)
+        if dm is not None:
+            return "UNET"
+        type_name = type(model).__name__.lower()
+        if "clip" in type_name:
+            return "CLIP"
+        if "vae" in type_name:
+            return "VAE"
+        return type_name or "other"
+    except Exception:
+        return "other"
 
 # ── UNET effective-dtype resolver (shared by snapshot and normal paths) ──
 # Resolution strategy depends on context:
@@ -764,6 +1213,9 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 "_minor_faults_before": _start_minflt,
                 "_major_faults_before": _start_majflt,
             }
+            # Classify the caller BEFORE the entry boundary so the entry line
+            # logs the ACTUAL classification, never the pre-classification
+            # placeholder ("not_observed"/"pending").
             if lane is not None and lane._lane == "UNET":
                 _caller = "background_unet_preparation"
             elif lane is not None and lane._lane == "CLIP":
@@ -792,6 +1244,32 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     "restore_session_id": _LATEST_RESTORE_SESSION_ID,
                     "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                 })
+            if lane is None and request_trace is None:
+                # Installed wrapper called outside any lane/request scope
+                _caller = "not_observed"
+                global _not_observed_gpu_calls
+                _not_observed_gpu_calls += 1
+            # ── Authoritative load_models_gpu boundary: entry ──
+            # role/identity/device/memory evidence per model, no tensor contents.
+            try:
+                _gpu_roles = ",".join(
+                    _resolve_model_role_for_boundary(m) for m in models
+                )
+                print(
+                    f"[v2.gpu_load_boundary] event=load_models_gpu_start "
+                    f"request_id={str(request_trace.request_id) if request_trace is not None else 'absent'} "
+                    f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+                    f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'} "
+                    f"roles={_gpu_roles} "
+                    f"model_count={len(models)} "
+                    f"contains_registered_unet={_gpu_record['contains_registered_unet']} "
+                    f"caller_classification={_caller} "
+                    f"gpu_allocated_before={_gpu_alloc_before if _gpu_alloc_before is not None else 'absent'} "
+                    f"gpu_reserved_before={_gpu_reserved_before if _gpu_reserved_before is not None else 'absent'}",
+                    flush=True,
+                )
+            except Exception:
+                pass
             # Always-on UNET first-CUDA demand start:
             # Record the monotonic_ns when load_models_gpu is first called
             # for a registered UNET in this request, regardless of lane state.
@@ -805,11 +1283,6 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     "request_id": request_trace.request_id,
                     "caller_classification": _caller,
                 })
-            if lane is None and request_trace is None:
-                # Installed wrapper called outside any lane/request scope
-                _caller = "not_observed"
-                global _not_observed_gpu_calls
-                _not_observed_gpu_calls += 1
             if lane is not None:
                 lane._on_gpu_commit_about_to_start()
                 _get_mutation_lane().acquire(lane._lane if lane else None)
@@ -988,6 +1461,29 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                 phase="execution",
                                 metadata=dict(_gpu_record),
                             )
+                        # ── Authoritative load_models_gpu boundary: exit ──
+                        # Post-load device/cache/memory evidence so activation is
+                        # proven by data, not only by fast return.
+                        try:
+                            _gpu_roles_exit = ",".join(
+                                _resolve_model_role_for_boundary(m) for m in models
+                            )
+                            _gpu_mem_delta = _gpu_record.get("gpu_allocated_delta_bytes")
+                            print(
+                                f"[v2.gpu_load_boundary] event=load_models_gpu_end "
+                                f"request_id={str(request_trace.request_id) if request_trace is not None else 'absent'} "
+                                f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+                                f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'} "
+                                f"roles={_gpu_roles_exit} "
+                                f"model_count={len(models)} "
+                                f"caller_classification={_caller} "
+                                f"wall_ms={_gpu_record.get('wall_ms')} "
+                                f"gpu_allocated_after={_gpu_alloc_after if _gpu_alloc_after is not None else 'absent'} "
+                                f"gpu_allocated_delta_bytes={_gpu_mem_delta if _gpu_mem_delta is not None else 'absent'}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 # ── Residency sampler: unet_gpu_load_after ──
@@ -5421,13 +5917,13 @@ class V2LoaderBridge:
         "CLIPTextEncode": "encode",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, max_workers: int = 3) -> None:
         self.coordinator = ModelPreloadCoordinator(
             unet_loader=self._load_unet,
             clip_loader=self._load_clip,
             vae_loader=self._load_vae,
             prefill_loader=self._prefill,
-            max_workers=3,
+            max_workers=max_workers,
         )
         self._nodes: Any | None = None
         self._original_methods: dict[str, Callable[..., Any]] = {}

@@ -469,6 +469,26 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
                 }
                 request_trace.emit("unet_first_cuda_op", metadata=metadata)
 
+                # ── Authoritative first-UNET-forward boundary ──
+                # Marks the one-shot stall watchdog (no-op when unarmed) and
+                # emits a one-line diagnostic.  No tensor contents.
+                try:
+                    from comfymodal_runtime.model_preload import mark_first_unet_forward
+                    mark_first_unet_forward(request_id)
+                except Exception:
+                    pass
+                print(
+                    f"[v2.unet_forward_boundary] event=first_unet_forward "
+                    f"request_id={request_id} "
+                    f"diffusion_model_object_id={dm_id} "
+                    f"patcher_object_id={str(id(unet))} "
+                    f"model_object_id={str(id(getattr(unet, 'model', None)))} "
+                    f"x_device={x_device} "
+                    f"x_dtype={str(x.dtype) if x is not None else ''} "
+                    f"elapsed_ms={elapsed_ms}",
+                    flush=True,
+                )
+
                 # Clean up demand start storage (no longer needed for this request)
                 _clear_demand_start_ns(request_id)
 

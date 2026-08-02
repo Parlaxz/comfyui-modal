@@ -913,8 +913,12 @@ _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {
     ".comfymodal_experiments", ".custom_node_requirements", ".baked_custom_node_deps",
     ".presets", ".preset_blobs",
 }
+# Canonical clone filter — must match comfyapp.py's exact pattern so the
+# local archive sync, the image-baked manifest, and the runtime volume
+# generation all exclude the same agent/worktree clones (including
+# ``comfyui-modal-agent1-full-trace`` variants).
 _CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
-    r"^comfyui-modal-(?:agent(?:\d+|[-_].*)|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
+    r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
     re.IGNORECASE,
 )
 _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS = {".pyc", ".pyo"}

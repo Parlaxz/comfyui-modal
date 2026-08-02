@@ -31,7 +31,7 @@ class ModelFileFact:
     mtime_ns: int
 
 
-# Current policy version — increment when compute-policy semantics change
+# Current policy version â€” increment when compute-policy semantics change
 # so that old snapshots with stale/legacy defaults are rejected.
 CPU_SNAPSHOT_UNET_POLICY_VERSION: int = 2
 
@@ -83,8 +83,8 @@ class StorageRange:
 class StorageRegistry:
     """Deduplicated registry of CPU storage ranges for one model.
 
-    ``ranges`` — tuple of ``StorageRange`` for each unique storage object.
-    ``total_bytes`` — sum of ``length`` across all ranges.
+    ``ranges`` â€” tuple of ``StorageRange`` for each unique storage object.
+    ``total_bytes`` â€” sum of ``length`` across all ranges.
     Registry stores underlying unaligned storage data pointer + exact byte length,
     deduplicating by storage identity and byte range, merging identical ranges.
     """
@@ -320,12 +320,12 @@ def _build_model_key(normalized: dict[str, Any]) -> ModelRestoreKey:
     )
 
 
-# ── Compute policy identity field ───────────────────────────────────
+# â”€â”€ Compute policy identity field â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # This field in model_spec distinguishes the compute/manual-cast policy
 # used during snapshot construction so that a snapshot built with one
 # policy cannot match an identity that requested a different policy.
-#   "default"  — no explicit override (legacy / non-BF16).
-#   "bf16_native" — manual_cast_dtype=None, native BF16 compute.
+#   "default"  â€” no explicit override (legacy / non-BF16).
+#   "bf16_native" â€” manual_cast_dtype=None, native BF16 compute.
 _COMPUTE_POLICY_DEFAULT = "default"
 _COMPUTE_POLICY_BF16_NATIVE = "bf16_native"
 
@@ -340,7 +340,7 @@ def _resolve_compute_policy(
     Returns ``"bf16_native"`` when the effective dtype resolves to BF16
     AND the primary target GPU supports BF16 (so the model is built with
     native BF16 compute, no manual cast).  Uses primary target semantics
-    consistently with ``resolve_unet_effective_dtype`` — fallback GPUs
+    consistently with ``resolve_unet_effective_dtype`` â€” fallback GPUs
     are NOT considered for policy resolution.
 
     Returns ``"default"`` otherwise.
@@ -349,10 +349,10 @@ def _resolve_compute_policy(
     _primary = target_gpus[0] if target_gpus else ""
     if not _primary:
         return _COMPUTE_POLICY_DEFAULT
-    # "default" weight_dtype on a BF16-capable primary → native
+    # "default" weight_dtype on a BF16-capable primary â†’ native
     if weight_dtype_str == "default" and gpu_supports_bf16(_primary):
         return _COMPUTE_POLICY_BF16_NATIVE
-    # Explicit bf16 on a BF16-capable primary → native
+    # Explicit bf16 on a BF16-capable primary â†’ native
     import torch as _torch
     _is_explicit_bf16 = (
         weight_dtype_str == "bfloat16"
@@ -407,7 +407,7 @@ def _build_model_spec(normalized: dict[str, Any]) -> dict[str, Any]:
 def _stat_file(role: str, filename: str, *, resolve_path: Callable[[str, str], str]) -> ModelFileFact:
     """Stat one model file through the resolve_path callback.
 
-    Never reads or hashes file content — stat only.
+    Never reads or hashes file content â€” stat only.
     """
     resolved = resolve_path(role, filename)
     st = os.stat(resolved)
@@ -495,7 +495,7 @@ def _collect_unet_modules(obj: Any) -> list[tuple[str, Any]]:
         if dm is not None and _is_module_like(dm) and dm is not model:
             result.append(("model.diffusion_model", dm))
     elif model is not None:
-        # model itself isn't a module — try diffusion_model directly
+        # model itself isn't a module â€” try diffusion_model directly
         dm = getattr(model, "diffusion_model", None)
         if dm is not None and _is_module_like(dm):
             result.append(("model.diffusion_model", dm))
@@ -683,7 +683,7 @@ def validate_snapshot_unet_bf16_native(
             f"{_detail_str}"
         )
 
-    # ── Resolve the actual diffusion model ─────────────────────────────
+    # â”€â”€ Resolve the actual diffusion model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _model = getattr(unet, "model", None)
     if _model is None:
         raise RuntimeError(
@@ -692,11 +692,11 @@ def validate_snapshot_unet_bf16_native(
         )
     _dm = getattr(_model, "diffusion_model", _model)
 
-    # ── Read manual_cast_dtype from inner BaseModel ────────────────────
+    # â”€â”€ Read manual_cast_dtype from inner BaseModel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _manual = getattr(_model, "manual_cast_dtype", None)
     _manual_str = str(_manual) if _manual is not None else "none"
 
-    # ── Read model_dtype() from patcher ────────────────────────────────
+    # â”€â”€ Read model_dtype() from patcher â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _md_fn = getattr(unet, "model_dtype", None)
     _model_dtype_str: str = "absent"
     if callable(_md_fn):
@@ -706,7 +706,7 @@ def validate_snapshot_unet_bf16_native(
         except Exception:
             _model_dtype_str = "error"
 
-    # ── Capture parameter distribution (full, no early raise) ──────────
+    # â”€â”€ Capture parameter distribution (full, no early raise) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _distribution: dict[str, Any] | str = "unavailable"
     if param_distribution is not None:
         _distribution = param_distribution
@@ -721,7 +721,7 @@ def validate_snapshot_unet_bf16_native(
         except Exception:
             _distribution = "unavailable"
 
-    # ── Build full metadata string for all error messages ──────────────
+    # â”€â”€ Build full metadata string for all error messages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _full_msg(checks: list[str]) -> str:
         _parts = [f"{context}BF16-native validation failed"]
         if checks:
@@ -734,19 +734,19 @@ def validate_snapshot_unet_bf16_native(
         )
         return " ".join(_parts)
 
-    # ── Invariant 1: manual_cast_dtype must be None ────────────────────
+    # â”€â”€ Invariant 1: manual_cast_dtype must be None â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if _manual is not None:
         raise RuntimeError(_full_msg([
             f"manual_cast_dtype is {_manual!r}, expected None",
         ]))
 
-    # ── Invariant 2: model_dtype() must be bfloat16 ────────────────────
+    # â”€â”€ Invariant 2: model_dtype() must be bfloat16 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if _model_dtype_str not in (str(_torch.bfloat16), "torch.bfloat16"):
         raise RuntimeError(_full_msg([
             f"model_dtype={_model_dtype_str}, expected bfloat16",
         ]))
 
-    # ── Invariant 3: non-zero floating params, all BF16 on CPU ─────────
+    # â”€â”€ Invariant 3: non-zero floating params, all BF16 on CPU â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if isinstance(_distribution, str) and _distribution == "unavailable":
         raise RuntimeError(_full_msg([
             "diffusion model is uninspectable (no parameters accessible)",
@@ -886,7 +886,7 @@ def inspect_and_validate_snapshot_params(
 # ---------------------------------------------------------------------------
 
 
-# ── Object-ID keys excluded from semantic diff ─────────────────────────
+# â”€â”€ Object-ID keys excluded from semantic diff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _OBJECT_ID_KEYS: frozenset[str] = frozenset({
     "patcher_object_id",
@@ -902,7 +902,7 @@ _OBJECT_ID_KEYS: frozenset[str] = frozenset({
 def _first_tensor_info(iterator_fn: Callable[..., Any]) -> tuple[str, str]:
     """Inspect exactly the first item from *iterator_fn(recurse=True)*.
 
-    Uses ``next(iter(...), None)`` — never calls ``list()``, never inspects
+    Uses ``next(iter(...), None)`` â€” never calls ``list()``, never inspects
     a second tensor.  Returns ``(device_str, dtype_str)`` or
     ``("absent", "absent")`` on any failure.
     """
@@ -958,12 +958,12 @@ def collect_unet_runtime_state(
 
     Returns a flat dict with the fields specified in the comfymodal
     runtime-state comparison protocol.  Inspects at most one parameter
-    and one buffer (``next(iter(...))`` — never ``list()``).  No mutation,
+    and one buffer (``next(iter(...))`` â€” never ``list()``).  No mutation,
     no CUDA synchronisation, no tensor content.
 
     For a real ``comfy.model_patcher.ModelPatcher``:
 
-    * ``model_dtype`` is a **method** — called safely.
+    * ``model_dtype`` is a **method** â€” called safely.
     * ``manual_cast_dtype`` / ``device`` / ``model_loaded_weight_memory`` /
       ``model_lowvram`` / ``lowvram_patch_counter`` live on ``.model``
       (patches a long-standing bug where the previous code read them
@@ -983,24 +983,24 @@ def collect_unet_runtime_state(
 
     _MISSING = object()
 
-    # ── Type identities ───────────────────────────────────────────────
+    # â”€â”€ Type identities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     state["patcher_type"] = type(unet).__qualname__ if not isinstance(unet, (int, float, bool, str, bytes)) else type(unet).__name__
     state["model_type"] = type(_model).__qualname__ if _model is not None else "absent"
     state["diffusion_model_type"] = type(_dm).__qualname__ if _dm is not None else "absent"
 
-    # ── Object identities (included in raw records, excluded from diff) ─
+    # â”€â”€ Object identities (included in raw records, excluded from diff) â”€
     state["patcher_object_id"] = str(id(unet))
     state["model_object_id"] = str(id(_model)) if _model is not None else "absent"
     state["diffusion_model_object_id"] = str(id(_dm)) if _dm is not None else "absent"
 
-    # ── Device attributes (on patcher) ────────────────────────────────
+    # â”€â”€ Device attributes (on patcher) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     state["load_device"] = _safe_str_of_attr(unet, "load_device")
     state["offload_device"] = _safe_str_of_attr(unet, "offload_device")
 
-    # ── current_device = model.device (not from first parameter) ───────
+    # â”€â”€ current_device = model.device (not from first parameter) â”€â”€â”€â”€â”€â”€â”€
     state["current_device"] = _safe_str(getattr(_model, "device", None)) if _model is not None else "absent"
 
-    # ── First parameter / first buffer (diffusion_model first, model fallback) ─
+    # â”€â”€ First parameter / first buffer (diffusion_model first, model fallback) â”€
     _inspect_module = _dm if _dm is not None else _model
     if _inspect_module is not None:
         _fp_dev, _fp_dtype = _first_tensor_info(_inspect_module.named_parameters)
@@ -1013,7 +1013,7 @@ def collect_unet_runtime_state(
     state["first_buffer_device"] = _fb_dev
     state["first_buffer_dtype"] = _fb_dtype
 
-    # ── Model dtype fields ────────────────────────────────────────────
+    # â”€â”€ Model dtype fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # model_dtype is a method on the patcher; call it safely.
     _md_fn = getattr(unet, "model_dtype", None)
     if callable(_md_fn):
@@ -1027,7 +1027,7 @@ def collect_unet_runtime_state(
     state["manual_cast_dtype"] = _safe_str_of_attr(_model, "manual_cast_dtype") if _model is not None else "absent"
     state["weight_dtype"] = _safe_str_of_attr(unet, "weight_dtype")
 
-    # ── Options ───────────────────────────────────────────────────────
+    # â”€â”€ Options â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _mo = getattr(unet, "model_options", _MISSING)
     if _mo is _MISSING:
         state["model_options_keys"] = "absent"
@@ -1045,7 +1045,7 @@ def collect_unet_runtime_state(
     else:
         state["transformer_options_keys"] = "absent"
 
-    # ── Patch counters ────────────────────────────────────────────────
+    # â”€â”€ Patch counters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _patches = getattr(unet, "patches", _MISSING)
     if _patches is _MISSING:
         state["patch_count"] = "absent"
@@ -1061,12 +1061,12 @@ def collect_unet_runtime_state(
     else:
         state["object_patch_count"] = "absent"
 
-    # ── Model-level memory / lowvram (on .model) ──────────────────────
+    # â”€â”€ Model-level memory / lowvram (on .model) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     state["model_loaded_weight_memory"] = _safe_str_of_attr(_model, "model_loaded_weight_memory") if _model is not None else "absent"
     state["model_lowvram"] = _safe_str_of_attr(_model, "model_lowvram") if _model is not None else "absent"
     state["model_lowvram_patch_counter"] = _safe_str_of_attr(_model, "lowvram_patch_counter") if _model is not None else "absent"
 
-    # ── Forward function (from diffusion_model, not patcher) ──────────
+    # â”€â”€ Forward function (from diffusion_model, not patcher) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if _dm is not None:
         _forward = getattr(_dm, "forward", None)
     else:
@@ -1079,7 +1079,7 @@ def collect_unet_runtime_state(
         state["forward_module"] = "absent"
         state["forward_qualname"] = "absent"
 
-    # ── loaded_models membership (function call) ──────────────────────
+    # â”€â”€ loaded_models membership (function call) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _loaded = "absent"
     if model_management is not None:
         try:
@@ -1138,7 +1138,7 @@ def collect_unet_forward_probe_state(
     records identity, model-state fields, parameter/buffer distribution,
     forward-callable structure, and collector timing.
 
-    **Safety (enforced by caller convention — never guaranteed at
+    **Safety (enforced by caller convention â€” never guaranteed at
     runtime)**: this function never calls ``.cpu()``, ``.cuda()``,
     ``.to()``, ``.item()``, ``.clone()``, ``.numpy()``,
     ``torch.cuda.synchronize()``, or ``load_models_gpu()``.  It never
@@ -1168,7 +1168,7 @@ def collect_unet_forward_probe_state(
 
     state: dict[str, Any] = {}
 
-    # ── Resolve diffusion_model ──────────────────────────────────────
+    # â”€â”€ Resolve diffusion_model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _model = getattr(unet, "model", None)
     _dm: Any = diffusion_model
     if _dm is None:
@@ -1177,7 +1177,7 @@ def collect_unet_forward_probe_state(
         if _dm is None:
             _dm = getattr(unet, "diffusion_model", None)
 
-    # ── 1. Identity ──────────────────────────────────────────────────
+    # â”€â”€ 1. Identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     state["patcher_object_id"] = str(id(unet))
     state["patcher_type"] = type(unet).__qualname__
 
@@ -1187,14 +1187,14 @@ def collect_unet_forward_probe_state(
     state["diffusion_model_object_id"] = str(id(_dm)) if _dm is not None else "absent"
     state["diffusion_model_type"] = type(_dm).__qualname__ if _dm is not None else "absent"
 
-    # ── 2. Model state ───────────────────────────────────────────────
+    # â”€â”€ 2. Model state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     state["load_device"] = _safe_str_of_attr(unet, "load_device")
     state["offload_device"] = _safe_str_of_attr(unet, "offload_device")
 
     _model_device = getattr(_model, "device", None) if _model is not None else None
     state["model_device"] = _safe_str(_model_device)
 
-    # model_dtype() — callable method on patcher
+    # model_dtype() â€” callable method on patcher
     _md_fn = getattr(unet, "model_dtype", None)
     if callable(_md_fn):
         try:
@@ -1217,7 +1217,7 @@ def collect_unet_forward_probe_state(
         _safe_str_of_attr(_model, "lowvram_patch_counter") if _model is not None else "absent"
     )
 
-    # ── 3. Parameter distribution ────────────────────────────────────
+    # â”€â”€ 3. Parameter distribution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _param_count = 0
     _total_param_numel = 0
     _param_dev_dtype_count: dict[str, int] = {}
@@ -1248,7 +1248,7 @@ def collect_unet_forward_probe_state(
     state["param_dev_dtype_numel"] = dict(_param_dev_dtype_numel)
     state["param_distribution_hash"] = _param_h.hexdigest()
 
-    # ── 4. Buffer distribution ───────────────────────────────────────
+    # â”€â”€ 4. Buffer distribution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _buffer_count = 0
     _total_buffer_numel = 0
     _buf_dev_dtype_count: dict[str, int] = {}
@@ -1279,7 +1279,7 @@ def collect_unet_forward_probe_state(
     state["buffer_dev_dtype_numel"] = dict(_buf_dev_dtype_numel)
     state["buffer_distribution_hash"] = _buf_h.hexdigest()
 
-    # ── 5. Forward callable structure ────────────────────────────────
+    # â”€â”€ 5. Forward callable structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _forward_fn = getattr(_dm, "forward", None) if _dm is not None else None
     if _forward_fn is not None:
         _self = getattr(_forward_fn, "__self__", None)
@@ -1314,7 +1314,7 @@ def collect_unet_forward_probe_state(
         state["wrapper_chain"] = []
         state["wrapper_chain_hash"] = hashlib.sha256().hexdigest()
 
-    # ── 6. Collector metadata ────────────────────────────────────────
+    # â”€â”€ 6. Collector metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _elapsed_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
     state["collector_duration_ms"] = _elapsed_ms
 
@@ -1344,10 +1344,10 @@ def rehydrate_cpu_snapshot_unet(
     fields, clear CacheDiT, call ``load_models_gpu``, reconstruct or
     reload the UNET, or copy state from another object.
     """
-    # ── Pre-state ─────────────────────────────────────────────────────
+    # â”€â”€ Pre-state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _pre_state = collect_unet_runtime_state(unet, model_management=model_management)
 
-    # ── Validate shape ────────────────────────────────────────────────
+    # â”€â”€ Validate shape â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if not hasattr(unet, "model"):
         return False, "unet missing .model attribute"
     if not hasattr(unet, "load_device"):
@@ -1355,7 +1355,7 @@ def rehydrate_cpu_snapshot_unet(
     if not hasattr(unet, "offload_device"):
         return False, "unet missing .offload_device attribute"
 
-    # ── Validate required model_management functions ──────────────────
+    # â”€â”€ Validate required model_management functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _gt = getattr(model_management, "get_torch_device", None)
     _uo = getattr(model_management, "unet_offload_device", None)
     if not callable(_gt):
@@ -1363,14 +1363,14 @@ def rehydrate_cpu_snapshot_unet(
     if not callable(_uo):
         return False, "model_management.unet_offload_device is not callable"
 
-    # ── Assign devices ────────────────────────────────────────────────
+    # â”€â”€ Assign devices â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         unet.load_device = _gt()
         unet.offload_device = _uo()
     except Exception as exc:
         return False, f"device assignment failed: {exc}"
 
-    # ── Post-state ────────────────────────────────────────────────────
+    # â”€â”€ Post-state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _post_state = collect_unet_runtime_state(unet, model_management=model_management)
 
     # Emit pre/post trace when available
@@ -1476,7 +1476,7 @@ def load_cpu_snapshot_models(
     returned ``CpuSnapshotModels`` carries a ``compute_policy`` attribute
     that distinguishes the compute/manual-cast policy so stale snapshots
     built with a different policy cannot match.  The model_spec does NOT
-    contain compute_policy — matching uses the separate field.
+    contain compute_policy â€” matching uses the separate field.
 
     Load order: CLIP -> gc.collect -> UNET -> gc.collect.
     All loading happens under torch.no_grad().
@@ -1662,7 +1662,7 @@ def validate_cpu_snapshot_models(
 
     Returns (True, 'ok') on success or (False, reason_string) on failure.
     """
-    # Identity check — all fields
+    # Identity check â€” all fields
     if models.model_key != expected_key:
         for field_name in (
             "unet_identity",
@@ -1793,7 +1793,7 @@ def validate_cpu_snapshot_models(
     if not ok:
         return (False, reason)
 
-    # Policy version/identity validation — reject legacy/stale snapshots
+    # Policy version/identity validation â€” reject legacy/stale snapshots
     if models.policy_version == 0:
         return (False, "policy_version is 0 (legacy/unset); current version is "
                 f"{CPU_SNAPSHOT_UNET_POLICY_VERSION}")
@@ -1882,3 +1882,171 @@ def retarget_cpu_snapshot_models(
     clip_patcher.offload_device = model_management.text_encoder_offload_device()
 
     return (True, "ok")
+
+
+# ---------------------------------------------------------------------------
+# Post-load GPU residency proof (evidence, no tensor contents)
+# ---------------------------------------------------------------------------
+
+
+def prove_unet_gpu_residency(
+    unet: Any,
+    *,
+    model_management: Any = None,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Collect post-load GPU-activation evidence for *unet* using only
+    primitive facts â€” parameter device distribution, patcher load/current
+    device, diffusion-model current device, model-cache membership, and GPU
+    memory.  Never transfers or mutates tensors; never returns tensor data.
+
+    Returns a dict with:
+      ``status`` â€” ``gpu_resident`` | ``partially_gpu`` | ``cpu_resident`` |
+        ``meta`` | ``unknown`` | ``no_params`` | ``absent``
+      ``unet_object_id``, ``parameter_count``, ``gpu_parameter_count``,
+      ``cpu_parameter_count``, ``meta_parameter_count``,
+      ``unknown_parameter_count``, ``gpu_parameter_fraction``, ``load_device``,
+      ``current_device``, ``diffusion_model_current_device``,
+      ``model_cache_size``, ``unet_in_model_cache``, ``gpu_allocated_bytes``,
+      ``gpu_reserved_bytes``.
+
+    Meta/unknown device parameters are classified as ``meta``/``unknown``
+    (NOT CPU-resident) so CPU-only, dynamic/offload, and meta/unknown paths
+    remain compatible and report diagnostic status instead of failing.
+    """
+    evidence: dict[str, Any] = {
+        "status": "absent",
+        "unet_object_id": int(id(unet)) if unet is not None else 0,
+    }
+    if unet is None:
+        return evidence
+    try:
+        import torch
+    except Exception:
+        return evidence
+
+    dm = _resolve_inner_model(unet)
+
+    # 1. Parameter device distribution (floating-point params only)
+    gpu_params = 0
+    cpu_params = 0
+    meta_params = 0
+    unknown_params = 0
+    total = 0
+    try:
+        for p in dm.parameters():
+            dev = str(getattr(p, "device", ""))
+            total += 1
+            if dev.startswith("cuda"):
+                gpu_params += 1
+            elif dev == "cpu":
+                cpu_params += 1
+            elif dev == "meta":
+                meta_params += 1
+            else:
+                unknown_params += 1
+    except Exception:
+        pass
+    evidence["parameter_count"] = total
+    evidence["gpu_parameter_count"] = gpu_params
+    evidence["cpu_parameter_count"] = cpu_params
+    evidence["meta_parameter_count"] = meta_params
+    evidence["unknown_parameter_count"] = unknown_params
+    evidence["gpu_parameter_fraction"] = round(gpu_params / total, 4) if total else 0.0
+
+    # 2. Patcher device fields
+    load_device = getattr(unet, "load_device", None)
+    current_device = getattr(unet, "current_device", None)
+    evidence["load_device"] = str(load_device) if load_device is not None else "absent"
+    evidence["current_device"] = (
+        str(current_device) if current_device is not None else "absent"
+    )
+    dm_current = getattr(dm, "current_device", None)
+    evidence["diffusion_model_current_device"] = (
+        str(dm_current) if dm_current is not None else "absent"
+    )
+
+    # 3. Model-cache membership
+    in_cache = False
+    cache_size = 0
+    try:
+        if model_management is None:
+            from comfy import model_management as _mmg
+            model_management = _mmg
+        _clm = getattr(model_management, "current_loaded_models", None)
+        if _clm is not None:
+            cache_size = len(_clm)
+            for _lm in _clm:
+                _m = getattr(_lm, "model", None)
+                if _m is not None and id(_m) == id(unet):
+                    in_cache = True
+                    break
+    except Exception:
+        pass
+    evidence["model_cache_size"] = cache_size
+    evidence["unet_in_model_cache"] = int(in_cache)
+
+    # 4. GPU memory (totals only, no tensor contents)
+    try:
+        if torch.cuda.is_available():
+            evidence["gpu_allocated_bytes"] = int(torch.cuda.memory_allocated())
+            evidence["gpu_reserved_bytes"] = int(torch.cuda.memory_reserved())
+    except Exception:
+        pass
+
+    # 5. Overall status
+    # Meta/unknown device params are NOT CPU-residency evidence: they are
+    # reported as meta/unknown (partial/unknown), never as CPU-resident.
+    if total == 0:
+        evidence["status"] = "no_params"
+    elif gpu_params == total:
+        evidence["status"] = "gpu_resident"
+    elif gpu_params > 0:
+        evidence["status"] = "partially_gpu"
+    elif meta_params or unknown_params:
+        evidence["status"] = "unknown"
+    elif cpu_params == total:
+        evidence["status"] = "cpu_resident"
+    else:
+        evidence["status"] = "unknown"
+    return evidence
+
+
+def verify_unet_gpu_residency(
+    unet: Any,
+    *,
+    model_management: Any = None,
+    request_id: str = "",
+    context: str = "",
+    enforce: bool = False,
+) -> dict[str, Any]:
+    """Prove GPU activation with post-load evidence; emit a one-line
+    ``[v2.unet_gpu_residency]`` diagnostic.
+
+    Raises RuntimeError ONLY when *enforce* is True AND the model HAS
+    parameters and NONE of them are on a CUDA device (status=cpu_resident) â€”
+    the classic CPU-snapshot stall signature.  Enforcement is gated by the
+    caller to the production CPU-snapshot path sampling the exact retained
+    snapshot/bridge object.  All other paths (normal non-snapshot, CPU-only,
+    dynamic/offload, meta/unknown, no-parameter stubs) report diagnostic
+    status instead of raising.
+    """
+    evidence = prove_unet_gpu_residency(
+        unet, model_management=model_management, request_id=request_id
+    )
+    _fields = " ".join(f"{k}={v}" for k, v in evidence.items())
+    print(
+        f"[v2.unet_gpu_residency] {context or 'check'} "
+        f"request_id={request_id or 'absent'} enforce={int(bool(enforce))} {_fields}",
+        flush=True,
+    )
+    if enforce and evidence.get("status") == "cpu_resident":
+        raise RuntimeError(
+            f"{context or 'UNET'} is CPU-resident with parameters; "
+            "GPU activation was not proven before sampling "
+            f"(gpu_parameters={evidence.get('gpu_parameter_count')}/"
+            f"{evidence.get('parameter_count')} "
+            f"load_device={evidence.get('load_device')} "
+            f"current_device={evidence.get('current_device')})"
+        )
+    return evidence

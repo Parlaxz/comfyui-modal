@@ -222,11 +222,17 @@ def _verify_sage_snapshot_identity(
     return True
 
 
-# Three known ComfyUI-Manager config.ini locations (relative to comfyui_root).
+# Canonical ComfyUI-Manager config.ini location (relative to comfyui_root).
+#
+# Only ``user/__manager/config.ini`` is ever written.  The legacy locations
+# (``user/default/__manager/config.ini`` and
+# ``user/default/ComfyUI-Manager/config.ini``) are deliberately NOT created:
+# their presence makes ComfyUI-Manager's import-time migration take the
+# "first update after upgrade" branch, which pip-installs ComfyUI requirements
+# and moves the legacy directory — an actual installation that
+# ``network_mode = offline`` does NOT gate.
 _MANAGER_CONFIG_PATHS: tuple[str, ...] = (
     "user/__manager/config.ini",
-    "user/default/__manager/config.ini",
-    "user/default/ComfyUI-Manager/config.ini",
 )
 
 
@@ -936,8 +942,14 @@ def configure_manager_offline(
     comfyui_root: str,
     environ: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Set environment hints *and* write ``config.ini`` files so ComfyUI-Manager
-    stays offline even when it reads config before checking environment variables.
+    """Set environment hints *and* write the canonical ``config.ini`` so
+    ComfyUI-Manager stays offline even when it reads config before checking
+    environment variables.
+
+    Only ``user/__manager/config.ini`` is written.  Legacy config locations
+    are deliberately never created — their presence makes ComfyUI-Manager's
+    import-time migration pip-install ComfyUI requirements, which
+    ``network_mode = offline`` does not gate.
 
     Parameters
     ----------

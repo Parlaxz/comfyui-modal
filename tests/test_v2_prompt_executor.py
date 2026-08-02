@@ -2256,3 +2256,48 @@ def test_v2_base64_counters_truthful_descriptor_zero():
     assert result.get("include_base64") is False
     for img in result.get("images", []):
         assert "data" not in img, "descriptor path must not contain data"
+
+
+def test_v2_production_snapshot_marker_accepted_and_cleaned_up():
+    """_execute_v2_prompt_executor accepts request_bound_to_production_snapshot;
+    when True the request is marked as a production CPU-snapshot request during
+    execution and unmarked in the finally cleanup."""
+    import comfymodal_runtime.model_preload as mp
+
+    executor = _Executor()
+    marked_during_execution = []
+
+    async def _checked_execute_async(**kwargs):
+        marked_during_execution.append(
+            mp.is_production_cpu_snapshot_request("req-prod-marker")
+        )
+        executor.executed.append(kwargs)
+
+    executor.execute_async = _checked_execute_async
+    api = SimpleNamespace(_executor=executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = ExecutionPlan(
+        workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
+        execution_options=ExecutionOptions(production_enabled=False),
+    )
+    trace = RuntimeTrace(request_id="req-prod-marker", process="remote")
+    context = ExecutionContext(request_id="req-prod-marker", trace=trace)
+    fake_execution = SimpleNamespace(validate_prompt=_validate_prompt)
+
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        result = asyncio.run(entrypoint._execute_v2_prompt_executor(
+            plan,
+            context,
+            api,
+            trace,
+            request_bound_to_production_snapshot=True,
+        ))
+
+    assert marked_during_execution == [True], (
+        "request must be marked as production CPU-snapshot during execution"
+    )
+    assert mp.is_production_cpu_snapshot_request("req-prod-marker") is False, (
+        "production marker must be cleaned up in the finally block"
+    )
