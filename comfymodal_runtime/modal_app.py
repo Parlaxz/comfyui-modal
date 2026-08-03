@@ -223,6 +223,12 @@ V2_RESTORE_STATE_FILE = os.environ.get(
 ).strip() or "restore_state.json"
 PROFILE_VOLUME_NAME = os.environ.get("COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles")
 PROFILE_PATH = "/mnt/comfymodal_profiles"
+# Dedicated prompt-encoding cache volume (shared with comfyapp.py).  Mounted
+# in the V2 GPU container ONLY when the persistent CLIP cache or the exact
+# CLIP conditioning cache feature is enabled, so a default deploy keeps the
+# exact pre-feature volume layout.
+PROMPT_CACHE_VOLUME_NAME = "comfymodal-prompt-encoding-cache"
+PROMPT_CACHE_VOLUME_PATH = "/root/prompt_cache_vol"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
 CLASS_NAME = "ModalRuntimeEntrypoint"
@@ -2011,6 +2017,21 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
         ),
+        "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE": os.environ.get(
+            "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE", "0"
+        ),
+        "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE": os.environ.get(
+            "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE", "0"
+        ),
+        "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_ROOT": os.environ.get(
+            "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_ROOT", ""
+        ),
+        "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_ENTRIES": os.environ.get(
+            "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_ENTRIES", ""
+        ),
+        "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_BYTES": os.environ.get(
+            "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_BYTES", ""
+        ),
         "COMFYMODAL_V2_UNET_FORWARD_DIAG": os.environ.get(
             "COMFYMODAL_V2_UNET_FORWARD_DIAG", "0"
         ),
@@ -2265,6 +2286,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "custom_nodes_volume": None,
             "runtime_state_volume": None,
             "profile_volume": None,
+            "prompt_cache_volume": None,
             "source_identity": identity,
             "spec": runtime_spec,
         }
@@ -2281,6 +2303,15 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
                 f"profile Volume '{runtime_spec.profile_volume_name}' is None "
                 f"after from_name(create_if_missing=True); cannot create full-trace session"
             )
+    prompt_cache_volume = None
+    if (
+        env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE")
+        or env_flag("COMFYMODAL_V2_CLIP_CONDITIONING_CACHE")
+        or env_flag("COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE")
+    ):
+        prompt_cache_volume = _modal.Volume.from_name(
+            PROMPT_CACHE_VOLUME_NAME, create_if_missing=True
+        )
     app = _modal.App(runtime_spec.app_name, image=image)
     return {
         "app": app,
@@ -2289,6 +2320,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "custom_nodes_volume": custom_nodes_volume,
         "runtime_state_volume": runtime_state_volume,
         "profile_volume": profile_volume,
+        "prompt_cache_volume": prompt_cache_volume,
         "source_identity": identity,
         "spec": runtime_spec,
     }
@@ -11561,6 +11593,11 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
                 "Ensure COMFYMODAL_V2_PROFILE_VOLUME names an existing Volume."
             )
         _volumes[spec.profile_path] = _pv
+    # Add the dedicated prompt-encoding cache volume when the persistent or
+    # exact CLIP conditioning cache is enabled (default deploy unchanged).
+    _pcv = resources.get("prompt_cache_volume")
+    if _pcv is not None:
+        _volumes[PROMPT_CACHE_VOLUME_PATH] = _pcv
     return resources["app"].cls(
         gpu=_gpu_arg,
         cpu=spec.cpu,
