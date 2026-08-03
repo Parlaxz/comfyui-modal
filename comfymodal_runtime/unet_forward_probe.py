@@ -125,17 +125,30 @@ def _ensure_context_vars() -> None:
 _unet_gpu_demand_start: dict[str, int] = {}
 _unet_gpu_demand_lock = threading.RLock()
 
+# Bounded: the demand-start map can never grow without bound, even for
+# request ids that never consume their entry (the normal cleanup is
+# _clear_demand_start_ns after the first CUDA forward).
+_UNET_GPU_DEMAND_MAX = 256
+
 
 def set_unet_gpu_demand_start(request_id: str, monotonic_ns: int) -> None:
     """Record demand start for UNET GPU first forward timing.
 
     Called from the outermost ``load_models_gpu`` wrapper when the model
     list contains a registered UNET.  Thread-safe.
+
+    Preserves first-demand semantics: a request id already present in the
+    map is never overwritten.  The map is insertion-ordered, so when the
+    fixed maximum is exceeded the OLDEST request ids are evicted first.
     """
     with _unet_gpu_demand_lock:
         # Only record the *first* demand start per request.
         if request_id not in _unet_gpu_demand_start:
             _unet_gpu_demand_start[request_id] = monotonic_ns
+            if len(_unet_gpu_demand_start) > _UNET_GPU_DEMAND_MAX:
+                _excess = len(_unet_gpu_demand_start) - _UNET_GPU_DEMAND_MAX
+                for _stale in list(_unet_gpu_demand_start.keys())[:_excess]:
+                    del _unet_gpu_demand_start[_stale]
 
 
 def _get_demand_start_ns(request_id: str) -> int | None:
@@ -212,11 +225,19 @@ def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None
             return
         pre_handle = dm.register_forward_pre_hook(_forward_pre_hook, with_kwargs=True)
         _installed_hook_handles.append(pre_handle)
-        # Install forward post-hook for completion recording
-        post_handle = dm.register_forward_hook(_forward_post_hook)
-        _installed_hook_handles.append(post_handle)
         global _unet_forward_hooks_installed
         _unet_forward_hooks_installed = True
+        # The forward post-hook is OPTIONAL: lightweight objects (probe
+        # stubs, minimal probes) may not implement ``register_forward_hook``.
+        # A missing or failing post-hook must never roll back the
+        # already-installed pre-hook or raise a hook_install_failed path.
+        # Production torch modules implement both hooks.
+        try:
+            _post_register = getattr(dm, "register_forward_hook", None)
+            if callable(_post_register):
+                _installed_hook_handles.append(_post_register(_forward_post_hook))
+        except Exception:
+            pass
     except Exception as _hook_exc:
         print(f"[unet_probe] hook_install_failed dm_type={type(dm).__name__} "
               f"error={str(_hook_exc)[:120]}", flush=True)
@@ -525,7 +546,14 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
             for k in list(_dedup.keys())[:excess]:
                 del _dedup[k]
 
-    state = collect_unet_forward_probe_state(unet, diffusion_model=module)
+    try:
+        state = collect_unet_forward_probe_state(unet, diffusion_model=module)
+    except Exception as _state_exc:
+        # Observer failure must never break inference: report and continue
+        # with an empty diagnostic state.
+        print(f"[unet_probe] diagnostic state collection failed: "
+              f"{type(_state_exc).__name__}: {str(_state_exc)[:120]}", flush=True)
+        state = {}
 
     diag_metadata: dict[str, Any] = {
         "schema_version": schema_version,
@@ -563,7 +591,13 @@ def install_nextdit_forward_pre_hook() -> bool:
 
         @functools.wraps(_orig_forward)
         def _patched_forward(self, *args: object, **kwargs: object) -> object:
-            _forward_pre_hook(self, args)
+            # The probe is an observer: a probe failure must never break
+            # inference, so report it and always call the original forward.
+            try:
+                _forward_pre_hook(self, args)
+            except Exception as _probe_exc:
+                print(f"[unet_probe] nextdit pre-hook error: "
+                      f"{type(_probe_exc).__name__}: {str(_probe_exc)[:120]}", flush=True)
             return _orig_forward(self, *args, **kwargs)
 
         NextDiT.forward = _patched_forward
@@ -667,7 +701,14 @@ def emit_post_load_models_gpu_event(models: list[Any]) -> None:
             continue
         unet, source, schema_version = entry
 
-        state = collect_unet_forward_probe_state(unet, diffusion_model=dm)
+        try:
+            state = collect_unet_forward_probe_state(unet, diffusion_model=dm)
+        except Exception as _state_exc:
+            # Observer failure must never break the GPU loader: report and
+            # continue with an empty diagnostic state.
+            print(f"[unet_probe] diagnostic state collection failed: "
+                  f"{type(_state_exc).__name__}: {str(_state_exc)[:120]}", flush=True)
+            state = {}
 
         m = getattr(patcher, "model", None) if patcher is not None else None
         metadata: dict[str, Any] = {

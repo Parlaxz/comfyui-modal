@@ -299,10 +299,108 @@ class TestAtomicPlanSeedPersistence(unittest.TestCase):
         assert read_seed is not None
         self.assertEqual(read_seed.get("workflow_hash"), "wf-hash-2")
 
+    def test_plan_only_republish_preserves_existing_seed(self):
+        """A plan-only republish (omitted seed) must not erase the persisted
+        deployment-scoped seed."""
+        plan_a = RestorePlan(
+            generation=1,
+            model_key=ModelRestoreKey(unet_identity="unet-a"),
+            source_workflow_hash="wf-1",
+        )
+        plan_b = RestorePlan(
+            generation=2,
+            model_key=ModelRestoreKey(unet_identity="unet-b"),
+            source_workflow_hash="wf-2",
+        )
+        seed = _build_seed_payload()
+        self.publisher.publish(plan_a, snapshot_seed=seed)
+
+        result = self.publisher.publish_with_metrics(plan_b)
+        self.assertTrue(result["changed"])
+        read_seed = self.publisher.read_snapshot_seed()
+        self.assertIsNotNone(read_seed)
+        assert read_seed is not None
+        self.assertEqual(read_seed, seed)
+
+    def test_unchanged_plan_omitted_seed_is_noop(self):
+        """Unchanged plan + existing seed + omitted incoming seed → no-op."""
+        plan = RestorePlan(
+            generation=1,
+            model_key=ModelRestoreKey(unet_identity="unet-a"),
+            source_workflow_hash="wf-1",
+        )
+        seed = _build_seed_payload()
+        self.publisher.publish(plan, snapshot_seed=seed)
+        first_write_count = self.coordinator.metrics.write_count
+
+        result = self.publisher.publish_with_metrics(plan)
+        self.assertFalse(result["changed"])
+        self.assertEqual(self.coordinator.metrics.write_count, first_write_count)
+        read_seed = self.publisher.read_snapshot_seed()
+        self.assertIsNotNone(read_seed)
+        assert read_seed is not None
+        self.assertEqual(read_seed, seed)
+
     def test_read_snapshot_seed_absent_when_none(self):
         plan = RestorePlan(generation=1, source_workflow_hash="wf-1")
         self.publisher.publish(plan)
         self.assertIsNone(self.publisher.read_snapshot_seed())
+
+
+class TestAsyncPlanOnlyRepublishPreservesSeed(unittest.TestCase):
+    """Async plan-only republish preserves the persisted seed; unchanged plan
+    + omitted seed is a no-op."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.volume = MountedStateVolume(root=self._tmp.name)
+        self.coordinator = CommitCoordinator(self.volume, state_path="restore_state_async.json")
+        self.publisher = RestorePlanPublisher(self.coordinator)
+
+    def test_async_plan_only_republish_preserves_existing_seed(self):
+        async def run():
+            plan_a = RestorePlan(
+                generation=1,
+                model_key=ModelRestoreKey(unet_identity="unet-a"),
+                source_workflow_hash="wf-1",
+            )
+            plan_b = RestorePlan(
+                generation=2,
+                model_key=ModelRestoreKey(unet_identity="unet-b"),
+                source_workflow_hash="wf-2",
+            )
+            seed = _build_seed_payload()
+            await self.publisher.publish_with_metrics_async(plan_a, snapshot_seed=seed)
+            return seed, await self.publisher.publish_with_metrics_async(plan_b)
+
+        seed, result = asyncio.run(run())
+        self.assertTrue(result["changed"])
+        read_seed = self.publisher.read_snapshot_seed()
+        self.assertIsNotNone(read_seed)
+        assert read_seed is not None
+        self.assertEqual(read_seed, seed)
+
+    def test_async_unchanged_plan_omitted_seed_is_noop(self):
+        async def run():
+            plan = RestorePlan(
+                generation=1,
+                model_key=ModelRestoreKey(unet_identity="unet-a"),
+                source_workflow_hash="wf-1",
+            )
+            seed = _build_seed_payload()
+            await self.publisher.publish_with_metrics_async(plan, snapshot_seed=seed)
+            first_write_count = self.coordinator.metrics.write_count
+            result = await self.publisher.publish_with_metrics_async(plan)
+            return seed, result, first_write_count
+
+        seed, result, first_write_count = asyncio.run(run())
+        self.assertFalse(result["changed"])
+        self.assertEqual(self.coordinator.metrics.write_count, first_write_count)
+        read_seed = self.publisher.read_snapshot_seed()
+        self.assertIsNotNone(read_seed)
+        assert read_seed is not None
+        self.assertEqual(read_seed, seed)
 
 
 # ── 3. Remote-state read / hydration ──────────────────────────────────────

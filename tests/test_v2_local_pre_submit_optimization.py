@@ -996,10 +996,11 @@ class TestBreakdownIntact(unittest.TestCase):
                       "[v2.local_submission_breakdown] must include request_id")
 
     def test_breakdown_required_fields_present(self):
-        """All required breakdown fields are still present."""
+        """All required breakdown fields are still present in the module that
+        owns the breakdown dict (``comfymodal_runtime.trace``)."""
         import inspect
-        from canonical_execution import execute_plan
-        source = inspect.getsource(execute_plan)
+        from comfymodal_runtime.trace import _build_local_submission_breakdown
+        source = inspect.getsource(_build_local_submission_breakdown)
         required_fields = [
             "local_receive_to_worker_start_ms",
             "worker_start_to_plan_build_ms",
@@ -1021,10 +1022,11 @@ class TestBreakdownIntact(unittest.TestCase):
                           f"Breakdown must contain field: {field}")
 
     def test_breakdown_print_has_handle_cache_fields(self):
-        """Breakdown print includes handle_cache_hit, created_modal_client, etc."""
+        """Breakdown print includes handle_cache_hit, created_modal_client,
+        etc. in the module that owns the breakdown dict."""
         import inspect
-        from canonical_execution import execute_plan
-        source = inspect.getsource(execute_plan)
+        from comfymodal_runtime.trace import _build_local_submission_breakdown
+        source = inspect.getsource(_build_local_submission_breakdown)
         for field in ("handle_cache_hit", "created_modal_client",
                        "performed_cls_from_name", "constructed_class_instance"):
             self.assertIn(field, source,
@@ -1151,13 +1153,14 @@ class TestOperationCounts(unittest.TestCase):
 class TestDominantStageEvidence(unittest.TestCase):
     """The [v2.local_submission_breakdown] print captures dominant stage data.
     In testing without remote setter, `active_profile_ms` is the only stage
-    that runs (profile prep is skipped or trivial)."""
+    that runs (profile prep is skipped or trivial).  The breakdown dict is
+    owned by ``comfymodal_runtime.trace``."""
 
     def test_breakdown_contains_all_local_stages(self):
-        """All local pre-submission stages appear in the breakdown print."""
+        """All local pre-submission stages appear in the breakdown source."""
         import inspect
-        from canonical_execution import execute_plan
-        source = inspect.getsource(execute_plan)
+        from comfymodal_runtime.trace import _build_local_submission_breakdown
+        source = inspect.getsource(_build_local_submission_breakdown)
         # Direct stages
         for stage in ("plan_build_ms", "active_profile_ms", "restore_plan_build_ms",
                        "restore_publish_ms", "handle_lookup_ms", "payload_materialization_ms",
@@ -1168,7 +1171,7 @@ class TestDominantStageEvidence(unittest.TestCase):
         # Derived stages
         for stage in ("restore_publish_to_transport_entry_ms",
                        "transport_entry_to_handle_lookup_ms",
-                       "payload_ready_to_generator_create_ms"):
+                       "payload_ready_to_modal_call_ms"):
             self.assertIn(stage, source,
                           f"Breakdown must contain {stage}")
 

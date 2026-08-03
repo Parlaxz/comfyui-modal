@@ -2522,10 +2522,13 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
                           f"Breakdown must reference {field}")
 
     def test_breakdown_contains_restore_publication_metadata(self):
-        """[v2.local_submission_breakdown] references restore publish metadata."""
+        """[v2.local_submission_breakdown] references restore publish metadata.
+
+        The breakdown dict is owned by ``comfymodal_runtime.trace``
+        (``_build_local_submission_breakdown``), not execute_plan."""
         import inspect
-        from canonical_execution import execute_plan
-        source = inspect.getsource(execute_plan)
+        from comfymodal_runtime.trace import _build_local_submission_breakdown
+        source = inspect.getsource(_build_local_submission_breakdown)
         for field in (
             "restore_publish_generation",
             "restore_publish_cache_skipped",
@@ -2574,7 +2577,17 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
     # ── Category 7: backward compatibility ─────────────────────────
 
     def test_existing_events_preserved(self):
-        """All existing valid events are still present after instrumentation."""
+        """All existing valid events are still present after instrumentation
+        across the modules that own them: ``build_execution_plan``,
+        ``execute_plan``, and ``ModalTransport.run_plan_stream``."""
+        import inspect
+        from canonical_execution import build_execution_plan, execute_plan
+        from comfymodal_runtime.modal_transport import ModalTransport
+        sources = "".join([
+            inspect.getsource(build_execution_plan),
+            inspect.getsource(execute_plan),
+            inspect.getsource(ModalTransport.run_plan_stream),
+        ])
         existing_events = {
             "plan_build_start", "plan_build_end",
             "active_profile_prepare_start", "active_profile_prepare_end",
@@ -2585,12 +2598,9 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
             "modal_generator_create_start", "modal_submission_attempt",
             "execute_plan_entry",
         }
-        import inspect
-        from canonical_execution import execute_plan
-        source = inspect.getsource(execute_plan)
         for evt in existing_events:
-            self.assertIn(evt, source,
-                          f"Existing event '{evt}' must still be in execute_plan")
+            self.assertIn(evt, sources,
+                          f"Existing event '{evt}' must still be emitted by an owning module")
 
     def test_existing_trace_fields_preserved(self):
         """Existing metadata/trace fields (generator_create_ms, etc.) are still set."""
@@ -2647,21 +2657,13 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
     # ═══════════════════════════════════════════════════════════════════════
 
     def test_breakdown_contains_all_required_fields(self):
-        """[v2.local_submission_breakdown] contains ALL required field names."""
+        """[v2.local_submission_breakdown] contains ALL required field names.
+
+        The breakdown dict is owned by ``comfymodal_runtime.trace``
+        (``_build_local_submission_breakdown``), not execute_plan."""
         import inspect
-        from canonical_execution import execute_plan
-        source = inspect.getsource(execute_plan)
-        # Find the breakdown print statement (f-string line starting with
-        # f"[v2.local_submission_breakdown] ")
-        bd_print_start = source.find("[v2.local_submission_breakdown]")
-        self.assertGreater(bd_print_start, 0,
-                           "Breakdown section must exist in execute_plan source")
-        # Search for the f-string after the header comment (find 2nd occurrence
-        # that is inside the actual print/f-string).
-        bd_fstring = source.find('f"request_id={_breakdown', bd_print_start)
-        if bd_fstring < 0:
-            bd_fstring = bd_print_start
-        bd_section = source[bd_fstring:bd_fstring + 5000]
+        from comfymodal_runtime.trace import _build_local_submission_breakdown
+        source = inspect.getsource(_build_local_submission_breakdown)
         required_fields = [
             "request_id",
             "local_receive_to_worker_start_ms",
@@ -2675,7 +2677,7 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
             "handle_lookup_ms",
             "payload_materialization_ms",
             "payload_size_measurement_ms",
-            "payload_ready_to_generator_create_ms",
+            "payload_ready_to_modal_call_ms",
             "generator_create_ms",
             "generator_created_to_first_iteration_ms",
             "local_receive_to_actual_submission_ms",
@@ -2684,8 +2686,8 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
             "reconciliation_status",
         ]
         for field in required_fields:
-            self.assertIn(field, bd_section,
-                          f"Required field '{field}' must appear in breakdown section")
+            self.assertIn(field, source,
+                          f"Required field '{field}' must appear in breakdown source")
 
     def test_breakdown_equations_e2e_v1(self):
         """measured_children_ms + residual_ms ≈ total across V1 path events."""

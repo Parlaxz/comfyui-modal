@@ -440,7 +440,8 @@ class RestorePlanPublisher:
         When *snapshot_seed* is provided (a validated schema-v2 seed payload)
         it is written atomically alongside the plan in the same state write,
         making the seed deployment-scoped and read-back-able via
-        ``read_snapshot_seed``.
+        ``read_snapshot_seed``.  When omitted and a valid seed is already
+        persisted, the republished plan preserves that seed unchanged.
         """
         started = time.perf_counter()
         current_plan = self._load_current_plan()
@@ -454,9 +455,11 @@ class RestorePlanPublisher:
                 # identity AND the atomically-persisted snapshot seed.  A
                 # changed seed (e.g. a new deployment custom-node generation)
                 # with an unchanged plan still forces a republish so the
-                # deployment-scoped seed is never stale.
+                # deployment-scoped seed is never stale.  An omitted incoming
+                # seed leaves the persisted seed untouched, so an unchanged
+                # plan is always a no-op in that case.
                 current_seed = self.read_snapshot_seed()
-                if current_seed == incoming_seed:
+                if incoming_seed is None or current_seed == incoming_seed:
                     reload_ms = round((reload_completed - started) * 1000.0, 3)
                     compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
                     result = {
@@ -511,6 +514,10 @@ class RestorePlanPublisher:
         _state_payload: dict[str, Any] = {"restore_plan": plan_dict}
         if snapshot_seed is not None:
             _state_payload["snapshot_seed"] = dict(snapshot_seed)
+        else:
+            _preserved_seed = self.read_snapshot_seed()
+            if _preserved_seed is not None:
+                _state_payload["snapshot_seed"] = _preserved_seed
         self._coordinator.write_state(
             generation,
             _state_payload,
@@ -549,7 +556,8 @@ class RestorePlanPublisher:
         ``coordinator.commit_async()`` to avoid blocking the event loop when
         the underlying Modal Volume commit is async.  Also uses async reload
         (``coordinator.reload_async()``) so Modal's Volume reload is not
-        called synchronously from async code.
+        called synchronously from async code.  An omitted *snapshot_seed*
+        preserves the currently persisted valid seed on a republish.
         """
         started = time.perf_counter()
         current_plan = await self._load_current_plan_async()
@@ -561,9 +569,11 @@ class RestorePlanPublisher:
             if self._identity_hash(current_plan) == self._identity_hash(new_plan):
                 # No-op detection covers the COMPLETE state payload — plan
                 # identity AND the atomically-persisted snapshot seed (see the
-                # sync variant for the rationale).
+                # sync variant for the rationale).  An omitted incoming seed
+                # leaves the persisted seed untouched, so an unchanged plan is
+                # always a no-op in that case.
                 current_seed = self.read_snapshot_seed()
-                if current_seed == incoming_seed:
+                if incoming_seed is None or current_seed == incoming_seed:
                     reload_ms = round((reload_completed - started) * 1000.0, 3)
                     compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
                     result = {
@@ -618,6 +628,10 @@ class RestorePlanPublisher:
         _state_payload_async: dict[str, Any] = {"restore_plan": plan_dict}
         if snapshot_seed is not None:
             _state_payload_async["snapshot_seed"] = dict(snapshot_seed)
+        else:
+            _preserved_seed = self.read_snapshot_seed()
+            if _preserved_seed is not None:
+                _state_payload_async["snapshot_seed"] = _preserved_seed
         self._coordinator.write_state(
             generation,
             _state_payload_async,

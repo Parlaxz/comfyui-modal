@@ -92,6 +92,11 @@ def _reset_globals():
         _ufp_mod._registry.clear()
     with _ufp_mod._dedup_lock:
         _ufp_mod._dedup.clear()
+    # CUDA fake tensors consume the always-on first-CUDA dedup slot, so it
+    # must be cleared between tests or later tests with reused request ids
+    # would never emit the diagnostic event.
+    with _ufp_mod._first_cuda_dedup_lock:
+        _ufp_mod._first_cuda_dedup.clear()
 
 
 class _TraceContext:
@@ -223,8 +228,8 @@ class TestOncePerRequest(unittest.TestCase):
         patcher = _FakeUNETPatcher(model=model)
         register_unet_forward_probe(patcher, source="cpu_snapshot")
         with _TraceContext("req-001") as trace:
-            _forward_pre_hook(dm, (_FakeTensor(),))
-            _forward_pre_hook(dm, (_FakeTensor(),))
+            _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
+            _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
         probe_events = [e for e in trace._events if e.name == "unet_forward_probe"]
         self.assertEqual(len(probe_events), 1)
 
@@ -234,9 +239,9 @@ class TestOncePerRequest(unittest.TestCase):
         patcher = _FakeUNETPatcher(model=model)
         register_unet_forward_probe(patcher, source="cpu_snapshot")
         with _TraceContext("req-001") as trace1:
-            _forward_pre_hook(dm, (_FakeTensor(),))
+            _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
         with _TraceContext("req-002") as trace2:
-            _forward_pre_hook(dm, (_FakeTensor(),))
+            _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
         probe1 = [e for e in trace1._events if e.name == "unet_forward_probe"]
         probe2 = [e for e in trace2._events if e.name == "unet_forward_probe"]
         self.assertEqual(len(probe1), 1)
@@ -308,7 +313,7 @@ class TestCorrectInputMetadata(unittest.TestCase):
         return probe_events[0] if probe_events else None
 
     def test_x_shape_captured(self):
-        event = self._capture_forward_event(_FakeTensor(shape=[1, 4, 128, 128]))
+        event = self._capture_forward_event(_FakeTensor(shape=[1, 4, 128, 128], device="cuda:0"))
         self.assertIsNotNone(event)
         self.assertEqual(list(event.metadata.get("x_shape", [])), [1, 4, 128, 128])
 
@@ -318,12 +323,12 @@ class TestCorrectInputMetadata(unittest.TestCase):
         self.assertEqual(event.metadata.get("x_device"), "cuda:0")
 
     def test_x_dtype_captured(self):
-        event = self._capture_forward_event(_FakeTensor(dtype="torch.bfloat16"))
+        event = self._capture_forward_event(_FakeTensor(dtype="torch.bfloat16", device="cuda:0"))
         self.assertIsNotNone(event)
         self.assertEqual(event.metadata.get("x_dtype"), "torch.bfloat16")
 
     def test_positional_arg(self):
-        event = self._capture_forward_event(_FakeTensor(shape=[2, 4, 64, 64]))
+        event = self._capture_forward_event(_FakeTensor(shape=[2, 4, 64, 64], device="cuda:0"))
         self.assertIsNotNone(event)
         self.assertEqual(list(event.metadata.get("x_shape", [])), [2, 4, 64, 64])
 
@@ -432,13 +437,15 @@ class TestForwardHookInstallation(unittest.TestCase):
     def test_noop_when_disabled(self):
         # install_nextdit_forward_pre_hook is not gated by _is_enabled,
         # so it always tries to install.  When NextDiT is unavailable
-        # it returns False.
+        # it returns False.  Simulate unavailability deterministically by
+        # halting the module import (None in sys.modules) regardless of
+        # whether a local ComfyUI tree makes NextDiT importable.
         saved = _ufp_mod._nextdit_hook_installed
         _ufp_mod._nextdit_hook_installed = False
         try:
-            result = install_nextdit_forward_pre_hook()
-            # NextDiT is not available in test env, so returns False
-            self.assertFalse(result)
+            with patch.dict(sys.modules, {"comfy.ldm.lumina.model": None}):
+                result = install_nextdit_forward_pre_hook()
+                self.assertFalse(result)
         finally:
             _ufp_mod._nextdit_hook_installed = saved
 
@@ -500,7 +507,7 @@ class TestForwardEventSchema(unittest.TestCase):
         patcher = _FakeUNETPatcher(model=model)
         register_unet_forward_probe(patcher, source="cpu_snapshot")
         with _TraceContext("req-fwd") as trace:
-            _forward_pre_hook(dm, (_FakeTensor(shape=[1, 4, 64, 64]),))
+            _forward_pre_hook(dm, (_FakeTensor(shape=[1, 4, 64, 64], device="cuda:0"),))
         probe_events = [e for e in trace._events if e.name == "unet_forward_probe"]
         self.assertEqual(len(probe_events), 1)
         meta = probe_events[0].metadata
