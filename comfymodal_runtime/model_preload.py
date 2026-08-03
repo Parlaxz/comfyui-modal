@@ -1948,6 +1948,19 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         "force_patch_weights": force_patch_weights,
                         "force_full_load": force_full_load,
                     })
+                # ── Phase 1A candidate (clip_gpu_ready): fire the armed
+                # single-use retained-UNET activation exactly once.  Runs
+                # AFTER the qualifying successful CLIP load_models_gpu call
+                # returned AND the mutation lane was released above; only
+                # outermost prefill-lane calls with the exact armed CLIP
+                # patcher and no registered UNET qualify.  Uses the prefill
+                # lane trace/request id — never _ACTIVE_REQUEST_TRACE (absent
+                # in coordinator threads).
+                _maybe_fire_clip_gpu_ready_activation(
+                    models=models,
+                    lane_trace=lane,
+                    load_ok=_diag_ok,
+                )
                 if _diag_ok:
                     emit_post_load_models_gpu_event(models)
                     # load_models_gpu duration measurement (complementary to the
@@ -7098,16 +7111,29 @@ class V2LoaderBridge:
             # Hooked at the established real execution-prefill CLIP callback
             # boundary — immediately before the actual prefill encode (never
             # request entry / tokenization / graph fallback / dummy encode).
-            # Mode "early" schedules the retained UNET GPU activation once
-            # through the coordinator pool; "late" (default) is a no-op that
-            # preserves Phase 0 behavior.
-            clip_encode_start(
-                self,
-                trace=trace,
-                request_id=_request_id,
-                clip=clip,
-                encode_entries=filtered,
-            )
+            # Mode "clip_encode_start" schedules the retained UNET GPU
+            # activation once through the coordinator pool; "clip_gpu_ready"
+            # instead ARMS a request-scoped single-use trigger that is fired
+            # by the GPU loader wrapper hook after the first qualifying
+            # successful CLIP load_models_gpu call from the real prefill
+            # encode returns and the mutation lane is released; "late"
+            # (default) is a no-op that preserves Phase 0 behavior.
+            if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+                _unet_activation_arm(
+                    self,
+                    trace=trace,
+                    request_id=_request_id,
+                    clip=clip,
+                    encode_entries=filtered,
+                )
+            else:
+                clip_encode_start(
+                    self,
+                    trace=trace,
+                    request_id=_request_id,
+                    clip=clip,
+                    encode_entries=filtered,
+                )
 
             # ── Phase B: actual encode (wall / thread / process CPU) ──
             _encode_start = _capture_phase_counters()
@@ -7155,6 +7181,16 @@ class V2LoaderBridge:
                 trace.emit(_EVENT_ENCODE_END, phase="execution",
                            metadata={"counters": _encode_end,
                                      "encoded_count": len(results)})
+                # ── Phase 1A candidate (clip_gpu_ready): concise encode-end
+                # marker closing the required timing chain
+                # (clip_gpu_load_end <= unet_activation_scheduled <=
+                # unet_activation_load_start < clip_encode_end).
+                if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+                    trace.emit(_EVENT_CLIP_ENCODE_END, phase="execution",
+                               metadata={"counters": _encode_end,
+                                         "encoded_count": len(results),
+                                         "mode": _UNET_ACTIVATION_MODE_CLIP_GPU_READY,
+                                         "request_id": _request_id})
 
             if trace:
                 unet_skipped = prep.unet_future is None
@@ -7725,7 +7761,7 @@ class V2LoaderBridge:
             _request_id = str(self._trace.request_id)
         _rt = trace or self._trace
         _mode = unet_activation_mode()
-        if _mode != _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
+        if _mode not in _UNET_ACTIVATION_MODE_ACTIVE:
             # Late mode (the default) preserves Phase 0 exactly: the UNET
             # graph consumer must not emit any unet_early_activation_*
             # graph-demand/join markers, perform join helper work, create
@@ -7913,7 +7949,7 @@ class V2LoaderBridge:
         if (
             lane == "UNET"
             and result is not None
-            and unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_ENCODE_START
+            and unet_activation_mode() in _UNET_ACTIVATION_MODE_ACTIVE
         ):
             self._join_unet_early_activation(result, trace=self._trace)
         if self._trace:
@@ -8169,7 +8205,8 @@ class V2LoaderBridge:
 # ═══════════════════════════════════════════════════════════════════════
 # Mode "late" (default) preserves Phase 0 behavior exactly: the retained
 # UNET is returned at graph/sampler demand and loaded on the critical path.
-# The ONLY allowed opt-in value is exactly "clip_encode_start" — the
+# The ONLY allowed opt-in values are exactly "clip_encode_start" (the
+# original candidate) and "clip_gpu_ready" (V2-only timing candidate) — the
 # historical "early" spelling and any other value normalize to "late" so no
 # candidate path can activate for them.  In "clip_encode_start" mode the
 # retained UNET GPU activation is scheduled once, through the existing
@@ -8184,6 +8221,15 @@ class V2LoaderBridge:
 # continues as a cache validation.  Any skip/failure/cancellation/invalid
 # outcome is made terminal before exactly one caller elects the unchanged
 # late fallback.
+#
+# "clip_gpu_ready" runs the SAME eligibility/identity/VRAM proofs at the
+# same pre-encode boundary but only ARMS a request-scoped single-use
+# trigger there (no submit).  The retained-UNET activation is scheduled
+# exactly once by the existing GPU loader wrapper hook AFTER the first
+# qualifying successful CLIP load_models_gpu call from the real prefill
+# encode returns and the mutation lane is released (marker order:
+# clip_gpu_load_end <= unet_activation_scheduled <=
+# unet_activation_load_start < clip_encode_end).
 
 _EVENT_UNET_EA_MODE = "unet_early_activation_mode"
 _EVENT_UNET_EA_ELIGIBLE = "unet_early_activation_eligible"
@@ -8206,10 +8252,28 @@ _EVENT_UNET_EA_TERMINAL = "unet_early_activation_terminal"
 _EVENT_UNET_EA_FALLBACK = "unet_early_activation_fallback"
 _EVENT_UNET_EA_RECONCILIATION = "unet_early_activation_reconciliation"
 
+# ── Concise clip_gpu_ready timing markers ────────────────────────────────
+# Required monotonic order (clip_gpu_ready mode only):
+#   clip_gpu_load_end <= unet_activation_scheduled <=
+#   unet_activation_load_start < clip_encode_end
+_EVENT_CLIP_GPU_LOAD_END = "clip_gpu_load_end"
+_EVENT_UNET_ACTIVATION_SCHEDULED = "unet_activation_scheduled"
+_EVENT_UNET_ACTIVATION_LOAD_START = "unet_activation_load_start"
+_EVENT_CLIP_ENCODE_END = "clip_encode_end"
+
 _UNET_ACTIVATION_MODE_LATE = "late"
 _UNET_ACTIVATION_MODE_CLIP_ENCODE_START = "clip_encode_start"
+_UNET_ACTIVATION_MODE_CLIP_GPU_READY = "clip_gpu_ready"
+# Legacy documented opt-in set (kept for the existing activation tests).
+# ``clip_gpu_ready`` is accepted by ``_resolve_unet_activation_mode``
+# explicitly below.
 _UNET_ACTIVATION_MODE_VALID = frozenset(
     {_UNET_ACTIVATION_MODE_LATE, _UNET_ACTIVATION_MODE_CLIP_ENCODE_START}
+)
+# Modes that schedule/join the retained-UNET activation future.  Late mode
+# is NOT included — it must never create state, join, or add graph waits.
+_UNET_ACTIVATION_MODE_ACTIVE = frozenset(
+    {_UNET_ACTIVATION_MODE_CLIP_ENCODE_START, _UNET_ACTIVATION_MODE_CLIP_GPU_READY}
 )
 
 # Bounded safety margin for the early-activation VRAM pre-check.  The margin
@@ -8222,7 +8286,8 @@ _EARLY_ACTIVATION_MARGIN_RATIO = 0.1
 def _resolve_unet_activation_mode(raw: str) -> str:
     """Normalize a ``COMFYMODAL_V2_UNET_ACTIVATION_MODE`` value.
 
-    The ONLY allowed opt-in value is exactly ``"clip_encode_start"``.
+    The ONLY allowed opt-in values are exactly ``"clip_encode_start"`` (the
+    original candidate) and ``"clip_gpu_ready"`` (V2-only timing candidate).
     ``"late"`` is the default.  Any other value — including the historical
     ``"early"`` spelling — and the default fall back to ``"late"`` so Phase 0
     behavior is never altered by a typo or an unknown value, and no candidate
@@ -8231,6 +8296,8 @@ def _resolve_unet_activation_mode(raw: str) -> str:
     value = str(raw or "").strip().lower()
     if value == _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
         return _UNET_ACTIVATION_MODE_CLIP_ENCODE_START
+    if value == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+        return _UNET_ACTIVATION_MODE_CLIP_GPU_READY
     if value == _UNET_ACTIVATION_MODE_LATE:
         return _UNET_ACTIVATION_MODE_LATE
     return _UNET_ACTIVATION_MODE_LATE
@@ -8245,8 +8312,9 @@ _UNET_ACTIVATION_MODE_LOG_EMITTED: bool = False
 def unet_activation_mode() -> str:
     """Return the effective UNET activation mode.
 
-    ``"late"`` (default) preserves Phase 0 behavior exactly; the only
-    allowed opt-in value is ``"clip_encode_start"``.  Logs the parsed
+    ``"late"`` (default) preserves Phase 0 behavior exactly; the allowed
+    opt-in values are ``"clip_encode_start"`` (original candidate) and
+    ``"clip_gpu_ready"`` (V2-only timing candidate).  Logs the parsed
     effective mode once per process on first access.
     """
     global _UNET_ACTIVATION_MODE_LOG_EMITTED
@@ -8298,6 +8366,24 @@ def _unet_activation_new_state(request_id: str) -> dict[str, Any]:
         "eligibility_reason": "",
         "clip_encode_entries": 0,
         "clip_object_id": "",
+        # ── clip_gpu_ready single-use trigger state ───────────────────
+        # ``armed`` — a request-scoped single-use trigger has been armed at
+        # the pre-encode boundary (eligibility proven, nothing scheduled).
+        # ``fired`` — the armed trigger has been claimed exactly once by the
+        # GPU loader wrapper hook (armed->scheduled claim is atomic under
+        # ``_UNET_ACTIVATION_LOCK``).  ``clip_patcher_object_id`` is the
+        # exact armed CLIP patcher identity the firing load must match.
+        # The fire-time scheduling references (bridge/prep/model_key/clip/
+        # trace) are held only for the lifetime of the request state and are
+        # dropped by the existing finalize path — no leaked refs.
+        "armed": False,
+        "fired": False,
+        "clip_patcher_object_id": "",
+        "bridge": None,
+        "prep": None,
+        "model_key": None,
+        "clip": None,
+        "trace": None,
         "clip_encode_start_mono_ns": 0,
         "clip_encode_end_mono_ns": 0,
         "clip_encode_wall_ms": 0.0,
@@ -8436,6 +8522,7 @@ def _prove_unet_early_activation_eligible(
     request_id: str,
     clip: Any,
     mode: str,
+    trigger: str = "clip_encode_start",
 ) -> tuple[bool, str, dict[str, Any]]:
     """Prove every eligibility condition at the real prefill boundary.
 
@@ -8444,11 +8531,12 @@ def _prove_unet_early_activation_eligible(
     ``unet_early_activation_skipped`` with the exact reason and must NOT
     schedule.  Evidence carries the per-condition booleans plus the VRAM
     free/required/margin numbers so the skipped/eligible markers are
-    self-contained.
+    self-contained.  *trigger* names the scheduling mode
+    (``"clip_encode_start"`` / ``"clip_gpu_ready"``) for the evidence.
     """
     evidence: dict[str, Any] = {
         "mode": mode,
-        "trigger": "clip_encode_start",
+        "trigger": trigger,
         "request_id": request_id,
         "caller_execution_prefill": False,
         "cpu_snapshot_mode_active": False,
@@ -9221,6 +9309,18 @@ def _run_early_unet_activation(
     # lane wait is measured against the wrapper's gpu_lane_wait_start below.
     _lane_wait_start_ns = time.monotonic_ns()
     if trace is not None:
+        # ── Phase 1A candidate (clip_gpu_ready): concise load-start marker
+        # BEFORE the existing load-start/actual load.  The worker acquires
+        # the activation lock before this point, so this marker is
+        # guaranteed to follow ``unet_activation_scheduled`` (emitted while
+        # the scheduler held the same lock).
+        if mode == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+            trace.emit(_EVENT_UNET_ACTIVATION_LOAD_START, phase="execution", metadata={
+                "mode": mode,
+                "trigger": state.get("trigger", ""),
+                "request_id": request_id,
+                "key_hash": state.get("key_hash", ""),
+            })
         trace.emit(_EVENT_UNET_EA_LANE_WAIT_START, phase="execution", metadata={
             "mode": mode,
             "trigger": state.get("trigger", ""),
@@ -9303,6 +9403,144 @@ def _run_early_unet_activation(
 # ── Public API ──────────────────────────────────────────────────────────
 
 
+def _unet_activation_submit(
+    bridge: "V2LoaderBridge",
+    *,
+    request_id: str,
+    trace: RuntimeTrace | None,
+    prep: RestorePreparation,
+    model_key: ModelRestoreKey,
+    mode: str,
+    trigger: str,
+    clip: Any,
+    encode_entries: list[dict[str, Any]] | int | None,
+    key_components: dict[str, Any],
+    key_hash: str,
+    create_state: bool = True,
+) -> bool:
+    """Shared coordinator/single-flight scheduling core for the retained-UNET
+    activation.
+
+    Used by BOTH the ``clip_encode_start`` boundary hook and the
+    ``clip_gpu_ready`` GPU-loader fire hook so both modes schedule through
+    the same coordinator ``_submit`` path.  Atomically (under the existing
+    activation lock) creates/finds the request state, submits the
+    retained-UNET activation worker once through
+    ``bridge.coordinator._submit``, records the future, and emits the
+    mode-appropriate scheduled marker WHILE HOLDING the lock — so the marker
+    is guaranteed to precede any worker-emitted load-start marker
+    (monotonic-order invariant).  Single-flight: a state that already has a
+    future is never resubmitted.  *create_state* must be False for the fire
+    path (``clip_gpu_ready``) so a request whose state was already popped by
+    request-end finalize is never re-created / re-scheduled.  Returns True
+    when scheduled (or already scheduled), False on submit failure (state
+    marked terminal ``failed``) or when *create_state* is False and no state
+    exists.
+    """
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(request_id)
+        if _state is not None and _state.get("future") is not None:
+            return True
+        if _state is None:
+            if not create_state:
+                return False
+            _state = _unet_activation_new_state(request_id)
+            _UNET_ACTIVATION_STATE[request_id] = _state
+        _state["owner"] = trigger
+        _state["trigger"] = trigger
+        _state["mode"] = mode
+        _state["eligible"] = True
+        _state["eligibility_reason"] = "ok"
+        _state["key"] = key_components
+        _state["key_hash"] = key_hash
+        # clip_encode_start_mono_ns is intentionally NOT set here (scheduling
+        # time).  It is recorded at the ACTUAL encode boundary by
+        # record_clip_encode_start() in the execution-prefill worker so the
+        # waterfall reconciliation measures the real encode start, not the
+        # schedule/submit time (submitted_mono_ns stays separate below).
+        if isinstance(encode_entries, int):
+            _state["clip_encode_entries"] = max(0, encode_entries)
+        else:
+            _state["clip_encode_entries"] = max(0, len(encode_entries or []))
+        _state["clip_object_id"] = str(id(clip)) if clip is not None else ""
+        _state["status"] = "scheduled"
+        _state["submitted_mono_ns"] = time.monotonic_ns()
+
+        def _worker() -> Any:
+            return _run_early_unet_activation(
+                bridge,
+                prep=prep,
+                trace=trace,
+                request_id=request_id,
+                state=_state,
+                clip=clip,
+                key_hash=key_hash,
+                mode=mode,
+            )
+
+        try:
+            _future = bridge.coordinator._submit(
+                "unet_early_activation", _worker, prep, trace,
+                phase="execution", expected_read_count=0,
+            )
+        except Exception as exc:
+            _state["status"] = "failed"
+            _state["terminal"] = True
+            _state["reason"] = "submit_failed"
+            _state["error"] = str(exc)[:200]
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+            if trace is not None:
+                trace.emit(_EVENT_UNET_EA_FAILED, phase="execution", metadata={
+                    "mode": mode,
+                    "trigger": trigger,
+                    "request_id": request_id,
+                    "key_hash": key_hash,
+                    "reason": "submit_failed",
+                    "error": str(exc)[:200],
+                })
+            return False
+        _state["future"] = _future
+        # Emit the scheduled marker(s) WHILE HOLDING the lock.  The worker
+        # must acquire the same lock before it can emit any load-start
+        # marker, so ``unet_activation_scheduled`` is guaranteed to precede
+        # ``unet_activation_load_start`` in the trace (reliable monotonic
+        # order).  The existing ``unet_early_activation_scheduled`` marker
+        # is preserved unchanged.
+        if trace is not None:
+            _sched_meta = {
+                "mode": mode,
+                "trigger": trigger,
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "clip_encode_entries": _state.get("clip_encode_entries", 0),
+                "unet_patcher_object_id": key_components.get("unet_patcher_object_id", ""),
+                "unet_diffusion_object_id": key_components.get("unet_diffusion_object_id", ""),
+                "unet_identity_hash": stable_hash(str(model_key.unet_identity))[:16],
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+            }
+            trace.emit(_EVENT_UNET_EA_SCHEDULED, phase="execution", metadata=_sched_meta)
+            if mode == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+                trace.emit(_EVENT_UNET_ACTIVATION_SCHEDULED, phase="execution", metadata={
+                    "mode": mode,
+                    "trigger": trigger,
+                    "request_id": request_id,
+                    "key_hash": key_hash,
+                    "unet_patcher_object_id": key_components.get("unet_patcher_object_id", ""),
+                    "unet_diffusion_object_id": key_components.get("unet_diffusion_object_id", ""),
+                })
+    _unet_activation_trim()
+    print(
+        f"[v2.unet_early_activation] event=scheduled "
+        f"request_id={request_id or 'absent'} mode={mode} trigger={trigger} "
+        f"key_hash={key_hash} clip_encode_entries={_state.get('clip_encode_entries', 0)} "
+        f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+        f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+        flush=True,
+    )
+    return True
+
+
 def clip_encode_start(
     bridge: "V2LoaderBridge",
     *,
@@ -9328,8 +9566,10 @@ def clip_encode_start(
     claims the request slot and schedules the worker once through the
     existing coordinator pool; every subsequent call joins the same future.
     Mode-gated (default ``"late"`` is a no-op that preserves Phase 0
-    behavior; no candidate path can activate for ``early``).  Returns True
-    when scheduled (or already scheduled), False when late/ineligible.
+    behavior; ``"clip_gpu_ready"`` uses the arm/fire path instead of this
+    scheduling entry; no candidate path can activate for ``early``).
+    Returns True when scheduled (or already scheduled), False when
+    late/ineligible.
     """
     mode = unet_activation_mode()
     if mode != _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
@@ -9367,6 +9607,7 @@ def clip_encode_start(
         request_id=_request_id,
         clip=clip,
         mode=mode,
+        trigger="clip_encode_start",
     )
     _eligible_meta = dict(_evidence)
     _eligible_meta.update({
@@ -9413,87 +9654,251 @@ def clip_encode_start(
         unet=_retained_unet,
         weight_dtype=_unet_requested_weight_dtype(bridge, model_key),
     )
+    return _unet_activation_submit(
+        bridge,
+        request_id=_request_id, trace=trace, prep=prep, model_key=model_key,
+        mode=mode, trigger="clip_encode_start",
+        clip=clip, encode_entries=encode_entries,
+        key_components=_key_components, key_hash=_key_hash,
+    )
+
+
+def _unet_activation_arm(
+    bridge: "V2LoaderBridge",
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+    clip: Any = None,
+    encode_entries: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Arm the request-scoped single-use retained-UNET activation trigger
+    (``COMFYMODAL_V2_UNET_ACTIVATION_MODE=clip_gpu_ready``).
+
+    Runs at the established real execution-prefill CLIP callback boundary
+    (``_execution_prefill`` — the ONLY integration call) immediately before
+    the actual prefill encode.  Performs the SAME eligibility / identity /
+    VRAM proofs as ``clip_encode_start`` (execution-prefill caller, mode,
+    production CPU-snapshot request marker, exact retained snapshot→bridge
+    identity chain, completed retained-UNET future, no same-request/key
+    future, live CUDA validity, and safe VRAM for the exact active CLIP +
+    retained UNET) but MUST NOT submit or schedule the UNET here.  The
+    retained-UNET activation is scheduled later — exactly once — by the
+    existing GPU loader wrapper hook when the first qualifying successful
+    CLIP ``load_models_gpu`` call from the real prefill encode returns and
+    the mutation lane is released.  Idempotent per request: a second arm (or
+    an already armed/fired/scheduled state) is a no-op.  Mode-gated
+    (``"late"`` and ``"clip_encode_start"`` are no-ops).  Returns True when
+    armed (or already armed), False when late/ineligible.
+    """
+    mode = unet_activation_mode()
+    if mode != _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+        return False
+    if bridge is None:
+        return False
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None or prep.unet_future is None:
+        return False
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    if not _request_id:
+        return False
+    # Idempotent: an armed / fired / scheduled trigger is never re-armed.
+    with _UNET_ACTIVATION_LOCK:
+        _existing = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and (
+            _existing.get("armed", False)
+            or _existing.get("fired", False)
+            or _existing.get("future") is not None
+        ):
+            return True
+
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_MODE, phase="execution", metadata={
+            "mode": mode,
+            "trigger": "clip_gpu_ready",
+            "request_id": _request_id,
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+
+    # ── Eligibility gate (same proofs as clip_encode_start) ─────────
+    _eligible, _reason, _evidence = _prove_unet_early_activation_eligible(
+        bridge,
+        request_id=_request_id,
+        clip=clip,
+        mode=mode,
+        trigger="clip_gpu_ready",
+    )
+    _eligible_meta = dict(_evidence)
+    _eligible_meta.update({
+        "eligible": bool(_eligible),
+        "reason": _reason,
+    })
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_ELIGIBLE, phase="execution", metadata=_eligible_meta)
+    if not _eligible:
+        if trace is not None:
+            _skip_meta = {
+                "mode": mode,
+                "trigger": "clip_gpu_ready",
+                "request_id": _request_id,
+                "eligible": False,
+                "reason": _reason,
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+                "free_bytes": _evidence.get("free_bytes"),
+                "required_bytes": _evidence.get("required_bytes"),
+                "margin_bytes": _evidence.get("margin_bytes"),
+            }
+            trace.emit(_EVENT_UNET_EA_SKIPPED, phase="execution", metadata=_skip_meta)
+        print(
+            f"[v2.unet_early_activation] event=skipped "
+            f"request_id={_request_id or 'absent'} mode={mode} trigger=clip_gpu_ready "
+            f"reason={_reason} eligible=0",
+            flush=True,
+        )
+        return False
+
+    # ── Key with REAL retained identities (same as clip_encode_start) ──
+    try:
+        _retained_unet = prep.unet_future.result()
+    except Exception:
+        _retained_unet = None
+    _key_components, _key_hash = _build_unet_activation_key(
+        mode=mode,
+        model_key=model_key,
+        request_id=_request_id,
+        unet=_retained_unet,
+        weight_dtype=_unet_requested_weight_dtype(bridge, model_key),
+    )
+    _clip_patcher = _resolve_clip_patcher(clip)
     with _UNET_ACTIVATION_LOCK:
         _state = _UNET_ACTIVATION_STATE.get(_request_id)
-        if _state is not None and _state.get("future") is not None:
+        if _state is not None and (
+            _state.get("armed", False)
+            or _state.get("fired", False)
+            or _state.get("future") is not None
+        ):
             return True
         if _state is None:
             _state = _unet_activation_new_state(_request_id)
             _UNET_ACTIVATION_STATE[_request_id] = _state
-        _state["owner"] = "clip_encode_start"
-        _state["trigger"] = "clip_encode_start"
+        _state["owner"] = "clip_gpu_ready"
+        _state["trigger"] = "clip_gpu_ready"
         _state["mode"] = mode
         _state["eligible"] = True
         _state["eligibility_reason"] = "ok"
         _state["key"] = _key_components
         _state["key_hash"] = _key_hash
-        # clip_encode_start_mono_ns is intentionally NOT set here (scheduling
-        # time).  It is recorded at the ACTUAL encode boundary by
-        # record_clip_encode_start() in the execution-prefill worker so the
-        # waterfall reconciliation measures the real encode start, not the
-        # schedule/submit time (submitted_mono_ns stays separate below).
         _state["clip_encode_entries"] = max(0, len(encode_entries or []))
         _state["clip_object_id"] = str(id(clip)) if clip is not None else ""
-        _state["status"] = "scheduled"
-        _state["submitted_mono_ns"] = time.monotonic_ns()
-
-        def _worker() -> Any:
-            return _run_early_unet_activation(
-                bridge,
-                prep=prep,
-                trace=trace,
-                request_id=_request_id,
-                state=_state,
-                clip=clip,
-                key_hash=_key_hash,
-                mode=mode,
-            )
-
-        try:
-            _future = bridge.coordinator._submit(
-                "unet_early_activation", _worker, prep, trace,
-                phase="execution", expected_read_count=0,
-            )
-        except Exception as exc:
-            _state["status"] = "failed"
-            _state["terminal"] = True
-            _state["reason"] = "submit_failed"
-            _state["error"] = str(exc)[:200]
-            _state["terminal_mono_ns"] = time.monotonic_ns()
-            if trace is not None:
-                trace.emit(_EVENT_UNET_EA_FAILED, phase="execution", metadata={
-                    "mode": mode,
-                    "trigger": "clip_encode_start",
-                    "request_id": _request_id,
-                    "key_hash": _key_hash,
-                    "reason": "submit_failed",
-                    "error": str(exc)[:200],
-                })
-            return False
-        _state["future"] = _future
-    _unet_activation_trim()
-    if trace is not None:
-        trace.emit(_EVENT_UNET_EA_SCHEDULED, phase="execution", metadata={
-            "mode": mode,
-            "trigger": "clip_encode_start",
-            "request_id": _request_id,
-            "key_hash": _key_hash,
-            "clip_encode_entries": _state.get("clip_encode_entries", 0),
-            "unet_patcher_object_id": _key_components.get("unet_patcher_object_id", ""),
-            "unet_diffusion_object_id": _key_components.get("unet_diffusion_object_id", ""),
-            "unet_identity_hash": stable_hash(str(model_key.unet_identity))[:16],
-            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
-            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
-        })
-    print(
-        f"[v2.unet_early_activation] event=scheduled "
-        f"request_id={_request_id or 'absent'} mode={mode} trigger=clip_encode_start "
-        f"key_hash={_key_hash} clip_encode_entries={_state.get('clip_encode_entries', 0)} "
-        f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
-        f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
-        flush=True,
-    )
+        _state["clip_patcher_object_id"] = str(id(_clip_patcher)) if _clip_patcher is not None else ""
+        _state["status"] = "armed"
+        _state["armed"] = True
+        # Fire-time scheduling references (dropped with the request state by
+        # the existing finalize path — no leaked refs).
+        _state["bridge"] = bridge
+        _state["prep"] = prep
+        _state["model_key"] = model_key
+        _state["clip"] = clip
+        _state["trace"] = trace
+        _state["encode_entries"] = max(0, len(encode_entries or []))
     return True
+
+
+def _maybe_fire_clip_gpu_ready_activation(
+    *,
+    models: list[Any],
+    lane_trace: "ModelLaneTrace | None",
+    load_ok: bool,
+) -> None:
+    """clip_gpu_ready fire hook (existing GPU loader wrapper, outermost
+    prefill-lane calls only).
+
+    Called after a ``load_models_gpu`` call has returned AND the existing
+    mutation lane has been released.  For
+    ``COMFYMODAL_V2_UNET_ACTIVATION_MODE=clip_gpu_ready`` it claims the
+    request-scoped single-use armed trigger atomically (armed→scheduled,
+    so multiple CLIP loads can never fire twice) and schedules the existing
+    retained-UNET activation through the shared coordinator/single-flight
+    path (``_unet_activation_submit``).  Requires: a successful load, the
+    outermost prefill-lane call, NO registered UNET in *models*, the exact
+    armed CLIP patcher identity present in *models*, and the prefill lane
+    trace/request id (never ``_ACTIVE_REQUEST_TRACE`` — absent in
+    coordinator threads).  Emits the concise ``clip_gpu_load_end`` marker
+    after the lane release and BEFORE scheduling.  Never fires for
+    ``late``/``clip_encode_start`` modes and never schedules twice.
+    """
+    if not load_ok:
+        return
+    if _UNET_ACTIVATION_MODE != _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+        return
+    if lane_trace is None or getattr(lane_trace, "_lane", "") != "prefill":
+        return
+    if _has_registered_unet_in_models(models):
+        return
+    _trace = getattr(lane_trace, "_trace", None)
+    if _trace is None:
+        return
+    _request_id = str(getattr(_trace, "request_id", "") or "")
+    if not _request_id:
+        return
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _state is None or not _state.get("armed", False) or _state.get("fired", False):
+            return
+        if _state.get("future") is not None:
+            return
+        # Exact armed CLIP patcher identity must be present in the load list.
+        _armed_patcher_id = str(_state.get("clip_patcher_object_id", "") or "")
+        if not _armed_patcher_id:
+            return
+        _matched = False
+        for _m in models:
+            try:
+                if str(id(_m)) == _armed_patcher_id:
+                    _matched = True
+                    break
+                if str(id(_resolve_clip_patcher(_m))) == _armed_patcher_id:
+                    _matched = True
+                    break
+            except Exception:
+                continue
+        if not _matched:
+            return
+        # Atomic armed→scheduled claim: a second qualifying CLIP load for
+        # the same request can never fire again.
+        _state["fired"] = True
+        _bridge = _state.get("bridge")
+        _prep = _state.get("prep")
+        _model_key = _state.get("model_key")
+        _clip = _state.get("clip")
+        _encode_entries = _state.get("encode_entries", 0)
+        _key_components = _state.get("key") or {}
+        _key_hash = _state.get("key_hash", "")
+        _mode = _state.get("mode", "")
+        _trigger = _state.get("trigger", "clip_gpu_ready")
+    if _bridge is None or _prep is None or _model_key is None:
+        return
+    # Concise marker AFTER the lane release, BEFORE scheduling.
+    if _trace is not None:
+        _trace.emit(_EVENT_CLIP_GPU_LOAD_END, phase="execution", metadata={
+            "mode": _mode,
+            "trigger": _trigger,
+            "request_id": _request_id,
+            "clip_patcher_object_id": _armed_patcher_id,
+            "lane": "prefill",
+        })
+    _unet_activation_submit(
+        _bridge,
+        request_id=_request_id, trace=_trace, prep=_prep,
+        model_key=_model_key, mode=_mode, trigger=_trigger,
+        clip=_clip, encode_entries=_encode_entries,
+        key_components=_key_components, key_hash=_key_hash,
+        create_state=False,
+    )
 
 
 def record_clip_encode_start(
@@ -9586,8 +9991,10 @@ def join_unet_early_activation(
     path continues as a cache validation.  On any non-ready terminal outcome
     exactly one caller elects the unchanged late fallback (atomic, never
     overwritten, never racing a pending future — the future is joined to
-    terminal before any election)."""
-    if unet_activation_mode() != _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
+    terminal before any election).  Mode-gated: only the active modes
+    (``clip_encode_start`` / ``clip_gpu_ready``) join the future; late mode
+    is a no-op."""
+    if unet_activation_mode() not in _UNET_ACTIVATION_MODE_ACTIVE:
         return {"scheduled": False, "status": "mode_late", "terminal": False,
                 "valid": False, "reason": "", "join_wait_ms": 0.0}
     _request_id = str(request_id or "")
