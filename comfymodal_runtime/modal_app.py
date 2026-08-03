@@ -754,6 +754,10 @@ def _is_production_profile() -> bool:
     return os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower() == "production"
 
 
+def _vae_snapshot_enabled() -> bool:
+    return env_flag("COMFYMODAL_V2_VAE_SNAPSHOT")
+
+
 def _safe_snapshot_identity(value: Any, role: str) -> str:
     if value is None:
         return "absent"
@@ -2006,6 +2010,7 @@ def _runtime_env() -> dict[str, str]:
     """Build the runtime environment dict for Modal's class-level ``env=`` parameter.
 
     Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
+    ``COMFYMODAL_V2_VAE_SNAPSHOT`` and
     ``COMFYMODAL_ENABLE_GPU_SNAPSHOT`` (both defaulting to ``"0"`` when
     absent from the local process environment), optional
     ``COMFYMODAL_V2_MEMORY_MB`` when present, full-trace/profile env keys
@@ -2022,6 +2027,9 @@ def _runtime_env() -> dict[str, str]:
         ),
         "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
+            "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -4843,6 +4851,8 @@ class ModalRuntimeEntrypoint:
                 env_vae = os.environ.get("COMFYMODAL_WARMUP_VAE", "")
                 if env_vae.strip():
                     profile["vae"] = env_vae
+                if not _vae_snapshot_enabled():
+                    profile["vae"] = ""
                 return profile
             print(
                 "[v2.cpu_snapshot] status=skipped reason=profile_unavailable "
@@ -4872,6 +4882,8 @@ class ModalRuntimeEntrypoint:
                     f"cpu model snapshot profile {key} must be a non-empty string, "
                     f"got {value!r}"
                 )
+        if not _vae_snapshot_enabled():
+            profile["vae"] = ""
         return profile
 
     def _use_cpu_snapshot_models_on_bridge(
