@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 
-from tests.v2_baseline_fixtures import BASELINE_ROWS
+from tests.v2_baseline_fixtures import BASELINE_EXPECTED, BASELINE_ROWS
 from tools.v2_waterfall import (
     build_waterfall,
     render_comparison,
@@ -359,20 +359,31 @@ def _build_baseline_report(row: dict):
 def test_three_baseline_rows_reconcile_within_tolerance():
     """Each sanitized baseline row reconciles within max(50ms, 0.5% total) with
     the platform row populated, restore counted exactly once, and restore-to-
-    method-entry separate."""
-    for row in BASELINE_ROWS:
+    method-entry separate.  Fixture totals and exact supplied source values are
+    asserted verbatim — not merely self-consistency."""
+    assert len(BASELINE_ROWS) == len(BASELINE_EXPECTED) == 3
+    for row, expected in zip(BASELINE_ROWS, BASELINE_EXPECTED):
         dispatch = row["dispatch_to_modal_entry_ms"]
         restore_total = row["restore_total_ms"]
         restore_to_method = row["restore_end_to_modal_method_ms"]
         expected_platform = dispatch - restore_total - restore_to_method
         assert expected_platform > 0, "fixture platform duration must be positive"
+        # Fixture fields carry the exact supplied values.
+        assert dispatch == expected["dispatch_to_modal_entry_ms"]
+        assert restore_total == expected["restore_total_ms"]
+        assert restore_to_method == expected["restore_end_to_modal_method_ms"]
+        assert abs(expected_platform - expected["platform_ms"]) < 1e-9
 
         report = _build_baseline_report(row)
         stages = {stage.key: stage for stage in report.stages}
 
-        # Total from the local command->response span.
+        # Total from the local command->response span equals the supplied total.
         assert report.total_ms is not None
         assert report.total_ms > 0
+        assert abs(report.total_ms - expected["total_ms"]) < 1e-9, (
+            f"{row['request_id']}: total {report.total_ms}ms != "
+            f"supplied {expected['total_ms']}ms"
+        )
         # Each row reconciles within tolerance (platform is accounted, not
         # leaked into the generic residual).
         assert report.reconciliation_ms is not None
@@ -408,6 +419,10 @@ def test_three_baseline_rows_reconcile_within_tolerance():
         assert stages["restore_to_method_entry"].duration_ms is not None
         assert abs(stages["restore_to_method_entry"].duration_ms - restore_to_method) < 1e-9
 
+        # Provider/region placement is preserved on the identity.
+        assert stages and report.identity.get("cloud") == expected["cloud"]
+        assert report.identity.get("region") == expected["region"]
+
         # Local handle lookup stays a separate row from the platform row.
         assert stages["modal_handle_submission"].duration_ms is not None
         assert stages["modal_handle_submission"].duration_ms > 0
@@ -417,6 +432,28 @@ def test_three_baseline_rows_reconcile_within_tolerance():
         residual = stages.get("captured_timeline_gap")
         if residual is not None and residual.duration_ms is not None:
             assert abs(residual.duration_ms - expected_platform) > 1e-9
+
+
+def test_baseline_rows_assert_exact_supplied_source_values():
+    """The fixture rows are the verbatim supplied runs: total, dispatch,
+    restore, restore-to-method, and placement are asserted exactly on the
+    report stages, not derived from fixture self-consistency alone."""
+    for row, expected in zip(BASELINE_ROWS, BASELINE_EXPECTED):
+        report = _build_baseline_report(row)
+        stages = {stage.key: stage for stage in report.stages}
+        assert abs(report.total_ms - expected["total_ms"]) < 1e-9
+        assert abs(stages["modal_scheduling"].duration_ms - expected["platform_ms"]) < 1e-9
+        assert abs(stages["application_restore"].duration_ms - expected["restore_total_ms"]) < 1e-9
+        assert abs(
+            stages["restore_to_method_entry"].duration_ms - expected["restore_end_to_modal_method_ms"]
+        ) < 1e-9
+        # Exact supplied dispatch flows only through the derived platform row.
+        assert abs(
+            expected["dispatch_to_modal_entry_ms"]
+            - expected["restore_total_ms"]
+            - expected["restore_end_to_modal_method_ms"]
+            - stages["modal_scheduling"].duration_ms
+        ) < 1e-9
 
 
 def test_baseline_negative_derived_platform_rejected():
@@ -438,3 +475,166 @@ def test_baseline_negative_derived_platform_rejected():
         for s in report.stages
         if s.duration_ms is not None
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Step 3 seed-detail fallback + cross-process return-stage guards
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _seed_result(events):
+    return {"request_id": "seed-detail", "trace": {"events": events}}
+
+
+def test_seed_validate_detail_measured_from_boundary_pair():
+    """When both snapshot seed validate start/end events exist on the remote
+    process, the validate detail is MEASURED from the monotonic pair — the
+    authoritative metadata is only the fallback."""
+    events = [
+        _event("snapshot_graph_seed_validate_start", 1000, 1000, "remote", budget_ms=25),
+        _event("snapshot_graph_seed_validate_end", 1001, 1100, "remote", decision="match", schema=2),
+        _event("snapshot_graph_seed_apply_start", 1001, 1100, "remote", decision="match", schema=2),
+        _event("snapshot_graph_seed_apply_end", 1002, 1150, "remote",
+               decision="match", schema=2,
+               validate_ms=0.4, apply_ms=0.03, total_ms=0.47),
+    ]
+    report = build_waterfall(result=_seed_result(events), timing={}, wall_ms=1000)
+    details = {detail.key: detail for detail in report.details}
+    validate = details["snapshot_graph_seed_validate"]
+    assert validate.duration_ms == 100.0        # (1100 - 1000)ms monotonic
+    assert validate.status == "measured"
+    assert validate.clock_scope == "monotonic:remote"
+    assert validate.source_fields == ("snapshot_graph_seed_validate_start", "snapshot_graph_seed_validate_end")
+    apply_detail = details["snapshot_graph_seed_apply"]
+    assert apply_detail.duration_ms == 50.0     # (1150 - 1100)ms monotonic
+    assert apply_detail.status == "measured"
+    # Detail rows stay excluded from the accounted total.
+    assert all(detail.included_in_total is False for detail in report.details)
+
+
+def test_seed_validate_detail_falls_back_to_apply_end_metadata():
+    """snapshot_graph_seed_validate_end carries only the decision, so when the
+    validate start event is missing the validate duration is DERIVED from the
+    authoritative apply-end metadata (validate_ms) instead of 'unavailable'."""
+    events = [
+        _event("snapshot_graph_seed_validate_end", 1000, 1000, "remote", decision="match", schema=2),
+        _event("snapshot_graph_seed_apply_end", 1001, 1001, "remote",
+               decision="match", schema=2,
+               validate_ms=0.394, apply_ms=0.029, total_ms=0.471),
+    ]
+    report = build_waterfall(result=_seed_result(events), timing={}, wall_ms=1000)
+    details = {detail.key: detail for detail in report.details}
+    validate = details["snapshot_graph_seed_validate"]
+    assert validate.duration_ms == 0.394
+    assert validate.status == "derived"
+    assert validate.source_fields == ("validate_ms",)
+    apply_detail = details["snapshot_graph_seed_apply"]
+    # apply_ms is preferred; total_ms is the broader fallback only.
+    assert apply_detail.duration_ms == 0.029
+    assert apply_detail.status == "derived"
+    assert apply_detail.source_fields == ("apply_ms",)
+
+
+def test_seed_apply_detail_falls_back_to_total_ms():
+    """When apply_ms is absent the apply detail preserves the authoritative
+    total_ms rather than becoming unavailable."""
+    events = [
+        _event("snapshot_graph_seed_apply_end", 1001, 1001, "remote",
+               decision="match", schema=2, validate_ms=0.4, total_ms=0.47),
+    ]
+    report = build_waterfall(result=_seed_result(events), timing={}, wall_ms=1000)
+    apply_detail = next(d for d in report.details if d.key == "snapshot_graph_seed_apply")
+    assert apply_detail.duration_ms == 0.47
+    assert apply_detail.status == "derived"
+    assert apply_detail.source_fields == ("total_ms",)
+
+
+def test_seed_validate_detail_falls_back_to_executor_seed_apply_marker():
+    """executor_seed_apply_end.seed_apply.validate_ms is the authoritative Step 3
+    fallback when the snapshot-graph events are entirely absent."""
+    events = [{
+        "name": "executor_seed_apply_end",
+        "process": "remote",
+        "wall_unix_ns": 0,
+        "monotonic_ns": 0,
+        "metadata": {
+            "seed_apply": {
+                "decision": "match", "schema": 2,
+                "validate_ms": 0.394, "apply_ms": 0.029, "total_ms": 0.471,
+            },
+        },
+    }]
+    report = build_waterfall(result=_seed_result(events), timing={}, wall_ms=1000)
+    details = {detail.key: detail for detail in report.details}
+    validate = details["snapshot_graph_seed_validate"]
+    assert validate.duration_ms == 0.394
+    assert validate.status == "derived"
+    assert validate.source_fields == ("executor_seed_apply_end.seed_apply.validate_ms",)
+    apply_detail = details["snapshot_graph_seed_apply"]
+    assert apply_detail.duration_ms == 0.029
+    assert apply_detail.source_fields == ("executor_seed_apply_end.seed_apply.apply_ms",)
+
+
+def test_cross_process_clock_skew_return_stages_unavailable_not_negative():
+    """Mirrors the production three-run artifact: the local wall clock runs
+    ~0.6s behind the remote clock, so remote output_collect_end appears after
+    the local final_result_received.  The remote_return_handoff (cross-process
+    wall) must be unavailable/derived — never a negative measured duration and
+    never subtracted into reconciliation.  The local return hop is the same
+    instant (~0ms), not a fabricated negative."""
+    events = [
+        _event("output_persist_start", 11600, 7600, "remote"),
+        _event("output_persist_end", 12300, 8300, "remote"),
+        _event("output_collect_start", 12301, 8301, "remote"),
+        _event("output_collect_end", 12302, 8302, "remote"),
+        # Local clock is behind: the local receive wall time is EARLIER than
+        # the remote completion wall time, which is impossible on one clock.
+        _event("remote_return_start", 12200, 12200, "local"),
+        _event("final_result_received", 12200, 12201, "local"),
+    ]
+    report = build_waterfall(
+        result=_seed_result(events),
+        timing={},
+        wall_ms=2000,
+        command_start_unix_ms=10000,
+        response_received_unix_ns=12200 * 1_000_000,
+    )
+    stages = {stage.key: stage for stage in report.stages}
+    for key in ("remote_return_handoff", "remote_local_return"):
+        stage = stages[key]
+        assert stage.status != "invalid"
+        assert stage.duration_ms is None or stage.duration_ms >= 0
+    # The cross-process handoff span is unreliable under clock skew: it must
+    # not be reported as a measured (negative or absurd) value.
+    assert stages["remote_return_handoff"].duration_ms is None
+    # No phantom negative duration warnings for the skewed return segments.
+    assert not any("negative duration" in warning for warning in report.warnings)
+
+
+def test_return_stages_measure_with_valid_response_boundaries():
+    """With a trace that has valid (same-clock) response boundaries, the return
+    stages are measured non-negative instead of being dropped as unavailable,
+    and reconciliation is still reported."""
+    events = [
+        _event("output_persist_start", 11600, 7600, "remote"),
+        _event("output_persist_end", 12300, 8300, "remote"),
+        _event("output_collect_end", 12350, 8350, "remote"),
+        _event("remote_return_start", 13100, 13100, "local"),
+        _event("final_result_received", 13100, 13101, "local"),
+    ]
+    report = build_waterfall(
+        result=_seed_result(events),
+        timing={},
+        wall_ms=15000,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=13100 * 1_000_000,
+    )
+    stages = {stage.key: stage for stage in report.stages}
+    handoff = stages["remote_return_handoff"]
+    assert handoff.status != "invalid"
+    assert handoff.duration_ms is None or handoff.duration_ms >= 0
+    ret = stages["remote_local_return"]
+    assert ret.duration_ms is not None and ret.duration_ms >= 0
+    assert ret.status != "invalid"
+    assert report.reconciliation_ms is not None
+    assert not any("negative duration" in warning for warning in report.warnings)

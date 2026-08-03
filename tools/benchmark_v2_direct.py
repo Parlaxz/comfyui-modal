@@ -1224,6 +1224,47 @@ def _check_acceptance(
                                 f"expected={expected!r}"
                             )
 
+        # ── Step 3 evidence: snapshot graph seed apply ──
+        # Every fresh request must carry the executor seed-apply seam result:
+        # a snapshot_graph_seed_apply_end trace event attesting schema-v2,
+        # within_budget, zero invalidations (fresh workflow == published seed),
+        # sampler entries untouched, and an explicit fallback reason (the
+        # marker must never silently claim "seeded").
+        _seed_apply_ev = _trace_event(_ev_result, "snapshot_graph_seed_apply_end")
+        if _seed_apply_ev is None:
+            failures.append(
+                f"{run_label}: snapshot_graph_seed_apply_end event missing"
+            )
+        else:
+            _sa_meta = _event_metadata(_seed_apply_ev)
+            if not isinstance(_sa_meta, dict) or not _sa_meta:
+                failures.append(f"{run_label}: seed apply metadata empty or absent")
+            else:
+                _sa_schema = _sa_meta.get("schema", 0)
+                if _sa_schema != 2:
+                    failures.append(
+                        f"{run_label}: seed apply schema={_sa_schema}, expected 2"
+                    )
+                if _sa_meta.get("within_budget") is not True:
+                    failures.append(
+                        f"{run_label}: seed apply within_budget not true "
+                        f"({_sa_meta.get('within_budget')})"
+                    )
+                if _sa_meta.get("invalidated", -1) != 0:
+                    failures.append(
+                        f"{run_label}: seed apply invalidated="
+                        f"{_sa_meta.get('invalidated')}, expected 0"
+                    )
+                if _sa_meta.get("sampler_untouched") is not True:
+                    failures.append(
+                        f"{run_label}: seed apply sampler_untouched not true "
+                        f"({_sa_meta.get('sampler_untouched')})"
+                    )
+                if not isinstance(_sa_meta.get("fallback_reason"), str) or not _sa_meta.get("fallback_reason"):
+                    failures.append(
+                        f"{run_label}: seed apply fallback_reason missing"
+                    )
+
         # exec_start_to_cached_ms must be present; threshold <= 500ms
         _esc = timing.get("exec_start_to_cached_ms")
         if not isinstance(_esc, (int, float)):

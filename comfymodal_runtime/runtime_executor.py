@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 
-from .contracts import ExecutionPlan
+from .contracts import ExecutionPlan, SnapshotExecutionSeed
 from .trace import RuntimeTrace
 
 
@@ -46,6 +46,400 @@ _PRE_SAMPLER_REQUIRED_OPERATIONS = (
 
 # Sentinel to distinguish a cached None from a cache miss
 _MISS_SENTINEL = object()
+
+
+# ── SnapshotExecutionSeed identity validation (Step 3 consumer) ───────────
+# Pure, deterministic, fail-closed: reuse of snapshot static structure is only
+# ever enabled when workflow AND deployment identity positively match.  The
+# seed itself contains only structural data (see contracts.SnapshotExecutionSeed);
+# the consumer never stores outputs, tensors, request state, caches, random
+# state, GPU handles, sampler outputs, or seed-dependent values.
+
+_SEED_DECISION_NO_SEED = "no_seed"
+_SEED_DECISION_MATCH = "match"
+_SEED_DECISION_MISMATCH = "identity_mismatch"
+
+
+def seed_identity_decision(
+    seed: SnapshotExecutionSeed | Mapping[str, Any] | None,
+    *,
+    workflow_hash: str = "",
+    source_workflow_hash: str = "",
+    deployment_combined_hash: str = "",
+    custom_node_generation: str = "",
+) -> dict[str, Any]:
+    """Deterministic, fail-closed identity validation for a snapshot seed.
+
+    ``seed`` may be a ``SnapshotExecutionSeed``, a serializable mapping (v1 or
+    v2 payload), or ``None``.  Returns a decision dict:
+
+      status         — ``no_seed`` | ``match`` | ``identity_mismatch``
+      reuse_enabled  — bool (True only for ``match``)
+      reasons        — list[str] of every failed check (empty on match)
+      seed_schema_version — int (0 when no seed)
+
+    Reuse is enabled ONLY when every present identity check positively
+    matches:
+
+    * Workflow identity — the request's authoritative workflow hash (either
+      ``workflow_hash`` or ``source_workflow_hash``) must equal one of the
+      seed's recorded hashes.  A seed with no recorded hash, or a request
+      with no hash, is unverifiable and therefore does NOT enable reuse.
+    * Deployment identity — when the seed records a deployment hash, the
+      request must supply an EQUAL deployment hash.  Missing request hash is
+      fail-closed (unverifiable).
+    * Custom-node generation — same rule as deployment identity.
+
+    No exception is raised on mismatch; the caller decides how to surface it.
+    """
+    if seed is None:
+        return {
+            "status": _SEED_DECISION_NO_SEED,
+            "reuse_enabled": False,
+            "reasons": [],
+            "seed_schema_version": 0,
+        }
+    if isinstance(seed, Mapping):
+        seed = SnapshotExecutionSeed.from_dict(seed)
+    if not isinstance(seed, SnapshotExecutionSeed):
+        return {
+            "status": _SEED_DECISION_MISMATCH,
+            "reuse_enabled": False,
+            "reasons": ["invalid_seed_type"],
+            "seed_schema_version": 0,
+        }
+
+    reasons: list[str] = []
+
+    # ── Workflow identity (positive match required for reuse) ──
+    request_hashes = {h for h in (str(workflow_hash or ""), str(source_workflow_hash or "")) if h}
+    seed_hashes = {
+        h for h in (str(seed.workflow_hash or ""), str(seed.source_workflow_hash or "")) if h
+    }
+    if request_hashes and seed_hashes:
+        if not request_hashes & seed_hashes:
+            reasons.append("workflow_hash_mismatch")
+    elif not seed_hashes:
+        reasons.append("seed_workflow_hash_missing")
+    elif not request_hashes:
+        reasons.append("workflow_hash_unverifiable")
+
+    # ── Deployment identity (fail-closed when unverifiable) ──
+    seed_deployment = str(seed.deployment_combined_hash or "")
+    if seed_deployment:
+        if not deployment_combined_hash:
+            reasons.append("deployment_hash_unverifiable")
+        elif str(deployment_combined_hash) != seed_deployment:
+            reasons.append("deployment_hash_mismatch")
+
+    # ── Custom-node generation (fail-closed when unverifiable) ──
+    seed_custom_node = str(seed.custom_node_generation or "")
+    if seed_custom_node:
+        if not custom_node_generation:
+            reasons.append("custom_node_generation_unverifiable")
+        elif str(custom_node_generation) != seed_custom_node:
+            reasons.append("custom_node_generation_mismatch")
+
+    status = _SEED_DECISION_MATCH if not reasons else _SEED_DECISION_MISMATCH
+    return {
+        "status": status,
+        "reuse_enabled": status == _SEED_DECISION_MATCH,
+        "reasons": reasons,
+        "seed_schema_version": int(getattr(seed, "schema_version", 0) or 0),
+    }
+
+
+def seed_eligible_static_structure(
+    seed: SnapshotExecutionSeed | None,
+) -> dict[str, dict[str, Any]]:
+    """Extract ONLY eligible loader/static structure from a seed for reuse.
+
+    Returns ``{node_id: static_inputs}`` for nodes whose static inputs are
+    recorded in ``static_node_signatures`` and that are NOT sampler nodes.
+    Sampler nodes, sampler static inputs, dynamic inputs, and any output /
+    conditioning / latent / request / cache / GPU data are NEVER returned.
+
+    Callers MUST gate any actual reuse behind ``seed_identity_decision``
+    returning ``reuse_enabled=True``.
+    """
+    if seed is None:
+        return {}
+    sampler_ids = set(seed.sampler_node_ids)
+    eligible: dict[str, dict[str, Any]] = {}
+    for entry in seed.static_node_signatures:
+        if not isinstance(entry, Mapping):
+            continue
+        node_id = str(entry.get("node_id", ""))
+        if not node_id or node_id in sampler_ids:
+            continue
+        static_inputs = entry.get("static_inputs")
+        if isinstance(static_inputs, Mapping):
+            eligible[node_id] = dict(static_inputs)
+    return eligible
+
+
+def _freeze_static_value(value: Any) -> Any:
+    """Normalize a static input value for deterministic equality checks.
+
+    Mapping keys are stringified; lists/tuples are converted to tuples so
+    ComfyUI's ``["node", 0]`` link lists compare equal to recorded tuples.
+    """
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(k), _freeze_static_value(v)) for k, v in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_static_value(v) for v in value)
+    return value
+
+
+def _static_inputs_match(recorded: Mapping[str, Any], supplied: Mapping[str, Any]) -> bool:
+    """Exact-key-set + value equality between recorded and supplied static inputs."""
+    if set(recorded.keys()) != set(supplied.keys()):
+        return False
+    for key, expected in recorded.items():
+        if key not in supplied:
+            return False
+        if _freeze_static_value(expected) != _freeze_static_value(supplied[key]):
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Step 3: executor-cache seed apply seam
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SEED_APPLY_BUDGET_MS: float = 25.0
+
+
+def _live_static_inputs(node_class: str, inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """Static signature of a live workflow node using the SAME conservative
+    classifier as the pure seed builder.  Link edges and fixed loader
+    filenames/options are static; seed, prompt text, strengths, dimensions,
+    and unknown values are dynamic and never compared."""
+    from .execution_seed import _classify_inputs
+
+    static_inputs, _dynamic = _classify_inputs(str(node_class), inputs or {})
+    return dict(static_inputs)
+
+
+def _recorded_static_signatures(seed: SnapshotExecutionSeed) -> dict[str, dict[str, Any]]:
+    """Map ``node_id -> {"node_class", "static_inputs", "hash"}`` from the seed."""
+    recorded: dict[str, dict[str, Any]] = {}
+    for entry in seed.static_node_signatures:
+        if not isinstance(entry, Mapping):
+            continue
+        node_id = str(entry.get("node_id", ""))
+        if not node_id:
+            continue
+        static_inputs = entry.get("static_inputs")
+        recorded[node_id] = {
+            "node_class": str(entry.get("node_class", "") or ""),
+            "static_inputs": dict(static_inputs) if isinstance(static_inputs, Mapping) else {},
+        }
+    return recorded
+
+
+async def apply_snapshot_seed_to_executor(
+    executor: Any,
+    seed: SnapshotExecutionSeed | Mapping[str, Any] | None,
+    *,
+    workflow: Mapping[str, Any] | None = None,
+    workflow_hash: str = "",
+    source_workflow_hash: str = "",
+    deployment_combined_hash: str = "",
+    custom_node_generation: str = "",
+    trace: RuntimeTrace | None = None,
+    budget_ms: float = _SEED_APPLY_BUDGET_MS,
+) -> dict[str, Any]:
+    """Verify and (on mismatch) invalidate seeded loader cache entries.
+
+    Called ONLY from the existing ``seeded_set_prompt`` hook after
+    ``original_set_prompt`` and after Step 1-2 loader seeding.  Fail-closed:
+    any mismatch/error yields an honest fallback marker and execution
+    continues unchanged.
+
+    Rules (never violated):
+      * Never inserts or replaces loader ``CacheEntry`` values — this seam
+        only VERIFIES entries that Step 1-2 loader seeding already inserted
+        and DELETES stale ones whose static signature differs.
+      * Never touches sampler entries — sampler node ids are excluded by
+        construction.
+      * Never bypasses ComfyUI cache-key validation — deletions go through
+        ``outputs_cache.delete`` using the same data key the cache owns.
+      * Never reuses dynamic inputs/outputs — only structural/static
+        signatures are compared.
+
+    Emits ``snapshot_graph_seed_validate_start/end`` and
+    ``snapshot_graph_seed_apply_start/end`` trace events plus a concise
+    ``[v2.seed_apply]`` marker.  Measures only seed validation/application —
+    never ``set_prompt`` or Step 1-2 loader seeding.
+    """
+    started = time.perf_counter()
+
+    # ── Normalize seed (fail-closed on malformed payloads) ──
+    normalized: SnapshotExecutionSeed | None = None
+    if isinstance(seed, SnapshotExecutionSeed):
+        normalized = seed
+    elif isinstance(seed, Mapping):
+        try:
+            normalized = SnapshotExecutionSeed.from_dict(seed)
+        except Exception:
+            normalized = None
+
+    caches = getattr(executor, "caches", None)
+    outputs_cache = getattr(caches, "outputs", None) if caches is not None else None
+
+    def _emit(name: str, **metadata: Any) -> None:
+        if trace is not None:
+            trace.emit(name, phase="execution", metadata=metadata)
+
+    # ── Validate phase: identity + structural/static signature comparison ──
+    _validate_started = time.perf_counter()
+    _emit("snapshot_graph_seed_validate_start", budget_ms=budget_ms)
+    decision = seed_identity_decision(
+        normalized,
+        workflow_hash=workflow_hash,
+        source_workflow_hash=source_workflow_hash,
+        deployment_combined_hash=deployment_combined_hash,
+        custom_node_generation=custom_node_generation,
+    )
+    status = decision.get("status", "no_seed")
+    reasons = list(decision.get("reasons", []) or [])
+    schema = int(decision.get("seed_schema_version", 0) or 0)
+
+    verified_pre = 0
+    stale_candidates: list[str] = []
+    observed_missing_in_workflow = 0
+    non_loader_static_observed = 0
+    sampler_node_count = 0
+
+    if (
+        status == "match"
+        and normalized is not None
+        and isinstance(workflow, Mapping)
+        and workflow
+    ):
+        sampler_node_count = len(tuple(normalized.sampler_node_ids or ()))
+        recorded = _recorded_static_signatures(normalized)
+        workflow_map = {str(nid): node for nid, node in workflow.items()}
+        loader_ids = tuple(str(i) for i in (normalized.loader_node_ids or ()))
+        sampler_ids = frozenset(str(i) for i in (normalized.sampler_node_ids or ()))
+        for entry in normalized.static_node_signatures:
+            if not isinstance(entry, Mapping):
+                continue
+            node_id = str(entry.get("node_id", ""))
+            if not node_id:
+                continue
+            if node_id in sampler_ids:
+                continue  # sampler entries are observational-only and untouched
+            rec = recorded.get(node_id)
+            if rec is None:
+                continue
+            if node_id not in loader_ids:
+                # Non-loader structure is observational only — never mutated.
+                if rec.get("static_inputs"):
+                    non_loader_static_observed += 1
+                continue
+            live_node = workflow_map.get(node_id)
+            if not isinstance(live_node, Mapping):
+                observed_missing_in_workflow += 1
+                continue
+            try:
+                live_static = _live_static_inputs(
+                    str(live_node.get("class_type", "")),
+                    live_node.get("inputs", {}),
+                )
+            except Exception:
+                stale_candidates.append(node_id)
+                continue
+            if _static_inputs_match(rec.get("static_inputs", {}), live_static):
+                verified_pre += 1
+            else:
+                stale_candidates.append(node_id)
+
+    validate_ms = (time.perf_counter() - _validate_started) * 1000.0
+
+    # ── Fallback decision (honest, never silently "seeded") ──
+    fallback_reason = "none"
+    if status == "no_seed":
+        fallback_reason = "no_seed"
+    elif status == "identity_mismatch":
+        fallback_reason = ",".join(reasons) if reasons else "identity_mismatch"
+    elif status == "match" and not isinstance(workflow, Mapping):
+        fallback_reason = "workflow_unavailable"
+    elif status == "match" and outputs_cache is None:
+        fallback_reason = "outputs_cache_unavailable"
+
+    _emit(
+        "snapshot_graph_seed_validate_end",
+        decision=status,
+        schema=schema,
+        reasons=",".join(reasons),
+        verified_pre=verified_pre,
+        stale_candidates=",".join(stale_candidates) if stale_candidates else "",
+        observed_missing_in_workflow=observed_missing_in_workflow,
+        non_loader_static_observed=non_loader_static_observed,
+        sampler_node_count=sampler_node_count,
+    )
+
+    # ── Apply phase: invalidate stale loader entries only ──
+    _apply_started = time.perf_counter()
+    _emit("snapshot_graph_seed_apply_start", decision=status, schema=schema)
+    invalidated: list[str] = []
+    invalidated_errors: list[str] = []
+    if status == "match" and outputs_cache is not None:
+        for node_id in stale_candidates:
+            delete_fn = getattr(outputs_cache, "delete", None)
+            if not callable(delete_fn):
+                invalidated_errors.append(node_id)
+                continue
+            try:
+                result = delete_fn(node_id)
+                if inspect.isawaitable(result):
+                    await result
+                invalidated.append(node_id)
+            except Exception:
+                invalidated_errors.append(node_id)
+
+    apply_ms = (time.perf_counter() - _apply_started) * 1000.0
+    total_ms = (time.perf_counter() - started) * 1000.0
+    within_budget = total_ms <= float(budget_ms)
+    verified = verified_pre
+    sampler_untouched = True
+
+    marker = {
+        "decision": status,
+        "schema": schema,
+        "validate_ms": round(validate_ms, 3),
+        "apply_ms": round(apply_ms, 3),
+        "total_ms": round(total_ms, 3),
+        "budget_ms": float(budget_ms),
+        "within_budget": within_budget,
+        "verified": verified,
+        "invalidated": len(invalidated),
+        "invalidated_node_ids": ",".join(invalidated) if invalidated else "",
+        "invalidated_errors": ",".join(invalidated_errors) if invalidated_errors else "",
+        "sampler_untouched": sampler_untouched,
+        "fallback_reason": fallback_reason,
+    }
+
+    _emit(
+        "snapshot_graph_seed_apply_end",
+        **marker,
+    )
+    print(
+        f"[v2.seed_apply] decision={status} schema={schema} "
+        f"validate_ms={marker['validate_ms']} apply_ms={marker['apply_ms']} "
+        f"total_ms={marker['total_ms']} budget_ms={marker['budget_ms']} "
+        f"within_budget={1 if within_budget else 0} verified={verified} "
+        f"invalidated={len(invalidated)} sampler_untouched={1 if sampler_untouched else 0} "
+        f"fallback_reason={fallback_reason}",
+        flush=True,
+    )
+    return marker
 
 
 @dataclass
@@ -84,6 +478,9 @@ class PreSamplerCache:
         "_clock", "_lock", "_trace", "_graph_cache_key",
         "_node_input_cache", "_published_models",
         "_conditioning_cache",
+        # Step 3 seed-consumer state (fail-closed; empty unless validated)
+        "_seed_reuse_enabled", "_seed_static_structure",
+        "_seed_sampler_node_ids", "_seed_decision",
         # counters
         "operation_count", "operation_hits", "operation_timing_ms",
         "dominant_spans", "node_class_map", "lock_acquisition_count",
@@ -102,6 +499,12 @@ class PreSamplerCache:
         self._published_models: dict[tuple[str, str], Any] = {}
         self._conditioning_cache: dict[tuple, Any] = {}
         self._trace: RuntimeTrace | None = trace
+
+        # Step 3 seed-consumer state — never enabled without identity match.
+        self._seed_reuse_enabled: bool = False
+        self._seed_static_structure: dict[str, dict[str, Any]] = {}
+        self._seed_sampler_node_ids: frozenset[str] = frozenset()
+        self._seed_decision: dict[str, Any] | None = None
 
         # Operation counters
         self.operation_count: dict[str, int] = {
@@ -289,6 +692,102 @@ class PreSamplerCache:
             self._graph_cache_key = wf_hash
             return self._graph_cache_key
 
+    def consume_snapshot_seed(
+        self,
+        seed: SnapshotExecutionSeed | Mapping[str, Any] | None,
+        *,
+        workflow_hash: str = "",
+        source_workflow_hash: str = "",
+        deployment_combined_hash: str = "",
+        custom_node_generation: str = "",
+    ) -> dict[str, Any]:
+        """Consume a snapshot execution seed at request start, fail-closed.
+
+        Validates workflow AND deployment identity deterministically via
+        :func:`seed_identity_decision`.  ONLY on a positive ``match`` is
+        eligible loader/static structure retained for ``resolve_inputs``
+        reuse.  Sampler node ids are recorded so sampler nodes are NEVER
+        reused.  Sampler static inputs, outputs, conditioning, latents,
+        request/cache/random state, and GPU handles are never stored.
+
+        When no seed is supplied, the cache keeps its existing behavior
+        (no reuse, no state) — fully compatible.
+
+        Returns the decision dict (see ``seed_identity_decision``) and
+        records it on ``seed_decision``.
+        """
+        normalized_seed: SnapshotExecutionSeed | None = None
+        if isinstance(seed, Mapping):
+            normalized_seed = SnapshotExecutionSeed.from_dict(seed)
+        elif isinstance(seed, SnapshotExecutionSeed):
+            normalized_seed = seed
+
+        decision = seed_identity_decision(
+            normalized_seed,
+            workflow_hash=workflow_hash,
+            source_workflow_hash=source_workflow_hash,
+            deployment_combined_hash=deployment_combined_hash,
+            custom_node_generation=custom_node_generation,
+        )
+        self._seed_decision = decision
+        if not decision.get("reuse_enabled", False):
+            # Fail-closed: no identity match → no reusable structure.
+            self._seed_reuse_enabled = False
+            self._seed_static_structure = {}
+            self._seed_sampler_node_ids = frozenset()
+            return decision
+
+        eligible = seed_eligible_static_structure(normalized_seed)
+        self._seed_reuse_enabled = True
+        self._seed_static_structure = eligible
+        if normalized_seed is None:
+            # Unreachable: reuse_enabled=True implies a non-None validated seed.
+            self._seed_sampler_node_ids = frozenset()
+        else:
+            self._seed_sampler_node_ids = frozenset(
+                str(i) for i in normalized_seed.sampler_node_ids
+            )
+        return decision
+
+    @property
+    def seed_decision(self) -> dict[str, Any] | None:
+        """Last snapshot-seed consumption decision, or ``None`` if never called."""
+        if self._seed_decision is None:
+            return None
+        return dict(self._seed_decision)
+
+    @property
+    def seed_reuse_enabled(self) -> bool:
+        """True only after a positively validated seed identity match."""
+        return bool(self._seed_reuse_enabled)
+
+    def reuse_seed_static_inputs(
+        self,
+        node_id: str,
+        class_type: str,
+        inputs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return recorded seed static inputs for an eligible node, or ``None``.
+
+        Reuse is gated on BOTH a validated seed match (``seed_reuse_enabled``)
+        and the node being non-sampler static structure whose recorded static
+        input key set exactly matches *inputs*.  Sampler nodes, nodes without
+        a recorded static structure, and nodes with any extra/differing input
+        keys return ``None`` (caller falls back to normal resolution).  This
+        never serves sampler outputs or seed-dependent data.
+        """
+        if not self._seed_reuse_enabled:
+            return None
+        node_id = str(node_id)
+        if node_id in self._seed_sampler_node_ids:
+            return None
+        recorded = self._seed_static_structure.get(node_id)
+        if recorded is None:
+            return None
+        if not _static_inputs_match(recorded, inputs):
+            return None
+        return dict(recorded)
+
     def resolve_inputs(
         self,
         node_id: str,
@@ -303,6 +802,11 @@ class PreSamplerCache:
         opaque model objects are distinguished by ``id()`` only.
         Nested scalar/link sequences are fingerprinted element-wise;
         opaque objects within sequences also use ``id()``.
+
+        When a validated snapshot seed is present, eligible non-sampler
+        loader/static nodes whose static inputs exactly match are returned
+        directly from the recorded seed structure (a ``reused`` cache hit)
+        without invoking the builder.
 
         When *builder* is provided and inputs are not cached, the builder
         is called and its wall time recorded as ``input_resolution``
@@ -322,6 +826,17 @@ class PreSamplerCache:
                 cache_hit=True,
             )
             return cached
+
+        # Step 3 seed reuse: eligible non-sampler static structure only.
+        seed_static = self.reuse_seed_static_inputs(node_id, class_type, inputs)
+        if seed_static is not None:
+            self._node_input_cache[fp] = seed_static
+            self._record_operation(
+                "cache_lookup", lookup_elapsed,
+                node_id=node_id, class_type=class_type,
+                cache_hit=True, reused=True,
+            )
+            return seed_static
 
         if builder is not None:
             build_start = self._clock()
@@ -2219,6 +2734,59 @@ class RuntimeExecutor:
         self.subprocess_runner = subprocess_runner
         self.allow_compatibility_fallback = allow_compatibility_fallback
 
+    def _consume_seed_for_request(
+        self,
+        ctx: ExecutionContext,
+        plan: ExecutionPlan,
+        cache: PreSamplerCache | None,
+    ) -> None:
+        """Consume a snapshot execution seed at request start, fail-closed.
+
+        Reads ``ctx.metadata["snapshot_execution_seed"]`` (a
+        ``SnapshotExecutionSeed`` or serializable mapping).  When absent,
+        existing behavior is fully preserved (no decision recorded, no reuse).
+
+        When present, validates workflow AND deployment identity against the
+        plan before enabling any loader/static reuse, then records the
+        decision on ``ctx.metadata["snapshot_seed_decision"]``.  Deployment /
+        custom-node identity is sourced from ``ctx.metadata`` first, then
+        ``plan.request_metadata``, so existing callers that place those
+        values in either location work unchanged.
+        """
+        seed = ctx.metadata.get("snapshot_execution_seed")
+        if seed is None:
+            return
+        if cache is None:
+            return
+        request_meta = plan.request_metadata or {}
+        deployment_hash = str(
+            ctx.metadata.get("deployment_combined_hash", "")
+            or (request_meta.get("deployment_combined_hash", "") if hasattr(request_meta, "get") else "")
+        )
+        custom_node_generation = str(
+            ctx.metadata.get("custom_node_generation", "")
+            or (request_meta.get("custom_node_generation", "") if hasattr(request_meta, "get") else "")
+        )
+        decision = cache.consume_snapshot_seed(
+            seed,
+            workflow_hash=plan.workflow_hash,
+            source_workflow_hash=plan.source_workflow_hash,
+            deployment_combined_hash=deployment_hash,
+            custom_node_generation=custom_node_generation,
+        )
+        ctx.metadata["snapshot_seed_decision"] = decision
+        if ctx.trace is not None:
+            ctx.trace.emit(
+                "snapshot_seed_consumed",
+                phase="execution",
+                metadata={
+                    "status": decision.get("status", ""),
+                    "reuse_enabled": 1 if decision.get("reuse_enabled") else 0,
+                    "reasons": ",".join(decision.get("reasons", []) or []),
+                    "seed_schema_version": decision.get("seed_schema_version", 0),
+                },
+            )
+
     async def execute(
         self,
         plan: ExecutionPlan,
@@ -2230,6 +2798,9 @@ class RuntimeExecutor:
         cache: PreSamplerCache | None = ctx.metadata.get("pre_sampler_cache")
         if cache is not None:
             cache.build_cache_key(plan)
+        # Step 3: consume snapshot seed at request start (fail-closed, no-op
+        # when no seed is supplied).
+        self._consume_seed_for_request(ctx, plan, cache)
         diagnostics = self.select_backend(plan.execution_options.requested_backend)
         started = time.perf_counter()
         runner = self._runner_for(diagnostics.selected)
@@ -2294,6 +2865,9 @@ class RuntimeExecutor:
         cache: PreSamplerCache | None = ctx.metadata.get("pre_sampler_cache")
         if cache is not None:
             cache.build_cache_key(plan)
+        # Step 3: consume snapshot seed at request start (fail-closed, no-op
+        # when no seed is supplied).
+        self._consume_seed_for_request(ctx, plan, cache)
         diagnostics = self.select_backend(plan.execution_options.requested_backend)
         runner = self._runner_for(diagnostics.selected)
         if runner is None:
@@ -2359,7 +2933,13 @@ class RuntimeExecutor:
 # ═══════════════════════════════════════════════════════════════════════
 # Lives here (not in modal_app.py) to avoid circular import with model_preload.
 
-# Per-request dedup set for SAMPLER_SAMPLE wrapper.
+# In-flight dedup set for the SAMPLER_SAMPLE wrapper.  Keys are
+# ``(request_id, str(id(executor)))`` and are REMOVED when the invocation
+# completes (the wrapper's ``finally``).  The set therefore only ever holds
+# currently-in-flight sampler invocations: it cannot grow without bound, and a
+# later sampler whose executor happens to reuse a freed ``id()`` is never
+# suppressed.  Sequential invocations of the same executor each emit their own
+# start/end pair (one pair per actual sampler invocation).
 _sampler_wrapper_dedup: set[tuple[str, str]] = set()
 _sampler_wrapper_dedup_lock = threading.RLock()
 
@@ -2386,14 +2966,52 @@ def _build_sampling_wrapper() -> Callable:
     not count toward them).  The watchdog is canceled by the request owner
     (modal_app's finally) on normal/error completion.
 
-    Deduplication is per ``(request_id, id(executor))`` to ensure exactly one
-    start/end pair per sampler invocation, even if the wrapper is registered
-    on multiple model options (snapshot, normal, alternate).
+    Deduplication is per ``(request_id, id(executor))`` and is in-flight-only:
+    the key is removed in the wrapper's ``finally`` when the invocation
+    completes, so the set never grows without bound and never suppresses a
+    later sampler from ``id(executor)`` reuse.  Each actual sampler
+    invocation emits exactly one start/end pair; the one-shot stall watchdog
+    stays single per request (arming is idempotent per request_id).
 
     Does NOT copy ``CFGGuider.inner_sample`` or any other sampler internals.
     Preserves all model options, wrapper chains, and per-step callbacks.
     """
     from comfymodal_runtime.model_preload import _ACTIVE_REQUEST_TRACE
+
+    def _sampler_node_context(guider: Any) -> tuple[str, str]:
+        """Resolve the authoritative sampler node context ``(node_id, node_class)``.
+
+        Preferred source: a COMPLETE guider-owned pair — ``_node_id`` /
+        ``_class_type`` (or the non-underscore ``node_id`` / ``class_type``),
+        set by custom sampler nodes.  Fallback: a COMPLETE
+        ``_current_node_context`` ContextVar pair set by ``_patched_exec_node``,
+        so a stock ComfyUI guider still reports the exact sampler node — e.g.
+        node id ``1242`` / ``ClownsharKSampler_Beta`` when present — at the
+        watchdog arm, sampling_start, first_unet_forward, first_sampler_step,
+        and sampling_end markers.
+
+        A partial pair from one source is NEVER combined with a field from the
+        other source: that would fabricate a mixed identity (e.g. one guider
+        field plus one ContextVar field).  If neither source yields a complete
+        pair, both blank values are returned.
+        """
+        guider_node_id = str(getattr(guider, "_node_id", getattr(guider, "node_id", "")) or "")
+        guider_node_class = str(getattr(guider, "_class_type", getattr(guider, "class_type", "")) or "")
+        if guider_node_id and guider_node_class:
+            return guider_node_id, guider_node_class
+        try:
+            _ctx = _current_node_context.get()
+        except Exception:
+            _ctx = None
+        if _ctx is not None:
+            ctx_node_id, ctx_node_class = _ctx
+            ctx_node_id = str(ctx_node_id or "")
+            ctx_node_class = str(ctx_node_class or "")
+            if ctx_node_id and ctx_node_class:
+                return ctx_node_id, ctx_node_class
+        # No complete pair from either source: never mix one guider field with
+        # one ContextVar field.  Report both blank rather than a mixed identity.
+        return "", ""
 
     def _sampler_boundary_meta(
         trace: Any,
@@ -2412,8 +3030,7 @@ def _build_sampling_wrapper() -> Callable:
             meta["restored_instance_id"] = _LATEST_RESTORED_INSTANCE_ID or ""
         except Exception:
             pass
-        meta["node_id"] = str(getattr(guider, "_node_id", getattr(guider, "node_id", "")))
-        meta["node_class"] = str(getattr(guider, "_class_type", getattr(guider, "class_type", "")))
+        meta["node_id"], meta["node_class"] = _sampler_node_context(guider)
         meta["steps"] = steps
         patcher = getattr(guider, "model_patcher", None)
         if patcher is None:
@@ -2463,7 +3080,10 @@ def _build_sampling_wrapper() -> Callable:
         if trace is None:
             return executor(*args, **kwargs)
 
-        # Dedup: one start/end per (request_id, id(executor)).
+        # Dedup is in-flight-only: the key is removed in the finally below
+        # when this invocation completes, so the set cannot grow without bound
+        # and a later sampler whose executor reuses a freed id() is never
+        # suppressed.  Each actual sampler invocation emits its own pair.
         dedup_key = (trace.request_id, str(id(executor)))
         with _sampler_wrapper_dedup_lock:
             if dedup_key in _sampler_wrapper_dedup:
@@ -2477,9 +3097,12 @@ def _build_sampling_wrapper() -> Callable:
         steps = int(len(sigmas)) - 1 if sigmas is not None and hasattr(sigmas, "__len__") else 0
 
         # Get node metadata from sampler (first arg is CFGGuider self).
+        # Authoritative node context: guider attributes first, then the active
+        # _current_node_context ContextVar (node id 1242 / ClownsharKSampler_Beta
+        # when present) so the watchdog arm, sampling_start, first_unet_forward,
+        # first_sampler_step and sampling_end all carry the exact sampler node.
         sampler_self = args[0] if args else None
-        node_id = str(getattr(sampler_self, "_node_id", getattr(sampler_self, "node_id", "")))
-        node_class = str(getattr(sampler_self, "_class_type", getattr(sampler_self, "class_type", "")))
+        node_id, node_class = _sampler_node_context(sampler_self)
 
         start_meta = _sampler_boundary_meta(trace, sampler_self, steps=steps)
 
@@ -2527,6 +3150,11 @@ def _build_sampling_wrapper() -> Callable:
                     request_id=str(trace.request_id),
                 )
             except RuntimeError:
+                # Fail-closed before the sampler runs: release the in-flight
+                # dedup key so a later sampler (or a later request reusing
+                # this executor id) is never suppressed by a stale key.
+                with _sampler_wrapper_dedup_lock:
+                    _sampler_wrapper_dedup.discard(dedup_key)
                 raise
             except Exception:
                 # Unrelated bridge/verification errors (non-snapshot paths)
@@ -2568,6 +3196,10 @@ def _build_sampling_wrapper() -> Callable:
             )
         except Exception as _residency_exc:
             if "CPU-resident" in str(_residency_exc):
+                # Fail-closed before the sampler runs: release the in-flight
+                # dedup key (see identity-mismatch path above).
+                with _sampler_wrapper_dedup_lock:
+                    _sampler_wrapper_dedup.discard(dedup_key)
                 raise
             pass
 
@@ -2675,6 +3307,11 @@ def _build_sampling_wrapper() -> Callable:
         try:
             return executor(*args, **kwargs)
         finally:
+            # Request-scoped cleanup: drop the in-flight dedup key so the set
+            # never grows and a later invocation (including one whose executor
+            # reuses this id) is never suppressed.
+            with _sampler_wrapper_dedup_lock:
+                _sampler_wrapper_dedup.discard(dedup_key)
             duration_ms = round((time.monotonic_ns() - t0) / 1_000_000, 3)
             trace.emit("sampling_end", phase="execution", metadata={
                 "node_id": node_id,

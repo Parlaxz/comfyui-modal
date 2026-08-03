@@ -110,72 +110,145 @@ def _resolve_inner_model(model: Any) -> Any:
     return model
 
 
+def _dedupe_storage_target_modules(modules: list[Any]) -> list[Any]:
+    """Return identity-unique modules from *modules*, preserving order.
+
+    ``id()`` deduplication prevents a CLIP wrapper resolving to the same
+    module more than once (e.g. ``cond_stage_model`` reached both directly
+    and through ``patcher.model``).
+    """
+    seen: set[int] = set()
+    result: list[Any] = []
+    for module in modules:
+        if module is None:
+            continue
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        result.append(module)
+    return result
+
+
+def _resolve_storage_target_modules(model: Any) -> list[Any]:
+    """Resolve the concrete ``torch.nn.Module``(s) owning retained CPU storage.
+
+    CLIP wrapper shape (``comfy.sd.CLIP``): the wrapper itself is NOT an
+    ``nn.Module``; its weights live in ``cond_stage_model`` (and its
+    ``clip_l``/``clip_g`` submodules) or in ``patcher.model``.  A module
+    passed directly (the ``cond_stage_model`` or ``patcher.model``) is
+    scanned itself plus any ``clip_l``/``clip_g`` leaf submodules so its
+    own parameters are never skipped.  UNET patchers and every other object
+    fall back to ``_resolve_inner_model`` so existing UNET resolution is
+    unchanged (``model.diffusion_model``).  Returns identity-unique
+    modules.  Never mutates, never moves, never copies.
+    """
+    targets: list[Any] = []
+    collected = _collect_clip_modules(model)
+    if collected:
+        targets.extend(module for _, module in collected)
+        # A directly-passed module that the collector resolved to leaf
+        # submodules only must include itself so parameters held directly on
+        # the module (outside clip_l/clip_g) are scanned too.  Identity-dedup
+        # makes this safe when the module was already collected.
+        if _is_module_like(model) and all(module is not model for _, module in collected):
+            targets.insert(0, model)
+    elif _is_module_like(model):
+        targets.append(model)
+    else:
+        inner = _resolve_inner_model(model)
+        if inner is not None:
+            targets.append(inner)
+    return _dedupe_storage_target_modules(targets)
+
+
 def build_unique_storage_registry(model: Any) -> StorageRegistry:
     """Build a deduplicated ``StorageRegistry`` from *model* parameters and buffers.
 
-    Iterates all parameters/buffers using existing UNET/CLIP helpers,
-    reads ``untyped_storage().data_ptr()`` and ``nbytes()`` (fallback to
-    ``storage().data_ptr()`` / ``numel() * element_size()``).
-    Deduplicates by storage identity (``id(storage)``) and identical
-    byte ranges.  CPU-only, non-meta, nonzero usable tensors only.
-    No reads/copy/contiguous/cpu/numpy.  Resolves model modules via
-    existing UNET/CLIP helpers before parameters/buffers.
-    Catches per tensor, not whole enumeration.
+    Iterates all parameters/buffers across the exact retained module(s):
+    CLIP wrappers resolve to ``cond_stage_model`` / ``patcher.model`` (and
+    their ``clip_l``/``clip_g`` submodules) while UNET patchers resolve to
+    the diffusion model as before.  Reads ``untyped_storage().data_ptr()``
+    and ``nbytes()`` (fallback to ``storage().data_ptr()`` /
+    ``numel() * element_size()``).  Deduplicates by storage identity
+    (``id(storage)``) and identical byte ranges ACROSS all resolved
+    modules.  CPU-only, non-meta, nonzero usable tensors only.
+    No reads/copy/contiguous/cpu/numpy.  Catches per tensor, not whole
+    enumeration.  When no resolved module can be inspected at all, raises
+    (so ``advise_storage_pages_willneed`` reports a truthful error rather
+    than inventing an empty registry).
     Returns ``StorageRegistry`` with page-aligned ``StorageRange`` entries.
     """
-    import torch as _torch
-    # Resolve inner module via helper before accessing parameters/buffers
-    _inner = _resolve_inner_model(model)
+    _target_modules = _resolve_storage_target_modules(model)
     _ranges: list[StorageRange] = []
     _total_bytes: int = 0
     seen_ids: set[int] = set()
     seen_ranges: set[tuple[int, int]] = set()
+    _inspection_failures = 0
 
-    # Iterate parameters (per-tensor try/except)
-    for _p in _inner.parameters():
+    for _target in _target_modules:
+        # Iterate parameters (per-tensor try/except)
         try:
-            if _p.device.type != "cpu" or _p.is_meta or _p.numel() == 0:
-                continue
-            _st = _p.untyped_storage() if hasattr(_p, "untyped_storage") else _p.storage()
-            _sid = id(_st)
-            if _sid in seen_ids:
-                continue
-            seen_ids.add(_sid)
-            _ptr = _st.data_ptr()
-            _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _p.numel() * _p.element_size()
-            if _nbytes <= 0:
-                continue
-            _key = (_ptr, _nbytes)
-            if _key in seen_ranges:
-                continue
-            seen_ranges.add(_key)
-            _ranges.append(StorageRange(address=_ptr, length=_nbytes))
-            _total_bytes += _nbytes
+            _parameters = _target.parameters()
         except Exception:
-            continue
+            _inspection_failures += 1
+            _parameters = ()
+        for _p in _parameters:
+            try:
+                if _p.device.type != "cpu" or _p.is_meta or _p.numel() == 0:
+                    continue
+                _st = _p.untyped_storage() if hasattr(_p, "untyped_storage") else _p.storage()
+                _sid = id(_st)
+                if _sid in seen_ids:
+                    continue
+                seen_ids.add(_sid)
+                _ptr = _st.data_ptr()
+                _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _p.numel() * _p.element_size()
+                if _nbytes <= 0:
+                    continue
+                _key = (_ptr, _nbytes)
+                if _key in seen_ranges:
+                    continue
+                seen_ranges.add(_key)
+                _ranges.append(StorageRange(address=_ptr, length=_nbytes))
+                _total_bytes += _nbytes
+            except Exception:
+                continue
 
-    # Iterate buffers (per-tensor try/except)
-    for _b in _inner.buffers():
+        # Iterate buffers (per-tensor try/except)
         try:
-            if _b.device.type != "cpu" or _b.is_meta or _b.numel() == 0:
-                continue
-            _st = _b.untyped_storage() if hasattr(_b, "untyped_storage") else _b.storage()
-            _sid = id(_st)
-            if _sid in seen_ids:
-                continue
-            seen_ids.add(_sid)
-            _ptr = _st.data_ptr()
-            _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _b.numel() * _b.element_size()
-            if _nbytes <= 0:
-                continue
-            _key = (_ptr, _nbytes)
-            if _key in seen_ranges:
-                continue
-            seen_ranges.add(_key)
-            _ranges.append(StorageRange(address=_ptr, length=_nbytes))
-            _total_bytes += _nbytes
+            _buffers = _target.buffers()
         except Exception:
-            continue
+            _inspection_failures += 1
+            _buffers = ()
+        for _b in _buffers:
+            try:
+                if _b.device.type != "cpu" or _b.is_meta or _b.numel() == 0:
+                    continue
+                _st = _b.untyped_storage() if hasattr(_b, "untyped_storage") else _b.storage()
+                _sid = id(_st)
+                if _sid in seen_ids:
+                    continue
+                seen_ids.add(_sid)
+                _ptr = _st.data_ptr()
+                _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _b.numel() * _b.element_size()
+                if _nbytes <= 0:
+                    continue
+                _key = (_ptr, _nbytes)
+                if _key in seen_ranges:
+                    continue
+                seen_ranges.add(_key)
+                _ranges.append(StorageRange(address=_ptr, length=_nbytes))
+                _total_bytes += _nbytes
+            except Exception:
+                continue
+
+    if _inspection_failures == len(_target_modules) and not _ranges and _target_modules:
+        # Every resolved module was uninspectable: surface truthfully instead
+        # of pretending the model has no storage.
+        raise RuntimeError(
+            "model exposes no inspectable parameters/buffers "
+            f"({len(_target_modules)} resolved module(s))"
+        )
 
     return StorageRegistry(ranges=tuple(_ranges), total_bytes=_total_bytes)
 
@@ -186,6 +259,11 @@ def sample_storage_residency(registry: StorageRegistry) -> dict[str, Any]:
     Uses ``ctypes`` ``mincore()`` syscall.  Returns a dict with exact keys:
       status, storage_count, total_bytes, total_pages, resident_pages,
       resident_bytes, resident_percent, duration_ms.
+
+    ``total_pages`` is the page count over PAGE-ALIGNED ranges: each range
+    start is aligned down and end aligned up to the page size before
+    sampling, so ``total_pages * page_size`` (the aligned coverage) may
+    exceed the raw storage ``total_bytes``.
 
     Non-posix or unavailable mincore => status="unsupported".
     Syscall/pointer errors => status="error" (not "unsupported").
@@ -274,6 +352,272 @@ def sample_storage_residency(registry: StorageRegistry) -> dict[str, Any]:
             "resident_percent": None,
             "duration_ms": round((time.monotonic_ns() - _start_mono) / 1_000_000, 3),
         }
+
+
+# ---------------------------------------------------------------------------
+# Native page-readiness (synchronous MADV_WILLNEED advisory)
+# ---------------------------------------------------------------------------
+# Phase B consistency candidate: retained anonymous CPU tensor storage is
+# synchronously advised via libc madvise(MADV_WILLNEED) immediately before
+# the CLIP prefill encode loop and immediately before the first
+# request-scoped graph UNET activation.  Gated by
+# ``COMFYMODAL_V2_PAGE_READINESS_MODE=willneed`` (off by default — current
+# production behavior is unchanged until explicitly tested).  Uses the
+# deduplicated ``StorageRegistry`` / ``build_unique_storage_registry`` above.
+# No tensor element loop, no copies, no CUDA sync, no model mutation.
+# Synchronous only — never hidden in a future.
+#
+# TRUTHFULNESS: ``madvise(MADV_WILLNEED)`` is an ADVISORY syscall.  A return
+# of 0 means the kernel *accepted* the advice for the range; it does NOT
+# guarantee the physical pages are resident.  ``status="ok"`` therefore means
+# the advisory was accepted for every range — never that the pages were
+# populated.  Reported counts are ``advised_*`` (bytes/pages/percent covered
+# by accepted advice), never ``populated_*``.
+
+_PAGE_READINESS_ENV_KEY: str = "COMFYMODAL_V2_PAGE_READINESS_MODE"
+_PAGE_READINESS_MODE_WILLNEED: str = "willneed"
+# Linux madvise(2) flag value for MADV_WILLNEED (kernel should prefault).
+_MADV_WILLNEED: int = 3
+
+
+def page_readiness_mode() -> str:
+    """Return the normalized page-readiness mode from the environment.
+
+    ``COMFYMODAL_V2_PAGE_READINESS_MODE=willneed`` enables the synchronous
+    native page-readiness candidate; any other value (including absent)
+    returns ``"off"`` so current production behavior is unchanged until
+    explicitly tested.  Read at call time so tests can set the env var
+    between imports.
+    """
+    raw = os.environ.get(_PAGE_READINESS_ENV_KEY, "").strip().lower()
+    if raw == _PAGE_READINESS_MODE_WILLNEED:
+        return _PAGE_READINESS_MODE_WILLNEED
+    return "off"
+
+
+def _is_posix() -> bool:
+    """True on POSIX platforms (Linux).  Split out for focused tests."""
+    return os.name == "posix"
+
+
+def _page_size() -> int:
+    """Best-effort system page size (fallback 4096).  Split out for tests."""
+    try:
+        size = os.sysconf("SC_PAGE_SIZE")
+        return int(size) if size and int(size) > 0 else 4096
+    except Exception:
+        return 4096
+
+
+def _page_fault_counters() -> dict[str, Any]:
+    """Best-effort process page-fault counters (major/minor) or None each."""
+    try:
+        import resource as _r
+        _ru = _r.getrusage(_r.RUSAGE_SELF)
+        return {"major_faults": int(_ru.ru_majflt), "minor_faults": int(_ru.ru_minflt)}
+    except Exception:
+        return {"major_faults": None, "minor_faults": None}
+
+
+def _fault_deltas(before: Mapping[str, Any] | None) -> tuple[int | None, int | None]:
+    """Non-negative major/minor fault deltas from a before snapshot (or None)."""
+    if not before:
+        return None, None
+    after = _page_fault_counters()
+    _major_b = before.get("major_faults")
+    _minor_b = before.get("minor_faults")
+    _major_delta: int | None = None
+    _minor_delta: int | None = None
+    if _major_b is not None and after["major_faults"] is not None:
+        _major_delta = max(0, int(after["major_faults"]) - int(_major_b))
+    if _minor_b is not None and after["minor_faults"] is not None:
+        _minor_delta = max(0, int(after["minor_faults"]) - int(_minor_b))
+    return _major_delta, _minor_delta
+
+
+def _libc_madvise_willneed() -> Any | None:
+    """Resolve libc ``madvise`` with ``MADV_WILLNEED`` support.
+
+    Returns a callable ``fn(address: int, length: int) -> (ret, errno)``
+    (raw syscall return code plus errno, errno ``None`` on success) or
+    ``None`` when unavailable (non-POSIX or missing libc symbol).  Never
+    raises.  Split out for focused tests that mock the syscall without
+    requiring Linux.
+    """
+    if not _is_posix():
+        return None
+    try:
+        import ctypes as _ctypes
+        _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+        _fn = getattr(_libc, "madvise", None)
+        if _fn is None:
+            return None
+        _fn.argtypes = [_ctypes.c_void_p, _ctypes.c_size_t, _ctypes.c_int]
+        _fn.restype = _ctypes.c_int
+
+        def _call(address: int, length: int) -> tuple[int, int | None]:
+            _ret = _fn(
+                _ctypes.c_void_p(address),
+                _ctypes.c_size_t(length),
+                _MADV_WILLNEED,
+            )
+            _errno = _ctypes.get_errno() if _ret != 0 else None
+            return int(_ret), _errno
+
+        return _call
+    except Exception:
+        return None
+
+
+def advise_storage_pages_willneed(model_or_registry: Any) -> dict[str, Any]:
+    """Synchronously advise the kernel to prefault retained anonymous CPU storage.
+
+    Builds the deduplicated registry from *model_or_registry* (a model
+    object or an existing ``StorageRegistry``), then calls libc
+    ``madvise(MADV_WILLNEED)`` on page-aligned ranges.  Synchronous only —
+    never hidden in a future.
+
+    Truthfulness contract (advisory semantics — never invent residency):
+      * ``status="unsupported"`` when the syscall is unavailable (non-Linux
+        or missing symbol) — never invents success.
+      * ``status="empty"`` when the registry has no ranges.
+      * ``status="ok"`` when every range's advisory was ACCEPTED (ret == 0).
+        This means the kernel accepted the advice — NOT that the physical
+        pages are resident.
+      * ``status="partial"`` when some ranges were accepted and some failed.
+      * ``status="error"`` when every range failed (or the registry build
+        raised) — per-range error reason is included.
+
+    No tensor element loop, no copies, no CUDA sync, no model mutation.
+    Returns a flat JSON-safe dict:
+      status, mode, storage_count, range_count, total_bytes, total_pages,
+      advised_pages, advised_bytes, advised_percent, major_faults,
+      minor_faults, duration_ms, error_reason, ranges (per-range records).
+
+    ``total_pages`` / ``advised_pages`` are page counts over PAGE-ALIGNED
+    ranges: each range start is aligned down and end aligned up to the page
+    size before the advisory (``madvise`` operates on whole pages), so the
+    aligned byte coverage (``total_pages * page_size`` /
+    ``advised_pages * page_size``) may exceed the raw storage
+    ``total_bytes``.  ``advised_bytes`` likewise reflects the aligned
+    (rounded-up) coverage, not raw storage bytes.
+    """
+    _start_ns = time.monotonic_ns()
+    _faults_before = _page_fault_counters()
+
+    if isinstance(model_or_registry, StorageRegistry):
+        registry = model_or_registry
+    else:
+        try:
+            registry = build_unique_storage_registry(model_or_registry)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "mode": _PAGE_READINESS_MODE_WILLNEED,
+                "storage_count": None,
+                "range_count": None,
+                "total_bytes": None,
+                "total_pages": None,
+                "advised_pages": None,
+                "advised_bytes": None,
+                "advised_percent": None,
+                "major_faults": None,
+                "minor_faults": None,
+                "duration_ms": round((time.monotonic_ns() - _start_ns) / 1_000_000, 3),
+                "error_reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "ranges": [],
+            }
+
+    _range_count = len(registry.ranges)
+    _base: dict[str, Any] = {
+        "status": "unsupported",
+        "mode": _PAGE_READINESS_MODE_WILLNEED,
+        "storage_count": _range_count,
+        "range_count": _range_count,
+        "total_bytes": registry.total_bytes,
+        "total_pages": None,
+        "advised_pages": None,
+        "advised_bytes": None,
+        "advised_percent": None,
+        "major_faults": None,
+        "minor_faults": None,
+        "duration_ms": round((time.monotonic_ns() - _start_ns) / 1_000_000, 3),
+        "error_reason": "",
+        "ranges": [],
+    }
+    _major_delta, _minor_delta = _fault_deltas(_faults_before)
+    _base["major_faults"] = _major_delta
+    _base["minor_faults"] = _minor_delta
+
+    if not registry.ranges:
+        _base["status"] = "empty"
+        return _base
+
+    _madvise = _libc_madvise_willneed()
+    if _madvise is None:
+        return _base  # status=unsupported (syscall unavailable — never invent success)
+
+    page_size = _page_size()
+    total_pages = 0
+    advised_pages = 0
+    failed_count = 0
+    range_records: list[dict[str, Any]] = []
+    error_reason = ""
+    for _r in registry.ranges:
+        _start_aligned = _r.address & ~(page_size - 1)
+        _end = _r.address + _r.length
+        _end_aligned = (_end + page_size - 1) & ~(page_size - 1)
+        _aligned_length = _end_aligned - _start_aligned
+        _n_pages = _aligned_length // page_size
+        if _n_pages <= 0:
+            continue
+        total_pages += _n_pages
+        _ret, _errno = _madvise(_start_aligned, _aligned_length)
+        _record: dict[str, Any] = {
+            "address": _start_aligned,
+            "length": _aligned_length,
+            "pages": _n_pages,
+            "ret": _ret,
+            "errno": _errno,
+        }
+        if _ret == 0:
+            advised_pages += _n_pages
+            _record["status"] = "ok"
+        else:
+            failed_count += 1
+            _record["status"] = "error"
+            if not error_reason:
+                error_reason = (
+                    f"madvise(MADV_WILLNEED) failed errno={_errno} "
+                    f"at address={hex(_start_aligned)}"
+                )
+        range_records.append(_record)
+
+    if failed_count == 0:
+        status = "ok"
+    elif advised_pages > 0:
+        status = "partial"
+    else:
+        status = "error"
+
+    _major_after, _minor_after = _fault_deltas(_faults_before)
+    _advised_bytes = advised_pages * page_size
+    return {
+        "status": status,
+        "mode": _PAGE_READINESS_MODE_WILLNEED,
+        "storage_count": _range_count,
+        "range_count": len(range_records),
+        "total_bytes": registry.total_bytes,
+        "total_pages": total_pages,
+        "advised_pages": advised_pages,
+        "advised_bytes": _advised_bytes,
+        "advised_percent": round(advised_pages / total_pages * 100, 2) if total_pages else 0.0,
+        "major_faults": _major_after,
+        "minor_faults": _minor_after,
+        "duration_ms": round((time.monotonic_ns() - _start_ns) / 1_000_000, 3),
+        "error_reason": error_reason,
+        "ranges": range_records,
+    }
 
 
 # ---------------------------------------------------------------------------

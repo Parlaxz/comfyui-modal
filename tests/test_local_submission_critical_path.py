@@ -48,7 +48,7 @@ class _Publisher:
         self.plans = []
         self.publish_count = 0
 
-    def publish(self, plan):
+    def publish(self, plan, *, snapshot_seed=None):
         self.plans.append(plan)
         self.publish_count += 1
         return self.publish_count
@@ -1380,7 +1380,7 @@ class TestFailedCallsNotCached(unittest.TestCase):
         publish_count = [0]
 
         class _FailingPublisher:
-            def publish(self, plan):
+            def publish(self, plan, *, snapshot_seed=None):
                 publish_count[0] += 1
                 return {"status": "error", "ok": False, "error": "simulated"}
 
@@ -1556,7 +1556,7 @@ class _FakeRestorePublisher:
         self.plans = []
         self.publish_count = 0
 
-    async def publish(self, plan):
+    async def publish(self, plan, *, snapshot_seed=None):
         self.plans.append(plan)
         self.publish_count += 1
         return {"generation": "test", "ok": True}

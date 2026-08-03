@@ -21,6 +21,8 @@ from comfymodal_runtime.restore_plan import (
     derive_prefill_key,
     RestorePlanPublisher,
 )
+from comfymodal_runtime.runtime_bootstrap import RuntimeBootstrap
+from comfymodal_runtime.runtime_executor import RuntimeExecutor
 from comfymodal_runtime.runtime_state import (
     CommitCoordinator,
     FakeVolume,
@@ -281,6 +283,11 @@ class TestRestorePlanPublisher(unittest.TestCase):
 
     def test_modal_volume_publication_is_authoritative_and_synchronous(self):
         import comfymodal_runtime.modal_app as modal_app
+        from comfymodal_runtime.execution_seed import (
+            build_snapshot_seed_payload,
+            read_snapshot_seed_payload,
+        )
+        from comfymodal_runtime.runtime_state import MountedStateVolume
 
         class FakeModalVolume:
             def __init__(self):
@@ -297,20 +304,24 @@ class TestRestorePlanPublisher(unittest.TestCase):
             modal_volume = FakeModalVolume()
             resources = {"runtime_state_volume": modal_volume}
             plan = RestorePlan(generation=0, source_workflow_hash="wf-modal")
+            seed_payload = build_snapshot_seed_payload(
+                {"10": {"class_type": "KSampler", "inputs": {"seed": 42, "sampler_name": "euler", "scheduler": "normal"}}},
+                output_node_ids=["10"],
+                workflow_hash="wf-seed",
+                deployment_combined_hash="dep-hash-1",
+            )
+            self.assertIsNotNone(seed_payload)
             with patch.object(modal_app, "_MODAL_RESOURCES", resources), \
                  patch.object(modal_app, "RUNTIME_STATE_PATH", tmp):
-                first = modal_app._publish_restore_plan_impl(plan)
-                second = modal_app._publish_restore_plan_impl(plan)
-                from comfymodal_runtime.runtime_bootstrap import RuntimeBootstrap
-                from comfymodal_runtime.runtime_executor import RuntimeExecutor
-                entrypoint = modal_app.ModalRuntimeEntrypoint(
+                first = modal_app._publish_restore_plan_impl(plan, snapshot_seed=seed_payload)
+                second = modal_app._publish_restore_plan_impl(plan, snapshot_seed=seed_payload)
+                restored = modal_app.ModalRuntimeEntrypoint(
                     bootstrap=RuntimeBootstrap(
                         restore_gpu_state=lambda: None,
                         initialize_cuda=lambda: {"cuda_available": 1},
                     ),
                     executor=RuntimeExecutor(in_process_runner=lambda *_args: {"ok": True}),
-                )
-                restored = entrypoint.restore()
+                ).restore()
 
             self.assertEqual(first["status"], "published")
             self.assertEqual(first["generation"], 0)
@@ -320,9 +331,30 @@ class TestRestorePlanPublisher(unittest.TestCase):
             self.assertGreaterEqual(modal_volume.reload_count, 2)
             self.assertEqual(first["models_volume_write_count"], 0)
             self.assertEqual(first["models_volume_commit_count"], 0)
-            self.assertIsNotNone(entrypoint._restore_plan)
-            if entrypoint._restore_plan is not None:
-                self.assertEqual(str(entrypoint._restore_plan.generation), "0")
+            # The seed payload was persisted alongside the plan atomically on
+            # the deployment-scoped volume, and mirrored to snapshot_seed.json
+            # so restore-time hydration reads the publisher-side payload.
+            self.assertEqual(first["snapshot_seed_present"], 1)
+            self.assertEqual(first["snapshot_seed_file_written"], 1)
+            self.assertEqual(second["snapshot_seed_present"], 1)
+            self.assertEqual(second["snapshot_seed_file_written"], 0,
+                             "Byte-identical seed must not be rewritten on no-op")
+            loaded = read_snapshot_seed_payload(root=tmp)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded["seed_source"], "publisher_plan")
+            self.assertTrue(loaded["topology_available"])
+            # Atomic readback: the same seed is readable from the restore-plan
+            # state file (single publication, not an unrelated local-only file).
+            from comfymodal_runtime.restore_plan import RestorePlanPublisher
+            atomic_volume = MountedStateVolume(root=tmp)
+            atomic_pub = RestorePlanPublisher(
+                CommitCoordinator(atomic_volume, state_path=modal_app.V2_RESTORE_STATE_FILE)
+            )
+            atomic_seed = atomic_pub.read_snapshot_seed()
+            self.assertIsNotNone(atomic_seed)
+            assert atomic_seed is not None
+            self.assertEqual(atomic_seed.get("workflow_hash"), "wf-seed")
             self.assertEqual(restored["status"], "restored")
 
 

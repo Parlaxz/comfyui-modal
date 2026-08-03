@@ -95,6 +95,31 @@ def _base_events() -> list[dict[str, Any]]:
     ]
 
 
+def _seed_apply_events() -> list[dict[str, Any]]:
+    """Step 3 snapshot-graph seed apply evidence: schema-v2, within budget,
+    zero invalidations, sampler untouched, explicit fallback reason."""
+    return [
+        _ev("snapshot_graph_seed_validate_start", mono_ns=1100,
+            metadata={"budget_ms": 25}),
+        _ev("snapshot_graph_seed_validate_end", mono_ns=1200,
+            metadata={"decision": "match", "schema": 2, "reasons": "",
+                      "verified_pre": 2, "stale_candidates": "",
+                      "observed_missing_in_workflow": 0,
+                      "non_loader_static_observed": 0,
+                      "sampler_node_count": 1}),
+        _ev("snapshot_graph_seed_apply_start", mono_ns=1300,
+            metadata={"decision": "match", "schema": 2}),
+        _ev("snapshot_graph_seed_apply_end", mono_ns=1400,
+            metadata={"decision": "match", "schema": 2,
+                      "validate_ms": 0.1, "apply_ms": 0.1, "total_ms": 0.2,
+                      "budget_ms": 25.0, "within_budget": True,
+                      "verified": 2, "invalidated": 0,
+                      "invalidated_node_ids": "", "invalidated_errors": "",
+                      "sampler_untouched": True,
+                      "fallback_reason": "none"}),
+    ]
+
+
 def _required_events() -> list[dict[str, Any]]:
     return [
         _ev("executor_loader_cache_seed_end",
@@ -107,7 +132,7 @@ def _required_events() -> list[dict[str, Any]]:
         _ev("sampling_end", mono_ns=8000000, metadata={"steps": 8}),
         _ev("vae_decode_start", mono_ns=9000000),
         _ev("vae_decode_end", mono_ns=12000000),
-    ]
+    ] + _seed_apply_events()
 
 
 # ═══════════════════════════════════════════════════════════════════════

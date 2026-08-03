@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from comfymodal_runtime.contracts import (
     ModelRestoreKey,
@@ -424,36 +424,56 @@ class RestorePlanPublisher:
         )
         return trace
 
-    def publish(self, new_plan: RestorePlan) -> int:
-        """Publish *new_plan* and return its authoritative generation."""
-        return int(self.publish_with_metrics(new_plan)["generation"])
+    def publish(self, new_plan: RestorePlan, *, snapshot_seed: Mapping[str, Any] | None = None) -> int:
+        """Publish *new_plan* (and optional *snapshot_seed*) and return its
+        authoritative generation."""
+        return int(self.publish_with_metrics(new_plan, snapshot_seed=snapshot_seed)["generation"])
 
-    def publish_with_metrics(self, new_plan: RestorePlan) -> dict[str, Any]:
-        """Publish *new_plan* and return generation plus lifecycle timings."""
+    def publish_with_metrics(
+        self,
+        new_plan: RestorePlan,
+        *,
+        snapshot_seed: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Publish *new_plan* and return generation plus lifecycle timings.
+
+        When *snapshot_seed* is provided (a validated schema-v2 seed payload)
+        it is written atomically alongside the plan in the same state write,
+        making the seed deployment-scoped and read-back-able via
+        ``read_snapshot_seed``.
+        """
         started = time.perf_counter()
         current_plan = self._load_current_plan()
         reload_completed = time.perf_counter()
+        incoming_seed = dict(snapshot_seed) if snapshot_seed is not None else None
 
         compare_started = time.perf_counter()
         if current_plan is not None:
             if self._identity_hash(current_plan) == self._identity_hash(new_plan):
-                reload_ms = round((reload_completed - started) * 1000.0, 3)
-                compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
-                result = {
-                    "changed": False,
-                    "generation": self._safe_generation(current_plan.generation),
-                    "reload_ms": reload_ms,
-                    "compare_ms": compare_ms,
-                    "write_ms": 0.0,
-                    "commit_ms": 0.0,
-                    "bytes_written": 0,
-                    "state_path": getattr(self._coordinator, "state_path", ""),
-                    "model_identity_changed": False,
-                    "prefill_identity_changed": False,
-                }
-                result["trace"] = self._build_publication_trace(result).to_dict()
-                self.last_publish = result
-                return result
+                # The no-op check covers the COMPLETE state payload: the plan
+                # identity AND the atomically-persisted snapshot seed.  A
+                # changed seed (e.g. a new deployment custom-node generation)
+                # with an unchanged plan still forces a republish so the
+                # deployment-scoped seed is never stale.
+                current_seed = self.read_snapshot_seed()
+                if current_seed == incoming_seed:
+                    reload_ms = round((reload_completed - started) * 1000.0, 3)
+                    compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
+                    result = {
+                        "changed": False,
+                        "generation": self._safe_generation(current_plan.generation),
+                        "reload_ms": reload_ms,
+                        "compare_ms": compare_ms,
+                        "write_ms": 0.0,
+                        "commit_ms": 0.0,
+                        "bytes_written": 0,
+                        "state_path": getattr(self._coordinator, "state_path", ""),
+                        "model_identity_changed": False,
+                        "prefill_identity_changed": False,
+                    }
+                    result["trace"] = self._build_publication_trace(result).to_dict()
+                    self.last_publish = result
+                    return result
 
         compare_completed = time.perf_counter()
         # Identity-change flags: first publication both true; otherwise compare
@@ -488,9 +508,12 @@ class RestorePlanPublisher:
         plan_dict["generation"] = generation
         before_bytes = self._coordinator.metrics.total_write_bytes
         write_started = time.perf_counter()
+        _state_payload: dict[str, Any] = {"restore_plan": plan_dict}
+        if snapshot_seed is not None:
+            _state_payload["snapshot_seed"] = dict(snapshot_seed)
         self._coordinator.write_state(
             generation,
-            {"restore_plan": plan_dict},
+            _state_payload,
         )
         write_completed = time.perf_counter()
         after_bytes = self._coordinator.metrics.total_write_bytes
@@ -513,7 +536,12 @@ class RestorePlanPublisher:
         self.last_publish = result
         return result
 
-    async def publish_with_metrics_async(self, new_plan: RestorePlan) -> dict[str, Any]:
+    async def publish_with_metrics_async(
+        self,
+        new_plan: RestorePlan,
+        *,
+        snapshot_seed: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Async variant of ``publish_with_metrics`` that performs exactly one
         awaited async commit and no blocking Modal commit.
 
@@ -526,27 +554,33 @@ class RestorePlanPublisher:
         started = time.perf_counter()
         current_plan = await self._load_current_plan_async()
         reload_completed = time.perf_counter()
+        incoming_seed = dict(snapshot_seed) if snapshot_seed is not None else None
 
         compare_started = time.perf_counter()
         if current_plan is not None:
             if self._identity_hash(current_plan) == self._identity_hash(new_plan):
-                reload_ms = round((reload_completed - started) * 1000.0, 3)
-                compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
-                result = {
-                    "changed": False,
-                    "generation": self._safe_generation(current_plan.generation),
-                    "reload_ms": reload_ms,
-                    "compare_ms": compare_ms,
-                    "write_ms": 0.0,
-                    "commit_ms": 0.0,
-                    "bytes_written": 0,
-                    "state_path": getattr(self._coordinator, "state_path", ""),
-                    "model_identity_changed": False,
-                    "prefill_identity_changed": False,
-                }
-                result["trace"] = self._build_publication_trace(result).to_dict()
-                self.last_publish = result
-                return result
+                # No-op detection covers the COMPLETE state payload — plan
+                # identity AND the atomically-persisted snapshot seed (see the
+                # sync variant for the rationale).
+                current_seed = self.read_snapshot_seed()
+                if current_seed == incoming_seed:
+                    reload_ms = round((reload_completed - started) * 1000.0, 3)
+                    compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
+                    result = {
+                        "changed": False,
+                        "generation": self._safe_generation(current_plan.generation),
+                        "reload_ms": reload_ms,
+                        "compare_ms": compare_ms,
+                        "write_ms": 0.0,
+                        "commit_ms": 0.0,
+                        "bytes_written": 0,
+                        "state_path": getattr(self._coordinator, "state_path", ""),
+                        "model_identity_changed": False,
+                        "prefill_identity_changed": False,
+                    }
+                    result["trace"] = self._build_publication_trace(result).to_dict()
+                    self.last_publish = result
+                    return result
 
         compare_completed = time.perf_counter()
         # Identity-change flags: first publication both true; otherwise compare
@@ -581,9 +615,12 @@ class RestorePlanPublisher:
         plan_dict["generation"] = generation
         before_bytes = self._coordinator.metrics.total_write_bytes
         write_started = time.perf_counter()
+        _state_payload_async: dict[str, Any] = {"restore_plan": plan_dict}
+        if snapshot_seed is not None:
+            _state_payload_async["snapshot_seed"] = dict(snapshot_seed)
         self._coordinator.write_state(
             generation,
-            {"restore_plan": plan_dict},
+            _state_payload_async,
         )
         write_completed = time.perf_counter()
         after_bytes = self._coordinator.metrics.total_write_bytes
@@ -636,6 +673,17 @@ class RestorePlanPublisher:
             return None
         return RestorePlan.from_dict(plan_data)
 
+    def read_snapshot_seed(self) -> dict[str, Any] | None:
+        """Read the deployment-scoped snapshot-seed payload written alongside
+        the restore plan (``None`` when absent/invalid)."""
+        state = self._coordinator.read_state()
+        if state is None:
+            return None
+        seed_data = state.get("snapshot_seed")
+        if not isinstance(seed_data, Mapping) or not seed_data:
+            return None
+        return dict(seed_data)
+
 
 class RemoteRestorePlanPublisher:
     """Async adapter that publishes through the v2 Modal transport."""
@@ -644,7 +692,17 @@ class RemoteRestorePlanPublisher:
         self.transport = transport
         self.workspace = workspace
 
-    async def publish(self, plan: RestorePlan) -> dict[str, Any]:
+    async def publish(
+        self,
+        plan: RestorePlan,
+        *,
+        snapshot_seed: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Publish *plan* (and optional schema-v2 *snapshot_seed*) through the
+        v2 Modal transport so both are written atomically to the
+        deployment-scoped runtime-state volume."""
         return await self.transport.publish_restore_plan(
-            plan.to_dict(), workspace=self.workspace,
+            plan.to_dict(),
+            workspace=self.workspace,
+            snapshot_seed=snapshot_seed,
         )

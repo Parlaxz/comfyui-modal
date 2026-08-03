@@ -45,6 +45,35 @@ def _make_result_with_events(events: list[dict[str, Any]],
     return result
 
 
+def _seed_apply_events(request_id: str) -> list[dict[str, Any]]:
+    """Step 3 snapshot-graph seed apply evidence (schema-v2, within budget,
+    zero invalidations, sampler untouched, explicit fallback reason)."""
+    return [
+        _make_event("snapshot_graph_seed_validate_start", mono_ns=1100,
+                    metadata={"request_id": request_id, "budget_ms": 25}),
+        _make_event("snapshot_graph_seed_validate_end", mono_ns=1200,
+                    metadata={"request_id": request_id, "decision": "match",
+                              "schema": 2, "reasons": "", "verified_pre": 2,
+                              "stale_candidates": "",
+                              "observed_missing_in_workflow": 0,
+                              "non_loader_static_observed": 0,
+                              "sampler_node_count": 1}),
+        _make_event("snapshot_graph_seed_apply_start", mono_ns=1300,
+                    metadata={"request_id": request_id, "decision": "match",
+                              "schema": 2}),
+        _make_event("snapshot_graph_seed_apply_end", mono_ns=1400,
+                    metadata={"request_id": request_id, "decision": "match",
+                              "schema": 2, "validate_ms": 0.1,
+                              "apply_ms": 0.1, "total_ms": 0.2,
+                              "budget_ms": 25.0, "within_budget": True,
+                              "verified": 2, "invalidated": 0,
+                              "invalidated_node_ids": "",
+                              "invalidated_errors": "",
+                              "sampler_untouched": True,
+                              "fallback_reason": "none"}),
+    ]
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # Identity extraction
 # ═════════════════════════════════════════════════════════════════════════
@@ -159,6 +188,28 @@ class TestAcceptanceIdentityProof(unittest.TestCase):
                 _make_event("output_persist_end", mono_ns=5000000,
                             metadata={"request_id": request_id,
                                       "duration_ms": 5.0, "commit_ms": 3.0}),
+                _make_event("snapshot_graph_seed_validate_start", mono_ns=1200,
+                            metadata={"request_id": request_id, "budget_ms": 25}),
+                _make_event("snapshot_graph_seed_validate_end", mono_ns=1300,
+                            metadata={"request_id": request_id, "decision": "match",
+                                      "schema": 2, "reasons": "", "verified_pre": 2,
+                                      "stale_candidates": "",
+                                      "observed_missing_in_workflow": 0,
+                                      "non_loader_static_observed": 0,
+                                      "sampler_node_count": 1}),
+                _make_event("snapshot_graph_seed_apply_start", mono_ns=1400,
+                            metadata={"request_id": request_id, "decision": "match",
+                                      "schema": 2}),
+                _make_event("snapshot_graph_seed_apply_end", mono_ns=1500,
+                            metadata={"request_id": request_id, "decision": "match",
+                                      "schema": 2, "validate_ms": 0.1,
+                                      "apply_ms": 0.1, "total_ms": 0.2,
+                                      "budget_ms": 25.0, "within_budget": True,
+                                      "verified": 2, "invalidated": 0,
+                                      "invalidated_node_ids": "",
+                                      "invalidated_errors": "",
+                                      "sampler_untouched": True,
+                                      "fallback_reason": "none"}),
             ]
         else:
             events.append(
@@ -313,7 +364,7 @@ class TestAssetFetch(unittest.TestCase):
             _make_event("output_persist_start", mono_ns=4600, metadata={"request_id": "r"}),
             _make_event("output_persist_end", mono_ns=5000000,
                         metadata={"request_id": "r", "duration_ms": 5.0, "commit_ms": 3.0}),
-        ]
+        ] + _seed_apply_events("r")
         result = _make_result_with_events(events, images=images)
         result["output_diagnostics"] = {"output_volume_commit_ms": 3.0}
         result["identity"] = _extract_identity_from_trace(result, "r")
@@ -389,7 +440,7 @@ class TestTimingGates(unittest.TestCase):
             _make_event("output_persist_start", mono_ns=base + 2001000, metadata={"request_id": request_id}),
             _make_event("output_persist_end", mono_ns=int(base + ms * 1_000_000),
                         metadata={"request_id": request_id, "duration_ms": 5.0, "commit_ms": 3.0}),
-        ]
+        ] + _seed_apply_events(request_id)
         result = _make_result_with_events(events, images=[{"asset_id": "a", "backend_path": "p.png"}])
         result["output_diagnostics"] = {"output_volume_commit_ms": 3.0}
         result["identity"] = _extract_identity_from_trace(result, request_id)
@@ -668,7 +719,7 @@ class TestWrappedArtifact(unittest.TestCase):
             _make_event("output_persist_end", mono_ns=base + 9_500_000_000,
                         metadata={"request_id": "r", "duration_ms": 5.0,
                                   "commit_ms": 3.0}),
-        ]
+        ] + _seed_apply_events("r")
         result = _make_result_with_events(
             events, images=[{"asset_id": "a", "backend_path": "p.png"}],
         )

@@ -54,7 +54,7 @@ class _Publisher:
         self.plans = []
         self.publish_count = 0
 
-    def publish(self, plan):
+    def publish(self, plan, *, snapshot_seed=None):
         self.plans.append(plan)
         self.publish_count += 1
         return self.publish_count
@@ -1590,7 +1590,7 @@ class TestTwoIdenticalExecutionsSkipBothRemoteOps(unittest.TestCase):
             return {"status": "written", "changed": True}
 
         class _CountingPublisher:
-            def publish(self, plan):
+            def publish(self, plan, *, snapshot_seed=None):
                 publisher_calls[0] += 1
                 return 1
 
@@ -1634,7 +1634,7 @@ class TestTwoIdenticalExecutionsSkipBothRemoteOps(unittest.TestCase):
             return {"status": "written", "changed": True}
 
         class _CountingPublisher:
-            def publish(self, plan):
+            def publish(self, plan, *, snapshot_seed=None):
                 publisher_calls[0] += 1
                 return publisher_calls[0]
 

@@ -553,6 +553,53 @@ class TestBoundedDedup(unittest.TestCase):
             _ufp_mod._DEDUP_MAX = saved_max
 
 
+class TestFirstCudaDedupBounded(unittest.TestCase):
+    """The always-on unet_first_cuda_op dedup must stay bounded: it can never
+    grow without bound even for request ids that never pass through
+    reset_first_cuda_dedup, and each fresh request still emits exactly once."""
+
+    def setUp(self):
+        _reset_globals()
+        with _ufp_mod._first_cuda_dedup_lock:
+            _ufp_mod._first_cuda_dedup.clear()
+
+    def test_first_cuda_dedup_trimmed(self):
+        saved_max = _ufp_mod._FIRST_CUDA_DEDUP_MAX
+        try:
+            _ufp_mod._FIRST_CUDA_DEDUP_MAX = 3
+            dm = _FakeDiffusionModel()
+            model = _FakeModel(diffusion_model=dm)
+            patcher = _FakeUNETPatcher(model=model)
+            register_unet_forward_probe(patcher, source="cpu_snapshot")
+            for i in range(10):
+                with _TraceContext(f"req-cuda-bounded-{i:03d}"):
+                    _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
+            with _ufp_mod._first_cuda_dedup_lock:
+                self.assertLessEqual(
+                    len(_ufp_mod._first_cuda_dedup), _ufp_mod._FIRST_CUDA_DEDUP_MAX,
+                    "first_cuda_dedup must be trimmed at the bound",
+                )
+        finally:
+            _ufp_mod._FIRST_CUDA_DEDUP_MAX = saved_max
+
+    def test_first_cuda_dedup_cleared_by_request_reset(self):
+        """reset_first_cuda_dedup still clears the (dict-backed) dedup so the
+        next request emits unet_first_cuda_op again."""
+        dm = _FakeDiffusionModel()
+        model = _FakeModel(diffusion_model=dm)
+        patcher = _FakeUNETPatcher(model=model)
+        register_unet_forward_probe(patcher, source="cpu_snapshot")
+        with _TraceContext("req-reset-1") as trace1:
+            _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
+        ops1 = [e for e in trace1.events if e.name == "unet_first_cuda_op"]
+        self.assertEqual(len(ops1), 1)
+        _ufp_mod.reset_first_cuda_dedup()
+        with _TraceContext("req-reset-2") as trace2:
+            _forward_pre_hook(dm, (_FakeTensor(device="cuda:0"),))
+        ops2 = [e for e in trace2.events if e.name == "unet_first_cuda_op"]
+        self.assertEqual(len(ops2), 1)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Fix 4: resolve_diffusion_model tests
 # ═══════════════════════════════════════════════════════════════════════

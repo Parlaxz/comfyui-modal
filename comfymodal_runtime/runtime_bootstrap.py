@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .contracts import SnapshotExecutionSeed
 from .trace import RuntimeTrace
@@ -247,6 +247,9 @@ class BootstrapConfig:
     install_requirements_on_startup: bool = False
     # Lane B — path for persisting pre-scan generation record
     prescan_record_path: str = ""
+    # Step 3 — deployment-scoped seed payload path (hydrated at restore when
+    # present; empty disables hydration and falls back to the minimal seed)
+    seed_payload_path: str = ""
 
 
 @dataclass
@@ -289,6 +292,11 @@ class BootstrapState:
     snapshot_loader_outputs: dict[str, Any] = field(default_factory=dict)
     snapshot_model_identities: dict[str, str] = field(default_factory=dict)
     snapshot_seed_built: bool = False
+    # Step 3 — seed attestation observability (source/topology, JSON-safe only)
+    snapshot_seed_source: str = ""                      # "publisher_plan" | "startup_minimal" | ""
+    snapshot_seed_topology_available: bool = False
+    snapshot_seed_schema_version: int = 0
+    snapshot_seed_workflow_hash: str = ""
     # -- Legacy prescan identity aliases (backward-compatible diagnostics) --
     prescan_runtime_generation: str = ""
     prescan_custom_node_generation: str = ""
@@ -353,6 +361,110 @@ class BootstrapState:
         self.snapshot_execution_seed = seed
         self.snapshot_seed_built = True
         return seed
+
+    def build_snapshot_execution_seed_v2(
+        self,
+        workflow: Mapping[str, Any],
+        *,
+        output_node_ids: Sequence[str] = (),
+        workflow_hash: str = "",
+        source_workflow_hash: str = "",
+        custom_node_generation: str = "",
+        deployment_combined_hash: str = "",
+        loader_cache_signatures: Sequence[Mapping[str, Any]] = (),
+        sampler_static_inputs: Sequence[Mapping[str, Any]] = (),
+    ) -> SnapshotExecutionSeed:
+        """Build and store a schema-v2 ``SnapshotExecutionSeed`` from the
+        canonical workflow using the pure graph-analysis builder.
+
+        This is the runtime integration entry point for Step 3: it delegates
+        entirely to :func:`comfymodal_runtime.execution_seed.build_snapshot_execution_seed`
+        so the stored seed contains ONLY deterministic structural data
+        (topology, execution order, loader/static signatures) and never
+        outputs, tensors, request state, caches, random state, or GPU handles.
+
+        The v1-compatible ``build_snapshot_execution_seed`` method above is
+        unchanged and remains the backward-compatible path for existing
+        callers that pass individual identity fields.
+
+        ``workflow`` is a canonical ComfyUI mapping
+        ``{node_id: {"class_type": ..., "inputs": {...}}}``.
+        """
+        from .execution_seed import build_snapshot_execution_seed as _pure_build
+
+        seed = _pure_build(
+            workflow,
+            output_node_ids=output_node_ids,
+            workflow_hash=workflow_hash,
+            source_workflow_hash=source_workflow_hash,
+            custom_node_generation=custom_node_generation,
+            deployment_combined_hash=deployment_combined_hash,
+            loader_cache_signatures=loader_cache_signatures,
+            sampler_static_inputs=sampler_static_inputs,
+        )
+        self.snapshot_execution_seed = seed
+        self.snapshot_seed_built = True
+        return seed
+
+    def get_snapshot_execution_seed(self) -> SnapshotExecutionSeed | None:
+        """Return the stored seed (schema v1 or v2), or ``None`` when unset."""
+        return self.snapshot_execution_seed
+
+    def build_minimal_snapshot_seed_v2(
+        self,
+        *,
+        workflow_hash: str = "",
+        source_workflow_hash: str = "",
+        custom_node_generation: str = "",
+        deployment_combined_hash: str = "",
+        loader_cache_signatures: Sequence[dict[str, Any]] = (),
+    ) -> SnapshotExecutionSeed:
+        """Build and store an honest minimal schema-v2 seed (restore fallback).
+
+        Used when the persisted publisher seed payload is unavailable at
+        restore: ``seed_source="startup_minimal"``,
+        ``topology_available=False``.  Contains only identity/loader-signature
+        fields — never topology, static node structure, outputs, or request
+        state.
+        """
+        from .execution_seed import minimal_snapshot_seed_payload
+
+        payload = minimal_snapshot_seed_payload(
+            workflow_hash=workflow_hash,
+            source_workflow_hash=source_workflow_hash,
+            custom_node_generation=custom_node_generation,
+            deployment_combined_hash=deployment_combined_hash,
+            loader_cache_signatures=loader_cache_signatures,
+        )
+        seed = SnapshotExecutionSeed.from_dict(payload["seed"])
+        self.snapshot_execution_seed = seed
+        self.snapshot_seed_built = True
+        self.snapshot_seed_source = "startup_minimal"
+        self.snapshot_seed_topology_available = False
+        self.snapshot_seed_schema_version = int(seed.schema_version)
+        self.snapshot_seed_workflow_hash = seed.workflow_hash
+        return seed
+
+    def hydrate_snapshot_seed_payload(self, payload: Mapping[str, Any]) -> bool:
+        """Set the stored seed from a validated persisted seed payload.
+
+        Returns ``True`` when a recognized schema-v2 payload was applied;
+        ``False`` (no change) when the payload is invalid.  Never mutates
+        anything except the stored seed and its observability fields.
+        """
+        from .execution_seed import snapshot_seed_payload_from_dict
+
+        normalized = snapshot_seed_payload_from_dict(payload)
+        if normalized is None:
+            return False
+        seed = SnapshotExecutionSeed.from_dict(normalized["seed"])
+        self.snapshot_execution_seed = seed
+        self.snapshot_seed_built = True
+        self.snapshot_seed_source = str(normalized.get("seed_source", "") or "")
+        self.snapshot_seed_topology_available = bool(normalized.get("topology_available", False))
+        self.snapshot_seed_schema_version = int(seed.schema_version)
+        self.snapshot_seed_workflow_hash = seed.workflow_hash
+        return True
 
     def freeze_custom_node_identity(
         self, *,
@@ -1306,6 +1418,62 @@ class RuntimeBootstrap:
         except Exception as exc:
             print(f"[bootstrap] prescan_identity_restore_error: {exc}", flush=True)
 
+    def _try_hydrate_snapshot_seed_payload(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        workflow_hash: str = "",
+    ) -> bool:
+        """Hydrate the persisted deployment-scoped seed payload at restore.
+
+        Reads ``config.seed_payload_path`` (the narrow existing-state path;
+        on Modal this is ``{RUNTIME_STATE_PATH}/snapshot_seed.json``) and
+        applies it to ``self.state`` when valid.  Returns ``True`` when a
+        schema-v2 payload was hydrated.  Never raises — any failure is an
+        honest fallback to the minimal seed.
+        """
+        from .execution_seed import (
+            read_snapshot_seed_payload,
+            snapshot_seed_observability,
+        )
+
+        path = getattr(self.config, "seed_payload_path", "") or ""
+        if not path:
+            return False
+        try:
+            import os as _os
+
+            payload = read_snapshot_seed_payload(root=_os.path.dirname(path))
+            if payload is None:
+                return False
+            if not self.state.hydrate_snapshot_seed_payload(payload):
+                return False
+        except Exception:
+            return False
+        obs = snapshot_seed_observability(self.state.snapshot_execution_seed)
+        print(
+            f"[v2.seed_restore] source=publisher_plan schema=2 "
+            f"topology_available={1 if self.state.snapshot_seed_topology_available else 0} "
+            f"workflow_hash={self.state.snapshot_seed_workflow_hash[:16]} "
+            f"loader_nodes={obs['loader_node_count']} sampler_nodes={obs['sampler_node_count']} "
+            f"reachable_nodes={obs['reachable_node_count']} static_signatures={obs['static_signature_count']}",
+            flush=True,
+        )
+        if trace:
+            trace.emit(
+                "snapshot_seed_hydrated",
+                phase="restore",
+                metadata={
+                    "seed_source": self.state.snapshot_seed_source,
+                    "topology_available": 1 if self.state.snapshot_seed_topology_available else 0,
+                    "schema_version": self.state.snapshot_seed_schema_version,
+                    "workflow_hash": self.state.snapshot_seed_workflow_hash[:16],
+                    "seed_payload_path": path,
+                    **obs,
+                },
+            )
+        return True
+
     # REMOVED: _build_and_store_snapshot_certificate — placeholder superseded
     # by the V2 workflow certificate built in ModalRuntimeEntrypoint.startup().
 
@@ -1546,7 +1714,12 @@ class RuntimeBootstrap:
             else:
                 self.state.custom_node_generation = self.state.snapshot_custom_node_generation
 
-            # Lane B — build SnapshotExecutionSeed from model identities
+            # Lane B — build/hydrate SnapshotExecutionSeed (Step 3)
+            # Hydrate the persisted publisher seed payload when available;
+            # otherwise fall back honestly to a minimal schema-v2 seed
+            # (seed_source=startup_minimal, topology_available=false).
+            from .execution_seed import snapshot_seed_observability
+
             _unet_id = self.state.cuda.get("unet_identity", "")
             _clip_id = self.state.cuda.get("clip_identity", "")
             _loader_sigs: list[dict[str, Any]] = []
@@ -1554,13 +1727,42 @@ class RuntimeBootstrap:
                 _loader_sigs.append({"node_id": "unet", "signature": _unet_id})
             if _clip_id:
                 _loader_sigs.append({"node_id": "clip", "signature": _clip_id})
-            _seed_started = _emit_startup_stage("snapshot_execution_seed", "start", trace=trace, phase="restore")
-            self.state.build_snapshot_execution_seed(
-                workflow_hash=self.state.snapshot_certificate.get("identity_components", {}).get("workflow_hash", ""),
-                custom_node_generation=self.state.snapshot_custom_node_generation,
-                deployment_combined_hash=self.state.deployment_combined_hash,
-                loader_cache_signatures=_loader_sigs,
+            _cert_wf_hash = str(
+                self.state.snapshot_certificate
+                .get("identity_components", {}).get("workflow_hash", "") or ""
             )
+            _seed_started = _emit_startup_stage("snapshot_execution_seed", "start", trace=trace, phase="restore")
+            _seed_hydrated = self._try_hydrate_snapshot_seed_payload(
+                trace=trace, workflow_hash=_cert_wf_hash,
+            )
+            if not _seed_hydrated:
+                self.state.build_minimal_snapshot_seed_v2(
+                    workflow_hash=_cert_wf_hash,
+                    custom_node_generation=self.state.snapshot_custom_node_generation,
+                    deployment_combined_hash=self.state.deployment_combined_hash,
+                    loader_cache_signatures=_loader_sigs,
+                )
+                _min_obs = snapshot_seed_observability(self.state.snapshot_execution_seed)
+                print(
+                    "[v2.seed_restore] "
+                    f"source=startup_minimal schema=2 topology_available=0 "
+                    f"workflow_hash={self.state.snapshot_seed_workflow_hash[:16]} "
+                    f"loader_signatures={len(_loader_sigs)}",
+                    flush=True,
+                )
+                if trace:
+                    trace.emit(
+                        "snapshot_seed_minimal_fallback",
+                        phase="restore",
+                        metadata={
+                            "seed_source": "startup_minimal",
+                            "topology_available": 0,
+                            "schema_version": 2,
+                            "workflow_hash": self.state.snapshot_seed_workflow_hash[:16],
+                            "loader_signature_count": len(_loader_sigs),
+                            **_min_obs,
+                        },
+                    )
             _emit_startup_stage("snapshot_execution_seed", "end", started=_seed_started, trace=trace, phase="restore")
             if trace and self.state.snapshot_seed_built:
                 trace.emit(
@@ -1573,6 +1775,9 @@ class RuntimeBootstrap:
                         ),
                         "loader_count": len(_loader_sigs),
                         "deployment_hash": self.state.deployment_combined_hash[:16] if self.state.deployment_combined_hash else "",
+                        "seed_source": self.state.snapshot_seed_source,
+                        "topology_available": 1 if self.state.snapshot_seed_topology_available else 0,
+                        "seed_schema_version": self.state.snapshot_seed_schema_version,
                     },
                 )
 
