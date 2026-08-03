@@ -29,14 +29,28 @@ from typing import Any, AsyncIterator, Callable, ContextManager, Iterator, Mappi
 
 from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
-from .contracts import DeploymentIdentity, ExecutionPlan, ModelRestoreKey, RestorePlan, _thaw, stable_hash
+from .contracts import (
+    DeploymentIdentity,
+    ExecutionPlan,
+    ModelRestoreKey,
+    RestorePlan,
+    SnapshotExecutionSeed,
+    _thaw,
+    stable_hash,
+)
 from .deployment_spec import build_deployment_identity
 from .env import env_flag
-from .restore_plan import build_restore_model_spec, derive_model_key, derive_prefill_key
-from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
+from .restore_plan import (
+    RestorePlanPublisher,
+    build_restore_model_spec,
+    derive_model_key,
+    derive_prefill_key,
+)
+from .runtime_bootstrap import BootstrapConfig, BootstrapState, RuntimeBootstrap
 from .runtime_executor import (
     ExecutionContext,
     RuntimeExecutor,
+    apply_snapshot_seed_to_executor,
     pre_sampler_instrumentation_scope,
     set_lock_wait_ms,
     _attach_structured_report,
@@ -199,6 +213,14 @@ RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "c
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
+# Deployment-scoped runtime-state file that carries the authoritative
+# RestorePlan plus the atomically-written schema-v2 ``snapshot_seed`` payload
+# (written together by ``RestorePlanPublisher.publish_with_metrics*`` on the
+# runtime-state volume).  Overridable per deployment via env so the same code
+# can target a dedicated state file without redeploying.
+V2_RESTORE_STATE_FILE = os.environ.get(
+    "COMFYMODAL_V2_RESTORE_STATE_FILE", "restore_state.json"
+).strip() or "restore_state.json"
 PROFILE_VOLUME_NAME = os.environ.get("COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles")
 PROFILE_PATH = "/mnt/comfymodal_profiles"
 MIN_CONTAINERS = 0
@@ -2006,6 +2028,12 @@ def _runtime_env() -> dict[str, str]:
         ),
         "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": os.environ.get(
             "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET", ""
+        ),
+        # Native page-readiness candidate — off (empty) by default so
+        # current production behavior is unchanged until explicitly set to
+        # "willneed".  Absent locally stays absent remotely.
+        "COMFYMODAL_V2_PAGE_READINESS_MODE": os.environ.get(
+            "COMFYMODAL_V2_PAGE_READINESS_MODE", ""
         ),
         "COMFYMODAL_PRELOAD_MODE": os.environ.get(
             "COMFYMODAL_PRELOAD_MODE", "clip_only"
@@ -5067,6 +5095,7 @@ class ModalRuntimeEntrypoint:
             models_path=MODELS_PATH,
             custom_nodes_path=CUSTOM_NODES_PATH,
             prescan_record_path=f"{RUNTIME_STATE_PATH}/prescan_custom_nodes.json",
+            seed_payload_path=f"{RUNTIME_STATE_PATH}/snapshot_seed.json",
             min_containers=MIN_CONTAINERS,
             scaledown_window=SCALEDOWN_WINDOW,
         )
@@ -9300,6 +9329,13 @@ class ModalRuntimeEntrypoint:
                     pass
                 from comfymodal_runtime.model_preload import clear_retained_unet_identity_chain
                 clear_retained_unet_identity_chain(_watchdog_request_id)
+                # Release the per-request UNET native page-readiness guard so
+                # a future request with the same id can activate again.
+                try:
+                    from comfymodal_runtime.model_preload import _unet_page_readiness_clear
+                    _unet_page_readiness_clear(_watchdog_request_id)
+                except Exception:
+                    pass
                 if _production_snapshot_marked:
                     try:
                         from comfymodal_runtime.model_preload import unmark_production_cpu_snapshot_request
@@ -10196,6 +10232,42 @@ class ModalRuntimeEntrypoint:
                 phase="execution",
                 metadata={"diagnostics": _seeded},
             )
+            # ── Step 3: real executor-cache seed apply seam ──
+            # Runs AFTER original_set_prompt and AFTER Step 1-2 loader
+            # seeding.  Verifies structural/static signatures against the live
+            # workflow and invalidates stale loader entries only — never
+            # inserts/replaces loader CacheEntries and never touches sampler
+            # entries.  Fail-closed: any mismatch/error continues execution.
+            _seed_apply: dict[str, Any] = {}
+            try:
+                _seed_apply = await apply_snapshot_seed_to_executor(
+                    executor,
+                    state.snapshot_execution_seed,
+                    workflow=_wf,
+                    workflow_hash=_wf_hash,
+                    source_workflow_hash=str(plan.source_workflow_hash or ""),
+                    deployment_combined_hash=_dep_hash,
+                    custom_node_generation=_cn_gen,
+                    trace=trace,
+                )
+            except Exception as _seed_apply_exc:
+                _seed_apply = {
+                    "decision": "error",
+                    "schema": 0,
+                    "total_ms": 0.0,
+                    "within_budget": False,
+                    "verified": 0,
+                    "invalidated": 0,
+                    "sampler_untouched": True,
+                    "fallback_reason": f"apply_error:{type(_seed_apply_exc).__name__}",
+                }
+                print(
+                    f"[v2.seed_apply] decision=error schema=0 validate_ms=0 "
+                    f"apply_ms=0 total_ms=0 budget_ms=25 within_budget=0 "
+                    f"verified=0 invalidated=0 sampler_untouched=1 "
+                    f"fallback_reason=apply_error:{type(_seed_apply_exc).__name__}",
+                    flush=True,
+                )
             trace.emit(
                 "executor_seed_apply_end",
                 phase="execution",
@@ -10204,6 +10276,7 @@ class ModalRuntimeEntrypoint:
                         1 for v in _seeded.values()
                         if isinstance(v, dict) and v.get("decision") == "seeded"
                     ),
+                    "seed_apply": dict(_seed_apply),
                 },
             )
             return result
@@ -10355,6 +10428,145 @@ class ModalRuntimeEntrypoint:
             "sha256": digest,
             "filename": candidate.name,
         }
+
+    def publish_restore_plan(
+        self,
+        plan_payload: Mapping[str, Any],
+        snapshot_seed: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Modal-exposed method: publish a ``RestorePlan`` (and optional
+        schema-v2 ``snapshot_seed`` payload) to the deployment-scoped
+        runtime-state volume.
+
+        The seed payload is persisted atomically alongside the plan in
+        ``V2_RESTORE_STATE_FILE`` AND as ``snapshot_seed.json`` on the same
+        volume so restore-time hydration finds the publisher-side payload
+        before any validated cold request.  The payload is never rebuilt or
+        re-validated in the container — it is exactly what the publisher
+        sent.  Fail-closed: any error raises so the caller's trace records
+        the failure and restore falls back to ``startup_minimal``.
+
+        This container's ``restore()`` may have already run before the seed
+        was written, so a later request can reuse THIS container without
+        restore-time hydration seeing the newly published payload.  After a
+        successful remote write, the exact validated ``snapshot_seed`` is
+        hydrated into the current container's ``BootstrapState`` so the next
+        request on this container sees ``seed_source=publisher_plan``.
+        Hydration failure is explicit and fail-closed — never silently
+        claiming seeded parity.
+        """
+        result = _publish_restore_plan_remote(plan_payload, snapshot_seed=snapshot_seed)
+        if snapshot_seed is not None:
+            self._hydrate_published_snapshot_seed(snapshot_seed)
+        return result
+
+    def _hydrate_published_snapshot_seed(
+        self, snapshot_seed: Mapping[str, Any],
+    ) -> BootstrapState:
+        """Hydrate the exact validated publisher ``snapshot_seed`` payload
+        into this container's ``BootstrapState``.
+
+        Restore-time hydration ran before the publisher wrote the volume, so
+        requests reusing this container must see the published payload in
+        memory.  The payload is validated via
+        ``BootstrapState.hydrate_snapshot_seed_payload`` — it is never rebuilt
+        from ``plan_payload`` or request workflow.  Emits a concise
+        ``snapshot_seed_remote_hydrated=1`` marker on success.  Raises
+        (fail-closed) when bootstrap state is unavailable or the payload is
+        invalid, without claiming seeded parity.
+        """
+        bootstrap = getattr(self, "bootstrap", None)
+        state = getattr(bootstrap, "state", None)
+        trace = getattr(self, "_lifecycle_trace", None)
+        if state is None:
+            message = (
+                "publish_restore_plan: BootstrapState unavailable; "
+                "published snapshot_seed NOT hydrated in this container"
+            )
+            print(f"[publish_restore_plan] {message}", flush=True)
+            if trace is not None:
+                trace.emit(
+                    "snapshot_seed_remote_hydrate_error",
+                    phase="publish",
+                    metadata={
+                        "snapshot_seed_remote_hydrated": 0,
+                        "reason": "bootstrap_state_unavailable",
+                    },
+                )
+            raise RuntimeError(message)
+        if not state.hydrate_snapshot_seed_payload(snapshot_seed):
+            message = (
+                "publish_restore_plan: published snapshot_seed payload failed "
+                "validation; current container NOT seeded (restore will "
+                "honestly fall back to startup_minimal)"
+            )
+            print(f"[publish_restore_plan] {message}", flush=True)
+            if trace is not None:
+                trace.emit(
+                    "snapshot_seed_remote_hydrate_error",
+                    phase="publish",
+                    metadata={
+                        "snapshot_seed_remote_hydrated": 0,
+                        "reason": "invalid_payload",
+                    },
+                )
+            raise RuntimeError(message)
+        print(
+            f"[publish_restore_plan] snapshot_seed_remote_hydrated=1 "
+            f"seed_source={state.snapshot_seed_source} "
+            f"topology_available={1 if state.snapshot_seed_topology_available else 0} "
+            f"workflow_hash={state.snapshot_seed_workflow_hash[:16]}",
+            flush=True,
+        )
+        if trace is not None:
+            trace.emit(
+                "snapshot_seed_remote_hydrated",
+                phase="publish",
+                metadata={
+                    "snapshot_seed_remote_hydrated": 1,
+                    "seed_source": state.snapshot_seed_source,
+                    "topology_available": 1 if state.snapshot_seed_topology_available else 0,
+                    "schema_version": state.snapshot_seed_schema_version,
+                    "workflow_hash": state.snapshot_seed_workflow_hash[:16],
+                },
+            )
+        return state
+
+    def _attach_snapshot_seed_metadata(self, context: ExecutionContext) -> None:
+        """Step 3: attach frozen restore-time snapshot-seed metadata per request.
+
+        Attaches exactly three keys to ``context.metadata``:
+
+          snapshot_execution_seed  — the frozen ``bootstrap.state.
+                                     snapshot_execution_seed`` object, or ``None``.
+          deployment_combined_hash — ``_V2_DEPLOYMENT_COMBINED_HASH`` when
+                                     non-empty, else ``bootstrap.state.
+                                     deployment_combined_hash``.
+          custom_node_generation   — ``bootstrap.state.snapshot_custom_node_generation``
+                                     when non-empty, else ``bootstrap.state.
+                                     custom_node_generation``.
+
+        All reads use defensive ``getattr`` because cold-unpickled instances
+        may lack bootstrap state.  No v2 seed is built from ``plan.workflow``
+        at request time and shared bootstrap state is never mutated.  No
+        workflow/output/tensor/request state is persisted in metadata.
+        """
+        bootstrap = getattr(self, "bootstrap", None)
+        state = getattr(bootstrap, "state", None)
+        snapshot_seed: SnapshotExecutionSeed | None = None
+        deployment_hash = str(_V2_DEPLOYMENT_COMBINED_HASH or "")
+        custom_node_generation = ""
+        if state is not None:
+            snapshot_seed = getattr(state, "snapshot_execution_seed", None)
+            if not deployment_hash:
+                deployment_hash = str(getattr(state, "deployment_combined_hash", "") or "")
+            custom_node_generation = str(
+                getattr(state, "snapshot_custom_node_generation", "")
+                or getattr(state, "custom_node_generation", "")
+            )
+        context.metadata["snapshot_execution_seed"] = snapshot_seed
+        context.metadata["deployment_combined_hash"] = deployment_hash
+        context.metadata["custom_node_generation"] = custom_node_generation
 
     async def run_plan_stream(
         self,
@@ -10555,6 +10767,9 @@ class ModalRuntimeEntrypoint:
             cancelled=cancelled,
             trace=RuntimeTrace(request_id=_t4_request_id or request_id, process="remote"),
         )
+        # Step 3: attach frozen restore-time snapshot-seed metadata per request.
+        # Defensive getattr — cold-unpickled instances may lack bootstrap state.
+        self._attach_snapshot_seed_metadata(context)
         context.trace.set_metadata(
             **identity,
             trace_id=context.trace.trace_id,
@@ -11238,6 +11453,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
+        "publish_restore_plan",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -11272,6 +11488,7 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
+    setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
     return cls
 
 
@@ -11328,7 +11545,20 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     )(remote_class)
 
 
-def _publish_restore_plan_impl(plan: RestorePlan) -> dict[str, Any]:
+def _publish_restore_plan_impl(
+    plan: RestorePlan,
+    *,
+    snapshot_seed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Publish *plan* (and optional *snapshot_seed*) to the deployment-scoped
+    runtime-state volume and return the authoritative publication result.
+
+    The schema-v2 seed payload is written through the same
+    ``RestorePlanPublisher`` write so it lands atomically alongside the plan
+    in ``V2_RESTORE_STATE_FILE`` AND as ``snapshot_seed.json`` on the same
+    volume (the path restore-time hydration reads).  The payload is never
+    rebuilt or re-validated here — it is exactly the publisher-side payload.
+    """
     resources = globals().get("_MODAL_RESOURCES", {})
     modal_volume = resources.get("runtime_state_volume")
     if modal_volume is None:
@@ -11348,13 +11578,43 @@ def _publish_restore_plan_impl(plan: RestorePlan) -> dict[str, Any]:
     volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
     coordinator = CommitCoordinator(volume, state_path=V2_RESTORE_STATE_FILE)
     publisher = RestorePlanPublisher(coordinator)
-    result = publisher.publish_with_metrics(plan)
+    # Persist the standalone seed file FIRST so a single volume commit (the
+    # coordinator's) durably covers both files.  Idempotent: a byte-identical
+    # file already on the volume is not rewritten, so an unchanged-plan
+    # republish adds no extra commit.  Fail-closed: on serialization error we
+    # still publish the plan; hydration then falls back to minimal.
+    seed_file_written = False
+    if snapshot_seed is not None:
+        try:
+            from .execution_seed import SEED_PAYLOAD_FILENAME
+
+            encoded = json.dumps(
+                dict(snapshot_seed), separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+            try:
+                _existing = volume.read_bytes(SEED_PAYLOAD_FILENAME)
+            except Exception:
+                _existing = b""
+            if _existing != encoded:
+                volume.write_bytes(SEED_PAYLOAD_FILENAME, encoded)
+                seed_file_written = True
+        except Exception as _seed_write_exc:
+            print(
+                f"[publish_restore_plan] snapshot_seed file write error "
+                f"error={str(_seed_write_exc)[:120]}",
+                flush=True,
+            )
+    result = publisher.publish_with_metrics(plan, snapshot_seed=snapshot_seed)
+    if snapshot_seed is not None and seed_file_written and not result.get("changed"):
+        # No-op plan publish does not commit — commit the standalone seed file
+        # explicitly so the deployment-scoped payload is durable.
+        volume.commit()
     readback_started = time.perf_counter()
     authoritative = publisher.read_current_plan()
     readback_ms = round((time.perf_counter() - readback_started) * 1000.0, 3)
     if authoritative is None:
         raise RuntimeError("published RestorePlan could not be read back from runtime-state Volume")
-    # â”€â”€ Add publish_readback event to publication trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Add publish_readback event to publication trace ──
     pub_trace = result.get("trace", {})
     if isinstance(pub_trace, dict) and "events" in pub_trace:
         pub_trace["events"].append({
@@ -11372,13 +11632,19 @@ def _publish_restore_plan_impl(plan: RestorePlan) -> dict[str, Any]:
         "runtime_state_volume": RUNTIME_STATE_VOLUME_NAME,
         "state_path": V2_RESTORE_STATE_FILE,
         "readback_ms": readback_ms,
+        "snapshot_seed_present": int(snapshot_seed is not None),
+        "snapshot_seed_file_written": int(seed_file_written),
         "models_volume_write_count": 0,
         "models_volume_commit_count": 0,
     })
     return result
 
 
-async def _publish_restore_plan_impl_async(plan: RestorePlan) -> dict[str, Any]:
+async def _publish_restore_plan_impl_async(
+    plan: RestorePlan,
+    *,
+    snapshot_seed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Async variant of ``_publish_restore_plan_impl`` that uses async commit.
 
     Uses ``RestorePlanPublisher.publish_with_metrics_async()`` which calls
@@ -11400,7 +11666,30 @@ async def _publish_restore_plan_impl_async(plan: RestorePlan) -> dict[str, Any]:
     volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
     coordinator = CommitCoordinator(volume, state_path=V2_RESTORE_STATE_FILE)
     publisher = RestorePlanPublisher(coordinator)
-    result = await publisher.publish_with_metrics_async(plan)
+    seed_file_written = False
+    if snapshot_seed is not None:
+        try:
+            from .execution_seed import SEED_PAYLOAD_FILENAME
+
+            encoded = json.dumps(
+                dict(snapshot_seed), separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+            try:
+                _existing = volume.read_bytes(SEED_PAYLOAD_FILENAME)
+            except Exception:
+                _existing = b""
+            if _existing != encoded:
+                volume.write_bytes(SEED_PAYLOAD_FILENAME, encoded)
+                seed_file_written = True
+        except Exception as _seed_write_exc:
+            print(
+                f"[publish_restore_plan] snapshot_seed file write error "
+                f"error={str(_seed_write_exc)[:120]}",
+                flush=True,
+            )
+    result = await publisher.publish_with_metrics_async(plan, snapshot_seed=snapshot_seed)
+    if snapshot_seed is not None and seed_file_written and not result.get("changed"):
+        await volume.commit_async()
     readback_started = time.perf_counter()
     authoritative = await publisher.read_current_plan_async()
     readback_ms = round((time.perf_counter() - readback_started) * 1000.0, 3)
@@ -11423,19 +11712,28 @@ async def _publish_restore_plan_impl_async(plan: RestorePlan) -> dict[str, Any]:
         "runtime_state_volume": RUNTIME_STATE_VOLUME_NAME,
         "state_path": V2_RESTORE_STATE_FILE,
         "readback_ms": readback_ms,
+        "snapshot_seed_present": int(snapshot_seed is not None),
+        "snapshot_seed_file_written": int(seed_file_written),
         "models_volume_write_count": 0,
         "models_volume_commit_count": 0,
     })
     return result
 
 
-def _removed_publish_restore_plan_remote(plan_payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Publish before GPU class lookup so the next snap=False sees the plan."""
+def _publish_restore_plan_remote(
+    plan_payload: Mapping[str, Any],
+    snapshot_seed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Registered Modal remote method body: publish before GPU class lookup so
+    the next snap=False sees the plan (and the schema-v2 seed payload)."""
     _t0 = time.perf_counter()
     print("[publish_restore_plan] entry", flush=True)
     try:
         identity = _capture_remote_identity()
-        result = _publish_restore_plan_impl(RestorePlan.from_dict(plan_payload))
+        result = _publish_restore_plan_impl(
+            RestorePlan.from_dict(plan_payload),
+            snapshot_seed=snapshot_seed,
+        )
         result.setdefault("identity", {}).update(identity)
         _elapsed_ms = round((time.perf_counter() - _t0) * 1000, 1)
         print(f"[publish_restore_plan] success elapsed_ms={_elapsed_ms}", flush=True)

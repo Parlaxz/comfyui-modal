@@ -268,9 +268,15 @@ _dedup: dict[tuple[str, str], bool] = {}
 _dedup_lock = threading.RLock()
 _DEDUP_MAX = 1024
 
-# Separate dedup for unet_first_cuda_op (one per request)
-_first_cuda_dedup: set[str] = set()
+# Bounded dedup for unet_first_cuda_op (one emit per request).
+# Dict preserves insertion order so the OLDEST request ids are evicted first
+# when the bound is reached — the set can never grow without bound, even for
+# requests that never pass through the request-start reset path
+# (reset_first_cuda_dedup).  Membership checks and .clear() behave exactly as
+# before (the reset path is the primary cleanup).
+_first_cuda_dedup: dict[str, bool] = {}
 _first_cuda_dedup_lock = threading.RLock()
+_FIRST_CUDA_DEDUP_MAX = 1024
 # ── Forward post hook registry ─────────────────────────────────────────────
 # A single post-hook handle is stored so we can remove/replace it.
 _forward_post_handle: Any = None
@@ -409,7 +415,14 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
         if request_id not in _first_cuda_dedup:
             x_device = str(x.device) if x is not None else ""
             if x_device.startswith("cuda"):
-                _first_cuda_dedup.add(request_id)
+                _first_cuda_dedup[request_id] = True
+                # Bounded: evict the oldest request ids when the bound is hit
+                # so this per-request/global structure never grows without
+                # bound (primary cleanup remains reset_first_cuda_dedup).
+                if len(_first_cuda_dedup) > _FIRST_CUDA_DEDUP_MAX:
+                    excess = len(_first_cuda_dedup) - _FIRST_CUDA_DEDUP_MAX
+                    for _stale in list(_first_cuda_dedup.keys())[:excess]:
+                        del _first_cuda_dedup[_stale]
                 _first_cuda_emitted = True
 
                 # Compute elapsed from demand start.

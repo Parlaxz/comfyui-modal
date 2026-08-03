@@ -87,3 +87,6 @@ playwright-*.md
 
 # Lane A disk-persisted caches
 .cache/
+
+# Runtime-state volume directory (restore-plan + snapshot-seed payloads)
+.runtime_state/

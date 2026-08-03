@@ -28,7 +28,7 @@ class _Publisher:
     def __init__(self):
         self.plans = []
 
-    def publish(self, plan):
+    def publish(self, plan, *, snapshot_seed=None):
         self.plans.append(plan)
         return 1
 

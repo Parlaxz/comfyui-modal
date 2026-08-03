@@ -201,8 +201,15 @@ class TestSamplerWrapperIntegration(unittest.TestCase):
         self.assertIn("sampling_end", names,
                       "sampling_end must be emitted even on exception")
 
-    def test_dedup_prevents_duplicate_events(self):
-        """Same (request_id, executor_id) must not emit duplicate events."""
+    def test_two_invocations_emit_one_pair_each_and_dedup_does_not_grow(self):
+        """Each actual sampler invocation must emit its own sampling_start/
+        sampling_end pair, and the dedup set must not grow after completion
+        (request-scoped cleanup) — a later invocation is never suppressed."""
+        from comfymodal_runtime.runtime_executor import (
+            _sampler_wrapper_dedup,
+            _sampler_wrapper_dedup_lock,
+        )
+
         def _original(*args, **kwargs):
             return {"ok": True}
 
@@ -220,10 +227,19 @@ class TestSamplerWrapperIntegration(unittest.TestCase):
         finally:
             self._reset_trace()
 
-        # First call is deduped by same executor, only one set of events
-        start_count = len([e for e in self._trace.events if e.name == "sampling_start"])
-        self.assertEqual(start_count, 1,
-                         "duplicate executor invocations must not emit second sampling_start")
+        # Two sequential invocations -> two start/end pairs (one per actual
+        # invocation), not one pair deduped away.
+        starts = len([e for e in self._trace.events if e.name == "sampling_start"])
+        ends = len([e for e in self._trace.events if e.name == "sampling_end"])
+        self.assertEqual(starts, 2,
+                         "each actual invocation must emit its own sampling_start")
+        self.assertEqual(ends, 2,
+                         "each actual invocation must emit its own sampling_end")
+        # The dedup set holds no keys once the invocations complete: it cannot
+        # grow without bound and cannot suppress a later sampler.
+        with _sampler_wrapper_dedup_lock:
+            self.assertEqual(len(_sampler_wrapper_dedup), 0,
+                             "dedup must be cleaned up after each invocation")
 
     def test_wrapper_preserves_return_value(self):
         """Wrapper must return the original function's result."""

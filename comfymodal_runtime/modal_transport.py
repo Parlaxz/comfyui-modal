@@ -30,6 +30,32 @@ class TransportError(RuntimeError):
     pass
 
 
+async def _aclose_iterator(iterator: Any) -> None:
+    """Best-effort explicit close of an inner remote async iterator/generator.
+
+    Modal's ``remote_gen.aio()`` returns a real async generator.  If one is
+    abandoned (never exhausted, or abandoned on exception/cancellation), its
+    eventual garbage-collection schedules a pending ``async_generator_athrow``
+    task that can outlive the request and be reported as a leaked task after
+    the benchmark process completes.  Closing it here — after the final event
+    has been yielded, or on exception/cancellation — runs the SDK-owned
+    cleanup deterministically inside the request scope.
+
+    This is intentionally best-effort and never delays the yielded result:
+    it runs in ``finally`` only after the last yield, cleanup errors are
+    swallowed so they never mask the result or the original transport error,
+    and objects without an ``aclose`` (e.g. test fakes) are skipped untouched.
+    """
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except Exception:
+        # Cleanup is best-effort: never let it mask the result/exception.
+        pass
+
+
 @dataclass(frozen=True)
 class HandleCacheKey:
     """Cache key for Modal function/cls handles.
@@ -265,6 +291,7 @@ class ModalTransport:
         _generator_end_wall_ns = None
         _generator_end_mono_ns = None
         _submission_boundary_source = None
+        _iterator: Any = None
         try:
             if fn is not None:
                 # V1-compatible stream path — measure plan serialization
@@ -440,7 +467,7 @@ class ModalTransport:
                         })
                         _modal_input_id_emitted = True
             if hasattr(stream, "__aiter__"):
-                iterator = stream.__aiter__()
+                _iterator = stream.__aiter__()
                 _submission_wall_ns = time.time_ns()
                 _submission_mono_ns = time.monotonic_ns()
                 if runtime_trace is not None and fn is None:
@@ -475,7 +502,7 @@ class ModalTransport:
                     _origin_from_meta.setdefault("modal_submission_attempt_mono_ns", _submission_mono_ns)
                     _origin_from_meta.setdefault("modal_submission_boundary_source", _submission_boundary_source)
                 try:
-                    first_event = await iterator.__anext__()
+                    first_event = await _iterator.__anext__()
                 except StopAsyncIteration:
                     return
                 _first_event_wall_ns = time.time_ns()
@@ -483,12 +510,12 @@ class ModalTransport:
                 if fn is None:
                     _modal_input_id = str(
                         getattr(stream, "input_id", "")
-                        or getattr(iterator, "input_id", "")
+                        or getattr(_iterator, "input_id", "")
                         or _modal_input_id
                     )
                     _modal_input_created_at = (
                         getattr(stream, "input_created_at", None)
-                        or getattr(iterator, "input_created_at", None)
+                        or getattr(_iterator, "input_created_at", None)
                         or _modal_input_created_at
                     )
                 if runtime_trace is not None:
@@ -564,7 +591,7 @@ class ModalTransport:
                         _final_breakdown,
                     )
                 yield first_event
-                async for event in iterator:
+                async for event in _iterator:
                     if runtime_trace is not None and isinstance(event, dict) and event.get("type") == "result":
                         runtime_trace.emit("final_result_received", phase="local")
                     yield event
@@ -576,6 +603,12 @@ class ModalTransport:
                     yield {"type": "result", "data": result}
         except Exception as exc:
             raise TransportError(str(exc)) from exc
+        finally:
+            # Close the inner remote generator after the result is fully
+            # yielded, on exception, or on cancellation (finally always runs).
+            # Best-effort: never delays/changes the yielded result and never
+            # masks the original outcome.
+            await _aclose_iterator(_iterator)
 
     async def run_checkpoint_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
         fn = self.checkpoint_stream_fn
@@ -589,9 +622,66 @@ class ModalTransport:
             stream = handle.run_checkpoint_stream.remote_gen.aio(*args, **kwargs)
         if hasattr(stream, "__aiter__"):
             ait = stream.__aiter__()
-            async for event in ait:
-                yield event
+            try:
+                async for event in ait:
+                    yield event
+            finally:
+                await _aclose_iterator(ait)
         else:
             result = await stream if inspect.isawaitable(stream) else stream
             if isinstance(result, dict):
                 yield {"type": "result", "data": result}
+
+    async def publish_restore_plan(
+        self,
+        plan_payload: Mapping[str, Any],
+        *,
+        workspace: dict[str, Any] | None = None,
+        snapshot_seed: Mapping[str, Any] | None = None,
+        gpu: str | None = None,
+        runtime_trace: RuntimeTrace | None = None,
+    ) -> dict[str, Any]:
+        """Publish a ``RestorePlan`` dict (and optional schema-v2
+        ``snapshot_seed`` payload) through the registered v2 Modal method.
+
+        The remote method writes both atomically to the deployment-scoped
+        runtime-state volume (and mirrors the seed to ``snapshot_seed.json``
+        for restore-time hydration).  Returns the authoritative publication
+        result dict.  The seed payload is passed through unchanged — it is
+        never rebuilt or re-validated on the remote side.
+        """
+        handle = self._v2_handle(
+            workspace=workspace, gpu=gpu, runtime_trace=runtime_trace,
+        )
+        if runtime_trace is not None:
+            runtime_trace.emit(
+                "restore_plan_remote_submit",
+                phase="local",
+                metadata={
+                    "plan_payload_bytes": len(
+                        json.dumps(
+                            dict(plan_payload or {}),
+                            separators=(",", ":"), default=str,
+                        ).encode("utf-8")
+                    ),
+                    "snapshot_seed_present": int(snapshot_seed is not None),
+                },
+            )
+        publish_fn = handle.publish_restore_plan
+        remote = getattr(publish_fn, "remote", None)
+        if remote is not None and callable(getattr(remote, "aio", None)):
+            result = remote.aio(plan_payload, snapshot_seed=snapshot_seed)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        if inspect.iscoroutinefunction(publish_fn):
+            result = publish_fn(plan_payload, snapshot_seed=snapshot_seed)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        result = await asyncio.to_thread(
+            publish_fn, plan_payload, snapshot_seed=snapshot_seed,
+        )
+        if inspect.isawaitable(result):
+            return await result
+        return result

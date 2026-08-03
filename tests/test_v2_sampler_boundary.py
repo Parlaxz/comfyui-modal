@@ -33,6 +33,7 @@ from comfymodal_runtime.model_preload import V2LoaderBridge
 from comfymodal_runtime.runtime_executor import (
     _COMFYMODAL_V2_SAMPLING_WRAPPER,
     _sampler_wrapper_dedup,
+    _sampler_wrapper_dedup_lock,
 )
 from comfymodal_runtime.trace import RuntimeTrace
 
@@ -398,7 +399,8 @@ class SamplerIdentityMismatchTests(unittest.TestCase):
 
     def test_sampler_gets_different_object_fails(self):
         """Guider patcher differs from the bridge-served object -> fail before
-        sampling with the exact identity-mismatch error."""
+        sampling with the exact identity-mismatch error.  The in-flight dedup
+        key must also be released so a later sampler is never suppressed."""
         served = _FakePatcher()
         different = _FakePatcher()
         token = self._publish(served)
@@ -412,7 +414,7 @@ class SamplerIdentityMismatchTests(unittest.TestCase):
             with redirect_stdout(buf), self.assertRaises(RuntimeError) as ctx:
                 executor.execute(
                     guider, type("S", (), {"__len__": lambda self: 9})(),
-                    {}, None, None, None, None, None,
+                    {}, None, None, None, None,
                 )
             msg = str(ctx.exception)
             self.assertIn("Retained UNET identity mismatch", msg)
@@ -420,6 +422,12 @@ class SamplerIdentityMismatchTests(unittest.TestCase):
             self.assertIn("sampler", msg)
             # The sampler must NOT have run.
             self.assertNotIn("[v2.sampler_boundary] event=sampling_start", buf.getvalue())
+            # Fail-closed raise must release the in-flight dedup key.
+            with _sampler_wrapper_dedup_lock:
+                self.assertEqual(
+                    len(_sampler_wrapper_dedup), 0,
+                    "identity-mismatch raise must release the dedup key",
+                )
         finally:
             self.mp._ACTIVE_V2_LOADER_BRIDGE.reset(token)
 
@@ -752,6 +760,50 @@ class SamplerNodeContextAndCleanupTests(unittest.TestCase):
         self.assertEqual(watchdog.sampler_class, "KSampler")
         start_events = [e for e in self.trace.events if e.name == "sampling_start"]
         self.assertEqual(start_events[0].metadata.get("node_id"), "n-1")
+        self.mp.cancel_sampler_stall_watchdog("samp-ctx")
+
+    def test_partial_guider_pair_never_mixes_with_context_var(self):
+        """A partial guider pair (node_id only) must NEVER mix one guider field
+        with one ContextVar field: the complete ContextVar pair (1242 /
+        ClownsharKSampler_Beta) wins as a unit."""
+        patcher = _FakePatcher()
+        guider = SimpleNamespace(_node_id="n-partial", model_patcher=patcher)
+        self._ctx_token = runtime_exec._current_node_context.set(
+            ("1242", "ClownsharKSampler_Beta")
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._run_wrapper(guider, callback=lambda *a: "step", step_count=1)
+        watchdog = self._armed_watchdog()
+        self.assertIsNotNone(watchdog)
+        # Complete ContextVar pair wins as a unit; no guider/ContextVar mix.
+        self.assertEqual(watchdog.sampler_node_id, "1242")
+        self.assertEqual(watchdog.sampler_class, "ClownsharKSampler_Beta")
+        start_events = [e for e in self.trace.events if e.name == "sampling_start"]
+        self.assertEqual(start_events[0].metadata.get("node_id"), "1242")
+        self.assertEqual(start_events[0].metadata.get("node_class"), "ClownsharKSampler_Beta")
+        self.mp.cancel_sampler_stall_watchdog("samp-ctx")
+
+    def test_partial_sources_return_blank_not_mixed(self):
+        """When neither source provides a complete pair, no mixed or partial
+        identity is reported — both fields are blank rather than fabricated."""
+        patcher = _FakePatcher()
+        # Partial guider node_id + partial ContextVar class: mixing would
+        # fabricate ("n-only", "ClownsharKSampler_Beta"); both blank instead.
+        guider = SimpleNamespace(_node_id="n-only", model_patcher=patcher)
+        self._ctx_token = runtime_exec._current_node_context.set(
+            ("", "ClownsharKSampler_Beta")
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._run_wrapper(guider, callback=lambda *a: "step", step_count=1)
+        watchdog = self._armed_watchdog()
+        self.assertIsNotNone(watchdog)
+        self.assertEqual(watchdog.sampler_node_id, "")
+        self.assertEqual(watchdog.sampler_class, "")
+        start_events = [e for e in self.trace.events if e.name == "sampling_start"]
+        self.assertEqual(start_events[0].metadata.get("node_id"), "")
+        self.assertEqual(start_events[0].metadata.get("node_class"), "")
         self.mp.cancel_sampler_stall_watchdog("samp-ctx")
 
     def test_successful_completion_cleanup_no_timeout(self):

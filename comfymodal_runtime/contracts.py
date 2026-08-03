@@ -101,6 +101,42 @@ def _normalized_ids(values: Any) -> tuple[str, ...]:
     return tuple(sorted(result, key=sort_key))
 
 
+def _ordered_ids(values: Any) -> tuple[str, ...]:
+    """Stringify, deduplicate, and preserve order for order-sensitive IDs.
+
+    Unlike ``_normalized_ids`` this does NOT sort: used for execution order
+    hints where the recorded sequence is semantically meaningful.
+    """
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ()
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return tuple(result)
+
+
+def _normalized_entries(values: Any) -> tuple[dict[str, Any], ...]:
+    """Normalize a sequence of mapping entries into frozen, str-keyed dicts.
+
+    Non-mapping entries are dropped; frozen mapping proxies keep the frozen
+    dataclass truly immutable while staying JSON-thawable via ``to_dict``.
+    """
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ()
+    result: list[dict[str, Any]] = []
+    for item in values:
+        if isinstance(item, Mapping):
+            entry = dict(item)
+        else:
+            continue
+        result.append(_freeze(entry))
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class ExecutionOptions:
     production_enabled: bool = True
@@ -525,44 +561,98 @@ class OutputStrategy:
 class SnapshotExecutionSeed:
     """Immutable seed data for restoring cached executor state from snapshot.
 
-    Contains only deterministic identity fields — no outputs, latents, random
-    state, or request IDs.  Used to seed the live ``executor.caches`` and
-    ``executor.outputs`` with snapshot-time model objects.
+    Schema v2 stores ONLY deterministic structural data — no outputs,
+    conditioning tensors, latents, seed-dependent node outputs, request/client
+    IDs, cancellation/progress/random state, mutable ComfyUI cache objects, or
+    GPU handles.
 
     Built from the same canonical workflow once at snapshot startup and stored
-    on the snapshotted entrypoint/bootstrap.
+    on the snapshotted entrypoint/bootstrap.  v1 payloads remain readable via
+    ``from_dict``: schema-v2-only fields fall back to empty/derived values and
+    the recorded ``schema_version`` is preserved.
     """
-    schema_version: int = 1
+    schema_version: int = 2
     workflow_hash: str = ""
+    source_workflow_hash: str = ""
     output_node_ids: tuple[str, ...] = ()
+    reachable_node_ids: tuple[str, ...] = ()
+    execution_order_hint: tuple[str, ...] = ()
     loader_node_ids: tuple[str, ...] = ()
     loader_cache_signatures: tuple[dict[str, Any], ...] = ()
+    static_node_signatures: tuple[dict[str, Any], ...] = ()
+    dynamic_input_map: tuple[dict[str, Any], ...] = ()
     sampler_node_ids: tuple[str, ...] = ()
     sampler_static_inputs: tuple[dict[str, Any], ...] = ()
     custom_node_generation: str = ""
     deployment_combined_hash: str = ""
 
+    def __post_init__(self) -> None:
+        workflow_hash = str(self.workflow_hash or "")
+        object.__setattr__(self, "workflow_hash", workflow_hash)
+        object.__setattr__(self, "source_workflow_hash", str(self.source_workflow_hash or workflow_hash))
+        object.__setattr__(self, "output_node_ids", _normalized_ids(self.output_node_ids))
+        object.__setattr__(self, "reachable_node_ids", _normalized_ids(self.reachable_node_ids))
+        object.__setattr__(self, "execution_order_hint", _ordered_ids(self.execution_order_hint))
+        object.__setattr__(self, "loader_node_ids", _normalized_ids(self.loader_node_ids))
+        object.__setattr__(self, "loader_cache_signatures", _normalized_entries(self.loader_cache_signatures))
+        object.__setattr__(self, "static_node_signatures", _normalized_entries(self.static_node_signatures))
+        object.__setattr__(self, "dynamic_input_map", _normalized_entries(self.dynamic_input_map))
+        object.__setattr__(self, "sampler_node_ids", _normalized_ids(self.sampler_node_ids))
+        object.__setattr__(self, "sampler_static_inputs", _normalized_entries(self.sampler_static_inputs))
+        object.__setattr__(self, "custom_node_generation", str(self.custom_node_generation or ""))
+        object.__setattr__(self, "deployment_combined_hash", str(self.deployment_combined_hash or ""))
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any] | None) -> "SnapshotExecutionSeed":
+        """Restore a seed from a dict, tolerating v1 or partial payloads.
+
+        Only known structural keys are read; any forbidden runtime state
+        (outputs, latents, request IDs, caches, ...) present in the source is
+        ignored and never deserialized.
+        """
+        source = dict(value or {})
+        workflow_hash = str(source.get("workflow_hash", ""))
+        return cls(
+            schema_version=int(source.get("schema_version", 2)),
+            workflow_hash=workflow_hash,
+            source_workflow_hash=str(source.get("source_workflow_hash", workflow_hash)),
+            output_node_ids=source.get("output_node_ids", ()),
+            reachable_node_ids=source.get("reachable_node_ids", ()),
+            execution_order_hint=source.get("execution_order_hint", ()),
+            loader_node_ids=source.get("loader_node_ids", ()),
+            loader_cache_signatures=source.get("loader_cache_signatures", ()),
+            static_node_signatures=source.get("static_node_signatures", ()),
+            dynamic_input_map=source.get("dynamic_input_map", ()),
+            sampler_node_ids=source.get("sampler_node_ids", ()),
+            sampler_static_inputs=source.get("sampler_static_inputs", ()),
+            custom_node_generation=str(source.get("custom_node_generation", "")),
+            deployment_combined_hash=str(source.get("deployment_combined_hash", "")),
+        )
+
     @property
     def stable_hash(self) -> str:
-        return stable_hash({
-            "schema_version": self.schema_version,
-            "workflow_hash": self.workflow_hash,
-            "output_node_ids": self.output_node_ids,
-            "loader_node_ids": self.loader_node_ids,
-            "loader_cache_signatures": self.loader_cache_signatures,
-            "custom_node_generation": self.custom_node_generation,
-            "deployment_combined_hash": self.deployment_combined_hash,
-        })
+        """Deterministic hash over ALL structural identity fields.
+
+        Includes the schema version, workflow hashes, topology, loader and
+        sampler fields.  Never includes outputs, conditioning, latents,
+        random/request/client/cancellation/progress state, or mutable objects.
+        """
+        return stable_hash(self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "workflow_hash": self.workflow_hash,
+            "source_workflow_hash": self.source_workflow_hash,
             "output_node_ids": list(self.output_node_ids),
+            "reachable_node_ids": list(self.reachable_node_ids),
+            "execution_order_hint": list(self.execution_order_hint),
             "loader_node_ids": list(self.loader_node_ids),
-            "loader_cache_signatures": list(self.loader_cache_signatures),
+            "loader_cache_signatures": [_thaw(entry) for entry in self.loader_cache_signatures],
+            "static_node_signatures": [_thaw(entry) for entry in self.static_node_signatures],
+            "dynamic_input_map": [_thaw(entry) for entry in self.dynamic_input_map],
             "sampler_node_ids": list(self.sampler_node_ids),
-            "sampler_static_inputs": list(self.sampler_static_inputs),
+            "sampler_static_inputs": [_thaw(entry) for entry in self.sampler_static_inputs],
             "custom_node_generation": self.custom_node_generation,
             "deployment_combined_hash": self.deployment_combined_hash,
         }

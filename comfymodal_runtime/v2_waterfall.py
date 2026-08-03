@@ -300,7 +300,24 @@ def _candidate(
     if start is not None and end is not None:
         duration = _duration_between(start, end)
         if duration is not None:
-            return _Candidate(start, end, duration, "event" if start.source == end.source == "event" else "metadata", MEASURED, _clock_scope(start, end))
+            if duration < 0 and start.process != end.process:
+                # Cross-process wall-clock intervals are unreliable: the local
+                # and remote hosts are not on a shared clock, so a negative
+                # interval here reflects clock skew, not a real duration.
+                # Never report a phantom negative measured value; fall through
+                # to authoritative duration keys, else mark unavailable so the
+                # interval is not subtracted into reconciliation.
+                duration = None
+            elif duration < 0 and start.process == end.process and abs(duration) < 2.0:
+                # Conservative same-process order guard: the local return
+                # markers are the same instant (final_result_received is
+                # emitted a sub-ms/a-few-ms before execute_plan emits
+                # remote_return_start), so a small same-process negative is a
+                # boundary-order artifact, not a real duration.  Report the
+                # true ~0 span instead of an INVALID negative.
+                duration = 0.0
+            if duration is not None:
+                return _Candidate(start, end, duration, "event" if start.source == end.source == "event" else "metadata", MEASURED, _clock_scope(start, end))
     for key in duration_keys:
         value = _first_value(result, (key,))
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -469,14 +486,25 @@ def _stage_candidate(result: Mapping[str, Any], key: str) -> _Candidate:
         end = event("output_persist_end", process="remote") or event("output_encode_end", process="remote")
         return _candidate(result, start, end, duration_keys=("output_collection_ms", "output_persist_ms", "output_commit_ms"))
     if key == "remote_local_return":
-        start = event(("output_persist_end", "output_collect_end", "remote_return_start"), last=True)
+        # The local hop: remote_return_start (emitted by execute_plan once the
+        # result leaves the transport) → final local receive.  Both boundaries
+        # are local so the interval is same-clock and never overlaps the
+        # cross-process handoff row.  Traces without a local return marker
+        # fall back to the remote output persist/collect boundary.
+        start = (
+            event("remote_return_start", process="local", last=True)
+            or event(("output_persist_end", "output_collect_end"), process="remote", last=True)
+            or event(("output_persist_end", "output_collect_end", "remote_return_start"), last=True)
+        )
         end = event(("response_received", "final_result_received", "local_result_received"), process="local", last=True)
         return _candidate(result, start, end, duration_keys=("remote_return_ms", "trigger_to_result_ms"))
     if key == "remote_return_handoff":
         return _candidate(
             result,
-            event("output_collect_end", last=True),
-            event("remote_return_start", process="local", last=True),
+            event("output_collect_end", process="remote", last=True)
+            or event("output_collect_end", last=True),
+            event("remote_return_start", process="local", last=True)
+            or event(("final_result_received", "response_received"), process="local", last=True),
         )
     return _Candidate()
 
@@ -520,6 +548,76 @@ def _intervals_overlap(a: WaterfallStage, b: WaterfallStage) -> bool:
     if a.start_ns is None or a.end_ns is None or b.start_ns is None or b.end_ns is None:
         return False
     return bool(a.clock_scope and a.clock_scope == b.clock_scope and max(a.start_ns, b.start_ns) < min(a.end_ns, b.end_ns))
+
+
+def _seed_apply_marker(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Authoritative Step 3 seed-apply marker nested on ``executor_seed_apply_end``.
+
+    The executor-apply trace event carries the full per-phase timing dict
+    (``validate_ms`` / ``apply_ms`` / ``total_ms``) under ``seed_apply``, which
+    is emitted by the executor even when the snapshot-graph events are absent.
+    """
+    for event in _events(result):
+        if event.get("name") != "executor_seed_apply_end":
+            continue
+        marker = _as_mapping(event.get("metadata")).get("seed_apply")
+        if isinstance(marker, Mapping):
+            return marker
+    return {}
+
+
+def _seed_phase_duration(
+    result: Mapping[str, Any],
+    *,
+    start_event: str,
+    end_event: str,
+    fallback_keys: Sequence[str],
+) -> _Candidate:
+    """Duration for one Step 3 snapshot-graph seed phase (validate or apply).
+
+    Priority:
+      1. measured — same-process monotonic pair between the phase's own
+         start/end trace events (``snapshot_graph_seed_validate_start`` →
+         ``snapshot_graph_seed_validate_end``, and the apply equivalents)
+      2. derived — authoritative metadata for the phase.  ``validate_ms`` is
+         NOT carried on ``snapshot_graph_seed_validate_end``; it lives on the
+         apply-end metadata (``snapshot_graph_seed_apply_end``) and on the
+         nested ``executor_seed_apply_end.seed_apply`` dict, so those are the
+         fallback sources.
+    Returns a _Candidate whose status is MEASURED, DERIVED or UNAVAILABLE.
+    """
+    start = _event_boundary(result, start_event)
+    end = _event_boundary(result, end_event)
+    if start is not None and end is not None:
+        if (
+            start.process
+            and start.process == end.process
+            and start.monotonic_ns is not None
+            and end.monotonic_ns is not None
+        ):
+            duration = (end.monotonic_ns - start.monotonic_ns) / 1_000_000.0
+            if duration >= 0:
+                return _Candidate(
+                    start, end, duration, "event", MEASURED,
+                    _clock_scope(start, end), (start_event, end_event),
+                )
+    for key in fallback_keys:
+        value = _first_value(result, (key,))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return _Candidate(
+                duration_ms=float(value), source="metadata", status=DERIVED,
+                clock_scope="metadata", source_fields=(key,),
+            )
+    marker = _seed_apply_marker(result)
+    for key in fallback_keys:
+        value = marker.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return _Candidate(
+                duration_ms=float(value), source="metadata", status=DERIVED,
+                clock_scope="metadata",
+                source_fields=(f"executor_seed_apply_end.seed_apply.{key}",),
+            )
+    return _Candidate()
 
 
 def _detail_stages(result: Mapping[str, Any], total_ms: float | None) -> tuple[WaterfallStage, ...]:
@@ -570,6 +668,75 @@ def _detail_stages(result: Mapping[str, Any], total_ms: float | None) -> tuple[W
             included_in_total=False,
             clock_scope="metadata",
         ))
+
+    # Step 3: snapshot graph seed validate/apply detail stages.  Rendered from
+    # the seed-apply trace event metadata (included_in_total=False so the
+    # waterfall reconciliation is preserved — this is a request-scoped span
+    # inside prompt-executor/cache setup).
+    #
+    # ``snapshot_graph_seed_validate_end`` carries only the decision, not a
+    # validate duration.  The authoritative per-phase timings live on the
+    # apply-end metadata (``snapshot_graph_seed_apply_end`` and the nested
+    # ``executor_seed_apply_end.seed_apply`` dict), so each phase prefers its
+    # own measured start/end boundary pair and falls back to those fields.
+    if {event.get("name") for event in _events(result)} & {
+        "snapshot_graph_seed_validate_start",
+        "snapshot_graph_seed_validate_end",
+        "snapshot_graph_seed_apply_start",
+        "snapshot_graph_seed_apply_end",
+        "executor_seed_apply_end",
+    }:
+        for phase_key, phase_label, start_name, end_name, fallback_keys in (
+            (
+                "snapshot_graph_seed_validate",
+                "Snapshot graph seed validate",
+                "snapshot_graph_seed_validate_start",
+                "snapshot_graph_seed_validate_end",
+                ("validate_ms",),
+            ),
+            (
+                "snapshot_graph_seed_apply",
+                "Snapshot graph seed apply",
+                "snapshot_graph_seed_apply_start",
+                "snapshot_graph_seed_apply_end",
+                ("apply_ms", "total_ms"),
+            ),
+        ):
+            candidate = _seed_phase_duration(
+                result,
+                start_event=start_name,
+                end_event=end_name,
+                fallback_keys=fallback_keys,
+            )
+            decision = str(
+                _event_metadata_value(result, end_name, "decision", last=True)
+                or _event_metadata_value(result, "snapshot_graph_seed_apply_end", "decision", last=True)
+                or ""
+            )
+            schema = _event_metadata_value(result, end_name, "schema", last=True)
+            if schema is None:
+                schema = _event_metadata_value(result, "snapshot_graph_seed_apply_end", "schema", last=True)
+            label = phase_label
+            if decision:
+                label += f" [{decision} schema={schema}]"
+            details.append(WaterfallStage(
+                key=phase_key,
+                label=label,
+                group="detail",
+                start_ns=None,
+                end_ns=None,
+                duration_ms=candidate.duration_ms,
+                cumulative_ms=None,
+                percentage=(candidate.duration_ms / total_ms * 100.0 if candidate.duration_ms is not None and total_ms and total_ms > 0 else None),
+                source=candidate.source or "detail",
+                status=candidate.status,
+                is_detail=True,
+                parent_key="prompt_executor_cache_setup",
+                included_in_total=False,
+                clock_scope=candidate.clock_scope or "metadata",
+                source_fields=candidate.source_fields,
+            ))
+
     structured = _as_mapping(result).get("pre_sampler_structured_report")
     for index, record in enumerate(_as_mapping(structured).get("cpu_owner_records", ())):
         if not isinstance(record, Mapping):
@@ -672,7 +839,15 @@ def build_waterfall(
                 or _event_boundary(result_view, ("transport_entry", "modal_handle_lookup_start"), process="local"),
             )
         elif key == "remote_local_return" and response is not None:
-            start = _event_boundary(result_view, ("output_persist_end", "output_collect_end", "remote_return_start"), last=True)
+            start = _event_boundary(
+                result_view, "remote_return_start", process="local", last=True,
+            ) or _event_boundary(
+                result_view, ("output_persist_end", "output_collect_end"),
+                process="remote", last=True,
+            ) or _event_boundary(
+                result_view, ("output_persist_end", "output_collect_end", "remote_return_start"),
+                last=True,
+            )
             candidate = _candidate(result_view, start, response, duration_keys=("remote_return_ms", "trigger_to_result_ms"))
         else:
             candidate = _stage_candidate(result_view, key)

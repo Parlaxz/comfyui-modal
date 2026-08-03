@@ -125,6 +125,7 @@ _REQUIRED_KEYS: frozenset[str] = frozenset({
     "executor_exists",
     "executor_thread_count",
     "executor_work_queue_size",
+    "pool_threads",
     "pending_lane_count",
 })
 
@@ -133,10 +134,11 @@ def _assert_snapshot_contract(self: unittest.TestCase, snap: dict) -> None:
     """Verify structural contract of every snapshot dict."""
     self.assertIsInstance(snap, dict)
     self.assertEqual(set(snap.keys()), _REQUIRED_KEYS, msg=snap)
-    # All values must be None / bool / str / int
+    # All values must be None / bool / str / int / list
+    # (``pool_threads`` is a list of {native_id, name} dicts).
     for key, val in snap.items():
         self.assertIsInstance(
-            val, (type(None), bool, str, int),
+            val, (type(None), bool, str, int, list),
             msg=f"key {key!r} has unexpected type {type(val).__name__}: {val!r}",
         )
 
@@ -166,8 +168,8 @@ class DiagnosticSnapshotEmptyTest(unittest.TestCase):
         self.assertFalse(snap["executor_exists"])
         self.assertIsNone(snap["executor_thread_count"])
         self.assertIsNone(snap["executor_work_queue_size"])
-        # Pending lane count
-        self.assertIsNone(snap["pending_lane_count"])
+        # Pending lane count — real tracked value (no submissions yet → 0)
+        self.assertEqual(snap["pending_lane_count"], 0)
 
 
 class DiagnosticSnapshotAfterClearTest(unittest.TestCase):
@@ -187,7 +189,10 @@ class DiagnosticSnapshotAfterClearTest(unittest.TestCase):
         self.assertIsNone(snap["current_model_key_hash"])
         self.assertIsNone(snap["current_prefill_key_hash"])
         self.assertFalse(snap["executor_exists"])  # close_workers not called yet
-        self.assertIsNone(snap["pending_lane_count"])
+        # Real tracked pending count: submitted lanes drain to 0 (or are
+        # briefly in-flight) — never an unconditional None.
+        self.assertIsInstance(snap["pending_lane_count"], int)
+        self.assertGreaterEqual(snap["pending_lane_count"], 0)
 
     @staticmethod
     def _minimal_plan() -> RestorePlan:
@@ -227,8 +232,11 @@ class DiagnosticSnapshotWithPreparationTest(unittest.TestCase):
         self.assertTrue(snap["executor_exists"])
         self.assertIsInstance(snap["executor_thread_count"], int)
         self.assertIsInstance(snap["executor_work_queue_size"], int)
-        # Pending lane count (no authoritative tracking)
-        self.assertIsNone(snap["pending_lane_count"])
+        # Pending lane count — real tracked count of submitted-not-completed
+        # lanes (0..2 right after a 2-lane prepare).
+        self.assertIsInstance(snap["pending_lane_count"], int)
+        self.assertGreaterEqual(snap["pending_lane_count"], 0)
+        self.assertLessEqual(snap["pending_lane_count"], 2)
 
     def test_model_key_hash_no_prefill(self) -> None:
         """Prefill key missing -> prefill hash is None."""
@@ -493,7 +501,8 @@ class DiagnosticSnapshotExecutorTest(unittest.TestCase):
         self.assertGreaterEqual(snap["executor_work_queue_size"], 0)
 
     def test_queue_unavailable(self) -> None:
-        """Executor without _work_queue -> work_queue_size is None."""
+        """Executor without _work_queue -> falls back to the coordinator's
+        real tracked queue depth (0 here because nothing was submitted)."""
         bridge = V2LoaderBridge()
         # Inject a pool-like object without _work_queue
         pool = _NoQueuePool()
@@ -502,27 +511,31 @@ class DiagnosticSnapshotExecutorTest(unittest.TestCase):
         snap = bridge.diagnostic_snapshot()
         self.assertTrue(snap["executor_exists"])
         self.assertIsNone(snap["executor_thread_count"])
-        self.assertIsNone(snap["executor_work_queue_size"])
+        # Real queue depth is still observable via the coordinator counters.
+        self.assertEqual(snap["executor_work_queue_size"], 0)
 
 
 class DiagnosticSnapshotPendingLaneTest(unittest.TestCase):
-    """Pending lane count behaviour (no authoritative tracking => None)."""
+    """Pending lane count — real tracked value (submitted-not-completed)."""
 
-    def test_pending_lane_always_none(self) -> None:
-        """Snapshot always reports None for pending_lane_count."""
+    def test_pending_lane_count_tracks_real_submissions(self) -> None:
         bridge = V2LoaderBridge()
-        # No preparation
-        self.assertIsNone(bridge.diagnostic_snapshot()["pending_lane_count"])
-        # With preparation
+        # No preparation, no submissions → 0
+        self.assertEqual(bridge.diagnostic_snapshot()["pending_lane_count"], 0)
+        # With preparation: 2 lanes submitted; count reflects real in-flight
+        # state and drains to 0 once the workers complete.
         calls: list[tuple] = []
         nodes = _fake_nodes(calls)
         bridge.install(nodes)
         plan = DiagnosticSnapshotWithPreparationTest._plan()
         bridge.prepare(plan)
-        self.assertIsNone(bridge.diagnostic_snapshot()["pending_lane_count"])
-        # After close_workers
+        snap = bridge.diagnostic_snapshot()
+        self.assertIsInstance(snap["pending_lane_count"], int)
+        self.assertGreaterEqual(snap["pending_lane_count"], 0)
+        self.assertLessEqual(snap["pending_lane_count"], 2)
+        # After close_workers (waits for all futures) → 0
         bridge.close_workers()
-        self.assertIsNone(bridge.diagnostic_snapshot()["pending_lane_count"])
+        self.assertEqual(bridge.diagnostic_snapshot()["pending_lane_count"], 0)
 
 
 class DiagnosticSnapshotConcurrencyTest(unittest.TestCase):

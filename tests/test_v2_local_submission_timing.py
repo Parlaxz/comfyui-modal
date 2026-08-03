@@ -3000,5 +3000,147 @@ class TestPlanMaterializationTracking(unittest.TestCase):
                       "Transport must only call plan.to_dict() as fallback")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Inner remote async iterator cleanup
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestTransportIteratorCleanup(unittest.TestCase):
+    """The transport must explicitly close/await the inner remote async
+    iterator after the result, on exception, and on cancellation so Modal
+    SDK-owned tasks (async_generator_athrow / synchronizer) do not leak past
+    request completion."""
+
+    class _ClosableGen:
+        """Async iterator that records explicit aclose() calls like Modal's
+        remote_gen.aio() object."""
+
+        def __init__(self, events):
+            self._events = list(events)
+            self._index = 0
+            self.aclose_calls = 0
+            self.input_id = "closable-input"
+            self.input_created_at = time.time_ns()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index >= len(self._events):
+                raise StopAsyncIteration
+            event = self._events[self._index]
+            self._index += 1
+            return event
+
+        async def aclose(self):
+            self.aclose_calls += 1
+
+    def _factory(self, gen: Any) -> Any:
+        return lambda **kw: SimpleNamespace(
+            run_plan_stream=SimpleNamespace(
+                remote_gen=SimpleNamespace(aio=lambda *a, **kw: gen),
+            ),
+        )
+
+    def _plan(self, request_id: str) -> ExecutionPlan:
+        return ExecutionPlan(
+            workflow={"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+        )
+
+    def test_aclose_called_after_normal_completion(self):
+        gen = self._ClosableGen([
+            {"type": "status", "data": {"phase": "restore"}},
+            {"type": "result", "data": {"images": [], "outputs": {}}},
+        ])
+
+        async def run():
+            transport = ModalTransport(v2_handle_factory=self._factory(gen))
+            messages: list[dict] = []
+            async for msg in transport.run_plan_stream(
+                self._plan("aclose-normal"),
+                gpu="rtx-pro-6000", workspace={"id": "ws"},
+                trace={"prompt_id": "aclose-normal"},
+            ):
+                messages.append(msg)
+            self.assertEqual(len(messages), 2)
+            self.assertEqual(gen.aclose_calls, 1,
+                             "inner iterator must be explicitly closed after the result")
+
+        asyncio.run(run())
+
+    def test_aclose_called_after_empty_stream(self):
+        gen = self._ClosableGen([])
+
+        async def run():
+            transport = ModalTransport(v2_handle_factory=self._factory(gen))
+            async for _ in transport.run_plan_stream(
+                self._plan("aclose-empty"),
+                gpu="rtx-pro-6000", workspace={"id": "ws"},
+                trace={"prompt_id": "aclose-empty"},
+            ):
+                pass
+            self.assertEqual(gen.aclose_calls, 1,
+                             "inner iterator must be closed when the stream ends immediately")
+
+        asyncio.run(run())
+
+    def test_aclose_called_on_exception(self):
+        class _FailingGen:
+            aclose_calls = 0
+
+            def __init__(self):
+                self.input_id = ""
+                self.input_created_at = None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise RuntimeError("remote stream failed")
+
+            async def aclose(self):
+                _FailingGen.aclose_calls += 1
+
+        async def run():
+            transport = ModalTransport(v2_handle_factory=self._factory(_FailingGen()))
+            with self.assertRaises(TransportError):
+                async for _ in transport.run_plan_stream(
+                    self._plan("aclose-exc"),
+                    gpu="rtx-pro-6000", workspace={"id": "ws"},
+                    trace={"prompt_id": "aclose-exc"},
+                ):
+                    pass
+            self.assertEqual(_FailingGen.aclose_calls, 1,
+                             "inner iterator must be closed when the stream raises")
+
+        asyncio.run(run())
+
+    def test_aclose_called_when_consumer_stops_early(self):
+        gen = self._ClosableGen([
+            {"type": "status", "data": {"phase": "restore"}},
+            {"type": "result", "data": {"images": [], "outputs": {}}},
+        ])
+
+        async def run():
+            transport = ModalTransport(v2_handle_factory=self._factory(gen))
+            stream = transport.run_plan_stream(
+                self._plan("aclose-break"),
+                gpu="rtx-pro-6000", workspace={"id": "ws"},
+                trace={"prompt_id": "aclose-break"},
+            )
+            async for _ in stream:
+                break
+            # Abandoning the stream without closing would defer inner cleanup
+            # to garbage collection (the pending async_generator_athrow leak
+            # this fix targets).  Closing the transport generator must
+            # deterministically close the inner remote iterator.
+            await stream.aclose()  # type: ignore[attr-defined]
+            self.assertEqual(gen.aclose_calls, 1,
+                             "inner iterator must be closed when the transport generator is closed")
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()

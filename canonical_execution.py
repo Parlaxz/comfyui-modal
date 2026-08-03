@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import inspect
 import json
 import os
 import sys
@@ -42,7 +43,12 @@ from workflow_metadata import (
 )
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, stable_hash
 from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key
+from comfymodal_runtime.restore_plan import (
+    RestorePlan,
+    build_restore_model_spec,
+    derive_model_key,
+    derive_prefill_key,
+)
 from comfymodal_runtime.trace import (
     RuntimeTrace,
     _build_local_submission_breakdown,
@@ -474,6 +480,7 @@ def _evict_profile_prep_cache() -> None:
 # _RESTORE_PUBLISH_CACHE, _RESTORE_PUBLISH_CACHE_LOCK, _evict_profile_prep_cache,
 # and _evict_restore_publish_cache are all defined.
 _populate_profile_cache_from_disk()
+_populate_restore_cache_from_disk()
 
 
 def _reset_all_cache_counters() -> None:
@@ -1223,179 +1230,320 @@ async def execute_plan(
     except Exception as _identity_exc:
         runtime_trace.set_metadata(request_identity_error=f"{type(_identity_exc).__name__}: {_identity_exc}")
 
-    # No remote publication stage exists.  Keep the legacy argument temporarily
-    # accepted for local compatibility, but never inspect or invoke it.
-    if False:
+    # ── Step 3: build the deployment-scoped schema-v2 seed (publisher side) ──
+    # The canonical workflow is available on the publisher side.  Build the
+    # deterministic seed payload exactly once and hand it to the restore
+    # publisher so it is persisted atomically alongside the restore plan on
+    # the shared runtime-state volume — never reconstructed from the request
+    # workflow inside the container.  When no publisher is configured
+    # (dry-run / local-only path) the payload is persisted to the local
+    # .runtime_state for observability parity.  Honest fallback: when the
+    # workflow is empty, publication is unavailable, or persistence fails,
+    # restore() falls back to a minimal startup seed — never guessed and
+    # never claiming seeded parity.
+    _seed_payload_ctx: dict[str, Any] = {
+        "built": 0, "topology_available": 0, "schema_version": 0,
+        "persisted": 0, "error": "",
+    }
+    _seed_payload: dict[str, Any] | None = None
+    _seed_obs_fields: dict[str, Any] = {}
+    try:
+        from comfymodal_runtime.execution_seed import (
+            build_snapshot_seed_payload,
+            snapshot_seed_observability,
+        )
+
+        _seed_req_meta = plan.request_metadata or {}
+        _seed_cn_gen = str(
+            _seed_req_meta.get("custom_node_generation", "") if hasattr(_seed_req_meta, "get") else ""
+        )
+        _seed_dep_hash = str(
+            _seed_req_meta.get("deployment_combined_hash", "") if hasattr(_seed_req_meta, "get") else ""
+        )
+        if not _seed_dep_hash:
+            _seed_dep_hash = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+        _seed_payload = build_snapshot_seed_payload(
+            _canonical_workflow,
+            output_node_ids=plan.output_node_ids,
+            workflow_hash=plan.workflow_hash,
+            source_workflow_hash=plan.source_workflow_hash,
+            custom_node_generation=_seed_cn_gen,
+            deployment_combined_hash=_seed_dep_hash,
+        )
+        if _seed_payload is not None:
+            _seed_obs_fields = snapshot_seed_observability(_seed_payload.get("seed"))
+            _seed_payload_ctx.update({
+                "built": 1,
+                "topology_available": 1,
+                "schema_version": int(_seed_payload.get("schema_version", 0) or 0),
+                **_seed_obs_fields,
+            })
+    except Exception as _seed_exc:
+        _seed_payload_ctx["error"] = f"{type(_seed_exc).__name__}: {str(_seed_exc)[:120]}"
+
+    # ── Restore-plan + seed publication (V2-only, publisher side) ──
+    # Replaces the previously disabled restore-publication block with the
+    # narrowest equivalent V2-only path: the plan is derived from the
+    # canonical workflow here, and the already-built seed payload is passed
+    # through unchanged — never rebuilt or re-validated in the remote
+    # request.  Publication is best-effort and fail-closed: any failure is
+    # recorded on the trace, nothing is cached, and the seed is never claimed
+    # persisted (restore() then honestly falls back to ``startup_minimal``).
+    _restore_publish_error = ""
+    if restore_publisher is not None:
         runtime_trace.emit("plan_serialization_start", phase="local",
                            metadata={"purpose": "restore_publication"})
         workflow = _canonical_workflow  # reuse canonical payload
         runtime_trace.emit("plan_serialization_end", phase="local",
                            metadata={"purpose": "restore_publication",
                                      "reused_canonical": True})
-        model_key = derive_model_key(workflow)
-        prefill_key = derive_prefill_key(model_key, workflow)
-        restore_plan = RestorePlan(
-            generation=0,
-            model_key=model_key,
-            prefill_key=prefill_key,
-            model_spec=build_restore_model_spec(workflow, dict(plan.model_stack)),
-            prefill_spec=dict(prefill_key.encode_options),
-            source_workflow_hash=plan.source_workflow_hash,
-            workflow=workflow,
-            workflow_hash=plan.workflow_hash,
-        )
+        try:
+            model_key = derive_model_key(workflow)
+            prefill_key = derive_prefill_key(model_key, workflow)
+            restore_plan = RestorePlan(
+                generation=0,
+                model_key=model_key,
+                prefill_key=prefill_key,
+                model_spec=build_restore_model_spec(workflow, dict(plan.model_stack)),
+                prefill_spec=dict(prefill_key.encode_options),
+                source_workflow_hash=plan.source_workflow_hash,
+                workflow=workflow,
+                workflow_hash=plan.workflow_hash,
+            )
+        except Exception as _plan_exc:
+            restore_plan = None
+            _restore_publish_error = (
+                f"restore_plan_build_error:{type(_plan_exc).__name__}:{str(_plan_exc)[:120]}"
+            )
+            runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
         runtime_trace.emit("restore_plan_build_end", phase="local")
-        runtime_trace.emit("restore_plan_publish_start", phase="local")
 
-        # ── Local process-safe cache: skip remote call when identity
-        #    is unchanged for the same app/workspace ──
-        plan_identity = _restore_plan_identity_hash(restore_plan)
-        _restore_app_identity = _app_identity()
-        _restore_ws_id = _workspace_identity(workspace)
-        cache_key = _profile_prep_cache_key(
-            _restore_app_identity, _restore_ws_id, plan_identity, "",
-        )
+        if restore_plan is not None:
+            runtime_trace.emit("restore_plan_publish_start", phase="local")
 
-        # ── Instrumentation metadata ──
-        _restore_cache_pid = os.getpid()
-        _restore_cache_module_id = str(id(sys.modules[__name__]))
-        _restore_cache_obj_id = str(id(_RESTORE_PUBLISH_CACHE))
-        _restore_cache_size_before = len(_RESTORE_PUBLISH_CACHE)
-        _restore_cache_reset_count_current = _restore_cache_reset_count
-        _restore_miss_reason = ""
+            # Tracks whether the authoritative publication succeeded (or was
+            # skipped via a prior-success cache hit).  Drives the honest seed
+            # ``persisted`` flag: only a confirmed-success publication may
+            # claim the deployment-scoped seed exists.
+            _publish_succeeded = False
 
-        _restore_cache_lookup_start_ns = time.perf_counter_ns()
-        with _RESTORE_PUBLISH_CACHE_LOCK:
-            _cached_restore = _RESTORE_PUBLISH_CACHE.get(cache_key)
-        _restore_cache_lookup_ms = round((time.perf_counter_ns() - _restore_cache_lookup_start_ns) / 1_000_000, 3)
-
-        if _cached_restore is not None:
-            # Identity unchanged — skip the remote publish call entirely.
-            # Return the cached metadata including observed generation.
-            _cached_publish_result = dict(_cached_restore.get("publication_result", {}))
-            observed_generation = _cached_publish_result.get(
-                "generation", _cached_publish_result.get("observed_generation", "")
-            )
-            runtime_trace.emit(
-                "restore_publish_cache_skip", phase="local",
-                metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
-            )
-            runtime_trace.set_metadata(
-                restore_publish_cache_skipped=True,
-                restore_publish_cache_hit=True,
-                restore_cache_lookup_ms=_restore_cache_lookup_ms,
-                restore_publish_ms=_restore_cache_lookup_ms,
-                restore_remote_call_performed=False,
-                restore_publish_result=_cached_publish_result,
-                # Restore instrumentation
-                restore_cache_pid=_restore_cache_pid,
-                restore_cache_module_id=_restore_cache_module_id,
-                restore_cache_object_id=_restore_cache_obj_id,
-                restore_cache_size_before=_restore_cache_size_before,
-                restore_cache_key_hash=cache_key[:64],
-                restore_identity_hash=plan_identity[:16],
-                complete_plan_identity_hash=plan_identity[:16],
-                restore_cache_reset_count=_restore_cache_reset_count_current,
-                restore_miss_reason="",
-                # Disk cache telemetry
-                disk_restore_cache_hit=cache_key in _restore_disk_cache,
-                disk_restore_read_count=_disk_restore_read_count,
-                disk_restore_write_count=_disk_restore_write_count,
-                disk_restore_miss_count=_disk_restore_miss_count,
-                disk_restore_corruption_count=_disk_restore_corruption_count,
-            )
-        else:
-            # ── Cache miss — determine reason ──
-            _restore_miss_reason = "key_not_found"
-            if _restore_cache_size_before > 0:
-                _restore_miss_reason = "identity_mismatch"
-            elif _restore_cache_reset_count_current > 0:
-                _restore_miss_reason = "cache_reset"
-
-            runtime_trace.set_metadata(
-                restore_publish_cache_skipped=False,
-                restore_publish_cache_hit=False,
-                restore_cache_lookup_ms=_restore_cache_lookup_ms,
-            )
-            publish_result = restore_publisher.publish(restore_plan)
-            if inspect.isawaitable(publish_result):
-                publish_result = await publish_result
-            runtime_trace.set_metadata(restore_remote_call_performed=True)
-            _publish_succeeded = True
-            if isinstance(publish_result, Mapping):
-                observed_generation = publish_result.get(
-                    "generation", publish_result.get("observed_generation", "")
-                )
-                runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
-                # Guard cache against semantic failure: detect any of:
-                #   status in error/failure/failed, ok==False, success==False,
-                #   or a truthy error/failure field.
-                _pub_status = publish_result.get("status", "")
-                _pub_ok = publish_result.get("ok", True)
-                _pub_success = publish_result.get("success", True)
-                _pub_error_field = publish_result.get("error") or publish_result.get("failure")
-                if (_pub_status in ("error", "failure", "failed")
-                        or _pub_ok is False
-                        or _pub_success is False
-                        or bool(_pub_error_field)):
-                    _publish_succeeded = False
-            else:
-                observed_generation = publish_result
-            # On success populate cache with metadata; on failure remove stale.
-            if _publish_succeeded:
-                _publication_result = (
-                    dict(publish_result)
-                    if isinstance(publish_result, Mapping)
-                    else {"generation": observed_generation}
-                )
-                with _RESTORE_PUBLISH_CACHE_LOCK:
-                    _RESTORE_PUBLISH_CACHE[cache_key] = {
-                        "identity_hash": plan_identity,
-                        "publication_result": _publication_result,
-                    }
-                    while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
-                        _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
-                # Persist to disk after confirmed remote success
-                _restore_disk_entry = {
-                    "identity_hash": plan_identity,
-                    "publication_result": dict(_publication_result),
-                    "ws_id": _restore_ws_id,
-                    "app_identity": _restore_app_identity,
-                    "ts": time.time(),
-                    "pid": _restore_cache_pid,
+            # ── Local process-safe cache: skip remote call when identity
+            #    is unchanged for the same app/workspace.  The seed identity
+            #    participates so a changed seed forces a republish.  Only
+            #    deterministic seed fields hash (never the volatile built_at). ──
+            plan_identity = _restore_plan_identity_hash(restore_plan)
+            seed_identity = ""
+            if _seed_payload is not None:
+                _seed_core = {
+                    "schema_version": _seed_payload.get("schema_version"),
+                    "seed_source": _seed_payload.get("seed_source"),
+                    "workflow_hash": _seed_payload.get("workflow_hash"),
+                    "seed": _seed_payload.get("seed"),
                 }
-                with _restore_disk_lock:
-                    _restore_disk_cache[cache_key] = _restore_disk_entry
-                    while len(_restore_disk_cache) > _DISK_CACHE_MAX:
-                        _restore_disk_cache.pop(next(iter(_restore_disk_cache)), None)
-                _flush_restore_disk_cache()
-            else:
-                with _RESTORE_PUBLISH_CACHE_LOCK:
-                    _RESTORE_PUBLISH_CACHE.pop(cache_key, None)
-                # Also remove from disk cache (invalidation)
-                _remove_restore_disk_entry(cache_key)
-            # Instrumentation metadata on miss path
-            runtime_trace.set_metadata(
-                restore_cache_pid=_restore_cache_pid,
-                restore_cache_module_id=_restore_cache_module_id,
-                restore_cache_object_id=_restore_cache_obj_id,
-                restore_cache_size_before=_restore_cache_size_before,
-                restore_cache_key_hash=cache_key[:64],
-                restore_identity_hash=plan_identity[:16],
-                complete_plan_identity_hash=plan_identity[:16],
-                restore_cache_reset_count=_restore_cache_reset_count_current,
-                restore_miss_reason=_restore_miss_reason,
-                # Disk cache telemetry
-                disk_restore_cache_hit=cache_key in _restore_disk_cache,
-                disk_restore_read_count=_disk_restore_read_count,
-                disk_restore_write_count=_disk_restore_write_count,
-                disk_restore_miss_count=_disk_restore_miss_count,
-                disk_restore_corruption_count=_disk_restore_corruption_count,
+                seed_identity = stable_hash(_seed_core)
+            _restore_app_identity = _app_identity()
+            _restore_ws_id = _workspace_identity(workspace)
+            cache_key = _profile_prep_cache_key(
+                _restore_app_identity, _restore_ws_id, plan_identity, seed_identity,
             )
 
-        runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
+            # ── Instrumentation metadata ──
+            _restore_cache_pid = os.getpid()
+            _restore_cache_module_id = str(id(sys.modules[__name__]))
+            _restore_cache_obj_id = str(id(_RESTORE_PUBLISH_CACHE))
+            _restore_cache_size_before = len(_RESTORE_PUBLISH_CACHE)
+            _restore_cache_reset_count_current = _restore_cache_reset_count
+            _restore_miss_reason = ""
+
+            _restore_cache_lookup_start_ns = time.perf_counter_ns()
+            with _RESTORE_PUBLISH_CACHE_LOCK:
+                _cached_restore = _RESTORE_PUBLISH_CACHE.get(cache_key)
+            _restore_cache_lookup_ms = round((time.perf_counter_ns() - _restore_cache_lookup_start_ns) / 1_000_000, 3)
+
+            if _cached_restore is not None:
+                # Identity unchanged — skip the remote publish call entirely.
+                # Return the cached metadata including observed generation.
+                # The cached entry is evidence of an earlier successful
+                # publication, so the seed was persisted with it.
+                _publish_succeeded = True
+                _cached_publish_result = dict(_cached_restore.get("publication_result", {}))
+                observed_generation = _cached_publish_result.get(
+                    "generation", _cached_publish_result.get("observed_generation", "")
+                )
+                runtime_trace.emit(
+                    "restore_publish_cache_skip", phase="local",
+                    metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
+                )
+                runtime_trace.set_metadata(
+                    restore_publish_cache_skipped=True,
+                    restore_publish_cache_hit=True,
+                    restore_cache_lookup_ms=_restore_cache_lookup_ms,
+                    restore_publish_ms=_restore_cache_lookup_ms,
+                    restore_remote_call_performed=False,
+                    restore_publish_result=_cached_publish_result,
+                    # Restore instrumentation
+                    restore_cache_pid=_restore_cache_pid,
+                    restore_cache_module_id=_restore_cache_module_id,
+                    restore_cache_object_id=_restore_cache_obj_id,
+                    restore_cache_size_before=_restore_cache_size_before,
+                    restore_cache_key_hash=cache_key[:64],
+                    restore_identity_hash=plan_identity[:16],
+                    complete_plan_identity_hash=plan_identity[:16],
+                    restore_cache_reset_count=_restore_cache_reset_count_current,
+                    restore_miss_reason="",
+                    # Disk cache telemetry
+                    disk_restore_cache_hit=cache_key in _restore_disk_cache,
+                    disk_restore_read_count=_disk_restore_read_count,
+                    disk_restore_write_count=_disk_restore_write_count,
+                    disk_restore_miss_count=_disk_restore_miss_count,
+                    disk_restore_corruption_count=_disk_restore_corruption_count,
+                )
+            else:
+                # ── Cache miss — determine reason ──
+                _restore_miss_reason = "key_not_found"
+                if _restore_cache_size_before > 0:
+                    _restore_miss_reason = "identity_mismatch"
+                elif _restore_cache_reset_count_current > 0:
+                    _restore_miss_reason = "cache_reset"
+
+                runtime_trace.set_metadata(
+                    restore_publish_cache_skipped=False,
+                    restore_publish_cache_hit=False,
+                    restore_cache_lookup_ms=_restore_cache_lookup_ms,
+                )
+                try:
+                    publish_result = restore_publisher.publish(
+                        restore_plan, snapshot_seed=_seed_payload,
+                    )
+                except Exception as _pub_exc:
+                    publish_result = None
+                    _restore_publish_error = (
+                        f"restore_plan_publish_error:{type(_pub_exc).__name__}:{str(_pub_exc)[:120]}"
+                    )
+                    runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
+                    runtime_trace.emit(
+                        "restore_plan_publish_error", phase="local",
+                        metadata={"error": _restore_publish_error},
+                    )
+                if inspect.isawaitable(publish_result):
+                    try:
+                        publish_result = await publish_result
+                    except Exception as _pub_exc:
+                        publish_result = None
+                        _restore_publish_error = (
+                            f"restore_plan_publish_error:{type(_pub_exc).__name__}:{str(_pub_exc)[:120]}"
+                        )
+                        runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
+                        runtime_trace.emit(
+                            "restore_plan_publish_error", phase="local",
+                            metadata={"error": _restore_publish_error},
+                        )
+                runtime_trace.set_metadata(restore_remote_call_performed=True)
+                _publish_succeeded = publish_result is not None
+                if isinstance(publish_result, Mapping):
+                    observed_generation = publish_result.get(
+                        "generation", publish_result.get("observed_generation", "")
+                    )
+                    runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
+                    # Guard cache against semantic failure: detect any of:
+                    #   status in error/failure/failed, ok==False, success==False,
+                    #   or a truthy error/failure field.
+                    _pub_status = publish_result.get("status", "")
+                    _pub_ok = publish_result.get("ok", True)
+                    _pub_success = publish_result.get("success", True)
+                    _pub_error_field = publish_result.get("error") or publish_result.get("failure")
+                    if (_pub_status in ("error", "failure", "failed")
+                            or _pub_ok is False
+                            or _pub_success is False
+                            or bool(_pub_error_field)):
+                        _publish_succeeded = False
+                else:
+                    observed_generation = publish_result
+                # On success populate cache with metadata; on failure remove stale.
+                if _publish_succeeded:
+                    _publication_result = (
+                        dict(publish_result)
+                        if isinstance(publish_result, Mapping)
+                        else {"generation": observed_generation}
+                    )
+                    with _RESTORE_PUBLISH_CACHE_LOCK:
+                        _RESTORE_PUBLISH_CACHE[cache_key] = {
+                            "identity_hash": plan_identity,
+                            "publication_result": _publication_result,
+                        }
+                        while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
+                            _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
+                    # Persist to disk after confirmed remote success
+                    _restore_disk_entry = {
+                        "identity_hash": plan_identity,
+                        "publication_result": dict(_publication_result),
+                        "ws_id": _restore_ws_id,
+                        "app_identity": _restore_app_identity,
+                        "ts": time.time(),
+                        "pid": _restore_cache_pid,
+                    }
+                    with _restore_disk_lock:
+                        _restore_disk_cache[cache_key] = _restore_disk_entry
+                        while len(_restore_disk_cache) > _DISK_CACHE_MAX:
+                            _restore_disk_cache.pop(next(iter(_restore_disk_cache)), None)
+                    _flush_restore_disk_cache()
+                else:
+                    with _RESTORE_PUBLISH_CACHE_LOCK:
+                        _RESTORE_PUBLISH_CACHE.pop(cache_key, None)
+                    # Also remove from disk cache (invalidation)
+                    _remove_restore_disk_entry(cache_key)
+                # Instrumentation metadata on miss path
+                runtime_trace.set_metadata(
+                    restore_cache_pid=_restore_cache_pid,
+                    restore_cache_module_id=_restore_cache_module_id,
+                    restore_cache_object_id=_restore_cache_obj_id,
+                    restore_cache_size_before=_restore_cache_size_before,
+                    restore_cache_key_hash=cache_key[:64],
+                    restore_identity_hash=plan_identity[:16],
+                    complete_plan_identity_hash=plan_identity[:16],
+                    restore_cache_reset_count=_restore_cache_reset_count_current,
+                    restore_miss_reason=_restore_miss_reason,
+                    # Disk cache telemetry
+                    disk_restore_cache_hit=cache_key in _restore_disk_cache,
+                    disk_restore_read_count=_disk_restore_read_count,
+                    disk_restore_write_count=_disk_restore_write_count,
+                    disk_restore_miss_count=_disk_restore_miss_count,
+                    disk_restore_corruption_count=_disk_restore_corruption_count,
+                )
+            # Seed is persisted only when the authoritative publication
+            # succeeded (the seed was written atomically with the plan).  On
+            # cache-hit the seed was already persisted on the earlier
+            # successful publish; on any failure it is never claimed.
+            if _seed_payload is not None and _publish_succeeded:
+                _seed_payload_ctx["persisted"] = 1
+            runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
-        pass
+        # Dry-run / no remote publisher configured — persist the seed to the
+        # local .runtime_state path (existing local-observability behavior).
+        if _seed_payload is not None:
+            try:
+                from comfymodal_runtime.execution_seed import persist_snapshot_seed_payload
+                _seed_persisted = persist_snapshot_seed_payload(_seed_payload)
+                _seed_payload_ctx["persisted"] = 1 if _seed_persisted else 0
+            except Exception:
+                _seed_payload_ctx["persisted"] = 0
+
+    if _seed_payload is not None and _seed_payload_ctx.get("persisted"):
+        print(
+            f"[v2.seed_build] source=publisher_plan schema=2 "
+            f"topology_available=1 persisted=1 "
+            f"workflow_hash={str(_seed_payload.get('workflow_hash', ''))[:16]} "
+            f"loader_nodes={_seed_obs_fields.get('loader_node_count', 0)} "
+            f"sampler_nodes={_seed_obs_fields.get('sampler_node_count', 0)} "
+            f"reachable_nodes={_seed_obs_fields.get('reachable_node_count', 0)} "
+            f"static_signatures={_seed_obs_fields.get('static_signature_count', 0)}",
+            flush=True,
+        )
+    runtime_trace.emit(
+        "snapshot_seed_build",
+        phase="local",
+        metadata=_seed_payload_ctx,
+    )
 
     # ── Direct Modal submission ──
     runtime_trace.emit("modal_submit_start", phase="local",

@@ -4,6 +4,13 @@ Controls:
   COMFYMODAL_V2_PREFILL_LANES — critical|all|none (default critical)
   COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET — legacy barrier (default off)
   COMFYMODAL_V2_DEEP_MODEL_DIAG=1 — enable deep /proc, faults, open/mmap/safetensors
+  COMFYMODAL_V2_PAGE_READINESS_MODE — off (default) | willneed
+      Enables the synchronous native page-readiness candidate
+      (libc madvise MADV_WILLNEED advisory) immediately before the CLIP
+      prefill encode loop and before the first request-scoped graph UNET
+      activation.  Off by default so production behavior is unchanged.
+      ``status=ok`` reports the advisory was accepted — it does NOT
+      guarantee physical pages are resident.
 """
 
 from __future__ import annotations
@@ -28,6 +35,9 @@ from .contracts import ModelRestoreKey, PrefillKey, stable_hash
 from .env import env_flag
 from .cpu_snapshot_models import (
     collect_unet_runtime_state,
+    page_readiness_mode,
+    advise_storage_pages_willneed,
+    _PAGE_READINESS_MODE_WILLNEED,
 )
 from .trace import RuntimeTrace
 from .unet_forward_probe import (
@@ -244,6 +254,536 @@ def _record_clip_encode(
         request_trace = _ACTIVE_REQUEST_TRACE.get()
         if request_trace is not None:
             request_trace.emit("clip_encode_diagnostic", phase="execution", metadata=dict(record))
+
+
+# ── CLIP execution-prefill phase attribution (Phase B diagnostics) ───
+# One per-request reconciliation record partitions the prefill worker
+# lifetime into non-overlapping stages:
+#
+#   prefill_total_ms = queue_ms + readiness_ms + encode_ms + completion_ms
+#                      + unattributed_ms
+#
+# ``unattributed_ms`` is the COMPUTED accounting error (never hidden): the
+# difference between the measured total and the sum of the measured child
+# stages.  A boundary that was never recorded is reported truthfully as
+# ``None`` (never silently zeroed) and flips ``reconciliation_status`` to
+# ``"incomplete"``.
+
+# ── Event names for the prefill lifecycle (single source of truth) ────
+_EVENT_SUBMISSION = "execution_prefill_scheduled"
+_EVENT_WORKER_START = "execution_prefill_submitted"
+_EVENT_READINESS_START = "execution_prefill_readiness_start"
+_EVENT_READINESS_END = "execution_prefill_readiness_end"
+_EVENT_ENCODE_START = "execution_prefill_encode_start"
+_EVENT_ENCODE_END = "execution_prefill_encode_end"
+_EVENT_COMPLETED = "execution_prefill_completed"
+_EVENT_FAILED = "execution_prefill_failed"
+_EVENT_GRAPH_WAIT_START = "graph_prefill_wait_start"
+_EVENT_GRAPH_WAIT_END = "graph_prefill_wait_end"
+_EVENT_RECONCILIATION = "clip_prefill_reconciliation"
+
+# ── Event names for synchronous native page-readiness (Phase B candidate) ──
+# stage=clip_prefill: emitted between the CLIP readiness wait and the encode
+# loop when COMFYMODAL_V2_PAGE_READINESS_MODE=willneed.  stage=unet_activation:
+# emitted immediately before the first request-scoped graph load_models_gpu call.
+_EVENT_PAGE_READINESS_START = "execution_prefill_page_readiness_start"
+_EVENT_PAGE_READINESS_END = "execution_prefill_page_readiness_end"
+_EVENT_UNET_PAGE_READINESS = "unet_activation_page_readiness"
+
+
+def _capture_torch_thread_counts() -> dict[str, Any]:
+    """Best-effort torch intraop/interop thread counts (lazy import).
+
+    Returns ``torch_available`` plus intraop/interop counts (None when
+    torch is absent or the accessor is unavailable).  Never raises.
+    """
+    result: dict[str, Any] = {
+        "torch_available": False,
+        "torch_intraop_threads": None,
+        "torch_interop_threads": None,
+    }
+    try:
+        import torch
+        result["torch_available"] = True
+        result["torch_intraop_threads"] = int(torch.get_num_threads())
+        result["torch_interop_threads"] = int(torch.get_num_interop_threads())
+    except Exception:
+        pass
+    return result
+
+
+def _capture_native_thread_count() -> int | None:
+    """Native thread count: ``/proc/self/status Threads:`` on Linux, else
+    ``len(threading.enumerate())``.  Never raises."""
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/self/status") as _f:
+                for _line in _f:
+                    if _line.startswith("Threads:"):
+                        return int(_line.split()[1])
+        except Exception:
+            pass
+    try:
+        return len(threading.enumerate())
+    except Exception:
+        return None
+
+
+def _capture_phase_counters() -> dict[str, Any]:
+    """One phase snapshot for prefill attribution.
+
+    Returns a flat JSON-safe dict.  Wall / thread / process clocks and the
+    native tid are always present; ``rusage`` (RUSAGE_THREAD, Linux),
+    ``io`` (per-tid ``/proc/self/task/<tid>/io``, Linux), ``torch``, and
+    ``native_thread_count`` are attempted natively and reported truthfully
+    as ``None`` when unavailable.
+    """
+    return {
+        "mono_ns": time.monotonic_ns(),
+        "thread_time_ns": time.thread_time_ns() if hasattr(time, "thread_time_ns") else None,
+        "process_time_ns": time.process_time_ns() if hasattr(time, "process_time_ns") else None,
+        "native_tid": _capture_tid(),
+        "native_thread_count": _capture_native_thread_count(),
+        "rusage": _capture_rusage_thread_snapshot(),
+        "io": _capture_proc_tid_io_snapshot(),
+        "torch": _capture_torch_thread_counts(),
+    }
+
+
+def _phase_counter_deltas(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compute deltas between two ``_capture_phase_counters()`` snapshots.
+
+    Wall and process CPU deltas are valid whenever both snapshots exist.
+    Thread-bounded deltas (thread CPU, RUSAGE_THREAD minor/major faults and
+    voluntary/involuntary context switches, per-tid io) are only valid when
+    the native thread id matches; otherwise they are reported as ``None``
+    (truthful, never fabricated).
+    """
+    if not before or not after:
+        return {}
+    result: dict[str, Any] = {}
+    _same_tid = (
+        isinstance(before.get("native_tid"), int)
+        and before.get("native_tid") == after.get("native_tid")
+    )
+
+    b_mono = before.get("mono_ns")
+    a_mono = after.get("mono_ns")
+    if isinstance(b_mono, int) and isinstance(a_mono, int):
+        result["wall_ms"] = round(max(0, a_mono - b_mono) / 1_000_000, 3)
+
+    b_tt = before.get("thread_time_ns")
+    a_tt = after.get("thread_time_ns")
+    if _same_tid and isinstance(b_tt, int) and isinstance(a_tt, int):
+        result["thread_cpu_ms"] = round(max(0, a_tt - b_tt) / 1_000_000, 3)
+    else:
+        result["thread_cpu_ms"] = None
+
+    b_pt = before.get("process_time_ns")
+    a_pt = after.get("process_time_ns")
+    if isinstance(b_pt, int) and isinstance(a_pt, int):
+        result["process_cpu_ms"] = round(max(0, a_pt - b_pt) / 1_000_000, 3)
+    else:
+        result["process_cpu_ms"] = None
+
+    if _same_tid:
+        _ru = _compute_rusage_deltas(before.get("rusage"), after.get("rusage"))
+        result["minor_faults"] = _ru.get("minflt") if _ru else None
+        result["major_faults"] = _ru.get("majflt") if _ru else None
+        result["voluntary_context_switches"] = _ru.get("nvcsw") if _ru else None
+        result["involuntary_context_switches"] = _ru.get("nivcsw") if _ru else None
+        _io = _compute_io_deltas(before.get("io"), after.get("io"))
+        result["io_read_bytes"] = _io.get("read_bytes") if _io else None
+        result["io_write_bytes"] = _io.get("write_bytes") if _io else None
+    else:
+        result["minor_faults"] = None
+        result["major_faults"] = None
+        result["voluntary_context_switches"] = None
+        result["involuntary_context_switches"] = None
+        result["io_read_bytes"] = None
+        result["io_write_bytes"] = None
+    return result
+
+
+def _phase_counter_deltas_from_events(
+    before_meta: Mapping[str, Any] | None,
+    after_meta: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Compute phase deltas from two event-metadata dicts carrying
+    ``counters`` snapshots (as captured by ``_capture_phase_counters()``)."""
+    b = (before_meta or {}).get("counters")
+    a = (after_meta or {}).get("counters")
+    if not isinstance(b, Mapping) or not isinstance(a, Mapping):
+        return {}
+    return _phase_counter_deltas(dict(b), dict(a))
+
+
+def _first_event_mono_ns(trace: Any, name: str) -> int | None:
+    """Return the monotonic_ns of the first event named *name*, or None."""
+    for event in trace.events:
+        if event.name == name:
+            return event.monotonic_ns
+    return None
+
+
+def _first_event_meta(trace: Any, name: str) -> dict[str, Any] | None:
+    """Return the metadata of the first event named *name*, or None."""
+    for event in trace.events:
+        if event.name == name:
+            return dict(event.metadata)
+    return None
+
+
+def _terminal_prefill_event(trace: Any) -> tuple[str, int, dict[str, Any]] | None:
+    """Return ``(name, monotonic_ns, metadata)`` of the last terminal prefill
+    event (``execution_prefill_completed`` / ``execution_prefill_failed``), or
+    None when neither is present.  Latest-by-monotonic wins."""
+    best_name: str | None = None
+    best_ns = -1
+    best_meta: dict[str, Any] = {}
+    for event in trace.events:
+        if event.name in (_EVENT_COMPLETED, _EVENT_FAILED) and event.monotonic_ns >= best_ns:
+            best_name = event.name
+            best_ns = event.monotonic_ns
+            best_meta = dict(event.metadata)
+    if best_name is None:
+        return None
+    return best_name, best_ns, best_meta
+
+
+def _bounded_delta_ms(start_ns: int | None, end_ns: int | None) -> float | None:
+    """Non-negative ms between two monotonic boundaries, or None when either
+    boundary is absent.  Reversed boundaries yield None (never fabricated)."""
+    if start_ns is None or end_ns is None:
+        return None
+    delta = end_ns - start_ns
+    if delta < 0:
+        return None
+    return round(delta / 1_000_000, 3)
+
+
+def build_clip_prefill_reconciliation(
+    trace: Any,
+    *,
+    outcome: str = "unknown",
+    request_id: str = "",
+    tolerance_ms: float = 50.0,
+) -> dict[str, Any]:
+    """Build the per-request CLIP execution-prefill reconciliation record.
+
+    Reads the prefill lifecycle events already emitted on *trace* and
+    partitions the worker lifetime into non-overlapping stages:
+
+      queue_ms        submission → worker start       (cross-thread, wall only)
+      readiness_ms    readiness_start → readiness_end (model/future readiness)
+      page_readiness_ms  page_readiness_start → end  (synchronous native page
+                      readiness candidate; only when mode=willneed)
+      encode_ms       encode_start → encode_end       (CLIP encode loop)
+      completion_ms   encode_end → terminal           (store + finalization)
+
+    ``unattributed_ms = prefill_total_ms - (queue + readiness +
+    page_readiness + encode + completion)`` is the COMPUTED accounting
+    error — reported explicitly, never hidden.  Missing boundaries are
+    ``None`` (truthful) and flip the status to ``"incomplete"``.  When the
+    page-readiness candidate is disabled (mode off), ``page_readiness_ms``
+    is ``None`` and ``page_readiness_applied`` is False; the stage is then
+    excluded from the completeness check so default production runs still
+    reconcile as before.  *outcome* describes how the graph consumed the
+    result: ``consumed`` / ``fallback_error`` / ``fallback_unavailable``.
+    """
+    sub_ns = _first_event_mono_ns(trace, _EVENT_SUBMISSION)
+    ws_ns = _first_event_mono_ns(trace, _EVENT_WORKER_START)
+    rs_ns = _first_event_mono_ns(trace, _EVENT_READINESS_START)
+    re_ns = _first_event_mono_ns(trace, _EVENT_READINESS_END)
+    prs_ns = _first_event_mono_ns(trace, _EVENT_PAGE_READINESS_START)
+    pre_ns = _first_event_mono_ns(trace, _EVENT_PAGE_READINESS_END)
+    es_ns = _first_event_mono_ns(trace, _EVENT_ENCODE_START)
+    ee_ns = _first_event_mono_ns(trace, _EVENT_ENCODE_END)
+    gws_ns = _first_event_mono_ns(trace, _EVENT_GRAPH_WAIT_START)
+    gwe_ns = _first_event_mono_ns(trace, _EVENT_GRAPH_WAIT_END)
+    terminal = _terminal_prefill_event(trace)
+
+    prefill_total_ms = _bounded_delta_ms(sub_ns, terminal[1] if terminal else None)
+    queue_ms = _bounded_delta_ms(sub_ns, ws_ns)
+    readiness_ms = _bounded_delta_ms(rs_ns, re_ns)
+    page_readiness_applied = prs_ns is not None and pre_ns is not None
+    page_readiness_ms = _bounded_delta_ms(prs_ns, pre_ns)
+    encode_ms = _bounded_delta_ms(es_ns, ee_ns)
+    completion_ms = _bounded_delta_ms(ee_ns, terminal[1] if terminal else None)
+    request_wait_ms = _bounded_delta_ms(gws_ns, gwe_ns)
+
+    if page_readiness_applied:
+        child_fields = (
+            queue_ms, readiness_ms, page_readiness_ms, encode_ms, completion_ms,
+        )
+    else:
+        child_fields = (queue_ms, readiness_ms, encode_ms, completion_ms)
+    measured_children_ms: float | None = None
+    if all(isinstance(v, (int, float)) for v in child_fields):
+        measured_children_ms = round(sum(float(v) for v in child_fields), 3)
+
+    unattributed_ms: float | None = None
+    if isinstance(prefill_total_ms, (int, float)) and isinstance(measured_children_ms, (int, float)):
+        unattributed_ms = round(prefill_total_ms - measured_children_ms, 3)
+
+    # ── Reconciliation status ─────────────────────────────────────────
+    _completeness_fields = [prefill_total_ms, queue_ms, readiness_ms, encode_ms, completion_ms]
+    if page_readiness_applied:
+        _completeness_fields.append(page_readiness_ms)
+    status = "incomplete"
+    if all(v is not None for v in _completeness_fields) and isinstance(unattributed_ms, (int, float)):
+        if unattributed_ms < -tolerance_ms:
+            status = "overlap"
+        elif unattributed_ms > tolerance_ms:
+            status = "unmeasured_gap"
+        else:
+            status = "complete"
+
+    # ── Per-phase counter detail (worker thread, truthful None) ───────
+    rs_meta = _first_event_meta(trace, _EVENT_READINESS_START)
+    re_meta = _first_event_meta(trace, _EVENT_READINESS_END)
+    pr_meta = _first_event_meta(trace, _EVENT_PAGE_READINESS_END)
+    es_meta = _first_event_meta(trace, _EVENT_ENCODE_START)
+    ee_meta = _first_event_meta(trace, _EVENT_ENCODE_END)
+    ws_meta = _first_event_meta(trace, _EVENT_WORKER_START)
+
+    readiness = _phase_counter_deltas_from_events(rs_meta, re_meta)
+    encode = _phase_counter_deltas_from_events(es_meta, ee_meta)
+
+    page_readiness: dict[str, Any] = {}
+    if isinstance(pr_meta, Mapping):
+        page_readiness = {
+            "mode": pr_meta.get("mode"),
+            "status": pr_meta.get("status"),
+            "wall_ms": pr_meta.get("wall_ms"),
+            "storage_count": pr_meta.get("storage_count"),
+            "range_count": pr_meta.get("range_count"),
+            "total_bytes": pr_meta.get("total_bytes"),
+            "total_pages": pr_meta.get("total_pages"),
+            "advised_pages": pr_meta.get("advised_pages"),
+            "advised_bytes": pr_meta.get("advised_bytes"),
+            "advised_percent": pr_meta.get("advised_percent"),
+            "major_faults": pr_meta.get("major_faults"),
+            "minor_faults": pr_meta.get("minor_faults"),
+            "error_reason": pr_meta.get("error_reason", ""),
+        }
+
+    worker_counters: dict[str, Any] = {}
+    if isinstance(ws_meta, Mapping):
+        _wc = ws_meta.get("counters")
+        if isinstance(_wc, Mapping):
+            worker_counters = dict(_wc)
+
+    return {
+        "request_id": request_id,
+        "outcome": outcome,
+        "prefill_total_ms": prefill_total_ms,
+        "queue_ms": queue_ms,
+        "readiness_ms": readiness_ms,
+        "page_readiness_ms": page_readiness_ms,
+        "page_readiness_applied": page_readiness_applied,
+        "encode_ms": encode_ms,
+        "completion_ms": completion_ms,
+        "request_wait_ms": request_wait_ms,
+        "measured_children_ms": measured_children_ms,
+        "unattributed_ms": unattributed_ms,
+        "reconciliation_status": status,
+        "encoded_count": terminal[2].get("encoded_count") if terminal else None,
+        "terminal_event": terminal[0] if terminal else None,
+        "worker_native_tid": worker_counters.get("native_tid"),
+        "worker_native_thread_count": worker_counters.get("native_thread_count"),
+        "torch_available": bool((worker_counters.get("torch") or {}).get("torch_available")),
+        "torch_intraop_threads": (worker_counters.get("torch") or {}).get("torch_intraop_threads"),
+        "torch_interop_threads": (worker_counters.get("torch") or {}).get("torch_interop_threads"),
+        "readiness": readiness,
+        "encode": encode,
+        "page_readiness": page_readiness,
+    }
+
+
+def emit_clip_prefill_reconciliation(
+    trace: RuntimeTrace | None,
+    *,
+    outcome: str,
+    request_id: str = "",
+) -> dict[str, Any] | None:
+    """Emit exactly one ``clip_prefill_reconciliation`` record on *trace*.
+
+    Returns the emitted record dict, or None when *trace* is None.
+    """
+    if trace is None:
+        return None
+    record = build_clip_prefill_reconciliation(
+        trace, outcome=outcome, request_id=request_id or str(trace.request_id),
+    )
+    trace.emit(_EVENT_RECONCILIATION, phase="execution", metadata=record)
+    return record
+
+
+# ── Synchronous native page-readiness (Phase B candidate) ──────────────
+# Gated by COMFYMODAL_V2_PAGE_READINESS_MODE=willneed (off by default).
+# Both helpers are synchronous (never hidden in a future), never schedule
+# additional work, never re-encode, and never touch CUDA or mutate models.
+# The UNET activation is guarded per-request so a request can never invoke
+# the readiness helper twice for the same UNET activation; the guard is
+# cleared in existing request cleanup (modal_app request finally block).
+
+# Bounded per-request guard.  An insertion-ordered dict (not a set) so the
+# OLDEST claims are evicted first when the bound is reached — the guard can
+# never grow without bound even for request ids that bypass the existing
+# modal_app request finally-block cleanup.  Membership checks, claim-once
+# semantics and normal request cleanup behave exactly as before (clear
+# remains the primary cleanup path; the bound is only a safety net).
+_UNET_PAGE_READINESS_DONE: dict[str, bool] = {}
+_UNET_PAGE_READINESS_LOCK: RLock = RLock()
+_UNET_PAGE_READINESS_DONE_MAX = 1024
+
+
+def _unet_page_readiness_begin(request_id: str) -> bool:
+    """Atomically claim the first graph UNET activation for *request_id*.
+
+    Returns True only for the first claim per request; every subsequent
+    claim for the same request returns False (a request can never invoke
+    the readiness helper twice for the same UNET activation).  Empty
+    request ids are never claimed.  The guard map is bounded: when the
+    bound is reached the oldest claim is evicted first, so request ids
+    that bypass normal request cleanup cannot leak forever."""
+    if not request_id:
+        return False
+    with _UNET_PAGE_READINESS_LOCK:
+        if request_id in _UNET_PAGE_READINESS_DONE:
+            return False
+        _UNET_PAGE_READINESS_DONE[request_id] = True
+        if len(_UNET_PAGE_READINESS_DONE) > _UNET_PAGE_READINESS_DONE_MAX:
+            _excess = len(_UNET_PAGE_READINESS_DONE) - _UNET_PAGE_READINESS_DONE_MAX
+            for _stale in list(_UNET_PAGE_READINESS_DONE.keys())[:_excess]:
+                del _UNET_PAGE_READINESS_DONE[_stale]
+        return True
+
+
+def _unet_page_readiness_clear(request_id: str) -> None:
+    """Release the per-request UNET page-readiness guard (request cleanup)."""
+    if not request_id:
+        return
+    with _UNET_PAGE_READINESS_LOCK:
+        _UNET_PAGE_READINESS_DONE.pop(request_id, None)
+
+
+def _unet_page_readiness_is_done(request_id: str) -> bool:
+    """True when the readiness guard is currently claimed for *request_id*."""
+    if not request_id:
+        return False
+    with _UNET_PAGE_READINESS_LOCK:
+        return _UNET_PAGE_READINESS_DONE.get(request_id, False)
+
+
+def _first_registered_unet_model(models: list[Any]) -> Any | None:
+    """Return the first model in *models* that is a registered retained UNET.
+
+    Uses ``resolve_diffusion_model`` + the weak registry lookup so the exact
+    retained UNET is targeted (CacheDiT wrappers wrapping the SAME diffusion
+    model are still accepted).  Never raises.
+    """
+    try:
+        from .unet_forward_probe import _lookup_entry, resolve_diffusion_model
+        for model in models:
+            _, dm = resolve_diffusion_model(model)
+            if dm is not None and _lookup_entry(dm) is not None:
+                return model
+    except Exception:
+        pass
+    return None
+
+
+def _run_clip_page_readiness(
+    clip: Any,
+    *,
+    trace: RuntimeTrace | None,
+    request_id: str,
+) -> dict[str, Any] | None:
+    """Synchronous native page-readiness for the exact retained CLIP object.
+
+    Called in ``_execution_prefill`` after the CLIP future/readiness wait and
+    immediately before the encode loop.  Gated by
+    ``COMFYMODAL_V2_PAGE_READINESS_MODE=willneed``; returns None when
+    off (no-op, no events emitted).  Emits structured start/end events with
+    ``stage=clip_prefill`` and the full readiness evidence (mode, status,
+    wall_ms, storage/range/page counts, native fault counters, error
+    reason).  Never schedules another future or duplicates the encode.
+    ``status=ok`` means the madvise(MADV_WILLNEED) advisory was accepted —
+    NOT that the physical pages are resident.
+    """
+    if page_readiness_mode() != "willneed":
+        return None
+    if clip is None:
+        if trace is not None:
+            trace.emit(
+                _EVENT_PAGE_READINESS_START, phase="execution",
+                metadata={"mode": "willneed", "stage": "clip_prefill",
+                          "status": "skip", "reason": "no_clip"},
+            )
+        return None
+    if trace is not None:
+        trace.emit(
+            _EVENT_PAGE_READINESS_START, phase="execution",
+            metadata={"mode": "willneed", "stage": "clip_prefill",
+                      "request_id": request_id,
+                      "counters": _capture_phase_counters()},
+        )
+    try:
+        result = advise_storage_pages_willneed(clip)
+    except Exception as exc:
+        result = {
+            "status": "error", "mode": "willneed",
+            "error_reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+        }
+    if trace is not None:
+        meta: dict[str, Any] = dict(result)
+        meta["stage"] = "clip_prefill"
+        meta["request_id"] = request_id
+        meta["mode"] = "willneed"
+        meta["counters"] = _capture_phase_counters()
+        trace.emit(_EVENT_PAGE_READINESS_END, phase="execution", metadata=meta)
+    return result
+
+
+def _run_unet_page_readiness(
+    unet: Any,
+    *,
+    trace: RuntimeTrace | None,
+    request_id: str,
+) -> dict[str, Any] | None:
+    """Synchronous native page-readiness for the retained UNET activation.
+
+    Called immediately before the existing original ``load_models_gpu`` call
+    for the FIRST request-scoped graph UNET activation only (registered
+    retained UNET, request trace, no active model lane).  Never run for
+    restore-time background lanes or non-UNET/CLIP calls.  Emits
+    ``stage=unet_activation`` readiness evidence.  ``status=ok`` means the
+    madvise(MADV_WILLNEED) advisory was accepted — NOT that the physical
+    pages are resident.
+    """
+    if page_readiness_mode() != "willneed":
+        return None
+    if unet is None:
+        return None
+    try:
+        result = advise_storage_pages_willneed(unet)
+    except Exception as exc:
+        result = {
+            "status": "error", "mode": "willneed",
+            "error_reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+        }
+    if trace is not None:
+        meta = dict(result)
+        meta["stage"] = "unet_activation"
+        meta["request_id"] = request_id
+        meta["mode"] = "willneed"
+        trace.emit(_EVENT_UNET_PAGE_READINESS, phase="execution", metadata=meta)
+    return result
 
 
 # ── Per-worker lane context (set around worker callback) ─────────────
@@ -1318,6 +1858,34 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 except Exception:
                     pass
                 _residency_sampler_fired = True
+        # ── Synchronous native page-readiness: first request-scoped graph ──
+        # UNET activation only.  Conditions: outermost call (before == 0), a
+        # request trace, NO active model lane (never a restore-time background
+        # lane), and a registered retained UNET in the model list.  The mode
+        # gate runs FIRST so that when the candidate is off (default) nothing
+        # is claimed, traversed, or called.  The per-request guard guarantees
+        # the readiness helper runs at most once per request for the same UNET
+        # activation; it is released in the existing request cleanup
+        # (modal_app request finally block).  Gated by
+        # COMFYMODAL_V2_PAGE_READINESS_MODE=willneed (off by default);
+        # synchronous, never schedules a future or duplicates the transfer.
+        if (
+            before == 0
+            and request_trace is not None
+            and lane is None
+            and page_readiness_mode() == _PAGE_READINESS_MODE_WILLNEED
+            and _has_registered_unet_in_models(models)
+        ):
+            _pr_request_id = str(request_trace.request_id)
+            if _unet_page_readiness_begin(_pr_request_id):
+                try:
+                    _pr_unet = _first_registered_unet_model(models)
+                    if _pr_unet is not None:
+                        _run_unet_page_readiness(
+                            _pr_unet, trace=request_trace, request_id=_pr_request_id,
+                        )
+                except Exception:
+                    pass
         _diag_ok = False
         try:
             _retval = original(models, memory_required=memory_required,
@@ -5502,6 +6070,27 @@ class ModelPreloadCoordinator:
         self._pool_lock = RLock()
         self._active: RestorePreparation | None = None
         self.mutation_lane = _get_mutation_lane()
+        # ── Real lane counters (Phase B diagnostics) ──────────────────
+        # Tracked alongside the executor without touching scheduling: the
+        # pool is the only enqueue point and each submitted task runs and
+        # completes exactly once, so these counters mirror the executor's
+        # real queue depth / pending lane count.  A dedicated lock keeps
+        # worker-thread counter updates independent of ``_pool_lock`` (so a
+        # worker finalizing while ``close()`` holds ``_pool_lock`` can never
+        # deadlock on pool shutdown).
+        self._lane_count_lock = threading.Lock()
+        self._queued_count: int = 0   # submitted but not yet picked up
+        self._pending_count: int = 0  # submitted but not yet completed
+
+    def queue_depth(self) -> int:
+        """Real number of lane tasks submitted but not yet started by a worker."""
+        with self._lane_count_lock:
+            return self._queued_count
+
+    def pending_lane_count(self) -> int:
+        """Real number of lane tasks submitted but not yet completed."""
+        with self._lane_count_lock:
+            return self._pending_count
 
     def prepare(
         self,
@@ -5694,6 +6283,11 @@ class ModelPreloadCoordinator:
             self._pool = None
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=False)
+        # All submitted tasks are terminal after shutdown(wait=True): reset
+        # the real lane counters so a later pool recreation starts clean.
+        with self._lane_count_lock:
+            self._queued_count = 0
+            self._pending_count = 0
 
     def _ensure_pool(self) -> ThreadPoolExecutor:
         with self._pool_lock:
@@ -5729,12 +6323,18 @@ class ModelPreloadCoordinator:
         canonical_lane = _LANE_TO_CANONICAL.get(name, name.upper())
         lane_trace: ModelLaneTrace | None = None
         if trace:
+            # Real coordinator state at submission (before this task joins
+            # the queue) — read-only, never alters scheduling.
+            _queue_depth_at_submit = self.queue_depth()
+            _pending_at_submit = self.pending_lane_count()
             trace.emit(
                 "preload_submitted",
                 phase=phase,
                 metadata={
                     "lane": name,
                     "submission_id": sid,
+                    "queue_depth": _queue_depth_at_submit,
+                    "pending_lane_count": _pending_at_submit,
                 },
             )
             lane_trace = ModelLaneTrace(
@@ -5746,11 +6346,23 @@ class ModelPreloadCoordinator:
         # Capture monotonic clock just before pool handoff for queue delay.
         _submit_started_ns = time.monotonic_ns()
 
+        # Track the task in the real lane counters (the pool is the only
+        # enqueue point).  Queue/pending decrements happen in run().
+        with self._lane_count_lock:
+            self._queued_count += 1
+            self._pending_count += 1
+
         def run() -> Any:
             nonlocal callback
             started = time.time()
             _queue_wait_ms = round((time.monotonic_ns() - _submit_started_ns) / 1_000_000, 3)
             setattr(preparation.diagnostics, f"{effective_diag}_started_at", started)
+            # ── Real coordinator state at worker start (this task has been
+            # picked up, so the queue no longer counts it) ────────────
+            with self._lane_count_lock:
+                self._queued_count = max(0, self._queued_count - 1)
+                _queue_depth_at_worker = self._queued_count
+                _pending_at_worker = self._pending_count
             # ── Activate per-worker lane context ────────────────
             ctx_token = None
             if lane_trace is not None:
@@ -5765,6 +6377,8 @@ class ModelPreloadCoordinator:
                             "lane": name,
                             "submission_id": sid,
                             "queue_wait_ms": _queue_wait_ms,
+                            "queue_depth": _queue_depth_at_worker,
+                            "pending_lane_count": _pending_at_worker,
                         },
                     )
                 # Install core dispatch wrappers (idempotent per-component,
@@ -5830,7 +6444,19 @@ class ModelPreloadCoordinator:
             finally:
                 if ctx_token is not None:
                     _ACTIVE_LANE_TRACE.reset(ctx_token)
-        return self._ensure_pool().submit(run)
+                # Task is terminal: drop it from the real pending count.
+                # Uses the dedicated lane-count lock (never ``_pool_lock``)
+                # so this can never block pool shutdown in ``close()``.
+                with self._lane_count_lock:
+                    self._pending_count = max(0, self._pending_count - 1)
+        try:
+            return self._ensure_pool().submit(run)
+        except Exception:
+            # The task never reached the pool: release its lane counters.
+            with self._lane_count_lock:
+                self._queued_count = max(0, self._queued_count - 1)
+                self._pending_count = max(0, self._pending_count - 1)
+            raise
 
     def _wait(
         self,
@@ -5939,6 +6565,9 @@ class V2LoaderBridge:
         """Number of events on ``_preparation_trace`` when ``prepare()`` returned."""
         self._prefill_results: dict[tuple[int, str], Any] = {}
         self._prefill_lock = RLock()
+        self._reconciliation_emitted: bool = False
+        """True once ``clip_prefill_reconciliation`` has been emitted for the
+        current preparation/request (one record per request)."""
 
     def install(self, nodes_module: Any | None = None, *, trace: RuntimeTrace | None = None) -> bool:
         """Install wrappers on the live ComfyUI node classes once.
@@ -6003,6 +6632,7 @@ class V2LoaderBridge:
         self._trace = trace
         with self._prefill_lock:
             self._prefill_results.clear()
+            self._reconciliation_emitted = False
         self._preparation = None
         if not self._model_key or not (
             self._model_key.unet_identity or self._model_key.clip_identity
@@ -6215,15 +6845,27 @@ class V2LoaderBridge:
             except Exception:
                 executor_thread_count = None
             try:
-                executor_work_queue_size = pool._work_queue.qsize()
+                executor_work_queue_size = int(pool._work_queue.qsize())
             except Exception:
+                # queue.SimpleQueue has no qsize(); fall back to the real
+                # coordinator-tracked queue depth (submitted-not-started).
                 executor_work_queue_size = None
+                try:
+                    if coordinator is not None:
+                        executor_work_queue_size = coordinator.queue_depth()
+                except Exception:
+                    pass
         else:
             executor_thread_count = None
             executor_work_queue_size = None
 
-        # Pending lane count — no authoritative tracking exists on this bridge.
+        # Pending lane count — real tracked count (submitted-not-completed).
         pending_lane_count: int | None = None
+        try:
+            if coordinator is not None:
+                pending_lane_count = coordinator.pending_lane_count()
+        except Exception:
+            pass
 
         # Pool threads info from coordinator
         pool_threads = []
@@ -6368,12 +7010,21 @@ class V2LoaderBridge:
             """
             nonlocal wait_for_unet
             if trace:
-                trace.emit("execution_prefill_submitted", phase="execution",
+                trace.emit(_EVENT_WORKER_START, phase="execution",
                            metadata={"lane_mode": lane_mode,
                                      "total_entries": len(entries),
                                      "filtered": len(filtered),
                                      "wait_for_unet": wait_for_unet,
-                                     "unet_future_exists": prep.unet_future is not None})
+                                     "unet_future_exists": prep.unet_future is not None,
+                                     "counters": _capture_phase_counters()})
+            # ── Phase B: model-readiness (future/model wait) ────────
+            # Snapshot BEFORE the first future wait so readiness_ms spans
+            # every pre-encode wait (UNET barrier + CLIP) contiguously.
+            _readiness_start = _capture_phase_counters()
+            if trace:
+                trace.emit(_EVENT_READINESS_START, phase="execution",
+                           metadata={"counters": _readiness_start,
+                                     "wait_for_unet": wait_for_unet})
             # ── Legacy barrier: wait for UNET before CLIP ──────────
             if wait_for_unet:
                 try:
@@ -6385,7 +7036,7 @@ class V2LoaderBridge:
                         )
                 except Exception as exc:
                     if trace:
-                        trace.emit("execution_prefill_failed", phase="execution",
+                        trace.emit(_EVENT_FAILED, phase="execution",
                                    metadata={"error": str(exc)[:200],
                                               "phase": "wait_unet"})
                     return None
@@ -6398,15 +7049,20 @@ class V2LoaderBridge:
                 )
             except Exception as exc:
                 if trace:
-                    trace.emit("execution_prefill_failed", phase="execution",
+                    trace.emit(_EVENT_FAILED, phase="execution",
                                metadata={"error": str(exc)[:200],
                                           "phase": "wait_clip"})
                 return None
             if clip is None:
                 if trace:
-                    trace.emit("execution_prefill_failed", phase="execution",
+                    trace.emit(_EVENT_FAILED, phase="execution",
                                metadata={"reason": "no_clip"})
                 return None
+            _readiness_end = _capture_phase_counters()
+            if trace:
+                trace.emit(_EVENT_READINESS_END, phase="execution",
+                           metadata={"counters": _readiness_end,
+                                     "wait_for_unet": wait_for_unet})
 
             # ── UNET status when prefill is about to start encoding ──
             # Record whether UNET was skipped (no future), pending
@@ -6427,6 +7083,23 @@ class V2LoaderBridge:
                                    "unet_resolved": not unet_skipped and not unet_pending,
                                })
 
+            # ── Phase B: synchronous native page-readiness (candidate) ──
+            # Immediately after the CLIP future/readiness wait and directly
+            # before the encode loop.  Gated by
+            # COMFYMODAL_V2_PAGE_READINESS_MODE=willneed (off by
+            # default); no-op otherwise.  Synchronous, never schedules a
+            # future, never re-encodes.  Its duration is attributed as an
+            # explicit ``page_readiness`` stage in the reconciliation
+            # record — never shifted into restore, CLIP future wait, UNET
+            # load, sampler wait, or residual.
+            _run_clip_page_readiness(clip, trace=trace, request_id=_request_id)
+
+            # ── Phase B: actual encode (wall / thread / process CPU) ──
+            _encode_start = _capture_phase_counters()
+            if trace:
+                trace.emit(_EVENT_ENCODE_START, phase="execution",
+                           metadata={"counters": _encode_start,
+                                     "filtered_entries": len(filtered)})
             # Encode eligible entries using original CLIPTextEncode. The
             # request-owned state is explicitly captured because ContextVars
             # do not propagate to the coordinator's thread pool.
@@ -6448,23 +7121,39 @@ class V2LoaderBridge:
                                    phase="execution",
                                    metadata={"error": str(exc)[:200],
                                              "text_length": len(text)})
-            # Store results for graph consumption
-            with self._prefill_lock:
-                self._prefill_results.update(results)
+            # ── Terminal events FIRST, then publish results ──────────────
+            # ``_prefill_results`` is published under ``_prefill_lock`` AFTER
+            # ``execution_prefill_encode_end``/``execution_prefill_completed``
+            # have been emitted.  A graph consumer that finds a published
+            # cache hit can therefore never observe the result before the
+            # terminal events, so a successful prefill can never emit
+            # ``clip_prefill_reconciliation`` ahead of the encode-end/completed
+            # boundaries (which would yield a spuriously incomplete record).
+            _encode_end = _capture_phase_counters()
+            if trace:
+                trace.emit(_EVENT_ENCODE_END, phase="execution",
+                           metadata={"counters": _encode_end,
+                                     "encoded_count": len(results)})
 
             if trace:
                 unet_skipped = prep.unet_future is None
                 unet_pending = (
                     not unet_skipped and not prep.unet_future.done()
                 ) if prep.unet_future is not None else False
-                trace.emit("execution_prefill_completed", phase="execution",
+                trace.emit(_EVENT_COMPLETED, phase="execution",
                            metadata={"encoded_count": len(results),
                                      "filtered_entries": len(filtered),
                                      "total_entries": len(entries),
                                      "wait_for_unet": wait_for_unet,
                                      "unet_skipped": unet_skipped,
                                      "unet_pending": unet_pending,
-                                     "unet_resolved": not unet_skipped and not unet_pending})
+                                     "unet_resolved": not unet_skipped and not unet_pending,
+                                     "counters": _encode_end})
+            # Store results for graph consumption — last, so any consumer
+            # that observes a published result has already seen the terminal
+            # events above (cache-hit reconciliation ordering invariant).
+            with self._prefill_lock:
+                self._prefill_results.update(results)
             return results
 
         # Use the coordinator's scheduler to submit (idempotent via
@@ -6577,6 +7266,7 @@ class V2LoaderBridge:
 
         with self._prefill_lock:
             self._prefill_results.clear()
+            self._reconciliation_emitted = False
 
         prep = RestorePreparation(model_key=model_key, prefill_key=prefill_key)
         _now = time.time()
@@ -6651,6 +7341,7 @@ class V2LoaderBridge:
         self.coordinator._active = None
         with self._prefill_lock:
             self._prefill_results.clear()
+            self._reconciliation_emitted = False
 
     def drain_worker_events(self, target_trace: RuntimeTrace | None = None) -> int:
         """Wait for all preparation futures and drain late events to *target_trace*.
@@ -7206,6 +7897,22 @@ class V2LoaderBridge:
                 })
             return _LOADER_MISS
 
+        # ── Phase B: one reconciliation record per request ──────────
+        # Emitted exactly once (per bridge/request) at the first terminal
+        # demand outcome: the prefetched result consumed or fallen back.
+        def _emit_reconciliation(outcome: str) -> None:
+            if self._reconciliation_emitted:
+                return
+            with self._prefill_lock:
+                if self._reconciliation_emitted:
+                    return
+                emit_clip_prefill_reconciliation(
+                    self._trace,
+                    outcome=outcome,
+                    request_id=str(self._trace.request_id) if self._trace is not None else "",
+                )
+                self._reconciliation_emitted = True
+
         # --- Graph demand and wait ---
         if self._trace:
             self._trace.emit("graph_prefill_demand", phase="execution", metadata={
@@ -7264,6 +7971,7 @@ class V2LoaderBridge:
                 self._trace.emit("graph_wait_end", phase="execution", metadata={
                     "lane": "prefill", "status": "error",
                 })
+            _emit_reconciliation("fallback_error")
             return _LOADER_MISS
         if result is _LOADER_MISS:
             if self._trace:
@@ -7288,6 +7996,7 @@ class V2LoaderBridge:
                 self._trace.emit("graph_wait_end", phase="execution", metadata={
                     "lane": "prefill", "status": "unavailable",
                 })
+            _emit_reconciliation("fallback_unavailable")
             return _LOADER_MISS
         if self._trace:
             self._trace.emit("graph_prefill_wait_end", phase="execution", metadata={"status": "ok"})
@@ -7317,6 +8026,7 @@ class V2LoaderBridge:
                     "graph_wait_duration_ms": round(graph_wait_ms, 3) if graph_wait_ms is not None else None,
                 },
             )
+        _emit_reconciliation("consumed")
         return result
 
     def _invoke_original(self, class_name: str, kwargs: Mapping[str, Any]) -> Any:
