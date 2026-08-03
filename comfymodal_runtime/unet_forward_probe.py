@@ -522,6 +522,10 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
                     f"elapsed_ms={elapsed_ms}",
                     flush=True,
                 )
+                print(
+                    f"[v2.sampler_parity] UNET compute_dtype={str(x.dtype) if x is not None else 'unknown'}",
+                    flush=True,
+                )
 
                 # Clean up demand start storage (no longer needed for this request)
                 _clear_demand_start_ns(request_id)
