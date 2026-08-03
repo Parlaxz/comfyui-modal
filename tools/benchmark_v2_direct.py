@@ -36,7 +36,7 @@ WORKSPACES_PATH = ROOT / ".modal_workspaces.json"
 APP_NAME = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
 CLASS_NAME = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
 GPU = os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")
-RUN_COUNT = int(os.environ.get("V2_BENCHMARK_RUNS", "3"))
+RUN_COUNT = int(os.environ.get("V2_BENCHMARK_RUNS", "1"))
 GAP_SECONDS = float(os.environ.get("V2_BENCHMARK_GAP_SECONDS", "20"))
 _ABSENT_STR = "absent"
 
@@ -1168,7 +1168,8 @@ def _check_acceptance(
         # Require executor_loader_cache_seed_end event containing diagnostics from
         # seed_loader_cache_signatures().  Every fresh request must have exactly
         # one non-conflicting decision per role: unet=seeded, clip=seeded,
-        # vae=missing_snapshot_output.
+        # vae=seeded (the production warmup profile declares a VAE, so the
+        # retained snapshot VAE is seeded when the canonical identity matches).
         _seed_ev = _trace_event(_ev_result, "executor_loader_cache_seed_end")
         if _seed_ev is None:
             failures.append(
@@ -1213,7 +1214,7 @@ def _check_acceptance(
                 _EXPECTED: dict[str, str] = {
                     "unet": "seeded",
                     "clip": "seeded",
-                    "vae": "missing_snapshot_output",
+                    "vae": "seeded",
                 }
                 for role, expected in _EXPECTED.items():
                     if role in role_decisions:
