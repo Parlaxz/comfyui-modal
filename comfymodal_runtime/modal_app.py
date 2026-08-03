@@ -6832,6 +6832,32 @@ class ModalRuntimeEntrypoint:
                                             f"unet_match=1",
                                             flush=True,
                                         )
+                                        _cd_model = getattr(_patched_model, "model", None)
+                                        _cd_transformer = getattr(_cd_model, "diffusion_model", None)
+                                        _cd_weight_dtype = None
+                                        _cd_model_dtype = getattr(_patched_model, "model_dtype", None)
+                                        if callable(_cd_model_dtype):
+                                            try:
+                                                _cd_weight_dtype = _cd_model_dtype()
+                                            except Exception:
+                                                _cd_weight_dtype = None
+                                        if _cd_weight_dtype is None and _cd_transformer is not None:
+                                            try:
+                                                _cd_parameter = next(_cd_transformer.parameters(), None)
+                                                _cd_weight_dtype = getattr(_cd_parameter, "dtype", None)
+                                            except Exception:
+                                                _cd_weight_dtype = None
+                                        _cd_manual_cast = getattr(_cd_model, "manual_cast_dtype", None)
+                                        _cd_target = type(_cd_transformer).__name__ if _cd_transformer is not None else "unknown"
+                                        print(
+                                            f"[v2.sampler_parity] "
+                                            f"UNET weight_dtype={_cd_weight_dtype} "
+                                            f"manual_cast_dtype={_cd_manual_cast if _cd_manual_cast is not None else 'None'} "
+                                            f"CacheDiT target={_cd_target} "
+                                            f"CacheDiT attachment_count={_cd_result.get('cache_dit_attachment_count', 0)} "
+                                            f"CacheDiT fallback={_cd_result.get('cache_dit_fallback', 1)}",
+                                            flush=True,
+                                        )
                                         # ── Authoritative CacheDiT boundary ──
                                         # Exact retained-UNET identity before/after
                                         # patch, plus patch count (1 per request).
