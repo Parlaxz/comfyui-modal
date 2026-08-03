@@ -615,8 +615,9 @@ class TestRestorePublisherWiring(unittest.TestCase):
         asyncio.run(run())
 
     def test_restore_publisher_not_called_when_omitted(self):
-        """When restore_publisher is None, no publication occurs and the event
-        records not_configured."""
+        """When restore_publisher is None, no publication occurs: exactly one
+        restore_plan_publish_start/end pair is emitted and the terminal
+        marker records status=not_configured with honest cache/remote metadata."""
         async def stream(**kwargs):
             yield {"type": "result", "data": {"images": [], "outputs": {}}}
 
@@ -628,14 +629,53 @@ class TestRestorePublisherWiring(unittest.TestCase):
             )
             trace = RuntimeTrace(request_id="no_pub", process="local")
             transport = ModalTransport(prompt_stream_fn=stream)
-            await execute_plan(plan, transport=transport, trace=trace)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            start_events = [e for e in trace.events if e.name == "restore_plan_publish_start"]
             found_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
+            self.assertEqual(len(start_events), 1,
+                             "Must have exactly one restore_plan_publish_start event")
             self.assertEqual(len(found_events), 1,
                              "Must have exactly one restore_plan_publish_end event")
             md = found_events[0].metadata
             status = md.get("status") if hasattr(md, "get") else md.get("status")
             self.assertEqual(status, "not_configured",
                              f"status should be 'not_configured'. metadata={md} type={type(md)}")
+            # Honest metadata: no remote publication was performed or simulated.
+            self.assertFalse(trace._metadata.get("restore_remote_call_performed", False),
+                             "no remote call must be recorded when publisher is None")
+            local_timing = result.get("trace", {}).get("local_timing", {})
+            self.assertIsNone(
+                local_timing.get("restore_remote_call_performed"),
+                "no-publisher derived timing must not claim a remote call",
+            )
+        asyncio.run(run())
+
+    def test_restore_plan_build_start_paired_with_end(self):
+        """restore_plan_build_start is emitted immediately before the restore
+        plan build and paired with restore_plan_build_end on the publisher path."""
+        async def stream(**kwargs):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="build_pair",
+                validate=False,
+            )
+            publisher = _Publisher()
+            transport = ModalTransport(prompt_stream_fn=stream)
+            trace = RuntimeTrace(request_id="build_pair", process="local")
+            await execute_plan(plan, transport=transport, restore_publisher=publisher, trace=trace)
+            starts = [e for e in trace.events if e.name == "restore_plan_build_start"]
+            ends = [e for e in trace.events if e.name == "restore_plan_build_end"]
+            self.assertEqual(len(starts), 1,
+                             "Must have exactly one restore_plan_build_start event")
+            self.assertEqual(len(ends), 1,
+                             "Must have exactly one restore_plan_build_end event")
+            self.assertLess(starts[0].monotonic_ns, ends[0].monotonic_ns,
+                            "restore_plan_build_start must precede restore_plan_build_end")
+            self.assertEqual(len(publisher.plans), 1,
+                             "Publisher must still be called exactly once")
         asyncio.run(run())
 
     def test_publisher_generation_returned_in_event(self):
@@ -678,7 +718,7 @@ class _FailPublisher:
         self.plans = []
         self._fail_on = fail_on
 
-    def publish(self, plan: RestorePlan) -> int:
+    def publish(self, plan: RestorePlan, *, snapshot_seed=None) -> int:
         self.call_count += 1
         self.plans.append(plan)
         if self.call_count == self._fail_on:
@@ -878,7 +918,13 @@ class TestRestorePublishCache(unittest.TestCase):
         asyncio.run(run())
 
     def test_different_environment_isolation(self):
-        """Same plan in a different Modal environment publishes again."""
+        """Same plan in a different Modal environment publishes again.
+
+        The local restore cache is scoped by app/workspace identity.  A real
+        environment change is expressed the way deployments express it — a
+        different app identity (``COMFYMODAL_V2_APP_NAME``) alongside the
+        ``COMFYMODAL_V2_ENVIRONMENT`` label — which forces a re-publish.
+        """
         async def run():
             plan = build_execution_plan(
                 {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
@@ -938,8 +984,9 @@ class TestRestorePublishCache(unittest.TestCase):
     # ── failure does not poison cache ────────────────────────────────────
 
     def test_failed_publish_does_not_cache(self):
-        """When the publisher raises, the cache is NOT populated, so a retry
-        will call the publisher again."""
+        """When the publisher raises, execute_plan stays fail-closed: the
+        failure is recorded on the trace, nothing is cached, and a retry
+        will call the publisher again (no exception propagates)."""
         async def run():
             plan = build_execution_plan(
                 {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
@@ -947,14 +994,25 @@ class TestRestorePublishCache(unittest.TestCase):
             )
             publisher = _FailPublisher(fail_on=1)
             transport = ModalTransport(prompt_stream_fn=self._stream())
+            trace = RuntimeTrace(request_id="fail_test", process="local")
 
-            # First call fails → exception → no cache entry
-            with self.assertRaises(RuntimeError):
-                await execute_plan(
-                    plan, transport=transport, restore_publisher=publisher,
-                )
+            # First call fails → recorded on trace → no cache entry
+            await execute_plan(
+                plan, transport=transport, restore_publisher=publisher, trace=trace,
+            )
             self.assertEqual(publisher.call_count, 1,
                              "Publisher must have been called once")
+            self.assertIn("restore_publish_error", trace._metadata,
+                          "Failed publication must be recorded on the trace")
+            self.assertTrue(
+                str(trace._metadata["restore_publish_error"]).startswith("restore_plan_publish_error"),
+                trace._metadata["restore_publish_error"],
+            )
+            # Nothing was cached from the failed publication
+            import canonical_execution as ce
+            with ce._RESTORE_PUBLISH_CACHE_LOCK:
+                self.assertEqual(len(ce._RESTORE_PUBLISH_CACHE), 0,
+                                 "Failed publication must not populate the cache")
 
             # Retry with a fresh publisher (same plan) — must NOT be skipped
             publisher2 = _Publisher()
@@ -966,8 +1024,8 @@ class TestRestorePublishCache(unittest.TestCase):
         asyncio.run(run())
 
     def test_failure_then_success_then_skip(self):
-        """After a failure and a subsequent success, the cache is populated
-        and a third call skips."""
+        """After a recorded failure and a subsequent success, the cache is
+        populated and a third call skips."""
         async def run():
             plan = build_execution_plan(
                 {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
@@ -975,12 +1033,14 @@ class TestRestorePublishCache(unittest.TestCase):
             )
             transport = ModalTransport(prompt_stream_fn=self._stream())
 
-            # First: fail on first call
+            # First: fail on first call — recorded on trace, nothing cached
             fail_pub = _FailPublisher(fail_on=1)
-            with self.assertRaises(RuntimeError):
-                await execute_plan(
-                    plan, transport=transport, restore_publisher=fail_pub,
-                )
+            trace = RuntimeTrace(request_id="fail_success_test", process="local")
+            await execute_plan(
+                plan, transport=transport, restore_publisher=fail_pub, trace=trace,
+            )
+            self.assertIn("restore_publish_error", trace._metadata,
+                          "Failed publication must be recorded on the trace")
 
             # Second: succeed (new publisher, cache miss → publish → cache)
             success_pub = _Publisher()

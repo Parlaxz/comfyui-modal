@@ -340,7 +340,8 @@ _RESTORE_PUBLISH_CACHE: dict[str, dict] = {}
 """``{cache_key: {"identity_hash": str, "publication_result": dict}}`` — cached
 publication metadata keyed by plan identity.
 
-Cache-key format: ``stable_hash({app_identity, ws_id, plan_identity_hash})``.
+Cache-key format: ``stable_hash({app_identity, environment, ws_id,
+plan_identity_hash, seed_identity})``.
 Also serves as the last-successful publication store — cleared only by
 module reload or explicit ``_reset_restore_publish_cache()``.
 Thread-safe via ``_RESTORE_PUBLISH_CACHE_LOCK``.
@@ -397,11 +398,21 @@ def _restore_plan_identity_hash(plan: RestorePlan) -> str:
 
 
 def _reset_restore_publish_cache() -> None:
-    """Clear the restore-plan publish cache (test / teardown only)."""
+    """Clear the restore-plan publish cache and its persisted disk mirror.
+
+    Test / teardown only.  Clears the in-memory ``_RESTORE_PUBLISH_CACHE``
+    AND the restore disk cache (``_restore_disk_cache`` mirror plus the
+    ``v2_restore_cache.json`` file via the atomic writer) so a later process
+    cannot repopulate from a stale on-disk restore publication.  The profile
+    caches are left untouched.
+    """
     global _restore_cache_reset_count
     with _RESTORE_PUBLISH_CACHE_LOCK:
         _RESTORE_PUBLISH_CACHE.clear()
         _restore_cache_reset_count += 1
+    with _restore_disk_lock:
+        _restore_disk_cache.clear()
+    _write_disk_cache("restore", {})
 
 
 def _evict_restore_publish_cache() -> None:
@@ -458,6 +469,23 @@ def _profile_prep_cache_key(
         "p": prefill_key,
     }
     return stable_hash(identity)
+
+
+def _restore_publish_cache_key(
+    app_identity: str,
+    environment: str,
+    ws_id: str,
+    plan_identity: str,
+    seed_identity: str,
+) -> str:
+    """Return the deployment-scoped restore publication cache key."""
+    return stable_hash({
+        "app": app_identity,
+        "environment": environment,
+        "workspace": ws_id,
+        "plan": plan_identity,
+        "seed": seed_identity,
+    })
 
 
 def _reset_profile_prep_cache() -> None:
@@ -1297,6 +1325,10 @@ async def execute_plan(
         runtime_trace.emit("plan_serialization_end", phase="local",
                            metadata={"purpose": "restore_publication",
                                      "reused_canonical": True})
+        # Paired restore-plan build markers bound the plan derivation from the
+        # canonical workflow (restore_plan_build_start/end).
+        runtime_trace.emit("restore_plan_build_start", phase="local",
+                           metadata={"purpose": "restore_plan"})
         try:
             model_key = derive_model_key(workflow)
             prefill_key = derive_prefill_key(model_key, workflow)
@@ -1317,7 +1349,6 @@ async def execute_plan(
             )
             runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
         runtime_trace.emit("restore_plan_build_end", phase="local")
-
         if restore_plan is not None:
             runtime_trace.emit("restore_plan_publish_start", phase="local")
 
@@ -1343,8 +1374,12 @@ async def execute_plan(
                 seed_identity = stable_hash(_seed_core)
             _restore_app_identity = _app_identity()
             _restore_ws_id = _workspace_identity(workspace)
-            cache_key = _profile_prep_cache_key(
-                _restore_app_identity, _restore_ws_id, plan_identity, seed_identity,
+            cache_key = _restore_publish_cache_key(
+                _restore_app_identity,
+                os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "").strip() or "__default__",
+                _restore_ws_id,
+                plan_identity,
+                seed_identity,
             )
 
             # ── Instrumentation metadata ──
@@ -1516,10 +1551,25 @@ async def execute_plan(
             # successful publish; on any failure it is never claimed.
             if _seed_payload is not None and _publish_succeeded:
                 _seed_payload_ctx["persisted"] = 1
+            # Represent the publish generation in request metadata when it is
+            # actually known (cache hit or confirmed publish) — never invented.
+            if observed_generation is not None:
+                runtime_trace.set_metadata(restore_publish_generation=observed_generation)
             runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
         # Dry-run / no remote publisher configured — persist the seed to the
         # local .runtime_state path (existing local-observability behavior).
+        # No remote publication is performed or simulated: the publish
+        # markers bound the local not-configured handling and carry an honest
+        # status so downstream breakdown consumers can attribute the gap.
+        runtime_trace.emit("restore_plan_publish_start", phase="local",
+                           metadata={"status": "not_configured"})
+        runtime_trace.set_metadata(
+            restore_publish_cache_skipped=None,
+            restore_publish_cache_hit=False,
+            restore_remote_call_performed=False,
+            restore_publish_status="not_configured",
+        )
         if _seed_payload is not None:
             try:
                 from comfymodal_runtime.execution_seed import persist_snapshot_seed_payload
@@ -1527,6 +1577,8 @@ async def execute_plan(
                 _seed_payload_ctx["persisted"] = 1 if _seed_persisted else 0
             except Exception:
                 _seed_payload_ctx["persisted"] = 0
+        runtime_trace.emit("restore_plan_publish_end", phase="local",
+                           metadata={"status": "not_configured"})
 
     if _seed_payload is not None and _seed_payload_ctx.get("persisted"):
         print(
@@ -1628,6 +1680,8 @@ async def execute_plan(
         "queue_wait_before_worker_ms": _origin.get("queue_wait_before_worker_ms"),
         "plan_build_ms": _event_span_ms(runtime_trace, "plan_build_start", "plan_build_end"),
         "active_profile_ms": _event_span_ms(runtime_trace, "active_profile_prepare_start", "active_profile_prepare_end"),
+        "restore_plan_build_ms": _strict_event_span_ms(runtime_trace, "restore_plan_build_start", "restore_plan_build_end"),
+        "restore_publish_ms": _strict_event_span_ms(runtime_trace, "restore_plan_publish_start", "restore_plan_publish_end"),
         "handle_lookup_ms": _event_span_ms(runtime_trace, "modal_handle_lookup_start", "modal_handle_lookup_end"),
         "payload_serialize_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "modal_payload_serialize_end"),
         "payload_materialization_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "payload_measure_size_start"),
@@ -1967,6 +2021,10 @@ async def execute_plan(
                 else:
                     _all_worker_known = False
                     _missing_stages.append(_wk)
+            for _wk in ("restore_plan_build_ms", "restore_publish_ms"):
+                _wv = _local_stages.get(_wk)
+                if isinstance(_wv, (int, float)):
+                    _worker_leaf_vals.append(float(_wv))
             for _wk in ("generator_create_ms", "generator_create_to_first_iteration_ms"):
                 _wv = _transport_meta.get(_wk)
                 if isinstance(_wv, (int, float)):
