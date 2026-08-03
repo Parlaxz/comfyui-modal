@@ -6269,6 +6269,37 @@ class ModelPreloadCoordinator:
             )
             return prep.prefill_future
 
+    def schedule_vae_activation(
+        self,
+        callback: Callable[[], Any],
+        preparation: RestorePreparation | None = None,
+        *,
+        trace: RuntimeTrace | None = None,
+    ) -> Future[Any] | None:
+        """Schedule execution-phase VAE activation work (single-flight).
+
+        Public API: atomically checks whether
+        ``preparation.vae_future`` is already set and, only when None,
+        submits *callback* to the worker pool (idempotent).  The critical
+        section is minimised to the check-and-set so the non-reentrant
+        thread-pool code path never runs while holding the lock.  No second
+        mutation lock/framework is introduced — the callback performs its
+        GPU/cache mutation through the existing shared ``mutation_lane``
+        (acquired by the existing ``load_models_gpu`` wrapper as owner
+        ``VAE`` around the actual load).  The callback typically performs
+        the VAE GPU/cache activation.  Returns the future (new or
+        existing), or None when no active preparation exists.
+        """
+        prep = preparation or self._require_active()
+        with self._pool_lock:
+            if prep.vae_future is not None:
+                return prep.vae_future
+            prep.vae_future = self._submit(
+                "vae", callback, prep, trace,
+                phase="execution", expected_read_count=0,
+            )
+            return prep.vae_future
+
     def pool_threads_info(self) -> list[dict[str, Any]]:
         """Return list of {native_id, name} for each live pool thread."""
         result: list[dict[str, Any]] = []
@@ -6554,6 +6585,7 @@ class V2LoaderBridge:
         "DualCLIPLoader": "load_clip",
         "VAELoader": "load_vae",
         "CLIPTextEncode": "encode",
+        "VAEDecode": "decode",
     }
 
     def __init__(self, max_workers: int = 3) -> None:
@@ -6581,6 +6613,16 @@ class V2LoaderBridge:
         self._reconciliation_emitted: bool = False
         """True once ``clip_prefill_reconciliation`` has been emitted for the
         current preparation/request (one record per request)."""
+        # ── VAE early activation (sampling_end mode) resolution sources ──
+        self._exact_vae: Any | None = None
+        """Future exact VAE object accepted via ``set_exact_vae()``
+        (snapshot/seed-compatible branch).  Takes precedence in
+        ``resolve_vae_object``."""
+        self._graph_vae_output: Any | None = None
+        """Captured graph VAELoader output (first VAELoader result served by
+        this bridge for the current request), used as an exact-object source
+        in ``resolve_vae_object``.  Reset per ``prepare()``/``clear()``."""
+        self._snapshot_loader_outputs: Mapping[str, Any] | None = None
 
     def install(self, nodes_module: Any | None = None, *, trace: RuntimeTrace | None = None) -> bool:
         """Install wrappers on the live ComfyUI node classes once.
@@ -6645,8 +6687,13 @@ class V2LoaderBridge:
         self._trace = trace
         with self._prefill_lock:
             self._prefill_results.clear()
-            self._reconciliation_emitted = False
+        self._reconciliation_emitted = False
         self._preparation = None
+        self._exact_vae = None
+        self._snapshot_loader_outputs = None
+        # Reset the per-request captured graph VAELoader output so a fresh
+        # request never reuses a previous request's captured VAE object.
+        self._graph_vae_output = None
         if not self._model_key or not (
             self._model_key.unet_identity or self._model_key.clip_identity
         ):
@@ -6692,10 +6739,18 @@ class V2LoaderBridge:
         _erc["unet"] = 1
         _erc["clip"] = self._compute_clip_expected_read_count()
         _erc["vae"] = 1 if self._model_key.vae_identity else 0
-        prepare_vae = self._resolve_lane_override(
-            prepare_vae,
-            bool(self._model_key.vae_identity and self._request_list("vae")),
-        )
+        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
+            # sampling_end mode: restore/preparation must NOT submit a VAE
+            # future.  The VAE GPU activation is scheduled exactly once at
+            # the real SAMPLER_SAMPLE sampling_end boundary via
+            # schedule_vae_early_activation_at_sampling_end(); the original
+            # (patched) graph VAELoader remains the unchanged late fallback.
+            prepare_vae = False
+        else:
+            prepare_vae = self._resolve_lane_override(
+                prepare_vae,
+                bool(self._model_key.vae_identity and self._request_list("vae")),
+            )
 
         self._preparation = self.coordinator.prepare(
             self._model_key,
@@ -7293,6 +7348,10 @@ class V2LoaderBridge:
         """
         if self._preparation is None or self._model_key is None:
             return None
+        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
+            # sampling_end mode: never submit a VAE future from extension
+            # either — the VAE is activated once at sampling_end.
+            prepare_vae = False
         return self.coordinator.extend(
             self._preparation,
             prepare_unet=prepare_unet,
@@ -7327,6 +7386,9 @@ class V2LoaderBridge:
 
         prep = RestorePreparation(model_key=model_key, prefill_key=prefill_key)
         _now = time.time()
+        # Reset the per-request captured graph VAELoader output so a fresh
+        # request never reuses a previous request's captured VAE object.
+        self._graph_vae_output = None
 
         # Set completed futures BEFORE publishing the preparation,
         # so graph-time consumers never observe an incomplete state.
@@ -7395,6 +7457,9 @@ class V2LoaderBridge:
         self._trace = None
         self._preparation_trace = None
         self._preparation_event_cursor = 0
+        self._exact_vae = None
+        self._snapshot_loader_outputs = None
+        self._graph_vae_output = None
         self.coordinator._active = None
         with self._prefill_lock:
             self._prefill_results.clear()
@@ -7458,6 +7523,24 @@ class V2LoaderBridge:
                 active = current_v2_loader_bridge()
                 if active is not None:
                     result = active._consume_vae(args, kwargs)
+                    if result is not _LOADER_MISS:
+                        # Capture whatever the bridge served so the VAE
+                        # resolution adapter can reuse the exact graph VAE
+                        # object at the sampling_end boundary.
+                        active._capture_graph_vae_output(result)
+                        return result
+                result = original(node, *args, **kwargs)
+                if active is not None:
+                    active._capture_graph_vae_output(result)
+                return result
+        elif class_name == "VAEDecode":
+            def wrapped(node: Any, *args: Any, **kwargs: Any) -> Any:
+                active = current_v2_loader_bridge()
+                if active is not None:
+                    # VAEDecode demand join (sampling_end mode): joins the
+                    # activation future outside the mutation lane; always
+                    # falls through so decode stays in normal graph order.
+                    result = active._consume_vae_decode(args, kwargs)
                     if result is not _LOADER_MISS:
                         return result
                 return original(node, *args, **kwargs)
@@ -7727,6 +7810,16 @@ class V2LoaderBridge:
 
     def _consume_vae(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
         identity = str(kwargs.get("vae_name", args[0] if args else ""))
+        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
+            # sampling_end mode: no VAE future was prepared at restore.
+            # Join the sampling_end activation future (when present and
+            # terminal-ready) outside the mutation lane; on any absent /
+            # failed / invalid / not-ready outcome return _LOADER_MISS so
+            # the unchanged original VAELoader path proceeds.
+            _outcome = self._join_vae_early_activation(trace=self._trace)
+            if _outcome.get("valid") and _outcome.get("vae") is not None:
+                return (_outcome["vae"],)
+            return _LOADER_MISS
         return self._consume_model_impl(
             lane="VAE",
             loader_class="VAELoader",
@@ -7737,6 +7830,179 @@ class V2LoaderBridge:
             demand_metadata={"vae_name": identity, "lane": "VAE"},
             emit_consumed_on_error=False,
             skip_loader_class=True,
+        )
+
+    def _consume_vae_decode(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
+        """VAEDecode demand hook (sampling_end VAE activation join).
+
+        Joins the request's sampling_end VAE activation future OUTSIDE the
+        mutation lane and emits the concise consumed line (once per
+        request).  Decode itself stays in normal graph order — this hook
+        never executes decode and always returns ``_LOADER_MISS`` so the
+        original VAEDecode path proceeds unchanged.  In any non-active mode
+        this is a no-op.
+        """
+        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
+            self._join_vae_early_activation(trace=self._trace)
+        return _LOADER_MISS
+
+    def set_exact_vae(self, vae: Any) -> None:
+        """Accept a future exact VAE object (snapshot/seed-compatible branch).
+
+        The exact object takes precedence over the captured graph VAELoader
+        output and the original VAELoader fallback in ``resolve_vae_object``.
+        """
+        self._exact_vae = vae
+
+    def set_snapshot_loader_outputs(self, outputs: Mapping[str, Any] | None) -> None:
+        """Accept snapshot/seed loader outputs without owning their lifecycle."""
+        self._snapshot_loader_outputs = outputs if isinstance(outputs, Mapping) else None
+
+    def _capture_graph_vae_output(self, result: Any) -> None:
+        """Capture the first graph VAELoader output of the current request.
+
+        First capture wins (the workflow's VAELoader node is authoritative);
+        a later different VAELoader output is ignored.  Never duplicates
+        transfers — the object is only referenced, not re-loaded.
+        """
+        if self._graph_vae_output is not None:
+            return
+        _vae = result[0] if isinstance(result, (tuple, list)) and result else result
+        if _vae is not None:
+            self._graph_vae_output = _vae
+
+    def resolve_vae_object(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+    ) -> tuple[Any, str]:
+        """Resolve the exact VAE object for sampling_end early activation.
+
+        Small VAE-resolution adapter.  Priority:
+          1. ``set_exact_vae()`` object (snapshot/seed-compatible inputs).
+          2. Snapshot/seed-compatible attributes when the later branch
+             provides them — ``getattr(self._cpu_snapshot_models, 'vae',
+             None)`` and ``self._snapshot_loader_outputs['vae']`` — both
+             absent-safe (the bridge never fabricates a source).
+          3. Captured graph VAELoader output of this request.
+          4. Existing original VAELoader resolution (``self._load_vae``).
+
+        Returns ``(vae, source)`` or ``(None, "")`` when no resolution is
+        possible.  Each source is consulted at most once per call; no VAE
+        object/transfer is duplicated.
+        """
+        _vae = getattr(self, "_exact_vae", None)
+        if _vae is not None:
+            return _vae, "exact_object"
+        try:
+            _models = getattr(self, "_cpu_snapshot_models", None)
+            _vae = getattr(_models, "vae", None)
+            if _vae is not None:
+                return _vae, "snapshot_models"
+        except Exception:
+            pass
+        try:
+            _outputs = getattr(self, "_snapshot_loader_outputs", None)
+            if isinstance(_outputs, Mapping):
+                _vae = _outputs.get("vae")
+                if _vae is not None:
+                    return _vae, "snapshot_loader_outputs"
+        except Exception:
+            pass
+        if self._graph_vae_output is not None:
+            return self._graph_vae_output, "graph_vae_loader"
+        if self._model_key is not None and getattr(self._model_key, "vae_identity", ""):
+            try:
+                return self._load_vae(self._model_key), "original_loader"
+            except Exception:
+                return None, ""
+        return None, ""
+
+    def _join_vae_early_activation(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+    ) -> dict[str, Any]:
+        """Join the request's sampling_end VAE activation future at graph
+        (VAEDecode/VAELoader) demand.  Runs OUTSIDE the mutation lane.
+
+        Emits the concise ``[v2.vae_early_activation] event=consumed
+        join_wait_ms=...`` line exactly once per request (first successful
+        ready join wins).  Returns an outcome dict; ``valid=True`` with
+        ``vae`` set only when the activation is terminal-ready and
+        validated.  Any other outcome lets the caller fall back to the
+        unchanged original VAEDecode/loader path.
+        """
+        if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+            return {"scheduled": False, "status": "mode_late", "terminal": False,
+                    "valid": False, "reason": "", "join_wait_ms": 0.0, "vae": None}
+        _rt = trace or self._trace
+        _request_id = str(_rt.request_id) if _rt is not None else ""
+        _state = _vae_activation_get(_request_id)
+        if _state is None or _state.get("future") is None:
+            return {"scheduled": False, "status": "not_scheduled", "terminal": False,
+                    "valid": False, "reason": "", "join_wait_ms": 0.0, "vae": None}
+        _demand_ns = time.monotonic_ns()
+        _state["join_demand_mono_ns"] = _demand_ns
+        _future = _state["future"]
+        try:
+            _future.result()
+        except Exception as exc:
+            return _vae_activation_fallback(
+                _state, _rt, _request_id,
+                reason="future_error", error=str(exc)[:200],
+                join_wait_ms=round((time.monotonic_ns() - _demand_ns) / 1_000_000, 3),
+            )
+        _join_wait_ms = round((time.monotonic_ns() - _demand_ns) / 1_000_000, 3)
+        _state["join_completed_mono_ns"] = time.monotonic_ns()
+        _state["join_wait_ms"] = _join_wait_ms
+        with _VAE_ACTIVATION_LOCK:
+            _status = _state.get("status", "")
+            _terminal = bool(_state.get("terminal", False))
+        if _terminal and _status == "ready":
+            _valid, _reason, _vae = _validate_vae_early_activation(_state)
+            if _valid:
+                with _VAE_ACTIVATION_LOCK:
+                    _joined = bool(_state.get("joined", False))
+                    if not _joined:
+                        _state["joined"] = True
+                if _rt is not None and not _joined:
+                    _rt.emit(_EVENT_VAE_EA_CONSUMED, phase="execution", metadata={
+                        "mode": _state.get("mode", ""),
+                        "trigger": _state.get("trigger", ""),
+                        "request_id": _request_id,
+                        "key_hash": _state.get("key_hash", ""),
+                        "join_wait_ms": _join_wait_ms,
+                        "transfer_count": _state.get("transfer_count", 0),
+                        "cache_present": bool(_state.get("cache_present", False)),
+                        "vae_object_id": _state.get("vae_object_id", ""),
+                        "vae_resolution_source": _state.get("vae_resolution_source", ""),
+                        "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                        "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+                    })
+                if not _joined:
+                    print(
+                        f"[v2.vae_early_activation] event=consumed "
+                        f"request_id={_request_id or 'absent'} mode={_state.get('mode', '')} "
+                        f"key_hash={_state.get('key_hash', '')} join_wait_ms={_join_wait_ms} "
+                        f"status=ready source={_state.get('vae_resolution_source', '') or 'absent'}",
+                        flush=True,
+                    )
+                return {"scheduled": True, "status": "ready", "terminal": True,
+                        "valid": True, "reason": "", "join_wait_ms": _join_wait_ms,
+                        "vae": _vae}
+            return _vae_activation_fallback(
+                _state, _rt, _request_id,
+                reason=f"invalid:{_reason}", join_wait_ms=_join_wait_ms,
+            )
+        if _terminal:
+            return _vae_activation_fallback(
+                _state, _rt, _request_id,
+                reason=str(_state.get("reason", _status) or _status),
+                join_wait_ms=_join_wait_ms,
+            )
+        return _vae_activation_fallback(
+            _state, _rt, _request_id, reason="non_terminal", join_wait_ms=_join_wait_ms,
         )
 
     def _join_unet_early_activation(
@@ -10194,6 +10460,940 @@ def finalize_unet_early_activation(
         trace.emit(_EVENT_UNET_EA_RECONCILIATION, phase="execution", metadata=_record)
     _emit_unet_early_activation_reconciliation_line(_record)
     return _record
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V2 VAE early activation (COMFYMODAL_V2_VAE_ACTIVATION_MODE)
+# ═══════════════════════════════════════════════════════════════════════
+# Mode "late" (default) preserves existing behavior exactly: the VAE may be
+# submitted during restore preparation (prepare_vae) and is served at graph
+# VAELoader demand through the original loader.  The ONLY allowed opt-in
+# value is "sampling_end" (V2-only production timing): restore/preparation
+# never submits a VAE future; instead the VAE GPU/cache activation is
+# scheduled exactly once, through the existing coordinator pool and its
+# shared mutation lane, at the real SAMPLER_SAMPLE sampling_end boundary
+# (hooked from runtime_executor._build_sampling_wrapper — never from
+# progress/milestones).  The worker performs the normal ComfyUI GPU/cache
+# load through the existing model-management wrappers on the shared
+# mutation lane; VAEDecode demand joins the same future outside the lane.
+# Any resolution/load/validation failure falls back to the unchanged
+# original graph loader path.
+_VAE_ACTIVATION_MODE_LATE = "late"
+_VAE_ACTIVATION_MODE_SAMPLING_END = "sampling_end"
+_VAE_ACTIVATION_MODE_VALID = frozenset(
+    {_VAE_ACTIVATION_MODE_LATE, _VAE_ACTIVATION_MODE_SAMPLING_END}
+)
+# Modes that schedule/join the VAE activation future.  Late mode is NOT
+# included — it must never create state, join, or add graph waits.
+_VAE_ACTIVATION_MODE_ACTIVE = frozenset({_VAE_ACTIVATION_MODE_SAMPLING_END})
+
+_EVENT_VAE_EA_MODE = "vae_early_activation_mode"
+_EVENT_VAE_EA_SCHEDULED = "vae_early_activation_scheduled"
+_EVENT_VAE_EA_LOAD_START = "vae_early_activation_load_start"
+_EVENT_VAE_EA_TERMINAL = "vae_early_activation_terminal"
+_EVENT_VAE_EA_CONSUMED = "vae_early_activation_consumed"
+_EVENT_VAE_EA_SKIPPED = "vae_early_activation_skipped"
+_EVENT_VAE_EA_FAILED = "vae_early_activation_failed"
+_EVENT_VAE_EA_INVALID = "vae_early_activation_invalid"
+_EVENT_VAE_EA_CANCELLED = "vae_early_activation_cancelled"
+_EVENT_VAE_EA_FALLBACK = "vae_early_activation_fallback"
+_EVENT_VAE_EA_RECONCILIATION = "vae_early_activation_reconciliation"
+
+
+def _resolve_vae_activation_mode(raw: str) -> str:
+    """Normalize a ``COMFYMODAL_V2_VAE_ACTIVATION_MODE`` value.
+
+    The ONLY allowed opt-in value is exactly ``"sampling_end"`` (V2-only).
+    ``"late"`` is the default.  Any other value — including any historical
+    ``"early"`` spelling — falls back to ``"late"`` so existing behavior is
+    never altered by a typo or an unknown value.
+    """
+    value = str(raw or "").strip().lower()
+    if value == _VAE_ACTIVATION_MODE_SAMPLING_END:
+        return _VAE_ACTIVATION_MODE_SAMPLING_END
+    return _VAE_ACTIVATION_MODE_LATE
+
+
+_VAE_ACTIVATION_MODE: str = _resolve_vae_activation_mode(
+    os.environ.get("COMFYMODAL_V2_VAE_ACTIVATION_MODE", _VAE_ACTIVATION_MODE_LATE)
+)
+_VAE_ACTIVATION_MODE_LOG_EMITTED: bool = False
+
+
+def vae_activation_mode() -> str:
+    """Return the effective VAE activation mode.
+
+    ``"late"`` (default) preserves existing behavior exactly; the only
+    allowed opt-in value is ``"sampling_end"``.  Logs the parsed effective
+    mode once per process on first access.
+    """
+    global _VAE_ACTIVATION_MODE_LOG_EMITTED
+    if not _VAE_ACTIVATION_MODE_LOG_EMITTED:
+        _VAE_ACTIVATION_MODE_LOG_EMITTED = True
+        try:
+            print(
+                f"[v2.vae_early_activation] event=mode "
+                f"mode={_VAE_ACTIVATION_MODE} "
+                f"env_raw={os.environ.get('COMFYMODAL_V2_VAE_ACTIVATION_MODE', 'late')} "
+                f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+                f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    return _VAE_ACTIVATION_MODE
+
+
+# ── Request-scoped VAE activation state ────────────────────────────────
+# One dict per request_id: future / key / trigger / owner / terminal /
+# error plus post-load validation evidence.  Bounded (oldest request ids
+# are evicted first) and never persisted across restored containers — the
+# key never contains the restored identity and the state is dropped by
+# request-end cleanup.
+
+_VAE_ACTIVATION_STATE: dict[str, dict[str, Any]] = {}
+_VAE_ACTIVATION_LOCK: RLock = RLock()
+_VAE_ACTIVATION_MAX = 64
+
+
+def _vae_activation_new_state(request_id: str) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "future": None,
+        "owner": "sampling_end",
+        "trigger": "sampling_end",
+        "mode": _VAE_ACTIVATION_MODE,
+        "key": {},
+        "key_hash": "",
+        "status": "idle",
+        "terminal": False,
+        "cancelled": False,
+        "joined": False,
+        "fallback_elected": False,
+        "fallback_reason": "",
+        "reason": "",
+        "error": "",
+        "transfer_count": 0,
+        "vae": None,
+        "vae_object_id": "",
+        "vae_patcher_object_id": "",
+        "vae_resolution_source": "",
+        "vae_identity": "",
+        "sampling_end_mono_ns": 0,
+        "sampling_end_duration_ms": 0.0,
+        "submitted_mono_ns": 0,
+        "worker_started_mono_ns": 0,
+        "terminal_mono_ns": 0,
+        "join_demand_mono_ns": 0,
+        "join_completed_mono_ns": 0,
+        "join_wait_ms": 0.0,
+        "lane_wait_ms": 0.0,
+        "load_wall_ms": 0.0,
+        "gpu_free_bytes": None,
+        "gpu_required_bytes": None,
+        "safety_margin_bytes": None,
+        "gpu_allocated_before": None,
+        "gpu_allocated_after": None,
+        "gpu_allocated_delta_bytes": None,
+        "cache_present": False,
+        "current_device": "",
+        "load_device": "",
+        "compute_dtype": "",
+        "loaded_bytes": None,
+        "model_bytes": None,
+        "residency_status": "",
+        "diagnostics": {},
+    }
+
+
+def _vae_activation_get(request_id: str) -> dict[str, Any] | None:
+    """Return the VAE activation state dict for *request_id* (live ref)."""
+    if not request_id:
+        return None
+    with _VAE_ACTIVATION_LOCK:
+        return _VAE_ACTIVATION_STATE.get(request_id)
+
+
+def _vae_activation_trim() -> None:
+    """Evict the OLDEST request ids when the bound is exceeded."""
+    with _VAE_ACTIVATION_LOCK:
+        if len(_VAE_ACTIVATION_STATE) > _VAE_ACTIVATION_MAX:
+            _excess = len(_VAE_ACTIVATION_STATE) - _VAE_ACTIVATION_MAX
+            for _stale in list(_VAE_ACTIVATION_STATE.keys())[:_excess]:
+                _VAE_ACTIVATION_STATE.pop(_stale, None)
+
+
+# ── Identity key ───────────────────────────────────────────────────────
+
+
+def _build_vae_activation_key(
+    *,
+    mode: str,
+    model_key: ModelRestoreKey,
+    request_id: str,
+    vae: Any,
+    source: str,
+    sampling_end_mono_ns: int,
+) -> tuple[dict[str, Any], str]:
+    """Build the request-scoped identity key for the VAE early activation.
+
+    Covers the exact VAE object identity, the VAE patcher identity, the
+    requested vae identity, resolution source, compute dtype, and target
+    device.  Returns ``(components, key_hash)``.
+    """
+    _vae_id = str(id(vae)) if vae is not None else ""
+    _patcher_id = ""
+    _device = ""
+    _compute_dtype = ""
+    if vae is not None:
+        try:
+            _patcher = getattr(vae, "patcher", None)
+            if _patcher is not None:
+                _patcher_id = str(id(_patcher))
+                _dev = getattr(_patcher, "load_device", None)
+                if _dev is not None:
+                    _device = str(_dev)
+                _md = getattr(_patcher, "model_dtype", None)
+                _compute_dtype = str(_md()) if callable(_md) else ""
+            if not _compute_dtype:
+                _compute_dtype = str(getattr(vae, "vae_dtype", "") or "")
+        except Exception:
+            pass
+    if not _device:
+        try:
+            import comfy.model_management as _mm_vk
+            _device = str(_mm_vk.get_torch_device())
+        except Exception:
+            _device = ""
+    components = {
+        "mode": mode,
+        "request_id": request_id,
+        "vae_identity": str(model_key.vae_identity) if model_key is not None else "",
+        "vae_object_id": _vae_id,
+        "vae_patcher_object_id": _patcher_id,
+        "vae_resolution_source": source,
+        "compute_dtype": _compute_dtype,
+        "device": _device,
+        "sampling_end_mono_ns": int(sampling_end_mono_ns or 0),
+    }
+    key_hash = stable_hash(components)[:24]
+    return components, key_hash
+
+
+# ── Live ComfyUI model-management helpers for the VAE worker ──────────
+
+
+def _vae_patcher_loaded_bytes(patcher: Any) -> int:
+    """Return the VAE patcher's loaded (GPU) bytes via its ModelPatcher API."""
+    try:
+        _fn = getattr(patcher, "loaded_size", None)
+        if callable(_fn):
+            return int(_fn() or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _module_device(module: Any) -> str:
+    if module is None:
+        return ""
+    try:
+        for tensor in module.parameters():
+            return str(tensor.device)
+    except Exception:
+        pass
+    try:
+        for tensor in module.buffers():
+            return str(tensor.device)
+    except Exception:
+        pass
+    return ""
+
+
+def _probe_vae_activation_evidence(vae: Any, patcher: Any) -> dict[str, Any]:
+    """Read-only residency/cache/device/dtype evidence after the early VAE
+    load.  Never raises, never transfers or mutates tensors, never mutates
+    ComfyUI cache lists.  Reuses the real model-management cache/loaded-size
+    APIs only — no fabricated evidence.
+    """
+    evidence: dict[str, Any] = {
+        "vae_object_id": str(id(vae)) if vae is not None else "",
+        "vae_patcher_object_id": str(id(patcher)) if patcher is not None else "",
+        "cache_present": False,
+        "current_device": "",
+        "load_device": "",
+        "compute_dtype": "",
+        "loaded_bytes": None,
+        "model_bytes": None,
+        "residency_status": "unknown",
+    }
+    if patcher is not None:
+        try:
+            import comfy.model_management as _mm_vae
+            _loaded = getattr(_mm_vae, "current_loaded_models", None)
+            if _loaded is not None:
+                for _lm in _loaded:
+                    if getattr(_lm, "model", None) is patcher:
+                        evidence["cache_present"] = True
+                        break
+        except Exception:
+            pass
+        try:
+            _dev = getattr(patcher, "load_device", None)
+            if _dev is not None:
+                evidence["load_device"] = str(_dev)
+        except Exception:
+            pass
+        try:
+            _md = getattr(patcher, "model_dtype", None)
+            if callable(_md):
+                evidence["compute_dtype"] = str(_md() or "")
+        except Exception:
+            pass
+        if not evidence["compute_dtype"]:
+            evidence["compute_dtype"] = str(getattr(vae, "vae_dtype", "") or "")
+        try:
+            _fn = getattr(patcher, "loaded_size", None)
+            if callable(_fn):
+                evidence["loaded_bytes"] = int(_fn() or 0)
+        except Exception:
+            pass
+        try:
+            _fn = getattr(patcher, "model_size", None)
+            if callable(_fn):
+                evidence["model_bytes"] = int(_fn() or 0)
+        except Exception:
+            pass
+    _fs = getattr(vae, "first_stage_model", None)
+    evidence["current_device"] = _module_device(_fs)
+    if not evidence["current_device"]:
+        evidence["current_device"] = _module_device(getattr(patcher, "model", None))
+    _cur = str(evidence.get("current_device", "") or "").lower()
+    _lb = evidence.get("loaded_bytes")
+    _mb = evidence.get("model_bytes")
+    if _cur and "cpu" in _cur:
+        evidence["residency_status"] = "cpu_resident"
+    elif _lb is not None and _mb is not None and _lb > 0 and _lb >= _mb:
+        evidence["residency_status"] = "resident_full"
+    elif evidence.get("cache_present") and _cur:
+        evidence["residency_status"] = "resident"
+    elif _cur:
+        evidence["residency_status"] = "gpu_resident"
+    else:
+        evidence["residency_status"] = "unknown"
+    return evidence
+
+
+def _measure_vae_activation_lane_wait_ms(
+    trace: RuntimeTrace | None,
+    *,
+    request_id: str,
+    wait_start_ns: int | None,
+) -> float | None:
+    """Measure the truthful mutation-lane wait from existing lane trace events.
+
+    The existing GPU loader wrapper acquires the shared mutation lane INSIDE
+    ``load_models_gpu`` and emits ``gpu_lane_wait_start`` at the instant the
+    lane is actually acquired.  The worker's own load-start marker precedes
+    the load call, so the interval between the worker marker and the
+    wrapper's ``gpu_lane_wait_start`` (lane ``VAE``) is the truthful lane
+    wait.  Returns None when the wrapper never reported the lane acquisition
+    — the value is never fabricated.  The worker never acquires the lane
+    itself, so this cannot deadlock the existing GPU wrapper.
+    """
+    if trace is None or not wait_start_ns:
+        return None
+    _wait_ns: int | None = None
+    for _event in trace.events:
+        if _event.name != "gpu_lane_wait_start":
+            continue
+        _meta = _event.metadata or {}
+        if str(_meta.get("lane", "")) != "VAE":
+            continue
+        if _event.monotonic_ns < wait_start_ns:
+            continue
+        _wait_ns = _event.monotonic_ns - wait_start_ns
+        break
+    if _wait_ns is None or _wait_ns < 0:
+        return None
+    return round(_wait_ns / 1_000_000, 3)
+
+
+# ── Terminal / fallback helpers ────────────────────────────────────────
+
+
+def _vae_activation_terminal(
+    state: dict[str, Any],
+    trace: RuntimeTrace | None,
+    request_id: str,
+    *,
+    status: str,
+    reason: str,
+    error: str = "",
+    transfer_count: int = 0,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Establish the terminal VAE activation state exactly once and emit the
+    concise ``event=terminal`` line (with the requested status)."""
+    with _VAE_ACTIVATION_LOCK:
+        _first_terminal = not state.get("terminal", False)
+        if not state.get("terminal", False):
+            state["terminal"] = True
+            state["status"] = status
+            state["reason"] = reason
+            if error:
+                state["error"] = error
+            if transfer_count:
+                state["transfer_count"] = transfer_count
+            state["terminal_mono_ns"] = time.monotonic_ns()
+        if diagnostics:
+            _diag = state.setdefault("diagnostics", {})
+            for _k, _v in dict(diagnostics).items():
+                if not isinstance(_v, (bytes, bytearray)):
+                    _diag[_k] = _v
+    if not _first_terminal:
+        return {
+            "status": state.get("status", status),
+            "reason": state.get("reason", reason),
+            "terminal": True,
+        }
+    if trace is not None:
+        trace.emit(_EVENT_VAE_EA_TERMINAL, phase="execution", metadata={
+            "mode": state.get("mode", ""),
+            "trigger": state.get("trigger", ""),
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+            "status": state.get("status", status),
+            "reason": state.get("reason", reason),
+            "error": state.get("error", "") or None,
+            "transfer_count": state.get("transfer_count", 0),
+            "vae_object_id": state.get("vae_object_id", ""),
+            "vae_patcher_object_id": state.get("vae_patcher_object_id", ""),
+            "vae_resolution_source": state.get("vae_resolution_source", ""),
+            "cache_present": bool(state.get("cache_present", False)),
+            "residency_status": state.get("residency_status", ""),
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+    print(
+        f"[v2.vae_early_activation] event=terminal "
+        f"request_id={request_id or 'absent'} mode={state.get('mode', '')} "
+        f"key_hash={state.get('key_hash', '')} status={state.get('status', status)} "
+        f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'} "
+        f"transfer_count={state.get('transfer_count', 0)} "
+        f"source={state.get('vae_resolution_source', '') or 'absent'}",
+        flush=True,
+    )
+    return {
+        "status": state.get("status", status),
+        "reason": state.get("reason", reason),
+        "terminal": True,
+    }
+
+
+def _vae_activation_fallback(
+    state: dict[str, Any],
+    trace: RuntimeTrace | None,
+    request_id: str,
+    *,
+    reason: str,
+    error: str = "",
+    join_wait_ms: float = 0.0,
+) -> dict[str, Any]:
+    """Record the unchanged late fallback exactly once (atomic, never
+    overwritten).  Returns an outcome dict with ``valid=False``."""
+    with _VAE_ACTIVATION_LOCK:
+        _elected = bool(state.get("fallback_elected", False))
+        if not _elected:
+            state["fallback_elected"] = True
+            state["fallback_reason"] = reason
+            state["terminal"] = True
+            if error:
+                state["error"] = error
+    if trace is not None and not _elected:
+        trace.emit(_EVENT_VAE_EA_FALLBACK, phase="execution", metadata={
+            "mode": state.get("mode", ""),
+            "trigger": state.get("trigger", ""),
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+            "status": state.get("status", "fallback"),
+            "reason": reason,
+            "error": error or None,
+            "join_wait_ms": round(float(join_wait_ms), 3),
+        })
+    return {"scheduled": True, "status": state.get("status", "fallback"),
+            "terminal": True, "valid": False, "reason": reason,
+            "join_wait_ms": round(float(join_wait_ms), 3), "vae": None}
+
+
+# ── Early VAE activation worker ────────────────────────────────────────
+
+
+def _run_early_vae_activation(
+    bridge: "V2LoaderBridge",
+    *,
+    prep: RestorePreparation,
+    trace: RuntimeTrace | None,
+    request_id: str,
+    state: dict[str, Any],
+    vae: Any,
+    source: str,
+    key_hash: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Early VAE GPU/cache activation worker (coordinator pool).
+
+    Runs after the authoritative sampling_end boundary.  Uses the exact
+    adapter-resolved VAE object and the original ComfyUI
+    ``load_models_gpu`` path — the existing GPU loader wrapper acquires the
+    shared mutation lane as owner ``VAE`` around the actual load, so the
+    worker can never overlap active sampling.  Emits the concise
+    ``[v2.vae_early_activation] event=load_start`` immediately before the
+    GPU/cache mutation and ``event=terminal status=ready`` only after
+    successful validation (identity / target device / dtype / cache
+    membership / residency).  Never executes VAE decode.  No ContextVar
+    assumptions: request/trace/bridge are carried explicitly.
+    """
+    with _VAE_ACTIVATION_LOCK:
+        state["status"] = "running"
+        state["worker_started_mono_ns"] = time.monotonic_ns()
+    if vae is None:
+        return _vae_activation_terminal(
+            state, trace, request_id, status="skipped", reason="no_vae_object"
+        )
+    state["vae_object_id"] = str(id(vae))
+    state["vae_resolution_source"] = source
+    _patcher = getattr(vae, "patcher", None)
+    state["vae_patcher_object_id"] = str(id(_patcher)) if _patcher is not None else ""
+    if _patcher is None:
+        return _vae_activation_terminal(
+            state, trace, request_id, status="skipped", reason="no_vae_patcher"
+        )
+    # Reject identity drift between scheduling and the worker (the key was
+    # built with the REAL resolved object at the sampling_end boundary).
+    _expected_id = str((state.get("key") or {}).get("vae_object_id", "") or "")
+    if _expected_id and _expected_id != str(id(vae)):
+        return _vae_activation_terminal(
+            state, trace, request_id, status="invalid", reason="identity_changed"
+        )
+    # Request cleanup may have finalized while we queued.
+    if state.get("cancelled") or state.get("terminal"):
+        return _vae_activation_terminal(
+            state, trace, request_id, status="cancelled", reason="request_finalized"
+        )
+    # VRAM pre-check (outside the lane).
+    _vram = _check_early_activation_vram([_patcher])
+    state["gpu_free_bytes"] = _vram.get("free_bytes")
+    state["gpu_required_bytes"] = _vram.get("required_bytes")
+    state["safety_margin_bytes"] = _vram.get("margin_bytes")
+    if not _vram.get("ok"):
+        return _vae_activation_terminal(
+            state, trace, request_id, status="skipped",
+            reason=str(_vram.get("reason", "vram_insufficient")),
+            diagnostics=_vram,
+        )
+    # Re-check cancellation IMMEDIATELY before the GPU mutation.
+    if state.get("cancelled") or state.get("terminal"):
+        return _vae_activation_terminal(
+            state, trace, request_id, status="cancelled", reason="request_finalized"
+        )
+    # ── Original ComfyUI GPU/cache load path (lane acquired by the
+    # existing wrapper as owner "VAE" around the load only). ──
+    _loaded_before = _vae_patcher_loaded_bytes(_patcher)
+    _gpu_alloc_before = _gpu_allocated_bytes()
+    _load_start = _capture_phase_counters()
+    _lane_wait_start_ns = time.monotonic_ns()
+    if trace is not None:
+        trace.emit(_EVENT_VAE_EA_LOAD_START, phase="execution", metadata={
+            "mode": mode,
+            "trigger": state.get("trigger", ""),
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+            "source": source,
+        })
+    print(
+        f"[v2.vae_early_activation] event=load_start "
+        f"request_id={request_id or 'absent'} mode={mode} "
+        f"key_hash={state.get('key_hash', '')} source={source or 'absent'} "
+        f"vae_object_id={state.get('vae_object_id', '')} "
+        f"vae_patcher_object_id={state.get('vae_patcher_object_id', '')}",
+        flush=True,
+    )
+    try:
+        _mm_load_models_gpu([_patcher])
+    except Exception as exc:
+        return _vae_activation_terminal(
+            state, trace, request_id, status="failed",
+            reason="load_failed", error=str(exc)[:200],
+        )
+    _load_end = _capture_phase_counters()
+    _deltas = _phase_counter_deltas(_load_start, _load_end)
+    state["load_wall_ms"] = _deltas.get("wall_ms", 0.0) or 0.0
+    state["transfer_count"] = 1 if _vae_patcher_loaded_bytes(_patcher) > _loaded_before else 0
+    _gpu_alloc_after = _gpu_allocated_bytes()
+    state["gpu_allocated_before"] = _gpu_alloc_before
+    state["gpu_allocated_after"] = _gpu_alloc_after
+    if _gpu_alloc_before is not None and _gpu_alloc_after is not None:
+        state["gpu_allocated_delta_bytes"] = _gpu_alloc_after - _gpu_alloc_before
+    state["lane_wait_ms"] = _measure_vae_activation_lane_wait_ms(
+        trace, request_id=request_id, wait_start_ns=_lane_wait_start_ns,
+    ) or 0.0
+    # ── Terminal validation (identity/device/dtype/cache/residency) ──
+    _evidence = _probe_vae_activation_evidence(vae, _patcher)
+    state["cache_present"] = bool(_evidence.get("cache_present", False))
+    state["current_device"] = str(_evidence.get("current_device", "") or "")
+    state["load_device"] = str(_evidence.get("load_device", "") or "")
+    state["compute_dtype"] = str(_evidence.get("compute_dtype", "") or "")
+    state["loaded_bytes"] = _evidence.get("loaded_bytes")
+    state["model_bytes"] = _evidence.get("model_bytes")
+    state["residency_status"] = str(_evidence.get("residency_status", "") or "")
+    if state["residency_status"] == "cpu_resident" or not state["cache_present"]:
+        return _vae_activation_terminal(
+            state, trace, request_id, status="invalid",
+            reason="residency_not_proven", diagnostics=_evidence,
+        )
+    return _vae_activation_terminal(
+        state, trace, request_id, status="ready", reason="ok",
+        transfer_count=state["transfer_count"], diagnostics=_evidence,
+    )
+
+
+# ── Public API ─────────────────────────────────────────────────────────
+
+
+def release_sampler_mutation_lane_at_sampling_end(
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+) -> bool:
+    """Release the existing sampler owner after the authoritative boundary."""
+    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+        return False
+    lane = _get_mutation_lane()
+    if lane.owner != "sampler":
+        return False
+    lane.release("sampler")
+    if trace is not None:
+        trace.emit("sampler_lane_released_at_sampling_end", phase="execution", metadata={
+            "request_id": request_id or str(trace.request_id),
+        })
+    return True
+
+
+def acquire_sampler_mutation_lane_at_sampling_start() -> None:
+    """Reacquire the shared sampler owner for later sampler invocations."""
+    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+        return
+    lane = _get_mutation_lane()
+    if lane.owner != "sampler":
+        lane.acquire("sampler")
+
+
+def schedule_vae_early_activation_at_sampling_end(
+    bridge: "V2LoaderBridge",
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+    sampler_node_id: str = "",
+    sampler_node_class: str = "",
+    duration_ms: float = 0.0,
+) -> bool:
+    """Schedule the sampling_end VAE early activation exactly once.
+
+    Hooked from the real SAMPLER_SAMPLE sampling_end boundary
+    (``runtime_executor._build_sampling_wrapper``) — never from
+    progress/milestones, restore, or active sampling.  Ordering:
+      1. authoritative ``sampling_end`` trace/log (already emitted by the
+         wrapper BEFORE this call);
+      2. release the existing ``sampler`` mutation-lane ownership so the
+         VAE worker's lane-acquiring load can proceed after sampling
+         (idempotent — the outer execute finally release stays harmless);
+      3. emit exactly one concise
+         ``[v2.vae_early_activation] event=scheduled trigger=sampling_end``
+         line;
+      4. submit the VAE activation future through the existing coordinator
+         pool (single-flight via ``RestorePreparation.vae_future``).
+    In ``late`` mode (default) this is a no-op.  Any resolution failure
+    falls back silently to the unchanged original graph loader path.
+    Returns True when scheduled (or already scheduled).
+    """
+    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+        return False
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    if not _request_id:
+        return False
+    release_sampler_mutation_lane_at_sampling_end(
+        trace=trace,
+        request_id=_request_id,
+    )
+    if bridge is None:
+        return False
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None or not getattr(model_key, "vae_identity", ""):
+        return False
+    # Idempotent: a scheduled future for this request is never rescheduled.
+    with _VAE_ACTIVATION_LOCK:
+        _existing = _VAE_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None:
+            return bool(_existing.get("future") is not None)
+        _state = _vae_activation_new_state(_request_id)
+        _state["status"] = "resolving"
+        _state["sampling_end_mono_ns"] = time.monotonic_ns()
+        _state["sampling_end_duration_ms"] = round(float(duration_ms or 0.0), 3)
+        _VAE_ACTIVATION_STATE[_request_id] = _state
+    _sampling_end_mono_ns = time.monotonic_ns()
+    # Resolve the exact VAE object via the bridge adapter.
+    try:
+        _vae, _source = bridge.resolve_vae_object(trace=trace)
+    except Exception as exc:
+        _vae_activation_terminal(
+            _state, trace, _request_id, status="failed",
+            reason="resolution_failed", error=str(exc)[:200],
+        )
+        return False
+    if _vae is None:
+        if trace is not None:
+            trace.emit(_EVENT_VAE_EA_SKIPPED, phase="execution", metadata={
+                "mode": _VAE_ACTIVATION_MODE,
+                "trigger": "sampling_end",
+                "request_id": _request_id,
+                "reason": "no_vae_resolution",
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+            })
+        _vae_activation_terminal(
+            _state, trace, _request_id, status="skipped",
+            reason="no_vae_resolution",
+        )
+        return False
+    _key_components, _key_hash = _build_vae_activation_key(
+        mode=_VAE_ACTIVATION_MODE,
+        model_key=model_key,
+        request_id=_request_id,
+        vae=_vae,
+        source=_source,
+        sampling_end_mono_ns=_sampling_end_mono_ns,
+    )
+    return _vae_activation_submit(
+        bridge,
+        request_id=_request_id, trace=trace, prep=prep, model_key=model_key,
+        vae=_vae, source=_source,
+        key_components=_key_components, key_hash=_key_hash,
+        trigger="sampling_end",
+        sampling_end_duration_ms=duration_ms,
+    )
+
+
+def _vae_activation_submit(
+    bridge: "V2LoaderBridge",
+    *,
+    request_id: str,
+    trace: RuntimeTrace | None,
+    prep: RestorePreparation,
+    model_key: ModelRestoreKey,
+    vae: Any,
+    source: str,
+    key_components: dict[str, Any],
+    key_hash: str,
+    trigger: str = "sampling_end",
+    sampling_end_duration_ms: float = 0.0,
+) -> bool:
+    """Shared coordinator/single-flight scheduling core for the VAE early
+    activation.
+
+    Atomically (under the existing activation lock) creates/finds the
+    request state, emits the concise scheduled line, and submits the VAE
+    activation worker once through ``bridge.coordinator.schedule_vae_activation``
+    (single-flight via ``RestorePreparation.vae_future``).  The scheduled
+    line is emitted WHILE HOLDING the lock, so it is guaranteed to precede
+    any worker-emitted load-start marker (monotonic-order invariant).
+    Returns True when scheduled (or already scheduled), False on submit
+    failure.
+    """
+    with _VAE_ACTIVATION_LOCK:
+        _state = _VAE_ACTIVATION_STATE.get(request_id)
+        if _state is not None and _state.get("future") is not None:
+            return True
+        if _state is None:
+            _state = _vae_activation_new_state(request_id)
+            _VAE_ACTIVATION_STATE[request_id] = _state
+        _state["owner"] = trigger
+        _state["trigger"] = trigger
+        _state["mode"] = _VAE_ACTIVATION_MODE
+        _state["key"] = key_components
+        _state["key_hash"] = key_hash
+        _state["vae"] = vae
+        _state["vae_object_id"] = key_components.get("vae_object_id", "")
+        _state["vae_patcher_object_id"] = key_components.get("vae_patcher_object_id", "")
+        _state["vae_resolution_source"] = source
+        _state["vae_identity"] = key_components.get("vae_identity", "")
+        _state["sampling_end_mono_ns"] = int(key_components.get("sampling_end_mono_ns", 0) or 0)
+        _state["sampling_end_duration_ms"] = round(float(sampling_end_duration_ms or 0.0), 3)
+        _state["status"] = "scheduled"
+        _state["submitted_mono_ns"] = time.monotonic_ns()
+        # Emit the concise scheduled line BEFORE submitting so the worker's
+        # load-start (guarded by the same lock) can never precede it.
+        if trace is not None:
+            trace.emit(_EVENT_VAE_EA_SCHEDULED, phase="execution", metadata={
+                "mode": _VAE_ACTIVATION_MODE,
+                "trigger": trigger,
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "source": source,
+                "vae_object_id": key_components.get("vae_object_id", ""),
+                "vae_patcher_object_id": key_components.get("vae_patcher_object_id", ""),
+                "vae_identity_hash": stable_hash(str(model_key.vae_identity))[:16] if model_key is not None else "",
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+            })
+        print(
+            f"[v2.vae_early_activation] event=scheduled "
+            f"request_id={request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
+            f"trigger={trigger} key_hash={key_hash} source={source or 'absent'} "
+            f"vae_identity_hash={stable_hash(str(model_key.vae_identity))[:16] if model_key is not None else ''} "
+            f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+            f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+            flush=True,
+        )
+
+        def _worker() -> Any:
+            return _run_early_vae_activation(
+                bridge,
+                prep=prep,
+                trace=trace,
+                request_id=request_id,
+                state=_state,
+                vae=vae,
+                source=source,
+                key_hash=key_hash,
+                mode=_VAE_ACTIVATION_MODE,
+            )
+
+        try:
+            _future = bridge.coordinator.schedule_vae_activation(
+                _worker, prep, trace=trace,
+            )
+        except Exception as exc:
+            _state["status"] = "failed"
+            _state["terminal"] = True
+            _state["reason"] = "submit_failed"
+            _state["error"] = str(exc)[:200]
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+            print(
+                f"[v2.vae_early_activation] event=terminal "
+                f"request_id={request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
+                f"status=failed reason=submit_failed error={str(exc)[:200]}",
+                flush=True,
+            )
+            return False
+        if _future is None:
+            _state["status"] = "failed"
+            _state["terminal"] = True
+            _state["reason"] = "no_active_preparation"
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+            return False
+        _state["future"] = _future
+    _vae_activation_trim()
+    return True
+
+
+def _validate_vae_early_activation(
+    state: dict[str, Any],
+    *,
+    demanded_vae: Any = None,
+) -> tuple[bool, str, Any]:
+    """Validate the early-activated VAE at graph demand.
+
+    Rechecks identity (exact VAE object id), cache membership, residency,
+    target device, and compute dtype against the values recorded by the
+    worker's post-load evidence.  Never raises; returns ``(valid, reason,
+    vae)``.
+    """
+    _vae = state.get("vae")
+    if _vae is None:
+        return False, "vae_missing", None
+    _key = state.get("key") or {}
+    _expected_id = _key.get("vae_object_id", "")
+    if _expected_id and _expected_id != str(id(_vae)):
+        return False, "vae_identity_mismatch", None
+    if demanded_vae is not None and demanded_vae is not _vae:
+        return False, "graph_vae_identity_mismatch", None
+    if not state.get("cache_present", False):
+        return False, "cache_missing", None
+    if state.get("residency_status") in {"", "unknown", "cpu_resident"}:
+        return False, "residency_unproven", None
+    _device = _key.get("device", "")
+    _cur = str(state.get("current_device", "") or "")
+    if not _device or not _cur:
+        return False, "device_unproven", None
+    if str(_cur) != str(_device):
+        return False, "device_mismatch", None
+    _expected_dtype = _key.get("compute_dtype", "")
+    _actual = str(state.get("compute_dtype", "") or "")
+    if not _expected_dtype or not _actual:
+        return False, "dtype_unproven", None
+    if _actual != _expected_dtype:
+        return False, "dtype_mismatch", None
+    return True, "ok", _vae
+
+
+def finalize_vae_early_activation(
+    request_id: str,
+    *,
+    trace: RuntimeTrace | None = None,
+) -> dict[str, Any] | None:
+    """Request-end cleanup + reconciliation.
+
+    Marks any still-pending VAE activation cancelled (the worker observes
+    this before its GPU mutation), pops the request state, and emits a
+    concise reconciliation record.  Never leaves an activation future or
+    model mutation pending — the coordinator pool shutdown in
+    ``close_workers`` terminates any in-flight worker.
+    """
+    if not request_id:
+        return None
+    with _VAE_ACTIVATION_LOCK:
+        _state = _VAE_ACTIVATION_STATE.pop(request_id, None)
+    if _state is None:
+        return None
+    _future = _state.get("future")
+    with _VAE_ACTIVATION_LOCK:
+        if not _state.get("terminal", False):
+            _state["status"] = "cancelled"
+            _state["cancelled"] = True
+            _state["terminal"] = True
+            _state["reason"] = "request_finalized"
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+        if _future is not None and not _future.done():
+            try:
+                _future.cancel()
+            except Exception:
+                pass
+    if trace is not None:
+        trace.emit(_EVENT_VAE_EA_RECONCILIATION, phase="execution", metadata={
+            "request_id": request_id,
+            "mode": _state.get("mode", ""),
+            "trigger": _state.get("trigger", ""),
+            "key_hash": _state.get("key_hash", ""),
+            "status": _state.get("status", ""),
+            "terminal": bool(_state.get("terminal", False)),
+            "join_wait_ms": _state.get("join_wait_ms", 0.0),
+            "lane_wait_ms": _state.get("lane_wait_ms", 0.0),
+            "load_wall_ms": _state.get("load_wall_ms", 0.0),
+            "transfer_count": _state.get("transfer_count", 0),
+            "cache_present": bool(_state.get("cache_present", False)),
+            "residency_status": _state.get("residency_status", ""),
+            "vae_object_id": _state.get("vae_object_id", ""),
+            "vae_resolution_source": _state.get("vae_resolution_source", ""),
+            "sampling_end_mono_ns": _state.get("sampling_end_mono_ns", 0),
+            "sampling_end_duration_ms": _state.get("sampling_end_duration_ms", 0.0),
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+    return _state
 
 
 # ── Backward-compatible aliases for test imports ─────────────────────
