@@ -2035,6 +2035,16 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_PAGE_READINESS_MODE": os.environ.get(
             "COMFYMODAL_V2_PAGE_READINESS_MODE", ""
         ),
+        # Phase 1A retained-UNET activation candidate — default "late" so
+        # Phase 0 behavior is unchanged until explicitly set to
+        # "clip_encode_start".  The exact raw value is preserved (no
+        # normalization here) so model_preload._resolve_unet_activation_mode
+        # remains the single canonical parser; it never activates the
+        # candidate for unknown/empty values, so this cannot turn on by
+        # default.
+        "COMFYMODAL_V2_UNET_ACTIVATION_MODE": os.environ.get(
+            "COMFYMODAL_V2_UNET_ACTIVATION_MODE", "late"
+        ),
         "COMFYMODAL_PRELOAD_MODE": os.environ.get(
             "COMFYMODAL_PRELOAD_MODE", "clip_only"
         ),
@@ -7660,6 +7670,22 @@ class ModalRuntimeEntrypoint:
                         )
                         if _is_production_profile():
                             _request_bound_to_production_snapshot = True
+                            # ── Production CPU-snapshot request marker ──
+                            # Set HERE (before execution-phase prefill is
+                            # scheduled) so the Phase 1A early-activation
+                            # eligibility gate can prove the request is bound
+                            # to the production CPU snapshot at the real
+                            # prefill boundary.  Idempotent; unmarked in the
+                            # request finally block below.
+                            try:
+                                from comfymodal_runtime.model_preload import (
+                                    mark_production_cpu_snapshot_request,
+                                )
+                                mark_production_cpu_snapshot_request(
+                                    str(context.request_id)
+                                )
+                            except Exception:
+                                pass
                         if _request_time_activation_required:
                             # Request-time activation completed: the bridge
                             # serves the exact retained objects.  Mark the
@@ -9294,19 +9320,14 @@ class ModalRuntimeEntrypoint:
             # no-op when no sampler ever ran).
             _watchdog_request_id = str(context.request_id)
             # ── Production CPU-snapshot request marker ──
-            # Set only for the production snapshot (non-bypass) bind.  Gates
-            # fail-closed CPU-residency enforcement in the sampler wrapper to
-            # the exact retained snapshot/bridge object being sampled; all
-            # other paths stay diagnostic.  Unmarked in the finally below so
-            # the request key is always cleaned up.
-            _production_snapshot_marked = False
-            if request_bound_to_production_snapshot:
-                try:
-                    from comfymodal_runtime.model_preload import mark_production_cpu_snapshot_request
-                    mark_production_cpu_snapshot_request(_watchdog_request_id)
-                    _production_snapshot_marked = True
-                except Exception:
-                    _production_snapshot_marked = False
+            # The marker is ALREADY set at the request-time snapshot binding
+            # (before the execution-phase prefill is scheduled) so the Phase
+            # 1A early-activation eligibility gate can prove the CPU-snapshot
+            # binding at the real prefill boundary.  Nothing is re-marked
+            # here: only production non-bypass requests
+            # (request_bound_to_production_snapshot) are unmarked in the
+            # finally below; false/non-production requests are never marked.
+            _production_snapshot_marked = bool(request_bound_to_production_snapshot)
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -9334,6 +9355,15 @@ class ModalRuntimeEntrypoint:
                 try:
                     from comfymodal_runtime.model_preload import _unet_page_readiness_clear
                     _unet_page_readiness_clear(_watchdog_request_id)
+                except Exception:
+                    pass
+                # Phase 1A: request-end early-UNET-activation cleanup and
+                # reconciliation.  No activation future or model mutation may
+                # outlive the request (pending work is marked cancelled; the
+                # coordinator pool shutdown in close_workers terminates it).
+                try:
+                    from comfymodal_runtime.model_preload import finalize_unet_early_activation
+                    finalize_unet_early_activation(_watchdog_request_id, trace=trace)
                 except Exception:
                     pass
                 if _production_snapshot_marked:

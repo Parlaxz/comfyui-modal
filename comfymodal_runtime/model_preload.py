@@ -7094,8 +7094,28 @@ class V2LoaderBridge:
             # load, sampler wait, or residual.
             _run_clip_page_readiness(clip, trace=trace, request_id=_request_id)
 
+            # ── Phase 1A candidate: early retained-UNET activation ──
+            # Hooked at the established real execution-prefill CLIP callback
+            # boundary — immediately before the actual prefill encode (never
+            # request entry / tokenization / graph fallback / dummy encode).
+            # Mode "early" schedules the retained UNET GPU activation once
+            # through the coordinator pool; "late" (default) is a no-op that
+            # preserves Phase 0 behavior.
+            clip_encode_start(
+                self,
+                trace=trace,
+                request_id=_request_id,
+                clip=clip,
+                encode_entries=filtered,
+            )
+
             # ── Phase B: actual encode (wall / thread / process CPU) ──
             _encode_start = _capture_phase_counters()
+            # Record the ACTUAL encode start immediately after the counter
+            # snapshot and immediately before the encode loop so the
+            # activation waterfall reconciles against the real encode start
+            # (never the scheduling/submit time).
+            record_clip_encode_start(_request_id, _encode_start)
             if trace:
                 trace.emit(_EVENT_ENCODE_START, phase="execution",
                            metadata={"counters": _encode_start,
@@ -7130,6 +7150,7 @@ class V2LoaderBridge:
             # ``clip_prefill_reconciliation`` ahead of the encode-end/completed
             # boundaries (which would yield a spuriously incomplete record).
             _encode_end = _capture_phase_counters()
+            record_clip_encode_end(_request_id, _encode_start, _encode_end)
             if trace:
                 trace.emit(_EVENT_ENCODE_END, phase="execution",
                            metadata={"counters": _encode_end,
@@ -7682,6 +7703,64 @@ class V2LoaderBridge:
             skip_loader_class=True,
         )
 
+    def _join_unet_early_activation(
+        self,
+        unet: Any,
+        *,
+        trace: RuntimeTrace | None = None,
+    ) -> dict[str, Any]:
+        """Join the request's early UNET activation future at graph/sampler
+        demand.
+
+        Emits ``unet_early_activation_graph_demand`` then
+        ``graph_join_start`` / ``graph_join_end`` around the join, which
+        runs OUTSIDE the mutation lane.  A terminal non-ready outcome
+        elects the unchanged late fallback exactly once inside
+        ``join_unet_early_activation``."""
+        _active = _ACTIVE_REQUEST_TRACE.get()
+        _request_id = str(_active.request_id) if _active is not None else ""
+        if not _request_id and trace is not None:
+            _request_id = str(trace.request_id)
+        if not _request_id and self._trace is not None:
+            _request_id = str(self._trace.request_id)
+        _rt = trace or self._trace
+        _mode = unet_activation_mode()
+        if _mode != _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
+            # Late mode (the default) preserves Phase 0 exactly: the UNET
+            # graph consumer must not emit any unet_early_activation_*
+            # graph-demand/join markers, perform join helper work, create
+            # state, or add a graph wait.  Return immediately BEFORE any
+            # marker is emitted.
+            return {"scheduled": False, "status": "mode_late", "terminal": False,
+                    "valid": False, "reason": "", "join_wait_ms": 0.0}
+        if _rt is not None:
+            _rt.emit(_EVENT_UNET_EA_GRAPH_DEMAND, phase="execution", metadata={
+                "mode": _mode,
+                "request_id": _request_id,
+                "sampler_patcher_object_id": str(id(unet)) if unet is not None else "",
+            })
+            _rt.emit(_EVENT_UNET_EA_GRAPH_JOIN_START, phase="execution", metadata={
+                "mode": _mode,
+                "request_id": _request_id,
+                "key_hash": "",
+            })
+        _outcome = join_unet_early_activation(
+            self, unet=unet, trace=_rt, request_id=_request_id,
+        )
+        if _rt is not None:
+            _state = _unet_activation_get(_request_id)
+            _rt.emit(_EVENT_UNET_EA_GRAPH_JOIN_END, phase="execution", metadata={
+                "mode": _mode,
+                "request_id": _request_id,
+                "key_hash": (_state or {}).get("key_hash", ""),
+                "status": _outcome.get("status", ""),
+                "valid": bool(_outcome.get("valid", False)),
+                "terminal": bool(_outcome.get("terminal", False)),
+                "join_wait_ms": _outcome.get("join_wait_ms", 0.0),
+                "sampler_patcher_object_id": str(id(unet)) if unet is not None else "",
+            })
+        return _outcome
+
     def _consume_model_impl(
         self,
         *,
@@ -7822,6 +7901,21 @@ class V2LoaderBridge:
                     "lane": lane, "status": "unavailable",
                 })
             return _LOADER_MISS
+        # ── Phase 1A candidate: join the early retained-UNET activation at
+        # graph/sampler demand (OUTSIDE the mutation lane) and validate
+        # diffusion identity / residency / cache / dtype / device.  Phase 0
+        # control flow is preserved: the retained UNET is still returned and
+        # the original sampler load path continues as a cache validation.  A
+        # non-ready terminal outcome elects the unchanged late fallback
+        # exactly once (atomic, never overwritten).  Late mode is gated here
+        # so the UNET graph consumer never emits early-activation markers or
+        # performs join work (the helper double-checks the mode too).
+        if (
+            lane == "UNET"
+            and result is not None
+            and unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_ENCODE_START
+        ):
+            self._join_unet_early_activation(result, trace=self._trace)
         if self._trace:
             self._trace.emit(f"graph_{diagnostics_prefix}_wait_end", phase="execution",
                              metadata={"status": "ok"})
@@ -8067,6 +8161,1632 @@ class V2LoaderBridge:
                     "error": str(exc)[:200],
                 })
             raise
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1A candidate: early retained-UNET activation
+# (COMFYMODAL_V2_UNET_ACTIVATION_MODE)
+# ═══════════════════════════════════════════════════════════════════════
+# Mode "late" (default) preserves Phase 0 behavior exactly: the retained
+# UNET is returned at graph/sampler demand and loaded on the critical path.
+# The ONLY allowed opt-in value is exactly "clip_encode_start" — the
+# historical "early" spelling and any other value normalize to "late" so no
+# candidate path can activate for them.  In "clip_encode_start" mode the
+# retained UNET GPU activation is scheduled once, through the existing
+# coordinator pool, at the real execution-prefill CLIP callback boundary
+# (immediately before the actual prefill encode) AFTER every eligibility
+# condition is proven (execution-prefill caller, mode, production
+# CPU-snapshot request marker, exact retained snapshot→bridge identity
+# chain, completed retained-UNET future, no same-request/key future, live
+# CUDA validity, and safe VRAM for the exact active CLIP + retained UNET).
+# The early load overlaps the CLIP encode; the graph demand then joins the
+# same future outside the mutation lane and the original sampler load path
+# continues as a cache validation.  Any skip/failure/cancellation/invalid
+# outcome is made terminal before exactly one caller elects the unchanged
+# late fallback.
+
+_EVENT_UNET_EA_MODE = "unet_early_activation_mode"
+_EVENT_UNET_EA_ELIGIBLE = "unet_early_activation_eligible"
+_EVENT_UNET_EA_SCHEDULED = "unet_early_activation_scheduled"
+_EVENT_UNET_EA_WORKER_START = "unet_early_activation_worker_start"
+_EVENT_UNET_EA_LANE_WAIT_START = "unet_early_activation_lane_wait_start"
+_EVENT_UNET_EA_LANE_ACQUIRED = "unet_early_activation_lane_acquired"
+_EVENT_UNET_EA_LOAD_START = "unet_early_activation_load_start"
+_EVENT_UNET_EA_LOAD_END = "unet_early_activation_load_end"
+_EVENT_UNET_EA_COMPLETED = "unet_early_activation_completed"
+_EVENT_UNET_EA_SKIPPED = "unet_early_activation_skipped"
+_EVENT_UNET_EA_FAILED = "unet_early_activation_failed"
+_EVENT_UNET_EA_INVALID = "unet_early_activation_invalid"
+_EVENT_UNET_EA_CANCELLED = "unet_early_activation_cancelled"
+_EVENT_UNET_EA_GRAPH_DEMAND = "unet_early_activation_graph_demand"
+_EVENT_UNET_EA_GRAPH_JOIN_START = "unet_early_activation_graph_join_start"
+_EVENT_UNET_EA_GRAPH_JOIN_END = "unet_early_activation_graph_join_end"
+_EVENT_UNET_EA_CONSUMED = "unet_early_activation_consumed"
+_EVENT_UNET_EA_TERMINAL = "unet_early_activation_terminal"
+_EVENT_UNET_EA_FALLBACK = "unet_early_activation_fallback"
+_EVENT_UNET_EA_RECONCILIATION = "unet_early_activation_reconciliation"
+
+_UNET_ACTIVATION_MODE_LATE = "late"
+_UNET_ACTIVATION_MODE_CLIP_ENCODE_START = "clip_encode_start"
+_UNET_ACTIVATION_MODE_VALID = frozenset(
+    {_UNET_ACTIVATION_MODE_LATE, _UNET_ACTIVATION_MODE_CLIP_ENCODE_START}
+)
+
+# Bounded safety margin for the early-activation VRAM pre-check.  The margin
+# is never allowed to leave the [min, max] band (never grows with model size).
+_EARLY_ACTIVATION_MARGIN_MIN_BYTES = 256 * 1024 * 1024
+_EARLY_ACTIVATION_MARGIN_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_EARLY_ACTIVATION_MARGIN_RATIO = 0.1
+
+
+def _resolve_unet_activation_mode(raw: str) -> str:
+    """Normalize a ``COMFYMODAL_V2_UNET_ACTIVATION_MODE`` value.
+
+    The ONLY allowed opt-in value is exactly ``"clip_encode_start"``.
+    ``"late"`` is the default.  Any other value — including the historical
+    ``"early"`` spelling — and the default fall back to ``"late"`` so Phase 0
+    behavior is never altered by a typo or an unknown value, and no candidate
+    path can activate for ``early``.
+    """
+    value = str(raw or "").strip().lower()
+    if value == _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
+        return _UNET_ACTIVATION_MODE_CLIP_ENCODE_START
+    if value == _UNET_ACTIVATION_MODE_LATE:
+        return _UNET_ACTIVATION_MODE_LATE
+    return _UNET_ACTIVATION_MODE_LATE
+
+
+_UNET_ACTIVATION_MODE: str = _resolve_unet_activation_mode(
+    os.environ.get("COMFYMODAL_V2_UNET_ACTIVATION_MODE", _UNET_ACTIVATION_MODE_LATE)
+)
+_UNET_ACTIVATION_MODE_LOG_EMITTED: bool = False
+
+
+def unet_activation_mode() -> str:
+    """Return the effective UNET activation mode.
+
+    ``"late"`` (default) preserves Phase 0 behavior exactly; the only
+    allowed opt-in value is ``"clip_encode_start"``.  Logs the parsed
+    effective mode once per process on first access.
+    """
+    global _UNET_ACTIVATION_MODE_LOG_EMITTED
+    if not _UNET_ACTIVATION_MODE_LOG_EMITTED:
+        _UNET_ACTIVATION_MODE_LOG_EMITTED = True
+        try:
+            print(
+                f"[v2.unet_early_activation] event=mode "
+                f"mode={_UNET_ACTIVATION_MODE} "
+                f"env_raw={os.environ.get('COMFYMODAL_V2_UNET_ACTIVATION_MODE', 'late')} "
+                f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+                f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    return _UNET_ACTIVATION_MODE
+
+
+# ── Request-scoped activation state ─────────────────────────────────────
+# One dict per request_id: future / key / trigger / owner / terminal / error
+# plus diagnostics.  Bounded (oldest request ids are evicted first) and
+# never persisted across restored containers — the key never contains the
+# restored identity and the state is dropped by request-end cleanup.
+
+_UNET_ACTIVATION_STATE: dict[str, dict[str, Any]] = {}
+_UNET_ACTIVATION_LOCK: RLock = RLock()
+_UNET_ACTIVATION_MAX = 128
+
+
+def _unet_activation_new_state(request_id: str) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "future": None,
+        "owner": "clip_encode_start",
+        "trigger": "",
+        "key": {},
+        "key_hash": "",
+        "mode": _UNET_ACTIVATION_MODE,
+        "status": "idle",
+        "terminal": False,
+        "cancelled": False,
+        "fallback_elected": False,
+        "fallback_reason": "",
+        "reason": "",
+        "error": "",
+        "transfer_count": 0,
+        "eligible": False,
+        "eligibility_reason": "",
+        "clip_encode_entries": 0,
+        "clip_object_id": "",
+        "clip_encode_start_mono_ns": 0,
+        "clip_encode_end_mono_ns": 0,
+        "clip_encode_wall_ms": 0.0,
+        "clip_encode_process_cpu_ms": 0.0,
+        "clip_encode_thread_cpu_ms": 0.0,
+        "submitted_mono_ns": 0,
+        "worker_started_mono_ns": 0,
+        "terminal_mono_ns": 0,
+        "join_demand_mono_ns": 0,
+        "join_completed_mono_ns": 0,
+        "join_wait_ms": 0.0,
+        "lane_wait_ms": 0.0,
+        "load_wall_ms": 0.0,
+        "load_thread_cpu_ms": None,
+        "load_process_cpu_ms": None,
+        "gpu_free_bytes": None,
+        "gpu_required_bytes": None,
+        "safety_margin_bytes": None,
+        "gpu_allocated_before": None,
+        "gpu_allocated_after": None,
+        "gpu_allocated_delta_bytes": None,
+        "unet_patcher_object_id": "",
+        "unet_diffusion_object_id": "",
+        "sampler_patcher_object_id": "",
+        "unet_identity_hash": "",
+        "clip_retained": False,
+        "clip_resident": False,
+        "clip_residency_status": "",
+        "cache_present": False,
+        "diagnostics": {},
+    }
+
+
+def _unet_activation_get(request_id: str) -> dict[str, Any] | None:
+    """Return the activation state dict for *request_id* (live reference)."""
+    if not request_id:
+        return None
+    with _UNET_ACTIVATION_LOCK:
+        return _UNET_ACTIVATION_STATE.get(request_id)
+
+
+def _unet_activation_trim() -> None:
+    """Evict the OLDEST request ids when the bound is exceeded."""
+    with _UNET_ACTIVATION_LOCK:
+        if len(_UNET_ACTIVATION_STATE) > _UNET_ACTIVATION_MAX:
+            _excess = len(_UNET_ACTIVATION_STATE) - _UNET_ACTIVATION_MAX
+            for _stale in list(_UNET_ACTIVATION_STATE.keys())[:_excess]:
+                _UNET_ACTIVATION_STATE.pop(_stale, None)
+
+
+# ── Eligibility proofs (Hard Correction 2) ───────────────────────────────
+# Every proof uses existing APIs/state only: the production CPU-snapshot
+# request marker, the retained-UNET identity chain recorded during restore
+# (``record_retained_unet_identity``), the completed snapshot future, the
+# request-scoped activation state, live CUDA validity, and the live VRAM
+# helper.  No GPU snapshots and no page-readiness machinery are used.
+
+
+def _prove_execution_prefill_caller(caller: str) -> tuple[bool, str]:
+    """Prove the call originates from the execution-prefill boundary.
+
+    ``clip_encode_start`` is integrated ONLY from the existing
+    ``_execution_prefill`` callback (submitted as ``execution_prefill`` lane
+    work through the coordinator pool).  When a lane context is visible it
+    must be the ``prefill`` lane — a call made from a restore-time
+    UNET/CLIP/VAE worker or any other lane fails closed.
+    """
+    if caller != "execution_prefill":
+        return False, "caller_not_execution_prefill"
+    lane = _ACTIVE_LANE_TRACE.get()
+    if lane is not None and getattr(lane, "_lane", "") != "prefill":
+        return False, "caller_lane_not_prefill"
+    return True, "ok"
+
+
+def _prove_unet_identity_chain(request_id: str, unet: Any) -> tuple[bool, str]:
+    """Prove the exact retained snapshot→bridge UNET identity chain exists.
+
+    Reuses the existing per-request identity chain recorded by
+    ``record_retained_unet_identity`` at restore/request-time activation
+    (stages ``snapshot`` and ``bridge``).  For the request chain BOTH the
+    snapshot and bridge entries must be present and nonzero, the snapshot
+    object id must EQUAL the bridge object id (exact identity equality, not
+    mere key presence), and the resolved retained UNET object id must match
+    that exact bridge id.  Any missing / mismatched link fails closed.
+    Never invents a second registry.
+    """
+    if not request_id:
+        return False, "identity_chain_incomplete"
+    with _SNAPSHOT_UNET_CHAIN_LOCK:
+        chain = dict(_SNAPSHOT_UNET_CHAIN.get(request_id, {}))
+    snap_id = int(chain.get("snapshot", 0) or 0)
+    bridge_id = int(chain.get("bridge", 0) or 0)
+    if not snap_id or not bridge_id:
+        return False, "identity_chain_incomplete"
+    if snap_id != bridge_id:
+        return False, "snapshot_bridge_identity_mismatch"
+    obj_id, _dm = _resolve_logical_unet_identity(unet)
+    if obj_id != bridge_id:
+        return False, "bridge_unet_identity_mismatch"
+    return True, "ok"
+
+
+def _cuda_environment_valid() -> tuple[bool, str]:
+    """Prove the live CUDA environment can perform the GPU activation.
+
+    Requires torch CUDA availability AND a resolvable ComfyUI torch device.
+    Never mutates CUDA state.
+    """
+    try:
+        import torch as _torch_cuda
+        if not _torch_cuda.cuda.is_available():
+            return False, "cuda_unavailable"
+        import comfy.model_management as _mm_cuda
+        _dev = _mm_cuda.get_torch_device()
+        if _dev is None:
+            return False, "torch_device_unavailable"
+        return True, "ok"
+    except Exception as exc:
+        return False, f"cuda_probe_error:{type(exc).__name__}"
+
+
+def _resolve_clip_patcher(clip: Any) -> Any:
+    """Return the exact active CLIP patcher object from a CLIP wrapper."""
+    if clip is None:
+        return None
+    _patcher = getattr(clip, "patcher", None)
+    if _patcher is None:
+        _patcher = getattr(clip, "model", None)
+    return _patcher
+
+
+def _prove_unet_early_activation_eligible(
+    bridge: "V2LoaderBridge",
+    *,
+    request_id: str,
+    clip: Any,
+    mode: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Prove every eligibility condition at the real prefill boundary.
+
+    Returns ``(eligible, reason, evidence)``.  When any proof cannot be made
+    the caller MUST emit ``unet_early_activation_eligible`` false and
+    ``unet_early_activation_skipped`` with the exact reason and must NOT
+    schedule.  Evidence carries the per-condition booleans plus the VRAM
+    free/required/margin numbers so the skipped/eligible markers are
+    self-contained.
+    """
+    evidence: dict[str, Any] = {
+        "mode": mode,
+        "trigger": "clip_encode_start",
+        "request_id": request_id,
+        "caller_execution_prefill": False,
+        "cpu_snapshot_mode_active": False,
+        "identity_chain_proven": False,
+        "unet_available": False,
+        "no_existing_future": True,
+        "cuda_valid": False,
+        "vram_safe": False,
+        "free_bytes": None,
+        "required_bytes": None,
+        "margin_bytes": None,
+        "clip_retained": False,
+        "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+        "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+    }
+    _ok, _reason = _prove_execution_prefill_caller("execution_prefill")
+    if not _ok:
+        return False, _reason, evidence
+    evidence["caller_execution_prefill"] = True
+
+    if not request_id or not is_production_cpu_snapshot_request(request_id):
+        return False, "cpu_snapshot_mode_inactive", evidence
+    evidence["cpu_snapshot_mode_active"] = True
+
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None:
+        return False, "preparation_unavailable", evidence
+    if prep.unet_future is None:
+        return False, "unet_future_absent", evidence
+
+    # Exact retained snapshot and bridge UNET identities must match.
+    # A completed snapshot future is expected for the candidate; the exact
+    # retained UNET is required before scheduling so the identity key can be
+    # built with REAL patcher/diffusion ids (never blank placeholders).
+    if not prep.unet_future.done():
+        return False, "unet_future_pending", evidence
+    try:
+        unet = prep.unet_future.result()
+    except Exception:
+        return False, "unet_future_failed", evidence
+    if unet is None:
+        return False, "no_retained_unet", evidence
+    evidence["unet_available"] = True
+    _ok, _reason = _prove_unet_identity_chain(request_id, unet)
+    if not _ok:
+        return False, _reason, evidence
+    evidence["identity_chain_proven"] = True
+
+    # No same-request/key future may already exist.
+    with _UNET_ACTIVATION_LOCK:
+        _existing = _UNET_ACTIVATION_STATE.get(request_id)
+    if _existing is not None and _existing.get("future") is not None:
+        return False, "future_already_scheduled", evidence
+    evidence["no_existing_future"] = True
+
+    # CUDA must be valid.
+    _ok, _reason = _cuda_environment_valid()
+    if not _ok:
+        return False, _reason, evidence
+    evidence["cuda_valid"] = True
+
+    # Safe VRAM must retain the exact active CLIP plus the retained UNET.
+    _load_models: list[Any] = [unet]
+    _clip_patcher = _resolve_clip_patcher(clip)
+    if _clip_patcher is not None and _clip_patcher is not unet:
+        _load_models.append(_clip_patcher)
+    _vram = _check_early_activation_vram(_load_models)
+    evidence["free_bytes"] = _vram.get("free_bytes")
+    evidence["required_bytes"] = _vram.get("required_bytes")
+    evidence["margin_bytes"] = _vram.get("margin_bytes")
+    evidence["clip_retained"] = bool(_vram.get("clip_retained", False))
+    if not _vram.get("ok"):
+        return False, str(_vram.get("reason", "vram_insufficient")), evidence
+    evidence["vram_safe"] = True
+    return True, "ok", evidence
+
+
+# ── Identity key ─────────────────────────────────────────────────────────
+
+
+def _unet_activation_modal_hashes() -> dict[str, str]:
+    """Best-effort workflow / custom-node / deployment hashes.
+
+    Reads live module state only (never triggers an import) so the key can
+    cover deployment identity without coupling model_preload to modal_app.
+    """
+    result: dict[str, str] = {}
+    try:
+        import sys as _sys_ma
+        _ma = _sys_ma.modules.get("comfymodal_runtime.modal_app")
+        if _ma is not None:
+            _wf = getattr(_ma, "_V2_WORKFLOW_HASH", None)
+            if _wf is not None:
+                result["workflow_hash"] = str(_wf.get() or "")
+            result["deployment_hash"] = str(
+                getattr(_ma, "_V2_DEPLOYMENT_COMBINED_HASH", "") or ""
+            )
+            _seed = getattr(_ma, "_LATEST_SNAPSHOT_EXECUTION_SEED", None)
+            if _seed is not None:
+                result["custom_node_generation"] = str(
+                    getattr(_seed, "custom_node_generation", "") or ""
+                )
+    except Exception:
+        pass
+    return result
+
+
+def _unet_requested_weight_dtype(bridge: "V2LoaderBridge", model_key: Any) -> str:
+    try:
+        _req = bridge._find_request("unet", model_key.unet_identity)
+        if isinstance(_req, Mapping):
+            return str(_req.get("weight_dtype", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _build_unet_activation_key(
+    *,
+    mode: str,
+    model_key: ModelRestoreKey | None,
+    request_id: str,
+    unet: Any = None,
+    weight_dtype: str = "",
+) -> tuple[dict[str, Any], str]:
+    """Build the request-scoped identity key for the early activation.
+
+    Covers the underlying diffusion identity, the retained patcher identity,
+    workflow/custom-node/deployment hashes (when available), the weight and
+    compute dtype, the device, and the mode.  Returns
+    ``(components, key_hash)``.
+    """
+    from .unet_forward_probe import resolve_diffusion_model
+
+    _patcher_id = ""
+    _dm_id = ""
+    _dm_device = ""
+    _compute_dtype = ""
+    if unet is not None:
+        try:
+            _patcher_id = str(id(unet))
+        except Exception:
+            pass
+        try:
+            _patcher, _dm = resolve_diffusion_model(unet)
+            if _dm is not None:
+                _dm_id = str(id(_dm))
+                _dm_device = str(getattr(_dm, "current_device", "") or "")
+        except Exception:
+            pass
+        try:
+            _md = getattr(unet, "model_dtype", None)
+            _compute_dtype = str(_md()) if callable(_md) else ""
+        except Exception:
+            pass
+    _modal = _unet_activation_modal_hashes()
+    _device = _dm_device
+    if not _device:
+        try:
+            _dev = getattr(unet, "load_device", None)
+            if _dev is not None:
+                _device = str(_dev)
+        except Exception:
+            pass
+    if not _device:
+        try:
+            import comfy.model_management as _mm_ea
+            _device = str(_mm_ea.get_torch_device())
+        except Exception:
+            _device = ""
+    components = {
+        "mode": mode,
+        "request_id": request_id,
+        "unet_identity": str(model_key.unet_identity) if model_key is not None else "",
+        "unet_patcher_object_id": _patcher_id,
+        "unet_diffusion_object_id": _dm_id,
+        "workflow_hash": _modal.get("workflow_hash", ""),
+        "custom_node_generation": _modal.get("custom_node_generation", ""),
+        "deployment_hash": _modal.get("deployment_hash", ""),
+        "weight_dtype": weight_dtype,
+        "compute_dtype": _compute_dtype,
+        "device": _device,
+    }
+    key_hash = stable_hash(components)[:24]
+    return components, key_hash
+
+
+# ── Live ComfyUI model-management indirections (patchable in tests) ────
+
+
+def _mm_load_models_gpu(models: list[Any], **kwargs: Any) -> Any:
+    """Call the live ComfyUI ``load_models_gpu`` (the original load path)."""
+    import comfy.model_management as _mm
+    return _mm.load_models_gpu(models, **kwargs)
+
+
+def _mm_get_free_memory(device: Any) -> int | None:
+    try:
+        import comfy.model_management as _mm
+        _fn = getattr(_mm, "get_free_memory", None)
+        if not callable(_fn):
+            return None
+        _free = _fn(device)
+        return int(_free) if _free is not None else None
+    except Exception:
+        return None
+
+
+def _mm_extra_reserved_memory() -> int:
+    try:
+        import comfy.model_management as _mm
+        _fn = getattr(_mm, "extra_reserved_memory", None)
+        if callable(_fn):
+            return int(_fn() or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _clip_patcher_in_loaded_models(clip_patcher: Any) -> bool:
+    """True when *clip_patcher* is in the real required-loaded cache."""
+    if clip_patcher is None:
+        return False
+    try:
+        import comfy.model_management as _mm
+        _loaded = getattr(_mm, "current_loaded_models", None)
+        if _loaded is None:
+            return False
+        for _lm in _loaded:
+            _m = getattr(_lm, "model", None)
+            if _m is not None and _m is clip_patcher:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _unet_loaded_bytes(unet: Any) -> int:
+    """Return the UNET's loaded (GPU) bytes via its ModelPatcher API."""
+    try:
+        _fn = getattr(unet, "loaded_size", None)
+        if callable(_fn):
+            return int(_fn() or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _check_early_activation_vram(models: list[Any]) -> dict[str, Any]:
+    """Inspect free/required VRAM with a bounded safety margin.
+
+    Never mutates memory or the cache lists.  Returns an outcome dict with
+    ``ok`` and, on failure, a structured ``reason`` (skip/fail open).
+    ``clip_retained`` reports whether the exact active CLIP patcher is part
+    of the requested load (second slot) — the pre-load residency guarantee
+    that safe VRAM can retain CLIP + UNET together.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "reason": "",
+        "free_bytes": None,
+        "required_bytes": None,
+        "margin_bytes": None,
+        "clip_retained": False,
+    }
+    _required = 0
+    _device = None
+    for _idx, _m in enumerate(models):
+        try:
+            _size = int(getattr(_m, "model_size", lambda: 0)() or 0)
+        except Exception:
+            _size = 0
+        _required += _size
+        if _idx == 1:
+            result["clip_retained"] = True
+        _dev = getattr(_m, "load_device", None)
+        if _dev is not None:
+            _device = _dev
+    if _required <= 0:
+        result["reason"] = "model_size_unavailable"
+        return result
+    if _device is None:
+        result["reason"] = "device_unavailable"
+        return result
+    _free = _mm_get_free_memory(_device)
+    if _free is None:
+        result["reason"] = "vram_unavailable"
+        return result
+    _required_bytes = int(_required * 1.1) + _mm_extra_reserved_memory()
+    _margin = int(
+        min(
+            _EARLY_ACTIVATION_MARGIN_MAX_BYTES,
+            max(
+                _EARLY_ACTIVATION_MARGIN_MIN_BYTES,
+                _required_bytes * _EARLY_ACTIVATION_MARGIN_RATIO,
+            ),
+        )
+    )
+    result["free_bytes"] = int(_free)
+    result["required_bytes"] = _required_bytes
+    result["margin_bytes"] = _margin
+    if int(_free) < _required_bytes + _margin:
+        result["reason"] = "vram_insufficient"
+        return result
+    result["ok"] = True
+    return result
+
+
+def _probe_clip_residency(clip_patcher: Any) -> dict[str, Any]:
+    """Post-load residency proof for the exact active CLIP patcher.
+
+    Read-only evidence: model-cache membership and loaded/model bytes when
+    the patcher exposes the ModelPatcher API.  Never transfers or mutates
+    tensors, never mutates ComfyUI cache lists.
+    """
+    evidence: dict[str, Any] = {
+        "clip_patcher_object_id": str(id(clip_patcher)) if clip_patcher is not None else "",
+        "clip_in_model_cache": False,
+        "clip_loaded_bytes": None,
+        "clip_model_bytes": None,
+        "clip_residency_status": "absent",
+    }
+    if clip_patcher is None:
+        return evidence
+    try:
+        _loaded = _clip_patcher_in_loaded_models(clip_patcher)
+        evidence["clip_in_model_cache"] = bool(_loaded)
+    except Exception:
+        pass
+    try:
+        _fn = getattr(clip_patcher, "loaded_size", None)
+        if callable(_fn):
+            evidence["clip_loaded_bytes"] = int(_fn() or 0)
+    except Exception:
+        pass
+    try:
+        _fn = getattr(clip_patcher, "model_size", None)
+        if callable(_fn):
+            evidence["clip_model_bytes"] = int(_fn() or 0)
+    except Exception:
+        pass
+    if evidence["clip_in_model_cache"]:
+        _lb = evidence["clip_loaded_bytes"]
+        _mb = evidence["clip_model_bytes"]
+        if _lb is not None and _mb is not None:
+            evidence["clip_residency_status"] = (
+                "resident_full" if _lb >= _mb else "resident_partial"
+            )
+        else:
+            evidence["clip_residency_status"] = "resident"
+    else:
+        evidence["clip_residency_status"] = "not_in_cache"
+    return evidence
+
+
+def _gpu_allocated_bytes() -> int | None:
+    """Best-effort live CUDA allocated bytes (totals only).  Never raises."""
+    try:
+        import torch as _torch_gpu_bytes
+        if _torch_gpu_bytes.cuda.is_available():
+            return int(_torch_gpu_bytes.cuda.memory_allocated())
+    except Exception:
+        pass
+    return None
+
+
+def _probe_early_activation_evidence(unet: Any) -> dict[str, Any]:
+    """Read-only residency/cache/device evidence after the early load.
+
+    Never raises, never transfers or mutates tensors.
+    """
+    evidence: dict[str, Any] = {
+        "residency_status": "unknown",
+        "cache_present": False,
+        "current_device": "",
+        "load_device": "",
+    }
+    from .unet_forward_probe import resolve_diffusion_model
+
+    _patcher, _dm = resolve_diffusion_model(unet)
+    if _dm is not None:
+        try:
+            evidence["current_device"] = str(getattr(_dm, "current_device", "") or "")
+        except Exception:
+            pass
+        try:
+            evidence["load_device"] = str(getattr(_dm, "device", "") or "")
+        except Exception:
+            pass
+    try:
+        from .cpu_snapshot_models import prove_unet_gpu_residency
+        _res = prove_unet_gpu_residency(unet, request_id="")
+        evidence["residency_status"] = _res.get("status", "unknown")
+        evidence["gpu_parameter_count"] = _res.get("gpu_parameter_count", 0)
+        evidence["parameter_count"] = _res.get("parameter_count", 0)
+    except Exception:
+        evidence["residency_status"] = "unknown"
+    try:
+        import comfy.model_management as _mm
+        _loaded = getattr(_mm, "current_loaded_models", None)
+        if _loaded is not None:
+            for _lm in _loaded:
+                _m = getattr(_lm, "model", None)
+                if _m is not None and _m is unet:
+                    evidence["cache_present"] = True
+                    break
+    except Exception:
+        pass
+    return evidence
+
+
+# ── Terminal / marker helpers ───────────────────────────────────────────
+
+_EVENT_UNET_EA_STATUS_MAP: dict[str, str] = {
+    "ready": _EVENT_UNET_EA_COMPLETED,
+    "skipped": _EVENT_UNET_EA_SKIPPED,
+    "failed": _EVENT_UNET_EA_FAILED,
+    "invalid": _EVENT_UNET_EA_INVALID,
+    "cancelled": _EVENT_UNET_EA_CANCELLED,
+}
+
+
+def _early_activation_base_meta(state: dict[str, Any], request_id: str) -> dict[str, Any]:
+    return {
+        "mode": state.get("mode", ""),
+        "trigger": state.get("trigger", ""),
+        "request_id": request_id,
+        "key_hash": state.get("key_hash", ""),
+        "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+        "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        "unet_patcher_object_id": state.get("unet_patcher_object_id", ""),
+        "unet_diffusion_object_id": state.get("unet_diffusion_object_id", ""),
+        "sampler_patcher_object_id": state.get("sampler_patcher_object_id", ""),
+        "clip_object_id": state.get("clip_object_id", ""),
+    }
+
+
+def _early_activation_extra_meta(state: dict[str, Any]) -> dict[str, Any]:
+    """Durations / VRAM / GPU-allocation / residency evidence shared by the
+    terminal and fallback markers.  All values come from live state."""
+    return {
+        "submitted_mono_ns": state.get("submitted_mono_ns", 0) or 0,
+        "worker_started_mono_ns": state.get("worker_started_mono_ns", 0) or 0,
+        "terminal_mono_ns": state.get("terminal_mono_ns", 0) or 0,
+        "clip_encode_start_mono_ns": state.get("clip_encode_start_mono_ns", 0) or 0,
+        "clip_encode_end_mono_ns": state.get("clip_encode_end_mono_ns", 0) or 0,
+        "lane_wait_ms": state.get("lane_wait_ms", 0.0) or 0.0,
+        "load_wall_ms": state.get("load_wall_ms", 0.0) or 0.0,
+        "load_thread_cpu_ms": state.get("load_thread_cpu_ms"),
+        "load_process_cpu_ms": state.get("load_process_cpu_ms"),
+        "gpu_free_bytes": state.get("gpu_free_bytes"),
+        "gpu_required_bytes": state.get("gpu_required_bytes"),
+        "safety_margin_bytes": state.get("safety_margin_bytes"),
+        "gpu_allocated_before": state.get("gpu_allocated_before"),
+        "gpu_allocated_after": state.get("gpu_allocated_after"),
+        "gpu_allocated_delta_bytes": state.get("gpu_allocated_delta_bytes"),
+        "clip_retained": bool(state.get("clip_retained", False)),
+        "clip_resident": bool(state.get("clip_resident", False)),
+        "clip_residency_status": state.get("clip_residency_status", ""),
+        "cache_present": bool(state.get("cache_present", False)),
+        "transfer_count": state.get("transfer_count", 0),
+    }
+
+
+def _early_activation_terminal(
+    state: dict[str, Any],
+    trace: RuntimeTrace | None,
+    request_id: str,
+    *,
+    status: str,
+    reason: str,
+    error: str = "",
+    transfer_count: int = 0,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Establish the terminal state exactly once and emit the status marker
+    plus the generic ``unet_early_activation_terminal`` marker."""
+    with _UNET_ACTIVATION_LOCK:
+        if not state.get("terminal", False):
+            state["terminal"] = True
+            state["status"] = status
+            state["reason"] = reason
+            if error:
+                state["error"] = error
+            if transfer_count:
+                state["transfer_count"] = transfer_count
+            state["terminal_mono_ns"] = time.monotonic_ns()
+        if diagnostics:
+            _diag = state.setdefault("diagnostics", {})
+            for _k, _v in dict(diagnostics).items():
+                if not isinstance(_v, (bytes, bytearray)):
+                    _diag[_k] = _v
+    _event = _EVENT_UNET_EA_STATUS_MAP.get(state.get("status", status))
+    if trace is not None and _event is not None:
+        _meta = _early_activation_base_meta(state, request_id)
+        _meta.update({
+            "status": state.get("status", status),
+            "reason": state.get("reason", reason),
+            "error": state.get("error", "") or None,
+            "transfer_count": state.get("transfer_count", 0),
+        })
+        _meta.update(_early_activation_extra_meta(state))
+        trace.emit(_event, phase="execution", metadata=_meta)
+    if trace is not None:
+        _term_meta = _early_activation_base_meta(state, request_id)
+        _term_meta.update({
+            "status": state.get("status", status),
+            "reason": state.get("reason", reason),
+            "error": state.get("error", "") or None,
+            "transfer_count": state.get("transfer_count", 0),
+        })
+        _term_meta.update(_early_activation_extra_meta(state))
+        trace.emit(_EVENT_UNET_EA_TERMINAL, phase="execution", metadata=_term_meta)
+    print(
+        f"[v2.unet_early_activation] event=terminal "
+        f"request_id={request_id or 'absent'} mode={state.get('mode', '')} "
+        f"key_hash={state.get('key_hash', '')} status={state.get('status', status)} "
+        f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'} "
+        f"transfer_count={state.get('transfer_count', 0)}",
+        flush=True,
+    )
+    return {
+        "status": state.get("status", status),
+        "reason": state.get("reason", reason),
+        "terminal": True,
+    }
+
+
+def _elect_early_activation_fallback(
+    state: dict[str, Any],
+    trace: RuntimeTrace | None,
+    request_id: str,
+    *,
+    reason: str,
+    error: str = "",
+    join_wait_ms: float = 0.0,
+) -> dict[str, Any]:
+    """Elect the unchanged late fallback exactly once (atomic, never
+    overwritten).  Returns an outcome dict with ``valid=False``."""
+    with _UNET_ACTIVATION_LOCK:
+        _elected = bool(state.get("fallback_elected", False))
+        if not _elected:
+            state["fallback_elected"] = True
+            state["fallback_reason"] = reason
+            state["terminal"] = True
+            if error:
+                state["error"] = error
+        _status = state.get("status", "fallback")
+        _reason = state.get("fallback_reason", reason)
+    if trace is not None and not _elected:
+        _meta = _early_activation_base_meta(state, request_id)
+        _meta.update({
+            "status": _status,
+            "reason": _reason,
+            "error": error or None,
+            "join_wait_ms": round(float(join_wait_ms), 3),
+        })
+        _meta.update(_early_activation_extra_meta(state))
+        trace.emit(_EVENT_UNET_EA_FALLBACK, phase="execution", metadata=_meta)
+        _term_meta = _early_activation_base_meta(state, request_id)
+        _term_meta.update({
+            "status": _status,
+            "reason": _reason,
+            "error": error or None,
+        })
+        _term_meta.update(_early_activation_extra_meta(state))
+        trace.emit(_EVENT_UNET_EA_TERMINAL, phase="execution", metadata=_term_meta)
+        print(
+            f"[v2.unet_early_activation] event=fallback "
+            f"request_id={request_id or 'absent'} mode={state.get('mode', '')} "
+            f"key_hash={state.get('key_hash', '')} reason={_reason} "
+            f"error={error or 'absent'} status={_status}",
+            flush=True,
+        )
+    return {
+        "scheduled": True,
+        "status": _status,
+        "terminal": True,
+        "valid": False,
+        "reason": _reason,
+        "join_wait_ms": round(float(join_wait_ms), 3),
+    }
+
+
+# ── Early activation worker ─────────────────────────────────────────────
+
+
+def _measure_early_activation_lane_wait_ms(
+    trace: RuntimeTrace | None,
+    *,
+    request_id: str,
+    wait_start_ns: int | None,
+) -> float | None:
+    """Measure the truthful mutation-lane wait from existing lane trace events.
+
+    The existing GPU loader wrapper acquires the coordinator-owned mutation
+    lane INSIDE ``load_models_gpu`` and emits ``gpu_lane_wait_start`` at the
+    instant the lane is actually acquired.  The worker's own
+    ``unet_early_activation_lane_wait_start`` marker is emitted immediately
+    before the load call, so the interval between the two existing events is
+    the truthful lane wait.  Returns None when the wrapper never reported the
+    lane acquisition (e.g. a load path that does not emit lane events) — the
+    value is never fabricated.  The worker never acquires the mutation lane
+    itself, so this cannot deadlock the existing GPU wrapper.
+    """
+    if trace is None or not wait_start_ns:
+        return None
+    _wait_ns: int | None = None
+    for _event in trace.events:
+        if _event.name != "gpu_lane_wait_start":
+            continue
+        _meta = _event.metadata or {}
+        if str(_meta.get("lane", "")) != "UNET_EARLY_ACTIVATION":
+            continue
+        if _event.monotonic_ns < wait_start_ns:
+            continue
+        _wait_ns = _event.monotonic_ns - wait_start_ns
+        break
+    if _wait_ns is None or _wait_ns < 0:
+        return None
+    return round(_wait_ns / 1_000_000, 3)
+
+
+def _run_early_unet_activation(
+    bridge: "V2LoaderBridge",
+    *,
+    prep: RestorePreparation,
+    trace: RuntimeTrace | None,
+    request_id: str,
+    state: dict[str, Any],
+    clip: Any,
+    key_hash: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Early retained-UNET GPU activation worker (coordinator pool).
+
+    Uses the exact retained UNET and the original ComfyUI
+    ``load_models_gpu`` / ``LoadedModel.model_load`` path — never transfers
+    or mutates ComfyUI cache lists manually.  The existing GPU loader
+    wrapper acquires the coordinator-owned mutation lane only around the
+    actual load; nothing here holds the lane while queued, validating, or
+    running CLIP.  Waits for the retained objects OUTSIDE the lane, emits
+    ``lane_wait_start``/``lane_acquired`` and ``load_start``/``load_end``
+    around the original load path only.  The exact active CLIP patcher is
+    kept resident by loading it alongside through the real required-loaded
+    argument/API; the load is skipped when safe residency cannot be
+    guaranteed (VRAM) and a post-load CLIP residency proof is recorded.
+    Re-checks cancellation immediately before mutation so a finalized
+    request never gets an unowned load.  Never applies request-dependent
+    sampler patches.
+    """
+    with _UNET_ACTIVATION_LOCK:
+        state["status"] = "running"
+        state["worker_started_mono_ns"] = time.monotonic_ns()
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_WORKER_START, phase="execution", metadata={
+            "mode": mode,
+            "trigger": state.get("trigger", ""),
+            "request_id": request_id,
+            "key_hash": key_hash,
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+
+    # ── Wait for the exact retained UNET (outside the lane) ──────────
+    try:
+        unet = bridge.coordinator.wait_unet(
+            prep, trace=trace, demand_source="execution_prefill"
+        )
+    except Exception as exc:
+        return _early_activation_terminal(
+            state, trace, request_id, status="failed",
+            reason="unet_future_failed", error=str(exc)[:200],
+        )
+    if unet is None:
+        return _early_activation_terminal(
+            state, trace, request_id, status="skipped", reason="no_retained_unet"
+        )
+    state["unet_patcher_object_id"] = str(id(unet))
+
+    # Request cleanup may have finalized while we waited.
+    if state.get("cancelled") or state.get("terminal"):
+        return _early_activation_terminal(
+            state, trace, request_id, status="cancelled", reason="request_finalized"
+        )
+
+    # ── Resolve diffusion identity + dtype/device (outside the lane) ──
+    # The activation key was built at scheduling time with the REAL retained
+    # patcher/diffusion ids.  If the resolved identity changed between
+    # scheduling and the worker (a different retained object surfaced), the
+    # activation is rejected — never reuse a key across identity changes.
+    from .unet_forward_probe import resolve_diffusion_model
+
+    _patcher, _dm = resolve_diffusion_model(unet)
+    _patcher_id = str(id(_patcher)) if _patcher is not None else str(id(unet))
+    _dm_id = str(id(_dm)) if _dm is not None else ""
+    if _dm is not None:
+        state["unet_diffusion_object_id"] = _dm_id
+    _expected_patcher = str((state.get("key") or {}).get("unet_patcher_object_id", "") or "")
+    _expected_dm = str((state.get("key") or {}).get("unet_diffusion_object_id", "") or "")
+    if _expected_patcher and _expected_patcher != _patcher_id:
+        return _early_activation_terminal(
+            state, trace, request_id, status="invalid",
+            reason="identity_changed_patcher",
+        )
+    if _expected_dm and _expected_dm != _dm_id:
+        return _early_activation_terminal(
+            state, trace, request_id, status="invalid",
+            reason="identity_changed_diffusion",
+        )
+    _state_key = dict(state.get("key") or {})
+    _state_key["unet_patcher_object_id"] = _patcher_id
+    _state_key["unet_diffusion_object_id"] = _dm_id
+    try:
+        _md = getattr(unet, "model_dtype", None)
+        if callable(_md):
+            _state_key["compute_dtype"] = str(_md() or "")
+    except Exception:
+        pass
+    try:
+        _dev = getattr(unet, "load_device", None)
+        if _dev is not None:
+            _state_key["device"] = str(_dev)
+    except Exception:
+        pass
+    state["key"] = _state_key
+    # Recompute the key hash with the resolved identity before publication.
+    state["key_hash"] = stable_hash(_state_key)[:24]
+
+    # Protect the exact active CLIP patcher by loading it alongside the UNET
+    # through the real required-loaded argument (models list of the original
+    # ComfyUI load path).  Never manually transfers tensors or mutates the
+    # cache lists.
+    _load_models: list[Any] = [unet]
+    _clip_patcher = _resolve_clip_patcher(clip)
+    if _clip_patcher is not None and _clip_patcher is not unet:
+        _load_models.append(_clip_patcher)
+
+    # ── VRAM / residency pre-check (outside the lane) ────────────────
+    _vram = _check_early_activation_vram(_load_models)
+    state["gpu_free_bytes"] = _vram.get("free_bytes")
+    state["gpu_required_bytes"] = _vram.get("required_bytes")
+    state["safety_margin_bytes"] = _vram.get("margin_bytes")
+    state["clip_retained"] = bool(_vram.get("clip_retained", False))
+    if not _vram.get("ok"):
+        return _early_activation_terminal(
+            state, trace, request_id, status="skipped",
+            reason=str(_vram.get("reason", "vram_insufficient")),
+            diagnostics=_vram,
+        )
+
+    # ── Re-check cancellation IMMEDIATELY before the GPU mutation ────
+    # A request finalized between the earlier checks and the mutation must
+    # never load unowned.  The lane is acquired by the existing GPU loader
+    # wrapper only around the actual load.
+    if state.get("cancelled") or state.get("terminal"):
+        return _early_activation_terminal(
+            state, trace, request_id, status="cancelled", reason="request_finalized"
+        )
+
+    # ── Original ComfyUI load path (lane acquired by the existing wrapper) ──
+    # lane_wait_start/lane_acquired + load_start/load_end bracket the
+    # original load_models_gpu/LoadedModel path only; nothing else holds
+    # the lane.
+    _loaded_before = _unet_loaded_bytes(unet)
+    _gpu_alloc_before = _gpu_allocated_bytes()
+    _load_start = _capture_phase_counters()
+    # Monotonic boundary of the worker's lane-wait marker — the truthful
+    # lane wait is measured against the wrapper's gpu_lane_wait_start below.
+    _lane_wait_start_ns = time.monotonic_ns()
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_LANE_WAIT_START, phase="execution", metadata={
+            "mode": mode,
+            "trigger": state.get("trigger", ""),
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+        })
+        trace.emit(_EVENT_UNET_EA_LOAD_START, phase="execution", metadata={
+            "mode": mode,
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+            "model_count": len(_load_models),
+        })
+    try:
+        _mm_load_models_gpu(_load_models)
+    except Exception as exc:
+        return _early_activation_terminal(
+            state, trace, request_id, status="failed",
+            reason="load_failed", error=str(exc)[:200],
+        )
+    _load_end = _capture_phase_counters()
+    _deltas = _phase_counter_deltas(_load_start, _load_end)
+    state["load_wall_ms"] = _deltas.get("wall_ms", 0.0) or 0.0
+    state["load_thread_cpu_ms"] = _deltas.get("thread_cpu_ms")
+    state["load_process_cpu_ms"] = _deltas.get("process_cpu_ms")
+    state["transfer_count"] = 1 if _unet_loaded_bytes(unet) > _loaded_before else 0
+    _gpu_alloc_after = _gpu_allocated_bytes()
+    state["gpu_allocated_before"] = _gpu_alloc_before
+    state["gpu_allocated_after"] = _gpu_alloc_after
+    if _gpu_alloc_before is not None and _gpu_alloc_after is not None:
+        state["gpu_allocated_delta_bytes"] = _gpu_alloc_after - _gpu_alloc_before
+    # Truthful mutation-lane wait from the existing lane trace events around
+    # the load (worker lane_wait_start -> wrapper gpu_lane_wait_start).  The
+    # wrapper owns the lane; we never acquire it ourselves, so this cannot
+    # deadlock.  None (fake/absent wrapper events) stays 0.0 — never invented.
+    state["lane_wait_ms"] = _measure_early_activation_lane_wait_ms(
+        trace, request_id=request_id, wait_start_ns=_lane_wait_start_ns,
+    ) or 0.0
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_LOAD_END, phase="execution", metadata={
+            "mode": mode,
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+            "load_wall_ms": state.get("load_wall_ms", 0.0),
+            "transfer_count": state.get("transfer_count", 0),
+        })
+        trace.emit(_EVENT_UNET_EA_LANE_ACQUIRED, phase="execution", metadata={
+            "mode": mode,
+            "request_id": request_id,
+            "key_hash": state.get("key_hash", ""),
+            "load_wall_ms": state.get("load_wall_ms", 0.0),
+        })
+
+    # ── Terminal validation: UNET residency + cache + CLIP residency ──
+    _evidence = _probe_early_activation_evidence(unet)
+    state["cache_present"] = bool(_evidence.get("cache_present", False))
+    _res_status = _evidence.get("residency_status", "unknown")
+    _clip_evidence = _probe_clip_residency(_clip_patcher)
+    state["clip_resident"] = bool(_clip_evidence.get("clip_in_model_cache", False))
+    state["clip_residency_status"] = str(_clip_evidence.get("clip_residency_status", "absent"))
+    _combined_diag = dict(_evidence)
+    _combined_diag["clip_residency"] = _clip_evidence
+    if _res_status == "cpu_resident" or not state["cache_present"]:
+        return _early_activation_terminal(
+            state, trace, request_id, status="invalid",
+            reason="residency_not_proven", diagnostics=_combined_diag,
+        )
+    # The exact active CLIP patcher was requested alongside; if it is not
+    # resident post-load, safe residency was not guaranteed.
+    if state["clip_retained"] and not state["clip_resident"]:
+        return _early_activation_terminal(
+            state, trace, request_id, status="invalid",
+            reason="clip_residency_not_proven", diagnostics=_combined_diag,
+        )
+    return _early_activation_terminal(
+        state, trace, request_id, status="ready", reason="ok",
+        transfer_count=state["transfer_count"], diagnostics=_combined_diag,
+    )
+
+
+# ── Public API ──────────────────────────────────────────────────────────
+
+
+def clip_encode_start(
+    bridge: "V2LoaderBridge",
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+    clip: Any = None,
+    encode_entries: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Schedule the early retained-UNET GPU activation once per request.
+
+    Hooked at the established real execution-prefill CLIP callback boundary
+    (``_execution_prefill`` — the ONLY integration call) immediately before
+    the actual prefill encode, never at request entry / tokenization / graph
+    fallback / dummy encode.  Before scheduling, every eligibility condition
+    is proven at the boundary (execution-prefill caller, mode
+    ``clip_encode_start``, production CPU-snapshot request marker, exact
+    retained snapshot→bridge identity chain, completed retained-UNET future,
+    no same-request/key future, live CUDA validity, and safe VRAM for the
+    exact active CLIP + retained UNET).  Any proof that cannot be made emits
+    ``unet_early_activation_eligible`` false and
+    ``unet_early_activation_skipped`` with the exact reason and does NOT
+    schedule.  Idempotent across positive/negative encodes: the first caller
+    claims the request slot and schedules the worker once through the
+    existing coordinator pool; every subsequent call joins the same future.
+    Mode-gated (default ``"late"`` is a no-op that preserves Phase 0
+    behavior; no candidate path can activate for ``early``).  Returns True
+    when scheduled (or already scheduled), False when late/ineligible.
+    """
+    mode = unet_activation_mode()
+    if mode != _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
+        return False
+    if bridge is None:
+        return False
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None or prep.unet_future is None:
+        return False
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    if not _request_id:
+        return False
+    # Idempotent across positive/negative encodes: a scheduled future for
+    # this request is joined, never re-scheduled.
+    with _UNET_ACTIVATION_LOCK:
+        _existing = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and _existing.get("future") is not None:
+            return True
+
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_MODE, phase="execution", metadata={
+            "mode": mode,
+            "trigger": "clip_encode_start",
+            "request_id": _request_id,
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+
+    # ── Eligibility gate (Hard Correction 2) ────────────────────────
+    _eligible, _reason, _evidence = _prove_unet_early_activation_eligible(
+        bridge,
+        request_id=_request_id,
+        clip=clip,
+        mode=mode,
+    )
+    _eligible_meta = dict(_evidence)
+    _eligible_meta.update({
+        "eligible": bool(_eligible),
+        "reason": _reason,
+    })
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_ELIGIBLE, phase="execution", metadata=_eligible_meta)
+    if not _eligible:
+        if trace is not None:
+            _skip_meta = {
+                "mode": mode,
+                "trigger": "clip_encode_start",
+                "request_id": _request_id,
+                "eligible": False,
+                "reason": _reason,
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+                "free_bytes": _evidence.get("free_bytes"),
+                "required_bytes": _evidence.get("required_bytes"),
+                "margin_bytes": _evidence.get("margin_bytes"),
+            }
+            trace.emit(_EVENT_UNET_EA_SKIPPED, phase="execution", metadata=_skip_meta)
+        print(
+            f"[v2.unet_early_activation] event=skipped "
+            f"request_id={_request_id or 'absent'} mode={mode} trigger=clip_encode_start "
+            f"reason={_reason} eligible=0",
+            flush=True,
+        )
+        return False
+
+    # ── Key with REAL retained identities (Hard Correction 3) ──────
+    # A completed snapshot future is expected for the candidate; the exact
+    # retained UNET is resolved here so the key is never built with blank
+    # placeholders.
+    try:
+        _retained_unet = prep.unet_future.result()
+    except Exception:
+        _retained_unet = None
+    _key_components, _key_hash = _build_unet_activation_key(
+        mode=mode,
+        model_key=model_key,
+        request_id=_request_id,
+        unet=_retained_unet,
+        weight_dtype=_unet_requested_weight_dtype(bridge, model_key),
+    )
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _state is not None and _state.get("future") is not None:
+            return True
+        if _state is None:
+            _state = _unet_activation_new_state(_request_id)
+            _UNET_ACTIVATION_STATE[_request_id] = _state
+        _state["owner"] = "clip_encode_start"
+        _state["trigger"] = "clip_encode_start"
+        _state["mode"] = mode
+        _state["eligible"] = True
+        _state["eligibility_reason"] = "ok"
+        _state["key"] = _key_components
+        _state["key_hash"] = _key_hash
+        # clip_encode_start_mono_ns is intentionally NOT set here (scheduling
+        # time).  It is recorded at the ACTUAL encode boundary by
+        # record_clip_encode_start() in the execution-prefill worker so the
+        # waterfall reconciliation measures the real encode start, not the
+        # schedule/submit time (submitted_mono_ns stays separate below).
+        _state["clip_encode_entries"] = max(0, len(encode_entries or []))
+        _state["clip_object_id"] = str(id(clip)) if clip is not None else ""
+        _state["status"] = "scheduled"
+        _state["submitted_mono_ns"] = time.monotonic_ns()
+
+        def _worker() -> Any:
+            return _run_early_unet_activation(
+                bridge,
+                prep=prep,
+                trace=trace,
+                request_id=_request_id,
+                state=_state,
+                clip=clip,
+                key_hash=_key_hash,
+                mode=mode,
+            )
+
+        try:
+            _future = bridge.coordinator._submit(
+                "unet_early_activation", _worker, prep, trace,
+                phase="execution", expected_read_count=0,
+            )
+        except Exception as exc:
+            _state["status"] = "failed"
+            _state["terminal"] = True
+            _state["reason"] = "submit_failed"
+            _state["error"] = str(exc)[:200]
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+            if trace is not None:
+                trace.emit(_EVENT_UNET_EA_FAILED, phase="execution", metadata={
+                    "mode": mode,
+                    "trigger": "clip_encode_start",
+                    "request_id": _request_id,
+                    "key_hash": _key_hash,
+                    "reason": "submit_failed",
+                    "error": str(exc)[:200],
+                })
+            return False
+        _state["future"] = _future
+    _unet_activation_trim()
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_SCHEDULED, phase="execution", metadata={
+            "mode": mode,
+            "trigger": "clip_encode_start",
+            "request_id": _request_id,
+            "key_hash": _key_hash,
+            "clip_encode_entries": _state.get("clip_encode_entries", 0),
+            "unet_patcher_object_id": _key_components.get("unet_patcher_object_id", ""),
+            "unet_diffusion_object_id": _key_components.get("unet_diffusion_object_id", ""),
+            "unet_identity_hash": stable_hash(str(model_key.unet_identity))[:16],
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+    print(
+        f"[v2.unet_early_activation] event=scheduled "
+        f"request_id={_request_id or 'absent'} mode={mode} trigger=clip_encode_start "
+        f"key_hash={_key_hash} clip_encode_entries={_state.get('clip_encode_entries', 0)} "
+        f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+        f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+        flush=True,
+    )
+    return True
+
+
+def record_clip_encode_start(
+    request_id: str,
+    start_counters: Mapping[str, Any] | None,
+) -> None:
+    """Record the ACTUAL prefill encode start into the request activation state.
+
+    ``clip_encode_start_mono_ns`` must represent the real encode start
+    boundary (captured immediately before the encode loop) — never the
+    scheduling time.  The schedule/submit timestamp stays separate in
+    ``submitted_mono_ns``.  No-op when no activation state exists (safe when
+    no early future was scheduled) or when the counters carry no monotonic
+    clock (never fabricated).
+    """
+    if not request_id:
+        return
+    _state = _unet_activation_get(request_id)
+    if _state is None:
+        return
+    _mono = int((start_counters or {}).get("mono_ns", 0) or 0)
+    if _mono:
+        _state["clip_encode_start_mono_ns"] = _mono
+
+
+def record_clip_encode_end(
+    request_id: str,
+    start_counters: Mapping[str, Any] | None,
+    end_counters: Mapping[str, Any] | None,
+) -> None:
+    """Record the prefill encode interval into the request activation state."""
+    if not request_id:
+        return
+    _state = _unet_activation_get(request_id)
+    if _state is None:
+        return
+    _deltas = _phase_counter_deltas(dict(start_counters), dict(end_counters))
+    _state["clip_encode_end_mono_ns"] = int((end_counters or {}).get("mono_ns", 0) or 0)
+    _state["clip_encode_wall_ms"] = float(_deltas.get("wall_ms", 0.0) or 0.0)
+    _state["clip_encode_process_cpu_ms"] = float(_deltas.get("process_cpu_ms") or 0.0)
+    _state["clip_encode_thread_cpu_ms"] = float(_deltas.get("thread_cpu_ms") or 0.0)
+
+
+def _validate_early_activated_unet(unet: Any, state: dict[str, Any]) -> tuple[bool, str]:
+    """Validate diffusion identity / residency / cache / dtype / device of the
+    early-activated retained UNET at graph demand.  The patcher object may
+    legitimately differ (CacheDiT wrapper / re-attach) as long as the
+    resolved diffusion model matches.  Never raises."""
+    from .unet_forward_probe import resolve_diffusion_model
+
+    _patcher, _dm = resolve_diffusion_model(unet)
+    if _dm is None:
+        return False, "diffusion_missing"
+    _key = state.get("key") or {}
+    _expected_dm = _key.get("unet_diffusion_object_id", "")
+    if _expected_dm and _expected_dm != str(id(_dm)):
+        return False, "diffusion_identity_mismatch"
+    _evidence = _probe_early_activation_evidence(unet)
+    if _evidence.get("residency_status") == "cpu_resident":
+        return False, "cpu_resident"
+    if not _evidence.get("cache_present"):
+        return False, "cache_missing"
+    _device = _key.get("device", "")
+    if _device:
+        _cur = _evidence.get("current_device", "")
+        if _cur and str(_cur) not in ("", "absent") and str(_cur) != str(_device):
+            return False, "device_mismatch"
+    _expected_dtype = _key.get("compute_dtype", "")
+    if _expected_dtype:
+        try:
+            _md = getattr(unet, "model_dtype", None)
+            _actual_dtype = str(_md()) if callable(_md) else ""
+        except Exception:
+            _actual_dtype = ""
+        if _actual_dtype and _actual_dtype != _expected_dtype:
+            return False, "dtype_mismatch"
+    return True, "ok"
+
+
+def join_unet_early_activation(
+    bridge: "V2LoaderBridge",
+    *,
+    unet: Any,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Find and join the request's early activation future at graph/sampler
+    demand.  Runs OUTSIDE the mutation lane.  Validates diffusion identity,
+    residency, cache, dtype and device; on success the original sampler load
+    path continues as a cache validation.  On any non-ready terminal outcome
+    exactly one caller elects the unchanged late fallback (atomic, never
+    overwritten, never racing a pending future — the future is joined to
+    terminal before any election)."""
+    if unet_activation_mode() != _UNET_ACTIVATION_MODE_CLIP_ENCODE_START:
+        return {"scheduled": False, "status": "mode_late", "terminal": False,
+                "valid": False, "reason": "", "join_wait_ms": 0.0}
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    _state = _unet_activation_get(_request_id)
+    if _state is None or _state.get("future") is None:
+        return {"scheduled": False, "status": "not_scheduled", "terminal": False,
+                "valid": False, "reason": "", "join_wait_ms": 0.0}
+    _state["sampler_patcher_object_id"] = str(id(unet)) if unet is not None else ""
+    _demand_ns = time.monotonic_ns()
+    _state["join_demand_mono_ns"] = _demand_ns
+    _future = _state["future"]
+    try:
+        _future.result()
+    except Exception as exc:
+        with _UNET_ACTIVATION_LOCK:
+            _state["terminal"] = True
+            _state["status"] = "failed"
+            _state["reason"] = "future_error"
+            _state["error"] = str(exc)[:200]
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+        return _elect_early_activation_fallback(
+            _state, trace, _request_id,
+            reason="future_error", error=str(exc)[:200],
+            join_wait_ms=round((time.monotonic_ns() - _demand_ns) / 1_000_000, 3),
+        )
+    _join_wait_ms = round((time.monotonic_ns() - _demand_ns) / 1_000_000, 3)
+    _state["join_completed_mono_ns"] = time.monotonic_ns()
+    _state["join_wait_ms"] = _join_wait_ms
+    with _UNET_ACTIVATION_LOCK:
+        _status = _state.get("status", "")
+        _terminal = bool(_state.get("terminal", False))
+    if _terminal and _status == "ready":
+        _valid, _reason = _validate_early_activated_unet(unet, _state)
+        if _valid:
+            if trace is not None:
+                trace.emit(_EVENT_UNET_EA_CONSUMED, phase="execution", metadata={
+                    "mode": _state.get("mode", ""),
+                    "request_id": _request_id,
+                    "key_hash": _state.get("key_hash", ""),
+                    "join_wait_ms": _join_wait_ms,
+                    "transfer_count": _state.get("transfer_count", 0),
+                    "cache_present": bool(_state.get("cache_present", False)),
+                })
+            return {"scheduled": True, "status": "ready", "terminal": True,
+                    "valid": True, "reason": "", "join_wait_ms": _join_wait_ms}
+        return _elect_early_activation_fallback(
+            _state, trace, _request_id,
+            reason=f"invalid:{_reason}", join_wait_ms=_join_wait_ms,
+        )
+    if _terminal:
+        return _elect_early_activation_fallback(
+            _state, trace, _request_id,
+            reason=str(_state.get("reason", _status) or _status),
+            join_wait_ms=_join_wait_ms,
+        )
+    return _elect_early_activation_fallback(
+        _state, trace, _request_id, reason="non_terminal", join_wait_ms=_join_wait_ms,
+    )
+
+
+def _build_unet_early_activation_reconciliation(state: dict[str, Any]) -> dict[str, Any]:
+    """Request-end derived intervals (waterfall arithmetic)."""
+    _clip_start = state.get("clip_encode_start_mono_ns") or 0
+    _clip_end = state.get("clip_encode_end_mono_ns") or 0
+    _act_start = state.get("submitted_mono_ns") or 0
+    _act_end = state.get("terminal_mono_ns") or 0
+    clip_interval_ms = _bounded_delta_ms(_clip_start or None, _clip_end or None)
+    activation_interval_ms = _bounded_delta_ms(_act_start or None, _act_end or None)
+    _overlap_ms: float | None = None
+    _sequential_ms: float | None = None
+    _combined_ms: float | None = None
+    _efficiency: float | None = None
+    if (
+        isinstance(clip_interval_ms, float)
+        and isinstance(activation_interval_ms, float)
+        and _clip_start and _clip_end and _act_start and _act_end
+    ):
+        _start = max(_clip_start, _act_start)
+        _end = min(_clip_end, _act_end)
+        _overlap = max(0, _end - _start)
+        _overlap_ms = round(_overlap / 1_000_000, 3)
+        _sequential_ms = round(clip_interval_ms + activation_interval_ms, 3)
+        _combined_ms = round(max(0.0, _sequential_ms - _overlap_ms), 3)
+        if _sequential_ms > 0:
+            _efficiency = round(_overlap_ms / _sequential_ms, 4)
+    _clip_slowdown_ms: float | None = None
+    if isinstance(clip_interval_ms, float):
+        _excess = clip_interval_ms - float(state.get("clip_encode_process_cpu_ms", 0.0) or 0.0)
+        _clip_slowdown_ms = round(max(0.0, _excess), 3)
+    return {
+        "request_id": state.get("request_id", ""),
+        "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+        "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        "mode": state.get("mode", ""),
+        "trigger": state.get("trigger", ""),
+        "key_hash": state.get("key_hash", ""),
+        "status": state.get("status", ""),
+        "terminal": bool(state.get("terminal", False)),
+        "fallback_elected": bool(state.get("fallback_elected", False)),
+        "fallback_reason": state.get("fallback_reason", ""),
+        "reason": state.get("reason", ""),
+        "transfer_count": state.get("transfer_count", 0),
+        "clip_interval_ms": clip_interval_ms,
+        "activation_interval_ms": activation_interval_ms,
+        "overlap_ms": _overlap_ms,
+        "sequential_equivalent_ms": _sequential_ms,
+        "combined_interval_ms": _combined_ms,
+        "efficiency": _efficiency,
+        "clip_slowdown_ms": _clip_slowdown_ms,
+        "graph_visible_wait_ms": state.get("join_wait_ms", 0.0) or 0.0,
+        "join_wait_ms": state.get("join_wait_ms", 0.0) or 0.0,
+        "clip_encode_wall_ms": state.get("clip_encode_wall_ms", 0.0),
+        "clip_encode_process_cpu_ms": state.get("clip_encode_process_cpu_ms", 0.0),
+        "lane_wait_ms": state.get("lane_wait_ms", 0.0),
+        "load_wall_ms": state.get("load_wall_ms", 0.0),
+        "load_thread_cpu_ms": state.get("load_thread_cpu_ms"),
+        "load_process_cpu_ms": state.get("load_process_cpu_ms"),
+        "submitted_mono_ns": state.get("submitted_mono_ns", 0) or 0,
+        "worker_started_mono_ns": state.get("worker_started_mono_ns", 0) or 0,
+        "terminal_mono_ns": state.get("terminal_mono_ns", 0) or 0,
+        "clip_encode_start_mono_ns": state.get("clip_encode_start_mono_ns", 0) or 0,
+        "clip_encode_end_mono_ns": state.get("clip_encode_end_mono_ns", 0) or 0,
+        "gpu_free_bytes": state.get("gpu_free_bytes"),
+        "gpu_required_bytes": state.get("gpu_required_bytes"),
+        "safety_margin_bytes": state.get("safety_margin_bytes"),
+        "gpu_allocated_before": state.get("gpu_allocated_before"),
+        "gpu_allocated_after": state.get("gpu_allocated_after"),
+        "gpu_allocated_delta_bytes": state.get("gpu_allocated_delta_bytes"),
+        "clip_retained": bool(state.get("clip_retained", False)),
+        "clip_resident": bool(state.get("clip_resident", False)),
+        "clip_residency_status": state.get("clip_residency_status", ""),
+        "cache_present": bool(state.get("cache_present", False)),
+        "eligible": bool(state.get("eligible", False)),
+        "eligibility_reason": state.get("eligibility_reason", ""),
+        "clip_encode_entries": state.get("clip_encode_entries", 0),
+        "unet_patcher_object_id": state.get("unet_patcher_object_id", ""),
+        "unet_diffusion_object_id": state.get("unet_diffusion_object_id", ""),
+        "sampler_patcher_object_id": state.get("sampler_patcher_object_id", ""),
+        "clip_object_id": state.get("clip_object_id", ""),
+    }
+
+
+def _emit_unet_early_activation_reconciliation_line(
+    record: dict[str, Any],
+) -> None:
+    try:
+        _parts = []
+        for _k, _v in record.items():
+            if _k == "request_id":
+                continue
+            _parts.append(f"{_k}={_v if _v is not None else 'absent'}")
+        print(
+            f"[v2.unet_early_activation] event=reconciliation "
+            f"request_id={record.get('request_id') or 'absent'} " + " ".join(_parts),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def finalize_unet_early_activation(
+    request_id: str,
+    *,
+    trace: RuntimeTrace | None = None,
+) -> dict[str, Any] | None:
+    """Request-end cleanup + reconciliation.
+
+    Emits ``unet_early_activation_reconciliation`` with the request-end
+    derived intervals, marks any still-pending activation cancelled (the
+    worker observes this before its GPU mutation), and drops the request
+    state.  Never leaves an activation future or model mutation pending —
+    the coordinator pool shutdown in ``close_workers`` terminates any
+    in-flight worker."""
+    if not request_id:
+        return None
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.pop(request_id, None)
+    if _state is None:
+        return None
+    _future = _state.get("future")
+    with _UNET_ACTIVATION_LOCK:
+        if not _state.get("terminal", False):
+            _state["status"] = "cancelled"
+            _state["cancelled"] = True
+            _state["terminal"] = True
+            _state["reason"] = "request_finalized"
+            _state["terminal_mono_ns"] = time.monotonic_ns()
+        if _future is not None and not _future.done():
+            try:
+                _future.cancel()
+            except Exception:
+                pass
+    _record = _build_unet_early_activation_reconciliation(_state)
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_RECONCILIATION, phase="execution", metadata=_record)
+    _emit_unet_early_activation_reconciliation_line(_record)
+    return _record
 
 
 # ── Backward-compatible aliases for test imports ─────────────────────
