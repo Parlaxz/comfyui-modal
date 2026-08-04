@@ -10123,6 +10123,29 @@ def _clip_cache_compute_dtype(clip: Any) -> str:
                 return str(value)
         except Exception:
             continue
+        for attr_name in ("compute_dtype", "model_compute_dtype", "manual_cast_dtype"):
+            try:
+                value = getattr(owner, attr_name, None)
+                if value is not None:
+                    return str(value)
+            except Exception:
+                continue
+        model = getattr(owner, "model", None)
+        if model is not None:
+            for attr_name in ("compute_dtype", "model_compute_dtype", "manual_cast_dtype", "dtype"):
+                try:
+                    value = getattr(model, attr_name, None)
+                    if value is not None:
+                        return str(value)
+                except Exception:
+                    continue
+        try:
+            parameters = getattr(owner, "parameters", None)
+            parameter = next(iter(parameters())) if callable(parameters) else None
+            if parameter is not None:
+                return str(parameter.dtype)
+        except Exception:
+            continue
     return ""
 
 
