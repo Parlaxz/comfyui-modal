@@ -581,11 +581,14 @@ class BootstrapState:
             custom_node_generation, or deployment_combined_hash.
           - Each loader role is independently compared using canonical
             per-role identity (``compute_loader_role_identity``).
-          - VAE always reports ``missing_snapshot_output`` (snapshot lacks VAE).
+          - VAE is seeded only when a snapshot VAE output exists AND the
+            canonical VAE role identity matches; otherwise it reports
+            ``missing_snapshot_output`` or ``identity_mismatch`` exactly like
+            the other roles (with stale-cache invalidation).
           - CheckpointLoader/CheckpointLoaderSimple report ``unsupported``
             unless safely role-separated.
-          - UNET and CLIP report ``identity_mismatch`` with exact mismatched
-            fields when request vs. snapshot role identity differs.
+          - UNET, CLIP, and VAE report ``identity_mismatch`` with exact
+            mismatched fields when request vs. snapshot role identity differs.
         """
         import hashlib
         from .contracts import (
@@ -698,16 +701,10 @@ class BootstrapState:
                 }
                 continue
 
-            # 3. VAE: always missing_snapshot_output (snapshot has no VAE)
-            if _role == "vae":
-                results[node_id] = {
-                    "decision": "missing_snapshot_output",
-                    "role": _role,
-                    "expected_identity": "",
-                    "actual_identity": "",
-                    "mismatch_fields": "none",
-                }
-                continue
+            # 3. VAE: seeded only when an output exists AND the canonical VAE
+            #    role identity matches.  Mismatch and absent-output paths fall
+            #    through to the generic checks below (identity_mismatch /
+            #    missing_snapshot_output with stale-cache invalidation).
 
             # 4. Check output availability
             _out = loader_outputs.get(node_id)
