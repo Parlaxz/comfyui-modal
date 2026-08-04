@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .contracts import ModelRestoreKey
+from .runtime_shape import runtime_shape_config
 from .trace import RuntimeTrace
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ class CpuSnapshotModels:
     compute_policy: str = "default"
     policy_version: int = CPU_SNAPSHOT_UNET_POLICY_VERSION
     target_gpus: tuple[str, ...] = ()
+    construction_order: str = "O0"
 
 
 # ---------------------------------------------------------------------------
@@ -1872,8 +1874,9 @@ def load_cpu_snapshot_models(
     built with a different policy cannot match.  The model_spec does NOT
     contain compute_policy — matching uses the separate field.
 
-    Load order: CLIP -> gc.collect -> UNET -> gc.collect -> VAE -> gc.collect.
-    All loading happens under torch.no_grad().
+    Load order is selected by ``COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER`` and is
+    one of O0 through O3. All loading happens under torch.no_grad() with a
+    gc.collect barrier after each role.
 
     Callback invocation shapes:
       load_clip(name, type, device)           -- single CLIP
@@ -1892,6 +1895,104 @@ def load_cpu_snapshot_models(
     timings: dict[str, float] = {}
     active_object_type = ""
     active_basename = ""
+    construction_order = runtime_shape_config().snapshot_model_order
+
+    def _bounded_model_management_state() -> dict[str, Any]:
+        if os.environ.get("COMFYMODAL_V2_SNAPSHOT_ORDER_DIAGNOSTICS", "").strip() != "1":
+            return {}
+        try:
+            import sys
+            management = sys.modules.get("comfy.model_management")
+            loaded = getattr(management, "current_loaded_models", None)
+            return {
+                "current_loaded_models_count": len(loaded) if loaded is not None else None,
+                "loaded_models_count": (
+                    len(management.loaded_models())
+                    if management is not None and callable(getattr(management, "loaded_models", None))
+                    else None
+                ),
+            }
+        except Exception as exc:
+            return {"state_error": type(exc).__name__}
+
+    def _load_role(role: str) -> Any:
+        nonlocal active_object_type, active_basename
+        active_basename = os.path.basename(
+            normalized.get("clip1", "") if role == "clip"
+            else normalized.get(role, "")
+        )
+        if trace:
+            trace.emit(
+                f"cpu_snapshot_{role}_load_start",
+                phase="restore",
+                metadata={
+                    "model_key_hash": model_key_hash,
+                    "basename": active_basename,
+                    "construction_order": construction_order,
+                },
+            )
+        role_start = time.monotonic_ns()
+        obj: Any = None
+        try:
+            with torch.no_grad():
+                if role == "clip":
+                    if normalized.get("clip2"):
+                        obj = load_clip(
+                            normalized["clip1"], normalized["clip2"],
+                            normalized.get("clip_type", "stable_diffusion"), "default",
+                        )
+                    else:
+                        obj = load_clip(
+                            normalized["clip1"],
+                            normalized.get("clip_type", "stable_diffusion"), "default",
+                        )
+                elif role == "unet":
+                    obj = load_unet(normalized["unet"], normalized.get("weight_dtype", "default"))
+                elif role == "vae":
+                    if load_vae is None:
+                        raise RuntimeError(
+                            "profile declares a VAE but no load_vae callback was provided"
+                        )
+                    obj = load_vae(normalized["vae"])
+                else:
+                    raise RuntimeError(f"unsupported snapshot model role: {role}")
+            active_object_type = type(obj).__name__
+            duration_ms = round((time.monotonic_ns() - role_start) / 1_000_000, 2)
+            timings[f"{role}_load_ms"] = duration_ms
+            gc.collect()
+            state = _bounded_model_management_state()
+            if trace:
+                trace.emit(
+                    f"cpu_snapshot_{role}_load_end",
+                    phase="restore",
+                    metadata={
+                        "model_key_hash": model_key_hash,
+                        "object_type": type(obj).__name__,
+                        "basename": active_basename,
+                        "duration_ms": duration_ms,
+                        "gc_barrier": "complete",
+                        "construction_order": construction_order,
+                        **state,
+                    },
+                )
+            return obj
+        except BaseException as exc:
+            if trace:
+                trace.emit(
+                    f"cpu_snapshot_{role}_load_end",
+                    phase="restore",
+                    metadata={
+                        "model_key_hash": model_key_hash,
+                        "object_type": active_object_type,
+                        "basename": active_basename,
+                        "duration_ms": round((time.monotonic_ns() - role_start) / 1_000_000, 2),
+                        "gc_barrier": "failed",
+                        "construction_order": construction_order,
+                        "status": "error",
+                        "reason": str(exc)[:200],
+                    },
+                )
+            raise
 
     try:
         normalized = _normalize_profile(profile) if isinstance(profile, Mapping) else {}
@@ -1900,119 +2001,22 @@ def load_cpu_snapshot_models(
         )
         model_key_hash = model_key.stable_hash[:16]
 
-        # --- CLIP load ---
-        active_object_type = ""
-        active_basename = os.path.basename(normalized["clip1"])
-        if trace:
-            trace.emit(
-                "cpu_snapshot_clip_load_start",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "basename": active_basename,
-                },
-            )
-        clip_start = time.monotonic_ns()
-        with torch.no_grad():
-            if normalized.get("clip2"):
-                clip_obj = load_clip(
-                    normalized["clip1"],
-                    normalized["clip2"],
-                    normalized.get("clip_type", "stable_diffusion"),
-                    "default",
-                )
+        order_map = {
+            "O0": ("clip", "unet", "vae"),
+            "O1": ("unet", "vae", "clip"),
+            "O2": ("unet", "clip", "vae"),
+            "O3": ("clip", "vae", "unet"),
+        }
+        for role in order_map[construction_order]:
+            if role == "vae" and not normalized.get("vae"):
+                continue
+            loaded = _load_role(role)
+            if role == "clip":
+                clip_obj = loaded
+            elif role == "unet":
+                unet_obj = loaded
             else:
-                clip_obj = load_clip(
-                    normalized["clip1"],
-                    normalized.get("clip_type", "stable_diffusion"),
-                    "default",
-                )
-        clip_end = time.monotonic_ns()
-        clip_ms = round((clip_end - clip_start) / 1_000_000, 2)
-        timings["clip_load_ms"] = clip_ms
-        if trace:
-            trace.emit(
-                "cpu_snapshot_clip_load_end",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "object_type": type(clip_obj).__name__,
-                    "basename": active_basename,
-                    "duration_ms": clip_ms,
-                },
-            )
-
-        gc.collect()
-
-        # --- UNET load ---
-        active_basename = os.path.basename(normalized["unet"])
-        if trace:
-            trace.emit(
-                "cpu_snapshot_unet_load_start",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "basename": active_basename,
-                },
-            )
-        unet_start = time.monotonic_ns()
-        with torch.no_grad():
-            unet_obj = load_unet(
-                normalized["unet"],
-                normalized.get("weight_dtype", "default"),
-            )
-        unet_end = time.monotonic_ns()
-        unet_ms = round((unet_end - unet_start) / 1_000_000, 2)
-        timings["unet_load_ms"] = unet_ms
-        if trace:
-            trace.emit(
-                "cpu_snapshot_unet_load_end",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "object_type": type(unet_obj).__name__,
-                    "basename": active_basename,
-                    "duration_ms": unet_ms,
-                },
-            )
-
-        gc.collect()
-
-        # --- VAE load (only when the profile declares one) ---
-        if normalized.get("vae"):
-            active_basename = os.path.basename(normalized["vae"])
-            if trace:
-                trace.emit(
-                    "cpu_snapshot_vae_load_start",
-                    phase="restore",
-                    metadata={
-                        "model_key_hash": model_key_hash,
-                        "basename": active_basename,
-                    },
-                )
-            vae_start = time.monotonic_ns()
-            with torch.no_grad():
-                if load_vae is None:
-                    raise RuntimeError(
-                        "profile declares a VAE but no load_vae callback was provided"
-                    )
-                vae_obj = load_vae(normalized["vae"])
-            vae_end = time.monotonic_ns()
-            vae_ms = round((vae_end - vae_start) / 1_000_000, 2)
-            timings["vae_load_ms"] = vae_ms
-            if trace:
-                trace.emit(
-                    "cpu_snapshot_vae_load_end",
-                    phase="restore",
-                    metadata={
-                        "model_key_hash": model_key_hash,
-                        "object_type": type(vae_obj).__name__,
-                        "basename": active_basename,
-                        "duration_ms": vae_ms,
-                    },
-                )
-
-            gc.collect()
+                vae_obj = loaded
 
         # Derive compute policy from target_gpus (snapshot identity)
         _cp = _COMPUTE_POLICY_DEFAULT
@@ -2032,6 +2036,7 @@ def load_cpu_snapshot_models(
             compute_policy=_cp,
             policy_version=CPU_SNAPSHOT_UNET_POLICY_VERSION,
             target_gpus=target_gpus or (),
+            construction_order=construction_order,
         )
 
         ok, reason = validate_cpu_snapshot_models(
@@ -2054,6 +2059,7 @@ def load_cpu_snapshot_models(
                     "basename": active_basename,
                     "status": "ok",
                     "duration_ms": total_ms,
+                    "construction_order": construction_order,
                 },
             )
 
@@ -2075,6 +2081,7 @@ def load_cpu_snapshot_models(
                     "basename": active_basename,
                     "status": "error",
                     "reason": str(exc),
+                    "construction_order": construction_order,
                 },
             )
         raise
@@ -2096,6 +2103,15 @@ def validate_cpu_snapshot_models(
 
     Returns (True, 'ok') on success or (False, reason_string) on failure.
     """
+    _effective_order = runtime_shape_config().snapshot_model_order
+    _stored_order = getattr(models, "construction_order", "")
+    if _stored_order != _effective_order:
+        return (
+            False,
+            f"construction_order mismatch: stored={_stored_order!r} "
+            f"current={_effective_order!r}",
+        )
+
     # Identity check â€” all fields
     if models.model_key != expected_key:
         for field_name in (
