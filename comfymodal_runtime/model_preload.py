@@ -33,7 +33,11 @@ from typing import Any, Callable, Iterator
 
 from .contracts import ModelRestoreKey, PrefillKey, stable_hash
 from .env import env_flag
-from .clip_conditioning_cache import get_exact_conditioning_cache, log_conditioning_cache_decision
+from .clip_conditioning_cache import (
+    conditioning_cache_key_summary,
+    get_exact_conditioning_cache,
+    log_conditioning_cache_decision,
+)
 from .cpu_snapshot_models import (
     collect_unet_runtime_state,
     page_readiness_mode,
@@ -7149,10 +7153,18 @@ class V2LoaderBridge:
             _cc_hit_results: dict[tuple[int, str], Any] = {}
             _cc_exact_hit = False
             _cc_ctx: dict[str, Any] = {}
+            _cc_key_info: dict[str, Any] = {
+                "key_hash": "absent",
+                "identity_status": "invalid",
+                "schema_version": 0,
+                "validation_scope": "",
+                "missing": "",
+            }
             if _cc_cache_svc is not None:
                 _cc_ctx = _build_clip_conditioning_cache_context(
                     self, clip=clip, trace=trace, request_id=_request_id,
                 )
+                _cc_key_info = conditioning_cache_key_summary(_cc_ctx, filtered)
                 _cc_hits, _cc_miss_entries, _cc_hit_count, _cc_miss_count = (
                     _cc_cache_svc.lookup_many(_cc_ctx, filtered)
                 )
@@ -7179,7 +7191,11 @@ class V2LoaderBridge:
                         encode_entries=filtered,
                     )
                     log_conditioning_cache_decision(
-                        "exact_hit", encode_calls=0,
+                        "exact_hit", key_hash=_cc_key_info["key_hash"],
+                        identity_status=_cc_key_info["identity_status"],
+                        encode_calls=0,
+                        schema_version=_cc_key_info["schema_version"],
+                        validation_scope=_cc_key_info["validation_scope"],
                         entries=len(filtered),
                         request_id=_request_id or "absent",
                     )
@@ -7189,6 +7205,10 @@ class V2LoaderBridge:
                             phase="execution",
                             metadata={
                                 "decision": "exact_hit",
+                                "key_hash": _cc_key_info["key_hash"],
+                                "identity_status": _cc_key_info["identity_status"],
+                                "schema_version": _cc_key_info["schema_version"],
+                                "validation_scope": _cc_key_info["validation_scope"],
                                 "encode_calls": 0,
                                 "entry_count": len(filtered),
                             },
@@ -7248,8 +7268,16 @@ class V2LoaderBridge:
                                        metadata={"error": str(exc)[:200],
                                                  "text_length": len(text)})
             if _cc_stored:
+                _cc_stored_key_info = conditioning_cache_key_summary(
+                    _cc_ctx, _cc_miss_entries
+                )
                 log_conditioning_cache_decision(
-                    "miss_stored", stored=_cc_stored,
+                    "miss_stored", key_hash=_cc_stored_key_info["key_hash"],
+                    identity_status=_cc_stored_key_info["identity_status"],
+                    encode_calls=_cc_encode_calls,
+                    schema_version=_cc_stored_key_info["schema_version"],
+                    validation_scope=_cc_stored_key_info["validation_scope"],
+                    stored=_cc_stored,
                     entries=len(filtered),
                     request_id=_request_id or "absent",
                 )
@@ -7259,6 +7287,10 @@ class V2LoaderBridge:
                         phase="execution",
                         metadata={
                             "decision": "miss_stored",
+                            "key_hash": _cc_stored_key_info["key_hash"],
+                            "identity_status": _cc_stored_key_info["identity_status"],
+                            "schema_version": _cc_stored_key_info["schema_version"],
+                            "validation_scope": _cc_stored_key_info["validation_scope"],
                             "stored_count": _cc_stored,
                             "encode_calls": _cc_encode_calls,
                         },
@@ -7866,7 +7898,10 @@ class V2LoaderBridge:
             _request_id = str(self._trace.request_id)
         _rt = trace or self._trace
         _mode = unet_activation_mode()
-        if _mode not in _UNET_ACTIVATION_MODE_ACTIVE:
+        if (
+            _mode not in _UNET_ACTIVATION_MODE_ACTIVE
+            and not _unet_cache_hit_activation_pending(_request_id)
+        ):
             # Late mode (the default) preserves Phase 0 exactly: the UNET
             # graph consumer must not emit any unet_early_activation_*
             # graph-demand/join markers, perform join helper work, create
@@ -8048,15 +8083,16 @@ class V2LoaderBridge:
         # control flow is preserved: the retained UNET is still returned and
         # the original sampler load path continues as a cache validation.  A
         # non-ready terminal outcome elects the unchanged late fallback
-        # exactly once (atomic, never overwritten).  Late mode is gated here
-        # so the UNET graph consumer never emits early-activation markers or
-        # performs join work (the helper double-checks the mode too).
-        if (
-            lane == "UNET"
-            and result is not None
-            and unet_activation_mode() in _UNET_ACTIVATION_MODE_ACTIVE
-        ):
-            self._join_unet_early_activation(result, trace=self._trace)
+        # exactly once (atomic, never overwritten).  Late mode remains gated
+        # except for a pending exact-cache-hit activation.
+        if lane == "UNET" and result is not None:
+            _request_trace = self._trace or _ACTIVE_REQUEST_TRACE.get()
+            _request_id = str(_request_trace.request_id) if _request_trace is not None else ""
+            if (
+                unet_activation_mode() in _UNET_ACTIVATION_MODE_ACTIVE
+                or _unet_cache_hit_activation_pending(_request_id)
+            ):
+                self._join_unet_early_activation(result, trace=self._trace)
         if self._trace:
             self._trace.emit(f"graph_{diagnostics_prefix}_wait_end", phase="execution",
                              metadata={"status": "ok"})
@@ -8369,6 +8405,7 @@ _EVENT_CLIP_ENCODE_END = "clip_encode_end"
 _UNET_ACTIVATION_MODE_LATE = "late"
 _UNET_ACTIVATION_MODE_CLIP_ENCODE_START = "clip_encode_start"
 _UNET_ACTIVATION_MODE_CLIP_GPU_READY = "clip_gpu_ready"
+_UNET_ACTIVATION_TRIGGER_CACHE_HIT = "conditioning_cache_hit"
 # Legacy documented opt-in set (kept for the existing activation tests).
 # ``clip_gpu_ready`` is accepted by ``_resolve_unet_activation_mode``
 # explicitly below.
@@ -8528,6 +8565,18 @@ def _unet_activation_get(request_id: str) -> dict[str, Any] | None:
         return None
     with _UNET_ACTIVATION_LOCK:
         return _UNET_ACTIVATION_STATE.get(request_id)
+
+
+def _unet_cache_hit_activation_pending(request_id: str) -> bool:
+    if not request_id:
+        return False
+    with _UNET_ACTIVATION_LOCK:
+        state = _UNET_ACTIVATION_STATE.get(request_id)
+        return bool(
+            state is not None
+            and state.get("trigger") == _UNET_ACTIVATION_TRIGGER_CACHE_HIT
+            and state.get("future") is not None
+        )
 
 
 def _unet_activation_trim() -> None:
@@ -9158,10 +9207,11 @@ def _early_activation_terminal(
         trace.emit(_EVENT_UNET_EA_TERMINAL, phase="execution", metadata=_term_meta)
     print(
         f"[v2.unet_early_activation] event=terminal "
+        f"trigger={state.get('trigger', '')} status={state.get('status', status)} "
+        f"transfer_count={state.get('transfer_count', 0)} "
         f"request_id={request_id or 'absent'} mode={state.get('mode', '')} "
-        f"key_hash={state.get('key_hash', '')} status={state.get('status', status)} "
-        f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'} "
-        f"transfer_count={state.get('transfer_count', 0)}",
+        f"key_hash={state.get('key_hash', '')} "
+        f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'}",
         flush=True,
     )
     return {
@@ -9637,7 +9687,8 @@ def _unet_activation_submit(
     _unet_activation_trim()
     print(
         f"[v2.unet_early_activation] event=scheduled "
-        f"request_id={request_id or 'absent'} mode={mode} trigger={trigger} "
+        f"trigger={trigger} "
+        f"request_id={request_id or 'absent'} mode={mode} "
         f"key_hash={key_hash} clip_encode_entries={_state.get('clip_encode_entries', 0)} "
         f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
         f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
@@ -10246,12 +10297,10 @@ def _schedule_unet_activation_conditioning_cache_hit(
     scheduling core (``_unet_activation_submit``) with
     ``trigger=conditioning_cache_hit``.  A cache hit means no CLIP encode
     and therefore no CLIP GPU load, so the clip_gpu_ready fire event will
-    never occur — scheduling directly here avoids waiting for it.  Late
-    mode and ineligible outcomes preserve current behavior (no schedule).
+    never occur — scheduling directly here avoids waiting for it.  An
+    ineligible outcome preserves the normal late-load fallback.
     """
     mode = unet_activation_mode()
-    if mode not in _UNET_ACTIVATION_MODE_ACTIVE:
-        return False
     if bridge is None:
         return False
     prep = getattr(bridge, "_preparation", None)
@@ -10270,7 +10319,7 @@ def _schedule_unet_activation_conditioning_cache_hit(
     if trace is not None:
         trace.emit(_EVENT_UNET_EA_MODE, phase="execution", metadata={
             "mode": mode,
-            "trigger": "conditioning_cache_hit",
+            "trigger": _UNET_ACTIVATION_TRIGGER_CACHE_HIT,
             "request_id": _request_id,
             "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
             "restore_session_id": _LATEST_RESTORE_SESSION_ID,
@@ -10278,9 +10327,9 @@ def _schedule_unet_activation_conditioning_cache_hit(
     _eligible, _reason, _evidence = _prove_unet_early_activation_eligible(
         bridge,
         request_id=_request_id,
-        clip=clip,
+        clip=None,
         mode=mode,
-        trigger="conditioning_cache_hit",
+        trigger=_UNET_ACTIVATION_TRIGGER_CACHE_HIT,
     )
     _eligible_meta = dict(_evidence)
     _eligible_meta.update({"eligible": bool(_eligible), "reason": _reason})
@@ -10290,7 +10339,7 @@ def _schedule_unet_activation_conditioning_cache_hit(
         if trace is not None:
             trace.emit(_EVENT_UNET_EA_SKIPPED, phase="execution", metadata={
                 "mode": mode,
-                "trigger": "conditioning_cache_hit",
+                "trigger": _UNET_ACTIVATION_TRIGGER_CACHE_HIT,
                 "request_id": _request_id,
                 "eligible": False,
                 "reason": _reason,
@@ -10300,7 +10349,7 @@ def _schedule_unet_activation_conditioning_cache_hit(
         print(
             f"[v2.unet_early_activation] event=skipped "
             f"request_id={_request_id or 'absent'} mode={mode} "
-            f"trigger=conditioning_cache_hit reason={_reason} eligible=0",
+            f"trigger={_UNET_ACTIVATION_TRIGGER_CACHE_HIT} reason={_reason} eligible=0",
             flush=True,
         )
         return False
@@ -10318,13 +10367,13 @@ def _schedule_unet_activation_conditioning_cache_hit(
     scheduled = _unet_activation_submit(
         bridge,
         request_id=_request_id, trace=trace, prep=prep, model_key=model_key,
-        mode=mode, trigger="conditioning_cache_hit",
-        clip=clip, encode_entries=encode_entries,
+        mode=mode, trigger=_UNET_ACTIVATION_TRIGGER_CACHE_HIT,
+        clip=None, encode_entries=encode_entries,
         key_components=_key_components, key_hash=_key_hash,
     )
     if scheduled:
         print(
-            "[v2.unet_early_activation] trigger=conditioning_cache_hit",
+            f"[v2.unet_early_activation] trigger={_UNET_ACTIVATION_TRIGGER_CACHE_HIT}",
             flush=True,
         )
     return scheduled
@@ -10421,15 +10470,23 @@ def join_unet_early_activation(
     exactly one caller elects the unchanged late fallback (atomic, never
     overwritten, never racing a pending future — the future is joined to
     terminal before any election).  Mode-gated: only the active modes
-    (``clip_encode_start`` / ``clip_gpu_ready``) join the future; late mode
-    is a no-op."""
-    if unet_activation_mode() not in _UNET_ACTIVATION_MODE_ACTIVE:
-        return {"scheduled": False, "status": "mode_late", "terminal": False,
-                "valid": False, "reason": "", "join_wait_ms": 0.0}
+    (``clip_encode_start`` / ``clip_gpu_ready``) join the future; an explicit
+    ``conditioning_cache_hit`` future is also joined in late mode."""
     _request_id = str(request_id or "")
     if not _request_id and trace is not None:
         _request_id = str(trace.request_id)
     _state = _unet_activation_get(_request_id)
+    _cache_hit_pending = bool(
+        _state is not None
+        and _state.get("trigger") == _UNET_ACTIVATION_TRIGGER_CACHE_HIT
+        and _state.get("future") is not None
+    )
+    if (
+        unet_activation_mode() not in _UNET_ACTIVATION_MODE_ACTIVE
+        and not _cache_hit_pending
+    ):
+        return {"scheduled": False, "status": "mode_late", "terminal": False,
+                "valid": False, "reason": "", "join_wait_ms": 0.0}
     if _state is None or _state.get("future") is None:
         return {"scheduled": False, "status": "not_scheduled", "terminal": False,
                 "valid": False, "reason": "", "join_wait_ms": 0.0}
