@@ -33,6 +33,11 @@ from typing import Any, Callable, Iterator
 
 from .contracts import ModelRestoreKey, PrefillKey, stable_hash
 from .env import env_flag
+from .clip_conditioning_cache import (
+    conditioning_cache_key_summary,
+    get_exact_conditioning_cache,
+    log_conditioning_cache_decision,
+)
 from .cpu_snapshot_models import (
     collect_unet_runtime_state,
     page_readiness_mode,
@@ -6588,6 +6593,12 @@ class V2LoaderBridge:
         self._model_key: ModelRestoreKey | None = None
         self._prefill_key: PrefillKey | None = None
         self._model_spec: Mapping[str, Any] = {}
+        self._workflow_hash: str = ""
+        """Compiled workflow hash captured from the restore plan (exact key
+        input for the CLIP conditioning cache)."""
+        self._production_options_hash: str = ""
+        """Effective production-options hash captured from the restore plan
+        (exact key input covering production preset bindings)."""
         self._preparation: RestorePreparation | None = None
         self._trace: RuntimeTrace | None = None
         self._preparation_trace: RuntimeTrace | None = None
@@ -6660,6 +6671,17 @@ class V2LoaderBridge:
         self._model_key = plan.model_key
         self._prefill_key = plan.prefill_key
         self._model_spec = plan.model_spec if isinstance(plan.model_spec, Mapping) else {}
+        self._workflow_hash = str(
+            getattr(plan, "workflow_hash", "") or getattr(plan, "source_workflow_hash", "") or ""
+        )
+        _exec_options = getattr(plan, "execution_options", None)
+        if _exec_options is not None and hasattr(_exec_options, "to_dict"):
+            try:
+                self._production_options_hash = stable_hash(_exec_options.to_dict())
+            except Exception:
+                self._production_options_hash = ""
+        else:
+            self._production_options_hash = ""
         self._trace = trace
         with self._prefill_lock:
             self._prefill_results.clear()
@@ -7136,72 +7158,189 @@ class V2LoaderBridge:
             # successful CLIP load_models_gpu call from the real prefill
             # encode returns and the mutation lane is released; "late"
             # (default) is a no-op that preserves Phase 0 behavior.
-            if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
-                _armed = _unet_activation_arm(
-                    self,
-                    trace=trace,
-                    request_id=_request_id,
-                    clip=clip,
-                    encode_entries=filtered,
+            # ── Exact CLIP conditioning cache (opt-in) ──────────────
+            # An exact hit serves the completed CPU conditioning directly:
+            # zero CLIP GPU loads and zero CLIP encodes.  Because no CLIP
+            # encode runs, the retained-UNET activation is scheduled through
+            # the existing shared scheduling core with
+            # trigger=conditioning_cache_hit instead of waiting for a
+            # clip_encode_start/clip_gpu_ready fire event that will not
+            # happen.  Every cache failure is a miss (unchanged encode).
+            _cc_cache_svc = get_exact_conditioning_cache()
+            _cc_miss_entries: list[dict[str, Any]] = list(filtered)
+            _cc_hit_results: dict[tuple[int, str], Any] = {}
+            _cc_exact_hit = False
+            _cc_ctx: dict[str, Any] = {}
+            _cc_key_info: dict[str, Any] = {
+                "key_hash": "absent",
+                "identity_status": "invalid",
+                "schema_version": 0,
+                "validation_scope": "",
+                "missing": "",
+            }
+            if _cc_cache_svc is not None:
+                _cc_ctx = _build_clip_conditioning_cache_context(
+                    self, clip=clip, trace=trace, request_id=_request_id,
                 )
-                if _armed:
-                    _clip_patcher = _resolve_clip_patcher(clip)
-                    if _clip_patcher is not None:
-                        try:
-                            _mm_load_models_gpu(
-                                [_clip_patcher], force_full_load=True,
-                            )
-                        except Exception as _exc:
-                            if trace is not None:
-                                trace.emit(
-                                    "clip_gpu_ready_force_load_error",
-                                    phase="execution",
-                                    metadata={
-                                        "request_id": _request_id,
-                                        "error": str(_exc)[:200],
-                                    },
+                _cc_key_info = conditioning_cache_key_summary(_cc_ctx, filtered)
+                _cc_hits, _cc_miss_entries, _cc_hit_count, _cc_miss_count = (
+                    _cc_cache_svc.lookup_many(_cc_ctx, filtered)
+                )
+                if trace:
+                    trace.emit(
+                        "clip_conditioning_cache_lookup",
+                        phase="execution",
+                        metadata={
+                            "hit_count": _cc_hit_count,
+                            "miss_count": _cc_miss_count,
+                            "entry_count": len(filtered),
+                        },
+                    )
+                for _cc_index, _cc_value in _cc_hits.items():
+                    _cc_text = str(filtered[_cc_index].get("text", ""))
+                    _cc_hit_results[(id(clip), _cc_text)] = _cc_value
+                _cc_exact_hit = bool(filtered) and _cc_miss_count == 0
+                if _cc_exact_hit:
+                    _schedule_unet_activation_conditioning_cache_hit(
+                        self,
+                        trace=trace,
+                        request_id=_request_id,
+                        clip=clip,
+                        encode_entries=filtered,
+                    )
+                    log_conditioning_cache_decision(
+                        "exact_hit", key_hash=_cc_key_info["key_hash"],
+                        identity_status=_cc_key_info["identity_status"],
+                        encode_calls=0,
+                        schema_version=_cc_key_info["schema_version"],
+                        validation_scope=_cc_key_info["validation_scope"],
+                        entries=len(filtered),
+                        request_id=_request_id or "absent",
+                    )
+                    if trace:
+                        trace.emit(
+                            "clip_conditioning_cache_decision",
+                            phase="execution",
+                            metadata={
+                                "decision": "exact_hit",
+                                "key_hash": _cc_key_info["key_hash"],
+                                "identity_status": _cc_key_info["identity_status"],
+                                "schema_version": _cc_key_info["schema_version"],
+                                "validation_scope": _cc_key_info["validation_scope"],
+                                "encode_calls": 0,
+                                "entry_count": len(filtered),
+                            },
+                        )
+            # The existing activation hooks run only when the encode loop
+            # will actually run (miss or partial).  On an exact hit the
+            # activation was already scheduled above with
+            # trigger=conditioning_cache_hit.
+            if not _cc_exact_hit:
+                if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+                    _armed = _unet_activation_arm(
+                        self,
+                        trace=trace,
+                        request_id=_request_id,
+                        clip=clip,
+                        encode_entries=_cc_miss_entries or filtered,
+                    )
+                    if _armed:
+                        _clip_patcher = _resolve_clip_patcher(clip)
+                        if _clip_patcher is not None:
+                            try:
+                                _mm_load_models_gpu(
+                                    [_clip_patcher], force_full_load=True,
                                 )
-            else:
-                clip_encode_start(
-                    self,
-                    trace=trace,
-                    request_id=_request_id,
-                    clip=clip,
-                    encode_entries=filtered,
-                )
+                            except Exception as _exc:
+                                if trace is not None:
+                                    trace.emit(
+                                        "clip_gpu_ready_force_load_error",
+                                        phase="execution",
+                                        metadata={
+                                            "request_id": _request_id,
+                                            "error": str(_exc)[:200],
+                                        },
+                                    )
+                else:
+                    clip_encode_start(
+                        self,
+                        trace=trace,
+                        request_id=_request_id,
+                        clip=clip,
+                        encode_entries=_cc_miss_entries or filtered,
+                    )
 
             # ── Phase B: actual encode (wall / thread / process CPU) ──
             _encode_start = _capture_phase_counters()
-            # Record the ACTUAL encode start immediately after the counter
-            # snapshot and immediately before the encode loop so the
-            # activation waterfall reconciles against the real encode start
-            # (never the scheduling/submit time).
-            record_clip_encode_start(_request_id, _encode_start)
-            if trace:
-                trace.emit(_EVENT_ENCODE_START, phase="execution",
-                           metadata={"counters": _encode_start,
-                                     "filtered_entries": len(filtered)})
-            # Encode eligible entries using original CLIPTextEncode. The
-            # request-owned state is explicitly captured because ContextVars
-            # do not propagate to the coordinator's thread pool.
-            results: dict[tuple[int, str], Any] = {}
-            for entry in filtered:
-                text = str(entry.get("text", ""))
-                try:
-                    result = _record_clip_encode(
-                        caller="execution_prefill", clip=clip, text=text,
-                        _explicit_state=_worker_state,
-                        callback=lambda c=clip, t=text: self._invoke_original(
-                            "CLIPTextEncode", {"clip": c, "text": t}
-                        ),
+            results: dict[tuple[int, str], Any] = dict(_cc_hit_results)
+            _cc_stored = 0
+            _cc_encode_calls = 0
+            if not _cc_exact_hit:
+                record_clip_encode_start(_request_id, _encode_start)
+                if trace:
+                    trace.emit(_EVENT_ENCODE_START, phase="execution",
+                               metadata={"counters": _encode_start,
+                                         "filtered_entries": len(_cc_miss_entries)})
+                for entry in _cc_miss_entries:
+                    text = str(entry.get("text", ""))
+                    try:
+                        result = _record_clip_encode(
+                            caller="execution_prefill", clip=clip, text=text,
+                            _explicit_state=_worker_state,
+                            callback=lambda c=clip, t=text: self._invoke_original(
+                                "CLIPTextEncode", {"clip": c, "text": t}
+                            ),
+                        )
+                        _cc_encode_calls += 1
+                        results[(id(clip), text)] = result
+                        if _cc_cache_svc is not None:
+                            if _cc_cache_svc.store_entry(_cc_ctx, entry, result):
+                                _cc_stored += 1
+                    except Exception as exc:
+                        if trace:
+                            trace.emit("execution_prefill_encode_error",
+                                       phase="execution",
+                                       metadata={"error": str(exc)[:200],
+                                                 "text_length": len(text)})
+            if _cc_stored:
+                _cc_stored_key_info = conditioning_cache_key_summary(
+                    _cc_ctx, _cc_miss_entries
+                )
+                log_conditioning_cache_decision(
+                    "miss_stored", key_hash=_cc_stored_key_info["key_hash"],
+                    identity_status=_cc_stored_key_info["identity_status"],
+                    encode_calls=_cc_encode_calls,
+                    schema_version=_cc_stored_key_info["schema_version"],
+                    validation_scope=_cc_stored_key_info["validation_scope"],
+                    stored=_cc_stored,
+                    entries=len(filtered),
+                    request_id=_request_id or "absent",
+                )
+                if trace:
+                    trace.emit(
+                        "clip_conditioning_cache_decision",
+                        phase="execution",
+                        metadata={
+                            "decision": "miss_stored",
+                            "key_hash": _cc_stored_key_info["key_hash"],
+                            "identity_status": _cc_stored_key_info["identity_status"],
+                            "schema_version": _cc_stored_key_info["schema_version"],
+                            "validation_scope": _cc_stored_key_info["validation_scope"],
+                            "stored_count": _cc_stored,
+                            "encode_calls": _cc_encode_calls,
+                        },
                     )
-                    results[(id(clip), text)] = result
-                except Exception as exc:
-                    if trace:
-                        trace.emit("execution_prefill_encode_error",
-                                   phase="execution",
-                                   metadata={"error": str(exc)[:200],
-                                             "text_length": len(text)})
+            elif _cc_cache_svc is not None and trace:
+                trace.emit(
+                    "clip_conditioning_cache_decision",
+                    phase="execution",
+                    metadata={
+                        "decision": "miss_not_stored",
+                        "encode_calls": _cc_encode_calls,
+                        "entry_count": len(_cc_miss_entries),
+                        "reason": getattr(_cc_cache_svc, "last_store_reason", ""),
+                    },
+                )
             # ── Terminal events FIRST, then publish results ──────────────
             # ``_prefill_results`` is published under ``_prefill_lock`` AFTER
             # ``execution_prefill_encode_end``/``execution_prefill_completed``
@@ -7211,21 +7350,18 @@ class V2LoaderBridge:
             # ``clip_prefill_reconciliation`` ahead of the encode-end/completed
             # boundaries (which would yield a spuriously incomplete record).
             _encode_end = _capture_phase_counters()
-            record_clip_encode_end(_request_id, _encode_start, _encode_end)
-            if trace:
-                trace.emit(_EVENT_ENCODE_END, phase="execution",
-                           metadata={"counters": _encode_end,
-                                     "encoded_count": len(results)})
-                # ── Phase 1A candidate (clip_gpu_ready): concise encode-end
-                # marker closing the required timing chain
-                # (clip_gpu_load_end <= unet_activation_scheduled <=
-                # unet_activation_load_start < clip_encode_end).
-                if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
-                    trace.emit(_EVENT_CLIP_ENCODE_END, phase="execution",
+            if not _cc_exact_hit:
+                record_clip_encode_end(_request_id, _encode_start, _encode_end)
+                if trace:
+                    trace.emit(_EVENT_ENCODE_END, phase="execution",
                                metadata={"counters": _encode_end,
-                                         "encoded_count": len(results),
-                                         "mode": _UNET_ACTIVATION_MODE_CLIP_GPU_READY,
-                                         "request_id": _request_id})
+                                         "encoded_count": _cc_encode_calls})
+                    if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
+                        trace.emit(_EVENT_CLIP_ENCODE_END, phase="execution",
+                                   metadata={"counters": _encode_end,
+                                             "encoded_count": _cc_encode_calls,
+                                             "mode": _UNET_ACTIVATION_MODE_CLIP_GPU_READY,
+                                             "request_id": _request_id})
 
             if trace:
                 unet_skipped = prep.unet_future is None
@@ -7233,7 +7369,8 @@ class V2LoaderBridge:
                     not unet_skipped and not prep.unet_future.done()
                 ) if prep.unet_future is not None else False
                 trace.emit(_EVENT_COMPLETED, phase="execution",
-                           metadata={"encoded_count": len(results),
+                           metadata={"encoded_count": _cc_encode_calls,
+                                     "cache_hit_count": len(_cc_hit_results),
                                      "filtered_entries": len(filtered),
                                      "total_entries": len(entries),
                                      "wait_for_unet": wait_for_unet,
@@ -7796,7 +7933,10 @@ class V2LoaderBridge:
             _request_id = str(self._trace.request_id)
         _rt = trace or self._trace
         _mode = unet_activation_mode()
-        if _mode not in _UNET_ACTIVATION_MODE_ACTIVE:
+        if (
+            _mode not in _UNET_ACTIVATION_MODE_ACTIVE
+            and not _unet_cache_hit_activation_pending(_request_id)
+        ):
             # Late mode (the default) preserves Phase 0 exactly: the UNET
             # graph consumer must not emit any unet_early_activation_*
             # graph-demand/join markers, perform join helper work, create
@@ -7978,15 +8118,16 @@ class V2LoaderBridge:
         # control flow is preserved: the retained UNET is still returned and
         # the original sampler load path continues as a cache validation.  A
         # non-ready terminal outcome elects the unchanged late fallback
-        # exactly once (atomic, never overwritten).  Late mode is gated here
-        # so the UNET graph consumer never emits early-activation markers or
-        # performs join work (the helper double-checks the mode too).
-        if (
-            lane == "UNET"
-            and result is not None
-            and unet_activation_mode() in _UNET_ACTIVATION_MODE_ACTIVE
-        ):
-            self._join_unet_early_activation(result, trace=self._trace)
+        # exactly once (atomic, never overwritten).  Late mode remains gated
+        # except for a pending exact-cache-hit activation.
+        if lane == "UNET" and result is not None:
+            _request_trace = self._trace or _ACTIVE_REQUEST_TRACE.get()
+            _request_id = str(_request_trace.request_id) if _request_trace is not None else ""
+            if (
+                unet_activation_mode() in _UNET_ACTIVATION_MODE_ACTIVE
+                or _unet_cache_hit_activation_pending(_request_id)
+            ):
+                self._join_unet_early_activation(result, trace=self._trace)
         if self._trace:
             self._trace.emit(f"graph_{diagnostics_prefix}_wait_end", phase="execution",
                              metadata={"status": "ok"})
@@ -8303,6 +8444,7 @@ _EVENT_CLIP_ENCODE_END = "clip_encode_end"
 _UNET_ACTIVATION_MODE_LATE = "late"
 _UNET_ACTIVATION_MODE_CLIP_ENCODE_START = "clip_encode_start"
 _UNET_ACTIVATION_MODE_CLIP_GPU_READY = "clip_gpu_ready"
+_UNET_ACTIVATION_TRIGGER_CACHE_HIT = "conditioning_cache_hit"
 # Legacy documented opt-in set (kept for the existing activation tests).
 # ``clip_gpu_ready`` is accepted by ``_resolve_unet_activation_mode``
 # explicitly below.
@@ -8462,6 +8604,18 @@ def _unet_activation_get(request_id: str) -> dict[str, Any] | None:
         return None
     with _UNET_ACTIVATION_LOCK:
         return _UNET_ACTIVATION_STATE.get(request_id)
+
+
+def _unet_cache_hit_activation_pending(request_id: str) -> bool:
+    if not request_id:
+        return False
+    with _UNET_ACTIVATION_LOCK:
+        state = _UNET_ACTIVATION_STATE.get(request_id)
+        return bool(
+            state is not None
+            and state.get("trigger") == _UNET_ACTIVATION_TRIGGER_CACHE_HIT
+            and state.get("future") is not None
+        )
 
 
 def _unet_activation_trim() -> None:
@@ -9442,10 +9596,11 @@ def _early_activation_terminal(
         trace.emit(_EVENT_UNET_EA_TERMINAL, phase="execution", metadata=_term_meta)
     print(
         f"[v2.unet_early_activation] event=terminal "
+        f"trigger={state.get('trigger', '')} status={state.get('status', status)} "
+        f"transfer_count={state.get('transfer_count', 0)} "
         f"request_id={request_id or 'absent'} mode={state.get('mode', '')} "
-        f"key_hash={state.get('key_hash', '')} status={state.get('status', status)} "
-        f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'} "
-        f"transfer_count={state.get('transfer_count', 0)}",
+        f"key_hash={state.get('key_hash', '')} "
+        f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'}",
         flush=True,
     )
     return {
@@ -9945,7 +10100,8 @@ def _unet_activation_submit(
     _unet_activation_trim()
     print(
         f"[v2.unet_early_activation] event=scheduled "
-        f"request_id={request_id or 'absent'} mode={mode} trigger={trigger} "
+        f"trigger={trigger} "
+        f"request_id={request_id or 'absent'} mode={mode} "
         f"key_hash={key_hash} clip_encode_entries={_state.get('clip_encode_entries', 0)} "
         f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
         f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
@@ -10440,6 +10596,328 @@ def _maybe_fire_clip_gpu_ready_activation(
     )
 
 
+# ── Exact CLIP conditioning cache: identity + scheduling helpers ────────
+# The exact-conditioning cache reads authoritative identities at the real
+# prefill boundary and, on an exact hit, schedules the SAME retained-UNET
+# activation through the existing shared scheduling core
+# (``_unet_activation_submit``) with ``trigger=conditioning_cache_hit`` —
+# never a second activation implementation, and never a wait for the
+# clip_gpu_ready fire event that will not happen when no CLIP encode runs.
+
+
+def _read_models_generation() -> str:
+    """Authoritative models-volume generation (weights/content identity)."""
+    try:
+        import sys as _sys_gen
+        _comfyapp = _sys_gen.modules.get("comfyapp")
+        if _comfyapp is None:
+            return ""
+        _fn = getattr(_comfyapp, "_read_models_generation_record", None)
+        if callable(_fn):
+            return str((_fn() or {}).get("generation", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _read_custom_nodes_generation() -> str:
+    """Authoritative custom-nodes generation (custom-node identity)."""
+    try:
+        import sys as _sys_cng
+        _comfyapp = _sys_cng.modules.get("comfyapp")
+        if _comfyapp is None:
+            return ""
+        _fn = getattr(_comfyapp, "_read_custom_nodes_generation_record", None)
+        if callable(_fn):
+            return str((_fn() or {}).get("generation", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _read_effective_options_hash(trace: RuntimeTrace | None) -> str:
+    """Read the effective production-options hash published at method entry.
+
+    Falls back to trace metadata; returns '' when unavailable (the cache
+    then fails closed rather than keying without preset bindings).
+    """
+    if trace is not None:
+        try:
+            for _ev in trace.events:
+                _meta = _ev.metadata or {}
+                if _ev.name == "remote_method_entry" and _meta.get("effective_options_hash"):
+                    return str(_meta["effective_options_hash"])
+        except Exception:
+            pass
+        try:
+            _meta_val = (trace._metadata or {}).get("effective_options_hash", "")
+            if _meta_val:
+                return str(_meta_val)
+        except Exception:
+            pass
+    return ""
+
+
+def _read_effective_workflow_hash(trace: RuntimeTrace | None) -> str:
+    """Read the authoritative request workflow hash from the runtime trace."""
+    if trace is None:
+        return ""
+    try:
+        for event in reversed(trace.events):
+            metadata = event.metadata or {}
+            if event.name in {"remote_method_entry", "method_entry"}:
+                value = metadata.get("workflow_hash") or metadata.get("source_workflow_hash")
+                if value:
+                    return str(value)
+    except Exception:
+        pass
+    try:
+        metadata = trace._metadata or {}
+        return str(
+            metadata.get("workflow_hash")
+            or metadata.get("source_workflow_hash")
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _clip_cache_tokenizer_identity(clip: Any) -> str:
+    tokenizer = getattr(clip, "tokenizer", None)
+    if tokenizer is None:
+        return ""
+    identity: dict[str, Any] = {
+        "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+        "options": dict(getattr(clip, "tokenizer_options", {}) or {}),
+    }
+    for name in ("name_or_path", "vocab_size", "model_max_length"):
+        value = getattr(tokenizer, name, None)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            identity[name] = value
+    try:
+        return stable_hash(identity)
+    except Exception:
+        return ""
+
+
+def _clip_cache_compute_dtype(clip: Any) -> str:
+    for owner in (
+        getattr(clip, "patcher", None),
+        getattr(clip, "cond_stage_model", None),
+    ):
+        if owner is None:
+            continue
+        try:
+            value = owner.model_dtype() if callable(getattr(owner, "model_dtype", None)) else getattr(owner, "dtype", None)
+            if value is not None:
+                return str(value)
+        except Exception:
+            continue
+        for attr_name in ("compute_dtype", "model_compute_dtype", "manual_cast_dtype"):
+            try:
+                value = getattr(owner, attr_name, None)
+                if value is not None:
+                    return str(value)
+            except Exception:
+                continue
+        model = getattr(owner, "model", None)
+        if model is not None:
+            for attr_name in ("compute_dtype", "model_compute_dtype", "manual_cast_dtype", "dtype"):
+                try:
+                    value = getattr(model, attr_name, None)
+                    if value is not None:
+                        return str(value)
+                except Exception:
+                    continue
+        try:
+            parameters = getattr(owner, "parameters", None)
+            parameter = next(iter(parameters())) if callable(parameters) else None
+            if parameter is not None:
+                return str(parameter.dtype)
+        except Exception:
+            continue
+    return ""
+
+
+def _build_clip_conditioning_cache_context(
+    bridge: "V2LoaderBridge",
+    *,
+    clip: Any = None,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Build the shared (non-entry) key context for the exact cache.
+
+    Every conditioning-affecting input available at this boundary is
+    included; per-entry fields (text, role, node class) are merged by the
+    cache module.  Missing identities fail closed inside the cache module.
+    """
+    _model_key = getattr(bridge, "_model_key", None)
+    ctx: dict[str, Any] = {
+        "request_id": str(request_id or ""),
+        "clip_identity": "",
+        "clip_type": "",
+        "loader_class": "",
+        "filenames": [],
+        "weight_dtype": "",
+        "compute_dtype": _clip_cache_compute_dtype(clip),
+        "tokenizer_identity": _clip_cache_tokenizer_identity(clip),
+        "entry_layer": getattr(clip, "layer_idx", "") if clip is not None else "",
+        "entry_skip": getattr(clip, "skip", "") if clip is not None else "",
+    }
+    if _model_key is not None:
+        ctx["clip_identity"] = str(getattr(_model_key, "clip_identity", "") or "")
+        ctx["clip_type"] = str(getattr(_model_key, "clip_type", "") or "")
+    # CLIP loader identity + weight dtype from the concrete loader request
+    # list (base fallback; each entry carries its authoritative values).
+    try:
+        for _req in bridge._request_list("clip"):
+            _lc = str(_req.get("loader_class", "") or "")
+            if _lc:
+                ctx["loader_class"] = _lc
+            _fn = _req.get("clip_name")
+            if _fn:
+                ctx["filenames"] = [str(_fn)]
+            elif _req.get("clip_name1") and _req.get("clip_name2"):
+                ctx["filenames"] = [str(_req["clip_name1"]), str(_req["clip_name2"])]
+            _wd = str(_req.get("weight_dtype", "") or "")
+            if _wd:
+                ctx["weight_dtype"] = _wd
+            break
+    except Exception:
+        pass
+    _modal_hashes = _unet_activation_modal_hashes()
+    _trace_workflow_hash = _read_effective_workflow_hash(trace)
+    ctx["model_generation"] = str(
+        getattr(_model_key, "model_volume_generation", "") or _read_models_generation() or ""
+    )
+    ctx["custom_node_generation"] = str(
+        _modal_hashes.get("custom_node_generation", "")
+        or _read_custom_nodes_generation()
+        or ""
+    )
+    ctx["deployment_hash"] = str(
+        _modal_hashes.get("deployment_hash", "")
+        or os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+        or ""
+    )
+    ctx["workflow_hash"] = str(
+        _trace_workflow_hash
+        or getattr(bridge, "_workflow_hash", "")
+        or _modal_hashes.get("workflow_hash", "")
+        or ""
+    )
+    ctx["production_options_hash"] = str(
+        _read_effective_options_hash(trace)
+        or getattr(bridge, "_production_options_hash", "")
+        or ""
+    )
+    try:
+        import torch as _torch
+        ctx["torch_version"] = str(_torch.__version__)
+        ctx["torch_num_threads"] = int(_torch.get_num_threads())
+    except Exception:
+        ctx["torch_version"] = ""
+        ctx["torch_num_threads"] = 0
+    return ctx
+
+
+def _schedule_unet_activation_conditioning_cache_hit(
+    bridge: "V2LoaderBridge",
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+    clip: Any = None,
+    encode_entries: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Schedule the retained-UNET activation on an exact cache hit.
+
+    Uses ONLY the existing eligibility proofs, identity key, and shared
+    scheduling core (``_unet_activation_submit``) with
+    ``trigger=conditioning_cache_hit``.  A cache hit means no CLIP encode
+    and therefore no CLIP GPU load, so the clip_gpu_ready fire event will
+    never occur — scheduling directly here avoids waiting for it.  An
+    ineligible outcome preserves the normal late-load fallback.
+    """
+    mode = unet_activation_mode()
+    if bridge is None:
+        return False
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None or prep.unet_future is None:
+        return False
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    if not _request_id:
+        return False
+    with _UNET_ACTIVATION_LOCK:
+        _existing = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and _existing.get("future") is not None:
+            return True
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_MODE, phase="execution", metadata={
+            "mode": mode,
+            "trigger": _UNET_ACTIVATION_TRIGGER_CACHE_HIT,
+            "request_id": _request_id,
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+    _eligible, _reason, _evidence = _prove_unet_early_activation_eligible(
+        bridge,
+        request_id=_request_id,
+        clip=None,
+        mode=mode,
+        trigger=_UNET_ACTIVATION_TRIGGER_CACHE_HIT,
+    )
+    _eligible_meta = dict(_evidence)
+    _eligible_meta.update({"eligible": bool(_eligible), "reason": _reason})
+    if trace is not None:
+        trace.emit(_EVENT_UNET_EA_ELIGIBLE, phase="execution", metadata=_eligible_meta)
+    if not _eligible:
+        if trace is not None:
+            trace.emit(_EVENT_UNET_EA_SKIPPED, phase="execution", metadata={
+                "mode": mode,
+                "trigger": _UNET_ACTIVATION_TRIGGER_CACHE_HIT,
+                "request_id": _request_id,
+                "eligible": False,
+                "reason": _reason,
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+            })
+        print(
+            f"[v2.unet_early_activation] event=skipped "
+            f"request_id={_request_id or 'absent'} mode={mode} "
+            f"trigger={_UNET_ACTIVATION_TRIGGER_CACHE_HIT} reason={_reason} eligible=0",
+            flush=True,
+        )
+        return False
+    try:
+        _retained_unet = prep.unet_future.result()
+    except Exception:
+        _retained_unet = None
+    _key_components, _key_hash = _build_unet_activation_key(
+        mode=mode,
+        model_key=model_key,
+        request_id=_request_id,
+        unet=_retained_unet,
+        weight_dtype=_unet_requested_weight_dtype(bridge, model_key),
+    )
+    scheduled = _unet_activation_submit(
+        bridge,
+        request_id=_request_id, trace=trace, prep=prep, model_key=model_key,
+        mode=mode, trigger=_UNET_ACTIVATION_TRIGGER_CACHE_HIT,
+        clip=None, encode_entries=encode_entries,
+        key_components=_key_components, key_hash=_key_hash,
+    )
+    if scheduled:
+        print(
+            f"[v2.unet_early_activation] trigger={_UNET_ACTIVATION_TRIGGER_CACHE_HIT}",
+            flush=True,
+        )
+    return scheduled
+
+
 def record_clip_encode_start(
     request_id: str,
     start_counters: Mapping[str, Any] | None,
@@ -10531,15 +11009,23 @@ def join_unet_early_activation(
     exactly one caller elects the unchanged late fallback (atomic, never
     overwritten, never racing a pending future — the future is joined to
     terminal before any election).  Mode-gated: only the active modes
-    (``clip_encode_start`` / ``clip_gpu_ready``) join the future; late mode
-    is a no-op."""
-    if unet_activation_mode() not in _UNET_ACTIVATION_MODE_ACTIVE:
-        return {"scheduled": False, "status": "mode_late", "terminal": False,
-                "valid": False, "reason": "", "join_wait_ms": 0.0}
+    (``clip_encode_start`` / ``clip_gpu_ready``) join the future; an explicit
+    ``conditioning_cache_hit`` future is also joined in late mode."""
     _request_id = str(request_id or "")
     if not _request_id and trace is not None:
         _request_id = str(trace.request_id)
     _state = _unet_activation_get(_request_id)
+    _cache_hit_pending = bool(
+        _state is not None
+        and _state.get("trigger") == _UNET_ACTIVATION_TRIGGER_CACHE_HIT
+        and _state.get("future") is not None
+    )
+    if (
+        unet_activation_mode() not in _UNET_ACTIVATION_MODE_ACTIVE
+        and not _cache_hit_pending
+    ):
+        return {"scheduled": False, "status": "mode_late", "terminal": False,
+                "valid": False, "reason": "", "join_wait_ms": 0.0}
     if _state is None or _state.get("future") is None:
         return {"scheduled": False, "status": "not_scheduled", "terminal": False,
                 "valid": False, "reason": "", "join_wait_ms": 0.0}
