@@ -268,9 +268,9 @@ def _tensor_to_bytes(tensor: Any) -> tuple[bytes, str, list[int]]:
     import numpy as _np
     import torch as _th
 
-    if tensor.device.type != "cpu" or tensor.requires_grad:
-        raise ValueError("conditioning tensor must be detached CPU data")
-    t = tensor.detach().contiguous()
+    if tensor.requires_grad:
+        raise ValueError("conditioning tensor must be detached")
+    t = tensor.detach().to(device="cpu").contiguous()
     if t.dtype == _th.bfloat16:
         raw = t.view(_th.int16).numpy().tobytes()
     else:

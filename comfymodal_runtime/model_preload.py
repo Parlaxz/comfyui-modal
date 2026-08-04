@@ -7156,6 +7156,16 @@ class V2LoaderBridge:
                 _cc_hits, _cc_miss_entries, _cc_hit_count, _cc_miss_count = (
                     _cc_cache_svc.lookup_many(_cc_ctx, filtered)
                 )
+                if trace:
+                    trace.emit(
+                        "clip_conditioning_cache_lookup",
+                        phase="execution",
+                        metadata={
+                            "hit_count": _cc_hit_count,
+                            "miss_count": _cc_miss_count,
+                            "entry_count": len(filtered),
+                        },
+                    )
                 for _cc_index, _cc_value in _cc_hits.items():
                     _cc_text = str(filtered[_cc_index].get("text", ""))
                     _cc_hit_results[(id(clip), _cc_text)] = _cc_value
@@ -7173,6 +7183,16 @@ class V2LoaderBridge:
                         entries=len(filtered),
                         request_id=_request_id or "absent",
                     )
+                    if trace:
+                        trace.emit(
+                            "clip_conditioning_cache_decision",
+                            phase="execution",
+                            metadata={
+                                "decision": "exact_hit",
+                                "encode_calls": 0,
+                                "entry_count": len(filtered),
+                            },
+                        )
             # The existing activation hooks run only when the encode loop
             # will actually run (miss or partial).  On an exact hit the
             # activation was already scheduled above with
@@ -7232,6 +7252,26 @@ class V2LoaderBridge:
                     "miss_stored", stored=_cc_stored,
                     entries=len(filtered),
                     request_id=_request_id or "absent",
+                )
+                if trace:
+                    trace.emit(
+                        "clip_conditioning_cache_decision",
+                        phase="execution",
+                        metadata={
+                            "decision": "miss_stored",
+                            "stored_count": _cc_stored,
+                            "encode_calls": _cc_encode_calls,
+                        },
+                    )
+            elif _cc_cache_svc is not None and trace:
+                trace.emit(
+                    "clip_conditioning_cache_decision",
+                    phase="execution",
+                    metadata={
+                        "decision": "miss_not_stored",
+                        "encode_calls": _cc_encode_calls,
+                        "entry_count": len(_cc_miss_entries),
+                    },
                 )
             # ── Terminal events FIRST, then publish results ──────────────
             # ``_prefill_results`` is published under ``_prefill_lock`` AFTER
