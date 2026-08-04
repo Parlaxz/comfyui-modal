@@ -284,6 +284,15 @@ class BootstrapState:
     # Lane B — snapshot-memory validation certificate
     snapshot_certificate: dict[str, Any] = field(default_factory=dict)
     snapshot_cert_valid: bool = False
+    # V2 certificate snapshot retention observability (defaulted).  Populated
+    # at snapshot creation so the retained deployment-scoped certificate
+    # survives the CPU memory snapshot and is reusable by the request-time
+    # snapshot-memory fast path after restore.
+    snapshot_cert_identity: str = ""
+    snapshot_cert_workflow_hash: str = ""
+    snapshot_cert_retained: bool = False
+    snapshot_cert_reason: str = ""
+    snapshot_cert_timings: dict[str, float] = field(default_factory=dict)
     # Lane B — graph trimming evidence
     graph_removable_node_ids: list[str] = field(default_factory=list)
     graph_trimming_possible: bool = False
@@ -519,6 +528,22 @@ class BootstrapState:
                 self.snapshot_cert_valid = bool(result.get("valid"))
         except Exception:
             self.snapshot_cert_valid = False
+        if self.snapshot_cert_valid and cert.get("schema_version") == 2:
+            self.snapshot_cert_identity = str(
+                cert.get("identity", "") or cert.get("cert_identity", "") or ""
+            )
+        elif not self.snapshot_cert_valid:
+            self.snapshot_cert_identity = ""
+            self.snapshot_cert_retained = False
+
+    def invalidate_snapshot_certificate(self, *, reason: str = "") -> None:
+        self.snapshot_certificate = {}
+        self.snapshot_cert_valid = False
+        self.snapshot_cert_identity = ""
+        self.snapshot_cert_workflow_hash = ""
+        self.snapshot_cert_retained = False
+        self.snapshot_cert_reason = str(reason or "")
+        self.snapshot_cert_timings = {}
 
     def set_graph_trimming_evidence(
         self, *, removable_ids: list[str], trimming_possible: bool,

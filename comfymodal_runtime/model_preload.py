@@ -1858,6 +1858,23 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 except Exception:
                     pass
                 _residency_sampler_fired = True
+        # ``force_full_load`` only bypasses ComfyUI's low-VRAM calculation;
+        # it does not clear a stale ModelPatcher loaded-byte/device state.
+        # For the V2 clip_gpu_ready prefill call, normalize the exact armed
+        # CLIP patcher while the existing mutation lane is held, immediately
+        # before the real load path.  This keeps the subsequent call a normal
+        # ComfyUI load (and therefore preserves the existing fire hook), while
+        # preventing a zero-effect load from being mistaken for a GPU transfer.
+        if (
+            before == 0
+            and force_full_load
+            and lane is not None
+            and getattr(lane, "_lane", "") == "prefill"
+            and not _has_registered_unet_in_models(models)
+        ):
+            _prepare_armed_clip_for_force_load(
+                models, request_trace or getattr(lane, "_trace", None),
+            )
         # ── Synchronous native page-readiness: first request-scoped graph ──
         # UNET activation only.  Conditions: outermost call (before == 0), a
         # request trace, NO active model lane (never a restore-time background
@@ -1960,6 +1977,7 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     models=models,
                     lane_trace=lane,
                     load_ok=_diag_ok,
+                    gpu_allocated_before=_gpu_alloc_before,
                 )
                 if _diag_ok:
                     emit_post_load_models_gpu_event(models)
@@ -7119,13 +7137,30 @@ class V2LoaderBridge:
             # encode returns and the mutation lane is released; "late"
             # (default) is a no-op that preserves Phase 0 behavior.
             if unet_activation_mode() == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
-                _unet_activation_arm(
+                _armed = _unet_activation_arm(
                     self,
                     trace=trace,
                     request_id=_request_id,
                     clip=clip,
                     encode_entries=filtered,
                 )
+                if _armed:
+                    _clip_patcher = _resolve_clip_patcher(clip)
+                    if _clip_patcher is not None:
+                        try:
+                            _mm_load_models_gpu(
+                                [_clip_patcher], force_full_load=True,
+                            )
+                        except Exception as _exc:
+                            if trace is not None:
+                                trace.emit(
+                                    "clip_gpu_ready_force_load_error",
+                                    phase="execution",
+                                    metadata={
+                                        "request_id": _request_id,
+                                        "error": str(_exc)[:200],
+                                    },
+                                )
             else:
                 clip_encode_start(
                     self,
@@ -8257,6 +8292,10 @@ _EVENT_UNET_EA_RECONCILIATION = "unet_early_activation_reconciliation"
 #   clip_gpu_load_end <= unet_activation_scheduled <=
 #   unet_activation_load_start < clip_encode_end
 _EVENT_CLIP_GPU_LOAD_END = "clip_gpu_load_end"
+_EVENT_CLIP_GPU_RESIDENT = "clip_gpu_resident"
+# Distinct skip event for failed/unsupported residency proof — only a
+# PROVEN residency ever emits ``clip_gpu_resident``.
+_EVENT_CLIP_GPU_RESIDENCY_SKIP = "clip_gpu_residency_skip"
 _EVENT_UNET_ACTIVATION_SCHEDULED = "unet_activation_scheduled"
 _EVENT_UNET_ACTIVATION_LOAD_START = "unet_activation_load_start"
 _EVENT_CLIP_ENCODE_END = "clip_encode_end"
@@ -8734,6 +8773,116 @@ def _mm_load_models_gpu(models: list[Any], **kwargs: Any) -> Any:
     return _mm.load_models_gpu(models, **kwargs)
 
 
+def _prepare_armed_clip_for_force_load(
+    models: list[Any], request_trace: Any,
+) -> None:
+    """Clear stale state before the V2 prefill CLIP force-load.
+
+    ComfyUI's ``force_full_load`` flag bypasses the low-VRAM sizing branch,
+    but ``ModelPatcher.partially_load`` still returns early when its internal
+    ``model_loaded_weight_memory`` says the full model is loaded.  A restored
+    CLIP can therefore be physically off-device while the patcher metadata
+    claims it is resident.  Only the exact request-armed CLIP patcher is
+    normalized, and only when the strict read-only proof rejects it.  The
+    caller invokes this while the existing GPU mutation lane is held; the
+    actual transfer remains the normal wrapped ``load_models_gpu`` path.
+    """
+    _request_id = str(getattr(request_trace, "request_id", "") or "")
+    if not _request_id:
+        return
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _state is None or not _state.get("armed", False):
+            return
+        _armed_id = str(_state.get("clip_patcher_object_id", "") or "")
+    if not _armed_id:
+        return
+
+    _exact = None
+    for _model in models:
+        try:
+            if str(id(_model)) == _armed_id:
+                _exact = _model
+                break
+            _resolved = _resolve_clip_patcher(_model)
+            if _resolved is not None and str(id(_resolved)) == _armed_id:
+                _exact = _resolved
+                break
+        except Exception:
+            continue
+    if _exact is None:
+        return
+
+    _before = _probe_clip_full_cuda_residency(_exact)
+    if _before.get("ok", False):
+        return
+
+    _unpatch = getattr(_exact, "unpatch_model", None)
+    if not callable(_unpatch):
+        return
+    _offload = getattr(_exact, "offload_device", None)
+    _reset_error = ""
+    try:
+        if _offload is None:
+            _unpatch()
+        else:
+            _unpatch(_offload)
+    except TypeError:
+        try:
+            _unpatch(_offload, unpatch_weights=True)
+        except Exception as _exc:
+            _reset_error = str(_exc)[:200]
+    except Exception as _exc:
+        _reset_error = str(_exc)[:200]
+
+    _after_reset = _probe_clip_full_cuda_residency(_exact)
+    _direct_model_load = False
+    _direct_model_load_error = ""
+    # Some restored CLIP patchers retain the stale state across unpatching,
+    # or their normal ``load_models_gpu`` call re-enters the stale-state
+    # branch.  In that case invoke the exact patcher's own full-load methods
+    # while the mutation lane is held.  This is still ComfyUI's model-patcher
+    # loading path, but avoids the second metadata-driven early return.
+    if not _after_reset.get("ok", False):
+        try:
+            _load_device = getattr(_exact, "load_device", None)
+            _patch_model = getattr(_exact, "patch_model", None)
+            _load = getattr(_exact, "load", None)
+            if (
+                callable(_patch_model)
+                and callable(_load)
+                and _normalize_cuda_device_key(_load_device) is not None
+            ):
+                _patch_model(load_weights=False)
+                _load(
+                    device_to=_load_device,
+                    lowvram_model_memory=0,
+                    full_load=True,
+                )
+                _sync_clip_load_device(_exact)
+                _direct_model_load = True
+        except Exception as _exc:
+            _direct_model_load_error = str(_exc)[:200]
+    _after_prepare = _probe_clip_full_cuda_residency(_exact)
+
+    if request_trace is not None:
+        request_trace.emit(
+            "clip_gpu_ready_force_load_reset",
+            phase="execution",
+            metadata={
+                "request_id": _request_id,
+                "clip_patcher_object_id": _armed_id,
+                "reason": _before.get("reason", "residency_not_proven"),
+                "reset_error": _reset_error,
+                "direct_model_load": _direct_model_load,
+                "direct_model_load_error": _direct_model_load_error,
+                "evidence": _before,
+                "after_reset_evidence": _after_reset,
+                "after_prepare_evidence": _after_prepare,
+            },
+        )
+
+
 def _mm_get_free_memory(device: Any) -> int | None:
     try:
         import comfy.model_management as _mm
@@ -8890,6 +9039,246 @@ def _probe_clip_residency(clip_patcher: Any) -> dict[str, Any]:
             evidence["clip_residency_status"] = "resident"
     else:
         evidence["clip_residency_status"] = "not_in_cache"
+    return evidence
+
+
+def _normalize_cuda_device_key(dev: Any) -> tuple[str, int] | None:
+    """Normalize a ``torch.device`` or ``cuda[:index]`` string to a CUDA key.
+
+    Returns ``("cuda", index)`` for any CUDA device value — bare ``cuda``
+    and ``cuda:0`` normalize to the SAME key (index defaults to 0) so they
+    are never a false mismatch — and None for absent/non-CUDA values.
+    Never raises.
+    """
+    if dev is None:
+        return None
+    _dev_str = ""
+    try:
+        import torch as _torch_norm
+        if isinstance(dev, _torch_norm.device):
+            _dev_str = str(dev)
+        elif isinstance(dev, str):
+            _dev_str = dev
+        else:
+            _dev_str = str(getattr(dev, "type", "") or "")
+    except Exception:
+        try:
+            _dev_str = str(dev)
+        except Exception:
+            return None
+    _dev_str = _dev_str.strip().lower()
+    if _dev_str == "cuda":
+        return ("cuda", 0)
+    if _dev_str.startswith("cuda:"):
+        try:
+            _idx = int(_dev_str.split(":", 1)[1])
+        except Exception:
+            return None
+        return ("cuda", _idx)
+    return None
+
+
+def _sync_clip_load_device(clip_patcher: Any) -> dict[str, Any]:
+    """Synchronize the CLIP patcher's load device before a residency probe.
+
+    Best-effort CUDA device sync ONLY — never transfers or mutates model
+    state and never raises.  Returns structured evidence (``ok``,
+    ``reason``, ``device``, ``synchronized``).  When CUDA is unavailable it
+    is a no-op with ``reason=cuda_unavailable``.  Synchronizes the patcher's
+    CUDA ``load_device`` when present (robustly parsed for ``torch.device``
+    or ``cuda[:index]`` strings); otherwise uses the safe
+    ``torch.cuda.synchronize()`` current-device fallback.  Must be called
+    OUTSIDE ``_UNET_ACTIVATION_LOCK`` — it can block on in-flight CUDA work.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "reason": "",
+        "device": "",
+        "synchronized": False,
+    }
+    try:
+        import torch as _torch_sync
+        if not _torch_sync.cuda.is_available():
+            result["reason"] = "cuda_unavailable"
+            return result
+        _dev = None
+        try:
+            _dev = getattr(clip_patcher, "load_device", None)
+        except Exception:
+            _dev = None
+        if _normalize_cuda_device_key(_dev) is not None:
+            try:
+                _target = _torch_sync.device(str(_dev))
+            except Exception:
+                _target = None
+            result["device"] = str(_dev)
+        else:
+            # Safe current-device fallback (None selects the current device).
+            _target = None
+            try:
+                result["device"] = str(_torch_sync.cuda.current_device())
+            except Exception:
+                result["device"] = "current"
+        _torch_sync.cuda.synchronize(_target)
+        result["ok"] = True
+        result["synchronized"] = True
+        return result
+    except Exception as exc:
+        result["reason"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        return result
+
+
+def _probe_clip_full_cuda_residency(clip_patcher: Any) -> dict[str, Any]:
+    """Full post-load CUDA residency proof for the exact active CLIP patcher.
+
+    Structured read-only evidence: ``ok``, ``reason``, the exact object id,
+    exact ``current_loaded_models`` cache membership, loaded/model bytes,
+    residency status, and device info.  ``resident_full`` (and ``ok=True``)
+    is reported ONLY when ALL of the following hold:
+
+      * the exact patcher is identity-present in ComfyUI's live
+        ``current_loaded_models`` cache, and
+      * ``loaded_size() >= model_size() > 0``, and
+      * the exact patcher's ``load_device`` is present and CUDA — robustly
+        parsed for ``torch.device`` or ``cuda[:index]`` strings — for ALL
+        patchers (dynamic included); the dynamic exemption applies ONLY to
+        ordinary parameter/buffer enumeration (dynamic patchers manage
+        weights via vbar/pin state and never require ordinary parameter
+        devices), never to proving the CUDA load device, and
+      * every parameter and buffer of the patcher's underlying model sits on
+        the patcher's CUDA load device — non-dynamic patchers only, and only
+        when those collections are available.  Device comparison is
+        normalized so ``cuda`` and ``cuda:0`` never mismatch falsely.
+
+    Never transfers or mutates tensors, never mutates cache lists, and
+    never raises.  Anything weaker (partial / unknown / absent / off-device)
+    is invalid.
+    """
+    evidence: dict[str, Any] = {
+        "ok": False,
+        "reason": "no_clip_patcher",
+        "clip_patcher_object_id": str(id(clip_patcher)) if clip_patcher is not None else "",
+        "clip_in_model_cache": False,
+        "cache_membership": "absent",
+        "clip_loaded_bytes": None,
+        "clip_model_bytes": None,
+        "clip_residency_status": "absent",
+        "is_dynamic": False,
+        "load_device": "",
+        "load_device_is_cuda": False,
+        "device_check_ok": None,
+        "device_mismatch_count": 0,
+        "device_check_reason": "",
+        "device_info": {},
+    }
+    if clip_patcher is None:
+        return evidence
+    try:
+        _is_dynamic = bool(
+            (getattr(clip_patcher, "is_dynamic", None) or (lambda: False))()
+        )
+    except Exception:
+        _is_dynamic = False
+    evidence["is_dynamic"] = bool(_is_dynamic)
+    try:
+        _load_dev = getattr(clip_patcher, "load_device", None)
+    except Exception:
+        _load_dev = None
+    _load_dev_key = _normalize_cuda_device_key(_load_dev)
+    evidence["load_device"] = str(_load_dev) if _load_dev is not None else ""
+    evidence["load_device_is_cuda"] = _load_dev_key is not None
+    try:
+        _in_cache = _clip_patcher_in_loaded_models(clip_patcher)
+        evidence["clip_in_model_cache"] = bool(_in_cache)
+        evidence["cache_membership"] = "present" if _in_cache else "absent"
+    except Exception:
+        evidence["cache_membership"] = "unknown"
+    try:
+        _fn = getattr(clip_patcher, "loaded_size", None)
+        if callable(_fn):
+            evidence["clip_loaded_bytes"] = int(_fn() or 0)
+    except Exception:
+        pass
+    try:
+        _fn = getattr(clip_patcher, "model_size", None)
+        if callable(_fn):
+            evidence["clip_model_bytes"] = int(_fn() or 0)
+    except Exception:
+        pass
+    _lb = evidence["clip_loaded_bytes"]
+    _mb = evidence["clip_model_bytes"]
+    _bytes_ok = bool(
+        isinstance(_lb, int) and isinstance(_mb, int)
+        and _mb > 0 and _lb >= _mb
+    )
+    # Parameter/buffer device proof — non-dynamic patchers with a CUDA load
+    # device only, and only when the collections are available (a failed
+    # enumeration means the requirement cannot be assessed and is waived).
+    # ``ModelPatcher`` itself is a plain class, so the ordinary parameter
+    # and buffer collections come from its underlying ``.model`` module.
+    # The CUDA load-device requirement is STRICT for ALL patchers (dynamic
+    # included); the dynamic exemption applies ONLY to enumeration below.
+    _devices_ok: bool | None = None
+    _mismatch = 0
+    _dev_reason = ""
+    if not evidence["load_device_is_cuda"]:
+        # Absent or non-CUDA load device: reject the proof outright.
+        _devices_ok = False
+        _dev_reason = "load_device_absent" if _load_dev is None else "load_device_not_cuda"
+    elif not _is_dynamic:
+        _devices_ok = True
+        try:
+            _target = _load_dev
+            _target_key = _normalize_cuda_device_key(_target)
+            _module = clip_patcher
+            try:
+                _under = getattr(clip_patcher, "model", None)
+                if _under is not None and hasattr(_under, "parameters"):
+                    _module = _under
+            except Exception:
+                pass
+            for _tensors in (_module.parameters(), _module.buffers()):
+                for _t in _tensors:
+                    # Normalized comparison: ``cuda`` == ``cuda:0``.
+                    if _normalize_cuda_device_key(getattr(_t, "device", None)) != _target_key:
+                        _mismatch += 1
+            if _mismatch:
+                _devices_ok = False
+                _dev_reason = "parameter_device_mismatch"
+        except Exception as exc:
+            _devices_ok = None
+            _dev_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+    evidence["device_check_ok"] = _devices_ok
+    evidence["device_mismatch_count"] = _mismatch
+    evidence["device_check_reason"] = _dev_reason
+    evidence["device_info"] = {
+        "load_device": evidence["load_device"],
+        "load_device_is_cuda": evidence["load_device_is_cuda"],
+        "is_dynamic": bool(_is_dynamic),
+        "parameter_buffer_devices_ok": _devices_ok,
+        "device_mismatch_count": _mismatch,
+        "device_check_reason": _dev_reason,
+    }
+    if evidence["clip_in_model_cache"] and _bytes_ok:
+        if _devices_ok is False:
+            evidence["reason"] = _dev_reason or "parameter_device_mismatch"
+            evidence["clip_residency_status"] = "resident_off_device"
+        else:
+            evidence["ok"] = True
+            evidence["reason"] = "ok"
+            evidence["clip_residency_status"] = "resident_full"
+    elif not evidence["clip_in_model_cache"]:
+        evidence["reason"] = "not_in_cache"
+        evidence["clip_residency_status"] = "not_in_cache"
+    elif not _bytes_ok:
+        evidence["reason"] = "bytes_incomplete"
+        evidence["clip_residency_status"] = (
+            "resident_unknown_bytes"
+            if (_mb is None or _lb is None)
+            else "resident_partial"
+        )
+    else:
+        evidence["reason"] = "residency_incomplete"
     return evidence
 
 
@@ -9377,8 +9766,18 @@ def _run_early_unet_activation(
     _evidence = _probe_early_activation_evidence(unet)
     state["cache_present"] = bool(_evidence.get("cache_present", False))
     _res_status = _evidence.get("residency_status", "unknown")
-    _clip_evidence = _probe_clip_residency(_clip_patcher)
-    state["clip_resident"] = bool(_clip_evidence.get("clip_in_model_cache", False))
+    # The retained CLIP patcher was loaded alongside; synchronize its load
+    # device OUTSIDE the lock (async loads can still be in flight), then run
+    # the exact same strict full-CUDA-residency proof as the fire hook.
+    # ``ready`` requires BOTH the post-load sync evidence ``ok`` (a CUDA sync
+    # actually ran) AND the strict proof ``ok`` — partial/unknown residency
+    # or an absent/non-CUDA load device is invalid.
+    _clip_sync = _sync_clip_load_device(_clip_patcher)
+    _clip_evidence = _probe_clip_full_cuda_residency(_clip_patcher)
+    _clip_evidence["residency_sync"] = _clip_sync
+    state["clip_resident"] = bool(
+        _clip_sync.get("ok", False) and _clip_evidence.get("ok", False)
+    )
     state["clip_residency_status"] = str(_clip_evidence.get("clip_residency_status", "absent"))
     _combined_diag = dict(_evidence)
     _combined_diag["clip_residency"] = _clip_evidence
@@ -9387,8 +9786,9 @@ def _run_early_unet_activation(
             state, trace, request_id, status="invalid",
             reason="residency_not_proven", diagnostics=_combined_diag,
         )
-    # The exact active CLIP patcher was requested alongside; if it is not
-    # resident post-load, safe residency was not guaranteed.
+    # The exact active CLIP patcher was requested alongside; full residency
+    # proof (exact cache identity + loaded>=model>0 + device placement) is
+    # required — a partial/unknown CLIP residency is never ``ready``.
     if state["clip_retained"] and not state["clip_resident"]:
         return _early_activation_terminal(
             state, trace, request_id, status="invalid",
@@ -9417,6 +9817,7 @@ def _unet_activation_submit(
     key_components: dict[str, Any],
     key_hash: str,
     create_state: bool = True,
+    residency_evidence: Mapping[str, Any] | None = None,
 ) -> bool:
     """Shared coordinator/single-flight scheduling core for the retained-UNET
     activation.
@@ -9435,7 +9836,9 @@ def _unet_activation_submit(
     request-end finalize is never re-created / re-scheduled.  Returns True
     when scheduled (or already scheduled), False on submit failure (state
     marked terminal ``failed``) or when *create_state* is False and no state
-    exists.
+    exists.  *residency_evidence* (optional, ``clip_gpu_ready`` fire path)
+    carries the proven CLIP residency evidence into the concise
+    ``unet_activation_scheduled`` marker metadata.
     """
     with _UNET_ACTIVATION_LOCK:
         _state = _UNET_ACTIVATION_STATE.get(request_id)
@@ -9521,14 +9924,24 @@ def _unet_activation_submit(
             }
             trace.emit(_EVENT_UNET_EA_SCHEDULED, phase="execution", metadata=_sched_meta)
             if mode == _UNET_ACTIVATION_MODE_CLIP_GPU_READY:
-                trace.emit(_EVENT_UNET_ACTIVATION_SCHEDULED, phase="execution", metadata={
+                _activation_meta = {
                     "mode": mode,
                     "trigger": trigger,
                     "request_id": request_id,
                     "key_hash": key_hash,
                     "unet_patcher_object_id": key_components.get("unet_patcher_object_id", ""),
                     "unet_diffusion_object_id": key_components.get("unet_diffusion_object_id", ""),
-                })
+                }
+                if residency_evidence is not None:
+                    # Proven residency evidence rides the scheduled marker so
+                    # the concise clip_gpu_ready timing chain stays
+                    # self-contained (existing marker model supports it).
+                    _activation_meta["clip_residency_status"] = str(
+                        residency_evidence.get("clip_residency_status", "") or ""
+                    )
+                    _activation_meta["clip_loaded_bytes"] = residency_evidence.get("clip_loaded_bytes")
+                    _activation_meta["clip_model_bytes"] = residency_evidence.get("clip_model_bytes")
+                trace.emit(_EVENT_UNET_ACTIVATION_SCHEDULED, phase="execution", metadata=_activation_meta)
     _unet_activation_trim()
     print(
         f"[v2.unet_early_activation] event=scheduled "
@@ -9813,6 +10226,7 @@ def _maybe_fire_clip_gpu_ready_activation(
     models: list[Any],
     lane_trace: "ModelLaneTrace | None",
     load_ok: bool,
+    gpu_allocated_before: int | None = None,
 ) -> None:
     """clip_gpu_ready fire hook (existing GPU loader wrapper, outermost
     prefill-lane calls only).
@@ -9820,15 +10234,34 @@ def _maybe_fire_clip_gpu_ready_activation(
     Called after a ``load_models_gpu`` call has returned AND the existing
     mutation lane has been released.  For
     ``COMFYMODAL_V2_UNET_ACTIVATION_MODE=clip_gpu_ready`` it claims the
-    request-scoped single-use armed trigger atomically (armed→scheduled,
-    so multiple CLIP loads can never fire twice) and schedules the existing
+    request-scoped single-use armed trigger and schedules the existing
     retained-UNET activation through the shared coordinator/single-flight
     path (``_unet_activation_submit``).  Requires: a successful load, the
     outermost prefill-lane call, NO registered UNET in *models*, the exact
     armed CLIP patcher identity present in *models*, and the prefill lane
     trace/request id (never ``_ACTIVE_REQUEST_TRACE`` — absent in
-    coordinator threads).  Emits the concise ``clip_gpu_load_end`` marker
-    after the lane release and BEFORE scheduling.  Never fires for
+    coordinator threads).
+
+    The claim is PROVEN, not asserted: after the filters the exact armed
+    patcher reference is captured under the activation lock WITHOUT setting
+    ``fired``, the lock is released, the patcher's load device is
+    synchronized OUTSIDE the lock, the post-sync CUDA allocation delta is
+    captured against the outer wrapper's ``gpu_allocated_before``
+    (``_gpu_alloc_before`` — required for production; optional only for
+    compatibility), and full CUDA residency is proven with
+    ``_probe_clip_full_cuda_residency``.  Firing additionally requires the
+    sync evidence ``ok`` AND a known positive allocation delta — a missing/
+    zero/negative delta (zero-effect load) is a skip, never a fire.  On any
+    failure a concise ``clip_gpu_residency_skip`` trace/log skip with
+    reason/evidence (including before/after/delta) is emitted and the armed
+    trigger is never burned (``fired`` stays False); ``clip_gpu_resident``
+    is emitted ONLY on proven success.  On proof success the
+    ``clip_gpu_resident`` evidence event is emitted BEFORE scheduling, then
+    the lock is reacquired and the claim is re-verified (state still exists,
+    still armed, not fired, no future, same exact patcher identity) before
+    ``fired`` is set and the coordinator refs are captured.  Emits the
+    concise ``clip_gpu_load_end`` marker after the lane release and BEFORE
+    scheduling (with residency evidence) and never fires for
     ``late``/``clip_encode_start`` modes and never schedules twice.
     """
     if not load_ok:
@@ -9845,6 +10278,11 @@ def _maybe_fire_clip_gpu_ready_activation(
     _request_id = str(getattr(_trace, "request_id", "") or "")
     if not _request_id:
         return
+
+    # ── Phase 1: capture the exact armed patcher/state refs (no fire) ──
+    # ``fired`` is intentionally NOT set while only holding the lock: the
+    # claim is proven outside the lock (sync + full residency) before it is
+    # consumed, so a failed proof never burns the armed trigger.
     with _UNET_ACTIVATION_LOCK:
         _state = _UNET_ACTIVATION_STATE.get(_request_id)
         if _state is None or not _state.get("armed", False) or _state.get("fired", False):
@@ -9855,22 +10293,113 @@ def _maybe_fire_clip_gpu_ready_activation(
         _armed_patcher_id = str(_state.get("clip_patcher_object_id", "") or "")
         if not _armed_patcher_id:
             return
-        _matched = False
+        _exact_patcher = None
         for _m in models:
             try:
                 if str(id(_m)) == _armed_patcher_id:
-                    _matched = True
+                    _exact_patcher = _m
                     break
-                if str(id(_resolve_clip_patcher(_m))) == _armed_patcher_id:
-                    _matched = True
+                _resolved = _resolve_clip_patcher(_m)
+                if _resolved is not None and str(id(_resolved)) == _armed_patcher_id:
+                    _exact_patcher = _resolved
                     break
             except Exception:
                 continue
-        if not _matched:
+        if _exact_patcher is None:
+            return
+        _mode = _state.get("mode", "")
+        _trigger = _state.get("trigger", "clip_gpu_ready")
+
+    # ── Phase 2: prove full CUDA residency OUTSIDE the lock ──────────
+    # Sync the patcher's load device first so the probe observes completed
+    # GPU work (async loads can still be in flight), capture the post-sync
+    # CUDA allocation delta against the outer wrapper's before-snapshot,
+    # then run the strict full-residency proof.  Firing requires the sync
+    # evidence ``ok`` AND a known positive allocation delta; a failed proof
+    # is a skip, never a fire.
+    _sync_evidence = _sync_clip_load_device(_exact_patcher)
+    _gpu_alloc_after = _gpu_allocated_bytes()
+    _gpu_alloc_delta: int | None = None
+    if gpu_allocated_before is not None and _gpu_alloc_after is not None:
+        _gpu_alloc_delta = _gpu_alloc_after - gpu_allocated_before
+    _proof = _probe_clip_full_cuda_residency(_exact_patcher)
+    _proof["residency_sync"] = _sync_evidence
+    _proof["gpu_allocated_before"] = gpu_allocated_before
+    _proof["gpu_allocated_after"] = _gpu_alloc_after
+    _proof["gpu_allocated_delta_bytes"] = _gpu_alloc_delta
+    _sync_ok = bool(_sync_evidence.get("ok", False))
+    _alloc_ok = bool(_gpu_alloc_delta is not None and _gpu_alloc_delta > 0)
+    if not (_sync_ok and _alloc_ok and _proof.get("ok", False)):
+        if not _sync_ok:
+            _reason = str(_sync_evidence.get("reason", "") or "sync_not_ok")
+        elif not _alloc_ok:
+            _reason = (
+                "gpu_alloc_delta_unknown" if _gpu_alloc_delta is None
+                else "zero_gpu_alloc_delta"
+            )
+        else:
+            _reason = str(_proof.get("reason", "residency_not_proven") or "residency_not_proven")
+        if _trace is not None:
+            _trace.emit(_EVENT_CLIP_GPU_RESIDENCY_SKIP, phase="execution", metadata={
+                "mode": _mode,
+                "trigger": _trigger,
+                "request_id": _request_id,
+                "status": "skip",
+                "reason": _reason,
+                "clip_patcher_object_id": _proof.get("clip_patcher_object_id", ""),
+                "gpu_allocated_before": gpu_allocated_before,
+                "gpu_allocated_after": _gpu_alloc_after,
+                "gpu_allocated_delta_bytes": _gpu_alloc_delta,
+                "evidence": _proof,
+            })
+        print(
+            f"[v2.clip_gpu_ready] event=clip_gpu_residency_skip "
+            f"request_id={_request_id or 'absent'} mode={_mode} trigger={_trigger} "
+            f"reason={_reason} resident=0 "
+            f"gpu_allocated_before={gpu_allocated_before if gpu_allocated_before is not None else 'absent'} "
+            f"gpu_allocated_after={_gpu_alloc_after if _gpu_alloc_after is not None else 'absent'} "
+            f"gpu_allocated_delta_bytes={_gpu_alloc_delta if _gpu_alloc_delta is not None else 'absent'}",
+            flush=True,
+        )
+        return
+
+    # ── Phase 3: residency evidence event BEFORE scheduling ──────────
+    if _trace is not None:
+        _trace.emit(_EVENT_CLIP_GPU_RESIDENT, phase="execution", metadata={
+            "mode": _mode,
+            "trigger": _trigger,
+            "request_id": _request_id,
+            "status": "resident_full",
+            "reason": "ok",
+            "clip_patcher_object_id": _proof.get("clip_patcher_object_id", ""),
+            "gpu_allocated_before": gpu_allocated_before,
+            "gpu_allocated_after": _gpu_alloc_after,
+            "gpu_allocated_delta_bytes": _gpu_alloc_delta,
+            "evidence": _proof,
+        })
+    print(
+        f"[v2.clip_gpu_ready] event=clip_gpu_resident "
+        f"request_id={_request_id or 'absent'} mode={_mode} trigger={_trigger} "
+        f"clip_patcher_object_id={_proof.get('clip_patcher_object_id', '')} "
+        f"loaded_bytes={_proof.get('clip_loaded_bytes')} "
+        f"model_bytes={_proof.get('clip_model_bytes')} "
+        f"gpu_allocated_delta_bytes={_gpu_alloc_delta if _gpu_alloc_delta is not None else 'absent'}",
+        flush=True,
+    )
+
+    # ── Phase 4: reacquire the lock, re-verify, then claim fired ─────
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(_request_id)
+        if _state is None or not _state.get("armed", False) or _state.get("fired", False):
+            return
+        if _state.get("future") is not None:
+            return
+        if str(_state.get("clip_patcher_object_id", "") or "") != str(id(_exact_patcher)):
             return
         # Atomic armed→scheduled claim: a second qualifying CLIP load for
         # the same request can never fire again.
         _state["fired"] = True
+        _state["clip_residency_status"] = "resident_full"
         _bridge = _state.get("bridge")
         _prep = _state.get("prep")
         _model_key = _state.get("model_key")
@@ -9882,15 +10411,24 @@ def _maybe_fire_clip_gpu_ready_activation(
         _trigger = _state.get("trigger", "clip_gpu_ready")
     if _bridge is None or _prep is None or _model_key is None:
         return
-    # Concise marker AFTER the lane release, BEFORE scheduling.
+    # Concise marker AFTER the lane release, BEFORE scheduling, carrying the
+    # residency evidence for the load-end marker.
     if _trace is not None:
-        _trace.emit(_EVENT_CLIP_GPU_LOAD_END, phase="execution", metadata={
+        _load_end_meta: dict[str, Any] = {
             "mode": _mode,
             "trigger": _trigger,
             "request_id": _request_id,
             "clip_patcher_object_id": _armed_patcher_id,
             "lane": "prefill",
-        })
+            "clip_residency_status": _proof.get("clip_residency_status", "resident_full"),
+            "clip_loaded_bytes": _proof.get("clip_loaded_bytes"),
+            "clip_model_bytes": _proof.get("clip_model_bytes"),
+            "residency_sync": _sync_evidence,
+            "gpu_allocated_before": gpu_allocated_before,
+            "gpu_allocated_after": _gpu_alloc_after,
+            "gpu_allocated_delta_bytes": _gpu_alloc_delta,
+        }
+        _trace.emit(_EVENT_CLIP_GPU_LOAD_END, phase="execution", metadata=_load_end_meta)
     _unet_activation_submit(
         _bridge,
         request_id=_request_id, trace=_trace, prep=_prep,
@@ -9898,6 +10436,7 @@ def _maybe_fire_clip_gpu_ready_activation(
         clip=_clip, encode_entries=_encode_entries,
         key_components=_key_components, key_hash=_key_hash,
         create_state=False,
+        residency_evidence=_proof,
     )
 
 
