@@ -6344,17 +6344,43 @@ class ModelPreloadCoordinator:
             pass
         return result
 
-    def close(self) -> None:
+    def close(
+        self,
+        *,
+        timeout: float | None = None,
+        cancel_futures: bool = False,
+    ) -> dict[str, Any]:
         with self._pool_lock:
             pool = self._pool
             self._pool = None
         if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=False)
-        # All submitted tasks are terminal after shutdown(wait=True): reset
-        # the real lane counters so a later pool recreation starts clean.
-        with self._lane_count_lock:
-            self._queued_count = 0
-            self._pending_count = 0
+            threads = list(getattr(pool, "_threads", ()) or ())
+            if timeout is None:
+                pool.shutdown(wait=True, cancel_futures=cancel_futures)
+            else:
+                pool.shutdown(wait=False, cancel_futures=cancel_futures)
+                deadline = time.monotonic() + max(0.0, float(timeout))
+                for thread in threads:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    thread.join(timeout=remaining)
+            alive_threads = [thread for thread in threads if thread.is_alive()]
+        else:
+            alive_threads = []
+        if not alive_threads:
+            with self._lane_count_lock:
+                self._queued_count = 0
+                self._pending_count = 0
+        return {
+            "pool_present": pool is not None,
+            "thread_count": len(threads) if pool is not None else 0,
+            "alive_thread_count": len(alive_threads),
+            "alive_threads": [
+                {"name": str(thread.name)[:80], "native_id": getattr(thread, "native_id", None)}
+                for thread in alive_threads[:8]
+            ],
+        }
 
     def _ensure_pool(self) -> ThreadPoolExecutor:
         with self._pool_lock:
@@ -7468,16 +7494,22 @@ class V2LoaderBridge:
         """Return *override* when not None, else *computed*."""
         return override if override is not None else computed
 
-    def close_workers(self) -> None:
+    def close_workers(
+        self,
+        *,
+        timeout: float | None = None,
+        cancel_futures: bool = False,
+        wait_futures: bool = True,
+    ) -> dict[str, Any]:
         """Wait for submitted restore futures and shut down the coordinator pool.
         Swallows worker exceptions so existing loader fallback behavior remains.
         The coordinator recreates a pool on the next _submit call."""
         prep = self._preparation
+        _present = 0
+        _done = 0
+        _failed = 0
         if prep is not None:
             _cw_start_ns = time.monotonic_ns()
-            _present = 0
-            _done = 0
-            _failed = 0
             for future in (prep.unet_future, prep.clip_future, prep.vae_future):
                 if future is not None:
                     _present += 1
@@ -7485,10 +7517,16 @@ class V2LoaderBridge:
                         _done += 1
                         if future.exception() is not None:
                             _failed += 1
-                    try:
-                        future.result()
-                    except Exception:
-                        _failed += 1
+                    if wait_futures:
+                        try:
+                            future.result()
+                        except Exception:
+                            _failed += 1
+                    elif cancel_futures and not future.done():
+                        try:
+                            future.cancel()
+                        except Exception:
+                            pass
             _cw_wait_ms = round((time.monotonic_ns() - _cw_start_ns) / 1_000_000, 3)
             if self._trace:
                 self._trace.emit("close_workers_start", phase="restore", metadata={
@@ -7501,7 +7539,16 @@ class V2LoaderBridge:
                     "present": _present,
                     "done_final": _present,
                 })
-        self.coordinator.close()
+        _pool_result = self.coordinator.close(
+            timeout=timeout,
+            cancel_futures=cancel_futures,
+        )
+        return {
+            "present": _present,
+            "done_before_wait": _done,
+            "failed": _failed,
+            "pool": _pool_result,
+        }
 
     def extend_preparation(
         self,
@@ -12430,6 +12477,49 @@ def finalize_vae_early_activation(
             "restore_session_id": _LATEST_RESTORE_SESSION_ID,
         })
     return _state
+
+
+def teardown_diagnostic_snapshot() -> dict[str, Any]:
+    """Return bounded state for activation workers and sampler watchdogs."""
+    result: dict[str, Any] = {}
+    for name, state_map, lock in (
+        ("unet_activation", _UNET_ACTIVATION_STATE, _UNET_ACTIVATION_LOCK),
+        ("vae_activation", _VAE_ACTIVATION_STATE, _VAE_ACTIVATION_LOCK),
+    ):
+        entries: list[dict[str, Any]] = []
+        try:
+            with lock:
+                current = list(state_map.items())[:32]
+            for request_id, state in current:
+                future = state.get("future") if isinstance(state, dict) else None
+                entries.append({
+                    "request_id": str(request_id)[:96],
+                    "status": str(state.get("status", ""))[:48],
+                    "terminal": bool(state.get("terminal", False)),
+                    "future_exists": future is not None,
+                    "future_done": bool(future.done()) if future is not None else None,
+                    "future_running": bool(future.running()) if future is not None else None,
+                    "future_cancelled": bool(future.cancelled()) if future is not None else None,
+                })
+        except Exception as exc:
+            entries = [{"error_type": type(exc).__name__}]
+        result[name] = {"count": len(entries), "entries": entries}
+    try:
+        with _SAMPLER_STALL_WATCHDOG_LOCK:
+            watchdogs = list(_SAMPLER_STALL_WATCHDOGS.items())[:32]
+        result["sampler_stall_watchdogs"] = {
+            "count": len(watchdogs),
+            "entries": [
+                {
+                    "request_id": str(request_id)[:96],
+                    "thread_alive": bool(getattr(watchdog, "_thread", None) and watchdog._thread.is_alive()),
+                }
+                for request_id, watchdog in watchdogs
+            ],
+        }
+    except Exception as exc:
+        result["sampler_stall_watchdogs"] = {"error_type": type(exc).__name__}
+    return result
 
 
 # ── Backward-compatible aliases for test imports ─────────────────────
