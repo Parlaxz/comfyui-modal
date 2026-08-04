@@ -1290,6 +1290,85 @@ async def _read_v2_validation_certificate_async(
             flush=True,
         )
         return None, timings
+
+
+def _read_v2_validation_certificate_for_snapshot(
+    cert_identity: str,
+    *,
+    expected_components: dict[str, str] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, float], str]:
+    """Reload the Modal runtime-state volume exactly once, then read/parse/
+    validate the exact ``v2_cert_<identity>.json`` for snapshot retention.
+
+    Startup-only helper (synchronous reload is correct here; the existing
+    ``_read_v2_validation_certificate`` API and its fallback are unchanged).
+
+    Returns ``(normalized_payload, timings, status)``:
+      - ``normalized_payload`` — a normalized dict with keys ``schema_version``,
+        ``identity``, ``preflight_ok``, ``outputs_to_execute``, ``node_errors``,
+        ``identity_components``, or ``None`` on any failure.
+      - ``timings`` — ``cert_volume_reload_ms``, ``cert_file_read_ms``,
+        ``cert_json_parse_validate_ms``.
+      - ``status`` — ``ok`` | ``volume_unavailable`` | ``file_missing`` |
+        ``parse_error`` | ``invalid``.
+
+    Never raises.  Uses the unchanged ``_validate_cert_dict_payload`` with the
+    expected identity components.
+    """
+    timings: dict[str, float] = {
+        "cert_volume_reload_ms": 0.0,
+        "cert_file_read_ms": 0.0,
+        "cert_json_parse_validate_ms": 0.0,
+    }
+    try:
+        import json as _json
+        resources = globals().get("_MODAL_RESOURCES", {})
+        modal_volume = resources.get("runtime_state_volume")
+        if modal_volume is None:
+            return None, timings, "volume_unavailable"
+        from .runtime_state import ModalMountedStateVolume
+        volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+
+        _t0 = time.perf_counter()
+        volume.reload()
+        timings["cert_volume_reload_ms"] = round((time.perf_counter() - _t0) * 1000, 3)
+
+        filename = _v2_cert_filename(cert_identity)
+        _t1 = time.perf_counter()
+        if not volume.exists(filename):
+            timings["cert_file_read_ms"] = round((time.perf_counter() - _t1) * 1000, 3)
+            return None, timings, "file_missing"
+        raw = volume.read_bytes(filename)
+        timings["cert_file_read_ms"] = round((time.perf_counter() - _t1) * 1000, 3)
+        if not raw:
+            return None, timings, "file_missing"
+
+        _t2 = time.perf_counter()
+        payload = _json.loads(raw.decode("utf-8"))
+        result = _validate_cert_dict_payload(
+            payload, cert_identity, expected_components=expected_components,
+        )
+        timings["cert_json_parse_validate_ms"] = round((time.perf_counter() - _t2) * 1000, 3)
+        if result is None or not isinstance(payload, dict):
+            return None, timings, "invalid"
+        normalized: dict[str, Any] = {
+            "schema_version": payload.get("schema_version"),
+            "identity": payload.get("identity", ""),
+            "preflight_ok": bool(payload.get("preflight_ok")),
+            "outputs_to_execute": list(result["outputs_to_execute"]),
+            "node_errors": dict(result.get("node_errors") or {}),
+            "identity_components": dict(payload.get("identity_components") or {}),
+        }
+        return normalized, timings, "ok"
+    except Exception as exc:
+        print(
+            f"[v2.cert_snapshot] status=fallback reason=read_error "
+            f"error={str(exc)[:120]}",
+            flush=True,
+        )
+        return None, timings, "read_error"
+
+
 def _capture_remote_identity() -> dict[str, Any]:
     """Capture Modal identity and environment metadata at remote entry.
 
@@ -5280,6 +5359,131 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
 
+            # ── V2 certificate snapshot retention (production) ──
+            # At snapshot creation, retain the deployment-scoped validation
+            # certificate in BootstrapState so it survives the CPU memory
+            # snapshot.  The request-time snapshot-memory fast path reuses
+            # this exact state after restore.  Non-fatal: every failure falls
+            # back to request-time volume reads with status=fallback.
+            _cert_snap_stage = _v2_startup_stage(
+                "certificate_snapshot_retention", "start", trace=trace,
+            )
+            _cert_snap_ok = False
+            _cert_snap_reason = ""
+            _cert_snap_identity = ""
+            _cert_snap_workflow_hash = ""
+            _cert_snap_timings: dict[str, float] = {
+                "cert_volume_reload_ms": 0.0,
+                "cert_file_read_ms": 0.0,
+                "cert_json_parse_validate_ms": 0.0,
+            }
+            try:
+                from .execution_seed import read_snapshot_seed_payload as _read_seed_payload
+
+                _snap_seed_payload = _read_seed_payload(root=RUNTIME_STATE_PATH)
+                if _snap_seed_payload is None:
+                    _cert_snap_reason = "seed_missing"
+                else:
+                    _cert_snap_workflow_hash = str(
+                        (_snap_seed_payload or {}).get("workflow_hash", "") or ""
+                    )
+                    if not _cert_snap_workflow_hash:
+                        _cert_snap_reason = "seed_workflow_hash_empty"
+                    else:
+                        _snap_repair_mode, _snap_cn_gen, _snap_cn_src = (
+                            _get_preflight_context(self._legacy_api, self._legacy_module)
+                        )
+                        # Same eligibility gates as request-time cert lookup;
+                        # fail closed on any incomplete context.
+                        _cert_snap_eligible = (
+                            _V2_VALIDATION_CERT_ENABLED
+                            and bool(_V2_DEPLOYMENT_COMBINED_HASH)
+                            and _snap_repair_mode in ("off", "fail_fast", "dev")
+                            and bool(_snap_cn_gen)
+                        )
+                        if not _cert_snap_eligible:
+                            _cert_snap_reason = "not_eligible"
+                        else:
+                            _cert_snap_identity, _cert_snap_components = _compute_v2_cert_identity(
+                                _cert_snap_workflow_hash,
+                                repair_mode=_snap_repair_mode,
+                                custom_nodes_generation=_snap_cn_gen,
+                            )
+                            _cert_snap_payload, _cert_snap_timings, _cert_snap_status = (
+                                _read_v2_validation_certificate_for_snapshot(
+                                    _cert_snap_identity,
+                                    expected_components=_cert_snap_components,
+                                )
+                            )
+                            if _cert_snap_payload is None:
+                                _cert_snap_reason = f"cert_{_cert_snap_status}"
+                            else:
+                                # Reuse the existing identity recomputation for
+                                # trust — never weaken the stored-identity check.
+                                state.set_snapshot_certificate(_cert_snap_payload)
+                                if not state.snapshot_cert_valid:
+                                    state.set_snapshot_certificate({})
+                                    _cert_snap_reason = "cert_identity_recompute_failed"
+                                else:
+                                    state.snapshot_cert_retained = True
+                                    state.snapshot_cert_identity = _cert_snap_identity
+                                    state.snapshot_cert_workflow_hash = _cert_snap_workflow_hash
+                                    state.snapshot_cert_reason = ""
+                                    state.snapshot_cert_timings = dict(_cert_snap_timings)
+                                    _cert_snap_ok = True
+            except Exception as _cert_snap_exc:
+                _cert_snap_reason = f"error:{type(_cert_snap_exc).__name__}"
+            if _cert_snap_ok:
+                state.snapshot_cert_reason = ""
+                trace.emit(
+                    "v2_cert_snapshot_retained",
+                    phase="startup",
+                    metadata={
+                        "status": "retained",
+                        "cert_identity": _cert_snap_identity[:16],
+                        "workflow_hash": _cert_snap_workflow_hash[:16],
+                        **{_k: _v for _k, _v in _cert_snap_timings.items()},
+                    },
+                )
+                print(
+                    f"[v2.cert_snapshot] status=retained "
+                    f"identity={_cert_snap_identity[:16]} "
+                    f"workflow_hash={_cert_snap_workflow_hash[:16]} "
+                    f"cert_volume_reload_ms={_cert_snap_timings['cert_volume_reload_ms']} "
+                    f"cert_file_read_ms={_cert_snap_timings['cert_file_read_ms']} "
+                    f"cert_json_parse_validate_ms={_cert_snap_timings['cert_json_parse_validate_ms']}",
+                    flush=True,
+                )
+                _v2_startup_stage(
+                    "certificate_snapshot_retention", "end",
+                    started=_cert_snap_stage,
+                    trace=trace,
+                    metadata={
+                        "status": "retained",
+                        "cert_identity": _cert_snap_identity[:16],
+                        "workflow_hash": _cert_snap_workflow_hash[:16],
+                        **{_k: _v for _k, _v in _cert_snap_timings.items()},
+                    },
+                )
+            else:
+                state.snapshot_cert_retained = False
+                state.snapshot_cert_reason = _cert_snap_reason
+                print(
+                    f"[v2.cert_snapshot] status=fallback reason={_cert_snap_reason}",
+                    flush=True,
+                )
+                _v2_startup_stage(
+                    "certificate_snapshot_retention", "end",
+                    started=_cert_snap_stage,
+                    trace=trace,
+                    metadata={"status": "fallback", "reason": _cert_snap_reason},
+                )
+                trace.emit(
+                    "v2_cert_snapshot_fallback",
+                    phase="startup",
+                    metadata={"status": "fallback", "reason": _cert_snap_reason},
+                )
+
             # ── V2 dependency manifest persistence (before cert preflight) ──
             # Persist the immutable dependency manifest so the startup
             # certificate preflight finds a valid manifest.  This was
@@ -8529,53 +8733,70 @@ class ModalRuntimeEntrypoint:
                         # enter process-cache/Volume/dependency preflight/validation paths.
                         _snap_cert_source = None
                         _snapshot_valid = False
-                        if hasattr(self, 'bootstrap') and self.bootstrap is not None:
-                            _bs = getattr(self.bootstrap, 'state', None)
-                            if _bs is not None and _bs.snapshot_cert_valid:
-                                _sc = _bs.snapshot_certificate
-                                _sc_components = _sc.get("identity_components", {}) if isinstance(_sc, dict) else {}
-                                _sc_outputs = _sc.get("outputs_to_execute", [])
-                                _sc_errors = _sc.get("node_errors", {})
-                                # Match full identity_components dictionary: workflow_hash,
-                                # deployment_hash, repair_mode, custom_nodes_generation,
-                                # schema_version — or cert_identity — not only workflow_hash
-                                # and custom_nodes_generation.
-                                _sc_identity_ok = (
-                                    isinstance(_sc_components, dict)
-                                    and _sc_components == _v2_cert_components
+                        _snap_fallback_reason = ""
+                        _bs_ret = getattr(getattr(self, 'bootstrap', None), 'state', None)
+                        if _bs_ret is None:
+                            _snap_fallback_reason = "snapshot_state_unavailable"
+                        elif not _bs_ret.snapshot_cert_valid:
+                            _snap_fallback_reason = "snapshot_cert_invalid"
+                        else:
+                            _sc = _bs_ret.snapshot_certificate
+                            _sc_components = _sc.get("identity_components", {}) if isinstance(_sc, dict) else {}
+                            _sc_outputs = _sc.get("outputs_to_execute", [])
+                            _sc_errors = _sc.get("node_errors", {})
+                            # Match full identity_components dictionary: workflow_hash,
+                            # deployment_hash, repair_mode, custom_nodes_generation,
+                            # schema_version — or cert_identity — not only workflow_hash
+                            # and custom_nodes_generation.
+                            _sc_identity_ok = (
+                                isinstance(_sc_components, dict)
+                                and _sc_components == _v2_cert_components
+                            )
+                            if not _sc_identity_ok:
+                                # Fallback: match by cert_identity
+                                _sc_cert_id = str(_sc.get("identity", "") or "")
+                                _sc_identity_ok = bool(_sc_cert_id and _sc_cert_id == _v2_cert_identity)
+                            if not _sc_identity_ok:
+                                _snap_fallback_reason = "identity_mismatch"
+                            elif not (
+                                _sc.get("preflight_ok") is True
+                                and isinstance(_sc_outputs, list)
+                                and len(_sc_outputs) > 0
+                                and all(isinstance(o, str) for o in _sc_outputs)
+                                and len(set(_sc_outputs)) == len(_sc_outputs)
+                                and isinstance(_sc_errors, dict)
+                            ):
+                                _snap_fallback_reason = "invalid_payload"
+                            else:
+                                outputs_to_execute = list(_sc_outputs)
+                                node_errors = copy.deepcopy(_sc_errors) if isinstance(_sc_errors, dict) else {}
+                                _v2_cert_hit = True
+                                _v2_cert_preflight_skip = True
+                                _snapshot_valid = True
+                                _cached_valid = True
+                                _diag_cert_cache_hit = True
+                                _diag_cert_volume_reload_ms = 0.0
+                                _diag_cert_file_read_ms = 0.0
+                                _diag_cert_json_parse_validate_ms = 0.0
+                                _diag_cert_total_ms = _diag_cert_identity_build_ms
+                                _snap_cert_source = "snapshot_memory"
+                                print(
+                                    f"[v2.cert] decision=snapshot_exact_reuse "
+                                    f"source=snapshot_memory hit=1 "
+                                    f"identity={_v2_cert_identity[:16]} "
+                                    f"outputs={len(outputs_to_execute)} "
+                                    f"cert_volume_reload_ms=0.0 "
+                                    f"cert_file_read_ms=0.0 "
+                                    f"cert_json_parse_validate_ms=0.0",
+                                    flush=True,
                                 )
-                                if not _sc_identity_ok:
-                                    # Fallback: match by cert_identity
-                                    _sc_cert_id = str(_sc.get("identity", "") or "")
-                                    _sc_identity_ok = bool(_sc_cert_id and _sc_cert_id == _v2_cert_identity)
-                                if (
-                                    _sc_identity_ok
-                                    and _sc.get("preflight_ok") is True
-                                    and isinstance(_sc_outputs, list)
-                                    and len(_sc_outputs) > 0
-                                    and all(isinstance(o, str) for o in _sc_outputs)
-                                    and len(set(_sc_outputs)) == len(_sc_outputs)
-                                    and isinstance(_sc_errors, dict)
-                                ):
-                                    outputs_to_execute = list(_sc_outputs)
-                                    node_errors = copy.deepcopy(_sc_errors) if isinstance(_sc_errors, dict) else {}
-                                    _v2_cert_hit = True
-                                    _v2_cert_preflight_skip = True
-                                    _snapshot_valid = True
-                                    _cached_valid = True
-                                    _diag_cert_cache_hit = True
-                                    _diag_cert_volume_reload_ms = 0.0
-                                    _diag_cert_file_read_ms = 0.0
-                                    _diag_cert_json_parse_validate_ms = 0.0
-                                    _diag_cert_total_ms = _diag_cert_identity_build_ms
-                                    _snap_cert_source = "snapshot_memory"
-                                    print(
-                                        f"[v2.cert] source=snapshot_memory hit=1 "
-                                        f"outputs={len(outputs_to_execute)}",
-                                        flush=True,
-                                    )
-
                         if not _snapshot_valid:
+                            print(
+                                f"[v2.cert] decision=snapshot_fallback "
+                                f"reason={_snap_fallback_reason or 'unknown'} "
+                                f"identity={_v2_cert_identity[:16]}",
+                                flush=True,
+                            )
                             # -- Process-local cache lookup --
                             _cache_key = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                             _cached = _V2_CERT_PROCESS_CACHE.get(_cache_key)
@@ -8720,6 +8941,15 @@ class ModalRuntimeEntrypoint:
                             phase="execution",
                             metadata={
                                 "cert_identity": _v2_cert_identity[:16],
+                                "cert_source": (
+                                    _snap_cert_source
+                                    or ("process_cache" if _diag_cert_cache_hit else "volume")
+                                ),
+                                "cert_decision": (
+                                    "snapshot_exact_reuse"
+                                    if _snap_cert_source == "snapshot_memory"
+                                    else "cache_reuse" if _diag_cert_cache_hit else "volume_read"
+                                ),
                                 "hit": _v2_cert_hit,
                                 "preflight_skip": _v2_cert_preflight_skip,
                                 "cert_cache_hit": _diag_cert_cache_hit,
@@ -8828,8 +9058,8 @@ class ModalRuntimeEntrypoint:
             # Oracle Gate 2: if a cert skip occurred but the repair reports
             # nodes that were missing before repair, the cached validation
             # result may be stale because repair changed node availability.
-            # Only invalidates the request cache -- never mutates the snapshot
-            # cert on bootstrap state.
+            # Invalidate both request and retained snapshot state when repair
+            # changes the node availability behind a certificate.
             if (
                 _v2_cert_preflight_skip
                 and isinstance(repair_summary, Mapping)
@@ -8846,6 +9076,23 @@ class ModalRuntimeEntrypoint:
                 node_errors = {}
                 _cache_key_inval = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                 _V2_CERT_PROCESS_CACHE.pop(_cache_key_inval, None)
+                _bs_gate2 = getattr(getattr(self, "bootstrap", None), "state", None)
+                _retained_gate2 = str(
+                    getattr(_bs_gate2, "snapshot_cert_identity", "")
+                    or ((_bs_gate2.snapshot_certificate or {}).get("identity", "")
+                        if _bs_gate2 is not None else "")
+                )
+                if (
+                    _bs_gate2 is not None
+                    and _bs_gate2.snapshot_cert_valid
+                    and _retained_gate2 == _v2_cert_identity
+                ):
+                    _bs_gate2.invalidate_snapshot_certificate(reason="oracle_gate2_repair")
+                    print(
+                        f"[v2.cert] snapshot_retained_invalidated "
+                        f"reason=oracle_gate2_repair identity={_v2_cert_identity[:16]}",
+                        flush=True,
+                    )
                 _v2_preflight_ran = True
                 _pf_start2 = time.perf_counter()
                 if callable(_preflight_fn):
@@ -10036,15 +10283,45 @@ class ModalRuntimeEntrypoint:
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
             # Only write when preflight actually ran (not on cert skip).
-            # Also store on BootstrapState for snapshot persistence.
             if _v2_schedule_cert_write and _v2_preflight_ran:
-                await _write_v2_validation_certificate(
+                _cert_write_ok = await _write_v2_validation_certificate(
                     _v2_cert_identity,
                     outputs_to_execute,
                     node_errors,
                     components=_v2_cert_components,
                     preflight_ok=True,
                 )
+                _bs_write = getattr(getattr(self, "bootstrap", None), "state", None)
+                if _bs_write is not None:
+                    if _cert_write_ok:
+                        _fresh_cert = {
+                            "schema_version": _V2_CERT_SCHEMA_VERSION,
+                            "identity": _v2_cert_identity,
+                            "preflight_ok": True,
+                            "outputs_to_execute": list(outputs_to_execute),
+                            "node_errors": copy.deepcopy(node_errors) if node_errors else {},
+                            "identity_components": dict(_v2_cert_components),
+                        }
+                        _bs_write.set_snapshot_certificate(_fresh_cert)
+                        if _bs_write.snapshot_cert_valid:
+                            _bs_write.snapshot_cert_retained = True
+                            _bs_write.snapshot_cert_identity = _v2_cert_identity
+                            _bs_write.snapshot_cert_workflow_hash = _v2_cert_components.get("workflow_hash", "")
+                            _bs_write.snapshot_cert_reason = "request_write"
+                            print(
+                                f"[v2.cert] snapshot_retained_updated "
+                                f"reason=request_write identity={_v2_cert_identity[:16]}",
+                                flush=True,
+                            )
+                        else:
+                            _bs_write.invalidate_snapshot_certificate(reason="request_write_invalid")
+                    else:
+                        _bs_write.invalidate_snapshot_certificate(reason="certificate_write_failed")
+                        print(
+                            f"[v2.cert] snapshot_retained_invalidated "
+                            f"reason=certificate_write_failed identity={_v2_cert_identity[:16]}",
+                            flush=True,
+                        )
 
 
             # Stop sampling at result completion before assembling request diagnostics.
