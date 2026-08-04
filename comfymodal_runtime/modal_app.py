@@ -485,9 +485,10 @@ def _canonical_role_match_report(
 
     Returns a dict with:
       ``compatible`` (bool) — True when BOTH UNET and CLIP role identities
-        are equivalent.  VAE does NOT participate.
+        are equivalent.
       ``unet_match`` (bool) — True when UNET identity matches.
       ``clip_match`` (bool) — True when CLIP identity matches.
+      ``vae_match`` (bool) — True when VAE identity matches.
       ``unet_mismatch_fields`` (list[str]) — Differing UNET fields.
       ``clip_mismatch_fields`` (list[str]) — Differing CLIP fields.
       ``unet_request_identity``, ``unet_snapshot_identity``,
@@ -509,8 +510,10 @@ def _canonical_role_match_report(
         "compatible": False,
         "unet_match": False,
         "clip_match": False,
+        "vae_match": False,
         "unet_mismatch_fields": [],
         "clip_mismatch_fields": [],
+        "vae_mismatch_fields": [],
         "reason": "unknown",
     }
 
@@ -540,13 +543,25 @@ def _canonical_role_match_report(
         custom_node_generation=snapshot_custom_node_generation,
         deployment_combined_hash=snapshot_deployment_combined_hash,
     )
+    vae_request = compute_loader_role_identity(
+        "vae", request_model_spec or {},
+        custom_node_generation=request_custom_node_generation,
+        deployment_combined_hash=request_deployment_combined_hash,
+    )
+    vae_snapshot = compute_loader_role_identity(
+        "vae", snapshot_model_spec or {},
+        custom_node_generation=snapshot_custom_node_generation,
+        deployment_combined_hash=snapshot_deployment_combined_hash,
+    )
 
     unet_mismatch = find_role_identity_mismatch_fields(unet_request, unet_snapshot)
     clip_mismatch = find_role_identity_mismatch_fields(clip_request, clip_snapshot)
+    vae_mismatch = find_role_identity_mismatch_fields(vae_request, vae_snapshot)
 
     unet_match = len(unet_mismatch) == 0
     clip_match = len(clip_mismatch) == 0
-    compatible = unet_match and clip_match
+    vae_match = len(vae_mismatch) == 0
+    compatible = unet_match and clip_match and vae_match
 
     # Build human-readable reason
     parts: list[str] = []
@@ -554,17 +569,23 @@ def _canonical_role_match_report(
         parts.append(f"UNET:{','.join(unet_mismatch)}")
     if not clip_match:
         parts.append(f"CLIP:{','.join(clip_mismatch)}")
+    if not vae_match:
+        parts.append(f"VAE:{','.join(vae_mismatch)}")
     reason = "; ".join(parts) if parts else "ok"
 
     result["compatible"] = compatible
     result["unet_match"] = unet_match
     result["clip_match"] = clip_match
+    result["vae_match"] = vae_match
     result["unet_mismatch_fields"] = unet_mismatch
     result["clip_mismatch_fields"] = clip_mismatch
+    result["vae_mismatch_fields"] = vae_mismatch
     result["unet_request_identity"] = unet_request
     result["unet_snapshot_identity"] = unet_snapshot
     result["clip_request_identity"] = clip_request
     result["clip_snapshot_identity"] = clip_snapshot
+    result["vae_request_identity"] = vae_request
+    result["vae_snapshot_identity"] = vae_snapshot
     result["reason"] = reason
     return result
 
@@ -634,23 +655,44 @@ def _cpu_snapshot_spec_projection(spec: Any) -> dict[str, list[dict[str, Any]]]:
 def _cpu_snapshot_specs_match(spec_a: Any, spec_b: Any) -> bool:
     """Compare two model_spec dicts using only the requested identity fields.
 
-    Compares UNET identity (``unet_name``, ``weight_dtype``, ``loader_class``)
-    and CLIP identity (filenames, ``loader_class``, ``type``, single-vs-dual
-    layout) while ignoring ``node_id``, ``model_stack``, VAE loaders, CLIP
-    ``device``, and any other extraneous fields.
+    Compares UNET identity (``unet_name``, ``weight_dtype``, ``loader_class``),
+    CLIP identity (filenames, ``loader_class``, ``type``, single-vs-dual
+    layout), and the exact VAE loader identity while ignoring ``node_id``,
+    ``model_stack``, CLIP ``device``, and any other extraneous fields.
 
     Preserves list multiplicity and order so extra or differently-ordered
     loaders cause a mismatch.
     """
-    return _cpu_snapshot_spec_projection(spec_a) == _cpu_snapshot_spec_projection(spec_b)
+    return (
+        _cpu_snapshot_spec_projection(spec_a) == _cpu_snapshot_spec_projection(spec_b)
+        and _cpu_snapshot_vae_projection(spec_a) == _cpu_snapshot_vae_projection(spec_b)
+    )
+
+
+def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str], ...]:
+    """Return exact VAE loader identity for snapshot compatibility checks."""
+    if not isinstance(spec, Mapping):
+        return ()
+    loaders = spec.get("loaders", {})
+    if not isinstance(loaders, Mapping):
+        return ()
+    result: list[tuple[str, str]] = []
+    for loader in loaders.get("vae", []):
+        if isinstance(loader, Mapping):
+            result.append((
+                str(loader.get("loader_class", "")),
+                str(loader.get("vae_name", "")),
+            ))
+    return tuple(result)
 
 
 def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKey) -> bool:
-    """Compare two model keys ignoring ``vae_identity``.
+    """Compare two model keys, including exact ``vae_identity``.
 
     Compares only fields that are materially derived on both Plan A snapshot
     construction and Plan B request derivation: ``unet_identity``,
-    ``clip_identity`` (including dual-file dual identity), and ``clip_type``.
+    ``clip_identity`` (including dual-file dual identity), ``clip_type``, and
+    ``vae_identity``.
 
     Fields such as ``loader_configuration``, ``model_volume_generation``,
     and ``optimization_loader_options`` are default-only and never populated
@@ -661,6 +703,7 @@ def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKe
         key_a.unet_identity == key_b.unet_identity
         and key_a.clip_identity == key_b.clip_identity
         and key_a.clip_type == key_b.clip_type
+        and key_a.vae_identity == key_b.vae_identity
     )
 
 
@@ -668,10 +711,11 @@ def _cpu_snapshot_key_mismatch_reason(
     key_a: ModelRestoreKey,
     key_b: ModelRestoreKey,
 ) -> str | None:
-    """Return exact mismatch reason or None if keys match (ignoring vae_identity).
+    """Return exact mismatch reason or None if keys match.
 
     Checks only the materially-derived fields: ``unet_identity``,
-    ``clip_identity`` (including dual-file dual identity), and ``clip_type``.
+    ``clip_identity`` (including dual-file dual identity), ``clip_type``, and
+    ``vae_identity``.
     Fields never populated by ``identity_from_profile`` or ``derive_model_key``
     (``loader_configuration``, ``model_volume_generation``,
     ``optimization_loader_options``) are not checked.
@@ -682,6 +726,8 @@ def _cpu_snapshot_key_mismatch_reason(
         return "CLIP identity mismatch"
     if key_a.clip_type != key_b.clip_type:
         return "clip_type mismatch"
+    if key_a.vae_identity != key_b.vae_identity:
+        return "VAE identity mismatch"
     return None
 
 
@@ -728,7 +774,17 @@ def _cpu_snapshot_spec_mismatch_reason(
         else:
             return "CLIP single/dual structural mismatch"
 
-    if proj_a != proj_b:
+    vae_a = _cpu_snapshot_vae_projection(spec_a)
+    vae_b = _cpu_snapshot_vae_projection(spec_b)
+    if len(vae_a) != len(vae_b):
+        return "VAE loader count mismatch"
+    for va, vb in zip(vae_a, vae_b):
+        if va[0] != vb[0]:
+            return "VAE loader_class mismatch"
+        if va[1] != vb[1]:
+            return "VAE filename mismatch"
+
+    if proj_a != proj_b or vae_a != vae_b:
         return "spec projection mismatch"
     return None
 

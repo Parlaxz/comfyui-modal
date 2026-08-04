@@ -8015,7 +8015,11 @@ class V2LoaderBridge:
         this is a no-op.
         """
         if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
-            self._join_vae_early_activation(trace=self._trace)
+            _demanded_vae = kwargs.get("vae", args[0] if args else None)
+            self._join_vae_early_activation(
+                trace=self._trace,
+                demanded_vae=_demanded_vae,
+            )
         return _LOADER_MISS
 
     def set_exact_vae(self, vae: Any) -> None:
@@ -8065,12 +8069,12 @@ class V2LoaderBridge:
         """
         _vae = getattr(self, "_exact_vae", None)
         if _vae is not None:
-            return _vae, "exact_object"
+            return _vae, "snapshot_vae"
         try:
             _models = getattr(self, "_cpu_snapshot_models", None)
             _vae = getattr(_models, "vae", None)
             if _vae is not None:
-                return _vae, "snapshot_models"
+                return _vae, "snapshot_vae"
         except Exception:
             pass
         try:
@@ -8078,7 +8082,7 @@ class V2LoaderBridge:
             if isinstance(_outputs, Mapping):
                 _vae = _outputs.get("vae")
                 if _vae is not None:
-                    return _vae, "snapshot_loader_outputs"
+                    return _vae, "snapshot_vae"
         except Exception:
             pass
         if self._graph_vae_output is not None:
@@ -8094,6 +8098,7 @@ class V2LoaderBridge:
         self,
         *,
         trace: RuntimeTrace | None = None,
+        demanded_vae: Any = None,
     ) -> dict[str, Any]:
         """Join the request's sampling_end VAE activation future at graph
         (VAEDecode/VAELoader) demand.  Runs OUTSIDE the mutation lane.
@@ -8132,7 +8137,10 @@ class V2LoaderBridge:
             _status = _state.get("status", "")
             _terminal = bool(_state.get("terminal", False))
         if _terminal and _status == "ready":
-            _valid, _reason, _vae = _validate_vae_early_activation(_state)
+            _valid, _reason, _vae = _validate_vae_early_activation(
+                _state,
+                demanded_vae=demanded_vae,
+            )
             if _valid:
                 with _VAE_ACTIVATION_LOCK:
                     _joined = bool(_state.get("joined", False))
