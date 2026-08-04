@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+IPC_STREAM_LIMIT = 128 * 1024 * 1024
+
 # ── Protocol frame keys ─────────────────────────────────────────────────────
 
 FRAME_DECISION = "decision"
@@ -387,6 +389,7 @@ async def _serve(auth_token: str, state_path: str) -> None:
         lambda reader, writer: _handle_connection(reader, writer, auth_token, owner),
         host="127.0.0.1",
         port=0,
+        limit=IPC_STREAM_LIMIT,
     )
     port = server.sockets[0].getsockname()[1]
     if state_path:
