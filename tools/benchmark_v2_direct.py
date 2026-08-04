@@ -2007,7 +2007,7 @@ async def _run_acceptance_sequence(
 
 
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
-               acceptance: bool = False) -> None:
+               acceptance: bool = False, certificate_warmup: bool = False) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
@@ -2025,6 +2025,26 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             workspace=workspace, transport=transport, output_dir=output_dir,
         )
         return
+
+    if certificate_warmup:
+        print("[v2.certificate_warmup] phase=execute_start", flush=True)
+        await _run_one(
+            index=0,
+            workflow=workflow,
+            modal_options=modal_options,
+            workspace=workspace,
+            transport=transport,
+            output_dir=output_dir,
+            _defer_waterfall=True,
+        )
+        print("[v2.certificate_warmup] phase=execute_complete", flush=True)
+        return
+
+    print(
+        "[v2.certificate_warmup] measured_request "
+        f"warmup_used={int(os.environ.get('COMFYMODAL_V2_CERTIFICATE_WARMUP', '0') == '1')}",
+        flush=True,
+    )
 
     if cpu_snapshot_unet_ab:
         await _run_ab_compare(
@@ -2108,9 +2128,16 @@ if __name__ == "__main__":
              "C fresh restored. Validates identity, timing, asset proofs, "
              "and acceptance criteria. Exits non-zero on failure.",
     )
+    _parser.add_argument(
+        "--certificate-warmup",
+        action="store_true",
+        default=False,
+        help="Run one validated setup request to populate the certificate for the current deployment identity; do not count it as a benchmark run.",
+    )
     _args = _parser.parse_args()
     asyncio.run(main(
         bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
         cpu_snapshot_unet_ab=_args.cpu_snapshot_unet_ab,
         acceptance=_args.acceptance,
+        certificate_warmup=_args.certificate_warmup,
     ))

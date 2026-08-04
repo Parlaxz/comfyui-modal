@@ -2084,6 +2084,30 @@ def _attach_structured_report(result: dict[str, Any], state: dict[str, Any]) -> 
     if cpu_records:
         structured["cpu_owner_records"] = list(cpu_records)
 
+    # Preserve report fields assembled by an inner execution scope.  A
+    # populated structured report may already be present on *result* (for
+    # example assembled closer to the instrumentation point inside the
+    # runner).  The fields computed above come from *state* and are valid
+    # regardless; blindly replacing an existing populated report with this
+    # mapping would silently discard those live diagnostics before result
+    # delivery.  The inner report is more specific on a key conflict, so
+    # retain it and record only bounded conflict names.
+    existing = result.get("pre_sampler_structured_report")
+    if isinstance(existing, Mapping):
+        merged = dict(existing)
+        conflicts: list[str] = []
+        for key, value in structured.items():
+            if key not in merged:
+                merged[key] = value
+            elif merged[key] != value and len(conflicts) < 16:
+                conflicts.append(str(key))
+        if conflicts:
+            prior_conflicts = merged.get("_structured_report_merge_conflicts")
+            if isinstance(prior_conflicts, list):
+                conflicts = list(prior_conflicts[:16]) + conflicts
+            merged["_structured_report_merge_conflicts"] = conflicts[:16]
+        structured = merged
+
     # Always set the key so consumers can reliably detect its presence.
     # When empty, it indicates no live instrumentation data was collected.
     result["pre_sampler_structured_report"] = structured

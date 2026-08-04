@@ -33,13 +33,45 @@ if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=1"
 if not defined V2_BENCHMARK_GAP_SECONDS set "V2_BENCHMARK_GAP_SECONDS=0"
 if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
 
-set "REPO_ROOT=%~dp0"
-cd /d "%REPO_ROOT%" || exit /b 1
+set "CREDENTIAL_ROOT=%~dp0"
+if not defined COMFYMODAL_SOURCE_ROOT set "COMFYMODAL_SOURCE_ROOT=!CREDENTIAL_ROOT!"
+if not defined COMFYMODAL_EXPECTED_SOURCE_SHA (
+    echo === ERROR: COMFYMODAL_EXPECTED_SOURCE_SHA is required ===
+    exit /b 1
+)
+if not defined COMFYMODAL_EXPECTED_SOURCE_BRANCH set "COMFYMODAL_EXPECTED_SOURCE_BRANCH=opt/kernel-first-step-prebuild"
+for /f %%a in ('git -C "!COMFYMODAL_SOURCE_ROOT!" rev-parse HEAD 2^>nul') do set "COMFYMODAL_SOURCE_SHA=%%a"
+for /f %%a in ('git -C "!COMFYMODAL_SOURCE_ROOT!" branch --show-current 2^>nul') do set "COMFYMODAL_SOURCE_BRANCH=%%a"
+if not defined COMFYMODAL_SOURCE_SHA (
+    echo === ERROR: source worktree is not a git checkout ===
+    exit /b 1
+)
+if /i not "!COMFYMODAL_SOURCE_SHA!"=="!COMFYMODAL_EXPECTED_SOURCE_SHA!" (
+    echo === ERROR: source SHA mismatch ===
+    echo expected=!COMFYMODAL_EXPECTED_SOURCE_SHA!
+    echo actual=!COMFYMODAL_SOURCE_SHA!
+    exit /b 1
+)
+if /i not "!COMFYMODAL_SOURCE_BRANCH!"=="!COMFYMODAL_EXPECTED_SOURCE_BRANCH!" (
+    echo === ERROR: source branch mismatch ===
+    echo expected=!COMFYMODAL_EXPECTED_SOURCE_BRANCH!
+    echo actual=!COMFYMODAL_SOURCE_BRANCH!
+    exit /b 1
+)
+for /f "delims=" %%a in ('git -C "!COMFYMODAL_SOURCE_ROOT!" status --porcelain 2^>nul') do set "COMFYMODAL_SOURCE_DIRTY=1"
+if defined COMFYMODAL_SOURCE_DIRTY (
+    echo === ERROR: source worktree is dirty ===
+    exit /b 1
+)
+set "REPO_ROOT=!COMFYMODAL_SOURCE_ROOT!"
+set "COMFYMODAL_WORKSPACE_FILE=!CREDENTIAL_ROOT!.modal_workspaces.json"
+set "COMFYMODAL_WORKFLOW_FILE=!CREDENTIAL_ROOT!latest_benchmark_workflow.json"
+cd /d "!REPO_ROOT!" || exit /b 1
 
 REM -- Workspace loading -------------------------------------------
 echo === Loading active workspace ===
 set "WS_FILE=%TEMP%\_ws_%RANDOM%.txt"
-python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[])if w.get('id')==aid),None);tid=ws and ws.get('token_id')or'';ts=ws and ws.get('token_secret')or'';label=ws and ws.get('label','')or'';open(sys.argv[1],'w').write('MODAL_TOKEN_ID='+tid+'\nMODAL_TOKEN_SECRET='+ts+'\nMODAL_WORKSPACE_LABEL='+label)" "%WS_FILE%"
+python -c "import json,sys;d=json.load(open(sys.argv[1]));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[])if w.get('id')==aid),None);tid=ws and ws.get('token_id')or'';ts=ws and ws.get('token_secret')or'';label=ws and ws.get('label','')or'';open(sys.argv[2],'w').write('MODAL_TOKEN_ID='+tid+'\nMODAL_TOKEN_SECRET='+ts+'\nMODAL_WORKSPACE_LABEL='+label)" "!COMFYMODAL_WORKSPACE_FILE!" "%WS_FILE%"
 if errorlevel 1 (
     echo === ERROR: Python workspace extraction failed ===
     if defined WS_FILE if exist "%WS_FILE%" del /q "%WS_FILE%"
@@ -301,8 +333,23 @@ if /i "!COMFYMODAL_DEPLOY_ONLY!"=="1" (
     exit /b 0
 )
 
-REM -- Benchmark invocation ------------------------------------------
-REM Default: V2_BENCHMARK_RUNS=1 -> exactly one run.  The acceptance
+REM -- Certificate warmup and benchmark invocation -------------------
+REM Certificate identities include the deployed source hash, so a redeploy
+REM must not reuse an older certificate. Establish the current certificate
+REM with one validated setup request before the measured run.
+if not defined COMFYMODAL_V2_CERTIFICATE_WARMUP set "COMFYMODAL_V2_CERTIFICATE_WARMUP=0"
+echo certificate_warmup=!COMFYMODAL_V2_CERTIFICATE_WARMUP!
+if /i "!COMFYMODAL_V2_CERTIFICATE_WARMUP!"=="1" (
+    echo === Running V2 certificate warmup - setup request; not counted ===
+    python tools\benchmark_v2_direct.py --certificate-warmup
+    if errorlevel 1 (
+        echo === ERROR: Certificate warmup failed ===
+        exit /b 1
+    )
+    echo === V2 certificate warmup completed ===
+)
+
+REM Default: V2_BENCHMARK_RUNS=1 -> exactly one measured run.  The acceptance
 REM sequence (A fresh / B reused / C fresh, ~3+ requests) runs ONLY via
 REM the explicit opt-in env V2_BENCHMARK_MODE=acceptance so the single-run
 REM contract of this script is never silently exceeded.
