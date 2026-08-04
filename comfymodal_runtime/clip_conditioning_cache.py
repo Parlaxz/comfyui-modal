@@ -34,6 +34,7 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Mapping as ABCMapping
 from typing import Any, Mapping
 
 from .env import env_flag
@@ -117,9 +118,22 @@ def _s(value: Any) -> str:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        _jsonable(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         allow_nan=False,
     )
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, ABCMapping):
+        return {
+            str(key): _jsonable(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported key value: {type(value).__name__}")
 
 
 def _canonical_value(value: Any) -> Any:
