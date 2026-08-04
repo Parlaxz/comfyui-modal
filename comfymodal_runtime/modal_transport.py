@@ -12,6 +12,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping
 
 from .contracts import ExecutionPlan
+from .local_handle_client import (
+    PersistentHandleError,
+    PersistentHandleUnavailable,
+    build_handle_key,
+    get_default_handle_client,
+    is_stale_handle_error,
+)
 from .trace import (
     _build_local_submission_breakdown,
     _emit_breakdown_line,
@@ -60,17 +67,16 @@ async def _aclose_iterator(iterator: Any) -> None:
 class HandleCacheKey:
     """Cache key for Modal function/cls handles.
 
-    Equality is value-based so the same workspace/app/target/
+    Equality is value-based so the same workspace/app/target/deployment/
     environment produces the same dict key across call boundaries.
-    Invocation-time cloud overrides are excluded — target identity
-    is purely workspace + environment + app + class.
 
     *cloud* (optional) isolates caches across different Modal cloud
-    placements (e.g. ``"gcp"`` vs ``"aws"``).  *factory_identity*
-    (optional) isolates caches across different ``v2_handle_factory``
-    callables so that distinct factory objects never share a cached
-    handle.  *gpu* (optional) isolates caches across different GPU
-    configurations so that distinct GPU targets never share a cached
+    placements (e.g. ``"gcp"`` vs ``"aws"``).  *token_id* and
+    *deployment_identity* isolate credential and deployment generations.
+    *factory_identity* (optional) isolates caches across different
+    ``v2_handle_factory`` callables so that distinct factory objects never
+    share a cached handle.  *gpu* (optional) isolates caches across different
+    GPU configurations so that distinct GPU targets never share a cached
     handle.
     """
 
@@ -80,6 +86,8 @@ class HandleCacheKey:
     environment: str = ""
     cloud: str = ""
     gpu: str = ""
+    token_id: str = ""
+    deployment_identity: str = ""
     factory_identity: object | None = None
 
 
@@ -96,6 +104,10 @@ class HandleCache:
         with self._lock:
             self._values[key] = value
         return value
+
+    def invalidate(self, key: HandleCacheKey) -> None:
+        with self._lock:
+            self._values.pop(key, None)
 
     def clear(self) -> None:
         with self._lock:
@@ -115,11 +127,98 @@ class ModalTransport:
         checkpoint_stream_fn: Callable[..., Any] | None = None,
         v2_handle_factory: Callable[..., Any] | None = None,
         handle_cache: HandleCache | None = None,
+        persistent_handle_client: Any | None = None,
     ) -> None:
         self.prompt_stream_fn = prompt_stream_fn
         self.checkpoint_stream_fn = checkpoint_stream_fn
         self.v2_handle_factory = v2_handle_factory
         self.handle_cache = handle_cache or _SHARED_HANDLE_CACHE
+        self.persistent_handle_client = persistent_handle_client
+
+    @staticmethod
+    def _persistent_enabled() -> bool:
+        return os.environ.get("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+    @staticmethod
+    def _deployment_identity(
+        payload: Mapping[str, Any] | None = None,
+        snapshot_seed: Mapping[str, Any] | None = None,
+    ) -> str:
+        metadata = payload.get("request_metadata", {}) if isinstance(payload, Mapping) else {}
+        identity = metadata.get("deployment_combined_hash", "") if isinstance(metadata, Mapping) else ""
+        if not identity and isinstance(snapshot_seed, Mapping):
+            seed = snapshot_seed.get("seed", {})
+            if isinstance(seed, Mapping):
+                identity = seed.get("deployment_combined_hash", "")
+        return str(identity or os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", ""))
+
+    def _cache_key(
+        self,
+        *,
+        workspace: dict[str, Any] | None,
+        app_name: str,
+        class_name: str,
+        environment: str,
+        cloud: str,
+        gpu: str,
+        deployment_identity: str,
+    ) -> HandleCacheKey:
+        return HandleCacheKey(
+            str((workspace or {}).get("id", "default")),
+            app_name,
+            class_name,
+            environment=environment,
+            cloud=cloud,
+            gpu=gpu,
+            token_id=str((workspace or {}).get("token_id", "")),
+            deployment_identity=deployment_identity,
+            factory_identity=self.v2_handle_factory,
+        )
+
+    def _persistent_key(
+        self,
+        *,
+        workspace: dict[str, Any] | None,
+        app_name: str,
+        class_name: str,
+        environment: str,
+        cloud: str,
+        gpu: str,
+        deployment_identity: str,
+    ) -> dict[str, str]:
+        return build_handle_key(
+            workspace_identity=str((workspace or {}).get("id", "default")),
+            token_id=str((workspace or {}).get("token_id", "")),
+            app_name=app_name,
+            class_name=class_name,
+            deployment_identity=deployment_identity,
+            environment=environment,
+            cloud=cloud,
+            gpu=gpu,
+        )
+
+    def _persistent_client(self) -> Any:
+        return self.persistent_handle_client or get_default_handle_client()
+
+    @staticmethod
+    def _fallback_direct(reason: Any) -> None:
+        print(
+            f"[v2.local_handle] decision=fallback_direct reason={type(reason).__name__}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _persistent_failure_is_local(exc: BaseException) -> bool:
+        if isinstance(exc, PersistentHandleUnavailable):
+            return True
+        if not isinstance(exc, PersistentHandleError):
+            return False
+        return str(exc.frame.get("type", "")) in {
+            "", "proxy_read_failed", "proxy_internal", "resolve_failed",
+            "auth_failed", "unknown_op",
+        }
 
     @staticmethod
     def _resolve_v2_cloud(gpu: str) -> str:
@@ -180,22 +279,22 @@ class ModalTransport:
         *,
         workspace: dict[str, Any] | None,
         gpu: Any = None,
+        deployment_identity: str = "",
         runtime_trace: RuntimeTrace | None = None,
     ) -> Any:
         selected_gpu_str = self._canonicalize_gpu_config(gpu)
         app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
         class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
-        workspace_id = str((workspace or {}).get("id", "default"))
         environment = self._resolve_environment()
         cloud = self._resolve_v2_cloud(gpu)
-        key = HandleCacheKey(
-            workspace_id,
-            app_name,
-            class_name,
+        key = self._cache_key(
+            workspace=workspace,
+            app_name=app_name,
+            class_name=class_name,
             environment=environment,
             cloud=cloud,
             gpu=selected_gpu_str,
-            factory_identity=self.v2_handle_factory,
+            deployment_identity=deployment_identity,
         )
         cached = self.handle_cache.get(key)
         if cached is not None:
@@ -292,6 +391,10 @@ class ModalTransport:
         _generator_end_mono_ns = None
         _submission_boundary_source = None
         _iterator: Any = None
+        _using_persistent_handle = False
+        _persistent_mode = False
+        _persistent_client: Any = None
+        _direct_retry_done = False
         try:
             if fn is not None:
                 # V1-compatible stream path — measure plan serialization
@@ -333,16 +436,29 @@ class ModalTransport:
                     runtime_trace.emit("pre_handle_residual_start", phase="local")
                     runtime_trace.emit("pre_handle_residual_end", phase="local")
                     runtime_trace.emit("modal_handle_lookup_start", phase="local")
-                handle = self._v2_handle(
-                    workspace=workspace, gpu=gpu, runtime_trace=runtime_trace,
-                )
+                _deployment_identity = self._deployment_identity(plan.request_metadata)
+                _app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
+                _class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
+                _gpu_str = self._canonicalize_gpu_config(gpu)
+                _persistent_mode = self._persistent_enabled() and self.v2_handle_factory is None
+                handle = None
+                if not _persistent_mode:
+                    handle = self._v2_handle(
+                        workspace=workspace,
+                        gpu=gpu,
+                        deployment_identity=_deployment_identity,
+                        runtime_trace=runtime_trace,
+                    )
                 if runtime_trace is not None:
-                    runtime_trace.emit("modal_handle_lookup_end", phase="local")
-                    gpu_str = self._canonicalize_gpu_config(gpu)
-                    # handle_lookup_app_name set inside _v2_handle (actual app_name)
+                    if not _persistent_mode:
+                        runtime_trace.emit("modal_handle_lookup_end", phase="local")
+                    # Direct lookup sets the actual app name; the persistent
+                    # owner uses the same environment-selected target.
                     runtime_trace.set_metadata(
-                        handle_lookup_class_name=type(handle).__name__,
-                        handle_lookup_gpu=gpu_str,
+                        handle_lookup_app_name=_app_name,
+                        handle_lookup_class_name=(_class_name if _persistent_mode else type(handle).__name__),
+                        handle_lookup_gpu=_gpu_str,
+                        local_handle_mode=("persistent_ipc" if _persistent_mode else "direct"),
                     )
                     runtime_trace.emit("modal_payload_serialize_start", phase="local")
                 plan_dict = plan_dict if plan_dict is not None else plan.to_dict()
@@ -428,16 +544,97 @@ class ModalTransport:
                         if "__request_origin_info__" not in plan_dict:
                             plan_dict["__request_origin_info__"] = _origin_from_meta
                 try:
+                    if _persistent_mode:
+                        _persistent_client = self._persistent_client()
+                        _persistent_key = self._persistent_key(
+                            workspace=workspace,
+                            app_name=_app_name,
+                            class_name=_class_name,
+                            environment=self._resolve_environment(),
+                            cloud=self._resolve_v2_cloud(gpu),
+                            gpu=_gpu_str,
+                            deployment_identity=_deployment_identity,
+                        )
+                        stream = await _persistent_client.run_plan_stream(
+                            _persistent_key,
+                            workspace or {},
+                            plan_dict,
+                            request_id=request_id,
+                            gpu=_gpu_str,
+                        )
+                        _using_persistent_handle = True
+                    else:
+                        stream = handle.run_plan_stream.remote_gen.aio(
+                            plan_dict, request_id=request_id,
+                        )
+                except (PersistentHandleUnavailable, PersistentHandleError) as exc:
+                    if not _persistent_mode or not self._persistent_failure_is_local(exc):
+                        raise
+                    self._fallback_direct(exc)
+                    _persistent_mode = False
+                    _using_persistent_handle = False
+                    handle = self._v2_handle(
+                        workspace=workspace,
+                        gpu=gpu,
+                        deployment_identity=_deployment_identity,
+                        runtime_trace=runtime_trace,
+                    )
                     stream = handle.run_plan_stream.remote_gen.aio(
                         plan_dict, request_id=request_id,
                     )
-                except Exception:
-                    if runtime_trace is not None:
-                        runtime_trace.set_metadata(
-                            modal_generator_create_start_wall_ns=_generator_start_wall_ns,
-                            modal_generator_create_start_mono_ns=_generator_start_mono_ns,
+                    _generator_end_wall_ns = time.time_ns()
+                    _generator_end_mono_ns = time.monotonic_ns()
+                except Exception as exc:
+                    if _persistent_mode:
+                        self._fallback_direct(exc)
+                        _persistent_mode = False
+                        _using_persistent_handle = False
+                        handle = self._v2_handle(
+                            workspace=workspace,
+                            gpu=gpu,
+                            deployment_identity=_deployment_identity,
+                            runtime_trace=runtime_trace,
                         )
-                    raise
+                        stream = handle.run_plan_stream.remote_gen.aio(
+                            plan_dict, request_id=request_id,
+                        )
+                        _generator_end_wall_ns = time.time_ns()
+                        _generator_end_mono_ns = time.monotonic_ns()
+                    elif not _direct_retry_done and is_stale_handle_error(exc):
+                        self.handle_cache.invalidate(self._cache_key(
+                            workspace=workspace,
+                            app_name=_app_name,
+                            class_name=_class_name,
+                            environment=self._resolve_environment(),
+                            cloud=self._resolve_v2_cloud(gpu),
+                            gpu=_gpu_str,
+                            deployment_identity=_deployment_identity,
+                        ))
+                        _direct_retry_done = True
+                        handle = self._v2_handle(
+                            workspace=workspace,
+                            gpu=gpu,
+                            deployment_identity=_deployment_identity,
+                            runtime_trace=runtime_trace,
+                        )
+                        stream = handle.run_plan_stream.remote_gen.aio(
+                            plan_dict, request_id=request_id,
+                        )
+                        _generator_end_wall_ns = time.time_ns()
+                        _generator_end_mono_ns = time.monotonic_ns()
+                    else:
+                        if runtime_trace is not None:
+                            runtime_trace.set_metadata(
+                                modal_generator_create_start_wall_ns=_generator_start_wall_ns,
+                                modal_generator_create_start_mono_ns=_generator_start_mono_ns,
+                            )
+                        raise
+                if runtime_trace is not None:
+                    runtime_trace.set_metadata(
+                        local_handle_mode=("persistent_ipc" if _using_persistent_handle else "direct"),
+                    )
+                if _using_persistent_handle and runtime_trace is not None:
+                    runtime_trace.emit("modal_handle_lookup_end", phase="local")
                 _generator_end_wall_ns = time.time_ns()
                 _generator_end_mono_ns = time.monotonic_ns()
                 _modal_input_id = str(getattr(stream, "input_id", "") or "")
@@ -505,6 +702,59 @@ class ModalTransport:
                     first_event = await _iterator.__anext__()
                 except StopAsyncIteration:
                     return
+                except PersistentHandleError as exc:
+                    if not _using_persistent_handle or not self._persistent_failure_is_local(exc):
+                        raise
+                    await _aclose_iterator(_iterator)
+                    _iterator = None
+                    self._fallback_direct(exc)
+                    _persistent_mode = False
+                    _using_persistent_handle = False
+                    handle = self._v2_handle(
+                        workspace=workspace,
+                        gpu=gpu,
+                        deployment_identity=_deployment_identity,
+                        runtime_trace=runtime_trace,
+                    )
+                    stream = handle.run_plan_stream.remote_gen.aio(
+                        plan_dict, request_id=request_id,
+                    )
+                    _generator_end_wall_ns = time.time_ns()
+                    _generator_end_mono_ns = time.monotonic_ns()
+                    _iterator = stream.__aiter__() if hasattr(stream, "__aiter__") else None
+                    if _iterator is None:
+                        raise TransportError("direct v2 stream fallback is not asynchronous")
+                    first_event = await _iterator.__anext__()
+                except Exception as exc:
+                    if not is_stale_handle_error(exc) or _direct_retry_done:
+                        raise
+                    await _aclose_iterator(_iterator)
+                    _iterator = None
+                    self.handle_cache.invalidate(self._cache_key(
+                        workspace=workspace,
+                        app_name=_app_name,
+                        class_name=_class_name,
+                        environment=self._resolve_environment(),
+                        cloud=self._resolve_v2_cloud(gpu),
+                        gpu=_gpu_str,
+                        deployment_identity=_deployment_identity,
+                    ))
+                    _direct_retry_done = True
+                    handle = self._v2_handle(
+                        workspace=workspace,
+                        gpu=gpu,
+                        deployment_identity=_deployment_identity,
+                        runtime_trace=runtime_trace,
+                    )
+                    stream = handle.run_plan_stream.remote_gen.aio(
+                        plan_dict, request_id=request_id,
+                    )
+                    _generator_end_wall_ns = time.time_ns()
+                    _generator_end_mono_ns = time.monotonic_ns()
+                    _iterator = stream.__aiter__() if hasattr(stream, "__aiter__") else None
+                    if _iterator is None:
+                        raise TransportError("direct v2 stale retry is not asynchronous")
+                    first_event = await _iterator.__anext__()
                 _first_event_wall_ns = time.time_ns()
                 _first_event_mono_ns = time.monotonic_ns()
                 if fn is None:
@@ -615,9 +865,12 @@ class ModalTransport:
         if fn is not None:
             stream = fn(*args, **kwargs)
         else:
+            _checkpoint_workspace = kwargs.pop("workspace", None)
+            _checkpoint_gpu = kwargs.pop("gpu", None)
             handle = self._v2_handle(
-                workspace=kwargs.pop("workspace", None),
-                gpu=kwargs.pop("gpu", None),
+                workspace=_checkpoint_workspace,
+                gpu=_checkpoint_gpu,
+                deployment_identity=self._deployment_identity(kwargs.get("plan_payload")),
             )
             stream = handle.run_checkpoint_stream.remote_gen.aio(*args, **kwargs)
         if hasattr(stream, "__aiter__"):
@@ -650,9 +903,12 @@ class ModalTransport:
         result dict.  The seed payload is passed through unchanged — it is
         never rebuilt or re-validated on the remote side.
         """
-        handle = self._v2_handle(
-            workspace=workspace, gpu=gpu, runtime_trace=runtime_trace,
+        _deployment_identity = self._deployment_identity(
+            plan_payload, snapshot_seed,
         )
+        _app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
+        _class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
+        _gpu_str = self._canonicalize_gpu_config(gpu)
         if runtime_trace is not None:
             runtime_trace.emit(
                 "restore_plan_remote_submit",
@@ -667,21 +923,68 @@ class ModalTransport:
                     "snapshot_seed_present": int(snapshot_seed is not None),
                 },
             )
-        publish_fn = handle.publish_restore_plan
-        remote = getattr(publish_fn, "remote", None)
-        if remote is not None and callable(getattr(remote, "aio", None)):
-            result = remote.aio(plan_payload, snapshot_seed=snapshot_seed)
-            if inspect.isawaitable(result):
-                return await result
-            return result
-        if inspect.iscoroutinefunction(publish_fn):
-            result = publish_fn(plan_payload, snapshot_seed=snapshot_seed)
-            if inspect.isawaitable(result):
-                return await result
-            return result
-        result = await asyncio.to_thread(
-            publish_fn, plan_payload, snapshot_seed=snapshot_seed,
-        )
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        _persistent_mode = self._persistent_enabled() and self.v2_handle_factory is None
+        if _persistent_mode:
+            _persistent_key = self._persistent_key(
+                workspace=workspace,
+                app_name=_app_name,
+                class_name=_class_name,
+                environment=self._resolve_environment(),
+                cloud=self._resolve_v2_cloud(gpu),
+                gpu=_gpu_str,
+                deployment_identity=_deployment_identity,
+            )
+            try:
+                return await self._persistent_client().publish_restore_plan(
+                    _persistent_key,
+                    workspace or {},
+                    plan_payload,
+                    snapshot_seed=snapshot_seed,
+                    gpu=_gpu_str,
+                )
+            except (PersistentHandleUnavailable, PersistentHandleError) as exc:
+                if not self._persistent_failure_is_local(exc):
+                    raise
+                self._fallback_direct(exc)
+
+        _direct_retry_done = False
+        while True:
+            handle = self._v2_handle(
+                workspace=workspace,
+                gpu=gpu,
+                deployment_identity=_deployment_identity,
+                runtime_trace=runtime_trace,
+            )
+            try:
+                publish_fn = handle.publish_restore_plan
+                remote = getattr(publish_fn, "remote", None)
+                if remote is not None and callable(getattr(remote, "aio", None)):
+                    result = remote.aio(plan_payload, snapshot_seed=snapshot_seed)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+                if inspect.iscoroutinefunction(publish_fn):
+                    result = publish_fn(plan_payload, snapshot_seed=snapshot_seed)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+                result = await asyncio.to_thread(
+                    publish_fn, plan_payload, snapshot_seed=snapshot_seed,
+                )
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+            except Exception as exc:
+                if not is_stale_handle_error(exc) or _direct_retry_done:
+                    raise
+                self.handle_cache.invalidate(self._cache_key(
+                    workspace=workspace,
+                    app_name=_app_name,
+                    class_name=_class_name,
+                    environment=self._resolve_environment(),
+                    cloud=self._resolve_v2_cloud(gpu),
+                    gpu=_gpu_str,
+                    deployment_identity=_deployment_identity,
+                ))
+                _direct_retry_done = True
+                continue

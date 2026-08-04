@@ -91,7 +91,13 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
-def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
+def _timing(
+    result: dict[str, Any],
+    wall_ms: float,
+    *,
+    command_start_unix_ms: int | None = None,
+    response_received_unix_ns: int | None = None,
+) -> dict[str, Any]:
     trace = result.get("trace", {}) if isinstance(result, dict) else {}
     deltas = trace.get("deltas_ms", {}) if isinstance(trace, dict) else {}
     derived = trace.get("derived_ms", {}) if isinstance(trace, dict) else {}
@@ -128,12 +134,25 @@ def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
         if local_submit is not None and remote_entry is not None
         else None
     )
+    handle_lookup_ms = duration_ms("modal_handle_lookup_start", "modal_handle_lookup_end")
+    submission_to_first_remote_event_ms = duration_ms(
+        "modal_submission_attempt", "modal_first_remote_event",
+    )
+    command_to_response_ms = None
+    if command_start_unix_ms is not None and response_received_unix_ns is not None:
+        command_to_response_ms = round(
+            (response_received_unix_ns - int(command_start_unix_ms) * 1_000_000) / 1_000_000.0,
+            1,
+        )
     # Forward local_timing from result (copied/safe block)
     _local_timing = result.get("local_timing", {}) if isinstance(result, dict) else {}
     if not isinstance(_local_timing, dict):
         _local_timing = {}
     return {
         "wall_ms": round(wall_ms, 1),
+        "handle_lookup_ms": handle_lookup_ms,
+        "submission_to_first_remote_event_ms": submission_to_first_remote_event_ms,
+        "command_to_response_ms": command_to_response_ms,
         "submit2entry_ms": deltas.get("modal_submit_to_entry_ms", submit2entry_ms),
         "t3b_to_t8_ms": deltas.get("t3b_to_t8", derived.get("t3b_to_t8_ms", validation_to_output_ms)),
         "restore_total_ms": restore.get("restore_total_ms") if isinstance(restore, dict) else None,
@@ -539,11 +558,17 @@ async def _run_one(
         raise RuntimeError(f"V2 run {index} returned app {identity['app_name']!r}, expected {APP_NAME!r}")
     artifact = {
         "run_index": index,
+        "request_id": prompt_id,
         "prompt_id": prompt_id,
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
         "identity": identity,
         "event_types": ["result"],
-        "timing": _timing(result, wall_ms),
+        "timing": _timing(
+            result,
+            wall_ms,
+            command_start_unix_ms=_command_start_for_origin,
+            response_received_unix_ns=_response_wall_ns,
+        ),
         "result": result,
     }
     _command_start_ms: int | None = None
@@ -588,7 +613,12 @@ async def _run_one(
             json.dumps(artifact, default=str, indent=2), encoding="utf-8"
         )
 
-    print(json.dumps({"run_index": index, "identity": identity, "timing": artifact["timing"]}, default=str))
+    print(json.dumps({
+        "run_index": index,
+        "request_id": prompt_id,
+        "identity": identity,
+        "timing": artifact["timing"],
+    }, default=str))
     if not _defer_waterfall:
         print(render_waterfall(_waterfall), flush=True)
     return artifact
@@ -1948,6 +1978,7 @@ async def _run_acceptance_sequence(
 
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
                acceptance: bool = False) -> None:
+    os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
     os.environ["COMFYMODAL_V2_GPU"] = GPU
@@ -1995,7 +2026,12 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         "gap_seconds": GAP_SECONDS,
         "trace_handoff_errors": len(trace_errors),
         "waterfall_runs": sum(1 for item in artifacts if item.get("waterfall")),
-        "runs": [{"run_index": item["run_index"], "identity": item["identity"], "timing": item["timing"]} for item in artifacts],
+        "runs": [{
+            "run_index": item["run_index"],
+            "request_id": item.get("request_id", item.get("prompt_id", "")),
+            "identity": item["identity"],
+            "timing": item["timing"],
+        } for item in artifacts],
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, default=str, indent=2), encoding="utf-8")
     _reports = [item["waterfall"] for item in artifacts if item.get("waterfall")]
