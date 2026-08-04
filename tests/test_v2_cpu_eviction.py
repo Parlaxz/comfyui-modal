@@ -42,9 +42,10 @@ from comfymodal_runtime.contracts import ModelRestoreKey
 def _clean_env():
     """Remove eviction env vars so tests start from a known state."""
     for key in ("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT",
-                "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS",
-                "COMFYMODAL_V2_EVICT_RETAIN_ROLE",
-                "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
+                 "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS",
+                 "COMFYMODAL_V2_EVICT_RETAIN_ROLE",
+                 "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS",
+                 "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
                 "COMFYMODAL_ENABLE_GPU_SNAPSHOT"):
         os.environ.pop(key, None)
 
@@ -311,6 +312,11 @@ class RuntimeEnvPropagationTests(unittest.TestCase):
         self.assertEqual(env["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"], "0")
         self.assertEqual(env["COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS"], "0")
         self.assertEqual(env["COMFYMODAL_V2_EVICT_RETAIN_ROLE"], "none")
+
+    def test_teardown_diagnostics_passthrough(self):
+        self.assertNotIn("COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS", _runtime_env())
+        os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = "1"
+        self.assertEqual(_runtime_env()["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"], "1")
 
 
 # ── Memory field contract tests ──────────────────────────────────────────

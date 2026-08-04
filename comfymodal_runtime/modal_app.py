@@ -2275,6 +2275,8 @@ def _runtime_env() -> dict[str, str]:
                     "COMFYMODAL_V2_EVICT_RETAIN_ROLE"):
         if _ev_key in os.environ:
             env[_ev_key] = os.environ[_ev_key]
+    if "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS" in os.environ:
+        env["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
