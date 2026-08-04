@@ -10068,6 +10068,30 @@ def _read_effective_options_hash(trace: RuntimeTrace | None) -> str:
     return ""
 
 
+def _read_effective_workflow_hash(trace: RuntimeTrace | None) -> str:
+    """Read the authoritative request workflow hash from the runtime trace."""
+    if trace is None:
+        return ""
+    try:
+        for event in reversed(trace.events):
+            metadata = event.metadata or {}
+            if event.name in {"remote_method_entry", "method_entry"}:
+                value = metadata.get("workflow_hash") or metadata.get("source_workflow_hash")
+                if value:
+                    return str(value)
+    except Exception:
+        pass
+    try:
+        metadata = trace._metadata or {}
+        return str(
+            metadata.get("workflow_hash")
+            or metadata.get("source_workflow_hash")
+            or ""
+        )
+    except Exception:
+        return ""
+
+
 def _clip_cache_tokenizer_identity(clip: Any) -> str:
     tokenizer = getattr(clip, "tokenizer", None)
     if tokenizer is None:
@@ -10150,6 +10174,7 @@ def _build_clip_conditioning_cache_context(
     except Exception:
         pass
     _modal_hashes = _unet_activation_modal_hashes()
+    _trace_workflow_hash = _read_effective_workflow_hash(trace)
     ctx["model_generation"] = str(
         getattr(_model_key, "model_volume_generation", "") or _read_models_generation() or ""
     )
@@ -10164,7 +10189,8 @@ def _build_clip_conditioning_cache_context(
         or ""
     )
     ctx["workflow_hash"] = str(
-        getattr(bridge, "_workflow_hash", "")
+        _trace_workflow_hash
+        or getattr(bridge, "_workflow_hash", "")
         or _modal_hashes.get("workflow_hash", "")
         or ""
     )
