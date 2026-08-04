@@ -869,15 +869,10 @@ class BootstrapState:
             results["cache_dit_applied"] = True
             results["patched_model"] = _patched_model
             results["unet_identity"] = self._cachedit_unet_identity
-            results["cache_dit_target"] = type(_transformer).__name__ if _transformer is not None else "unknown"
-            results["cache_dit_attachment_count"] = 1
-            results["cache_dit_fallback"] = 0
             results["workflow_hash"] = workflow_hash[:16] if workflow_hash else ""
             results["ok"] = True
         except Exception as exc:
             results["error"] = str(exc)[:120]
-            results["cache_dit_attachment_count"] = 0
-            results["cache_dit_fallback"] = 1
         return results
 
     def _restore_res4lyf_prepare(
