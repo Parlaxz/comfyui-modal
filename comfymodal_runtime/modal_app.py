@@ -754,6 +754,10 @@ def _is_production_profile() -> bool:
     return os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower() == "production"
 
 
+def _vae_snapshot_enabled() -> bool:
+    return env_flag("COMFYMODAL_V2_VAE_SNAPSHOT")
+
+
 def _safe_snapshot_identity(value: Any, role: str) -> str:
     if value is None:
         return "absent"
@@ -767,30 +771,45 @@ def production_snapshot_invariant(
     phase: str,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and report the production CLIP/UNET snapshot contract."""
+    """Validate and report the production CLIP/UNET/VAE snapshot contract."""
     profile_name = (profile or os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit")).strip().lower()
     clip = getattr(models, "clip", None) if models is not None else None
     unet = getattr(models, "unet", None) if models is not None else None
+    vae = getattr(models, "vae", None) if models is not None else None
     actual_clip = int(clip is not None)
     actual_unet = int(unet is not None)
-    status = "pass" if profile_name != "production" or (actual_clip and actual_unet) else "fail"
-    reason = "models_present" if status == "pass" else f"missing_clip={1 - actual_clip};missing_unet={1 - actual_unet}"
+    expected_vae = int(bool(getattr(getattr(models, "model_key", None), "vae_identity", None)))
+    actual_vae = int(vae is not None)
+    if profile_name == "production":
+        vae_ok = actual_vae == expected_vae
+        status = "pass" if (actual_clip and actual_unet and vae_ok) else "fail"
+        reason = "models_present" if status == "pass" else (
+            f"missing_clip={1 - actual_clip};missing_unet={1 - actual_unet};"
+            f"expected_vae={expected_vae};actual_vae={actual_vae}"
+        )
+    else:
+        status = "pass"
+        reason = "models_present"
     result = {
         "profile": profile_name,
         "expected_clip": 1,
         "expected_unet": 1,
         "actual_clip": actual_clip,
         "actual_unet": actual_unet,
+        "expected_vae": expected_vae,
+        "actual_vae": actual_vae,
         "clip_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "clip_identity", None), "clip"),
         "unet_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "unet_identity", None), "unet"),
+        "vae_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "vae_identity", None), "vae"),
         "status": status,
         "reason": reason,
         "phase": phase,
     }
     if profile_name == "production":
         print(
-            "[v2.production_snapshot_invariant] "
-            + " ".join(f"{key}={value}" for key, value in result.items()),
+            f"[v2.production_snapshot_invariant] "
+            f"expected_vae={expected_vae} actual_vae={actual_vae} status={status} "
+            f"phase={phase}",
             flush=True,
         )
         if status == "fail":
@@ -2070,6 +2089,7 @@ def _runtime_env() -> dict[str, str]:
     """Build the runtime environment dict for Modal's class-level ``env=`` parameter.
 
     Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
+    ``COMFYMODAL_V2_VAE_SNAPSHOT`` and
     ``COMFYMODAL_ENABLE_GPU_SNAPSHOT`` (both defaulting to ``"0"`` when
     absent from the local process environment), optional
     ``COMFYMODAL_V2_MEMORY_MB`` when present, full-trace/profile env keys
@@ -2086,6 +2106,9 @@ def _runtime_env() -> dict[str, str]:
         ),
         "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
+            "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -2285,6 +2308,35 @@ def _load_cpu_snapshot_unet(
     finally:
         if _aimdo_mm is not None:
             _aimdo_mm.aimdo_enabled = _aimdo_orig
+
+
+def _load_cpu_snapshot_vae(
+    vae_name: str,
+    *,
+    vae_cls: Any,
+) -> Any:
+    """Load one snapshot VAE through the live VAELoader machinery.
+
+    Called only inside the CPU-only snapshot context, so the loaded VAE is
+    constructed on CPU and never moved to GPU.  Uses the original wrapped
+    ``load_vae`` (``_comfy_modal_v2_original``) when a V2 wrapper is
+    installed, otherwise the bound method — same convention as the CLIP
+    snapshot loader.
+    """
+    if vae_cls is None:
+        raise RuntimeError(
+            "snapshot VAE loader is unavailable (VAELoader class not found)"
+        )
+    loader = vae_cls()
+    cls_method = vae_cls.load_vae if vae_cls else None
+    orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+    if orig is not None:
+        out = orig(loader, vae_name)
+    else:
+        out = loader.load_vae(vae_name)
+    if isinstance(out, (tuple, list)) and len(out) > 0:
+        return out[0]
+    return out
 
 
 def _reference_image() -> Any:
@@ -4878,6 +4930,8 @@ class ModalRuntimeEntrypoint:
                 env_vae = os.environ.get("COMFYMODAL_WARMUP_VAE", "")
                 if env_vae.strip():
                     profile["vae"] = env_vae
+                if not _vae_snapshot_enabled():
+                    profile["vae"] = ""
                 return profile
             print(
                 "[v2.cpu_snapshot] status=skipped reason=profile_unavailable "
@@ -4907,6 +4961,8 @@ class ModalRuntimeEntrypoint:
                     f"cpu model snapshot profile {key} must be a non-empty string, "
                     f"got {value!r}"
                 )
+        if not _vae_snapshot_enabled():
+            profile["vae"] = ""
         return profile
 
     def _use_cpu_snapshot_models_on_bridge(
@@ -5569,6 +5625,7 @@ class ModalRuntimeEntrypoint:
                         _unet_cls = _mappings.get("UNETLoader")
                         _clip_cls = _mappings.get("CLIPLoader")
                         _dual_clip_cls = _mappings.get("DualCLIPLoader")
+                        _vae_cls = _mappings.get("VAELoader")
 
                         # ── Resolve target GPU(s) from configured policy ──
                         # Inside the CPU snapshot context, CUDA APIs cannot be
@@ -5654,6 +5711,21 @@ class ModalRuntimeEntrypoint:
                                 return out[0]
                             return out
 
+                        # VAE loader: returns first public output.
+                        # load_cpu_snapshot_models passes (vae_name).  Resolve
+                        # original from class-level _comfy_modal_v2_original
+                        # (unbound) when V2 wrappers are installed; otherwise
+                        # use the bound method.
+                        def _cpu_load_vae(vae_name: str) -> Any:
+                            _started = _v2_startup_stage("vae_snapshot_load", "start", trace=trace)
+                            try:
+                                return _load_cpu_snapshot_vae(
+                                    vae_name,
+                                    vae_cls=_vae_cls,
+                                )
+                            finally:
+                                _v2_startup_stage("vae_snapshot_load", "end", started=_started, trace=trace)
+
                         # Load under CPU-only context
                         import comfy.utils as _comfy_utils
 
@@ -5674,10 +5746,18 @@ class ModalRuntimeEntrypoint:
                                     cpu_profile,
                                     load_unet=_cpu_load_unet,
                                     load_clip=_cpu_load_clip,
+                                    load_vae=_cpu_load_vae,
                                     resolve_path=_cpu_resolve_path,
                                     trace=trace,
                                     target_gpus=_target_gpus,
                                 )
+                                if _cpu_models.vae is not None:
+                                    print(
+                                        f"[v2.vae_snapshot] status=retained "
+                                        f"vae_identity={_cpu_models.model_key.vae_identity} "
+                                        f"object_type={type(_cpu_models.vae).__name__}",
+                                        flush=True,
+                                    )
                                 production_snapshot_invariant(
                                     _cpu_models,
                                     phase="startup",
@@ -5812,6 +5892,7 @@ class ModalRuntimeEntrypoint:
                                 if _cpu_models.model_key else "",
                                 "clip_object_type": type(_cpu_models.clip).__name__ if _cpu_models.clip is not None else "",
                                 "unet_object_type": type(_cpu_models.unet).__name__ if _cpu_models.unet is not None else "",
+                                "vae_object_type": type(_cpu_models.vae).__name__ if _cpu_models.vae is not None else "",
                                 "duration_ms": _created_duration_ms,
                             },
                         )
@@ -6581,9 +6662,11 @@ class ModalRuntimeEntrypoint:
 
                 def _validate_resolve_path(role: str, filename: str) -> str:
                     # Map unet -> diffusion_models (the live category used by
-                    # nodes.py), clip1/clip2 -> text_encoders.
+                    # nodes.py), clip1/clip2 -> text_encoders, vae -> vae.
                     if role == "unet":
                         folder = "diffusion_models"
+                    elif role == "vae":
+                        folder = "vae"
                     else:
                         folder = "text_encoders"
                     resolver = getattr(_fp_restore, "get_full_path_or_raise", None)
@@ -6659,6 +6742,8 @@ class ModalRuntimeEntrypoint:
                             if models.clip is not None else "",
                             "unet_object_type": type(models.unet).__name__
                             if models.unet is not None else "",
+                            "vae_object_type": type(models.vae).__name__
+                            if models.vae is not None else "",
                             "duration_ms": _activation_duration_ms,
                             "keys_match": int(_keys_match),
                             "specs_match": int(_specs_match),
@@ -6972,10 +7057,12 @@ class ModalRuntimeEntrypoint:
                     state.snapshot_loader_outputs = {
                         "unet": models.unet,
                         "clip": models.clip,
+                        "vae": models.vae,
                     }
                     state.snapshot_model_identities = {
                         "unet": str(getattr(plan.model_key, "unet_identity", "") or ""),
                         "clip": str(getattr(plan.model_key, "clip_identity", "") or ""),
+                        "vae": str(getattr(plan.model_key, "vae_identity", "") or ""),
                     }
                     register_unet_forward_probe(models.unet, source="cpu_snapshot")
                     # Explicitly install SAMPLER_SAMPLE timing wrapper on the
@@ -7912,7 +7999,7 @@ class ModalRuntimeEntrypoint:
                             # same executor_loader_cache_seed_end evidence for a
                             # request-activated container as for a
                             # restore-activated one (unet=seeded, clip=seeded,
-                            # vae=missing_snapshot_output).
+                            # vae=seeded when the retained VAE identity matches).
                             _rt_state = getattr(
                                 getattr(self, "bootstrap", None), "state", None
                             )
@@ -7920,6 +8007,7 @@ class ModalRuntimeEntrypoint:
                                 _rt_state.snapshot_loader_outputs = {
                                     "unet": self._cpu_snapshot_models.unet,
                                     "clip": self._cpu_snapshot_models.clip,
+                                    "vae": getattr(self._cpu_snapshot_models, "vae", None),
                                 }
                                 _rt_state.snapshot_model_identities = {
                                     "unet": str(
@@ -7927,6 +8015,9 @@ class ModalRuntimeEntrypoint:
                                     ),
                                     "clip": str(
                                         getattr(request_model_key, "clip_identity", "") or ""
+                                    ),
+                                    "vae": str(
+                                        getattr(request_model_key, "vae_identity", "") or ""
                                     ),
                                 }
                                 # A cold run never built the deterministic
@@ -7942,6 +8033,9 @@ class ModalRuntimeEntrypoint:
                                     _rt_clip_ident = str(
                                         getattr(request_model_key, "clip_identity", "") or ""
                                     )
+                                    _rt_vae_ident = str(
+                                        getattr(request_model_key, "vae_identity", "") or ""
+                                    )
                                     if _rt_unet_ident:
                                         _rt_loader_sigs.append(
                                             {"node_id": "unet", "signature": _rt_unet_ident}
@@ -7949,6 +8043,10 @@ class ModalRuntimeEntrypoint:
                                     if _rt_clip_ident:
                                         _rt_loader_sigs.append(
                                             {"node_id": "clip", "signature": _rt_clip_ident}
+                                        )
+                                    if _rt_vae_ident:
+                                        _rt_loader_sigs.append(
+                                            {"node_id": "vae", "signature": _rt_vae_ident}
                                         )
                                     _rt_state.build_snapshot_execution_seed(
                                         workflow_hash=str(getattr(plan, "workflow_hash", "") or ""),
@@ -10516,8 +10614,8 @@ class ModalRuntimeEntrypoint:
                 allow_cache=True,
             )
             # Print every candidate exactly once with canonical format.
-            # Format: [v2.executor_seed] node=<id> class=<class> role=<unet|clip|vae>
-            #   decision=<seeded|missing_snapshot_output|identity_mismatch|unsupported>
+            # Format: [v2.executor_seed] class=<class> decision=<seeded|missing_snapshot_output|identity_mismatch|unsupported>
+            #   node=<id> role=<unet|clip|vae>
             #   expected_identity=<short hash> actual_identity=<short hash>
             #   mismatch_fields=<exact comma-separated fields or none>
             for _node_id, _outcome in _seeded.items():
@@ -10528,8 +10626,8 @@ class ModalRuntimeEntrypoint:
                 _ai = _outcome.get("actual_identity", "") if isinstance(_outcome, dict) else ""
                 _mf = _outcome.get("mismatch_fields", "none") if isinstance(_outcome, dict) else "none"
                 print(
-                    f"[v2.executor_seed] node={_node_id} "
-                    f"class={_ct} role={_r} decision={_d} "
+                    f"[v2.executor_seed] class={_ct} decision={_d} "
+                    f"node={_node_id} role={_r} "
                     f"expected_identity={_ei} actual_identity={_ai} "
                     f"mismatch_fields={_mf}",
                     flush=True,
