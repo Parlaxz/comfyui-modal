@@ -11020,7 +11020,9 @@ def _run_early_vae_activation(
         flush=True,
     )
     try:
-        _mm_load_models_gpu([_patcher])
+        import torch as _torch_vae
+        with _torch_vae.inference_mode():
+            _mm_load_models_gpu([_patcher])
     except Exception as exc:
         return _vae_activation_terminal(
             state, trace, request_id, status="failed",
