@@ -83,7 +83,7 @@ def _min_seed_diag() -> dict[str, dict[str, str]]:
     return {
         "10": {"role": "unet", "decision": "seeded"},
         "20": {"role": "clip", "decision": "seeded"},
-        "30": {"role": "vae", "decision": "missing_snapshot_output"},
+        "30": {"role": "vae", "decision": "seeded"},
     }
 
 
@@ -176,7 +176,7 @@ class TestCheckAcceptanceFreshStrictness(unittest.TestCase):
 
     def test_missing_role_in_seed_fails(self):
         diag = {"10": {"role": "unet", "decision": "seeded"},
-                "30": {"role": "vae", "decision": "missing_snapshot_output"}}
+                "30": {"role": "vae", "decision": "seeded"}}
         events = _base_events() + [ev for ev in _required_events()]
         events[1] = _ev("executor_loader_cache_seed_end",
                         metadata={"diagnostics": diag})
@@ -192,7 +192,7 @@ class TestCheckAcceptanceFreshStrictness(unittest.TestCase):
             "10": {"role": "unet", "decision": "seeded"},
             "11": {"role": "unet", "decision": "identity_mismatch"},
             "20": {"role": "clip", "decision": "seeded"},
-            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+            "30": {"role": "vae", "decision": "seeded"},
         }
         events = _base_events() + [ev for ev in _required_events()]
         events[1] = _ev("executor_loader_cache_seed_end",
