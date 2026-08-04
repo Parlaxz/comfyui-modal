@@ -10654,7 +10654,8 @@ def _build_vae_activation_key(
                 if _dev is not None:
                     _device = str(_dev)
                 _md = getattr(_patcher, "model_dtype", None)
-                _compute_dtype = str(_md()) if callable(_md) else ""
+                _md_value = _md() if callable(_md) else None
+                _compute_dtype = str(_md_value) if _md_value is not None else ""
             if not _compute_dtype:
                 _compute_dtype = str(getattr(vae, "vae_dtype", "") or "")
         except Exception:
