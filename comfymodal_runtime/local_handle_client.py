@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+IPC_STREAM_LIMIT = 128 * 1024 * 1024
+
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
 
@@ -485,7 +487,7 @@ class PersistentHandleClient:
     async def _try_connect_ok(self, port: int, token: str) -> bool:
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", port),
+                asyncio.open_connection("127.0.0.1", port, limit=IPC_STREAM_LIMIT),
                 timeout=self._connect_timeout,
             )
         except (OSError, asyncio.TimeoutError):
@@ -566,7 +568,9 @@ class PersistentHandleClient:
         key = self._ensure_token_id_in_key(key, workspace)
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", self._owner_port),
+                asyncio.open_connection(
+                    "127.0.0.1", self._owner_port, limit=IPC_STREAM_LIMIT,
+                ),
                 timeout=self._connect_timeout,
             )
         except (OSError, asyncio.TimeoutError) as exc:
@@ -611,7 +615,9 @@ class PersistentHandleClient:
         key = self._ensure_token_id_in_key(key, workspace)
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", self._owner_port),
+                asyncio.open_connection(
+                    "127.0.0.1", self._owner_port, limit=IPC_STREAM_LIMIT,
+                ),
                 timeout=self._connect_timeout,
             )
         except (OSError, asyncio.TimeoutError) as exc:
