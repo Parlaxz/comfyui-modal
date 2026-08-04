@@ -760,8 +760,8 @@ class ExactConditioningCache:
                 return False
             digest = exact_key_digest(components)
             return self._process_value(components, digest, value)
-        except Exception:
-            self._last_store_reason = "store_exception"
+        except Exception as exc:
+            self._last_store_reason = f"store_exception:{type(exc).__name__}:{exc}"[:160]
             return False
 
     def _process_value(
