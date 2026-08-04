@@ -562,6 +562,7 @@ class ContainerResourceSampler:
         self._gz_path: Path | None = None
         self._gz_file: Any = None
         self._stopped = threading.Event()
+        self._stop_timed_out = False
         # Resolve cgroup v2 path once at init
         self._cgroup_dir = _resolve_cgroup_v2_path()
 
@@ -579,13 +580,21 @@ class ContainerResourceSampler:
         self._thread = threading.Thread(target=self._run, daemon=True, name="res-sampler")
         self._thread.start()
 
-    def stop(self) -> dict[str, Any]:
+    def stop(self, *, timeout: float = 0.5) -> dict[str, Any]:
         self._running = False
-        self._stopped.wait(timeout=10)
-        self._close_gz()
+        self._stopped.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout)))
+        self._stop_timed_out = bool(thread is not None and thread.is_alive())
+        if not self._stop_timed_out:
+            self._thread = None
+        with self._lock:
+            self._close_gz()
         return {
             "sample_count": self._sample_count,
             "path": str(self._gz_path) if self._gz_path else "",
+            "thread_alive": self._stop_timed_out,
         }
 
     def _close_gz(self) -> None:
@@ -597,24 +606,26 @@ class ContainerResourceSampler:
             self._gz_file = None
 
     def close(self) -> None:
-        self._running = False
-        self._close_gz()
+        self.stop()
 
     # ── Sampling loop ────────────────────────────────────────────────────────────────
 
     def _run(self) -> None:
-        while self._running:
-            try:
-                sample = self._collect_sample()
-                with self._lock:
-                    if self._gz_file is not None and not self._gz_file.closed:
-                        self._gz_file.write(json.dumps(sample, default=_json_fallback) + "\n")
-                        self._gz_file.flush()
-                        self._sample_count += 1
-            except Exception as exc:
-                log.warning("ResourceSampler sample error: %s", exc)
-            time.sleep(self._interval_s)
-        self._stopped.set()
+        try:
+            while self._running and not self._stopped.is_set():
+                try:
+                    sample = self._collect_sample()
+                    with self._lock:
+                        if self._gz_file is not None and not self._gz_file.closed:
+                            self._gz_file.write(json.dumps(sample, default=_json_fallback) + "\n")
+                            self._gz_file.flush()
+                            self._sample_count += 1
+                except Exception as exc:
+                    log.warning("ResourceSampler sample error: %s", exc)
+                if self._stopped.wait(self._interval_s):
+                    break
+        finally:
+            self._stopped.set()
 
     def collect_sample(self) -> dict[str, Any]:
         """Collect one resource sample snapshot immediately (thread-safe)."""
@@ -2345,6 +2356,33 @@ class FullExecutionTraceSession:
     @property
     def resource_sampler(self) -> ContainerResourceSampler | None:
         return self._resource_sampler
+
+    def close_for_exit(self, *, timeout: float = 0.5) -> dict[str, Any]:
+        """Stop runtime tracing services without packaging or volume writes."""
+        result: dict[str, Any] = {"state": self._state}
+        sampler = self._resource_sampler
+        if sampler is not None:
+            result["resource_sampler"] = sampler.stop(timeout=timeout)
+            self._resource_sampler = None
+        with self._torch_profiler_lock:
+            profiler = self._torch_profiler
+            self._torch_profiler = None
+            self._torch_profiler_active = False
+        if profiler is not None:
+            try:
+                profiler.__exit__(None, None, None)
+                result["torch_profiler"] = "stopped_without_export"
+            except Exception as exc:
+                result["torch_profiler"] = {"error_type": type(exc).__name__}
+        viztracer = self._viztracer
+        self._viztracer = None
+        if viztracer is not None:
+            try:
+                viztracer.stop()
+                result["viztracer"] = "stopped_without_export"
+            except Exception as exc:
+                result["viztracer"] = {"error_type": type(exc).__name__}
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════

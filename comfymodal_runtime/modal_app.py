@@ -104,6 +104,7 @@ from .output_delivery import (
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall
+from .teardown_diagnostics import TeardownDiagnostics
 
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
@@ -1466,6 +1467,7 @@ def _capture_remote_identity() -> dict[str, Any]:
     except Exception:
         pass
     for env_key, meta_key in (
+        ("MODAL_CONTAINER_ID", "modal_container_id"),
         ("MODAL_TASK_ID", "container_task_id"),
         ("MODAL_IMAGE_ID", "image_id"),
         ("MODAL_CLOUD_PROVIDER", "cloud"),
@@ -3088,6 +3090,7 @@ class _CgroupCpuSampler:
         self._failure_reason: str | None = None
         self._prev_usage_usec: int | None = None
         self._prev_mono_ns: int | None = None
+        self._stop_timed_out = False
 
     def start(self) -> None:
         if not self._cpu_stat_path or self._thread is not None:
@@ -3180,13 +3183,15 @@ class _CgroupCpuSampler:
             self.compute_peak_cores(), self.compute_spike_intervals()
         )
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 0.5) -> None:
         thread = self._thread
         if thread is None:
             return
         self._stop_event.set()
-        thread.join()
-        self._thread = None
+        thread.join(timeout=max(0.0, float(timeout)))
+        self._stop_timed_out = thread.is_alive()
+        if not self._stop_timed_out:
+            self._thread = None
         self._sample()
 
     def _snapshot(self) -> list[_CgroupCpuSample]:
@@ -3375,6 +3380,7 @@ class _ProcessCpuSampler:
         self._failure_reason: str | None = None
         self._prev_mono_ns: int | None = None
         self._prev_process_ns: int | None = None
+        self._stop_timed_out = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -3415,13 +3421,15 @@ class _ProcessCpuSampler:
             self._prev_mono_ns = now_mono_ns
             self._prev_process_ns = now_process_ns
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 0.5) -> None:
         thread = self._thread
         if thread is None:
             return
         self._stop_event.set()
-        thread.join()
-        self._thread = None
+        thread.join(timeout=max(0.0, float(timeout)))
+        self._stop_timed_out = thread.is_alive()
+        if not self._stop_timed_out:
+            self._thread = None
         self._sample()
 
     def report(self) -> None:
@@ -3845,6 +3853,187 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_retained_model_type: str = ""
         # Release status: "not_run", "released", "skipped", "not_present", "error".
         self._snapshot_eviction_retained_release_status: str = "not_run"
+        self._init_teardown_diagnostics()
+
+    def _init_teardown_diagnostics(self) -> None:
+        if hasattr(self, "_teardown_diagnostics"):
+            return
+        self._teardown_diagnostics = TeardownDiagnostics(
+            container_session_id=getattr(self, "container_session_id", _V2_CONTAINER_SESSION_ID),
+        )
+        self._teardown_diagnostics.configure_paths(
+            models=MODELS_PATH,
+            custom_nodes=CUSTOM_NODES_PATH,
+            runtime_state=RUNTIME_STATE_PATH,
+            profile=PROFILE_PATH,
+            prompt_cache=PROMPT_CACHE_VOLUME_PATH,
+        )
+        self._teardown_diagnostics.register_provider(
+            "runtime_owned_objects", self._teardown_runtime_snapshot,
+        )
+
+    @staticmethod
+    def _future_teardown_state(future: Any) -> dict[str, Any]:
+        if future is None:
+            return {"exists": False}
+        try:
+            return {
+                "exists": True,
+                "done": bool(future.done()),
+                "running": bool(future.running()),
+                "cancelled": bool(future.cancelled()),
+            }
+        except Exception:
+            return {"exists": True, "status": "unavailable"}
+
+    def _teardown_runtime_snapshot(self) -> dict[str, Any]:
+        bridge = getattr(self, "_preload_bridge", None)
+        preload: dict[str, Any] = {}
+        if bridge is not None:
+            try:
+                preload = bridge.diagnostic_snapshot()
+            except Exception as exc:
+                preload = {"error_type": type(exc).__name__}
+        trace_session = getattr(self, "_full_trace_session", None)
+        trace_state: dict[str, Any] = {"present": trace_session is not None}
+        if trace_session is not None:
+            try:
+                trace_state.update(trace_session.status_dict())
+            except Exception as exc:
+                trace_state["error_type"] = type(exc).__name__
+        api = getattr(self, "_legacy_api", None)
+        legacy_workers: list[dict[str, Any]] = []
+        try:
+            for key, worker in list(getattr(api, "_actual_load_futures", {}).items())[:32]:
+                legacy_workers.append({
+                    "key": str(key)[:128],
+                    "name": str(getattr(worker, "name", ""))[:96],
+                    "daemon": bool(getattr(worker, "daemon", False)),
+                    "alive": bool(worker.is_alive()) if hasattr(worker, "is_alive") else None,
+                })
+        except Exception as exc:
+            legacy_workers = [{"error_type": type(exc).__name__}]
+        activation_state: dict[str, Any] = {}
+        try:
+            from .model_preload import teardown_diagnostic_snapshot
+            activation_state = teardown_diagnostic_snapshot()
+        except Exception as exc:
+            activation_state = {"error_type": type(exc).__name__}
+        samplers = {
+            "cgroup": {
+                "present": getattr(self, "_cgroup_sampler", None) is not None,
+                "thread_alive": bool(
+                    getattr(getattr(self, "_cgroup_sampler", None), "_thread", None)
+                    and self._cgroup_sampler._thread.is_alive()
+                ),
+                "stop_timed_out": bool(getattr(getattr(self, "_cgroup_sampler", None), "_stop_timed_out", False)),
+            },
+            "process_cpu": {
+                "present": getattr(self, "_process_cpu_sampler", None) is not None,
+                "thread_alive": bool(
+                    getattr(getattr(self, "_process_cpu_sampler", None), "_thread", None)
+                    and self._process_cpu_sampler._thread.is_alive()
+                ),
+                "stop_timed_out": bool(getattr(getattr(self, "_process_cpu_sampler", None), "_stop_timed_out", False)),
+            },
+        }
+        resource_sampler = getattr(trace_session, "resource_sampler", None)
+        writers = {
+            "full_trace_resource_writer_open": bool(
+                resource_sampler is not None and getattr(resource_sampler, "_gz_file", None) is not None
+            ),
+        }
+        return {
+            "full_trace_session": trace_state,
+            "resource_samplers": samplers,
+            "preload_coordinator": preload,
+            "activation_futures": activation_state,
+            "legacy_request_workers": legacy_workers,
+            "runtime_executor": {
+                "type": type(getattr(self, "executor", None)).__name__,
+                "persistent_executor": False,
+            },
+            "commit_coordinator": {
+                "present": getattr(self, "_runtime_state_coordinator", None) is not None,
+                "pending": bool(getattr(getattr(self, "_runtime_state_coordinator", None), "in_flight", False)),
+            },
+            "open_trace_writers": writers,
+            "request_background_tasks": {"owned_async_tasks": "see_async_tasks"},
+        }
+
+    def _run_teardown_stage(self, name: str, callback: Callable[[], Any]) -> None:
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        started = time.monotonic_ns()
+        if diagnostics is not None:
+            diagnostics.emit("cleanup_stage_start", stage=name)
+        error: dict[str, Any] = {}
+        try:
+            callback()
+        except Exception as exc:
+            error = {"error_type": type(exc).__name__, "error": str(exc)[:160]}
+            if diagnostics is not None and diagnostics.enabled:
+                print(
+                    f"[v2.teardown] cleanup_stage_failure stage={name} "
+                    f"error_type={type(exc).__name__}",
+                    flush=True,
+                )
+        if diagnostics is not None:
+            diagnostics.emit(
+                "cleanup_stage_end",
+                stage=name,
+                elapsed_ms=(time.monotonic_ns() - started) / 1_000_000.0,
+                **error,
+            )
+
+    def exit(self) -> None:
+        self._lazy_init_snapshot_state()
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.set_identity(
+                container_session_id=getattr(self, "container_session_id", ""),
+                restored_instance_id=getattr(self, "_restored_instance_id", ""),
+            )
+            diagnostics.emit("exit_hook_start")
+        started = time.monotonic_ns()
+        try:
+            def stop_samplers() -> None:
+                for sampler_name in ("_cgroup_sampler", "_process_cpu_sampler"):
+                    sampler = getattr(self, sampler_name, None)
+                    if sampler is not None:
+                        sampler.stop(timeout=0.5)
+
+            self._run_teardown_stage("request_samplers", stop_samplers)
+
+            def stop_preload_workers() -> None:
+                bridge = getattr(self, "_preload_bridge", None)
+                if bridge is not None:
+                    bridge.close_workers(
+                        timeout=0.5,
+                        cancel_futures=True,
+                        wait_futures=False,
+                    )
+
+            self._run_teardown_stage("preload_workers", stop_preload_workers)
+
+            def stop_trace_services() -> None:
+                session = getattr(self, "_full_trace_session", None)
+                if session is not None:
+                    session.close_for_exit(timeout=0.5)
+
+            self._run_teardown_stage("trace_services", stop_trace_services)
+
+            def stop_legacy_workers() -> None:
+                self._join_legacy_background_threads(
+                    getattr(self, "_legacy_api", None), join_timeout=0.25,
+                )
+
+            self._run_teardown_stage("legacy_request_workers", stop_legacy_workers)
+        finally:
+            if diagnostics is not None:
+                diagnostics.emit(
+                    "exit_hook_end",
+                    elapsed_ms=(time.monotonic_ns() - started) / 1_000_000.0,
+                )
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -3914,6 +4103,7 @@ class ModalRuntimeEntrypoint:
             self._cpu_snapshot_unet_runtime_state = None
         if not hasattr(self, "_full_trace_session"):
             self._full_trace_session = None
+        self._init_teardown_diagnostics()
         if not hasattr(self, "_torch_thread_limit_applied"):
             self._torch_thread_limit_applied = False
         if not hasattr(self, "_restore_torch_intraop_threads"):
@@ -6487,7 +6677,19 @@ class ModalRuntimeEntrypoint:
             restored_instance_id = uuid.uuid4().hex
             self._restored_instance_id = restored_instance_id
             _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+            os.environ["COMFYMODAL_RESTORED_INSTANCE_ID"] = restored_instance_id
             set_model_load_identity(restored_instance_id, restore_session_id)
+            self._teardown_diagnostics.set_identity(
+                container_session_id=self.container_session_id,
+                restored_instance_id=restored_instance_id,
+                modal_input_id=identity.get("modal_input_id", ""),
+                modal_task_id=identity.get("container_task_id", ""),
+                modal_container_id=identity.get("modal_container_id", ""),
+            )
+            if identity.get("modal_input_id"):
+                os.environ["COMFYMODAL_INPUT_ID"] = str(identity["modal_input_id"])
+            if identity.get("modal_container_id"):
+                os.environ["COMFYMODAL_CONTAINER_ID"] = str(identity["modal_container_id"])
             # â”€â”€ Full-trace session: update identity now that IDs exist â”€â”€
             if _V2_FULL_TRACE_ENABLED and self._full_trace_session is not None:
                 try:
@@ -10887,6 +11089,10 @@ class ModalRuntimeEntrypoint:
                     temp.write_bytes(raw)
                     os.replace(temp, target)
                     wrote = True
+                    if hasattr(self, "_teardown_diagnostics"):
+                        self._teardown_diagnostics.record_file_write(
+                            target, volume=RUNTIME_STATE_PATH,
+                        )
                 finally:
                     try:
                         temp.unlink(missing_ok=True)
@@ -11116,12 +11322,37 @@ class ModalRuntimeEntrypoint:
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        self._lazy_init_snapshot_state()
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        identity = _capture_remote_identity()
+        if diagnostics is not None:
+            diagnostics.set_identity(
+                container_session_id=getattr(self, "container_session_id", ""),
+                restored_instance_id=getattr(self, "_restored_instance_id", ""),
+                modal_input_id=identity.get("modal_input_id", ""),
+                modal_task_id=identity.get("container_task_id", ""),
+                modal_container_id=identity.get("modal_container_id", ""),
+                request_id=request_id,
+            )
+        terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
                 plan_payload, request_id=request_id, cancelled=cancelled,
             ):
+                if not terminal_started and event.get("type") in {"result", "error"}:
+                    terminal_started = True
+                    if diagnostics is not None:
+                        diagnostics.set_identity(request_id=event.get("request_id", request_id))
+                        diagnostics.emit(
+                            "request_terminal_start",
+                            terminal_status=str(event.get("type", "unknown")),
+                        )
                 yield event
         except Exception as exc:
+            if not terminal_started:
+                terminal_started = True
+                if diagnostics is not None:
+                    diagnostics.emit("request_terminal_start", terminal_status="exception")
             yield {
                 "type": "error",
                 "phase": "setup_failed",
@@ -11130,6 +11361,13 @@ class ModalRuntimeEntrypoint:
                 ),
                 "request_id": request_id or "",
             }
+        finally:
+            if not terminal_started:
+                terminal_started = True
+                if diagnostics is not None:
+                    diagnostics.emit("request_terminal_start", terminal_status="generator_closed")
+            if diagnostics is not None:
+                diagnostics.emit("request_terminal_end")
 
     async def _run_plan_stream_impl(
         self,
@@ -11987,6 +12225,7 @@ def _build_decorated_v2_class() -> type:
         self._snapshot_eviction_retained_model_id = 0
         self._snapshot_eviction_retained_model_type = ""
         self._snapshot_eviction_retained_release_status = "not_run"
+        self._init_teardown_diagnostics()
         self._v2_initialized = True
 
     # Wrap each Modal-exposed method to lazy-init first.
@@ -11994,7 +12233,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
-        "publish_restore_plan",
+        "publish_restore_plan", "exit",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -12025,6 +12264,9 @@ def _build_decorated_v2_class() -> type:
     # Apply Modal lifecycle/method decorators.
     setattr(cls, "startup", _modal.enter(snap=True)(cls.startup))
     setattr(cls, "restore", _modal.enter(snap=False)(cls.restore))
+    _exit_decorator = getattr(_modal, "exit", None)
+    if callable(_exit_decorator):
+        setattr(cls, "exit", _exit_decorator()(cls.exit))
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
