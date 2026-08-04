@@ -40,6 +40,11 @@ from .contracts import (
 )
 from .deployment_spec import build_deployment_identity
 from .env import env_flag
+from .runtime_shape import (
+    apply_torch_thread_policy,
+    log_effective_runtime_shape,
+    runtime_shape_config,
+)
 from .restore_plan import (
     RestorePlanPublisher,
     build_restore_model_spec,
@@ -1888,6 +1893,10 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     â€” never client-generated IDs or raw workflow/image/credential data.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
+    runtime_shape = runtime_shape_config(
+        cpu_request=actual.cpu,
+        memory_request=actual.memory,
+    )
     return {
         # â”€â”€ App / class identity (from remote-observed values) â”€â”€â”€â”€â”€â”€â”€â”€
         "app_name": actual.app_name,
@@ -1898,6 +1907,9 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "memory_mb": actual.memory,
         "target_inputs": actual.target_inputs,
         "max_inputs": actual.max_inputs,
+        "runtime_shape_id": runtime_shape.runtime_shape_id,
+        "snapshot_model_order": runtime_shape.snapshot_model_order,
+        "runtime_shape": runtime_shape.identity_payload(),
         # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "snapshot_enabled": str(actual.enable_memory_snapshot),
         "gpu_snapshot_enabled": str(env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")),
@@ -1919,21 +1931,8 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
 
 
 def _parse_memory_mb() -> int:
-    """Parse COMFYMODAL_V2_MEMORY_MB, default 24576, positive int required."""
-    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "40960").strip()
-    if not raw:
-        return 40960
-    try:
-        val = int(raw)
-    except (ValueError, TypeError):
-        raise RuntimeError(
-            f"COMFYMODAL_V2_MEMORY_MB={raw!r} is not a valid integer"
-        )
-    if val <= 0:
-        raise RuntimeError(
-            f"COMFYMODAL_V2_MEMORY_MB={val} must be a positive integer (MiB)"
-        )
-    return val
+    """Return the normalized Modal memory request in MiB."""
+    return runtime_shape_config().memory_request
 
 
 def _parse_evict_models_before_snapshot() -> bool:
@@ -2029,7 +2028,7 @@ def _snapshot_target_fingerprint(
     }
 
     # Complete normalized _runtime_env() mapping (captures snapshot/warmup class env)
-    _env = _runtime_env()
+    _env = _runtime_env(actual)
 
     # Experimental_options GPU snapshot flag
     _enable_gpu_snapshot = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
@@ -2066,6 +2065,13 @@ def _snapshot_target_fingerprint(
         # ── Source / env (static deployment config only) ─────────────────
         "source_combined_hash": _combined,
         "runtime_env": _env,
+        "runtime_shape": runtime_shape_config(
+            cpu_request=actual.cpu,
+            memory_request=actual.memory,
+        ).identity_payload(),
+        "effective_deployment_combined_hash": globals().get(
+            "_V2_DEPLOYMENT_COMBINED_HASH", ""
+        ),
         "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
         "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
     }
@@ -2100,7 +2106,7 @@ class ModalRuntimeSpec:
     runtime_state_path: str = RUNTIME_STATE_PATH
     profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
-    cpu: int = 16
+    cpu: int = dataclasses.field(default_factory=lambda: runtime_shape_config().cpu_request)
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1
@@ -2147,7 +2153,7 @@ def _collect_warmup_env() -> dict[str, str]:
     return {k: os.environ[k] for k in _WARMUP_KEYS if k in os.environ}
 
 
-def _runtime_env() -> dict[str, str]:
+def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     """Build the runtime environment dict for Modal's class-level ``env=`` parameter.
 
     Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
@@ -2260,9 +2266,11 @@ def _runtime_env() -> dict[str, str]:
         ),
 
     }
-    memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
-    if memory_mb is not None:
-        env["COMFYMODAL_V2_MEMORY_MB"] = memory_mb
+    runtime_shape = runtime_shape_config(
+        cpu_request=spec.cpu if spec is not None else None,
+        memory_request=spec.memory if spec is not None else None,
+    )
+    env.update(runtime_shape.environment())
     # Propagate COMFYMODAL_V2_RESTORE_TORCH_THREADS without hardcoded default.
     # Absent remains absent; present values are passed through exactly (no strip).
     if "COMFYMODAL_V2_RESTORE_TORCH_THREADS" in os.environ:
@@ -2465,6 +2473,10 @@ def _reference_image() -> Any:
 def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     """Build the actual v2 app, image, Volumes, and source identity."""
     runtime_spec = spec or ModalRuntimeSpec()
+    runtime_shape = runtime_shape_config(
+        cpu_request=runtime_spec.cpu,
+        memory_request=runtime_spec.memory,
+    )
     runtime_root = Path(__file__).resolve().parent
     custom_root = _local_custom_nodes_root()
     identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
@@ -2479,6 +2491,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "prompt_cache_volume": None,
             "source_identity": identity,
             "spec": runtime_spec,
+            "runtime_shape": runtime_shape.identity_payload(),
         }
 
     image = _reference_image()
@@ -2513,6 +2526,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "prompt_cache_volume": prompt_cache_volume,
         "source_identity": identity,
         "spec": runtime_spec,
+        "runtime_shape": runtime_shape.identity_payload(),
     }
 
 
@@ -3877,6 +3891,48 @@ class ModalRuntimeEntrypoint:
         except Exception:
             pass
         return joined
+
+    def _close_snapshot_build_pools(self, api: Any = None, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+        """Close known snapshot-build pools before the lifecycle returns."""
+        joined = self._join_legacy_background_threads(api, join_timeout=30.0)
+        removed = 0
+        if api is not None:
+            try:
+                futures = getattr(api, "_actual_load_futures", None)
+                if isinstance(futures, dict):
+                    for key, worker in list(futures.items()):
+                        if worker is None or not getattr(worker, "is_alive", lambda: False)():
+                            futures.pop(key, None)
+                            removed += 1
+            except Exception:
+                pass
+        try:
+            self._preload_bridge.close_workers()
+            coordinator_closed = 1
+        except Exception as exc:
+            coordinator_closed = 0
+            print(
+                f"[v2.snapshot_pools] status=error error_type={type(exc).__name__}",
+                flush=True,
+            )
+        try:
+            native_threads = len(os.listdir("/proc/self/task"))
+        except Exception:
+            native_threads = None
+        result = {
+            "legacy_threads_joined": joined,
+            "legacy_worker_refs_removed": removed,
+            "coordinator_closed": coordinator_closed,
+            "native_thread_count": native_threads,
+        }
+        print(
+            "[v2.snapshot_pools] stage=before_snapshot_capture "
+            + " ".join(f"{key}={value}" for key, value in result.items()),
+            flush=True,
+        )
+        if trace is not None:
+            trace.emit("snapshot_pools_closed", phase="startup", metadata=result)
+        return result
 
     @staticmethod
     def _check_unet_deferral_eligible(api: Any, plan: Any) -> bool:
@@ -5425,6 +5481,12 @@ class ModalRuntimeEntrypoint:
         )
         _report_host_memory("restore_start")
         _startup_perf = time.perf_counter()
+        _thread_shape = apply_torch_thread_policy(stage="image_runtime_initialization")
+        self._torch_thread_limit_applied = True
+        self._restore_torch_intraop_threads = _thread_shape.get("torch_intraop_threads")
+        self._restore_actual_torch_intraop_threads = _thread_shape.get("torch_intraop_threads")
+        self._restore_torch_interop_threads = _thread_shape.get("torch_interop_threads")
+        self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
         identity = _capture_remote_identity()
         self._configure_runtime()
         trace = RuntimeTrace(process="remote")
@@ -5465,7 +5527,9 @@ class ModalRuntimeEntrypoint:
             f"class={_reg_cls.__name__} "
             f"gpu={_gpu_str} "
             f"cpu={_spec.cpu} "
-            f"memory={_spec.memory}",
+            f"memory={_spec.memory} "
+            f"runtime_shape_id={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).runtime_shape_id} "
+            f"snapshot_model_order={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).snapshot_model_order}",
             flush=True,
         )
         _runtime_id = _snapshot_runtime_identity()
@@ -6078,6 +6142,7 @@ class ModalRuntimeEntrypoint:
         # could accidentally keep model objects alive.
         # Missing or incomplete _cpu_snapshot_models is non-fatal: emits
         # status=skipped with the exact reason, continues to startup ready.
+        self._close_snapshot_build_pools(getattr(self, "_legacy_api", None), trace=trace)
         if _parse_evict_models_before_snapshot():
             _cpu_models = getattr(self, "_cpu_snapshot_models", None)
             if _cpu_models is not None:
@@ -6400,6 +6465,7 @@ class ModalRuntimeEntrypoint:
         # Applied before normal restore work, _configure_runtime, plan
         # reading, bootstrap, snapshot validation/retarget/activation.
         self._apply_torch_thread_limit()
+        log_effective_runtime_shape(stage="after_restore")
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
@@ -11143,6 +11209,7 @@ class ModalRuntimeEntrypoint:
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
         _v2_startup_stage("first_remote_method_entry", "entry", phase="request")
+        log_effective_runtime_shape(stage="request_entry")
         # Consistent field-name aliases for method-entry timestamps
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
@@ -12086,7 +12153,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         scaledown_window=spec.scaledown_window,
         volumes=_volumes,
         enable_memory_snapshot=spec.enable_memory_snapshot,
-        env=_runtime_env(),
+        env=_runtime_env(spec),
         **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
     )(remote_class)
 
@@ -12317,6 +12384,7 @@ except Exception:
         "profile_volume": None,
         "source_identity": None,
         "spec": ModalRuntimeSpec(),
+        "runtime_shape": runtime_shape_config().identity_payload(),
     }
 # Phase 1: Pre-compute deployment combined hash from the canonical
 # DeploymentIdentity / source_identity used by V2 resources.  This
@@ -12328,6 +12396,10 @@ _V2_DEPLOYMENT_COMBINED_HASH = (
     if _MODAL_RESOURCES.get("source_identity") is not None
     else ""
 )
+_V2_DEPLOYMENT_COMBINED_HASH = stable_hash({
+    "source_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
+    "runtime_shape": runtime_shape_config().identity_payload(),
+})
 # Modal CLI discovers the application through a module-level ``app`` object.
 # Keep the resource construction above as the single source of truth while
 # exposing the registered shadow app for ``modal deploy -m``.
