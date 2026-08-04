@@ -72,6 +72,7 @@ _REQUIRED_KEY_FIELDS = (
 
 _LOG_EMITTED = False
 _LOG_LOCK = threading.Lock()
+_LAST_SERIALIZE_ERROR = ""
 
 
 def _log_once(flag_name: str, **kv: Any) -> None:
@@ -312,6 +313,8 @@ def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
     """
     import torch as _th
 
+    global _LAST_SERIALIZE_ERROR
+    _LAST_SERIALIZE_ERROR = ""
     try:
         result_container = "list"
         if isinstance(value, tuple):
@@ -362,7 +365,8 @@ def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
             "conditioning": {"entries": entries_out},
         }
         return header, data
-    except Exception:
+    except Exception as exc:
+        _LAST_SERIALIZE_ERROR = f"{type(exc).__name__}:{exc}"[:160]
         return None
 
 
@@ -495,6 +499,7 @@ class ExactConditioningCache:
         self._manifest_path = os.path.join(self._root, "manifest.json")
         self._lock = threading.RLock()
         self._commit_hook: Any = None
+        self._last_store_reason = ""
         os.makedirs(self._entries_dir, exist_ok=True)
 
     # ── Commit hook (registered by the Modal prompt-cache volume owner) ──
@@ -746,13 +751,17 @@ class ExactConditioningCache:
     ) -> bool:
         """Atomically store *value* after the unchanged encode completes."""
         try:
+            self._last_store_reason = ""
             ctx = _merge_entry_context(base_ctx, entry)
             components = build_exact_key_components(ctx)
-            if _key_usable(components):
+            missing = _key_usable(components)
+            if missing:
+                self._last_store_reason = f"key:{missing}"
                 return False
             digest = exact_key_digest(components)
             return self._process_value(components, digest, value)
         except Exception:
+            self._last_store_reason = "store_exception"
             return False
 
     def _process_value(
@@ -763,14 +772,20 @@ class ExactConditioningCache:
     ) -> bool:
         header, data = serialize_conditioning(value)
         if header is None:
+            self._last_store_reason = _LAST_SERIALIZE_ERROR or "serialization_failed"
             return False
         if len(data) > self._max_bytes:
+            self._last_store_reason = "entry_exceeds_byte_cap"
             return False
         header["key_hash"] = digest
         header["key_components"] = components
         header["model_identity"] = _model_identity_block(components)
         header["created_at"] = time.time()
         return self._write_entry(components, header, data)
+
+    @property
+    def last_store_reason(self) -> str:
+        return self._last_store_reason
 
     def _write_entry(
         self,

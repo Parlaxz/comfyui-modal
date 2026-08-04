@@ -7271,6 +7271,7 @@ class V2LoaderBridge:
                         "decision": "miss_not_stored",
                         "encode_calls": _cc_encode_calls,
                         "entry_count": len(_cc_miss_entries),
+                        "reason": getattr(_cc_cache_svc, "last_store_reason", ""),
                     },
                 )
             # ── Terminal events FIRST, then publish results ──────────────
