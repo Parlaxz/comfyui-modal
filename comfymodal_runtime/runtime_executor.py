@@ -3246,6 +3246,13 @@ def _build_sampling_wrapper() -> Callable:
             pass
 
         t0 = time.monotonic_ns()
+        try:
+            from comfymodal_runtime.model_preload import (
+                acquire_sampler_mutation_lane_at_sampling_start,
+            )
+            acquire_sampler_mutation_lane_at_sampling_start()
+        except Exception:
+            pass
         trace.emit("sampling_start", phase="execution", metadata={
             "node_id": node_id,
             "node_class": node_class,
@@ -3325,6 +3332,39 @@ def _build_sampling_wrapper() -> Callable:
             _end_meta = dict(start_meta)
             _end_meta["duration_ms"] = duration_ms
             _sampler_boundary_line("sampling_end", _end_meta)
+            # ── V2 VAE early activation (sampling_end mode) ─────────────
+            # The authoritative sampling_end trace event and
+            # [v2.sampler_boundary] line are emitted FIRST above; then the
+            # existing sampler mutation-lane ownership is released, the
+            # concise [v2.vae_early_activation] event=scheduled line is
+            # emitted, and the VAE activation future is submitted exactly
+            # once through the existing coordinator pool (see
+            # model_preload.schedule_vae_early_activation_at_sampling_end).
+            # Hooked from this real SAMPLER_SAMPLE boundary — never from
+            # progress/milestones.  Any failure falls back silently to the
+            # unchanged late path (the graph VAEDecode/loader handles it).
+            try:
+                from comfymodal_runtime.model_preload import (
+                    current_v2_loader_bridge,
+                    release_sampler_mutation_lane_at_sampling_end,
+                    schedule_vae_early_activation_at_sampling_end,
+                )
+                release_sampler_mutation_lane_at_sampling_end(
+                    trace=trace,
+                    request_id=str(trace.request_id),
+                )
+                _vae_bridge = current_v2_loader_bridge()
+                if _vae_bridge is not None:
+                    schedule_vae_early_activation_at_sampling_end(
+                        _vae_bridge,
+                        trace=trace,
+                        request_id=str(trace.request_id),
+                        sampler_node_id=node_id,
+                        sampler_node_class=node_class,
+                        duration_ms=duration_ms,
+                    )
+            except Exception:
+                pass
 
     return _wrapper
 

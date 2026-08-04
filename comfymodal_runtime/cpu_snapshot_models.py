@@ -1,9 +1,10 @@
 """CPU snapshot model loading, validation, and retargeting.
 
 This module produces a validated CpuSnapshotModels struct from a warmup
-profile (mode=split only).  It loads CLIP and UNET sequentially with
-gc.collect barriers, emits trace events, and supports validation and
-device retargeting against the live ComfyUI model_management module.
+profile (mode=split only).  It loads CLIP, UNET, and (when the profile
+declares one) VAE sequentially with gc.collect barriers, emits trace
+events, and supports validation and device retargeting against the live
+ComfyUI model_management module.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from .trace import RuntimeTrace
 
 @dataclass(frozen=True)
 class ModelFileFact:
-    role: str  # "unet", "clip1", "clip2"
+    role: str  # "unet", "clip1", "clip2", "vae"
     path: str
     size_bytes: int
     mtime_ns: int
@@ -59,6 +60,7 @@ class CpuSnapshotModels:
     file_facts: tuple[ModelFileFact, ...]
     unet: Any = None
     clip: Any = None
+    vae: Any = None
     load_timings_ms: dict[str, float] = field(default_factory=dict)
     compute_policy: str = "default"
     policy_version: int = CPU_SNAPSHOT_UNET_POLICY_VERSION
@@ -624,7 +626,7 @@ def advise_storage_pages_willneed(model_or_registry: Any) -> dict[str, Any]:
 # Private helpers
 # ---------------------------------------------------------------------------
 
-_LOADER_KEYS = frozenset({"mode", "unet", "clip1", "clip2", "clip_type", "weight_dtype"})
+_LOADER_KEYS = frozenset({"mode", "unet", "clip1", "clip2", "vae", "clip_type", "weight_dtype"})
 
 
 def _normalize_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
@@ -641,7 +643,7 @@ def _normalize_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
     stable = _normalize_stable_profile(raw)
     normalized: dict[str, Any] = {
         key: stable.get(key, "")
-        for key in ("mode", "unet", "clip1", "clip2", "clip_type")
+        for key in ("mode", "unet", "clip1", "clip2", "vae", "clip_type")
     }
     if raw.get("clip2") and normalized["clip2"] != raw["clip2"]:
         normalized["clip2"] = raw["clip2"].strip()
@@ -659,7 +661,7 @@ def _build_model_key(normalized: dict[str, Any]) -> ModelRestoreKey:
     return ModelRestoreKey(
         unet_identity=normalized["unet"],
         clip_identity=clip,
-        vae_identity="",
+        vae_identity=normalized.get("vae", ""),
         clip_type=normalized["clip_type"],
     )
 
@@ -739,11 +741,18 @@ def _build_model_spec(normalized: dict[str, Any]) -> dict[str, Any]:
             "type": clip_type,
             "device": "default",
         }
+    vae_loaders: list[dict[str, Any]] = []
+    vae_name = normalized.get("vae", "")
+    if vae_name:
+        vae_loaders.append({
+            "loader_class": "VAELoader",
+            "vae_name": vae_name,
+        })
     return {
         "loaders": {
             "unet": [unet_loader],
             "clip": [clip_loader],
-            "vae": [],
+            "vae": vae_loaders,
         },
     }
 
@@ -945,6 +954,42 @@ def _is_valid_clip_patcher(obj: Any) -> tuple[bool, str]:
             dt = _tensor_device_type_of_value(dev)
             if dt is not None and (dt.startswith("cuda") or dt == "meta"):
                 return False, f"clip.patcher.{attr_name} is {dt}"
+
+    return True, ""
+
+
+def _is_valid_vae(obj: Any) -> tuple[bool, str]:
+    """Validate VAE wrapper shape and tensor devices.
+
+    A ComfyUI ``comfy.sd.VAE`` exposes ``.patcher`` (a ModelPatcher with
+    ``load_device``/``offload_device``) and ``.first_stage_model`` (the
+    concrete torch module holding the weights).
+
+    Returns (True, "") on success, (False, reason) on failure.
+    """
+    if not hasattr(obj, "patcher"):
+        return False, "vae missing .patcher attribute"
+    patcher = getattr(obj, "patcher", None)
+    if not hasattr(patcher, "load_device"):
+        return False, "vae.patcher missing .load_device attribute"
+    if not hasattr(patcher, "offload_device"):
+        return False, "vae.patcher missing .offload_device attribute"
+
+    first_stage = getattr(obj, "first_stage_model", None)
+    if first_stage is None or not _is_module_like(first_stage):
+        return False, "vae cannot locate inspectable first_stage_model module"
+
+    ok, reason = _check_tensor_devices(first_stage, "vae.first_stage_model.")
+    if not ok:
+        return False, reason
+
+    # Also verify load_device/offload_device strings are not CUDA/meta
+    for attr_name in ("load_device", "offload_device"):
+        dev = getattr(patcher, attr_name, None)
+        if dev is not None:
+            dt = _tensor_device_type_of_value(dev)
+            if dt is not None and (dt.startswith("cuda") or dt == "meta"):
+                return False, f"vae.patcher.{attr_name} is {dt}"
 
     return True, ""
 
@@ -1794,13 +1839,16 @@ def identity_from_profile(
     model_key = _build_model_key(normalized)
     model_spec = _build_model_spec(normalized)
 
-    # Stat files in deterministic role order: unet, clip1, clip2 (only when unique)
+    # Stat files in deterministic role order: unet, clip1, clip2 (only when unique),
+    # then vae (only when the profile declares one).
     facts: list[ModelFileFact] = [
         _stat_file("unet", normalized["unet"], resolve_path=resolve_path),
         _stat_file("clip1", normalized["clip1"], resolve_path=resolve_path),
     ]
     if normalized.get("clip2") and normalized["clip2"] != normalized["clip1"]:
         facts.append(_stat_file("clip2", normalized["clip2"], resolve_path=resolve_path))
+    if normalized.get("vae"):
+        facts.append(_stat_file("vae", normalized["vae"], resolve_path=resolve_path))
 
     return (model_key, model_spec, tuple(facts))
 
@@ -1810,25 +1858,28 @@ def load_cpu_snapshot_models(
     *,
     load_unet: Callable[..., Any],
     load_clip: Callable[..., Any],
+    load_vae: Callable[..., Any] | None = None,
     resolve_path: Callable[[str, str], str],
     trace: RuntimeTrace | None = None,
     target_gpus: tuple[str, ...] | None = None,
 ) -> CpuSnapshotModels:
-    """Load CLIP and UNET from the given profile and return a validated snapshot.
+    """Load CLIP, UNET, and (when the profile declares one) VAE from the
+    given profile and return a validated snapshot.
 
     When *target_gpus* is provided (snapshot construction path), the
     returned ``CpuSnapshotModels`` carries a ``compute_policy`` attribute
     that distinguishes the compute/manual-cast policy so stale snapshots
     built with a different policy cannot match.  The model_spec does NOT
-    contain compute_policy â€” matching uses the separate field.
+    contain compute_policy — matching uses the separate field.
 
-    Load order: CLIP -> gc.collect -> UNET -> gc.collect.
+    Load order: CLIP -> gc.collect -> UNET -> gc.collect -> VAE -> gc.collect.
     All loading happens under torch.no_grad().
 
     Callback invocation shapes:
       load_clip(name, type, device)           -- single CLIP
       load_clip(name1, name2, type, device)   -- dual CLIP
       load_unet(name, weight_dtype)            -- UNET
+      load_vae(name)                           -- VAE (only when profile declares one)
     """
     import torch
 
@@ -1837,6 +1888,7 @@ def load_cpu_snapshot_models(
     normalized: dict[str, Any] = {}
     clip_obj: Any = None
     unet_obj: Any = None
+    vae_obj: Any = None
     timings: dict[str, float] = {}
     active_object_type = ""
     active_basename = ""
@@ -1926,6 +1978,42 @@ def load_cpu_snapshot_models(
 
         gc.collect()
 
+        # --- VAE load (only when the profile declares one) ---
+        if normalized.get("vae"):
+            active_basename = os.path.basename(normalized["vae"])
+            if trace:
+                trace.emit(
+                    "cpu_snapshot_vae_load_start",
+                    phase="restore",
+                    metadata={
+                        "model_key_hash": model_key_hash,
+                        "basename": active_basename,
+                    },
+                )
+            vae_start = time.monotonic_ns()
+            with torch.no_grad():
+                if load_vae is None:
+                    raise RuntimeError(
+                        "profile declares a VAE but no load_vae callback was provided"
+                    )
+                vae_obj = load_vae(normalized["vae"])
+            vae_end = time.monotonic_ns()
+            vae_ms = round((vae_end - vae_start) / 1_000_000, 2)
+            timings["vae_load_ms"] = vae_ms
+            if trace:
+                trace.emit(
+                    "cpu_snapshot_vae_load_end",
+                    phase="restore",
+                    metadata={
+                        "model_key_hash": model_key_hash,
+                        "object_type": type(vae_obj).__name__,
+                        "basename": active_basename,
+                        "duration_ms": vae_ms,
+                    },
+                )
+
+            gc.collect()
+
         # Derive compute policy from target_gpus (snapshot identity)
         _cp = _COMPUTE_POLICY_DEFAULT
         if target_gpus:
@@ -1939,6 +2027,7 @@ def load_cpu_snapshot_models(
             file_facts=facts,
             unet=unet_obj,
             clip=clip_obj,
+            vae=vae_obj,
             load_timings_ms=timings,
             compute_policy=_cp,
             policy_version=CPU_SNAPSHOT_UNET_POLICY_VERSION,
@@ -2002,7 +2091,8 @@ def validate_cpu_snapshot_models(
 
     Compares all model_key fields, verifies model_spec structurally,
     confirms split-mode in normalized_profile, re-resolves and re-stats
-    each file fact, and validates UNET/CLIP object shape and tensor safety.
+    each file fact, and validates UNET/CLIP/VAE object shape and tensor
+    safety (VAE only when the profile declares one).
 
     Returns (True, 'ok') on success or (False, reason_string) on failure.
     """
@@ -2053,6 +2143,9 @@ def validate_cpu_snapshot_models(
         return (False, "normalized_profile unet does not match model_key")
     if models.model_key.clip_identity != normalized_clip_identity:
         return (False, "normalized_profile clips do not match model_key")
+    normalized_vae_identity = str(norm.get("vae", "") or "")
+    if models.model_key.vae_identity != normalized_vae_identity:
+        return (False, "normalized_profile vae does not match model_key")
 
     # Verify exact single/dual loader structure when clip loaders are present.
     clip_loaders = models.model_spec.get("loaders", {}).get("clip", [])
@@ -2075,14 +2168,29 @@ def validate_cpu_snapshot_models(
             if first.get("clip_name") != norm["clip1"]:
                 return (False, "model_spec clip_name mismatch")
 
-    # Unique file facts: only include clip2 when different from clip1
+    vae_loaders = models.model_spec.get("loaders", {}).get("vae", [])
+    if normalized_vae_identity:
+        if len(vae_loaders) != 1:
+            return (False, "model_spec should contain one VAELoader when vae supplied")
+        vae_loader = vae_loaders[0]
+        if vae_loader.get("loader_class") != "VAELoader":
+            return (False, "model_spec should use VAELoader when vae supplied")
+        if vae_loader.get("vae_name") != normalized_vae_identity:
+            return (False, "model_spec vae_name mismatch")
+    elif vae_loaders:
+        return (False, "model_spec contains VAELoader without vae profile identity")
+
+    # Unique file facts: only include clip2 when different from clip1;
+    # include vae only when the profile declares one.
+    expected_roles: list[str] = ["unet", "clip1"]
     if clip2 and clip2 != norm.get("clip1"):
-        expected_roles = ("unet", "clip1", "clip2")
-    else:
-        expected_roles = ("unet", "clip1")
+        expected_roles.append("clip2")
+    if norm.get("vae"):
+        expected_roles.append("vae")
+    expected_roles_tuple = tuple(expected_roles)
     actual_roles = tuple(fact.role for fact in models.file_facts)
-    if actual_roles != expected_roles:
-        return (False, f"file fact roles mismatch: {actual_roles!r} != {expected_roles!r}")
+    if actual_roles != expected_roles_tuple:
+        return (False, f"file fact roles mismatch: {actual_roles!r} != {expected_roles_tuple!r}")
 
     # Re-resolve and re-stat each file fact
     for fact in models.file_facts:
@@ -2093,6 +2201,8 @@ def validate_cpu_snapshot_models(
             filename = norm.get("clip1")
         elif role == "clip2":
             filename = norm.get("clip2")
+        elif role == "vae":
+            filename = norm.get("vae")
         else:
             continue
 
@@ -2127,6 +2237,11 @@ def validate_cpu_snapshot_models(
         return (False, "unet is None")
     if models.clip is None:
         return (False, "clip is None")
+    expected_vae = bool(models.model_key.vae_identity)
+    if expected_vae and models.vae is None:
+        return (False, "vae is None but model_key declares vae_identity")
+    if not expected_vae and models.vae is not None:
+        return (False, "vae present but model_key declares no vae_identity")
 
     # Shape and tensor safety
     ok, reason = _is_valid_unet_patcher(models.unet)
@@ -2136,6 +2251,11 @@ def validate_cpu_snapshot_models(
     ok, reason = _is_valid_clip_patcher(models.clip)
     if not ok:
         return (False, reason)
+
+    if expected_vae:
+        ok, reason = _is_valid_vae(models.vae)
+        if not ok:
+            return (False, reason)
 
     # Policy version/identity validation â€” reject legacy/stale snapshots
     if models.policy_version == 0:
@@ -2178,18 +2298,20 @@ def retarget_cpu_snapshot_models(
 ) -> tuple[bool, str]:
     """Retarget model device attributes using ComfyUI's model_management.
 
-    Sets load_device/offload_device on UNET and CLIP patchers.
-    Never transfers model weights or selects hardcoded devices.
+    Sets load_device/offload_device on UNET, CLIP, and (when present) VAE
+    patchers.  Never transfers model weights or selects hardcoded devices.
 
     Returns (True, 'ok') or (False, reason).
     """
-    # Validate all 4 required functions exist and are callable
+    # Validate all required functions exist and are callable
     required_funcs = [
         "get_torch_device",
         "unet_offload_device",
         "text_encoder_device",
         "text_encoder_offload_device",
     ]
+    if models.vae is not None:
+        required_funcs.extend(["vae_device", "vae_offload_device"])
     for func_name in required_funcs:
         func = getattr(model_management, func_name, None)
         if not callable(func):
@@ -2204,6 +2326,11 @@ def retarget_cpu_snapshot_models(
     if not ok_clip:
         return (False, "unsupported_clip_shape")
 
+    if models.vae is not None:
+        ok_vae, _ = _is_valid_vae(models.vae)
+        if not ok_vae:
+            return (False, "unsupported_vae_shape")
+
     # Verify patcher fields exist for assignment
     if not hasattr(models.unet, "load_device") or not hasattr(models.unet, "offload_device"):
         return (False, "unsupported_unet_shape")
@@ -2213,6 +2340,13 @@ def retarget_cpu_snapshot_models(
         return (False, "unsupported_clip_shape")
     if not hasattr(clip_patcher, "load_device") or not hasattr(clip_patcher, "offload_device"):
         return (False, "unsupported_clip_shape")
+
+    if models.vae is not None:
+        vae_patcher = getattr(models.vae, "patcher", None)
+        if vae_patcher is None:
+            return (False, "unsupported_vae_shape")
+        if not hasattr(vae_patcher, "load_device") or not hasattr(vae_patcher, "offload_device"):
+            return (False, "unsupported_vae_shape")
 
     # All checks passed - make device-policy assignments only.
     # UNET: delegate to rehydrate_cpu_snapshot_unet for instrumentation.
@@ -2224,6 +2358,17 @@ def retarget_cpu_snapshot_models(
 
     clip_patcher.load_device = model_management.text_encoder_device()
     clip_patcher.offload_device = model_management.text_encoder_offload_device()
+
+    if models.vae is not None:
+        vae_patcher.load_device = model_management.vae_device()
+        vae_patcher.offload_device = model_management.vae_offload_device()
+        # The VAE wrapper's own .device mirrors patcher.load_device and is
+        # used directly by encode/decode lambdas.
+        if hasattr(models.vae, "device"):
+            try:
+                models.vae.device = model_management.vae_device()
+            except Exception:
+                pass
 
     return (True, "ok")
 

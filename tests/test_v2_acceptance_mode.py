@@ -141,7 +141,7 @@ class TestAcceptanceIdentityProof(unittest.TestCase):
         return {
             "10": {"role": "unet", "decision": "seeded"},
             "20": {"role": "clip", "decision": "seeded"},
-            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+            "30": {"role": "vae", "decision": "seeded"},
         }
 
     def _result_with_counts(self, instance_id: str, request_id: str,
@@ -348,7 +348,7 @@ class TestAssetFetch(unittest.TestCase):
                         metadata={"request_id": "r", "diagnostics": {
                             "10": {"role": "unet", "decision": "seeded"},
                             "20": {"role": "clip", "decision": "seeded"},
-                            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+                            "30": {"role": "vae", "decision": "seeded"},
                         }}),
             _make_event("prompt_executor_milestones", mono_ns=2000,
                         metadata={"request_id": "r", "execution_start_to_cached_ms": 200.0}),
@@ -422,7 +422,7 @@ class TestTimingGates(unittest.TestCase):
                         metadata={"request_id": request_id, "diagnostics": {
                             "10": {"role": "unet", "decision": "seeded"},
                             "20": {"role": "clip", "decision": "seeded"},
-                            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+                            "30": {"role": "vae", "decision": "seeded"},
                         }}),
             _make_event("prompt_executor_milestones", mono_ns=base + 300000,
                         metadata={"request_id": request_id, "execution_start_to_cached_ms": 200.0}),
@@ -690,7 +690,7 @@ class TestWrappedArtifact(unittest.TestCase):
                         metadata={"request_id": "r", "diagnostics": {
                             "10": {"role": "unet", "decision": "seeded"},
                             "20": {"role": "clip", "decision": "seeded"},
-                            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+                            "30": {"role": "vae", "decision": "seeded"},
                         }}),
             _make_event("prompt_executor_milestones", mono_ns=base + 300_000_000,
                         metadata={"request_id": "r", "execution_start_to_cached_ms": 200.0}),
