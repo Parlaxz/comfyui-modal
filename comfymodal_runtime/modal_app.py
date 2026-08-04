@@ -2168,6 +2168,9 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_UNET_ACTIVATION_MODE": os.environ.get(
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE", "late"
         ),
+        "COMFYMODAL_V2_VAE_ACTIVATION_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_ACTIVATION_MODE", "late"
+        ),
         "COMFYMODAL_PRELOAD_MODE": os.environ.get(
             "COMFYMODAL_PRELOAD_MODE", "clip_only"
         ),
@@ -7062,6 +7065,12 @@ class ModalRuntimeEntrypoint:
                             models.clip,
                             trace=trace,
                         )
+                        try:
+                            self._preload_bridge.set_exact_vae(
+                                getattr(models, "vae", None)
+                            )
+                        except Exception:
+                            pass
                     _do_activate_bridge()
                     _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = round(
                         (time.monotonic_ns() - _retarget_start_ns) / 1_000_000, 3
@@ -7087,10 +7096,21 @@ class ModalRuntimeEntrypoint:
                     record_retained_unet_identity("snapshot", models.unet, request_id=_restore_chain_request_id)
                     record_retained_unet_identity("activation", models.unet, request_id=_restore_chain_request_id)
                     state.snapshot_loader_outputs = {
+                        **(
+                            dict(state.snapshot_loader_outputs)
+                            if isinstance(state.snapshot_loader_outputs, Mapping)
+                            else {}
+                        ),
                         "unet": models.unet,
                         "clip": models.clip,
                         "vae": models.vae,
                     }
+                    try:
+                        self._preload_bridge.set_snapshot_loader_outputs(
+                            state.snapshot_loader_outputs
+                        )
+                    except Exception:
+                        pass
                     state.snapshot_model_identities = {
                         "unet": str(getattr(plan.model_key, "unet_identity", "") or ""),
                         "clip": str(getattr(plan.model_key, "clip_identity", "") or ""),
@@ -7985,6 +8005,12 @@ class ModalRuntimeEntrypoint:
                             self._cpu_snapshot_models.clip,
                             trace=trace,
                         )
+                        try:
+                            self._preload_bridge.set_exact_vae(
+                                getattr(self._cpu_snapshot_models, "vae", None)
+                            )
+                        except Exception:
+                            pass
                         _unet_source = "cpu_snapshot"
                         _clip_source = "cpu_snapshot"
                         _reason = "ok"
@@ -8037,10 +8063,24 @@ class ModalRuntimeEntrypoint:
                             )
                             if _rt_state is not None:
                                 _rt_state.snapshot_loader_outputs = {
+                                    **(
+                                        dict(_rt_state.snapshot_loader_outputs)
+                                        if isinstance(
+                                            _rt_state.snapshot_loader_outputs,
+                                            Mapping,
+                                        )
+                                        else {}
+                                    ),
                                     "unet": self._cpu_snapshot_models.unet,
                                     "clip": self._cpu_snapshot_models.clip,
                                     "vae": getattr(self._cpu_snapshot_models, "vae", None),
                                 }
+                                try:
+                                    self._preload_bridge.set_snapshot_loader_outputs(
+                                        _rt_state.snapshot_loader_outputs
+                                    )
+                                except Exception:
+                                    pass
                                 _rt_state.snapshot_model_identities = {
                                     "unet": str(
                                         getattr(request_model_key, "unet_identity", "") or ""
@@ -9741,6 +9781,14 @@ class ModalRuntimeEntrypoint:
                 try:
                     from comfymodal_runtime.model_preload import finalize_unet_early_activation
                     finalize_unet_early_activation(_watchdog_request_id, trace=trace)
+                except Exception:
+                    pass
+                # V2 VAE early activation (sampling_end mode): request-end
+                # cleanup.  No activation future or model mutation may
+                # outlive the request.
+                try:
+                    from comfymodal_runtime.model_preload import finalize_vae_early_activation
+                    finalize_vae_early_activation(_watchdog_request_id, trace=trace)
                 except Exception:
                     pass
                 if _production_snapshot_marked:
