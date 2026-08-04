@@ -522,10 +522,50 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
                     f"elapsed_ms={elapsed_ms}",
                     flush=True,
                 )
-                print(
-                    f"[v2.sampler_parity] UNET compute_dtype={str(x.dtype) if x is not None else 'unknown'}",
-                    flush=True,
-                )
+                try:
+                    _parity_model = getattr(unet, "model", None)
+                    _parity_weight_dtype = None
+                    _parity_model_dtype = getattr(unet, "model_dtype", None)
+                    if callable(_parity_model_dtype):
+                        try:
+                            _parity_weight_dtype = _parity_model_dtype()
+                        except Exception:
+                            _parity_weight_dtype = None
+                    if _parity_weight_dtype is None:
+                        try:
+                            _parity_parameter = next(module.parameters(), None)
+                            _parity_weight_dtype = getattr(_parity_parameter, "dtype", None)
+                        except Exception:
+                            _parity_weight_dtype = None
+                    _parity_manual_cast = getattr(_parity_model, "manual_cast_dtype", None)
+                    _parity_cache_config = getattr(module, "_cache_dit_config", None)
+                    _parity_original_forward = getattr(module, "_original_forward", None)
+                    _parity_active_forward = getattr(module, "forward", None)
+                    _parity_attached = (
+                        isinstance(_parity_cache_config, dict)
+                        and _parity_original_forward is not None
+                        and _parity_active_forward is not _parity_original_forward
+                    )
+                    print(
+                        f"[v2.sampler_parity] "
+                        f"UNET weight_dtype={_parity_weight_dtype} "
+                        f"UNET compute_dtype={str(x.dtype) if x is not None else 'unknown'} "
+                        f"manual_cast_dtype={_parity_manual_cast if _parity_manual_cast is not None else 'None'} "
+                        f"CacheDiT target={type(module).__name__} "
+                        f"CacheDiT attachment_count={1 if _parity_attached else 0} "
+                        f"CacheDiT fallback={0 if _parity_attached else 1}",
+                        flush=True,
+                    )
+                except Exception:
+                    print(
+                        f"[v2.sampler_parity] "
+                        f"UNET weight_dtype=unknown "
+                        f"UNET compute_dtype={str(x.dtype) if x is not None else 'unknown'} "
+                        f"manual_cast_dtype=unknown "
+                        f"CacheDiT target={type(module).__name__} "
+                        f"CacheDiT attachment_count=0 CacheDiT fallback=1",
+                        flush=True,
+                    )
 
                 # Clean up demand start storage (no longer needed for this request)
                 _clear_demand_start_ns(request_id)
