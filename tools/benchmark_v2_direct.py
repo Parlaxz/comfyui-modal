@@ -91,6 +91,33 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
+def _validate_remote_profile(result: dict[str, Any]) -> None:
+    """Reject a production benchmark when the remote profile is not production."""
+    requested_profile = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "").strip().lower()
+    if requested_profile != "production":
+        return
+
+    trace = result.get("trace", {}) if isinstance(result, dict) else {}
+    trace_metadata = trace.get("metadata", {}) if isinstance(trace, dict) else {}
+    request_origin = (
+        trace_metadata.get("request_origin_info", {})
+        if isinstance(trace_metadata, dict)
+        else {}
+    )
+    remote_effective = (
+        str(request_origin.get("env_profile", "")).strip().lower()
+        if isinstance(request_origin, dict)
+        else ""
+    ) or "absent"
+    if remote_effective != "production":
+        raise RuntimeError(
+            "V2 production profile mismatch:\n"
+            "requested=production\n"
+            f"remote_effective={remote_effective}\n"
+            "The benchmark would bypass the CPU snapshot fast path."
+        )
+
+
 def _timing(
     result: dict[str, Any],
     wall_ms: float,
@@ -551,6 +578,7 @@ async def _run_one(
         workspace=workspace,
         trace=runtime_trace,
     )
+    _validate_remote_profile(result)
     _response_wall_ns, _response_mono_ns = _capture_ts()
     wall_ms = (time.perf_counter() - started) * 1000.0
     identity = _identity(result)
@@ -1771,6 +1799,7 @@ async def _run_acceptance_sequence(
             profile_checker=check_active_warmup_profile,
             gpu=_GPU, workspace=workspace, trace=runtime_trace,
         )
+        _validate_remote_profile(result)
         _response_wall_ns, _response_mono_ns = _capture_ts()
         wall_ms = (time.perf_counter() - started) * 1000.0
 
