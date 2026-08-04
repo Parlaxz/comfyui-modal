@@ -2045,6 +2045,9 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_UNET_ACTIVATION_MODE": os.environ.get(
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE", "late"
         ),
+        "COMFYMODAL_V2_VAE_ACTIVATION_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_ACTIVATION_MODE", "late"
+        ),
         "COMFYMODAL_PRELOAD_MODE": os.environ.get(
             "COMFYMODAL_PRELOAD_MODE", "clip_only"
         ),
