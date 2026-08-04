@@ -70,6 +70,9 @@ _REQUIRED_KEY_FIELDS = (
     "compute_dtype",
     "torch_version",
 )
+_KEY_VALIDATION_SCOPE = (
+    "clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs"
+)
 
 _LOG_EMITTED = False
 _LOG_LOCK = threading.Lock()
@@ -185,6 +188,38 @@ def build_exact_key_components(ctx: Mapping[str, Any]) -> dict[str, Any]:
 def exact_key_digest(components: Mapping[str, Any]) -> str:
     blob = _canonical_json(components)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def conditioning_cache_key_summary(
+    base_ctx: Mapping[str, Any],
+    entries: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    digests: list[str] = []
+    missing: list[str] = []
+    for entry in entries:
+        components = build_exact_key_components(
+            _merge_entry_context(base_ctx, entry)
+        )
+        digest = exact_key_digest(components)
+        digests.append(digest)
+        reason = _key_usable(components)
+        if reason:
+            missing.append(reason)
+    if not digests:
+        key_hash = "absent"
+    elif len(digests) == 1:
+        key_hash = digests[0]
+    else:
+        key_hash = hashlib.sha256(
+            _canonical_json(sorted(digests)).encode("utf-8")
+        ).hexdigest()
+    return {
+        "key_hash": key_hash,
+        "identity_status": "valid" if digests and not missing else "invalid",
+        "schema_version": SCHEMA_VERSION,
+        "validation_scope": _KEY_VALIDATION_SCOPE,
+        "missing": ",".join(sorted(set(missing))),
+    }
 
 
 def _merge_entry_context(base_ctx: Mapping[str, Any], entry: Mapping[str, Any]) -> dict[str, Any]:
