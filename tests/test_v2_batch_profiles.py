@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = (ROOT / "deploy_and_run_v2_single.bat").read_text(encoding="utf-8")
 RUN = (ROOT / "run_v2_single.bat").read_text(encoding="utf-8")
+FULL_TRACE = (ROOT / "deploy_v2_full_trace_only.bat").read_text(encoding="utf-8")
 MODAL_APP = (ROOT / "comfymodal_runtime" / "modal_app.py").read_text(encoding="utf-8")
 MODAL_TRANSPORT = (ROOT / "comfymodal_runtime" / "modal_transport.py").read_text(encoding="utf-8")
 BENCHMARK = (ROOT / "tools" / "benchmark_v2_direct.py").read_text(encoding="utf-8")
@@ -41,6 +42,17 @@ def test_default_snapshot_and_caller_benchmark_values_are_preserved():
             ("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1"),
         ):
             assert f'if not defined {key} set "{key}={value}"' in source
+
+
+def test_production_memory_and_release_defaults_are_explicit():
+    for source in (DEPLOY, RUN):
+        assert 'if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"' in source
+        assert 'if not defined COMFYMODAL_V2_BASELINE_MEMORY_REQUEST set "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST=49152"' in source
+        assert 'if not defined COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST set "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST=1"' in source
+        assert 'echo release_gpu_after_request=!COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST!' in source
+    assert 'if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"' in FULL_TRACE
+    assert 'if not defined COMFYMODAL_V2_BASELINE_MEMORY_REQUEST set "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST=49152"' in FULL_TRACE
+    assert 'if not defined COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST set "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST=0"' in FULL_TRACE
 
 
 def test_acceptance_is_opt_in_env_only_in_both_batches():
@@ -98,6 +110,7 @@ def test_profile_summary_is_sanitized():
             "unet_activation_mode",
             "vae_activation_mode",
             "persistent_local_handle",
+            "release_gpu_after_request",
         ):
             assert f"echo {field}=" in summary
 
@@ -124,6 +137,7 @@ def test_profile_flags_are_forwarded_to_remote_runtime_allowlist():
         "COMFYMODAL_V2_PAGEFAULT_TRACKING",
         "COMFYMODAL_V2_PREFILL_LANES",
         "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET",
+        "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST",
     ):
         assert f'"{key}"' in MODAL_APP
 

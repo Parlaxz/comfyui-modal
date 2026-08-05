@@ -46,7 +46,8 @@ def _clean_env():
                  "COMFYMODAL_V2_EVICT_RETAIN_ROLE",
                  "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS",
                  "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
-                "COMFYMODAL_ENABLE_GPU_SNAPSHOT"):
+                 "COMFYMODAL_ENABLE_GPU_SNAPSHOT",
+                 "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"):
         os.environ.pop(key, None)
 
 
@@ -317,6 +318,30 @@ class RuntimeEnvPropagationTests(unittest.TestCase):
         self.assertNotIn("COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS", _runtime_env())
         os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = "1"
         self.assertEqual(_runtime_env()["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"], "1")
+
+    def test_release_gpu_production_default_enabled(self):
+        with patch.dict(os.environ, {"COMFYMODAL_V2_ENV_PROFILE": "production"}, clear=True):
+            self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "1")
+
+    def test_release_gpu_nonproduction_and_inherit_defaults_disabled(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "0")
+        with patch.dict(os.environ, {"COMFYMODAL_V2_ENV_PROFILE": "inherit"}, clear=True):
+            self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "0")
+        with patch.dict(os.environ, {"COMFYMODAL_V2_ENV_PROFILE": "diagnostic"}, clear=True):
+            self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "0")
+
+    def test_release_gpu_explicit_value_is_preserved(self):
+        with patch.dict(os.environ, {
+            "COMFYMODAL_V2_ENV_PROFILE": "production",
+            "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": "0",
+        }, clear=True):
+            self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "0")
+        with patch.dict(os.environ, {
+            "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+            "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": "yes",
+        }, clear=True):
+            self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "yes")
 
 
 # ── Memory field contract tests ──────────────────────────────────────────

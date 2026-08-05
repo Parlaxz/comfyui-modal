@@ -16,9 +16,10 @@ set "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS=50"
 set "COMFYMODAL_V2_PROFILE_VOLUME=comfymodal-v2-profiles"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
-:: Diagnostic deploy: production-consistent memory (40960), not the benchmark
-:: winner baseline (49152).  49152 remains an explicit override.
-if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=40960"
+:: Diagnostic deploy uses the verified 48 GiB production baseline.
+if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
+if not defined COMFYMODAL_V2_BASELINE_MEMORY_REQUEST set "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST=49152"
+if not defined COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST set "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST=0"
 
 :: Repo root = script directory, safe from any CWD
 set "REPO_ROOT=%~dp0"

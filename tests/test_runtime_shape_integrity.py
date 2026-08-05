@@ -47,8 +47,8 @@ def test_tbase_is_pass_through_and_keeps_native_settings_out_of_environment() ->
         "COMFYMODAL_V2_THREAD_POLICY": "TBASE",
         "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER": "O0",
         "COMFYMODAL_V2_CPU_REQUEST": "16",
-        "COMFYMODAL_V2_MEMORY_REQUEST": "40960",
-        "COMFYMODAL_V2_MEMORY_MB": "40960",
+        "COMFYMODAL_V2_MEMORY_REQUEST": "49152",
+        "COMFYMODAL_V2_MEMORY_MB": "49152",
         "COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT": config.runtime_shape_fingerprint,
     }
 
@@ -163,13 +163,13 @@ def test_benchmark_guard_rejects_multiple_changed_axes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "16")
-    monkeypatch.setenv("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", "40960")
+    monkeypatch.setenv("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", "49152")
     with pytest.raises(RuntimeError, match="multiple axes"):
         _runtime_shape_guard({
             "thread_policy": "T1",
             "snapshot_model_order": "O1",
             "cpu_request": 16,
-            "memory_request": 40960,
+            "memory_request": 49152,
         })
 
 
@@ -181,7 +181,7 @@ def test_benchmark_guard_allows_explicit_multi_axis_override(
         "thread_policy": "T1",
         "snapshot_model_order": "O1",
         "cpu_request": 16,
-        "memory_request": 40960,
+        "memory_request": 49152,
     })
     assert guard["changed_axes"] == ["thread_policy", "snapshot_model_order"]
     assert guard["allow_multi_axis"] is True

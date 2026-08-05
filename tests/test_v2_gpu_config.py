@@ -207,9 +207,9 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.gpu, ("H100", "T4"))
 
-    def test_default_memory_is_40960(self):
+    def test_default_memory_is_49152(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 40960)
+        self.assertEqual(spec.memory, 49152)
 
     def test_default_cpu_is_16(self):
         spec = ModalRuntimeSpec()
@@ -679,9 +679,9 @@ class TestAppClsContract(unittest.TestCase):
         gpu_list = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
         self.assertEqual(gpu_list, "RTX-PRO-6000")
 
-    def test_spec_memory_default_40960(self):
+    def test_spec_memory_default_49152(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 40960)
+        self.assertEqual(spec.memory, 49152)
 
     def test_spec_min_containers_zero(self):
         spec = ModalRuntimeSpec()
