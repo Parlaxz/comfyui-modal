@@ -30,14 +30,18 @@ Per-arm runs emit the real runtime env assignments:
     COMFYMODAL_V2_VAE_PREFETCH_MODE  - prefetch mode bound to the arm
 
 Fixed run protocol defaults (exact; overridable only via known knobs):
-    fixture_path     - c5_latest_benchmark_workflow.json
-    output_node      - 107
+    fixture_path     - c5_latest_performance_workflow.json
+    output_node      - 9 (existing SaveImage node; the performance output)
     seed             - 1111894690380134
     gpu              - rtx-pro-6000
     min_containers   - 0
     scaledown_window - 4
     cold_runs        - 2 (expected two cold runs)
     gap_seconds      - 20
+
+Quality/comparer fixture metadata (retained, not the run target):
+    quality_fixture_path - c5_latest_benchmark_workflow.json
+    quality_output_node  - 107 (Image Comparer (rgthree))
 
 Usage:
     python tools/c5_vae_policy_runner.py --arms v0 v1 v2
@@ -49,8 +53,12 @@ import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-FIXTURE_PATH = "c5_latest_benchmark_workflow.json"
-OUTPUT_NODE_ID = "107"
+# Performance fixture: normal-production output, existing SaveImage node 9.
+FIXTURE_PATH = "c5_latest_performance_workflow.json"
+OUTPUT_NODE_ID = "9"
+# Quality/comparer fixture metadata: the C5 comparer run, Image Comparer node 107.
+QUALITY_FIXTURE_PATH = "c5_latest_benchmark_workflow.json"
+QUALITY_OUTPUT_NODE_ID = "107"
 SEED = 1111894690380134
 GPU = "rtx-pro-6000"
 MIN_CONTAINERS = 0
@@ -166,6 +174,8 @@ def resolve_defaults(knobs: Dict[str, Any]) -> Dict[str, Any]:
         "scaledown_window": SCALEDOWN_WINDOW,
         "cold_runs": COLD_RUNS,
         "gap_seconds": GAP_SECONDS,
+        "quality_fixture_path": QUALITY_FIXTURE_PATH,
+        "quality_output_node": QUALITY_OUTPUT_NODE_ID,
     }
     merged.update(knobs)
     return merged
@@ -226,6 +236,8 @@ def build_arms(
                 "gap_seconds": cfg["gap_seconds"],
                 "fixture_path": cfg["fixture_path"],
                 "output_node": str(cfg["output_node"]),
+                "quality_fixture_path": cfg["quality_fixture_path"],
+                "quality_output_node": str(cfg["quality_output_node"]),
                 "seed": str(cfg["seed"]),
                 "gpu": cfg["gpu"],
                 "min_containers": cfg["min_containers"],
@@ -249,6 +261,8 @@ def build_manifest(
         "protocol": {
             "fixture_path": cfg["fixture_path"],
             "output_node": str(cfg["output_node"]),
+            "quality_fixture_path": cfg["quality_fixture_path"],
+            "quality_output_node": str(cfg["quality_output_node"]),
             "seed": str(cfg["seed"]),
             "gpu": cfg["gpu"],
             "min_containers": cfg["min_containers"],
