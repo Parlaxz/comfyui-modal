@@ -392,12 +392,18 @@ class PersistentHandleClient:
         auth_token: str = "",
         start_timeout: float = 30.0,
         connect_timeout: float = 10.0,
+        publish_timeout: float | None = None,
     ) -> None:
         self._repo_root = Path(repo_root) if repo_root else _default_repo_root()
         self._state_path = Path(state_path) if state_path else default_owner_state_path()
         self._auth_token = auth_token or secrets.token_urlsafe(32)
         self._start_timeout = start_timeout
         self._connect_timeout = connect_timeout
+        if publish_timeout is None:
+            publish_timeout = float(
+                os.environ.get("COMFYMODAL_LOCAL_HANDLE_PUBLISH_TIMEOUT", "600") or "600"
+            )
+        self._publish_timeout = publish_timeout
         self._owner_process: subprocess.Popen[Any] | None = None
         self._owner_port: int | None = None
         self._owner_ready = False
@@ -636,7 +642,7 @@ class PersistentHandleClient:
                 "request_id": str(request_id or ""),
             })
             while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=self._connect_timeout)
+                line = await asyncio.wait_for(reader.readline(), timeout=self._publish_timeout)
                 if not line:
                     raise PersistentHandleUnavailable(
                         "owner closed the connection before a result"

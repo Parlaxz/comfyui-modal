@@ -9670,12 +9670,18 @@ def _probe_clip_full_cuda_residency(clip_patcher: Any) -> dict[str, Any]:
                     # Normalized comparison: ``cuda`` == ``cuda:0``.
                     if _normalize_cuda_device_key(getattr(_t, "device", None)) != _target_key:
                         _mismatch += 1
-            if _mismatch:
-                _devices_ok = False
-                _dev_reason = "parameter_device_mismatch"
         except Exception as exc:
             _devices_ok = None
             _dev_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+    # A non-dynamic parameter/buffer mismatch is FATAL: any counted mismatch
+    # forces ``device_check_ok=False`` — overriding BOTH the success value
+    # AND the enumeration-waiver value (partial enumeration that then raised)
+    # — so a proof can never report ``resident_full`` while
+    # ``device_mismatch_count > 0``.  Dynamic patchers never reach the
+    # enumeration loop, so ``_mismatch`` stays 0 for them (exemption intact).
+    if _mismatch > 0:
+        _devices_ok = False
+        _dev_reason = "parameter_device_mismatch"
     evidence["device_check_ok"] = _devices_ok
     evidence["device_mismatch_count"] = _mismatch
     evidence["device_check_reason"] = _dev_reason

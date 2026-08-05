@@ -2255,6 +2255,12 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_FULL_TRACE_TORCH": os.environ.get(
             "COMFYMODAL_V2_FULL_TRACE_TORCH", "1"
         ),
+        "COMFYMODAL_FIRST_STEP_DIAG": os.environ.get(
+            "COMFYMODAL_FIRST_STEP_DIAG", "0"
+        ),
+        "COMFYMODAL_FIRST_STEP_CUDA_EVENTS": os.environ.get(
+            "COMFYMODAL_FIRST_STEP_CUDA_EVENTS", "0"
+        ),
         "COMFYMODAL_V2_PROFILE_VOLUME": os.environ.get(
             "COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles"
         ),
@@ -2273,6 +2279,10 @@ def _runtime_env() -> dict[str, str]:
                     "COMFYMODAL_V2_EVICT_RETAIN_ROLE"):
         if _ev_key in os.environ:
             env[_ev_key] = os.environ[_ev_key]
+    # Propagate teardown diagnostics flag (absent → absent in remote env).
+    # The runtime reads it during shutdown diagnostics collection.
+    if "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS" in os.environ:
+        env["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -11853,7 +11863,11 @@ class ModalRuntimeEntrypoint:
                     _cgroup_sampler.report()
                     self._cgroup_sampler = None
                     _cgroup_sampler = None
-                if str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}:
+                if str(_request_origin_info.get("trigger_source", "")).lower() in {
+                    "benchmark",
+                    "acceptance_benchmark",
+                    "fresh_benchmark",
+                }:
                     try:
                         _benchmark_run_index = _request_origin_info.get("benchmark_run_index", 0)
                         try:

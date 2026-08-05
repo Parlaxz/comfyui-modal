@@ -40,6 +40,13 @@ RUN_COUNT = int(os.environ.get("V2_BENCHMARK_RUNS", "1"))
 GAP_SECONDS = float(os.environ.get("V2_BENCHMARK_GAP_SECONDS", "20"))
 _ABSENT_STR = "absent"
 
+# VAE policy / provenance metadata (benchmark-only — never mutates runtime).
+_VAE_POLICY_ENV_KEY = "COMFYMODAL_V2_VAE_POLICY"
+_VAE_PREFETCH_ENV_KEY = "COMFYMODAL_V2_VAE_PREFETCH_MODE"
+_VAE_POLICY_DEFAULT = "v0"
+_VAE_PREFETCH_DEFAULT = "off"
+_VAE_POLICY_READY_EVENT = "cpu_snapshot_vae_policy_ready"
+
 
 def _load_workspace() -> dict[str, Any]:
     data = json.loads(WORKSPACES_PATH.read_text(encoding="utf-8"))
@@ -89,6 +96,71 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
             }
     metadata = trace.get("metadata", {}) if isinstance(trace, dict) else {}
     return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _requested_vae_policy() -> str:
+    """Requested VAE policy, read from the environment at artifact-build time.
+
+    Environment-derived (never invented): ``COMFYMODAL_V2_VAE_POLICY``,
+    defaulting to ``v0`` when unset or blank.
+    """
+    return os.environ.get(_VAE_POLICY_ENV_KEY, "").strip() or _VAE_POLICY_DEFAULT
+
+
+def _requested_vae_prefetch_mode() -> str:
+    """Requested VAE prefetch mode, read from the environment at artifact time.
+
+    Environment-derived: ``COMFYMODAL_V2_VAE_PREFETCH_MODE``, defaulting to
+    ``off`` when unset or blank.
+    """
+    return os.environ.get(_VAE_PREFETCH_ENV_KEY, "").strip() or _VAE_PREFETCH_DEFAULT
+
+
+def _extract_applied_vae_policy(result: dict[str, Any]) -> str | None:
+    """Recover the applied VAE policy from the ``cpu_snapshot_vae_policy_ready``
+    trace event.
+
+    Trace-derived, fail-closed: returns ``None`` when no trace evidence
+    exists so comparison can fail closed.  Never invents an applied policy
+    and never performs any conversion/cast.
+    """
+    trace_data = result.get("trace", {}) if isinstance(result, dict) else {}
+    events = trace_data.get("events", []) if isinstance(trace_data, dict) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("name") != _VAE_POLICY_READY_EVENT:
+            continue
+        meta = event.get("metadata", {})
+        if isinstance(meta, dict):
+            applied = meta.get("policy")
+            if isinstance(applied, str) and applied.strip():
+                return applied.strip()
+    return None
+
+
+def _workflow_hash(workflow: dict[str, Any]) -> str:
+    """Stable SHA-256 of the canonical workflow JSON (provenance)."""
+    import hashlib
+
+    canonical = json.dumps(
+        workflow, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _workflow_source_sha(workflow: dict[str, Any]) -> str:
+    """Best-effort source SHA from provenance fields inside the workflow.
+
+    Safely available only when the workflow carries an explicit provenance /
+    source identifier; otherwise ``"absent"``.  Never reads git and never
+    invents a source identity.
+    """
+    for key in ("source_sha", "source", "provenance_sha", "workflow_sha"):
+        val = workflow.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return "absent"
 
 
 def _validate_remote_profile(result: dict[str, Any]) -> None:
@@ -591,6 +663,16 @@ async def _run_one(
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
         "identity": identity,
         "event_types": ["result"],
+        "vae_policy": {
+            "requested_policy": _requested_vae_policy(),
+            "requested_prefetch_mode": _requested_vae_prefetch_mode(),
+            "applied_policy": _extract_applied_vae_policy(result),
+        },
+        "provenance": {
+            "workflow_hash": _workflow_hash(workflow),
+            "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
+            "source_sha": _workflow_source_sha(workflow),
+        },
         "timing": _timing(
             result,
             wall_ms,

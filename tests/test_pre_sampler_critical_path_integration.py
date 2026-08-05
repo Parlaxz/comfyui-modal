@@ -1584,6 +1584,20 @@ class TestStructuredReport:
         assert len(report["per_node_timings"]) == 6
 
     @pytest.mark.asyncio
+    async def test_structured_report_preserves_inner_scope_report(self):
+        """An empty outer scope must not erase an inner execution report."""
+        result: dict[str, Any] = {
+            "pre_sampler_structured_report": {
+                "per_node_timings": [{"node_id": "inner", "duration_ms": 12.0}],
+            },
+        }
+
+        _attach_structured_report(result, {})
+
+        report = result["pre_sampler_structured_report"]
+        assert report["per_node_timings"][0]["node_id"] == "inner"
+
+    @pytest.mark.asyncio
     async def test_structured_report_merged_into_critical_path(self):
         """When a result has pre_sampler_structured_report, the
         attach_pre_sampler_critical_path merges it into the summary."""
