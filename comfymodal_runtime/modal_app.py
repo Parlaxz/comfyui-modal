@@ -242,6 +242,44 @@ PROMPT_CACHE_VOLUME_NAME = "comfymodal-prompt-encoding-cache"
 PROMPT_CACHE_VOLUME_PATH = "/root/prompt_cache_vol"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
+# Bounded join budget for preload worker threads (used by the release path and
+# by the shutdown sweep).  Must stay finite so a stuck non-daemon
+# ``comfymodal-restore-*`` worker cannot block interpreter exit indefinitely;
+# 5s is far below Modal's 30s shutdown grace while still letting in-flight
+# restore work finish and be joined before the process exits.
+_PRELOAD_WORKER_JOIN_BUDGET_S = 5.0
+# Thread-name prefixes owned by this application (non-daemon workers created by
+# the comfymodal runtime).  The coordinator restore pool uses
+# ``comfymodal-restore-*``; stall-watchdogs and any future app workers share the
+# ``comfymodal-`` namespace.  These are the only threads the bounded shutdown
+# sweep is allowed to join.
+_APP_OWNED_THREAD_PREFIXES: tuple[str, ...] = ("comfymodal",)
+# Substrings that identify runtime/infrastructure threads that must never be
+# joined even if they were ever named with an app-owned prefix (belt and
+# suspenders; the inclusive prefix match above already avoids Modal/runtime
+# infra, which never carries the ``comfymodal`` prefix).  ``modal`` itself is
+# intentionally NOT excluded here because the app-owned prefix contains it.
+_RUNTIME_THREAD_EXCLUDE_SUBSTRINGS: tuple[str, ...] = (
+    "asyncio", "thread-", "MainThread", "fork_posix", "QueueFeederThread",
+    "SockThread", "uvicorn", "pydevd", "pytest", "unittest",
+)
+
+
+def _is_app_owned_worker_name(name: str) -> bool:
+    """True when a thread name identifies an app-owned worker eligible for the
+    bounded shutdown sweep.  Matches only the ``comfymodal`` namespace (never
+    Modal/runtime infrastructure threads, which never carry that prefix) and
+    ignores known runtime/infrastructure thread names.  Never matches the
+    current thread (that is filtered separately at the call site).
+    """
+    if not name:
+        return False
+    low = name.lower()
+    if any(sub in low for sub in _RUNTIME_THREAD_EXCLUDE_SUBSTRINGS):
+        return False
+    return any(low.startswith(prefix) for prefix in _APP_OWNED_THREAD_PREFIXES)
+
+
 CLASS_NAME = "ModalRuntimeEntrypoint"
 # Process-local restore-stage timer accumulator.
 # Populated by _wrap_restore_stage wrappers in _configure_runtime, consumed by
@@ -428,6 +466,8 @@ _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"),
     ("COMFYMODAL_V2_UNET_PRETOUCH", "COMFYMODAL_V2_UNET_PRETOUCH"),
     ("COMFYMODAL_V2_OBSERVABILITY_MODE", "COMFYMODAL_V2_OBSERVABILITY_MODE"),
+    ("minimal_teardown", "COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN"),
+    ("pin_unet_transfer", "COMFYMODAL_V2_PIN_UNET_TRANSFER"),
 )
 _REQUEST_DIAG_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUEST_DIAG_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
@@ -486,7 +526,6 @@ def _apply_request_variance_diagnostics(
         os.environ[env_name] = normalized
         applied[env_name] = normalized
     return applied
-
 
 # ── Activation diagnostics ContextVar ─────────────────────────────────
 # Activation diagnostics use _ACTIVATION_DIAGNOSTIC_STATE from model_preload.
@@ -4269,12 +4308,21 @@ class ModalRuntimeEntrypoint:
                 bridge = getattr(self, "_preload_bridge", None)
                 if bridge is not None:
                     bridge.close_workers(
-                        timeout=0.5,
+                        timeout=_PRELOAD_WORKER_JOIN_BUDGET_S,
                         cancel_futures=True,
                         wait_futures=False,
                     )
 
             self._run_teardown_stage("preload_workers", stop_preload_workers)
+
+            # Final bounded sweep for any non-daemon ``comfymodal-restore-*``
+            # worker that survived the coordinator close (e.g. the pool was
+            # already closed during an earlier release).  Such a surviving
+            # thread would otherwise block interpreter exit; this joins it
+            # within a fixed budget so shutdown stays bounded.
+            self._run_teardown_stage(
+                "preload_thread_sweep", self._join_lingering_preload_threads,
+            )
 
             def stop_trace_services() -> None:
                 session = getattr(self, "_full_trace_session", None)
@@ -4285,7 +4333,8 @@ class ModalRuntimeEntrypoint:
 
             def stop_legacy_workers() -> None:
                 self._join_legacy_background_threads(
-                    getattr(self, "_legacy_api", None), join_timeout=0.25,
+                    getattr(self, "_legacy_api", None),
+                    join_timeout=_PRELOAD_WORKER_JOIN_BUDGET_S,
                 )
 
             self._run_teardown_stage("legacy_request_workers", stop_legacy_workers)
@@ -4319,6 +4368,46 @@ class ModalRuntimeEntrypoint:
             self._lifecycle_trace = trace
         elif self._lifecycle_trace is not trace:
             self._lifecycle_trace.extend(trace.events)
+
+    def _join_lingering_preload_threads(self, budget_s: float = _PRELOAD_WORKER_JOIN_BUDGET_S) -> dict[str, Any]:
+        """Boundedly join app-owned non-daemon worker threads at shutdown.
+
+        The coordinator pool may already be closed (so ``close_workers`` no
+        longer tracks a survivor), but a surviving non-daemon worker would
+        otherwise block interpreter exit via concurrent.futures' atexit join.
+        This enumerates live threads and joins every app-owned
+        (``comfymodal``-prefixed) non-daemon worker within a fixed budget,
+        never joining the current thread or Modal/runtime infrastructure
+        threads, so shutdown stays bounded.  Never raises.  Returns
+        ``found``/``joined``/``still_alive`` and the alive names.
+        """
+        deadline = time.monotonic() + max(0.0, float(budget_s))
+        current = threading.current_thread()
+        targets = [
+            t for t in threading.enumerate()
+            if t is not current
+            and t.is_alive()
+            and not getattr(t, "daemon", True)
+            and _is_app_owned_worker_name(getattr(t, "name", "") or "")
+        ]
+        joined = 0
+        for t in targets:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                t.join(timeout=remaining)
+            except Exception:
+                pass
+            if not t.is_alive():
+                joined += 1
+        alive = [t for t in targets if t.is_alive()]
+        return {
+            "found": len(targets),
+            "joined": joined,
+            "still_alive": len(alive),
+            "alive_names": [str(t.name)[:80] for t in alive[:8]],
+        }
 
     def _join_legacy_background_threads(self, api: Any, *, join_timeout: float = 30.0) -> int:
         """Join remaining alive threads in the legacy API's ``_actual_load_futures``.
@@ -4356,6 +4445,14 @@ class ModalRuntimeEntrypoint:
         request_key = str(request_id or "")
         if not env_flag("COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"):
             return {"status": "disabled", "release_performed": False}
+
+        _minimal_raw = os.environ.get("COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN", "").strip().lower()
+        if _minimal_raw in ("1", "true", "yes", "on"):
+            minimal_teardown = True
+        elif _minimal_raw in ("0", "false", "no", "off"):
+            minimal_teardown = False
+        else:
+            minimal_teardown = _resolve_single_use_containers()
 
         self._lazy_init_snapshot_state()
         release_lock = getattr(self, "_request_gpu_release_lock", None)
@@ -4481,7 +4578,7 @@ class ModalRuntimeEntrypoint:
                 if not callable(close_workers):
                     return {"present": 0}
                 return close_workers(
-                    timeout=0.5,
+                    timeout=_PRELOAD_WORKER_JOIN_BUDGET_S,
                     cancel_futures=True,
                     wait_futures=False,
                 )
@@ -4564,10 +4661,53 @@ class ModalRuntimeEntrypoint:
                 if not callable(unload_all):
                     raise RuntimeError("unload_all_models unavailable")
                 unload_all_models_ran = True
-                unload_all()
-                unload_all_models_ok = True
+                # HIGH_VRAM retention fix: in this container ComfyUI's offload
+                # devices resolve to CUDA, so ModelPatcher.detach() (invoked by
+                # unload_all_models) would move weights back onto CUDA and
+                # torch.cuda.empty_cache() could not reclaim the resident
+                # ~12.47 GB.  Temporarily pin every loaded patcher's stored
+                # offload_device to CPU so detach() moves weights to CPU, then
+                # restore the original values so warm-path/idempotency behavior
+                # is preserved.
+                torch_module = sys.modules.get("torch")
+                cpu_device = None
+                if torch_module is not None:
+                    try:
+                        cpu_device = torch_module.device("cpu")
+                    except Exception:
+                        cpu_device = None
+                saved_offloads: list[tuple[Any, Any]] = []
+                loaded_models = getattr(
+                    model_management, "current_loaded_models", None
+                ) or ()
+                try:
+                    for entry in loaded_models:
+                        patcher = getattr(entry, "patcher", None)
+                        if patcher is None:
+                            patcher = getattr(entry, "model", None)
+                        if patcher is None:
+                            continue
+                        saved_offloads.append(
+                            (patcher, getattr(patcher, "offload_device", None))
+                        )
+                        if cpu_device is not None:
+                            try:
+                                patcher.offload_device = cpu_device
+                            except Exception:
+                                pass
+                    unload_all()
+                    unload_all_models_ok = True
+                finally:
+                    # Restore original offload devices so a subsequent request
+                    # or the shutdown hook observes the same warm-path state.
+                    for patcher, original in saved_offloads:
+                        try:
+                            patcher.offload_device = original
+                        except Exception:
+                            pass
 
-            run_stage("model_management_unload", unload_models)
+            if not minimal_teardown:
+                run_stage("model_management_unload", unload_models)
 
             def fallback_device_unload() -> dict[str, Any]:
                 nonlocal device_fallback_ran
@@ -4592,7 +4732,7 @@ class ModalRuntimeEntrypoint:
                     free_memory(1e30, device, keep_loaded=[])
                 return {"device_count": len(targets)}
 
-            if not unload_all_models_ok:
+            if not minimal_teardown and not unload_all_models_ok:
                 fields["device_fallback"] = run_stage(
                     "device_fallback", fallback_device_unload,
                 )
@@ -4605,7 +4745,8 @@ class ModalRuntimeEntrypoint:
                 if callable(cleanup_models):
                     cleanup_models()
 
-            run_stage("model_management_cleanup", cleanup_model_management)
+            if not minimal_teardown:
+                run_stage("model_management_cleanup", cleanup_model_management)
 
             def reset_legacy_executor() -> None:
                 nonlocal legacy_executor_reset
@@ -4616,13 +4757,15 @@ class ModalRuntimeEntrypoint:
                     reset()
                     legacy_executor_reset = True
 
-            run_stage("legacy_executor_reset", reset_legacy_executor)
+            if not minimal_teardown:
+                run_stage("legacy_executor_reset", reset_legacy_executor)
 
             def collect_garbage() -> None:
                 import gc
                 gc.collect()
 
-            run_stage("garbage_collection", collect_garbage)
+            if not minimal_teardown:
+                run_stage("garbage_collection", collect_garbage)
 
             def finish_cuda_cleanup() -> dict[str, Any]:
                 if not cuda_before.get("initialized"):
@@ -4645,7 +4788,10 @@ class ModalRuntimeEntrypoint:
                     "reserved": int(cuda_api.memory_reserved()),
                 }
 
-            cuda_after = run_stage("cuda_cleanup", finish_cuda_cleanup) or {}
+            if not minimal_teardown:
+                cuda_after = run_stage("cuda_cleanup", finish_cuda_cleanup) or {}
+            else:
+                cuda_after = {}
         except Exception as exc:
             status = "error"
             cleanup_errors.setdefault("release", {
@@ -4661,16 +4807,22 @@ class ModalRuntimeEntrypoint:
                 "status": status,
                 "release_performed": True,
                 "elapsed_ms": elapsed_ms,
+                "teardown_mode": "minimal" if minimal_teardown else "full",
                 "unload_all_models_ran": unload_all_models_ran,
                 "device_fallback_ran": device_fallback_ran,
                 "legacy_executor_reset": legacy_executor_reset,
                 "cleanup_errors": cleanup_errors,
                 "stage_results": stage_results,
                 "cuda_allocated_before": cuda_before.get("allocated"),
-                "cuda_allocated_after": cuda_after.get("allocated"),
+                "cuda_allocated_after": (
+                    cuda_after.get("allocated") if cuda_after else cuda_before.get("allocated")
+                ),
                 "cuda_reserved_before": cuda_before.get("reserved"),
-                "cuda_reserved_after": cuda_after.get("reserved"),
+                "cuda_reserved_after": (
+                    cuda_after.get("reserved") if cuda_after else cuda_before.get("reserved")
+                ),
             })
+            emit("request_gpu_release_teardown_mode", mode=fields["teardown_mode"])
             emit("request_gpu_release_end", **fields)
         return fields
 
@@ -12120,6 +12272,83 @@ class ModalRuntimeEntrypoint:
         context.metadata["deployment_combined_hash"] = deployment_hash
         context.metadata["custom_node_generation"] = custom_node_generation
 
+    def _run_terminal_cleanup_sync(
+        self,
+        *,
+        diagnostics: Any,
+        request_id: str,
+    ) -> None:
+        """Run the terminal cleanup sequence synchronously, exactly once per request.
+
+        Invoked the moment a terminal result/error event is identified — i.e. as
+        soon as the running request call finishes producing output and BEFORE
+        that event is handed off to the consumer.  Because it executes inline in
+        the very call that produces the terminal event, GPU/container release
+        begins at request-call completion and does NOT depend on a later
+        event-loop turn, a subsequent generator resume, or the generator
+        finalizer.  Runs production cleanup then GPU release in order.  Each
+        step is individually guarded so a cleanup error never masks the terminal
+        response or propagates to the consumer.  Idempotent: re-entry (e.g. a
+        racing generator close/exit) is a no-op.
+        """
+        if getattr(self, "_terminal_cleanup_done", False):
+            return
+        # Claim the per-request cleanup slot first so a racing generator
+        # close/exit cannot duplicate the sequence (the release lock and the
+        # idempotent pending-production-cleanup record back this up).
+        self._terminal_cleanup_done = True
+        try:
+            self._run_pending_production_cleanup()
+        except Exception:
+            pass
+        try:
+            self._release_gpu_after_request(
+                diagnostics=diagnostics,
+                request_id=request_id,
+            )
+        except Exception:
+            pass
+
+    def _release_after_stream_complete(self, *, request_id: str = "") -> dict[str, Any]:
+        """Post-response release hook for the Modal request-handler boundary.
+
+        Runs AFTER the response stream has been fully consumed so the stream
+        generator's frame (which holds the executor/model references behind the
+        live GPU residency) is released and garbage collection can actually
+        free GPU memory.  Resets the per-request GPU-release state so the
+        effective unload re-executes here even if ``run_plan_stream`` already
+        attempted a best-effort release while its generator frame was still
+        alive (which ``_release_gpu_after_request`` marks done).  Preserves
+        response delivery (already sent to the consumer), error handling, and
+        idempotency.  Never raises.
+        """
+        request_key = str(request_id or "")
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        if getattr(self, "_post_stream_release_done", False):
+            return {"status": "already_released", "release_performed": False}
+        self._post_stream_release_done = True
+        try:
+            release_lock = getattr(self, "_request_gpu_release_lock", None)
+            if release_lock is None:
+                release_lock = threading.Lock()
+                self._request_gpu_release_lock = release_lock
+            with release_lock:
+                self._request_gpu_release_done = False
+                self._request_gpu_release_request_id = request_key
+        except Exception:
+            pass
+        try:
+            self._run_pending_production_cleanup()
+        except Exception:
+            pass
+        try:
+            return self._release_gpu_after_request(
+                diagnostics=diagnostics,
+                request_id=request_key,
+            )
+        except Exception:
+            return {"status": "error"}
+
     async def run_plan_stream(
         self,
         plan_payload: Mapping[str, Any],
@@ -12148,6 +12377,8 @@ class ModalRuntimeEntrypoint:
             self._request_gpu_release_done = False
             self._request_gpu_release_request_id = str(request_id or "")
             self._terminal_response_delivered = False
+            self._terminal_cleanup_done = False
+            self._post_stream_release_done = False
         terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
@@ -12162,12 +12393,20 @@ class ModalRuntimeEntrypoint:
                             "request_terminal_start",
                             terminal_status=str(event.get("type", "unknown")),
                         )
+                    self._run_terminal_cleanup_sync(
+                        diagnostics=diagnostics,
+                        request_id=request_id,
+                    )
                 yield event
         except Exception as exc:
             if not terminal_started:
                 terminal_started = True
                 if diagnostics is not None:
                     diagnostics.emit("request_terminal_start", terminal_status="exception")
+                self._run_terminal_cleanup_sync(
+                    diagnostics=diagnostics,
+                    request_id=request_id,
+                )
             yield {
                 "type": "error",
                 "phase": "setup_failed",
@@ -12177,25 +12416,36 @@ class ModalRuntimeEntrypoint:
                 "request_id": request_id or "",
             }
         finally:
-            # Capture whether a real terminal result/error event was yielded
+            # Capture whether a real terminal result/error event was produced
             # BEFORE the forced generator_closed fallback below mutates the flag.
             _terminal_was_yielded = terminal_started
-            if not terminal_started:
-                terminal_started = True
-                if diagnostics is not None:
-                    diagnostics.emit("request_terminal_start", terminal_status="generator_closed")
-            if _terminal_was_yielded:
-                try:
-                    self._run_pending_production_cleanup()
-                except Exception:
-                    pass
-                try:
-                    self._release_gpu_after_request(
-                        diagnostics=diagnostics,
-                        request_id=request_id,
-                    )
-                except Exception:
-                    pass
+            if not getattr(self, "_terminal_cleanup_done", False):
+                # Cleanup did not run synchronously at terminal identification
+                # (e.g. the stream was cancelled/closed before any terminal
+                # event was produced).  Run the bounded, idempotent fallback so
+                # a cancelled stream still cleans up.  When cleanup already ran
+                # synchronously at request-call completion the guard makes this
+                # a no-op, so a repeated close/exit cannot duplicate the
+                # sequence.
+                if not terminal_started:
+                    terminal_started = True
+                    if diagnostics is not None:
+                        diagnostics.emit(
+                            "request_terminal_start",
+                            terminal_status="generator_closed",
+                        )
+                if _terminal_was_yielded:
+                    try:
+                        self._run_pending_production_cleanup()
+                    except Exception:
+                        pass
+                    try:
+                        self._release_gpu_after_request(
+                            diagnostics=diagnostics,
+                            request_id=request_id,
+                        )
+                    except Exception:
+                        pass
             if diagnostics is not None:
                 diagnostics.emit("request_terminal_end")
 
@@ -13121,11 +13371,27 @@ def _build_decorated_v2_class() -> type:
 
         def _make_wrapper(orig_method):
             if inspect.isasyncgenfunction(orig_method):
+                # Request-handler generator methods drive the remote response
+                # stream.  Their wrapper is the OUTERMOST post-call boundary:
+                # after ``async for`` finishes, the inner generator's frame is
+                # released, so GPU release here can actually free memory.  This
+                # is the authoritative release point (the inline/finally release
+                # inside ``run_plan_stream`` is only a best-effort first attempt
+                # made while the generator frame is still alive).
+                _release_on_close = orig_method.__name__ in (
+                    "run_plan_stream", "run_prompt_stream",
+                )
                 @functools.wraps(orig_method)
                 async def _wrapper(self, *args, **kwargs):
                     _v2_init_instance(self)
-                    async for item in orig_method(self, *args, **kwargs):
-                        yield item
+                    try:
+                        async for item in orig_method(self, *args, **kwargs):
+                            yield item
+                    finally:
+                        if _release_on_close:
+                            self._release_after_stream_complete(
+                                request_id=str(kwargs.get("request_id", "") or ""),
+                            )
                 return _wrapper
             elif inspect.isgeneratorfunction(orig_method):
                 @functools.wraps(orig_method)
@@ -13142,8 +13408,15 @@ def _build_decorated_v2_class() -> type:
 
         setattr(cls, _name, _make_wrapper(_orig))
 
-    # Apply Modal lifecycle/method decorators.
-    setattr(cls, "startup", _modal.enter(snap=True)(cls.startup))
+    # Apply Modal lifecycle/method decorators.  The startup snapshot flag must
+    # match COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT: default/true keeps snap=True,
+    # but a false token disables it (snap=False) so Modal accepts the A/B
+    # deployment with enable_memory_snapshot=False.  restore stays snap=False.
+    setattr(
+        cls,
+        "startup",
+        _modal.enter(snap=_resolve_enable_memory_snapshot())(cls.startup),
+    )
     setattr(cls, "restore", _modal.enter(snap=False)(cls.restore))
     _exit_decorator = getattr(_modal, "exit", None)
     if callable(_exit_decorator):

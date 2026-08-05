@@ -433,6 +433,96 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertTrue(spec.enable_memory_snapshot)
 
+    def test_memory_snapshot_default_when_env_absent(self):
+        saved = os.environ.pop("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", None)
+        try:
+            spec = ModalRuntimeSpec()
+            self.assertTrue(spec.enable_memory_snapshot)
+        finally:
+            if saved is not None:
+                os.environ["COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT"] = saved
+
+    def test_memory_snapshot_env_zero_disables(self):
+        with patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT": "0"},
+            clear=False,
+        ):
+            spec = ModalRuntimeSpec()
+            self.assertFalse(spec.enable_memory_snapshot)
+            # scaledown_window is unchanged by the override.
+            self.assertEqual(spec.scaledown_window, 4)
+
+    def test_memory_snapshot_env_false_tokens_disable(self):
+        for token in ("0", "false", "no", "off", "False", "OFF", "NO", " 0 "):
+            with patch.dict(
+                os.environ,
+                {"COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT": token},
+                clear=False,
+            ):
+                spec = ModalRuntimeSpec()
+                self.assertFalse(
+                    spec.enable_memory_snapshot,
+                    f"token {token!r} should disable memory snapshot",
+                )
+
+    def test_memory_snapshot_env_true_or_unknown_preserves_default(self):
+        for token in ("1", "true", "yes", "on", "banana", ""):
+            with patch.dict(
+                os.environ,
+                {"COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT": token},
+                clear=False,
+            ):
+                spec = ModalRuntimeSpec()
+                self.assertTrue(
+                    spec.enable_memory_snapshot,
+                    f"token {token!r} should keep default True",
+                )
+
+    def test_startup_enter_snap_follows_memory_snapshot_resolver(self):
+        """_build_decorated_v2_class selects startup snap= from the same
+        COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT resolver (default/true -> snap=True,
+        false token -> snap=False), while restore stays snap=False.  Uses a fake
+        Modal SDK so no live Modal app is required.
+        """
+        from comfymodal_runtime.modal_app import _build_decorated_v2_class
+
+        for expected, token in (
+            (True, None),
+            (True, "1"),
+            (False, "0"),
+            (False, "off"),
+        ):
+            records = {"enter_calls": [], "method_calls": []}
+
+            class FakeModal:
+                def enter(self, snap):
+                    records["enter_calls"].append(snap)
+                    return lambda fn: fn
+
+                def method(self, **kwargs):
+                    records["method_calls"].append(kwargs)
+                    return lambda fn: fn
+
+            saved = os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT")
+            os.environ.pop("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", None)
+            try:
+                if token is not None:
+                    os.environ["COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT"] = token
+                with patch("comfymodal_runtime.modal_app._modal", FakeModal()):
+                    cls = _build_decorated_v2_class()
+                self.assertIsNotNone(cls)
+                # enter() is called for startup first, then restore.
+                self.assertEqual(len(records["enter_calls"]), 2)
+                startup_snap, restore_snap = records["enter_calls"]
+                self.assertIs(startup_snap, expected)
+                self.assertIs(restore_snap, False)
+            finally:
+                if saved is not None:
+                    os.environ["COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT"] = saved
+                else:
+                    os.environ.pop("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", None)
+
     def test_no_hard_memory_limit_in_identity(self):
         spec = ModalRuntimeSpec()
         identity = _resource_identity(spec)
