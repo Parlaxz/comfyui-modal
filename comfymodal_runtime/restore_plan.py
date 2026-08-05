@@ -17,11 +17,13 @@ import time
 from typing import Any, Mapping
 
 from comfymodal_runtime.contracts import (
+    C5_IMPL_VERSION,
     ModelRestoreKey,
     PrefillKey,
     RestorePlan,
     resolve_vae_policy,
     stable_hash,
+    vae_prefetch_mode,
 )
 from comfymodal_runtime.runtime_state import CommitCoordinator
 from comfymodal_runtime.trace import RuntimeTrace
@@ -318,6 +320,8 @@ def build_restore_model_spec(workflow: dict, model_stack: dict | None = None) ->
                 "node_id": str(node_id),
                 "loader_class": class_type,
                 "vae_name": inputs["vae_name"],
+                "vae_prefetch_mode": vae_prefetch_mode(),
+                "c5_impl_version": C5_IMPL_VERSION,
                 **{
                     key: value
                     for key, value in _vae_policy.items()

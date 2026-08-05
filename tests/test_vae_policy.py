@@ -670,6 +670,69 @@ class ComputeLoaderRoleIdentityPolicyTests(unittest.TestCase):
         self.assertEqual(c.find_role_identity_mismatch_fields(a, b), [])
 
 
+class RestorePlanVaeSpecPolicyTests(unittest.TestCase):
+    """build_restore_model_spec VAE loader must carry prefetch + C5 identity."""
+
+    _PREFETCH_ENV = "COMFYMODAL_V2_VAE_PREFETCH_MODE"
+
+    def _request_spec(self, prefetch: str = "bounded_native_touch") -> dict:
+        old = os.environ.get(self._PREFETCH_ENV)
+        os.environ[self._PREFETCH_ENV] = prefetch
+        try:
+            from comfymodal_runtime.restore_plan import build_restore_model_spec
+            workflow = {
+                "1": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+            }
+            return build_restore_model_spec(workflow)
+        finally:
+            if old is None:
+                os.environ.pop(self._PREFETCH_ENV, None)
+            else:
+                os.environ[self._PREFETCH_ENV] = old
+
+    def test_request_spec_carries_prefetch_and_impl_version(self):
+        """Request VAE loader must not fall back to legacy_unset."""
+        c = _contracts()
+        spec = self._request_spec(prefetch="bounded_native_touch")
+        vae = spec["loaders"]["vae"][0]
+        self.assertEqual(vae["vae_prefetch_mode"], "bounded_native_touch")
+        self.assertEqual(vae["c5_impl_version"], c.C5_IMPL_VERSION)
+        # Regression guard: an omitted field used to project "legacy_unset"
+        # on the production side and fail C5 snapshot identity matching.
+        self.assertNotEqual(vae["vae_prefetch_mode"], "legacy_unset")
+        self.assertNotEqual(vae["c5_impl_version"], "legacy_unset")
+
+    def test_request_spec_matches_cpu_snapshot_vae_identity(self):
+        """Request VAE spec must equal the CPU snapshot VAE loader identity."""
+        c = _contracts()
+        req = self._request_spec(prefetch="off")
+        vae = req["loaders"]["vae"][0]
+        # Mirror the identity tuple consumed by compute_loader_role_identity.
+        req_tuple = (
+            str(vae.get("loader_class", "")),
+            str(vae.get("vae_name", "")),
+            str(vae.get("vae_policy_version", 0)),
+            str(vae.get("vae_weight_dtype", "legacy_unset")),
+            str(vae.get("vae_compute_dtype", "legacy_unset")),
+            str(vae.get("vae_memory_format", "legacy_unset")),
+            str(vae.get("vae_prefetch_mode", "legacy_unset")),
+            str(vae.get("c5_impl_version", "legacy_unset")),
+        )
+        snapshot = c.compute_loader_role_identity(
+            "vae", {"loaders": {"vae": [vae]}}
+        )
+        self.assertEqual(
+            snapshot["vae_prefetch_mode"], "off",
+            "request prefetch mode must match snapshot prefetch mode",
+        )
+        self.assertEqual(
+            snapshot["c5_impl_version"], c.C5_IMPL_VERSION,
+            "request C5 impl version must match snapshot C5 impl version",
+        )
+        # The projected tuple must not contain any legacy_unset fallback.
+        self.assertNotIn("legacy_unset", req_tuple)
+
+
 class VaePrefetchMetricContractTests(unittest.TestCase):
     def test_off_mode_presents_metric_contract(self):
         m = _cpu_snapshot()
