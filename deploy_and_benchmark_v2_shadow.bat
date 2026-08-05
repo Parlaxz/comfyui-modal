@@ -9,12 +9,11 @@ chcp 65001 >nul
 ::
 :: This wrapper reproduces the documented C8 latency winner
 :: (TBASE/O0/CPU 16/memory 49152 MiB) by pinning the winner baseline.  It
-:: intentionally does NOT represent the selected production shape
-:: (TBASE/O0/CPU 16/memory 40960 MiB) and must NOT be used as a production
-:: deployment default.  Production deployments use
-:: deploy_and_run_v2_single.bat / run_v2_single.bat, which default to
-:: memory 40960 MiB and VAE policy v1 (native BF16).  49152 is kept here only
-:: as an explicit benchmark-only baseline for reproducing the measured winner.
+:: intentionally remains benchmark-only and must NOT be used as a production
+:: deployment command.  It reproduces the verified production baseline
+:: (TBASE/O0/CPU 16/memory 49152 MiB).  Production deployments use
+:: deploy_and_run_v2_single.bat / run_v2_single.bat with the same memory
+:: baseline and VAE policy v1 (native BF16).
 :: ============================================================================
 
 :: Pin environment variables
@@ -25,9 +24,9 @@ set "COMFYMODAL_V2_DEEP_MODEL_DIAG=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
-:: Benchmark winner baseline (memory 49152).  Not a production default; the
-:: selected production shape is memory 40960 (see header above).
+:: Benchmark winner and production baseline (memory 49152).
 if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
+if not defined COMFYMODAL_V2_BASELINE_MEMORY_REQUEST set "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST=49152"
 
 :: Repo root = script directory, safe from any CWD
 set "REPO_ROOT=%~dp0"
