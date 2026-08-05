@@ -40,6 +40,11 @@ from .contracts import (
 )
 from .deployment_spec import build_deployment_identity
 from .env import env_flag
+from .runtime_shape import (
+    apply_torch_thread_policy,
+    runtime_shape_config,
+    validate_torch_thread_policy,
+)
 from .restore_plan import (
     RestorePlanPublisher,
     build_restore_model_spec,
@@ -670,21 +675,49 @@ def _cpu_snapshot_specs_match(spec_a: Any, spec_b: Any) -> bool:
     )
 
 
-def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str], ...]:
-    """Return exact VAE loader identity for snapshot compatibility checks."""
+def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str, str, str, str, str, str, str], ...]:
+    """Return exact VAE loader identity for snapshot compatibility checks.
+
+    The tuple mirrors the fields carried in ``compute_loader_role_identity``'s
+    VAE branch (loader_class, vae_name, vae_policy_version, vae_weight_dtype,
+    vae_compute_dtype, vae_memory_format, vae_prefetch_mode, c5_impl_version)
+    so restore matching and executor seeding derive the same identity.  Any
+    prefetch-strategy or C5 implementation-version difference is therefore
+    detected consistently on both sides.
+    """
     if not isinstance(spec, Mapping):
         return ()
     loaders = spec.get("loaders", {})
     if not isinstance(loaders, Mapping):
         return ()
-    result: list[tuple[str, str]] = []
+    result: list[tuple[str, str, str, str, str, str, str, str]] = []
     for loader in loaders.get("vae", []):
         if isinstance(loader, Mapping):
             result.append((
                 str(loader.get("loader_class", "")),
                 str(loader.get("vae_name", "")),
+                str(loader.get("vae_policy_version", 0)),
+                str(loader.get("vae_weight_dtype", "legacy_unset")),
+                str(loader.get("vae_compute_dtype", "legacy_unset")),
+                str(loader.get("vae_memory_format", "legacy_unset")),
+                str(loader.get("vae_prefetch_mode", "legacy_unset")),
+                str(loader.get("c5_impl_version", "legacy_unset")),
             ))
     return tuple(result)
+
+
+def _vae_policy_metadata_field(key: ModelRestoreKey, field: str) -> str:
+    """Best-effort read of a stable VAE policy-identity field from a key.
+
+    Mirrors the prefetch-strategy / C5 implementation-version fields that
+    ``compute_loader_role_identity`` carries in the VAE branch so key-level
+    matching and role-identity matching stay consistent.  Missing metadata
+    (legacy keys) yields ``""``.
+    """
+    md = getattr(key, "vae_policy_metadata", {})
+    if isinstance(md, Mapping):
+        return str(md.get(field, "") or "")
+    return ""
 
 
 def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKey) -> bool:
@@ -705,6 +738,14 @@ def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKe
         and key_a.clip_identity == key_b.clip_identity
         and key_a.clip_type == key_b.clip_type
         and key_a.vae_identity == key_b.vae_identity
+        and key_a.vae_policy_version == key_b.vae_policy_version
+        and key_a.vae_weight_dtype == key_b.vae_weight_dtype
+        and key_a.vae_compute_dtype == key_b.vae_compute_dtype
+        and key_a.vae_memory_format == key_b.vae_memory_format
+        and _vae_policy_metadata_field(key_a, "vae_prefetch_mode")
+        == _vae_policy_metadata_field(key_b, "vae_prefetch_mode")
+        and _vae_policy_metadata_field(key_a, "c5_impl_version")
+        == _vae_policy_metadata_field(key_b, "c5_impl_version")
     )
 
 
@@ -729,6 +770,24 @@ def _cpu_snapshot_key_mismatch_reason(
         return "clip_type mismatch"
     if key_a.vae_identity != key_b.vae_identity:
         return "VAE identity mismatch"
+    if key_a.vae_policy_version != key_b.vae_policy_version:
+        return "VAE policy version mismatch"
+    if key_a.vae_weight_dtype != key_b.vae_weight_dtype:
+        return "VAE weight dtype policy mismatch"
+    if key_a.vae_compute_dtype != key_b.vae_compute_dtype:
+        return "VAE compute dtype policy mismatch"
+    if key_a.vae_memory_format != key_b.vae_memory_format:
+        return "VAE memory format policy mismatch"
+    if (
+        _vae_policy_metadata_field(key_a, "vae_prefetch_mode")
+        != _vae_policy_metadata_field(key_b, "vae_prefetch_mode")
+    ):
+        return "VAE prefetch strategy mismatch"
+    if (
+        _vae_policy_metadata_field(key_a, "c5_impl_version")
+        != _vae_policy_metadata_field(key_b, "c5_impl_version")
+    ):
+        return "VAE C5 implementation version mismatch"
     return None
 
 
@@ -784,6 +843,14 @@ def _cpu_snapshot_spec_mismatch_reason(
             return "VAE loader_class mismatch"
         if va[1] != vb[1]:
             return "VAE filename mismatch"
+        if va[2] != vb[2]:
+            return "VAE policy version mismatch"
+        if va[3] != vb[3]:
+            return "VAE weight dtype policy mismatch"
+        if va[4] != vb[4]:
+            return "VAE compute dtype policy mismatch"
+        if va[5] != vb[5]:
+            return "VAE memory format policy mismatch"
 
     if proj_a != proj_b or vae_a != vae_b:
         return "spec projection mismatch"
@@ -864,6 +931,12 @@ def production_snapshot_invariant(
         "clip_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "clip_identity", None), "clip"),
         "unet_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "unet_identity", None), "unet"),
         "vae_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "vae_identity", None), "vae"),
+        "vae_policy_version": getattr(models, "vae_policy_version", None),
+        "vae_weight_dtype": getattr(models, "vae_weight_dtype", None),
+        "vae_compute_dtype": getattr(models, "vae_compute_dtype", None),
+        "vae_memory_format": getattr(models, "vae_memory_format", None),
+        "vae_prefetch_mode": getattr(models, "vae_policy_metadata", {}).get("vae_prefetch_mode"),
+        "c5_impl_version": getattr(models, "vae_policy_metadata", {}).get("c5_impl_version"),
         "status": status,
         "reason": reason,
         "phase": phase,
@@ -1890,6 +1963,10 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     â€” never client-generated IDs or raw workflow/image/credential data.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
+    runtime_shape = runtime_shape_config(
+        cpu_request=actual.cpu,
+        memory_request=actual.memory,
+    )
     return {
         # â”€â”€ App / class identity (from remote-observed values) â”€â”€â”€â”€â”€â”€â”€â”€
         "app_name": actual.app_name,
@@ -1900,6 +1977,11 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "memory_mb": actual.memory,
         "target_inputs": actual.target_inputs,
         "max_inputs": actual.max_inputs,
+        "runtime_shape_fingerprint": runtime_shape.runtime_shape_fingerprint,
+        "runtime_shape_label": runtime_shape.runtime_shape_label,
+        "runtime_shape_id": runtime_shape.runtime_shape_fingerprint,
+        "snapshot_model_order": runtime_shape.snapshot_model_order,
+        "runtime_shape": runtime_shape.identity_payload(),
         # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "snapshot_enabled": str(actual.enable_memory_snapshot),
         "gpu_snapshot_enabled": str(env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")),
@@ -1921,21 +2003,8 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
 
 
 def _parse_memory_mb() -> int:
-    """Parse COMFYMODAL_V2_MEMORY_MB, default 24576, positive int required."""
-    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "40960").strip()
-    if not raw:
-        return 40960
-    try:
-        val = int(raw)
-    except (ValueError, TypeError):
-        raise RuntimeError(
-            f"COMFYMODAL_V2_MEMORY_MB={raw!r} is not a valid integer"
-        )
-    if val <= 0:
-        raise RuntimeError(
-            f"COMFYMODAL_V2_MEMORY_MB={val} must be a positive integer (MiB)"
-        )
-    return val
+    """Return the normalized Modal memory request in MiB."""
+    return runtime_shape_config().memory_request
 
 
 def _parse_evict_models_before_snapshot() -> bool:
@@ -2031,7 +2100,7 @@ def _snapshot_target_fingerprint(
     }
 
     # Complete normalized _runtime_env() mapping (captures snapshot/warmup class env)
-    _env = _runtime_env()
+    _env = _runtime_env(actual)
 
     # Experimental_options GPU snapshot flag
     _enable_gpu_snapshot = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
@@ -2068,6 +2137,13 @@ def _snapshot_target_fingerprint(
         # ── Source / env (static deployment config only) ─────────────────
         "source_combined_hash": _combined,
         "runtime_env": _env,
+        "runtime_shape": runtime_shape_config(
+            cpu_request=actual.cpu,
+            memory_request=actual.memory,
+        ).identity_payload(),
+        "effective_deployment_combined_hash": globals().get(
+            "_V2_DEPLOYMENT_COMBINED_HASH", ""
+        ),
         "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
         "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
     }
@@ -2102,7 +2178,7 @@ class ModalRuntimeSpec:
     runtime_state_path: str = RUNTIME_STATE_PATH
     profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
-    cpu: int = 16
+    cpu: int = dataclasses.field(default_factory=lambda: runtime_shape_config().cpu_request)
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1
@@ -2149,7 +2225,7 @@ def _collect_warmup_env() -> dict[str, str]:
     return {k: os.environ[k] for k in _WARMUP_KEYS if k in os.environ}
 
 
-def _runtime_env() -> dict[str, str]:
+def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     """Build the runtime environment dict for Modal's class-level ``env=`` parameter.
 
     Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
@@ -2173,6 +2249,12 @@ def _runtime_env() -> dict[str, str]:
         ),
         "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_V2_VAE_POLICY": os.environ.get(
+            "COMFYMODAL_V2_VAE_POLICY", "v0"
+        ),
+        "COMFYMODAL_V2_VAE_PREFETCH_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_PREFETCH_MODE", "off"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -2262,9 +2344,11 @@ def _runtime_env() -> dict[str, str]:
         ),
 
     }
-    memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
-    if memory_mb is not None:
-        env["COMFYMODAL_V2_MEMORY_MB"] = memory_mb
+    runtime_shape = runtime_shape_config(
+        cpu_request=spec.cpu if spec is not None else None,
+        memory_request=spec.memory if spec is not None else None,
+    )
+    env.update(runtime_shape.environment())
     # Propagate COMFYMODAL_V2_RESTORE_TORCH_THREADS without hardcoded default.
     # Absent remains absent; present values are passed through exactly (no strip).
     if "COMFYMODAL_V2_RESTORE_TORCH_THREADS" in os.environ:
@@ -2469,6 +2553,10 @@ def _reference_image() -> Any:
 def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     """Build the actual v2 app, image, Volumes, and source identity."""
     runtime_spec = spec or ModalRuntimeSpec()
+    runtime_shape = runtime_shape_config(
+        cpu_request=runtime_spec.cpu,
+        memory_request=runtime_spec.memory,
+    )
     runtime_root = Path(__file__).resolve().parent
     custom_root = _local_custom_nodes_root()
     identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
@@ -2483,6 +2571,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "prompt_cache_volume": None,
             "source_identity": identity,
             "spec": runtime_spec,
+            "runtime_shape": runtime_shape.identity_payload(),
         }
 
     image = _reference_image()
@@ -2517,6 +2606,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "prompt_cache_volume": prompt_cache_volume,
         "source_identity": identity,
         "spec": runtime_spec,
+        "runtime_shape": runtime_shape.identity_payload(),
     }
 
 
@@ -4069,6 +4159,48 @@ class ModalRuntimeEntrypoint:
             pass
         return joined
 
+    def _close_snapshot_build_pools(self, api: Any = None, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+        """Close known snapshot-build pools before the lifecycle returns."""
+        joined = self._join_legacy_background_threads(api, join_timeout=30.0)
+        removed = 0
+        if api is not None:
+            try:
+                futures = getattr(api, "_actual_load_futures", None)
+                if isinstance(futures, dict):
+                    for key, worker in list(futures.items()):
+                        if worker is None or not getattr(worker, "is_alive", lambda: False)():
+                            futures.pop(key, None)
+                            removed += 1
+            except Exception:
+                pass
+        try:
+            self._preload_bridge.close_workers()
+            coordinator_closed = 1
+        except Exception as exc:
+            coordinator_closed = 0
+            print(
+                f"[v2.snapshot_pools] status=error error_type={type(exc).__name__}",
+                flush=True,
+            )
+        try:
+            native_threads = len(os.listdir("/proc/self/task"))
+        except Exception:
+            native_threads = None
+        result = {
+            "legacy_threads_joined": joined,
+            "legacy_worker_refs_removed": removed,
+            "coordinator_closed": coordinator_closed,
+            "native_thread_count": native_threads,
+        }
+        print(
+            "[v2.snapshot_pools] stage=before_snapshot_capture "
+            + " ".join(f"{key}={value}" for key, value in result.items()),
+            flush=True,
+        )
+        if trace is not None:
+            trace.emit("snapshot_pools_closed", phase="startup", metadata=result)
+        return result
+
     @staticmethod
     def _check_unet_deferral_eligible(api: Any, plan: Any) -> bool:
         """Return True when the optimized V2 UNET-deferral handoff is eligible.
@@ -5617,10 +5749,26 @@ class ModalRuntimeEntrypoint:
         )
         _report_host_memory("restore_start")
         _startup_perf = time.perf_counter()
-        identity = _capture_remote_identity()
-        self._configure_runtime()
         trace = RuntimeTrace(process="remote")
         trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+        _thread_shape = apply_torch_thread_policy(
+            stage="image_runtime_initialization",
+            trace=trace,
+            enforce=True,
+        )
+        self._torch_thread_limit_applied = True
+        self._restore_torch_intraop_threads = _thread_shape.get(
+            "requested_torch_intraop_threads"
+        )
+        self._restore_actual_torch_intraop_threads = _thread_shape.get(
+            "actual_torch_intraop_threads"
+        )
+        self._restore_torch_interop_threads = _thread_shape.get(
+            "actual_torch_interop_threads"
+        )
+        self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
+        identity = _capture_remote_identity()
+        self._configure_runtime()
         trace.set_metadata(**identity)
         trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         startup_session_id = uuid.uuid4().hex
@@ -5657,7 +5805,9 @@ class ModalRuntimeEntrypoint:
             f"class={_reg_cls.__name__} "
             f"gpu={_gpu_str} "
             f"cpu={_spec.cpu} "
-            f"memory={_spec.memory}",
+            f"memory={_spec.memory} "
+            f"runtime_shape_fingerprint={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).runtime_shape_fingerprint} "
+            f"snapshot_model_order={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).snapshot_model_order}",
             flush=True,
         )
         _runtime_id = _snapshot_runtime_identity()
@@ -6038,7 +6188,17 @@ class ModalRuntimeEntrypoint:
                                     print(
                                         f"[v2.vae_snapshot] status=retained "
                                         f"vae_identity={_cpu_models.model_key.vae_identity} "
-                                        f"object_type={type(_cpu_models.vae).__name__}",
+                                        f"object_type={type(_cpu_models.vae).__name__} "
+                                        f"object_id={id(_cpu_models.vae)} "
+                                        f"vae_policy_version={_cpu_models.vae_policy_version} "
+                                        f"vae_weight_dtype={_cpu_models.vae_weight_dtype} "
+                                        f"vae_compute_dtype={_cpu_models.vae_compute_dtype} "
+                                        f"vae_memory_format={_cpu_models.vae_memory_format} "
+                                        f"vae_prefetch_mode={_cpu_models.vae_policy_metadata.get('vae_prefetch_mode', 'absent') if isinstance(_cpu_models.vae_policy_metadata, Mapping) else 'absent'} "
+                                        f"c5_impl_version={_cpu_models.vae_policy_metadata.get('c5_impl_version', 'absent') if isinstance(_cpu_models.vae_policy_metadata, Mapping) else 'absent'} "
+                                        f"storage_bytes={_cpu_models.vae_validation_metadata.get('total_storage_bytes', 'absent')} "
+                                        f"floating_parameter_count={_cpu_models.vae_validation_metadata.get('floating_parameter_count', 'absent')} "
+                                        f"mismatched_parameter_buffer_count={_cpu_models.vae_validation_metadata.get('mismatched_parameter_buffer_count', 'absent')}",
                                         flush=True,
                                     )
                                 production_snapshot_invariant(
@@ -6270,6 +6430,7 @@ class ModalRuntimeEntrypoint:
         # could accidentally keep model objects alive.
         # Missing or incomplete _cpu_snapshot_models is non-fatal: emits
         # status=skipped with the exact reason, continues to startup ready.
+        self._close_snapshot_build_pools(getattr(self, "_legacy_api", None), trace=trace)
         if _parse_evict_models_before_snapshot():
             _cpu_models = getattr(self, "_cpu_snapshot_models", None)
             if _cpu_models is not None:
@@ -6345,7 +6506,27 @@ class ModalRuntimeEntrypoint:
             "_cachedit_preimport": _cd_preimport,
         }
 
-    def _apply_torch_thread_limit(self) -> None:
+    def _apply_torch_thread_limit(self, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+        observed = validate_torch_thread_policy(
+            stage="after_restore",
+            trace=trace,
+            enforce=True,
+        )
+        self._restore_torch_intraop_threads = observed.get(
+            "requested_torch_intraop_threads"
+        )
+        self._restore_actual_torch_intraop_threads = observed.get(
+            "actual_torch_intraop_threads"
+        )
+        self._restore_torch_interop_threads = observed.get(
+            "actual_torch_interop_threads"
+        )
+        self._restore_torch_thread_limit_status = observed.get(
+            "status", "validated"
+        )
+        return observed
+
+    def _legacy_apply_torch_thread_limit(self) -> None:
         """Apply torch intraop thread limit at earliest restore point.
 
         Strict parsing: absent/empty/whitespace-only = disabled.
@@ -6575,7 +6756,7 @@ class ModalRuntimeEntrypoint:
 
         # ── Eviction restore: inspect marker and apply idle ──────────────
         # FIRST executable ordering: marker inspection and idle delay
-        # must precede lazy_init_snapshot_state, _apply_torch_thread_limit,
+        # must precede lazy_init_snapshot_state and runtime-shape validation,
         # full-trace, timestamp setup, samplers, host reporting,
         # identity/config/plan/bootstrap/GPU.
         # _restore_eviction_boundary uses getattr defaults so is safe
@@ -6587,11 +6768,6 @@ class ModalRuntimeEntrypoint:
                 getattr(self, "_cpu_snapshot_models", None),
                 phase="restore",
             )
-
-        # ── Torch thread limit: earliest executable point ─────────────────
-        # Applied before normal restore work, _configure_runtime, plan
-        # reading, bootstrap, snapshot validation/retarget/activation.
-        self._apply_torch_thread_limit()
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
@@ -6672,6 +6848,7 @@ class ModalRuntimeEntrypoint:
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
             trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
+            _thread_shape = self._apply_torch_thread_limit(trace=trace)
             _v2_container_restore_count += 1
             self._restore_count = _v2_container_restore_count
             restore_session_id = uuid.uuid4().hex
@@ -6740,6 +6917,11 @@ class ModalRuntimeEntrypoint:
                     "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                     **identity,
                     **_resource_identity(),
+                    "stored_snapshot_model_order": getattr(
+                        getattr(self, "_cpu_snapshot_models", None),
+                        "construction_order",
+                        None,
+                    ),
                 },
             )
             trace.emit(
@@ -8378,7 +8560,28 @@ class ModalRuntimeEntrypoint:
                                         )
                                     if _rt_vae_ident:
                                         _rt_loader_sigs.append(
-                                            {"node_id": "vae", "signature": _rt_vae_ident}
+                                            {
+                                                "node_id": "vae",
+                                                "signature": _rt_vae_ident,
+                                                "vae_policy_version": getattr(
+                                                    request_model_key, "vae_policy_version", 0
+                                                ),
+                                                "vae_weight_dtype": getattr(
+                                                    request_model_key, "vae_weight_dtype", ""
+                                                ),
+                                                "vae_compute_dtype": getattr(
+                                                    request_model_key, "vae_compute_dtype", ""
+                                                ),
+                                                "vae_memory_format": getattr(
+                                                    request_model_key, "vae_memory_format", ""
+                                                ),
+                                                "vae_prefetch_mode": _vae_policy_metadata_field(
+                                                    request_model_key, "vae_prefetch_mode"
+                                                ),
+                                                "c5_impl_version": _vae_policy_metadata_field(
+                                                    request_model_key, "c5_impl_version"
+                                                ),
+                                            }
                                         )
                                     _rt_state.build_snapshot_execution_seed(
                                         workflow_hash=str(getattr(plan, "workflow_hash", "") or ""),
@@ -11560,8 +11763,18 @@ class ModalRuntimeEntrypoint:
             request_origin_info=_request_origin_info,
             **_entry_host,
             **_resource_identity(),
+            stored_snapshot_model_order=getattr(
+                getattr(self, "_cpu_snapshot_models", None),
+                "construction_order",
+                None,
+            ),
         )
         context.trace.set_metadata(**context_snapshot_age)
+        validate_torch_thread_policy(
+            stage="request_entry",
+            trace=context.trace,
+            enforce=True,
+        )
         if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
             _cgroup_sampler.set_phase_source(
                 lambda: (
@@ -11767,6 +11980,11 @@ class ModalRuntimeEntrypoint:
                     # â”€â”€ Remote-observed identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     **identity,
                     **_resource_identity(),
+                    "stored_snapshot_model_order": getattr(
+                        getattr(self, "_cpu_snapshot_models", None),
+                        "construction_order",
+                        None,
+                    ),
                 },
             )
             context.trace.emit(
@@ -12330,7 +12548,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         scaledown_window=spec.scaledown_window,
         volumes=_volumes,
         enable_memory_snapshot=spec.enable_memory_snapshot,
-        env=_runtime_env(),
+        env=_runtime_env(spec),
         **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
     )(remote_class)
 
@@ -12561,6 +12779,7 @@ except Exception:
         "profile_volume": None,
         "source_identity": None,
         "spec": ModalRuntimeSpec(),
+        "runtime_shape": runtime_shape_config().identity_payload(),
     }
 # Phase 1: Pre-compute deployment combined hash from the canonical
 # DeploymentIdentity / source_identity used by V2 resources.  This
@@ -12572,6 +12791,10 @@ _V2_DEPLOYMENT_COMBINED_HASH = (
     if _MODAL_RESOURCES.get("source_identity") is not None
     else ""
 )
+_V2_DEPLOYMENT_COMBINED_HASH = stable_hash({
+    "source_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
+    "runtime_shape": runtime_shape_config().identity_payload(),
+})
 # Modal CLI discovers the application through a module-level ``app`` object.
 # Keep the resource construction above as the single source of truth while
 # exposing the registered shadow app for ``modal deploy -m``.

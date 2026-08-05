@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -28,6 +29,278 @@ METADATA_MEMORY_MB = "memory_mb"
 METADATA_SNAPSHOT_ENABLED = "snapshot_enabled"
 METADATA_GPU_SNAPSHOT_ENABLED = "gpu_snapshot_enabled"
 METADATA_RESTORE_PLAN_GENERATION = "restore_plan_generation"
+
+VAE_POLICY_VERSION = 1
+VAE_POLICY_ENV_KEY = "COMFYMODAL_V2_VAE_POLICY"
+VAE_PREFETCH_ENV_KEY = "COMFYMODAL_V2_VAE_PREFETCH_MODE"
+
+# Static, architecture-sensitive C5 implementation version.  Bumped only
+# when the runtime-side (Category 5) VAE policy handling semantics change.
+C5_IMPL_VERSION = "1.0.0"
+
+# Best-effort runtime-version capture env overrides.  Deployments pin these
+# so policy identity stays stable across environments.
+C5_ARCH_ENV_KEY = "COMFYMODAL_V2_C5_ARCH"
+C5_TORCH_VERSION_ENV_KEY = "COMFYMODAL_V2_C5_TORCH_VERSION"
+C5_CUDA_VERSION_ENV_KEY = "COMFYMODAL_V2_C5_CUDA_VERSION"
+
+# Allowed Form-B tuple component value sets.
+VAE_WEIGHT_DTYPES = frozenset({"float32", "bfloat16", "float16"})
+VAE_COMPUTE_DTYPES = frozenset({
+    "float32", "bfloat16_native", "bfloat16_autocast",
+    "float16_native", "float16_autocast",
+})
+VAE_MEMORY_FORMATS = frozenset({"contiguous", "channels_last"})
+VAE_PREFETCH_MODES = frozenset({
+    "off", "madvise_willneed", "madvise_populate_read", "bounded_native_touch",
+})
+
+
+def vae_prefetch_mode() -> str:
+    raw = os.environ.get(VAE_PREFETCH_ENV_KEY, "off").strip().lower()
+    return raw if raw in VAE_PREFETCH_MODES else "off"
+
+
+_C5_RUNTIME_CACHE: dict[str, Any] | None = None
+
+
+def capture_c5_runtime_metadata() -> dict[str, Any]:
+    """Best-effort torch/CUDA/arch capture WITHOUT initializing CUDA.
+
+    Env overrides always win so deployments can pin versions for identity
+    stability.  ``torch.version`` and ``torch.cuda.get_arch_list()`` do not
+    initialize the CUDA runtime.  Results are cached when no overrides are
+    present (the common production case) so callers pay the capture cost at
+    most once per process.
+    """
+    global _C5_RUNTIME_CACHE
+    has_overrides = bool(
+        os.environ.get(C5_ARCH_ENV_KEY)
+        or os.environ.get(C5_TORCH_VERSION_ENV_KEY)
+        or os.environ.get(C5_CUDA_VERSION_ENV_KEY)
+    )
+    if _C5_RUNTIME_CACHE is not None and not has_overrides:
+        return dict(_C5_RUNTIME_CACHE)
+    torch_version = os.environ.get(C5_TORCH_VERSION_ENV_KEY, "").strip()
+    cuda_version = os.environ.get(C5_CUDA_VERSION_ENV_KEY, "").strip()
+    arch = os.environ.get(C5_ARCH_ENV_KEY, "").strip()
+    if not torch_version or not cuda_version or not arch:
+        try:
+            import torch
+            if not torch_version:
+                torch_version = str(getattr(torch, "__version__", "") or "")
+            if not cuda_version:
+                try:
+                    cuda_version = str(getattr(torch.version, "cuda", "") or "")
+                except Exception:
+                    cuda_version = ""
+            if not arch:
+                try:
+                    _arch_list = torch.cuda.get_arch_list()
+                    arch = ";".join(_arch_list) if _arch_list else ""
+                except Exception:
+                    arch = ""
+                if not arch:
+                    try:
+                        import platform as _p
+                        arch = _p.machine()
+                    except Exception:
+                        arch = ""
+        except Exception:
+            pass
+    result = {
+        "torch_version": torch_version,
+        "cuda_version": cuda_version,
+        "arch_identifier": arch,
+    }
+    if not has_overrides:
+        _C5_RUNTIME_CACHE = dict(result)
+    return result
+
+
+def _resolve_vae_policy_core(label: str) -> dict[str, Any] | None:
+    if label == "v0":
+        return {
+            "vae_weight_dtype": "float32",
+            "vae_compute_dtype": "float32",
+            "vae_memory_format": "contiguous",
+        }
+    if label == "v1":
+        return {
+            "vae_weight_dtype": "bfloat16",
+            "vae_compute_dtype": "bfloat16_native",
+            "vae_memory_format": "contiguous",
+        }
+    if label == "v2":
+        return {
+            "vae_weight_dtype": "bfloat16",
+            "vae_compute_dtype": "bfloat16_autocast",
+            "vae_memory_format": "contiguous",
+        }
+    if label == "v3":
+        return {
+            "vae_weight_dtype": "bfloat16",
+            "vae_compute_dtype": "bfloat16_autocast",
+            "vae_memory_format": "channels_last",
+        }
+    if label == "v4":
+        # Completes the controlled 2x2 (compute native/autocast) x
+        # (memory contiguous/channels_last) matrix on bfloat16:
+        #   v1 = native/contiguous, v2 = autocast/contiguous,
+        #   v3 = autocast/channels_last, v4 = native/channels_last.
+        return {
+            "vae_weight_dtype": "bfloat16",
+            "vae_compute_dtype": "bfloat16_native",
+            "vae_memory_format": "channels_last",
+        }
+    return None
+
+
+def _parse_vae_policy_tuple(value: str) -> dict[str, Any] | None:
+    """Parse the Form-B tuple form ``tuple:<weight>:<compute>:<format>``.
+
+    Returns the core policy dict only when all three components are in the
+    allowed value sets; otherwise ``None`` (callers fail closed).
+    """
+    parts = value.split(":")
+    if len(parts) != 4 or parts[0] != "tuple":
+        return None
+    weight, compute, fmt = parts[1], parts[2], parts[3]
+    if weight not in VAE_WEIGHT_DTYPES:
+        return None
+    if compute not in VAE_COMPUTE_DTYPES:
+        return None
+    if fmt not in VAE_MEMORY_FORMATS:
+        return None
+    return {
+        "vae_weight_dtype": weight,
+        "vae_compute_dtype": compute,
+        "vae_memory_format": fmt,
+    }
+
+
+def _resolve_vae_policy_detail(mode: str | None = None) -> tuple[dict[str, Any], str, str]:
+    """Shared resolution returning ``(core, resolved_mode, provenance)``.
+
+    Kept private so ``resolve_vae_policy`` can return exactly its original
+    key set (5 keys) — ``derive_model_key`` in restore_plan.py splats
+    ``resolve_vae_policy().items()`` (minus ``vae_policy_mode``) into the
+    ``ModelRestoreKey`` constructor, so adding keys here would break it.
+
+    Direct label semantics (the controlled matrix):
+        v0 - float32/float32/contiguous            (baseline)
+        v1 - bf16/bfloat16_native/contiguous       (V1 native)
+        v2 - bf16/bfloat16_autocast/contiguous     (V2 controlled-compute)
+        v3 - bf16/bfloat16_autocast/channels_last  (explicit winner-slot arm)
+        v4 - bf16/bfloat16_native/channels_last    (explicit winner-slot arm)
+    ``v3``/``v4`` are the harness's nominal winner-bound slots: in a
+    benchmark the harness binds them to the selected V3/V4 winner via the
+    explicit Form-B tuple ``tuple:<weight>:<compute>:<format>``.  The direct
+    label mappings above are provided for completeness and reference only;
+    they are unambiguous and never inferred from observed tensor dtype or
+    layout.  If the harness binds a tuple that does not parse, resolution
+    fails closed to v0 (provenance ``invalid_tuple_fallback``).
+    """
+    raw_mode = os.environ.get(VAE_POLICY_ENV_KEY, "v0") if mode is None else mode
+    raw = str(raw_mode or "v0").strip().lower()
+    if not raw:
+        raw = "v0"
+    from_env = mode is None
+    if raw in {"v0", "v1", "v2", "v3", "v4"}:
+        core = _resolve_vae_policy_core(raw)
+        resolved_mode = raw
+        provenance = "env" if from_env else "legacy_label"
+    elif raw.startswith("tuple:"):
+        core = _parse_vae_policy_tuple(raw)
+        if core is None:
+            core = _resolve_vae_policy_core("v0")
+            resolved_mode = "v0"
+            provenance = "invalid_tuple_fallback"
+        else:
+            resolved_mode = raw
+            provenance = "env" if from_env else "tuple_form_b"
+    else:
+        core = _resolve_vae_policy_core("v0")
+        resolved_mode = "v0"
+        provenance = "invalid_fallback"
+    return core, resolved_mode, provenance
+
+
+def resolve_vae_policy(mode: str | None = None) -> dict[str, Any]:
+    """Resolve the immutable VAE weight/compute/layout policy.
+
+    Accepts the legacy label modes ``v0``/``v1``/``v2``/``v3``/``v4`` and the
+    explicit Form-B tuple form ``tuple:<weight>:<compute>:<format>`` used
+    by the harness to bind the V3/V4 winner after selection.  Tuple
+    components are validated against the allowed value sets; invalid
+    tuples fail closed to the v0 default.  The mode is derived purely from
+    the supplied label/string — never inferred from observed tensor dtype
+    or layout.
+
+    Returns exactly ``vae_policy_version``, ``vae_weight_dtype``,
+    ``vae_compute_dtype``, ``vae_memory_format``, ``vae_policy_mode``.
+    Extended identity metadata (prefetch strategy, provenance, C5 impl
+    version, runtime versions) is available via ``build_vae_policy_metadata``.
+    """
+    core, resolved_mode, _provenance = _resolve_vae_policy_detail(mode)
+    return {
+        "vae_policy_version": VAE_POLICY_VERSION,
+        "vae_weight_dtype": core["vae_weight_dtype"],
+        "vae_compute_dtype": core["vae_compute_dtype"],
+        "vae_memory_format": core["vae_memory_format"],
+        "vae_policy_mode": resolved_mode,
+    }
+
+
+def build_vae_policy_metadata(
+    policy: Mapping[str, Any] | None = None,
+    *,
+    include_runtime_versions: bool = True,
+) -> dict[str, Any]:
+    """Full VAE policy identity metadata (requested/applied).
+
+    Merges the resolved policy (label or Form-B tuple) with the explicit
+    prefetch strategy, provenance, static C5 implementation version, and
+    best-effort runtime versions.  ``include_runtime_versions=False`` drops
+    the runtime-local torch/CUDA version strings for stable persistent
+    identity serialization (they remain in snapshot markers, activation
+    identity, and trace metadata).
+    """
+    mode = policy.get("vae_policy_mode") if isinstance(policy, Mapping) else None
+    core, resolved_mode, provenance = _resolve_vae_policy_detail(mode)
+    metadata = {
+        "vae_policy_version": VAE_POLICY_VERSION,
+        "vae_weight_dtype": core["vae_weight_dtype"],
+        "vae_compute_dtype": core["vae_compute_dtype"],
+        "vae_memory_format": core["vae_memory_format"],
+        "vae_policy_mode": resolved_mode,
+        "vae_policy_provenance": provenance,
+        "vae_prefetch_mode": vae_prefetch_mode(),
+        "c5_impl_version": C5_IMPL_VERSION,
+    }
+    if isinstance(policy, Mapping):
+        for key in ("vae_policy_version", "vae_weight_dtype", "vae_compute_dtype", "vae_memory_format"):
+            value = policy.get(key)
+            if value not in (None, ""):
+                metadata[key] = value
+        prefetch = policy.get("vae_prefetch_mode")
+        if prefetch not in (None, ""):
+            metadata["vae_prefetch_mode"] = str(prefetch).strip().lower()
+        source = policy.get("vae_policy_provenance")
+        if source not in (None, ""):
+            metadata["vae_policy_provenance"] = str(source)
+    metadata.update(capture_c5_runtime_metadata())
+    metadata["env_overrides"] = {
+        "vae_policy": bool(os.environ.get(VAE_POLICY_ENV_KEY)),
+        "vae_prefetch_mode": bool(os.environ.get(VAE_PREFETCH_ENV_KEY)),
+        "c5_arch": bool(os.environ.get(C5_ARCH_ENV_KEY)),
+        "c5_torch_version": bool(os.environ.get(C5_TORCH_VERSION_ENV_KEY)),
+        "c5_cuda_version": bool(os.environ.get(C5_CUDA_VERSION_ENV_KEY)),
+    }
+    if not include_runtime_versions:
+        metadata.pop("torch_version", None)
+        metadata.pop("cuda_version", None)
+    return metadata
 
 
 def diagnosis_metadata(**kwargs: Any) -> dict[str, Any]:
@@ -405,24 +678,47 @@ class ModelRestoreKey:
     loader_configuration: Mapping[str, Any] = field(default_factory=dict)
     model_volume_generation: str = ""
     optimization_loader_options: Mapping[str, Any] = field(default_factory=dict)
+    vae_policy_version: int = VAE_POLICY_VERSION
+    vae_weight_dtype: str = "float32"
+    vae_compute_dtype: str = "float32"
+    vae_memory_format: str = "contiguous"
+    vae_policy_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("loader_configuration", "optimization_loader_options"):
             object.__setattr__(self, name, _freeze(getattr(self, name) or {}))
         for name in ("unet_identity", "clip_identity", "vae_identity", "clip_type", "model_volume_generation"):
             object.__setattr__(self, name, str(getattr(self, name) or ""))
+        object.__setattr__(self, "vae_policy_version", int(self.vae_policy_version or 0))
+        for name in ("vae_weight_dtype", "vae_compute_dtype", "vae_memory_format"):
+            object.__setattr__(self, name, str(getattr(self, name) or ""))
+        object.__setattr__(self, "vae_policy_metadata", _freeze(self.vae_policy_metadata or {}))
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any] | None) -> "ModelRestoreKey":
         source = dict(value or {})
+        vae_identity = source.get("vae_identity", source.get("vae", ""))
+        policy = resolve_vae_policy()
+        # Unmarked or partially-marked VAEs fall back to the canonical
+        # model-key policy values (never zero/empty markers) so request and
+        # snapshot identities stay stable for VAEs that predate the policy
+        # fields.  Present fields always win; missing fields default.
         return cls(
             unet_identity=source.get("unet_identity", source.get("unet", "")),
             clip_identity=source.get("clip_identity", source.get("clip", "")),
-            vae_identity=source.get("vae_identity", source.get("vae", "")),
+            vae_identity=vae_identity,
             clip_type=source.get("clip_type", ""),
             loader_configuration=source.get("loader_configuration", source.get("loader_config", {})),
             model_volume_generation=str(source.get("model_volume_generation", source.get("model_generation", ""))),
             optimization_loader_options=source.get("optimization_loader_options", source.get("optimization_options", {})),
+            vae_policy_version=source.get("vae_policy_version", policy["vae_policy_version"]),
+            vae_weight_dtype=source.get("vae_weight_dtype", policy["vae_weight_dtype"]),
+            vae_compute_dtype=source.get("vae_compute_dtype", policy["vae_compute_dtype"]),
+            vae_memory_format=source.get("vae_memory_format", policy["vae_memory_format"]),
+            vae_policy_metadata=source.get(
+                "vae_policy_metadata",
+                build_vae_policy_metadata(include_runtime_versions=False),
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -434,6 +730,11 @@ class ModelRestoreKey:
             "loader_configuration": _thaw(self.loader_configuration),
             "model_volume_generation": self.model_volume_generation,
             "optimization_loader_options": _thaw(self.optimization_loader_options),
+            "vae_policy_version": self.vae_policy_version,
+            "vae_weight_dtype": self.vae_weight_dtype,
+            "vae_compute_dtype": self.vae_compute_dtype,
+            "vae_memory_format": self.vae_memory_format,
+            "vae_policy_metadata": _thaw(self.vae_policy_metadata),
         }
 
     @property
@@ -852,11 +1153,25 @@ def compute_loader_role_identity(
         base["loader_count"] = str(len(clip_parts))
     elif role == "vae":
         vae_entries = tuple(
-            str(e.get("vae_name", ""))
+            (
+                str(e.get("vae_name", "")),
+                str(e.get("vae_policy_version", 0)),
+                str(e.get("vae_weight_dtype", "legacy_unset")),
+                str(e.get("vae_compute_dtype", "legacy_unset")),
+                str(e.get("vae_memory_format", "legacy_unset")),
+                str(e.get("vae_prefetch_mode", "legacy_unset")),
+                str(e.get("c5_impl_version", "legacy_unset")),
+            )
             for e in entries
             if isinstance(e, Mapping)
         )
-        base["model_identity"] = ";".join(vae_entries) if vae_entries else ""
+        base["model_identity"] = ";".join(":".join(entry) for entry in vae_entries) if vae_entries else ""
+        base["vae_policy_version"] = vae_entries[0][1] if vae_entries else ""
+        base["vae_weight_dtype"] = vae_entries[0][2] if vae_entries else ""
+        base["vae_compute_dtype"] = vae_entries[0][3] if vae_entries else ""
+        base["vae_memory_format"] = vae_entries[0][4] if vae_entries else ""
+        base["vae_prefetch_mode"] = vae_entries[0][5] if vae_entries else ""
+        base["c5_impl_version"] = vae_entries[0][6] if vae_entries else ""
         base["loader_count"] = str(len(vae_entries))
     else:
         base["model_identity"] = ""
@@ -886,6 +1201,12 @@ def find_role_identity_mismatch_fields(
         "custom_node_generation",
         "deployment_combined_hash",
         "loader_count",
+        "vae_policy_version",
+        "vae_weight_dtype",
+        "vae_compute_dtype",
+        "vae_memory_format",
+        "vae_prefetch_mode",
+        "c5_impl_version",
     )
     mismatched: list[str] = []
     for field in _IDENTITY_FIELDS:
