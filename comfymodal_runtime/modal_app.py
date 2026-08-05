@@ -4496,8 +4496,7 @@ class ModalRuntimeEntrypoint:
 
             def collect_garbage() -> None:
                 import gc
-                gc.collect(0)
-                gc.collect(1)
+                gc.collect()
 
             run_stage("garbage_collection", collect_garbage)
 
