@@ -188,11 +188,18 @@ def _resolve_vae_policy_detail(mode: str | None = None) -> tuple[dict[str, Any],
     ``ModelRestoreKey`` constructor, so adding keys here would break it.
 
     Direct label semantics (the controlled matrix):
-        v0 - float32/float32/contiguous            (baseline)
-        v1 - bf16/bfloat16_native/contiguous       (V1 native)
+        v0 - float32/float32/contiguous            (FP32 fail-closed fallback/control)
+        v1 - bf16/bfloat16_native/contiguous       (V1 native — production default)
         v2 - bf16/bfloat16_autocast/contiguous     (V2 controlled-compute)
         v3 - bf16/bfloat16_autocast/channels_last  (explicit winner-slot arm)
         v4 - bf16/bfloat16_native/channels_last    (explicit winner-slot arm)
+    The production default (absent policy) is **v1**: weight bfloat16,
+    compute bfloat16_native, memory format contiguous, prefetch off.  v0
+    (float32/float32/contiguous) is preserved as an explicit FP32 control
+    option AND as the fail-closed fallback: any invalid/unsupported label or
+    tuple fails closed to v0 (provenance ``invalid_*_fallback``).  No
+    channels-last, prefetch, autocast, per-layer mixed dtype, or benchmark-only
+    matrices are enabled by default.
     ``v3``/``v4`` are the harness's nominal winner-bound slots: in a
     benchmark the harness binds them to the selected V3/V4 winner via the
     explicit Form-B tuple ``tuple:<weight>:<compute>:<format>``.  The direct
@@ -201,7 +208,7 @@ def _resolve_vae_policy_detail(mode: str | None = None) -> tuple[dict[str, Any],
     layout.  If the harness binds a tuple that does not parse, resolution
     fails closed to v0 (provenance ``invalid_tuple_fallback``).
     """
-    raw_mode = os.environ.get(VAE_POLICY_ENV_KEY, "v0") if mode is None else mode
+    raw_mode = os.environ.get(VAE_POLICY_ENV_KEY, "v1") if mode is None else mode
     raw = str(raw_mode or "v0").strip().lower()
     if not raw:
         raw = "v0"

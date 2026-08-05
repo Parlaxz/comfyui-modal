@@ -2285,7 +2285,7 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
             "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
         ),
         "COMFYMODAL_V2_VAE_POLICY": os.environ.get(
-            "COMFYMODAL_V2_VAE_POLICY", "v0"
+            "COMFYMODAL_V2_VAE_POLICY", "v1"
         ),
         "COMFYMODAL_V2_VAE_PREFETCH_MODE": os.environ.get(
             "COMFYMODAL_V2_VAE_PREFETCH_MODE", "off"
@@ -4154,6 +4154,14 @@ class ModalRuntimeEntrypoint:
                 )
 
             self._run_teardown_stage("legacy_request_workers", stop_legacy_workers)
+
+            # Shutdown-hook fallback: flush any production cleanup that was
+            # deferred for a stream cancelled before its terminal event.  This
+            # is a bounded, idempotent no-op when cleanup already ran in the
+            # stream finalizer (the pending record is cleared on first run).
+            self._run_teardown_stage(
+                "production_cleanup", self._run_pending_production_cleanup,
+            )
         finally:
             if diagnostics is not None:
                 diagnostics.emit(
@@ -11103,14 +11111,67 @@ class ModalRuntimeEntrypoint:
             # commit lane is free before any post-execution work.
             if _lane is not None and _lane_acquired[0]:
                 _lane.release("sampler")
+            # Post-response production cleanup is deferred to the stream
+            # generator's finalizer so it runs ONLY after the terminal
+            # result/error event has been yielded to the consumer.  Stash the
+            # (idempotent) cleanup callables + prompt id here; do NOT run them
+            # before the terminal handoff.
             if production_enabled:
+                _pending_cleanup = getattr(self, "_v2_pending_production_cleanup", None)
+                if not isinstance(_pending_cleanup, dict):
+                    _pending_cleanup = {}
+                _pending_cleanup.setdefault(
+                    "prompt_id", prompt_id,
+                )
+                _pending_cleanup.setdefault("trace", trace)
+                if callable(cleanup_request):
+                    _pending_cleanup["cleanup_request"] = cleanup_request
+                if callable(cleanup_registry):
+                    _pending_cleanup["cleanup_registry"] = cleanup_registry
+                self._v2_pending_production_cleanup = _pending_cleanup
+
+    def _run_pending_production_cleanup(self) -> None:
+        """Run deferred production cleanup exactly once, post-terminal-handoff.
+
+        This runs only from the ``run_plan_stream`` generator finalizer AFTER
+        the terminal result/error event has been yielded to the consumer (or
+        from the shutdown ``exit`` hook as a bounded fallback for a stream that
+        was cancelled before its terminal event).  It is idempotent: the
+        pending record is cleared before the callbacks run, so a second call
+        (e.g. consumer closes after terminal, then container ``exit`` runs) is
+        a no-op.  Never raises — cleanup must not mask the terminal result or
+        an in-flight exception on this finalization path.
+        """
+        pending = getattr(self, "_v2_pending_production_cleanup", None)
+        if not pending or not isinstance(pending, dict):
+            return
+        self._v2_pending_production_cleanup = None
+        prompt_id = str(pending.get("prompt_id", ""))
+        cleanup_request = pending.get("cleanup_request")
+        cleanup_registry = pending.get("cleanup_registry")
+        trace = pending.get("trace")
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        try:
+            if trace is not None:
                 trace.emit("production_cleanup_start", phase="output")
-            if production_enabled and callable(cleanup_request):
-                cleanup_request(prompt_id)
-            if production_enabled and callable(cleanup_registry):
-                cleanup_registry(prompt_id)
-            if production_enabled:
+            if diagnostics is not None:
+                diagnostics.emit("production_cleanup_start", stage="output")
+            try:
+                if callable(cleanup_request):
+                    cleanup_request(prompt_id)
+            finally:
+                try:
+                    if callable(cleanup_registry):
+                        cleanup_registry(prompt_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            if trace is not None:
                 trace.emit("production_cleanup_end", phase="output")
+            if diagnostics is not None:
+                diagnostics.emit("production_cleanup_end", stage="output")
 
     @staticmethod
     def _executor_error_message(executor: Any) -> str:
@@ -11621,12 +11682,21 @@ class ModalRuntimeEntrypoint:
                 "request_id": request_id or "",
             }
         finally:
+            # Capture whether a real terminal result/error event was yielded
+            # BEFORE the forced generator_closed fallback below mutates the flag.
+            _terminal_was_yielded = terminal_started
             if not terminal_started:
                 terminal_started = True
                 if diagnostics is not None:
                     diagnostics.emit("request_terminal_start", terminal_status="generator_closed")
             if diagnostics is not None:
                 diagnostics.emit("request_terminal_end")
+            # Deferred production cleanup: run ONLY after a terminal result/error
+            # event has been yielded to the consumer (_terminal_was_yielded).  If
+            # the stream was cancelled/closed before any terminal event, skip here
+            # and rely on the shutdown ``exit`` hook fallback (bounded + idempotent).
+            if _terminal_was_yielded:
+                self._run_pending_production_cleanup()
 
     async def _run_plan_stream_impl(
         self,
@@ -12508,6 +12578,7 @@ def _build_decorated_v2_class() -> type:
         self._snapshot_eviction_retained_model_id = 0
         self._snapshot_eviction_retained_model_type = ""
         self._snapshot_eviction_retained_release_status = "not_run"
+        self._v2_pending_production_cleanup: dict[str, Any] | None = None
         self._init_teardown_diagnostics()
         self._v2_initialized = True
 
