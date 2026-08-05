@@ -21,6 +21,7 @@ from modal_client import check_active_warmup_profile, set_active_warmup_profile
 from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
 from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
+from comfymodal_runtime.runtime_shape import runtime_shape_config
 from comfymodal_runtime.trace import RuntimeTrace
 from production_workflow import normalize_production_options
 from tools.v2_waterfall import (
@@ -81,6 +82,17 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
                 "class_name": metadata.get("class_name", ""),
                 "method_name": metadata.get("method_name", ""),
                 "gpu": metadata.get("gpu", ""),
+                "cpu": metadata.get("cpu"),
+                "memory_mb": metadata.get("memory_mb"),
+                "fingerprint": metadata.get("fingerprint", ""),
+                "runtime_shape": metadata.get("runtime_shape", {}),
+                "runtime_shape_fingerprint": metadata.get(
+                    "runtime_shape_fingerprint", ""
+                ),
+                "runtime_shape_label": metadata.get("runtime_shape_label"),
+                "stored_snapshot_model_order": metadata.get(
+                    "stored_snapshot_model_order"
+                ),
                 "container_session_id": (
                     metadata.get("container_session_id")
                     or result.get("container_session_id", "")
@@ -89,6 +101,144 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
             }
     metadata = trace.get("metadata", {}) if isinstance(trace, dict) else {}
     return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _runtime_shape_guard(shape: dict[str, Any]) -> dict[str, Any]:
+    def _baseline_int(env_name: str, fallback: int) -> int:
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            return fallback
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{env_name}={raw!r} is not an integer") from exc
+        if value <= 0:
+            raise RuntimeError(f"{env_name}={raw!r} must be positive")
+        return value
+
+    baseline_cpu = _baseline_int("COMFYMODAL_V2_BASELINE_CPU_REQUEST", 16)
+    baseline_memory = _baseline_int(
+        "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST",
+        int(shape["memory_request"]),
+    )
+    changed_axes: list[str] = []
+    if shape["thread_policy"] != "TBASE":
+        changed_axes.append("thread_policy")
+    if shape["snapshot_model_order"] != "O0":
+        changed_axes.append("snapshot_model_order")
+    if int(shape["cpu_request"]) != baseline_cpu:
+        changed_axes.append("cpu_request")
+    if int(shape["memory_request"]) != baseline_memory:
+        changed_axes.append("memory_request")
+    raw_override = os.environ.get("COMFYMODAL_V2_ALLOW_MULTI_AXIS", "").strip().lower()
+    allow_multi_axis = raw_override in {"1", "true", "yes", "on"}
+    guard = {
+        "changed_axes": changed_axes,
+        "allow_multi_axis": allow_multi_axis,
+        "baseline_cpu_request": baseline_cpu,
+        "baseline_memory_request": baseline_memory,
+    }
+    if len(changed_axes) > 1 and not allow_multi_axis:
+        raise RuntimeError(
+            "C8 experiment changes multiple axes without "
+            "COMFYMODAL_V2_ALLOW_MULTI_AXIS=1: "
+            + ", ".join(changed_axes)
+        )
+    return guard
+
+
+def _runtime_shape_observations(result: dict[str, Any]) -> list[dict[str, Any]]:
+    trace = result.get("trace", {}) if isinstance(result, dict) else {}
+    events = trace.get("events", []) if isinstance(trace, dict) else []
+    if not isinstance(events, list):
+        return []
+    return [
+        event.get("metadata", {})
+        for event in events
+        if isinstance(event, dict)
+        and event.get("name") == "runtime_shape_observed"
+        and isinstance(event.get("metadata"), dict)
+    ]
+
+
+def _validate_runtime_shape(
+    result: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    expected = runtime_shape_config().identity_payload()
+    guard = _runtime_shape_guard(expected)
+    deployed = identity.get("runtime_shape")
+    if not isinstance(deployed, dict):
+        deployed = {}
+    failures: list[str] = []
+    for key in (
+        "thread_policy",
+        "snapshot_model_order",
+        "cpu_request",
+        "memory_request",
+        "runtime_shape_fingerprint",
+        "runtime_shape_label",
+    ):
+        if deployed.get(key) != expected.get(key):
+            failures.append(
+                f"deployed {key}={deployed.get(key)!r} "
+                f"requested={expected.get(key)!r}"
+            )
+    if int(identity.get("cpu", -1) or -1) != int(expected["cpu_request"]):
+        failures.append(
+            f"resource cpu={identity.get('cpu')!r} requested={expected['cpu_request']!r}"
+        )
+    if int(identity.get("memory_mb", -1) or -1) != int(expected["memory_request"]):
+        failures.append(
+            "resource memory_mb="
+            f"{identity.get('memory_mb')!r} requested={expected['memory_request']!r}"
+        )
+    if not identity.get("fingerprint"):
+        failures.append("snapshot target fingerprint is missing")
+    observations = _runtime_shape_observations(result)
+    observed = observations[-1] if observations else {}
+    if not observed:
+        failures.append("runtime_shape_observed event is missing")
+    elif observed.get("runtime_shape_fingerprint") != expected["runtime_shape_fingerprint"]:
+        failures.append(
+            "observed runtime_shape_fingerprint="
+            f"{observed.get('runtime_shape_fingerprint')!r} "
+            f"requested={expected['runtime_shape_fingerprint']!r}"
+        )
+    if expected["thread_policy"] == "TBASE":
+        if observed.get("status") not in {"baseline_passthrough", "validated"}:
+            failures.append(f"baseline thread status={observed.get('status')!r}")
+    else:
+        if observed.get("status") not in {"applied", "already_applied", "validated"}:
+            failures.append(f"active thread status={observed.get('status')!r}")
+        if observed.get("requested_vs_actual_match") is not True:
+            failures.append("requested Torch thread counts do not match actual counts")
+    stored_order = identity.get("stored_snapshot_model_order")
+    if stored_order is None:
+        trace = result.get("trace", {}) if isinstance(result, dict) else {}
+        events = trace.get("events", []) if isinstance(trace, dict) else []
+        for event in events if isinstance(events, list) else []:
+            if not isinstance(event, dict) or event.get("name") != "cpu_snapshot_models_ready":
+                continue
+            metadata = event.get("metadata", {})
+            if isinstance(metadata, dict) and metadata.get("status") == "ok":
+                stored_order = metadata.get("construction_order")
+    if stored_order != expected["snapshot_model_order"]:
+        failures.append(
+            f"stored snapshot order={stored_order!r} "
+            f"deployed={expected['snapshot_model_order']!r}"
+        )
+    if failures:
+        raise RuntimeError("C8 runtime-shape validation failed: " + "; ".join(failures))
+    return {
+        "requested": expected,
+        "deployed": deployed,
+        "observed": observed,
+        "stored_snapshot_model_order": stored_order,
+        "snapshot_target_fingerprint": identity.get("fingerprint", ""),
+        "guard": guard,
+        "construction_order_semantics": "model_construction_order_only",
+    }
 
 
 def _validate_remote_profile(result: dict[str, Any]) -> None:
@@ -584,12 +734,14 @@ async def _run_one(
     identity = _identity(result)
     if identity.get("app_name") and identity.get("app_name") != APP_NAME:
         raise RuntimeError(f"V2 run {index} returned app {identity['app_name']!r}, expected {APP_NAME!r}")
+    runtime_shape_artifact = _validate_runtime_shape(result, identity)
     artifact = {
         "run_index": index,
         "request_id": prompt_id,
         "prompt_id": prompt_id,
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
         "identity": identity,
+        "runtime_shape": runtime_shape_artifact,
         "event_types": ["result"],
         "timing": _timing(
             result,
@@ -645,6 +797,7 @@ async def _run_one(
         "run_index": index,
         "request_id": prompt_id,
         "identity": identity,
+        "runtime_shape": runtime_shape_artifact,
         "timing": artifact["timing"],
     }, default=str))
     if not _defer_waterfall:
@@ -1464,6 +1617,7 @@ def _extract_identity_from_trace(result: dict[str, Any], request_id: str) -> dic
     instance_id = ""
     restore_count = 0
     request_count = 0
+    runtime_fields: dict[str, Any] = {}
     # Find the LAST matching remote_method_entry (most recent before return)
     for ev in events:
         if not isinstance(ev, dict):
@@ -1479,11 +1633,25 @@ def _extract_identity_from_trace(result: dict[str, Any], request_id: str) -> dic
             rqc = meta.get("request_count", 0)
             if isinstance(rqc, (int, float)):
                 request_count = int(rqc)
+            for field in (
+                "app_name",
+                "class_name",
+                "cpu",
+                "memory_mb",
+                "fingerprint",
+                "runtime_shape",
+                "runtime_shape_fingerprint",
+                "runtime_shape_label",
+                "stored_snapshot_model_order",
+            ):
+                if field in meta:
+                    runtime_fields[field] = meta[field]
     return {
         "restored_instance_id": instance_id,
         "restore_count": restore_count,
         "request_count": request_count,
         "request_id": request_id,
+        **runtime_fields,
     }
 
 
@@ -1805,6 +1973,7 @@ async def _run_acceptance_sequence(
 
         # Extract identity from REQUEST-SCOPED trace events
         identity = _extract_identity_from_trace(result, _req_id)
+        runtime_shape_artifact = _validate_runtime_shape(result, identity)
         instance_id = identity.get("restored_instance_id", "")
 
         # Extract images
@@ -1856,6 +2025,7 @@ async def _run_acceptance_sequence(
             "run_index": index,
             "timestamp": _fmt_ts(),
             "identity": identity,
+            "runtime_shape": runtime_shape_artifact,
             "images": images,
             "asset_proofs": asset_proofs,
             "timing": timing,
@@ -1975,6 +2145,10 @@ async def _run_acceptance_sequence(
         "app_name": _APP_NAME,
         "class_name": _CLASS_NAME,
         "gpu": _GPU,
+        "runtime_shape": {
+            "requested": runtime_shape_config().identity_payload(),
+            "guard": _runtime_shape_guard(runtime_shape_config().identity_payload()),
+        },
         "timestamp": _fmt_ts(),
         "wait_seconds": WAIT_SECONDS,
         "accepted": not ACCEPTANCE_FAILED,
@@ -1984,6 +2158,7 @@ async def _run_acceptance_sequence(
         entry = {
             "label": r["label"],
             "identity": r["identity"],
+            "runtime_shape": r.get("runtime_shape", {}),
             "timing": r["timing"],
             "waterfall": r.get("waterfall", {}),
             "asset_proofs": r["asset_proofs"],
@@ -2012,6 +2187,9 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
     os.environ["COMFYMODAL_V2_GPU"] = GPU
+    requested_shape = runtime_shape_config().identity_payload()
+    shape_guard = _runtime_shape_guard(requested_shape)
+    print(json.dumps({"runtime_shape": requested_shape, "guard": shape_guard}, sort_keys=True), flush=True)
     workspace = _load_workspace()
     workflow, modal_options = _load_workflow()
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
@@ -2052,6 +2230,10 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
     ]
     summary = {
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
+        "runtime_shape": {
+            "requested": requested_shape,
+            "guard": shape_guard,
+        },
         "run_count": len(artifacts),
         "gap_seconds": GAP_SECONDS,
         "trace_handoff_errors": len(trace_errors),
@@ -2060,6 +2242,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             "run_index": item["run_index"],
             "request_id": item.get("request_id", item.get("prompt_id", "")),
             "identity": item["identity"],
+            "runtime_shape": item.get("runtime_shape", {}),
             "timing": item["timing"],
         } for item in artifacts],
     }
