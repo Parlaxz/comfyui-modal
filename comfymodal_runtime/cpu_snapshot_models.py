@@ -122,13 +122,92 @@ class StorageRange:
 class StorageRegistry:
     """Deduplicated registry of CPU storage ranges for one model.
 
-    ``ranges`` â€” tuple of ``StorageRange`` for each unique storage object.
-    ``total_bytes`` â€” sum of ``length`` across all ranges.
-    Registry stores underlying unaligned storage data pointer + exact byte length,
-    deduplicating by storage identity and byte range, merging identical ranges.
+    ``ranges`` — tuple of ``StorageRange`` for each unique merged storage
+    interval (aliases/overlaps merged into a disjoint union).
+    ``total_bytes`` — total unique bytes across ``ranges`` (the union).
+    ``unique_storage_count`` — distinct storage objects scanned (supported).
+    ``raw_byte_count`` — sum of unique interval lengths before overlap merge.
+    ``alias_count`` — duplicate storage identities / exact ranges skipped.
+    ``overlap_count`` — overlapping intervals absorbed into an existing union.
+    ``overlap_bytes`` — ``raw_byte_count - total_bytes`` (>= 0).
+    ``unsupported_entries`` — per-entry JSON-safe reports for tensors that are
+      not CPU/dense/backed (meta/empty/sparse/quantized/non-CPU/unknown), so an
+      unfamiliar shape is reported, never run-fatal.
     """
     ranges: tuple[StorageRange, ...] = ()
     total_bytes: int = 0
+    unique_storage_count: int = 0
+    raw_byte_count: int = 0
+    alias_count: int = 0
+    overlap_count: int = 0
+    overlap_bytes: int = 0
+    unsupported_count: int = 0
+    unsupported_entries: tuple[dict[str, Any], ...] = ()
+
+
+def _tensor_support_class(tensor: Any) -> tuple[bool, str]:
+    """Classify *tensor* for CPU-storage scanning.
+
+    Returns ``(True, "")`` for a supported CPU dense non-empty tensor, or
+    ``(False, reason)`` for an unsupported entry (meta/empty/sparse/quantized/
+    mkldnn/non-CPU/unknown).  Never raises; reports per-entry so an unfamiliar
+    shape is not run-fatal.
+    """
+    try:
+        _dev = getattr(tensor, "device", None)
+        if isinstance(_dev, str):
+            _dev_str = _dev.lower()
+        else:
+            _dev_type = getattr(_dev, "type", None)
+            _dev_str = str(_dev_type() if callable(_dev_type) else (_dev_type or "")).lower()
+    except Exception:
+        _dev_str = "unknown"
+    if _dev_str and _dev_str not in ("cpu", ""):
+        return False, f"device:{_dev_str}"
+    if getattr(tensor, "is_meta", False):
+        return False, "meta"
+    try:
+        _numel_fn = getattr(tensor, "numel", None)
+        if _numel_fn is not None and int(_numel_fn()) == 0:
+            return False, "empty"
+    except Exception:
+        pass
+    for _attr, _label in (("is_sparse", "sparse"), ("is_quantized", "quantized"),
+                          ("is_mkldnn", "mkldnn"), ("is_nested", "nested")):
+        try:
+            if getattr(tensor, _attr, False):
+                return False, _label
+        except Exception:
+            pass
+    return True, ""
+
+
+def _merge_overlapping_intervals(
+    intervals: list[tuple[int, int]],
+) -> tuple[list[tuple[int, int]], int, int]:
+    """Merge overlapping/contained ``[address, address+length)`` intervals.
+
+    Returns ``(merged, overlap_count, overlap_bytes)``.  ``overlap_count`` is
+    the number of intervals absorbed by an existing segment; ``overlap_bytes``
+    is ``raw_sum - union_len`` (bytes double-counted before merge, >= 0).
+    """
+    if not intervals:
+        return [], 0, 0
+    _segs: list[tuple[int, int]] = []
+    for _addr, _len in sorted(intervals, key=lambda it: (it[0], it[1])):
+        _start = _addr
+        _end = _addr + _len
+        if _segs and _start <= _segs[-1][1]:
+            _prev_start, _prev_end = _segs[-1]
+            _segs[-1] = (_prev_start, max(_prev_end, _end))
+        else:
+            _segs.append((_start, _end))
+    _merged = [(_s, _e - _s) for _s, _e in _segs]
+    _raw_sum = sum(_len for _, _len in intervals)
+    _union_len = sum(_len for _, _len in _merged)
+    _overlap_count = max(0, len(intervals) - len(_merged))
+    _overlap_bytes = max(0, _raw_sum - _union_len)
+    return _merged, _overlap_count, _overlap_bytes
 
 
 def _resolve_inner_model(model: Any) -> Any:
@@ -226,6 +305,48 @@ def build_unique_storage_registry(model: Any) -> StorageRegistry:
     seen_ids: set[int] = set()
     seen_ranges: set[tuple[int, int]] = set()
     _inspection_failures = 0
+    _raw_intervals: list[tuple[int, int]] = []
+    _unique_storage_count = 0
+    _raw_byte_count = 0
+    _alias_count = 0
+    _unsupported_entries: list[dict[str, Any]] = []
+    _unsupported_ids: set[int] = set()
+
+    def _record_tensor(tensor: Any, kind: str) -> None:
+        nonlocal _unique_storage_count, _raw_byte_count, _alias_count
+        try:
+            _ok, _reason = _tensor_support_class(tensor)
+            if not _ok:
+                _oid = id(tensor)
+                if _oid not in _unsupported_ids:
+                    _unsupported_ids.add(_oid)
+                    _unsupported_entries.append({
+                        "kind": kind,
+                        "reason": _reason,
+                        "object_id": str(_oid),
+                        "type": type(tensor).__module__ + "." + type(tensor).__qualname__,
+                    })
+                return
+            _st = tensor.untyped_storage() if hasattr(tensor, "untyped_storage") else tensor.storage()
+            _sid = id(_st)
+            if _sid in seen_ids:
+                _alias_count += 1
+                return
+            seen_ids.add(_sid)
+            _ptr = _st.data_ptr()
+            _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else int(tensor.numel() * tensor.element_size())
+            if _nbytes <= 0:
+                return
+            _key = (_ptr, _nbytes)
+            if _key in seen_ranges:
+                _alias_count += 1
+                return
+            seen_ranges.add(_key)
+            _unique_storage_count += 1
+            _raw_byte_count += _nbytes
+            _raw_intervals.append((_ptr, _nbytes))
+        except Exception:
+            pass
 
     for _target in _target_modules:
         # Iterate parameters (per-tensor try/except)
@@ -236,23 +357,7 @@ def build_unique_storage_registry(model: Any) -> StorageRegistry:
             _parameters = ()
         for _p in _parameters:
             try:
-                if _p.device.type != "cpu" or _p.is_meta or _p.numel() == 0:
-                    continue
-                _st = _p.untyped_storage() if hasattr(_p, "untyped_storage") else _p.storage()
-                _sid = id(_st)
-                if _sid in seen_ids:
-                    continue
-                seen_ids.add(_sid)
-                _ptr = _st.data_ptr()
-                _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _p.numel() * _p.element_size()
-                if _nbytes <= 0:
-                    continue
-                _key = (_ptr, _nbytes)
-                if _key in seen_ranges:
-                    continue
-                seen_ranges.add(_key)
-                _ranges.append(StorageRange(address=_ptr, length=_nbytes))
-                _total_bytes += _nbytes
+                _record_tensor(_p, "parameter")
             except Exception:
                 continue
 
@@ -264,27 +369,11 @@ def build_unique_storage_registry(model: Any) -> StorageRegistry:
             _buffers = ()
         for _b in _buffers:
             try:
-                if _b.device.type != "cpu" or _b.is_meta or _b.numel() == 0:
-                    continue
-                _st = _b.untyped_storage() if hasattr(_b, "untyped_storage") else _b.storage()
-                _sid = id(_st)
-                if _sid in seen_ids:
-                    continue
-                seen_ids.add(_sid)
-                _ptr = _st.data_ptr()
-                _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _b.numel() * _b.element_size()
-                if _nbytes <= 0:
-                    continue
-                _key = (_ptr, _nbytes)
-                if _key in seen_ranges:
-                    continue
-                seen_ranges.add(_key)
-                _ranges.append(StorageRange(address=_ptr, length=_nbytes))
-                _total_bytes += _nbytes
+                _record_tensor(_b, "buffer")
             except Exception:
                 continue
 
-    if _inspection_failures == len(_target_modules) and not _ranges and _target_modules:
+    if _inspection_failures == len(_target_modules) and not _raw_intervals and _target_modules:
         # Every resolved module was uninspectable: surface truthfully instead
         # of pretending the model has no storage.
         raise RuntimeError(
@@ -292,7 +381,20 @@ def build_unique_storage_registry(model: Any) -> StorageRegistry:
             f"({len(_target_modules)} resolved module(s))"
         )
 
-    return StorageRegistry(ranges=tuple(_ranges), total_bytes=_total_bytes)
+    _merged, _overlap_count, _overlap_bytes = _merge_overlapping_intervals(_raw_intervals)
+    _ranges = [StorageRange(address=_addr, length=_len) for _addr, _len in _merged]
+    _total_bytes = sum(_len for _, _len in _merged)
+    return StorageRegistry(
+        ranges=tuple(_ranges),
+        total_bytes=_total_bytes,
+        unique_storage_count=_unique_storage_count,
+        raw_byte_count=_raw_byte_count,
+        alias_count=_alias_count,
+        overlap_count=_overlap_count,
+        overlap_bytes=_overlap_bytes,
+        unsupported_count=len(_unsupported_entries),
+        unsupported_entries=tuple(_unsupported_entries),
+    )
 
 
 def sample_storage_residency(registry: StorageRegistry) -> dict[str, Any]:

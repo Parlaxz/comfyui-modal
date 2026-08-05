@@ -30,6 +30,18 @@ from tools.v2_waterfall import (
     render_waterfall,
     waterfall_to_dict,
 )
+from tools.variance_report import (
+    build_summary,
+    build_matrix_summary,
+    extract_run_metrics,
+    load_runs_from_dir,
+    render_variance_report,
+    render_matrix_report,
+    percentile,
+    compute_stats,
+    slow_run_rate,
+    _num,
+)
 
 
 WORKFLOW_PATH = ROOT / "latest_benchmark_workflow.json"
@@ -40,6 +52,40 @@ GPU = os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")
 RUN_COUNT = int(os.environ.get("V2_BENCHMARK_RUNS", "1"))
 GAP_SECONDS = float(os.environ.get("V2_BENCHMARK_GAP_SECONDS", "20"))
 _ABSENT_STR = "absent"
+
+# ── Variance-cold mode (opt-in, never the default) ────────────────────────
+# Unique shadow app name used ONLY for variance mode.  Normal/production modes
+# keep the default APP_NAME identity above; this default is overridable only
+# by an explicit environment variable.
+VARIANCE_APP_NAME = os.environ.get(
+    "COMFYMODAL_V2_VARIANCE_APP_NAME", "stable-modal-comfy-v2-variance-shadow"
+)
+# Fixed one-request-at-a-time gap for true-cold scaledown between runs.
+VARIANCE_COLD_GAP_SECONDS = float(
+    os.environ.get("V2_VARIANCE_COLD_GAP_SECONDS", "25")
+)
+# Number of variance-cold runs (defaults to the shared run count).
+VARIANCE_RUN_COUNT = int(os.environ.get("V2_VARIANCE_RUN_COUNT", "0")) or RUN_COUNT
+
+# ── Variance-cold MATRIX (four-condition round-robin) ──────────────────────
+# Conditions: (diagnostics, pretouch) for each of the four cells.
+MATRIX_CONDITIONS: list[tuple[int, int]] = [(0, 0), (0, 1), (1, 0), (1, 1)]
+# Continue attempts until >= this many valid cold runs per condition.
+MATRIX_TARGET_COLD_PER_CONDITION = int(
+    os.environ.get("V2_MATRIX_TARGET_PER_CONDITION", "6")
+)
+# Safety cap on total attempts across all conditions.
+MATRIX_MAX_TOTAL_ATTEMPTS = int(os.environ.get("V2_MATRIX_MAX_TOTAL_ATTEMPTS", "200"))
+# ONE explicit fixed slow threshold (ms) applied across ALL conditions.
+# It is a NONZERO default (never derived from condition medians).  A cold
+# request normally takes tens of seconds; 60s separates pathological outliers.
+MATRIX_SLOW_THRESHOLD_MS = float(
+    os.environ.get("V2_VARIANCE_SLOW_THRESHOLD_MS", "60000") or 60000
+)
+# Fixed slow classification flags (ms), independent of any threshold.
+MATRIX_RESTORE_SLOW_MS = 3000.0
+MATRIX_UNET_ACTIVATION_SLOW_MS = 3000.0
+MATRIX_CONDITION_LABEL = lambda diag, pretouch: f"diag{int(diag)}_pt{int(pretouch)}"
 
 
 def _load_workspace() -> dict[str, Any]:
@@ -93,6 +139,20 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
                 "stored_snapshot_model_order": metadata.get(
                     "stored_snapshot_model_order"
                 ),
+                # Preserve the request-scoped cold-proof fields emitted by
+                # remote_method_entry.  The variance validator must inspect
+                # these values rather than treating their absence as a warm
+                # run after identity extraction.
+                "restore_count": metadata.get("restore_count"),
+                "request_count": metadata.get("request_count"),
+                "restored_instance_id": metadata.get("restored_instance_id", ""),
+                "restore_session_id": metadata.get("restore_session_id", ""),
+                "container_task_id": metadata.get("container_task_id", ""),
+                "modal_container_id": metadata.get("modal_container_id", ""),
+                "image_id": metadata.get("image_id", ""),
+                "cloud": metadata.get("cloud", ""),
+                "region": metadata.get("region", ""),
+                "modal_input_id": metadata.get("modal_input_id", ""),
                 "container_session_id": (
                     metadata.get("container_session_id")
                     or result.get("container_session_id", "")
@@ -594,6 +654,9 @@ async def _run_one(
     output_dir: Path,
     bypass_cpu_snapshot_unet: bool = False,
     _defer_waterfall: bool = False,
+    # Variance-cold mode: extra request-origin diagnostic keys carried to the
+    # remote runtime (e.g. variance_mode, variance_pretouch, env_profile).
+    _extra_origin: dict[str, Any] | None = None,
     # Test overrides (injected helpers, not used in production)
     _test_restore_publisher: Any = None,
     _test_profile_setter: Any = None,
@@ -619,6 +682,8 @@ async def _run_one(
         "local_receive_wall_ns": _t1_wall_ns,
         "local_receive_mono_ns": _t1_mono_ns,
     }
+    if _extra_origin:
+        request_origin_info.update(_extra_origin)
     prompt_id = _req_id  # request_id == prompt_id
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -2182,12 +2247,750 @@ async def _run_acceptance_sequence(
     return summary
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Variance-cold mode
+#
+# True-cold experiment: one request at a time, a fixed gap between runs, and a
+# strict per-run assertion that the run is genuinely cold (not silently reused).
+# Cold is proven from the request-scoped ``remote_method_entry`` metadata:
+#   * restore_count == 1
+#   * request_count == 1
+#   * a non-empty restored_instance_id
+#   * when available, a fresh container task/instance identity per run
+# Warm/reused runs are never relabeled cold; they are preserved as invalid.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _remote_entry_wall_iso(result: dict[str, Any]) -> str:
+    """Return ISO timestamp of the remote_method_entry wall clock, if present."""
+    trace = result.get("trace", {}) if isinstance(result, dict) else {}
+    events = trace.get("events", []) if isinstance(trace, dict) else []
+    for event in events:
+        if not isinstance(event, dict) or event.get("name") != "remote_method_entry":
+            continue
+        wall_ns = event.get("wall_unix_ns")
+        if isinstance(wall_ns, (int, float)) and wall_ns > 0:
+            try:
+                return datetime.fromtimestamp(wall_ns / 1_000_000_000, tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                return "unavailable"
+    return "unavailable"
+
+
+def _cold_identity_key(identity: dict[str, Any]) -> tuple[str, ...]:
+    """Canonical key for "same container/task instance" comparison.
+
+    Uses the most authoritative identity tokens available.  An empty tuple
+    means no freshness token could be established (freshness check is skipped,
+    never treated as proof of cold).
+    """
+    candidates = (
+        identity.get("container_task_id", ""),
+        identity.get("modal_container_id", ""),
+        identity.get("container_session_id", ""),
+        identity.get("restored_instance_id", ""),
+    )
+    present = tuple(str(c) for c in candidates if str(c).strip())
+    return present
+
+
+def _validate_cold_identity(
+    identity: dict[str, Any],
+    *,
+    run_index: int,
+    pretouch: int,
+    prev_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate true cold identity for one variance run.
+
+    Returns a dict with ``cold_valid`` (bool), ``cold`` (bool), and ``failures``
+    (list).  ``cold`` is True only when the run is both valid on its own and
+    provably fresh relative to *prev_identity*.  Missing identity tokens fail
+    explicitly — absence is never treated as cold.
+    """
+    failures: list[str] = []
+    label = f"variance-cold run {run_index} (pretouch={pretouch})"
+
+    restored_instance_id = str(identity.get("restored_instance_id", "") or "")
+    try:
+        restore_count = int(identity.get("restore_count", -1))
+    except (TypeError, ValueError):
+        restore_count = -1
+    try:
+        request_count = int(identity.get("request_count", -1))
+    except (TypeError, ValueError):
+        request_count = -1
+
+    if not restored_instance_id:
+        failures.append(f"{label}: restored_instance_id is empty/absent")
+    if restore_count != 1:
+        failures.append(f"{label}: restore_count={restore_count}, expected 1")
+    if request_count != 1:
+        failures.append(f"{label}: request_count={request_count}, expected 1")
+
+    # Freshness relative to the previous run (only when a token is available).
+    prev_key = _cold_identity_key(prev_identity or {})
+    cur_key = _cold_identity_key(identity)
+    freshness_checked = False
+    if prev_key and cur_key:
+        freshness_checked = True
+        if cur_key == prev_key:
+            failures.append(
+                f"{label}: not fresh — container/task identity identical to "
+                f"previous run ({cur_key})"
+            )
+    elif prev_identity is not None:
+        # We have a previous run but cannot establish a freshness token for it
+        # or the current run.  That is not proof of cold; flag it as a caveat
+        # only when the previous run was itself deemed cold.
+        if prev_identity.get("restored_instance_id"):
+            failures.append(
+                f"{label}: cannot establish freshness token; not provably cold"
+            )
+
+    cold = (len(failures) == 0) and (not prev_identity or freshness_checked or _cold_identity_key(identity))
+    return {
+        "cold_valid": len(failures) == 0,
+        "cold": cold and len(failures) == 0,
+        "failures": failures,
+        "freshness_checked": freshness_checked,
+    }
+
+
+def _variance_origin(index: int, pretouch: int, app_name: str) -> dict[str, Any]:
+    """Request-origin metadata carrying per-run variance diagnostics.
+
+    These keys travel inside ``__request_origin_info__`` so the remote runtime
+    can apply variance diagnostics / ``COMFYMODAL_V2_UNET_PRETOUCH`` without a
+    production default being changed.  ``env_profile`` is carried explicitly so
+    the remote request-time profile semantics match the submitter.
+    """
+    return {
+        "variance_mode": "cold",
+        "variance_pretouch": int(pretouch),
+        "variance_diagnostics": {
+            "variance_cold_gap_seconds": VARIANCE_COLD_GAP_SECONDS,
+            "benchmark_app": app_name,
+            "mode": "variance_cold",
+        },
+        "env_profile": os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "production").strip().lower() or "production",
+        "COMFYMODAL_V2_UNET_PRETOUCH": str(int(pretouch)),
+    }
+
+
+def _resolve_pretouch(cli_value: int | None) -> int:
+    """Resolve the UNET pretouch mode from CLI or env.
+
+    Explicit CLI value wins; otherwise ``V2_VARIANCE_PRETOUCH`` is read
+    (0 = disabled is the default).  Always returns 0 or 1.
+    """
+    if cli_value in (0, 1):
+        return int(cli_value)
+    raw = os.environ.get("V2_VARIANCE_PRETOUCH", "0").strip().lower()
+    return 1 if raw in {"1", "true", "yes", "on"} else 0
+
+
+def _resolve_slow_threshold() -> float:
+    """Resolve the ONE fixed slow threshold (ms) used across all conditions.
+
+    Uses the explicit env value when set, else the nonzero default.  A
+    non-positive value fails fast rather than silently disabling the
+    threshold — the threshold is never auto-derived from condition medians.
+    """
+    raw = os.environ.get("V2_VARIANCE_SLOW_THRESHOLD_MS", "").strip()
+    value = float(raw) if raw else MATRIX_SLOW_THRESHOLD_MS
+    if value <= 0:
+        raise RuntimeError(
+            "variance_matrix: V2_VARIANCE_SLOW_THRESHOLD_MS must be a positive "
+            f"value, got {raw!r}; a fixed threshold is required and is never "
+            "auto-derived from condition medians"
+        )
+    return value
+
+
+def _matrix_origin(index: int, diag: int, pretouch: int, app_name: str) -> dict[str, Any]:
+    """Request-origin metadata for one matrix attempt.
+
+    Carries the diagnostics and pretouch gates request-scoped so the remote
+    runtime (``_apply_request_variance_diagnostics``) applies
+    ``COMFYMODAL_V2_VARIANCE_DIAGNOSTICS`` / ``COMFYMODAL_V2_UNET_PRETOUCH``
+    per request without changing any production default.
+    """
+    return {
+        "variance_mode": "cold",
+        "variance_pretouch": int(pretouch),
+        "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": str(int(diag)),
+        "COMFYMODAL_V2_UNET_PRETOUCH": str(int(pretouch)),
+        "variance_diagnostics": {
+            "variance_cold_gap_seconds": VARIANCE_COLD_GAP_SECONDS,
+            "benchmark_app": app_name,
+            "mode": "variance_matrix",
+            "diagnostics": int(diag),
+            "pretouch": int(pretouch),
+        },
+        "env_profile": os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "production").strip().lower() or "production",
+    }
+
+
+def _classify_attempt(record: dict[str, Any]) -> str:
+    """Classify an attempt into cold / warm_invalid / failed / snapshot_capture.
+
+    A run that never restored (``restore_count == 0``) is a snapshot capture
+    and is NEVER counted as a valid cold request.  Absence of identity is
+    ``warm_invalid``.  Exceptions are ``failed``.
+    """
+    if record.get("error"):
+        return "failed"
+    identity = record.get("identity", {}) or {}
+    variance = record.get("variance", {}) or {}
+    if variance.get("cold_valid") and variance.get("cold"):
+        return "cold"
+    try:
+        restore_count = int(identity.get("restore_count", -1))
+    except (TypeError, ValueError):
+        restore_count = -1
+    if restore_count == 0:
+        return "snapshot_capture"
+    return "warm_invalid"
+
+
+def _slow_flag(value: float | None, threshold_ms: float) -> bool:
+    """True only when *value* is a real number above *threshold_ms*."""
+    return bool(value is not None and value > threshold_ms)
+
+
+def _classify_slow(record: dict[str, Any]) -> dict[str, bool]:
+    """Fixed slow flags: restore > 3s and UNET activation > 3s.
+
+    These are fixed classifications, independent of any median-derived
+    threshold.  UNET activation duration is sourced from the *extracted*
+    result/trace metric ``metrics.page_traversal.unet_demand_to_first_forward_ms``
+    (and the activation total when present), falling back to the raw
+    ``timing.unet_demand_to_first_forward_ms`` only when the trace-derived
+    value is absent.  Missing values never become slow.
+    """
+    timing = record.get("timing", {}) if isinstance(record.get("timing"), dict) else {}
+    metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
+    rt = metrics.get("restore", {}) if isinstance(metrics.get("restore"), dict) else {}
+    pt = metrics.get("page_traversal", {}) if isinstance(metrics.get("page_traversal"), dict) else {}
+
+    # Restore: prefer the extracted restore metric, fall back to raw timing.
+    restore = _num(rt.get("restore_total_ms")) or _num(timing.get("restore_total_ms"))
+    # UNET activation: trace-extracted demand->first-forward, then activation
+    # total, then raw timing field.
+    unet = (
+        _num(pt.get("unet_demand_to_first_forward_ms"))
+        or _num(pt.get("activation_total_ms"))
+        or _num(timing.get("unet_demand_to_first_forward_ms"))
+    )
+    return {
+        "restore_over_3s": _slow_flag(restore, MATRIX_RESTORE_SLOW_MS),
+        "unet_activation_over_3s": _slow_flag(unet, MATRIX_UNET_ACTIVATION_SLOW_MS),
+    }
+
+
+async def _run_variance_matrix(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    gap_seconds: float,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+    target_per_condition: int,
+    max_total_attempts: int,
+    slow_threshold_ms: float,
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Four-condition round-robin cold scheduler.
+
+    Round-robins across (diagnostics off/on) x (pretouch off/on).  Keeps
+    attempting each condition until it reaches *target_per_condition* valid
+    cold runs or the global attempt cap is hit.  Every attempt — including
+    failed, warm/invalid, slow and snapshot-capture runs — is preserved as
+    ``attempt_<seq>.json`` with a unique attempt ID and the full result trace.
+    Produces one consolidated ``variance_matrix_handoff.md`` + ``summary.json``.
+    """
+    print(
+        f"[v2.variance_matrix] mode=start gap={gap_seconds}s target={target_per_condition} "
+        f"max_attempts={max_total_attempts} slow_threshold_ms={slow_threshold_ms} app={app_name}",
+        flush=True,
+    )
+    per_cond: dict[str, dict[str, Any]] = {}
+    for diag, pretouch in MATRIX_CONDITIONS:
+        label = MATRIX_CONDITION_LABEL(diag, pretouch)
+        per_cond[label] = {"diag": diag, "pretouch": pretouch, "attempts": [],
+                           "cold_count": 0, "prev_identity": None}
+
+    records: list[dict[str, Any]] = []
+    total_attempts = 0
+    global_seq = 0
+    round_robin_idx = 0
+    target_met = False
+
+    while total_attempts < max_total_attempts:
+        # ── Round-robin pick the next condition that still needs cold runs ──
+        chosen: tuple[int, int] | None = None
+        for _ in range(len(MATRIX_CONDITIONS)):
+            cond = MATRIX_CONDITIONS[round_robin_idx % len(MATRIX_CONDITIONS)]
+            round_robin_idx += 1
+            label = MATRIX_CONDITION_LABEL(*cond)
+            if per_cond[label]["cold_count"] < target_per_condition:
+                chosen = cond
+                break
+        if chosen is None:
+            target_met = True
+            break  # every condition has reached its target
+
+        diag, pretouch = chosen
+        label = MATRIX_CONDITION_LABEL(diag, pretouch)
+        state = per_cond[label]
+        total_attempts += 1
+        global_seq += 1
+        attempt_seq_in_cond = len(state["attempts"])
+        attempt_id = f"matrix-{label}-{attempt_seq_in_cond}-{global_seq}-{uuid.uuid4().hex[:8]}"
+        attempt_file = f"attempt_{global_seq:04d}.json"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _matrix_origin(global_seq, diag, pretouch, app_name)
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=global_seq, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=global_seq, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": global_seq, "run_id": attempt_id, "request_id": "",
+                "identity": {}, "result": {}, "timing": {},
+                "variance": {"pretouch": pretouch, "cold_valid": False, "cold": False,
+                             "failures": [f"run raised: {str(exc)[:300]}"]},
+                "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable", "mode": "variance_matrix",
+                "error": str(exc)[:300],
+            }
+
+        # ── Augment with matrix metadata and write the raw attempt file ──
+        identity = artifact.get("identity", {}) or {}
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        cold_check = _validate_cold_identity(
+            identity, run_index=global_seq, pretouch=pretouch, prev_identity=state["prev_identity"],
+        )
+        artifact.setdefault("run_id", attempt_id)
+        artifact["attempt_id"] = attempt_id
+        artifact["attempt_file"] = attempt_file
+        artifact["condition_label"] = label
+        artifact["diag"] = diag
+        artifact["mode"] = "variance_matrix"
+        artifact["start_ts"] = artifact.get("start_ts") or _start_ts
+        artifact["end_ts"] = artifact.get("end_ts") or datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = artifact.get("remote_entry_ts") or _remote_entry_wall_iso(result)
+        if not artifact.get("error"):
+            artifact["variance"] = {
+                "pretouch": pretouch,
+                "cold_valid": cold_check["cold_valid"],
+                "cold": cold_check["cold"],
+                "failures": cold_check["failures"],
+                "freshness_checked": cold_check["freshness_checked"],
+            }
+        classification = _classify_attempt(artifact)
+        artifact["classification"] = classification
+        # Extract metrics FIRST so the fixed slow flags can use the trace-derived
+        # UNET activation duration (not only raw artifact.timing).
+        record = extract_run_metrics(artifact)
+        slow_flags = _classify_slow(record)
+        artifact["slow_flags"] = slow_flags
+        record["slow_flags"] = slow_flags
+        record["classification"] = classification
+        record["attempt_id"] = attempt_id
+        record["attempt_file"] = attempt_file
+        record["condition_label"] = label
+        record["diag"] = diag
+        # Runner logs / stderr are embedded when the runner supplied them;
+        # otherwise the full result trace in the attempt JSON is the log.
+        artifact["runner_log"] = artifact.get("runner_log", "")
+        artifact["attempt_log"] = artifact.get("attempt_log",
+                                               f"[matrix] cond={label} class={classification}")
+        record["attempt_log"] = artifact["attempt_log"]
+        (output_dir / attempt_file).write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+
+        records.append(record)
+
+        if classification == "cold":
+            state["cold_count"] += 1
+            state["prev_identity"] = identity
+        print(
+            f"[v2.variance_matrix] seq={global_seq} id={attempt_id} cond={label} "
+            f"class={classification} cold={state['cold_count']}/{target_per_condition}",
+            flush=True,
+        )
+
+        if total_attempts < max_total_attempts:
+            needs = any(
+                per_cond[MATRIX_CONDITION_LABEL(*c)]["cold_count"] < target_per_condition
+                for c in MATRIX_CONDITIONS
+            )
+            if needs:
+                print(f"[v2.variance_matrix] phase=gap seconds={gap_seconds}", flush=True)
+                await asyncio.sleep(gap_seconds)
+
+    meta = {
+        "mode": "variance_matrix",
+        "app_name": app_name,
+        "class_name": class_name,
+        "gpu": gpu,
+        "gap_seconds": gap_seconds,
+        "target_per_condition": target_per_condition,
+        "max_total_attempts": max_total_attempts,
+        "slow_threshold_ms": slow_threshold_ms,
+    }
+    summary = build_matrix_summary(
+        records, MATRIX_CONDITIONS, meta=meta, slow_threshold_ms=slow_threshold_ms,
+    )
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    handoff = render_matrix_report(summary, output_dir)
+    (output_dir / "variance_matrix_handoff.md").write_text(handoff, encoding="utf-8")
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "mode": "variance_matrix",
+        "total_attempts": summary["total_attempts"],
+        "total_cold": summary["total_cold"],
+        "target_per_condition": target_per_condition,
+        "target_met": target_met,
+        "per_condition_cold": {k: p["cold_count"] for k, p in summary["per_condition"].items()},
+    }, default=str), flush=True)
+
+    if not target_met:
+        raise RuntimeError(
+            "variance_matrix: reached the total-attempt cap before every condition "
+            f"collected {target_per_condition} valid cold runs; attempts preserved in "
+            f"{output_dir}"
+        )
+    return summary
+
+
+async def _run_variance_cold(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    run_count: int,
+    gap_seconds: float,
+    pretouch: int,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Run the variance-cold sequence: one request at a time with a gap.
+
+    Every run artifact (including slow/invalid runs) is preserved with run ID,
+    mode, identity, provider/region/image/task/container IDs, runtime
+    fingerprint/thread counts, exact timestamps, and the full result trace.
+    Produces ``summary.json`` and ``variance_cold_report.md``.
+    """
+    print(
+        f"[v2.variance_cold] mode=start runs={run_count} gap={gap_seconds}s "
+        f"pretouch={pretouch} app={app_name}",
+        flush=True,
+    )
+    records: list[dict[str, Any]] = []
+    prev_identity: dict[str, Any] | None = None
+
+    for index in range(run_count):
+        _run_id = f"variance-cold-p{pretouch}-{index}-{uuid.uuid4().hex[:8]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _variance_origin(index, pretouch, app_name)
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=index,
+                    workflow=workflow,
+                    modal_options=modal_options,
+                    workspace=workspace,
+                    transport=transport,
+                    output_dir=output_dir,
+                    _extra_origin=origin,
+                    _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=index,
+                    workflow=workflow,
+                    modal_options=modal_options,
+                    workspace=workspace,
+                    transport=transport,
+                    output_dir=output_dir,
+                    _extra_origin=origin,
+                    _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": index,
+                "run_id": _run_id,
+                "request_id": "",
+                "identity": {},
+                "result": {},
+                "timing": {},
+                "variance": {
+                    "pretouch": pretouch,
+                    "cold_valid": False,
+                    "cold": False,
+                    "failures": [f"run raised: {str(exc)[:300]}"],
+                },
+                "start_ts": _start_ts,
+                "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable",
+                "mode": "variance_cold",
+                "error": str(exc)[:300],
+            }
+            # Preserve failed/invalid runs in artifacts.
+            (output_dir / f"run_{index}.json").write_text(
+                json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+            )
+            records.append(extract_run_metrics(artifact))
+            print(f"[v2.variance_cold] run={index} ERROR {str(exc)[:200]}", flush=True)
+            prev_identity = None
+            if index + 1 < run_count:
+                await asyncio.sleep(gap_seconds)
+            continue
+
+        identity = artifact.get("identity", {}) or {}
+        cold_check = _validate_cold_identity(
+            identity, run_index=index, pretouch=pretouch, prev_identity=prev_identity,
+        )
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        artifact["run_id"] = _run_id
+        artifact["mode"] = "variance_cold"
+        artifact["start_ts"] = _start_ts
+        artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = _remote_entry_wall_iso(result)
+        artifact["variance"] = {
+            "pretouch": pretouch,
+            "cold_valid": cold_check["cold_valid"],
+            "cold": cold_check["cold"],
+            "failures": cold_check["failures"],
+            "freshness_checked": cold_check["freshness_checked"],
+        }
+        # Re-write the augmented artifact (run_<index>.json was written by _run_one).
+        (output_dir / f"run_{index}.json").write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(extract_run_metrics(artifact))
+
+        status = "COLD" if cold_check["cold"] else "NOT-COLD"
+        print(
+            f"[v2.variance_cold] run={index} id={_run_id} status={status} "
+            f"instance={identity.get('restored_instance_id', '')[:12]} "
+            f"task={identity.get('container_task_id', '')[:16]}",
+            flush=True,
+        )
+        if cold_check["failures"]:
+            print(f"[v2.variance_cold] run={index} failures={cold_check['failures']}", flush=True)
+
+        # Freshness baseline for the next run: only advance when this run was
+        # cold so a warm run never becomes the "previous" baseline.
+        if cold_check["cold"]:
+            prev_identity = identity
+
+        if index + 1 < run_count:
+            print(f"[v2.variance_cold] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    meta = {
+        "mode": "variance_cold",
+        "app_name": app_name,
+        "class_name": class_name,
+        "gpu": gpu,
+        "run_count": run_count,
+        "gap_seconds": gap_seconds,
+        "pretouch": pretouch,
+        "slow_threshold_ms": float(os.environ.get("V2_VARIANCE_SLOW_THRESHOLD_MS", "0") or 0),
+    }
+    summary = build_summary(records, meta=meta)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    report_md = render_variance_report(summary)
+    (output_dir / "variance_cold_report.md").write_text(report_md, encoding="utf-8")
+    print(f"[v2.variance_cold] report={output_dir / 'variance_cold_report.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "run_count": summary["run_count"],
+        "cold_count": summary["cold_count"],
+        "warm_or_invalid_count": summary["warm_or_invalid_count"],
+        "pretouch": pretouch,
+        "root_cause": summary["root_cause"].get("dominant"),
+    }, default=str), flush=True)
+    print(report_md, flush=True)
+
+    if summary["cold_count"] < run_count:
+        raise RuntimeError(
+            f"variance_cold: only {summary['cold_count']}/{run_count} runs were "
+            "confirmed cold; warm/reused runs are not valid cold evidence"
+        )
+    return summary
+
+
+def _report_only_from_dir(output_dir: Path) -> dict[str, Any]:
+    """Render a report from an existing artifacts directory without Modal.
+
+    Used when Modal/network is unavailable so the harness/report generator
+    remains testable locally.  Also the entry point for offline report
+    regeneration from a prior run.
+
+    Detects a variance-cold MATRIX directory (one containing ``attempt_*.json``
+    plus a ``summary.json``) and renders the consolidated matrix handoff.  A
+    plain variance-cold directory (``run_*.json``) keeps the existing
+    ``variance_cold_report.md`` behavior.
+    """
+    attempt_files = sorted(output_dir.glob("attempt_*.json"))
+    if attempt_files and (output_dir / "summary.json").is_file():
+        return _report_only_matrix_from_dir(output_dir, attempt_files)
+
+    # ── Variance-cold (run_*.json) path ──
+    records = load_runs_from_dir(output_dir)
+    meta = {
+        "mode": "variance_cold",
+        "app_name": os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME),
+        "class_name": CLASS_NAME,
+        "gpu": GPU,
+        "run_count": len(records),
+        "gap_seconds": VARIANCE_COLD_GAP_SECONDS,
+        "pretouch": int(os.environ.get("V2_VARIANCE_PRETOUCH", "0") or 0),
+        "slow_threshold_ms": float(os.environ.get("V2_VARIANCE_SLOW_THRESHOLD_MS", "0") or 0),
+        "limitation": "Report generated offline from existing artifacts; no new Modal "
+                      "runs were performed (Modal/network may be unavailable).",
+    }
+    summary = build_summary(records, meta=meta)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    report_md = render_variance_report(summary)
+    (output_dir / "variance_cold_report.md").write_text(report_md, encoding="utf-8")
+    print(f"[v2.variance_cold] offline_report={output_dir / 'variance_cold_report.md'}", flush=True)
+    print(report_md, flush=True)
+    return summary
+
+
+def _report_only_matrix_from_dir(output_dir: Path, attempt_files: list[Path]) -> dict[str, Any]:
+    """Render the consolidated variance-matrix handoff from existing attempt files.
+
+    Loads every ``attempt_*.json``, extracts metrics, builds the matrix summary
+    (condition labels taken from the artifacts; fixed slow threshold taken from
+    the existing ``summary.json`` or the 60000 ms default), and overwrites
+    ``summary.json`` + ``variance_matrix_handoff.md``.
+    """
+    records: list[dict[str, Any]] = []
+    conditions_set: set[tuple[int, int]] = set()
+    for f in attempt_files:
+        try:
+            artifact = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(artifact, dict):
+            continue
+        rec = extract_run_metrics(artifact)
+        rec["classification"] = artifact.get("classification")
+        rec["attempt_id"] = artifact.get("attempt_id")
+        rec["attempt_file"] = artifact.get("attempt_file") or f.name
+        rec["condition_label"] = artifact.get("condition_label")
+        diag = artifact.get("diag")
+        pretouch = 0
+        _var = artifact.get("variance")
+        if isinstance(_var, dict):
+            try:
+                pretouch = int(_var.get("pretouch", 0))
+            except (TypeError, ValueError):
+                pretouch = 0
+        if diag is not None:
+            conditions_set.add((int(diag), pretouch))
+        records.append(rec)
+
+    conditions = sorted(conditions_set) if conditions_set else list(MATRIX_CONDITIONS)
+
+    # Fixed slow threshold: reuse the existing summary value, else 60000 default.
+    slow_threshold_ms = MATRIX_SLOW_THRESHOLD_MS
+    try:
+        _existing = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+        if isinstance(_existing, dict):
+            _t = _existing.get("slow_threshold_ms")
+            if _t and float(_t) > 0:
+                slow_threshold_ms = float(_t)
+    except Exception:  # noqa: BLE001
+        pass
+
+    meta = {
+        "mode": "variance_matrix",
+        "app_name": os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME),
+        "class_name": CLASS_NAME,
+        "gpu": GPU,
+        "gap_seconds": VARIANCE_COLD_GAP_SECONDS,
+        "target_per_condition": MATRIX_TARGET_COLD_PER_CONDITION,
+        "slow_threshold_ms": slow_threshold_ms,
+        "limitation": "Matrix report generated offline from existing artifacts; "
+                      "no new Modal runs were performed.",
+    }
+    summary = build_matrix_summary(
+        records, conditions, meta=meta, slow_threshold_ms=slow_threshold_ms,
+    )
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    handoff = render_matrix_report(summary, output_dir)
+    (output_dir / "variance_matrix_handoff.md").write_text(handoff, encoding="utf-8")
+    print(f"[v2.variance_matrix] offline_report={output_dir / 'variance_matrix_handoff.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "mode": "variance_matrix",
+        "total_attempts": summary["total_attempts"],
+        "total_cold": summary["total_cold"],
+        "per_condition_cold": {k: p["cold_count"] for k, p in summary["per_condition"].items()},
+    }, default=str), flush=True)
+    return summary
+
+
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
-               acceptance: bool = False) -> None:
+               acceptance: bool = False, variance_cold: bool = False,
+               variance_matrix: bool = False,
+               variance_pretouch: int = 0, report_only: str | None = None,
+               gap_seconds: float | None = None, run_count: int | None = None) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
     os.environ["COMFYMODAL_V2_GPU"] = GPU
+
+    # ── Offline report regeneration (no Modal / network needed) ──────────
+    if report_only:
+        _report_dir = Path(report_only)
+        if not _report_dir.is_absolute():
+            _candidate = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / report_only
+            if _candidate.is_dir():
+                _report_dir = _candidate
+        if not _report_dir.is_dir():
+            raise RuntimeError(f"report-only directory not found: {report_only}")
+        _report_only_from_dir(_report_dir)
+        return
+
     requested_shape = runtime_shape_config().identity_payload()
     shape_guard = _runtime_shape_guard(requested_shape)
     print(json.dumps({"runtime_shape": requested_shape, "guard": shape_guard}, sort_keys=True), flush=True)
@@ -2197,6 +3000,42 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
     output_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"v2_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     transport = ModalTransport()
+
+    # ── Variance-cold mode (explicit opt-in; unique shadow app name) ──────
+    if variance_cold:
+        _vc_app = os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME) or VARIANCE_APP_NAME
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _vc_app
+        _vc_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _vc_runs = VARIANCE_RUN_COUNT if run_count is None else int(run_count)
+        await _run_variance_cold(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            run_count=_vc_runs, gap_seconds=_vc_gap, pretouch=int(variance_pretouch),
+            app_name=_vc_app, class_name=CLASS_NAME, gpu=GPU,
+        )
+        return
+
+    # ── Variance-cold MATRIX (four-condition round-robin) ───────────────
+    if variance_matrix:
+        _vm_app = os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME) or VARIANCE_APP_NAME
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _vm_app
+        _vm_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _target = MATRIX_TARGET_COLD_PER_CONDITION
+        _max_attempts = MATRIX_MAX_TOTAL_ATTEMPTS
+        if os.environ.get("V2_MATRIX_TARGET_PER_CONDITION"):
+            _target = int(os.environ["V2_MATRIX_TARGET_PER_CONDITION"])
+        if os.environ.get("V2_MATRIX_MAX_TOTAL_ATTEMPTS"):
+            _max_attempts = int(os.environ["V2_MATRIX_MAX_TOTAL_ATTEMPTS"])
+        # Fixed slow threshold: nonzero default, or fail fast — never derived.
+        _slow = _resolve_slow_threshold()
+        await _run_variance_matrix(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            gap_seconds=_vm_gap, app_name=_vm_app, class_name=CLASS_NAME, gpu=GPU,
+            target_per_condition=_target, max_total_attempts=_max_attempts,
+            slow_threshold_ms=_slow,
+        )
+        return
 
     if acceptance:
         await _run_acceptance_sequence(
@@ -2292,9 +3131,74 @@ if __name__ == "__main__":
              "C fresh restored. Validates identity, timing, asset proofs, "
              "and acceptance criteria. Exits non-zero on failure.",
     )
+    _parser.add_argument(
+        "--variance-cold",
+        action="store_true",
+        default=False,
+        help="Run variance-cold mode: one request at a time with a fixed gap, "
+             "asserting true cold identity from request-scoped "
+             "remote_method_entry (restore_count==1, request_count==1, "
+             "nonempty restored_instance_id, fresh container identity). "
+             "Opt-in; never the default.",
+    )
+    _parser.add_argument(
+        "--variance-matrix",
+        action="store_true",
+        default=False,
+        help="Run the variance-cold MATRIX: round-robin across four conditions "
+             "(diagnostics off/on) x (pretouch off/on), continuing until each "
+             "condition collects the target number of valid cold runs. "
+             "Preserves every attempt and emits one consolidated handoff report. "
+             "Opt-in; never the default.",
+    )
+    _parser.add_argument(
+        "--variance-pretouch",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="UNET pretouch mode for variance-cold runs: 0=disabled, 1=enabled. "
+             "Defaults to env V2_VARIANCE_PRETOUCH (0 when unset).",
+    )
+    _parser.add_argument(
+        "--report-only",
+        default=None,
+        metavar="DIR",
+        help="Render a variance-cold report from an existing artifacts "
+             "directory without contacting Modal (offline/testable).",
+    )
+    _parser.add_argument(
+        "--gap-seconds",
+        type=float,
+        default=None,
+        help="Override the inter-run gap (defaults to V2_VARIANCE_COLD_GAP_SECONDS=25).",
+    )
+    _parser.add_argument(
+        "--run-count",
+        type=int,
+        default=None,
+        help="Override the number of variance-cold runs (defaults to V2_VARIANCE_RUN_COUNT).",
+    )
     _args = _parser.parse_args()
+
+    _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
+
+    # --variance-cold / --variance-matrix imply the matching V2_BENCHMARK_MODE
+    # semantics; the env mode alone is also honoured by the .bat wrappers.
+    _variance_cold = _args.variance_cold or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "variance_cold"
+    )
+    _variance_matrix = _args.variance_matrix or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "variance_matrix"
+    )
+
     asyncio.run(main(
         bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
         cpu_snapshot_unet_ab=_args.cpu_snapshot_unet_ab,
         acceptance=_args.acceptance,
+        variance_cold=_variance_cold,
+        variance_matrix=_variance_matrix,
+        variance_pretouch=_variance_pretouch,
+        report_only=_args.report_only,
+        gap_seconds=_args.gap_seconds,
+        run_count=_args.run_count,
     ))

@@ -61,6 +61,17 @@ from .unet_forward_probe import (
     set_unet_gpu_demand_start,
     _has_registered_unet_in_models,
 )
+from .variance_diagnostics import (
+    activation_publication_ms,
+    capture_metric_snapshot,
+    cuda_sync_if_enabled,
+    pretouch_unet_storage,
+    reconciliation_fields,
+    registry_accounting,
+    timed_transfer_partition,
+    unet_pretouch_enabled,
+    variance_diagnostics_enabled,
+)
 
 # ── Prefill lane mode ─────────────────────────────────────────────────
 # Controls which CLIPTextEncode entries are pre-encoded during restore.
@@ -859,6 +870,34 @@ def _unet_page_readiness_is_done(request_id: str) -> bool:
         return _UNET_PAGE_READINESS_DONE.get(request_id, False)
 
 
+# Bounded per-request pre-touch guard.  Mirrors the page-readiness guard but
+# is only armed when COMFYMODAL_V2_UNET_PRETOUCH is enabled.  The bound (not
+# modal_app cleanup) is the safety net so a diagnostic-only pre-touch can never
+# leak without bound even when a request bypasses the existing cleanup.
+_UNET_PRETOUCH_DONE: dict[str, bool] = {}
+_UNET_PRETOUCH_LOCK: RLock = RLock()
+_UNET_PRETOUCH_DONE_MAX = 1024
+
+
+def _unet_pretouch_begin(request_id: str) -> bool:
+    """Atomically claim the first graph UNET pre-touch for *request_id*.
+
+    Returns True only for the first claim per request; every subsequent claim
+    for the same request returns False.  Empty request ids are never claimed.
+    Bounded: oldest claims are evicted first when the bound is reached."""
+    if not request_id:
+        return False
+    with _UNET_PRETOUCH_LOCK:
+        if request_id in _UNET_PRETOUCH_DONE:
+            return False
+        _UNET_PRETOUCH_DONE[request_id] = True
+        if len(_UNET_PRETOUCH_DONE) > _UNET_PRETOUCH_DONE_MAX:
+            _excess = len(_UNET_PRETOUCH_DONE) - _UNET_PRETOUCH_DONE_MAX
+            for _stale in list(_UNET_PRETOUCH_DONE.keys())[:_excess]:
+                del _UNET_PRETOUCH_DONE[_stale]
+        return True
+
+
 def _first_registered_unet_model(models: list[Any]) -> Any | None:
     """Return the first model in *models* that is a registered retained UNET.
 
@@ -875,6 +914,125 @@ def _first_registered_unet_model(models: list[Any]) -> Any | None:
     except Exception:
         pass
     return None
+
+
+# Attached CPU-storage attributes.  The early-activation worker builds the
+# unique CPU registry on the retained CPU snapshot BEFORE any transfer and
+# attaches it to the UNET object so it survives once the model is CUDA-resident.
+_CPU_STORAGE_REGISTRY_ATTR = "_comfy_modal_cpu_storage_registry"
+_CPU_PRETOUCH_ATTR = "_comfy_modal_cpu_pretouch_record"
+
+
+def _model_is_cpu_resident(model: Any) -> bool:
+    """True when *model*'s first parameter is on CPU (pre-transfer)."""
+    try:
+        for _p in model.parameters():
+            _dev = getattr(_p, "device", None)
+            _dt = getattr(_dev, "type", None)
+            _dev_str = str(_dt() if callable(_dt) else (_dev or "")).lower()
+            if _dev_str == "cuda":
+                return False
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _build_unet_cpu_registry(unet: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Build/attach the CPU UNET storage registry and optional pre-touch.
+
+    Called on the retained CPU snapshot BEFORE any transfer (early-activation
+    worker).  When variance diagnostics are on, builds the unique CPU registry
+    and attaches it to *unet* so it survives the transfer; when the pre-touch
+    gate is also on, runs the real-read/checksum traversal and attaches it.
+    Returns ``(registry_record, pretouch_record)``; both ``None`` when all
+    relevant gates are off (no behavior change).  Never raises — an unsupported
+    entry is reported, never fatal.
+    """
+    if not variance_diagnostics_enabled() and not unet_pretouch_enabled():
+        return None, None
+    _registry: dict[str, Any] | None = None
+    _pretouch: dict[str, Any] | None = None
+    try:
+        if variance_diagnostics_enabled():
+            _registry = registry_accounting(unet)
+            try:
+                setattr(unet, _CPU_STORAGE_REGISTRY_ATTR, _registry)
+            except Exception:
+                pass
+        if unet_pretouch_enabled():
+            _pretouch = pretouch_unet_storage(unet)
+            try:
+                setattr(unet, _CPU_PRETOUCH_ATTR, _pretouch)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _registry, _pretouch
+
+
+def _resolve_unet_cpu_registry_from_model(unet: Any) -> tuple[dict[str, Any] | None, str]:
+    """Resolve the CPU UNET registry on a single resolved UNET object.
+
+    Prefers a worker-attached registry (built on the retained CPU snapshot
+    pre-transfer).  Falls back to building fresh only if *unet* is still
+    CPU-resident.  If *unet* is already CUDA and no attached registry exists,
+    returns ``(None, "post_transfer_unavailable")`` — it never rebuilds on the
+    CUDA model (which would report every parameter as unsupported device:cuda).
+    """
+    if unet is None:
+        return None, "no_registered_unet"
+    try:
+        _attached = getattr(unet, _CPU_STORAGE_REGISTRY_ATTR, None)
+        if isinstance(_attached, Mapping):
+            return dict(_attached), "worker_attached"
+    except Exception:
+        pass
+    if _model_is_cpu_resident(unet):
+        try:
+            return registry_accounting(unet), "fresh_cpu"
+        except Exception:
+            return None, "registry_build_failed"
+    return None, "post_transfer_unavailable"
+
+
+def _resolve_unet_cpu_registry(models: list[Any]) -> tuple[dict[str, Any] | None, str]:
+    """Resolve the CPU UNET registry for the graph activation aggregate.
+
+    Prefers a registry attached by the early-activation worker (built on the
+    retained CPU snapshot pre-transfer).  Falls back to building fresh only if
+    the resolved registered UNET is still CPU-resident (late mode).  If the
+    model is already CUDA and no attached registry exists, returns
+    ``(None, "post_transfer_unavailable")`` — it never rebuilds on the CUDA
+    model (which would report every parameter as unsupported device:cuda).
+    """
+    try:
+        _unet = _first_registered_unet_model(models)
+    except Exception:
+        _unet = None
+    return _resolve_unet_cpu_registry_from_model(_unet)
+
+
+def _resolve_unet_cpu_pretouch_from_model(unet: Any) -> dict[str, Any] | None:
+    """Return a worker-attached CPU pretouch record on a single resolved UNET."""
+    if unet is None:
+        return None
+    try:
+        _p = getattr(unet, _CPU_PRETOUCH_ATTR, None)
+        if isinstance(_p, Mapping):
+            return dict(_p)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_unet_cpu_pretouch(models: list[Any]) -> dict[str, Any] | None:
+    """Return a worker-attached CPU pretouch record, if present."""
+    try:
+        _unet = _first_registered_unet_model(models)
+    except Exception:
+        _unet = None
+    return _resolve_unet_cpu_pretouch_from_model(_unet)
 
 
 def _run_clip_page_readiness(
@@ -1887,11 +2045,26 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _h2d_metric_name: str = ""
         # Activation diagnostics record (captured on outermost entry)
         _gpu_record: dict[str, Any] | None = None
+        # First request-scoped UNET activation variance (diagnostic-only).
+        _variance_first_unet = False
+        _variance_t0 = None
+        _variance_t1 = None
+        _variance_pretouch_record = None
+        _variance_page_readiness_record = None
+        _variance_registry_record = None
         if before == 0:
             count = _gpu_request_call_count_var.get()
             _gpu_request_call_count_var.set(count + 1)
             lane = _ACTIVE_LANE_TRACE.get()
             request_trace = _ACTIVE_REQUEST_TRACE.get()
+            _variance_first_unet = (
+                request_trace is not None
+                and lane is None
+                and _has_registered_unet_in_models(models)
+                and variance_diagnostics_enabled()
+            )
+            if _variance_first_unet:
+                _variance_t0 = capture_metric_snapshot()
             _graph_start_ns = time.monotonic_ns()
             _graph_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
             _graph_process_start_ns = time.process_time_ns() if hasattr(time, "process_time_ns") else None
@@ -2059,6 +2232,41 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             _prepare_armed_clip_for_force_load(
                 models, request_trace or getattr(lane, "_trace", None),
             )
+        # ── Diagnostic pre-touch: first request-scoped graph UNET activation ──
+        # Real-reads every page of every retained CPU UNET storage range
+        # (bounded by a per-page read chunk and a page budget) immediately
+        # before the normal request-scoped activation.  Gated by
+        # COMFYMODAL_V2_UNET_PRETOUCH (default off); diagnostic-only, never
+        # uses CUDA sync, never alters production defaults, and is
+        # exception-safe.  Bounded per-request guard (never modal_app cleanup).
+        if (
+            before == 0
+            and request_trace is not None
+            and lane is None
+            and unet_pretouch_enabled()
+            and _has_registered_unet_in_models(models)
+        ):
+            _pt_request_id = str(request_trace.request_id)
+            if _unet_pretouch_begin(_pt_request_id):
+                try:
+                    # Prefer the worker-attached CPU pretouch record (real
+                    # reads ran on the retained CPU snapshot pre-transfer).  If
+                    # absent, run fresh ONLY if the registered UNET is still
+                    # CPU-resident — never on a post-transfer CUDA model.
+                    _pt_attached = _resolve_unet_cpu_pretouch(models)
+                    if _pt_attached is not None:
+                        _variance_pretouch_record = _pt_attached
+                    else:
+                        _pt_unet = _first_registered_unet_model(models)
+                        if _pt_unet is not None and _model_is_cpu_resident(_pt_unet):
+                            _variance_pretouch_record = pretouch_unet_storage(_pt_unet)
+                            request_trace.emit(
+                                "unet_activation_pretouch",
+                                phase="execution",
+                                metadata=_variance_pretouch_record,
+                            )
+                except Exception:
+                    pass
         # ── Synchronous native page-readiness: first request-scoped graph ──
         # UNET activation only.  Conditions: outermost call (before == 0), a
         # request trace, NO active model lane (never a restore-time background
@@ -2082,11 +2290,40 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 try:
                     _pr_unet = _first_registered_unet_model(models)
                     if _pr_unet is not None:
-                        _run_unet_page_readiness(
+                        _variance_page_readiness_record = _run_unet_page_readiness(
                             _pr_unet, trace=request_trace, request_id=_pr_request_id,
                         )
                 except Exception:
                     pass
+        # ── Unique UNET registry accounting (diagnostics-on, pretouch off/on) ──
+        # Always build/record the deduplicated CPU UNET storage registry when
+        # variance diagnostics are on — independent of the pretouch gate — so
+        # the aggregate carries union bytes/pages even when pretouch is off.
+        # No reads are performed here; pretouch remains the explicit gated
+        # real-read operation.
+        if _variance_first_unet and _variance_registry_record is None:
+            # Resolve the CPU registry WITHOUT rebuilding on a post-transfer
+            # CUDA model: prefer the worker-attached CPU registry, else build
+            # fresh only if the registered UNET is still CPU-resident.  A
+            # post-transfer CUDA model with no attached registry is reported
+            # as unavailable, never as 0/device:cuda.
+            _variance_registry_record, _registry_source = _resolve_unet_cpu_registry(models)
+            if _variance_registry_record is not None:
+                _variance_registry_record["source"] = _registry_source
+            else:
+                _variance_registry_record = {"source": _registry_source,
+                                             "unique_storage_count": 0,
+                                             "total_bytes": 0,
+                                             "expected_pages": 0}
+        if _variance_first_unet:
+            _variance_t1 = capture_metric_snapshot()
+        # ── Synchronized CPU->GPU transfer (diagnostic-only sync) ──
+        # When the variance gate is on, synchronize CUDA before and after the
+        # actual load so the timed transfer reflects completion, not just async
+        # submission.  Gated on _variance_first_unet (which requires the gate),
+        # so no CUDA initialization is ever triggered when diagnostics are off.
+        if _variance_first_unet:
+            cuda_sync_if_enabled()
         _diag_ok = False
         try:
             _retval = original(models, memory_required=memory_required,
@@ -2094,6 +2331,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                minimum_memory_required=minimum_memory_required,
                                force_full_load=force_full_load)
             _diag_ok = True
+            if _variance_first_unet:
+                cuda_sync_if_enabled()
             return _retval
         finally:
             after = _gpu_depth.get()
@@ -2149,6 +2388,100 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         "force_patch_weights": force_patch_weights,
                         "force_full_load": force_full_load,
                     })
+                # ── First request-scoped UNET activation aggregate variance ──
+                # Diagnostic-only (COMFYMODAL_V2_VARIANCE_DIAGNOSTICS).  Splits
+                # the activation into explicit stages using our own metric
+                # snapshots, and reuses the existing model-patcher load
+                # breakdown event (never guessed).  Emitted after the transfer
+                # completes and only for a successful outermost first-UNET
+                # request-scoped activation.
+                if (
+                    _variance_first_unet
+                    and _diag_ok
+                    and _variance_t0 is not None
+                    and _variance_t1 is not None
+                ):
+                    try:
+                        _variance_t2 = capture_metric_snapshot()
+                        # Transfer bytes come from the unique registry union
+                        # (available whenever diagnostics are on, even when the
+                        # pretouch gate is off); pretouch is NOT the source.
+                        _transfer_bytes = None
+                        if isinstance(_variance_registry_record, Mapping):
+                            _tb = _variance_registry_record.get("total_bytes")
+                            if isinstance(_tb, int) and _tb > 0:
+                                _transfer_bytes = _tb
+                        # Truthful CPU page-traversal sub-stage: only populated
+                        # when an explicit traversal ran (pretouch or
+                        # page-readiness).  When neither ran, we do NOT claim
+                        # the pre-load interval is page hydration — the
+                        # sub-record carries wall_ms=None so the report reports
+                        # it unavailable.
+                        _hydration_ran = (
+                            _variance_pretouch_record is not None
+                            or _variance_page_readiness_record is not None
+                        )
+                        if _hydration_ran:
+                            _traversal = timed_transfer_partition(
+                                _variance_t0, _variance_t1, label="cpu_page_traversal",
+                            )
+                        else:
+                            _traversal = {"stage": "cpu_page_traversal", "wall_ms": None}
+                        # load_models_gpu launch + synchronized completion.
+                        _xf = timed_transfer_partition(
+                            _variance_t1, _variance_t2, label="cpu_to_gpu_transfer",
+                            bytes_=_transfer_bytes,
+                        )
+                        _loader_wall_ms = None
+                        if (_variance_t0 is not None and _variance_t2 is not None
+                                and isinstance(_variance_t0.get("mono_ns"), int)
+                                and isinstance(_variance_t2.get("mono_ns"), int)):
+                            _loader_wall_ms = round(
+                                max(0, _variance_t2["mono_ns"] - _variance_t0["mono_ns"]) / 1_000_000, 3
+                            )
+                        # Reconciliation sums only the measured outer stages.
+                        # Patcher bookkeeping is NESTED inside the transfer and
+                        # must never be counted as an exclusive substage.
+                        _recon = reconciliation_fields(
+                            _loader_wall_ms,
+                            {"cpu_page_traversal": _traversal.get("wall_ms"),
+                             "cpu_to_gpu_transfer": _xf.get("wall_ms")},
+                        )
+                        _patcher_ms = None
+                        _patcher_counts: dict[str, Any] = {}
+                        _load_models_gpu_wall_ms = None
+                        for _ev in request_trace.events:
+                            if _ev.name == "model_patcher_load_breakdown":
+                                _patcher_ms = _ev.metadata.get("wall_ms")
+                                for _k in ("patch_weight_count", "cast_count"):
+                                    _v = _ev.metadata.get(_k)
+                                    if _v is not None:
+                                        _patcher_counts[_k] = _v
+                            elif _ev.name == "load_models_gpu_duration":
+                                _load_models_gpu_wall_ms = _ev.metadata.get("duration_ms")
+                        _pub_ms, _pub_src = activation_publication_ms(request_trace)
+                        request_trace.emit(
+                            "first_unet_activation_variance",
+                            phase="execution",
+                            metadata={
+                                "request_id": str(request_trace.request_id),
+                                "gate": "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
+                                "cpu_page_traversal": _traversal,
+                                "cpu_to_gpu_transfer": _xf,
+                                "loader_reconciliation": _recon,
+                                "load_models_gpu_wall_ms": _load_models_gpu_wall_ms,
+                                "activation_future_publication_ms": _pub_ms,
+                                "activation_future_publication_source": _pub_src,
+                                "patcher_bookkeeping_ms": _patcher_ms,
+                                "patcher_bookkeeping_counts": _patcher_counts,
+                                "patcher_bookkeeping_nested": _patcher_ms is not None,
+                                "unet_storage_registry": _variance_registry_record,
+                                "pretouch": _variance_pretouch_record,
+                                "page_readiness": _variance_page_readiness_record,
+                            },
+                        )
+                    except Exception:
+                        pass
                 # ── Phase 1A candidate (clip_gpu_ready): fire the armed
                 # single-use retained-UNET activation exactly once.  Runs
                 # AFTER the qualifying successful CLIP load_models_gpu call
@@ -10624,6 +10957,60 @@ def _measure_early_activation_lane_wait_ms(
     return round(_wait_ns / 1_000_000, 3)
 
 
+def _emit_unet_worker_variance(
+    trace: Any,
+    *,
+    request_id: str,
+    mode: str,
+    registry_setup: dict[str, Any] | None,
+    page_traversal: dict[str, Any] | None,
+    synchronized_load: dict[str, Any] | None,
+    pretouch_record: dict[str, Any] | None,
+    registry_record: dict[str, Any] | None,
+    patcher_ms: float | None,
+    patcher_counts: dict[str, Any] | None,
+    patcher_nested: bool,
+) -> None:
+    """Emit one ``unet_activation_worker_variance`` record for the activation.
+
+    Non-overlapping fields: ``registry_setup``, ``page_traversal`` (pre-touch
+    hydration when it ran), and ``synchronized_load`` (the synchronized
+    load_models_gpu completion).  Patcher bookkeeping is reported as nested
+    (not an exclusive substage) and is excluded from the reconciliation sum.
+    A dedicated pre-touch record carries the real-read checksum/bytes proof.
+    """
+    if trace is None or not variance_diagnostics_enabled():
+        return
+    _reg_wall = registry_setup.get("wall_ms") if registry_setup else None
+    _sync_wall = synchronized_load.get("wall_ms") if synchronized_load else None
+    _trav_wall = page_traversal.get("duration_ms") if page_traversal else None
+    _loader_wall: float | None = None
+    _sub: dict[str, Any] = {"registry_setup": _reg_wall, "synchronized_load": _sync_wall}
+    if _trav_wall is not None:
+        _sub["page_traversal"] = _trav_wall
+    if isinstance(_reg_wall, (int, float)) and isinstance(_sync_wall, (int, float)):
+        _measured = _reg_wall + (_trav_wall or 0.0) + _sync_wall
+        _loader_wall = round(_measured, 3)
+    _recon = reconciliation_fields(_loader_wall, _sub)
+    _pub_ms, _pub_src = activation_publication_ms(trace)
+    trace.emit("unet_activation_worker_variance", phase="execution", metadata={
+        "request_id": request_id,
+        "mode": mode,
+        "gate": "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
+        "registry_setup": registry_setup,
+        "page_traversal": page_traversal,
+        "synchronized_load": synchronized_load,
+        "pretouch": pretouch_record,
+        "loader_reconciliation": _recon,
+        "patcher_bookkeeping_ms": patcher_ms,
+        "patcher_bookkeeping_counts": patcher_counts,
+        "patcher_bookkeeping_nested": patcher_nested,
+        "activation_future_publication_ms": _pub_ms,
+        "activation_future_publication_source": _pub_src,
+        "unet_storage_registry": registry_record or pretouch_record or registry_setup,
+    })
+
+
 def _run_early_unet_activation(
     bridge: "V2LoaderBridge",
     *,
@@ -10765,6 +11152,43 @@ def _run_early_unet_activation(
     # lane_wait_start/lane_acquired + load_start/load_end bracket the
     # original load_models_gpu/LoadedModel path only; nothing else holds
     # the lane.
+    # ── Diagnostic: build the CPU registry + pre-touch on the CPU snapshot ──
+    # `unet` from wait_unet is still the retained CPU snapshot.  Build the
+    # unique CPU registry here (and run the real-read pre-touch when enabled)
+    # BEFORE any transfer, and attach it so the graph aggregate can consume it
+    # even after the model becomes CUDA-resident.  Never rebuilds on CUDA.
+    _variance_registry_record = None
+    _variance_pretouch_record = None
+    _v_prep_before = None
+    _v_reg_after = None
+    _v_prep_after = None
+    _v_load_before = None
+    _v_load_after = None
+    if variance_diagnostics_enabled() or unet_pretouch_enabled():
+        _v_prep_before = capture_metric_snapshot()
+        if variance_diagnostics_enabled():
+            try:
+                _variance_registry_record = registry_accounting(unet)
+                try:
+                    setattr(unet, _CPU_STORAGE_REGISTRY_ATTR, _variance_registry_record)
+                except Exception:
+                    pass
+            except Exception:
+                _variance_registry_record = None
+        _v_reg_after = capture_metric_snapshot()
+        if unet_pretouch_enabled():
+            try:
+                _variance_pretouch_record = pretouch_unet_storage(unet)
+                try:
+                    setattr(unet, _CPU_PRETOUCH_ATTR, _variance_pretouch_record)
+                except Exception:
+                    pass
+                if trace is not None:
+                    trace.emit("unet_activation_pretouch", phase="execution",
+                               metadata=_variance_pretouch_record)
+            except Exception:
+                _variance_pretouch_record = None
+        _v_prep_after = capture_metric_snapshot()
     _loaded_before = _unet_loaded_bytes(unet)
     _gpu_alloc_before = _gpu_allocated_bytes()
     _load_start = _capture_phase_counters()
@@ -10797,7 +11221,13 @@ def _run_early_unet_activation(
             "model_count": len(_load_models),
         })
     try:
+        if variance_diagnostics_enabled():
+            cuda_sync_if_enabled()
+            _v_load_before = capture_metric_snapshot()
         _mm_load_models_gpu(_load_models)
+        if variance_diagnostics_enabled():
+            cuda_sync_if_enabled()
+            _v_load_after = capture_metric_snapshot()
     except Exception as exc:
         return _early_activation_terminal(
             state, trace, request_id, status="failed",
@@ -10814,6 +11244,47 @@ def _run_early_unet_activation(
     state["gpu_allocated_after"] = _gpu_alloc_after
     if _gpu_alloc_before is not None and _gpu_alloc_after is not None:
         state["gpu_allocated_delta_bytes"] = _gpu_alloc_after - _gpu_alloc_before
+    # ── Emit the worker activation variance record (non-overlapping stages) ──
+    if (
+        _v_prep_before is not None
+        and _v_reg_after is not None
+        and _v_load_after is not None
+        and trace is not None
+        and variance_diagnostics_enabled()
+    ):
+        try:
+            _reg_setup = timed_transfer_partition(
+                _v_prep_before, _v_reg_after, label="registry_setup",
+            )
+            _sync_load = timed_transfer_partition(
+                _v_load_before, _v_load_after,
+                label="synchronized_load",
+                bytes_=_variance_registry_record.get("total_bytes") if isinstance(_variance_registry_record, Mapping) else None,
+            )
+            _worker_patcher_ms = None
+            _worker_patcher_counts: dict[str, Any] = {}
+            for _ev in trace.events:
+                if _ev.name == "model_patcher_load_breakdown":
+                    _worker_patcher_ms = _ev.metadata.get("wall_ms")
+                    for _k in ("patch_weight_count", "cast_count"):
+                        _vv = _ev.metadata.get(_k)
+                        if _vv is not None:
+                            _worker_patcher_counts[_k] = _vv
+            _emit_unet_worker_variance(
+                trace,
+                request_id=request_id,
+                mode=mode,
+                registry_setup=_reg_setup,
+                page_traversal=_variance_pretouch_record,
+                synchronized_load=_sync_load,
+                pretouch_record=_variance_pretouch_record,
+                registry_record=_variance_registry_record,
+                patcher_ms=_worker_patcher_ms,
+                patcher_counts=_worker_patcher_counts,
+                patcher_nested=_worker_patcher_ms is not None,
+            )
+        except Exception:
+            pass
     # Truthful mutation-lane wait from the existing lane trace events around
     # the load (worker lane_wait_start -> wrapper gpu_lane_wait_start).  The
     # wrapper owns the lane; we never acquire it ourselves, so this cannot

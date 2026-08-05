@@ -3246,6 +3246,16 @@ def _build_sampling_wrapper() -> Callable:
             pass
 
         t0 = time.monotonic_ns()
+        _sv_before = None
+        try:
+            from comfymodal_runtime.variance_diagnostics import (
+                capture_metric_snapshot,
+                variance_diagnostics_enabled,
+            )
+            if variance_diagnostics_enabled():
+                _sv_before = capture_metric_snapshot()
+        except Exception:
+            pass
         try:
             from comfymodal_runtime.model_preload import (
                 acquire_sampler_mutation_lane_at_sampling_start,
@@ -3361,6 +3371,28 @@ def _build_sampling_wrapper() -> Callable:
             _end_meta = dict(start_meta)
             _end_meta["duration_ms"] = duration_ms
             _sampler_boundary_line("sampling_end", _end_meta)
+            # ── Sampler wait-on-activation variance (diagnostic-only) ──
+            # Emits a dedicated event separating the sampler wait on
+            # activation from sampling duration, using the existing
+            # join/activation demand boundaries.  Gated by
+            # COMFYMODAL_V2_VARIANCE_DIAGNOSTICS; no semantic change.
+            if _sv_before is not None:
+                try:
+                    from comfymodal_runtime.variance_diagnostics import (
+                        capture_metric_snapshot,
+                        emit_sampler_variance,
+                    )
+                    emit_sampler_variance(
+                        trace,
+                        node_id=node_id,
+                        node_class=node_class,
+                        steps=steps,
+                        before=_sv_before,
+                        after=capture_metric_snapshot(),
+                        sampling_duration_ms=duration_ms,
+                    )
+                except Exception:
+                    pass
             # ── V2 VAE early activation (sampling_end mode) ─────────────
             # The authoritative sampling_end trace event and
             # [v2.sampler_boundary] line are emitted FIRST above; then the
