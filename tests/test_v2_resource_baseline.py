@@ -465,6 +465,109 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.scaledown_window, 4)
 
+    def test_default_single_use_containers_false(self):
+        spec = ModalRuntimeSpec()
+        self.assertFalse(spec.single_use_containers)
+
+    def test_single_use_containers_env_true_enables(self):
+        for token in ("1", "true", "yes", "on"):
+            with patch.dict(
+                os.environ,
+                {"COMFYMODAL_V2_SINGLE_USE_CONTAINERS": token},
+                clear=False,
+            ):
+                spec = ModalRuntimeSpec()
+                self.assertTrue(
+                    spec.single_use_containers,
+                    f"token {token!r} should enable single-use containers",
+                )
+
+    def test_single_use_containers_env_false_or_unknown_preserves_default(self):
+        for token in ("0", "false", "no", "off", "banana", ""):
+            with patch.dict(
+                os.environ,
+                {"COMFYMODAL_V2_SINGLE_USE_CONTAINERS": token},
+                clear=False,
+            ):
+                spec = ModalRuntimeSpec()
+                self.assertFalse(
+                    spec.single_use_containers,
+                    f"token {token!r} should keep default False",
+                )
+
+    def test_modal_binding_forwards_default_single_use_containers_false(self):
+        class FakeApp:
+            def __init__(self):
+                self.kwargs = None
+
+            def cls(self, **kwargs):
+                self.kwargs = kwargs
+                return lambda cls: cls
+
+        class FakeModal:
+            @staticmethod
+            def concurrent(**kwargs):
+                return lambda cls: cls
+
+        app = FakeApp()
+        resources = {
+            "app": app,
+            "models_volume": object(),
+            "custom_nodes_volume": object(),
+            "runtime_state_volume": object(),
+        }
+        spec = ModalRuntimeSpec(gpu=("RTX-PRO-6000",), memory=24576)
+        with patch("comfymodal_runtime.modal_app._modal", FakeModal()), patch(
+            "comfymodal_runtime.modal_app._build_decorated_v2_class",
+            return_value=object,
+        ):
+            _register_remote_entrypoint(resources, spec)
+        self.assertFalse(app.kwargs["single_use_containers"])
+
+    def test_modal_binding_forwards_single_use_containers_true_opt_in(self):
+        class FakeApp:
+            def __init__(self):
+                self.kwargs = None
+
+            def cls(self, **kwargs):
+                self.kwargs = kwargs
+                return lambda cls: cls
+
+        class FakeModal:
+            @staticmethod
+            def concurrent(**kwargs):
+                return lambda cls: cls
+
+        app = FakeApp()
+        resources = {
+            "app": app,
+            "models_volume": object(),
+            "custom_nodes_volume": object(),
+            "runtime_state_volume": object(),
+        }
+        with patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1"},
+            clear=False,
+        ):
+            spec = ModalRuntimeSpec(gpu=("RTX-PRO-6000",), memory=24576)
+            with patch("comfymodal_runtime.modal_app._modal", FakeModal()), patch(
+                "comfymodal_runtime.modal_app._build_decorated_v2_class",
+                return_value=object,
+            ):
+                _register_remote_entrypoint(resources, spec)
+        self.assertTrue(app.kwargs["single_use_containers"])
+
+    def test_single_use_containers_in_resource_identity(self):
+        with patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1"},
+            clear=False,
+        ):
+            spec = ModalRuntimeSpec()
+            identity = _resource_identity(spec)
+        self.assertEqual(identity["single_use_containers"], "True")
+
 
 class TestCgroupV2Extended(unittest.TestCase):
     """Extended cgroup v2 path resolution and edge cases."""

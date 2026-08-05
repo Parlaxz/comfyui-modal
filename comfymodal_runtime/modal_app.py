@@ -2093,6 +2093,7 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "snapshot_enabled": str(actual.enable_memory_snapshot),
         "gpu_snapshot_enabled": str(env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")),
+        "single_use_containers": str(actual.single_use_containers),
         # â”€â”€ Volume names and mount paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "models_volume": actual.models_volume_name,
         "runtime_state_volume": actual.runtime_state_volume_name,
@@ -2290,6 +2291,18 @@ def _resolve_enable_memory_snapshot() -> bool:
     return True
 
 
+def _resolve_single_use_containers() -> bool:
+    """Resolve ``single_use_containers`` from ``COMFYMODAL_V2_SINGLE_USE_CONTAINERS``.
+
+    Defaults to ``False`` (preserving current behavior).  Set the env var to a
+    true token (``1``/``true``/``yes``/``on``) so Modal provisions a fresh
+    container per input and exits after the request completes instead of
+    waiting for the reusable input loop.  Any other explicit value keeps the
+    default ``False``.
+    """
+    return env_flag("COMFYMODAL_V2_SINGLE_USE_CONTAINERS")
+
+
 @dataclass(frozen=True)
 class ModalRuntimeSpec:
     app_name: str = APP_NAME
@@ -2311,6 +2324,9 @@ class ModalRuntimeSpec:
     scaledown_window: int = SCALEDOWN_WINDOW
     enable_memory_snapshot: bool = dataclasses.field(
         default_factory=_resolve_enable_memory_snapshot,
+    )
+    single_use_containers: bool = dataclasses.field(
+        default_factory=_resolve_single_use_containers,
     )
 
 
@@ -13193,6 +13209,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         scaledown_window=spec.scaledown_window,
         volumes=_volumes,
         enable_memory_snapshot=spec.enable_memory_snapshot,
+        single_use_containers=spec.single_use_containers,
         env=_runtime_env(spec),
         **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
     )(remote_class)
