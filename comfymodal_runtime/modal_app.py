@@ -39,7 +39,12 @@ from .contracts import (
     stable_hash,
 )
 from .deployment_spec import build_deployment_identity
-from .env import env_flag
+from .env import (
+    env_flag,
+    observability_allows,
+    observability_gate,
+    observability_mode,
+)
 from .runtime_shape import (
     apply_torch_thread_policy,
     runtime_shape_config,
@@ -369,16 +374,42 @@ _V2_WORKFLOW_HASH: ContextVar[str] = ContextVar("_v2_workflow_hash", default="")
 # When False, _sample_snapshot_residency and all UNET/CLIP storage
 # registries are disabled; no [v2.snapshot_residency] lines are printed.
 # Set COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS=1 to enable.
-_RESIDENCY_DIAGNOSTICS_ENABLED: bool = env_flag("COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS")
+_RESIDENCY_DIAGNOSTICS_ENABLED: bool = observability_gate(
+    "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "residency",
+)
 
 # ── V2 full-trace lifecycle gate ──────────────────────────────────────
 # Inert when COMFYMODAL_V2_FULL_TRACE != '1'.  The full-trace session
 # is created at restore entry and finalized after the first request.
-_V2_FULL_TRACE_ENABLED: bool = env_flag("COMFYMODAL_V2_FULL_TRACE")
+_V2_FULL_TRACE_ENABLED: bool = observability_gate(
+    "COMFYMODAL_V2_FULL_TRACE", "full_trace",
+)
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
 _FULL_TRACE_FINALIZED_LOCK = threading.Lock()
+
+
+def sync_observability_gates() -> None:
+    """Re-resolve import-time observability gates from the current env.
+
+    ``_RESIDENCY_DIAGNOSTICS_ENABLED`` and ``_V2_FULL_TRACE_ENABLED`` (here)
+    plus ``_PAGEFAULT_TRACKING`` and ``_DIAGNOSTIC_FLAG`` (model_preload) are
+    frozen at import time.  When ``run_plan_stream`` applies a request
+    env-profile override the effective observability mode changes; recompute
+    the module-level gates so they agree with call-time
+    ``observability_allows`` checks for that request.  Recomputing an
+    unchanged env yields identical values (no behavior change).
+    """
+    global _RESIDENCY_DIAGNOSTICS_ENABLED, _V2_FULL_TRACE_ENABLED
+    _RESIDENCY_DIAGNOSTICS_ENABLED = observability_gate(
+        "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "residency",
+    )
+    _V2_FULL_TRACE_ENABLED = observability_gate(
+        "COMFYMODAL_V2_FULL_TRACE", "full_trace",
+    )
+    from .model_preload import sync_observability_gates as _sync_model_preload_gates
+    _sync_model_preload_gates()
 
 # ── Activation diagnostics ContextVar ─────────────────────────────────
 # Activation diagnostics use _ACTIVATION_DIAGNOSTIC_STATE from model_preload.
@@ -2243,6 +2274,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     env = {
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ),
+        "COMFYMODAL_V2_OBSERVABILITY_MODE": os.environ.get(
+            "COMFYMODAL_V2_OBSERVABILITY_MODE", ""
         ),
         "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0"
@@ -8315,10 +8349,13 @@ class ModalRuntimeEntrypoint:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
         # Start process CPU sampler at method entry
-        self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
-        self._process_cpu_sampler.start()
+        self._process_cpu_sampler = None
+        if observability_allows("cpu_sampler"):
+            self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
+            self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
+        trace.set_metadata(observability_mode=observability_mode())
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
         trace.emit("runtime_config_end", phase="execution")
@@ -8738,7 +8775,9 @@ class ModalRuntimeEntrypoint:
         _cpu_snapshot_active = bool(self._cpu_snapshot_models_active)
         _activation_diagnostic_state: dict[str, Any] = {
             "request_id": str(context.request_id),
+            "observability_mode": observability_mode(),
             "clip_encode_calls": [],
+            "activation_receipts": [],
         }
 
         # ── Execution-phase CLIP prefill single-flight ──────────────────
@@ -8886,6 +8925,7 @@ class ModalRuntimeEntrypoint:
                     "clip_encode_prefill_wall_ms", "clip_encode_process_cpu_ms",
                     "load_models_gpu_calls", "unet_gpu_load_calls",
                     "load_models_gpu_wall_ms",
+                    "activation_receipt_count",
                     "gpu_allocated_delta_bytes",
                     "cpu_peak_cores", "cpu_above_16_ms", "cpu_above_19_ms",
                     "cpu_longest_above_19_ms",
@@ -10677,7 +10717,11 @@ class ModalRuntimeEntrypoint:
             if not isinstance(registry, Mapping):
                 registry = {}
             history_result = getattr(executor, "history_result", None)
-            history = {prompt_id: history_result} if isinstance(history_result, dict) else {}
+            history = (
+                {prompt_id: history_result}
+                if not production_enabled and isinstance(history_result, dict)
+                else {}
+            )
             output_dir = Path("/root/comfy/ComfyUI/output")
             trace.emit(
                 "output_chain_start",
@@ -10687,14 +10731,17 @@ class ModalRuntimeEntrypoint:
             chain = build_default_chain(
                 registry=registry,
                 history=history,
-                materials_dir=str(output_dir) if output_dir.is_dir() else "",
+                materials_dir=(str(output_dir) if output_dir.is_dir() else "")
+                if not production_enabled else "",
             )
             attempts = run_strategy_chain(
                 chain,
                 prompt_id=prompt_id,
                 output_node_ids=tuple(plan.output_node_ids),
-                materials_dir=str(output_dir) if output_dir.is_dir() else "",
+                materials_dir=(str(output_dir) if output_dir.is_dir() else "")
+                if not production_enabled else "",
                 request_start_boundary=started,
+                stop_after_success=production_enabled,
             )
             trace.emit(
                 "output_chain_end",
@@ -10977,6 +11024,10 @@ class ModalRuntimeEntrypoint:
                 _clip_calls: list = _ad.get("clip_encode_calls") or []
                 _gpu_calls: list = _ad.get("gpu_load_calls") or []
                 _ad["_clip_encode_records"] = list(_clip_calls)
+                _ad["activation_receipts"] = (
+                    list(_ad.get("activation_receipts") or [])
+                    + list((activation_diagnostic_state or {}).get("activation_receipts") or [])
+                )
                 _aggregate_clip_encode_diagnostics(
                     _ad,
                     list((activation_diagnostic_state or {}).get("clip_encode_calls") or []),
@@ -10989,6 +11040,9 @@ class ModalRuntimeEntrypoint:
                 _ad["load_models_gpu_calls"] = len(_gpu_calls)
                 _ad["unet_gpu_load_calls"] = sum(1 for g in _gpu_calls if g.get("contains_registered_unet"))
                 _ad["load_models_gpu_wall_ms"] = round(sum(g.get("wall_ms", 0) or 0 for g in _gpu_calls), 3)
+                _ad["activation_receipt_count"] = len(
+                    _ad.get("activation_receipts") or []
+                )
 
                 # GPU allocated delta
                 _gpu_alloc_sum = sum(g.get("gpu_allocated_delta_bytes", 0) or 0 for g in _gpu_calls)
@@ -11646,6 +11700,15 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
             _request_origin_info["env_profile"] = _effective_profile
+
+        # ── Keep observability gates consistent with the effective profile ──
+        # _RESIDENCY_DIAGNOSTICS_ENABLED / _V2_FULL_TRACE_ENABLED (here) and
+        # _PAGEFAULT_TRACKING / _DIAGNOSTIC_FLAG (model_preload) are frozen at
+        # import time.  Recompute them from the current env on every request so
+        # module-level gates and call-time observability_allows() checks agree
+        # for the effective env profile (incl. any request override applied
+        # above).  When the env is unchanged this recomputes identical values.
+        sync_observability_gates()
 
         _restore_timing_for_age = self._restore_timing or _LATEST_LIFECYCLE_TIMING or {}
         _callback_wall_for_age = _restore_timing_for_age.get(
