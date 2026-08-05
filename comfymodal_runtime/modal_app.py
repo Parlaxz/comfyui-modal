@@ -2284,6 +2284,13 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
         ),
+        "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": os.environ.get(
+            "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST",
+            "1"
+            if os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
+            == "production"
+            else "0",
+        ),
         "COMFYMODAL_V2_VAE_POLICY": os.environ.get(
             "COMFYMODAL_V2_VAE_POLICY", "v1"
         ),
@@ -3939,6 +3946,10 @@ class ModalRuntimeEntrypoint:
         self._restore_timing: dict[str, Any] | None = None
         self._cgroup_sampler: _CgroupCpuSampler | None = None
         self._process_cpu_sampler: _ProcessCpuSampler | None = None
+        self._request_gpu_release_lock = threading.Lock()
+        self._request_gpu_release_done = False
+        self._request_gpu_release_request_id = ""
+        self._terminal_response_delivered = False
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
@@ -4162,6 +4173,16 @@ class ModalRuntimeEntrypoint:
             self._run_teardown_stage(
                 "production_cleanup", self._run_pending_production_cleanup,
             )
+            if getattr(self, "_terminal_response_delivered", False):
+                self._run_teardown_stage(
+                    "request_gpu_release",
+                    lambda: self._release_gpu_after_request(
+                        diagnostics=diagnostics,
+                        request_id=getattr(
+                            self, "_request_gpu_release_request_id", ""
+                        ),
+                    ),
+                )
         finally:
             if diagnostics is not None:
                 diagnostics.emit(
@@ -4200,6 +4221,335 @@ class ModalRuntimeEntrypoint:
         except Exception:
             pass
         return joined
+
+    def _release_gpu_after_request(
+        self,
+        *,
+        diagnostics: Any = None,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        started_ns = time.monotonic_ns()
+        request_key = str(request_id or "")
+        if not env_flag("COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"):
+            return {"status": "disabled", "release_performed": False}
+
+        self._lazy_init_snapshot_state()
+        release_lock = getattr(self, "_request_gpu_release_lock", None)
+        if release_lock is None:
+            release_lock = threading.Lock()
+            self._request_gpu_release_lock = release_lock
+        with release_lock:
+            if (
+                getattr(self, "_request_gpu_release_done", False)
+                and getattr(self, "_request_gpu_release_request_id", "") == request_key
+            ):
+                return {"status": "already_released", "release_performed": False}
+            self._request_gpu_release_done = True
+            self._request_gpu_release_request_id = request_key
+
+        diagnostics = diagnostics or getattr(self, "_teardown_diagnostics", None)
+        stage_results: dict[str, dict[str, Any]] = {}
+        cleanup_errors: dict[str, dict[str, str]] = {}
+        fields: dict[str, Any] = {}
+        status = "ok"
+        unload_all_models_ran = False
+        unload_all_models_ok = False
+        device_fallback_ran = False
+        legacy_executor_reset = False
+        cuda_before: dict[str, Any] = {}
+        cuda_after: dict[str, Any] = {}
+
+        def emit(event: str, **values: Any) -> None:
+            try:
+                if diagnostics is not None:
+                    diagnostics.emit(event, **values)
+            except Exception as exc:
+                cleanup_errors.setdefault("diagnostics", {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:160],
+                })
+
+        def run_stage(name: str, callback: Callable[[], Any]) -> Any:
+            stage_started_ns = time.monotonic_ns()
+            try:
+                result = callback()
+                stage_results[name] = {
+                    "status": "ok",
+                    "elapsed_ms": round(
+                        (time.monotonic_ns() - stage_started_ns) / 1_000_000.0,
+                        3,
+                    ),
+                }
+                return result
+            except Exception as exc:
+                error = {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:160],
+                }
+                stage_results[name] = {
+                    "status": "error",
+                    "elapsed_ms": round(
+                        (time.monotonic_ns() - stage_started_ns) / 1_000_000.0,
+                        3,
+                    ),
+                    **error,
+                }
+                cleanup_errors[name] = error
+                return None
+
+        def cuda_memory_snapshot() -> dict[str, Any]:
+            torch_module = sys.modules.get("torch")
+            if torch_module is None:
+                return {
+                    "initialized": False,
+                    "status": "torch_unloaded",
+                    "allocated": None,
+                    "reserved": None,
+                }
+            cuda_api = getattr(torch_module, "cuda", None)
+            if cuda_api is None:
+                return {
+                    "initialized": False,
+                    "status": "cuda_api_unavailable",
+                    "allocated": None,
+                    "reserved": None,
+                }
+            initialized = bool(cuda_api.is_initialized())
+            if not initialized:
+                return {
+                    "initialized": False,
+                    "status": "not_initialized_skip",
+                    "allocated": None,
+                    "reserved": None,
+                }
+            return {
+                "initialized": True,
+                "status": "initialized",
+                "allocated": int(cuda_api.memory_allocated()),
+                "reserved": int(cuda_api.memory_reserved()),
+            }
+
+        emit("request_gpu_release_start", request_id=request_key)
+        try:
+            cuda_before = run_stage("cuda_memory_before", cuda_memory_snapshot) or {}
+
+            def stop_request_samplers() -> None:
+                for sampler_name in ("_cgroup_sampler", "_process_cpu_sampler"):
+                    sampler = getattr(self, sampler_name, None)
+                    if sampler is None:
+                        continue
+                    stop = getattr(sampler, "stop", None)
+                    if callable(stop):
+                        try:
+                            stop(timeout=0.5)
+                        except TypeError:
+                            stop()
+                    if sampler_name == "_cgroup_sampler":
+                        self._cgroup_sampler = None
+                    else:
+                        self._process_cpu_sampler = None
+
+            run_stage("request_samplers", stop_request_samplers)
+
+            def close_preload_workers() -> Any:
+                bridge = getattr(self, "_preload_bridge", None)
+                close_workers = getattr(bridge, "close_workers", None)
+                if not callable(close_workers):
+                    return {"present": 0}
+                return close_workers(
+                    timeout=0.5,
+                    cancel_futures=True,
+                    wait_futures=False,
+                )
+
+            fields["preload_workers"] = run_stage(
+                "preload_workers", close_preload_workers,
+            )
+
+            def join_legacy_workers() -> int:
+                return self._join_legacy_background_threads(
+                    getattr(self, "_legacy_api", None), join_timeout=0.5,
+                )
+
+            fields["legacy_workers_joined"] = run_stage(
+                "legacy_request_workers", join_legacy_workers,
+            )
+
+            def clear_activation_references() -> None:
+                if not request_key:
+                    return
+                from comfymodal_runtime.model_preload import (
+                    _unet_page_readiness_clear,
+                    cancel_sampler_stall_watchdog,
+                    clear_retained_unet_identity_chain,
+                    finalize_unet_early_activation,
+                    finalize_vae_early_activation,
+                    unmark_production_cpu_snapshot_request,
+                )
+                errors: list[str] = []
+                for callback in (
+                    lambda: cancel_sampler_stall_watchdog(request_key),
+                    lambda: clear_retained_unet_identity_chain(request_key),
+                    lambda: _unet_page_readiness_clear(request_key),
+                    lambda: finalize_unet_early_activation(request_key),
+                    lambda: finalize_vae_early_activation(request_key),
+                    lambda: unmark_production_cpu_snapshot_request(request_key),
+                ):
+                    try:
+                        callback()
+                    except Exception as exc:
+                        errors.append(type(exc).__name__)
+                if errors:
+                    raise RuntimeError(",".join(errors))
+
+            run_stage("activation_references", clear_activation_references)
+
+            def clear_bridge() -> None:
+                bridge = getattr(self, "_preload_bridge", None)
+                clear = getattr(bridge, "clear", None)
+                if callable(clear):
+                    clear()
+
+            run_stage("preload_references", clear_bridge)
+
+            def clear_request_state() -> None:
+                api = getattr(self, "_legacy_api", None)
+                if api is not None and hasattr(api, "_v2_graph_trace"):
+                    api._v2_graph_trace = None
+                futures = getattr(api, "_actual_load_futures", None)
+                if isinstance(futures, dict):
+                    for key, worker in list(futures.items()):
+                        alive = getattr(worker, "is_alive", None)
+                        if worker is None or not callable(alive) or not alive():
+                            futures.pop(key, None)
+                self._cpu_snapshot_models_active = False
+                self._snapshot_eviction_retained_model = None
+                self._snapshot_eviction_retained_model_id = 0
+                self._snapshot_eviction_retained_model_type = ""
+                self._snapshot_eviction_retained_release_status = "released_after_request"
+
+            run_stage("request_references", clear_request_state)
+
+            model_management_holder: dict[str, Any] = {}
+
+            def unload_models() -> None:
+                nonlocal unload_all_models_ran, unload_all_models_ok
+                import comfy.model_management as model_management
+                model_management_holder["module"] = model_management
+                unload_all = getattr(model_management, "unload_all_models", None)
+                if not callable(unload_all):
+                    raise RuntimeError("unload_all_models unavailable")
+                unload_all_models_ran = True
+                unload_all()
+                unload_all_models_ok = True
+
+            run_stage("model_management_unload", unload_models)
+
+            def fallback_device_unload() -> dict[str, Any]:
+                nonlocal device_fallback_ran
+                device_fallback_ran = True
+                model_management = model_management_holder.get("module")
+                if model_management is None:
+                    import comfy.model_management as model_management
+                free_memory = getattr(model_management, "free_memory", None)
+                get_devices = getattr(model_management, "get_all_torch_devices", None)
+                if not callable(free_memory) or not callable(get_devices):
+                    raise RuntimeError("Torch/CUDA device fallback unavailable")
+                devices = list(get_devices() or ())
+                targets = []
+                for device in devices:
+                    device_type = getattr(device, "type", None)
+                    if device_type is None:
+                        device_type = str(device).split(":", 1)[0]
+                    if str(device_type).lower() == "cpu":
+                        continue
+                    targets.append(device)
+                for device in targets:
+                    free_memory(1e30, device, keep_loaded=[])
+                return {"device_count": len(targets)}
+
+            if not unload_all_models_ok:
+                fields["device_fallback"] = run_stage(
+                    "device_fallback", fallback_device_unload,
+                )
+
+            def cleanup_model_management() -> None:
+                model_management = model_management_holder.get("module")
+                if model_management is None:
+                    import comfy.model_management as model_management
+                cleanup_models = getattr(model_management, "cleanup_models", None)
+                if callable(cleanup_models):
+                    cleanup_models()
+
+            run_stage("model_management_cleanup", cleanup_model_management)
+
+            def reset_legacy_executor() -> None:
+                nonlocal legacy_executor_reset
+                api = getattr(self, "_legacy_api", None)
+                executor = getattr(api, "_executor", None) if api is not None else None
+                reset = getattr(executor, "reset", None)
+                if callable(reset):
+                    reset()
+                    legacy_executor_reset = True
+
+            run_stage("legacy_executor_reset", reset_legacy_executor)
+
+            def collect_garbage() -> None:
+                import gc
+                gc.collect(0)
+                gc.collect(1)
+
+            run_stage("garbage_collection", collect_garbage)
+
+            def finish_cuda_cleanup() -> dict[str, Any]:
+                if not cuda_before.get("initialized"):
+                    return cuda_before
+                torch_module = sys.modules.get("torch")
+                cuda_api = getattr(torch_module, "cuda", None) if torch_module is not None else None
+                if cuda_api is None or not bool(cuda_api.is_initialized()):
+                    return {
+                        "initialized": False,
+                        "status": "not_initialized_skip",
+                        "allocated": None,
+                        "reserved": None,
+                    }
+                cuda_api.synchronize()
+                cuda_api.empty_cache()
+                return {
+                    "initialized": True,
+                    "status": "empty_cache_applied",
+                    "allocated": int(cuda_api.memory_allocated()),
+                    "reserved": int(cuda_api.memory_reserved()),
+                }
+
+            cuda_after = run_stage("cuda_cleanup", finish_cuda_cleanup) or {}
+        except Exception as exc:
+            status = "error"
+            cleanup_errors.setdefault("release", {
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:160],
+            })
+        finally:
+            if cleanup_errors:
+                status = "error"
+            elapsed_ms = round((time.monotonic_ns() - started_ns) / 1_000_000.0, 3)
+            fields.update({
+                "request_id": request_key,
+                "status": status,
+                "release_performed": True,
+                "elapsed_ms": elapsed_ms,
+                "unload_all_models_ran": unload_all_models_ran,
+                "device_fallback_ran": device_fallback_ran,
+                "legacy_executor_reset": legacy_executor_reset,
+                "cleanup_errors": cleanup_errors,
+                "stage_results": stage_results,
+                "cuda_allocated_before": cuda_before.get("allocated"),
+                "cuda_allocated_after": cuda_after.get("allocated"),
+                "cuda_reserved_before": cuda_before.get("reserved"),
+                "cuda_reserved_after": cuda_after.get("reserved"),
+            })
+            emit("request_gpu_release_end", **fields)
+        return fields
 
     def _close_snapshot_build_pools(self, api: Any = None, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
         """Close known snapshot-build pools before the lifecycle returns."""
@@ -4310,6 +4660,14 @@ class ModalRuntimeEntrypoint:
             self._snapshot_eviction_retained_model_type = ""
         if not hasattr(self, "_snapshot_eviction_retained_release_status"):
             self._snapshot_eviction_retained_release_status = "not_run"
+        if not hasattr(self, "_request_gpu_release_lock"):
+            self._request_gpu_release_lock = threading.Lock()
+        if not hasattr(self, "_request_gpu_release_done"):
+            self._request_gpu_release_done = False
+        if not hasattr(self, "_request_gpu_release_request_id"):
+            self._request_gpu_release_request_id = ""
+        if not hasattr(self, "_terminal_response_delivered"):
+            self._terminal_response_delivered = False
 
     def _evict_snapshot_models(
         self,
@@ -10248,14 +10606,18 @@ class ModalRuntimeEntrypoint:
             # no-op when no sampler ever ran).
             _watchdog_request_id = str(context.request_id)
             # ── Production CPU-snapshot request marker ──
-            # The marker is ALREADY set at the request-time snapshot binding
-            # (before the execution-phase prefill is scheduled) so the Phase
-            # 1A early-activation eligibility gate can prove the CPU-snapshot
-            # binding at the real prefill boundary.  Nothing is re-marked
-            # here: only production non-bypass requests
-            # (request_bound_to_production_snapshot) are unmarked in the
-            # finally below; false/non-production requests are never marked.
+            # Re-assert the marker immediately before execution.  The normal
+            # request path marks it at snapshot binding time, while direct
+            # execution callers may enter here without that earlier phase.
+            # The operation is idempotent; only production non-bypass requests
+            # (request_bound_to_production_snapshot) are unmarked in finally.
             _production_snapshot_marked = bool(request_bound_to_production_snapshot)
+            if _production_snapshot_marked:
+                try:
+                    from comfymodal_runtime.model_preload import mark_production_cpu_snapshot_request
+                    mark_production_cpu_snapshot_request(_watchdog_request_id)
+                except Exception:
+                    pass
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -11654,6 +12016,15 @@ class ModalRuntimeEntrypoint:
                 modal_container_id=identity.get("modal_container_id", ""),
                 request_id=request_id,
             )
+        self._lazy_init_snapshot_state()
+        release_lock = getattr(self, "_request_gpu_release_lock", None)
+        if release_lock is None:
+            release_lock = threading.Lock()
+            self._request_gpu_release_lock = release_lock
+        with release_lock:
+            self._request_gpu_release_done = False
+            self._request_gpu_release_request_id = str(request_id or "")
+            self._terminal_response_delivered = False
         terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
@@ -11661,6 +12032,7 @@ class ModalRuntimeEntrypoint:
             ):
                 if not terminal_started and event.get("type") in {"result", "error"}:
                     terminal_started = True
+                    self._terminal_response_delivered = True
                     if diagnostics is not None:
                         diagnostics.set_identity(request_id=event.get("request_id", request_id))
                         diagnostics.emit(
@@ -11689,14 +12061,20 @@ class ModalRuntimeEntrypoint:
                 terminal_started = True
                 if diagnostics is not None:
                     diagnostics.emit("request_terminal_start", terminal_status="generator_closed")
+            if _terminal_was_yielded:
+                try:
+                    self._run_pending_production_cleanup()
+                except Exception:
+                    pass
+                try:
+                    self._release_gpu_after_request(
+                        diagnostics=diagnostics,
+                        request_id=request_id,
+                    )
+                except Exception:
+                    pass
             if diagnostics is not None:
                 diagnostics.emit("request_terminal_end")
-            # Deferred production cleanup: run ONLY after a terminal result/error
-            # event has been yielded to the consumer (_terminal_was_yielded).  If
-            # the stream was cancelled/closed before any terminal event, skip here
-            # and rely on the shutdown ``exit`` hook fallback (bounded + idempotent).
-            if _terminal_was_yielded:
-                self._run_pending_production_cleanup()
 
     async def _run_plan_stream_impl(
         self,

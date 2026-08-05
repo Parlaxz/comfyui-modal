@@ -60,7 +60,7 @@ def _memory_request() -> int:
         return _positive_int("COMFYMODAL_V2_MEMORY_REQUEST", request_raw.strip())
     if mb_present:
         return _positive_int("COMFYMODAL_V2_MEMORY_MB", mb_raw.strip())
-    return 40960
+    return 49152
 
 
 def _shape_label() -> str | None:
