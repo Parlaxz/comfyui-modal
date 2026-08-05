@@ -36,6 +36,19 @@ class ModelFileFact:
 # Current policy version â€” increment when compute-policy semantics change
 # so that old snapshots with stale/legacy defaults are rejected.
 CPU_SNAPSHOT_UNET_POLICY_VERSION: int = 2
+_SNAPSHOT_CONSTRUCTION_ORDERS: dict[str, tuple[str, ...]] = {
+    "O0": ("clip", "unet", "vae"),
+    "O1": ("unet", "vae", "clip"),
+    "O2": ("unet", "clip", "vae"),
+    "O3": ("clip", "vae", "unet"),
+}
+
+
+def snapshot_construction_order(order: str) -> tuple[str, ...]:
+    try:
+        return _SNAPSHOT_CONSTRUCTION_ORDERS[order]
+    except KeyError as exc:
+        raise RuntimeError(f"unsupported snapshot model order: {order}") from exc
 
 
 def _policy_identity(
@@ -2001,13 +2014,7 @@ def load_cpu_snapshot_models(
         )
         model_key_hash = model_key.stable_hash[:16]
 
-        order_map = {
-            "O0": ("clip", "unet", "vae"),
-            "O1": ("unet", "vae", "clip"),
-            "O2": ("unet", "clip", "vae"),
-            "O3": ("clip", "vae", "unet"),
-        }
-        for role in order_map[construction_order]:
+        for role in snapshot_construction_order(construction_order):
             if role == "vae" and not normalized.get("vae"):
                 continue
             loaded = _load_role(role)
