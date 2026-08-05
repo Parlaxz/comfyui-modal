@@ -42,8 +42,8 @@ from .deployment_spec import build_deployment_identity
 from .env import env_flag
 from .runtime_shape import (
     apply_torch_thread_policy,
-    log_effective_runtime_shape,
     runtime_shape_config,
+    validate_torch_thread_policy,
 )
 from .restore_plan import (
     RestorePlanPublisher,
@@ -1907,7 +1907,9 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "memory_mb": actual.memory,
         "target_inputs": actual.target_inputs,
         "max_inputs": actual.max_inputs,
-        "runtime_shape_id": runtime_shape.runtime_shape_id,
+        "runtime_shape_fingerprint": runtime_shape.runtime_shape_fingerprint,
+        "runtime_shape_label": runtime_shape.runtime_shape_label,
+        "runtime_shape_id": runtime_shape.runtime_shape_fingerprint,
         "snapshot_model_order": runtime_shape.snapshot_model_order,
         "runtime_shape": runtime_shape.identity_payload(),
         # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5481,16 +5483,26 @@ class ModalRuntimeEntrypoint:
         )
         _report_host_memory("restore_start")
         _startup_perf = time.perf_counter()
-        _thread_shape = apply_torch_thread_policy(stage="image_runtime_initialization")
+        trace = RuntimeTrace(process="remote")
+        trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+        _thread_shape = apply_torch_thread_policy(
+            stage="image_runtime_initialization",
+            trace=trace,
+            enforce=True,
+        )
         self._torch_thread_limit_applied = True
-        self._restore_torch_intraop_threads = _thread_shape.get("torch_intraop_threads")
-        self._restore_actual_torch_intraop_threads = _thread_shape.get("torch_intraop_threads")
-        self._restore_torch_interop_threads = _thread_shape.get("torch_interop_threads")
+        self._restore_torch_intraop_threads = _thread_shape.get(
+            "requested_torch_intraop_threads"
+        )
+        self._restore_actual_torch_intraop_threads = _thread_shape.get(
+            "actual_torch_intraop_threads"
+        )
+        self._restore_torch_interop_threads = _thread_shape.get(
+            "actual_torch_interop_threads"
+        )
         self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
         identity = _capture_remote_identity()
         self._configure_runtime()
-        trace = RuntimeTrace(process="remote")
-        trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.set_metadata(**identity)
         trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         startup_session_id = uuid.uuid4().hex
@@ -5528,7 +5540,7 @@ class ModalRuntimeEntrypoint:
             f"gpu={_gpu_str} "
             f"cpu={_spec.cpu} "
             f"memory={_spec.memory} "
-            f"runtime_shape_id={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).runtime_shape_id} "
+            f"runtime_shape_fingerprint={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).runtime_shape_fingerprint} "
             f"snapshot_model_order={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).snapshot_model_order}",
             flush=True,
         )
@@ -6218,7 +6230,27 @@ class ModalRuntimeEntrypoint:
             "_cachedit_preimport": _cd_preimport,
         }
 
-    def _apply_torch_thread_limit(self) -> None:
+    def _apply_torch_thread_limit(self, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+        observed = validate_torch_thread_policy(
+            stage="after_restore",
+            trace=trace,
+            enforce=True,
+        )
+        self._restore_torch_intraop_threads = observed.get(
+            "requested_torch_intraop_threads"
+        )
+        self._restore_actual_torch_intraop_threads = observed.get(
+            "actual_torch_intraop_threads"
+        )
+        self._restore_torch_interop_threads = observed.get(
+            "actual_torch_interop_threads"
+        )
+        self._restore_torch_thread_limit_status = observed.get(
+            "status", "validated"
+        )
+        return observed
+
+    def _legacy_apply_torch_thread_limit(self) -> None:
         """Apply torch intraop thread limit at earliest restore point.
 
         Strict parsing: absent/empty/whitespace-only = disabled.
@@ -6448,7 +6480,7 @@ class ModalRuntimeEntrypoint:
 
         # ── Eviction restore: inspect marker and apply idle ──────────────
         # FIRST executable ordering: marker inspection and idle delay
-        # must precede lazy_init_snapshot_state, _apply_torch_thread_limit,
+        # must precede lazy_init_snapshot_state and runtime-shape validation,
         # full-trace, timestamp setup, samplers, host reporting,
         # identity/config/plan/bootstrap/GPU.
         # _restore_eviction_boundary uses getattr defaults so is safe
@@ -6460,12 +6492,6 @@ class ModalRuntimeEntrypoint:
                 getattr(self, "_cpu_snapshot_models", None),
                 phase="restore",
             )
-
-        # ── Torch thread limit: earliest executable point ─────────────────
-        # Applied before normal restore work, _configure_runtime, plan
-        # reading, bootstrap, snapshot validation/retarget/activation.
-        self._apply_torch_thread_limit()
-        log_effective_runtime_shape(stage="after_restore")
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
@@ -6546,6 +6572,7 @@ class ModalRuntimeEntrypoint:
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
             trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
+            _thread_shape = self._apply_torch_thread_limit(trace=trace)
             _v2_container_restore_count += 1
             self._restore_count = _v2_container_restore_count
             restore_session_id = uuid.uuid4().hex
@@ -6602,6 +6629,11 @@ class ModalRuntimeEntrypoint:
                     "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                     **identity,
                     **_resource_identity(),
+                    "stored_snapshot_model_order": getattr(
+                        getattr(self, "_cpu_snapshot_models", None),
+                        "construction_order",
+                        None,
+                    ),
                 },
             )
             trace.emit(
@@ -11209,7 +11241,6 @@ class ModalRuntimeEntrypoint:
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
         _v2_startup_stage("first_remote_method_entry", "entry", phase="request")
-        log_effective_runtime_shape(stage="request_entry")
         # Consistent field-name aliases for method-entry timestamps
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
@@ -11387,8 +11418,18 @@ class ModalRuntimeEntrypoint:
             request_origin_info=_request_origin_info,
             **_entry_host,
             **_resource_identity(),
+            stored_snapshot_model_order=getattr(
+                getattr(self, "_cpu_snapshot_models", None),
+                "construction_order",
+                None,
+            ),
         )
         context.trace.set_metadata(**context_snapshot_age)
+        validate_torch_thread_policy(
+            stage="request_entry",
+            trace=context.trace,
+            enforce=True,
+        )
         if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
             _cgroup_sampler.set_phase_source(
                 lambda: (
@@ -11594,6 +11635,11 @@ class ModalRuntimeEntrypoint:
                     # â”€â”€ Remote-observed identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     **identity,
                     **_resource_identity(),
+                    "stored_snapshot_model_order": getattr(
+                        getattr(self, "_cpu_snapshot_models", None),
+                        "construction_order",
+                        None,
+                    ),
                 },
             )
             context.trace.emit(
