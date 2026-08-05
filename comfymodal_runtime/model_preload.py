@@ -10179,6 +10179,96 @@ def _mm_load_models_gpu(models: list[Any], **kwargs: Any) -> Any:
     return _mm.load_models_gpu(models, **kwargs)
 
 
+# Max pinned bytes for the early-activation transfer fix (protects the
+# container from pinning unbounded pageable memory).
+_PIN_TRANSFER_MAX_BYTES = 20 * 1024 * 1024 * 1024  # 20 GiB
+
+
+def _pinned_transfer_enabled() -> bool:
+    """True when ``COMFYMODAL_V2_PIN_UNET_TRANSFER`` is enabled (default off)."""
+    return os.environ.get(
+        "COMFYMODAL_V2_PIN_UNET_TRANSFER", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _iter_model_tensors(model: Any):
+    """Yield the model's tensors without raising.
+
+    Prefers ``parameters()`` + ``buffers()``; falls back to
+    ``state_dict().values()`` when ``parameters()`` is missing.
+    """
+    try:
+        _params = list(model.parameters() or ())
+        _buffers = list(model.buffers() or ())
+        yield from _params
+        yield from _buffers
+        return
+    except Exception:
+        pass
+    try:
+        _sd = model.state_dict()
+        if isinstance(_sd, dict):
+            yield from _sd.values()
+        else:
+            yield from _sd.values() if hasattr(_sd, "values") else ()
+    except Exception:
+        return
+
+
+def _pin_cpu_storages_for_transfer(model: Any) -> list:
+    """Pin the CPU storages of *model* with ``cudaHostRegister`` so the H2D
+    copy uses the true DMA path instead of the driver's pageable staging path.
+
+    Returns a list of unpin callables (each ``cudaHostUnregister(ptr)``).
+    Never raises; returns ``[]`` on any failure or when the transfer is not
+    relevant.  Dedupes by ``(data_ptr(), nbytes())`` and bounds the total
+    pinned bytes to ``_PIN_TRANSFER_MAX_BYTES``.
+    """
+    _pins: list = []
+    if model is None:
+        return _pins
+    try:
+        import torch
+        _cudart = torch.cuda.cudart()
+        _register = getattr(_cudart, "cudaHostRegister", None)
+        _unregister = getattr(_cudart, "cudaHostUnregister", None)
+        if not callable(_register) or not callable(_unregister):
+            return _pins
+    except Exception:
+        return _pins
+
+    _seen: set[tuple[int, int]] = set()
+    _total_pinned = 0
+    for _tensor in _iter_model_tensors(model):
+        try:
+            if _tensor is None:
+                continue
+            if bool(getattr(_tensor, "is_cuda", False)):
+                continue
+            try:
+                _storage = _tensor.untyped_storage()
+            except Exception:
+                _storage = _tensor.storage()
+            _ptr = _storage.data_ptr()
+            _nbytes = int(_storage.nbytes())
+            if not isinstance(_ptr, int) or _ptr <= 0 or _nbytes <= 0:
+                continue
+            _key = (_ptr, _nbytes)
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            if _total_pinned + _nbytes > _PIN_TRANSFER_MAX_BYTES:
+                continue
+            _rc = _register(_ptr, _nbytes, 0)
+            _pins.append(
+                (lambda _p=_ptr: _unregister(_p))
+            )
+            _total_pinned += _nbytes
+        except Exception:
+            continue
+    return _pins
+
+
 def _prepare_armed_clip_for_force_load(
     models: list[Any], request_trace: Any,
 ) -> None:
@@ -10777,6 +10867,7 @@ def _early_activation_extra_meta(state: dict[str, Any]) -> dict[str, Any]:
         "submitted_mono_ns": state.get("submitted_mono_ns", 0) or 0,
         "worker_started_mono_ns": state.get("worker_started_mono_ns", 0) or 0,
         "terminal_mono_ns": state.get("terminal_mono_ns", 0) or 0,
+        "unet_resolved_mono_ns": state.get("unet_resolved_mono_ns", 0) or 0,
         "clip_encode_start_mono_ns": state.get("clip_encode_start_mono_ns", 0) or 0,
         "clip_encode_end_mono_ns": state.get("clip_encode_end_mono_ns", 0) or 0,
         "lane_wait_ms": state.get("lane_wait_ms", 0.0) or 0.0,
@@ -10960,6 +11051,7 @@ def _measure_early_activation_lane_wait_ms(
 def _emit_unet_worker_variance(
     trace: Any,
     *,
+    state: dict[str, Any],
     request_id: str,
     mode: str,
     registry_setup: dict[str, Any] | None,
@@ -10970,45 +11062,120 @@ def _emit_unet_worker_variance(
     patcher_ms: float | None,
     patcher_counts: dict[str, Any] | None,
     patcher_nested: bool,
+    dtype_layout_preparation: dict[str, Any] | None = None,
+    post_load_bookkeeping: dict[str, Any] | None = None,
 ) -> None:
     """Emit one ``unet_activation_worker_variance`` record for the activation.
 
     Non-overlapping fields: ``registry_setup``, ``page_traversal`` (pre-touch
-    hydration when it ran), and ``synchronized_load`` (the synchronized
-    load_models_gpu completion).  Patcher bookkeeping is reported as nested
+    hydration when it ran), ``synchronized_load`` (the synchronized
+    load_models_gpu completion), ``dtype_layout_preparation`` (identity
+    resolution + VRAM pre-check) and ``post_load_bookkeeping`` (post-load
+    evidence/residency proof).  Patcher bookkeeping is reported as nested
     (not an exclusive substage) and is excluded from the reconciliation sum.
     A dedicated pre-touch record carries the real-read checksum/bytes proof.
+
+    The ``loader_reconciliation`` is reconciled against the TRUE total
+    early-activation wall time (``unet_early_activation_scheduled`` →
+    ``unet_early_activation_completed``), not the self-sum of sub-stages, so
+    the residual measures the unmeasured gap/overlap (queue wait, scheduling,
+    lane wait, etc.).  ``early_activation_total_ms`` carries that true total.
     """
     if trace is None or not variance_diagnostics_enabled():
         return
-    _reg_wall = registry_setup.get("wall_ms") if registry_setup else None
-    _sync_wall = synchronized_load.get("wall_ms") if synchronized_load else None
-    _trav_wall = page_traversal.get("duration_ms") if page_traversal else None
-    _loader_wall: float | None = None
-    _sub: dict[str, Any] = {"registry_setup": _reg_wall, "synchronized_load": _sync_wall}
-    if _trav_wall is not None:
-        _sub["page_traversal"] = _trav_wall
-    if isinstance(_reg_wall, (int, float)) and isinstance(_sync_wall, (int, float)):
-        _measured = _reg_wall + (_trav_wall or 0.0) + _sync_wall
-        _loader_wall = round(_measured, 3)
-    _recon = reconciliation_fields(_loader_wall, _sub)
-    _pub_ms, _pub_src = activation_publication_ms(trace)
-    trace.emit("unet_activation_worker_variance", phase="execution", metadata={
-        "request_id": request_id,
-        "mode": mode,
-        "gate": "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
-        "registry_setup": registry_setup,
-        "page_traversal": page_traversal,
-        "synchronized_load": synchronized_load,
-        "pretouch": pretouch_record,
-        "loader_reconciliation": _recon,
-        "patcher_bookkeeping_ms": patcher_ms,
-        "patcher_bookkeeping_counts": patcher_counts,
-        "patcher_bookkeeping_nested": patcher_nested,
-        "activation_future_publication_ms": _pub_ms,
-        "activation_future_publication_source": _pub_src,
-        "unet_storage_registry": registry_record or pretouch_record or registry_setup,
-    })
+    try:
+        _reg_wall = registry_setup.get("wall_ms") if registry_setup else None
+        _sync_wall = synchronized_load.get("wall_ms") if synchronized_load else None
+        _trav_wall = page_traversal.get("duration_ms") if page_traversal else None
+        _dtype_wall = (
+            dtype_layout_preparation.get("wall_ms")
+            if dtype_layout_preparation else None
+        )
+        _bb_wall = (
+            post_load_bookkeeping.get("wall_ms")
+            if post_load_bookkeeping else None
+        )
+
+        # Queue delay (submitted -> worker start) and CPU-snapshot wait
+        # (worker start -> UNET resolved).  None when any timestamp missing;
+        # never negative.
+        _queue_delay_ms: float | None = None
+        _cpu_snapshot_wait_ms: float | None = None
+        _submitted = state.get("submitted_mono_ns")
+        _worker_started = state.get("worker_started_mono_ns")
+        _unet_resolved = state.get("unet_resolved_mono_ns")
+        if (
+            isinstance(_submitted, int)
+            and isinstance(_worker_started, int)
+            and _worker_started >= _submitted
+        ):
+            _queue_delay_ms = round((_worker_started - _submitted) / 1_000_000, 3)
+        if (
+            isinstance(_worker_started, int)
+            and isinstance(_unet_resolved, int)
+            and _unet_resolved >= _worker_started
+        ):
+            _cpu_snapshot_wait_ms = round(
+                (_unet_resolved - _worker_started) / 1_000_000, 3
+            )
+
+        # True total early-activation wall (scheduled -> completed events).
+        _true_total_ms: float | None = None
+        _sched_ns: int | None = None
+        _done_ns: int | None = None
+        for _ev in trace.events:
+            if _ev.name == _EVENT_UNET_EA_SCHEDULED and _sched_ns is None:
+                _sched_ns = _ev.monotonic_ns
+            elif _ev.name == _EVENT_UNET_EA_COMPLETED and _done_ns is None:
+                _done_ns = _ev.monotonic_ns
+        if (
+            isinstance(_sched_ns, int)
+            and isinstance(_done_ns, int)
+            and _done_ns >= _sched_ns
+        ):
+            _true_total_ms = round((_done_ns - _sched_ns) / 1_000_000, 3)
+
+        _sub: dict[str, Any] = {
+            "registry_setup": _reg_wall,
+            "synchronized_load": _sync_wall,
+        }
+        if _trav_wall is not None:
+            _sub["page_traversal"] = _trav_wall
+        if _queue_delay_ms is not None:
+            _sub["queue_delay"] = _queue_delay_ms
+        if _cpu_snapshot_wait_ms is not None:
+            _sub["cpu_snapshot_wait"] = _cpu_snapshot_wait_ms
+        if _dtype_wall is not None:
+            _sub["identity_dtype_prep"] = _dtype_wall
+        if _bb_wall is not None:
+            _sub["post_load_bookkeeping"] = _bb_wall
+
+        _recon = reconciliation_fields(_true_total_ms, _sub)
+        _pub_ms, _pub_src = activation_publication_ms(trace)
+        trace.emit("unet_activation_worker_variance", phase="execution", metadata={
+            "request_id": request_id,
+            "mode": mode,
+            "gate": "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
+            "registry_setup": registry_setup,
+            "page_traversal": page_traversal,
+            "synchronized_load": synchronized_load,
+            "pretouch": pretouch_record,
+            "loader_reconciliation": _recon,
+            "patcher_bookkeeping_ms": patcher_ms,
+            "patcher_bookkeeping_counts": patcher_counts,
+            "patcher_bookkeeping_nested": patcher_nested,
+            "activation_future_publication_ms": _pub_ms,
+            "activation_future_publication_source": _pub_src,
+            "unet_storage_registry": registry_record or pretouch_record or registry_setup,
+            "queue_delay_ms": _queue_delay_ms,
+            "cpu_snapshot_wait_ms": _cpu_snapshot_wait_ms,
+            "dtype_layout_preparation": dtype_layout_preparation,
+            "post_load_bookkeeping": post_load_bookkeeping,
+            "early_activation_total_ms": _true_total_ms,
+            "pinned_transfer": _pinned_transfer_enabled(),
+        })
+    except Exception:
+        pass
 
 
 def _run_early_unet_activation(
@@ -11067,6 +11234,7 @@ def _run_early_unet_activation(
             state, trace, request_id, status="skipped", reason="no_retained_unet"
         )
     state["unet_patcher_object_id"] = str(id(unet))
+    state["unet_resolved_mono_ns"] = time.monotonic_ns()
 
     # Request cleanup may have finalized while we waited.
     if state.get("cancelled") or state.get("terminal"):
@@ -11081,6 +11249,13 @@ def _run_early_unet_activation(
     # activation is rejected — never reuse a key across identity changes.
     from .unet_forward_probe import resolve_diffusion_model
 
+    # ── Diagnostic: dtype/layout preparation stage (resolve + VRAM check) ──
+    _v_dtype_before = _v_dtype_after = None
+    if variance_diagnostics_enabled():
+        try:
+            _v_dtype_before = capture_metric_snapshot()
+        except Exception:
+            _v_dtype_before = None
     _patcher, _dm = resolve_diffusion_model(unet)
     _patcher_id = str(id(_patcher)) if _patcher is not None else str(id(unet))
     _dm_id = str(id(_dm)) if _dm is not None else ""
@@ -11138,6 +11313,12 @@ def _run_early_unet_activation(
             reason=str(_vram.get("reason", "vram_insufficient")),
             diagnostics=_vram,
         )
+    # ── Diagnostic: end of the dtype/layout preparation stage ─────────
+    if variance_diagnostics_enabled():
+        try:
+            _v_dtype_after = capture_metric_snapshot()
+        except Exception:
+            _v_dtype_after = None
 
     # ── Re-check cancellation IMMEDIATELY before the GPU mutation ────
     # A request finalized between the earlier checks and the mutation must
@@ -11164,6 +11345,8 @@ def _run_early_unet_activation(
     _v_prep_after = None
     _v_load_before = None
     _v_load_after = None
+    _v_bb_before = None
+    _v_bb_after = None
     if variance_diagnostics_enabled() or unet_pretouch_enabled():
         _v_prep_before = capture_metric_snapshot()
         if variance_diagnostics_enabled():
@@ -11220,10 +11403,15 @@ def _run_early_unet_activation(
             "key_hash": state.get("key_hash", ""),
             "model_count": len(_load_models),
         })
+    _pins: list = []
     try:
-        if variance_diagnostics_enabled():
+        if variance_diagnostics_enabled() or _pinned_transfer_enabled():
             cuda_sync_if_enabled()
-            _v_load_before = capture_metric_snapshot()
+            _v_load_before = (
+                capture_metric_snapshot() if variance_diagnostics_enabled() else None
+            )
+        if _pinned_transfer_enabled():
+            _pins = _pin_cpu_storages_for_transfer(unet)
         _mm_load_models_gpu(_load_models)
         if variance_diagnostics_enabled():
             cuda_sync_if_enabled()
@@ -11233,7 +11421,19 @@ def _run_early_unet_activation(
             state, trace, request_id, status="failed",
             reason="load_failed", error=str(exc)[:200],
         )
+    finally:
+        for _unpin in _pins:
+            try:
+                _unpin()
+            except Exception:
+                pass
     _load_end = _capture_phase_counters()
+    # ── Diagnostic: post-load bookkeeping stage start (after the load) ──
+    if variance_diagnostics_enabled():
+        try:
+            _v_bb_before = capture_metric_snapshot()
+        except Exception:
+            _v_bb_before = None
     _deltas = _phase_counter_deltas(_load_start, _load_end)
     state["load_wall_ms"] = _deltas.get("wall_ms", 0.0) or 0.0
     state["load_thread_cpu_ms"] = _deltas.get("thread_cpu_ms")
@@ -11244,47 +11444,6 @@ def _run_early_unet_activation(
     state["gpu_allocated_after"] = _gpu_alloc_after
     if _gpu_alloc_before is not None and _gpu_alloc_after is not None:
         state["gpu_allocated_delta_bytes"] = _gpu_alloc_after - _gpu_alloc_before
-    # ── Emit the worker activation variance record (non-overlapping stages) ──
-    if (
-        _v_prep_before is not None
-        and _v_reg_after is not None
-        and _v_load_after is not None
-        and trace is not None
-        and variance_diagnostics_enabled()
-    ):
-        try:
-            _reg_setup = timed_transfer_partition(
-                _v_prep_before, _v_reg_after, label="registry_setup",
-            )
-            _sync_load = timed_transfer_partition(
-                _v_load_before, _v_load_after,
-                label="synchronized_load",
-                bytes_=_variance_registry_record.get("total_bytes") if isinstance(_variance_registry_record, Mapping) else None,
-            )
-            _worker_patcher_ms = None
-            _worker_patcher_counts: dict[str, Any] = {}
-            for _ev in trace.events:
-                if _ev.name == "model_patcher_load_breakdown":
-                    _worker_patcher_ms = _ev.metadata.get("wall_ms")
-                    for _k in ("patch_weight_count", "cast_count"):
-                        _vv = _ev.metadata.get(_k)
-                        if _vv is not None:
-                            _worker_patcher_counts[_k] = _vv
-            _emit_unet_worker_variance(
-                trace,
-                request_id=request_id,
-                mode=mode,
-                registry_setup=_reg_setup,
-                page_traversal=_variance_pretouch_record,
-                synchronized_load=_sync_load,
-                pretouch_record=_variance_pretouch_record,
-                registry_record=_variance_registry_record,
-                patcher_ms=_worker_patcher_ms,
-                patcher_counts=_worker_patcher_counts,
-                patcher_nested=_worker_patcher_ms is not None,
-            )
-        except Exception:
-            pass
     # Truthful mutation-lane wait from the existing lane trace events around
     # the load (worker lane_wait_start -> wrapper gpu_lane_wait_start).  The
     # wrapper owns the lane; we never acquire it ourselves, so this cannot
@@ -11326,6 +11485,12 @@ def _run_early_unet_activation(
     state["clip_residency_status"] = str(_clip_evidence.get("clip_residency_status", "absent"))
     _combined_diag = dict(_evidence)
     _combined_diag["clip_residency"] = _clip_evidence
+    # ── Diagnostic: post-load bookkeeping stage end (after CLIP residency) ──
+    if variance_diagnostics_enabled():
+        try:
+            _v_bb_after = capture_metric_snapshot()
+        except Exception:
+            _v_bb_after = None
     if _res_status == "cpu_resident" or not state["cache_present"]:
         return _early_activation_terminal(
             state, trace, request_id, status="invalid",
@@ -11339,10 +11504,73 @@ def _run_early_unet_activation(
             state, trace, request_id, status="invalid",
             reason="clip_residency_not_proven", diagnostics=_combined_diag,
         )
-    return _early_activation_terminal(
+    _result = _early_activation_terminal(
         state, trace, request_id, status="ready", reason="ok",
         transfer_count=state["transfer_count"], diagnostics=_combined_diag,
     )
+    # ── Emit the worker activation variance record (non-overlapping stages) ──
+    # Runs AFTER the ``ready`` terminal marker so the trace already contains
+    # ``unet_early_activation_completed`` when the true-total reconciliation
+    # reads it, and after the ``_v_bb_after`` capture so post_load_bookkeeping
+    # is non-None.
+    if (
+        _v_prep_before is not None
+        and _v_reg_after is not None
+        and _v_load_after is not None
+        and trace is not None
+        and variance_diagnostics_enabled()
+    ):
+        try:
+            _reg_setup = timed_transfer_partition(
+                _v_prep_before, _v_reg_after, label="registry_setup",
+            )
+            _sync_load = timed_transfer_partition(
+                _v_load_before, _v_load_after,
+                label="synchronized_load",
+                bytes_=_variance_registry_record.get("total_bytes") if isinstance(_variance_registry_record, Mapping) else None,
+            )
+            _worker_patcher_ms = None
+            _worker_patcher_counts: dict[str, Any] = {}
+            for _ev in trace.events:
+                if _ev.name == "model_patcher_load_breakdown":
+                    _worker_patcher_ms = _ev.metadata.get("wall_ms")
+                    for _k in ("patch_weight_count", "cast_count"):
+                        _vv = _ev.metadata.get(_k)
+                        if _vv is not None:
+                            _worker_patcher_counts[_k] = _vv
+            _emit_unet_worker_variance(
+                trace,
+                state=state,
+                request_id=request_id,
+                mode=mode,
+                registry_setup=_reg_setup,
+                page_traversal=_variance_pretouch_record,
+                synchronized_load=_sync_load,
+                pretouch_record=_variance_pretouch_record,
+                registry_record=_variance_registry_record,
+                patcher_ms=_worker_patcher_ms,
+                patcher_counts=_worker_patcher_counts,
+                patcher_nested=_worker_patcher_ms is not None,
+                dtype_layout_preparation=(
+                    timed_transfer_partition(
+                        _v_dtype_before, _v_dtype_after,
+                        label="dtype_layout_preparation",
+                    )
+                    if _v_dtype_before is not None and _v_dtype_after is not None
+                    else None
+                ),
+                post_load_bookkeeping=(
+                    timed_transfer_partition(
+                        _v_bb_before, _v_bb_after,
+                        label="post_load_bookkeeping",
+                    )
+                    if _v_bb_before is not None and _v_bb_after is not None
+                    else None
+                ),
+            )
+        except Exception:
+            pass
+    return _result
 
 
 # ── Public API ──────────────────────────────────────────────────────────

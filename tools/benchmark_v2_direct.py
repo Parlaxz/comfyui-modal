@@ -386,6 +386,35 @@ def _timing(
     _local_timing = result.get("local_timing", {}) if isinstance(result, dict) else {}
     if not isinstance(_local_timing, dict):
         _local_timing = {}
+    # Full restore breakdown: every restore_timing key ending in ``_ms``.
+    restore_breakdown: dict[str, Any] = {}
+    if isinstance(restore, dict):
+        for _rk, _rv in restore.items():
+            if isinstance(_rk, str) and _rk.endswith("_ms") and isinstance(_rv, (int, float)):
+                restore_breakdown[_rk] = round(float(_rv), 3)
+    # Worker-variance fields from the ``unet_activation_worker_variance`` event.
+    _ea_total_ms = None
+    _queue_delay_ms = None
+    _cpu_snapshot_wait_ms = None
+    _dtype_prep_ms = None
+    _post_load_bb_ms = None
+    for _event in events:
+        if not isinstance(_event, dict) or _event.get("name") != "unet_activation_worker_variance":
+            continue
+        _meta = _event.get("metadata", {}) if isinstance(_event.get("metadata"), dict) else {}
+        if isinstance(_meta.get("early_activation_total_ms"), (int, float)):
+            _ea_total_ms = float(_meta["early_activation_total_ms"])
+        if isinstance(_meta.get("queue_delay_ms"), (int, float)):
+            _queue_delay_ms = float(_meta["queue_delay_ms"])
+        if isinstance(_meta.get("cpu_snapshot_wait_ms"), (int, float)):
+            _cpu_snapshot_wait_ms = float(_meta["cpu_snapshot_wait_ms"])
+        _dtype_prep = _meta.get("dtype_layout_preparation")
+        if isinstance(_dtype_prep, dict) and isinstance(_dtype_prep.get("wall_ms"), (int, float)):
+            _dtype_prep_ms = float(_dtype_prep["wall_ms"])
+        _post_bb = _meta.get("post_load_bookkeeping")
+        if isinstance(_post_bb, dict) and isinstance(_post_bb.get("wall_ms"), (int, float)):
+            _post_load_bb_ms = float(_post_bb["wall_ms"])
+        break
     return {
         "wall_ms": round(wall_ms, 1),
         "handle_lookup_ms": handle_lookup_ms,
@@ -402,6 +431,12 @@ def _timing(
         "snapshot_callback_to_command_start_ms": result.get("snapshot_callback_to_command_start_ms"),
         "command_start_to_restore_start_ms": result.get("command_start_to_restore_start_ms"),
         "local_timing": _local_timing,
+        "restore_breakdown": restore_breakdown,
+        "early_activation_total_ms": _ea_total_ms,
+        "queue_delay_ms": _queue_delay_ms,
+        "cpu_snapshot_wait_ms": _cpu_snapshot_wait_ms,
+        "dtype_layout_preparation_ms": _dtype_prep_ms,
+        "post_load_bookkeeping_ms": _post_load_bb_ms,
     }
 
 
@@ -2357,7 +2392,7 @@ def _validate_cold_identity(
     }
 
 
-def _variance_origin(index: int, pretouch: int, app_name: str) -> dict[str, Any]:
+def _variance_origin(index: int, pretouch: int, app_name: str, teardown: str = "full", pin_transfer: int = 0) -> dict[str, Any]:
     """Request-origin metadata carrying per-run variance diagnostics.
 
     These keys travel inside ``__request_origin_info__`` so the remote runtime
@@ -2368,6 +2403,8 @@ def _variance_origin(index: int, pretouch: int, app_name: str) -> dict[str, Any]
     return {
         "variance_mode": "cold",
         "variance_pretouch": int(pretouch),
+        "minimal_teardown": 1 if teardown == "minimal" else 0,
+        "pin_unet_transfer": int(pin_transfer),
         "variance_diagnostics": {
             "variance_cold_gap_seconds": VARIANCE_COLD_GAP_SECONDS,
             "benchmark_app": app_name,
@@ -2408,7 +2445,7 @@ def _resolve_slow_threshold() -> float:
     return value
 
 
-def _matrix_origin(index: int, diag: int, pretouch: int, app_name: str) -> dict[str, Any]:
+def _matrix_origin(index: int, diag: int, pretouch: int, app_name: str, teardown: str = "full", pin_transfer: int = 0) -> dict[str, Any]:
     """Request-origin metadata for one matrix attempt.
 
     Carries the diagnostics and pretouch gates request-scoped so the remote
@@ -2419,6 +2456,8 @@ def _matrix_origin(index: int, diag: int, pretouch: int, app_name: str) -> dict[
     return {
         "variance_mode": "cold",
         "variance_pretouch": int(pretouch),
+        "minimal_teardown": 1 if teardown == "minimal" else 0,
+        "pin_unet_transfer": int(pin_transfer),
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": str(int(diag)),
         "COMFYMODAL_V2_UNET_PRETOUCH": str(int(pretouch)),
         "variance_diagnostics": {
@@ -2503,6 +2542,8 @@ async def _run_variance_matrix(
     target_per_condition: int,
     max_total_attempts: int,
     slow_threshold_ms: float,
+    teardown: str = "full",
+    pin_transfer: int = 0,
     _runner: Any = None,
 ) -> dict[str, Any]:
     """Four-condition round-robin cold scheduler.
@@ -2516,7 +2557,8 @@ async def _run_variance_matrix(
     """
     print(
         f"[v2.variance_matrix] mode=start gap={gap_seconds}s target={target_per_condition} "
-        f"max_attempts={max_total_attempts} slow_threshold_ms={slow_threshold_ms} app={app_name}",
+        f"max_attempts={max_total_attempts} slow_threshold_ms={slow_threshold_ms} "
+        f"teardown={teardown} pin_transfer={pin_transfer} app={app_name}",
         flush=True,
     )
     per_cond: dict[str, dict[str, Any]] = {}
@@ -2554,7 +2596,7 @@ async def _run_variance_matrix(
         attempt_id = f"matrix-{label}-{attempt_seq_in_cond}-{global_seq}-{uuid.uuid4().hex[:8]}"
         attempt_file = f"attempt_{global_seq:04d}.json"
         _start_ts = datetime.now(timezone.utc).isoformat()
-        origin = _matrix_origin(global_seq, diag, pretouch, app_name)
+        origin = _matrix_origin(global_seq, diag, pretouch, app_name, teardown=teardown, pin_transfer=pin_transfer)
 
         artifact: dict[str, Any] = {}
         try:
@@ -2574,7 +2616,9 @@ async def _run_variance_matrix(
             artifact = {
                 "run_index": global_seq, "run_id": attempt_id, "request_id": "",
                 "identity": {}, "result": {}, "timing": {},
-                "variance": {"pretouch": pretouch, "cold_valid": False, "cold": False,
+                "variance": {"pretouch": pretouch, "pin_transfer": pin_transfer,
+                             "teardown_mode": teardown,
+                             "cold_valid": False, "cold": False,
                              "failures": [f"run raised: {str(exc)[:300]}"]},
                 "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
                 "remote_entry_ts": "unavailable", "mode": "variance_matrix",
@@ -2599,6 +2643,8 @@ async def _run_variance_matrix(
         if not artifact.get("error"):
             artifact["variance"] = {
                 "pretouch": pretouch,
+                "pin_transfer": pin_transfer,
+                "teardown_mode": teardown,
                 "cold_valid": cold_check["cold_valid"],
                 "cold": cold_check["cold"],
                 "failures": cold_check["failures"],
@@ -2656,6 +2702,7 @@ async def _run_variance_matrix(
         "target_per_condition": target_per_condition,
         "max_total_attempts": max_total_attempts,
         "slow_threshold_ms": slow_threshold_ms,
+        "teardown_mode": teardown,
     }
     summary = build_matrix_summary(
         records, MATRIX_CONDITIONS, meta=meta, slow_threshold_ms=slow_threshold_ms,
@@ -2697,6 +2744,8 @@ async def _run_variance_cold(
     app_name: str,
     class_name: str,
     gpu: str,
+    teardown: str = "full",
+    pin_transfer: int = 0,
     _runner: Any = None,
 ) -> dict[str, Any]:
     """Run the variance-cold sequence: one request at a time with a gap.
@@ -2708,7 +2757,7 @@ async def _run_variance_cold(
     """
     print(
         f"[v2.variance_cold] mode=start runs={run_count} gap={gap_seconds}s "
-        f"pretouch={pretouch} app={app_name}",
+        f"pretouch={pretouch} teardown={teardown} pin_transfer={pin_transfer} app={app_name}",
         flush=True,
     )
     records: list[dict[str, Any]] = []
@@ -2717,7 +2766,7 @@ async def _run_variance_cold(
     for index in range(run_count):
         _run_id = f"variance-cold-p{pretouch}-{index}-{uuid.uuid4().hex[:8]}"
         _start_ts = datetime.now(timezone.utc).isoformat()
-        origin = _variance_origin(index, pretouch, app_name)
+        origin = _variance_origin(index, pretouch, app_name, teardown=teardown, pin_transfer=pin_transfer)
 
         artifact: dict[str, Any] = {}
         try:
@@ -2753,6 +2802,8 @@ async def _run_variance_cold(
                 "timing": {},
                 "variance": {
                     "pretouch": pretouch,
+                    "pin_transfer": pin_transfer,
+                    "teardown_mode": teardown,
                     "cold_valid": False,
                     "cold": False,
                     "failures": [f"run raised: {str(exc)[:300]}"],
@@ -2786,6 +2837,8 @@ async def _run_variance_cold(
         artifact["remote_entry_ts"] = _remote_entry_wall_iso(result)
         artifact["variance"] = {
             "pretouch": pretouch,
+            "pin_transfer": pin_transfer,
+            "teardown_mode": teardown,
             "cold_valid": cold_check["cold_valid"],
             "cold": cold_check["cold"],
             "failures": cold_check["failures"],
@@ -2824,6 +2877,7 @@ async def _run_variance_cold(
         "run_count": run_count,
         "gap_seconds": gap_seconds,
         "pretouch": pretouch,
+        "teardown_mode": teardown,
         "slow_threshold_ms": float(os.environ.get("V2_VARIANCE_SLOW_THRESHOLD_MS", "0") or 0),
     }
     summary = build_summary(records, meta=meta)
@@ -2973,7 +3027,8 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False,
                variance_pretouch: int = 0, report_only: str | None = None,
-               gap_seconds: float | None = None, run_count: int | None = None) -> None:
+               gap_seconds: float | None = None, run_count: int | None = None,
+               teardown: str = "full", pin_transfer: int = 0) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
@@ -3011,7 +3066,8 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             workflow=workflow, modal_options=modal_options,
             workspace=workspace, transport=transport, output_dir=output_dir,
             run_count=_vc_runs, gap_seconds=_vc_gap, pretouch=int(variance_pretouch),
-            app_name=_vc_app, class_name=CLASS_NAME, gpu=GPU,
+            app_name=_vc_app, class_name=CLASS_NAME, gpu=GPU, teardown=teardown,
+            pin_transfer=int(pin_transfer),
         )
         return
 
@@ -3033,7 +3089,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             workspace=workspace, transport=transport, output_dir=output_dir,
             gap_seconds=_vm_gap, app_name=_vm_app, class_name=CLASS_NAME, gpu=GPU,
             target_per_condition=_target, max_total_attempts=_max_attempts,
-            slow_threshold_ms=_slow,
+            slow_threshold_ms=_slow, teardown=teardown, pin_transfer=int(pin_transfer),
         )
         return
 
@@ -3178,6 +3234,24 @@ if __name__ == "__main__":
         default=None,
         help="Override the number of variance-cold runs (defaults to V2_VARIANCE_RUN_COUNT).",
     )
+    _parser.add_argument(
+        "--teardown",
+        choices=("full", "minimal"),
+        default=os.environ.get("V2_TEARDOWN_MODE", "full").strip().lower() or "full",
+        help="Request teardown mode: full (default) or minimal "
+             "(COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN; skip unload/cleanup/GC/CUDA). "
+             "Defaults to env V2_TEARDOWN_MODE.",
+    )
+    _parser.add_argument(
+        "--pin-transfer",
+        type=int,
+        choices=(0, 1),
+        default=int(os.environ.get("V2_PIN_TRANSFER", "0") or 0),
+        help="Pin the CPU-snapshot UNET storages with cudaHostRegister before "
+             "the transfer (COMFYMODAL_V2_PIN_UNET_TRANSFER) so the H2D copy "
+             "uses the true DMA path: 0=disabled (default), 1=enabled. "
+             "Defaults to env V2_PIN_TRANSFER.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -3201,4 +3275,6 @@ if __name__ == "__main__":
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,
         run_count=_args.run_count,
+        teardown=_args.teardown,
+        pin_transfer=int(_args.pin_transfer),
     ))

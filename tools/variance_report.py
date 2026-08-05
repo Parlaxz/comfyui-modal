@@ -320,7 +320,7 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
     variance = artifact.get("variance", {}) if isinstance(artifact.get("variance"), dict) else {}
 
     # ── Restore breakdown (from _restore_timing + timing) ──
-    restore = {
+    restore: dict[str, Any] = {
         "restore_total_ms": _num(timing.get("restore_total_ms")),
     }
     for key in (
@@ -328,6 +328,19 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
         "reload_models_ms", "reload_runtime_state_ms", "backend_startup_ms",
     ):
         restore[key] = _num(rt.get(key))
+
+    # Full per-stage restore breakdown (every restore_timing key ending in
+    # ``_ms``), carried as a nested dict plus flattened scalar keys so the
+    # report can render per-stage restore times via _metric_stats.
+    restore_breakdown: dict[str, Any] = {}
+    _rb = timing.get("restore_breakdown")
+    if isinstance(_rb, dict):
+        for _rk, _rv in _rb.items():
+            if isinstance(_rk, str) and _rk.endswith("_ms") and isinstance(_rv, (int, float)):
+                _flat = f"restore_breakdown_{_rk}"
+                restore[_flat] = round(float(_rv), 3)
+                restore_breakdown[_rk] = round(float(_rv), 3)
+    restore["restore_breakdown"] = restore_breakdown
 
     # ── CPU page traversal (page-fault trace events + first-UNET variance) ──
     pagein = _sum_trace_faults(
@@ -406,6 +419,14 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
         "activation_future_publication_ms": _pub_ms,
         "activation_future_publication_source": _pub_src,
         "registry_setup_ms": _wall_ms(_reg_setup),
+        # Worker-variance timing (queue / CPU-snapshot wait / dtype prep /
+        # post-load bookkeeping / true total), mirroring the
+        # activation_future_publication_ms handling.
+        "queue_delay_ms": _num(_act.get("queue_delay_ms")),
+        "cpu_snapshot_wait_ms": _num(_act.get("cpu_snapshot_wait_ms")),
+        "dtype_layout_preparation_ms": _wall_ms(_sub(_act, "dtype_layout_preparation")),
+        "post_load_bookkeeping_ms": _wall_ms(_sub(_act, "post_load_bookkeeping")),
+        "early_activation_total_ms": _num(_act.get("early_activation_total_ms")),
     }
 
     # ── Pretouch (from the activation event's pretouch record) ──
@@ -734,6 +755,25 @@ def build_summary(records: list[dict[str, Any]], *, meta: dict[str, Any] | None 
     cold_runs = [r for r in records if r.get("cold") is True]
     warm_or_invalid = [r for r in records if r.get("cold") is not True]
 
+    # Union of per-stage restore-breakdown keys across all records, so the
+    # report renders every measured restore sub-stage (even if some runs are
+    # missing a stage).  Derived from the flattened restore_breakdown_<stage>
+    # scalars carried by extract_run_metrics.
+    _rb_stages = sorted({
+        _k[len("restore_breakdown_"):]
+        for r in records
+        for _k in (r.get("metrics", {}).get("restore", {}) or {})
+        if isinstance(_k, str) and _k.startswith("restore_breakdown_")
+    })
+    _restore_cat: dict[str, Any] = {
+        "restore_total_ms": _metric_stats(records, "restore", "restore_total_ms"),
+        "snapshot_restore_ms": _metric_stats(records, "restore", "snapshot_restore_ms"),
+        "backend_startup_ms": _metric_stats(records, "restore", "backend_startup_ms"),
+    }
+    for _st in _rb_stages:
+        _restore_cat[f"restore_breakdown_{_st}"] = _metric_stats(
+            records, "restore", f"restore_breakdown_{_st}")
+
     return {
         "mode": "variance_cold",
         "generated_at": _fmt_ts(),
@@ -752,11 +792,7 @@ def build_summary(records: list[dict[str, Any]], *, meta: dict[str, Any] | None 
             ),
         },
         "category_stats": {
-            "restore": {
-                "restore_total_ms": _metric_stats(records, "restore", "restore_total_ms"),
-                "snapshot_restore_ms": _metric_stats(records, "restore", "snapshot_restore_ms"),
-                "backend_startup_ms": _metric_stats(records, "restore", "backend_startup_ms"),
-            },
+            "restore": _restore_cat,
             "page_traversal": {
                 "major_faults": _metric_stats(records, "page_traversal", "major_faults"),
                 "minor_faults": _metric_stats(records, "page_traversal", "minor_faults"),
@@ -772,6 +808,17 @@ def build_summary(records: list[dict[str, Any]], *, meta: dict[str, Any] | None 
                     records, "page_traversal", "cpu_to_gpu_transfer_wall_ms"),
                 "cpu_to_gpu_transfer_gb_per_s": _metric_stats(
                     records, "page_traversal", "cpu_to_gpu_transfer_gb_per_s"),
+                # Worker-variance timing (true total / queue / wait / stages).
+                "early_activation_total_ms": _metric_stats(
+                    records, "page_traversal", "early_activation_total_ms"),
+                "queue_delay_ms": _metric_stats(
+                    records, "page_traversal", "queue_delay_ms"),
+                "cpu_snapshot_wait_ms": _metric_stats(
+                    records, "page_traversal", "cpu_snapshot_wait_ms"),
+                "dtype_layout_preparation_ms": _metric_stats(
+                    records, "page_traversal", "dtype_layout_preparation_ms"),
+                "post_load_bookkeeping_ms": _metric_stats(
+                    records, "page_traversal", "post_load_bookkeeping_ms"),
             },
             "pretouch": {
                 "pretouch_enabled": _metric_stats(records, "pretouch", "pretouch_enabled"),
@@ -901,11 +948,15 @@ def render_variance_report(summary: dict[str, Any]) -> str:
     lines.append("")
 
     # ── Category tables ──
-    lines.append(_render_stats_table("Restore breakdown (ms)", {
+    _restore_tbl: dict[str, Any] = {
         "restore_total_ms": categories.get("restore", {}).get("restore_total_ms", {}),
         "snapshot_restore_ms": categories.get("restore", {}).get("snapshot_restore_ms", {}),
         "backend_startup_ms": categories.get("restore", {}).get("backend_startup_ms", {}),
-    }))
+    }
+    for _st in sorted(categories.get("restore", {}) or {}):
+        if isinstance(_st, str) and _st.startswith("restore_breakdown_"):
+            _restore_tbl[_st] = categories["restore"][_st]
+    lines.append(_render_stats_table("Restore breakdown (ms)", _restore_tbl))
     lines.append(_render_stats_table("CPU page traversal", {
         "major_faults": categories.get("page_traversal", {}).get("major_faults", {}),
         "minor_faults": categories.get("page_traversal", {}).get("minor_faults", {}),
@@ -919,6 +970,15 @@ def render_variance_report(summary: dict[str, Any]) -> str:
             "cpu_page_traversal_gb_per_s", {}),
         "cpu_to_gpu_transfer_wall_ms": categories.get("page_traversal", {}).get(
             "cpu_to_gpu_transfer_wall_ms", {}),
+        "early_activation_total_ms": categories.get("page_traversal", {}).get(
+            "early_activation_total_ms", {}),
+        "queue_delay_ms": categories.get("page_traversal", {}).get("queue_delay_ms", {}),
+        "cpu_snapshot_wait_ms": categories.get("page_traversal", {}).get(
+            "cpu_snapshot_wait_ms", {}),
+        "dtype_layout_preparation_ms": categories.get("page_traversal", {}).get(
+            "dtype_layout_preparation_ms", {}),
+        "post_load_bookkeeping_ms": categories.get("page_traversal", {}).get(
+            "post_load_bookkeeping_ms", {}),
     }))
     lines.append(_render_stats_table("Pretouch", {
         "pretouch_enabled": categories.get("pretouch", {}).get("pretouch_enabled", {}),
