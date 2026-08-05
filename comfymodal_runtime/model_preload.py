@@ -39,7 +39,7 @@ from .contracts import (
     capture_c5_runtime_metadata,
     stable_hash,
 )
-from .env import env_flag
+from .env import env_flag, observability_allows, observability_gate, observability_mode
 from .clip_conditioning_cache import (
     conditioning_cache_key_summary,
     get_exact_conditioning_cache,
@@ -83,7 +83,27 @@ _PREFILL_CRITICAL_ROLES: frozenset[str] = frozenset({"positive", "negative"})
 # Deliberately wraps the OUTERMOST invocation of each operation so
 # inner nested calls do not double-count.
 
-_PAGEFAULT_TRACKING: bool = env_flag("COMFYMODAL_V2_PAGEFAULT_TRACKING", default=True)
+_PAGEFAULT_TRACKING: bool = observability_gate(
+    "COMFYMODAL_V2_PAGEFAULT_TRACKING", "pagefault_tracking", default=True,
+)
+
+
+def sync_observability_gates() -> None:
+    """Re-resolve import-time observability gates from the current env.
+
+    ``_PAGEFAULT_TRACKING`` and ``_DIAGNOSTIC_FLAG`` are frozen at import time.
+    When ``run_plan_stream`` applies a request env-profile override the
+    effective observability mode changes; recompute the module-level gates so
+    they agree with call-time ``observability_allows`` checks for that request.
+    Recomputing an unchanged env yields identical values (no behavior change).
+    """
+    global _PAGEFAULT_TRACKING, _DIAGNOSTIC_FLAG
+    _PAGEFAULT_TRACKING = observability_gate(
+        "COMFYMODAL_V2_PAGEFAULT_TRACKING", "pagefault_tracking", default=True,
+    )
+    _DIAGNOSTIC_FLAG = observability_gate(
+        "COMFYMODAL_V2_DEEP_MODEL_DIAG", "deep_model_diagnostics",
+    )
 
 
 def _is_tensor_channels_last(value: Any) -> bool:
@@ -218,7 +238,9 @@ _LATEST_RESTORE_RETURN_MARKER: dict[str, Any] | None = None
 both restore IDs, MODAL_TASK_ID, and PID.  Read by ``run_plan_stream`` method
 entry for method-entry-gap computation."""
 
-_DIAGNOSTIC_FLAG: bool = env_flag("COMFYMODAL_V2_DEEP_MODEL_DIAG")
+_DIAGNOSTIC_FLAG: bool = observability_gate(
+    "COMFYMODAL_V2_DEEP_MODEL_DIAG", "deep_model_diagnostics",
+)
 """Controls deep diagnostics (proc/pagefault/open/mmap/safetensors detail).
 ``False`` by default — when disabled, only lightweight identity, restore
 total, CLIP read/ready, background submitted/ready, graph demand/wait,
@@ -255,6 +277,7 @@ _SLOW_READ_THRESHOLD_MS: float = _parse_slow_read_threshold()
 _ACTIVATION_DIAGNOSTIC_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
     "comfymodal_activation_diagnostic_state", default=None
 )
+_ACTIVATION_RECEIPT_MAX = 64
 
 
 def begin_activation_diagnostics(
@@ -267,11 +290,13 @@ def begin_activation_diagnostics(
     Returns the ContextVar token for end_activation_diagnostics()."""
     state: dict[str, Any] = {
         "request_id": request_id,
+        "observability_mode": observability_mode(),
         "clip_encode_calls": [],
         "gpu_load_calls": [],
         "model_patcher_calls": [],
         "first_forward": {},
         "residency": {},
+        "activation_receipts": [],
     }
     if cpu_snapshot_active is not None:
         state["cpu_snapshot_active"] = bool(cpu_snapshot_active)
@@ -283,6 +308,45 @@ def begin_activation_diagnostics(
 def get_activation_diagnostics() -> dict[str, Any] | None:
     """Return the current activation-diagnostic state dict or None."""
     return _ACTIVATION_DIAGNOSTIC_STATE.get()
+
+
+def record_activation_receipt(
+    stage: str,
+    *,
+    status: str,
+    role: str = "",
+    started_ns: int | None = None,
+    completed_ns: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    explicit_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Record one bounded, JSON-safe request-scoped activation receipt."""
+    if observability_mode() == "off":
+        return None
+    state = explicit_state if explicit_state is not None else _ACTIVATION_DIAGNOSTIC_STATE.get()
+    if state is None:
+        return None
+    receipt: dict[str, Any] = {
+        "stage": str(stage),
+        "status": str(status),
+        "role": str(role),
+        "request_id": str(state.get("request_id", "")),
+    }
+    if isinstance(started_ns, int):
+        receipt["started_monotonic_ns"] = started_ns
+    if isinstance(completed_ns, int):
+        receipt["completed_monotonic_ns"] = completed_ns
+    if isinstance(started_ns, int) and isinstance(completed_ns, int) and completed_ns >= started_ns:
+        receipt["wall_ms"] = round((completed_ns - started_ns) / 1_000_000, 3)
+    if metadata:
+        for key, value in metadata.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                receipt[str(key)] = value
+    receipts = state.setdefault("activation_receipts", [])
+    receipts.append(receipt)
+    if len(receipts) > _ACTIVATION_RECEIPT_MAX:
+        del receipts[:-_ACTIVATION_RECEIPT_MAX]
+    return receipt
 
 
 def end_activation_diagnostics(token: "contextvars.Token") -> dict[str, Any]:
@@ -328,16 +392,46 @@ def _record_clip_encode(
             "thread_cpu_ms": round((end_thread - start_thread) / 1_000_000, 3),
             "process_cpu_ms": round((end_process - start_process) / 1_000_000, 3),
         }
+        _detailed_activation = observability_allows("detailed_activation")
         if _explicit_state is not None:
-            _explicit_state.setdefault("clip_encode_calls", []).append(record)
-            _explicit_state["clip_encode_instrumentation_attached"] = True
+            if _detailed_activation:
+                _explicit_state.setdefault("clip_encode_calls", []).append(record)
+                _explicit_state["clip_encode_instrumentation_attached"] = True
+            try:
+                record_activation_receipt(
+                    "clip_encode",
+                    status="completed",
+                    role="CLIP",
+                    started_ns=start_wall,
+                    completed_ns=end_wall,
+                    metadata={"caller": caller, "text_length": len(str(text))},
+                    explicit_state=_explicit_state,
+                )
+            except Exception:
+                # Diagnostic accounting must never mask the CLIP encode result
+                # or an in-flight exception on this critical-path finally.
+                pass
         else:
             state = _ACTIVATION_DIAGNOSTIC_STATE.get()
             if state is not None:
-                state["clip_encode_calls"].append(record)
-                state["clip_encode_instrumentation_attached"] = True
+                if _detailed_activation:
+                    state["clip_encode_calls"].append(record)
+                    state["clip_encode_instrumentation_attached"] = True
+                try:
+                    record_activation_receipt(
+                        "clip_encode",
+                        status="completed",
+                        role="CLIP",
+                        started_ns=start_wall,
+                        completed_ns=end_wall,
+                        metadata={"caller": caller, "text_length": len(str(text))},
+                    )
+                except Exception:
+                    # Diagnostic accounting must never mask the CLIP encode
+                    # result or an in-flight exception on this critical path.
+                    pass
         request_trace = _ACTIVE_REQUEST_TRACE.get()
-        if request_trace is not None:
+        if request_trace is not None and _detailed_activation:
             request_trace.emit("clip_encode_diagnostic", phase="execution", metadata=dict(record))
 
 
@@ -1804,25 +1898,27 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             # Prepare activation diagnostic record.
             _start_minflt = 0
             _start_majflt = 0
-            try:
+            if observability_allows("detailed_activation"):
                 try:
-                    import resource as _r_gpu
-                    _start_ru = _r_gpu.getrusage(_r_gpu.RUSAGE_SELF)
-                    _start_minflt = _start_ru.ru_minflt
-                    _start_majflt = _start_ru.ru_majflt
-                except (ImportError, AttributeError):
+                    try:
+                        import resource as _r_gpu
+                        _start_ru = _r_gpu.getrusage(_r_gpu.RUSAGE_SELF)
+                        _start_minflt = _start_ru.ru_minflt
+                        _start_majflt = _start_ru.ru_majflt
+                    except (ImportError, AttributeError):
+                        pass
+                except Exception:
                     pass
-            except Exception:
-                pass
             _gpu_alloc_before = None
             _gpu_reserved_before = None
-            try:
-                import torch as _torch_gpu
-                if _torch_gpu.cuda.is_available():
-                    _gpu_alloc_before = int(_torch_gpu.cuda.memory_allocated())
-                    _gpu_reserved_before = int(_torch_gpu.cuda.memory_reserved())
-            except Exception:
-                pass
+            if observability_allows("detailed_activation"):
+                try:
+                    import torch as _torch_gpu
+                    if _torch_gpu.cuda.is_available():
+                        _gpu_alloc_before = int(_torch_gpu.cuda.memory_allocated())
+                        _gpu_reserved_before = int(_torch_gpu.cuda.memory_reserved())
+                except Exception:
+                    pass
             _gpu_record = {
                 "call_index": _gpu_request_call_count_var.get(),
                 "caller": "",
@@ -1848,14 +1944,17 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             elif lane is not None and lane._lane == "VAE":
                 _caller = "restore_vae_preparation"
             elif lane is None and request_trace is not None:
-                try:
-                    import inspect as _inspect
-                    _frames = " ".join(frame.function.lower() for frame in _inspect.stack(context=0)[:12])
-                    if "sampler" in _frames:
-                        _caller = "sampler_setup"
-                    else:
+                if observability_allows("detailed_activation"):
+                    try:
+                        import inspect as _inspect
+                        _frames = " ".join(frame.function.lower() for frame in _inspect.stack(context=0)[:12])
+                        if "sampler" in _frames:
+                            _caller = "sampler_setup"
+                        else:
+                            _caller = "graph_model_loading"
+                    except Exception:
                         _caller = "graph_model_loading"
-                except Exception:
+                else:
                     _caller = "graph_model_loading"
                 _model_identity_hash = stable_hash([type(model).__module__ + "." + type(model).__qualname__ for model in models])[:16]
                 request_trace.emit("graph_gpu_load_start", phase="execution", metadata={
@@ -2090,7 +2189,7 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                     },
                                 )
                 # ── Append GPU record to activation diagnostics state ──
-                if _gpu_record is not None and _diag_ok:
+                if _gpu_record is not None and _diag_ok and observability_allows("detailed_activation"):
                     try:
                         try:
                             import resource as _r_end
@@ -2139,6 +2238,18 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         _diag_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
                         if _diag_state is not None:
                             _diag_state["gpu_load_calls"].append(dict(_gpu_record))
+                            record_activation_receipt(
+                                "load_models_gpu",
+                                status="completed",
+                                role="UNET" if _gpu_record.get("contains_registered_unet") else "model",
+                                started_ns=_gpu_record.get("start_monotonic_ns"),
+                                completed_ns=_gpu_record.get("end_monotonic_ns"),
+                                metadata={
+                                    "caller": _caller,
+                                    "model_count": _gpu_record.get("model_count"),
+                                    "contains_registered_unet": _gpu_record.get("contains_registered_unet"),
+                                },
+                            )
                         if request_trace is not None:
                             request_trace.emit(
                                 "load_models_gpu_diagnostic",
@@ -2170,6 +2281,27 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                             pass
                     except Exception:
                         pass
+                elif _gpu_record is not None and _diag_ok:
+                    _end_wall_ns = time.monotonic_ns()
+                    _gpu_record["caller"] = _caller
+                    _gpu_record["end_monotonic_ns"] = _end_wall_ns
+                    _diag_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+                    if _diag_state is not None:
+                        try:
+                            record_activation_receipt(
+                                "load_models_gpu",
+                                status="completed",
+                                role="UNET" if _gpu_record.get("contains_registered_unet") else "model",
+                                started_ns=_gpu_record.get("start_monotonic_ns"),
+                                completed_ns=_end_wall_ns,
+                                metadata={
+                                    "caller": _caller,
+                                    "model_count": _gpu_record.get("model_count"),
+                                    "contains_registered_unet": _gpu_record.get("contains_registered_unet"),
+                                },
+                            )
+                        except Exception:
+                            pass
                 # ── Residency sampler: unet_gpu_load_after ──
                 if _residency_sampler_fired:
                     _res_cb_after = _RESIDENCY_SAMPLER_CALLBACK.get()
@@ -3313,6 +3445,17 @@ def _make_model_patcher_load_diagnostic_wrapper(original: Callable[..., Any]) ->
                         "model_type": type(self).__qualname__,
                         "wall_ms": _dur,
                     })
+                    try:
+                        record_activation_receipt(
+                            "model_patcher_load",
+                            status="completed",
+                            role="model_patcher",
+                            started_ns=_start_ns,
+                            completed_ns=time.monotonic_ns(),
+                            metadata={"model_type": type(self).__qualname__},
+                        )
+                    except Exception:
+                        pass
     setattr(wrapper, _SENTINEL_MP_LOAD, True)
     setattr(wrapper, _SENTINEL_MPD_LOAD, True)
     return wrapper

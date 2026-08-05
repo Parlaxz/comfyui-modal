@@ -23,7 +23,7 @@ import threading
 import time
 import weakref
 
-from .env import env_flag
+from .env import env_flag, observability_allows
 from contextvars import ContextVar
 from typing import Any
 
@@ -95,7 +95,7 @@ def _is_enabled() -> bool:
     Checked at call time so test files can set the env var between
     test file imports.
     """
-    return env_flag(_DIAG_ENV_KEY)
+    return env_flag(_DIAG_ENV_KEY) and observability_allows("unet_forward_diagnostics")
 
 # ── Lazy-resolved ContextVar references ──────────────────────────────────────
 # Resolved at first use (not at import) to avoid circular imports.
@@ -354,6 +354,19 @@ def _forward_post_hook(module: Any, args: tuple[Any, ...], output: Any) -> None:
     process_ms = round((end_process_ns - begin_process) / 1_000_000, 3)
     minor_faults = max(0, end_minor_faults - begin_minor)
     major_faults = max(0, end_major_faults - begin_major)
+
+    try:
+        from .model_preload import record_activation_receipt
+        record_activation_receipt(
+            "unet_forward",
+            status="completed",
+            role="UNET",
+            started_ns=begin_wall,
+            completed_ns=end_wall_ns,
+            metadata={"wall_ms": wall_ms},
+        )
+    except Exception:
+        pass
 
     # GPU alloc/reserved after
     _gpu_alloc_after = 0
