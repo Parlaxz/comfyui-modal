@@ -7,6 +7,25 @@ REM -- Pin environment variables ------------------------------------
 set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+REM -- Variance-cold mode (explicit opt-in) -------------------------
+REM Uses a unique shadow app name ONLY for variance mode.  Normal and
+REM production modes keep the default identity above.
+set "V2_IS_VARIANCE=0"
+if /i "!V2_BENCHMARK_MODE!"=="variance_cold" set "V2_IS_VARIANCE=1"
+if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" set "V2_IS_VARIANCE=1"
+set "V2_DEPLOY_IDENT=stable-modal-comfy-v2-shadow"
+set "V2_PROFILE_PRETOUCH=0"
+if /i "!V2_IS_VARIANCE!"=="1" (
+    set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"
+    set "V2_DEPLOY_IDENT=stable-modal-comfy-v2-variance-shadow"
+    if defined V2_VARIANCE_PRETOUCH set "V2_PROFILE_PRETOUCH=!V2_VARIANCE_PRETOUCH!"
+    if not defined V2_VARIANCE_COLD_GAP_SECONDS set "V2_VARIANCE_COLD_GAP_SECONDS=25"
+    REM Enable the runtime variance-diagnostics gate and the UNET pretouch gate
+    REM for the deployed container.  These are diagnostic-only and default OFF in
+    REM every other mode (production defaults are untouched).
+    set "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS=1"
+    set "COMFYMODAL_V2_UNET_PRETOUCH=!V2_PROFILE_PRETOUCH!"
+)
 if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=production"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
     set "COMFYMODAL_V2_FULL_TRACE=0"
@@ -124,6 +143,8 @@ echo eviction_idle_seconds=!V2_PROFILE_EVICT_IDLE!
 echo prefill_lanes=!V2_PROFILE_PREFILL!
 echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
 echo restore_torch_threads=!V2_PROFILE_THREADS!
+echo variance_pretouch=!V2_PROFILE_PRETOUCH!
+echo variance_mode=!V2_IS_VARIANCE!
 
 REM -- Modal CLI detection -----------------------------------------
 where modal >nul 2>nul
@@ -167,7 +188,7 @@ if "!V1_EXISTS!"=="1" (
     echo === V1 comfyui already deployed. Deploying V2 only ===
 
     set "V2_LOG=%TEMP%\_v2dpl_%RANDOM%.txt"
-    !MODAL_CLI! deploy -m comfymodal_runtime.modal_app > "!V2_LOG!" 2>&1
+    !MODAL_CLI! deploy -m comfymodal_runtime.modal_app --name "!COMFYMODAL_V2_APP_NAME!" > "!V2_LOG!" 2>&1
     set "V2_EXIT=!errorlevel!"
 
     echo.
@@ -182,9 +203,9 @@ if "!V1_EXISTS!"=="1" (
     )
 
     REM Validate V2 identifiers
-    findstr /C:"stable-modal-comfy-v2-shadow" "!V2_LOG!" >nul 2>nul
+    python -c "import sys; s=''.join(open(sys.argv[1],encoding='utf-8',errors='replace').read().split()); sys.exit(0 if ''.join(sys.argv[2].split()) in s else 1)" "!V2_LOG!" "!V2_DEPLOY_IDENT!"
     if errorlevel 1 (
-        echo === ERROR: V2 deploy output missing shadow app identifier ===
+        echo === ERROR: V2 deploy output missing shadow app identifier !V2_DEPLOY_IDENT! ===
         if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
         exit /b 1
     )
@@ -217,7 +238,7 @@ if "!V1_EXISTS!"=="1" (
     >>"!V1_CMD_FILE!" echo !MODAL_CLI! deploy comfyapp.py
     >>"!V1_CMD_FILE!" echo exit /b %%errorlevel%%
     > "!V2_CMD_FILE!" echo @echo off
-    >>"!V2_CMD_FILE!" echo !MODAL_CLI! deploy -m comfymodal_runtime.modal_app
+    >>"!V2_CMD_FILE!" echo !MODAL_CLI! deploy -m comfymodal_runtime.modal_app --name "!COMFYMODAL_V2_APP_NAME!"
     >>"!V2_CMD_FILE!" echo exit /b %%errorlevel%%
 
     echo === Deploying V1 and V2 concurrently. Timeout=!COMFYMODAL_DEPLOY_TIMEOUT_SECONDS!s ===
@@ -288,9 +309,9 @@ if "!V1_EXISTS!"=="1" (
     )
 
     REM Validate V2 identifiers
-    findstr /C:"stable-modal-comfy-v2-shadow" "!V2_LOG!" >nul 2>nul
+    python -c "import sys; s=''.join(open(sys.argv[1],encoding='utf-8',errors='replace').read().split()); sys.exit(0 if ''.join(sys.argv[2].split()) in s else 1)" "!V2_LOG!" "!V2_DEPLOY_IDENT!"
     if errorlevel 1 (
-        echo === ERROR: V2 deploy output missing shadow app identifier ===
+        echo === ERROR: V2 deploy output missing shadow app identifier !V2_DEPLOY_IDENT! ===
         if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
         if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
         exit /b 1
@@ -319,9 +340,30 @@ REM -- Benchmark invocation ------------------------------------------
 REM Default: V2_BENCHMARK_RUNS=1 -> exactly one run.  The acceptance
 REM sequence (A fresh / B reused / C fresh, ~3+ requests) runs ONLY via
 REM the explicit opt-in env V2_BENCHMARK_MODE=acceptance so the single-run
-REM contract of this script is never silently exceeded.
+REM contract of this script is never silently exceeded.  The variance-cold
+REM sequence (one request at a time, 25s gap, strict cold-identity proof)
+REM runs ONLY via the explicit opt-in V2_BENCHMARK_MODE=variance_cold.
+REM The four-condition round-robin matrix runs ONLY via the explicit
+REM opt-in V2_BENCHMARK_MODE=variance_matrix.
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMFYMODAL_COMMAND_START_UNIX_MS=%%a"
-if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
+if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
+    echo === Running V2 variance-cold MATRIX - explicit opt-in ===
+    python tools\benchmark_v2_direct.py --variance-matrix
+    if errorlevel 1 (
+        echo === ERROR: Variance-cold matrix benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 variance-cold matrix benchmark completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="variance_cold" (
+    echo === Running V2 variance-cold benchmark - explicit opt-in ===
+    if not defined V2_VARIANCE_RUN_COUNT set "V2_VARIANCE_RUN_COUNT=!V2_BENCHMARK_RUNS!"
+    python tools\benchmark_v2_direct.py --variance-cold --variance-pretouch !V2_PROFILE_PRETOUCH!
+    if errorlevel 1 (
+        echo === ERROR: Variance-cold benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 variance-cold benchmark completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
     echo === Running V2 acceptance benchmark - explicit opt-in ===
     python tools\benchmark_v2_direct.py --acceptance
     if errorlevel 1 (

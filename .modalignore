@@ -23,6 +23,9 @@ benchmark_logs/
 optimization_logs/
 .comfymodal_experiments/
 .custom_node_requirements/
+tests/
+**/tests/**
+**/__pycache__/**
 .baked_custom_node_deps/
 .presets/
 .preset_blobs/

@@ -387,7 +387,7 @@ class TestRegisterRemoteEntrypointProfileMount(unittest.TestCase):
             "runtime_state_volume": MagicMock(),
             "profile_volume": mock_pv,
         }
-        spec = ModalRuntimeSpec()
+        spec = ModalRuntimeSpec(app_name="variance-test-app")
 
         import comfymodal_runtime.modal_app as _ma
         _ma._V2_FULL_TRACE_ENABLED = True
@@ -543,7 +543,10 @@ class TestRegisterRemoteEntrypointEnvPropagation(unittest.TestCase):
 
         self.assertIsNotNone(app.kwargs, "app.cls must have been called")
         env = app.kwargs.get("env", {})
+        self.assertEqual(env.get("COMFYMODAL_V2_APP_NAME"), spec.app_name)
         required_env_keys = [
+            "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
+            "COMFYMODAL_V2_UNET_PRETOUCH",
             "COMFYMODAL_V2_FULL_TRACE",
             "COMFYMODAL_V2_FULL_TRACE_TORCH",
             "COMFYMODAL_V2_FULL_TRACE_ENTRIES",

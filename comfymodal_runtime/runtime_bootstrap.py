@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .contracts import SnapshotExecutionSeed
 from .trace import RuntimeTrace
+from .variance_diagnostics import variance_stage
 
 _log = logging.getLogger(__name__)
 
@@ -1217,10 +1218,11 @@ class RuntimeBootstrap:
 
             if trace:
                 trace.emit("sync_custom_nodes_start", phase="startup")
-            _custom_node_copy_started = _emit_startup_stage("custom_node_source_copy", "start", trace=trace)
-            if self.sync_custom_nodes:
-                self.sync_custom_nodes()
-            _emit_startup_stage("custom_node_source_copy", "end", started=_custom_node_copy_started, trace=trace)
+            with variance_stage(trace, stage="custom_node_source_copy", phase="startup"):
+                _custom_node_copy_started = _emit_startup_stage("custom_node_source_copy", "start", trace=trace)
+                if self.sync_custom_nodes:
+                    self.sync_custom_nodes()
+                _emit_startup_stage("custom_node_source_copy", "end", started=_custom_node_copy_started, trace=trace)
             if trace:
                 trace.emit("sync_custom_nodes_end", phase="startup")
 
@@ -1233,20 +1235,22 @@ class RuntimeBootstrap:
 
             if trace:
                 trace.emit("comfyui_path_setup_start", phase="startup")
-            _path_started = _emit_startup_stage("comfyui_path_startup", "start", trace=trace)
-            self._import_comfyui_path()
-            _emit_startup_stage("comfyui_path_startup", "end", started=_path_started, trace=trace)
+            with variance_stage(trace, stage="comfyui_path_startup", phase="startup"):
+                _path_started = _emit_startup_stage("comfyui_path_startup", "start", trace=trace)
+                self._import_comfyui_path()
+                _emit_startup_stage("comfyui_path_startup", "end", started=_path_started, trace=trace)
             if trace:
                 trace.emit("comfyui_path_setup_end", phase="startup")
 
             if trace:
                 trace.emit("backend_startup_start", phase="startup")
-            _backend_started = _emit_startup_stage("backend_startup", "start", trace=trace)
-            if self.start_backend and not self._backend_started:
-                backend = self.start_backend()
-                self.state.backend = str(backend or "in_process")
-                self._backend_started = True
-            _emit_startup_stage("backend_startup", "end", started=_backend_started, trace=trace)
+            with variance_stage(trace, stage="backend_startup", phase="startup"):
+                _backend_started = _emit_startup_stage("backend_startup", "start", trace=trace)
+                if self.start_backend and not self._backend_started:
+                    backend = self.start_backend()
+                    self.state.backend = str(backend or "in_process")
+                    self._backend_started = True
+                _emit_startup_stage("backend_startup", "end", started=_backend_started, trace=trace)
             if trace:
                 trace.emit("backend_startup_end", phase="startup")
 
@@ -1265,52 +1269,54 @@ class RuntimeBootstrap:
             # ── Lane B: CPU-snapshot Sage pre-discovery ──
             # After all custom-node imports complete, discover and patch the
             # Sage target function with a stable sentinel. No CUDA/GPU access.
-            _sage_snap_identity = _discover_and_patch_sage_cpu_snapshot(
-                custom_node_generation=self.state.custom_node_generation,
-                deployment_combined_hash=getattr(self, '_deployment_combined_hash', ''),
-                baked_cuda_available=bool(
-                    getattr(self, "_sage_baked_cuda_available", False)
-                ),
-            )
-            self.state.snapshot_sage_identity = _sage_snap_identity
-            if trace and _sage_snap_identity.get("sage_mode"):
-                trace.emit(
-                    "sage_snapshot_identity",
-                    phase="startup",
-                    metadata={
-                        "sage_mode": _sage_snap_identity.get("sage_mode", ""),
-                        "patch_version": _sage_snap_identity.get("patch_version", ""),
-                        "target": _sage_snap_identity.get("patched_callable_qualname", ""),
-                    },
+            with variance_stage(trace, stage="sage_discovery", phase="startup"):
+                _sage_snap_identity = _discover_and_patch_sage_cpu_snapshot(
+                    custom_node_generation=self.state.custom_node_generation,
+                    deployment_combined_hash=getattr(self, '_deployment_combined_hash', ''),
+                    baked_cuda_available=bool(
+                        getattr(self, "_sage_baked_cuda_available", False)
+                    ),
                 )
-
-            # Lane B — freeze custom-node identity and persist the atomic versioned record
-            _cn_identity_gen = self.state.custom_node_generation
-            _cn_identity_src = (
-                self.state.snapshot_custom_node_source or "observe_generations"
-            )
-            self.state.freeze_custom_node_identity(
-                custom_node_generation=_cn_identity_gen,
-                generation_source=_cn_identity_src,
-                schema_version="1",
-                deployment_combined_hash=getattr(self, '_deployment_combined_hash', ''),
-            )
-            # Persist atomic versioned record
-            try:
-                self._persist_custom_node_identity_record()
-                if trace:
+                self.state.snapshot_sage_identity = _sage_snap_identity
+                if trace and _sage_snap_identity.get("sage_mode"):
                     trace.emit(
-                        "custom_node_identity_frozen",
+                        "sage_snapshot_identity",
                         phase="startup",
                         metadata={
-                            "cn_gen": self.state.snapshot_custom_node_generation,
-                            "source": _cn_identity_src,
-                            "schema": self.state.snapshot_custom_node_schema,
-                            "deployment_hash": self.state.deployment_combined_hash[:16] if self.state.deployment_combined_hash else "",
+                            "sage_mode": _sage_snap_identity.get("sage_mode", ""),
+                            "patch_version": _sage_snap_identity.get("patch_version", ""),
+                            "target": _sage_snap_identity.get("patched_callable_qualname", ""),
                         },
                     )
-            except Exception as _pexc:
-                print(f"[bootstrap] custom_node_identity_persist error: {_pexc}", flush=True)
+
+            # Lane B — freeze custom-node identity and persist the atomic versioned record
+            with variance_stage(trace, stage="custom_node_identity", phase="startup"):
+                _cn_identity_gen = self.state.custom_node_generation
+                _cn_identity_src = (
+                    self.state.snapshot_custom_node_source or "observe_generations"
+                )
+                self.state.freeze_custom_node_identity(
+                    custom_node_generation=_cn_identity_gen,
+                    generation_source=_cn_identity_src,
+                    schema_version="1",
+                    deployment_combined_hash=getattr(self, '_deployment_combined_hash', ''),
+                )
+                # Persist atomic versioned record
+                try:
+                    self._persist_custom_node_identity_record()
+                    if trace:
+                        trace.emit(
+                            "custom_node_identity_frozen",
+                            phase="startup",
+                            metadata={
+                                "cn_gen": self.state.snapshot_custom_node_generation,
+                                "source": _cn_identity_src,
+                                "schema": self.state.snapshot_custom_node_schema,
+                                "deployment_hash": self.state.deployment_combined_hash[:16] if self.state.deployment_combined_hash else "",
+                            },
+                        )
+                except Exception as _pexc:
+                    print(f"[bootstrap] custom_node_identity_persist error: {_pexc}", flush=True)
 
             self.state.startup_completed_at = time.time()
             if trace:
@@ -1527,7 +1533,8 @@ class RuntimeBootstrap:
                     self.restore_gpu_state()
                 if trace:
                     trace.emit("restore_gpu_state_end", phase="restore")
-            _do_restore_gpu_state()
+            with variance_stage(trace, stage="restore_gpu_state", phase="restore"):
+                _do_restore_gpu_state()
 
             # ── 2. initialize_cuda_context ──
             def _do_initialize_cuda():
@@ -1546,7 +1553,8 @@ class RuntimeBootstrap:
                             "cuda_available": str(self.state.cuda.get("cuda_available", "")),
                         },
                     )
-            _do_initialize_cuda()
+            with variance_stage(trace, stage="cuda_init", phase="restore"):
+                _do_initialize_cuda()
 
             # ── Lane B: Sage exact-match fast path ──
             # After initialize_cuda, read sys.modules and verify the snapshot
@@ -1601,28 +1609,29 @@ class RuntimeBootstrap:
                 )
 
             if not _skipped_sage:
-                if trace:
-                    trace.emit("sage_policy_start", phase="restore")
-                if self.apply_sage_policy:
-                    sage_result = self.apply_sage_policy()
-                    if isinstance(sage_result, bool):
-                        self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
-                        self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
-                    elif isinstance(sage_result, dict):
-                        self.state.sage_mode = str(sage_result.get("mode", ""))
-                        self.state.sage_reason = str(sage_result.get("reason", ""))
-                    # Lane B: capture sage identity after successful application
-                    if self.state.sage_mode:
-                        self.state.sage_identity_captured = True
-                if trace:
-                    trace.emit(
-                        "sage_policy_end",
-                        phase="restore",
-                        metadata={
-                            "sage_mode": self.state.sage_mode,
-                            "sage_reason": self.state.sage_reason,
-                        },
-                    )
+                with variance_stage(trace, stage="sage_policy", phase="restore"):
+                    if trace:
+                        trace.emit("sage_policy_start", phase="restore")
+                    if self.apply_sage_policy:
+                        sage_result = self.apply_sage_policy()
+                        if isinstance(sage_result, bool):
+                            self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
+                            self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
+                        elif isinstance(sage_result, dict):
+                            self.state.sage_mode = str(sage_result.get("mode", ""))
+                            self.state.sage_reason = str(sage_result.get("reason", ""))
+                        # Lane B: capture sage identity after successful application
+                        if self.state.sage_mode:
+                            self.state.sage_identity_captured = True
+                    if trace:
+                        trace.emit(
+                            "sage_policy_end",
+                            phase="restore",
+                            metadata={
+                                "sage_mode": self.state.sage_mode,
+                                "sage_reason": self.state.sage_reason,
+                            },
+                        )
 
             # ── 3. reload_runtime_state ──
             def _do_reload_runtime_state():
@@ -1632,7 +1641,8 @@ class RuntimeBootstrap:
                     self.reload_runtime_state()
                 if trace:
                     trace.emit("reload_runtime_state_end", phase="restore")
-            _do_reload_runtime_state()
+            with variance_stage(trace, stage="runtime_state", phase="restore"):
+                _do_reload_runtime_state()
 
             # ── 4. reload_models ──
             def _do_reload_models():
@@ -1642,7 +1652,8 @@ class RuntimeBootstrap:
                     self.reload_models()
                 if trace:
                     trace.emit("reload_models_end", phase="restore")
-            _do_reload_models()
+            with variance_stage(trace, stage="models", phase="restore"):
+                _do_reload_models()
 
             # Lane B: restore prescan identity from persisted record
             if self.read_current_custom_node_identity is None:
@@ -1691,50 +1702,52 @@ class RuntimeBootstrap:
 
             _check_ms = round((time.perf_counter() - _check_start) * 1000, 3)
 
-            if _skipped_cn_sync:
-                print(
-                    f"[v2.custom_node_restore] "
-                    f"decision={_cn_decision} "
-                    f"callback_called=0 "
-                    f"source={_current_source} "
-                    f"check_ms={_check_ms}",
-                    flush=True,
-                )
-            else:
-                if _cn_fallback_reason:
+            with variance_stage(trace, stage="custom_node_sync", phase="restore"):
+                if _skipped_cn_sync:
                     print(
                         f"[v2.custom_node_restore] "
                         f"decision={_cn_decision} "
-                        f"callback_called=1 "
-                        f"source={_current_source if _current_source else 'unavailable'} "
-                        f"check_ms={_check_ms} "
-                        f"reason={_cn_fallback_reason}",
+                        f"callback_called=0 "
+                        f"source={_current_source} "
+                        f"check_ms={_check_ms}",
                         flush=True,
                     )
-                if trace:
-                    trace.emit("sync_custom_nodes_start", phase="restore")
-                if self.sync_custom_nodes:
-                    self.sync_custom_nodes()
-                if trace:
-                    trace.emit("sync_custom_nodes_end", phase="restore")
-            if not _skipped_cn_sync:
-                if trace:
-                    trace.emit("observe_generations_start", phase="restore")
-                if self.observe_generations:
-                    observed = self.observe_generations() or {}
-                    self.state.runtime_generation = str(observed.get("runtime_state", ""))
-                    self.state.custom_node_generation = str(observed.get("custom_nodes", ""))
-                if trace:
-                    trace.emit("observe_generations_end", phase="restore")
-                if self.state.custom_node_generation:
-                    self.state.snapshot_custom_node_generation = self.state.custom_node_generation
-                    self.state.snapshot_custom_node_source = "observe_generations"
-                    try:
-                        self._persist_custom_node_identity_record()
-                    except Exception as _pexc:
-                        print(f"[bootstrap] identity_publish_after_sync error: {_pexc}", flush=True)
-            else:
-                self.state.custom_node_generation = self.state.snapshot_custom_node_generation
+                else:
+                    if _cn_fallback_reason:
+                        print(
+                            f"[v2.custom_node_restore] "
+                            f"decision={_cn_decision} "
+                            f"callback_called=1 "
+                            f"source={_current_source if _current_source else 'unavailable'} "
+                            f"check_ms={_check_ms} "
+                            f"reason={_cn_fallback_reason}",
+                            flush=True,
+                        )
+                    if trace:
+                        trace.emit("sync_custom_nodes_start", phase="restore")
+                    if self.sync_custom_nodes:
+                        self.sync_custom_nodes()
+                    if trace:
+                        trace.emit("sync_custom_nodes_end", phase="restore")
+            with variance_stage(trace, stage="generation_observe", phase="restore"):
+                if not _skipped_cn_sync:
+                    if trace:
+                        trace.emit("observe_generations_start", phase="restore")
+                    if self.observe_generations:
+                        observed = self.observe_generations() or {}
+                        self.state.runtime_generation = str(observed.get("runtime_state", ""))
+                        self.state.custom_node_generation = str(observed.get("custom_nodes", ""))
+                    if trace:
+                        trace.emit("observe_generations_end", phase="restore")
+                    if self.state.custom_node_generation:
+                        self.state.snapshot_custom_node_generation = self.state.custom_node_generation
+                        self.state.snapshot_custom_node_source = "observe_generations"
+                        try:
+                            self._persist_custom_node_identity_record()
+                        except Exception as _pexc:
+                            print(f"[bootstrap] identity_publish_after_sync error: {_pexc}", flush=True)
+                else:
+                    self.state.custom_node_generation = self.state.snapshot_custom_node_generation
 
             # Lane B — build/hydrate SnapshotExecutionSeed (Step 3)
             # Hydrate the persisted publisher seed payload when available;
@@ -1754,37 +1767,38 @@ class RuntimeBootstrap:
                 .get("identity_components", {}).get("workflow_hash", "") or ""
             )
             _seed_started = _emit_startup_stage("snapshot_execution_seed", "start", trace=trace, phase="restore")
-            _seed_hydrated = self._try_hydrate_snapshot_seed_payload(
-                trace=trace, workflow_hash=_cert_wf_hash,
-            )
-            if not _seed_hydrated:
-                self.state.build_minimal_snapshot_seed_v2(
-                    workflow_hash=_cert_wf_hash,
-                    custom_node_generation=self.state.snapshot_custom_node_generation,
-                    deployment_combined_hash=self.state.deployment_combined_hash,
-                    loader_cache_signatures=_loader_sigs,
+            with variance_stage(trace, stage="snapshot_seed", phase="restore"):
+                _seed_hydrated = self._try_hydrate_snapshot_seed_payload(
+                    trace=trace, workflow_hash=_cert_wf_hash,
                 )
-                _min_obs = snapshot_seed_observability(self.state.snapshot_execution_seed)
-                print(
-                    "[v2.seed_restore] "
-                    f"source=startup_minimal schema=2 topology_available=0 "
-                    f"workflow_hash={self.state.snapshot_seed_workflow_hash[:16]} "
-                    f"loader_signatures={len(_loader_sigs)}",
-                    flush=True,
-                )
-                if trace:
-                    trace.emit(
-                        "snapshot_seed_minimal_fallback",
-                        phase="restore",
-                        metadata={
-                            "seed_source": "startup_minimal",
-                            "topology_available": 0,
-                            "schema_version": 2,
-                            "workflow_hash": self.state.snapshot_seed_workflow_hash[:16],
-                            "loader_signature_count": len(_loader_sigs),
-                            **_min_obs,
-                        },
+                if not _seed_hydrated:
+                    self.state.build_minimal_snapshot_seed_v2(
+                        workflow_hash=_cert_wf_hash,
+                        custom_node_generation=self.state.snapshot_custom_node_generation,
+                        deployment_combined_hash=self.state.deployment_combined_hash,
+                        loader_cache_signatures=_loader_sigs,
                     )
+                    _min_obs = snapshot_seed_observability(self.state.snapshot_execution_seed)
+                    print(
+                        "[v2.seed_restore] "
+                        f"source=startup_minimal schema=2 topology_available=0 "
+                        f"workflow_hash={self.state.snapshot_seed_workflow_hash[:16]} "
+                        f"loader_signatures={len(_loader_sigs)}",
+                        flush=True,
+                    )
+                    if trace:
+                        trace.emit(
+                            "snapshot_seed_minimal_fallback",
+                            phase="restore",
+                            metadata={
+                                "seed_source": "startup_minimal",
+                                "topology_available": 0,
+                                "schema_version": 2,
+                                "workflow_hash": self.state.snapshot_seed_workflow_hash[:16],
+                                "loader_signature_count": len(_loader_sigs),
+                                **_min_obs,
+                            },
+                        )
             _emit_startup_stage("snapshot_execution_seed", "end", started=_seed_started, trace=trace, phase="restore")
             if trace and self.state.snapshot_seed_built:
                 trace.emit(

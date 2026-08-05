@@ -411,6 +411,83 @@ def sync_observability_gates() -> None:
     from .model_preload import sync_observability_gates as _sync_model_preload_gates
     _sync_model_preload_gates()
 
+# ── Request-carried diagnostic env allowlist ─────────────────────────────
+# The variance benchmark runner may carry bounded diagnostic toggles in
+# ``__request_origin_info__`` so a single request can flip variance / pre-touch
+# on a diagnostic deployment.  Only the allowlisted keys below are ever
+# applied to ``os.environ``; every other key and any non-scalar value is
+# ignored, so there is no arbitrary env injection.  Values are validated
+# against a bounded set, never echo secrets, and are recorded back into
+# ``request_origin_info`` (propagated into trace metadata).  Applying these
+# env values mirrors the existing request env-profile override behavior and
+# never changes model/restore-plan identity or workflow.
+
+_REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
+    ("variance_mode", "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"),
+    ("variance_pretouch", "COMFYMODAL_V2_UNET_PRETOUCH"),
+    ("COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"),
+    ("COMFYMODAL_V2_UNET_PRETOUCH", "COMFYMODAL_V2_UNET_PRETOUCH"),
+    ("COMFYMODAL_V2_OBSERVABILITY_MODE", "COMFYMODAL_V2_OBSERVABILITY_MODE"),
+)
+_REQUEST_DIAG_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_REQUEST_DIAG_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+_REQUEST_OBSERVABILITY_MODES = frozenset({"full", "production", "off"})
+_REQUEST_DIAG_STRING_MAX = 64
+
+
+def _normalize_request_diag_env_value(value: Any) -> str | None:
+    """Return a bounded, validated env-string for a request-carried diagnostic
+    value, or ``None`` when the value is not an allowed scalar.
+
+    Accepts bools, ``0``/``1`` ints, and short innocuous strings.  Dicts,
+    lists, objects, empty values, and strings longer than the bound or
+    containing characters outside the innocuous set are rejected (never
+    applied, never leaked).
+    """
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value) if value in (0, 1) else None
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if not raw or len(raw) > _REQUEST_DIAG_STRING_MAX:
+            return None
+        if not all(ch.isalnum() or ch in "_-." for ch in raw):
+            return None
+        return raw
+    return None
+
+
+def _apply_request_variance_diagnostics(
+    request_origin_info: Mapping[str, Any],
+) -> dict[str, str]:
+    """Apply only allowlisted diagnostic env values carried by a request.
+
+    Returns a dict mapping env-var name -> normalized applied value for the
+    keys that were present and valid.  Boolean-typed keys accept only the
+    standard truth/false tokens; the observability mode accepts only the
+    bounded mode set.  Unknown keys, non-scalars, and out-of-allowlist values
+    are never applied.  Never touches model/restore-plan identity or workflow.
+    """
+    applied: dict[str, str] = {}
+    for origin_key, env_name in _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST:
+        if origin_key not in request_origin_info:
+            continue
+        normalized = _normalize_request_diag_env_value(
+            request_origin_info.get(origin_key)
+        )
+        if normalized is None:
+            continue
+        if env_name == "COMFYMODAL_V2_OBSERVABILITY_MODE":
+            if normalized not in _REQUEST_OBSERVABILITY_MODES:
+                continue
+        elif normalized not in (_REQUEST_DIAG_BOOL_TRUE | _REQUEST_DIAG_BOOL_FALSE):
+            continue
+        os.environ[env_name] = normalized
+        applied[env_name] = normalized
+    return applied
+
+
 # ── Activation diagnostics ContextVar ─────────────────────────────────
 # Activation diagnostics use _ACTIVATION_DIAGNOSTIC_STATE from model_preload.
 # begin_activation_diagnostics(request_id)/get_activation_diagnostics()/
@@ -2197,6 +2274,22 @@ def _snapshot_runtime_identity() -> dict[str, str]:
     }
 
 
+def _resolve_enable_memory_snapshot() -> bool:
+    """Resolve ``enable_memory_snapshot`` from ``COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT``.
+
+    Defaults to ``True`` (preserving current behavior).  Set the env var to a
+    false token (``0``/``false``/``no``/``off``) to disable the memory snapshot
+    at spec construction time for the A/B deployment override, so
+    ``_register_remote_entrypoint`` passes ``enable_memory_snapshot=False`` to
+    Modal.  True tokens (``1``/``true``/``yes``/``on``) and unknown/empty
+    values keep the default ``True``.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", "").strip().lower()
+    if raw and raw in _REQUEST_DIAG_BOOL_FALSE:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class ModalRuntimeSpec:
     app_name: str = APP_NAME
@@ -2216,7 +2309,9 @@ class ModalRuntimeSpec:
     max_inputs: int = 1
     min_containers: int = MIN_CONTAINERS
     scaledown_window: int = SCALEDOWN_WINDOW
-    enable_memory_snapshot: bool = True
+    enable_memory_snapshot: bool = dataclasses.field(
+        default_factory=_resolve_enable_memory_snapshot,
+    )
 
 
 def _local_custom_nodes_root() -> Path:
@@ -2272,6 +2367,19 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     ``image.env()`` precede ``add_local_python_source`` does not apply.
     """
     env = {
+        # Keep the runtime's self-reported app identity aligned with the
+        # deployment-selected Modal App name.  Without this, a uniquely named
+        # diagnostic deployment imports the module with the production
+        # fallback and rejects its own requests as the wrong app.
+        "COMFYMODAL_V2_APP_NAME": (
+            spec.app_name if spec is not None else APP_NAME
+        ),
+        "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "0"
+        ),
+        "COMFYMODAL_V2_UNET_PRETOUCH": os.environ.get(
+            "COMFYMODAL_V2_UNET_PRETOUCH", "0"
+        ),
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ),
@@ -12147,6 +12255,32 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
             _request_origin_info["env_profile"] = _effective_profile
+
+        # ── Request-carried variance diagnostics env (allowlisted only) ──
+        # The benchmark runner may carry bounded diagnostic toggles so a
+        # request can flip variance / pre-touch on a diagnostic deployment.
+        # Apply ONLY the allowlisted env values below (same persist-across-
+        # request semantics as the request env-profile override above); any
+        # other key or value is ignored, so there is no arbitrary env
+        # injection and production defaults are preserved.  Applied values are
+        # recorded into ``request_origin_info`` (propagated into trace
+        # metadata/request diagnostics) and are read at call time by the
+        # variance gates.  Model/restore-plan identity and workflow are never
+        # changed.
+        _applied_request_diag_env = _apply_request_variance_diagnostics(
+            _request_origin_info
+        )
+        if _applied_request_diag_env:
+            _request_origin_info.setdefault("applied_diagnostic_env", {}).update(
+                _applied_request_diag_env
+            )
+            print(
+                "[v2.request_variance_env] "
+                + " ".join(
+                    f"{_k}={_v}" for _k, _v in sorted(_applied_request_diag_env.items())
+                ),
+                flush=True,
+            )
 
         # ── Keep observability gates consistent with the effective profile ──
         # _RESIDENCY_DIAGNOSTICS_ENABLED / _V2_FULL_TRACE_ENABLED (here) and

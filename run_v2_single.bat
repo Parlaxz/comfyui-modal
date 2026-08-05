@@ -79,6 +79,8 @@ set "V2_PROFILE_THREADS=none"
 if defined COMFYMODAL_V2_RESTORE_TORCH_THREADS (
     set "V2_PROFILE_THREADS=!COMFYMODAL_V2_RESTORE_TORCH_THREADS!"
 )
+set "V2_PROFILE_PRETOUCH=0"
+if defined V2_VARIANCE_PRETOUCH set "V2_PROFILE_PRETOUCH=!V2_VARIANCE_PRETOUCH!"
 echo [v2.env_profile]
 echo env_profile=!COMFYMODAL_V2_ENV_PROFILE!
 echo thread_policy=!COMFYMODAL_V2_THREAD_POLICY!
@@ -104,13 +106,33 @@ echo eviction_idle_seconds=!V2_PROFILE_EVICT_IDLE!
 echo prefill_lanes=!V2_PROFILE_PREFILL!
 echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
 echo restore_torch_threads=!V2_PROFILE_THREADS!
+echo variance_pretouch=!V2_PROFILE_PRETOUCH!
 
 set "COMFYMODAL_COMMAND_START_UNIX_MS=!COMMAND_START_MS!"
 REM -- Benchmark invocation ------------------------------------------
 REM Default: V2_BENCHMARK_RUNS=1 -> exactly one run.  The acceptance
 REM sequence (A/B/C, ~3+ requests) runs ONLY via the explicit opt-in env
-REM V2_BENCHMARK_MODE=acceptance.
-if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
+REM V2_BENCHMARK_MODE=acceptance.  The variance-cold sequence (one request
+REM at a time, 25s gap, strict cold-identity proof) runs ONLY via the
+REM explicit opt-in V2_BENCHMARK_MODE=variance_cold.  The four-condition
+REM round-robin matrix runs ONLY via the explicit opt-in
+REM V2_BENCHMARK_MODE=variance_matrix.
+if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
+    echo === Running V2 variance-cold MATRIX - explicit opt-in ===
+    set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"
+    set "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS=1"
+    set "COMFYMODAL_V2_UNET_PRETOUCH=!V2_PROFILE_PRETOUCH!"
+    if not defined V2_VARIANCE_COLD_GAP_SECONDS set "V2_VARIANCE_COLD_GAP_SECONDS=25"
+    python tools\benchmark_v2_direct.py --variance-matrix
+) else if /i "!V2_BENCHMARK_MODE!"=="variance_cold" (
+    echo === Running V2 variance-cold benchmark - explicit opt-in ===
+    set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"
+    set "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS=1"
+    set "COMFYMODAL_V2_UNET_PRETOUCH=!V2_PROFILE_PRETOUCH!"
+    if not defined V2_VARIANCE_COLD_GAP_SECONDS set "V2_VARIANCE_COLD_GAP_SECONDS=25"
+    if not defined V2_VARIANCE_RUN_COUNT set "V2_VARIANCE_RUN_COUNT=!V2_BENCHMARK_RUNS!"
+    python tools\benchmark_v2_direct.py --variance-cold --variance-pretouch !V2_PROFILE_PRETOUCH!
+) else if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
     echo === Running V2 acceptance benchmark - explicit opt-in ===
     python tools\benchmark_v2_direct.py --acceptance
 ) else (
