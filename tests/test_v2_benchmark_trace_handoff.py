@@ -27,6 +27,7 @@ from tools.benchmark_v2_direct import (
     _find_in_dir,
     _run_one,
 )
+from comfymodal_runtime.runtime_shape import runtime_shape_config
 
 # ============================================================================
 # Fixtures
@@ -63,6 +64,33 @@ def _fake_downloader_success(**kwargs: Any) -> dict[str, Any]:
         "torch_trace_path": "",
         "manifest_path": "",
         "download_ms": 150.0,
+    }
+
+
+def _valid_runtime_trace() -> dict[str, Any]:
+    shape = runtime_shape_config().identity_payload()
+    remote_metadata = {
+        "method_name": "run_plan_stream",
+        "app_name": "stable-modal-comfy-v2-shadow",
+        "class_name": "ModalRuntimeEntrypointV2",
+        "gpu": "rtx-pro-6000",
+        "cpu": 16,
+        "memory_mb": 49152,
+        "fingerprint": "test-snapshot-fingerprint",
+        "runtime_shape": shape,
+        "runtime_shape_fingerprint": shape["runtime_shape_fingerprint"],
+        "runtime_shape_label": None,
+        "stored_snapshot_model_order": "O0",
+    }
+    return {
+        "events": [
+            {"name": "remote_method_entry", "metadata": remote_metadata},
+            {
+                "name": "runtime_shape_observed",
+                "metadata": {**shape, "status": "baseline_passthrough"},
+            },
+        ],
+        "metadata": {},
     }
 
 
@@ -429,7 +457,7 @@ class TestRunOneTraceHandoffPersistence(unittest.IsolatedAsyncioTestCase):
     async def test_handoff_error_persisted_to_run_file(self):
         """``_trace_handoff_error`` key appears in ``run_{index}.json``."""
         result = {
-            "trace": {"events": [], "metadata": {}},
+            "trace": _valid_runtime_trace(),
             "full_trace_artifact": {
                 "status": "error",
                 "error_type": "trace_collection_failed",
@@ -464,21 +492,7 @@ class TestRunOneTraceHandoffPersistence(unittest.IsolatedAsyncioTestCase):
     async def test_original_fields_preserved_after_handoff_error(self):
         """result, identity, timing survive alongside ``_trace_handoff_error``."""
         result = {
-            "trace": {
-                "events": [
-                    {
-                        "name": "remote_method_entry",
-                        "metadata": {
-                            "method_name": "run_plan_stream",
-                            "app_name": "stable-modal-comfy-v2-shadow",
-                            "class_name": "ModalRuntimeEntrypointV2",
-                            "gpu": "rtx-pro-6000",
-                        },
-                    },
-                ],
-                "deltas_ms": {},
-                "derived_ms": {},
-            },
+            "trace": _valid_runtime_trace(),
             "full_trace_artifact": {
                 "status": "error",
                 "error_type": "disk_full",
@@ -520,7 +534,7 @@ class TestRunOneTraceHandoffPersistence(unittest.IsolatedAsyncioTestCase):
     async def test_successful_handoff_no_error_key(self):
         """No ``_trace_handoff_error`` when handoff succeeds or is absent."""
         result = {
-            "trace": {"events": [], "metadata": {}},
+            "trace": _valid_runtime_trace(),
             # absent artifact — no handoff needed
         }
 
@@ -683,7 +697,7 @@ class TestDeployV2FullTraceOnlyBatchFile(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertIn(line, self.content)
         self.assertIn(
-            'if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=40960"',
+            'if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"',
             self.content,
         )
 
