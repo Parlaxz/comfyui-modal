@@ -90,10 +90,15 @@ class CpuSnapshotModels:
     target_gpus: tuple[str, ...] = ()
     construction_order: str = "O0"
     vae_policy_version: int = VAE_POLICY_VERSION
-    vae_weight_dtype: str = "float32"
-    vae_compute_dtype: str = "float32"
+    # Production-facing VAE defaults align to the native BF16 policy (v1):
+    # weight bfloat16, compute bfloat16_native, memory format contiguous,
+    # prefetch off.  Policy-aware construction overrides these from
+    # resolve_vae_policy(); v0 (float32/float32/contiguous) remains available as
+    # an explicit FP32 control/fail-closed fallback in contracts.py.
+    vae_weight_dtype: str = "bfloat16"
+    vae_compute_dtype: str = "bfloat16_native"
     vae_memory_format: str = "contiguous"
-    vae_policy_mode: str = "v0"
+    vae_policy_mode: str = "v1"
     vae_policy_metadata: dict[str, Any] = field(default_factory=dict)
     vae_validation_metadata: dict[str, Any] = field(default_factory=dict)
     vae_storage_registry: StorageRegistry | None = None
