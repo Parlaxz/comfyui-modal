@@ -674,21 +674,49 @@ def _cpu_snapshot_specs_match(spec_a: Any, spec_b: Any) -> bool:
     )
 
 
-def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str], ...]:
-    """Return exact VAE loader identity for snapshot compatibility checks."""
+def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str, str, str, str, str, str, str], ...]:
+    """Return exact VAE loader identity for snapshot compatibility checks.
+
+    The tuple mirrors the fields carried in ``compute_loader_role_identity``'s
+    VAE branch (loader_class, vae_name, vae_policy_version, vae_weight_dtype,
+    vae_compute_dtype, vae_memory_format, vae_prefetch_mode, c5_impl_version)
+    so restore matching and executor seeding derive the same identity.  Any
+    prefetch-strategy or C5 implementation-version difference is therefore
+    detected consistently on both sides.
+    """
     if not isinstance(spec, Mapping):
         return ()
     loaders = spec.get("loaders", {})
     if not isinstance(loaders, Mapping):
         return ()
-    result: list[tuple[str, str]] = []
+    result: list[tuple[str, str, str, str, str, str, str, str]] = []
     for loader in loaders.get("vae", []):
         if isinstance(loader, Mapping):
             result.append((
                 str(loader.get("loader_class", "")),
                 str(loader.get("vae_name", "")),
+                str(loader.get("vae_policy_version", 0)),
+                str(loader.get("vae_weight_dtype", "legacy_unset")),
+                str(loader.get("vae_compute_dtype", "legacy_unset")),
+                str(loader.get("vae_memory_format", "legacy_unset")),
+                str(loader.get("vae_prefetch_mode", "legacy_unset")),
+                str(loader.get("c5_impl_version", "legacy_unset")),
             ))
     return tuple(result)
+
+
+def _vae_policy_metadata_field(key: ModelRestoreKey, field: str) -> str:
+    """Best-effort read of a stable VAE policy-identity field from a key.
+
+    Mirrors the prefetch-strategy / C5 implementation-version fields that
+    ``compute_loader_role_identity`` carries in the VAE branch so key-level
+    matching and role-identity matching stay consistent.  Missing metadata
+    (legacy keys) yields ``""``.
+    """
+    md = getattr(key, "vae_policy_metadata", {})
+    if isinstance(md, Mapping):
+        return str(md.get(field, "") or "")
+    return ""
 
 
 def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKey) -> bool:
@@ -709,6 +737,14 @@ def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKe
         and key_a.clip_identity == key_b.clip_identity
         and key_a.clip_type == key_b.clip_type
         and key_a.vae_identity == key_b.vae_identity
+        and key_a.vae_policy_version == key_b.vae_policy_version
+        and key_a.vae_weight_dtype == key_b.vae_weight_dtype
+        and key_a.vae_compute_dtype == key_b.vae_compute_dtype
+        and key_a.vae_memory_format == key_b.vae_memory_format
+        and _vae_policy_metadata_field(key_a, "vae_prefetch_mode")
+        == _vae_policy_metadata_field(key_b, "vae_prefetch_mode")
+        and _vae_policy_metadata_field(key_a, "c5_impl_version")
+        == _vae_policy_metadata_field(key_b, "c5_impl_version")
     )
 
 
@@ -733,6 +769,24 @@ def _cpu_snapshot_key_mismatch_reason(
         return "clip_type mismatch"
     if key_a.vae_identity != key_b.vae_identity:
         return "VAE identity mismatch"
+    if key_a.vae_policy_version != key_b.vae_policy_version:
+        return "VAE policy version mismatch"
+    if key_a.vae_weight_dtype != key_b.vae_weight_dtype:
+        return "VAE weight dtype policy mismatch"
+    if key_a.vae_compute_dtype != key_b.vae_compute_dtype:
+        return "VAE compute dtype policy mismatch"
+    if key_a.vae_memory_format != key_b.vae_memory_format:
+        return "VAE memory format policy mismatch"
+    if (
+        _vae_policy_metadata_field(key_a, "vae_prefetch_mode")
+        != _vae_policy_metadata_field(key_b, "vae_prefetch_mode")
+    ):
+        return "VAE prefetch strategy mismatch"
+    if (
+        _vae_policy_metadata_field(key_a, "c5_impl_version")
+        != _vae_policy_metadata_field(key_b, "c5_impl_version")
+    ):
+        return "VAE C5 implementation version mismatch"
     return None
 
 
@@ -788,6 +842,14 @@ def _cpu_snapshot_spec_mismatch_reason(
             return "VAE loader_class mismatch"
         if va[1] != vb[1]:
             return "VAE filename mismatch"
+        if va[2] != vb[2]:
+            return "VAE policy version mismatch"
+        if va[3] != vb[3]:
+            return "VAE weight dtype policy mismatch"
+        if va[4] != vb[4]:
+            return "VAE compute dtype policy mismatch"
+        if va[5] != vb[5]:
+            return "VAE memory format policy mismatch"
 
     if proj_a != proj_b or vae_a != vae_b:
         return "spec projection mismatch"
@@ -868,6 +930,12 @@ def production_snapshot_invariant(
         "clip_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "clip_identity", None), "clip"),
         "unet_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "unet_identity", None), "unet"),
         "vae_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "vae_identity", None), "vae"),
+        "vae_policy_version": getattr(models, "vae_policy_version", None),
+        "vae_weight_dtype": getattr(models, "vae_weight_dtype", None),
+        "vae_compute_dtype": getattr(models, "vae_compute_dtype", None),
+        "vae_memory_format": getattr(models, "vae_memory_format", None),
+        "vae_prefetch_mode": getattr(models, "vae_policy_metadata", {}).get("vae_prefetch_mode"),
+        "c5_impl_version": getattr(models, "vae_policy_metadata", {}).get("c5_impl_version"),
         "status": status,
         "reason": reason,
         "phase": phase,
@@ -2179,6 +2247,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_V2_VAE_POLICY": os.environ.get(
+            "COMFYMODAL_V2_VAE_POLICY", "v0"
+        ),
+        "COMFYMODAL_V2_VAE_PREFETCH_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_PREFETCH_MODE", "off"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -5922,7 +5996,17 @@ class ModalRuntimeEntrypoint:
                                     print(
                                         f"[v2.vae_snapshot] status=retained "
                                         f"vae_identity={_cpu_models.model_key.vae_identity} "
-                                        f"object_type={type(_cpu_models.vae).__name__}",
+                                        f"object_type={type(_cpu_models.vae).__name__} "
+                                        f"object_id={id(_cpu_models.vae)} "
+                                        f"vae_policy_version={_cpu_models.vae_policy_version} "
+                                        f"vae_weight_dtype={_cpu_models.vae_weight_dtype} "
+                                        f"vae_compute_dtype={_cpu_models.vae_compute_dtype} "
+                                        f"vae_memory_format={_cpu_models.vae_memory_format} "
+                                        f"vae_prefetch_mode={_cpu_models.vae_policy_metadata.get('vae_prefetch_mode', 'absent') if isinstance(_cpu_models.vae_policy_metadata, Mapping) else 'absent'} "
+                                        f"c5_impl_version={_cpu_models.vae_policy_metadata.get('c5_impl_version', 'absent') if isinstance(_cpu_models.vae_policy_metadata, Mapping) else 'absent'} "
+                                        f"storage_bytes={_cpu_models.vae_validation_metadata.get('total_storage_bytes', 'absent')} "
+                                        f"floating_parameter_count={_cpu_models.vae_validation_metadata.get('floating_parameter_count', 'absent')} "
+                                        f"mismatched_parameter_buffer_count={_cpu_models.vae_validation_metadata.get('mismatched_parameter_buffer_count', 'absent')}",
                                         flush=True,
                                     )
                                 production_snapshot_invariant(
@@ -8272,7 +8356,28 @@ class ModalRuntimeEntrypoint:
                                         )
                                     if _rt_vae_ident:
                                         _rt_loader_sigs.append(
-                                            {"node_id": "vae", "signature": _rt_vae_ident}
+                                            {
+                                                "node_id": "vae",
+                                                "signature": _rt_vae_ident,
+                                                "vae_policy_version": getattr(
+                                                    request_model_key, "vae_policy_version", 0
+                                                ),
+                                                "vae_weight_dtype": getattr(
+                                                    request_model_key, "vae_weight_dtype", ""
+                                                ),
+                                                "vae_compute_dtype": getattr(
+                                                    request_model_key, "vae_compute_dtype", ""
+                                                ),
+                                                "vae_memory_format": getattr(
+                                                    request_model_key, "vae_memory_format", ""
+                                                ),
+                                                "vae_prefetch_mode": _vae_policy_metadata_field(
+                                                    request_model_key, "vae_prefetch_mode"
+                                                ),
+                                                "c5_impl_version": _vae_policy_metadata_field(
+                                                    request_model_key, "c5_impl_version"
+                                                ),
+                                            }
                                         )
                                     _rt_state.build_snapshot_execution_seed(
                                         workflow_hash=str(getattr(plan, "workflow_hash", "") or ""),
