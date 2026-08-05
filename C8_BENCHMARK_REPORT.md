@@ -26,8 +26,9 @@ TBASE/O0 is the current winner (CPU 16, memory 49152 MiB). For production the se
 cost-balanced shape is **TBASE/O0 / CPU 16 / memory 40960 MiB**: it requests 8 GiB less memory
 (49152 − 40960 = 8192 MiB = 8 GiB lower request) at a measured ~346 ms slower application wall
 time excluding platform variance (app wall 9,493.2 ms for Memory-40960 vs 9,147.0 ms for the
-49152 MiB baseline). 40960 MiB is the production override/fallback; the baseline baseline remains
-49152 MiB. It is not selected on total wall time — the platform-scheduling variance is excluded
+49152 MiB baseline). **40960 MiB is the production default**; 49152 MiB remains available as an
+explicit environment override and the benchmark-only baseline used to reproduce the documented
+latency winner. It is not selected on total wall time — the platform-scheduling variance is excluded
 when comparing the cost-balanced choice.
 
 ## Benchmark context
