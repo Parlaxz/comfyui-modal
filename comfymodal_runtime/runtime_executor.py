@@ -3262,6 +3262,35 @@ def _build_sampling_wrapper() -> Callable:
             "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
         _sampler_boundary_line("sampling_start", start_meta)
+        # ── V2 VAE CPU page prefetch (sampling_start hook) ──────────────
+        # CPU-only, bounded readiness work submitted through the bridge's
+        # coordinator pool (never the mutation lane).  Disabled mode is a
+        # silent no-op; an enabled-mode failure is surfaced with a
+        # diagnostic line instead of being swallowed.
+        try:
+            from comfymodal_runtime.model_preload import (
+                current_v2_loader_bridge,
+                vae_prefetch_mode,
+            )
+            _vae_prefetch_bridge = current_v2_loader_bridge()
+            if _vae_prefetch_bridge is not None:
+                _prefetch_mode = vae_prefetch_mode()
+                _prefetch_scheduled = _vae_prefetch_bridge.schedule_vae_cpu_prefetch(
+                    trace=trace,
+                    request_id=str(trace.request_id),
+                )
+                if not _prefetch_scheduled and _prefetch_mode != "off":
+                    print(
+                        f"[v2.vae_prefetch] event=schedule_failed "
+                        f"request_id={str(trace.request_id)} mode={_prefetch_mode}",
+                        flush=True,
+                    )
+        except Exception:
+            print(
+                f"[v2.vae_prefetch] event=schedule_exception "
+                f"request_id={str(trace.request_id)}",
+                flush=True,
+            )
         # Set the authoritative pre-sampler hard cutoff: every node-wall
         # measurement is clipped at this perf_counter_ns timestamp so that
         # no sampler/VAE/output wall time leaks into pre-sampler metrics.

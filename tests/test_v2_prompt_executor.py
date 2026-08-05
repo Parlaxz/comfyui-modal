@@ -100,6 +100,11 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
     fake_execution = SimpleNamespace(validate_prompt=_validate_prompt)
     with patch.dict("sys.modules", {"execution": fake_execution}):
         result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
+        # Production cleanup is deferred to the stream finalizer (post-terminal
+        # handoff).  The executor only stashes the pending cleanup; the runner
+        # (which the stream generator finally invokes) performs it.  Invoke it
+        # here to mirror the post-terminal-handoff finalizer path.
+        entrypoint._run_pending_production_cleanup()
 
         assert "data" not in result["images"][0], "descriptor mode should not include base64 data"
         assert result["images"][0]["asset_id"] != ""

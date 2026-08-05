@@ -144,6 +144,11 @@ class MountedStateVolume:
         os.replace(temp, final)
         self._write_count += 1
         self._write_bytes_total += len(data)
+        try:
+            from .teardown_diagnostics import record_volume_write
+            record_volume_write(final, volume=self._root)
+        except Exception:
+            pass
 
     def reload(self) -> None:
         """Hook for mounted filesystems; Modal-backed volumes override it."""

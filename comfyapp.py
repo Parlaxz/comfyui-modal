@@ -16,6 +16,11 @@ from typing import Any, Callable
 import modal
 from comfymodal_runtime.contracts import stable_hash
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.runtime_shape import (
+    apply_torch_thread_policy,
+    log_effective_runtime_shape,
+    runtime_shape_config,
+)
 
 # Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
 # Imported lazily with a guarded fallback so a missing/import-error in
@@ -452,7 +457,12 @@ def _is_authorized_production_direct_sink_request(prompt_id: str, node_id: str) 
 # ComfyModalProductionImageComparerOutput can use them.
 
 
-def _encode_image_tensor_batch(images_t, output_format, quality, webp_lossless_compression):
+def encode_image_tensor_batch(
+    images_t,
+    output_format="original",
+    quality=75,
+    webp_lossless_compression="balanced",
+):
     """Encode a single image batch tensor to bytes.
 
     Returns ``(entries, ext, mime_type, W, H)`` for a [B, H, W, C] uint8 tensor.
@@ -500,6 +510,9 @@ def _encode_image_tensor_batch(images_t, output_format, quality, webp_lossless_c
         raw_bytes = out_buf.read()
         entries.append((raw_bytes, ext, mime_type))
     return entries, ext, mime_type, W, H
+
+
+_encode_image_tensor_batch = encode_image_tensor_batch
 
 
 def _clamp_image_tensor(images):
@@ -609,7 +622,7 @@ class ComfyModalProductionOutput:
         images_t = _clamp_image_tensor(images)
         B, H, W, C = images_t.shape
 
-        entries, ext, mime_type, W, H = _encode_image_tensor_batch(
+        entries, ext, mime_type, W, H = encode_image_tensor_batch(
             images_t, output_format, quality, webp_lossless_compression
         )
 
@@ -623,6 +636,7 @@ class ComfyModalProductionOutput:
                 "filename": filename,
                 "bytes": raw_bytes,
                 "mime_type": mime_type,
+                "file_ext": ext,
                 "width": W,
                 "height": H,
                 "output_index": batch_idx,
@@ -731,13 +745,13 @@ class ComfyModalProductionImageComparerOutput:
             images_b_t = _clamp_image_tensor(image_b)
             _b_diag = f"shape={tuple(images_b_t.shape)} dtype={images_b_t.dtype}"
             print(f"[production.rgthree.encode] side=b (B-only) {_b_diag}")
-            b_encoded_tensors, ext, mime_type, W, H = _encode_image_tensor_batch(
+            b_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_b_t, output_format, quality, webp_lossless_compression
             )
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
                 result_entries.append({
-                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
@@ -749,13 +763,13 @@ class ComfyModalProductionImageComparerOutput:
             images_a_t = _clamp_image_tensor(image_a)
             _a_diag = f"shape={tuple(images_a_t.shape)} dtype={images_a_t.dtype}"
             print(f"[production.rgthree.encode] side=a (return-A mode) {_a_diag}")
-            a_encoded_tensors, ext, mime_type, W, H = _encode_image_tensor_batch(
+            a_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_a_t, output_format, quality, webp_lossless_compression
             )
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
                 result_entries.append({
-                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "a_images",
                     "comparison_side": "a", "format": output_format,
@@ -765,13 +779,13 @@ class ComfyModalProductionImageComparerOutput:
             images_b_t = _clamp_image_tensor(image_b)
             _b_diag = f"shape={tuple(images_b_t.shape)} dtype={images_b_t.dtype}"
             print(f"[production.rgthree.encode] side=b (return-A mode) {_b_diag}")
-            b_encoded_tensors, _, _, _, _ = _encode_image_tensor_batch(
+            b_encoded_tensors, _, _, _, _ = encode_image_tensor_batch(
                 images_b_t, output_format, quality, webp_lossless_compression
             )
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
                 result_entries.append({
-                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
@@ -783,13 +797,13 @@ class ComfyModalProductionImageComparerOutput:
             images_a_t = _clamp_image_tensor(image_a)
             _a_diag = f"shape={tuple(images_a_t.shape)} dtype={images_a_t.dtype}"
             print(f"[production.rgthree.encode] side=a (no-B fallback) {_a_diag}")
-            a_encoded_tensors, ext, mime_type, W, H = _encode_image_tensor_batch(
+            a_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_a_t, output_format, quality, webp_lossless_compression
             )
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
                 result_entries.append({
-                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
@@ -1669,6 +1683,7 @@ def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "
                     _active_profile_age = round(time.time() - float(_ca), 1)
     except Exception:
         pass
+    _shape = runtime_shape_config()
     print(
         f"[comfyapp.identity] event={event} COMFYAPP_VERSION={COMFYAPP_VERSION} "
         f"APP_NAME={APP_NAME} class_name={cls_name or '?'} method_name={method_name or '?'} "
@@ -1681,6 +1696,10 @@ def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "
         f"effective_PRELOAD_MODE={_resolve_preload_mode()} "
         f"effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE={_restore_background_code_enabled()} "
         f"effective_RESTORE_BACKGROUND_UNET={_restore_background_unet_enabled()} "
+        f"runtime_shape_fingerprint={_shape.runtime_shape_fingerprint} "
+        f"runtime_shape_label={_shape.runtime_shape_label or 'none'} "
+        f"snapshot_model_order={_shape.snapshot_model_order} "
+        f"cpu_request={_shape.cpu_request} memory_request={_shape.memory_request} "
         f"restored_instance_id={restored_instance_id} "
         f"CONTROL_BASELINE={CONTROL_BASELINE} "
         f"models_volume_id={VOLUME_NAME} "
@@ -7507,6 +7526,7 @@ _V2_RUNTIME_ENV = {
     "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
     "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
 }
+_V2_RUNTIME_ENV.update(runtime_shape_config().environment())
 
 # Combined requirements layer: one COPY + one pip loop (single cache unit).
 # When no requirements.txt changes, the layer is cached (~5s deploy).
@@ -17352,6 +17372,7 @@ class _ComfyAPIMixin:
         import sys
         import warnings
         import torch
+        apply_torch_thread_policy(stage="snapshot_pre_capture")
 
         comfy_path = "/root/comfy/ComfyUI"
         if comfy_path not in sys.path:
@@ -19818,6 +19839,7 @@ class _ComfyAPIMixin:
 
     @modal.enter(snap=False)
     def restore(self):
+        log_effective_runtime_shape(stage="after_restore")
         # ── Post-snapshot restored-instance identity ──
         self._restored_instance_id = uuid.uuid4().hex[:16]
         self._restored_instance_start_unix = time.time()
@@ -22770,6 +22792,7 @@ class _ComfyAPIMixin:
     ):
         global _container_request_count
         _container_request_count += 1
+        log_effective_runtime_shape(stage="request_entry")
         _rt_identity = getattr(self, "_last_restore_timing", None) or {}
         _log_remote_identity(
             "request",

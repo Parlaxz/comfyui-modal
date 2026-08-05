@@ -39,7 +39,17 @@ from .contracts import (
     stable_hash,
 )
 from .deployment_spec import build_deployment_identity
-from .env import env_flag
+from .env import (
+    env_flag,
+    observability_allows,
+    observability_gate,
+    observability_mode,
+)
+from .runtime_shape import (
+    apply_torch_thread_policy,
+    runtime_shape_config,
+    validate_torch_thread_policy,
+)
 from .restore_plan import (
     RestorePlanPublisher,
     build_restore_model_spec,
@@ -104,6 +114,7 @@ from .output_delivery import (
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall
+from .teardown_diagnostics import TeardownDiagnostics
 
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
@@ -363,16 +374,42 @@ _V2_WORKFLOW_HASH: ContextVar[str] = ContextVar("_v2_workflow_hash", default="")
 # When False, _sample_snapshot_residency and all UNET/CLIP storage
 # registries are disabled; no [v2.snapshot_residency] lines are printed.
 # Set COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS=1 to enable.
-_RESIDENCY_DIAGNOSTICS_ENABLED: bool = env_flag("COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS")
+_RESIDENCY_DIAGNOSTICS_ENABLED: bool = observability_gate(
+    "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "residency",
+)
 
 # ── V2 full-trace lifecycle gate ──────────────────────────────────────
 # Inert when COMFYMODAL_V2_FULL_TRACE != '1'.  The full-trace session
 # is created at restore entry and finalized after the first request.
-_V2_FULL_TRACE_ENABLED: bool = env_flag("COMFYMODAL_V2_FULL_TRACE")
+_V2_FULL_TRACE_ENABLED: bool = observability_gate(
+    "COMFYMODAL_V2_FULL_TRACE", "full_trace",
+)
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
 _FULL_TRACE_FINALIZED_LOCK = threading.Lock()
+
+
+def sync_observability_gates() -> None:
+    """Re-resolve import-time observability gates from the current env.
+
+    ``_RESIDENCY_DIAGNOSTICS_ENABLED`` and ``_V2_FULL_TRACE_ENABLED`` (here)
+    plus ``_PAGEFAULT_TRACKING`` and ``_DIAGNOSTIC_FLAG`` (model_preload) are
+    frozen at import time.  When ``run_plan_stream`` applies a request
+    env-profile override the effective observability mode changes; recompute
+    the module-level gates so they agree with call-time
+    ``observability_allows`` checks for that request.  Recomputing an
+    unchanged env yields identical values (no behavior change).
+    """
+    global _RESIDENCY_DIAGNOSTICS_ENABLED, _V2_FULL_TRACE_ENABLED
+    _RESIDENCY_DIAGNOSTICS_ENABLED = observability_gate(
+        "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "residency",
+    )
+    _V2_FULL_TRACE_ENABLED = observability_gate(
+        "COMFYMODAL_V2_FULL_TRACE", "full_trace",
+    )
+    from .model_preload import sync_observability_gates as _sync_model_preload_gates
+    _sync_model_preload_gates()
 
 # ── Activation diagnostics ContextVar ─────────────────────────────────
 # Activation diagnostics use _ACTIVATION_DIAGNOSTIC_STATE from model_preload.
@@ -669,21 +706,49 @@ def _cpu_snapshot_specs_match(spec_a: Any, spec_b: Any) -> bool:
     )
 
 
-def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str], ...]:
-    """Return exact VAE loader identity for snapshot compatibility checks."""
+def _cpu_snapshot_vae_projection(spec: Any) -> tuple[tuple[str, str, str, str, str, str, str, str], ...]:
+    """Return exact VAE loader identity for snapshot compatibility checks.
+
+    The tuple mirrors the fields carried in ``compute_loader_role_identity``'s
+    VAE branch (loader_class, vae_name, vae_policy_version, vae_weight_dtype,
+    vae_compute_dtype, vae_memory_format, vae_prefetch_mode, c5_impl_version)
+    so restore matching and executor seeding derive the same identity.  Any
+    prefetch-strategy or C5 implementation-version difference is therefore
+    detected consistently on both sides.
+    """
     if not isinstance(spec, Mapping):
         return ()
     loaders = spec.get("loaders", {})
     if not isinstance(loaders, Mapping):
         return ()
-    result: list[tuple[str, str]] = []
+    result: list[tuple[str, str, str, str, str, str, str, str]] = []
     for loader in loaders.get("vae", []):
         if isinstance(loader, Mapping):
             result.append((
                 str(loader.get("loader_class", "")),
                 str(loader.get("vae_name", "")),
+                str(loader.get("vae_policy_version", 0)),
+                str(loader.get("vae_weight_dtype", "legacy_unset")),
+                str(loader.get("vae_compute_dtype", "legacy_unset")),
+                str(loader.get("vae_memory_format", "legacy_unset")),
+                str(loader.get("vae_prefetch_mode", "legacy_unset")),
+                str(loader.get("c5_impl_version", "legacy_unset")),
             ))
     return tuple(result)
+
+
+def _vae_policy_metadata_field(key: ModelRestoreKey, field: str) -> str:
+    """Best-effort read of a stable VAE policy-identity field from a key.
+
+    Mirrors the prefetch-strategy / C5 implementation-version fields that
+    ``compute_loader_role_identity`` carries in the VAE branch so key-level
+    matching and role-identity matching stay consistent.  Missing metadata
+    (legacy keys) yields ``""``.
+    """
+    md = getattr(key, "vae_policy_metadata", {})
+    if isinstance(md, Mapping):
+        return str(md.get(field, "") or "")
+    return ""
 
 
 def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKey) -> bool:
@@ -704,6 +769,14 @@ def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKe
         and key_a.clip_identity == key_b.clip_identity
         and key_a.clip_type == key_b.clip_type
         and key_a.vae_identity == key_b.vae_identity
+        and key_a.vae_policy_version == key_b.vae_policy_version
+        and key_a.vae_weight_dtype == key_b.vae_weight_dtype
+        and key_a.vae_compute_dtype == key_b.vae_compute_dtype
+        and key_a.vae_memory_format == key_b.vae_memory_format
+        and _vae_policy_metadata_field(key_a, "vae_prefetch_mode")
+        == _vae_policy_metadata_field(key_b, "vae_prefetch_mode")
+        and _vae_policy_metadata_field(key_a, "c5_impl_version")
+        == _vae_policy_metadata_field(key_b, "c5_impl_version")
     )
 
 
@@ -728,6 +801,24 @@ def _cpu_snapshot_key_mismatch_reason(
         return "clip_type mismatch"
     if key_a.vae_identity != key_b.vae_identity:
         return "VAE identity mismatch"
+    if key_a.vae_policy_version != key_b.vae_policy_version:
+        return "VAE policy version mismatch"
+    if key_a.vae_weight_dtype != key_b.vae_weight_dtype:
+        return "VAE weight dtype policy mismatch"
+    if key_a.vae_compute_dtype != key_b.vae_compute_dtype:
+        return "VAE compute dtype policy mismatch"
+    if key_a.vae_memory_format != key_b.vae_memory_format:
+        return "VAE memory format policy mismatch"
+    if (
+        _vae_policy_metadata_field(key_a, "vae_prefetch_mode")
+        != _vae_policy_metadata_field(key_b, "vae_prefetch_mode")
+    ):
+        return "VAE prefetch strategy mismatch"
+    if (
+        _vae_policy_metadata_field(key_a, "c5_impl_version")
+        != _vae_policy_metadata_field(key_b, "c5_impl_version")
+    ):
+        return "VAE C5 implementation version mismatch"
     return None
 
 
@@ -783,6 +874,14 @@ def _cpu_snapshot_spec_mismatch_reason(
             return "VAE loader_class mismatch"
         if va[1] != vb[1]:
             return "VAE filename mismatch"
+        if va[2] != vb[2]:
+            return "VAE policy version mismatch"
+        if va[3] != vb[3]:
+            return "VAE weight dtype policy mismatch"
+        if va[4] != vb[4]:
+            return "VAE compute dtype policy mismatch"
+        if va[5] != vb[5]:
+            return "VAE memory format policy mismatch"
 
     if proj_a != proj_b or vae_a != vae_b:
         return "spec projection mismatch"
@@ -863,6 +962,12 @@ def production_snapshot_invariant(
         "clip_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "clip_identity", None), "clip"),
         "unet_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "unet_identity", None), "unet"),
         "vae_identity": _safe_snapshot_identity(getattr(getattr(models, "model_key", None), "vae_identity", None), "vae"),
+        "vae_policy_version": getattr(models, "vae_policy_version", None),
+        "vae_weight_dtype": getattr(models, "vae_weight_dtype", None),
+        "vae_compute_dtype": getattr(models, "vae_compute_dtype", None),
+        "vae_memory_format": getattr(models, "vae_memory_format", None),
+        "vae_prefetch_mode": getattr(models, "vae_policy_metadata", {}).get("vae_prefetch_mode"),
+        "c5_impl_version": getattr(models, "vae_policy_metadata", {}).get("c5_impl_version"),
         "status": status,
         "reason": reason,
         "phase": phase,
@@ -1466,6 +1571,7 @@ def _capture_remote_identity() -> dict[str, Any]:
     except Exception:
         pass
     for env_key, meta_key in (
+        ("MODAL_CONTAINER_ID", "modal_container_id"),
         ("MODAL_TASK_ID", "container_task_id"),
         ("MODAL_IMAGE_ID", "image_id"),
         ("MODAL_CLOUD_PROVIDER", "cloud"),
@@ -1888,6 +1994,10 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     â€” never client-generated IDs or raw workflow/image/credential data.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
+    runtime_shape = runtime_shape_config(
+        cpu_request=actual.cpu,
+        memory_request=actual.memory,
+    )
     return {
         # â”€â”€ App / class identity (from remote-observed values) â”€â”€â”€â”€â”€â”€â”€â”€
         "app_name": actual.app_name,
@@ -1898,6 +2008,11 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "memory_mb": actual.memory,
         "target_inputs": actual.target_inputs,
         "max_inputs": actual.max_inputs,
+        "runtime_shape_fingerprint": runtime_shape.runtime_shape_fingerprint,
+        "runtime_shape_label": runtime_shape.runtime_shape_label,
+        "runtime_shape_id": runtime_shape.runtime_shape_fingerprint,
+        "snapshot_model_order": runtime_shape.snapshot_model_order,
+        "runtime_shape": runtime_shape.identity_payload(),
         # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "snapshot_enabled": str(actual.enable_memory_snapshot),
         "gpu_snapshot_enabled": str(env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")),
@@ -1919,21 +2034,8 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
 
 
 def _parse_memory_mb() -> int:
-    """Parse COMFYMODAL_V2_MEMORY_MB, default 24576, positive int required."""
-    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "40960").strip()
-    if not raw:
-        return 40960
-    try:
-        val = int(raw)
-    except (ValueError, TypeError):
-        raise RuntimeError(
-            f"COMFYMODAL_V2_MEMORY_MB={raw!r} is not a valid integer"
-        )
-    if val <= 0:
-        raise RuntimeError(
-            f"COMFYMODAL_V2_MEMORY_MB={val} must be a positive integer (MiB)"
-        )
-    return val
+    """Return the normalized Modal memory request in MiB."""
+    return runtime_shape_config().memory_request
 
 
 def _parse_evict_models_before_snapshot() -> bool:
@@ -2029,7 +2131,7 @@ def _snapshot_target_fingerprint(
     }
 
     # Complete normalized _runtime_env() mapping (captures snapshot/warmup class env)
-    _env = _runtime_env()
+    _env = _runtime_env(actual)
 
     # Experimental_options GPU snapshot flag
     _enable_gpu_snapshot = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
@@ -2066,6 +2168,13 @@ def _snapshot_target_fingerprint(
         # ── Source / env (static deployment config only) ─────────────────
         "source_combined_hash": _combined,
         "runtime_env": _env,
+        "runtime_shape": runtime_shape_config(
+            cpu_request=actual.cpu,
+            memory_request=actual.memory,
+        ).identity_payload(),
+        "effective_deployment_combined_hash": globals().get(
+            "_V2_DEPLOYMENT_COMBINED_HASH", ""
+        ),
         "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
         "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
     }
@@ -2100,7 +2209,7 @@ class ModalRuntimeSpec:
     runtime_state_path: str = RUNTIME_STATE_PATH
     profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
-    cpu: int = 16
+    cpu: int = dataclasses.field(default_factory=lambda: runtime_shape_config().cpu_request)
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1
@@ -2147,7 +2256,7 @@ def _collect_warmup_env() -> dict[str, str]:
     return {k: os.environ[k] for k in _WARMUP_KEYS if k in os.environ}
 
 
-def _runtime_env() -> dict[str, str]:
+def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     """Build the runtime environment dict for Modal's class-level ``env=`` parameter.
 
     Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
@@ -2166,11 +2275,20 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ),
+        "COMFYMODAL_V2_OBSERVABILITY_MODE": os.environ.get(
+            "COMFYMODAL_V2_OBSERVABILITY_MODE", ""
+        ),
         "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0"
         ),
         "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_V2_VAE_POLICY": os.environ.get(
+            "COMFYMODAL_V2_VAE_POLICY", "v1"
+        ),
+        "COMFYMODAL_V2_VAE_PREFETCH_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_PREFETCH_MODE", "off"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -2260,9 +2378,11 @@ def _runtime_env() -> dict[str, str]:
         ),
 
     }
-    memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
-    if memory_mb is not None:
-        env["COMFYMODAL_V2_MEMORY_MB"] = memory_mb
+    runtime_shape = runtime_shape_config(
+        cpu_request=spec.cpu if spec is not None else None,
+        memory_request=spec.memory if spec is not None else None,
+    )
+    env.update(runtime_shape.environment())
     # Propagate COMFYMODAL_V2_RESTORE_TORCH_THREADS without hardcoded default.
     # Absent remains absent; present values are passed through exactly (no strip).
     if "COMFYMODAL_V2_RESTORE_TORCH_THREADS" in os.environ:
@@ -2273,6 +2393,8 @@ def _runtime_env() -> dict[str, str]:
                     "COMFYMODAL_V2_EVICT_RETAIN_ROLE"):
         if _ev_key in os.environ:
             env[_ev_key] = os.environ[_ev_key]
+    if "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS" in os.environ:
+        env["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -2465,6 +2587,10 @@ def _reference_image() -> Any:
 def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     """Build the actual v2 app, image, Volumes, and source identity."""
     runtime_spec = spec or ModalRuntimeSpec()
+    runtime_shape = runtime_shape_config(
+        cpu_request=runtime_spec.cpu,
+        memory_request=runtime_spec.memory,
+    )
     runtime_root = Path(__file__).resolve().parent
     custom_root = _local_custom_nodes_root()
     identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
@@ -2479,6 +2605,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "prompt_cache_volume": None,
             "source_identity": identity,
             "spec": runtime_spec,
+            "runtime_shape": runtime_shape.identity_payload(),
         }
 
     image = _reference_image()
@@ -2513,6 +2640,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "prompt_cache_volume": prompt_cache_volume,
         "source_identity": identity,
         "spec": runtime_spec,
+        "runtime_shape": runtime_shape.identity_payload(),
     }
 
 
@@ -3088,6 +3216,7 @@ class _CgroupCpuSampler:
         self._failure_reason: str | None = None
         self._prev_usage_usec: int | None = None
         self._prev_mono_ns: int | None = None
+        self._stop_timed_out = False
 
     def start(self) -> None:
         if not self._cpu_stat_path or self._thread is not None:
@@ -3180,13 +3309,15 @@ class _CgroupCpuSampler:
             self.compute_peak_cores(), self.compute_spike_intervals()
         )
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 0.5) -> None:
         thread = self._thread
         if thread is None:
             return
         self._stop_event.set()
-        thread.join()
-        self._thread = None
+        thread.join(timeout=max(0.0, float(timeout)))
+        self._stop_timed_out = thread.is_alive()
+        if not self._stop_timed_out:
+            self._thread = None
         self._sample()
 
     def _snapshot(self) -> list[_CgroupCpuSample]:
@@ -3375,6 +3506,7 @@ class _ProcessCpuSampler:
         self._failure_reason: str | None = None
         self._prev_mono_ns: int | None = None
         self._prev_process_ns: int | None = None
+        self._stop_timed_out = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -3415,13 +3547,15 @@ class _ProcessCpuSampler:
             self._prev_mono_ns = now_mono_ns
             self._prev_process_ns = now_process_ns
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 0.5) -> None:
         thread = self._thread
         if thread is None:
             return
         self._stop_event.set()
-        thread.join()
-        self._thread = None
+        thread.join(timeout=max(0.0, float(timeout)))
+        self._stop_timed_out = thread.is_alive()
+        if not self._stop_timed_out:
+            self._thread = None
         self._sample()
 
     def report(self) -> None:
@@ -3845,6 +3979,195 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_retained_model_type: str = ""
         # Release status: "not_run", "released", "skipped", "not_present", "error".
         self._snapshot_eviction_retained_release_status: str = "not_run"
+        self._init_teardown_diagnostics()
+
+    def _init_teardown_diagnostics(self) -> None:
+        if hasattr(self, "_teardown_diagnostics"):
+            return
+        self._teardown_diagnostics = TeardownDiagnostics(
+            container_session_id=getattr(self, "container_session_id", _V2_CONTAINER_SESSION_ID),
+        )
+        self._teardown_diagnostics.configure_paths(
+            models=MODELS_PATH,
+            custom_nodes=CUSTOM_NODES_PATH,
+            runtime_state=RUNTIME_STATE_PATH,
+            profile=PROFILE_PATH,
+            prompt_cache=PROMPT_CACHE_VOLUME_PATH,
+        )
+        self._teardown_diagnostics.register_provider(
+            "runtime_owned_objects", self._teardown_runtime_snapshot,
+        )
+
+    @staticmethod
+    def _future_teardown_state(future: Any) -> dict[str, Any]:
+        if future is None:
+            return {"exists": False}
+        try:
+            return {
+                "exists": True,
+                "done": bool(future.done()),
+                "running": bool(future.running()),
+                "cancelled": bool(future.cancelled()),
+            }
+        except Exception:
+            return {"exists": True, "status": "unavailable"}
+
+    def _teardown_runtime_snapshot(self) -> dict[str, Any]:
+        bridge = getattr(self, "_preload_bridge", None)
+        preload: dict[str, Any] = {}
+        if bridge is not None:
+            try:
+                preload = bridge.diagnostic_snapshot()
+            except Exception as exc:
+                preload = {"error_type": type(exc).__name__}
+        trace_session = getattr(self, "_full_trace_session", None)
+        trace_state: dict[str, Any] = {"present": trace_session is not None}
+        if trace_session is not None:
+            try:
+                trace_state.update(trace_session.status_dict())
+            except Exception as exc:
+                trace_state["error_type"] = type(exc).__name__
+        api = getattr(self, "_legacy_api", None)
+        legacy_workers: list[dict[str, Any]] = []
+        try:
+            for key, worker in list(getattr(api, "_actual_load_futures", {}).items())[:32]:
+                legacy_workers.append({
+                    "key": str(key)[:128],
+                    "name": str(getattr(worker, "name", ""))[:96],
+                    "daemon": bool(getattr(worker, "daemon", False)),
+                    "alive": bool(worker.is_alive()) if hasattr(worker, "is_alive") else None,
+                })
+        except Exception as exc:
+            legacy_workers = [{"error_type": type(exc).__name__}]
+        activation_state: dict[str, Any] = {}
+        try:
+            from .model_preload import teardown_diagnostic_snapshot
+            activation_state = teardown_diagnostic_snapshot()
+        except Exception as exc:
+            activation_state = {"error_type": type(exc).__name__}
+        samplers = {
+            "cgroup": {
+                "present": getattr(self, "_cgroup_sampler", None) is not None,
+                "thread_alive": bool(
+                    getattr(getattr(self, "_cgroup_sampler", None), "_thread", None)
+                    and self._cgroup_sampler._thread.is_alive()
+                ),
+                "stop_timed_out": bool(getattr(getattr(self, "_cgroup_sampler", None), "_stop_timed_out", False)),
+            },
+            "process_cpu": {
+                "present": getattr(self, "_process_cpu_sampler", None) is not None,
+                "thread_alive": bool(
+                    getattr(getattr(self, "_process_cpu_sampler", None), "_thread", None)
+                    and self._process_cpu_sampler._thread.is_alive()
+                ),
+                "stop_timed_out": bool(getattr(getattr(self, "_process_cpu_sampler", None), "_stop_timed_out", False)),
+            },
+        }
+        resource_sampler = getattr(trace_session, "resource_sampler", None)
+        writers = {
+            "full_trace_resource_writer_open": bool(
+                resource_sampler is not None and getattr(resource_sampler, "_gz_file", None) is not None
+            ),
+        }
+        return {
+            "full_trace_session": trace_state,
+            "resource_samplers": samplers,
+            "preload_coordinator": preload,
+            "activation_futures": activation_state,
+            "legacy_request_workers": legacy_workers,
+            "runtime_executor": {
+                "type": type(getattr(self, "executor", None)).__name__,
+                "persistent_executor": False,
+            },
+            "commit_coordinator": {
+                "present": getattr(self, "_runtime_state_coordinator", None) is not None,
+                "pending": bool(getattr(getattr(self, "_runtime_state_coordinator", None), "in_flight", False)),
+            },
+            "open_trace_writers": writers,
+            "request_background_tasks": {"owned_async_tasks": "see_async_tasks"},
+        }
+
+    def _run_teardown_stage(self, name: str, callback: Callable[[], Any]) -> None:
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        started = time.monotonic_ns()
+        if diagnostics is not None:
+            diagnostics.emit("cleanup_stage_start", stage=name)
+        error: dict[str, Any] = {}
+        try:
+            callback()
+        except Exception as exc:
+            error = {"error_type": type(exc).__name__, "error": str(exc)[:160]}
+            if diagnostics is not None and diagnostics.enabled:
+                print(
+                    f"[v2.teardown] cleanup_stage_failure stage={name} "
+                    f"error_type={type(exc).__name__}",
+                    flush=True,
+                )
+        if diagnostics is not None:
+            diagnostics.emit(
+                "cleanup_stage_end",
+                stage=name,
+                elapsed_ms=(time.monotonic_ns() - started) / 1_000_000.0,
+                **error,
+            )
+
+    def exit(self) -> None:
+        self._lazy_init_snapshot_state()
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.set_identity(
+                container_session_id=getattr(self, "container_session_id", ""),
+                restored_instance_id=getattr(self, "_restored_instance_id", ""),
+            )
+            diagnostics.emit("exit_hook_start")
+        started = time.monotonic_ns()
+        try:
+            def stop_samplers() -> None:
+                for sampler_name in ("_cgroup_sampler", "_process_cpu_sampler"):
+                    sampler = getattr(self, sampler_name, None)
+                    if sampler is not None:
+                        sampler.stop(timeout=0.5)
+
+            self._run_teardown_stage("request_samplers", stop_samplers)
+
+            def stop_preload_workers() -> None:
+                bridge = getattr(self, "_preload_bridge", None)
+                if bridge is not None:
+                    bridge.close_workers(
+                        timeout=0.5,
+                        cancel_futures=True,
+                        wait_futures=False,
+                    )
+
+            self._run_teardown_stage("preload_workers", stop_preload_workers)
+
+            def stop_trace_services() -> None:
+                session = getattr(self, "_full_trace_session", None)
+                if session is not None:
+                    session.close_for_exit(timeout=0.5)
+
+            self._run_teardown_stage("trace_services", stop_trace_services)
+
+            def stop_legacy_workers() -> None:
+                self._join_legacy_background_threads(
+                    getattr(self, "_legacy_api", None), join_timeout=0.25,
+                )
+
+            self._run_teardown_stage("legacy_request_workers", stop_legacy_workers)
+
+            # Shutdown-hook fallback: flush any production cleanup that was
+            # deferred for a stream cancelled before its terminal event.  This
+            # is a bounded, idempotent no-op when cleanup already ran in the
+            # stream finalizer (the pending record is cleared on first run).
+            self._run_teardown_stage(
+                "production_cleanup", self._run_pending_production_cleanup,
+            )
+        finally:
+            if diagnostics is not None:
+                diagnostics.emit(
+                    "exit_hook_end",
+                    elapsed_ms=(time.monotonic_ns() - started) / 1_000_000.0,
+                )
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -3877,6 +4200,48 @@ class ModalRuntimeEntrypoint:
         except Exception:
             pass
         return joined
+
+    def _close_snapshot_build_pools(self, api: Any = None, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+        """Close known snapshot-build pools before the lifecycle returns."""
+        joined = self._join_legacy_background_threads(api, join_timeout=30.0)
+        removed = 0
+        if api is not None:
+            try:
+                futures = getattr(api, "_actual_load_futures", None)
+                if isinstance(futures, dict):
+                    for key, worker in list(futures.items()):
+                        if worker is None or not getattr(worker, "is_alive", lambda: False)():
+                            futures.pop(key, None)
+                            removed += 1
+            except Exception:
+                pass
+        try:
+            self._preload_bridge.close_workers()
+            coordinator_closed = 1
+        except Exception as exc:
+            coordinator_closed = 0
+            print(
+                f"[v2.snapshot_pools] status=error error_type={type(exc).__name__}",
+                flush=True,
+            )
+        try:
+            native_threads = len(os.listdir("/proc/self/task"))
+        except Exception:
+            native_threads = None
+        result = {
+            "legacy_threads_joined": joined,
+            "legacy_worker_refs_removed": removed,
+            "coordinator_closed": coordinator_closed,
+            "native_thread_count": native_threads,
+        }
+        print(
+            "[v2.snapshot_pools] stage=before_snapshot_capture "
+            + " ".join(f"{key}={value}" for key, value in result.items()),
+            flush=True,
+        )
+        if trace is not None:
+            trace.emit("snapshot_pools_closed", phase="startup", metadata=result)
+        return result
 
     @staticmethod
     def _check_unet_deferral_eligible(api: Any, plan: Any) -> bool:
@@ -3914,6 +4279,7 @@ class ModalRuntimeEntrypoint:
             self._cpu_snapshot_unet_runtime_state = None
         if not hasattr(self, "_full_trace_session"):
             self._full_trace_session = None
+        self._init_teardown_diagnostics()
         if not hasattr(self, "_torch_thread_limit_applied"):
             self._torch_thread_limit_applied = False
         if not hasattr(self, "_restore_torch_intraop_threads"):
@@ -5425,10 +5791,26 @@ class ModalRuntimeEntrypoint:
         )
         _report_host_memory("restore_start")
         _startup_perf = time.perf_counter()
-        identity = _capture_remote_identity()
-        self._configure_runtime()
         trace = RuntimeTrace(process="remote")
         trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+        _thread_shape = apply_torch_thread_policy(
+            stage="image_runtime_initialization",
+            trace=trace,
+            enforce=True,
+        )
+        self._torch_thread_limit_applied = True
+        self._restore_torch_intraop_threads = _thread_shape.get(
+            "requested_torch_intraop_threads"
+        )
+        self._restore_actual_torch_intraop_threads = _thread_shape.get(
+            "actual_torch_intraop_threads"
+        )
+        self._restore_torch_interop_threads = _thread_shape.get(
+            "actual_torch_interop_threads"
+        )
+        self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
+        identity = _capture_remote_identity()
+        self._configure_runtime()
         trace.set_metadata(**identity)
         trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         startup_session_id = uuid.uuid4().hex
@@ -5465,7 +5847,9 @@ class ModalRuntimeEntrypoint:
             f"class={_reg_cls.__name__} "
             f"gpu={_gpu_str} "
             f"cpu={_spec.cpu} "
-            f"memory={_spec.memory}",
+            f"memory={_spec.memory} "
+            f"runtime_shape_fingerprint={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).runtime_shape_fingerprint} "
+            f"snapshot_model_order={runtime_shape_config(cpu_request=_spec.cpu, memory_request=_spec.memory).snapshot_model_order}",
             flush=True,
         )
         _runtime_id = _snapshot_runtime_identity()
@@ -5846,7 +6230,17 @@ class ModalRuntimeEntrypoint:
                                     print(
                                         f"[v2.vae_snapshot] status=retained "
                                         f"vae_identity={_cpu_models.model_key.vae_identity} "
-                                        f"object_type={type(_cpu_models.vae).__name__}",
+                                        f"object_type={type(_cpu_models.vae).__name__} "
+                                        f"object_id={id(_cpu_models.vae)} "
+                                        f"vae_policy_version={_cpu_models.vae_policy_version} "
+                                        f"vae_weight_dtype={_cpu_models.vae_weight_dtype} "
+                                        f"vae_compute_dtype={_cpu_models.vae_compute_dtype} "
+                                        f"vae_memory_format={_cpu_models.vae_memory_format} "
+                                        f"vae_prefetch_mode={_cpu_models.vae_policy_metadata.get('vae_prefetch_mode', 'absent') if isinstance(_cpu_models.vae_policy_metadata, Mapping) else 'absent'} "
+                                        f"c5_impl_version={_cpu_models.vae_policy_metadata.get('c5_impl_version', 'absent') if isinstance(_cpu_models.vae_policy_metadata, Mapping) else 'absent'} "
+                                        f"storage_bytes={_cpu_models.vae_validation_metadata.get('total_storage_bytes', 'absent')} "
+                                        f"floating_parameter_count={_cpu_models.vae_validation_metadata.get('floating_parameter_count', 'absent')} "
+                                        f"mismatched_parameter_buffer_count={_cpu_models.vae_validation_metadata.get('mismatched_parameter_buffer_count', 'absent')}",
                                         flush=True,
                                     )
                                 production_snapshot_invariant(
@@ -6078,6 +6472,7 @@ class ModalRuntimeEntrypoint:
         # could accidentally keep model objects alive.
         # Missing or incomplete _cpu_snapshot_models is non-fatal: emits
         # status=skipped with the exact reason, continues to startup ready.
+        self._close_snapshot_build_pools(getattr(self, "_legacy_api", None), trace=trace)
         if _parse_evict_models_before_snapshot():
             _cpu_models = getattr(self, "_cpu_snapshot_models", None)
             if _cpu_models is not None:
@@ -6153,7 +6548,27 @@ class ModalRuntimeEntrypoint:
             "_cachedit_preimport": _cd_preimport,
         }
 
-    def _apply_torch_thread_limit(self) -> None:
+    def _apply_torch_thread_limit(self, *, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+        observed = validate_torch_thread_policy(
+            stage="after_restore",
+            trace=trace,
+            enforce=True,
+        )
+        self._restore_torch_intraop_threads = observed.get(
+            "requested_torch_intraop_threads"
+        )
+        self._restore_actual_torch_intraop_threads = observed.get(
+            "actual_torch_intraop_threads"
+        )
+        self._restore_torch_interop_threads = observed.get(
+            "actual_torch_interop_threads"
+        )
+        self._restore_torch_thread_limit_status = observed.get(
+            "status", "validated"
+        )
+        return observed
+
+    def _legacy_apply_torch_thread_limit(self) -> None:
         """Apply torch intraop thread limit at earliest restore point.
 
         Strict parsing: absent/empty/whitespace-only = disabled.
@@ -6383,7 +6798,7 @@ class ModalRuntimeEntrypoint:
 
         # ── Eviction restore: inspect marker and apply idle ──────────────
         # FIRST executable ordering: marker inspection and idle delay
-        # must precede lazy_init_snapshot_state, _apply_torch_thread_limit,
+        # must precede lazy_init_snapshot_state and runtime-shape validation,
         # full-trace, timestamp setup, samplers, host reporting,
         # identity/config/plan/bootstrap/GPU.
         # _restore_eviction_boundary uses getattr defaults so is safe
@@ -6395,11 +6810,6 @@ class ModalRuntimeEntrypoint:
                 getattr(self, "_cpu_snapshot_models", None),
                 phase="restore",
             )
-
-        # ── Torch thread limit: earliest executable point ─────────────────
-        # Applied before normal restore work, _configure_runtime, plan
-        # reading, bootstrap, snapshot validation/retarget/activation.
-        self._apply_torch_thread_limit()
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
@@ -6480,6 +6890,7 @@ class ModalRuntimeEntrypoint:
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
             trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
+            _thread_shape = self._apply_torch_thread_limit(trace=trace)
             _v2_container_restore_count += 1
             self._restore_count = _v2_container_restore_count
             restore_session_id = uuid.uuid4().hex
@@ -6487,7 +6898,19 @@ class ModalRuntimeEntrypoint:
             restored_instance_id = uuid.uuid4().hex
             self._restored_instance_id = restored_instance_id
             _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+            os.environ["COMFYMODAL_RESTORED_INSTANCE_ID"] = restored_instance_id
             set_model_load_identity(restored_instance_id, restore_session_id)
+            self._teardown_diagnostics.set_identity(
+                container_session_id=self.container_session_id,
+                restored_instance_id=restored_instance_id,
+                modal_input_id=identity.get("modal_input_id", ""),
+                modal_task_id=identity.get("container_task_id", ""),
+                modal_container_id=identity.get("modal_container_id", ""),
+            )
+            if identity.get("modal_input_id"):
+                os.environ["COMFYMODAL_INPUT_ID"] = str(identity["modal_input_id"])
+            if identity.get("modal_container_id"):
+                os.environ["COMFYMODAL_CONTAINER_ID"] = str(identity["modal_container_id"])
             # â”€â”€ Full-trace session: update identity now that IDs exist â”€â”€
             if _V2_FULL_TRACE_ENABLED and self._full_trace_session is not None:
                 try:
@@ -6536,6 +6959,11 @@ class ModalRuntimeEntrypoint:
                     "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                     **identity,
                     **_resource_identity(),
+                    "stored_snapshot_model_order": getattr(
+                        getattr(self, "_cpu_snapshot_models", None),
+                        "construction_order",
+                        None,
+                    ),
                 },
             )
             trace.emit(
@@ -7929,10 +8357,13 @@ class ModalRuntimeEntrypoint:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
         # Start process CPU sampler at method entry
-        self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
-        self._process_cpu_sampler.start()
+        self._process_cpu_sampler = None
+        if observability_allows("cpu_sampler"):
+            self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
+            self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
+        trace.set_metadata(observability_mode=observability_mode())
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
         trace.emit("runtime_config_end", phase="execution")
@@ -8174,7 +8605,28 @@ class ModalRuntimeEntrypoint:
                                         )
                                     if _rt_vae_ident:
                                         _rt_loader_sigs.append(
-                                            {"node_id": "vae", "signature": _rt_vae_ident}
+                                            {
+                                                "node_id": "vae",
+                                                "signature": _rt_vae_ident,
+                                                "vae_policy_version": getattr(
+                                                    request_model_key, "vae_policy_version", 0
+                                                ),
+                                                "vae_weight_dtype": getattr(
+                                                    request_model_key, "vae_weight_dtype", ""
+                                                ),
+                                                "vae_compute_dtype": getattr(
+                                                    request_model_key, "vae_compute_dtype", ""
+                                                ),
+                                                "vae_memory_format": getattr(
+                                                    request_model_key, "vae_memory_format", ""
+                                                ),
+                                                "vae_prefetch_mode": _vae_policy_metadata_field(
+                                                    request_model_key, "vae_prefetch_mode"
+                                                ),
+                                                "c5_impl_version": _vae_policy_metadata_field(
+                                                    request_model_key, "c5_impl_version"
+                                                ),
+                                            }
                                         )
                                     _rt_state.build_snapshot_execution_seed(
                                         workflow_hash=str(getattr(plan, "workflow_hash", "") or ""),
@@ -8331,7 +8783,9 @@ class ModalRuntimeEntrypoint:
         _cpu_snapshot_active = bool(self._cpu_snapshot_models_active)
         _activation_diagnostic_state: dict[str, Any] = {
             "request_id": str(context.request_id),
+            "observability_mode": observability_mode(),
             "clip_encode_calls": [],
+            "activation_receipts": [],
         }
 
         # ── Execution-phase CLIP prefill single-flight ──────────────────
@@ -8479,6 +8933,7 @@ class ModalRuntimeEntrypoint:
                     "clip_encode_prefill_wall_ms", "clip_encode_process_cpu_ms",
                     "load_models_gpu_calls", "unet_gpu_load_calls",
                     "load_models_gpu_wall_ms",
+                    "activation_receipt_count",
                     "gpu_allocated_delta_bytes",
                     "cpu_peak_cores", "cpu_above_16_ms", "cpu_above_19_ms",
                     "cpu_longest_above_19_ms",
@@ -10270,7 +10725,11 @@ class ModalRuntimeEntrypoint:
             if not isinstance(registry, Mapping):
                 registry = {}
             history_result = getattr(executor, "history_result", None)
-            history = {prompt_id: history_result} if isinstance(history_result, dict) else {}
+            history = (
+                {prompt_id: history_result}
+                if not production_enabled and isinstance(history_result, dict)
+                else {}
+            )
             output_dir = Path("/root/comfy/ComfyUI/output")
             trace.emit(
                 "output_chain_start",
@@ -10280,14 +10739,17 @@ class ModalRuntimeEntrypoint:
             chain = build_default_chain(
                 registry=registry,
                 history=history,
-                materials_dir=str(output_dir) if output_dir.is_dir() else "",
+                materials_dir=(str(output_dir) if output_dir.is_dir() else "")
+                if not production_enabled else "",
             )
             attempts = run_strategy_chain(
                 chain,
                 prompt_id=prompt_id,
                 output_node_ids=tuple(plan.output_node_ids),
-                materials_dir=str(output_dir) if output_dir.is_dir() else "",
+                materials_dir=(str(output_dir) if output_dir.is_dir() else "")
+                if not production_enabled else "",
                 request_start_boundary=started,
+                stop_after_success=production_enabled,
             )
             trace.emit(
                 "output_chain_end",
@@ -10570,6 +11032,10 @@ class ModalRuntimeEntrypoint:
                 _clip_calls: list = _ad.get("clip_encode_calls") or []
                 _gpu_calls: list = _ad.get("gpu_load_calls") or []
                 _ad["_clip_encode_records"] = list(_clip_calls)
+                _ad["activation_receipts"] = (
+                    list(_ad.get("activation_receipts") or [])
+                    + list((activation_diagnostic_state or {}).get("activation_receipts") or [])
+                )
                 _aggregate_clip_encode_diagnostics(
                     _ad,
                     list((activation_diagnostic_state or {}).get("clip_encode_calls") or []),
@@ -10582,6 +11048,9 @@ class ModalRuntimeEntrypoint:
                 _ad["load_models_gpu_calls"] = len(_gpu_calls)
                 _ad["unet_gpu_load_calls"] = sum(1 for g in _gpu_calls if g.get("contains_registered_unet"))
                 _ad["load_models_gpu_wall_ms"] = round(sum(g.get("wall_ms", 0) or 0 for g in _gpu_calls), 3)
+                _ad["activation_receipt_count"] = len(
+                    _ad.get("activation_receipts") or []
+                )
 
                 # GPU allocated delta
                 _gpu_alloc_sum = sum(g.get("gpu_allocated_delta_bytes", 0) or 0 for g in _gpu_calls)
@@ -10642,14 +11111,67 @@ class ModalRuntimeEntrypoint:
             # commit lane is free before any post-execution work.
             if _lane is not None and _lane_acquired[0]:
                 _lane.release("sampler")
+            # Post-response production cleanup is deferred to the stream
+            # generator's finalizer so it runs ONLY after the terminal
+            # result/error event has been yielded to the consumer.  Stash the
+            # (idempotent) cleanup callables + prompt id here; do NOT run them
+            # before the terminal handoff.
             if production_enabled:
+                _pending_cleanup = getattr(self, "_v2_pending_production_cleanup", None)
+                if not isinstance(_pending_cleanup, dict):
+                    _pending_cleanup = {}
+                _pending_cleanup.setdefault(
+                    "prompt_id", prompt_id,
+                )
+                _pending_cleanup.setdefault("trace", trace)
+                if callable(cleanup_request):
+                    _pending_cleanup["cleanup_request"] = cleanup_request
+                if callable(cleanup_registry):
+                    _pending_cleanup["cleanup_registry"] = cleanup_registry
+                self._v2_pending_production_cleanup = _pending_cleanup
+
+    def _run_pending_production_cleanup(self) -> None:
+        """Run deferred production cleanup exactly once, post-terminal-handoff.
+
+        This runs only from the ``run_plan_stream`` generator finalizer AFTER
+        the terminal result/error event has been yielded to the consumer (or
+        from the shutdown ``exit`` hook as a bounded fallback for a stream that
+        was cancelled before its terminal event).  It is idempotent: the
+        pending record is cleared before the callbacks run, so a second call
+        (e.g. consumer closes after terminal, then container ``exit`` runs) is
+        a no-op.  Never raises — cleanup must not mask the terminal result or
+        an in-flight exception on this finalization path.
+        """
+        pending = getattr(self, "_v2_pending_production_cleanup", None)
+        if not pending or not isinstance(pending, dict):
+            return
+        self._v2_pending_production_cleanup = None
+        prompt_id = str(pending.get("prompt_id", ""))
+        cleanup_request = pending.get("cleanup_request")
+        cleanup_registry = pending.get("cleanup_registry")
+        trace = pending.get("trace")
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        try:
+            if trace is not None:
                 trace.emit("production_cleanup_start", phase="output")
-            if production_enabled and callable(cleanup_request):
-                cleanup_request(prompt_id)
-            if production_enabled and callable(cleanup_registry):
-                cleanup_registry(prompt_id)
-            if production_enabled:
+            if diagnostics is not None:
+                diagnostics.emit("production_cleanup_start", stage="output")
+            try:
+                if callable(cleanup_request):
+                    cleanup_request(prompt_id)
+            finally:
+                try:
+                    if callable(cleanup_registry):
+                        cleanup_registry(prompt_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            if trace is not None:
                 trace.emit("production_cleanup_end", phase="output")
+            if diagnostics is not None:
+                diagnostics.emit("production_cleanup_end", stage="output")
 
     @staticmethod
     def _executor_error_message(executor: Any) -> str:
@@ -10887,6 +11409,10 @@ class ModalRuntimeEntrypoint:
                     temp.write_bytes(raw)
                     os.replace(temp, target)
                     wrote = True
+                    if hasattr(self, "_teardown_diagnostics"):
+                        self._teardown_diagnostics.record_file_write(
+                            target, volume=RUNTIME_STATE_PATH,
+                        )
                 finally:
                     try:
                         temp.unlink(missing_ok=True)
@@ -11116,12 +11642,37 @@ class ModalRuntimeEntrypoint:
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        self._lazy_init_snapshot_state()
+        diagnostics = getattr(self, "_teardown_diagnostics", None)
+        identity = _capture_remote_identity()
+        if diagnostics is not None:
+            diagnostics.set_identity(
+                container_session_id=getattr(self, "container_session_id", ""),
+                restored_instance_id=getattr(self, "_restored_instance_id", ""),
+                modal_input_id=identity.get("modal_input_id", ""),
+                modal_task_id=identity.get("container_task_id", ""),
+                modal_container_id=identity.get("modal_container_id", ""),
+                request_id=request_id,
+            )
+        terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
                 plan_payload, request_id=request_id, cancelled=cancelled,
             ):
+                if not terminal_started and event.get("type") in {"result", "error"}:
+                    terminal_started = True
+                    if diagnostics is not None:
+                        diagnostics.set_identity(request_id=event.get("request_id", request_id))
+                        diagnostics.emit(
+                            "request_terminal_start",
+                            terminal_status=str(event.get("type", "unknown")),
+                        )
                 yield event
         except Exception as exc:
+            if not terminal_started:
+                terminal_started = True
+                if diagnostics is not None:
+                    diagnostics.emit("request_terminal_start", terminal_status="exception")
             yield {
                 "type": "error",
                 "phase": "setup_failed",
@@ -11130,6 +11681,22 @@ class ModalRuntimeEntrypoint:
                 ),
                 "request_id": request_id or "",
             }
+        finally:
+            # Capture whether a real terminal result/error event was yielded
+            # BEFORE the forced generator_closed fallback below mutates the flag.
+            _terminal_was_yielded = terminal_started
+            if not terminal_started:
+                terminal_started = True
+                if diagnostics is not None:
+                    diagnostics.emit("request_terminal_start", terminal_status="generator_closed")
+            if diagnostics is not None:
+                diagnostics.emit("request_terminal_end")
+            # Deferred production cleanup: run ONLY after a terminal result/error
+            # event has been yielded to the consumer (_terminal_was_yielded).  If
+            # the stream was cancelled/closed before any terminal event, skip here
+            # and rely on the shutdown ``exit`` hook fallback (bounded + idempotent).
+            if _terminal_was_yielded:
+                self._run_pending_production_cleanup()
 
     async def _run_plan_stream_impl(
         self,
@@ -11203,6 +11770,15 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
             _request_origin_info["env_profile"] = _effective_profile
+
+        # ── Keep observability gates consistent with the effective profile ──
+        # _RESIDENCY_DIAGNOSTICS_ENABLED / _V2_FULL_TRACE_ENABLED (here) and
+        # _PAGEFAULT_TRACKING / _DIAGNOSTIC_FLAG (model_preload) are frozen at
+        # import time.  Recompute them from the current env on every request so
+        # module-level gates and call-time observability_allows() checks agree
+        # for the effective env profile (incl. any request override applied
+        # above).  When the env is unchanged this recomputes identical values.
+        sync_observability_gates()
 
         _restore_timing_for_age = self._restore_timing or _LATEST_LIFECYCLE_TIMING or {}
         _callback_wall_for_age = _restore_timing_for_age.get(
@@ -11320,8 +11896,18 @@ class ModalRuntimeEntrypoint:
             request_origin_info=_request_origin_info,
             **_entry_host,
             **_resource_identity(),
+            stored_snapshot_model_order=getattr(
+                getattr(self, "_cpu_snapshot_models", None),
+                "construction_order",
+                None,
+            ),
         )
         context.trace.set_metadata(**context_snapshot_age)
+        validate_torch_thread_policy(
+            stage="request_entry",
+            trace=context.trace,
+            enforce=True,
+        )
         if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
             _cgroup_sampler.set_phase_source(
                 lambda: (
@@ -11527,6 +12113,11 @@ class ModalRuntimeEntrypoint:
                     # â”€â”€ Remote-observed identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     **identity,
                     **_resource_identity(),
+                    "stored_snapshot_model_order": getattr(
+                        getattr(self, "_cpu_snapshot_models", None),
+                        "construction_order",
+                        None,
+                    ),
                 },
             )
             context.trace.emit(
@@ -11987,6 +12578,8 @@ def _build_decorated_v2_class() -> type:
         self._snapshot_eviction_retained_model_id = 0
         self._snapshot_eviction_retained_model_type = ""
         self._snapshot_eviction_retained_release_status = "not_run"
+        self._v2_pending_production_cleanup: dict[str, Any] | None = None
+        self._init_teardown_diagnostics()
         self._v2_initialized = True
 
     # Wrap each Modal-exposed method to lazy-init first.
@@ -11994,7 +12587,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
-        "publish_restore_plan",
+        "publish_restore_plan", "exit",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -12025,6 +12618,9 @@ def _build_decorated_v2_class() -> type:
     # Apply Modal lifecycle/method decorators.
     setattr(cls, "startup", _modal.enter(snap=True)(cls.startup))
     setattr(cls, "restore", _modal.enter(snap=False)(cls.restore))
+    _exit_decorator = getattr(_modal, "exit", None)
+    if callable(_exit_decorator):
+        setattr(cls, "exit", _exit_decorator()(cls.exit))
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
@@ -12086,7 +12682,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         scaledown_window=spec.scaledown_window,
         volumes=_volumes,
         enable_memory_snapshot=spec.enable_memory_snapshot,
-        env=_runtime_env(),
+        env=_runtime_env(spec),
         **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
     )(remote_class)
 
@@ -12317,6 +12913,7 @@ except Exception:
         "profile_volume": None,
         "source_identity": None,
         "spec": ModalRuntimeSpec(),
+        "runtime_shape": runtime_shape_config().identity_payload(),
     }
 # Phase 1: Pre-compute deployment combined hash from the canonical
 # DeploymentIdentity / source_identity used by V2 resources.  This
@@ -12328,6 +12925,10 @@ _V2_DEPLOYMENT_COMBINED_HASH = (
     if _MODAL_RESOURCES.get("source_identity") is not None
     else ""
 )
+_V2_DEPLOYMENT_COMBINED_HASH = stable_hash({
+    "source_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
+    "runtime_shape": runtime_shape_config().identity_payload(),
+})
 # Modal CLI discovers the application through a module-level ``app`` object.
 # Keep the resource construction above as the single source of truth while
 # exposing the registered shadow app for ``modal deploy -m``.

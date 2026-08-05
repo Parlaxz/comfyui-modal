@@ -42,9 +42,10 @@ from comfymodal_runtime.contracts import ModelRestoreKey
 def _clean_env():
     """Remove eviction env vars so tests start from a known state."""
     for key in ("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT",
-                "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS",
-                "COMFYMODAL_V2_EVICT_RETAIN_ROLE",
-                "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
+                 "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS",
+                 "COMFYMODAL_V2_EVICT_RETAIN_ROLE",
+                 "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS",
+                 "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
                 "COMFYMODAL_ENABLE_GPU_SNAPSHOT"):
         os.environ.pop(key, None)
 
@@ -311,6 +312,11 @@ class RuntimeEnvPropagationTests(unittest.TestCase):
         self.assertEqual(env["COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"], "0")
         self.assertEqual(env["COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS"], "0")
         self.assertEqual(env["COMFYMODAL_V2_EVICT_RETAIN_ROLE"], "none")
+
+    def test_teardown_diagnostics_passthrough(self):
+        self.assertNotIn("COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS", _runtime_env())
+        os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = "1"
+        self.assertEqual(_runtime_env()["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"], "1")
 
 
 # ── Memory field contract tests ──────────────────────────────────────────
@@ -1988,7 +1994,13 @@ class RestoreBoundaryOrderingTest(unittest.TestCase):
         _clean_env()
 
     def test_restore_boundary_before_apply_torch_thread(self):
-        """entrypoint.restore() calls boundary before apply_torch_thread_limit."""
+        """entrypoint.restore() calls boundary, then configure_runtime, then apply_torch_thread_limit.
+
+        Reflects the accepted C8 source order: ``_restore_eviction_boundary``,
+        then ``_configure_runtime``, then ``_apply_torch_thread_limit`` (C8 runs
+        configure before apply).  The controlled stop is raised from
+        ``_apply_torch_thread_limit`` so all three ordering stages are recorded.
+        """
         entrypoint = ModalRuntimeEntrypoint()
         entrypoint._eviction_marker = None
         entrypoint._snapshot_models_evicted_before_capture = False
@@ -1997,33 +2009,33 @@ class RestoreBoundaryOrderingTest(unittest.TestCase):
         def _tracking_boundary():
             events.append("boundary")
             return original_boundary()
-        original_apply = entrypoint._apply_torch_thread_limit
-        def _tracking_apply():
+        def _tracking_configure(*args, **kwargs):
+            # Do not run the heavy real _configure_runtime body; record only.
+            events.append("configure_runtime")
+            return None
+        def _tracking_apply(*args, **kwargs):
             events.append("apply")
-            return original_apply()
-        entrypoint._configure_runtime = MagicMock()
+            raise RuntimeError("controlled stop after boundary ordering")
         entrypoint._restore_publisher = PropertyMock(return_value=None)
         with patch("comfymodal_runtime.modal_app._capture_remote_identity",
                    return_value={"container_id": "test"}):
             with patch.object(entrypoint, "_restore_eviction_boundary",
                               side_effect=_tracking_boundary):
-                with patch.object(entrypoint, "_apply_torch_thread_limit",
-                                  side_effect=_tracking_apply):
-                    original_configure = entrypoint._configure_runtime
-                    def _error_configure(*a, **kw):
-                        events.append("configure_runtime")
-                        raise RuntimeError("controlled stop after boundary ordering")
-                    entrypoint._configure_runtime = _error_configure
-                    with self.assertRaises(RuntimeError) as ctx:
-                        entrypoint.restore()
+                with patch.object(entrypoint, "_configure_runtime",
+                                  side_effect=_tracking_configure):
+                    with patch.object(entrypoint, "_apply_torch_thread_limit",
+                                      side_effect=_tracking_apply):
+                        with self.assertRaises(RuntimeError) as ctx:
+                            entrypoint.restore()
         self.assertIn("controlled stop", str(ctx.exception))
         self.assertIn("boundary", events)
-        self.assertIn("apply", events)
         self.assertIn("configure_runtime", events)
-        self.assertLess(events.index("boundary"), events.index("apply"),
-                        "boundary must precede apply_torch_thread_limit")
-        self.assertLess(events.index("apply"), events.index("configure_runtime"),
-                        "apply_torch_thread_limit must precede configure_runtime")
+        self.assertIn("apply", events)
+        # Accepted C8 source runs boundary -> configure_runtime -> apply_torch_thread_limit.
+        self.assertLess(events.index("boundary"), events.index("configure_runtime"),
+                        "boundary must precede configure_runtime")
+        self.assertLess(events.index("configure_runtime"), events.index("apply"),
+                        "configure_runtime must precede apply_torch_thread_limit")
 
 
 # ── Retain-role selector parsing tests ───────────────────────────────────

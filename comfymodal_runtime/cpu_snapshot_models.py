@@ -16,7 +16,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from .contracts import ModelRestoreKey
+from .contracts import (
+    C5_IMPL_VERSION,
+    ModelRestoreKey,
+    VAE_POLICY_VERSION,
+    VAE_PREFETCH_MODES,
+    build_vae_policy_metadata,
+    capture_c5_runtime_metadata,
+    resolve_vae_policy,
+    vae_prefetch_mode,
+)
+from .runtime_shape import runtime_shape_config
 from .trace import RuntimeTrace
 
 # ---------------------------------------------------------------------------
@@ -35,6 +45,19 @@ class ModelFileFact:
 # Current policy version â€” increment when compute-policy semantics change
 # so that old snapshots with stale/legacy defaults are rejected.
 CPU_SNAPSHOT_UNET_POLICY_VERSION: int = 2
+_SNAPSHOT_CONSTRUCTION_ORDERS: dict[str, tuple[str, ...]] = {
+    "O0": ("clip", "unet", "vae"),
+    "O1": ("unet", "vae", "clip"),
+    "O2": ("unet", "clip", "vae"),
+    "O3": ("clip", "vae", "unet"),
+}
+
+
+def snapshot_construction_order(order: str) -> tuple[str, ...]:
+    try:
+        return _SNAPSHOT_CONSTRUCTION_ORDERS[order]
+    except KeyError as exc:
+        raise RuntimeError(f"unsupported snapshot model order: {order}") from exc
 
 
 def _policy_identity(
@@ -65,6 +88,20 @@ class CpuSnapshotModels:
     compute_policy: str = "default"
     policy_version: int = CPU_SNAPSHOT_UNET_POLICY_VERSION
     target_gpus: tuple[str, ...] = ()
+    construction_order: str = "O0"
+    vae_policy_version: int = VAE_POLICY_VERSION
+    # Production-facing VAE defaults align to the native BF16 policy (v1):
+    # weight bfloat16, compute bfloat16_native, memory format contiguous,
+    # prefetch off.  Policy-aware construction overrides these from
+    # resolve_vae_policy(); v0 (float32/float32/contiguous) remains available as
+    # an explicit FP32 control/fail-closed fallback in contracts.py.
+    vae_weight_dtype: str = "bfloat16"
+    vae_compute_dtype: str = "bfloat16_native"
+    vae_memory_format: str = "contiguous"
+    vae_policy_mode: str = "v1"
+    vae_policy_metadata: dict[str, Any] = field(default_factory=dict)
+    vae_validation_metadata: dict[str, Any] = field(default_factory=dict)
+    vae_storage_registry: StorageRegistry | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +182,9 @@ def _resolve_storage_target_modules(model: Any) -> list[Any]:
     modules.  Never mutates, never moves, never copies.
     """
     targets: list[Any] = []
+    first_stage = getattr(model, "first_stage_model", None)
+    if _is_module_like(first_stage):
+        return [first_stage]
     collected = _collect_clip_modules(model)
     if collected:
         targets.extend(module for _, module in collected)
@@ -623,6 +663,183 @@ def advise_storage_pages_willneed(model_or_registry: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# CPU VAE page prefetch
+# ---------------------------------------------------------------------------
+
+_VAE_PREFETCH_MODES = VAE_PREFETCH_MODES
+_MADV_POPULATE_READ = 22
+_VAE_PREFETCH_MAX_TOUCH_PAGES = 131072
+
+
+def _libc_madvise_flag(flag: int) -> Any | None:
+    if not _is_posix():
+        return None
+    try:
+        import ctypes as _ctypes
+        _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+        _fn = getattr(_libc, "madvise", None)
+        if _fn is None:
+            return None
+        _fn.argtypes = [_ctypes.c_void_p, _ctypes.c_size_t, _ctypes.c_int]
+        _fn.restype = _ctypes.c_int
+
+        def _call(address: int, length: int) -> tuple[int, int | None]:
+            _ret = _fn(_ctypes.c_void_p(address), _ctypes.c_size_t(length), int(flag))
+            return int(_ret), (_ctypes.get_errno() if _ret != 0 else None)
+
+        return _call
+    except Exception:
+        return None
+
+
+def prefetch_vae_storage(
+    registry: StorageRegistry,
+    *,
+    mode: str | None = None,
+    max_touch_pages: int = _VAE_PREFETCH_MAX_TOUCH_PAGES,
+) -> dict[str, Any]:
+    """Prefetch a prebuilt VAE CPU-storage registry without Torch or CUDA."""
+    _start_ns = time.monotonic_ns()
+    _thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+    _faults_before = _page_fault_counters()
+    _mode = str(mode or vae_prefetch_mode()).strip().lower()
+    if _mode not in _VAE_PREFETCH_MODES:
+        _mode = "off"
+    _base: dict[str, Any] = {
+        "mode": _mode,
+        "vae_prefetch_mode": _mode,
+        "status": "off" if _mode == "off" else "pending",
+        "storage_count": len(registry.ranges),
+        "total_bytes": registry.total_bytes,
+        "total_pages": 0,
+        "prefetch_pages": 0,
+        "prefetch_bytes": 0,
+        "prefetch_percent": 0.0,
+        "major_faults": None,
+        "minor_faults": None,
+        "prefetch_cpu_ms": None,
+        "duration_ms": 0.0,
+        "error_reason": "",
+        # ── Bounded prefetch metric contract ─────────────────────────
+        "start_ms": round(time.time() * 1000, 3),
+        "end_ms": None,
+        "start_mono_ns": _start_ns,
+        "end_mono_ns": None,
+        "wall_ms": 0.0,
+        "process_cpu_ms": None,
+        "effective_cores": 1.0,
+        "bytes": 0,
+        "page_count": 0,
+        "ready_before_sampling_end": False,
+        "overlap_with_sampling_ms": 0.0,
+        "error": "",
+    }
+    if _mode == "off":
+        _base["end_ms"] = round(time.time() * 1000, 3)
+        _base["end_mono_ns"] = time.monotonic_ns()
+        _base["wall_ms"] = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+        _base["duration_ms"] = _base["wall_ms"]
+        _base["bytes"] = 0
+        _base["page_count"] = 0
+        return _base
+    if not registry.ranges:
+        _base["status"] = "empty"
+        _base["end_ms"] = round(time.time() * 1000, 3)
+        _base["end_mono_ns"] = time.monotonic_ns()
+        _base["wall_ms"] = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+        _base["duration_ms"] = _base["wall_ms"]
+        _base["bytes"] = 0
+        _base["page_count"] = 0
+        return _base
+
+    page_size = _page_size()
+    ranges: list[tuple[int, int, int]] = []
+    for item in registry.ranges:
+        start_aligned = item.address & ~(page_size - 1)
+        end_aligned = (item.address + item.length + page_size - 1) & ~(page_size - 1)
+        pages = max(0, (end_aligned - start_aligned) // page_size)
+        if pages:
+            ranges.append((start_aligned, end_aligned - start_aligned, pages))
+    total_pages = sum(item[2] for item in ranges)
+    _base["total_pages"] = total_pages
+    try:
+        if _mode in {"madvise_willneed", "madvise_populate_read"}:
+            flag = _MADV_WILLNEED if _mode == "madvise_willneed" else _MADV_POPULATE_READ
+            advise = _libc_madvise_flag(flag)
+            if advise is None:
+                _base["status"] = "unsupported"
+                _base["error_reason"] = "madvise_unavailable"
+            else:
+                failed = 0
+                for address, length, pages in ranges:
+                    ret, errno_value = advise(address, length)
+                    if ret == 0:
+                        _base["prefetch_pages"] += pages
+                    else:
+                        failed += 1
+                        if not _base["error_reason"]:
+                            _base["error_reason"] = f"madvise_failed_errno={errno_value}"
+                if failed == 0:
+                    _base["status"] = "ok"
+                elif _base["prefetch_pages"]:
+                    _base["status"] = "partial"
+                else:
+                    _base["status"] = "error"
+        elif _mode == "bounded_native_touch":
+            import ctypes as _ctypes
+            page_budget = max(0, min(int(max_touch_pages), total_pages))
+            touched = 0
+            for address, _length, pages in ranges:
+                for page_index in range(min(pages, page_budget - touched)):
+                    _ctypes.c_ubyte.from_address(address + page_index * page_size).value
+                    touched += 1
+                    if touched >= page_budget:
+                        break
+                if touched >= page_budget:
+                    break
+            _base["prefetch_pages"] = touched
+            _base["status"] = "ok" if touched == total_pages else "bounded"
+            if touched < total_pages:
+                _base["error_reason"] = "page_budget_reached"
+        _base["prefetch_bytes"] = int(_base["prefetch_pages"]) * page_size
+        _base["prefetch_percent"] = round(
+            int(_base["prefetch_pages"]) / total_pages * 100, 2
+        ) if total_pages else 0.0
+    except Exception as exc:
+        _base["status"] = "error"
+        _base["error_reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+    _faults_after = _page_fault_counters()
+    _base["major_faults"] = (
+        max(0, _faults_after["major_faults"] - _faults_before["major_faults"])
+        if _faults_after["major_faults"] is not None and _faults_before["major_faults"] is not None
+        else None
+    )
+    _base["minor_faults"] = (
+        max(0, _faults_after["minor_faults"] - _faults_before["minor_faults"])
+        if _faults_after["minor_faults"] is not None and _faults_before["minor_faults"] is not None
+        else None
+    )
+    _thread_end_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+    _base["prefetch_cpu_ms"] = (
+        round(max(0, _thread_end_ns - _thread_start_ns) / 1_000_000, 3)
+        if isinstance(_thread_start_ns, int) and isinstance(_thread_end_ns, int)
+        else None
+    )
+    _base["duration_ms"] = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+    _end_ns = time.monotonic_ns()
+    _end_wall_ms = round(time.time() * 1000, 3)
+    _base["end_ms"] = _end_wall_ms
+    _base["end_mono_ns"] = _end_ns
+    _base["wall_ms"] = _base["duration_ms"]
+    _base["process_cpu_ms"] = _base["prefetch_cpu_ms"]
+    _base["effective_cores"] = 1.0 if _base["status"] not in {"off", "empty"} else 0.0
+    _base["bytes"] = int(_base["prefetch_bytes"])
+    _base["page_count"] = int(_base["prefetch_pages"])
+    _base["error"] = _base["error_reason"]
+    return _base
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -649,6 +866,16 @@ def _normalize_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
         normalized["clip2"] = raw["clip2"].strip()
     if "weight_dtype" in stable:
         normalized["weight_dtype"] = stable["weight_dtype"]
+    _vae_policy = resolve_vae_policy(raw.get("vae_policy_mode"))
+    for _key in (
+        "vae_policy_version", "vae_weight_dtype", "vae_compute_dtype", "vae_memory_format",
+    ):
+        _value = raw.get(_key, _vae_policy[_key])
+        normalized[_key] = _value
+    normalized["vae_policy_mode"] = str(raw.get("vae_policy_mode", _vae_policy["vae_policy_mode"]) or _vae_policy["vae_policy_mode"])
+    _vae_full = build_vae_policy_metadata(normalized, include_runtime_versions=False)
+    for _key in ("vae_policy_provenance", "vae_prefetch_mode", "c5_impl_version", "arch_identifier"):
+        normalized[_key] = _vae_full[_key]
     return normalized
 
 
@@ -663,6 +890,13 @@ def _build_model_key(normalized: dict[str, Any]) -> ModelRestoreKey:
         clip_identity=clip,
         vae_identity=normalized.get("vae", ""),
         clip_type=normalized["clip_type"],
+        vae_policy_version=normalized.get("vae_policy_version", VAE_POLICY_VERSION),
+        vae_weight_dtype=normalized.get("vae_weight_dtype", "float32"),
+        vae_compute_dtype=normalized.get("vae_compute_dtype", "float32"),
+        vae_memory_format=normalized.get("vae_memory_format", "contiguous"),
+        vae_policy_metadata=build_vae_policy_metadata(
+            normalized, include_runtime_versions=False,
+        ),
     )
 
 
@@ -747,6 +981,12 @@ def _build_model_spec(normalized: dict[str, Any]) -> dict[str, Any]:
         vae_loaders.append({
             "loader_class": "VAELoader",
             "vae_name": vae_name,
+            "vae_policy_version": normalized.get("vae_policy_version", VAE_POLICY_VERSION),
+            "vae_weight_dtype": normalized.get("vae_weight_dtype", "float32"),
+            "vae_compute_dtype": normalized.get("vae_compute_dtype", "float32"),
+            "vae_memory_format": normalized.get("vae_memory_format", "contiguous"),
+            "vae_prefetch_mode": normalized.get("vae_prefetch_mode", "off"),
+            "c5_impl_version": normalized.get("c5_impl_version", C5_IMPL_VERSION),
         })
     return {
         "loaders": {
@@ -1004,6 +1244,168 @@ def _tensor_device_type_of_value(val: Any) -> str | None:
     if dt is None:
         return str(val).strip().lower().split(":")[0]
     return str(dt).strip().lower()
+
+
+def _vae_policy_from_model_key(model_key: ModelRestoreKey) -> dict[str, Any]:
+    return {
+        "vae_policy_version": int(getattr(model_key, "vae_policy_version", VAE_POLICY_VERSION) or 0),
+        "vae_weight_dtype": str(getattr(model_key, "vae_weight_dtype", "float32") or ""),
+        "vae_compute_dtype": str(getattr(model_key, "vae_compute_dtype", "float32") or ""),
+        "vae_memory_format": str(getattr(model_key, "vae_memory_format", "contiguous") or ""),
+        "vae_prefetch_mode": str(getattr(model_key, "vae_policy_metadata", {}).get("vae_prefetch_mode", "") if isinstance(getattr(model_key, "vae_policy_metadata", {}), Mapping) else ""),
+        "c5_impl_version": str(getattr(model_key, "vae_policy_metadata", {}).get("c5_impl_version", "") if isinstance(getattr(model_key, "vae_policy_metadata", {}), Mapping) else ""),
+    }
+
+
+def _vae_module(vae: Any) -> Any:
+    module = getattr(vae, "first_stage_model", None) if vae is not None else None
+    return module if _is_module_like(module) else None
+
+
+def _vae_supports_channels_last(torch: Any) -> bool:
+    """Best-effort capability probe for channels_last (no CUDA init).
+
+    Returns True only when a 4-D tensor can actually be materialized in
+    channels_last memory format on the current torch build.  Used to keep
+    channels-last latent handling explicit only when supported — unsupported
+    tensors are never forced.
+    """
+    if not hasattr(torch, "channels_last"):
+        return False
+    try:
+        probe = torch.zeros(1, 4, 8, 8)
+        converted = probe.contiguous(memory_format=torch.channels_last)
+        return bool(converted.is_contiguous(memory_format=torch.channels_last))
+    except Exception:
+        return False
+
+
+def _validate_vae_policy_metadata(
+    vae: Any,
+    policy: Mapping[str, Any],
+    *,
+    storage_registry: StorageRegistry | None = None,
+    context: str = "",
+) -> tuple[dict[str, Any], StorageRegistry]:
+    """Convert and validate one VAE once during CPU snapshot construction."""
+    import torch
+
+    module = _vae_module(vae)
+    if module is None:
+        raise RuntimeError(f"{context}VAE first_stage_model is not inspectable")
+    weight_dtype_name = str(policy.get("vae_weight_dtype", "float32"))
+    if weight_dtype_name == "bfloat16":
+        expected_dtype = torch.bfloat16
+    elif weight_dtype_name == "float32":
+        expected_dtype = torch.float32
+    else:
+        raise RuntimeError(
+            f"{context}unsupported VAE weight dtype {weight_dtype_name!r}"
+        )
+
+    for tensor in tuple(module.parameters()) + tuple(module.buffers()):
+        if getattr(tensor, "is_floating_point", lambda: False)():
+            tensor.data = tensor.data.to(dtype=expected_dtype)
+
+    memory_format = str(policy.get("vae_memory_format", "contiguous"))
+    channels_last_supported = False
+    if memory_format == "channels_last":
+        channels_last_supported = _vae_supports_channels_last(torch)
+        if not channels_last_supported:
+            raise RuntimeError(
+                f"{context}channels_last memory format requested but unsupported "
+                "for this torch/build; refusing to force unsupported tensors"
+            )
+        for tensor in tuple(module.parameters()) + tuple(module.buffers()):
+            if getattr(tensor, "ndim", 0) == 4:
+                tensor.data = tensor.data.contiguous(memory_format=torch.channels_last)
+    elif memory_format != "contiguous":
+        raise RuntimeError(f"{context}unsupported VAE memory format {memory_format!r}")
+
+    if hasattr(vae, "vae_dtype"):
+        vae.vae_dtype = expected_dtype
+    policy_marker = dict(policy)
+    policy_marker.setdefault("vae_prefetch_mode", vae_prefetch_mode())
+    policy_marker.setdefault("c5_impl_version", C5_IMPL_VERSION)
+    policy_marker.setdefault("vae_policy_provenance", "")
+    try:
+        from types import MappingProxyType
+        vae._comfy_modal_vae_policy = MappingProxyType(policy_marker)
+    except Exception:
+        vae._comfy_modal_vae_policy = policy_marker
+    vae._comfy_modal_vae_autocast_enabled = (
+        str(policy.get("vae_compute_dtype", "")) == "bfloat16_autocast"
+    )
+    vae._comfy_modal_vae_memory_format = memory_format
+    vae._comfy_modal_vae_latent_channels_last_required = (
+        memory_format == "channels_last" and channels_last_supported
+    )
+
+    registry = storage_registry or build_unique_storage_registry(vae)
+    floating_parameter_count = 0
+    floating_buffer_count = 0
+    mismatched_count = 0
+    floating_parameter_numel = 0
+    floating_buffer_numel = 0
+    for tensor in module.parameters():
+        if tensor.is_floating_point():
+            floating_parameter_count += 1
+            floating_parameter_numel += int(tensor.numel())
+            _mismatch = tensor.dtype != expected_dtype or _tensor_device_type(tensor) != "cpu"
+            if memory_format == "channels_last" and tensor.ndim == 4 and not tensor.is_contiguous(memory_format=torch.channels_last):
+                _mismatch = True
+            if memory_format == "contiguous" and not tensor.is_contiguous():
+                _mismatch = True
+            if _mismatch:
+                mismatched_count += 1
+    for tensor in module.buffers():
+        if tensor.is_floating_point():
+            floating_buffer_count += 1
+            floating_buffer_numel += int(tensor.numel())
+            _mismatch = tensor.dtype != expected_dtype or _tensor_device_type(tensor) != "cpu"
+            if memory_format == "channels_last" and tensor.ndim == 4 and not tensor.is_contiguous(memory_format=torch.channels_last):
+                _mismatch = True
+            if memory_format == "contiguous" and not tensor.is_contiguous():
+                _mismatch = True
+            if _mismatch:
+                mismatched_count += 1
+    if floating_parameter_count + floating_buffer_count == 0:
+        raise RuntimeError(f"{context}VAE has no floating parameters or buffers")
+    if mismatched_count:
+        raise RuntimeError(
+            f"{context}VAE policy validation failed: mismatched_parameter_buffer_count={mismatched_count}"
+        )
+    metadata = {
+        **policy_marker,
+        "object_id": str(id(vae)),
+        "weight_dtype": weight_dtype_name,
+        "compute_dtype": str(policy.get("vae_compute_dtype", "")),
+        "memory_format": memory_format,
+        "channels_last_supported": channels_last_supported,
+        "latent_channels_last_required": bool(
+            memory_format == "channels_last" and channels_last_supported
+        ),
+        "vae_prefetch_mode": policy_marker.get("vae_prefetch_mode", vae_prefetch_mode()),
+        "c5_impl_version": policy_marker.get("c5_impl_version", C5_IMPL_VERSION),
+        **capture_c5_runtime_metadata(),
+        "total_storage_bytes": registry.total_bytes,
+        "floating_parameter_count": floating_parameter_count,
+        "floating_buffer_count": floating_buffer_count,
+        "floating_parameter_numel": floating_parameter_numel,
+        "floating_buffer_numel": floating_buffer_numel,
+        "mismatched_parameter_buffer_count": mismatched_count,
+    }
+    if hasattr(vae, "size"):
+        vae.size = registry.total_bytes
+    patcher = getattr(vae, "patcher", None)
+    if patcher is not None and hasattr(patcher, "size"):
+        try:
+            patcher.size = registry.total_bytes
+        except Exception:
+            pass
+    vae._comfy_modal_vae_validation_metadata = dict(metadata)
+    vae._comfy_modal_vae_storage_registry = registry
+    return metadata, registry
 
 
 # ---------------------------------------------------------------------------
@@ -1872,8 +2274,9 @@ def load_cpu_snapshot_models(
     built with a different policy cannot match.  The model_spec does NOT
     contain compute_policy — matching uses the separate field.
 
-    Load order: CLIP -> gc.collect -> UNET -> gc.collect -> VAE -> gc.collect.
-    All loading happens under torch.no_grad().
+    Load order is selected by ``COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER`` and is
+    one of O0 through O3. All loading happens under torch.no_grad() with a
+    gc.collect barrier after each role.
 
     Callback invocation shapes:
       load_clip(name, type, device)           -- single CLIP
@@ -1889,129 +2292,149 @@ def load_cpu_snapshot_models(
     clip_obj: Any = None
     unet_obj: Any = None
     vae_obj: Any = None
+    vae_policy: dict[str, Any] = resolve_vae_policy()
+    vae_validation_metadata: dict[str, Any] = {}
+    vae_storage_registry: StorageRegistry | None = None
     timings: dict[str, float] = {}
     active_object_type = ""
     active_basename = ""
+    construction_order = runtime_shape_config().snapshot_model_order
+
+    def _bounded_model_management_state() -> dict[str, Any]:
+        if os.environ.get("COMFYMODAL_V2_SNAPSHOT_ORDER_DIAGNOSTICS", "").strip() != "1":
+            return {}
+        try:
+            import sys
+            management = sys.modules.get("comfy.model_management")
+            loaded = getattr(management, "current_loaded_models", None)
+            return {
+                "current_loaded_models_count": len(loaded) if loaded is not None else None,
+                "loaded_models_count": (
+                    len(management.loaded_models())
+                    if management is not None and callable(getattr(management, "loaded_models", None))
+                    else None
+                ),
+            }
+        except Exception as exc:
+            return {"state_error": type(exc).__name__}
+
+    def _load_role(role: str) -> Any:
+        nonlocal active_object_type, active_basename
+        active_basename = os.path.basename(
+            normalized.get("clip1", "") if role == "clip"
+            else normalized.get(role, "")
+        )
+        if trace:
+            trace.emit(
+                f"cpu_snapshot_{role}_load_start",
+                phase="restore",
+                metadata={
+                    "model_key_hash": model_key_hash,
+                    "basename": active_basename,
+                    "construction_order": construction_order,
+                },
+            )
+        role_start = time.monotonic_ns()
+        obj: Any = None
+        try:
+            with torch.no_grad():
+                if role == "clip":
+                    if normalized.get("clip2"):
+                        obj = load_clip(
+                            normalized["clip1"], normalized["clip2"],
+                            normalized.get("clip_type", "stable_diffusion"), "default",
+                        )
+                    else:
+                        obj = load_clip(
+                            normalized["clip1"],
+                            normalized.get("clip_type", "stable_diffusion"), "default",
+                        )
+                elif role == "unet":
+                    obj = load_unet(normalized["unet"], normalized.get("weight_dtype", "default"))
+                elif role == "vae":
+                    if load_vae is None:
+                        raise RuntimeError(
+                            "profile declares a VAE but no load_vae callback was provided"
+                        )
+                    obj = load_vae(normalized["vae"])
+                else:
+                    raise RuntimeError(f"unsupported snapshot model role: {role}")
+            active_object_type = type(obj).__name__
+            duration_ms = round((time.monotonic_ns() - role_start) / 1_000_000, 2)
+            timings[f"{role}_load_ms"] = duration_ms
+            gc.collect()
+            state = _bounded_model_management_state()
+            if trace:
+                trace.emit(
+                    f"cpu_snapshot_{role}_load_end",
+                    phase="restore",
+                    metadata={
+                        "model_key_hash": model_key_hash,
+                        "object_type": type(obj).__name__,
+                        "basename": active_basename,
+                        "duration_ms": duration_ms,
+                        "gc_barrier": "complete",
+                        "construction_order": construction_order,
+                        **state,
+                    },
+                )
+            return obj
+        except BaseException as exc:
+            if trace:
+                trace.emit(
+                    f"cpu_snapshot_{role}_load_end",
+                    phase="restore",
+                    metadata={
+                        "model_key_hash": model_key_hash,
+                        "object_type": active_object_type,
+                        "basename": active_basename,
+                        "duration_ms": round((time.monotonic_ns() - role_start) / 1_000_000, 2),
+                        "gc_barrier": "failed",
+                        "construction_order": construction_order,
+                        "status": "error",
+                        "reason": str(exc)[:200],
+                    },
+                )
+            raise
 
     try:
         normalized = _normalize_profile(profile) if isinstance(profile, Mapping) else {}
+        vae_policy = {
+            key: normalized.get(key, value)
+            for key, value in resolve_vae_policy(normalized.get("vae_policy_mode")).items()
+            if key != "vae_policy_mode"
+        }
+        vae_policy["vae_policy_mode"] = normalized.get(
+            "vae_policy_mode", resolve_vae_policy().get("vae_policy_mode", "v0")
+        )
         model_key, model_spec, facts = identity_from_profile(
             profile, resolve_path=resolve_path,
         )
         model_key_hash = model_key.stable_hash[:16]
 
-        # --- CLIP load ---
-        active_object_type = ""
-        active_basename = os.path.basename(normalized["clip1"])
-        if trace:
-            trace.emit(
-                "cpu_snapshot_clip_load_start",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "basename": active_basename,
-                },
-            )
-        clip_start = time.monotonic_ns()
-        with torch.no_grad():
-            if normalized.get("clip2"):
-                clip_obj = load_clip(
-                    normalized["clip1"],
-                    normalized["clip2"],
-                    normalized.get("clip_type", "stable_diffusion"),
-                    "default",
-                )
+        for role in snapshot_construction_order(construction_order):
+            if role == "vae" and not normalized.get("vae"):
+                continue
+            loaded = _load_role(role)
+            if role == "clip":
+                clip_obj = loaded
+            elif role == "unet":
+                unet_obj = loaded
             else:
-                clip_obj = load_clip(
-                    normalized["clip1"],
-                    normalized.get("clip_type", "stable_diffusion"),
-                    "default",
-                )
-        clip_end = time.monotonic_ns()
-        clip_ms = round((clip_end - clip_start) / 1_000_000, 2)
-        timings["clip_load_ms"] = clip_ms
-        if trace:
-            trace.emit(
-                "cpu_snapshot_clip_load_end",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "object_type": type(clip_obj).__name__,
-                    "basename": active_basename,
-                    "duration_ms": clip_ms,
-                },
-            )
+                vae_obj = loaded
 
-        gc.collect()
-
-        # --- UNET load ---
-        active_basename = os.path.basename(normalized["unet"])
-        if trace:
-            trace.emit(
-                "cpu_snapshot_unet_load_start",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "basename": active_basename,
-                },
+        if vae_obj is not None:
+            vae_validation_metadata, vae_storage_registry = _validate_vae_policy_metadata(
+                vae_obj,
+                vae_policy,
+                context="snapshot construction: ",
             )
-        unet_start = time.monotonic_ns()
-        with torch.no_grad():
-            unet_obj = load_unet(
-                normalized["unet"],
-                normalized.get("weight_dtype", "default"),
-            )
-        unet_end = time.monotonic_ns()
-        unet_ms = round((unet_end - unet_start) / 1_000_000, 2)
-        timings["unet_load_ms"] = unet_ms
-        if trace:
-            trace.emit(
-                "cpu_snapshot_unet_load_end",
-                phase="restore",
-                metadata={
-                    "model_key_hash": model_key_hash,
-                    "object_type": type(unet_obj).__name__,
-                    "basename": active_basename,
-                    "duration_ms": unet_ms,
-                },
-            )
-
-        gc.collect()
-
-        # --- VAE load (only when the profile declares one) ---
-        if normalized.get("vae"):
-            active_basename = os.path.basename(normalized["vae"])
             if trace:
                 trace.emit(
-                    "cpu_snapshot_vae_load_start",
+                    "cpu_snapshot_vae_policy_ready",
                     phase="restore",
-                    metadata={
-                        "model_key_hash": model_key_hash,
-                        "basename": active_basename,
-                    },
+                    metadata=dict(vae_validation_metadata),
                 )
-            vae_start = time.monotonic_ns()
-            with torch.no_grad():
-                if load_vae is None:
-                    raise RuntimeError(
-                        "profile declares a VAE but no load_vae callback was provided"
-                    )
-                vae_obj = load_vae(normalized["vae"])
-            vae_end = time.monotonic_ns()
-            vae_ms = round((vae_end - vae_start) / 1_000_000, 2)
-            timings["vae_load_ms"] = vae_ms
-            if trace:
-                trace.emit(
-                    "cpu_snapshot_vae_load_end",
-                    phase="restore",
-                    metadata={
-                        "model_key_hash": model_key_hash,
-                        "object_type": type(vae_obj).__name__,
-                        "basename": active_basename,
-                        "duration_ms": vae_ms,
-                    },
-                )
-
             gc.collect()
 
         # Derive compute policy from target_gpus (snapshot identity)
@@ -2032,6 +2455,17 @@ def load_cpu_snapshot_models(
             compute_policy=_cp,
             policy_version=CPU_SNAPSHOT_UNET_POLICY_VERSION,
             target_gpus=target_gpus or (),
+            construction_order=construction_order,
+            vae_policy_version=int(vae_policy.get("vae_policy_version", VAE_POLICY_VERSION)),
+            vae_weight_dtype=str(vae_policy.get("vae_weight_dtype", "float32")),
+            vae_compute_dtype=str(vae_policy.get("vae_compute_dtype", "float32")),
+            vae_memory_format=str(vae_policy.get("vae_memory_format", "contiguous")),
+            vae_policy_mode=str(vae_policy.get("vae_policy_mode", "v0")),
+            vae_policy_metadata=build_vae_policy_metadata(
+                vae_policy, include_runtime_versions=False,
+            ),
+            vae_validation_metadata=vae_validation_metadata,
+            vae_storage_registry=vae_storage_registry,
         )
 
         ok, reason = validate_cpu_snapshot_models(
@@ -2054,6 +2488,7 @@ def load_cpu_snapshot_models(
                     "basename": active_basename,
                     "status": "ok",
                     "duration_ms": total_ms,
+                    "construction_order": construction_order,
                 },
             )
 
@@ -2075,6 +2510,7 @@ def load_cpu_snapshot_models(
                     "basename": active_basename,
                     "status": "error",
                     "reason": str(exc),
+                    "construction_order": construction_order,
                 },
             )
         raise
@@ -2096,6 +2532,15 @@ def validate_cpu_snapshot_models(
 
     Returns (True, 'ok') on success or (False, reason_string) on failure.
     """
+    _effective_order = runtime_shape_config().snapshot_model_order
+    _stored_order = getattr(models, "construction_order", "")
+    if _stored_order != _effective_order:
+        return (
+            False,
+            f"construction_order mismatch: stored={_stored_order!r} "
+            f"current={_effective_order!r}",
+        )
+
     # Identity check â€” all fields
     if models.model_key != expected_key:
         for field_name in (
@@ -2106,6 +2551,10 @@ def validate_cpu_snapshot_models(
             "loader_configuration",
             "model_volume_generation",
             "optimization_loader_options",
+            "vae_policy_version",
+            "vae_weight_dtype",
+            "vae_compute_dtype",
+            "vae_memory_format",
         ):
             actual = getattr(models.model_key, field_name)
             expected = getattr(expected_key, field_name)
@@ -2256,6 +2705,34 @@ def validate_cpu_snapshot_models(
         ok, reason = _is_valid_vae(models.vae)
         if not ok:
             return (False, reason)
+
+        _expected_vae_policy = _vae_policy_from_model_key(expected_key)
+        _actual_vae_policy = {
+            "vae_policy_version": models.vae_policy_version,
+            "vae_weight_dtype": models.vae_weight_dtype,
+            "vae_compute_dtype": models.vae_compute_dtype,
+            "vae_memory_format": models.vae_memory_format,
+            "vae_prefetch_mode": str(models.vae_policy_metadata.get("vae_prefetch_mode", "")) if isinstance(models.vae_policy_metadata, Mapping) else "",
+            "c5_impl_version": str(models.vae_policy_metadata.get("c5_impl_version", "")) if isinstance(models.vae_policy_metadata, Mapping) else "",
+        }
+        if _actual_vae_policy != _expected_vae_policy:
+            return (
+                False,
+                "VAE policy fields mismatch: "
+                f"stored={_actual_vae_policy!r} expected={_expected_vae_policy!r}",
+            )
+        _metadata = models.vae_validation_metadata
+        if not isinstance(_metadata, Mapping):
+            return (False, "VAE validation metadata is missing")
+        for _field_name, _field_value in _expected_vae_policy.items():
+            if str(_metadata.get(_field_name, "")) != str(_field_value):
+                return (False, f"VAE validation metadata {_field_name} mismatch")
+        if str(_metadata.get("object_id", "")) != str(id(models.vae)):
+            return (False, "VAE validation metadata object identity mismatch")
+        if int(_metadata.get("mismatched_parameter_buffer_count", -1)) != 0:
+            return (False, "VAE validation metadata reports mismatched parameters/buffers")
+        if models.vae_storage_registry is None:
+            return (False, "VAE storage registry is missing")
 
     # Policy version/identity validation â€” reject legacy/stale snapshots
     if models.policy_version == 0:

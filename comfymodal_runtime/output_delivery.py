@@ -954,6 +954,7 @@ def run_strategy_chain(
     materials_dir: str = "",
     request_start_boundary: float = 0.0,
     descriptor_mode: bool = True,
+    stop_after_success: bool = False,
     **kwargs: Any,
 ) -> list[Attempt]:
     """Run each strategy in order, collecting attempts.
@@ -1003,6 +1004,8 @@ def run_strategy_chain(
             fallback_depth += 1
         if attempt.success:
             found_success = True
+            if stop_after_success:
+                break
     return results
 
 
@@ -1041,6 +1044,12 @@ def _replace_attempt_timing(
         attempt_number=attempt_number,
         total_base64_encoding_time_ms=attempt.total_base64_encoding_time_ms,
         serialized_result_bytes=attempt.serialized_result_bytes,
+        output_asset_write_ms=attempt.output_asset_write_ms,
+        output_volume_commit_ms=attempt.output_volume_commit_ms,
+        output_commit_overlap_ms=attempt.output_commit_overlap_ms,
+        output_hash_count=attempt.output_hash_count,
+        base64_encode_count=attempt.base64_encode_count,
+        base64_decode_count=attempt.base64_decode_count,
     )
 
 

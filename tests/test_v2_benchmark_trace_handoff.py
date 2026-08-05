@@ -683,7 +683,7 @@ class TestDeployV2FullTraceOnlyBatchFile(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertIn(line, self.content)
         self.assertIn(
-            'if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"',
+            'if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=40960"',
             self.content,
         )
 
