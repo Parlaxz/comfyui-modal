@@ -409,6 +409,42 @@ def test_release_end_is_observable_before_later_exit_hook(capsys, monkeypatch):
     assert events.index("request_gpu_release_end") < events.index("exit_hook_start")
 
 
+def test_release_requests_full_gc_collect_without_generation(monkeypatch):
+    _enabled_release(monkeypatch)
+    from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+
+    calls = []
+    fake_comfy, fake_mm, fake_torch, _ = _release_modules(calls=calls)
+
+    class FakeGc:
+        def __init__(self):
+            self.collect_calls = []
+
+        def collect(self, *args):
+            self.collect_calls.append(args)
+
+    fake_gc = FakeGc()
+    entrypoint = ModalRuntimeEntrypoint()
+    snapshot_models = SimpleNamespace(unet=object(), clip=object(), vae=object())
+    entrypoint._cpu_snapshot_models = snapshot_models
+    entrypoint._cpu_snapshot_models_active = True
+    entrypoint.bootstrap.state.snapshot_loader_outputs = {"unet": snapshot_models.unet}
+    entrypoint.bootstrap.state.snapshot_execution_seed = object()
+    with patch.dict(sys.modules, {
+        "comfy": fake_comfy,
+        "comfy.model_management": fake_mm,
+        "torch": fake_torch,
+        "gc": fake_gc,
+    }):
+        result = entrypoint._release_gpu_after_request(request_id="full-gc")
+    assert result["status"] == "ok"
+    assert fake_gc.collect_calls == [()]
+    assert entrypoint._cpu_snapshot_models is snapshot_models
+    assert entrypoint._cpu_snapshot_models_active is False
+    assert entrypoint.bootstrap.state.snapshot_loader_outputs
+    assert entrypoint.bootstrap.state.snapshot_execution_seed is not None
+
+
 def test_second_request_preserves_snapshot_identity_and_configuration(monkeypatch):
     import asyncio
 
