@@ -24,6 +24,8 @@ from tools.c5_vae_policy_runner import (
     MIN_CONTAINERS,
     OUTPUT_NODE_ID,
     PREFETCH_MODES,
+    QUALITY_FIXTURE_PATH,
+    QUALITY_OUTPUT_NODE_ID,
     SCALEDOWN_WINDOW,
     SEED,
     WINNER_COMPUTES,
@@ -158,7 +160,12 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(arm["expected_cold_runs"], COLD_RUNS)
         self.assertEqual(arm["gap_seconds"], GAP_SECONDS)
         self.assertEqual(arm["fixture_path"], FIXTURE_PATH)
-        self.assertEqual(FIXTURE_PATH, "c5_latest_benchmark_workflow.json")
+        self.assertEqual(arm["output_node"], "9")
+        self.assertEqual(FIXTURE_PATH, "c5_latest_performance_workflow.json")
+        self.assertEqual(arm["quality_fixture_path"], QUALITY_FIXTURE_PATH)
+        self.assertEqual(arm["quality_output_node"], QUALITY_OUTPUT_NODE_ID)
+        self.assertEqual(QUALITY_FIXTURE_PATH, "c5_latest_benchmark_workflow.json")
+        self.assertEqual(QUALITY_OUTPUT_NODE_ID, "107")
 
     def test_real_prefetch_modes(self):
         self.assertEqual(
@@ -241,6 +248,7 @@ class PlannerTests(unittest.TestCase):
 
 class FixtureInvariantTests(unittest.TestCase):
     C5 = REPO_ROOT / "c5_latest_benchmark_workflow.json"
+    PERFORMANCE = REPO_ROOT / "c5_latest_performance_workflow.json"
     CLEAN = REPO_ROOT / "clean_workflow.json"
 
     def test_c5_workflow_derived_from_clean(self):
@@ -267,6 +275,45 @@ class FixtureInvariantTests(unittest.TestCase):
         self.assertEqual(set(clean), set(p))
         changed = [k for k in clean if clean[k] != p[k]]
         self.assertEqual(changed, ["202"])
+
+    def test_performance_fixture_preserves_topology_and_seed(self):
+        with io.open(self.C5, encoding="utf-8") as f:
+            base = json.load(f)
+        with io.open(self.PERFORMANCE, encoding="utf-8") as f:
+            perf = json.load(f)
+        self.assertEqual(
+            set(perf["payload"]["prompt"]), set(base["payload"]["prompt"]),
+            "performance fixture must preserve the full prompt/topology",
+        )
+        self.assertEqual(
+            perf["payload"]["workflow_metadata"]["seed"],
+            base["payload"]["workflow_metadata"]["seed"],
+            "performance fixture must preserve the seed",
+        )
+        # model/sampler topology nodes must be byte-identical (202 is the global
+        # seed node only); the only intended deltas are the output selection and
+        # provenance metadata.
+        changed = [
+            k for k in base["payload"]["prompt"]
+            if base["payload"]["prompt"][k] != perf["payload"]["prompt"][k]
+        ]
+        self.assertEqual(changed, [])
+
+    def test_performance_fixture_output_node_is_saveimage(self):
+        with io.open(self.PERFORMANCE, encoding="utf-8") as f:
+            p = json.load(f)["payload"]
+        self.assertEqual(p["modal_options"]["production"]["output_node_ids"], ["9"])
+        self.assertEqual(p["workflow_metadata"]["output_node_ids"], ["9"])
+        self.assertIn("9", p["prompt"])
+        self.assertEqual(p["prompt"]["9"]["class_type"], "SaveImage")
+
+    def test_quality_fixture_output_node_is_image_comparer(self):
+        with io.open(self.C5, encoding="utf-8") as f:
+            p = json.load(f)["payload"]
+        self.assertEqual(p["modal_options"]["production"]["output_node_ids"], ["107"])
+        self.assertEqual(p["workflow_metadata"]["output_node_ids"], ["107"])
+        self.assertIn("107", p["prompt"])
+        self.assertEqual(p["prompt"]["107"]["class_type"], "Image Comparer (rgthree)")
 
 
 class GateThresholdTests(unittest.TestCase):
