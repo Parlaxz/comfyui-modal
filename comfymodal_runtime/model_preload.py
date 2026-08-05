@@ -31,8 +31,15 @@ from threading import Condition, Event, RLock, Thread
 from collections.abc import Mapping
 from typing import Any, Callable, Iterator
 
-from .contracts import ModelRestoreKey, PrefillKey, stable_hash
-from .env import env_flag
+from .contracts import (
+    C5_IMPL_VERSION,
+    ModelRestoreKey,
+    PrefillKey,
+    build_vae_policy_metadata,
+    capture_c5_runtime_metadata,
+    stable_hash,
+)
+from .env import env_flag, observability_allows, observability_gate, observability_mode
 from .clip_conditioning_cache import (
     conditioning_cache_key_summary,
     get_exact_conditioning_cache,
@@ -42,6 +49,8 @@ from .cpu_snapshot_models import (
     collect_unet_runtime_state,
     page_readiness_mode,
     advise_storage_pages_willneed,
+    prefetch_vae_storage,
+    vae_prefetch_mode,
     _PAGE_READINESS_MODE_WILLNEED,
 )
 from .trace import RuntimeTrace
@@ -74,7 +83,98 @@ _PREFILL_CRITICAL_ROLES: frozenset[str] = frozenset({"positive", "negative"})
 # Deliberately wraps the OUTERMOST invocation of each operation so
 # inner nested calls do not double-count.
 
-_PAGEFAULT_TRACKING: bool = env_flag("COMFYMODAL_V2_PAGEFAULT_TRACKING", default=True)
+_PAGEFAULT_TRACKING: bool = observability_gate(
+    "COMFYMODAL_V2_PAGEFAULT_TRACKING", "pagefault_tracking", default=True,
+)
+
+
+def sync_observability_gates() -> None:
+    """Re-resolve import-time observability gates from the current env.
+
+    ``_PAGEFAULT_TRACKING`` and ``_DIAGNOSTIC_FLAG`` are frozen at import time.
+    When ``run_plan_stream`` applies a request env-profile override the
+    effective observability mode changes; recompute the module-level gates so
+    they agree with call-time ``observability_allows`` checks for that request.
+    Recomputing an unchanged env yields identical values (no behavior change).
+    """
+    global _PAGEFAULT_TRACKING, _DIAGNOSTIC_FLAG
+    _PAGEFAULT_TRACKING = observability_gate(
+        "COMFYMODAL_V2_PAGEFAULT_TRACKING", "pagefault_tracking", default=True,
+    )
+    _DIAGNOSTIC_FLAG = observability_gate(
+        "COMFYMODAL_V2_DEEP_MODEL_DIAG", "deep_model_diagnostics",
+    )
+
+
+def _is_tensor_channels_last(value: Any) -> bool:
+    try:
+        import torch
+        return bool(
+            getattr(value, "ndim", 0) == 4
+            and value.is_contiguous(memory_format=torch.channels_last)
+        )
+    except Exception:
+        return False
+
+
+def _vae_decode_boundary_metadata(
+    active: Any,
+    vae: Any,
+    *,
+    trace: RuntimeTrace | None = None,
+) -> dict[str, Any]:
+    """Assemble the policy + bounded-prefetch metadata block for decode start/end.
+
+    Reads the VAE's applied policy marker and, when present, the active
+    bridge's bounded CPU prefetch metrics.  Always returns a plain dict with
+    stable keys; never raises.
+    """
+    result: dict[str, Any] = {
+        "vae_object_id": str(id(vae)) if vae is not None else "",
+        "vae_policy_version": 0,
+        "vae_weight_dtype": "",
+        "vae_compute_dtype": "",
+        "vae_memory_format": "",
+        "vae_prefetch_mode": "",
+        "c5_impl_version": C5_IMPL_VERSION,
+        "torch_version": "",
+        "cuda_version": "",
+        "arch_identifier": "",
+    }
+    if vae is not None:
+        policy = getattr(vae, "_comfy_modal_vae_policy", {})
+        if isinstance(policy, Mapping):
+            for key in ("vae_policy_version", "vae_weight_dtype", "vae_compute_dtype",
+                        "vae_memory_format", "vae_prefetch_mode", "c5_impl_version"):
+                value = policy.get(key)
+                if value not in (None, ""):
+                    result[key] = value
+        if not result["vae_prefetch_mode"]:
+            result["vae_prefetch_mode"] = vae_prefetch_mode()
+    _runtime = capture_c5_runtime_metadata()
+    result["torch_version"] = _runtime.get("torch_version", "")
+    result["cuda_version"] = _runtime.get("cuda_version", "")
+    result["arch_identifier"] = _runtime.get("arch_identifier", "")
+    prefetch: dict[str, Any] = {}
+    try:
+        if active is not None:
+            prefetch = dict(getattr(active, "_vae_prefetch_state", {}) or {})
+    except Exception:
+        prefetch = {}
+    result.update({
+        "prefetch_status": prefetch.get("status", ""),
+        "prefetch_start_ms": prefetch.get("result", {}).get("start_ms") if isinstance(prefetch.get("result"), Mapping) else None,
+        "prefetch_end_ms": prefetch.get("result", {}).get("end_ms") if isinstance(prefetch.get("result"), Mapping) else None,
+        "prefetch_wall_ms": prefetch.get("result", {}).get("wall_ms") if isinstance(prefetch.get("result"), Mapping) else None,
+        "prefetch_process_cpu_ms": prefetch.get("result", {}).get("process_cpu_ms") if isinstance(prefetch.get("result"), Mapping) else None,
+        "prefetch_effective_cores": prefetch.get("result", {}).get("effective_cores") if isinstance(prefetch.get("result"), Mapping) else None,
+        "prefetch_bytes": prefetch.get("result", {}).get("bytes") if isinstance(prefetch.get("result"), Mapping) else None,
+        "prefetch_page_count": prefetch.get("result", {}).get("page_count") if isinstance(prefetch.get("result"), Mapping) else None,
+        "ready_before_sampling_end": bool(prefetch.get("ready_before_sampling_end", False)),
+        "overlap_with_sampling_ms": prefetch.get("overlap_with_sampling_ms", 0.0),
+        "prefetch_error": prefetch.get("reason", "") or (prefetch.get("result", {}).get("error") if isinstance(prefetch.get("result"), Mapping) else ""),
+    })
+    return result
 
 
 @dataclass
@@ -138,7 +238,9 @@ _LATEST_RESTORE_RETURN_MARKER: dict[str, Any] | None = None
 both restore IDs, MODAL_TASK_ID, and PID.  Read by ``run_plan_stream`` method
 entry for method-entry-gap computation."""
 
-_DIAGNOSTIC_FLAG: bool = env_flag("COMFYMODAL_V2_DEEP_MODEL_DIAG")
+_DIAGNOSTIC_FLAG: bool = observability_gate(
+    "COMFYMODAL_V2_DEEP_MODEL_DIAG", "deep_model_diagnostics",
+)
 """Controls deep diagnostics (proc/pagefault/open/mmap/safetensors detail).
 ``False`` by default — when disabled, only lightweight identity, restore
 total, CLIP read/ready, background submitted/ready, graph demand/wait,
@@ -175,6 +277,7 @@ _SLOW_READ_THRESHOLD_MS: float = _parse_slow_read_threshold()
 _ACTIVATION_DIAGNOSTIC_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
     "comfymodal_activation_diagnostic_state", default=None
 )
+_ACTIVATION_RECEIPT_MAX = 64
 
 
 def begin_activation_diagnostics(
@@ -187,11 +290,13 @@ def begin_activation_diagnostics(
     Returns the ContextVar token for end_activation_diagnostics()."""
     state: dict[str, Any] = {
         "request_id": request_id,
+        "observability_mode": observability_mode(),
         "clip_encode_calls": [],
         "gpu_load_calls": [],
         "model_patcher_calls": [],
         "first_forward": {},
         "residency": {},
+        "activation_receipts": [],
     }
     if cpu_snapshot_active is not None:
         state["cpu_snapshot_active"] = bool(cpu_snapshot_active)
@@ -203,6 +308,45 @@ def begin_activation_diagnostics(
 def get_activation_diagnostics() -> dict[str, Any] | None:
     """Return the current activation-diagnostic state dict or None."""
     return _ACTIVATION_DIAGNOSTIC_STATE.get()
+
+
+def record_activation_receipt(
+    stage: str,
+    *,
+    status: str,
+    role: str = "",
+    started_ns: int | None = None,
+    completed_ns: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    explicit_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Record one bounded, JSON-safe request-scoped activation receipt."""
+    if observability_mode() == "off":
+        return None
+    state = explicit_state if explicit_state is not None else _ACTIVATION_DIAGNOSTIC_STATE.get()
+    if state is None:
+        return None
+    receipt: dict[str, Any] = {
+        "stage": str(stage),
+        "status": str(status),
+        "role": str(role),
+        "request_id": str(state.get("request_id", "")),
+    }
+    if isinstance(started_ns, int):
+        receipt["started_monotonic_ns"] = started_ns
+    if isinstance(completed_ns, int):
+        receipt["completed_monotonic_ns"] = completed_ns
+    if isinstance(started_ns, int) and isinstance(completed_ns, int) and completed_ns >= started_ns:
+        receipt["wall_ms"] = round((completed_ns - started_ns) / 1_000_000, 3)
+    if metadata:
+        for key, value in metadata.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                receipt[str(key)] = value
+    receipts = state.setdefault("activation_receipts", [])
+    receipts.append(receipt)
+    if len(receipts) > _ACTIVATION_RECEIPT_MAX:
+        del receipts[:-_ACTIVATION_RECEIPT_MAX]
+    return receipt
 
 
 def end_activation_diagnostics(token: "contextvars.Token") -> dict[str, Any]:
@@ -248,16 +392,46 @@ def _record_clip_encode(
             "thread_cpu_ms": round((end_thread - start_thread) / 1_000_000, 3),
             "process_cpu_ms": round((end_process - start_process) / 1_000_000, 3),
         }
+        _detailed_activation = observability_allows("detailed_activation")
         if _explicit_state is not None:
-            _explicit_state.setdefault("clip_encode_calls", []).append(record)
-            _explicit_state["clip_encode_instrumentation_attached"] = True
+            if _detailed_activation:
+                _explicit_state.setdefault("clip_encode_calls", []).append(record)
+                _explicit_state["clip_encode_instrumentation_attached"] = True
+            try:
+                record_activation_receipt(
+                    "clip_encode",
+                    status="completed",
+                    role="CLIP",
+                    started_ns=start_wall,
+                    completed_ns=end_wall,
+                    metadata={"caller": caller, "text_length": len(str(text))},
+                    explicit_state=_explicit_state,
+                )
+            except Exception:
+                # Diagnostic accounting must never mask the CLIP encode result
+                # or an in-flight exception on this critical-path finally.
+                pass
         else:
             state = _ACTIVATION_DIAGNOSTIC_STATE.get()
             if state is not None:
-                state["clip_encode_calls"].append(record)
-                state["clip_encode_instrumentation_attached"] = True
+                if _detailed_activation:
+                    state["clip_encode_calls"].append(record)
+                    state["clip_encode_instrumentation_attached"] = True
+                try:
+                    record_activation_receipt(
+                        "clip_encode",
+                        status="completed",
+                        role="CLIP",
+                        started_ns=start_wall,
+                        completed_ns=end_wall,
+                        metadata={"caller": caller, "text_length": len(str(text))},
+                    )
+                except Exception:
+                    # Diagnostic accounting must never mask the CLIP encode
+                    # result or an in-flight exception on this critical path.
+                    pass
         request_trace = _ACTIVE_REQUEST_TRACE.get()
-        if request_trace is not None:
+        if request_trace is not None and _detailed_activation:
             request_trace.emit("clip_encode_diagnostic", phase="execution", metadata=dict(record))
 
 
@@ -1724,25 +1898,27 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             # Prepare activation diagnostic record.
             _start_minflt = 0
             _start_majflt = 0
-            try:
+            if observability_allows("detailed_activation"):
                 try:
-                    import resource as _r_gpu
-                    _start_ru = _r_gpu.getrusage(_r_gpu.RUSAGE_SELF)
-                    _start_minflt = _start_ru.ru_minflt
-                    _start_majflt = _start_ru.ru_majflt
-                except (ImportError, AttributeError):
+                    try:
+                        import resource as _r_gpu
+                        _start_ru = _r_gpu.getrusage(_r_gpu.RUSAGE_SELF)
+                        _start_minflt = _start_ru.ru_minflt
+                        _start_majflt = _start_ru.ru_majflt
+                    except (ImportError, AttributeError):
+                        pass
+                except Exception:
                     pass
-            except Exception:
-                pass
             _gpu_alloc_before = None
             _gpu_reserved_before = None
-            try:
-                import torch as _torch_gpu
-                if _torch_gpu.cuda.is_available():
-                    _gpu_alloc_before = int(_torch_gpu.cuda.memory_allocated())
-                    _gpu_reserved_before = int(_torch_gpu.cuda.memory_reserved())
-            except Exception:
-                pass
+            if observability_allows("detailed_activation"):
+                try:
+                    import torch as _torch_gpu
+                    if _torch_gpu.cuda.is_available():
+                        _gpu_alloc_before = int(_torch_gpu.cuda.memory_allocated())
+                        _gpu_reserved_before = int(_torch_gpu.cuda.memory_reserved())
+                except Exception:
+                    pass
             _gpu_record = {
                 "call_index": _gpu_request_call_count_var.get(),
                 "caller": "",
@@ -1768,14 +1944,17 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             elif lane is not None and lane._lane == "VAE":
                 _caller = "restore_vae_preparation"
             elif lane is None and request_trace is not None:
-                try:
-                    import inspect as _inspect
-                    _frames = " ".join(frame.function.lower() for frame in _inspect.stack(context=0)[:12])
-                    if "sampler" in _frames:
-                        _caller = "sampler_setup"
-                    else:
+                if observability_allows("detailed_activation"):
+                    try:
+                        import inspect as _inspect
+                        _frames = " ".join(frame.function.lower() for frame in _inspect.stack(context=0)[:12])
+                        if "sampler" in _frames:
+                            _caller = "sampler_setup"
+                        else:
+                            _caller = "graph_model_loading"
+                    except Exception:
                         _caller = "graph_model_loading"
-                except Exception:
+                else:
                     _caller = "graph_model_loading"
                 _model_identity_hash = stable_hash([type(model).__module__ + "." + type(model).__qualname__ for model in models])[:16]
                 request_trace.emit("graph_gpu_load_start", phase="execution", metadata={
@@ -2010,7 +2189,7 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                     },
                                 )
                 # ── Append GPU record to activation diagnostics state ──
-                if _gpu_record is not None and _diag_ok:
+                if _gpu_record is not None and _diag_ok and observability_allows("detailed_activation"):
                     try:
                         try:
                             import resource as _r_end
@@ -2059,6 +2238,18 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         _diag_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
                         if _diag_state is not None:
                             _diag_state["gpu_load_calls"].append(dict(_gpu_record))
+                            record_activation_receipt(
+                                "load_models_gpu",
+                                status="completed",
+                                role="UNET" if _gpu_record.get("contains_registered_unet") else "model",
+                                started_ns=_gpu_record.get("start_monotonic_ns"),
+                                completed_ns=_gpu_record.get("end_monotonic_ns"),
+                                metadata={
+                                    "caller": _caller,
+                                    "model_count": _gpu_record.get("model_count"),
+                                    "contains_registered_unet": _gpu_record.get("contains_registered_unet"),
+                                },
+                            )
                         if request_trace is not None:
                             request_trace.emit(
                                 "load_models_gpu_diagnostic",
@@ -2090,6 +2281,27 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                             pass
                     except Exception:
                         pass
+                elif _gpu_record is not None and _diag_ok:
+                    _end_wall_ns = time.monotonic_ns()
+                    _gpu_record["caller"] = _caller
+                    _gpu_record["end_monotonic_ns"] = _end_wall_ns
+                    _diag_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+                    if _diag_state is not None:
+                        try:
+                            record_activation_receipt(
+                                "load_models_gpu",
+                                status="completed",
+                                role="UNET" if _gpu_record.get("contains_registered_unet") else "model",
+                                started_ns=_gpu_record.get("start_monotonic_ns"),
+                                completed_ns=_end_wall_ns,
+                                metadata={
+                                    "caller": _caller,
+                                    "model_count": _gpu_record.get("model_count"),
+                                    "contains_registered_unet": _gpu_record.get("contains_registered_unet"),
+                                },
+                            )
+                        except Exception:
+                            pass
                 # ── Residency sampler: unet_gpu_load_after ──
                 if _residency_sampler_fired:
                     _res_cb_after = _RESIDENCY_SAMPLER_CALLBACK.get()
@@ -3233,6 +3445,17 @@ def _make_model_patcher_load_diagnostic_wrapper(original: Callable[..., Any]) ->
                         "model_type": type(self).__qualname__,
                         "wall_ms": _dur,
                     })
+                    try:
+                        record_activation_receipt(
+                            "model_patcher_load",
+                            status="completed",
+                            role="model_patcher",
+                            started_ns=_start_ns,
+                            completed_ns=time.monotonic_ns(),
+                            metadata={"model_type": type(self).__qualname__},
+                        )
+                    except Exception:
+                        pass
     setattr(wrapper, _SENTINEL_MP_LOAD, True)
     setattr(wrapper, _SENTINEL_MPD_LOAD, True)
     return wrapper
@@ -6323,6 +6546,10 @@ class ModelPreloadCoordinator:
             )
             return prep.vae_future
 
+    def schedule_cpu_readiness(self, callback: Callable[[], Any]) -> Future[Any]:
+        """Submit CPU-only readiness work without entering the mutation lane."""
+        return self._ensure_pool().submit(callback)
+
     def pool_threads_info(self) -> list[dict[str, Any]]:
         """Return list of {native_id, name} for each live pool thread."""
         result: list[dict[str, Any]] = []
@@ -6344,17 +6571,43 @@ class ModelPreloadCoordinator:
             pass
         return result
 
-    def close(self) -> None:
+    def close(
+        self,
+        *,
+        timeout: float | None = None,
+        cancel_futures: bool = False,
+    ) -> dict[str, Any]:
         with self._pool_lock:
             pool = self._pool
             self._pool = None
         if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=False)
-        # All submitted tasks are terminal after shutdown(wait=True): reset
-        # the real lane counters so a later pool recreation starts clean.
-        with self._lane_count_lock:
-            self._queued_count = 0
-            self._pending_count = 0
+            threads = list(getattr(pool, "_threads", ()) or ())
+            if timeout is None:
+                pool.shutdown(wait=True, cancel_futures=cancel_futures)
+            else:
+                pool.shutdown(wait=False, cancel_futures=cancel_futures)
+                deadline = time.monotonic() + max(0.0, float(timeout))
+                for thread in threads:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    thread.join(timeout=remaining)
+            alive_threads = [thread for thread in threads if thread.is_alive()]
+        else:
+            alive_threads = []
+        if not alive_threads:
+            with self._lane_count_lock:
+                self._queued_count = 0
+                self._pending_count = 0
+        return {
+            "pool_present": pool is not None,
+            "thread_count": len(threads) if pool is not None else 0,
+            "alive_thread_count": len(alive_threads),
+            "alive_threads": [
+                {"name": str(thread.name)[:80], "native_id": getattr(thread, "native_id", None)}
+                for thread in alive_threads[:8]
+            ],
+        }
 
     def _ensure_pool(self) -> ThreadPoolExecutor:
         with self._pool_lock:
@@ -6652,6 +6905,8 @@ class V2LoaderBridge:
         this bridge for the current request), used as an exact-object source
         in ``resolve_vae_object``.  Reset per ``prepare()``/``clear()``."""
         self._snapshot_loader_outputs: Mapping[str, Any] | None = None
+        self._vae_prefetch_future: Future[Any] | None = None
+        self._vae_prefetch_state: dict[str, Any] = {}
 
     def install(self, nodes_module: Any | None = None, *, trace: RuntimeTrace | None = None) -> bool:
         """Install wrappers on the live ComfyUI node classes once.
@@ -6731,6 +6986,8 @@ class V2LoaderBridge:
         self._preparation = None
         self._exact_vae = None
         self._snapshot_loader_outputs = None
+        self._vae_prefetch_future = None
+        self._vae_prefetch_state = {}
         # Reset the per-request captured graph VAELoader output so a fresh
         # request never reuses a previous request's captured VAE object.
         self._graph_vae_output = None
@@ -6832,10 +7089,209 @@ class V2LoaderBridge:
         finally:
             _ACTIVE_V2_LOADER_BRIDGE.reset(token)
 
+    def schedule_vae_cpu_prefetch(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        request_id: str = "",
+    ) -> bool:
+        """Submit one bounded CPU-only VAE readiness task at sampling start."""
+        mode = vae_prefetch_mode()
+        if mode == "off":
+            return False
+        if self._vae_prefetch_future is not None:
+            return True
+        vae, source = self.resolve_vae_object(trace=trace)
+        registry = getattr(vae, "_comfy_modal_vae_storage_registry", None)
+        if vae is None or registry is None:
+            self._vae_prefetch_state = {
+                "mode": mode,
+                "vae_prefetch_mode": mode,
+                "status": "skipped",
+                "reason": "snapshot_vae_registry_unavailable",
+                "request_id": request_id,
+                "source": source,
+                "terminal": True,
+                "ready_before_sampling_end": False,
+                "overlap_with_sampling_ms": 0.0,
+                "result": {},
+            }
+            if trace is not None:
+                trace.emit("vae_prefetch_skipped", phase="execution", metadata={
+                    "vae_prefetch_mode": mode,
+                    "status": "skipped",
+                    "error": "snapshot_vae_registry_unavailable",
+                    "request_id": request_id,
+                    "source": source,
+                    "ready_before_sampling_end": False,
+                    "overlap_with_sampling_ms": 0.0,
+                })
+            return False
+
+        state: dict[str, Any] = {
+            "mode": mode,
+            "vae_prefetch_mode": mode,
+            "status": "scheduled",
+            "reason": "",
+            "request_id": request_id,
+            "source": source,
+            "vae_object_id": str(id(vae)),
+            "start_mono_ns": 0,
+            "end_mono_ns": 0,
+            "scheduled_mono_ns": time.monotonic_ns(),
+            "terminal": False,
+            "ready_before_sampling_end": False,
+            "overlap_with_sampling_ms": 0.0,
+            "result": {},
+        }
+        self._vae_prefetch_state = state
+
+        def _worker() -> dict[str, Any]:
+            state["start_mono_ns"] = time.monotonic_ns()
+            if trace is not None:
+                trace.emit("vae_prefetch_start", phase="execution", metadata={
+                    "mode": mode,
+                    "request_id": request_id,
+                    "source": source,
+                    "vae_object_id": str(id(vae)),
+                })
+            try:
+                result = prefetch_vae_storage(registry, mode=mode)
+                state["result"] = dict(result)
+                state["status"] = str(result.get("status", "error"))
+                return result
+            except Exception as exc:
+                state["status"] = "error"
+                state["reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+                return {"mode": mode, "status": "error", "error_reason": state["reason"]}
+            finally:
+                state["end_mono_ns"] = time.monotonic_ns()
+                state["terminal"] = True
+                if trace is not None:
+                    trace.emit("vae_prefetch_end", phase="execution", metadata={
+                        "mode": mode,
+                        "request_id": request_id,
+                        "source": source,
+                        "vae_object_id": str(id(vae)),
+                        **dict(state.get("result", {})),
+                        "status": state.get("status", "error"),
+                        "reason": state.get("reason", ""),
+                    })
+
+        try:
+            self._vae_prefetch_future = self.coordinator.schedule_cpu_readiness(_worker)
+            return True
+        except Exception as exc:
+            state["status"] = "error"
+            state["reason"] = f"submit_failed:{type(exc).__name__}"
+            state["terminal"] = True
+            if trace is not None:
+                trace.emit("vae_prefetch_end", phase="execution", metadata=dict(state))
+            return False
+
+    def join_vae_cpu_prefetch_bounded(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        request_id: str = "",
+        timeout_s: float | None = 0.05,
+        sampling_end_mono_ns: int = 0,
+    ) -> dict[str, Any]:
+        """Join the CPU prefetch at sampling end, then continue activation.
+
+        *timeout_s* ``None`` waits for the prefetch to finish completely
+        (it is CPU-only and bounded) — used as the safety barrier before
+        any GPU mutation that can free the snapshot CPU storage the
+        ``bounded_native_touch`` prefetch dereferences.  A finite timeout
+        keeps the sampling_end schedule non-blocking per the existing
+        bounded join/fallback contract.
+
+        *sampling_end_mono_ns* is the authoritative sampling-end monotonic
+        timestamp (when provided) used to derive ``overlap_with_sampling_ms``
+        and ``ready_before_sampling_end``.
+        """
+        future = self._vae_prefetch_future
+        state = self._vae_prefetch_state
+        if future is None:
+            return {"status": "absent", "join_wait_ms": 0.0}
+        started = time.monotonic_ns()
+        if trace is not None:
+            trace.emit("vae_prefetch_join_start", phase="execution", metadata={
+                "request_id": request_id,
+                "timeout_ms": None if timeout_s is None else round(timeout_s * 1000, 3),
+                "status": state.get("status", ""),
+                "vae_prefetch_mode": state.get("vae_prefetch_mode", state.get("mode", "")),
+            })
+        joined = False
+        timed_out = False
+        try:
+            if timeout_s is None:
+                future.result()
+            else:
+                future.result(timeout=max(0.0, float(timeout_s)))
+            joined = True
+        except TimeoutError:
+            timed_out = True
+        except Exception as exc:
+            state["reason"] = state.get("reason") or f"future_error:{type(exc).__name__}"
+        wait_ms = round((time.monotonic_ns() - started) / 1_000_000, 3)
+        ready = bool(joined or state.get("terminal", False))
+        # Overlap: the prefetch window [scheduled, prefetch_end] that fell
+        # within the sampling window [scheduled, sampling_end].
+        overlap_ms = 0.0
+        _scheduled = state.get("scheduled_mono_ns", 0)
+        _pf_start = state.get("start_mono_ns", 0)
+        _pf_end = state.get("end_mono_ns", 0)
+        _sampling_end = int(sampling_end_mono_ns or 0)
+        _sample_start = _scheduled or _pf_start or started
+        if _pf_start and _sampling_end and _sampling_end > _sample_start:
+            _overlap_start = max(_pf_start, _sample_start)
+            _overlap_end = min((_pf_end or _sampling_end), _sampling_end)
+            if _overlap_end > _overlap_start:
+                overlap_ms = round((_overlap_end - _overlap_start) / 1_000_000, 3)
+        state["ready_before_sampling_end"] = ready
+        state["overlap_with_sampling_ms"] = overlap_ms
+        result = {
+            "status": "complete" if joined else ("timeout" if timed_out else state.get("status", "error")),
+            "join_wait_ms": wait_ms,
+            "full_wait": timeout_s is None,
+            "prefetch_complete_before_sampling_end": bool(joined or state.get("terminal", False)),
+            "ready_before_sampling_end": ready,
+            "overlap_with_sampling_ms": overlap_ms,
+            "vae_prefetch_mode": state.get("vae_prefetch_mode", state.get("mode", "")),
+            "prefetch_mode": state.get("mode", ""),
+            "prefetch_status": state.get("status", ""),
+            "prefetch_reason": state.get("reason", ""),
+            "start_ms": state.get("result", {}).get("start_ms") if isinstance(state.get("result"), Mapping) else None,
+            "end_ms": state.get("result", {}).get("end_ms") if isinstance(state.get("result"), Mapping) else None,
+            "wall_ms": state.get("result", {}).get("wall_ms") if isinstance(state.get("result"), Mapping) else None,
+            "process_cpu_ms": state.get("result", {}).get("process_cpu_ms") if isinstance(state.get("result"), Mapping) else None,
+            "effective_cores": state.get("result", {}).get("effective_cores") if isinstance(state.get("result"), Mapping) else None,
+            "bytes": state.get("result", {}).get("bytes") if isinstance(state.get("result"), Mapping) else None,
+            "page_count": state.get("result", {}).get("page_count") if isinstance(state.get("result"), Mapping) else None,
+            "error": state.get("reason", "") or (state.get("result", {}).get("error") if isinstance(state.get("result"), Mapping) else ""),
+        }
+        if trace is not None:
+            trace.emit("vae_prefetch_join_end", phase="execution", metadata={
+                "request_id": request_id,
+                **result,
+            })
+        return result
+
     def diagnostics(self) -> dict[str, Any]:
         if self._preparation is None:
-            return {}
-        return self.coordinator.diagnostics(self._preparation)
+            result: dict[str, Any] = {}
+        else:
+            result = self.coordinator.diagnostics(self._preparation)
+        if self._vae_prefetch_state:
+            result["vae_prefetch"] = {
+                key: value
+                for key, value in self._vae_prefetch_state.items()
+                if key not in {"result"}
+            }
+            if isinstance(self._vae_prefetch_state.get("result"), Mapping):
+                result["vae_prefetch"].update(dict(self._vae_prefetch_state["result"]))
+        return result
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Return a read-only diagnostic snapshot of the bridge's current state.
@@ -7468,16 +7924,22 @@ class V2LoaderBridge:
         """Return *override* when not None, else *computed*."""
         return override if override is not None else computed
 
-    def close_workers(self) -> None:
+    def close_workers(
+        self,
+        *,
+        timeout: float | None = None,
+        cancel_futures: bool = False,
+        wait_futures: bool = True,
+    ) -> dict[str, Any]:
         """Wait for submitted restore futures and shut down the coordinator pool.
         Swallows worker exceptions so existing loader fallback behavior remains.
         The coordinator recreates a pool on the next _submit call."""
         prep = self._preparation
+        _present = 0
+        _done = 0
+        _failed = 0
         if prep is not None:
             _cw_start_ns = time.monotonic_ns()
-            _present = 0
-            _done = 0
-            _failed = 0
             for future in (prep.unet_future, prep.clip_future, prep.vae_future):
                 if future is not None:
                     _present += 1
@@ -7485,10 +7947,16 @@ class V2LoaderBridge:
                         _done += 1
                         if future.exception() is not None:
                             _failed += 1
-                    try:
-                        future.result()
-                    except Exception:
-                        _failed += 1
+                    if wait_futures:
+                        try:
+                            future.result()
+                        except Exception:
+                            _failed += 1
+                    elif cancel_futures and not future.done():
+                        try:
+                            future.cancel()
+                        except Exception:
+                            pass
             _cw_wait_ms = round((time.monotonic_ns() - _cw_start_ns) / 1_000_000, 3)
             if self._trace:
                 self._trace.emit("close_workers_start", phase="restore", metadata={
@@ -7501,7 +7969,16 @@ class V2LoaderBridge:
                     "present": _present,
                     "done_final": _present,
                 })
-        self.coordinator.close()
+        _pool_result = self.coordinator.close(
+            timeout=timeout,
+            cancel_futures=cancel_futures,
+        )
+        return {
+            "present": _present,
+            "done_before_wait": _done,
+            "failed": _failed,
+            "pool": _pool_result,
+        }
 
     def extend_preparation(
         self,
@@ -7545,6 +8022,8 @@ class V2LoaderBridge:
         self._prefill_key = prefill_key
         self._model_spec = dict(model_spec) if isinstance(model_spec, Mapping) else {}
         self._trace = trace
+        self._vae_prefetch_future = None
+        self._vae_prefetch_state = {}
 
         if not self.install(self._nodes, trace=trace):
             raise RuntimeError(
@@ -7632,6 +8111,8 @@ class V2LoaderBridge:
         self._exact_vae = None
         self._snapshot_loader_outputs = None
         self._graph_vae_output = None
+        self._vae_prefetch_future = None
+        self._vae_prefetch_state = {}
         self.coordinator._active = None
         with self._prefill_lock:
             self._prefill_results.clear()
@@ -7673,6 +8154,109 @@ class V2LoaderBridge:
             return len(new_events)
         return 0
 
+    @staticmethod
+    @contextmanager
+    def _vae_decode_compute_scope(
+        vae: Any,
+        trace: RuntimeTrace | None = None,
+    ) -> Iterator[None]:
+        policy = getattr(vae, "_comfy_modal_vae_policy", {})
+        compute_dtype = str(policy.get("vae_compute_dtype", "")) if isinstance(policy, Mapping) else ""
+        if compute_dtype != "bfloat16_autocast":
+            yield
+            return
+        try:
+            import torch
+            patcher = getattr(vae, "patcher", None)
+            device = getattr(patcher, "load_device", None)
+            device_type = str(getattr(device, "type", device or "cuda")).split(":")[0]
+            if device_type not in {"cuda", "cpu"}:
+                yield
+                return
+        except Exception:
+            yield
+            return
+        if trace is not None:
+            trace.emit("vae_decode_autocast_start", phase="execution", metadata={
+                "device_type": device_type,
+                "compute_dtype": compute_dtype,
+                "vae_object_id": str(id(vae)),
+            })
+        try:
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                yield
+        finally:
+            if trace is not None:
+                trace.emit("vae_decode_autocast_end", phase="execution", metadata={
+                    "device_type": device_type,
+                    "compute_dtype": compute_dtype,
+                    "vae_object_id": str(id(vae)),
+                })
+
+    @staticmethod
+    def _vae_decode_layout_inputs(
+        vae: Any,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        trace: RuntimeTrace | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        policy = getattr(vae, "_comfy_modal_vae_policy", {})
+        if not isinstance(policy, Mapping) or policy.get("vae_memory_format") != "channels_last":
+            return args, dict(kwargs)
+        # VAEDecode positional signature (ComfyUI nodes.py):
+        # decode(self, vae, samples) — vae at args[0], the LATENT at
+        # args[1].  The samples slot normally holds the LATENT dict whose
+        # tensor lives under its "samples" key; a raw 4-D tensor is also
+        # accepted.  Extraction is keyword-first, then positional.
+        latent_container = kwargs.get("samples") if "samples" in kwargs else (args[1] if len(args) > 1 else None)
+        latent_tensor = None
+        if isinstance(latent_container, Mapping) and "samples" in latent_container:
+            latent_tensor = latent_container.get("samples")
+        elif latent_container is not None and getattr(latent_container, "ndim", None) is not None:
+            latent_tensor = latent_container
+        required = bool(getattr(vae, "_comfy_modal_vae_latent_channels_last_required", False))
+        copied = False
+        copy_ms = 0.0
+        updated_args = args
+        updated_kwargs = dict(kwargs)
+        if required and latent_tensor is not None and getattr(latent_tensor, "ndim", 0) == 4:
+            try:
+                import torch
+                if not latent_tensor.is_contiguous(memory_format=torch.channels_last):
+                    started = time.monotonic_ns()
+                    converted = latent_tensor.contiguous(memory_format=torch.channels_last)
+                    copy_ms = round((time.monotonic_ns() - started) / 1_000_000, 3)
+                    copied = True
+                    if isinstance(latent_container, Mapping):
+                        _updated = dict(latent_container)
+                        _updated["samples"] = converted
+                        if "samples" in updated_kwargs:
+                            updated_kwargs["samples"] = _updated
+                        elif len(updated_args) > 1:
+                            updated_args = updated_args[:1] + (_updated,) + updated_args[2:]
+                    elif "samples" in updated_kwargs:
+                        updated_kwargs["samples"] = converted
+                    elif len(updated_args) > 1:
+                        updated_args = updated_args[:1] + (converted,) + updated_args[2:]
+            except Exception:
+                pass
+        if trace is not None:
+            trace.emit("vae_decode_layout", phase="execution", metadata={
+                "memory_format": "channels_last",
+                "latent_ndim": getattr(latent_tensor, "ndim", None),
+                "latent_is_channels_last": bool(
+                    latent_tensor is not None
+                    and getattr(latent_tensor, "ndim", 0) == 4
+                    and _is_tensor_channels_last(latent_tensor)
+                ),
+                "layout_copy_required": required,
+                "layout_copy_applied": copied,
+                "layout_copy_ms": copy_ms,
+                "hidden_conversion_detected": None,
+                "vae_object_id": str(id(vae)) if vae is not None else "",
+            })
+        return updated_args, updated_kwargs
+
     def _make_wrapper(self, class_name: str, method_name: str, original: Callable[..., Any]) -> Callable[..., Any]:
         if class_name == "UNETLoader":
             def wrapped(node: Any, *args: Any, **kwargs: Any) -> Any:
@@ -7708,14 +8292,41 @@ class V2LoaderBridge:
         elif class_name == "VAEDecode":
             def wrapped(node: Any, *args: Any, **kwargs: Any) -> Any:
                 active = current_v2_loader_bridge()
+                _demanded_vae = kwargs.get("vae", args[0] if args else None)
                 if active is not None:
                     # VAEDecode demand join (sampling_end mode): joins the
                     # activation future outside the mutation lane; always
                     # falls through so decode stays in normal graph order.
-                    result = active._consume_vae_decode(args, kwargs)
+                    result = active._consume_vae_decode(
+                        args, kwargs, demanded_vae=_demanded_vae,
+                    )
                     if result is not _LOADER_MISS:
                         return result
-                return original(node, *args, **kwargs)
+                _trace = active._trace if active is not None else _ACTIVE_REQUEST_TRACE.get()
+                _decode_args, _decode_kwargs = V2LoaderBridge._vae_decode_layout_inputs(
+                    _demanded_vae, args, kwargs, trace=_trace,
+                )
+                _decode_start_meta = _vae_decode_boundary_metadata(
+                    active, _demanded_vae, trace=_trace,
+                )
+                if _trace is not None:
+                    _trace.emit("vae_decode_start", phase="execution", metadata={
+                        **_decode_start_meta,
+                    })
+                _decode_wall_start = time.monotonic_ns()
+                try:
+                    with V2LoaderBridge._vae_decode_compute_scope(_demanded_vae, trace=_trace):
+                        _result = original(node, *_decode_args, **_decode_kwargs)
+                finally:
+                    _decode_wall_ms = round(
+                        (time.monotonic_ns() - _decode_wall_start) / 1_000_000, 3
+                    )
+                    if _trace is not None:
+                        _trace.emit("vae_decode_end", phase="execution", metadata={
+                            **_vae_decode_boundary_metadata(active, _demanded_vae, trace=_trace),
+                            "decode_wall_ms": _decode_wall_ms,
+                        })
+                return _result
         elif class_name == "CLIPTextEncode":
             def wrapped(node: Any, *args: Any, **kwargs: Any) -> Any:
                 active = current_v2_loader_bridge()
@@ -7991,6 +8602,15 @@ class V2LoaderBridge:
             _outcome = self._join_vae_early_activation(trace=self._trace)
             if _outcome.get("valid") and _outcome.get("vae") is not None:
                 return (_outcome["vae"],)
+            if self._exact_vae is not None:
+                if self._trace is not None:
+                    self._trace.emit("vae_direct_snapshot_fallback", phase="execution", metadata={
+                        "reason": _outcome.get("reason", "activation_unavailable"),
+                        "vae_object_id": str(id(self._exact_vae)),
+                        "source": "snapshot_vae",
+                        "original_loader_reconstruction": False,
+                    })
+                return (self._exact_vae,)
             return _LOADER_MISS
         return self._consume_model_impl(
             lane="VAE",
@@ -8004,7 +8624,13 @@ class V2LoaderBridge:
             skip_loader_class=True,
         )
 
-    def _consume_vae_decode(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
+    def _consume_vae_decode(
+        self,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        *,
+        demanded_vae: Any = None,
+    ) -> Any:
         """VAEDecode demand hook (sampling_end VAE activation join).
 
         Joins the request's sampling_end VAE activation future OUTSIDE the
@@ -8013,13 +8639,30 @@ class V2LoaderBridge:
         never executes decode and always returns ``_LOADER_MISS`` so the
         original VAEDecode path proceeds unchanged.  In any non-active mode
         this is a no-op.
+
+        *demanded_vae* is the exact VAE the graph is decoding (resolved by
+        the wrapper as ``kwargs['vae']`` or ``args[0]`` for the ComfyUI
+        positional ``decode(vae, samples)`` signature) so validation never
+        consults a different object.
         """
+        _demanded_vae = demanded_vae if demanded_vae is not None else (
+            kwargs.get("vae", args[0] if args else None)
+        )
         if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
-            _demanded_vae = kwargs.get("vae", args[0] if args else None)
             self._join_vae_early_activation(
                 trace=self._trace,
                 demanded_vae=_demanded_vae,
             )
+        # CPU-prefetch safety barrier: ``bounded_native_touch`` prefetch
+        # dereferences CPU addresses captured at snapshot time.  Wait for it
+        # to finish before the graph decode can trigger the VAE GPU
+        # mutation (which frees that storage).  No-op when no prefetch was
+        # scheduled (future is None).
+        self.join_vae_cpu_prefetch_bounded(
+            trace=self._trace,
+            request_id=str(getattr(self._trace, "request_id", "") or ""),
+            timeout_s=None,
+        )
         return _LOADER_MISS
 
     def set_exact_vae(self, vae: Any) -> None:
@@ -8060,8 +8703,9 @@ class V2LoaderBridge:
              provides them — ``getattr(self._cpu_snapshot_models, 'vae',
              None)`` and ``self._snapshot_loader_outputs['vae']`` — both
              absent-safe (the bridge never fabricates a source).
-          3. Captured graph VAELoader output of this request.
-          4. Existing original VAELoader resolution (``self._load_vae``).
+           3. Captured graph VAELoader output of this request.
+           4. No reconstruction fallback.  A missing object is explicit so
+              sampling_end cannot silently create a second VAE.
 
         Returns ``(vae, source)`` or ``(None, "")`` when no resolution is
         possible.  Each source is consulted at most once per call; no VAE
@@ -8087,11 +8731,12 @@ class V2LoaderBridge:
             pass
         if self._graph_vae_output is not None:
             return self._graph_vae_output, "graph_vae_loader"
-        if self._model_key is not None and getattr(self._model_key, "vae_identity", ""):
-            try:
-                return self._load_vae(self._model_key), "original_loader"
-            except Exception:
-                return None, ""
+        if trace is not None:
+            trace.emit("vae_resolution_fallback", phase="execution", metadata={
+                "reason": "no_existing_vae_object",
+                "vae_identity": str(getattr(self._model_key, "vae_identity", "") or ""),
+                "original_loader_reconstruction": False,
+            })
         return None, ""
 
     def _join_vae_early_activation(
@@ -11612,6 +12257,7 @@ def _vae_activation_new_state(request_id: str) -> dict[str, Any]:
         "vae_patcher_object_id": "",
         "vae_resolution_source": "",
         "vae_identity": "",
+        "prefetch_join": {},
         "sampling_end_mono_ns": 0,
         "sampling_end_duration_ms": 0.0,
         "submitted_mono_ns": 0,
@@ -11632,6 +12278,16 @@ def _vae_activation_new_state(request_id: str) -> dict[str, Any]:
         "current_device": "",
         "load_device": "",
         "compute_dtype": "",
+        "observed_compute_dtype": "",
+        "vae_policy_version": 0,
+        "vae_weight_dtype": "",
+        "vae_compute_dtype": "",
+        "vae_memory_format": "",
+        "vae_prefetch_mode": "",
+        "c5_impl_version": "",
+        "torch_version": "",
+        "cuda_version": "",
+        "arch_identifier": "",
         "loaded_bytes": None,
         "model_bytes": None,
         "residency_status": "",
@@ -11678,6 +12334,12 @@ def _build_vae_activation_key(
     _patcher_id = ""
     _device = ""
     _compute_dtype = ""
+    _policy_version: Any = int(getattr(model_key, "vae_policy_version", 0) or 0)
+    _weight_dtype = str(getattr(model_key, "vae_weight_dtype", "") or "")
+    _policy_compute_dtype = str(getattr(model_key, "vae_compute_dtype", "") or "")
+    _memory_format = str(getattr(model_key, "vae_memory_format", "") or "")
+    _prefetch_mode = str(getattr(model_key, "vae_policy_metadata", {}).get("vae_prefetch_mode", "") if isinstance(getattr(model_key, "vae_policy_metadata", {}), Mapping) else "")
+    _c5_impl = str(getattr(model_key, "vae_policy_metadata", {}).get("c5_impl_version", "") if isinstance(getattr(model_key, "vae_policy_metadata", {}), Mapping) else "")
     if vae is not None:
         try:
             _patcher = getattr(vae, "patcher", None)
@@ -11691,6 +12353,16 @@ def _build_vae_activation_key(
                 _compute_dtype = str(_md_value) if _md_value is not None else ""
             if not _compute_dtype:
                 _compute_dtype = str(getattr(vae, "vae_dtype", "") or "")
+            _policy = getattr(vae, "_comfy_modal_vae_policy", {})
+            if isinstance(_policy, Mapping):
+                _policy_version = int(_policy.get("vae_policy_version", 0) or 0)
+                _weight_dtype = str(_policy.get("vae_weight_dtype", "") or "")
+                _policy_compute_dtype = str(
+                    _policy.get("vae_compute_dtype", "") or _policy_compute_dtype
+                )
+                _memory_format = str(_policy.get("vae_memory_format", "") or "")
+                _prefetch_mode = str(_policy.get("vae_prefetch_mode", "") or _prefetch_mode)
+                _c5_impl = str(_policy.get("c5_impl_version", "") or _c5_impl)
         except Exception:
             pass
     if not _device:
@@ -11699,6 +12371,7 @@ def _build_vae_activation_key(
             _device = str(_mm_vk.get_torch_device())
         except Exception:
             _device = ""
+    _runtime = capture_c5_runtime_metadata()
     components = {
         "mode": mode,
         "request_id": request_id,
@@ -11707,6 +12380,15 @@ def _build_vae_activation_key(
         "vae_patcher_object_id": _patcher_id,
         "vae_resolution_source": source,
         "compute_dtype": _compute_dtype,
+        "vae_policy_version": _policy_version,
+        "vae_weight_dtype": _weight_dtype,
+        "vae_compute_dtype": _policy_compute_dtype,
+        "vae_memory_format": _memory_format,
+        "vae_prefetch_mode": _prefetch_mode,
+        "c5_impl_version": _c5_impl,
+        "torch_version": _runtime.get("torch_version", ""),
+        "cuda_version": _runtime.get("cuda_version", ""),
+        "arch_identifier": _runtime.get("arch_identifier", ""),
         "device": _device,
         "sampling_end_mono_ns": int(sampling_end_mono_ns or 0),
     }
@@ -11904,6 +12586,16 @@ def _vae_activation_terminal(
             "vae_object_id": state.get("vae_object_id", ""),
             "vae_patcher_object_id": state.get("vae_patcher_object_id", ""),
             "vae_resolution_source": state.get("vae_resolution_source", ""),
+            "vae_policy_version": state.get("vae_policy_version", 0),
+            "vae_weight_dtype": state.get("vae_weight_dtype", ""),
+            "vae_compute_dtype": state.get("vae_compute_dtype", ""),
+            "vae_memory_format": state.get("vae_memory_format", ""),
+            "vae_prefetch_mode": state.get("vae_prefetch_mode", ""),
+            "c5_impl_version": state.get("c5_impl_version", ""),
+            "torch_version": state.get("torch_version", ""),
+            "cuda_version": state.get("cuda_version", ""),
+            "arch_identifier": state.get("arch_identifier", ""),
+            "prefetch_join": state.get("prefetch_join", {}),
             "cache_present": bool(state.get("cache_present", False)),
             "residency_status": state.get("residency_status", ""),
             "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
@@ -11915,6 +12607,12 @@ def _vae_activation_terminal(
         f"key_hash={state.get('key_hash', '')} status={state.get('status', status)} "
         f"reason={state.get('reason', reason) or 'ok'} error={state.get('error', '') or 'absent'} "
         f"transfer_count={state.get('transfer_count', 0)} "
+        f"vae_policy_version={state.get('vae_policy_version', 0)} "
+        f"vae_weight_dtype={state.get('vae_weight_dtype', '') or 'absent'} "
+        f"vae_compute_dtype={state.get('vae_compute_dtype', '') or 'absent'} "
+        f"vae_memory_format={state.get('vae_memory_format', '') or 'absent'} "
+        f"vae_prefetch_mode={state.get('vae_prefetch_mode', '') or 'absent'} "
+        f"c5_impl_version={state.get('c5_impl_version', '') or 'absent'} "
         f"source={state.get('vae_resolution_source', '') or 'absent'}",
         flush=True,
     )
@@ -11952,6 +12650,13 @@ def _vae_activation_fallback(
             "key_hash": state.get("key_hash", ""),
             "status": state.get("status", "fallback"),
             "reason": reason,
+            "vae_policy_version": state.get("vae_policy_version", 0),
+            "vae_weight_dtype": state.get("vae_weight_dtype", ""),
+            "vae_compute_dtype": state.get("vae_compute_dtype", ""),
+            "vae_memory_format": state.get("vae_memory_format", ""),
+            "vae_prefetch_mode": state.get("vae_prefetch_mode", ""),
+            "c5_impl_version": state.get("c5_impl_version", ""),
+            "prefetch_join": state.get("prefetch_join", {}),
             "error": error or None,
             "join_wait_ms": round(float(join_wait_ms), 3),
         })
@@ -12033,6 +12738,16 @@ def _run_early_vae_activation(
         )
     # ── Original ComfyUI GPU/cache load path (lane acquired by the
     # existing wrapper as owner "VAE" around the load only). ──
+    # CPU-prefetch safety barrier: the ``bounded_native_touch`` prefetch
+    # dereferences snapshot-time CPU addresses; ``load_models_gpu`` can
+    # free that storage.  Wait for the prefetch (CPU-only, bounded) to
+    # finish before mutating GPU memory.  No-op when none was scheduled.
+    state["prefetch_join"] = bridge.join_vae_cpu_prefetch_bounded(
+        trace=trace,
+        request_id=request_id,
+        timeout_s=None,
+        sampling_end_mono_ns=int(state.get("sampling_end_mono_ns", 0) or 0),
+    )
     _loaded_before = _vae_patcher_loaded_bytes(_patcher)
     _gpu_alloc_before = _gpu_allocated_bytes()
     _load_start = _capture_phase_counters()
@@ -12079,7 +12794,8 @@ def _run_early_vae_activation(
     state["cache_present"] = bool(_evidence.get("cache_present", False))
     state["current_device"] = str(_evidence.get("current_device", "") or "")
     state["load_device"] = str(_evidence.get("load_device", "") or "")
-    state["compute_dtype"] = str(_evidence.get("compute_dtype", "") or "")
+    state["observed_compute_dtype"] = str(_evidence.get("compute_dtype", "") or "")
+    state["compute_dtype"] = state["observed_compute_dtype"]
     state["loaded_bytes"] = _evidence.get("loaded_bytes")
     state["model_bytes"] = _evidence.get("model_bytes")
     state["residency_status"] = str(_evidence.get("residency_status", "") or "")
@@ -12180,6 +12896,11 @@ def schedule_vae_early_activation_at_sampling_end(
         _state["sampling_end_mono_ns"] = time.monotonic_ns()
         _state["sampling_end_duration_ms"] = round(float(duration_ms or 0.0), 3)
         _VAE_ACTIVATION_STATE[_request_id] = _state
+    _state["prefetch_join"] = bridge.join_vae_cpu_prefetch_bounded(
+        trace=trace,
+        request_id=_request_id,
+        sampling_end_mono_ns=int(_state.get("sampling_end_mono_ns", 0) or 0),
+    )
     _sampling_end_mono_ns = time.monotonic_ns()
     # Resolve the exact VAE object via the bridge adapter.
     try:
@@ -12266,6 +12987,15 @@ def _vae_activation_submit(
         _state["vae_patcher_object_id"] = key_components.get("vae_patcher_object_id", "")
         _state["vae_resolution_source"] = source
         _state["vae_identity"] = key_components.get("vae_identity", "")
+        _state["vae_policy_version"] = key_components.get("vae_policy_version", 0)
+        _state["vae_weight_dtype"] = key_components.get("vae_weight_dtype", "")
+        _state["vae_compute_dtype"] = key_components.get("vae_compute_dtype", "")
+        _state["vae_memory_format"] = key_components.get("vae_memory_format", "")
+        _state["vae_prefetch_mode"] = key_components.get("vae_prefetch_mode", "")
+        _state["c5_impl_version"] = key_components.get("c5_impl_version", "")
+        _state["torch_version"] = key_components.get("torch_version", "")
+        _state["cuda_version"] = key_components.get("cuda_version", "")
+        _state["arch_identifier"] = key_components.get("arch_identifier", "")
         _state["sampling_end_mono_ns"] = int(key_components.get("sampling_end_mono_ns", 0) or 0)
         _state["sampling_end_duration_ms"] = round(float(sampling_end_duration_ms or 0.0), 3)
         _state["status"] = "scheduled"
@@ -12281,6 +13011,15 @@ def _vae_activation_submit(
                 "source": source,
                 "vae_object_id": key_components.get("vae_object_id", ""),
                 "vae_patcher_object_id": key_components.get("vae_patcher_object_id", ""),
+                "vae_policy_version": key_components.get("vae_policy_version", 0),
+                "vae_weight_dtype": key_components.get("vae_weight_dtype", ""),
+                "vae_compute_dtype": key_components.get("vae_compute_dtype", ""),
+                "vae_memory_format": key_components.get("vae_memory_format", ""),
+                "vae_prefetch_mode": key_components.get("vae_prefetch_mode", ""),
+                "c5_impl_version": key_components.get("c5_impl_version", ""),
+                "torch_version": key_components.get("torch_version", ""),
+                "cuda_version": key_components.get("cuda_version", ""),
+                "arch_identifier": key_components.get("arch_identifier", ""),
                 "vae_identity_hash": stable_hash(str(model_key.vae_identity))[:16] if model_key is not None else "",
                 "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                 "restore_session_id": _LATEST_RESTORE_SESSION_ID,
@@ -12290,6 +13029,15 @@ def _vae_activation_submit(
             f"request_id={request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
             f"trigger={trigger} key_hash={key_hash} source={source or 'absent'} "
             f"vae_identity_hash={stable_hash(str(model_key.vae_identity))[:16] if model_key is not None else ''} "
+            f"vae_policy_version={key_components.get('vae_policy_version', 0)} "
+            f"vae_weight_dtype={key_components.get('vae_weight_dtype', '') or 'absent'} "
+            f"vae_compute_dtype={key_components.get('vae_compute_dtype', '') or 'absent'} "
+            f"vae_memory_format={key_components.get('vae_memory_format', '') or 'absent'} "
+            f"vae_prefetch_mode={key_components.get('vae_prefetch_mode', '') or 'absent'} "
+            f"c5_impl_version={key_components.get('c5_impl_version', '') or 'absent'} "
+            f"torch={key_components.get('torch_version', '') or 'absent'} "
+            f"cuda={key_components.get('cuda_version', '') or 'absent'} "
+            f"arch={key_components.get('arch_identifier', '') or 'absent'} "
             f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
             f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
             flush=True,
@@ -12373,6 +13121,12 @@ def _validate_vae_early_activation(
         return False, "dtype_unproven", None
     if _actual != _expected_dtype:
         return False, "dtype_mismatch", None
+    for _policy_field in (
+        "vae_policy_version", "vae_weight_dtype", "vae_compute_dtype", "vae_memory_format",
+        "vae_prefetch_mode", "c5_impl_version",
+    ):
+        if str(state.get(_policy_field, "")) != str(_key.get(_policy_field, "")):
+            return False, f"{_policy_field}_mismatch", None
     return True, "ok", _vae
 
 
@@ -12424,12 +13178,65 @@ def finalize_vae_early_activation(
             "residency_status": _state.get("residency_status", ""),
             "vae_object_id": _state.get("vae_object_id", ""),
             "vae_resolution_source": _state.get("vae_resolution_source", ""),
+            "vae_policy_version": _state.get("vae_policy_version", 0),
+            "vae_weight_dtype": _state.get("vae_weight_dtype", ""),
+            "vae_compute_dtype": _state.get("vae_compute_dtype", ""),
+            "vae_memory_format": _state.get("vae_memory_format", ""),
+            "vae_prefetch_mode": _state.get("vae_prefetch_mode", ""),
+            "c5_impl_version": _state.get("c5_impl_version", ""),
+            "torch_version": _state.get("torch_version", ""),
+            "cuda_version": _state.get("cuda_version", ""),
+            "arch_identifier": _state.get("arch_identifier", ""),
+            "prefetch_join": _state.get("prefetch_join", {}),
             "sampling_end_mono_ns": _state.get("sampling_end_mono_ns", 0),
             "sampling_end_duration_ms": _state.get("sampling_end_duration_ms", 0.0),
             "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
             "restore_session_id": _LATEST_RESTORE_SESSION_ID,
         })
     return _state
+
+
+def teardown_diagnostic_snapshot() -> dict[str, Any]:
+    """Return bounded state for activation workers and sampler watchdogs."""
+    result: dict[str, Any] = {}
+    for name, state_map, lock in (
+        ("unet_activation", _UNET_ACTIVATION_STATE, _UNET_ACTIVATION_LOCK),
+        ("vae_activation", _VAE_ACTIVATION_STATE, _VAE_ACTIVATION_LOCK),
+    ):
+        entries: list[dict[str, Any]] = []
+        try:
+            with lock:
+                current = list(state_map.items())[:32]
+            for request_id, state in current:
+                future = state.get("future") if isinstance(state, dict) else None
+                entries.append({
+                    "request_id": str(request_id)[:96],
+                    "status": str(state.get("status", ""))[:48],
+                    "terminal": bool(state.get("terminal", False)),
+                    "future_exists": future is not None,
+                    "future_done": bool(future.done()) if future is not None else None,
+                    "future_running": bool(future.running()) if future is not None else None,
+                    "future_cancelled": bool(future.cancelled()) if future is not None else None,
+                })
+        except Exception as exc:
+            entries = [{"error_type": type(exc).__name__}]
+        result[name] = {"count": len(entries), "entries": entries}
+    try:
+        with _SAMPLER_STALL_WATCHDOG_LOCK:
+            watchdogs = list(_SAMPLER_STALL_WATCHDOGS.items())[:32]
+        result["sampler_stall_watchdogs"] = {
+            "count": len(watchdogs),
+            "entries": [
+                {
+                    "request_id": str(request_id)[:96],
+                    "thread_alive": bool(getattr(watchdog, "_thread", None) and watchdog._thread.is_alive()),
+                }
+                for request_id, watchdog in watchdogs
+            ],
+        }
+    except Exception as exc:
+        result["sampler_stall_watchdogs"] = {"error_type": type(exc).__name__}
+    return result
 
 
 # ── Backward-compatible aliases for test imports ─────────────────────
