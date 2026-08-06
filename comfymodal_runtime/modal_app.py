@@ -2622,6 +2622,31 @@ def _resolve_region_pin() -> str | None:
     return raw
 
 
+# ── Cloud pinning (provider A/B diagnostic only, default off) ────────────
+# COMFYMODAL_V2_CLOUD pins the deployment to a single Modal cloud provider
+# ("aws" or "gcp") so provider-level cold A/B comparisons can be run without
+# region pinning.  Only allowlisted values are accepted (a typo must fail
+# loudly).  Default (unset) preserves Modal's own placement behavior.
+_CLOUD_PIN_ALLOWLIST = frozenset({"aws", "gcp"})
+
+
+def _resolve_cloud_pin() -> str | None:
+    """Return the allowlisted pinned cloud provider, or ``None`` when unpinned.
+
+    Raises ``RuntimeError`` for a non-allowlisted value so a mistyped
+    deployment fails at deploy time instead of silently running unpinned.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_CLOUD", "").strip().lower()
+    if not raw:
+        return None
+    if raw not in _CLOUD_PIN_ALLOWLIST:
+        raise RuntimeError(
+            f"COMFYMODAL_V2_CLOUD={raw!r} is not in the cloud-pin allowlist "
+            "(aws, gcp); refusing to deploy unpinned"
+        )
+    return raw
+
+
 @dataclass(frozen=True)
 class ModalRuntimeSpec:
     app_name: str = APP_NAME
@@ -2715,6 +2740,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_HOST_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_HOST_DIAGNOSTICS", "0"
         ),
+        "COMFYMODAL_V2_CLOUD": os.environ.get(
+            "COMFYMODAL_V2_CLOUD", ""
+        ),
         "COMFYMODAL_V2_UNET_BACKING_VERIFY": os.environ.get(
             "COMFYMODAL_V2_UNET_BACKING_VERIFY", "0"
         ),
@@ -2723,6 +2751,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_SYNTH_H2D_PROBE": os.environ.get(
             "COMFYMODAL_V2_SYNTH_H2D_PROBE", "0"
+        ),
+        "COMFYMODAL_V2_PAGE_PATH_PROBE": os.environ.get(
+            "COMFYMODAL_V2_PAGE_PATH_PROBE", "0"
         ),
         "COMFYMODAL_V2_UNET_PRETOUCH": os.environ.get(
             "COMFYMODAL_V2_UNET_PRETOUCH", "0"
@@ -13867,6 +13898,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     if _pcv is not None:
         _volumes[PROMPT_CACHE_VOLUME_PATH] = _pcv
     _region_pin = _resolve_region_pin()
+    _cloud_pin = _resolve_cloud_pin()
     _cls_kwargs: dict[str, Any] = {
         "gpu": _gpu_arg,
         "cpu": spec.cpu,
@@ -13883,11 +13915,17 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         # Modal 1.4.3: ``region`` (str | sequence) pins the deployment to the
         # given region(s) via SchedulerPlacement.  Diagnostic A/B only.
         _cls_kwargs["region"] = _region_pin
+    if _cloud_pin is not None:
+        # ``cloud`` pins the deployment to a single cloud provider (aws/gcp)
+        # WITHOUT region pinning, so provider-level cold comparisons keep
+        # Modal's own region choice.  Diagnostic A/B only.
+        _cls_kwargs["cloud"] = _cloud_pin
     if _enable_gpu_snapshot:
         _cls_kwargs["experimental_options"] = {"enable_gpu_snapshot": True}
     print(
         f"[v2.region_pin] region={_region_pin or 'unpinned'} "
-        f"source=COMFYMODAL_V2_REGION",
+        f"cloud={_cloud_pin or 'unpinned'} "
+        f"source=COMFYMODAL_V2_REGION/COMFYMODAL_V2_CLOUD",
         flush=True,
     )
     return resources["app"].cls(**_cls_kwargs)(remote_class)

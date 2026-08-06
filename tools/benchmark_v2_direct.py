@@ -3862,6 +3862,388 @@ def _render_backing_ab_report(summary: dict[str, Any]) -> str:
     return "\n".join(_lines)
 
 
+PROVIDER_AWS_APP = os.environ.get(
+    "COMFYMODAL_V2_PROVIDER_AWS_APP", "stable-modal-comfy-v2-provider-aws-shadow"
+)
+PROVIDER_GCP_APP = os.environ.get(
+    "COMFYMODAL_V2_PROVIDER_GCP_APP", "stable-modal-comfy-v2-provider-gcp-shadow"
+)
+
+
+def _extract_page_path_probe(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the per-run ``page_path_probe`` trace event metadata."""
+    trace = result.get("trace", {}) if isinstance(result, dict) else {}
+    events = trace.get("events", []) if isinstance(trace, dict) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("name") == "page_path_probe":
+            metadata = event.get("metadata", {})
+            return dict(metadata) if isinstance(metadata, dict) else {}
+    return None
+
+
+def _provider_from_cloud(cloud: str) -> str:
+    """Map an identity cloud string to an arm provider ('aws'/'gcp'/'')."""
+    _c = str(cloud or "").upper()
+    if "AWS" in _c:
+        return "aws"
+    if "GCP" in _c:
+        return "gcp"
+    return ""
+
+
+async def _run_provider_ab(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    gap_seconds: float,
+    app_aws: str,
+    app_gcp: str,
+    class_name: str,
+    gpu: str,
+    target_cold: int,
+    max_attempts_per_arm: int,
+    skip_first: int = 2,
+    teardown: str = "minimal",
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Interleaved AWS-vs-GCP provider cold study with page-path isolation.
+
+    Two shadow deployments pinned to cloud providers (``cloud=`` kwarg, no
+    region pin): Arm aws and Arm gcp.  Strictly interleaved aws,gcp,aws,gcp,...
+    so placement/scheduling noise is shared.  Each arm discards its first
+    *skip_first* attempts (snapshot/cache build + the run after) and collects
+    *target_cold* valid cold runs (restore_count==1 && request_count==1 &&
+    fresh identity).  Any measured attempt whose reported provider does not
+    match its arm is rejected (preserved, not counted).  Caps at
+    *max_attempts_per_arm* attempts per arm.  Every attempt carries the
+    page-path record (mincore residency before/after traversal, traversal
+    bandwidth, real UNET H2D, contiguous 12.31 GB synthetic H2D, 454-storage
+    synthetic H2D) plus host diagnostics and timing.
+    """
+    print(
+        f"[v2.provider_ab] mode=start gap={gap_seconds}s target={target_cold} "
+        f"max_per_arm={max_attempts_per_arm} skip_first={skip_first} "
+        f"teardown={teardown} app_aws={app_aws} app_gcp={app_gcp}",
+        flush=True,
+    )
+    arms: tuple[tuple[str, str], ...] = (("aws", app_aws), ("gcp", app_gcp))
+    per_arm: dict[str, dict[str, Any]] = {
+        label: {"app": app, "attempts": [], "cold": 0, "skipped": 0,
+                "rejected": 0, "prev_identity": None}
+        for label, app in arms
+    }
+    records: list[dict[str, Any]] = []
+    total_attempts = 0
+    round_robin_idx = 0
+
+    while total_attempts < max_attempts_per_arm * len(arms):
+        chosen: tuple[str, str] | None = None
+        for _ in range(len(arms)):
+            label, app = arms[round_robin_idx % len(arms)]
+            round_robin_idx += 1
+            st = per_arm[label]
+            if st["cold"] < target_cold and len(st["attempts"]) < max_attempts_per_arm:
+                chosen = (label, app)
+                break
+        if chosen is None:
+            break
+        label, app = chosen
+        st = per_arm[label]
+        os.environ["COMFYMODAL_V2_APP_NAME"] = app
+        index = total_attempts
+        total_attempts += 1
+        arm_attempt = len(st["attempts"])
+        st["attempts"].append(arm_attempt)
+        _run_id = f"provider-ab-{label}-{arm_attempt}-{index}-{uuid.uuid4().hex[:8]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _variance_origin(
+            index, pretouch=0, app_name=app, teardown=teardown,
+            pin_transfer=0, quiesced_transfer=0,
+        )
+        origin["variance_mode"] = "provider_ab"
+        origin["COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"] = "1"
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": index, "run_id": _run_id, "request_id": "",
+                "identity": {}, "result": {}, "timing": {},
+                "variance": {
+                    "quiesced_transfer": 0, "teardown_mode": teardown,
+                    "cold_valid": False, "cold": False,
+                    "failures": [f"run raised: {str(exc)[:300]}"],
+                },
+                "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable", "mode": "provider_ab",
+                "error": str(exc)[:300],
+            }
+
+        identity = artifact.get("identity", {}) or {}
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        actual_provider = _provider_from_cloud(identity.get("cloud", ""))
+        cold_check = _validate_cold_identity(
+            identity, run_index=index, pretouch=0, prev_identity=st["prev_identity"],
+        )
+        artifact["run_id"] = _run_id
+        artifact["attempt_file"] = f"attempt_{index:04d}.json"
+        artifact["provider_arm"] = label
+        artifact["arm_attempt"] = arm_attempt
+        artifact["mode"] = "provider_ab"
+        artifact["start_ts"] = artifact.get("start_ts") or _start_ts
+        artifact["end_ts"] = artifact.get("end_ts") or datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = artifact.get("remote_entry_ts") or _remote_entry_wall_iso(result)
+        artifact["excluded_snapshot_builder"] = arm_attempt < skip_first
+        artifact["provider_mismatch"] = bool(actual_provider and actual_provider != label)
+        if not artifact.get("error"):
+            artifact["variance"] = {
+                "quiesced_transfer": 0,
+                "teardown_mode": teardown,
+                "cold_valid": cold_check["cold_valid"],
+                "cold": cold_check["cold"],
+                "failures": cold_check["failures"],
+                "freshness_checked": cold_check["freshness_checked"],
+            }
+        classification = _classify_attempt(artifact)
+        artifact["classification"] = classification
+        record = extract_run_metrics(artifact)
+        record["classification"] = classification
+        record["attempt_file"] = artifact["attempt_file"]
+        record["provider_arm"] = label
+        record["arm_attempt"] = arm_attempt
+        record["provider"] = identity.get("cloud", "")
+        record["actual_region"] = identity.get("region", "")
+        record["excluded_snapshot_builder"] = arm_attempt < skip_first
+        record["provider_mismatch"] = artifact["provider_mismatch"]
+        record["host_diagnostics"] = artifact.get("host_diagnostics", {})
+        record["page_path"] = _extract_page_path_probe(result)
+        record["gpu_uuid"] = _host_gpu_uuid(record)
+        _metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _transfer_ms = _p.get("cpu_to_gpu_transfer_wall_ms")
+        record["transfer_speed"] = _classify_transfer_speed(_transfer_ms)
+        record["transfer_ms"] = _transfer_ms
+        record["attempt_log"] = (
+            f"[provider_ab] arm={label} index={index} class={classification} "
+            f"speed={record['transfer_speed']} actual={actual_provider or '?'}"
+        )
+        (output_dir / artifact["attempt_file"]).write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(record)
+
+        if arm_attempt < skip_first:
+            st["skipped"] += 1
+            status = "SKIPPED(snapshot-builder)"
+        elif artifact["provider_mismatch"]:
+            st["rejected"] += 1
+            status = f"REJECTED(provider={actual_provider or '?'})"
+        elif cold_check["cold"] and cold_check["cold_valid"]:
+            st["cold"] += 1
+            st["prev_identity"] = identity
+            status = "COLD"
+        else:
+            status = "NOT-COLD"
+        print(
+            f"[v2.provider_ab] arm={label} index={index} id={_run_id} "
+            f"provider={identity.get('cloud', '?')} region={identity.get('region', '?')} "
+            f"status={status} speed={record['transfer_speed']} "
+            f"valid={st['cold']}/{target_cold}",
+            flush=True,
+        )
+        if total_attempts < max_attempts_per_arm * len(arms):
+            print(f"[v2.provider_ab] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    summary: dict[str, Any] = {
+        "mode": "provider_ab",
+        "app_aws": app_aws,
+        "app_gcp": app_gcp,
+        "class_name": class_name,
+        "gpu": gpu,
+        "gap_seconds": gap_seconds,
+        "target_cold": target_cold,
+        "max_attempts_per_arm": max_attempts_per_arm,
+        "skip_first": skip_first,
+        "teardown_mode": teardown,
+        "total_attempts": total_attempts,
+        "arms": {
+            label: {
+                "attempts": len(st["attempts"]),
+                "skipped_snapshot_builders": st["skipped"],
+                "rejected_provider_mismatch": st["rejected"],
+                "valid_cold": st["cold"],
+            }
+            for label, st in per_arm.items()
+        },
+        "records": records,
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps({k: v for k, v in summary.items() if k != "records"}, default=str, indent=2),
+        encoding="utf-8",
+    )
+    _report_md = _render_provider_ab_report(summary)
+    (output_dir / "provider_ab_report.md").write_text(_report_md, encoding="utf-8")
+    print(f"[v2.provider_ab] report={output_dir / 'provider_ab_report.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "total_attempts": total_attempts,
+        "arms": summary["arms"],
+    }, default=str), flush=True)
+    print(_report_md, flush=True)
+
+    _short: list[str] = [
+        f"arm {label}: {st['cold']}/{target_cold} valid cold in {len(st['attempts'])} attempts"
+        for label, st in per_arm.items()
+        if st["cold"] < target_cold
+    ]
+    if _short:
+        raise RuntimeError(
+            f"provider_ab: incomplete arms ({'; '.join(_short)}); "
+            f"attempts preserved in {output_dir}"
+        )
+    return summary
+
+
+def _render_provider_ab_report(summary: dict[str, Any]) -> str:
+    """Render the interleaved AWS/GCP provider + page-path report (markdown)."""
+    records = summary.get("records", []) or []
+    _lines: list[str] = []
+    _lines.append("# V2 Provider (AWS vs GCP) + Page-Path Cold Study\n")
+    _lines.append(
+        f"- Arm aws `{summary.get('app_aws', '')}` = cloud-pinned AWS (no region); "
+        f"Arm gcp `{summary.get('app_gcp', '')}` = cloud-pinned GCP (no region). "
+        f"Interleaved aws,gcp,aws,gcp,... · GPU `{summary.get('gpu', '')}` · "
+        f"gap `{summary.get('gap_seconds')}s` · teardown `{summary.get('teardown_mode', '')}`"
+    )
+    _lines.append(
+        f"- Protocol: first {summary.get('skip_first', 2)} attempts per arm excluded "
+        f"(snapshot/cache build + the run after); {summary.get('target_cold', 0)} valid "
+        f"cold per arm; provider-mismatch attempts rejected.  Per-run ordering: "
+        f"mincore-before -> native traversal -> mincore-after -> real UNET H2D -> "
+        f"12.31 GB contiguous synthetic H2D -> 454-storage synthetic H2D "
+        f"(synthetic cases run after the real transfer and are allocated/measured/"
+        f"freed separately).  Transfer classes: FAST <2.5 s, MEDIUM 2.5–5 s, SLOW >5 s.\n"
+    )
+    _lines.append("| arm | attempt | class | provider | region | GPU uuid | resid-before % | traversal (ms) | trav GB/s | resid-after % | real H2D (ms) | real GB/s | 12.3G contig (ms) | contig GB/s | 454-stor (ms) | 454 GB/s | restore (ms) | sched (ms) | cmd→resp (ms) |")
+    _lines.append("|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for r in sorted(records, key=lambda x: (x.get("provider_arm", ""), x.get("attempt_file", ""))):
+        _metrics = r.get("metrics", {}) if isinstance(r.get("metrics"), dict) else {}
+        _t = _metrics.get("transfer", {}) if isinstance(_metrics.get("transfer"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _rst = _metrics.get("restore", {}) if isinstance(_metrics.get("restore"), dict) else {}
+        _pp = r.get("page_path", {}) if isinstance(r.get("page_path"), dict) else {}
+        _rb = _pp.get("residency_before", {}) if isinstance(_pp.get("residency_before"), dict) else {}
+        _ra = _pp.get("residency_after_traversal", {}) if isinstance(_pp.get("residency_after_traversal"), dict) else {}
+        _tr = _pp.get("traversal", {}) if isinstance(_pp.get("traversal"), dict) else {}
+        _real = _pp.get("real_unet_h2d", {}) if isinstance(_pp.get("real_unet_h2d"), dict) else {}
+        _cont = _pp.get("contiguous_h2d", {}) if isinstance(_pp.get("contiguous_h2d"), dict) else {}
+        _multi = _pp.get("multi_storage_h2d", {}) if isinstance(_pp.get("multi_storage_h2d"), dict) else {}
+        _tag = "SKIP" if r.get("excluded_snapshot_builder") else r.get("classification", "")
+        if r.get("provider_mismatch"):
+            _tag = "REJECTED"
+        _rb_pct = f"{float(_rb.get('resident_fraction', 0) or 0) * 100:.1f}" if _rb.get("total_pages") else "?"
+        _ra_pct = f"{float(_ra.get('resident_fraction', 0) or 0) * 100:.1f}" if _ra.get("total_pages") else "?"
+        _lines.append(
+            f"| {r.get('provider_arm', '?')} | {r.get('attempt_file', '')} | {_tag} "
+            f"| {r.get('provider', '?')} | {r.get('actual_region', '?')} | {r.get('gpu_uuid', '?')} "
+            f"| {_rb_pct} | {_fmt_ms(_tr.get('wall_ms'))} | {_fmt_gbps(_tr.get('effective_gb_per_s'))} "
+            f"| {_ra_pct} | {_fmt_ms(_real.get('wall_ms'))} | {_fmt_gbps(_real.get('effective_gb_per_s'))} "
+            f"| {_fmt_ms(_cont.get('wall_ms'))} | {_fmt_gbps(_cont.get('gb_per_s'))} "
+            f"| {_fmt_ms(_multi.get('wall_ms'))} | {_fmt_gbps(_multi.get('gb_per_s'))} "
+            f"| {_fmt_ms(_rst.get('restore_total_ms'))} "
+            f"| {_fmt_ms(_t.get('pre_python_modal_scheduling_ms'))} "
+            f"| {_fmt_ms(_t.get('command_to_response_ms'))} |"
+        )
+    _lines.append("")
+
+    # ── Per-provider summary (valid cold runs only) ──
+    _lines.append("## Per provider (valid cold runs)\n")
+    _lines.append("| arm | n | real H2D ms (med/range) | real GB/s (med) | >5 s count | traversal ms (med/range) | resid-before % (med) | resid-after % (med) | contig 12.3G ms (med) | contig GB/s (med) | 454-stor ms (med) | 454 GB/s (med) | restore ms (med) | sched ms (med) | cmd→resp ms (med) |")
+    _lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for _arm in ("aws", "gcp"):
+        _group = [r for r in records
+                  if r.get("provider_arm") == _arm and not r.get("excluded_snapshot_builder")
+                  and not r.get("provider_mismatch")]
+        _vals = {k: [] for k in ("real", "trav", "cont", "multi", "restore", "sched", "cmd")}
+        _rb_med = _ra_med = None
+        for r in _group:
+            _pp = r.get("page_path", {}) if isinstance(r.get("page_path"), dict) else {}
+            _real = _pp.get("real_unet_h2d", {}) if isinstance(_pp.get("real_unet_h2d"), dict) else {}
+            _tr = _pp.get("traversal", {}) if isinstance(_pp.get("traversal"), dict) else {}
+            _cont = _pp.get("contiguous_h2d", {}) if isinstance(_pp.get("contiguous_h2d"), dict) else {}
+            _multi = _pp.get("multi_storage_h2d", {}) if isinstance(_pp.get("multi_storage_h2d"), dict) else {}
+            _rb = _pp.get("residency_before", {}) if isinstance(_pp.get("residency_before"), dict) else {}
+            _ra = _pp.get("residency_after_traversal", {}) if isinstance(_pp.get("residency_after_traversal"), dict) else {}
+            _metrics = r.get("metrics", {}) if isinstance(r.get("metrics"), dict) else {}
+            _t = _metrics.get("transfer", {}) if isinstance(_metrics.get("transfer"), dict) else {}
+            _rst = _metrics.get("restore", {}) if isinstance(_metrics.get("restore"), dict) else {}
+            for _k, _v in (("real", _real.get("wall_ms")), ("trav", _tr.get("wall_ms")),
+                           ("cont", _cont.get("wall_ms")), ("multi", _multi.get("wall_ms")),
+                           ("restore", _rst.get("restore_total_ms")),
+                           ("sched", _t.get("pre_python_modal_scheduling_ms")),
+                           ("cmd", _t.get("command_to_response_ms"))):
+                if isinstance(_v, (int, float)):
+                    _vals[_k].append(float(_v))
+            _rb_f = _rb.get("resident_fraction")
+            _ra_f = _ra.get("resident_fraction")
+            if isinstance(_rb_f, (int, float)):
+                _rb_med = _rb_f if _rb_med is None else (_rb_med + _rb_f) / 2
+            if isinstance(_ra_f, (int, float)):
+                _ra_med = _ra_f if _ra_med is None else (_ra_med + _ra_f) / 2
+
+        def _med(xs):
+            _s = sorted(xs)
+            return _s[len(_s) // 2] if _s else None
+
+        def _rng(xs):
+            _s = sorted(xs)
+            return f"{_s[0]:.0f}–{_s[-1]:.0f}" if _s else "?"
+
+        _real_vals = _vals["real"]
+        _over5 = sum(1 for v in _real_vals if v > 5000.0)
+        _gb = {}
+        for r in _group:
+            _pp = r.get("page_path", {}) if isinstance(r.get("page_path"), dict) else {}
+            _real = _pp.get("real_unet_h2d", {}) if isinstance(_pp.get("real_unet_h2d"), dict) else {}
+            _cont = _pp.get("contiguous_h2d", {}) if isinstance(_pp.get("contiguous_h2d"), dict) else {}
+            _multi = _pp.get("multi_storage_h2d", {}) if isinstance(_pp.get("multi_storage_h2d"), dict) else {}
+            for _k, _src in (("real_gb", _real), ("cont_gb", _cont), ("multi_gb", _multi)):
+                _v = _src.get("effective_gb_per_s") if _k == "real_gb" else _src.get("gb_per_s")
+                if isinstance(_v, (int, float)):
+                    _gb.setdefault(_k, []).append(float(_v))
+        _lines.append(
+            f"| {_arm} | {len(_group)} | {_fmt_ms(_med(_real_vals))} ({_rng(_real_vals)}) "
+            f"| {_fmt_gbps(_med(_gb.get('real_gb', [])))} | {_over5}/{len(_real_vals)} "
+            f"| {_fmt_ms(_med(_vals['trav']))} ({_rng(_vals['trav'])}) "
+            f"| {f'{_rb_med * 100:.1f}' if _rb_med is not None else '?'} "
+            f"| {f'{_ra_med * 100:.1f}' if _ra_med is not None else '?'} "
+            f"| {_fmt_ms(_med(_vals['cont']))} | {_fmt_gbps(_med(_gb.get('cont_gb', [])))} "
+            f"| {_fmt_ms(_med(_vals['multi']))} | {_fmt_gbps(_med(_gb.get('multi_gb', [])))} "
+            f"| {_fmt_ms(_med(_vals['restore']))} | {_fmt_ms(_med(_vals['sched']))} "
+            f"| {_fmt_ms(_med(_vals['cmd']))} |"
+        )
+    _lines.append("")
+    return "\n".join(_lines)
+
+
 async def _run_variance_matrix(
     workflow: dict[str, Any],
     modal_options: dict[str, Any],
@@ -4362,7 +4744,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False, transfer_ab: bool = False,
                region_ab: str | None = None, host_ab: bool = False,
-               backing_ab: bool = False,
+               backing_ab: bool = False, provider_ab: bool = False,
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
                teardown: str = "full", pin_transfer: int = 0,
@@ -4444,6 +4826,22 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             gap_seconds=_ta_gap, app_name=_ta_app, class_name=CLASS_NAME, gpu=GPU,
             target_per_condition=_ta_target, max_attempts_per_condition=_ta_max,
             teardown=teardown,
+        )
+        return
+
+    # ── Provider AWS-vs-GCP + page-path isolation study ─────────────────
+    if provider_ab:
+        _pa_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _pa_target = int(os.environ.get("V2_PROVIDER_AB_TARGET_COLD", "7"))
+        _pa_max = int(os.environ.get("V2_PROVIDER_AB_MAX_ATTEMPTS_PER_ARM", "12"))
+        _pa_skip = int(os.environ.get("V2_PROVIDER_AB_SKIP_FIRST", "2"))
+        await _run_provider_ab(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            gap_seconds=_pa_gap, app_aws=PROVIDER_AWS_APP, app_gcp=PROVIDER_GCP_APP,
+            class_name=CLASS_NAME, gpu=GPU,
+            target_cold=_pa_target, max_attempts_per_arm=_pa_max,
+            skip_first=_pa_skip, teardown=teardown,
         )
         return
 
@@ -4724,6 +5122,23 @@ if __name__ == "__main__":
              "Per-run synthetic 2 GiB anonymous H2D probe + /proc/self/maps "
              "backing evidence. Writes backing_ab_report.md.",
     )
+    _parser.add_argument(
+        "--provider-ab",
+        action="store_true",
+        default=False,
+        help="Run the interleaved AWS-vs-GCP provider + page-path isolation "
+             "study: Arm aws = cloud-pinned AWS (no region), Arm gcp = "
+             "cloud-pinned GCP (no region); shadow deployments "
+             "(COMFYMODAL_V2_PROVIDER_AWS_APP / _PROVIDER_GCP_APP), strictly "
+             "interleaved, per-arm skip-first-2, 7 valid cold per arm, cap 12 "
+             "attempts per arm, provider-mismatch attempts rejected "
+             "(V2_PROVIDER_AB_TARGET_COLD / _MAX_ATTEMPTS_PER_ARM / "
+             "_SKIP_FIRST).  Per-run page-path record: mincore residency "
+             "before/after native one-byte-per-page traversal, real UNET H2D "
+             "immediately after traversal, then 12.31 GB contiguous synthetic "
+             "H2D and a 454-storage synthetic H2D (isolated, after the real "
+             "transfer). Writes provider_ab_report.md.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -4742,6 +5157,9 @@ if __name__ == "__main__":
     _backing_ab = _args.backing_ab or (
         os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "backing_ab"
     )
+    _provider_ab = _args.provider_ab or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "provider_ab"
+    )
 
     asyncio.run(main(
         bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
@@ -4753,6 +5171,7 @@ if __name__ == "__main__":
         region_ab=_args.region_ab,
         host_ab=_host_ab,
         backing_ab=_backing_ab,
+        provider_ab=_provider_ab,
         variance_pretouch=_variance_pretouch,
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,
