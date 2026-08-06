@@ -1703,6 +1703,248 @@ def _capture_remote_identity() -> dict[str, Any]:
     return identity
 
 
+# ── Host diagnostics (diagnostic only; default off) ──────────────────────
+# COMFYMODAL_V2_HOST_DIAGNOSTICS=1 collects stable host characteristics once
+# per container (CPU model/family/model/stepping, socket/core/thread counts,
+# NUMA topology, kernel, GPU UUID / PCI bus / PCIe link generation+width,
+# driver / CUDA version, VM family + cloud instance type when discoverable)
+# and attaches them to every benchmark result so slow-run correlations can be
+# checked against underlying hardware / cloud placement.  Production default
+# stays off; nothing here ever raises or affects execution.
+_HOST_DIAGNOSTICS_CACHE: dict[str, Any] | None = None
+
+
+def _host_diagnostics_enabled() -> bool:
+    raw = os.environ.get("COMFYMODAL_V2_HOST_DIAGNOSTICS", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _run_capture(args: list[str], timeout: float = 3.0) -> str | None:
+    """Run one capture command; returns stripped stdout or None on failure."""
+    try:
+        import subprocess as _subprocess
+        _out = _subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout,
+        )
+        if _out.returncode == 0 and _out.stdout:
+            return _out.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _read_sys_path(path: str) -> str | None:
+    try:
+        _raw = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+        return _raw or None
+    except Exception:
+        return None
+
+
+def _capture_cpu_info() -> dict[str, Any]:
+    """Parse /proc/cpuinfo + lscpu for model, family/model/stepping, counts."""
+    info: dict[str, Any] = {}
+    try:
+        _lines = Path("/proc/cpuinfo").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except Exception:
+        _lines = []
+    _first: dict[str, str] = {}
+    _socket_core_pairs: set[tuple[str, str]] = set()
+    _sockets: set[str] = set()
+    _threads = 0
+    for _line in _lines:
+        if ":" not in _line:
+            continue
+        _key, _, _value = _line.partition(":")
+        _key = _key.strip()
+        _value = _value.strip()
+        if _key in ("model name", "cpu family", "model", "stepping", "vendor_id"):
+            if _key not in _first:
+                _first[_key] = _value
+        elif _key == "processor":
+            _threads += 1
+        elif _key == "physical id":
+            _sockets.add(_value)
+    if _first:
+        info["model_name"] = _first.get("model name")
+        info["vendor_id"] = _first.get("vendor_id")
+        info["cpu_family"] = _first.get("cpu family")
+        info["model"] = _first.get("model")
+        info["stepping"] = _first.get("stepping")
+    if _threads:
+        info["threads"] = _threads
+    if _sockets:
+        info["sockets"] = len(_sockets)
+    # Recover per-socket core ids with a dedicated pass (block-aligned).
+    _cur_socket: str | None = None
+    for _line in _lines:
+        if ":" not in _line:
+            continue
+        _key, _, _value = _line.partition(":")
+        _key = _key.strip()
+        _value = _value.strip()
+        if _key == "physical id":
+            _cur_socket = _value
+        elif _key == "core id" and _cur_socket is not None:
+            _socket_core_pairs.add((_cur_socket, _value))
+    if _socket_core_pairs:
+        info["cores"] = len(_socket_core_pairs)
+    _lscpu = _run_capture(["lscpu"])
+    if _lscpu:
+        info["lscpu"] = _lscpu
+    return info
+
+
+def _capture_numa() -> dict[str, Any] | None:
+    """NUMA topology via ``numactl --hardware`` when available, else sysfs."""
+    _out = _run_capture(["numactl", "--hardware"], timeout=5.0)
+    if _out:
+        return {"numactl_hardware": _out}
+    try:
+        _nodes: list[str] = []
+        for _entry in Path("/sys/devices/system/node").iterdir():
+            if _entry.name.startswith("node") and _entry.name[4:].isdigit():
+                _nodes.append(_entry.name)
+        if _nodes:
+            return {"nodes": sorted(_nodes)}
+    except Exception:
+        pass
+    return None
+
+
+def _capture_gpu_info() -> dict[str, Any] | None:
+    """GPU identity: UUID, PCI bus, PCIe generation/width, driver, CUDA."""
+    info: dict[str, Any] = {}
+    _query = _run_capture([
+        "nvidia-smi",
+        "--query-gpu=name,uuid,pci.bus_id,pcie.link.gen.current,"
+        "pcie.link.width.current,driver_version",
+        "--format=csv,noheader",
+    ])
+    if _query:
+        _parts = [p.strip() for p in _query.split(",")]
+        if len(_parts) >= 6:
+            info["name"] = _parts[0]
+            info["uuid"] = _parts[1]
+            info["pci_bus_id"] = _parts[2]
+            try:
+                info["pcie_link_gen_current"] = int(_parts[3])
+            except (TypeError, ValueError):
+                info["pcie_link_gen_current"] = _parts[3]
+            try:
+                info["pcie_link_width_current"] = int(_parts[4])
+            except (TypeError, ValueError):
+                info["pcie_link_width_current"] = _parts[4]
+            info["driver_version"] = _parts[5]
+    # nvidia-smi reports "[Unknown Error]" for pci.bus_id inside some
+    # sandboxes; fall back to sysfs (first PCI device with display class).
+    _bus = str(info.get("pci_bus_id", ""))
+    if not _bus or _bus == "[Unknown Error]":
+        try:
+            for _dev in sorted(Path("/sys/bus/pci/devices").iterdir()):
+                _cls = (_dev / "class").read_text(encoding="utf-8", errors="replace").strip()
+                if _cls.startswith("0x03"):
+                    info["pci_bus_id"] = _dev.name
+                    break
+        except Exception:
+            pass
+    _plain = _run_capture(["nvidia-smi"])
+    if _plain:
+        for _line in _plain.splitlines():
+            if "CUDA Version" in _line:
+                _rest = _line[_line.find("CUDA Version") + len("CUDA Version"):].strip()
+                _rest = _rest.lstrip(":").strip()
+                if _rest:
+                    info["cuda_version"] = _rest.split()[0]
+                break
+    if not info:
+        return None
+    return info
+
+
+def _capture_vm_identity() -> dict[str, Any]:
+    """VM family + cloud instance type when discoverable (best effort)."""
+    info: dict[str, Any] = {}
+    _product = _read_sys_path("/sys/class/dmi/id/product_name")
+    _vendor = _read_sys_path("/sys/class/dmi/id/sys_vendor")
+    _dt_model = _read_sys_path("/proc/device-tree/model")
+    if _product:
+        info["dmi_product_name"] = _product
+    if _vendor:
+        info["dmi_sys_vendor"] = _vendor
+    if _dt_model:
+        info["device_tree_model"] = _dt_model
+    # GCP metadata (machine-type / instance id)
+    try:
+        import urllib.request as _urllib
+        _req = _urllib.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/machine-type",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with _urllib.urlopen(_req, timeout=1.5) as _resp:
+            _mtype = _resp.read().decode("utf-8", errors="replace").strip()
+        if _mtype:
+            info["gcp_machine_type"] = _mtype.rsplit("/", 1)[-1]
+            info["vm_family"] = "gcp"
+    except Exception:
+        pass
+    # AWS metadata (instance type / id)
+    try:
+        import urllib.request as _urllib
+        _req = _urllib.Request("http://169.254.169.254/latest/meta-data/instance-type")
+        with _urllib.urlopen(_req, timeout=1.5) as _resp:
+            _itype = _resp.read().decode("utf-8", errors="replace").strip()
+        if _itype:
+            info["aws_instance_type"] = _itype
+            info["vm_family"] = "aws"
+    except Exception:
+        pass
+    return info
+
+
+def _capture_host_diagnostics() -> dict[str, Any] | None:
+    """Collect stable host characteristics once per container.
+
+    Gated by ``COMFYMODAL_V2_HOST_DIAGNOSTICS`` (default off).  Cached at
+    module level so later calls return the same per-container snapshot.
+    Never raises; every capture is best-effort and wrapped.
+    """
+    global _HOST_DIAGNOSTICS_CACHE
+    if not _host_diagnostics_enabled():
+        return None
+    if _HOST_DIAGNOSTICS_CACHE is not None:
+        return _HOST_DIAGNOSTICS_CACHE
+    diag: dict[str, Any] = {}
+    try:
+        diag["modal_cloud_provider"] = os.environ.get("MODAL_CLOUD_PROVIDER", "")
+        diag["modal_region"] = os.environ.get("MODAL_REGION", "")
+        diag["modal_task_id"] = os.environ.get("MODAL_TASK_ID", "")
+        diag["modal_container_id"] = os.environ.get("MODAL_CONTAINER_ID", "")
+        # Modal does not always export MODAL_CONTAINER_ID; the task id is the
+        # per-container key for single-use containers.
+        diag["container_key"] = (
+            diag["modal_container_id"] or diag["modal_task_id"]
+        )
+        diag["kernel"] = platform.release()
+        diag["cpu"] = _capture_cpu_info()
+        diag["numa"] = _capture_numa()
+        diag["gpu"] = _capture_gpu_info()
+        diag["vm"] = _capture_vm_identity()
+    except Exception as exc:  # noqa: BLE001
+        diag["capture_error"] = str(exc)[:200]
+    _HOST_DIAGNOSTICS_CACHE = diag
+    print(
+        f"[v2.host_diagnostics] captured provider={diag.get('modal_cloud_provider', '')} "
+        f"region={diag.get('modal_region', '')} "
+        f"container={diag.get('container_key', '')[:12]} "
+        f"cpu={diag.get('cpu', {}).get('model_name', '')}",
+        flush=True,
+    )
+    return diag
+
+
 # ── Full-trace packaging helpers (inert when disabled) ────────────────
 
 
@@ -2463,6 +2705,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "0"
+        ),
+        "COMFYMODAL_V2_HOST_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_HOST_DIAGNOSTICS", "0"
         ),
         "COMFYMODAL_V2_UNET_PRETOUCH": os.environ.get(
             "COMFYMODAL_V2_UNET_PRETOUCH", "0"
@@ -9645,6 +9890,8 @@ class ModalRuntimeEntrypoint:
                     self._process_cpu_sampler.report()
             except Exception:
                 pass
+            if _host_diagnostics_enabled():
+                result["host_diagnostics"] = _capture_host_diagnostics()
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})

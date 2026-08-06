@@ -135,6 +135,12 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
 ) else if /i "!V2_BENCHMARK_MODE!"=="acceptance" (
     echo === Running V2 acceptance benchmark - explicit opt-in ===
     python tools\benchmark_v2_direct.py --acceptance
+) else if /i "!V2_BENCHMARK_MODE!"=="host_ab" (
+    echo === Running V2 host-characteristics cold study - explicit opt-in ===
+    set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"
+    set "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS=1"
+    if not defined V2_VARIANCE_COLD_GAP_SECONDS set "V2_VARIANCE_COLD_GAP_SECONDS=25"
+    python tools\benchmark_v2_direct.py --host-ab --teardown minimal
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
