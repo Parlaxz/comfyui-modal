@@ -818,11 +818,14 @@ async def _run_ownership_study(
             flush=True,
         )
         # ── Early-stop gate: stop after ``stop_after_bad`` clearly failing
-        #    valid-cold runs for the same candidate (per the restore
-        #    protocol: two consecutive misses on the same candidate mean the
-        #    change is not worth more paid attempts).  Preserved attempts are
-        #    never deleted.
-        if stop_after_bad > 0 and artifact["classification"] == "cold":
+        #    VALID (non-excluded) cold runs for the same candidate (per the
+        #    restore protocol: two consecutive misses on the same candidate
+        #    mean the change is not worth more paid attempts).  Snapshot
+        #    builders and their following request are excluded unconditionally
+        #    and never count toward the gate.  Preserved attempts are never
+        #    deleted.
+        if (stop_after_bad > 0 and not artifact["excluded_snapshot_builder"]
+                and artifact["classification"] == "cold"):
             _wall_v = artifact.get("total_wall_stages", {}).get("command_to_response_ms")
             if isinstance(_wall_v, (int, float)) and _wall_v >= accept_under_ms:
                 _bad += 1

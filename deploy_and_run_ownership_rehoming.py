@@ -251,16 +251,21 @@ def main() -> None:
         # Restore mode: redeploy the LONG-LIVED shadow app lineage with
         # exclusive ownership ON and every heavy diagnostic OFF.  Placement is
         # controlled per step: gcp / aws pin first, then unpinned for the
-        # final six-run validation.
+        # final six-run validation.  ``--no-deploy`` re-runs the study against
+        # the existing deployment (same image/snapshot lineage) without
+        # creating a new image — required for fair repeated sampling.
         cloud = rest[0] if rest and rest[0] in ("gcp", "aws", "unpinned") else "gcp"
         if cloud in rest:
             rest.remove(cloud)
         if cloud == "unpinned":
             cloud = ""
         target = rest[0] if rest and rest[0].isdigit() else "3"
-        deploy(APP_RESTORE, cloud=cloud, extra={
-            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
-        })
+        if "--no-deploy" in args:
+            print(f"=== Restore no-deploy: reusing existing {APP_RESTORE} deployment ===")
+        else:
+            deploy(APP_RESTORE, cloud=cloud, extra={
+                "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+            })
         if "--deploy-only" in args:
             print("=== Restore deploy-only requested; study skipped ===")
             return
