@@ -63,8 +63,14 @@ from .unet_forward_probe import (
 )
 from .unet_backing import (
     capture_unet_backing_evidence,
+    mincore_unet_residency,
+    page_path_probe_enabled,
+    run_contiguous_h2d_probe,
+    run_multi_storage_h2d_probe,
     run_synth_h2d_probe,
     synth_h2d_probe_enabled,
+    traverse_unet_pages,
+    unet_storage_sizes,
 )
 from .variance_diagnostics import (
     activation_publication_ms,
@@ -11557,17 +11563,30 @@ def _run_early_unet_activation(
             except Exception:
                 _q_sampler = None
             _q_load_perf_start = time.perf_counter()
-        if variance_diagnostics_enabled() or _pinned_transfer_enabled():
-            cuda_sync_if_enabled()
-            _v_load_before = (
-                capture_metric_snapshot() if variance_diagnostics_enabled() else None
-            )
-        # ── Synthetic anonymous H2D probe (diagnostic only; default off) ──
-        # Immediately before the real UNET transfer: synchronously copy a
-        # touched 2 GB anonymous contiguous CPU tensor to the GPU, record
-        # duration + GB/s, free the GPU tensor, and classify the REAL UNET
-        # storage backing via /proc/self/maps.  Never raises.
-        if synth_h2d_probe_enabled():
+        # ── Page-path diagnostics (diagnostic only; default off) ─────────
+        # Part 1 (immediately before the real UNET H2D): mincore residency
+        # BEFORE touching, then a native one-byte-per-page traversal of every
+        # UNET storage, then residency AFTER.  The real H2D follows directly
+        # (the traversal may hydrate pages — that is exactly what is being
+        # measured).  Synthetic probes run only AFTER the real transfer so
+        # they cannot prewarm or alter it.
+        _page_path_record: dict[str, Any] | None = None
+        if page_path_probe_enabled():
+            try:
+                _pp: dict[str, Any] = {
+                    "enabled": True,
+                    "ordering": "mincore_before -> traversal -> mincore_after -> real_unet_h2d -> contiguous_h2d -> multi_storage_h2d",
+                    "residency_before": mincore_unet_residency(unet),
+                    "traversal": traverse_unet_pages(unet),
+                    "residency_after_traversal": mincore_unet_residency(unet),
+                    "unet_backing": capture_unet_backing_evidence(
+                        unet, label="at_transfer",
+                    ),
+                }
+                _page_path_record = _pp
+            except Exception:
+                _page_path_record = {"enabled": True, "error": "part1"}
+        elif synth_h2d_probe_enabled():
             try:
                 _synth_probe = run_synth_h2d_probe()
                 if isinstance(_synth_probe, dict) and _synth_probe.get("enabled"):
@@ -11581,12 +11600,50 @@ def _run_early_unet_activation(
                         )
             except Exception:
                 pass
+        if variance_diagnostics_enabled() or _pinned_transfer_enabled():
+            cuda_sync_if_enabled()
+            _v_load_before = (
+                capture_metric_snapshot() if variance_diagnostics_enabled() else None
+            )
         if _pinned_transfer_enabled():
             _pins = _pin_cpu_storages_for_transfer(unet)
         _mm_load_models_gpu(_load_models)
         if variance_diagnostics_enabled():
             cuda_sync_if_enabled()
             _v_load_after = capture_metric_snapshot()
+        # ── Page-path part 2 (after the real H2D; synthetic cases isolated) ──
+        if _page_path_record is not None:
+            try:
+                _pp = _page_path_record
+                _pp["real_unet_h2d"] = timed_transfer_partition(
+                    _v_load_before, _v_load_after,
+                    label="real_unet_h2d",
+                    bytes_=(
+                        _variance_registry_record.get("total_bytes")
+                        if isinstance(_variance_registry_record, Mapping)
+                        else None
+                    ),
+                )
+                _pp["contiguous_h2d"] = run_contiguous_h2d_probe(
+                    bytes_=sum(unet_storage_sizes(unet)),
+                )
+                # Release the contiguous probe's CPU memory before the
+                # 454-storage probe allocates its own (memory cap safety).
+                try:
+                    import gc as _gc
+                    _gc.collect()
+                except Exception:
+                    pass
+                _pp["multi_storage_h2d"] = run_multi_storage_h2d_probe(
+                    unet_storage_sizes(unet),
+                )
+                if trace is not None:
+                    trace.emit(
+                        "page_path_probe", phase="execution",
+                        metadata=_pp,
+                    )
+            except Exception:
+                pass
     except Exception as exc:
         return _early_activation_terminal(
             state, trace, request_id, status="failed",
