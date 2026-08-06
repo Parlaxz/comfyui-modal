@@ -303,26 +303,37 @@ def _assert_container_env(
     *,
     app_name: str,
     gpu: str,
+    expect_cloud: str = "",
+    expect_region: str = "",
 ) -> list[str]:
     """Assert the container env probe matches the study configuration.
 
     Returns a list of failures (empty = pass).  Never raises by itself; the
     caller aborts the study when failures are present.
+
+    ``expect_cloud`` / ``expect_region`` allow controlled restore-mode
+    phases to pin the deployment (COMFYMODAL_V2_CLOUD=gcp etc.) without
+    failing the assertion; the default (empty) keeps the study unpinned.
     """
     failures: list[str] = []
     env = probe.get("env") or {}
     if not isinstance(env, dict):
         return ["env probe returned no env mapping"]
-    for key, expected in _EXPECTED_GATE_ENV.items():
+    expected = dict(_EXPECTED_GATE_ENV)
+    if expect_cloud:
+        expected["COMFYMODAL_V2_CLOUD"] = expect_cloud
+    if expect_region:
+        expected["COMFYMODAL_V2_REGION"] = expect_region
+    for key, exp_val in expected.items():
         actual = str(env.get(key, "") or "")
-        if expected == "":
+        if exp_val == "":
             if not _gate_off(actual):
                 failures.append(
                     f"{key}: expected OFF, container has {actual!r}"
                 )
-        elif actual != expected:
+        elif actual != exp_val:
             failures.append(
-                f"{key}: expected {expected!r}, container has {actual!r}"
+                f"{key}: expected {exp_val!r}, container has {actual!r}"
             )
     remote_app = str(env.get("COMFYMODAL_V2_APP_NAME", "") or "")
     if remote_app and remote_app != app_name:
@@ -539,11 +550,16 @@ async def _run_ownership_study(
     target_cold: int,
     max_attempts: int,
     skip_first: int,
+    expect_cloud: str = "",
+    expect_region: str = "",
+    accept_under_ms: float = 13000.0,
+    stop_after_bad: int = 0,
 ) -> dict[str, Any]:
     os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
     prev_identity: dict[str, Any] | None = None
     records: list[dict[str, Any]] = []
     cold = 0
+    _bad = 0
     # ── Container env assertion (BEFORE any measured run) ─────────────────
     # The deploy script is not proof: ``_runtime_env`` silently dropped new
     # gates once.  Probe the deployed container's effective environment and
@@ -573,6 +589,7 @@ async def _run_ownership_study(
                 env_probe = probe
                 env_failures = _assert_container_env(
                     probe, app_name=app_name, gpu=GPU,
+                    expect_cloud=expect_cloud, expect_region=expect_region,
                 )
             else:
                 env_failures.append(
@@ -603,7 +620,8 @@ async def _run_ownership_study(
         "[v2.ownership] container env assertion PASSED: "
         "exclusive-owner=1 rehome=off probes=off synth-h2d=off backing-verify=off "
         "pretouch=off quiesced=off variance=off host-diag=off full-trace=off "
-        "cloud=unpinned region=unpinned profile=production "
+        f"cloud={expect_cloud or 'unpinned'} region={expect_region or 'unpinned'} "
+        "profile=production "
         f"cpu_request={env_probe.get('env', {}).get('COMFYMODAL_V2_CPU_REQUEST')} "
         f"memory_request={env_probe.get('env', {}).get('COMFYMODAL_V2_MEMORY_REQUEST')} "
         f"single_use={env_probe.get('env', {}).get('COMFYMODAL_V2_SINGLE_USE_CONTAINERS')} "
@@ -799,6 +817,42 @@ async def _run_ownership_study(
             f"error={artifact.get('error', '') or 'absent'}",
             flush=True,
         )
+        # ── Early-stop gate: stop after ``stop_after_bad`` clearly failing
+        #    valid-cold runs for the same candidate (per the restore
+        #    protocol: two consecutive misses on the same candidate mean the
+        #    change is not worth more paid attempts).  Preserved attempts are
+        #    never deleted.
+        if stop_after_bad > 0 and artifact["classification"] == "cold":
+            _wall_v = artifact.get("total_wall_stages", {}).get("command_to_response_ms")
+            if isinstance(_wall_v, (int, float)) and _wall_v >= accept_under_ms:
+                _bad += 1
+                if _bad >= stop_after_bad:
+                    summary: dict[str, Any] = {
+                        "mode": "ownership",
+                        "app_name": app_name,
+                        "phase": phase,
+                        "target_cold": target_cold,
+                        "max_attempts": max_attempts,
+                        "skip_first": skip_first,
+                        "gap_seconds": GAP_SECONDS,
+                        "valid_cold": cold,
+                        "accept_under_ms": accept_under_ms,
+                        "stop_after_bad": stop_after_bad,
+                        "aborted": True,
+                        "abort_reason": f"early_stop:{_bad}_runs_over_{accept_under_ms:.0f}ms",
+                        "records": records,
+                    }
+                    (output_dir / "summary.json").write_text(
+                        json.dumps({k: v for k, v in summary.items() if k != "records"},
+                                   default=str, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"[v2.ownership] EARLY STOP: {_bad} valid-cold runs at or above "
+                        f"{accept_under_ms:.0f} ms for the same candidate; attempts preserved",
+                        flush=True,
+                    )
+                    return summary
         if cold >= target_cold:
             break
         if index < max_attempts - 1:
@@ -813,6 +867,10 @@ async def _run_ownership_study(
         "skip_first": skip_first,
         "gap_seconds": GAP_SECONDS,
         "valid_cold": cold,
+        "accept_under_ms": accept_under_ms,
+        "stop_after_bad": stop_after_bad,
+        "expect_cloud": expect_cloud,
+        "expect_region": expect_region,
         "records": records,
     }
     (output_dir / "summary.json").write_text(
@@ -885,14 +943,22 @@ def _render_total_wall_report(
 ) -> str:
     records = summary.get("records", []) or []
     valid = [r for r in records if r.get("cold") and not r.get("excluded_snapshot_builder")]
+    accept_ms = float(summary.get("accept_under_ms", 13000.0) or 13000.0)
+    expect_cloud = str(summary.get("expect_cloud", "") or "")
+    expect_region = str(summary.get("expect_region", "") or "")
+    _placement = (
+        f"cloud={expect_cloud or 'unpinned'}"
+        + (f", region={expect_region}" if expect_region else ", region unpinned")
+    )
     _lines: list[str] = []
     _lines.append("# V2 Exclusive-Owner Total-Wall Validation — Six-Run Report")
     _lines.append("")
     _lines.append("> Shadow deployment only. Best-case production candidate: "
                   "`COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER=1`, rehoming OFF, all "
                   "page-path/synthetic-H2D/backing-verify/pretouch/quiesced/"
-                  "variance/host/full-trace diagnostics OFF, provider and region "
-                  "unpinned, single-use containers, minimal teardown.")
+                  "variance/host/full-trace diagnostics OFF, "
+                  f"{_placement}, "
+                  "single-use containers, minimal teardown.")
     _lines.append("")
     _lines.append("## Protocol")
     _lines.append("")
@@ -903,6 +969,7 @@ def _render_total_wall_report(
     _lines.append(f"- Target: **{summary.get('target_cold', 6)} valid cold single-use runs**; "
                   f"max {summary.get('max_attempts', 9)} post-deploy attempts; "
                   f"{summary.get('gap_seconds', 25)} s gaps.")
+    _lines.append(f"- Acceptance gate: command → response **< {accept_ms:.0f} ms** on every run.")
     _lines.append("- Stop immediately on exit-139 / snapshot fallback / stream loss / "
                   "duplicate migration / incorrect output / ownership-invariant failure.")
     _lines.append("")
@@ -1004,7 +1071,7 @@ def _render_total_wall_report(
     _lines.append("")
     _lines.append("## Per-run acceptance checks (valid cold runs)")
     _lines.append("")
-    _lines.append("| attempt | <13000 ms | 1 migration | worker ready | join ready | "
+    _lines.append(f"| attempt | <{accept_ms:.0f} ms | 1 migration | worker ready | join ready | "
                   "cache-only graph load | no fallback | no sampler-absent-pending | "
                   "no cancelled worker | output correct | residual <=100 ms |")
     _lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
@@ -1013,7 +1080,7 @@ def _render_total_wall_report(
         _checks = r.get("ownership_checks", {}) or {}
         _out = r.get("output_correctness", []) or []
         _wall = _stages.get("command_to_response_ms")
-        _under_13 = bool(isinstance(_wall, (int, float)) and _wall < 13000)
+        _under_13 = bool(isinstance(_wall, (int, float)) and _wall < accept_ms)
         _residual = _stages.get("remaining_residual_ms")
         _residual_ok = bool(
             isinstance(_residual, (int, float)) and abs(_residual) <= 100
@@ -1035,14 +1102,17 @@ def _render_total_wall_report(
     _lines.append("")
     _primary = [r.get("total_wall_stages", {}).get("command_to_response_ms") for r in valid]
     _primary = [float(v) for v in _primary if isinstance(v, (int, float))]
-    _all_under_13 = bool(_primary and all(v < 13000 for v in _primary))
+    _all_under_13 = bool(_primary and all(v < accept_ms for v in _primary))
     _no_crash = not summary.get("aborted") or summary.get("abort_reason") in (None, "")
     _enough = len(valid) >= summary.get("target_cold", 6)
     _failures: list[str] = []
     if not _enough:
         _failures.append(f"only {len(valid)}/{summary.get('target_cold', 6)} valid cold runs")
     if not _all_under_13:
-        _failures.append(f"command->response >= 13000 ms on {sum(1 for v in _primary if v >= 13000)} run(s)")
+        _failures.append(
+            f"command->response >= {accept_ms:.0f} ms on "
+            f"{sum(1 for v in _primary if v >= accept_ms)} run(s)"
+        )
     if not _no_crash:
         _failures.append(f"aborted: {summary.get('abort_reason')}")
     for r in valid:
@@ -1072,15 +1142,17 @@ def _render_total_wall_report(
     if _primary:
         _lines.append(f"- command->response distribution: min {min(_primary):.1f} ms, "
                       f"median {sorted(_primary)[len(_primary)//2]:.1f} ms, "
-                      f"max {max(_primary):.1f} ms; all < 13000 ms: {'yes' if _all_under_13 else 'no'}")
+                      f"max {max(_primary):.1f} ms; all < {accept_ms:.0f} ms: "
+                      f"{'yes' if _all_under_13 else 'no'}")
     if _failures:
         _lines.append("- Failures:")
         for _f in _failures:
             _lines.append(f"  - {_f}")
     _lines.append("")
     if _pass:
-        _lines.append("**PASS** — the current best production candidate delivers "
-                      "command submission -> durable response under 13.0 s on every run, "
+        _lines.append(f"**PASS** — the current best production candidate delivers "
+                      f"command submission -> durable response under {accept_ms:.1f} ms "
+                      "on every run, "
                       "with zero crashes, zero snapshot fallbacks, zero duplicate "
                       "migrations, and zero unexplained residual above 100 ms.")
     else:
@@ -1193,6 +1265,9 @@ def _rebuild_summary_from_attempts(output_dir: Path) -> dict[str, Any]:
         "skip_first": sum(1 for r in records if r.get("excluded_snapshot_builder")),
         "gap_seconds": GAP_SECONDS,
         "valid_cold": valid_cold,
+        "accept_under_ms": float(os.environ.get("V2_OWNERSHIP_ACCEPT_UNDER_MS", "13000") or 13000),
+        "expect_cloud": os.environ.get("V2_OWNERSHIP_EXPECT_CLOUD", ""),
+        "expect_region": os.environ.get("V2_OWNERSHIP_EXPECT_REGION", ""),
         "aborted": False,
         "records": records,
     }
@@ -1368,11 +1443,17 @@ async def _run_integrated_study(
     target_cold: int,
     max_attempts: int,
     skip_first: int,
+    expect_cloud: str = "",
+    expect_region: str = "",
+    accept_under_ms: float = 13000.0,
+    stop_after_bad: int = 0,
 ) -> dict[str, Any]:
     return await _run_ownership_study(
         workflow, modal_options, workspace, transport, output_dir,
         app_name=app_name, phase="integrated", target_cold=target_cold,
         max_attempts=max_attempts, skip_first=skip_first,
+        expect_cloud=expect_cloud, expect_region=expect_region,
+        accept_under_ms=accept_under_ms, stop_after_bad=stop_after_bad,
     )
 
 
@@ -1394,6 +1475,18 @@ async def main() -> None:
                              "after the ownership/integrated study")
     parser.add_argument("--output-dir", default="",
                         help="Artifacts directory for render-report mode")
+    parser.add_argument("--expect-cloud", default="",
+                        help="Expected COMFYMODAL_V2_CLOUD in the deployed container "
+                             "(e.g. gcp/aws) for controlled restore-mode phases; "
+                             "default unpinned")
+    parser.add_argument("--expect-region", default="",
+                        help="Expected COMFYMODAL_V2_REGION in the deployed container "
+                             "for controlled restore-mode phases; default unpinned")
+    parser.add_argument("--accept-under-ms", type=float, default=13000.0,
+                        help="Total-wall acceptance gate in ms (default 13000)")
+    parser.add_argument("--stop-after-bad", type=int, default=0,
+                        help="Stop early after N valid-cold runs at or above the "
+                             "acceptance gate (0 = disabled)")
     args = parser.parse_args()
 
     if args.mode == "render-report":
@@ -1426,6 +1519,9 @@ async def main() -> None:
             app_name=args.app,
             target_cold=args.target_cold, max_attempts=args.max_attempts,
             skip_first=args.skip_first,
+            expect_cloud=args.expect_cloud, expect_region=args.expect_region,
+            accept_under_ms=args.accept_under_ms,
+            stop_after_bad=args.stop_after_bad,
         )
         if args.report:
             _write_total_wall_report(summary, output_dir=output_dir)
@@ -1435,6 +1531,9 @@ async def main() -> None:
             app_name=args.app, phase=args.phase,
             target_cold=args.target_cold, max_attempts=args.max_attempts,
             skip_first=args.skip_first,
+            expect_cloud=args.expect_cloud, expect_region=args.expect_region,
+            accept_under_ms=args.accept_under_ms,
+            stop_after_bad=args.stop_after_bad,
         )
         if args.report:
             _write_total_wall_report(summary, output_dir=output_dir)

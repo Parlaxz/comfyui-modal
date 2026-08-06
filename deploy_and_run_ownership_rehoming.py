@@ -17,15 +17,25 @@ Apps (all shadow-only, never production):
                                                        rehoming, all heavy
                                                        diagnostics OFF
                                                        (Experiment 3)
-  stable-modal-comfy-v2-exclusive-owner-total-wall     UNPINNED, exclusive UNET
-                                                       owner ON, rehoming OFF,
-                                                       every page-path/synth
-                                                       H2D/backing-verify/
-                                                       pretouch/quiesced/
-                                                       variance/host/full-trace
-                                                       diagnostic OFF
-                                                       (six-run total-wall
-                                                       validation)
+   stable-modal-comfy-v2-exclusive-owner-total-wall     UNPINNED, exclusive UNET
+                                                        owner ON, rehoming OFF,
+                                                        every page-path/synth
+                                                        H2D/backing-verify/
+                                                        pretouch/quiesced/
+                                                        variance/host/full-trace
+                                                        diagnostic OFF
+                                                        (six-run total-wall
+                                                        validation)
+   stable-modal-comfy-v2-shadow (restore mode)          THE LONG-LIVED shadow
+                                                        app lineage from the
+                                                        historical fast runs,
+                                                        redeployed with
+                                                        exclusive UNET owner ON
+                                                        and all diagnostics OFF.
+                                                        Restores the fast path
+                                                        (platform entry ~0.2-0.4 s
+                                                        vs 4.4-38.3 s on the new
+                                                        six-run app lineage).
 
 Usage:
     python deploy_and_run_ownership_rehoming.py [--deploy-only]
@@ -33,6 +43,7 @@ Usage:
     python deploy_and_run_ownership_rehoming.py rehoming [runs]
     python deploy_and_run_ownership_rehoming.py integrated [target_cold]
     python deploy_and_run_ownership_rehoming.py total-wall [target_cold] [--deploy-only]
+    python deploy_and_run_ownership_rehoming.py restore [gcp|aws|unpinned] [target_cold] [--deploy-only]
 """
 from __future__ import annotations
 
@@ -48,6 +59,12 @@ APP_OWNERSHIP_NOPROBES = "stable-modal-comfy-v2-ownership-gcp-noprobes-shadow"
 APP_REHOMING = "stable-modal-comfy-v2-rehoming-shadow"
 APP_INTEGRATED = "stable-modal-comfy-v2-rehome-integrated-shadow"
 APP_TOTAL_WALL = "stable-modal-comfy-v2-exclusive-owner-total-wall"
+# Restore-mode shadow: the LONG-LIVED V2 shadow app lineage (first deployed
+# 2026-07-26) that produced the historical 9.2-10.2 s total-wall runs before
+# the ownership/rehoming studies.  Reusing the app identity preserves the
+# snapshot/image distribution behavior that the six-run study's brand-new
+# app lineage lost.
+APP_RESTORE = "stable-modal-comfy-v2-shadow"
 
 ws = json.loads((ROOT / ".modal_workspaces.json").read_text(encoding="utf-8"))
 aid = ws.get("active_workspace_id")
@@ -228,6 +245,42 @@ def main() -> None:
             ["--app", APP_TOTAL_WALL, "--phase", "probes_off",
              "--target-cold", target, "--max-attempts", "9",
              "--skip-first", "2", "--report"],
+            env_extra,
+        )
+    elif mode == "restore":
+        # Restore mode: redeploy the LONG-LIVED shadow app lineage with
+        # exclusive ownership ON and every heavy diagnostic OFF.  Placement is
+        # controlled per step: gcp / aws pin first, then unpinned for the
+        # final six-run validation.
+        cloud = rest[0] if rest and rest[0] in ("gcp", "aws", "unpinned") else "gcp"
+        if cloud in rest:
+            rest.remove(cloud)
+        if cloud == "unpinned":
+            cloud = ""
+        target = rest[0] if rest and rest[0].isdigit() else "3"
+        deploy(APP_RESTORE, cloud=cloud, extra={
+            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+        })
+        if "--deploy-only" in args:
+            print("=== Restore deploy-only requested; study skipped ===")
+            return
+        env_extra = {
+            "MODAL_TOKEN_ID": str(entry["token_id"]),
+            "MODAL_TOKEN_SECRET": str(entry["token_secret"]),
+            "COMFYMODAL_V2_APP_NAME": APP_RESTORE,
+            "COMFYMODAL_V2_GPU": "rtx-pro-6000",
+            "COMFYMODAL_V2_ENV_PROFILE": "production",
+            "V2_OWNERSHIP_GAP_SECONDS": "25",
+            "V2_OWNERSHIP_EXPECT_CLOUD": cloud,
+            "V2_OWNERSHIP_ACCEPT_UNDER_MS": "13500",
+        }
+        run_study(
+            "ownership",
+            ["--app", APP_RESTORE, "--phase", "probes_off",
+             "--target-cold", target, "--max-attempts", "8",
+             "--skip-first", "2", "--expect-cloud", cloud,
+             "--accept-under-ms", "13500", "--stop-after-bad", "2",
+             "--report"],
             env_extra,
         )
     elif mode == "integrated":
