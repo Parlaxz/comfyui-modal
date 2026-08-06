@@ -2758,6 +2758,16 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_UNET_PRETOUCH": os.environ.get(
             "COMFYMODAL_V2_UNET_PRETOUCH", "0"
         ),
+        # Exclusive request-scoped UNET ownership + post-restore rehoming —
+        # diagnostic shadow gates (default off).  Explicit passthrough so a
+        # shadow deployment baked with these flags actually reaches the
+        # container; without this they silently default to off.
+        "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": os.environ.get(
+            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER", "0"
+        ),
+        "COMFYMODAL_V2_UNET_REHOME_AFTER_RESTORE": os.environ.get(
+            "COMFYMODAL_V2_UNET_REHOME_AFTER_RESTORE", "0"
+        ),
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ),
@@ -11165,6 +11175,33 @@ class ModalRuntimeEntrypoint:
                                     _milestones["first_sampler_node"] = _node_str
                                     _milestones["first_sampler_node_class"] = _class_node
                                     _milestones["first_sampler_node_ns"] = _event_ns
+                                    # ── Exclusive UNET ownership: sampler-boundary join ──
+                                    # BEFORE the sampler acquires the mutation lane.  When a
+                                    # request-scoped early UNET activation worker is pending,
+                                    # the graph joins it here so the worker completes its
+                                    # load (holding/releasing the lane freely — the sampler
+                                    # has not acquired yet) before the sampler lane acquire.
+                                    # This prevents BOTH the concurrent-load race AND the
+                                    # worker-blocked-on-sampler-lane stall.  No state → adopt
+                                    # (normal late mode: nothing scheduled) — a no-op.
+                                    try:
+                                        from comfymodal_runtime.model_preload import (
+                                            exclusive_unet_owner_enabled,
+                                            graph_unet_join_or_adopt,
+                                        )
+                                        _ownership_join = None
+                                        if exclusive_unet_owner_enabled():
+                                            _ownership_join = graph_unet_join_or_adopt(
+                                                str(context.request_id), trace=trace,
+                                            )
+                                            _milestones["exclusive_ownership_join"] = dict(
+                                                _ownership_join
+                                            )
+                                    except Exception as _join_exc:
+                                        _milestones["exclusive_ownership_join"] = {
+                                            "decision": "error",
+                                            "error": f"{type(_join_exc).__name__}: {str(_join_exc)[:120]}",
+                                        }
                                     # Acquire mutation lane: blocks until previous
                                     # GPU commit finishes, preventing overlap
                                     # between model GPU commits and sampling.
@@ -12557,12 +12594,39 @@ class ModalRuntimeEntrypoint:
             "filename": candidate.name,
         }
 
+    def run_rehoming_experiment(
+        self,
+        *,
+        order: str = "original_first",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: one paired post-restore rehoming measurement.
+
+        Dedicated shadow method with NO graph execution.  On a restored
+        single-use container it measures the synchronized H2D of the
+        retained restored UNET storages vs the same model rehomed into
+        fresh anonymous RAM, alternating the measurement order per run
+        (``order=original_first|clone_first``) to remove order/prewarming
+        bias.  Never runs ComfyUI graph execution; never mutates the CPU
+        model during measurements; correctness is proven by a GPU-vs-clone
+        byte-equality pass after all timing measurements.  Every failure is
+        captured in the returned record; never raises.
+        """
+        from comfymodal_runtime.rehoming_experiment import (
+            run_rehoming_experiment_impl,
+        )
+        return run_rehoming_experiment_impl(
+            self, order=str(order or "original_first"), request_id=str(request_id or ""),
+        )
+
     def publish_restore_plan(
         self,
         plan_payload: Mapping[str, Any],
         snapshot_seed: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Modal-exposed method: publish a ``RestorePlan`` (and optional
+        schema-v2 ``snapshot_seed`` payload) to the deployment-scoped
+        runtime-state volume.
         schema-v2 ``snapshot_seed`` payload) to the deployment-scoped
         runtime-state volume.
 
@@ -13788,7 +13852,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
-        "publish_restore_plan", "exit",
+        "publish_restore_plan", "run_rehoming_experiment", "exit",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -13850,6 +13914,7 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
+    setattr(cls, "run_rehoming_experiment", _modal.method()(cls.run_rehoming_experiment))
     return cls
 
 
