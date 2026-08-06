@@ -115,6 +115,12 @@ from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall
 from .teardown_diagnostics import TeardownDiagnostics
+from .unet_backing import (
+    anon_snapshot_enabled,
+    backing_verify_enabled,
+    capture_unet_backing_evidence,
+    clone_unet_to_anonymous_ram,
+)
 
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
@@ -2709,6 +2715,15 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_HOST_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_HOST_DIAGNOSTICS", "0"
         ),
+        "COMFYMODAL_V2_UNET_BACKING_VERIFY": os.environ.get(
+            "COMFYMODAL_V2_UNET_BACKING_VERIFY", "0"
+        ),
+        "COMFYMODAL_V2_ANON_UNET_SNAPSHOT": os.environ.get(
+            "COMFYMODAL_V2_ANON_UNET_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_V2_SYNTH_H2D_PROBE": os.environ.get(
+            "COMFYMODAL_V2_SYNTH_H2D_PROBE", "0"
+        ),
         "COMFYMODAL_V2_UNET_PRETOUCH": os.environ.get(
             "COMFYMODAL_V2_UNET_PRETOUCH", "0"
         ),
@@ -5220,6 +5235,8 @@ class ModalRuntimeEntrypoint:
             self._request_gpu_release_request_id = ""
         if not hasattr(self, "_terminal_response_delivered"):
             self._terminal_response_delivered = False
+        if not hasattr(self, "_unet_backing_evidence"):
+            self._unet_backing_evidence = None
 
     def _evict_snapshot_models(
         self,
@@ -7272,6 +7289,42 @@ class ModalRuntimeEntrypoint:
                             )
                         except Exception:
                             raise
+
+                        # ── UNET snapshot backing diagnostic (default off) ──
+                        # Arm A (verify only): record /proc/self/maps backing
+                        # of every UNET storage right before snapshot capture.
+                        # Arm B (anon): additionally clone every parameter and
+                        # buffer into fresh anonymous CPU memory, release the
+                        # old storages, GC, then re-verify.  Never raises.
+                        if backing_verify_enabled() or anon_snapshot_enabled():
+                            try:
+                                _backing_before = capture_unet_backing_evidence(
+                                    _cpu_models.unet, label="before_capture",
+                                )
+                                self._unet_backing_evidence = {
+                                    "arm": "anon" if anon_snapshot_enabled() else "current",
+                                    "before_capture": _backing_before,
+                                }
+                                if anon_snapshot_enabled() and _cpu_models.unet is not None:
+                                    _clone_ev = clone_unet_to_anonymous_ram(_cpu_models.unet)
+                                    self._unet_backing_evidence["clone"] = {
+                                        "cloned": _clone_ev.get("cloned", 0),
+                                        "bytes": _clone_ev.get("bytes", 0),
+                                        "error": _clone_ev.get("error", ""),
+                                    }
+                                    self._unet_backing_evidence["after_clone"] = (
+                                        _clone_ev.get("post_clone", {})
+                                    )
+                                print(
+                                    "[v2.unet_backing] "
+                                    + json.dumps(self._unet_backing_evidence, default=str),
+                                    flush=True,
+                                )
+                            except Exception as _be_exc:  # noqa: BLE001
+                                self._unet_backing_evidence = {
+                                    "arm": "anon" if anon_snapshot_enabled() else "current",
+                                    "error": str(_be_exc)[:200],
+                                }
 
                         self._cpu_snapshot_models = _cpu_models
                         self._cpu_snapshot_models_active = False
@@ -9892,6 +9945,10 @@ class ModalRuntimeEntrypoint:
                 pass
             if _host_diagnostics_enabled():
                 result["host_diagnostics"] = _capture_host_diagnostics()
+            if backing_verify_enabled() or anon_snapshot_enabled():
+                _be = getattr(self, "_unet_backing_evidence", None)
+                if _be is not None:
+                    result["unet_backing_evidence"] = _be
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})

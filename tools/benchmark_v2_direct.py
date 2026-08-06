@@ -963,12 +963,16 @@ async def _run_one(
     _response_wall_ns, _response_mono_ns = _capture_ts()
     wall_ms = (time.perf_counter() - started) * 1000.0
     identity = _identity(result)
-    if identity.get("app_name") and identity.get("app_name") != APP_NAME:
-        raise RuntimeError(f"V2 run {index} returned app {identity['app_name']!r}, expected {APP_NAME!r}")
+    _expected_app = os.environ.get("COMFYMODAL_V2_APP_NAME", APP_NAME) or APP_NAME
+    if identity.get("app_name") and identity.get("app_name") != _expected_app:
+        raise RuntimeError(f"V2 run {index} returned app {identity['app_name']!r}, expected {_expected_app!r}")
     runtime_shape_artifact = _validate_runtime_shape(result, identity)
     _host_diag = result.get("host_diagnostics") if isinstance(result, dict) else None
     if not isinstance(_host_diag, dict):
         _host_diag = {}
+    _ube = result.get("unet_backing_evidence") if isinstance(result, dict) else None
+    if not isinstance(_ube, dict):
+        _ube = {}
     artifact = {
         "run_index": index,
         "request_id": prompt_id,
@@ -976,6 +980,7 @@ async def _run_one(
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
         "identity": identity,
         "host_diagnostics": _host_diag,
+        "unet_backing_evidence": _ube,
         "runtime_shape": runtime_shape_artifact,
         "event_types": ["result"],
         "timing": _timing(
@@ -3493,6 +3498,370 @@ def _render_host_ab_report(summary: dict[str, Any]) -> str:
     return "\n".join(_lines)
 
 
+BACKING_A_APP = os.environ.get(
+    "COMFYMODAL_V2_BACKING_A_APP", "stable-modal-comfy-v2-backing-a-shadow"
+)
+BACKING_B_APP = os.environ.get(
+    "COMFYMODAL_V2_BACKING_B_APP", "stable-modal-comfy-v2-backing-b-shadow"
+)
+
+
+def _extract_synth_probe(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the per-run ``synth_h2d_probe`` trace event metadata."""
+    trace = result.get("trace", {}) if isinstance(result, dict) else {}
+    events = trace.get("events", []) if isinstance(trace, dict) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("name") == "synth_h2d_probe":
+            metadata = event.get("metadata", {})
+            return dict(metadata) if isinstance(metadata, dict) else {}
+    return None
+
+
+def _host_gpu_uuid(record: dict[str, Any]) -> str:
+    host = record.get("host_diagnostics", {}) if isinstance(record.get("host_diagnostics"), dict) else {}
+    gpu = host.get("gpu", {}) if isinstance(host.get("gpu"), dict) else {}
+    return str(gpu.get("uuid", ""))[:16]
+
+
+async def _run_backing_ab(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    gap_seconds: float,
+    app_a: str,
+    app_b: str,
+    class_name: str,
+    gpu: str,
+    target_cold: int,
+    max_attempts_per_arm: int,
+    skip_first: int = 2,
+    teardown: str = "minimal",
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Interleaved A/B UNET-backing cold study.
+
+    Arm A = current CPU-snapshot UNET (safetensors/Volume-backed hypothesis).
+    Arm B = anonymous-RAM snapshot (UNET cloned into fresh anonymous CPU
+    memory before snapshot capture).  Two separate shadow deployments; runs
+    strictly interleaved A,B,A,B,... so placement/scheduling noise is shared.
+    Each arm discards its first *skip_first* attempts (snapshot/cache build
+    + the run after) and collects *target_cold* valid cold runs
+    (restore_count==1 && request_count==1 && fresh identity), single-use
+    containers, minimal teardown, 25 s gaps.  Every attempt is preserved as
+    ``attempt_<seq>.json`` with the per-run synthetic 2 GB anonymous H2D
+    probe, the real UNET synchronized transfer, host diagnostics and (on the
+    snapshot-build runs) the /proc/self/maps backing evidence.
+    """
+    print(
+        f"[v2.backing_ab] mode=start gap={gap_seconds}s target={target_cold} "
+        f"max_per_arm={max_attempts_per_arm} skip_first={skip_first} "
+        f"teardown={teardown} app_a={app_a} app_b={app_b}",
+        flush=True,
+    )
+    arms: tuple[tuple[str, str], ...] = (("A", app_a), ("B", app_b))
+    per_arm: dict[str, dict[str, Any]] = {
+        label: {"app": app, "attempts": [], "cold": 0, "skipped": 0,
+                "prev_identity": None}
+        for label, app in arms
+    }
+    records: list[dict[str, Any]] = []
+    total_attempts = 0
+    round_robin_idx = 0
+
+    while total_attempts < max_attempts_per_arm * len(arms):
+        chosen: tuple[str, str] | None = None
+        for _ in range(len(arms)):
+            label, app = arms[round_robin_idx % len(arms)]
+            round_robin_idx += 1
+            st = per_arm[label]
+            if st["cold"] < target_cold and len(st["attempts"]) < max_attempts_per_arm:
+                chosen = (label, app)
+                break
+        if chosen is None:
+            break
+        label, app = chosen
+        st = per_arm[label]
+        os.environ["COMFYMODAL_V2_APP_NAME"] = app
+        index = total_attempts
+        total_attempts += 1
+        arm_attempt = len(st["attempts"])
+        st["attempts"].append(arm_attempt)
+        _run_id = f"backing-ab-{label}-{arm_attempt}-{index}-{uuid.uuid4().hex[:8]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _variance_origin(
+            index, pretouch=0, app_name=app, teardown=teardown,
+            pin_transfer=0, quiesced_transfer=0,
+        )
+        origin["variance_mode"] = "backing_ab"
+        origin["COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"] = "1"
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": index, "run_id": _run_id, "request_id": "",
+                "identity": {}, "result": {}, "timing": {},
+                "variance": {
+                    "quiesced_transfer": 0, "teardown_mode": teardown,
+                    "cold_valid": False, "cold": False,
+                    "failures": [f"run raised: {str(exc)[:300]}"],
+                },
+                "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable", "mode": "backing_ab",
+                "error": str(exc)[:300],
+            }
+
+        identity = artifact.get("identity", {}) or {}
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        cold_check = _validate_cold_identity(
+            identity, run_index=index, pretouch=0, prev_identity=st["prev_identity"],
+        )
+        artifact["run_id"] = _run_id
+        artifact["attempt_file"] = f"attempt_{index:04d}.json"
+        artifact["arm"] = label
+        artifact["arm_attempt"] = arm_attempt
+        artifact["mode"] = "backing_ab"
+        artifact["start_ts"] = artifact.get("start_ts") or _start_ts
+        artifact["end_ts"] = artifact.get("end_ts") or datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = artifact.get("remote_entry_ts") or _remote_entry_wall_iso(result)
+        artifact["excluded_snapshot_builder"] = arm_attempt < skip_first
+        if not artifact.get("error"):
+            artifact["variance"] = {
+                "quiesced_transfer": 0,
+                "teardown_mode": teardown,
+                "cold_valid": cold_check["cold_valid"],
+                "cold": cold_check["cold"],
+                "failures": cold_check["failures"],
+                "freshness_checked": cold_check["freshness_checked"],
+            }
+        classification = _classify_attempt(artifact)
+        artifact["classification"] = classification
+        record = extract_run_metrics(artifact)
+        record["classification"] = classification
+        record["attempt_file"] = artifact["attempt_file"]
+        record["arm"] = label
+        record["arm_attempt"] = arm_attempt
+        record["provider"] = identity.get("cloud", "")
+        record["actual_region"] = identity.get("region", "")
+        record["excluded_snapshot_builder"] = arm_attempt < skip_first
+        record["host_diagnostics"] = artifact.get("host_diagnostics", {})
+        record["synth_h2d"] = _extract_synth_probe(result)
+        record["unet_backing_evidence"] = artifact.get("unet_backing_evidence", {})
+        record["gpu_uuid"] = _host_gpu_uuid(record)
+        _metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _transfer_ms = _p.get("cpu_to_gpu_transfer_wall_ms")
+        record["transfer_speed"] = _classify_transfer_speed(_transfer_ms)
+        record["transfer_ms"] = _transfer_ms
+        record["attempt_log"] = (
+            f"[backing_ab] arm={label} index={index} class={classification} "
+            f"speed={record['transfer_speed']}"
+        )
+        (output_dir / artifact["attempt_file"]).write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(record)
+
+        if arm_attempt < skip_first:
+            st["skipped"] += 1
+            status = "SKIPPED(snapshot-builder)"
+        elif cold_check["cold"] and cold_check["cold_valid"]:
+            st["cold"] += 1
+            st["prev_identity"] = identity
+            status = "COLD"
+        else:
+            status = "NOT-COLD"
+        _synth = record.get("synth_h2d") or {}
+        print(
+            f"[v2.backing_ab] arm={label} index={index} id={_run_id} "
+            f"provider={identity.get('cloud', '?')} region={identity.get('region', '?')} "
+            f"status={status} speed={record['transfer_speed']} "
+            f"synth={_fmt_ms(_synth.get('wall_ms'))} "
+            f"valid={st['cold']}/{target_cold}",
+            flush=True,
+        )
+        if total_attempts < max_attempts_per_arm * len(arms):
+            print(f"[v2.backing_ab] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    summary: dict[str, Any] = {
+        "mode": "backing_ab",
+        "app_a": app_a,
+        "app_b": app_b,
+        "class_name": class_name,
+        "gpu": gpu,
+        "gap_seconds": gap_seconds,
+        "target_cold": target_cold,
+        "max_attempts_per_arm": max_attempts_per_arm,
+        "skip_first": skip_first,
+        "teardown_mode": teardown,
+        "total_attempts": total_attempts,
+        "arms": {
+            label: {
+                "attempts": len(st["attempts"]),
+                "skipped_snapshot_builders": st["skipped"],
+                "valid_cold": st["cold"],
+            }
+            for label, st in per_arm.items()
+        },
+        "records": records,
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps({k: v for k, v in summary.items() if k != "records"}, default=str, indent=2),
+        encoding="utf-8",
+    )
+    _report_md = _render_backing_ab_report(summary)
+    (output_dir / "backing_ab_report.md").write_text(_report_md, encoding="utf-8")
+    print(f"[v2.backing_ab] report={output_dir / 'backing_ab_report.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "total_attempts": total_attempts,
+        "arms": summary["arms"],
+    }, default=str), flush=True)
+    print(_report_md, flush=True)
+
+    _short: list[str] = [
+        f"arm {label}: {st['cold']}/{target_cold} valid cold in {len(st['attempts'])} attempts"
+        for label, st in per_arm.items()
+        if st["cold"] < target_cold
+    ]
+    if _short:
+        raise RuntimeError(
+            f"backing_ab: incomplete arms ({'; '.join(_short)}); "
+            f"attempts preserved in {output_dir}"
+        )
+    return summary
+
+
+def _render_backing_ab_report(summary: dict[str, Any]) -> str:
+    """Render the interleaved A/B UNET-backing study report (markdown)."""
+    records = summary.get("records", []) or []
+    _lines: list[str] = []
+    _lines.append("# V2 UNET-Backing A/B Cold Study\n")
+    _lines.append(
+        f"- Arm A `{summary.get('app_a', '')}` = current CPU-snapshot UNET; "
+        f"Arm B `{summary.get('app_b', '')}` = anonymous-RAM snapshot. "
+        f"Interleaved A,B,A,B,... · GPU `{summary.get('gpu', '')}` · "
+        f"gap `{summary.get('gap_seconds')}s` · teardown `{summary.get('teardown_mode', '')}`"
+    )
+    _lines.append(
+        f"- Protocol: first {summary.get('skip_first', 2)} attempts per arm "
+        f"excluded (snapshot/cache build + the run after); "
+        f"{summary.get('target_cold', 0)} valid cold per arm.  Transfer classes: "
+        f"FAST <2.5 s, MEDIUM 2.5–5 s, SLOW >5 s.  Synth probe = 2 GiB touched "
+        f"anonymous contiguous float32 H2D immediately before the real transfer.\n"
+    )
+    _lines.append("| arm | attempt | class | provider | region | GPU uuid | synth H2D (ms) | synth GB/s | UNET tfr (ms) | UNET GB/s | speed | restore (ms) | sched (ms) | sampler wait (ms) |")
+    _lines.append("|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    for r in sorted(records, key=lambda x: (x.get("arm", ""), x.get("attempt_file", ""))):
+        _metrics = r.get("metrics", {}) if isinstance(r.get("metrics"), dict) else {}
+        _t = _metrics.get("transfer", {}) if isinstance(_metrics.get("transfer"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _rst = _metrics.get("restore", {}) if isinstance(_metrics.get("restore"), dict) else {}
+        _sp = _metrics.get("sampler", {}) if isinstance(_metrics.get("sampler"), dict) else {}
+        _synth = r.get("synth_h2d", {}) if isinstance(r.get("synth_h2d"), dict) else {}
+        _tag = "SKIP" if r.get("excluded_snapshot_builder") else r.get("classification", "")
+        _lines.append(
+            f"| {r.get('arm', '?')} | {r.get('attempt_file', '')} | {_tag} "
+            f"| {r.get('provider', '?')} | {r.get('actual_region', '?')} "
+            f"| {r.get('gpu_uuid', '?')} "
+            f"| {_fmt_ms(_synth.get('wall_ms'))} "
+            f"| {_fmt_gbps(_synth.get('gb_per_s'))} "
+            f"| {_fmt_ms(_p.get('cpu_to_gpu_transfer_wall_ms'))} "
+            f"| {_fmt_gbps(_p.get('cpu_to_gpu_transfer_gb_per_s'))} "
+            f"| {r.get('transfer_speed', '?')} "
+            f"| {_fmt_ms(_rst.get('restore_total_ms'))} "
+            f"| {_fmt_ms(_t.get('pre_python_modal_scheduling_ms'))} "
+            f"| {_fmt_ms(_sp.get('sampler_lane_wait_ms'))} |"
+        )
+    _lines.append("")
+
+    # ── Per-arm summary (valid cold runs only) ──
+    _lines.append("## Per arm (valid cold runs)\n")
+    _lines.append("| arm | n | UNET tfr ms (median/range) | UNET GB/s (median) | synth ms (median/range) | synth GB/s (median) | FAST | MEDIUM | SLOW |")
+    _lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for _arm in ("A", "B"):
+        _group = [r for r in records
+                  if r.get("arm") == _arm and not r.get("excluded_snapshot_builder")]
+        _tfr = sorted(float(r["transfer_ms"]) for r in _group if isinstance(r.get("transfer_ms"), (int, float)))
+        _synth_vals = [
+            float(s.get("wall_ms")) for r in _group
+            if isinstance(r.get("synth_h2d"), dict) and isinstance((s := r["synth_h2d"]).get("wall_ms"), (int, float))
+        ]
+        _synth_vals.sort()
+        _tfr_med = _tfr[len(_tfr) // 2] if _tfr else None
+        _tfr_range = f"{_tfr[0]:.0f}–{_tfr[-1]:.0f}" if _tfr else "?"
+        _syn_med = _synth_vals[len(_synth_vals) // 2] if _synth_vals else None
+        _syn_range = f"{_synth_vals[0]:.0f}–{_synth_vals[-1]:.0f}" if _synth_vals else "?"
+        _tfr_gb = [float(r.get("metrics", {}).get("page_traversal", {}).get("cpu_to_gpu_transfer_gb_per_s")) for r in _group]
+        _tfr_gb = sorted(g for g in _tfr_gb if g == g and g is not None)
+        _syn_gb = [
+            float(s.get("gb_per_s")) for r in _group
+            if isinstance(r.get("synth_h2d"), dict) and isinstance((s := r["synth_h2d"]).get("gb_per_s"), (int, float))
+        ]
+        _syn_gb = sorted(g for g in _syn_gb if g == g)
+        _n_fast = sum(1 for r in _group if r.get("transfer_speed") == "FAST")
+        _n_med = sum(1 for r in _group if r.get("transfer_speed") == "MEDIUM")
+        _n_slow = sum(1 for r in _group if r.get("transfer_speed") == "SLOW")
+        _lines.append(
+            f"| {_arm} | {len(_group)} | {_fmt_ms(_tfr_med)} ({_tfr_range}) "
+            f"| {_fmt_gbps(_tfr_gb[len(_tfr_gb)//2] if _tfr_gb else None)} "
+            f"| {_fmt_ms(_syn_med)} ({_syn_range}) "
+            f"| {_fmt_gbps(_syn_gb[len(_syn_gb)//2] if _syn_gb else None)} "
+            f"| {_n_fast} | {_n_med} | {_n_slow} |"
+        )
+    _lines.append("")
+
+    # ── Backing evidence (snapshot-build attempts + per-run at-transfer) ──
+    _lines.append("## Backing evidence (/proc/self/maps)\n")
+    for _arm in ("A", "B"):
+        _build_recs = [r for r in records
+                       if r.get("arm") == _arm and r.get("excluded_snapshot_builder")]
+        _ev = None
+        for _r in _build_recs:
+            _ev = _r.get("unet_backing_evidence", {})
+            if _ev:
+                break
+        _lines.append(f"### Arm {_arm} (snapshot-build run)\n")
+        if not _ev:
+            _lines.append("(no backing evidence captured)\n")
+            continue
+        _lines.append(f"```json\n{json.dumps(_ev, indent=1, default=str)}\n```\n")
+    _lines.append("### Per-run UNET backing at transfer time\n")
+    _lines.append("| arm | attempt | tensors | anonymous | volume-file | unknown | predominant |")
+    _lines.append("|---|---:|---:|---:|---:|---:|---|")
+    for r in sorted(records, key=lambda x: (x.get("arm", ""), x.get("attempt_file", ""))):
+        _synth = r.get("synth_h2d", {}) if isinstance(r.get("synth_h2d"), dict) else {}
+        _ub = _synth.get("unet_backing", {}) if isinstance(_synth.get("unet_backing"), dict) else {}
+        _counts = _ub.get("counts", {}) if isinstance(_ub.get("counts"), dict) else {}
+        _tag = "SKIP" if r.get("excluded_snapshot_builder") else r.get("classification", "")
+        _lines.append(
+            f"| {r.get('arm', '?')} | {r.get('attempt_file', '')} ({_tag}) "
+            f"| {_ub.get('tensors', '?')} | {_counts.get('anonymous', '?')} "
+            f"| {_counts.get('volume', '?')} | {_counts.get('unknown', '?')} "
+            f"| {_ub.get('predominant', '?')} |"
+        )
+    _lines.append("")
+    return "\n".join(_lines)
+
+
 async def _run_variance_matrix(
     workflow: dict[str, Any],
     modal_options: dict[str, Any],
@@ -3993,6 +4362,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False, transfer_ab: bool = False,
                region_ab: str | None = None, host_ab: bool = False,
+               backing_ab: bool = False,
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
                teardown: str = "full", pin_transfer: int = 0,
@@ -4074,6 +4444,22 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             gap_seconds=_ta_gap, app_name=_ta_app, class_name=CLASS_NAME, gpu=GPU,
             target_per_condition=_ta_target, max_attempts_per_condition=_ta_max,
             teardown=teardown,
+        )
+        return
+
+    # ── UNET-backing A/B (interleaved current vs anonymous-RAM snapshot) ──
+    if backing_ab:
+        _ba_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _ba_target = int(os.environ.get("V2_BACKING_AB_TARGET_COLD", "7"))
+        _ba_max = int(os.environ.get("V2_BACKING_AB_MAX_ATTEMPTS_PER_ARM", "12"))
+        _ba_skip = int(os.environ.get("V2_BACKING_AB_SKIP_FIRST", "2"))
+        await _run_backing_ab(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            gap_seconds=_ba_gap, app_a=BACKING_A_APP, app_b=BACKING_B_APP,
+            class_name=CLASS_NAME, gpu=GPU,
+            target_cold=_ba_target, max_attempts_per_arm=_ba_max,
+            skip_first=_ba_skip, teardown=teardown,
         )
         return
 
@@ -4323,6 +4709,21 @@ if __name__ == "__main__":
              "V2_HOST_AB_TARGET_COLD / V2_HOST_AB_MAX_ATTEMPTS / "
              "V2_HOST_AB_SKIP_FIRST). Writes host_ab_report.md.",
     )
+    _parser.add_argument(
+        "--backing-ab",
+        action="store_true",
+        default=False,
+        help="Run the interleaved UNET-backing A/B cold study: Arm A = current "
+             "CPU-snapshot UNET, Arm B = anonymous-RAM snapshot (clone every "
+             "UNET parameter/buffer into fresh anonymous CPU memory before "
+             "snapshot capture).  Two separate shadow deployments "
+             "(COMFYMODAL_V2_BACKING_A_APP / _BACKING_B_APP), strictly "
+             "interleaved A,B,A,B,..; each arm discards its first 2 attempts "
+             "and collects 7 valid cold runs (cap 12 per arm; "
+             "V2_BACKING_AB_TARGET_COLD / _MAX_ATTEMPTS_PER_ARM / _SKIP_FIRST). "
+             "Per-run synthetic 2 GiB anonymous H2D probe + /proc/self/maps "
+             "backing evidence. Writes backing_ab_report.md.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -4338,6 +4739,9 @@ if __name__ == "__main__":
     _host_ab = _args.host_ab or (
         os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "host_ab"
     )
+    _backing_ab = _args.backing_ab or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "backing_ab"
+    )
 
     asyncio.run(main(
         bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
@@ -4348,6 +4752,7 @@ if __name__ == "__main__":
         transfer_ab=_args.transfer_ab,
         region_ab=_args.region_ab,
         host_ab=_host_ab,
+        backing_ab=_backing_ab,
         variance_pretouch=_variance_pretouch,
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,
