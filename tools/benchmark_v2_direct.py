@@ -966,12 +966,16 @@ async def _run_one(
     if identity.get("app_name") and identity.get("app_name") != APP_NAME:
         raise RuntimeError(f"V2 run {index} returned app {identity['app_name']!r}, expected {APP_NAME!r}")
     runtime_shape_artifact = _validate_runtime_shape(result, identity)
+    _host_diag = result.get("host_diagnostics") if isinstance(result, dict) else None
+    if not isinstance(_host_diag, dict):
+        _host_diag = {}
     artifact = {
         "run_index": index,
         "request_id": prompt_id,
         "prompt_id": prompt_id,
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
         "identity": identity,
+        "host_diagnostics": _host_diag,
         "runtime_shape": runtime_shape_artifact,
         "event_types": ["result"],
         "timing": _timing(
@@ -3169,6 +3173,326 @@ def _render_region_ab_report(summary: dict[str, Any]) -> str:
     return "\n".join(_lines)
 
 
+def _classify_transfer_speed(transfer_ms: float | None) -> str:
+    """Classify a transfer by wall time: FAST <2.5 s, MEDIUM 2.5–5 s, SLOW >5 s."""
+    if transfer_ms is None:
+        return "NO-DATA"
+    if transfer_ms < 2500.0:
+        return "FAST"
+    if transfer_ms <= 5000.0:
+        return "MEDIUM"
+    return "SLOW"
+
+
+def _host_label(record: dict[str, Any]) -> str:
+    """Short stable host label for grouping: provider|region|cpu-model."""
+    host = record.get("host_diagnostics", {}) if isinstance(record.get("host_diagnostics"), dict) else {}
+    cpu = host.get("cpu", {}) if isinstance(host.get("cpu"), dict) else {}
+    model = str(cpu.get("model_name", "?"))
+    model = " ".join(model.split())[:48]
+    provider = str(record.get("provider", "") or host.get("modal_cloud_provider", ""))
+    region = str(record.get("region", "") or host.get("modal_region", ""))
+    return f"{provider or '?'}|{region or '?'}|{model or '?'}"
+
+
+async def _run_host_ab(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    gap_seconds: float,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+    target_cold: int,
+    max_attempts: int,
+    skip_first: int = 2,
+    teardown: str = "minimal",
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Unpinned cold-run host-characteristics study.
+
+    Same protocol as the region-pinned comparison but WITHOUT any region pin:
+    Modal places each request naturally, so provider / region / host hardware
+    vary across attempts.  The first *skip_first* attempts of the block are
+    EXCLUDED from the valid set unconditionally (snapshot/cache build + the
+    run after).  Then collects *target_cold* valid cold runs
+    (restore_count==1 && request_count==1 && fresh identity), production
+    overlap arm (quiesced=0), variance diagnostics ON for the synchronized
+    measurement, single-use containers, minimal teardown, 25 s gaps.  Every
+    attempt is preserved as ``attempt_<seq>.json`` including the remote
+    ``host_diagnostics`` (CPU model, NUMA, GPU UUID/PCIe, VM family).
+    """
+    print(
+        f"[v2.host_ab] mode=start gap={gap_seconds}s target={target_cold} "
+        f"max={max_attempts} skip_first={skip_first} teardown={teardown} "
+        f"app={app_name}",
+        flush=True,
+    )
+    records: list[dict[str, Any]] = []
+    prev_identity: dict[str, Any] | None = None
+    skipped = 0
+    valid_cold = 0
+    total_attempts = 0
+
+    while valid_cold < target_cold and total_attempts < max_attempts:
+        index = total_attempts
+        total_attempts += 1
+        _run_id = f"host-ab-{index}-{uuid.uuid4().hex[:8]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _variance_origin(
+            index, pretouch=0, app_name=app_name, teardown=teardown,
+            pin_transfer=0, quiesced_transfer=0,
+        )
+        origin["variance_mode"] = "host_ab"
+        origin["COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"] = "1"
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": index, "run_id": _run_id, "request_id": "",
+                "identity": {}, "result": {}, "timing": {},
+                "variance": {
+                    "quiesced_transfer": 0, "teardown_mode": teardown,
+                    "cold_valid": False, "cold": False,
+                    "failures": [f"run raised: {str(exc)[:300]}"],
+                },
+                "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable", "mode": "host_ab",
+                "error": str(exc)[:300],
+            }
+
+        identity = artifact.get("identity", {}) or {}
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        cold_check = _validate_cold_identity(
+            identity, run_index=index, pretouch=0, prev_identity=prev_identity,
+        )
+        artifact["run_id"] = _run_id
+        artifact["attempt_file"] = f"attempt_{index:04d}.json"
+        artifact["region"] = identity.get("region", "")
+        artifact["mode"] = "host_ab"
+        artifact["start_ts"] = artifact.get("start_ts") or _start_ts
+        artifact["end_ts"] = artifact.get("end_ts") or datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = artifact.get("remote_entry_ts") or _remote_entry_wall_iso(result)
+        artifact["excluded_snapshot_builder"] = index < skip_first
+        if not artifact.get("error"):
+            artifact["variance"] = {
+                "quiesced_transfer": 0,
+                "teardown_mode": teardown,
+                "cold_valid": cold_check["cold_valid"],
+                "cold": cold_check["cold"],
+                "failures": cold_check["failures"],
+                "freshness_checked": cold_check["freshness_checked"],
+            }
+        classification = _classify_attempt(artifact)
+        artifact["classification"] = classification
+        record = extract_run_metrics(artifact)
+        record["classification"] = classification
+        record["attempt_file"] = artifact["attempt_file"]
+        record["provider"] = identity.get("cloud", "")
+        record["actual_region"] = identity.get("region", "")
+        record["excluded_snapshot_builder"] = index < skip_first
+        record["host_diagnostics"] = artifact.get("host_diagnostics", {})
+        record["host_label"] = _host_label(record)
+        _metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _transfer_ms = _p.get("cpu_to_gpu_transfer_wall_ms")
+        record["transfer_speed"] = _classify_transfer_speed(_transfer_ms)
+        record["transfer_ms"] = _transfer_ms
+        record["attempt_log"] = (
+            f"[host_ab] index={index} class={classification} "
+            f"speed={record['transfer_speed']} host={record['host_label']}"
+        )
+        (output_dir / artifact["attempt_file"]).write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(record)
+
+        if index < skip_first:
+            skipped += 1
+            status = "SKIPPED(snapshot-builder)"
+        elif cold_check["cold"] and cold_check["cold_valid"]:
+            valid_cold += 1
+            prev_identity = identity
+            status = "COLD"
+        else:
+            status = "NOT-COLD"
+        print(
+            f"[v2.host_ab] index={index} id={_run_id} "
+            f"provider={identity.get('cloud', '?')} "
+            f"region={identity.get('region', '?')} status={status} "
+            f"speed={record['transfer_speed']} valid={valid_cold}/{target_cold}",
+            flush=True,
+        )
+        if total_attempts < max_attempts:
+            print(f"[v2.host_ab] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    summary: dict[str, Any] = {
+        "mode": "host_ab",
+        "app_name": app_name,
+        "class_name": class_name,
+        "gpu": gpu,
+        "gap_seconds": gap_seconds,
+        "target_cold": target_cold,
+        "max_attempts": max_attempts,
+        "skip_first": skip_first,
+        "teardown_mode": teardown,
+        "total_attempts": total_attempts,
+        "skipped_snapshot_builders": skipped,
+        "valid_cold": valid_cold,
+        "records": records,
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps({k: v for k, v in summary.items() if k != "records"}, default=str, indent=2),
+        encoding="utf-8",
+    )
+    _report_md = _render_host_ab_report(summary)
+    (output_dir / "host_ab_report.md").write_text(_report_md, encoding="utf-8")
+    print(f"[v2.host_ab] report={output_dir / 'host_ab_report.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "total_attempts": total_attempts,
+        "skipped": skipped,
+        "valid_cold": valid_cold,
+    }, default=str), flush=True)
+    print(_report_md, flush=True)
+
+    if valid_cold < target_cold:
+        raise RuntimeError(
+            f"host_ab: only {valid_cold}/{target_cold} valid cold runs in "
+            f"{max_attempts} attempts; attempts preserved in {output_dir}"
+        )
+    return summary
+
+
+def _render_host_ab_report(summary: dict[str, Any]) -> str:
+    """Render the unpinned host-characteristics study report (markdown)."""
+    records = summary.get("records", []) or []
+    _lines: list[str] = []
+    _lines.append("# V2 Host-Characteristics Cold Study\n")
+    _lines.append(
+        f"- Unpinned placement (no region pin) · app `{summary.get('app_name', '')}` "
+        f"· GPU `{summary.get('gpu', '')}` · gap `{summary.get('gap_seconds')}s` "
+        f"· teardown `{summary.get('teardown_mode', '')}`"
+    )
+    _lines.append(
+        f"- Protocol: first {summary.get('skip_first', 2)} attempts excluded "
+        f"(snapshot/cache build + the run after); "
+        f"{summary.get('valid_cold', 0)}/{summary.get('target_cold', 0)} valid cold "
+        f"collected in {summary.get('total_attempts', 0)} attempts; every attempt "
+        f"preserved.  Transfer speed classes: FAST <2.5 s, MEDIUM 2.5–5 s, SLOW >5 s.\n"
+    )
+    _lines.append("| attempt | class | provider | region | CPU model | threads | NUMA | PCIe | transfer (ms) | GB/s | speed | restore (ms) | cmd→resp (ms) |")
+    _lines.append("|---|---|---|---|---|---|---|---|---:|---:|---|---:|---:|")
+    for r in sorted(records, key=lambda x: x.get("attempt_file", "")):
+        _metrics = r.get("metrics", {}) if isinstance(r.get("metrics"), dict) else {}
+        _t = _metrics.get("transfer", {}) if isinstance(_metrics.get("transfer"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _rst = _metrics.get("restore", {}) if isinstance(_metrics.get("restore"), dict) else {}
+        _host = r.get("host_diagnostics", {}) if isinstance(r.get("host_diagnostics"), dict) else {}
+        _cpu = _host.get("cpu", {}) if isinstance(_host.get("cpu"), dict) else {}
+        _gpu = _host.get("gpu", {}) if isinstance(_host.get("gpu"), dict) else {}
+        _numa = _host.get("numa", {}) if isinstance(_host.get("numa"), dict) else {}
+        _model = str(_cpu.get("model_name", "?"))
+        _model = " ".join(_model.split())[:44]
+        _pcie = ""
+        if isinstance(_gpu.get("pcie_link_gen_current"), int) and isinstance(_gpu.get("pcie_link_width_current"), int):
+            _pcie = f"PCIe{_gpu['pcie_link_gen_current']} x{_gpu['pcie_link_width_current']}"
+        _tag = "SKIP" if r.get("excluded_snapshot_builder") else r.get("classification", "")
+        _lines.append(
+            f"| {r.get('attempt_file', '')} | {_tag} | {r.get('provider', '?')} "
+            f"| {r.get('actual_region', '?')} | {_model} "
+            f"| {_cpu.get('threads', '?')} | {('yes' if _numa else 'no')} | {_pcie} "
+            f"| {_fmt_ms(_p.get('cpu_to_gpu_transfer_wall_ms'))} "
+            f"| {_fmt_gbps(_p.get('cpu_to_gpu_transfer_gb_per_s'))} "
+            f"| {r.get('transfer_speed', '?')} "
+            f"| {_fmt_ms(_rst.get('restore_total_ms'))} "
+            f"| {_fmt_ms(_t.get('command_to_response_ms'))} |"
+        )
+    _lines.append("")
+
+    # ── By-host summary (valid cold runs only) ──
+    _lines.append("## By host (valid cold runs)\n")
+    _by_host: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        if r.get("excluded_snapshot_builder"):
+            continue
+        _by_host.setdefault(str(r.get("host_label", "?")), []).append(r)
+    _lines.append("| host (provider|region|CPU) | n | transfer ms (median/range) | GB/s (median) | FAST | MEDIUM | SLOW |")
+    _lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for _label in sorted(_by_host):
+        _group = _by_host[_label]
+        _vals = sorted(float(v) for v in (_r.get("transfer_ms") for _r in _group) if isinstance(v, (int, float)))
+        _median = _vals[len(_vals) // 2] if _vals else None
+        _range = f"{_vals[0]:.0f}–{_vals[-1]:.0f}" if _vals else "?"
+        _gb = [float(_r.get("metrics", {}).get("page_traversal", {}).get("cpu_to_gpu_transfer_gb_per_s")) for _r in _group]
+        _gb = [g for g in _gb if g == g]
+        _gb_med = sorted(_gb)[len(_gb) // 2] if _gb else None
+        _n_fast = sum(1 for _r in _group if _r.get("transfer_speed") == "FAST")
+        _n_med = sum(1 for _r in _group if _r.get("transfer_speed") == "MEDIUM")
+        _n_slow = sum(1 for _r in _group if _r.get("transfer_speed") == "SLOW")
+        _lines.append(
+            f"| {_label} | {len(_group)} | {_fmt_ms(_median)} ({_range}) "
+            f"| {_fmt_gbps(_gb_med)} | {_n_fast} | {_n_med} | {_n_slow} |"
+        )
+    _lines.append("")
+
+    # ── Host inventory (unique containers) ──
+    _lines.append("## Host inventory (unique containers)\n")
+    _seen: set[str] = set()
+    for r in sorted(records, key=lambda x: x.get("attempt_file", "")):
+        _host = r.get("host_diagnostics", {}) if isinstance(r.get("host_diagnostics"), dict) else {}
+        _cid = str(_host.get("container_key", "") or _host.get("modal_container_id", ""))
+        if not _cid or _cid in _seen:
+            continue
+        _seen.add(_cid)
+        _cpu = _host.get("cpu", {}) if isinstance(_host.get("cpu"), dict) else {}
+        _gpu = _host.get("gpu", {}) if isinstance(_host.get("gpu"), dict) else {}
+        _vm = _host.get("vm", {}) if isinstance(_host.get("vm"), dict) else {}
+        _numa = _host.get("numa", {}) if isinstance(_host.get("numa"), dict) else {}
+        _numa_nodes = _numa.get("nodes")
+        _numa_txt = "yes"
+        if isinstance(_numa_nodes, list):
+            _numa_txt = f"yes({len(_numa_nodes)} nodes)"
+        elif not _numa:
+            _numa_txt = "no"
+        _pcie = ""
+        if isinstance(_gpu.get("pcie_link_gen_current"), int) and isinstance(_gpu.get("pcie_link_width_current"), int):
+            _pcie = f"PCIe{_gpu['pcie_link_gen_current']} x{_gpu['pcie_link_width_current']}"
+        _lines.append(
+            f"- container `{_cid[:24]}`: provider={_host.get('modal_cloud_provider', '?')} "
+            f"region={_host.get('modal_region', '?')} · "
+            f"cpu=`{_cpu.get('model_name', '?')}` (family {_cpu.get('cpu_family', '?')}/model "
+            f"{_cpu.get('model', '?')}/stepping {_cpu.get('stepping', '?')}, "
+            f"{_cpu.get('sockets', '?')} socket(s)/{_cpu.get('cores', '?')} core(s)/"
+            f"{_cpu.get('threads', '?')} thread(s)) · kernel={_host.get('kernel', '?')} · "
+            f"numa={_numa_txt} · gpu=`{_gpu.get('name', '?')}` "
+            f"uuid=`{str(_gpu.get('uuid', '?'))[:24]}` bus={_gpu.get('pci_bus_id', '?')} "
+            f"{_pcie} driver={_gpu.get('driver_version', '?')} cuda={_gpu.get('cuda_version', '?')} · "
+            f"vm={_vm.get('vm_family', '?')} "
+            f"machine={_vm.get('gcp_machine_type', _vm.get('aws_instance_type', '?'))} "
+            f"dmi={_vm.get('dmi_product_name', '?')}"
+        )
+    _lines.append("")
+    return "\n".join(_lines)
+
+
 async def _run_variance_matrix(
     workflow: dict[str, Any],
     modal_options: dict[str, Any],
@@ -3668,7 +3992,7 @@ def _report_only_matrix_from_dir(output_dir: Path, attempt_files: list[Path]) ->
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False, transfer_ab: bool = False,
-               region_ab: str | None = None,
+               region_ab: str | None = None, host_ab: bool = False,
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
                teardown: str = "full", pin_transfer: int = 0,
@@ -3749,6 +4073,24 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             workspace=workspace, transport=transport, output_dir=output_dir,
             gap_seconds=_ta_gap, app_name=_ta_app, class_name=CLASS_NAME, gpu=GPU,
             target_per_condition=_ta_target, max_attempts_per_condition=_ta_max,
+            teardown=teardown,
+        )
+        return
+
+    # ── Host-characteristics cold study (unpinned placement) ────────────
+    if host_ab:
+        _ha_app = os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME) or VARIANCE_APP_NAME
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _ha_app
+        _ha_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _ha_target = int(os.environ.get("V2_HOST_AB_TARGET_COLD", "12"))
+        _ha_max = int(os.environ.get("V2_HOST_AB_MAX_ATTEMPTS", "18"))
+        _ha_skip = int(os.environ.get("V2_HOST_AB_SKIP_FIRST", "2"))
+        await _run_host_ab(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            gap_seconds=_ha_gap, app_name=_ha_app,
+            class_name=CLASS_NAME, gpu=GPU,
+            target_cold=_ha_target, max_attempts=_ha_max, skip_first=_ha_skip,
             teardown=teardown,
         )
         return
@@ -3968,6 +4310,19 @@ if __name__ == "__main__":
              "then collects 10 valid cold runs (cap 15 attempts). Writes "
              "region_ab_report.md.",
     )
+    _parser.add_argument(
+        "--host-ab",
+        action="store_true",
+        default=False,
+        help="Run the unpinned host-characteristics cold study: no region pin, "
+             "every attempt carries remote host_diagnostics (provider, region, "
+             "CPU model/family/stepping, sockets/cores/threads, NUMA, kernel, "
+             "GPU UUID/PCI bus/PCIe gen+width, driver/CUDA, VM family). "
+             "Excludes the first 2 attempts (snapshot/cache build + the run "
+             "after), then collects 12 valid cold runs (cap 18 attempts; "
+             "V2_HOST_AB_TARGET_COLD / V2_HOST_AB_MAX_ATTEMPTS / "
+             "V2_HOST_AB_SKIP_FIRST). Writes host_ab_report.md.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -3980,6 +4335,9 @@ if __name__ == "__main__":
     _variance_matrix = _args.variance_matrix or (
         os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "variance_matrix"
     )
+    _host_ab = _args.host_ab or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "host_ab"
+    )
 
     asyncio.run(main(
         bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
@@ -3989,6 +4347,7 @@ if __name__ == "__main__":
         variance_matrix=_variance_matrix,
         transfer_ab=_args.transfer_ab,
         region_ab=_args.region_ab,
+        host_ab=_host_ab,
         variance_pretouch=_variance_pretouch,
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,

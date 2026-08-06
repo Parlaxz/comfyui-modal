@@ -13,6 +13,7 @@ REM production modes keep the default identity above.
 set "V2_IS_VARIANCE=0"
 if /i "!V2_BENCHMARK_MODE!"=="variance_cold" set "V2_IS_VARIANCE=1"
 if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" set "V2_IS_VARIANCE=1"
+if /i "!V2_BENCHMARK_MODE!"=="host_ab" set "V2_IS_VARIANCE=1"
 set "V2_DEPLOY_IDENT=stable-modal-comfy-v2-shadow"
 set "V2_PROFILE_PRETOUCH=0"
 if /i "!V2_IS_VARIANCE!"=="1" (
@@ -371,6 +372,14 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
         exit /b 1
     )
     echo === V2 acceptance benchmark completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="host_ab" (
+    echo === Running V2 host-characteristics cold study - explicit opt-in ===
+    python tools\benchmark_v2_direct.py --host-ab --teardown minimal
+    if errorlevel 1 (
+        echo === ERROR: Host-AB benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 host-characteristics cold study completed ===
 ) else (
     echo === Running V2 benchmark - single run by default ===
     python tools\benchmark_v2_direct.py
