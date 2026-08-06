@@ -353,6 +353,18 @@ def _timing(
                 return int(value)
         return None
 
+    def event_mono(name: str, *, phase: str = "") -> int | None:
+        """First event's monotonic_ns (same-process duration helper)."""
+        for event in events:
+            if not isinstance(event, dict) or event.get("name") != name:
+                continue
+            if phase and event.get("phase") != phase:
+                continue
+            value = event.get("monotonic_ns")
+            if isinstance(value, (int, float)):
+                return int(value)
+        return None
+
     def duration_ms(start_name: str, end_name: str) -> float | None:
         start = event_ns(start_name)
         end = event_ns(end_name)
@@ -382,6 +394,111 @@ def _timing(
             (response_received_unix_ns - int(command_start_unix_ms) * 1_000_000) / 1_000_000.0,
             1,
         )
+    # ── Exact cross-process platform-entry reconciliation ────────────
+    # Every interval below is computed from RAW wall timestamps that exist in
+    # the trace events / restore timing — nothing is pushed into a generic
+    # residual.  Local boundary = local submission attempt (wall); remote
+    # boundaries = restore _restore_timing wall fields + method-entry event.
+    _restore_timing_dict = restore if isinstance(restore, dict) else {}
+    _remote_resume_ns = _num(_restore_timing_dict.get("remote_python_resume_wall_unix_ns"))
+    _restore_start_ns = _num(_restore_timing_dict.get("restore_method_start_wall_unix_ns"))
+    _restore_end_ns = _num(_restore_timing_dict.get("restore_method_end_wall_unix_ns"))
+    _local_submit_ns = event_ns("modal_submission_attempt") or event_ns("modal_submit_start")
+    _method_entry_ns = (
+        event_ns("run_plan_method_first_line")
+        or event_ns("remote_method_entry", method_name="run_plan_stream")
+    )
+    _first_remote_ns = event_ns("modal_first_remote_event")
+    _final_ns = event_ns("final_result_received")
+
+    def _wall_interval(start: Any, end: Any) -> float | None:
+        if (
+            start is None or end is None
+            or not isinstance(start, (int, float)) or not isinstance(end, (int, float))
+        ):
+            return None
+        _delta = int(end) - int(start)
+        if _delta < 0:
+            return None
+        return round(_delta / 1_000_000.0, 3)
+
+    submission_to_remote_python_resume_ms = _wall_interval(
+        _local_submit_ns, _remote_resume_ns
+    )
+    remote_python_resume_to_restore_start_ms = _wall_interval(
+        _remote_resume_ns, _restore_start_ns
+    )
+    restore_to_method_entry_ms = _wall_interval(_restore_end_ns, _method_entry_ns)
+    method_entry_to_first_remote_event_ms = _wall_interval(
+        _method_entry_ns, _first_remote_ns
+    )
+    first_remote_event_to_final_result_ms = _wall_interval(
+        _first_remote_ns, _final_ns
+    )
+    # ── Diagnostic UNET transfer stages (same-process monotonic) ──────
+    _ea_sched_mono = event_mono("unet_early_activation_scheduled")
+    _ea_load_start_mono = event_mono("unet_early_activation_load_start")
+    _ea_load_end_mono = event_mono("unet_early_activation_load_end")
+    _transfer_queue_delay_ms = None
+    if (
+        _ea_sched_mono is not None and _ea_load_start_mono is not None
+        and _ea_load_start_mono >= _ea_sched_mono
+    ):
+        _transfer_queue_delay_ms = round(
+            (_ea_load_start_mono - _ea_sched_mono) / 1_000_000.0, 3
+        )
+    _synchronized_transfer_ms = None
+    if (
+        _ea_load_start_mono is not None and _ea_load_end_mono is not None
+        and _ea_load_end_mono >= _ea_load_start_mono
+    ):
+        _synchronized_transfer_ms = round(
+            (_ea_load_end_mono - _ea_load_start_mono) / 1_000_000.0, 3
+        )
+    # Quiesce wait (quiesced-transfer A/B arm B): emitted only when the
+    # request-scoped diagnostic is enabled.
+    _quiesce_wait_ms = None
+    _quiesce_start_mono = event_mono("unet_quiesce_wait_start")
+    _quiesce_end_mono = event_mono("unet_quiesce_wait_end")
+    if (
+        _quiesce_start_mono is not None and _quiesce_end_mono is not None
+        and _quiesce_end_mono >= _quiesce_start_mono
+    ):
+        _quiesce_wait_ms = round(
+            (_quiesce_end_mono - _quiesce_start_mono) / 1_000_000.0, 3
+        )
+    # Graph/prefill activity: PromptExecutor invoke → sampler lane wait
+    # (the graph's own work before the sampler blocks on the mutation lane).
+    _graph_activity_ms = None
+    _invoke_mono = event_mono("prompt_executor_invoke_start")
+    _lane_wait_mono = event_mono("sampler_lane_wait_start")
+    if (
+        _invoke_mono is not None and _lane_wait_mono is not None
+        and _lane_wait_mono >= _invoke_mono
+    ):
+        _graph_activity_ms = round(
+            (_lane_wait_mono - _invoke_mono) / 1_000_000.0, 3
+        )
+    # Sampler lane wait (authoritative metadata from the boundary events).
+    _sampler_lane_wait_ms = None
+    _sl_meta = None
+    for _event in events:
+        if (
+            isinstance(_event, dict)
+            and _event.get("name") == "sampler_lane_wait_end"
+        ):
+            _sl_meta = _event.get("metadata", {}) if isinstance(_event.get("metadata"), dict) else {}
+            break
+    if isinstance(_sl_meta, dict) and isinstance(_sl_meta.get("wait_ms"), (int, float)):
+        _sampler_lane_wait_ms = round(float(_sl_meta["wait_ms"]), 3)
+    # Quiesced transfer sampler record (arm B; absent otherwise).
+    _quiesced_transfer = None
+    for _event in events:
+        if isinstance(_event, dict) and _event.get("name") == "unet_quiesced_transfer":
+            _qt_meta = _event.get("metadata", {})
+            if isinstance(_qt_meta, dict):
+                _quiesced_transfer = _qt_meta
+            break
     # Forward local_timing from result (copied/safe block)
     _local_timing = result.get("local_timing", {}) if isinstance(result, dict) else {}
     if not isinstance(_local_timing, dict):
@@ -437,6 +554,19 @@ def _timing(
         "cpu_snapshot_wait_ms": _cpu_snapshot_wait_ms,
         "dtype_layout_preparation_ms": _dtype_prep_ms,
         "post_load_bookkeeping_ms": _post_load_bb_ms,
+        # Exact cross-process platform-entry reconciliation (raw timestamps).
+        "submission_to_remote_python_resume_ms": submission_to_remote_python_resume_ms,
+        "remote_python_resume_to_restore_start_ms": remote_python_resume_to_restore_start_ms,
+        "restore_to_method_entry_ms": restore_to_method_entry_ms,
+        "method_entry_to_first_remote_event_ms": method_entry_to_first_remote_event_ms,
+        "first_remote_event_to_final_result_ms": first_remote_event_to_final_result_ms,
+        # Diagnostic UNET transfer stages.
+        "transfer_queue_delay_ms": _transfer_queue_delay_ms,
+        "synchronized_transfer_ms": _synchronized_transfer_ms,
+        "quiesce_wait_ms": _quiesce_wait_ms,
+        "graph_activity_ms": _graph_activity_ms,
+        "sampler_lane_wait_ms": _sampler_lane_wait_ms,
+        "quiesced_transfer": _quiesced_transfer,
     }
 
 
@@ -2392,26 +2522,30 @@ def _validate_cold_identity(
     }
 
 
-def _variance_origin(index: int, pretouch: int, app_name: str, teardown: str = "full", pin_transfer: int = 0) -> dict[str, Any]:
+def _variance_origin(index: int, pretouch: int, app_name: str, teardown: str = "full", pin_transfer: int = 0, quiesced_transfer: int = 0) -> dict[str, Any]:
     """Request-origin metadata carrying per-run variance diagnostics.
 
     These keys travel inside ``__request_origin_info__`` so the remote runtime
-    can apply variance diagnostics / ``COMFYMODAL_V2_UNET_PRETOUCH`` without a
-    production default being changed.  ``env_profile`` is carried explicitly so
-    the remote request-time profile semantics match the submitter.
+    can apply variance diagnostics / ``COMFYMODAL_V2_UNET_PRETOUCH`` /
+    ``COMFYMODAL_V2_UNET_QUIESCED_TRANSFER`` without a production default
+    being changed.  ``env_profile`` is carried explicitly so the remote
+    request-time profile semantics match the submitter.
     """
     return {
         "variance_mode": "cold",
         "variance_pretouch": int(pretouch),
         "minimal_teardown": 1 if teardown == "minimal" else 0,
         "pin_unet_transfer": int(pin_transfer),
+        "unet_quiesced_transfer": int(quiesced_transfer),
         "variance_diagnostics": {
             "variance_cold_gap_seconds": VARIANCE_COLD_GAP_SECONDS,
             "benchmark_app": app_name,
             "mode": "variance_cold",
+            "quiesced_transfer": int(quiesced_transfer),
         },
         "env_profile": os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "production").strip().lower() or "production",
         "COMFYMODAL_V2_UNET_PRETOUCH": str(int(pretouch)),
+        "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER": str(int(quiesced_transfer)),
     }
 
 
@@ -2445,27 +2579,31 @@ def _resolve_slow_threshold() -> float:
     return value
 
 
-def _matrix_origin(index: int, diag: int, pretouch: int, app_name: str, teardown: str = "full", pin_transfer: int = 0) -> dict[str, Any]:
+def _matrix_origin(index: int, diag: int, pretouch: int, app_name: str, teardown: str = "full", pin_transfer: int = 0, quiesced_transfer: int = 0) -> dict[str, Any]:
     """Request-origin metadata for one matrix attempt.
 
     Carries the diagnostics and pretouch gates request-scoped so the remote
     runtime (``_apply_request_variance_diagnostics``) applies
-    ``COMFYMODAL_V2_VARIANCE_DIAGNOSTICS`` / ``COMFYMODAL_V2_UNET_PRETOUCH``
-    per request without changing any production default.
+    ``COMFYMODAL_V2_VARIANCE_DIAGNOSTICS`` / ``COMFYMODAL_V2_UNET_PRETOUCH`` /
+    ``COMFYMODAL_V2_UNET_QUIESCED_TRANSFER`` per request without changing any
+    production default.
     """
     return {
         "variance_mode": "cold",
         "variance_pretouch": int(pretouch),
         "minimal_teardown": 1 if teardown == "minimal" else 0,
         "pin_unet_transfer": int(pin_transfer),
+        "unet_quiesced_transfer": int(quiesced_transfer),
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": str(int(diag)),
         "COMFYMODAL_V2_UNET_PRETOUCH": str(int(pretouch)),
+        "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER": str(int(quiesced_transfer)),
         "variance_diagnostics": {
             "variance_cold_gap_seconds": VARIANCE_COLD_GAP_SECONDS,
             "benchmark_app": app_name,
             "mode": "variance_matrix",
             "diagnostics": int(diag),
             "pretouch": int(pretouch),
+            "quiesced_transfer": int(quiesced_transfer),
         },
         "env_profile": os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "production").strip().lower() or "production",
     }
@@ -2526,6 +2664,286 @@ def _classify_slow(record: dict[str, Any]) -> dict[str, bool]:
         "restore_over_3s": _slow_flag(restore, MATRIX_RESTORE_SLOW_MS),
         "unet_activation_over_3s": _slow_flag(unet, MATRIX_UNET_ACTIVATION_SLOW_MS),
     }
+
+
+async def _run_transfer_ab(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    gap_seconds: float,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+    target_per_condition: int,
+    max_attempts_per_condition: int,
+    teardown: str = "minimal",
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Interleaved UNET-transfer contention A/B (quiesced transfer diagnostic).
+
+    A = current overlap (early activation runs concurrently with graph
+    execution; sampler lane absorbs the tail).  B = quiesced transfer
+    (request-scoped ``COMFYMODAL_V2_UNET_QUIESCED_TRANSFER=1``; the request
+    waits for the transfer to complete before graph execution begins, and the
+    worker samples per-thread CPU deltas during the synchronized transfer).
+    Both conditions run with variance diagnostics ON (request-scoped) so the
+    synchronized 12.31 GB CPU→GPU transfer is measured identically in A and B.
+
+    Runs are strictly interleaved A,B,A,B,… with *gap_seconds* cold gaps.
+    Continues until each condition collects *target_per_condition* valid cold
+    runs (restore_count==1 && request_count==1 && fresh identity) or
+    *max_attempts_per_condition* attempts.  EVERY attempt is preserved as
+    ``attempt_<seq>.json``; a consolidated ``transfer_ab_report.md`` +
+    ``summary.json`` are written.
+    """
+    conditions = (0, 1)  # quiesced_transfer: 0 = A (overlap), 1 = B (quiesced)
+    per_cond: dict[int, dict[str, Any]] = {
+        q: {"quiesced": q, "attempts": [], "cold_count": 0, "prev_identity": None}
+        for q in conditions
+    }
+    print(
+        f"[v2.transfer_ab] mode=start gap={gap_seconds}s "
+        f"target={target_per_condition} max_per_cond={max_attempts_per_condition} "
+        f"teardown={teardown} app={app_name}",
+        flush=True,
+    )
+    records: list[dict[str, Any]] = []
+    total_attempts = 0
+    global_seq = 0
+    round_robin_idx = 0
+    target_met = False
+
+    while total_attempts < max_attempts_per_condition * len(conditions):
+        chosen: int | None = None
+        for _ in range(len(conditions)):
+            q = conditions[round_robin_idx % len(conditions)]
+            round_robin_idx += 1
+            if per_cond[q]["cold_count"] < target_per_condition and (
+                len(per_cond[q]["attempts"]) < max_attempts_per_condition
+            ):
+                chosen = q
+                break
+        if chosen is None:
+            target_met = True
+            break
+
+        quiesced = chosen
+        state = per_cond[quiesced]
+        total_attempts += 1
+        global_seq += 1
+        attempt_seq_in_cond = len(state["attempts"])
+        label = "A-overlap" if quiesced == 0 else "B-quiesced"
+        attempt_id = f"transfer-ab-{label}-{attempt_seq_in_cond}-{global_seq}-{uuid.uuid4().hex[:8]}"
+        attempt_file = f"attempt_{global_seq:04d}.json"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _variance_origin(
+            global_seq, pretouch=0, app_name=app_name, teardown=teardown,
+            pin_transfer=0, quiesced_transfer=quiesced,
+        )
+        # Both arms measure the synchronized transfer identically (diagnostics
+        # request-scoped ON); only the quiesce flag differs.
+        origin["variance_mode"] = "transfer_ab"
+        origin["COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"] = "1"
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=global_seq, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=global_seq, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": global_seq, "run_id": attempt_id, "request_id": "",
+                "identity": {}, "result": {}, "timing": {},
+                "variance": {
+                    "quiesced_transfer": quiesced,
+                    "teardown_mode": teardown,
+                    "cold_valid": False, "cold": False,
+                    "failures": [f"run raised: {str(exc)[:300]}"],
+                },
+                "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable", "mode": "transfer_ab",
+                "error": str(exc)[:300],
+            }
+
+        identity = artifact.get("identity", {}) or {}
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        cold_check = _validate_cold_identity(
+            identity, run_index=global_seq, pretouch=0, prev_identity=state["prev_identity"],
+        )
+        artifact.setdefault("run_id", attempt_id)
+        artifact["attempt_id"] = attempt_id
+        artifact["attempt_file"] = attempt_file
+        artifact["condition_label"] = label
+        artifact["quiesced_transfer"] = quiesced
+        artifact["mode"] = "transfer_ab"
+        artifact["start_ts"] = artifact.get("start_ts") or _start_ts
+        artifact["end_ts"] = artifact.get("end_ts") or datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = artifact.get("remote_entry_ts") or _remote_entry_wall_iso(result)
+        if not artifact.get("error"):
+            artifact["variance"] = {
+                "quiesced_transfer": quiesced,
+                "teardown_mode": teardown,
+                "cold_valid": cold_check["cold_valid"],
+                "cold": cold_check["cold"],
+                "failures": cold_check["failures"],
+                "freshness_checked": cold_check["freshness_checked"],
+            }
+        classification = _classify_attempt(artifact)
+        artifact["classification"] = classification
+        record = extract_run_metrics(artifact)
+        slow_flags = _classify_slow(record)
+        artifact["slow_flags"] = slow_flags
+        record["slow_flags"] = slow_flags
+        record["classification"] = classification
+        record["attempt_id"] = attempt_id
+        record["attempt_file"] = attempt_file
+        record["condition_label"] = label
+        record["quiesced_transfer"] = quiesced
+        record["attempt_log"] = f"[transfer_ab] cond={label} class={classification}"
+        (output_dir / attempt_file).write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+
+        records.append(record)
+        if classification == "cold":
+            state["cold_count"] += 1
+            state["prev_identity"] = identity
+        print(
+            f"[v2.transfer_ab] seq={global_seq} id={attempt_id} cond={label} "
+            f"class={classification} cold={state['cold_count']}/{target_per_condition}",
+            flush=True,
+        )
+        if total_attempts < max_attempts_per_condition * len(conditions):
+            needs = any(
+                per_cond[q]["cold_count"] < target_per_condition
+                and len(per_cond[q]["attempts"]) < max_attempts_per_condition
+                for q in conditions
+            )
+            if needs:
+                print(f"[v2.transfer_ab] phase=gap seconds={gap_seconds}", flush=True)
+                await asyncio.sleep(gap_seconds)
+
+    # ── Summary + handoff report ──────────────────────────────────────
+    summary: dict[str, Any] = {
+        "mode": "transfer_ab",
+        "app_name": app_name,
+        "class_name": class_name,
+        "gpu": gpu,
+        "gap_seconds": gap_seconds,
+        "target_per_condition": target_per_condition,
+        "max_attempts_per_condition": max_attempts_per_condition,
+        "teardown_mode": teardown,
+        "total_attempts": total_attempts,
+        "conditions": {},
+        "records": records,
+    }
+    for q in conditions:
+        _cold = [r for r in records if r.get("quiesced_transfer") == q and r.get("classification") == "cold"]
+        _all = [r for r in records if r.get("quiesced_transfer") == q]
+        summary["conditions"][str(q)] = {
+            "label": "A-overlap" if q == 0 else "B-quiesced",
+            "attempts": len(_all),
+            "cold_count": len(_cold),
+        }
+    (output_dir / "summary.json").write_text(
+        json.dumps({k: v for k, v in summary.items() if k != "records"}, default=str, indent=2),
+        encoding="utf-8",
+    )
+    _report_md = _render_transfer_ab_report(summary)
+    (output_dir / "transfer_ab_report.md").write_text(_report_md, encoding="utf-8")
+    print(f"[v2.transfer_ab] report={output_dir / 'transfer_ab_report.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "mode": "transfer_ab",
+        "total_attempts": total_attempts,
+        "per_condition": {str(q): summary["conditions"][str(q)] for q in conditions},
+        "target_met": target_met,
+    }, default=str), flush=True)
+    print(_report_md, flush=True)
+
+    if not target_met:
+        raise RuntimeError(
+            "transfer_ab: reached the per-condition attempt cap before every "
+            f"condition collected {target_per_condition} valid cold runs; "
+            f"attempts preserved in {output_dir}"
+        )
+    return summary
+
+
+def _render_transfer_ab_report(summary: dict[str, Any]) -> str:
+    """Render the consolidated transfer A/B handoff report (markdown)."""
+    records = summary.get("records", []) or []
+    _lines: list[str] = []
+    _lines.append("# V2 UNET-Transfer Contention A/B (overlap vs quiesced)\n")
+    _lines.append(
+        f"- App: `{summary.get('app_name', '')}` · GPU `{summary.get('gpu', '')}` · "
+        f"gap `{summary.get('gap_seconds')}s` · teardown `{summary.get('teardown_mode', '')}`"
+    )
+    _lines.append(
+        f"- A = current overlap (early activation runs concurrently with graph); "
+        f"B = quiesced transfer (`COMFYMODAL_V2_UNET_QUIESCED_TRANSFER=1`, graph "
+        f"waits for transfer completion). Both arms: variance diagnostics ON, "
+        f"minimal teardown, single-use containers.\n"
+    )
+    _lines.append("| cond | attempt | class | cmd→resp (ms) | transfer queue delay (ms) | sync transfer (ms) | GB/s | restore (ms) | sampler wait (ms) | sampling (ms) | quiesce wait (ms) | graph activity (ms) |")
+    _lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for r in sorted(records, key=lambda x: (x.get("quiesced_transfer", 0), x.get("attempt_id", ""))):
+        _metrics = r.get("metrics", {}) if isinstance(r.get("metrics"), dict) else {}
+        _t = _metrics.get("transfer", {}) if isinstance(_metrics.get("transfer"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _rst = _metrics.get("restore", {}) if isinstance(_metrics.get("restore"), dict) else {}
+        _sp = _metrics.get("sampler", {}) if isinstance(_metrics.get("sampler"), dict) else {}
+        _label = "A" if r.get("quiesced_transfer") == 0 else "B"
+        _lines.append(
+            f"| {_label} | {r.get('attempt_id', '')} | {r.get('classification', '')} "
+            f"| {_fmt_ms(_t.get('command_to_response_ms'))} "
+            f"| {_fmt_ms(_t.get('transfer_queue_delay_ms'))} "
+            f"| {_fmt_ms(_p.get('cpu_to_gpu_transfer_wall_ms'))} "
+            f"| {_fmt_gbps(_p.get('cpu_to_gpu_transfer_gb_per_s'))} "
+            f"| {_fmt_ms(_rst.get('restore_total_ms'))} "
+            f"| {_fmt_ms(_sp.get('sampler_lane_wait_ms'))} "
+            f"| {_fmt_ms(_sp.get('sampling_ms'))} "
+            f"| {_fmt_ms(_t.get('quiesce_wait_ms'))} "
+            f"| {_fmt_ms(_t.get('graph_activity_ms'))} |"
+        )
+    _lines.append("")
+    for q, cond in (summary.get("conditions", {}) or {}).items():
+        _lines.append(
+            f"- Condition {q} ({cond.get('label', '')}): {cond.get('cold_count', 0)}/"
+            f"{summary.get('target_per_condition', 0)} valid cold, "
+            f"{cond.get('attempts', 0)} attempts preserved."
+        )
+    return "\n".join(_lines)
+
+
+def _fmt_ms(value: Any) -> str:
+    if value is None or value == "unavailable":
+        return "–"
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "–"
+
+
+def _fmt_gbps(value: Any) -> str:
+    if value is None or value == "unavailable":
+        return "–"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "–"
 
 
 async def _run_variance_matrix(
@@ -2746,6 +3164,7 @@ async def _run_variance_cold(
     gpu: str,
     teardown: str = "full",
     pin_transfer: int = 0,
+    quiesced_transfer: int = 0,
     _runner: Any = None,
 ) -> dict[str, Any]:
     """Run the variance-cold sequence: one request at a time with a gap.
@@ -2766,7 +3185,7 @@ async def _run_variance_cold(
     for index in range(run_count):
         _run_id = f"variance-cold-p{pretouch}-{index}-{uuid.uuid4().hex[:8]}"
         _start_ts = datetime.now(timezone.utc).isoformat()
-        origin = _variance_origin(index, pretouch, app_name, teardown=teardown, pin_transfer=pin_transfer)
+        origin = _variance_origin(index, pretouch, app_name, teardown=teardown, pin_transfer=pin_transfer, quiesced_transfer=quiesced_transfer)
 
         artifact: dict[str, Any] = {}
         try:
@@ -3025,10 +3444,11 @@ def _report_only_matrix_from_dir(output_dir: Path, attempt_files: list[Path]) ->
 
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
                acceptance: bool = False, variance_cold: bool = False,
-               variance_matrix: bool = False,
+               variance_matrix: bool = False, transfer_ab: bool = False,
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
-               teardown: str = "full", pin_transfer: int = 0) -> None:
+               teardown: str = "full", pin_transfer: int = 0,
+               quiesced_transfer: int = 0) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
@@ -3067,7 +3487,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             workspace=workspace, transport=transport, output_dir=output_dir,
             run_count=_vc_runs, gap_seconds=_vc_gap, pretouch=int(variance_pretouch),
             app_name=_vc_app, class_name=CLASS_NAME, gpu=GPU, teardown=teardown,
-            pin_transfer=int(pin_transfer),
+            pin_transfer=int(pin_transfer), quiesced_transfer=int(quiesced_transfer),
         )
         return
 
@@ -3090,6 +3510,22 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             gap_seconds=_vm_gap, app_name=_vm_app, class_name=CLASS_NAME, gpu=GPU,
             target_per_condition=_target, max_total_attempts=_max_attempts,
             slow_threshold_ms=_slow, teardown=teardown, pin_transfer=int(pin_transfer),
+        )
+        return
+
+    # ── UNET-transfer contention A/B (interleaved overlap vs quiesced) ──
+    if transfer_ab:
+        _ta_app = os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME) or VARIANCE_APP_NAME
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _ta_app
+        _ta_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _ta_target = int(os.environ.get("V2_TRANSFER_AB_TARGET_COLD", "10"))
+        _ta_max = int(os.environ.get("V2_TRANSFER_AB_MAX_ATTEMPTS_PER_CONDITION", "15"))
+        await _run_transfer_ab(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            gap_seconds=_ta_gap, app_name=_ta_app, class_name=CLASS_NAME, gpu=GPU,
+            target_per_condition=_ta_target, max_attempts_per_condition=_ta_max,
+            teardown=teardown,
         )
         return
 
@@ -3252,6 +3688,28 @@ if __name__ == "__main__":
              "uses the true DMA path: 0=disabled (default), 1=enabled. "
              "Defaults to env V2_PIN_TRANSFER.",
     )
+    _parser.add_argument(
+        "--quiesced-transfer",
+        type=int,
+        choices=(0, 1),
+        default=int(os.environ.get("V2_QUIESCED_TRANSFER", "0") or 0),
+        help="Quiesce the early UNET transfer (request-scoped "
+             "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER): the request waits for "
+             "the synchronized transfer to complete before graph/prefill "
+             "execution begins and samples per-thread CPU deltas during the "
+             "transfer. 0=overlap (A, default), 1=quiesced (B). "
+             "Defaults to env V2_QUIESCED_TRANSFER.",
+    )
+    _parser.add_argument(
+        "--transfer-ab",
+        action="store_true",
+        default=False,
+        help="Run the interleaved UNET-transfer contention A/B: A (overlap) "
+             "and B (quiesced transfer) alternating with 25s cold gaps until "
+             "each condition collects 10 valid cold runs (cap 15 attempts "
+             "per condition). Preserves every attempt and writes "
+             "transfer_ab_report.md.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -3271,10 +3729,12 @@ if __name__ == "__main__":
         acceptance=_args.acceptance,
         variance_cold=_variance_cold,
         variance_matrix=_variance_matrix,
+        transfer_ab=_args.transfer_ab,
         variance_pretouch=_variance_pretouch,
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,
         run_count=_args.run_count,
         teardown=_args.teardown,
         pin_transfer=int(_args.pin_transfer),
+        quiesced_transfer=int(_args.quiesced_transfer),
     ))

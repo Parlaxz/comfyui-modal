@@ -1799,6 +1799,23 @@ async def execute_plan(
     _remote_modal_method_entry_ns = _transport_meta.get("modal_method_entry_wall_ns")
     _remote_prompt_executor_invoke_start_ns = _transport_meta.get("prompt_executor_invoke_start_wall_ns")
 
+    # ── Fourth-tier fallback: the remote restore result's ``_restore_timing``
+    #    carries the exact cross-process wall timestamps (remote python
+    #    resume / restore method start / restore method end).  They exist in
+    #    every V2 result but were never forwarded into the local transport
+    #    metadata — without this tier the platform-entry intervals stayed
+    #    ``absent`` even though the raw timestamps existed.
+    _rt_remote = result.get("_restore_timing") if isinstance(result, dict) else None
+    if not isinstance(_rt_remote, dict):
+        _rt_remote = None
+    if _rt_remote is not None:
+        if _remote_python_resume_ns is None:
+            _remote_python_resume_ns = _rt_remote.get("remote_python_resume_wall_unix_ns")
+        if _remote_restore_method_start_ns is None:
+            _remote_restore_method_start_ns = _rt_remote.get("restore_method_start_wall_unix_ns")
+        if _remote_restore_method_end_ns is None:
+            _remote_restore_method_end_ns = _rt_remote.get("restore_method_end_wall_unix_ns")
+
     # Also try from _origin for remote timestamps that may be forwarded
     # as part of the local origin info (tolerate either location).
     if _remote_python_resume_ns is None:
@@ -1835,9 +1852,16 @@ async def execute_plan(
     # ── Fifth-tier fallback: merged trace event metadata ──
     # Inspect merged trace events for modal_method_entry / remote_method_entry
     # and prompt_executor_invoke_start by name, using their wall_unix_ns.
+    # Prefer the method-phase entry event: snapshot containers carry OLD
+    # session lifecycle events (remote_method_entry, phase=lifecycle) whose
+    # wall clock predates this request — the first match would be wrong.
     if _remote_modal_method_entry_ns is None or _remote_prompt_executor_invoke_start_ns is None:
         for _evt in merged_trace.events:
-            if _remote_modal_method_entry_ns is None and _evt.name in ("modal_method_entry", "remote_method_entry"):
+            if _remote_modal_method_entry_ns is None and _evt.name == "run_plan_method_first_line":
+                _remote_modal_method_entry_ns = _evt.wall_unix_ns
+            if _remote_modal_method_entry_ns is None and _evt.name == "remote_method_entry" and _evt.phase == "method":
+                _remote_modal_method_entry_ns = _evt.wall_unix_ns
+            if _remote_modal_method_entry_ns is None and _evt.name == "modal_method_entry":
                 _remote_modal_method_entry_ns = _evt.wall_unix_ns
             if _remote_prompt_executor_invoke_start_ns is None and _evt.name == "prompt_executor_invoke_start":
                 _remote_prompt_executor_invoke_start_ns = _evt.wall_unix_ns
