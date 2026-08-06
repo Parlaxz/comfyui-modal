@@ -65,6 +65,7 @@ from .unet_backing import (
     capture_unet_backing_evidence,
     mincore_unet_residency,
     page_path_probe_enabled,
+    rehome_after_restore_enabled,
     run_contiguous_h2d_probe,
     run_multi_storage_h2d_probe,
     run_synth_h2d_probe,
@@ -2054,6 +2055,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _model_identity_hash = ""
         _pf_h2d_before: _PageFaultSnapshot | None = None
         _h2d_metric_name: str = ""
+        # Exclusive-ownership join outcome (graph path; None when not applicable).
+        _ownership_join: dict[str, Any] | None = None
         # Activation diagnostics record (captured on outermost entry)
         _gpu_record: dict[str, Any] | None = None
         # First request-scoped UNET activation variance (diagnostic-only).
@@ -2151,6 +2154,7 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     "gpu_request_invocation_count": _gpu_request_call_count_var.get(),
                     "restore_session_id": _LATEST_RESTORE_SESSION_ID,
                     "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                    "contains_registered_unet": _gpu_record["contains_registered_unet"],
                 })
             if lane is None and request_trace is None:
                 # Installed wrapper called outside any lane/request scope
@@ -2243,6 +2247,31 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             _prepare_armed_clip_for_force_load(
                 models, request_trace or getattr(lane, "_trace", None),
             )
+        # ── Exclusive UNET ownership: graph join-or-adopt (before ANY
+        # inspection/mutation of a registered retained UNET). ──────────
+        # Graph-side ``load_models_gpu`` for a request-scoped registered
+        # UNET runs on the graph thread with NO mutation lane.  Under the
+        # exclusive-owner gate, the graph joins the scheduled activation
+        # future (or adopts) BEFORE the pretouch/page-readiness/registry
+        # diagnostics below can inspect the model and before ``original()``
+        # can patch/move/load it — so the worker and graph can never touch
+        # the same UNET concurrently.  A ready outcome turns the subsequent
+        # graph load into a cache validation; a cancelled/non-ready outcome
+        # means the graph owns (adopts) the load.
+        _ownership_join: dict[str, Any] | None = None
+        if (
+            before == 0
+            and lane is None
+            and request_trace is not None
+            and _has_registered_unet_in_models(models)
+            and exclusive_unet_owner_enabled()
+        ):
+            try:
+                _ownership_join = graph_unet_join_or_adopt(
+                    str(request_trace.request_id), trace=request_trace,
+                )
+            except Exception:
+                _ownership_join = {"decision": "error"}
         # ── Diagnostic pre-touch: first request-scoped graph UNET activation ──
         # Real-reads every page of every retained CPU UNET storage range
         # (bounded by a per-page read chunk and a page budget) immediately
@@ -2398,6 +2427,9 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         "memory_required": memory_required,
                         "force_patch_weights": force_patch_weights,
                         "force_full_load": force_full_load,
+                        "exclusive_ownership_join": (
+                            dict(_ownership_join) if _ownership_join is not None else None
+                        ),
                     })
                 # ── First request-scoped UNET activation aggregate variance ──
                 # Diagnostic-only (COMFYMODAL_V2_VARIANCE_DIAGNOSTICS).  Splits
@@ -9788,6 +9820,32 @@ _UNET_ACTIVATION_STATE: dict[str, dict[str, Any]] = {}
 _UNET_ACTIVATION_LOCK: RLock = RLock()
 _UNET_ACTIVATION_MAX = 128
 
+# ── Exclusive request-scoped UNET ownership (COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER) ──
+# Default OFF: production behavior is unchanged.  When ON, exactly one
+# authority may touch (inspect/patch/move/load) the retained UNET at a
+# time per request:
+#   * the early-activation worker publishes an ownership claim (with exact
+#     monotonic timestamps) BEFORE it touches storage or CUDA, and releases
+#     it at its terminal boundary;
+#   * the graph ``load_models_gpu`` path, before it inspects or mutates a
+#     registered UNET, joins the scheduled activation future (or adopts
+#     when none is pending) so the worker and graph can never touch the
+#     same UNET concurrently.
+# The join/adopt decision is atomic under ``_UNET_ACTIVATION_LOCK``; the
+# join wait itself runs outside the lock.  All ownership markers are
+# recorded in the request state always, and emitted/printed only when the
+# gate is on (or variance diagnostics are on).
+
+
+def exclusive_unet_owner_enabled() -> bool:
+    return os.environ.get(
+        "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Bounded graph-join wait: a stuck activation must never hang the graph.
+_GRAPH_JOIN_TIMEOUT_S = 120.0
+
 
 def _unet_activation_new_state(request_id: str) -> dict[str, Any]:
     return {
@@ -9839,6 +9897,29 @@ def _unet_activation_new_state(request_id: str) -> dict[str, Any]:
         "join_demand_mono_ns": 0,
         "join_completed_mono_ns": 0,
         "join_wait_ms": 0.0,
+        # ── Exclusive UNET ownership ledger (exact timestamps) ──────────
+        # ``ownership`` records claim/release boundaries: who owns the
+        # retained UNET, when ownership was claimed (before the worker
+        # touches storage/CUDA), and when it was released (terminal).
+        # ``graph_join`` records the graph demand side: decision (join/
+        # adopt/none), join start/completed monotonic timestamps and the
+        # outcome of the joined future.  Both are always recorded; trace
+        # events and prints are gated on the exclusive-owner flag.
+        "ownership": {
+            "claimed_mono_ns": 0,
+            "released_mono_ns": 0,
+            "by": "",
+            "status": "idle",
+        },
+        "graph_join": {
+            "decision": "",
+            "join_demand_mono_ns": 0,
+            "join_start_mono_ns": 0,
+            "join_completed_mono_ns": 0,
+            "join_wait_ms": 0.0,
+            "outcome_status": "",
+            "adopted": False,
+        },
         "lane_wait_ms": 0.0,
         "load_wall_ms": 0.0,
         "load_thread_cpu_ms": None,
@@ -9953,6 +10034,218 @@ def wait_unet_activation_quiesced(
         f"status={_state.get('status', '')} terminal={int(bool(_state.get('terminal', False)))}",
         flush=True,
     )
+    return _out
+
+
+# ── Exclusive UNET ownership: claim / release / graph join-or-adopt ─────
+# All markers are recorded in the request state ALWAYS (JSON-safe, cheap);
+# trace events + prints are emitted only when the exclusive-owner gate is
+# on or variance diagnostics are on, so default production emits nothing
+# new.
+
+_OWNERSHIP_EMIT_GATE: bool = False
+
+
+def _ownership_emit_gate() -> bool:
+    return exclusive_unet_owner_enabled() or variance_diagnostics_enabled()
+
+
+def unet_ownership_claim(state: dict[str, Any], *, by: str) -> dict[str, Any]:
+    """Publish the authoritative request-scoped UNET ownership claim.
+
+    Called by the early-activation worker BEFORE it touches storage or
+    CUDA.  Records the exact claim timestamp under the activation lock.
+    Returns the ownership ledger dict.  Never raises.
+    """
+    _now = time.monotonic_ns()
+    with _UNET_ACTIVATION_LOCK:
+        _ownership = state.setdefault("ownership", {})
+        _ownership["claimed_mono_ns"] = _now
+        _ownership["by"] = str(by)
+        _ownership["status"] = "claimed"
+    return dict(_ownership)
+
+
+def unet_ownership_release(
+    state: dict[str, Any],
+    *,
+    trace: RuntimeTrace | None = None,
+    status: str = "released",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Release the request-scoped UNET ownership at the terminal boundary.
+
+    Called by the worker terminal funnel and by request-end finalize.
+    Records the exact release timestamp; emits the ownership release
+    trace event + line only when the ownership gate is on.  Never raises.
+    """
+    _now = time.monotonic_ns()
+    with _UNET_ACTIVATION_LOCK:
+        _ownership = state.setdefault("ownership", {})
+        _was_claimed = bool(_ownership.get("claimed_mono_ns", 0))
+        _ownership["released_mono_ns"] = _now
+        _ownership["status"] = str(status)
+    if _ownership_emit_gate() and trace is not None and _was_claimed:
+        _meta = {
+            "request_id": request_id or str(state.get("request_id", "") or ""),
+            "claimed_mono_ns": _ownership.get("claimed_mono_ns", 0) or 0,
+            "released_mono_ns": _now,
+            "by": _ownership.get("by", ""),
+            "status": str(status),
+            "claimed_duration_ms": round(
+                max(0, _now - int(_ownership.get("claimed_mono_ns", 0) or 0)) / 1_000_000, 3
+            ),
+        }
+        try:
+            trace.emit("unet_ownership_release", phase="execution", metadata=_meta)
+            print(
+                f"[v2.unet_ownership] event=release "
+                f"request_id={_meta['request_id'] or 'absent'} "
+                f"by={_meta['by'] or 'absent'} status={status} "
+                f"claimed_mono_ns={_meta['claimed_mono_ns']} "
+                f"released_mono_ns={_now} "
+                f"claimed_duration_ms={_meta['claimed_duration_ms']}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    return dict(_ownership)
+
+
+def graph_unet_join_or_adopt(
+    request_id: str,
+    *,
+    trace: RuntimeTrace | None = None,
+    timeout_s: float = _GRAPH_JOIN_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Graph-demand join-or-adopt of the request-scoped UNET activation.
+
+    Runs on the graph ``load_models_gpu`` path BEFORE the graph inspects,
+    patches, moves or loads a registered retained UNET.  Atomic decision
+    under ``_UNET_ACTIVATION_LOCK``:
+
+      * a pending future exists → ``decision="join"``: the graph joins the
+        worker future (outside the lock, bounded) so the worker completes
+        its mutation before the graph proceeds.  A ready outcome means the
+        subsequent graph load is a cache validation (no second transfer);
+        any non-ready terminal outcome means the graph adopts the load.
+      * no pending future → ``decision="adopt"``: the graph owns the load
+        (normal late-mode behavior; nothing scheduled).
+      * already terminal ready → ``decision="already_ready"``: no wait.
+
+    Returns the bounded outcome dict; never raises.  When the gate is off
+    or no request id exists, returns ``{"decision": "none"}`` — the graph
+    proceeds exactly as before.
+    """
+    _out: dict[str, Any] = {
+        "decision": "none",
+        "joined": False,
+        "adopted": False,
+        "join_wait_ms": 0.0,
+        "outcome_status": "",
+        "timed_out": False,
+    }
+    if not request_id or not exclusive_unet_owner_enabled():
+        return _out
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(request_id)
+        _future = _state.get("future") if _state is not None else None
+        _already_terminal_ready = bool(
+            _state is not None
+            and _state.get("terminal", False)
+            and _state.get("status") == "ready"
+        )
+        _graph_join = _state.setdefault("graph_join", {}) if _state is not None else {}
+        if _graph_join:
+            _graph_join["join_demand_mono_ns"] = time.monotonic_ns()
+        if _state is not None and _future is not None and not _already_terminal_ready:
+            _out["decision"] = "join"
+            _graph_join["decision"] = "join"
+            _graph_join["join_start_mono_ns"] = time.monotonic_ns()
+        elif _state is not None and _already_terminal_ready:
+            _out["decision"] = "already_ready"
+            _graph_join["decision"] = "already_ready"
+            _out["adopted"] = False
+            _out["joined"] = False
+            _out["outcome_status"] = "ready"
+            if trace is not None and _ownership_emit_gate():
+                try:
+                    trace.emit("unet_graph_join", phase="execution", metadata={
+                        "request_id": request_id,
+                        "decision": "already_ready",
+                        "join_wait_ms": 0.0,
+                        "outcome_status": "ready",
+                    })
+                except Exception:
+                    pass
+            return _out
+        else:
+            _out["decision"] = "adopt"
+            _out["adopted"] = True
+            if _state is not None:
+                _graph_join["decision"] = "adopt"
+            return _out
+    if _out["decision"] != "join":
+        return _out
+    _demand_ns = time.monotonic_ns()
+    _joined_ok = False
+    _timed_out = False
+    _outcome_status = ""
+    try:
+        _result = _future.result(timeout=max(0.1, float(timeout_s)))
+        _joined_ok = True
+    except Exception:  # noqa: BLE001 - timeout/cancelled/error: graph adopts
+        _timed_out = True
+        try:
+            _res = _future.result(timeout=0.01)
+            _outcome_status = str(getattr(_res, "get", lambda: "")("status", ""))
+        except Exception:
+            _outcome_status = ""
+    _join_wait_ms = round((time.monotonic_ns() - _demand_ns) / 1_000_000, 3)
+    with _UNET_ACTIVATION_LOCK:
+        _state = _UNET_ACTIVATION_STATE.get(request_id)
+        _graph_join = _state.setdefault("graph_join", {}) if _state is not None else {}
+        _graph_join["join_completed_mono_ns"] = time.monotonic_ns()
+        _graph_join["join_wait_ms"] = _join_wait_ms
+        _state_status = _state.get("status", "") if _state is not None else ""
+        _state_terminal = bool(_state.get("terminal", False)) if _state is not None else False
+        _outcome_status = _outcome_status or _state_status
+        _joined = _joined_ok and not _timed_out
+        _adopted = (not _joined) or (not _state_terminal) or (
+            _state_status not in ("ready", "")
+        )
+        _graph_join["outcome_status"] = _outcome_status
+        _graph_join["adopted"] = bool(_adopted)
+    _out.update({
+        "joined": _joined,
+        "adopted": bool(_adopted),
+        "join_wait_ms": _join_wait_ms,
+        "outcome_status": _outcome_status,
+        "timed_out": _timed_out,
+    })
+    if trace is not None and _ownership_emit_gate():
+        try:
+            trace.emit("unet_graph_join", phase="execution", metadata={
+                "request_id": request_id,
+                "decision": "join",
+                "join_wait_ms": _join_wait_ms,
+                "joined": int(_joined),
+                "adopted": int(_adopted),
+                "outcome_status": _outcome_status,
+                "timed_out": int(_timed_out),
+                "join_start_mono_ns": _graph_join.get("join_start_mono_ns", 0),
+                "join_completed_mono_ns": _graph_join.get("join_completed_mono_ns", 0),
+            })
+            print(
+                f"[v2.unet_ownership] event=graph_join "
+                f"request_id={request_id or 'absent'} "
+                f"decision=join joined={int(_joined)} adopted={int(_adopted)} "
+                f"join_wait_ms={_join_wait_ms} outcome_status={_outcome_status or 'absent'} "
+                f"timed_out={int(_timed_out)}",
+                flush=True,
+            )
+        except Exception:
+            pass
     return _out
 
 
@@ -11059,6 +11352,10 @@ def _early_activation_terminal(
             for _k, _v in dict(diagnostics).items():
                 if not isinstance(_v, (bytes, bytearray)):
                     _diag[_k] = _v
+    # ── Exclusive ownership release at the terminal boundary ──
+    unet_ownership_release(
+        state, trace=trace, status=f"released:{status}", request_id=request_id,
+    )
     _event = _EVENT_UNET_EA_STATUS_MAP.get(state.get("status", status))
     if trace is not None and _event is not None:
         _meta = _early_activation_base_meta(state, request_id)
@@ -11354,6 +11651,30 @@ def _run_early_unet_activation(
     with _UNET_ACTIVATION_LOCK:
         state["status"] = "running"
         state["worker_started_mono_ns"] = time.monotonic_ns()
+    # ── Exclusive ownership claim: publish BEFORE touching storage or CUDA ──
+    # The worker owns the retained UNET from this point until its terminal
+    # boundary; the graph load path joins this future before it mutates the
+    # model, so the two can never inspect/patch/move/load concurrently.
+    _ownership = unet_ownership_claim(state, by="worker")
+    if _ownership_emit_gate() and trace is not None:
+        try:
+            trace.emit("unet_ownership_claim", phase="execution", metadata={
+                "mode": mode,
+                "trigger": state.get("trigger", ""),
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "by": "worker",
+                "claimed_mono_ns": _ownership.get("claimed_mono_ns", 0) or 0,
+            })
+            print(
+                f"[v2.unet_ownership] event=claim "
+                f"request_id={request_id or 'absent'} by=worker "
+                f"trigger={state.get('trigger', '')} "
+                f"claimed_mono_ns={_ownership.get('claimed_mono_ns', 0) or 0}",
+                flush=True,
+            )
+        except Exception:
+            pass
     if trace is not None:
         trace.emit(_EVENT_UNET_EA_WORKER_START, phase="execution", metadata={
             "mode": mode,
@@ -11600,6 +11921,42 @@ def _run_early_unet_activation(
                         )
             except Exception:
                 pass
+        # ── Post-restore rehoming (COMFYMODAL_V2_UNET_REHOME_AFTER_RESTORE) ──
+        # Clone every retained UNET parameter/buffer storage into fresh
+        # anonymous RAM immediately before the real H2D so the transfer
+        # reads ordinary anonymous pages instead of the Modal-restored
+        # pages.  Runs AFTER the page-path probes (which measure the
+        # restored pages) and under the exclusive ownership claim, so no
+        # other thread can touch the UNET while it is being rehomed.  The
+        # clone rebinds in place — module/parameter identity is unchanged.
+        _rehome_record: dict[str, Any] | None = None
+        if rehome_after_restore_enabled():
+            try:
+                from .unet_backing import clone_unet_to_fresh_ram_after_restore
+                _rehome_start = _capture_phase_counters()
+                _rehome_record = clone_unet_to_fresh_ram_after_restore(unet)
+                _rehome_end = _capture_phase_counters()
+                _rehome_deltas = _phase_counter_deltas(_rehome_start, _rehome_end)
+                _rehome_record["wall_ms"] = _rehome_deltas.get("wall_ms")
+                _rehome_record["process_cpu_ms"] = _rehome_deltas.get("process_cpu_ms")
+                _rehome_record["thread_cpu_ms"] = _rehome_deltas.get("thread_cpu_ms")
+                state["rehome_clone"] = _rehome_record
+                if trace is not None:
+                    trace.emit("unet_rehome_clone", phase="execution",
+                               metadata=_rehome_record)
+                print(
+                    f"[v2.unet_rehome] event=clone "
+                    f"request_id={request_id or 'absent'} "
+                    f"storages={_rehome_record.get('cloned_storages', 0)} "
+                    f"bytes={_rehome_record.get('bytes', 0)} "
+                    f"wall_ms={_rehome_record.get('wall_ms')} "
+                    f"process_cpu_ms={_rehome_record.get('process_cpu_ms')} "
+                    f"error={_rehome_record.get('error', '') or 'absent'}",
+                    flush=True,
+                )
+            except Exception as _rehome_exc:
+                _rehome_record = {"error": str(_rehome_exc)[:200]}
+                state["rehome_clone"] = _rehome_record
         if variance_diagnostics_enabled() or _pinned_transfer_enabled():
             cuda_sync_if_enabled()
             _v_load_before = (
@@ -13042,6 +13399,9 @@ def _build_unet_early_activation_reconciliation(state: dict[str, Any]) -> dict[s
         "unet_diffusion_object_id": state.get("unet_diffusion_object_id", ""),
         "sampler_patcher_object_id": state.get("sampler_patcher_object_id", ""),
         "clip_object_id": state.get("clip_object_id", ""),
+        "ownership": dict(state.get("ownership") or {}),
+        "graph_join": dict(state.get("graph_join") or {}),
+        "rehome_clone": dict(state.get("rehome_clone") or {}),
     }
 
 
@@ -13096,6 +13456,13 @@ def finalize_unet_early_activation(
             except Exception:
                 pass
     _record = _build_unet_early_activation_reconciliation(_state)
+    # ── Ownership release on the cancelled/finalized path ──
+    # The worker's terminal funnel may never have run (request finalized
+    # while queued/running); release the ownership claim here so a
+    # cancelled activation can never leave the UNET owned.
+    unet_ownership_release(
+        _state, trace=trace, status="released:cancelled", request_id=request_id,
+    )
     if trace is not None:
         trace.emit(_EVENT_UNET_EA_RECONCILIATION, phase="execution", metadata=_record)
     _emit_unet_early_activation_reconciliation_line(_record)
