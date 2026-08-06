@@ -636,7 +636,7 @@ def _detail_stages(result: Mapping[str, Any], total_ms: float | None) -> tuple[W
         ("production_registry_setup", "production registry setup", "remote_method_setup", "production_registry_setup_ms"),
         ("pregraph_setup", "pregraph setup", "remote_method_setup", "pregraph_setup_ms"),
         ("executor_reset", "executor reset", "remote_method_setup", "executor_reset_ms"),
-        ("sampler_lane_wait", "sampler lane wait", "remote_method_setup", "sampler_lane_wait_ms"),
+        ("sampler_lane_wait", "sampler lane wait", "sampler_node_to_sampling", "sampler_lane_wait_ms"),
         ("residual_before_invoke", "residual before executor invoke", "remote_method_setup", "residual_before_invoke_ms"),
         ("pre_sampler_total", "pre-sampler total", "remote_method_setup", "pre_sampler_total_ms"),
         ("measured_children", "measured pre-sampler children", "remote_method_setup", "measured_children_ms"),
@@ -648,6 +648,10 @@ def _detail_stages(result: Mapping[str, Any], total_ms: float | None) -> tuple[W
         ("lane_acquired_to_actual_stage", "lane acquired to actual stage", "sampler_node_to_sampling", "lane_acquired_to_actual_stage_ms"),
         ("output_encode", "output encode", "output_persistence", "output_encode_ms"),
         ("output_commit", "output commit", "output_persistence", "output_commit_ms"),
+        ("unet_quiesce_wait", "UNET quiesce wait (diagnostic)", "remote_method_setup", "quiesce_wait_ms"),
+        ("unet_transfer_queue_delay", "UNET transfer queue delay", "remote_method_setup", "transfer_queue_delay_ms"),
+        ("unet_synchronized_transfer", "UNET synchronized transfer", "remote_method_setup", "synchronized_transfer_ms"),
+        ("graph_prefill_activity", "graph/prefill activity", "prompt_executor_cache_setup", "graph_activity_ms"),
     )
     for key, label, parent, metadata_key in detail_specs:
         value = _first_value(result, (metadata_key,))

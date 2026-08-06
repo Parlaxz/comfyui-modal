@@ -468,6 +468,7 @@ _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("COMFYMODAL_V2_OBSERVABILITY_MODE", "COMFYMODAL_V2_OBSERVABILITY_MODE"),
     ("minimal_teardown", "COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN"),
     ("pin_unet_transfer", "COMFYMODAL_V2_PIN_UNET_TRANSFER"),
+    ("unet_quiesced_transfer", "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER"),
 )
 _REQUEST_DIAG_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUEST_DIAG_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
@@ -7403,6 +7404,15 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        # ── Remote resume / restore method boundary timestamps ──────────
+        # Captured at the TRUE first executable line of restore() so the
+        # Modal-scheduling-before-Python-resumes gap (submission → this
+        # point) and the resume→restore-start preamble are measurable
+        # cross-process against the local submission wall clock.
+        remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
+        remote_python_resume_mono_ns: int = time.monotonic_ns()
+        restore_method_start_wall_ns: int = remote_python_resume_wall_ns
+        restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_stage_started = _v2_startup_stage("post_snapshot_restore", "start")
         _callback_return = dict(_V2_STARTUP_CALLBACK_RETURN)
         _snapshot_callback_age_at_restore_ms: float | None = None
@@ -7488,11 +7498,6 @@ class ModalRuntimeEntrypoint:
                 self._full_trace_session = None
         _full_trace_started = False
         _full_trace_error: str | None = None
-        # ── Remote resume / restore method boundary timestamps ──────────
-        remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
-        remote_python_resume_mono_ns: int = time.monotonic_ns()
-        restore_method_start_wall_ns: int = remote_python_resume_wall_ns
-        restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_status: str = "unknown"
         _restore_end_wall_ns: int | None = None
         _restore_end_mono_ns: int | None = None
@@ -9303,6 +9308,19 @@ class ModalRuntimeEntrypoint:
                 else:
                     # Model identity differs — clear bridge and deactivate.
                     if _is_production_profile():
+                        print(
+                            "[v2.cpu_snapshot_request] status=mismatch "
+                            f"reason=model_or_spec_mismatch "
+                            f"request_key_hash={request_model_key.stable_hash[:16] if hasattr(request_model_key, 'stable_hash') else ''} "
+                            f"snapshot_key_hash={snapshot_key.stable_hash[:16] if hasattr(snapshot_key, 'stable_hash') else ''} "
+                            f"unet_mismatch_fields={','.join(_role_report.get('unet_mismatch_fields', [])) or 'none'} "
+                            f"clip_mismatch_fields={','.join(_role_report.get('clip_mismatch_fields', [])) or 'none'} "
+                            f"vae_mismatch_fields={','.join(_role_report.get('vae_mismatch_fields', [])) or 'none'} "
+                            f"unet_match={int(bool(_role_report.get('unet_match', False)))} "
+                            f"clip_match={int(bool(_role_report.get('clip_match', False)))} "
+                            f"vae_match={int(bool(_role_report.get('vae_match', False)))}",
+                            flush=True,
+                        )
                         raise RuntimeError(
                             "Production CPU snapshot model/spec identity mismatch; "
                             "refusing graph-loader fallback"
@@ -9319,6 +9337,12 @@ class ModalRuntimeEntrypoint:
                             "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
                             "snapshot_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
                             "request_key_hash": request_model_key.stable_hash[:16],
+                            "unet_mismatch_fields": _role_report.get("unet_mismatch_fields", []),
+                            "clip_mismatch_fields": _role_report.get("clip_mismatch_fields", []),
+                            "vae_mismatch_fields": _role_report.get("vae_mismatch_fields", []),
+                            "unet_match": bool(_role_report.get("unet_match", False)),
+                            "clip_match": bool(_role_report.get("clip_match", False)),
+                            "vae_match": bool(_role_report.get("vae_match", False)),
                             "clip_object_type": type(self._cpu_snapshot_models.clip).__name__,
                             "unet_object_type": type(self._cpu_snapshot_models.unet).__name__,
                             "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
@@ -10602,6 +10626,40 @@ class ModalRuntimeEntrypoint:
             })
             if _pregraph_error:
                 raise RuntimeError(_pregraph_error)
+            # ── Diagnostic-only quiesced UNET transfer (default off) ──
+            # COMFYMODAL_V2_UNET_QUIESCED_TRANSFER (request-scoped): wait
+            # for the early UNET activation transfer to complete BEFORE
+            # graph/prefill execution begins so the transfer runs with only
+            # the worker + backend on the CPUs (serialization A/B arm B).
+            # No-op when the flag is off or no activation was scheduled;
+            # bounded and never raises.
+            _quiesce_outcome: dict[str, Any] = {}
+            _quiesce_flag = os.environ.get(
+                "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if _quiesce_flag:
+                try:
+                    from comfymodal_runtime.model_preload import (
+                        wait_unet_activation_quiesced,
+                    )
+                    _quiesce_outcome = wait_unet_activation_quiesced(
+                        str(context.request_id), trace=trace,
+                    )
+                except Exception as _q_exc:
+                    _quiesce_outcome = {"waited": False, "reason": f"error:{type(_q_exc).__name__}"}
+                    print(
+                        f"[v2.unet_quiesced_transfer] event=wait_error "
+                        f"request_id={str(context.request_id) or 'absent'} "
+                        f"error={type(_q_exc).__name__}",
+                        flush=True,
+                    )
+            trace.emit("unet_quiesce_request", phase="execution", metadata={
+                "enabled": _quiesce_flag,
+                "waited": bool(_quiesce_outcome.get("waited", False)),
+                "wait_ms": _quiesce_outcome.get("wait_ms"),
+                "status": _quiesce_outcome.get("status", ""),
+                "reason": _quiesce_outcome.get("reason", ""),
+            })
             execute_async = getattr(executor, "execute_async", None)
             execute_kwargs = {
                 "prompt": workflow,

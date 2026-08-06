@@ -427,6 +427,12 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
         "dtype_layout_preparation_ms": _wall_ms(_sub(_act, "dtype_layout_preparation")),
         "post_load_bookkeeping_ms": _wall_ms(_sub(_act, "post_load_bookkeeping")),
         "early_activation_total_ms": _num(_act.get("early_activation_total_ms")),
+        # UNET transfer stages (diagnostic; from trace events / timing).
+        "transfer_queue_delay_ms": _num(timing.get("transfer_queue_delay_ms")),
+        "synchronized_transfer_ms": _num(timing.get("synchronized_transfer_ms")),
+        "quiesce_wait_ms": _num(timing.get("quiesce_wait_ms")),
+        "graph_activity_ms": _num(timing.get("graph_activity_ms")),
+        "sampler_lane_wait_ms": _num(timing.get("sampler_lane_wait_ms")),
     }
 
     # ── Pretouch (from the activation event's pretouch record) ──
@@ -444,6 +450,13 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
     }
 
     # ── Transfer / throughput ──
+    # Quiesced-transfer sampler record (arm B only; absent in arm A).
+    _qt = timing.get("quiesced_transfer")
+    if not isinstance(_qt, dict):
+        _qt = {}
+    _qt_threads = _qt.get("per_thread_totals", [])
+    if not isinstance(_qt_threads, list):
+        _qt_threads = []
     transfer = {
         "output_commit_ms": _num(timing.get("output_commit_ms")),
         "first_iteration_to_first_remote_event_ms": _num(
@@ -462,6 +475,47 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
         "synchronized_load_wall_ms": (_wall_ms(_sync) if _sync_valid else None),
         "synchronized_load_bytes": (_num(_sync.get("bytes")) if _sync_valid else None),
         "synchronized_load_gb_per_s": (_num(_sync.get("effective_gb_per_s")) if _sync_valid else None),
+        # Exact cross-process platform-entry reconciliation (raw timestamps).
+        "submission_to_remote_python_resume_ms": _num(
+            timing.get("submission_to_remote_python_resume_ms")
+        ),
+        "remote_python_resume_to_restore_start_ms": _num(
+            timing.get("remote_python_resume_to_restore_start_ms")
+        ),
+        "restore_to_method_entry_ms": _num(timing.get("restore_to_method_entry_ms")),
+        "method_entry_to_first_remote_event_ms": _num(
+            timing.get("method_entry_to_first_remote_event_ms")
+        ),
+        "first_remote_event_to_final_result_ms": _num(
+            timing.get("first_remote_event_to_final_result_ms")
+        ),
+        "pre_python_modal_scheduling_ms": _num(
+            timing.get("submission_to_remote_python_resume_ms")
+        ),
+        # UNET transfer stages (diagnostic).
+        "transfer_queue_delay_ms": _num(timing.get("transfer_queue_delay_ms")),
+        "synchronized_transfer_ms": _num(timing.get("synchronized_transfer_ms")),
+        "quiesce_wait_ms": _num(timing.get("quiesce_wait_ms")),
+        "graph_activity_ms": _num(timing.get("graph_activity_ms")),
+        "sampler_lane_wait_ms": _num(timing.get("sampler_lane_wait_ms")),
+        "quiesced_transfer_enabled": int(variance.get("quiesced_transfer", 0)),
+        # Per-thread CPU ownership during the synchronized transfer (arm B).
+        "quiesced_transfer_duration_ms": _num(_qt.get("transfer_duration_ms")),
+        "quiesced_transfer_bytes": _num(_qt.get("transfer_bytes")),
+        "quiesced_transfer_gb_per_s": _num(_qt.get("effective_gb_per_s")),
+        "quiesced_transfer_process_cpu_ms": _num(_qt.get("process_cpu_ms")),
+        "quiesced_transfer_thread_cpu_ms": _num(_qt.get("thread_cpu_ms")),
+        "quiesced_transfer_sample_count": _num(_qt.get("sample_count")),
+        "quiesced_transfer_native_threads": _num(_qt.get("native_thread_count")),
+        "quiesced_transfer_affinity": str(_qt.get("affinity_cpus_allowed") or UNAVAILABLE),
+        "quiesced_transfer_numa_nodes": str(_qt.get("numa_nodes") or UNAVAILABLE),
+        "quiesced_transfer_current_cpu": _num(_qt.get("current_cpu")),
+        "quiesced_thread_cpu_owners": [
+            {"tid": _num(_t.get("tid")), "comm": str(_t.get("comm") or ""),
+             "cpu_ms": _num(_t.get("cpu_ms")),
+             "samples_active": _num(_t.get("samples_active"))}
+            for _t in _qt_threads
+        ],
     }
 
     # ── Bookkeeping (local preparation + patcher) ──
@@ -493,6 +547,7 @@ def extract_run_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
         "sampling_process_cpu_ms": _num(sampler_ev.get("process_cpu_ms")),
         "activation_wait_ms": _num(sampler_ev.get("activation_wait_ms")),
         "activation_wait_source": str(sampler_ev.get("activation_wait_source") or UNAVAILABLE),
+        "sampler_lane_wait_ms": _num(timing.get("sampler_lane_wait_ms")),
     }
 
     # ── Unique storage / page / checksum / read metrics ──

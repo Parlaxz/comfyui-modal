@@ -9858,6 +9858,93 @@ def _unet_activation_get(request_id: str) -> dict[str, Any] | None:
         return _UNET_ACTIVATION_STATE.get(request_id)
 
 
+# Diagnostic-only quiesced-transfer wait (COMFYMODAL_V2_UNET_QUIESCED_TRANSFER).
+# Bounded wait budget so a stuck activation can never hang the request.
+_QUIESCE_WAIT_TIMEOUT_S = 120.0
+_QUIESCE_STATE_POLL_S = 0.005
+
+
+def wait_unet_activation_quiesced(
+    request_id: str,
+    *,
+    trace: RuntimeTrace | None = None,
+    timeout_s: float = _QUIESCE_WAIT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Diagnostic-only: block until the request's early UNET activation finishes.
+
+    Waits for the activation state to exist (the execution-prefill worker
+    schedules it through ``_unet_activation_submit``) and then joins the
+    worker future so the synchronized CPU→GPU transfer completes BEFORE
+    graph/prefill execution begins.  Returns immediately when no activation
+    state/future exists (mode=late, no exact cache hit, or already
+    finalized) — a no-op that preserves normal overlap.  Bounded by
+    *timeout_s*; on timeout the request proceeds (the sampler lane absorbs
+    the residual wait) and the outcome is recorded, never raised.
+    """
+    _out: dict[str, Any] = {
+        "waited": False,
+        "scheduled": False,
+        "terminal": False,
+        "timed_out": False,
+        "wait_ms": None,
+        "status": "",
+        "reason": "",
+    }
+    if not request_id:
+        _out["reason"] = "no_request_id"
+        return _out
+    _deadline = time.monotonic() + max(0.1, float(timeout_s))
+    _state = None
+    while time.monotonic() < _deadline:
+        _state = _unet_activation_get(request_id)
+        if _state is not None and _state.get("future") is not None:
+            break
+        time.sleep(_QUIESCE_STATE_POLL_S)
+    if _state is None or _state.get("future") is None:
+        _out["reason"] = "no_activation_state" if _state is None else "no_future"
+        return _out
+    _future = _state["future"]
+    if trace is not None:
+        trace.emit("unet_quiesce_wait_start", phase="execution", metadata={
+            "request_id": request_id,
+            "key_hash": _state.get("key_hash", ""),
+            "status": _state.get("status", ""),
+        })
+    _start_ns = time.monotonic_ns()
+    _timed_out = False
+    try:
+        _result_f = _future.result(timeout=max(0.1, float(timeout_s)))
+    except Exception:  # noqa: BLE001 - timeout or cancelled future: proceed
+        _timed_out = True
+    _wait_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+    if trace is not None:
+        trace.emit("unet_quiesce_wait_end", phase="execution", metadata={
+            "request_id": request_id,
+            "key_hash": _state.get("key_hash", ""),
+            "wait_ms": _wait_ms,
+            "timed_out": _timed_out,
+            "status": _state.get("status", ""),
+            "terminal": bool(_state.get("terminal", False)),
+        })
+    _out.update({
+        "waited": True,
+        "scheduled": True,
+        "terminal": bool(_state.get("terminal", False)),
+        "timed_out": _timed_out,
+        "wait_ms": _wait_ms,
+        "status": str(_state.get("status", "") or ""),
+        "reason": "timed_out" if _timed_out else "completed",
+    })
+    print(
+        f"[v2.unet_quiesced_transfer] event=wait "
+        f"request_id={request_id or 'absent'} "
+        f"wait_ms={_wait_ms} timed_out={int(_timed_out)} "
+        f"status={_state.get('status', '')} terminal={int(bool(_state.get('terminal', False)))}",
+        flush=True,
+    )
+    return _out
+
+
 def _unet_cache_hit_activation_pending(request_id: str) -> bool:
     if not request_id:
         return False
@@ -10188,6 +10275,20 @@ def _pinned_transfer_enabled() -> bool:
     """True when ``COMFYMODAL_V2_PIN_UNET_TRANSFER`` is enabled (default off)."""
     return os.environ.get(
         "COMFYMODAL_V2_PIN_UNET_TRANSFER", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def quiesced_transfer_enabled() -> bool:
+    """True when the request-scoped quiesced UNET transfer diagnostic is on.
+
+    ``COMFYMODAL_V2_UNET_QUIESCED_TRANSFER`` (default off).  When enabled,
+    the remote request method waits for the early UNET activation transfer
+    to complete BEFORE graph/prefill execution begins (serialization), and
+    the worker samples per-thread CPU deltas during the synchronized
+    transfer.  Diagnostic-only: never changes production behavior when off.
+    """
+    return os.environ.get(
+        "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER", ""
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -10860,6 +10961,37 @@ def _early_activation_base_meta(state: dict[str, Any], request_id: str) -> dict[
     }
 
 
+def _early_activation_identity_meta() -> dict[str, Any]:
+    """Provider / region / image / task / container / restored-instance identity.
+
+    Read from the active trace metadata when available (the remote runtime
+    stamps ``_capture_remote_identity()`` + restore ids into it); falls back
+    to the process-global latest restored-instance tokens.  Best-effort:
+    never raises, unknown fields stay ``""``.
+    """
+    _meta: dict[str, Any] = {}
+    try:
+        _act = _ACTIVE_REQUEST_TRACE.get()
+        if _act is not None:
+            _meta = dict(getattr(_act, "_metadata", {}) or {})
+    except Exception:  # noqa: BLE001
+        _meta = {}
+    return {
+        "cloud": str(_meta.get("cloud", "") or ""),
+        "region": str(_meta.get("region", "") or ""),
+        "image_id": str(_meta.get("image_id", "") or ""),
+        "container_task_id": str(_meta.get("container_task_id", "") or ""),
+        "modal_container_id": str(_meta.get("modal_container_id", "") or ""),
+        "container_session_id": str(_meta.get("container_session_id", "") or ""),
+        "restored_instance_id": str(
+            _meta.get("restored_instance_id", "") or _LATEST_RESTORED_INSTANCE_ID or ""
+        ),
+        "restore_session_id": str(
+            _meta.get("restore_session_id", "") or _LATEST_RESTORE_SESSION_ID or ""
+        ),
+    }
+
+
 def _early_activation_extra_meta(state: dict[str, Any]) -> dict[str, Any]:
     """Durations / VRAM / GPU-allocation / residency evidence shared by the
     terminal and fallback markers.  All values come from live state."""
@@ -11064,6 +11196,7 @@ def _emit_unet_worker_variance(
     patcher_nested: bool,
     dtype_layout_preparation: dict[str, Any] | None = None,
     post_load_bookkeeping: dict[str, Any] | None = None,
+    quiesced_transfer: dict[str, Any] | None = None,
 ) -> None:
     """Emit one ``unet_activation_worker_variance`` record for the activation.
 
@@ -11173,6 +11306,7 @@ def _emit_unet_worker_variance(
             "post_load_bookkeeping": post_load_bookkeeping,
             "early_activation_total_ms": _true_total_ms,
             "pinned_transfer": _pinned_transfer_enabled(),
+            "quiesced_transfer": quiesced_transfer,
         })
     except Exception:
         pass
@@ -11404,7 +11538,20 @@ def _run_early_unet_activation(
             "model_count": len(_load_models),
         })
     _pins: list = []
+    _q_sampler = None
+    _q_transfer: dict[str, Any] | None = None
     try:
+        if quiesced_transfer_enabled():
+            # Diagnostic-only B arm: sample per-thread CPU deltas every
+            # ~100 ms while the synchronized transfer is in flight so the
+            # fast-vs-slow CPU ownership can be attributed precisely.
+            try:
+                from .thread_cpu_sampler import ThreadCpuSampler
+                _q_sampler = ThreadCpuSampler(interval_s=0.1)
+                _q_sampler.start()
+            except Exception:
+                _q_sampler = None
+            _q_load_perf_start = time.perf_counter()
         if variance_diagnostics_enabled() or _pinned_transfer_enabled():
             cuda_sync_if_enabled()
             _v_load_before = (
@@ -11427,6 +11574,40 @@ def _run_early_unet_activation(
                 _unpin()
             except Exception:
                 pass
+        if _q_sampler is not None:
+            try:
+                _q_duration_ms = round(
+                    (time.perf_counter() - _q_load_perf_start) * 1000.0, 3
+                )
+                _q_bytes: int | None = None
+                if isinstance(_variance_registry_record, Mapping):
+                    try:
+                        _q_bytes = int(_variance_registry_record.get("total_bytes") or 0)
+                        if _q_bytes <= 0:
+                            _q_bytes = None
+                    except (TypeError, ValueError):
+                        _q_bytes = None
+                if _q_bytes is None:
+                    _q_alloc_before = state.get("gpu_allocated_before")
+                    _q_alloc_after = state.get("gpu_allocated_after")
+                    if (
+                        isinstance(_q_alloc_before, (int, float))
+                        and isinstance(_q_alloc_after, (int, float))
+                        and _q_alloc_after >= _q_alloc_before
+                    ):
+                        _q_bytes = int(_q_alloc_after - _q_alloc_before)
+                _q_summary = _q_sampler.stop(
+                    transfer_duration_ms=_q_duration_ms, transfer_bytes=_q_bytes,
+                )
+                _q_transfer = dict(_q_summary)
+                _q_identity = _early_activation_identity_meta()
+                _q_transfer["identity"] = _q_identity
+                state["quiesced_transfer"] = _q_transfer
+                if trace is not None:
+                    trace.emit("unet_quiesced_transfer", phase="execution",
+                               metadata=_q_transfer)
+            except Exception:
+                _q_transfer = None
     _load_end = _capture_phase_counters()
     # ── Diagnostic: post-load bookkeeping stage start (after the load) ──
     if variance_diagnostics_enabled():
@@ -11567,6 +11748,7 @@ def _run_early_unet_activation(
                     if _v_bb_before is not None and _v_bb_after is not None
                     else None
                 ),
+                quiesced_transfer=_q_transfer,
             )
         except Exception:
             pass
