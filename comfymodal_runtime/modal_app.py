@@ -2780,6 +2780,13 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_VAE_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_VAE_SNAPSHOT", "0"
         ),
+        # Single-use containers: the Modal class kwarg is resolved from this
+        # env at deploy time; propagate the raw value so the container's own
+        # env mirror is faithful (it previously defaulted to off inside the
+        # container even when the deployment was single-use).
+        "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": os.environ.get(
+            "COMFYMODAL_V2_SINGLE_USE_CONTAINERS", "0"
+        ),
         "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": os.environ.get(
             "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST",
             "1"
@@ -12619,6 +12626,82 @@ class ModalRuntimeEntrypoint:
             self, order=str(order or "original_first"), request_id=str(request_id or ""),
         )
 
+    def run_env_probe(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: echo the container's effective gate environment.
+
+        Read-only, timestamp-free, zero-CUDA.  Returns the exact values the
+        container sees for every COMFYMODAL_V2_* gate that must be proven to
+        have reached the container (``_runtime_env`` silently dropped new
+        gates in an earlier deployment, so the deploy script alone is not
+        proof).  The benchmark runner calls this once before the measured
+        runs and aborts when any expected gate value is wrong.  Never raises.
+        """
+        keys = (
+            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER",
+            "COMFYMODAL_V2_UNET_REHOME_AFTER_RESTORE",
+            "COMFYMODAL_V2_PAGE_PATH_PROBE",
+            "COMFYMODAL_V2_SYNTH_H2D_PROBE",
+            "COMFYMODAL_V2_UNET_BACKING_VERIFY",
+            "COMFYMODAL_V2_ANON_UNET_SNAPSHOT",
+            "COMFYMODAL_V2_UNET_PRETOUCH",
+            "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER",
+            "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
+            "COMFYMODAL_V2_HOST_DIAGNOSTICS",
+            "COMFYMODAL_V2_FULL_TRACE",
+            "COMFYMODAL_V2_PAGEFAULT_TRACKING",
+            "COMFYMODAL_V2_CLOUD",
+            "COMFYMODAL_V2_REGION",
+            "COMFYMODAL_V2_ENV_PROFILE",
+            "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
+            "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
+            "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE",
+            "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE",
+            "COMFYMODAL_V2_THREAD_POLICY",
+            "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER",
+            "COMFYMODAL_V2_BASELINE_CPU_REQUEST",
+            "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST",
+            "COMFYMODAL_V2_CPU_REQUEST",
+            "COMFYMODAL_V2_MEMORY_REQUEST",
+            "COMFYMODAL_V2_MEMORY_MB",
+            "COMFYMODAL_V2_SINGLE_USE_CONTAINERS",
+            "COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN",
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
+            "COMFYMODAL_V2_VAE_SNAPSHOT",
+            "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST",
+            "COMFYMODAL_V2_PREFILL_LANES",
+            "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET",
+        )
+        env = {key: os.environ.get(key, "") for key in keys}
+        env["MODAL_CLOUD_PROVIDER"] = os.environ.get("MODAL_CLOUD_PROVIDER", "")
+        env["MODAL_REGION"] = os.environ.get("MODAL_REGION", "")
+        env["MODAL_IMAGE_ID"] = os.environ.get("MODAL_IMAGE_ID", "")
+        env["COMFYMODAL_V2_APP_NAME"] = os.environ.get("COMFYMODAL_V2_APP_NAME", "")
+        result: dict[str, Any] = {
+            "status": "ok",
+            "request_id": str(request_id or ""),
+            "env": env,
+            "single_use_containers": str(
+                _resolve_single_use_containers()
+            ),
+        }
+        try:
+            spec = _MODAL_RESOURCES.get("spec") or ModalRuntimeSpec()
+            result["min_containers"] = int(getattr(spec, "min_containers", 0))
+            result["scaledown_window"] = int(getattr(spec, "scaledown_window", 4))
+            result["gpu"] = list(getattr(spec, "gpu", ()) or ())
+            result["cpu"] = int(getattr(spec, "cpu", 0))
+            result["memory_mb"] = int(getattr(spec, "memory", 0))
+            result["single_use_containers_spec"] = str(
+                bool(getattr(spec, "single_use_containers", False))
+            )
+        except Exception:
+            pass
+        return result
+
     def publish_restore_plan(
         self,
         plan_payload: Mapping[str, Any],
@@ -13852,7 +13935,8 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
-        "publish_restore_plan", "run_rehoming_experiment", "exit",
+        "publish_restore_plan", "run_rehoming_experiment",
+        "run_env_probe", "exit",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -13915,6 +13999,7 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
     setattr(cls, "run_rehoming_experiment", _modal.method()(cls.run_rehoming_experiment))
+    setattr(cls, "run_env_probe", _modal.method()(cls.run_env_probe))
     return cls
 
 

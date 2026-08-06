@@ -91,9 +91,10 @@ def test_complete_trace_has_required_non_overlapping_rows_and_reconciles():
     )
     assert [stage.key for stage in report.stages] == [
         "local_preparation", "modal_handle_submission", "modal_scheduling",
-        "application_restore", "restore_to_method_entry", "remote_method_setup",
+        "application_restore", "restore_to_method_entry", "method_entry_to_unet_claim",
+        "unet_claim_to_ready", "remote_method_setup",
         "prompt_executor_cache_setup", "first_node_to_clip", "clip_to_sampler_node",
-        "sampler_node_to_sampling", "sampling", "post_sampling_transition", "vae", "output_persistence",
+        "sampler_graph_join_wait", "sampler_node_to_sampling", "sampling", "post_sampling_transition", "vae", "output_persistence",
         "remote_return_handoff", "remote_local_return",
     ]
     assert all(not stage.overlaps for stage in report.stages)

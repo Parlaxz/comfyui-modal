@@ -45,6 +45,7 @@ class WaterfallStage:
     included_in_total: bool = True
     clock_scope: str = ""
     source_fields: tuple[str, ...] = ()
+    concurrent: bool = False
 
 
 @dataclass(frozen=True)
@@ -433,6 +434,49 @@ def _stage_candidate(result: Mapping[str, Any], key: str) -> _Candidate:
         start = restore_end
         end = remote_entry
         return _candidate(result, start, end, duration_keys=("restore_end_to_modal_method_ms",))
+    if key == "method_entry_to_unet_claim":
+        # Method entry → the request-scoped UNET ownership claim (worker
+        # publishes before touching storage/CUDA).  Both boundaries are remote
+        # so the interval is same-process monotonic.  The claim event is only
+        # emitted under the exclusive-owner gate; without it the stage is
+        # unavailable (never a phantom zero).
+        claim_event = _event_boundary(result, "unet_ownership_claim", process="remote")
+        return _candidate(result, remote_entry, claim_event, duration_keys=("method_entry_to_unet_claim_ms",))
+    if key == "unet_claim_to_ready":
+        # Worker claim → terminal ready (the load itself).  Concurrent with
+        # graph-side stages by design; reported explicitly, excluded from the
+        # accounted total (see build_waterfall concurrency handling).
+        claim_event = _event_boundary(result, "unet_ownership_claim", process="remote")
+        terminal = (
+            _event_boundary(result, "unet_early_activation_terminal", process="remote")
+            or _event_boundary(result, "unet_early_activation_terminal")
+        )
+        candidate = _candidate(
+            result, claim_event, terminal,
+            duration_keys=("unet_claim_to_ready_ms", "early_activation_total_ms", "synchronized_transfer_ms"),
+        )
+        return candidate
+    if key == "sampler_graph_join_wait":
+        # The sampler-boundary graph join: first sampler node → join
+        # completion.  The join is the worker-future wait that was previously
+        # hidden inside the residual; the authoritative join span lives on the
+        # ``unet_graph_join`` event metadata (join_start_mono_ns /
+        # join_completed_mono_ns) or its join_wait_ms.
+        join_meta = _event_metadata_value(result, "unet_graph_join", "join_start_mono_ns", last=True)
+        join_end_meta = _event_metadata_value(result, "unet_graph_join", "join_completed_mono_ns", last=True)
+        if isinstance(join_meta, (int, float)) and isinstance(join_end_meta, (int, float)):
+            start = Boundary("sampler_graph_join_wait", None, int(join_meta), "remote", "metadata")
+            end = Boundary("sampler_graph_join_wait", None, int(join_end_meta), "remote", "metadata")
+            candidate = _candidate(result, start, end)
+            if candidate.duration_ms is not None:
+                return candidate
+        join_wait = _event_metadata_value(result, "unet_graph_join", "join_wait_ms", last=True)
+        if isinstance(join_wait, (int, float)) and not isinstance(join_wait, bool):
+            return _candidate_from_duration(float(join_wait), source_fields=("unet_graph_join.join_wait_ms",))
+        # No ownership-gate join metadata: the stage is genuinely unavailable
+        # (never a phantom zero).  The lane-wait span is already attributed to
+        # ``sampler_node_to_sampling``, so reusing it here would double count.
+        return _Candidate()
     if key == "remote_method_setup":
         start = remote_entry
         end = event("prompt_executor_invoke_start", process="remote") or event("graph_execution_start", process="remote")
@@ -509,23 +553,26 @@ def _stage_candidate(result: Mapping[str, Any], key: str) -> _Candidate:
     return _Candidate()
 
 
-_STAGE_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("local_preparation", "Local preparation", "local"),
-    ("modal_handle_submission", "Modal handle and submission", "local"),
-    ("modal_scheduling", "Modal scheduling/host snapshot restoration", "platform"),
-    ("application_restore", "Application restore", "application"),
-    ("restore_to_method_entry", "Restore-to-method entry", "platform"),
-    ("remote_method_setup", "Remote method setup", "application"),
-    ("prompt_executor_cache_setup", "PromptExecutor/cache setup", "application"),
-    ("first_node_to_clip", "First node to CLIP", "application"),
-    ("clip_to_sampler_node", "CLIP to sampler node", "application"),
-    ("sampler_node_to_sampling", "Sampler node to sampling", "application"),
-    ("sampling", "Sampling", "application"),
-    ("post_sampling_transition", "Post-sampling transition", "application"),
-    ("vae", "VAE", "application"),
-    ("output_persistence", "Output persistence", "application"),
-    ("remote_return_handoff", "Remote result handoff", "local"),
-    ("remote_local_return", "Remote/local return", "local"),
+_STAGE_SPECS: tuple[tuple[str, str, str, bool], ...] = (
+    ("local_preparation", "Local preparation", "local", False),
+    ("modal_handle_submission", "Modal handle and submission", "local", False),
+    ("modal_scheduling", "Pre-Python Modal scheduling (command to Python restore start)", "platform", False),
+    ("application_restore", "Application restore", "application", False),
+    ("restore_to_method_entry", "Restore-to-method entry", "platform", False),
+    ("method_entry_to_unet_claim", "Method entry to UNET ownership claim", "application", True),
+    ("unet_claim_to_ready", "UNET claim to ready (worker load)", "application", True),
+    ("remote_method_setup", "Remote method setup", "application", False),
+    ("prompt_executor_cache_setup", "PromptExecutor/cache setup", "application", False),
+    ("first_node_to_clip", "First node to CLIP", "application", False),
+    ("clip_to_sampler_node", "CLIP to sampler node", "application", False),
+    ("sampler_graph_join_wait", "Sampler graph-join wait", "application", False),
+    ("sampler_node_to_sampling", "Sampler node to sampling", "application", False),
+    ("sampling", "Sampling", "application", False),
+    ("post_sampling_transition", "Post-sampling transition", "application", False),
+    ("vae", "VAE", "application", False),
+    ("output_persistence", "Output persistence", "application", False),
+    ("remote_return_handoff", "Remote result handoff", "local", False),
+    ("remote_local_return", "Remote/local return", "local", False),
 )
 
 
@@ -834,7 +881,7 @@ def build_waterfall(
     command_start = _command_boundary(command_start_unix_ms)
     response = _response_boundary(response_received_unix_ns)
     stages: list[WaterfallStage] = []
-    for key, label, group in _STAGE_SPECS:
+    for key, label, group, concurrent in _STAGE_SPECS:
         if key == "local_preparation" and command_start is not None:
             candidate = _candidate(
                 result_view,
@@ -875,6 +922,7 @@ def build_waterfall(
             status=status,
             clock_scope=candidate.clock_scope,
             source_fields=candidate.source_fields,
+            concurrent=concurrent,
         ))
 
     total: float | None
@@ -898,7 +946,17 @@ def build_waterfall(
                 stages[index] = WaterfallStage(**{**stage.__dict__, "status": INVALID})
 
     for index, stage in enumerate(stages):
-        overlaps = tuple(other.label for other in stages[:index] if _intervals_overlap(stage, other))
+        if stage.concurrent:
+            # Intentional concurrency: the worker claim/ready spans overlap the
+            # graph-side stages by design (the whole point of early
+            # activation).  They are reported as explicit stages but are not
+            # part of the sequential accounted total, so they can never
+            # inflate or invalidate the reconciliation.
+            continue
+        overlaps = tuple(
+            other.label for other in stages[:index]
+            if not other.concurrent and _intervals_overlap(stage, other)
+        )
         if overlaps:
             warnings.append(f"{stage.label}: overlaps {', '.join(overlaps)}")
             stages[index] = WaterfallStage(**{**stage.__dict__, "overlaps": overlaps, "status": INVALID})
@@ -906,7 +964,7 @@ def build_waterfall(
     accounted_values = [
         stage.duration_ms
         for stage in stages
-        if stage.included_in_total and stage.duration_ms is not None and stage.status != INVALID
+        if stage.included_in_total and not stage.concurrent and stage.duration_ms is not None and stage.status != INVALID
     ]
     accounted_before_residual = sum(accounted_values)
     residual = total - accounted_before_residual if total is not None and accounted_before_residual is not None else None
@@ -936,7 +994,7 @@ def build_waterfall(
     cumulative = 0.0
     completed: list[WaterfallStage] = []
     for stage in stages:
-        if stage.duration_ms is not None and stage.status != INVALID:
+        if stage.duration_ms is not None and stage.status != INVALID and not stage.concurrent:
             cumulative += stage.duration_ms
             cum_value: float | None = cumulative
         else:
@@ -948,7 +1006,7 @@ def build_waterfall(
     accounted_values = [
         stage.duration_ms
         for stage in stages
-        if stage.included_in_total and stage.duration_ms is not None and stage.status != INVALID
+        if stage.included_in_total and not stage.concurrent and stage.duration_ms is not None and stage.status != INVALID
     ]
     accounted = sum(accounted_values) if accounted_values else None
     reconciliation = total - accounted if total is not None and accounted is not None else None
@@ -1056,7 +1114,10 @@ def render_waterfall(report: WaterfallReport | Mapping[str, Any], *, terminal_co
     for stage in report.stages:
         prefix = f"{row:2d}"
         source = stage.source or "-"
-        line = f" {prefix} | {_shorten(stage.label, label_width)} | {_fmt_duration(stage.duration_ms, stage.status):>10} | {_fmt_duration(stage.cumulative_ms):>10} | {_fmt_num(stage.percentage, '%'):>7} | "
+        label_text = stage.label
+        if stage.concurrent:
+            label_text = "~ " + label_text
+        line = f" {prefix} | {_shorten(label_text, label_width)} | {_fmt_duration(stage.duration_ms, stage.status):>10} | {_fmt_duration(stage.cumulative_ms):>10} | {_fmt_num(stage.percentage, '%'):>7} | "
         if source_enabled:
             line += f"{_shorten(source, source_width)} | "
         line += _bar(stage, report.total_ms, bar_width)
@@ -1089,6 +1150,7 @@ def _report_from_value(value: WaterfallReport | Mapping[str, Any]) -> WaterfallR
     def stage_from_dict(stage: Mapping[str, Any]) -> WaterfallStage:
         data = dict(stage)
         data["source_fields"] = tuple(data.get("source_fields", ()))
+        data.setdefault("concurrent", False)
         return WaterfallStage(**data)
 
     stages = tuple(stage_from_dict(stage) for stage in value.get("stages", ()) if isinstance(stage, Mapping))
@@ -1170,6 +1232,7 @@ def waterfall_to_dict(report: WaterfallReport) -> dict[str, Any]:
             "included_in_total": stage.included_in_total,
             "clock_scope": stage.clock_scope,
             "source_fields": list(stage.source_fields),
+            "concurrent": stage.concurrent,
         }
     return {
         "run_label": report.run_label,
