@@ -17,12 +17,22 @@ Apps (all shadow-only, never production):
                                                        rehoming, all heavy
                                                        diagnostics OFF
                                                        (Experiment 3)
+  stable-modal-comfy-v2-exclusive-owner-total-wall     UNPINNED, exclusive UNET
+                                                       owner ON, rehoming OFF,
+                                                       every page-path/synth
+                                                       H2D/backing-verify/
+                                                       pretouch/quiesced/
+                                                       variance/host/full-trace
+                                                       diagnostic OFF
+                                                       (six-run total-wall
+                                                       validation)
 
 Usage:
     python deploy_and_run_ownership_rehoming.py [--deploy-only]
     python deploy_and_run_ownership_rehoming.py ownership --phase probes_on [target_cold]
     python deploy_and_run_ownership_rehoming.py rehoming [runs]
     python deploy_and_run_ownership_rehoming.py integrated [target_cold]
+    python deploy_and_run_ownership_rehoming.py total-wall [target_cold] [--deploy-only]
 """
 from __future__ import annotations
 
@@ -37,6 +47,7 @@ APP_OWNERSHIP_PROBES = "stable-modal-comfy-v2-ownership-gcp-probes-shadow"
 APP_OWNERSHIP_NOPROBES = "stable-modal-comfy-v2-ownership-gcp-noprobes-shadow"
 APP_REHOMING = "stable-modal-comfy-v2-rehoming-shadow"
 APP_INTEGRATED = "stable-modal-comfy-v2-rehome-integrated-shadow"
+APP_TOTAL_WALL = "stable-modal-comfy-v2-exclusive-owner-total-wall"
 
 ws = json.loads((ROOT / ".modal_workspaces.json").read_text(encoding="utf-8"))
 aid = ws.get("active_workspace_id")
@@ -137,6 +148,12 @@ def run_study(mode: str, args: list[str], env_extra: dict[str, str]) -> None:
 
 def main() -> None:
     args = sys.argv[1:]
+    if args and args[0] == "total-wall" and "--deploy-only" in args:
+        deploy(APP_TOTAL_WALL, cloud="", extra={
+            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+        })
+        print("=== Total-wall deploy-only requested; study skipped ===")
+        return
     if "--deploy-only" in args:
         deploy(APP_OWNERSHIP_PROBES, cloud="gcp", extra={
             "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
@@ -190,6 +207,29 @@ def main() -> None:
             "V2_OWNERSHIP_GAP_SECONDS": "25",
         }
         run_study("rehoming", ["--app", APP_REHOMING, "--runs", runs], env_extra)
+    if mode == "total-wall":
+        deploy(APP_TOTAL_WALL, cloud="", extra={
+            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+        })
+        if "--deploy-only" in args:
+            print("=== Total-wall deploy-only requested; study skipped ===")
+            return
+        env_extra = {
+            "MODAL_TOKEN_ID": str(entry["token_id"]),
+            "MODAL_TOKEN_SECRET": str(entry["token_secret"]),
+            "COMFYMODAL_V2_APP_NAME": APP_TOTAL_WALL,
+            "COMFYMODAL_V2_GPU": "rtx-pro-6000",
+            "COMFYMODAL_V2_ENV_PROFILE": "production",
+            "V2_OWNERSHIP_GAP_SECONDS": "25",
+        }
+        target = rest[0] if rest and rest[0].isdigit() else "6"
+        run_study(
+            "ownership",
+            ["--app", APP_TOTAL_WALL, "--phase", "probes_off",
+             "--target-cold", target, "--max-attempts", "9",
+             "--skip-first", "2", "--report"],
+            env_extra,
+        )
     elif mode == "integrated":
         target = rest[0] if rest else "7"
         env_extra = {
