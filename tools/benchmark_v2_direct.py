@@ -2946,6 +2946,229 @@ def _fmt_gbps(value: Any) -> str:
         return "–"
 
 
+async def _run_region_ab(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    gap_seconds: float,
+    region: str,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+    target_cold: int,
+    max_attempts: int,
+    skip_first: int = 2,
+    teardown: str = "minimal",
+    _runner: Any = None,
+) -> dict[str, Any]:
+    """Region-pinned cold transfer comparison (one pinned region per run).
+
+    Deployed with ``COMFYMODAL_V2_REGION=<region>`` so every request lands on
+    the pinned region pool.  The first *skip_first* attempts of the block are
+    EXCLUDED from the valid set unconditionally: attempt 1 is the
+    snapshot/cache-build run and attempt 2 is the run that restores the
+    freshly-built snapshot — both are "snapshot builders" (the second often
+    does not look like one).  Then collects *target_cold* valid cold runs
+    (restore_count==1 && request_count==1 && fresh identity), production
+    overlap arm (quiesced=0), variance diagnostics ON for the synchronized
+    measurement, single-use containers, minimal teardown, 25 s gaps.  Every
+    attempt is preserved as ``attempt_<seq>.json``.
+    """
+    print(
+        f"[v2.region_ab] mode=start region={region} gap={gap_seconds}s "
+        f"target={target_cold} max={max_attempts} skip_first={skip_first} "
+        f"teardown={teardown} app={app_name}",
+        flush=True,
+    )
+    records: list[dict[str, Any]] = []
+    prev_identity: dict[str, Any] | None = None
+    skipped = 0
+    valid_cold = 0
+    total_attempts = 0
+
+    while valid_cold < target_cold and total_attempts < max_attempts:
+        index = total_attempts
+        total_attempts += 1
+        _run_id = f"region-ab-{region}-{index}-{uuid.uuid4().hex[:8]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        origin = _variance_origin(
+            index, pretouch=0, app_name=app_name, teardown=teardown,
+            pin_transfer=0, quiesced_transfer=0,
+        )
+        origin["variance_mode"] = "region_ab"
+        origin["COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"] = "1"
+        origin["pinned_region"] = region
+
+        artifact: dict[str, Any] = {}
+        try:
+            if _runner is not None:
+                artifact = await _runner(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+            else:
+                artifact = await _run_one(
+                    index=index, workflow=workflow, modal_options=modal_options,
+                    workspace=workspace, transport=transport, output_dir=output_dir,
+                    _extra_origin=origin, _defer_waterfall=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            artifact = {
+                "run_index": index, "run_id": _run_id, "request_id": "",
+                "identity": {}, "result": {}, "timing": {},
+                "variance": {
+                    "quiesced_transfer": 0, "teardown_mode": teardown,
+                    "cold_valid": False, "cold": False,
+                    "failures": [f"run raised: {str(exc)[:300]}"],
+                },
+                "start_ts": _start_ts, "end_ts": datetime.now(timezone.utc).isoformat(),
+                "remote_entry_ts": "unavailable", "mode": "region_ab",
+                "error": str(exc)[:300],
+            }
+
+        identity = artifact.get("identity", {}) or {}
+        result = artifact.get("result", {}) if isinstance(artifact.get("result"), dict) else {}
+        cold_check = _validate_cold_identity(
+            identity, run_index=index, pretouch=0, prev_identity=prev_identity,
+        )
+        artifact["run_id"] = _run_id
+        artifact["attempt_file"] = f"attempt_{index:04d}.json"
+        artifact["pinned_region"] = region
+        artifact["region"] = identity.get("region", "")
+        artifact["mode"] = "region_ab"
+        artifact["start_ts"] = artifact.get("start_ts") or _start_ts
+        artifact["end_ts"] = artifact.get("end_ts") or datetime.now(timezone.utc).isoformat()
+        artifact["remote_entry_ts"] = artifact.get("remote_entry_ts") or _remote_entry_wall_iso(result)
+        artifact["excluded_snapshot_builder"] = index < skip_first
+        if not artifact.get("error"):
+            artifact["variance"] = {
+                "quiesced_transfer": 0,
+                "teardown_mode": teardown,
+                "cold_valid": cold_check["cold_valid"],
+                "cold": cold_check["cold"],
+                "failures": cold_check["failures"],
+                "freshness_checked": cold_check["freshness_checked"],
+            }
+        classification = _classify_attempt(artifact)
+        artifact["classification"] = classification
+        record = extract_run_metrics(artifact)
+        record["classification"] = classification
+        record["attempt_file"] = artifact["attempt_file"]
+        record["pinned_region"] = region
+        record["actual_region"] = identity.get("region", "")
+        record["excluded_snapshot_builder"] = index < skip_first
+        record["attempt_log"] = (
+            f"[region_ab] region={region} index={index} class={classification}"
+        )
+        (output_dir / artifact["attempt_file"]).write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(record)
+
+        if index < skip_first:
+            skipped += 1
+            status = "SKIPPED(snapshot-builder)"
+        elif cold_check["cold"] and cold_check["cold_valid"]:
+            valid_cold += 1
+            prev_identity = identity
+            status = "COLD"
+        else:
+            status = "NOT-COLD"
+        print(
+            f"[v2.region_ab] index={index} id={_run_id} region={region} "
+            f"actual={identity.get('region', '?')} status={status} "
+            f"valid={valid_cold}/{target_cold}",
+            flush=True,
+        )
+        if total_attempts < max_attempts:
+            print(f"[v2.region_ab] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    summary: dict[str, Any] = {
+        "mode": "region_ab",
+        "region": region,
+        "app_name": app_name,
+        "class_name": class_name,
+        "gpu": gpu,
+        "gap_seconds": gap_seconds,
+        "target_cold": target_cold,
+        "max_attempts": max_attempts,
+        "skip_first": skip_first,
+        "teardown_mode": teardown,
+        "total_attempts": total_attempts,
+        "skipped_snapshot_builders": skipped,
+        "valid_cold": valid_cold,
+        "records": records,
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps({k: v for k, v in summary.items() if k != "records"}, default=str, indent=2),
+        encoding="utf-8",
+    )
+    _report_md = _render_region_ab_report(summary)
+    (output_dir / "region_ab_report.md").write_text(_report_md, encoding="utf-8")
+    print(f"[v2.region_ab] report={output_dir / 'region_ab_report.md'}", flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "region": region,
+        "total_attempts": total_attempts,
+        "skipped": skipped,
+        "valid_cold": valid_cold,
+    }, default=str), flush=True)
+    print(_report_md, flush=True)
+
+    if valid_cold < target_cold:
+        raise RuntimeError(
+            f"region_ab: only {valid_cold}/{target_cold} valid cold runs in "
+            f"region {region} after {max_attempts} attempts; attempts preserved "
+            f"in {output_dir}"
+        )
+    return summary
+
+
+def _render_region_ab_report(summary: dict[str, Any]) -> str:
+    """Render the region-pinned cold comparison report (markdown)."""
+    records = summary.get("records", []) or []
+    _lines: list[str] = []
+    _lines.append("# V2 Region-Pinned Transfer Comparison\n")
+    _lines.append(
+        f"- Pinned region: `{summary.get('region', '')}` · app "
+        f"`{summary.get('app_name', '')}` · GPU `{summary.get('gpu', '')}` · "
+        f"gap `{summary.get('gap_seconds')}s` · teardown `{summary.get('teardown_mode', '')}`"
+    )
+    _lines.append(
+        f"- Protocol: first {summary.get('skip_first', 2)} attempts excluded "
+        f"(snapshot/cache build + the run after); "
+        f"{summary.get('valid_cold', 0)}/{summary.get('target_cold', 0)} valid cold "
+        f"collected in {summary.get('total_attempts', 0)} attempts; every attempt preserved.\n"
+    )
+    _lines.append("| attempt | class | actual region | cmd→resp (ms) | pre-python sched (ms) | restore (ms) | tfr queue (ms) | sync tfr (ms) | GB/s | sampler wait (ms) | sampling (ms) |")
+    _lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for r in sorted(records, key=lambda x: x.get("attempt_file", "")):
+        _metrics = r.get("metrics", {}) if isinstance(r.get("metrics"), dict) else {}
+        _t = _metrics.get("transfer", {}) if isinstance(_metrics.get("transfer"), dict) else {}
+        _p = _metrics.get("page_traversal", {}) if isinstance(_metrics.get("page_traversal"), dict) else {}
+        _rst = _metrics.get("restore", {}) if isinstance(_metrics.get("restore"), dict) else {}
+        _sp = _metrics.get("sampler", {}) if isinstance(_metrics.get("sampler"), dict) else {}
+        _tag = "SKIP" if r.get("excluded_snapshot_builder") else r.get("classification", "")
+        _lines.append(
+            f"| {r.get('attempt_file', '')} | {_tag} | {r.get('actual_region', '?')} "
+            f"| {_fmt_ms(_t.get('command_to_response_ms'))} "
+            f"| {_fmt_ms(_t.get('pre_python_modal_scheduling_ms'))} "
+            f"| {_fmt_ms(_rst.get('restore_total_ms'))} "
+            f"| {_fmt_ms(_t.get('transfer_queue_delay_ms'))} "
+            f"| {_fmt_ms(_p.get('cpu_to_gpu_transfer_wall_ms'))} "
+            f"| {_fmt_gbps(_p.get('cpu_to_gpu_transfer_gb_per_s'))} "
+            f"| {_fmt_ms(_sp.get('sampler_lane_wait_ms'))} "
+            f"| {_fmt_ms(_sp.get('sampling_ms'))} |"
+        )
+    _lines.append("")
+    return "\n".join(_lines)
+
+
 async def _run_variance_matrix(
     workflow: dict[str, Any],
     modal_options: dict[str, Any],
@@ -3445,6 +3668,7 @@ def _report_only_matrix_from_dir(output_dir: Path, attempt_files: list[Path]) ->
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False, transfer_ab: bool = False,
+               region_ab: str | None = None,
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
                teardown: str = "full", pin_transfer: int = 0,
@@ -3525,6 +3749,29 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             workspace=workspace, transport=transport, output_dir=output_dir,
             gap_seconds=_ta_gap, app_name=_ta_app, class_name=CLASS_NAME, gpu=GPU,
             target_per_condition=_ta_target, max_attempts_per_condition=_ta_max,
+            teardown=teardown,
+        )
+        return
+
+    # ── Region-pinned cold comparison (one pinned region per invocation) ──
+    if region_ab:
+        _ra_app = os.environ.get("COMFYMODAL_V2_VARIANCE_APP_NAME", VARIANCE_APP_NAME) or VARIANCE_APP_NAME
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _ra_app
+        _ra_region = str(region_ab or os.environ.get("COMFYMODAL_V2_REGION", "") or "").strip()
+        if not _ra_region:
+            raise RuntimeError(
+                "region_ab: no pinned region; pass --region-ab REGION or set "
+                "COMFYMODAL_V2_REGION (the deployment must be pinned to the same region)"
+            )
+        _ra_gap = VARIANCE_COLD_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _ra_target = int(os.environ.get("V2_REGION_AB_TARGET_COLD", "10"))
+        _ra_max = int(os.environ.get("V2_REGION_AB_MAX_ATTEMPTS", "15"))
+        await _run_region_ab(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+            gap_seconds=_ra_gap, region=_ra_region, app_name=_ra_app,
+            class_name=CLASS_NAME, gpu=GPU,
+            target_cold=_ra_target, max_attempts=_ra_max,
             teardown=teardown,
         )
         return
@@ -3710,6 +3957,17 @@ if __name__ == "__main__":
              "per condition). Preserves every attempt and writes "
              "transfer_ab_report.md.",
     )
+    _parser.add_argument(
+        "--region-ab",
+        default=None,
+        metavar="REGION",
+        help="Run the region-pinned cold transfer comparison for one pinned "
+             "region (e.g. us-east-2 or us-east4; the deployment must be "
+             "pinned to the same region via COMFYMODAL_V2_REGION). Excludes "
+             "the first 2 attempts (snapshot/cache build + the run after), "
+             "then collects 10 valid cold runs (cap 15 attempts). Writes "
+             "region_ab_report.md.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -3730,6 +3988,7 @@ if __name__ == "__main__":
         variance_cold=_variance_cold,
         variance_matrix=_variance_matrix,
         transfer_ab=_args.transfer_ab,
+        region_ab=_args.region_ab,
         variance_pretouch=_variance_pretouch,
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,

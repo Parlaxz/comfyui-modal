@@ -218,5 +218,27 @@ class WorkerVarianceRecordTest(unittest.TestCase):
         self.assertEqual(evs[0].metadata.get("quiesced_transfer"), q_record)
 
 
+class RegionPinTest(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("COMFYMODAL_V2_REGION", None)
+
+    def test_default_unpinned(self):
+        from comfymodal_runtime.modal_app import _resolve_region_pin
+        os.environ.pop("COMFYMODAL_V2_REGION", None)
+        self.assertIsNone(_resolve_region_pin())
+
+    def test_allowlisted_region(self):
+        from comfymodal_runtime.modal_app import _resolve_region_pin
+        for region in ("us-east-2", "us-east4", "ap-northeast-1"):
+            os.environ["COMFYMODAL_V2_REGION"] = region
+            self.assertEqual(_resolve_region_pin(), region)
+
+    def test_unlisted_region_raises(self):
+        from comfymodal_runtime.modal_app import _resolve_region_pin
+        os.environ["COMFYMODAL_V2_REGION"] = "mars-1"
+        with self.assertRaises(RuntimeError):
+            _resolve_region_pin()
+
+
 if __name__ == "__main__":
     unittest.main()
