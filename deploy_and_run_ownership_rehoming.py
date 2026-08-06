@@ -250,21 +250,28 @@ def main() -> None:
     elif mode == "restore":
         # Restore mode: redeploy the LONG-LIVED shadow app lineage with
         # exclusive ownership ON and every heavy diagnostic OFF.  Placement is
-        # controlled per step: gcp / aws pin first, then unpinned for the
-        # final six-run validation.  ``--no-deploy`` re-runs the study against
-        # the existing deployment (same image/snapshot lineage) without
-        # creating a new image — required for fair repeated sampling.
+        # controlled per step: gcp / aws cloud pin (optionally plus a region
+        # pin) first, then unpinned for the final six-run validation.
+        # ``--no-deploy`` re-runs the study against the existing deployment
+        # (same image/snapshot lineage) without creating a new image —
+        # required for fair repeated sampling.
         cloud = rest[0] if rest and rest[0] in ("gcp", "aws", "unpinned") else "gcp"
         if cloud in rest:
             rest.remove(cloud)
         if cloud == "unpinned":
             cloud = ""
+        region = ""
+        if rest and rest[0] == "--region":
+            rest.pop(0)
+            if rest:
+                region = rest.pop(0)
         target = rest[0] if rest and rest[0].isdigit() else "3"
         if "--no-deploy" in args:
             print(f"=== Restore no-deploy: reusing existing {APP_RESTORE} deployment ===")
         else:
             deploy(APP_RESTORE, cloud=cloud, extra={
                 "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+                **({"COMFYMODAL_V2_REGION": region} if region else {}),
             })
         if "--deploy-only" in args:
             print("=== Restore deploy-only requested; study skipped ===")
@@ -279,15 +286,17 @@ def main() -> None:
             "V2_OWNERSHIP_EXPECT_CLOUD": cloud,
             "V2_OWNERSHIP_ACCEPT_UNDER_MS": "13500",
         }
-        run_study(
-            "ownership",
-            ["--app", APP_RESTORE, "--phase", "probes_off",
-             "--target-cold", target, "--max-attempts", "8",
-             "--skip-first", "2", "--expect-cloud", cloud,
-             "--accept-under-ms", "13500", "--stop-after-bad", "2",
-             "--report"],
-            env_extra,
-        )
+        study_args = [
+            "--app", APP_RESTORE, "--phase", "probes_off",
+            "--target-cold", target, "--max-attempts", "8",
+            "--skip-first", "2", "--expect-cloud", cloud,
+            "--accept-under-ms", "13500", "--stop-after-bad", "2",
+            "--report",
+        ]
+        if region:
+            study_args += ["--expect-region", region]
+            env_extra["V2_OWNERSHIP_EXPECT_REGION"] = region
+        run_study("ownership", study_args, env_extra)
     elif mode == "integrated":
         target = rest[0] if rest else "7"
         env_extra = {
