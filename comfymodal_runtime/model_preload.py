@@ -61,6 +61,11 @@ from .unet_forward_probe import (
     set_unet_gpu_demand_start,
     _has_registered_unet_in_models,
 )
+from .unet_backing import (
+    capture_unet_backing_evidence,
+    run_synth_h2d_probe,
+    synth_h2d_probe_enabled,
+)
 from .variance_diagnostics import (
     activation_publication_ms,
     capture_metric_snapshot,
@@ -11557,6 +11562,25 @@ def _run_early_unet_activation(
             _v_load_before = (
                 capture_metric_snapshot() if variance_diagnostics_enabled() else None
             )
+        # ── Synthetic anonymous H2D probe (diagnostic only; default off) ──
+        # Immediately before the real UNET transfer: synchronously copy a
+        # touched 2 GB anonymous contiguous CPU tensor to the GPU, record
+        # duration + GB/s, free the GPU tensor, and classify the REAL UNET
+        # storage backing via /proc/self/maps.  Never raises.
+        if synth_h2d_probe_enabled():
+            try:
+                _synth_probe = run_synth_h2d_probe()
+                if isinstance(_synth_probe, dict) and _synth_probe.get("enabled"):
+                    _synth_probe["unet_backing"] = capture_unet_backing_evidence(
+                        unet, label="at_transfer",
+                    )
+                    if trace is not None:
+                        trace.emit(
+                            "synth_h2d_probe", phase="execution",
+                            metadata=_synth_probe,
+                        )
+            except Exception:
+                pass
         if _pinned_transfer_enabled():
             _pins = _pin_cpu_storages_for_transfer(unet)
         _mm_load_models_gpu(_load_models)
