@@ -2343,6 +2343,37 @@ def _resolve_single_use_containers() -> bool:
     return env_flag("COMFYMODAL_V2_SINGLE_USE_CONTAINERS")
 
 
+# ── Region pinning (diagnostic A/B only, default off) ─────────────────────
+# COMFYMODAL_V2_REGION pins the deployment to a single Modal region so cold
+# A/B comparisons can isolate region-pool behavior.  Only allowlisted region
+# strings are accepted (a typo must fail loudly, never silently deploy
+# unpinned).  AWS regions use dashes (us-east-2); GCP regions use no dashes
+# (us-east4).  Default (unset) preserves the existing multi-region behavior.
+_REGION_PIN_ALLOWLIST = frozenset({
+    "us-east-1", "us-east-2", "us-west-2", "eu-west-1", "eu-central-1",
+    "ap-northeast-1", "ap-southeast-1", "ap-southeast-2", "ca-central-1",
+    "sa-east-1", "us-east4", "us-west1", "us-central1", "us-west4",
+    "europe-west1", "europe-west4", "asia-east1", "asia-southeast1",
+})
+
+
+def _resolve_region_pin() -> str | None:
+    """Return the allowlisted pinned region, or ``None`` when unpinned.
+
+    Raises ``RuntimeError`` for a non-allowlisted value so a mistyped
+    deployment fails at deploy time instead of silently running unpinned.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_REGION", "").strip()
+    if not raw:
+        return None
+    if raw not in _REGION_PIN_ALLOWLIST:
+        raise RuntimeError(
+            f"COMFYMODAL_V2_REGION={raw!r} is not in the region-pin allowlist; "
+            "refusing to deploy unpinned"
+        )
+    return raw
+
+
 @dataclass(frozen=True)
 class ModalRuntimeSpec:
     app_name: str = APP_NAME
@@ -13531,19 +13562,31 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     _pcv = resources.get("prompt_cache_volume")
     if _pcv is not None:
         _volumes[PROMPT_CACHE_VOLUME_PATH] = _pcv
-    return resources["app"].cls(
-        gpu=_gpu_arg,
-        cpu=spec.cpu,
-        memory=spec.memory,
-        timeout=spec.timeout,
-        min_containers=spec.min_containers,
-        scaledown_window=spec.scaledown_window,
-        volumes=_volumes,
-        enable_memory_snapshot=spec.enable_memory_snapshot,
-        single_use_containers=spec.single_use_containers,
-        env=_runtime_env(spec),
-        **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
-    )(remote_class)
+    _region_pin = _resolve_region_pin()
+    _cls_kwargs: dict[str, Any] = {
+        "gpu": _gpu_arg,
+        "cpu": spec.cpu,
+        "memory": spec.memory,
+        "timeout": spec.timeout,
+        "min_containers": spec.min_containers,
+        "scaledown_window": spec.scaledown_window,
+        "volumes": _volumes,
+        "enable_memory_snapshot": spec.enable_memory_snapshot,
+        "single_use_containers": spec.single_use_containers,
+        "env": _runtime_env(spec),
+    }
+    if _region_pin is not None:
+        # Modal 1.4.3: ``region`` (str | sequence) pins the deployment to the
+        # given region(s) via SchedulerPlacement.  Diagnostic A/B only.
+        _cls_kwargs["region"] = _region_pin
+    if _enable_gpu_snapshot:
+        _cls_kwargs["experimental_options"] = {"enable_gpu_snapshot": True}
+    print(
+        f"[v2.region_pin] region={_region_pin or 'unpinned'} "
+        f"source=COMFYMODAL_V2_REGION",
+        flush=True,
+    )
+    return resources["app"].cls(**_cls_kwargs)(remote_class)
 
 
 def _publish_restore_plan_impl(

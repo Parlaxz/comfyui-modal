@@ -200,7 +200,46 @@ teardown comparisons were not revisited. No speculative fix was implemented.
   deployment had it enabled). This is a deploy-env correction, not a code
   regression.
 
-## 5. Files changed
+## 6. Region-pinned comparison (us-east-2 vs us-east4)
+
+Follow-up controlled test (10 valid cold runs per region, single-use, minimal
+teardown, production overlap arm, diagnostics ON, 25 s gaps; first 2 attempts
+per block excluded as snapshot builders). Deployments pinned via
+`COMFYMODAL_V2_REGION` (Modal 1.4.3 `region=` kwarg). Artifacts:
+`comfymodal-data/benchmarks/runs/v2_2026-08-06_05-39-25` (us-east-2) and
+`v2_2026-08-06_05-56-29` (us-east4). Every run verified on the pinned region.
+
+| Metric | us-east-2 (AWS) | us-east4 (GCP) |
+|---|---:|---:|
+| Transfer median / range | **2,165 ms** / 2,088–2,355 ms (tight, ±6 %) | **983 ms** / 925–5,785 ms (wide) |
+| GB/s median / range | 5.69 / 5.23–5.90 | 12.53 / 2.13–13.31 |
+| Bad runs (>5 s) | **0/10** | 1/10 (5,785 ms @ 2.13 GB/s) |
+| cmd→response median / avg | 24.7 s / 34.7 s (4 runs 31–94 s scheduling) | **18.0 s / 17.7 s** (tight 15.3–19.3 s) |
+| Restore median | 1.17 s | 0.83 s |
+| Sampler lane wait median | 1,828 ms | 880 ms |
+| Sampling median | 3,701 ms | 3,703 ms |
+
+Reading: the two pools differ in KIND, not just quality. The AWS us-east-2
+pool is the consistency play — zero slow transfers in 18 controlled runs
+(and tight ~2.2 s @ 5.7 GB/s every time) — but it is never fast and its
+Modal scheduling is per-session erratic (4/10 runs this session at 31–94 s).
+The GCP us-east4 pool is typically **2× faster** (0.98 s @ 12.5 GB/s, tight
+end-to-end ~18 s) but carries the slow tail: 3/19 controlled runs >5 s this
+session and last (12.8 s / 14.9 s / 5.8 s). Historically every slow draw
+cluster lives on GCP us-east4 (9/35) with occasional us-east-2 (2/15) and
+ap-northeast-1 (1/3).
+
+Conclusion: neither region is strictly better. If the goal is worst-case
+elimination, pin us-east-2; if typical latency matters more than the tail,
+us-east4 wins end-to-end. This is consistent with the host-side conclusion —
+the bimodal slow side is a property of specific host pools, and pinning
+changes the odds but cannot eliminate the mechanism.
+
+## 7. Files changed
+
+- `comfymodal_runtime/modal_app.py` — region pinning via
+  `COMFYMODAL_V2_REGION` (allowlisted; `region=` kwarg on the Modal cls;
+  default off; non-allowlisted value fails at deploy time).
 
 - `comfymodal_runtime/thread_cpu_sampler.py` — new: per-thread CPU delta
   sampler (proc stat/comm/status, affinity, NUMA, processor; bounded).
@@ -220,14 +259,52 @@ teardown comparisons were not revisited. No speculative fix was implemented.
   (submission→resume, resume→restore-start, restore→method-entry,
   method-entry→first-event, first-event→final) + transfer stages + quiesced
   record; `--quiesced-transfer`; `--transfer-ab` interleaved mode with
-  `transfer_ab_report.md`; origin keys.
+  `transfer_ab_report.md`; origin keys; `--region-ab` pinned-region mode
+  (skip-first-2 snapshot builders, collect N valid cold, `region_ab_report.md`).
 - `tools/variance_report.py` — `extract_run_metrics` surfaces the new
   platform-gap + transfer + per-thread ownership fields.
 - `canonical_execution.py` — `_restore_timing` fallback tier (raw wall fields
   already present in every result), method-phase entry-event preference.
-- `deploy_v2_transfer_ab.bat`, `run_transfer_ab.bat` — reproduction wrappers
-  (verified production config incl. `COMFYMODAL_V2_VAE_SNAPSHOT=1`).
+- `deploy_v2_transfer_ab.bat`, `run_transfer_ab.bat`,
+  `deploy_and_run_region_ab.py` — reproduction wrappers (verified production
+  config incl. `COMFYMODAL_V2_VAE_SNAPSHOT=1`; region pinning via env).
 - `tests/test_v2_quiesced_transfer.py` — new tests.
 - `V2_TRANSFER_AND_PLATFORM_GAP_REPORT.md` — this report.
 
 Final commit SHA: see commit message.
+
+## Replication note
+
+Reproduce the region-pinned comparison (one region per invocation):
+
+```
+:: Block 1 — us-east-2 (AWS)
+python deploy_and_run_region_ab.py us-east-2
+
+:: Block 2 — us-east4 (GCP)
+python deploy_and_run_region_ab.py us-east4
+```
+
+Each invocation: (1) deploys `stable-modal-comfy-v2-shadow` with the verified
+production config (CPU 16 / mem 49152 MiB, TBASE/O0, single-use containers,
+minimal teardown, VAE snapshot, exact CLIP conditioning cache, mode `late`,
+diagnostics off by default) plus `COMFYMODAL_V2_REGION=<region>` which pins
+the deployment via Modal's `region=` kwarg; (2) runs
+`tools/benchmark_v2_direct.py --region-ab <region> --teardown minimal`, which
+skips the first 2 attempts (snapshot/cache build + the run after — both
+excluded unconditionally even if the second looks clean), then collects 10
+valid cold runs (restore_count==1 && request_count==1 && fresh identity) with
+25 s gaps, cap 15 attempts. Every attempt is preserved as
+`attempt_<seq>.json` in a fresh
+`comfymodal-data/benchmarks/runs/v2_<utc-timestamp>/` dir plus
+`region_ab_report.md` and `summary.json`. The A/B transfer and quiesced modes
+use the same wrappers (`run_transfer_ab.bat` for the interleaved 10+10 A/B,
+`--quiesced-transfer 1` + `--variance-cold` for a single quiesced block).
+
+Key numbers to compare after each block (from `region_ab_report.md` or the
+attempt files): synchronized transfer wall/GB/s
+(`unet_activation_worker_variance.synchronized_load`), command→response,
+pre-Python scheduling, restore, sampler lane wait. The first block's first run
+is always a cache-miss/snapshot build; the second block reuses the warm
+conditioning-cache volume, so its first run is often an `exact_hit` — the
+skip-first-2 rule keeps both blocks comparable regardless.
