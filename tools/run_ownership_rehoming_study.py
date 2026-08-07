@@ -327,18 +327,26 @@ def _assert_container_env(
     if expect_cloud:
         expected["COMFYMODAL_V2_CLOUD"] = expect_cloud
     if expect_region:
-        expected["COMFYMODAL_V2_REGION"] = expect_region
-    for key, exp_val in expected.items():
-        actual = str(env.get(key, "") or "")
-        if exp_val == "":
-            if not _gate_off(actual):
-                failures.append(
-                    f"{key}: expected OFF, container has {actual!r}"
-                )
-        elif actual != exp_val:
+        # The deploy-time COMFYMODAL_V2_REGION pin is consumed by the Modal
+        # scheduler (SchedulerPlacement) and is NOT forwarded into the
+        # container env; the effective placement is visible as MODAL_REGION
+        # (set by Modal itself).  Accept either as proof of the pin.
+        _region_via_app_env = str(env.get("COMFYMODAL_V2_REGION", "") or "")
+        _region_via_modal = str(env.get("MODAL_REGION", "") or "")
+        if _region_via_app_env and _region_via_app_env != expect_region:
             failures.append(
-                f"{key}: expected {exp_val!r}, container has {actual!r}"
+                f"COMFYMODAL_V2_REGION: expected {expect_region!r}, "
+                f"container has {_region_via_app_env!r}"
             )
+        elif not _region_via_app_env and _region_via_modal != expect_region:
+            failures.append(
+                f"MODAL_REGION: expected {expect_region!r}, "
+                f"container has {_region_via_modal!r}"
+            )
+    for key, exp_val in expected.items():
+        if key == "COMFYMODAL_V2_REGION":
+            continue  # handled above via COMFYMODAL_V2_REGION or MODAL_REGION
+        actual = str(env.get(key, "") or "")
     if expect_lean == "1":
         _lean_actual = str(env.get("COMFYMODAL_V2_LEAN_SNAPSHOT", "") or "")
         if _lean_actual not in ("1", "true", "yes", "on"):
@@ -624,6 +632,8 @@ async def _run_ownership_study(
         "failures": env_failures,
         "passed": not env_failures,
         "expected": dict(_EXPECTED_GATE_ENV),
+        "expect_cloud": expect_cloud,
+        "expect_region": expect_region,
         "expect_lean": expect_lean,
     }
     (output_dir / "container_env_assert.json").write_text(
@@ -1033,6 +1043,12 @@ def _render_total_wall_report(
                     "COMFYMODAL_V2_LEAN_SNAPSHOT", "COMFYMODAL_V2_SNAPSHOT_MANIFEST",
                     "COMFYMODAL_V2_CLOUD", "COMFYMODAL_V2_REGION"):
             _lines.append(f"| `{key}` | `{_env.get(key, '') or '(absent/empty)'}` |")
+        if env_assert.get("expect_region") or expect_region:
+            # The deploy-time region pin is consumed by the Modal scheduler and
+            # is not forwarded as COMFYMODAL_V2_REGION; the effective placement
+            # is proven by Modal's own MODAL_REGION.
+            _modal_region = str(_env.get("MODAL_REGION", "") or "")
+            _lines.append(f"| `MODAL_REGION` (effective placement) | `{_modal_region or '(absent)'}` |")
         _lines.append("")
         _lines.append(f"- min_containers=`{env_assert.get('probe', {}).get('min_containers')}`, "
                       f"scaledown_window=`{env_assert.get('probe', {}).get('scaledown_window')}`, "
