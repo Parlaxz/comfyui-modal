@@ -115,12 +115,39 @@ from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall
 from .teardown_diagnostics import TeardownDiagnostics
-from .unet_backing import (
-    anon_snapshot_enabled,
-    backing_verify_enabled,
-    capture_unet_backing_evidence,
-    clone_unet_to_anonymous_ram,
+
+# ── Lean production snapshot gate (diagnostic A/B; default off) ──────────
+# COMFYMODAL_V2_LEAN_SNAPSHOT=1 defers the default-off UNET-backing
+# diagnostic module from the import-time surface so the memory snapshot is
+# captured WITHOUT that module's constants/mappings.  This reproduces the
+# last-known-fast import surface (pre-73ad06b) for the same-image A/B.
+# All unet_backing functions are gated behind their own env flags
+# (default off), so the stubs below are behavior-identical in production.
+_LEAN_SNAPSHOT = (
+    os.environ.get("COMFYMODAL_V2_LEAN_SNAPSHOT", "").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
+
+if _LEAN_SNAPSHOT:
+
+    def anon_snapshot_enabled() -> bool:  # type: ignore[no-redef]
+        return False
+
+    def backing_verify_enabled() -> bool:  # type: ignore[no-redef]
+        return False
+
+    def capture_unet_backing_evidence(*_a: Any, **_k: Any) -> dict[str, Any]:  # type: ignore[no-redef]
+        return {}
+
+    def clone_unet_to_anonymous_ram(*_a: Any, **_k: Any) -> dict[str, Any]:  # type: ignore[no-redef]
+        return {}
+else:
+    from .unet_backing import (
+        anon_snapshot_enabled,
+        backing_verify_enabled,
+        capture_unet_backing_evidence,
+        clone_unet_to_anonymous_ram,
+    )
 
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
@@ -2823,6 +2850,18 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "0"
+        ),
+        # Snapshot-build manifest (diagnostic only; default off).  Explicit
+        # passthrough so a shadow deployment baked with this flag reaches the
+        # container; without this it silently defaults to off and the
+        # pre-capture / first-restored-line manifests are never produced.
+        "COMFYMODAL_V2_SNAPSHOT_MANIFEST": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0"
+        ),
+        # Lean production snapshot arm (diagnostic A/B; default off).
+        # Deferred in modal_app/model_preload at import time when on.
+        "COMFYMODAL_V2_LEAN_SNAPSHOT": os.environ.get(
+            "COMFYMODAL_V2_LEAN_SNAPSHOT", "0"
         ),
         "COMFYMODAL_V2_DEEP_MODEL_DIAG": os.environ.get(
             "COMFYMODAL_V2_DEEP_MODEL_DIAG", "0"
@@ -7530,6 +7569,22 @@ class ModalRuntimeEntrypoint:
             metadata={"status": "skipped", "reason": "vae_not_part_of_cpu_snapshot", "duration_ms": 0.0},
         )
 
+        # ── Snapshot-build manifest (diagnostic only; default off) ────────
+        # Record the full process state Modal is about to serialize into the
+        # memory snapshot: RSS/mappings/modules/threads/fds/GC/retained
+        # models/executors + image identity.  Never enabled on measured
+        # latency runs; only shadow diagnostic deployments set the gate.
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_build_manifest import capture_snapshot_manifest
+                capture_snapshot_manifest(
+                    "before_capture",
+                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
+                    extra={"lifecycle": "startup", "snap": "True"},
+                )
+        except Exception:
+            pass
+
         _startup_return_wall_ns = time.time_ns()
         _startup_return_mono_ns = time.monotonic_ns()
         _V2_STARTUP_CALLBACK_RETURN.update({
@@ -7790,6 +7845,20 @@ class ModalRuntimeEntrypoint:
         remote_python_resume_mono_ns: int = time.monotonic_ns()
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        # ── Snapshot-build manifest at the FIRST restored Python line ─────
+        # (diagnostic only; default off — never enabled on measured runs).
+        # Same capture as startup's ``before_capture`` so the two manifests
+        # can be diffed to see exactly what the restore changed.
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_build_manifest import capture_snapshot_manifest
+                capture_snapshot_manifest(
+                    "first_restored_line",
+                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
+                    extra={"lifecycle": "restore", "snap": "False"},
+                )
+        except Exception:
+            pass
         _restore_stage_started = _v2_startup_stage("post_snapshot_restore", "start")
         _callback_return = dict(_V2_STARTUP_CALLBACK_RETURN)
         _snapshot_callback_age_at_restore_ms: float | None = None
@@ -12655,6 +12724,8 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_PAGEFAULT_TRACKING",
             "COMFYMODAL_V2_CLOUD",
             "COMFYMODAL_V2_REGION",
+            "COMFYMODAL_V2_SNAPSHOT_MANIFEST",
+            "COMFYMODAL_V2_LEAN_SNAPSHOT",
             "COMFYMODAL_V2_ENV_PROFILE",
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
             "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
@@ -12698,6 +12769,46 @@ class ModalRuntimeEntrypoint:
             result["single_use_containers_spec"] = str(
                 bool(getattr(spec, "single_use_containers", False))
             )
+        except Exception:
+            pass
+        return result
+
+    def run_entry_probe(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: timestamp the literal first Python line.
+
+        Returns immediately.  This isolates ``submission → Python resume``
+        (the pre-Python scheduling stage) without any graph execution or
+        model work, so an A/B can compare two snapshot compositions using
+        the exact same boundary as the historical metric.  The first
+        executable line of this method is the first Python code the
+        restored process runs for the request; the wall timestamp is
+        returned so the local runner can compute the delta against its own
+        submission wall clock.  Never raises.
+        """
+        entry_wall_ns: int = time.time_ns()
+        entry_mono_ns: int = time.monotonic_ns()
+        result: dict[str, Any] = {
+            "status": "ok",
+            "request_id": str(request_id or ""),
+            "entry_wall_unix_ns": entry_wall_ns,
+            "entry_mono_ns": entry_mono_ns,
+            "container_session_id": _V2_CONTAINER_SESSION_ID,
+            "image_id": os.environ.get("MODAL_IMAGE_ID", ""),
+            "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+            "region": os.environ.get("MODAL_REGION", ""),
+        }
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_build_manifest import capture_snapshot_manifest
+                capture_snapshot_manifest(
+                    "entry_probe",
+                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
+                    extra={"lifecycle": "entry_probe", "snap": "False"},
+                )
         except Exception:
             pass
         return result
@@ -13936,7 +14047,7 @@ def _build_decorated_v2_class() -> type:
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
-        "run_env_probe", "exit",
+        "run_env_probe", "run_entry_probe", "exit",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -14000,6 +14111,7 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
     setattr(cls, "run_rehoming_experiment", _modal.method()(cls.run_rehoming_experiment))
     setattr(cls, "run_env_probe", _modal.method()(cls.run_env_probe))
+    setattr(cls, "run_entry_probe", _modal.method()(cls.run_entry_probe))
     return cls
 
 

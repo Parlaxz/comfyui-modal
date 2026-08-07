@@ -61,18 +61,62 @@ from .unet_forward_probe import (
     set_unet_gpu_demand_start,
     _has_registered_unet_in_models,
 )
-from .unet_backing import (
-    capture_unet_backing_evidence,
-    mincore_unet_residency,
-    page_path_probe_enabled,
-    rehome_after_restore_enabled,
-    run_contiguous_h2d_probe,
-    run_multi_storage_h2d_probe,
-    run_synth_h2d_probe,
-    synth_h2d_probe_enabled,
-    traverse_unet_pages,
-    unet_storage_sizes,
+# ── Lean production snapshot gate (diagnostic A/B; default off) ──────────
+# COMFYMODAL_V2_LEAN_SNAPSHOT=1 defers the default-off UNET-backing
+# diagnostic module from the import-time surface so the memory snapshot is
+# captured WITHOUT that module's constants/mappings — reproducing the
+# last-known-fast import surface (pre-73ad06b).  Every unet_backing helper
+# is only reachable behind its own env gate (default off), so the stubs
+# below are behavior-identical in production.
+_LEAN_SNAPSHOT: bool = (
+    os.environ.get("COMFYMODAL_V2_LEAN_SNAPSHOT", "").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
+
+if _LEAN_SNAPSHOT:
+
+    def capture_unet_backing_evidence(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {}
+
+    def mincore_unet_residency(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {}
+
+    def page_path_probe_enabled() -> bool:
+        return False
+
+    def rehome_after_restore_enabled() -> bool:
+        return False
+
+    def run_contiguous_h2d_probe(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {}
+
+    def run_multi_storage_h2d_probe(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {}
+
+    def run_synth_h2d_probe(*, bytes_: int = 2 * 1024 * 1024 * 1024, sample_count: int | None = None) -> dict[str, Any] | None:
+        return None
+
+    def synth_h2d_probe_enabled() -> bool:
+        return False
+
+    def traverse_unet_pages(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {}
+
+    def unet_storage_sizes(unet: Any) -> list[int]:
+        return []
+else:
+    from .unet_backing import (
+        capture_unet_backing_evidence,
+        mincore_unet_residency,
+        page_path_probe_enabled,
+        rehome_after_restore_enabled,
+        run_contiguous_h2d_probe,
+        run_multi_storage_h2d_probe,
+        run_synth_h2d_probe,
+        synth_h2d_probe_enabled,
+        traverse_unet_pages,
+        unet_storage_sizes,
+    )
 from .variance_diagnostics import (
     activation_publication_ms,
     capture_metric_snapshot,

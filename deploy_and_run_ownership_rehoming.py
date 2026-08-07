@@ -26,16 +26,31 @@ Apps (all shadow-only, never production):
                                                         diagnostic OFF
                                                         (six-run total-wall
                                                         validation)
-   stable-modal-comfy-v2-shadow (restore mode)          THE LONG-LIVED shadow
-                                                        app lineage from the
-                                                        historical fast runs,
-                                                        redeployed with
-                                                        exclusive UNET owner ON
-                                                        and all diagnostics OFF.
-                                                        Restores the fast path
-                                                        (platform entry ~0.2-0.4 s
-                                                        vs 4.4-38.3 s on the new
-                                                        six-run app lineage).
+    stable-modal-comfy-v2-shadow (restore mode)          THE LONG-LIVED shadow
+                                                         app lineage from the
+                                                         historical fast runs,
+                                                         redeployed with
+                                                         exclusive UNET owner ON
+                                                         and all diagnostics OFF.
+                                                         Restores the fast path
+                                                         (platform entry ~0.2-0.4 s
+                                                         vs 4.4-38.3 s on the new
+                                                         six-run app lineage).
+    stable-modal-comfy-v2-shadow (lean mode)             The same long-lived
+                                                         shadow lineage with
+                                                         lean snapshot ON
+                                                         (COMFYMODAL_V2_LEAN_SNAPSHOT=1,
+                                                         UNET-backing diagnostic
+                                                         deferred from import
+                                                         time), exclusive UNET
+                                                         owner ON, all heavy
+                                                         diagnostics OFF.  This
+                                                         is the direct lean
+                                                         production candidate
+                                                         validated by
+                                                         V2_LEAN_SNAPSHOT_DIRECT_
+                                                         VALIDATION_REPORT.md.
+
 
 Usage:
     python deploy_and_run_ownership_rehoming.py [--deploy-only]
@@ -44,6 +59,8 @@ Usage:
     python deploy_and_run_ownership_rehoming.py integrated [target_cold]
     python deploy_and_run_ownership_rehoming.py total-wall [target_cold] [--deploy-only]
     python deploy_and_run_ownership_rehoming.py restore [gcp|aws|unpinned] [target_cold] [--deploy-only]
+    python deploy_and_run_ownership_rehoming.py lean [gcp|aws|unpinned] [--region us-east4] [--deploy-only] [--no-deploy]
+    python deploy_and_run_ownership_rehoming.py snapshot-ab [current|lean] [--region us-east4] [--no-deploy] [--deploy-only] [--manifest]
 """
 from __future__ import annotations
 
@@ -297,6 +314,111 @@ def main() -> None:
             study_args += ["--expect-region", region]
             env_extra["V2_OWNERSHIP_EXPECT_REGION"] = region
         run_study("ownership", study_args, env_extra)
+    elif mode == "lean":
+        # Lean production snapshot candidate: the long-lived shadow lineage
+        # redeployed with the lean import gate ON (UNET-backing diagnostic
+        # deferred from the import-time surface) + exclusive UNET owner ON
+        # and every heavy diagnostic OFF.  One clean deployment; the study
+        # then collects 6 valid cold single-use generations with 25 s gaps.
+        # ``--no-deploy`` re-samples the same deployment (no new image).
+        cloud = rest[0] if rest and rest[0] in ("gcp", "aws", "unpinned") else "gcp"
+        if cloud in rest:
+            rest.remove(cloud)
+        if cloud == "unpinned":
+            cloud = ""
+        region = ""
+        if rest and rest[0] == "--region":
+            rest.pop(0)
+            if rest:
+                region = rest.pop(0)
+        if "--no-deploy" in args:
+            print(f"=== Lean no-deploy: reusing existing {APP_RESTORE} deployment ===")
+        else:
+            deploy(APP_RESTORE, cloud=cloud, extra={
+                "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+                "COMFYMODAL_V2_LEAN_SNAPSHOT": "1",
+                **({"COMFYMODAL_V2_REGION": region} if region else {}),
+            })
+        if "--deploy-only" in args:
+            print("=== Lean deploy-only requested; study skipped ===")
+            return
+        env_extra = {
+            "MODAL_TOKEN_ID": str(entry["token_id"]),
+            "MODAL_TOKEN_SECRET": str(entry["token_secret"]),
+            "COMFYMODAL_V2_APP_NAME": APP_RESTORE,
+            "COMFYMODAL_V2_GPU": "rtx-pro-6000",
+            "COMFYMODAL_V2_ENV_PROFILE": "production",
+            "V2_OWNERSHIP_GAP_SECONDS": "25",
+            "V2_OWNERSHIP_EXPECT_CLOUD": cloud,
+            "V2_OWNERSHIP_EXPECT_LEAN": "1",
+            "V2_OWNERSHIP_ACCEPT_UNDER_MS": "13500",
+        }
+        study_args = [
+            "--app", APP_RESTORE, "--phase", "probes_off",
+            "--target-cold", "6", "--max-attempts", "10",
+            "--skip-first", "2", "--expect-cloud", cloud,
+            "--expect-lean", "1", "--accept-under-ms", "13500",
+            "--stop-after-bad", "0",
+            "--report", "--report-name", "V2_LEAN_SNAPSHOT_DIRECT_VALIDATION_REPORT.md",
+        ]
+        if region:
+            study_args += ["--expect-region", region]
+            env_extra["V2_OWNERSHIP_EXPECT_REGION"] = region
+        run_study("ownership", study_args, env_extra)
+    elif mode == "snapshot-ab":
+        # Same-image snapshot-composition A/B: one deployment per arm, SAME
+        # modal.Image + code revision, resources, region and test window.
+        # Arm "current" = production snapshot composition (lean off).
+        # Arm "lean"    = production snapshot with the default-off UNET
+        #                 backing diagnostic deferred from import time
+        #                 (COMFYMODAL_V2_LEAN_SNAPSHOT=1), reproducing the
+        #                 last-known-fast import surface.
+        # Entry probes measure submission → first Python line only.
+        # ``--manifest`` bakes the snapshot-build manifest ON (composition
+        # evidence runs only; NEVER on measured latency runs).
+        arm = rest[0] if rest and rest[0] in ("current", "lean") else "current"
+        if arm in rest:
+            rest.remove(arm)
+        region = ""
+        if rest and rest[0] == "--region":
+            rest.pop(0)
+            if rest:
+                region = rest.pop(0)
+        manifest = "--manifest" in args
+        no_deploy = "--no-deploy" in args
+        cloud = "gcp"  # same region-pinned pool for causal isolation
+        app = APP_RESTORE if arm == "current" else f"{APP_RESTORE}-lean"
+        extra: dict[str, str] = {
+            "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
+            "COMFYMODAL_V2_LEAN_SNAPSHOT": "1" if arm == "lean" else "0",
+            "COMFYMODAL_V2_SNAPSHOT_MANIFEST": "1" if manifest else "0",
+        }
+        if region:
+            extra["COMFYMODAL_V2_REGION"] = region
+        if no_deploy:
+            print(f"=== snapshot-ab no-deploy: reusing {app} deployment ===")
+        else:
+            deploy(app, cloud=cloud, extra=extra)
+        if "--deploy-only" in args:
+            print("=== snapshot-ab deploy-only requested; study skipped ===")
+            return
+        env_extra = {
+            "MODAL_TOKEN_ID": str(entry["token_id"]),
+            "MODAL_TOKEN_SECRET": str(entry["token_secret"]),
+            "COMFYMODAL_V2_APP_NAME": app,
+            "COMFYMODAL_V2_GPU": "rtx-pro-6000",
+            "COMFYMODAL_V2_ENV_PROFILE": "production",
+            "V2_OWNERSHIP_GAP_SECONDS": "25",
+        }
+        study_args = [
+            "--app", app, "--arm", arm, "--runs", "3", "--max-attempts", "6",
+            "--skip-first", "2", "--expect-cloud", cloud,
+            "--expect-lean", "1" if arm == "lean" else "0",
+            "--expect-manifest", "1" if manifest else "0",
+        ]
+        if region:
+            study_args += ["--expect-region", region]
+        run_study("snapshot-ab", study_args, env_extra)
     elif mode == "integrated":
         target = rest[0] if rest else "7"
         env_extra = {
