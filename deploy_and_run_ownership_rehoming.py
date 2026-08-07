@@ -59,7 +59,7 @@ Usage:
     python deploy_and_run_ownership_rehoming.py integrated [target_cold]
     python deploy_and_run_ownership_rehoming.py total-wall [target_cold] [--deploy-only]
     python deploy_and_run_ownership_rehoming.py restore [gcp|aws|unpinned] [target_cold] [--deploy-only]
-    python deploy_and_run_ownership_rehoming.py lean [gcp|aws|unpinned] [--region us-east4] [--deploy-only] [--no-deploy]
+    python deploy_and_run_ownership_rehoming.py lean [gcp|aws|unpinned] [--deploy-only] [--no-deploy]
     python deploy_and_run_ownership_rehoming.py snapshot-ab [current|lean] [--region us-east4] [--no-deploy] [--deploy-only] [--manifest]
 """
 from __future__ import annotations
@@ -320,24 +320,20 @@ def main() -> None:
         # deferred from the import-time surface) + exclusive UNET owner ON
         # and every heavy diagnostic OFF.  One clean deployment; the study
         # then collects 6 valid cold single-use generations with 25 s gaps.
+        # Region pins are NOT allowed for this candidate — placement is
+        # left to Modal (cloud may be pinned to gcp/aws or left unpinned).
         # ``--no-deploy`` re-samples the same deployment (no new image).
         cloud = rest[0] if rest and rest[0] in ("gcp", "aws", "unpinned") else "gcp"
         if cloud in rest:
             rest.remove(cloud)
         if cloud == "unpinned":
             cloud = ""
-        region = ""
-        if rest and rest[0] == "--region":
-            rest.pop(0)
-            if rest:
-                region = rest.pop(0)
         if "--no-deploy" in args:
             print(f"=== Lean no-deploy: reusing existing {APP_RESTORE} deployment ===")
         else:
             deploy(APP_RESTORE, cloud=cloud, extra={
                 "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
                 "COMFYMODAL_V2_LEAN_SNAPSHOT": "1",
-                **({"COMFYMODAL_V2_REGION": region} if region else {}),
             })
         if "--deploy-only" in args:
             print("=== Lean deploy-only requested; study skipped ===")
@@ -361,9 +357,6 @@ def main() -> None:
             "--stop-after-bad", "0",
             "--report", "--report-name", "V2_LEAN_SNAPSHOT_DIRECT_VALIDATION_REPORT.md",
         ]
-        if region:
-            study_args += ["--expect-region", region]
-            env_extra["V2_OWNERSHIP_EXPECT_REGION"] = region
         run_study("ownership", study_args, env_extra)
     elif mode == "snapshot-ab":
         # Same-image snapshot-composition A/B: one deployment per arm, SAME
