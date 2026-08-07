@@ -305,6 +305,7 @@ def _assert_container_env(
     gpu: str,
     expect_cloud: str = "",
     expect_region: str = "",
+    expect_lean: str = "",
 ) -> list[str]:
     """Assert the container env probe matches the study configuration.
 
@@ -314,6 +315,9 @@ def _assert_container_env(
     ``expect_cloud`` / ``expect_region`` allow controlled restore-mode
     phases to pin the deployment (COMFYMODAL_V2_CLOUD=gcp etc.) without
     failing the assertion; the default (empty) keeps the study unpinned.
+    ``expect_lean`` ("1"/"0") asserts COMFYMODAL_V2_LEAN_SNAPSHOT reached
+    the container — the lean production candidate must prove it, not
+    assume it.
     """
     failures: list[str] = []
     env = probe.get("env") or {}
@@ -334,6 +338,20 @@ def _assert_container_env(
         elif actual != exp_val:
             failures.append(
                 f"{key}: expected {exp_val!r}, container has {actual!r}"
+            )
+    if expect_lean == "1":
+        _lean_actual = str(env.get("COMFYMODAL_V2_LEAN_SNAPSHOT", "") or "")
+        if _lean_actual not in ("1", "true", "yes", "on"):
+            failures.append(
+                "COMFYMODAL_V2_LEAN_SNAPSHOT: expected ON, "
+                f"container has {_lean_actual!r}"
+            )
+    elif expect_lean == "0":
+        _lean_actual = str(env.get("COMFYMODAL_V2_LEAN_SNAPSHOT", "") or "")
+        if not _gate_off(_lean_actual):
+            failures.append(
+                "COMFYMODAL_V2_LEAN_SNAPSHOT: expected OFF, "
+                f"container has {_lean_actual!r}"
             )
     remote_app = str(env.get("COMFYMODAL_V2_APP_NAME", "") or "")
     if remote_app and remote_app != app_name:
@@ -552,6 +570,7 @@ async def _run_ownership_study(
     skip_first: int,
     expect_cloud: str = "",
     expect_region: str = "",
+    expect_lean: str = "",
     accept_under_ms: float = 13000.0,
     stop_after_bad: int = 0,
 ) -> dict[str, Any]:
@@ -590,6 +609,7 @@ async def _run_ownership_study(
                 env_failures = _assert_container_env(
                     probe, app_name=app_name, gpu=GPU,
                     expect_cloud=expect_cloud, expect_region=expect_region,
+                    expect_lean=expect_lean,
                 )
             else:
                 env_failures.append(
@@ -604,6 +624,7 @@ async def _run_ownership_study(
         "failures": env_failures,
         "passed": not env_failures,
         "expected": dict(_EXPECTED_GATE_ENV),
+        "expect_lean": expect_lean,
     }
     (output_dir / "container_env_assert.json").write_text(
         json.dumps(env_assert_record, default=str, indent=2), encoding="utf-8",
@@ -874,6 +895,7 @@ async def _run_ownership_study(
         "stop_after_bad": stop_after_bad,
         "expect_cloud": expect_cloud,
         "expect_region": expect_region,
+        "expect_lean": expect_lean,
         "records": records,
     }
     (output_dir / "summary.json").write_text(
@@ -949,19 +971,32 @@ def _render_total_wall_report(
     accept_ms = float(summary.get("accept_under_ms", 13000.0) or 13000.0)
     expect_cloud = str(summary.get("expect_cloud", "") or "")
     expect_region = str(summary.get("expect_region", "") or "")
+    expect_lean = str(summary.get("expect_lean", "") or "")
     _placement = (
         f"cloud={expect_cloud or 'unpinned'}"
         + (f", region={expect_region}" if expect_region else ", region unpinned")
     )
     _lines: list[str] = []
-    _lines.append("# V2 Exclusive-Owner Total-Wall Validation — Six-Run Report")
-    _lines.append("")
-    _lines.append("> Shadow deployment only. Best-case production candidate: "
-                  "`COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER=1`, rehoming OFF, all "
-                  "page-path/synthetic-H2D/backing-verify/pretouch/quiesced/"
-                  "variance/host/full-trace diagnostics OFF, "
-                  f"{_placement}, "
-                  "single-use containers, minimal teardown.")
+    if expect_lean == "1":
+        _lines.append("# V2 Lean-Snapshot Direct Validation — Six-Run Report")
+        _lines.append("")
+        _lines.append("> Shadow deployment only. Lean production candidate: "
+                      "`COMFYMODAL_V2_LEAN_SNAPSHOT=1` (UNET-backing diagnostic "
+                      "deferred from the import-time surface), "
+                      "`COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER=1`, rehoming OFF, all "
+                      "page-path/synthetic-H2D/backing-verify/pretouch/quiesced/"
+                      "variance/host/manifest/full-trace diagnostics OFF, "
+                      f"{_placement}, "
+                      "single-use containers, minimal teardown.")
+    else:
+        _lines.append("# V2 Exclusive-Owner Total-Wall Validation — Six-Run Report")
+        _lines.append("")
+        _lines.append("> Shadow deployment only. Best-case production candidate: "
+                      "`COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER=1`, rehoming OFF, all "
+                      "page-path/synthetic-H2D/backing-verify/pretouch/quiesced/"
+                      "variance/host/full-trace diagnostics OFF, "
+                      f"{_placement}, "
+                      "single-use containers, minimal teardown.")
     _lines.append("")
     _lines.append("## Protocol")
     _lines.append("")
@@ -995,6 +1030,7 @@ def _render_total_wall_report(
                     "COMFYMODAL_V2_UNET_BACKING_VERIFY", "COMFYMODAL_V2_UNET_PRETOUCH",
                     "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER", "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
                     "COMFYMODAL_V2_HOST_DIAGNOSTICS", "COMFYMODAL_V2_FULL_TRACE",
+                    "COMFYMODAL_V2_LEAN_SNAPSHOT", "COMFYMODAL_V2_SNAPSHOT_MANIFEST",
                     "COMFYMODAL_V2_CLOUD", "COMFYMODAL_V2_REGION"):
             _lines.append(f"| `{key}` | `{_env.get(key, '') or '(absent/empty)'}` |")
         _lines.append("")
@@ -1186,7 +1222,12 @@ def _git_sha() -> str:
         return "unknown"
 
 
-def _write_total_wall_report(summary: dict[str, Any], *, output_dir: Path) -> Path:
+def _write_total_wall_report(
+    summary: dict[str, Any],
+    *,
+    output_dir: Path,
+    report_name: str = "V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md",
+) -> Path:
     try:
         import subprocess
         out = subprocess.run(
@@ -1201,7 +1242,7 @@ def _write_total_wall_report(summary: dict[str, Any], *, output_dir: Path) -> Pa
         commit_sha=_git_sha(),
         files_changed=changed,
     )
-    report_path = ROOT / "V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md"
+    report_path = ROOT / report_name
     report_path.write_text(report_md, encoding="utf-8")
     print(f"[v2.total_wall] report={report_path}", flush=True)
     return report_path
@@ -1271,6 +1312,7 @@ def _rebuild_summary_from_attempts(output_dir: Path) -> dict[str, Any]:
         "accept_under_ms": float(os.environ.get("V2_OWNERSHIP_ACCEPT_UNDER_MS", "13000") or 13000),
         "expect_cloud": os.environ.get("V2_OWNERSHIP_EXPECT_CLOUD", ""),
         "expect_region": os.environ.get("V2_OWNERSHIP_EXPECT_REGION", ""),
+        "expect_lean": os.environ.get("V2_OWNERSHIP_EXPECT_LEAN", ""),
         "aborted": False,
         "records": records,
     }
@@ -1435,6 +1477,194 @@ async def _run_rehoming_study(
 # ── integrated mode ───────────────────────────────────────────────────────
 
 
+async def _run_snapshot_ab_study(
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    app_name: str,
+    arm: str,
+    runs: int,
+    max_attempts: int,
+    skip_first: int,
+    expect_cloud: str = "",
+    expect_region: str = "",
+    expect_lean: str = "",
+    expect_manifest: str = "",
+) -> dict[str, Any]:
+    """Same-image snapshot-composition A/B: entry-probe timing per arm.
+
+    Calls the immediate-return ``run_entry_probe`` method N times and
+    measures ``submission → first Python line`` (the same wall-clock
+    boundary as the historical pre-Python metric) with no graph execution.
+    The snapshot builder and the immediately following request are
+    excluded, mirroring the restore-study protocol.
+    """
+    os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
+    handle = await asyncio.to_thread(
+        transport._v2_handle, workspace=workspace, gpu=GPU,
+    )
+    # ── Container env assertion (same machinery as the ownership study) ──
+    env_probe: dict[str, Any] = {}
+    env_failures: list[str] = []
+    try:
+        fn = getattr(handle, "run_env_probe", None)
+        if fn is None:
+            env_failures.append("deployed container has no run_env_probe method")
+        else:
+            remote = getattr(fn, "remote", None)
+            if remote is not None and callable(getattr(remote, "aio", None)):
+                probe = remote.aio(request_id="v2-env-probe")
+                if asyncio.iscoroutine(probe):
+                    probe = await probe
+            elif asyncio.iscoroutinefunction(fn):
+                probe = await fn(request_id="v2-env-probe")
+            else:
+                probe = await asyncio.to_thread(fn, request_id="v2-env-probe")
+            if asyncio.iscoroutine(probe):
+                probe = await probe
+            if isinstance(probe, dict):
+                env_probe = probe
+                env_failures = _assert_container_env(
+                    probe, app_name=app_name, gpu=GPU,
+                    expect_cloud=expect_cloud, expect_region=expect_region,
+                )
+            else:
+                env_failures.append(
+                    f"run_env_probe returned non-dict: {type(probe).__name__}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        env_failures.append(
+            f"run_env_probe call failed: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+    # Arm-specific gates: lean snapshot composition + manifest capture must
+    # match the arm that was deployed.
+    env = env_probe.get("env") or {}
+    for key, expected in (
+        ("COMFYMODAL_V2_LEAN_SNAPSHOT", expect_lean),
+        ("COMFYMODAL_V2_SNAPSHOT_MANIFEST", expect_manifest),
+    ):
+        actual = str(env.get(key, "") or "")
+        if expected == "0" and actual not in ("", "0", "false", "no", "off"):
+            env_failures.append(f"{key}: expected OFF, container has {actual!r}")
+        elif expected == "1" and actual not in ("1", "true", "yes", "on"):
+            env_failures.append(f"{key}: expected ON, container has {actual!r}")
+    if env_failures:
+        print(
+            f"[v2.snapshot_ab] arm={arm} CONTAINER ENV ASSERTION FAILED:", flush=True,
+        )
+        for _f in env_failures:
+            print(f"  - {_f}", flush=True)
+        raise RuntimeError(
+            f"snapshot-ab: arm {arm} container env assertion failed "
+            "(see container_env_assert.json)"
+        )
+    print(
+        f"[v2.snapshot_ab] arm={arm} env assertion PASSED "
+        f"lean={expect_lean or '0'} manifest={expect_manifest or '0'} "
+        f"cloud={expect_cloud or 'unpinned'} region={expect_region or 'unpinned'}",
+        flush=True,
+    )
+    (output_dir / f"container_env_assert_{arm}.json").write_text(
+        json.dumps({"probe": env_probe, "failures": env_failures, "arm": arm},
+                   default=str, indent=2), encoding="utf-8",
+    )
+
+    records: list[dict[str, Any]] = []
+    valid = 0
+    for index in range(max_attempts):
+        _run_id = f"snapshot_ab_{arm}_{index}-{uuid.uuid4().hex[:8]}"
+        _req_id = f"v2-snapab-{arm}-{index}-{uuid.uuid4().hex[:12]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        _t0_wall = time.time_ns()
+        _t0_perf = time.perf_counter()
+        artifact: dict[str, Any] = {
+            "run_index": index, "run_id": _run_id, "request_id": _req_id,
+            "arm": arm, "start_ts": _start_ts, "mode": "snapshot_ab",
+        }
+        try:
+            fn = handle.run_entry_probe
+            remote = getattr(fn, "remote", None)
+            if remote is not None and callable(getattr(remote, "aio", None)):
+                result = remote.aio(request_id=_req_id)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            elif asyncio.iscoroutinefunction(fn):
+                result = await fn(request_id=_req_id)
+            else:
+                result = await asyncio.to_thread(fn, request_id=_req_id)
+            if asyncio.iscoroutine(result):
+                result = await result
+            artifact["result"] = result if isinstance(result, dict) else {"raw": str(result)[:300]}
+        except Exception as exc:  # noqa: BLE001
+            artifact["error"] = f"remote call failed: {type(exc).__name__}: {str(exc)[:300]}"
+            artifact["result"] = {}
+        _res = artifact.get("result") or {}
+        _entry_wall = _res.get("entry_wall_unix_ns")
+        if isinstance(_entry_wall, (int, float)) and _entry_wall:
+            artifact["submission_to_entry_wall_ms"] = round(
+                max(0, int(_entry_wall) - _t0_wall) / 1_000_000.0, 3
+            )
+        else:
+            artifact["submission_to_entry_wall_ms"] = None
+        artifact["round_trip_wall_ms"] = round((time.perf_counter() - _t0_perf) * 1000.0, 1)
+        artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
+        artifact["excluded_snapshot_builder"] = index == 0
+        artifact["excluded_after_builder"] = index == 1
+        artifact["image_id"] = _res.get("image_id", "")
+        artifact["cloud"] = _res.get("cloud", "")
+        artifact["region"] = _res.get("region", "")
+        artifact["container_session_id"] = _res.get("container_session_id", "")
+        artifact["valid_entry_probe"] = bool(
+            not artifact.get("error")
+            and artifact.get("submission_to_entry_wall_ms") is not None
+            and not artifact["excluded_snapshot_builder"]
+            and not artifact["excluded_after_builder"]
+        )
+        if artifact["valid_entry_probe"]:
+            valid += 1
+        artifact_path = output_dir / f"attempt_{index:04d}_{arm}.json"
+        artifact_path.write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8",
+        )
+        records.append(artifact)
+        print(
+            f"[v2.snapshot_ab] arm={arm} index={index} "
+            f"excluded={int(artifact['excluded_snapshot_builder'] or artifact['excluded_after_builder'])} "
+            f"valid={int(artifact['valid_entry_probe'])} "
+            f"submit_to_entry_ms={artifact['submission_to_entry_wall_ms']} "
+            f"image={artifact['image_id']} cloud={artifact['cloud']} region={artifact['region']}",
+            flush=True,
+        )
+        if valid >= runs:
+            break
+        if index < max_attempts - 1:
+            print(
+                f"[v2.snapshot_ab] arm={arm} sleeping {GAP_SECONDS}s before next probe",
+                flush=True,
+            )
+            await asyncio.sleep(GAP_SECONDS)
+    vals = sorted(
+        a["submission_to_entry_wall_ms"] for a in records if a["valid_entry_probe"]
+    )
+    summary: dict[str, Any] = {
+        "arm": arm,
+        "runs_requested": runs,
+        "valid_entry_probes": valid,
+        "submission_to_entry_ms": {
+            "min": vals[0] if vals else None,
+            "median": vals[len(vals) // 2] if vals else None,
+            "max": vals[-1] if vals else None,
+        },
+        "records": len(records),
+    }
+    (output_dir / f"summary_{arm}.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8",
+    )
+    print(f"[v2.snapshot_ab] arm={arm} summary={json.dumps(summary, default=str)}", flush=True)
+    return summary
+
+
 async def _run_integrated_study(
     workflow: dict[str, Any],
     modal_options: dict[str, Any],
@@ -1465,7 +1695,7 @@ async def _run_integrated_study(
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["ownership", "rehoming", "integrated", "render-report"])
+    parser.add_argument("mode", choices=["ownership", "rehoming", "integrated", "snapshot-ab", "render-report"])
     parser.add_argument("--app", required=True)
     parser.add_argument("--phase", default="probes_on",
                         choices=["probes_on", "probes_off"])
@@ -1473,6 +1703,13 @@ async def main() -> None:
     parser.add_argument("--max-attempts", type=int, default=12)
     parser.add_argument("--skip-first", type=int, default=2)
     parser.add_argument("--runs", type=int, default=4)
+    parser.add_argument("--arm", default="",
+                        help="snapshot-ab arm label (current|lean) for artifact naming")
+    parser.add_argument("--expect-lean", default="",
+                        help="Expected COMFYMODAL_V2_LEAN_SNAPSHOT (1 or 0) in the "
+                             "deployed container for the lean candidate")
+    parser.add_argument("--expect-manifest", default="",
+                        help="snapshot-ab: expected COMFYMODAL_V2_SNAPSHOT_MANIFEST (1 or 0)")
     parser.add_argument("--report", action="store_true",
                         help="Write V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md "
                              "after the ownership/integrated study")
@@ -1490,6 +1727,9 @@ async def main() -> None:
     parser.add_argument("--stop-after-bad", type=int, default=0,
                         help="Stop early after N valid-cold runs at or above the "
                              "acceptance gate (0 = disabled)")
+    parser.add_argument("--report-name", default="",
+                        help="Report file name for --report / render-report "
+                             "(default V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md)")
     args = parser.parse_args()
 
     if args.mode == "render-report":
@@ -1498,7 +1738,10 @@ async def main() -> None:
             sys.exit(1)
         output_dir = Path(args.output_dir)
         summary = _rebuild_summary_from_attempts(output_dir)
-        _write_total_wall_report(summary, output_dir=output_dir)
+        _write_total_wall_report(
+            summary, output_dir=output_dir,
+            report_name=args.report_name or "V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md",
+        )
         print(f"[v2.total_wall] offline render done; valid_cold={summary['valid_cold']}", flush=True)
         return
 
@@ -1516,6 +1759,15 @@ async def main() -> None:
             workspace, transport, output_dir,
             app_name=args.app, runs=args.runs,
         )
+    elif args.mode == "snapshot-ab":
+        summary = await _run_snapshot_ab_study(
+            workspace, transport, output_dir,
+            app_name=args.app, arm=args.arm or "arm",
+            runs=args.runs, max_attempts=args.max_attempts,
+            skip_first=args.skip_first,
+            expect_cloud=args.expect_cloud, expect_region=args.expect_region,
+            expect_lean=args.expect_lean, expect_manifest=args.expect_manifest,
+        )
     elif args.mode == "integrated":
         summary = await _run_integrated_study(
             workflow, modal_options, workspace, transport, output_dir,
@@ -1527,7 +1779,10 @@ async def main() -> None:
             stop_after_bad=args.stop_after_bad,
         )
         if args.report:
-            _write_total_wall_report(summary, output_dir=output_dir)
+            _write_total_wall_report(
+                summary, output_dir=output_dir,
+                report_name=args.report_name or "V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md",
+            )
     else:
         summary = await _run_ownership_study(
             workflow, modal_options, workspace, transport, output_dir,
@@ -1535,11 +1790,15 @@ async def main() -> None:
             target_cold=args.target_cold, max_attempts=args.max_attempts,
             skip_first=args.skip_first,
             expect_cloud=args.expect_cloud, expect_region=args.expect_region,
+            expect_lean=args.expect_lean,
             accept_under_ms=args.accept_under_ms,
             stop_after_bad=args.stop_after_bad,
         )
         if args.report:
-            _write_total_wall_report(summary, output_dir=output_dir)
+            _write_total_wall_report(
+                summary, output_dir=output_dir,
+                report_name=args.report_name or "V2_EXCLUSIVE_OWNER_TOTAL_WALL_6_RUN_REPORT.md",
+            )
     print(f"[v2.ownership_rehoming] output_dir={output_dir}", flush=True)
 
 
