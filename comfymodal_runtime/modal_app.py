@@ -2863,6 +2863,14 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_LEAN_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_LEAN_SNAPSHOT", "0"
         ),
+        # Exclude the UNET from the snapshot composition (diagnostic gate;
+        # default off).  Explicit passthrough so a deployment baked with this
+        # flag actually reaches the container; without it, `_runtime_env`
+        # silently drops the key and the real container would run with
+        # exclusion disabled and fail closed.
+        "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET", "0"
+        ),
         "COMFYMODAL_V2_DEEP_MODEL_DIAG": os.environ.get(
             "COMFYMODAL_V2_DEEP_MODEL_DIAG", "0"
         ),
@@ -12695,6 +12703,33 @@ class ModalRuntimeEntrypoint:
             self, order=str(order or "original_first"), request_id=str(request_id or ""),
         )
 
+    def run_numa_experiment(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: one NUMA causality cascade on a restored container.
+
+        On a restored single-use container: captures topology (CPU model,
+        affinity, NUMA nodes/distances, GPU PCI bus + GPU NUMA node), the
+        actual NUMA distribution of the restored UNET pages (numa_maps +
+        exact move_pages status), baseline synchronized H2D of those exact
+        restored storages, then — if permitted — physically migrates the
+        same pages to the GPU-local NUMA node (verified, not inferred) and
+        repeats the identical H2D, then migrates to a remote node and
+        repeats again; finally runs fresh node-bound buffers (mbind) with
+        identical H2D as the locality-only control.  Byte equality of the
+        transferred data is proven after all timing.  Never runs graph
+        execution; never mutates the CPU model.  Every failure is captured
+        in the returned record; never raises.
+        """
+        from comfymodal_runtime.numa_experiment import (
+            run_numa_experiment_impl,
+        )
+        return run_numa_experiment_impl(
+            self, request_id=str(request_id or ""),
+        )
+
     def run_env_probe(
         self,
         *,
@@ -12726,6 +12761,7 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_REGION",
             "COMFYMODAL_V2_SNAPSHOT_MANIFEST",
             "COMFYMODAL_V2_LEAN_SNAPSHOT",
+            "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET",
             "COMFYMODAL_V2_ENV_PROFILE",
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
             "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
@@ -12787,7 +12823,13 @@ class ModalRuntimeEntrypoint:
         executable line of this method is the first Python code the
         restored process runs for the request; the wall timestamp is
         returned so the local runner can compute the delta against its own
-        submission wall clock.  Never raises.
+        submission wall clock.  Also returns the literal-first-line wall
+        timestamp of ``restore()`` (``remote_python_resume_wall_unix_ns``
+        captured by the restore lifecycle into ``_LATEST_LIFECYCLE_TIMING``)
+        so the runner can measure the historical boundary
+        (submission → restore() first line) exactly.  On a warm container
+        without a fresh restore the value may be stale — warm requests are
+        not valid probes.  Never raises.
         """
         entry_wall_ns: int = time.time_ns()
         entry_mono_ns: int = time.monotonic_ns()
@@ -14059,6 +14101,7 @@ def _build_decorated_v2_class() -> type:
         "run_plan_stream", "run_prompt_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
+        "run_numa_experiment",
         "run_env_probe", "run_entry_probe", "exit",
     )
     # Lifecycle / infrastructure / probe / no-graph methods.  Their dict
@@ -14069,7 +14112,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore", "exit",
         "read_output_asset",
         "run_env_probe", "run_entry_probe",
-        "run_rehoming_experiment",
+        "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
     })
     for _name in _METHODS_TO_WRAP:
@@ -14161,6 +14204,7 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
     setattr(cls, "run_rehoming_experiment", _modal.method()(cls.run_rehoming_experiment))
+    setattr(cls, "run_numa_experiment", _modal.method()(cls.run_numa_experiment))
     setattr(cls, "run_env_probe", _modal.method()(cls.run_env_probe))
     setattr(cls, "run_entry_probe", _modal.method()(cls.run_entry_probe))
     return cls

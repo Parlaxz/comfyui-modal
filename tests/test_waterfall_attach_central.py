@@ -114,6 +114,7 @@ class ModalWrapperSourceContractTests(unittest.TestCase):
     def test_non_workflow_methods_exempted(self):
         self.assertIn('"startup", "restore", "exit"', MODAL_APP)
         self.assertIn('"read_output_asset"', MODAL_APP)
+        self.assertIn('"run_numa_experiment"', MODAL_APP)
         self.assertIn('"publish_restore_plan"', MODAL_APP)
 
     def test_shared_helper_imported(self):
