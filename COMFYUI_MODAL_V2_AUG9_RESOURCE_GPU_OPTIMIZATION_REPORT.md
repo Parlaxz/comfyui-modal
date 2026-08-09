@@ -127,6 +127,20 @@ Every valid GPU run: `restore_count=1, request_count=1, images=1, no error, sing
 
 **Invalidated results:** none among the 9 measured GPU runs (all runtime-path VALID). Cycle-2/3 RAM-arm runs excluded from RAM decision (telemetry unavailable) — preserved. One pre-existing failing unit test (bat-structure assertion, fails at HEAD too).
 
+**ZERO-PAID-RUN PATH REANALYSIS (follow-up, 2026-08-09):** All 18 runs (8× RTX reference + 1× candidate + 9× GPU arms) were re-extracted on seven path axes to test whether any GPU run took a slower path than the RTX reference. Classification axes: conditioning-cache hit/miss (`clip_conditioning_cache_decision` lookup decision `exact_hit`, corroborated by `clip_conditioning_cache_lookup` hit_count and `unet_early_activation_mode.trigger=conditioning_cache_hit`), early-UNET-activation scheduled/lane-acquired, activation start/ready wall times, sampler-visible wait, actual `load_models_gpu` wall, sampling.
+
+| arm | cache | ea sched | load_models_gpu ms (phase) | req-time load? | sampler_lane_wait ms | pre_sampler ms | py→result ms | sampling ms | class |
+|---|---|---|---|---|---|---|---|---|---|
+| RTX r0–r7 (n=8) | HIT ×8 | ✓ ×8 | 1.0–3.8 (exec) | no ×8 | 1788–2558 | 3762–4588 | 10443–12528 | 3730–3793 | **FAST ×8** |
+| CAND r0 | HIT | ✓ | 4.3 (exec) | no | 1486 | 3331 | 10067 | 3679 | **FAST** |
+| A100 r0–r2 | HIT ×3 | ✓ ×3 | 5.7–6.3 (exec) | no ×3 | 2298–2748 | 5742–7403 | 15596–16923 | 5699–5711 | **FAST ×3** |
+| H100 r0–r2 | HIT ×3 | ✓ ×3 | 2.9–4.5 (exec) | no ×3 | 4405–13633 | 8415–22931 | 23719–32976 | 2385–2454 | **FAST ×3** |
+| H200 r0–r2 | HIT ×3 | ✓ ×3 | 2.1–7.5 (exec) | no ×3 | 4878–5994 | 8251–9262 | 16623–18088 | 2310–2346 | **FAST ×3** |
+
+Fast-path predicate (derived from the RTX reference population): `cache_hit == exact_hit AND early_activation_scheduled AND lane_acquired AND load_models_gpu_ms < 1000 AND load_models_gpu_at_request == False`. **All 9 GPU runs satisfy it (n_fast == n_all per arm) → path-filtered medians are identical to the unfiltered table above; no GPU median changes.**
+
+**Mechanism verdict — the hypothesis is falsified:** no conditioning-cache miss, no late/missing early activation, no request-time `load_models_gpu` (1–7.5 ms bookkeeping only; restore-time `reload_models` ~68–145 ms) on any run. The large TWO-LANE lane-waits are a **transfer-bandwidth effect of the early-activation CPU→GPU H2D of the retained ~12.3 GB snapshot UNET**, not a path change: RTX `unet_early_activation` load_wall 2145–3062 ms → lane_wait 1788–2558 ms; A100 load_wall 3003–4710 ms → 2298–2748 ms; H100 load_wall 5100–20322 ms → 4405–13633 ms (two runs ~19.5–20.3 s load); H200 load_wall 5291–6318 ms → 4878–5994 ms. Sampler wait tracks load at a roughly constant fraction (≈0.66–0.82×) on both RTX and H100 — the absolute wait scales with host transfer time, so H100's lane-wait does NOT collapse to RTX-like ~2 s under path filtering. Sampling itself is faster on H100/H200 (2.31–2.45 s) and slower on A100 (5.70 s) than RTX (3.75 s); the GPU arms' penalty is entirely early-activation transfer + placement window. Machine-readable output: `C:\Users\parla\AppData\Local\Temp\opencode\gpu_path_reanalysis.json` (18 per-run dicts + per-arm medians + predicate). **Analysis caveat noted:** `clip_conditioning_cache_decision` emits a later *store* decision `miss_not_stored` that must not be mistaken for a lookup miss (downstream analyzers should key on the lookup event).
+
 # 10–14. Distributions, actual CPU/RAM, GPU identities
 
 **Scheduling (submission→restore banner, ms):** RTX(cpu8) p50 79321 / p90 134100 · A100 p50 76299 / p90 83655 · H100 p50 9433 / p90 12634 · H200 p50 7615 / p90 12931. **The experiment window suffered a severe placement storm** (all arms; many runs 60–135 s, some >10 min). These are platform placement facts, not request-shape effects; queue wait is not billed by Modal.
@@ -218,7 +232,7 @@ CPU $0.0000131/core/s (physical core = 2 vCPU; requested floor 8 cores), RAM $0.
 
 # 23. Unresolved anomalies
 
-1. **H100 TWO-LANE lane wait p50 13.4 s** (H200 5.5 s, A100 2.3 s, RTX 2.1 s) — same verified runtime path; early-activation UNET CPU→GPU load is dramatically slower on H100 hosts (us-west-2). Candidate causes: host CPU/PCIe variance, snapshot page residency on H100 instance types, or CPU-shape (8 vs 16) interaction. Needs the ≥200 ms waterfall audit (explicitly NOT started).
+1. **H100 TWO-LANE lane wait p50 13.4 s** (H200 5.5 s, A100 2.3 s, RTX 2.1 s) — zero-paid-run path reanalysis confirmed all H100 runs are fast-path (cache hit, early activation scheduled, no request-time load); the wait is the early-activation H2D of the retained ~12.3 GB snapshot UNET on H100 hosts (load_wall 5.1–20.3 s), i.e. a transfer-bandwidth/host effect, not a runtime-path difference. Needs the ≥200 ms waterfall audit / bandwidth-topology investigation (page-fault H2D, NUMA/pinning).
 2. **Placement storm** throughout the experiment window (sub2resume 60 s–>10 min; queue wait unbilled but dominates user wall).
 3. **cgroup `cpu.stat` unreadable** in this Modal/gVisor runtime — CPU telemetry is process-tick based (limitation documented).
 4. `identity.gpu` stale reporting — fixed in code (`bf8055a`), fix **unverified by a paid run** (canary DNF on placement).
