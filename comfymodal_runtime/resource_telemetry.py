@@ -143,32 +143,61 @@ def _read_int(path: str) -> int | None:
         return None
 
 
-def _read_cpu_stat(cgroup_root: str) -> dict[str, int] | None:
-    """Parse ``cpu.stat`` into {usage_usec, user_usec, system_usec, ...}."""
-    try:
-        with open(os.path.join(cgroup_root, "cpu.stat"), "r", encoding="utf-8") as fh:
-            out: dict[str, int] = {}
-            for line in fh:
-                parts = line.split()
-                if len(parts) == 2:
-                    key = str(parts[0]).strip()
-                    try:
-                        out[key] = int(str(parts[1]).strip())
-                    except ValueError:
-                        pass
-        if "usage_usec" not in out:
-            return None
-        return out
-    except Exception:
-        return None
+def _cgroup_candidates(cgroup_root: str | None = None) -> list[str]:
+    """Candidate cgroup roots, best first.
+
+    Includes the explicitly requested root, the mountinfo-resolved base (when
+    it differs), and the default mount.  Readers probe each candidate for the
+    actual files, so a resolved-but-wrong directory never shadows the
+    working default mount.
+    """
+    candidates: list[str] = []
+    for candidate in (cgroup_root, _resolve_cgroup_v2_base(), _DEFAULT_CGROUP_ROOT):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates or [_DEFAULT_CGROUP_ROOT]
 
 
-def _read_memory(cgroup_root: str) -> dict[str, Any] | None:
-    current = _read_int(os.path.join(cgroup_root, "memory.current"))
-    peak = _read_int(os.path.join(cgroup_root, "memory.peak"))
-    if current is None:
-        return None
-    return {"current": current, "peak": peak}
+def _read_cpu_stat(cgroup_root: str | None) -> dict[str, int] | None:
+    """Parse ``cpu.stat`` into {usage_usec, user_usec, system_usec, ...}.
+
+    Probes every candidate cgroup root for a readable ``cpu.stat``.
+    """
+    for root in _cgroup_candidates(cgroup_root):
+        path = os.path.join(root, "cpu.stat")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                out: dict[str, int] = {}
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        key = str(parts[0]).strip()
+                        try:
+                            out[key] = int(str(parts[1]).strip())
+                        except ValueError:
+                            pass
+            if "usage_usec" not in out:
+                continue
+            return out
+        except Exception:
+            continue
+    return None
+
+
+def _read_memory(cgroup_root: str | None) -> dict[str, Any] | None:
+    """Read memory.current/peak from the first candidate root that has them.
+
+    Includes the legacy cgroup v1 path as a final fallback.
+    """
+    for root in _cgroup_candidates(cgroup_root):
+        current = _read_int(os.path.join(root, "memory.current"))
+        if current is None:
+            current = _read_int(os.path.join(root, "memory", "memory.usage_in_bytes"))
+        if current is None:
+            continue
+        peak = _read_int(os.path.join(root, "memory.peak"))
+        return {"current": current, "peak": peak}
+    return None
 
 
 def percentile(values: list[float], pct: float) -> float | None:
