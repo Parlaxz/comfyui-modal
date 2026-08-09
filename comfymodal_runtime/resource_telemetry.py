@@ -39,6 +39,68 @@ def telemetry_enabled() -> bool:
     return os.environ.get(_ENV_FLAG, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_cgroup_v2_base(
+    mountinfo_path: str = "/proc/self/mountinfo",
+    cgroup_path: str = "/proc/self/cgroup",
+) -> str | None:
+    """Resolve the process cgroup v2 directory from procfs metadata.
+
+    Mirrors the runtime's own resolver: the cgroup2 mount point from
+    ``/proc/self/mountinfo`` joined with the unified ``0::`` line from
+    ``/proc/self/cgroup`` (e.g. ``/sys/fs/cgroup/user.slice/job-123``).
+    Returns ``None`` on any error (the caller falls back to
+    ``/sys/fs/cgroup``).
+    """
+    mount_point: str | None = None
+    try:
+        with open(mountinfo_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                separator = next(
+                    (index for index, part in enumerate(parts) if part == "-"),
+                    None,
+                )
+                if (
+                    separator is not None
+                    and separator >= 5
+                    and separator + 1 < len(parts)
+                    and parts[separator + 1] == "cgroup2"
+                ):
+                    candidate = parts[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n")
+                    if candidate.startswith("/"):
+                        mount_point = candidate
+                        break
+    except Exception:
+        return None
+    if not mount_point:
+        return None
+
+    cgroup_rel: str | None = None
+    try:
+        with open(cgroup_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("0::"):
+                    cgroup_rel = stripped[3:]
+                    break
+    except Exception:
+        return None
+    if cgroup_rel is None:
+        return None
+
+    if cgroup_rel in ("", "/"):
+        return mount_point
+    return os.path.join(mount_point, cgroup_rel.lstrip("/"))
+
+
+def _resolve_cgroup_root() -> str:
+    """Best-effort cgroup v2 base, falling back to the default mount."""
+    base = _resolve_cgroup_v2_base()
+    if base is not None and os.path.isdir(base):
+        return base
+    return _DEFAULT_CGROUP_ROOT
+
+
 def _read_int(path: str) -> int | None:
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -88,9 +150,9 @@ def percentile(values: list[float], pct: float) -> float | None:
 class ResourceTelemetry:
     """50 ms cgroup CPU/RAM sampler with stage attribution + aggregation."""
 
-    def __init__(self, interval_ms: int = INTERVAL_MS, cgroup_root: str = _DEFAULT_CGROUP_ROOT):
+    def __init__(self, interval_ms: int = INTERVAL_MS, cgroup_root: str | None = None):
         self._interval = max(10, int(interval_ms)) / 1000.0
-        self._cgroup_root = cgroup_root
+        self._cgroup_root = cgroup_root or _resolve_cgroup_root()
         self._lock = threading.Lock()
         self._samples: list[dict[str, Any]] = []
         self._thread: threading.Thread | None = None
