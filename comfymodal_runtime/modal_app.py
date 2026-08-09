@@ -2761,6 +2761,10 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_APP_NAME": (
             spec.app_name if spec is not None else APP_NAME
         ),
+        # Forward the requested GPU into the container env so the container-side
+        # spec rebuild (identity.gpu / gpu_requested_order) reflects the actual
+        # deploy request instead of the parse_gpu_request() default.
+        "COMFYMODAL_V2_GPU": os.environ.get("COMFYMODAL_V2_GPU", ""),
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "0"
         ),
@@ -13972,6 +13976,14 @@ class ModalRuntimeEntrypoint:
                     except Exception:
                         pass
                     self._resource_tel = None
+                # Fail-closed GPU provenance: requested spec vs actual allocated
+                # hardware (torch device properties) on every result payload.
+                try:
+                    data["gpu_allocation"] = _detect_gpu_allocation(
+                        _MODAL_RESOURCES.get("spec", ModalRuntimeSpec()).gpu
+                    )
+                except Exception:
+                    pass
                 _is_benchmark = str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}
                 try:
                     _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")

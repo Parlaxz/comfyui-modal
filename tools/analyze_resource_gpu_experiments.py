@@ -80,7 +80,23 @@ def _event_wall(events: list[dict[str, Any]], name: str, last: bool = False) -> 
     return found
 
 
-def analyze_run(path: Path) -> dict[str, Any]:
+def _event_metadata(events: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for ev in events:
+        if isinstance(ev, dict) and ev.get("name") == name and isinstance(ev.get("metadata"), dict):
+            return ev["metadata"]
+    return None
+
+
+def _normalize_actual_gpu(name: str) -> str:
+    """Lower-case canonical token for matching (e.g. 'nvidia h100 80gb hbm3' -> 'h100')."""
+    cleaned = name.lower().replace("_", "-").replace("  ", " ")
+    for token in ("rtx pro 6000", "h100", "h200", "b200", "b300", "l40s", "a100", "a10", "t4", "l4"):
+        if token in cleaned:
+            return token
+    return cleaned
+
+
+def analyze_run(path: Path, expect_gpu: str | None = None) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     result = data.get("result") or {}
     identity = data.get("identity") or {}
@@ -115,6 +131,95 @@ def analyze_run(path: Path) -> dict[str, Any]:
         run["gpu"] = [str(g) for g in gpu]
     else:
         run["gpu"] = str(gpu)
+
+    # -- GPU provenance (fail-closed gate) ----------------------------------
+    alloc = result.get("gpu_allocation") or {}
+    host_diag = result.get("host_diagnostics") or {}
+    hd_gpu = host_diag.get("gpu") or {}
+    actual_name = (
+        alloc.get("gpu_actual_name")
+        or hd_gpu.get("name")
+        or ""
+    )
+    requested_order = alloc.get("gpu_requested_order") or ""
+    run["gpu_provenance"] = {
+        "requested_spec": str(identity.get("gpu")),
+        "gpu_requested_order": requested_order,
+        "gpu_actual_name": actual_name,
+        "gpu_compute_capability": alloc.get("gpu_compute_capability")
+        or hd_gpu.get("compute_capability") or "",
+        "gpu_uuid": hd_gpu.get("uuid") or "",
+        "gpu_pci_bus_id": hd_gpu.get("pci_bus_id") or "",
+        "evidence_source": "gpu_allocation" if alloc else ("host_diagnostics" if hd_gpu else "absent"),
+    }
+    gpu_gate = "absent"
+    if actual_name and expect_gpu:
+        expected = expect_gpu.strip().lower().rstrip("!")
+        gpu_gate = "pass" if _normalize_actual_gpu(actual_name) == expected else "fail"
+    elif not expect_gpu:
+        gpu_gate = "not_checked"
+    run["gpu_gate"] = gpu_gate
+
+    # -- runtime-path evidence (candidate invariants) ------------------------
+    invariant = _event_metadata(events, "snapshot_activation_invariant") or {}
+    lane_waits = [
+        ev.get("metadata") for ev in events
+        if isinstance(ev, dict) and ev.get("name") == "sampler_lane_wait_end"
+        and isinstance(ev.get("metadata"), dict)
+        and ev["metadata"].get("blocking_owner") == "UNET_EARLY_ACTIVATION"
+    ]
+    ea_events = [
+        str(ev.get("name")) for ev in events
+        if isinstance(ev, dict) and str(ev.get("name", "")).startswith("unet_early_activation")
+    ]
+    load_pairs: list[dict[str, Any]] = []
+    for ev in events:
+        if isinstance(ev, dict) and ev.get("name") == "cpu_snapshot_unet_load_start":
+            meta = ev.get("metadata")
+            if isinstance(meta, dict):
+                load_pairs.append(meta)
+    first_cuda = _event_metadata(events, "unet_first_cuda_op") or {}
+    cachedit = _event_metadata(events, "v2_startup_cachedit_preparation") or {}
+    deltas_ms = trace.get("deltas_ms") or {}
+    cachedit_ms = (
+        cachedit.get("elapsed_ms")
+        or cachedit.get("duration_ms")
+        or deltas_ms.get("v2_startup_cachedit_preparation")
+        or deltas_ms.get("t8_cachedit")
+    )
+    sage = _event_metadata(events, "sage_snapshot_identity") or {}
+    run["runtime_path"] = {
+        "snapshot_invariant": {
+            "status": invariant.get("status"),
+            "clip_present": invariant.get("clip_present"),
+            "unet_present": invariant.get("unet_present"),
+            "cpu_snapshot_active": invariant.get("cpu_snapshot_active"),
+            "reason": invariant.get("reason"),
+            "stored_snapshot_model_order": invariant.get("stored_snapshot_model_order")
+            or (data.get("runtime_shape") or {}).get("snapshot_model_order"),
+        },
+        "two_lane_sampler_join_count": len(lane_waits),
+        "unet_early_activation_events": sorted(set(ea_events)),
+        "unet_load_pair_count": len(load_pairs),
+        "unet_load_phases": [m.get("phase") for m in load_pairs],
+        "unet_first_cuda_op": {
+            "elapsed_ms": first_cuda.get("elapsed_ms"),
+            "model_identity": first_cuda.get("model_identity"),
+            "x_device": first_cuda.get("x_device"),
+        },
+        "cachedit": {
+            "prepare_ms": cachedit_ms,
+            "target": cachedit.get("target"),
+            "fallback": cachedit.get("fallback"),
+        },
+        "sage": {
+            "mode": sage.get("sage_mode"),
+            "patch_version": sage.get("patch_version"),
+            "target": sage.get("target"),
+        },
+    }
+    run["cachedit_event_present"] = bool(cachedit)
+    run["sage_event_present"] = bool(sage)
 
     # -- reconciled timing semantics ----------------------------------------
     sub_to_resume = _num(timing.get("submission_to_remote_python_resume_ms"))
@@ -195,6 +300,14 @@ def analyze_run(path: Path) -> dict[str, Any]:
 def summarize(arm: str, label: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
     valid = [r for r in runs if r["valid"]]
     invalid = [r for r in runs if not r["valid"]]
+    gate_fail = [r for r in valid if r.get("gpu_gate") == "fail"]
+    gate_absent = [r for r in valid if r.get("gpu_gate") == "absent"]
+    # GPU-gate failures downgrade a run from valid to invalid for the arm.
+    for r in gate_fail:
+        r["valid"] = False
+        r["invalid_reasons"].append(f"gpu_gate=fail (actual={r.get('gpu_provenance', {}).get('gpu_actual_name')})")
+    valid = [r for r in runs if r["valid"]]
+    invalid = [r for r in runs if not r["valid"]]
 
     def collect(key: str) -> list[float]:
         return [
@@ -243,9 +356,16 @@ def summarize(arm: str, label: str, runs: list[dict[str, Any]]) -> dict[str, Any
         "runs_requested": len(runs),
         "valid": len(valid),
         "invalid": len(invalid),
+        "gpu_gate_absent": len(gate_absent),
+        "gpu_gate_fail": len(gate_fail),
         "invalid_details": [{"file": r["file"], "reasons": r["invalid_reasons"]} for r in invalid],
         "regions": regions,
         "gpu": gpus,
+        "gpu_actual_names": sorted({
+            str(r.get("gpu_provenance", {}).get("gpu_actual_name")) for r in runs
+            if r.get("gpu_provenance", {}).get("gpu_actual_name")
+        }),
+        "runtime_path_sample": (valid[0].get("runtime_path") if valid else None),
         "timing": timing_stats,
         "telemetry": telemetry_stats,
         "per_run": runs,
@@ -257,20 +377,27 @@ def main() -> int:
     parser.add_argument("--arm", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--runs", required=True, help="glob of run_*.json")
+    parser.add_argument("--expect-gpu", default="", help="intended arm GPU; fail-closed gate")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
     files = sorted(glob.glob(args.runs))
+    if not files and "," in args.runs:
+        files = [p.strip() for p in args.runs.split(",") if p.strip()]
     if not files:
         print(f"[analyze] no run files matched: {args.runs}")
         return 1
-    runs = [analyze_run(Path(f)) for f in files]
+    expect = args.expect_gpu.strip() or None
+    runs = [analyze_run(Path(f), expect_gpu=expect) for f in files]
     summary = summarize(args.arm, args.label, runs)
     out_path = Path(args.out) if args.out else ROOT / "comfymodal-data" / "benchmarks" / "resource_experiments" / f"{args.arm}_summary.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print(f"[analyze] {args.arm}: {summary['valid']}/{summary['runs_requested']} valid "
-          f"regions={summary['regions']} gpu={summary['gpu']}")
+          f"regions={summary['regions']} gpu={summary['gpu']} "
+          f"gate_fail={summary['gpu_gate_fail']} gate_absent={summary['gpu_gate_absent']}")
+    if summary["gpu_actual_names"]:
+        print(f"[analyze]   actual GPU names: {summary['gpu_actual_names']}")
     for k in ("submission_to_restore_banner_ms", "python_resume_to_result_ms",
               "submission_to_result_ms", "two_lane_ms", "sampling_ms", "vae_ms"):
         s = summary["timing"][k]
