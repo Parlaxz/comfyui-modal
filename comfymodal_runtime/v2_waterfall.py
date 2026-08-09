@@ -16,6 +16,7 @@ UNAVAILABLE = "unavailable"
 MEASURED = "measured"
 DERIVED = "derived"
 INVALID = "invalid"
+NON_APPLICABLE = "non_applicable"
 
 
 @dataclass(frozen=True)
@@ -1248,7 +1249,138 @@ def waterfall_to_dict(report: WaterfallReport) -> dict[str, Any]:
     }
 
 
+def _is_valid_waterfall(value: Any) -> bool:
+    """True for a real report dict (as produced by ``waterfall_to_dict``).
+
+    Error / absent / non-applicable markers are NOT valid, so an idempotent
+    finalizer never mistakes them for a completed report.
+    """
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("status") in ("error", "absent", NON_APPLICABLE):
+        return False
+    return "stages" in value
+
+
+def is_graph_result(value: Any) -> bool:
+    """True when *value* carries a graph workflow result / timing payload.
+
+    Non-graph payloads (checkpoint summaries, asset reads, health, canary,
+    restore-only, NUMA, rehoming probes) return ``False`` so callers never
+    fabricate graph waterfall stages for them.
+    """
+    if not isinstance(value, Mapping):
+        return False
+    for _key in ("trace", "timing", "images", "outputs", "generation_wall_ms"):
+        if _key in value:
+            return True
+    return False
+
+
+def graph_result_from_event(event: Any) -> dict[str, Any] | None:
+    """Extract the graph workflow result dict from a stream event, or ``None``.
+
+    Handles terminal ``{"type": "result", "data": {...}}`` events and nested
+    checkpoint ``cell.completed`` / ``cell.failed`` events whose ``data`` or
+    ``payload`` carries a ``result`` dict.  Returns the result dict only when
+    one is present; never for summaries, cell metadata, probes, or absent
+    results.  Callers still apply ``is_graph_result`` before attaching.
+    """
+    if not isinstance(event, Mapping):
+        return None
+    etype = event.get("type")
+    if etype == "result":
+        data = event.get("data")
+        return data if isinstance(data, dict) else None
+    if etype in ("cell.completed", "cell.failed"):
+        for _container in (event.get("data"), event.get("payload")):
+            if isinstance(_container, Mapping):
+                _nested = _container.get("result")
+                if isinstance(_nested, dict):
+                    return _nested
+    return None
+
+
+def attach_waterfall(
+    result: dict[str, Any],
+    *,
+    report: WaterfallReport | None = None,
+    result_view: Mapping[str, Any] | None = None,
+    timing: Mapping[str, Any] | None = None,
+    wall_ms: float | None = None,
+    command_start_unix_ms: int | None = None,
+    response_received_unix_ns: int | None = None,
+    run_label: str = "",
+) -> dict[str, Any] | None:
+    """Idempotent, non-raising waterfall finalizer (mutates *result* in place).
+
+    Preserves an existing valid waterfall; otherwise builds a report from
+    *result_view* (or *result* itself) via ``build_waterfall`` — or serializes
+    a prebuilt *report* — and attaches it as ``result["waterfall"]``.
+
+    A failure never raises into the workflow: an error marker is attached and
+    a concise line is printed.  Returns the attached/preserved waterfall dict,
+    or ``None`` when *result* is not a dict.
+    """
+    if not isinstance(result, dict):
+        return None
+    existing = result.get("waterfall")
+    if _is_valid_waterfall(existing):
+        return existing
+    try:
+        if report is None:
+            view = result_view if result_view is not None else dict(result)
+            report = build_waterfall(
+                result=view,
+                timing=dict(timing) if timing else {},
+                wall_ms=wall_ms,
+                command_start_unix_ms=command_start_unix_ms,
+                response_received_unix_ns=response_received_unix_ns,
+                run_label=run_label,
+            )
+        result["waterfall"] = waterfall_to_dict(report)
+        print(render_waterfall(report), flush=True)
+        return result["waterfall"]
+    except Exception as exc:  # noqa: BLE001
+        result["waterfall"] = {
+            "status": "error",
+            "error_type": type(exc).__name__,
+        }
+        print(
+            f"[v2.waterfall] status=error error_type={type(exc).__name__}",
+            flush=True,
+        )
+        return result["waterfall"]
+
+
+def mark_waterfall_non_applicable(
+    result: dict[str, Any],
+    *,
+    method: str = "",
+) -> dict[str, Any] | None:
+    """Attach an explicit non-applicable terminal classification.
+
+    Used for lifecycle / infrastructure / probe / no-graph results so every
+    result-returning path has an explicit terminal marker WITHOUT fabricated
+    graph stages.  Idempotent: preserves an existing valid waterfall; otherwise
+    sets ``result["waterfall"] = {"status": NON_APPLICABLE, ...}``.  Returns the
+    attached marker dict, or ``None`` when *result* is not a dict.
+    """
+    if not isinstance(result, dict):
+        return None
+    existing = result.get("waterfall")
+    if _is_valid_waterfall(existing):
+        return existing
+    marker: dict[str, Any] = {"status": NON_APPLICABLE}
+    if method:
+        marker["method"] = method
+    result["waterfall"] = marker
+    return marker
+
+
 __all__ = [
     "Boundary", "WaterfallStage", "WaterfallReport", "build_waterfall",
     "render_waterfall", "render_comparison", "waterfall_to_dict",
+    "attach_waterfall", "mark_waterfall_non_applicable", "is_graph_result",
+    "graph_result_from_event", "NON_APPLICABLE",
 ]

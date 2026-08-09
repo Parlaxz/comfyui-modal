@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 chcp 65001 >nul
 
 REM -- Pin environment variables ------------------------------------
-set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
+if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
 REM -- Variance-cold mode (explicit opt-in) -------------------------
@@ -14,7 +14,7 @@ set "V2_IS_VARIANCE=0"
 if /i "!V2_BENCHMARK_MODE!"=="variance_cold" set "V2_IS_VARIANCE=1"
 if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" set "V2_IS_VARIANCE=1"
 if /i "!V2_BENCHMARK_MODE!"=="host_ab" set "V2_IS_VARIANCE=1"
-set "V2_DEPLOY_IDENT=stable-modal-comfy-v2-shadow"
+if not defined V2_DEPLOY_IDENT set "V2_DEPLOY_IDENT=stable-modal-comfy-v2-shadow"
 set "V2_PROFILE_PRETOUCH=0"
 if /i "!V2_IS_VARIANCE!"=="1" (
     set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"

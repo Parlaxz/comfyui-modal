@@ -23,6 +23,7 @@ from .trace import (
     _build_local_submission_breakdown,
     _emit_breakdown_line,
 )
+from .v2_waterfall import attach_waterfall, graph_result_from_event, is_graph_result
 
 if TYPE_CHECKING:
     from .trace import RuntimeTrace
@@ -840,16 +841,35 @@ class ModalTransport:
                         "[v2.local_submission_breakdown]",
                         _final_breakdown,
                     )
+                if isinstance(first_event, dict) and first_event.get("type") == "result":
+                    _fe_data = first_event.get("data")
+                    if isinstance(_fe_data, dict) and is_graph_result(_fe_data):
+                        attach_waterfall(
+                            _fe_data,
+                            run_label="modal_transport run_prompt_stream",
+                        )
                 yield first_event
                 async for event in _iterator:
-                    if runtime_trace is not None and isinstance(event, dict) and event.get("type") == "result":
-                        runtime_trace.emit("final_result_received", phase="local")
+                    if isinstance(event, dict) and event.get("type") == "result":
+                        if runtime_trace is not None:
+                            runtime_trace.emit("final_result_received", phase="local")
+                        _rdata = event.get("data")
+                        if isinstance(_rdata, dict) and is_graph_result(_rdata):
+                            attach_waterfall(
+                                _rdata,
+                                run_label="modal_transport run_prompt_stream",
+                            )
                     yield event
             else:
                 result = await stream if inspect.isawaitable(stream) else stream
                 if isinstance(result, dict):
                     if runtime_trace is not None:
                         runtime_trace.emit("non_stream_result_received", phase="local")
+                    if is_graph_result(result):
+                        attach_waterfall(
+                            result,
+                            run_label="modal_transport run_prompt_stream",
+                        )
                     yield {"type": "result", "data": result}
         except Exception as exc:
             raise TransportError(str(exc)) from exc
@@ -877,11 +897,26 @@ class ModalTransport:
             ait = stream.__aiter__()
             try:
                 async for event in ait:
+                    # Finalize nested cell.completed/cell.failed graph results
+                    # and terminal result events; never fabricate stages for
+                    # summaries/cells/probes.
+                    if isinstance(event, dict):
+                        _gres = graph_result_from_event(event)
+                        if isinstance(_gres, dict) and is_graph_result(_gres):
+                            attach_waterfall(
+                                _gres,
+                                run_label="modal_transport run_checkpoint_stream",
+                            )
                     yield event
             finally:
                 await _aclose_iterator(ait)
         else:
             result = await stream if inspect.isawaitable(stream) else stream
+            if isinstance(result, dict) and is_graph_result(result):
+                attach_waterfall(
+                    result,
+                    run_label="modal_transport run_checkpoint_stream",
+                )
             if isinstance(result, dict):
                 yield {"type": "result", "data": result}
 

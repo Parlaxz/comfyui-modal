@@ -23,6 +23,22 @@ from gpu_catalog import (
 # there is one source of truth.
 from production_workflow import _canonical_workflow_hash, COMPILER_SCHEMA_VERSION, HASH_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.v2_waterfall import (
+    attach_waterfall,
+    graph_result_from_event,
+    is_graph_result,
+)
+
+
+def _attach_waterfall_for_graph(result, *, run_label):
+    """Attach the default waterfall to a graph-like Modal result (idempotent).
+
+    Only graph workflow result / timing payloads are finalized; non-graph
+    payloads (checkpoint summaries, asset reads, health, canary, restore-only,
+    NUMA, rehoming probes) never receive fabricated graph stages.
+    """
+    if is_graph_result(result):
+        attach_waterfall(result, run_label=run_label)
 
 
 def _short_hash(h: str) -> str:
@@ -401,11 +417,13 @@ async def run_prompt(
         workflow_hash=_precomputed_hash,
     )
     async with _run_prompt_semaphore:
-        return await asyncio.to_thread(
+        _result = await asyncio.to_thread(
             lambda: _workspace_api(selected, gpu).run_prompt.remote(
                 workflow, input_images or {}, trace or {}, modal_options or {}, production_report,
             ),
         )
+    _attach_waterfall_for_graph(_result, run_label="modal_client run_prompt")
+    return _result
 
 
 # NOTE: no @_modal_error_handler here — that decorator does `await func()`
@@ -531,6 +549,11 @@ async def run_prompt_stream(
                 print(f"[modal-client] phase=first_msg arrived=True")
             if isinstance(msg, dict) and msg.get("type") == "result":
                 _v1_result = msg
+                _rdata = msg.get("data")
+                if isinstance(_rdata, dict):
+                    _attach_waterfall_for_graph(
+                        _rdata, run_label="modal_client run_prompt_stream",
+                    )
             yield msg
     except TimeoutError:
         raise TimeoutError(
@@ -613,6 +636,15 @@ async def run_checkpoint_stream(
         )
     try:
         async for msg in gen:
+            # Only graph result / timing payloads get a waterfall.  Covers both
+            # terminal ``type == "result"`` events and nested
+            # ``cell.completed`` / ``cell.failed`` events carrying a graph
+            # ``result`` dict.  Summaries, cells, and probes never get stages.
+            _gres = graph_result_from_event(msg)
+            if isinstance(_gres, dict):
+                _attach_waterfall_for_graph(
+                    _gres, run_label="modal_client run_checkpoint_stream",
+                )
             yield msg
     except TimeoutError:
         raise TimeoutError(

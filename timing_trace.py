@@ -926,9 +926,11 @@ class TraceV4(Trace):
 
 # Fields to deep-copy from a Modal result dict when extracting a compact
 # timing payload.  Excludes outputs (which may contain base64 image data).
+# ``waterfall`` is a small structured report dict (from waterfall_to_dict),
+# not output/base64 data, so it is carried into the compact payload.
 _REMOTE_TIMING_FIELDS: tuple[str, ...] = (
     "trace", "wall_clock_trace", "_wall_clock_summary",
-    "_restore_timing", "scheduler_trace",
+    "_restore_timing", "scheduler_trace", "waterfall",
 )
 
 # Diagnostic/conditionally-relevant timing fields included only when present.
@@ -942,9 +944,10 @@ def extract_remote_timing_payload(result_data: dict) -> dict:
     """Extract a compact timing payload from a Modal result dict.
 
     Deep-copies only timing-related fields (``trace``, ``wall_clock_trace``,
-    ``_wall_clock_summary``, ``_restore_timing``, ``scheduler_trace``) and
-    diagnostic timing fields when present, **excluding** ``outputs`` (which
-    may contain base64 image data).
+    ``_wall_clock_summary``, ``_restore_timing``, ``scheduler_trace``,
+    ``waterfall``) and diagnostic timing fields when present, **excluding**
+    ``outputs`` (which may contain base64 image data).  ``waterfall`` is a
+    small structured report dict, not output/base64 data, so it is retained.
 
     Returns a flat dict containing only the recognised timing keys, or an
     empty dict if none are present.

@@ -639,3 +639,53 @@ def test_return_stages_measure_with_valid_response_boundaries():
     assert ret.status != "invalid"
     assert report.reconciliation_ms is not None
     assert not any("negative duration" in warning for warning in report.warnings)
+
+
+def test_serialized_waterfall_dict_contract():
+    """waterfall_to_dict emits the exact frontend-usable top-level shape."""
+    report = build_waterfall(
+        result=_complete_result(),
+        timing={},
+        wall_ms=None,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=13100 * 1_000_000,
+        run_label="remote normal run",
+    )
+    data = waterfall_to_dict(report)
+    assert set(data.keys()) == {
+        "run_label", "request_id", "identity",
+        "total_ms", "accounted_ms", "reconciliation_ms", "tolerance_ms",
+        "warnings", "stages", "details",
+    }
+    assert data["run_label"] == "remote normal run"
+    assert data["request_id"] == "request-1"
+    assert isinstance(data["identity"], dict)
+    assert data["total_ms"] is not None
+    assert data["accounted_ms"] is not None
+    assert data["reconciliation_ms"] is not None
+    assert data["tolerance_ms"] is not None
+    assert isinstance(data["warnings"], list)
+    assert isinstance(data["stages"], list) and data["stages"]
+    assert isinstance(data["details"], list)
+    # A serialized report must be JSON-serializable end to end (frontend contract).
+    import json
+    round_tripped = json.loads(json.dumps(data))
+    assert round_tripped.keys() == data.keys()
+    # It must also re-render, proving the dict shape feeds render_waterfall.
+    assert "V2 COLD WATERFALL" in render_waterfall(data)
+
+
+def test_tools_v2_waterfall_reexports_shared_api():
+    """tools.v2_waterfall re-exports the shared finalizer/marker/guard API."""
+    import importlib
+
+    mod = importlib.import_module("tools.v2_waterfall")
+    for name in (
+        "attach_waterfall",
+        "graph_result_from_event",
+        "mark_waterfall_non_applicable",
+        "is_graph_result",
+        "NON_APPLICABLE",
+    ):
+        assert hasattr(mod, name), f"tools.v2_waterfall missing {name}"
+        assert name in mod.__all__

@@ -3657,5 +3657,463 @@ class TotalCountBeforeFilterBarWiringRED(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Test 20: Serialized v2 waterfall normalization (timings.waterfall)
+# ---------------------------------------------------------------------------
+
+def _make_fake_waterfall() -> dict:
+    """Build a waterfall report shaped exactly like the backend's
+    waterfall_to_dict output (see comfymodal_runtime/v2_waterfall.py)."""
+    return {
+        "run_label": "run 123",
+        "request_id": "req_abc",
+        "identity": {"restored_instance_id": "inst_1", "fresh": "true"},
+        "total_ms": 12345.6,
+        "accounted_ms": 12100.0,
+        "reconciliation_ms": 245.6,
+        "tolerance_ms": 61.7,
+        "warnings": [
+            "reconciliation exceeds tolerance: 245.600ms > 61.700ms",
+            "VAE: negative duration",
+        ],
+        "stages": [
+            {
+                "key": "local_preparation",
+                "label": "Local preparation",
+                "group": "local",
+                "start_ns": 1000000,
+                "end_ns": 1500000,
+                "duration_ms": 500.0,
+                "cumulative_ms": 500.0,
+                "percentage": 4.05,
+                "source": "event",
+                "status": "measured",
+                "overlaps": [],
+                "is_detail": False,
+                "parent_key": "",
+                "included_in_total": True,
+                "clock_scope": "monotonic",
+                "source_fields": ["local_receive_wall_ns"],
+                "concurrent": False,
+            },
+            {
+                "key": "method_entry_to_unet_claim",
+                "label": "Method entry to UNET ownership claim",
+                "group": "application",
+                "start_ns": 2000000,
+                "end_ns": 3000000,
+                "duration_ms": 1000.0,
+                "cumulative_ms": None,
+                "percentage": 8.1,
+                "source": "derived",
+                "status": "derived",
+                "overlaps": [],
+                "is_detail": False,
+                "parent_key": "",
+                "included_in_total": True,
+                "clock_scope": "wall",
+                "source_fields": [],
+                "concurrent": True,
+            },
+            {
+                "key": "captured_timeline_gap",
+                "label": "Captured timeline gaps / residual",
+                "group": "platform",
+                "start_ns": None,
+                "end_ns": None,
+                "duration_ms": 245.6,
+                "cumulative_ms": None,
+                "percentage": 1.99,
+                "source": "accounting",
+                "status": "derived",
+                "overlaps": [],
+                "is_detail": False,
+                "parent_key": "",
+                "included_in_total": False,
+                "clock_scope": "wall",
+                "source_fields": ["command_to_response_ms"],
+                "concurrent": False,
+            },
+            {
+                "key": "sampling",
+                "label": "Sampling",
+                "group": "application",
+                "start_ns": None,
+                "end_ns": None,
+                "duration_ms": None,
+                "cumulative_ms": None,
+                "percentage": None,
+                "source": "",
+                "status": "unavailable",
+                "overlaps": [],
+                "is_detail": False,
+                "parent_key": "",
+                "included_in_total": True,
+                "clock_scope": "",
+                "source_fields": [],
+                "concurrent": False,
+            },
+            {
+                "key": "vae",
+                "label": "VAE",
+                "group": "application",
+                "start_ns": 100,
+                "end_ns": 50,
+                "duration_ms": -50.0,
+                "cumulative_ms": None,
+                "percentage": None,
+                "source": "event",
+                "status": "invalid",
+                "overlaps": ["Sampling"],
+                "is_detail": False,
+                "parent_key": "",
+                "included_in_total": True,
+                "clock_scope": "monotonic",
+                "source_fields": [],
+                "concurrent": False,
+            },
+        ],
+        "details": [
+            {"key": "detail_a", "label": "Detail A", "group": "application",
+             "start_ns": 1, "end_ns": 2, "duration_ms": 1.0, "cumulative_ms": None,
+             "percentage": None, "source": "event", "status": "measured",
+             "overlaps": [], "is_detail": True, "parent_key": "",
+             "included_in_total": False, "clock_scope": "", "source_fields": [],
+             "concurrent": False},
+        ],
+    }
+
+
+class WaterfallAdvancedDiagnosticsRED(unittest.TestCase):
+    """RED: normalizeAdvancedTimingDiagnostics must return a validated
+    normalized waterfall display model from timings.waterfall, or null when
+    absent/invalid — never throwing, and never leaking raw nanosecond clocks.
+
+    Backend contract (waterfall_to_dict):
+      - timings.waterfall = { run_label, request_id, identity, total_ms,
+        accounted_ms, reconciliation_ms, tolerance_ms, warnings[], stages[],
+        details[] }
+      - each stage carries key/label/group/duration_ms/percentage/status/
+        concurrent/included_in_total plus raw clocks (start_ns/end_ns),
+        source_fields, overlaps, clock_scope, is_detail, parent_key.
+    """
+
+    NORMALIZER_PATH = REPO_ROOT / "web" / "studio-run-normalizer.js"
+
+    def setUp(self):
+        if not self.NORMALIZER_PATH.exists():
+            self.skipTest(f"web/studio-run-normalizer.js not found")
+        if shutil.which("node") is None:
+            self.skipTest("Node.js not available")
+
+    def _run_advanced(self, timings_dict: dict, stages: list | None = None) -> dict:
+        if stages is None:
+            stages = []
+        stdout = _run_js_fn("normalizeAdvancedTimingDiagnostics", timings_dict, stages)
+        return json.loads(stdout)
+
+    def test_waterfall_normalized_preserves_display_fields(self):
+        """Given a full waterfall payload, the normalized display model must
+        preserve total/accounted/reconciliation/tolerance, warnings, request
+        id, and per-stage display fields (label, durationMs, percentage,
+        status, concurrent, includedInTotal)."""
+        timings = {"waterfall": _make_fake_waterfall()}
+        diag = self._run_advanced(timings)
+        wf = diag.get("waterfall")
+
+        # ---- RED: waterfall must be present (not null) ----
+        self.assertIsNotNone(wf, "waterfall must be normalized when present")
+
+        # ---- RED: reconciliation summary preserved ----
+        self.assertEqual(wf.get("totalMs"), 12345.6)
+        self.assertEqual(wf.get("accountedMs"), 12100.0)
+        self.assertEqual(wf.get("reconciliationMs"), 245.6)
+        self.assertEqual(wf.get("toleranceMs"), 61.7)
+        self.assertEqual(wf.get("requestId"), "req_abc")
+        self.assertEqual(wf.get("runLabel"), "run 123")
+        self.assertTrue(wf.get("hasDetails"), "details presence must be surfaced")
+
+        # ---- RED: warnings preserved ----
+        self.assertEqual(wf.get("warnings"), [
+            "reconciliation exceeds tolerance: 245.600ms > 61.700ms",
+            "VAE: negative duration",
+        ])
+
+        # ---- RED: all 5 stages preserved in serialized order ----
+        stages = wf.get("stages", [])
+        self.assertEqual(len(stages), 5)
+        s0 = stages[0]
+        self.assertEqual(s0.get("label"), "Local preparation")
+        self.assertEqual(s0.get("durationMs"), 500.0)
+        self.assertEqual(s0.get("percentage"), 4.05)
+        self.assertEqual(s0.get("status"), "measured")
+        self.assertFalse(s0.get("concurrent"))
+        self.assertTrue(s0.get("includedInTotal"))
+        self.assertEqual(stages[1].get("status"), "derived")
+        self.assertTrue(stages[1].get("concurrent"))
+        self.assertFalse(stages[2].get("includedInTotal"))
+        self.assertEqual(stages[3].get("status"), "unavailable")
+        self.assertIsNone(stages[3].get("durationMs"))
+
+    def test_waterfall_coerces_negative_duration_to_null(self):
+        """A stage with a negative duration (backend marks it INVALID) must
+        surface durationMs=null so display code never formats a negative
+        duration."""
+        timings = {"waterfall": _make_fake_waterfall()}
+        diag = self._run_advanced(timings)
+        stages = diag["waterfall"]["stages"]
+
+        vae = next(s for s in stages if s.get("key") == "vae")
+        self.assertEqual(vae.get("status"), "invalid")
+        self.assertIsNone(vae.get("durationMs"),
+                          "negative duration must be coerced to null")
+
+    def test_waterfall_excludes_raw_nanosecond_and_debug_fields(self):
+        """The display model must not expose raw nanosecond clocks, source
+        field names, overlap lists, or identity/detail blobs."""
+        timings = {"waterfall": _make_fake_waterfall()}
+        diag = self._run_advanced(timings)
+        wf = diag["waterfall"]
+
+        # ---- RED: top level must be the display model only ----
+        for hidden in ("identity", "details", "stages_raw"):
+            self.assertNotIn(hidden, wf,
+                             f"top-level '{hidden}' must not be exposed")
+
+        # ---- RED: per-stage raw fields must be absent ----
+        allowed = {"key", "label", "group", "durationMs", "percentage",
+                   "status", "concurrent", "includedInTotal"}
+        for stage in wf.get("stages", []):
+            for hidden in ("start_ns", "end_ns", "cumulative_ms", "source",
+                           "overlaps", "is_detail", "parent_key",
+                           "clock_scope", "source_fields"):
+                self.assertNotIn(hidden, stage,
+                                 f"stage field '{hidden}' must not be exposed")
+            self.assertTrue(
+                set(stage.keys()).issubset(allowed),
+                f"stage exposes unexpected fields: {sorted(stage.keys())}"
+            )
+
+    def test_waterfall_null_when_absent(self):
+        """Legacy timings without a waterfall must yield waterfall=null, and
+        the other diagnostics must remain intact (no regression)."""
+        timings = {
+            "trace": {"trace_version": "2.0.0", "deltas_ms": {"sampler": 3310}},
+            "wall_clock_trace": {},
+            "timing_sources": {"sampling_ms": "remote_trace"},
+        }
+        diag = self._run_advanced(timings)
+
+        # ---- RED: no waterfall -> null ----
+        self.assertIsNone(diag.get("waterfall"))
+
+        # ---- RED: legacy diagnostics untouched ----
+        self.assertEqual(diag.get("traceVersion"), "2.0.0")
+        self.assertEqual(diag.get("rawDeltasMs"), {"sampler": 3310})
+        # No stages were passed, so quality is "missing" — unchanged from the
+        # pre-waterfall behavior.
+        self.assertEqual(diag.get("timingQuality"), "missing")
+
+        # ---- RED: totally absent timings -> null, not an error ----
+        diag_empty = self._run_advanced({})
+        self.assertIsNone(diag_empty.get("waterfall"))
+        diag_none = self._run_advanced(None)
+        self.assertIsNone(diag_none.get("waterfall"))
+
+    def test_waterfall_null_when_invalid_shape(self):
+        """Malformed waterfall payloads must yield null, never throw."""
+        cases = [
+            {"waterfall": {}},                       # no stages key
+            {"waterfall": {"stages": "not-an-array"}},
+            {"waterfall": "plain string"},
+            {"waterfall": 42},
+            {"waterfall": None},
+        ]
+        for timings in cases:
+            with self.subTest(timings=timings):
+                diag = self._run_advanced(timings)
+                self.assertIsNone(
+                    diag.get("waterfall"),
+                    f"waterfall must be null for invalid shape {timings!r}"
+                )
+
+    def test_waterfall_rides_through_normalizeStudioRun(self):
+        """A raw history record carrying timing_summary.waterfall must surface
+        the normalized model at nr.advancedTiming.waterfall."""
+        raw_run = {
+            "id": "run_x",
+            "timing_summary": {
+                "end_to_end_total_ms": 37000.0,
+                "waterfall": _make_fake_waterfall(),
+            },
+        }
+        stdout = _run_js_fn("normalizeStudioRun", raw_run, "")
+        nr = json.loads(stdout)
+        wf = nr.get("advancedTiming", {}).get("waterfall")
+
+        # ---- RED: waterfall flows through normalizeStudioRun ----
+        self.assertIsNotNone(wf, "normalizeStudioRun must carry waterfall")
+        self.assertEqual(wf.get("totalMs"), 12345.6)
+        self.assertEqual(len(wf.get("stages", [])), 5)
+
+        # ---- RED: duration still prefers end_to_end_total_ms ----
+        self.assertEqual(nr.get("durationMs"), 37000.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 21: buildWaterfallLines display text (web/studio-history.js)
+# ---------------------------------------------------------------------------
+
+class WaterfallHistoryLinesRED(unittest.TestCase):
+    """RED: web/studio-run-normalizer.js must export a pure
+    ``buildWaterfallLines`` helper that turns the normalized waterfall into
+    display lines, so the Diagnostics panel renders grounded, accessible text
+    (no emoji glyphs, explicit derived/unavailable/invalid/concurrent markers,
+    capped warnings) and so the text is directly testable via Node.
+
+    Contract:
+      buildWaterfallLines(wf) -> [{kind, text}, ...]
+      - kind in {meta, stage, warn-header, warn, warn-more}
+      - null/absent wf -> []
+    """
+
+    NORMALIZER_PATH = REPO_ROOT / "web" / "studio-run-normalizer.js"
+
+    def setUp(self):
+        if not self.NORMALIZER_PATH.exists():
+            self.skipTest(f"web/studio-run-normalizer.js not found")
+        if shutil.which("node") is None:
+            self.skipTest("Node.js not available")
+
+    def _call_build_lines(self, wf) -> list:
+        js_snippet = (
+            "import{buildWaterfallLines}from"
+            + json.dumps(self.NORMALIZER_PATH.resolve().as_uri())
+            + ";"
+            + "const r=buildWaterfallLines(" + json.dumps(wf) + ");"
+            + "process.stdout.write(JSON.stringify(r));"
+        )
+        proc = subprocess.run(
+            ["node", "--input-type=module", "-e", js_snippet],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Node subprocess failed (exit={proc.returncode}):\n"
+                f"stderr: {proc.stderr[:500]}"
+            )
+        return json.loads(proc.stdout)
+
+    @staticmethod
+    def _normalized_waterfall() -> dict:
+        """Replicate the display model produced by the normalizer for the
+        fake waterfall (independent of the normalizer test above)."""
+        return {
+            "runLabel": "run 123",
+            "requestId": "req_abc",
+            "totalMs": 12345.6,
+            "accountedMs": 12100.0,
+            "reconciliationMs": 245.6,
+            "toleranceMs": 61.7,
+            "warnings": [
+                "reconciliation exceeds tolerance: 245.600ms > 61.700ms",
+                "VAE: negative duration",
+            ],
+            "hasDetails": True,
+            "stages": [
+                {"key": "local_preparation", "label": "Local preparation",
+                 "group": "local", "durationMs": 500.0, "percentage": 4.05,
+                 "status": "measured", "concurrent": False,
+                 "includedInTotal": True},
+                {"key": "method_entry_to_unet_claim",
+                 "label": "Method entry to UNET ownership claim",
+                 "group": "application", "durationMs": 1000.0,
+                 "percentage": 8.1, "status": "derived",
+                 "concurrent": True, "includedInTotal": True},
+                {"key": "captured_timeline_gap",
+                 "label": "Captured timeline gaps / residual",
+                 "group": "platform", "durationMs": 245.6,
+                 "percentage": 1.99, "status": "derived",
+                 "concurrent": False, "includedInTotal": False},
+                {"key": "sampling", "label": "Sampling", "group": "application",
+                 "durationMs": None, "percentage": None,
+                 "status": "unavailable", "concurrent": False,
+                 "includedInTotal": True},
+                {"key": "vae", "label": "VAE", "group": "application",
+                 "durationMs": None, "percentage": None,
+                 "status": "invalid", "concurrent": False,
+                 "includedInTotal": True},
+            ],
+        }
+
+    def test_meta_line_has_total_accounted_unaccounted_and_tolerance(self):
+        """The meta line must read Total / Accounted / Unaccounted with a
+        sign, unit-consistent durations, and an explicit tolerance verdict."""
+        lines = self._call_build_lines(self._normalized_waterfall())
+        meta = next((ln["text"] for ln in lines if ln["kind"] == "meta"), None)
+
+        # ---- RED: full meta text ----
+        self.assertIsNotNone(meta, "meta line must be present")
+        self.assertEqual(
+            meta,
+            "Total: 12.3s \u00b7 Accounted: 12.1s \u00b7 "
+            "Unaccounted: +246ms (over tolerance)"
+        )
+
+    def test_meta_within_tolerance_verdict(self):
+        """When reconciliation is within tolerance, the verdict must read
+        'within tolerance'."""
+        wf = self._normalized_waterfall()
+        wf["reconciliationMs"] = 5.0
+        wf["toleranceMs"] = 61.7
+        lines = self._call_build_lines(wf)
+        meta = next((ln["text"] for ln in lines if ln["kind"] == "meta"), None)
+        self.assertIn("Unaccounted: +5ms (within tolerance)", meta or "")
+
+    def test_stage_rows_use_duration_percent_and_text_markers(self):
+        """Stage rows must combine label, duration, percentage, and explicit
+        text markers for derived/invalid/concurrent; unavailable renders as
+        'n/a' in the duration slot (no '?', no color-only status)."""
+        lines = self._call_build_lines(self._normalized_waterfall())
+        stage_lines = [ln["text"] for ln in lines if ln["kind"] == "stage"]
+
+        self.assertEqual(stage_lines, [
+            "Local preparation \u2014 500ms (4%)",
+            "Method entry to UNET ownership claim \u2014 1.0s (8%) "
+            "[derived, concurrent]",
+            "Captured timeline gaps / residual \u2014 246ms (2%) [derived]",
+            "Sampling \u2014 n/a",
+            "VAE \u2014 n/a [invalid]",
+        ])
+
+        # ---- RED: no raw '?' placeholders and no emoji glyphs ----
+        for text in stage_lines:
+            self.assertNotIn("?", text)
+            self.assertNotIn("\u26a0", text)
+            self.assertNotIn("\U0001f6a8", text)
+
+    def test_warnings_capped_at_three_with_overflow(self):
+        """Warnings render as text-prefixed 'Warn:' lines, capped at 3, with
+        a '+N more' overflow line."""
+        wf = self._normalized_waterfall()
+        wf["warnings"] = ["w1", "w2", "w3", "w4", "w5"]
+        lines = self._call_build_lines(wf)
+        warn_lines = [ln["text"] for ln in lines if ln["kind"] == "warn"]
+
+        # ---- RED: exactly 3 warnings shown ----
+        self.assertEqual(warn_lines, ["Warn: w1", "Warn: w2", "Warn: w3"])
+
+        # ---- RED: overflow count ----
+        more = [ln["text"] for ln in lines if ln["kind"] == "warn-more"]
+        self.assertEqual(more, ["+2 more"])
+
+    def test_null_or_absent_waterfall_yields_empty_lines(self):
+        """buildWaterfallLines must return [] for null/absent waterfall so
+        legacy records render nothing new."""
+        self.assertEqual(self._call_build_lines(None), [])
+        self.assertEqual(self._call_build_lines({}), [])
+        self.assertEqual(self._call_build_lines("junk"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@
 //   2. run.asset_id            → /assets/<id>
 //   3. run.output_path         → /studio/outputs/<path>
 
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines } from "./studio-run-normalizer.js";
 import { listUnifiedHistory, listExperiments, updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 import { loadExperimentIntoPlayground } from "./studio-playground.js";
 import { el, createImagePreviewOverlay, registerLayerHandler } from "./studio-ui.js";
@@ -289,6 +289,32 @@ function renderNoteEditor(nr, apiBase) {
 
 // ── Timing Card ───────────────────────────────────────────────────────────
 //
+// Waterfall block (DOM wrapper over shared buildWaterfallLines)
+//
+// Rendered inside the Diagnostics panel.  Purely informational; no
+// interactive elements.  Uses slightly lighter text (#aaa) than the
+// surrounding #666 diagnostics body for readability of the added content.
+// Line text comes from buildWaterfallLines (web/studio-run-normalizer.js)
+// so History and Playground surface identical copy.
+
+function renderWaterfallBlock(wf) {
+  var block = el("div", {
+    "data-testid": "waterfall-diagnostics",
+    style: "margin:4px 0 0;color:#aaa;",
+  });
+  block.appendChild(el("div", {
+    text: "Waterfall",
+    style: "margin:3px 0 1px;font-weight:600;color:#888;",
+  }));
+  buildWaterfallLines(wf).forEach(function (line) {
+    var style = "margin:0;padding-left:6px;";
+    if (line.kind === "meta") style = "margin:0 0 2px;";
+    else if (line.kind === "warn-header") style = "margin:3px 0 1px;font-weight:600;color:#888;";
+    block.appendChild(el("div", { text: line.text, style: style }));
+  });
+  return block;
+}
+
 // Compact timing summary card for the preview overlay.
 // Includes expandable advanced diagnostics.
 
@@ -366,6 +392,8 @@ function renderTimingCard(nr) {
     var advBtn = el("button", {
       class: "comfymodal-studio-advanced-timing-toggle",
       text: "\u25b6 Diagnostics",
+      "aria-expanded": "false",
+      "aria-controls": "comfymodal-studio-advanced-timing-panel",
       style: "font-size:9px;color:#666;cursor:pointer;background:none;border:none;padding:2px 0;margin-top:2px;display:block;",
       onclick: function () {
         var panel = card.querySelector(".comfymodal-studio-advanced-timing-panel");
@@ -373,12 +401,14 @@ function renderTimingCard(nr) {
           var isHidden = panel.style.display === "none" || panel.style.display === "";
           panel.style.display = isHidden ? "block" : "none";
           advBtn.textContent = isHidden ? "\u25bc Diagnostics" : "\u25b6 Diagnostics";
+          advBtn.setAttribute("aria-expanded", isHidden ? "true" : "false");
         }
       },
     });
     card.appendChild(advBtn);
 
     var advPanel = el("div", {
+      id: "comfymodal-studio-advanced-timing-panel",
       class: "comfymodal-studio-advanced-timing-panel",
       style: "display:none;font-size:9px;color:#666;margin-top:2px;padding:2px 4px;background:#0a0a0a;border:1px solid #1a1a1a;border-radius:2px;",
     });
@@ -432,6 +462,11 @@ function renderTimingCard(nr) {
           style: "margin:0;padding-left:6px;",
         }));
       });
+    }
+
+    // Waterfall (serialized v2 report) — only when the record carries one
+    if (diag.waterfall) {
+      advPanel.appendChild(renderWaterfallBlock(diag.waterfall));
     }
 
     card.appendChild(advPanel);

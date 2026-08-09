@@ -2261,6 +2261,13 @@ async def execute_plan(
     )
     _emit_breakdown_line("[v2.local_submission_breakdown.final]", _breakdown)
     result["trace"] = remote_trace
+    # Local fallback: finalize a waterfall if the remote path omitted one.
+    # Idempotent — an existing valid remote report is preserved unchanged.
+    try:
+        from comfymodal_runtime.v2_waterfall import attach_waterfall
+        attach_waterfall(result, run_label="canonical execute_plan")
+    except Exception:  # noqa: BLE001
+        pass
     return result
 
 
@@ -2689,6 +2696,13 @@ async def execute_modal_prompt(
                 run_trace.merge_into_trace(
                     result.setdefault("trace", {})
                 )
+            # Local fallback: finalize a waterfall if the remote path omitted
+            # one.  Idempotent — an existing valid remote report is preserved.
+            try:
+                from comfymodal_runtime.v2_waterfall import attach_waterfall
+                attach_waterfall(result, run_label="canonical execute_modal_prompt")
+            except Exception:  # noqa: BLE001
+                pass
 
         return result
 

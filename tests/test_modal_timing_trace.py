@@ -2,7 +2,7 @@ import ast
 import unittest
 from pathlib import Path
 
-from timing_trace import Trace, coerce_t0_from_browser
+from timing_trace import Trace, coerce_t0_from_browser, extract_remote_timing_payload
 
 from comfymodal_runtime.contracts import TraceEvent
 from comfymodal_runtime.trace import RuntimeTrace, merge_runtime_traces
@@ -138,6 +138,21 @@ class TimingTraceUnitTests(unittest.TestCase):
         summary = trace.summary()
         self.assertEqual(summary["deltas_ms"]["t9_to_t10"], 10.0)
         self.assertEqual(summary["deltas_ms"]["modal_to_browser"], 640.0)
+
+    def test_extract_remote_timing_payload_carries_waterfall(self):
+        result = {
+            "trace": {"stages": {}},
+            "waterfall": {"status": "measured", "stages": [], "total_ms": 12.0},
+            "outputs": {"9": [{"data": "aGVsbG8="}]},  # base64 must be excluded
+        }
+        payload = extract_remote_timing_payload(result)
+        self.assertIn("waterfall", payload)
+        self.assertEqual(payload["waterfall"]["total_ms"], 12.0)
+        self.assertNotIn("outputs", payload)
+
+    def test_extract_remote_timing_payload_absent_waterfall_omitted(self):
+        payload = extract_remote_timing_payload({"trace": {"stages": {}}})
+        self.assertNotIn("waterfall", payload)
 
 
 class TimingTraceWiringTests(unittest.TestCase):

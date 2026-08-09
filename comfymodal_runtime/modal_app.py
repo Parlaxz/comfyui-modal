@@ -113,7 +113,7 @@ from .output_delivery import (
 )
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
-from .v2_waterfall import build_waterfall, render_waterfall
+from .v2_waterfall import build_waterfall, render_waterfall, waterfall_to_dict, attach_waterfall, mark_waterfall_non_applicable, is_graph_result, graph_result_from_event
 from .teardown_diagnostics import TeardownDiagnostics
 
 # ── Lean production snapshot gate (diagnostic A/B; default off) ──────────
@@ -12791,11 +12791,15 @@ class ModalRuntimeEntrypoint:
         """
         entry_wall_ns: int = time.time_ns()
         entry_mono_ns: int = time.monotonic_ns()
+        _latest = _LATEST_LIFECYCLE_TIMING or {}
         result: dict[str, Any] = {
             "status": "ok",
             "request_id": str(request_id or ""),
             "entry_wall_unix_ns": entry_wall_ns,
             "entry_mono_ns": entry_mono_ns,
+            "restore_first_line_wall_unix_ns": (
+                _latest.get("remote_python_resume_wall_unix_ns") or 0
+            ),
             "container_session_id": _V2_CONTAINER_SESSION_ID,
             "image_id": os.environ.get("MODAL_IMAGE_ID", ""),
             "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
@@ -13903,32 +13907,40 @@ class ModalRuntimeEntrypoint:
                     _cgroup_sampler.report()
                     self._cgroup_sampler = None
                     _cgroup_sampler = None
-                if str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}:
-                    try:
+                _is_benchmark = str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}
+                try:
+                    _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
+                    if not isinstance(_command_start_ms, (int, float)) or isinstance(_command_start_ms, bool):
+                        _command_start_ms = None
+                    if _is_benchmark:
                         _benchmark_run_index = _request_origin_info.get("benchmark_run_index", 0)
                         try:
                             _benchmark_run_number = int(_benchmark_run_index) + 1
                         except (TypeError, ValueError):
                             _benchmark_run_number = 1
-                        _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
-                        if not isinstance(_command_start_ms, (int, float)) or isinstance(_command_start_ms, bool):
-                            _command_start_ms = None
-                        _waterfall_started_ms = (time.monotonic_ns() - _method_first_line_ns) / 1_000_000
-                        _waterfall_now_ns = time.time_ns()
-                        _waterfall = build_waterfall(
-                            result=data,
-                            timing=data.get("timing", {}) if isinstance(data.get("timing"), Mapping) else {},
-                            wall_ms=_waterfall_started_ms,
-                            command_start_unix_ms=int(_command_start_ms) if _command_start_ms is not None else None,
-                            response_received_unix_ns=_waterfall_now_ns,
-                            run_label=f"remote benchmark run {_benchmark_run_number}",
-                        )
-                        print(render_waterfall(_waterfall), flush=True)
-                    except Exception as _waterfall_exc:
-                        print(
-                            f"[v2.waterfall] status=error error_type={type(_waterfall_exc).__name__}",
-                            flush=True,
-                        )
+                        _run_label = f"remote benchmark run {_benchmark_run_number}"
+                    else:
+                        _run_label = "remote normal run"
+                    _waterfall_started_ms = (time.monotonic_ns() - _method_first_line_ns) / 1_000_000
+                    _waterfall_now_ns = time.time_ns()
+                    _waterfall = build_waterfall(
+                        result=data,
+                        timing=data.get("timing", {}) if isinstance(data.get("timing"), Mapping) else {},
+                        wall_ms=_waterfall_started_ms,
+                        command_start_unix_ms=int(_command_start_ms) if _command_start_ms is not None else None,
+                        response_received_unix_ns=_waterfall_now_ns,
+                        run_label=_run_label,
+                    )
+                    attach_waterfall(data, report=_waterfall, run_label=_run_label)
+                except Exception as _waterfall_exc:
+                    data["waterfall"] = {
+                        "status": "error",
+                        "error_type": type(_waterfall_exc).__name__,
+                    }
+                    print(
+                        f"[v2.waterfall] status=error error_type={type(_waterfall_exc).__name__}",
+                        flush=True,
+                    )
             yield event
 
     async def run_prompt_stream(
@@ -14049,6 +14061,17 @@ def _build_decorated_v2_class() -> type:
         "publish_restore_plan", "run_rehoming_experiment",
         "run_env_probe", "run_entry_probe", "exit",
     )
+    # Lifecycle / infrastructure / probe / no-graph methods.  Their dict
+    # results must NOT receive a fabricated graph waterfall.  Any future Modal
+    # result-returning method NOT in this set gets the default graph-like
+    # finalization (see the plain wrapper branch below).
+    _NON_WORKFLOW_METHODS = frozenset({
+        "startup", "restore", "exit",
+        "read_output_asset",
+        "run_env_probe", "run_entry_probe",
+        "run_rehoming_experiment",
+        "publish_restore_plan",
+    })
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
 
@@ -14069,6 +14092,19 @@ def _build_decorated_v2_class() -> type:
                     _v2_init_instance(self)
                     try:
                         async for item in orig_method(self, *args, **kwargs):
+                            # Default waterfall fallback for every terminal
+                            # graph result event, including nested
+                            # cell.completed/cell.failed results.  Idempotent:
+                            # a stream that already attached a valid waterfall
+                            # is left unchanged.  Non-graph payloads
+                            # (summaries, probes) never get fabricated stages.
+                            if isinstance(item, dict):
+                                _gres = graph_result_from_event(item)
+                                if isinstance(_gres, dict) and is_graph_result(_gres):
+                                    attach_waterfall(
+                                        _gres,
+                                        run_label=f"modal {orig_method.__name__} stream",
+                                    )
                             yield item
                     finally:
                         if _release_on_close:
@@ -14086,7 +14122,22 @@ def _build_decorated_v2_class() -> type:
                 @functools.wraps(orig_method)
                 def _wrapper(self, *args, **kwargs):
                     _v2_init_instance(self)
-                    return orig_method(self, *args, **kwargs)
+                    _result = orig_method(self, *args, **kwargs)
+                    if isinstance(_result, dict):
+                        if orig_method.__name__ in _NON_WORKFLOW_METHODS:
+                            # Explicit non-applicable terminal classification
+                            # (no fabricated graph stages).
+                            mark_waterfall_non_applicable(
+                                _result, method=orig_method.__name__,
+                            )
+                        else:
+                            # Default for future graph-like Modal result
+                            # methods: finalize with a waterfall.
+                            attach_waterfall(
+                                _result,
+                                run_label=f"modal {orig_method.__name__}",
+                            )
+                    return _result
                 return _wrapper
 
         setattr(cls, _name, _make_wrapper(_orig))
