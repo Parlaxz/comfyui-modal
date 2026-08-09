@@ -13089,14 +13089,14 @@ class ModalRuntimeEntrypoint:
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self._lazy_init_snapshot_state()
-        _resource_tel = None
+        self._resource_tel = None
         if os.environ.get("COMFYMODAL_V2_RESOURCE_TELEMETRY", "0").strip().lower() in {"1", "true", "yes", "on"}:
             try:
                 from .resource_telemetry import ResourceTelemetry
-                _resource_tel = ResourceTelemetry()
-                _resource_tel.start()
+                self._resource_tel = ResourceTelemetry()
+                self._resource_tel.start()
             except Exception:
-                _resource_tel = None
+                self._resource_tel = None
         diagnostics = getattr(self, "_teardown_diagnostics", None)
         identity = _capture_remote_identity()
         if diagnostics is not None:
@@ -13961,17 +13961,17 @@ class ModalRuntimeEntrypoint:
                     _cgroup_sampler.report()
                     self._cgroup_sampler = None
                     _cgroup_sampler = None
-                if _resource_tel is not None:
+                if getattr(self, "_resource_tel", None) is not None:
                     try:
                         from .resource_telemetry import build_stage_boundaries
                         _tel_events = (data.get("trace") or {}).get("events") or []
                         _tel_bounds = build_stage_boundaries(
                             _tel_events, data.get("_restore_timing") or {},
                         )
-                        data["resource_telemetry"] = _resource_tel.summarize(_tel_bounds)
+                        data["resource_telemetry"] = self._resource_tel.summarize(_tel_bounds)
                     except Exception:
                         pass
-                    _resource_tel = None
+                    self._resource_tel = None
                 _is_benchmark = str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}
                 try:
                     _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
