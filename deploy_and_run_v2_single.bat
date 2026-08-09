@@ -6,7 +6,7 @@ chcp 65001 >nul
 REM -- Pin environment variables ------------------------------------
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
-set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+if not defined COMFYMODAL_V2_GPU set "COMFYMODAL_V2_GPU=rtx-pro-6000"
 REM -- Variance-cold mode (explicit opt-in) -------------------------
 REM Uses a unique shadow app name ONLY for variance mode.  Normal and
 REM production modes keep the default identity above.
