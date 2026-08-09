@@ -140,7 +140,7 @@ def main() -> int:
             ph_env["COMFYMODAL_DEPLOY_ONLY"] = "1"
         log_path = ARM_ROOT / f"{args.arm}_{phase}.log"
         manifest["logs"][phase] = str(log_path)
-        cmd = ["cmd", "/c", "deploy_and_run_v2_single.bat" if deploy_only else "run_v2_single.bat"]
+        cmd = ["cmd", "/c", ".\\deploy_and_run_v2_single.bat" if deploy_only else ".\\run_v2_single.bat"]
         return _run(cmd, log_path, timeout_s=2400, env=ph_env)
 
     try:
