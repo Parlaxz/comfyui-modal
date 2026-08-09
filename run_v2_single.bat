@@ -5,7 +5,7 @@ for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixT
 chcp 65001 >nul
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
-set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+if not defined COMFYMODAL_V2_GPU set "COMFYMODAL_V2_GPU=rtx-pro-6000"
 set "COMFYMODAL_V2_CLOUD="
 if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=production"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
