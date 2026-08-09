@@ -1993,6 +1993,90 @@ def collect_unet_runtime_state(
     return state
 
 
+def _two_lane_read_residency(unet: Any) -> dict[str, Any]:
+    """Read the ComfyUI residency fields for the graph early-exit proof.
+
+    ComfyUI's ``ModelPatcher.partially_load`` early-exits (returns ``0``
+    without transferring weights) when ``model_lowvram is False`` and
+    ``model_loaded_weight_memory > 0`` — the patcher metadata claims the
+    full model is already resident.  In the pinned parent ComfyUI both
+    fields live on ``ModelPatcher.model`` (the **BaseModel**), not on the
+    patcher wrapper itself and not on the inner diffusion model.
+
+    This proof reads both fields from a deduplicated candidate list
+    ``[patcher, patcher.model, patcher.model.diffusion_model]`` — the
+    BaseModel is the always-checked, preferred target — and synthesizes a
+    JSON-safe, fail-closed verdict: it never claims the model is resident
+    unless the fields are actually present and readable.  Never raises.
+    """
+    _candidates: list[Any] = []
+    _seen: set[int] = set()
+
+    def _add(obj: Any) -> None:
+        if obj is None:
+            return
+        _oid = id(obj)
+        if _oid in _seen:
+            return
+        _seen.add(_oid)
+        _candidates.append(obj)
+
+    _patcher = unet
+    _add(_patcher)
+    _base = getattr(_patcher, "model", None)
+    _add(_base)
+    # Safely useful nested target: the BaseModel's inner diffusion model.
+    if _base is not None:
+        _add(getattr(_base, "diffusion_model", None))
+
+    def _read(attr: str):
+        # The always-checked BaseModel is authoritative first.
+        if _base is not None:
+            _val = getattr(_base, attr, None)
+            if _val is not None and not callable(_val):
+                return _val
+        for _cand in _candidates:
+            _val = getattr(_cand, attr, None)
+            if _val is None or callable(_val):
+                continue
+            return _val
+        return None
+
+    _lowvram = _read("model_lowvram")
+    _mem = _read("model_loaded_weight_memory")
+
+    out: dict[str, Any] = {
+        "candidate_count": len(_candidates),
+        "base_model_present": _base is not None,
+        "model_lowvram": "absent",
+        "model_loaded_weight_memory": "absent",
+        "source": "none",
+        "resident": False,
+        "ok": False,
+        "reason": "fields_unavailable",
+    }
+    if _lowvram is None or _mem is None:
+        return out
+
+    try:
+        _lowvram_bool = bool(_lowvram)
+    except Exception:  # noqa: BLE001
+        _lowvram_bool = False
+    try:
+        _mem_num = float(_mem)
+    except Exception:  # noqa: BLE001
+        _mem_num = 0.0
+
+    _resident = (_lowvram_bool is False) and (_mem_num > 0)
+    out["model_lowvram"] = _lowvram_bool
+    out["model_loaded_weight_memory"] = _mem_num
+    out["source"] = "base_model" if _base is not None else "candidate"
+    out["resident"] = bool(_resident)
+    out["ok"] = True
+    out["reason"] = "resident" if _resident else "not_resident"
+    return out
+
+
 def diff_unet_runtime_states(
     snapshot_state: dict[str, Any],
     normal_state: dict[str, Any],

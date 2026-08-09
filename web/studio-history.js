@@ -289,7 +289,10 @@ function renderNoteEditor(nr, apiBase) {
 
 // ── Timing Card ───────────────────────────────────────────────────────────
 //
-// Waterfall block (DOM wrapper over shared buildWaterfallLines)
+// Compact timing summary card for the preview overlay.
+// Includes expandable advanced diagnostics.
+
+// ── Waterfall block (DOM wrapper over shared buildWaterfallLines) ─────────
 //
 // Rendered inside the Diagnostics panel.  Purely informational; no
 // interactive elements.  Uses slightly lighter text (#aaa) than the
@@ -314,9 +317,6 @@ function renderWaterfallBlock(wf) {
   });
   return block;
 }
-
-// Compact timing summary card for the preview overlay.
-// Includes expandable advanced diagnostics.
 
 function renderTimingCard(nr) {
   if (!nr.timingStages || nr.timingStages.length === 0) {

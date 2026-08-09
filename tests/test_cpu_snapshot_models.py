@@ -1726,6 +1726,93 @@ class TestCollectUnetRuntimeState(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Tests: _two_lane_read_residency (graph early-exit proof)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestTwoLaneReadResidency(unittest.TestCase):
+    """_two_lane_read_residency reads the actual ComfyUI residency fields.
+
+    ComfyUI's ``ModelPatcher.partially_load`` early-exits when
+    ``model_lowvram is False and model_loaded_weight_memory > 0``.  Both
+    fields live on ``ModelPatcher.model`` (the BaseModel), not on the
+    patcher wrapper or the inner diffusion model.  The proof reads them
+    from a deduplicated candidate list and synthesis succeeds only when
+    that inner target is valid; otherwise it fails closed (never claims
+    resident).
+    """
+
+    @staticmethod
+    def _read(patcher):
+        from comfymodal_runtime.cpu_snapshot_models import _two_lane_read_residency
+        return _two_lane_read_residency(patcher)
+
+    def test_resident_when_base_model_claims_full_load(self):
+        """BaseModel with lowvram=False and loaded_weight_memory>0 is resident."""
+        out = self._read(_FakeRealPatcher("cpu"))
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["base_model_present"])
+        self.assertIs(out["model_lowvram"], False)
+        self.assertEqual(out["model_loaded_weight_memory"], float(1234567890))
+        self.assertTrue(out["resident"])
+        self.assertEqual(out["source"], "base_model")
+        self.assertEqual(out["reason"], "resident")
+
+    def test_not_resident_when_base_model_marks_lowvram(self):
+        """lowvram=True means the full model is not loaded -> not resident."""
+        patcher = _FakeRealPatcher("cpu")
+        patcher.model.model_lowvram = True
+        out = self._read(patcher)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["resident"])
+        self.assertEqual(out["reason"], "not_resident")
+
+    def test_not_resident_when_no_loaded_memory(self):
+        """loaded_weight_memory == 0 means nothing loaded -> not resident."""
+        patcher = _FakeRealPatcher("cpu")
+        patcher.model.model_loaded_weight_memory = 0
+        out = self._read(patcher)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["resident"])
+
+    def test_fails_closed_when_inner_target_missing(self):
+        """No .model at all -> synthesis fails closed, never resident."""
+        out = self._read(_FakeUNETNoModel())
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["base_model_present"])
+        self.assertFalse(out["resident"])
+        self.assertEqual(out["reason"], "fields_unavailable")
+
+    def test_fails_closed_when_inner_target_lacks_fields(self):
+        """Inner .model present but without the residency fields -> fail closed."""
+        out = self._read(_FakeUNETMinimal())
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["base_model_present"])
+        self.assertFalse(out["resident"])
+        self.assertEqual(out["model_lowvram"], "absent")
+        self.assertEqual(out["model_loaded_weight_memory"], "absent")
+
+    def test_direct_fake_coverage(self):
+        """A fake carrying the fields directly (no .model) still resolves."""
+        class _DirectFake:
+            model_lowvram = False
+            model_loaded_weight_memory = 999
+        out = self._read(_DirectFake())
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["base_model_present"])
+        self.assertTrue(out["resident"])
+        self.assertEqual(out["source"], "candidate")
+
+    def test_json_safe_no_objects(self):
+        """Verdict contains only JSON-safe primitives, never object reprs."""
+        out = self._read(_FakeRealPatcher("cpu"))
+        for key, value in out.items():
+            self.assertIsInstance(value, (str, int, float, bool, list, dict))
+            self.assertNotIn("<", str(value), msg=f"object repr leaked in {key}")
+            self.assertNotIn("FakeTensor", str(value), msg=f"tensor leaked in {key}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Tests: diff_unet_runtime_states
 # ══════════════════════════════════════════════════════════════════════
 
