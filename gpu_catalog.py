@@ -27,6 +27,7 @@ GPU_CANONICAL_MAP: dict[str, str] = {
     "h100": "H100",
     "h200": "H200",
     "b200": "B200",
+    "b300": "B300",
 }
 
 # ── Default ordered GPU request ─────────────────────────────────────────
@@ -132,6 +133,7 @@ GPU_CATALOG = [
     {"value": "h100", "label": "H100", "modal_gpu": "h100", "class_name": "ComfyAPI_H100", "profile": "high_mem"},
     {"value": "h200", "label": "H200", "modal_gpu": "h200", "class_name": "ComfyAPI_H200", "profile": "high_mem"},
     {"value": "b200", "label": "B200", "modal_gpu": "b200", "class_name": "ComfyAPI_B200", "profile": "high_mem"},
+    {"value": "b300", "label": "B300", "modal_gpu": "b300", "class_name": "ComfyAPI_B300", "profile": "high_mem"},
 ]
 
 GPU_VALUES = [entry["value"] for entry in GPU_CATALOG]
