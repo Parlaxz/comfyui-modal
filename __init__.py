@@ -117,6 +117,7 @@ from canonical_execution import (
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.result_delivery import materialize_modal_result as _materialize_v2_result
 from comfymodal_runtime.trace import RuntimeTrace
+from comfymodal_runtime.v2_waterfall import attach_waterfall, is_graph_result
 from comparison import (
     create_profile,
     update_profile,
@@ -2006,6 +2007,15 @@ def _register_running(item: tuple) -> int:
     return key
 
 
+def _timing_payload_with_waterfall(meta_obj: dict) -> dict:
+    """Build the run-history timing payload preserving the trace and carrying
+    the V2 waterfall so it is persisted to timing.json alongside the trace."""
+    payload = dict(meta_obj.get("trace") or {})
+    if isinstance(meta_obj.get("waterfall"), dict) and meta_obj["waterfall"]:
+        payload["waterfall"] = meta_obj["waterfall"]
+    return payload
+
+
 def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool, meta: dict | None = None):
     pq = _pq()
     if pq is None:
@@ -2042,7 +2052,7 @@ def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool, meta
             status="success" if success else "error",
             meta=meta_obj,
             log_text=str(meta_obj.get("error", "")) if not success else "",
-            timings=meta_obj.get("trace") or {},
+            timings=_timing_payload_with_waterfall(meta_obj),
             output_path=output_path,
         )
         # Stash the run id back into the meta so the API caller can
@@ -2867,6 +2877,7 @@ async def _execute_job(item: tuple, item_id: int):
             "scheduler_trace": result.get("scheduler_trace"),
             "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
             "_production_evidence": result.get("_production_evidence") if isinstance(result, dict) else None,
+            "waterfall": result.get("waterfall", {}) if isinstance(result, dict) else {},
         }
         _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
 
@@ -5956,6 +5967,7 @@ if _server:
                 "output_policy": data.get("output_policy", {}),
                 "studio_meta": data.get("studio_meta", {}),
                 "total_cells": data.get("total_cells", 0),
+                "waterfall": payload.get("waterfall", {}),
             }
             record = REGISTRY.history().record_run(
                 kind="experiment_cell",
@@ -6127,6 +6139,20 @@ if _server:
                             payload["experiment_revision"] = data.get("revision", 0)
                             payload["output_policy"] = data.get("output_policy", {})
                             # B6: no base64 in durable events
+                            # Local shared-finalizer fallback: if an upstream
+                            # client bypassed the wrapper, finalize graph-like
+                            # result_data so history retains a waterfall.
+                            if is_graph_result(result_data):
+                                attach_waterfall(
+                                    result_data,
+                                    run_label="experiment cell materialize",
+                                )
+                            # Carry the graph result's waterfall (a small
+                            # structured report dict) into the durable payload
+                            # when present; never fabricate one for summaries.
+                            _wf = result_data.get("waterfall")
+                            if isinstance(_wf, dict):
+                                payload["waterfall"] = copy.deepcopy(_wf)
                             data.pop("result", None)
                             # B2 step 10: rename tmp to final path.
                             # No inner try/except OSError: if the rename fails,

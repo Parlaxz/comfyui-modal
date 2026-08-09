@@ -344,11 +344,80 @@ export function normalizeTimingStages(timings) {
 }
 
 /**
+ * Normalize the serialized v2 waterfall report (timings.waterfall) into a
+ * compact display model, or null when absent/invalid.
+ *
+ * The backend serializes a WaterfallReport (see comfymodal_runtime/v2_waterfall.py
+ * waterfall_to_dict) with total/accounted/reconciliation/tolerance, warnings,
+ * request_id, and a stages list.  Only the fields needed for display are copied;
+ * raw nanosecond clocks (start_ns/end_ns), source fields, and overlap detail are
+ * deliberately NOT exposed in the display model.
+ *
+ * Returns null (not {}) for legacy records with no waterfall so consumers render
+ * exactly as they do today.
+ *
+ * @param {object} timings - Raw timings/trace object.
+ * @returns {object|null}
+ */
+function _normalizeWaterfall(timings) {
+  if (!timings || typeof timings !== "object") return null;
+  var raw = timings.waterfall;
+  if (raw == null && timings.deltas_ms && typeof timings.deltas_ms === "object") {
+    raw = timings.deltas_ms.waterfall;
+  }
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.stages)) return null;
+
+  function toFiniteNumber(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  // Durations/percentages/totals are never negative; negative or NaN input
+  // is coerced to null so display code never formats an impossible value.
+  function toNonNegativeNumber(v) {
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+  }
+  function toBool(v, fallback) {
+    return typeof v === "boolean" ? v : fallback;
+  }
+  function toText(v, fallback) {
+    return typeof v === "string" && v.length > 0 ? v : fallback;
+  }
+
+  var stages = [];
+  raw.stages.forEach(function (s) {
+    if (!s || typeof s !== "object") return;
+    stages.push({
+      key: toText(s.key, ""),
+      label: toText(s.label, toText(s.key, "")),
+      group: toText(s.group, ""),
+      durationMs: toNonNegativeNumber(s.duration_ms),
+      percentage: toNonNegativeNumber(s.percentage),
+      status: toText(s.status, "unavailable"),
+      concurrent: toBool(s.concurrent, false),
+      includedInTotal: toBool(s.included_in_total, true),
+    });
+  });
+
+  return {
+    runLabel: toText(raw.run_label, ""),
+    requestId: toText(raw.request_id, ""),
+    totalMs: toNonNegativeNumber(raw.total_ms),
+    accountedMs: toNonNegativeNumber(raw.accounted_ms),
+    reconciliationMs: toFiniteNumber(raw.reconciliation_ms),
+    toleranceMs: toNonNegativeNumber(raw.tolerance_ms),
+    warnings: Array.isArray(raw.warnings)
+      ? raw.warnings.filter(function (w) { return typeof w === "string" && w.length > 0; })
+      : [],
+    hasDetails: Array.isArray(raw.details) && raw.details.length > 0,
+    stages: stages,
+  };
+}
+
+/**
  * Build advanced timing diagnostics for expandable display.
  *
  * Secondary to the summary — includes trace version, timing quality/reason,
  * missing fields, raw deltas_ms, derived stages, wall_clock_trace,
- * scheduler_trace, and sources.
+ * scheduler_trace, sources, and the normalized waterfall (when present).
  *
  * @param {object} timings - Raw timings/trace object.
  * @param {Array} stages - Normalized timing stages (from normalizeTimingStages).
@@ -366,6 +435,7 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
       wallClockTrace: null,
       schedulerTrace: null,
       sources: {},
+      waterfall: null,
     };
   }
 
@@ -463,6 +533,9 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
   var rawDerivedMs = trace.derived_ms || timings.derived_ms || null;
   var rawStages = trace.stages || timings.stages || null;
 
+  // ── Serialized v2 waterfall report (null when absent/invalid) ──────
+  var waterfall = _normalizeWaterfall(timings);
+
   return {
     traceVersion: traceVersion,
     timingQuality: timingQuality,
@@ -475,6 +548,7 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
     schedulerTrace: timings.scheduler_trace || null,
     sources: sources,
     backendTimingSources: backendTimingSources,
+    waterfall: waterfall,
   };
 }
 
@@ -531,6 +605,75 @@ export function _formatDuration(ms) {
   var m = Math.floor(ms / 60000);
   var s = (ms % 60000) / 1000;
   return m + "m " + s.toFixed(0) + "s";
+}
+
+/**
+ * Build the display lines for the normalized v2 waterfall report.
+ *
+ * Pure (no DOM) so it is directly testable via Node and shared by both
+ * timing consumers (History's Diagnostics panel and Playground's Advanced
+ * metadata panel) so they always surface the same copy.  Returns an array
+ * of { kind, text } lines; consumers map kinds to presentation:
+ *   - meta        reconciliation summary (Total / Accounted / Unaccounted)
+ *   - stage       canonical waterfall stage row
+ *   - warn-header warnings section heading
+ *   - warn        individual warning (text-prefixed, accessible)
+ *   - warn-more   "+N more" overflow line
+ *
+ * Returns [] for null/absent waterfall (legacy records render nothing new).
+ *
+ * @param {object|null} wf - Normalized waterfall (nr.advancedTiming.waterfall).
+ * @returns {Array<{kind:string, text:string}>}
+ */
+export function buildWaterfallLines(wf) {
+  var lines = [];
+  if (!wf || typeof wf !== "object") return lines;
+
+  // Reconciliation summary: Total / Accounted / Unaccounted (+ tolerance status)
+  var metaParts = [];
+  if (wf.totalMs != null) metaParts.push("Total: " + _formatDuration(wf.totalMs));
+  if (wf.accountedMs != null) metaParts.push("Accounted: " + _formatDuration(wf.accountedMs));
+  if (wf.reconciliationMs != null) {
+    var sign = wf.reconciliationMs >= 0 ? "+" : "\u2212";
+    var unaccounted = sign + _formatDuration(Math.abs(wf.reconciliationMs));
+    if (wf.toleranceMs != null) {
+      unaccounted += " (" + (Math.abs(wf.reconciliationMs) > wf.toleranceMs ? "over tolerance" : "within tolerance") + ")";
+    }
+    metaParts.push("Unaccounted: " + unaccounted);
+  }
+  if (metaParts.length > 0) lines.push({ kind: "meta", text: metaParts.join(" \u00b7 ") });
+
+  // Canonical stage rows, in serialized order, with explicit status markers
+  var stageList = Array.isArray(wf.stages) ? wf.stages : [];
+  stageList.forEach(function (st) {
+    var rowText = st.label || st.key || "?";
+    if (st.durationMs != null && st.durationMs > 0) {
+      rowText += " \u2014 " + _formatDuration(st.durationMs);
+      if (st.percentage != null) rowText += " (" + Math.round(st.percentage) + "%)";
+    } else {
+      rowText += " \u2014 n/a";
+    }
+    var markers = [];
+    if (st.status === "derived") markers.push("derived");
+    else if (st.status === "invalid") markers.push("invalid");
+    if (st.concurrent) markers.push("concurrent");
+    if (markers.length > 0) rowText += " [" + markers.join(", ") + "]";
+    lines.push({ kind: "stage", text: rowText });
+  });
+
+  // Capped warnings — text "Warn:" prefix (no emoji glyphs)
+  if (wf.warnings && wf.warnings.length > 0) {
+    var MAX_WARNINGS = 3;
+    lines.push({ kind: "warn-header", text: "Warnings:" });
+    wf.warnings.slice(0, MAX_WARNINGS).forEach(function (w) {
+      lines.push({ kind: "warn", text: "Warn: " + w });
+    });
+    if (wf.warnings.length > MAX_WARNINGS) {
+      lines.push({ kind: "warn-more", text: "+" + (wf.warnings.length - MAX_WARNINGS) + " more" });
+    }
+  }
+
+  return lines;
 }
 
 // ── Annotation normalization ─────────────────────────────────────────────

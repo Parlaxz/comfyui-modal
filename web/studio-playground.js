@@ -19,7 +19,7 @@ import {
   getPresetCapabilitySummary,
   getUnavailableControlReasons,
 } from "./studio-preset-capabilities.js";
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines } from "./studio-run-normalizer.js";
 import {
   saveSelection,
   loadSelection,
@@ -4652,6 +4652,29 @@ function renderMetadataSection(state, context) {
     }
     if (diag.backendTimingSources && Object.keys(diag.backendTimingSources).length > 0) {
       advancedItems.push({ label: "Backend Sources", value: JSON.stringify(diag.backendTimingSources).substring(0, 200) + (JSON.stringify(diag.backendTimingSources).length > 200 ? "\u2026" : "") });
+    }
+
+    // Waterfall summary (serialized v2 report) — same display text as
+    // History's Diagnostics panel via the shared buildWaterfallLines helper.
+    // Absent (no rows) for legacy records without a waterfall.
+    if (diag.waterfall) {
+      var wfLines = buildWaterfallLines(diag.waterfall);
+      var wfMeta = wfLines.filter(function (l) { return l.kind === "meta"; })
+        .map(function (l) { return l.text; });
+      if (wfMeta.length > 0) {
+        advancedItems.push({ label: "Waterfall", value: wfMeta.join(" | ") });
+      }
+      var wfStages = wfLines.filter(function (l) { return l.kind === "stage"; })
+        .map(function (l) { return l.text; });
+      if (wfStages.length > 0) {
+        advancedItems.push({ label: "Waterfall Stages", value: wfStages.join(" | ") });
+      }
+      var wfWarnings = wfLines
+        .filter(function (l) { return l.kind === "warn" || l.kind === "warn-more"; })
+        .map(function (l) { return l.text; });
+      if (wfLines.some(function (l) { return l.kind === "warn-header"; }) && wfWarnings.length > 0) {
+        advancedItems.push({ label: "Waterfall Warnings", value: wfWarnings.join(" | ") });
+      }
     }
   }
 

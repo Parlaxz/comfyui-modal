@@ -213,6 +213,7 @@ class V2ExperimentInvoker:
         _timing_payload = {
             "trace": trace_dict,
             "_restore_timing": result.get("_restore_timing", {}) if isinstance(result, dict) else {},
+            "waterfall": result.get("waterfall", {}) if isinstance(result, dict) else {},
         }
 
         # Return in the shape expected by ExperimentRunner

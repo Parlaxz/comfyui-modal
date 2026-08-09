@@ -161,4 +161,4 @@ def test_production_profile_guard_uses_remote_metadata():
 def test_benchmark_waterfall_is_emitted_by_remote_modal_runtime():
     assert "from .v2_waterfall import build_waterfall, render_waterfall" in MODAL_APP
     assert 'trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}' in MODAL_APP
-    assert "print(render_waterfall(_waterfall), flush=True)" in MODAL_APP
+    assert "attach_waterfall(data, report=_waterfall, run_label=_run_label)" in MODAL_APP

@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_START_MS=%%a"
 
 chcp 65001 >nul
-set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
+if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
 set "COMFYMODAL_V2_CLOUD="

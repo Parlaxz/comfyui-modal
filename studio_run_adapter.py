@@ -2870,7 +2870,7 @@ async def _schedule_and_start(
     # 4. Preserve compact raw trace structures (no base64)
     if timing_payload:
         for raw_key in ("trace", "wall_clock_trace", "_wall_clock_summary",
-                         "_restore_timing", "scheduler_trace"):
+                         "_restore_timing", "scheduler_trace", "waterfall"):
             val = timing_payload.get(raw_key)
             if val is not None:
                 timings[raw_key] = copy.deepcopy(val)
@@ -2972,6 +2972,8 @@ async def _schedule_and_start(
         meta_merge["primary_asset_id"] = primary_asset_id
     if resolved_meta.get("workflow_hash"):
         meta_merge["workflow_hash"] = resolved_meta["workflow_hash"]
+    if timing_payload and isinstance(timing_payload.get("waterfall"), dict):
+        meta_merge["waterfall"] = copy.deepcopy(timing_payload["waterfall"])
 
     # Finalize the submission record — only set output_path if truly completed
     if run_history_id:
@@ -3558,6 +3560,12 @@ async def direct_studio_run_completion(
             timings["remote_timings"] = dict(_remote_timings_blk)
             timing_sources["remote_timings"] = "derived"
 
+        # Preserve the V2 waterfall from the remote result
+        _waterfall = result.get("waterfall", {}) if isinstance(result, dict) else {}
+        if _waterfall and isinstance(_waterfall, dict):
+            timings["waterfall"] = copy.deepcopy(_waterfall)
+            timing_sources["waterfall"] = "remote_trace"
+
         # platform_pre_restore_ms
         _t2_submit = _merged_stages.get("t2_local_modal_submit_start") or _merged_stages.get("t2_local_dispatch")
         _restore_start = _restore_timing.get("restore_start_unix_s")
@@ -3625,6 +3633,8 @@ async def direct_studio_run_completion(
         if output_paths:
             meta_merge["output_paths"] = list(output_paths)
         meta_merge["output_count"] = len(output_paths)
+        if _waterfall and isinstance(_waterfall, dict):
+            meta_merge["waterfall"] = copy.deepcopy(_waterfall)
 
         # ── Finalize history ──────────────────────────────────────────
         completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
