@@ -19,6 +19,10 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+from comfymodal_runtime.local_handle_client import (
+    PersistentHandleError,
+    PersistentHandleUnavailable,
+)
 from comfymodal_runtime.modal_transport import (
     HandleCache,
     HandleCacheKey,
@@ -291,3 +295,117 @@ class TestCallPublishWithSpawnHelper(unittest.TestCase):
                 transport._call_publish_with_spawn(spawnable, {}),
             )
         self.assertFalse(call.cancel_called)
+
+
+# ── Persistent-path failure classification (single-publish guarantee) ──────
+
+
+class _PersistentFailClient:
+    """Persistent client that raises a configurable failure."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    async def publish_restore_plan(self, *args, **kwargs):
+        raise self.exc
+
+
+class TestPersistentFailureClassification(unittest.TestCase):
+    """``_persistent_failure_is_local`` must be True ONLY for pre-op
+    failures (owner unreachable / handle resolution) — never for post-op
+    failures where the remote publish may have already executed."""
+
+    def test_pre_op_unavailable_is_local(self):
+        self.assertTrue(ModalTransport._persistent_failure_is_local(
+            PersistentHandleUnavailable("cannot connect to local handle owner"),
+        ))
+
+    def test_pre_op_resolve_failed_is_local(self):
+        self.assertTrue(ModalTransport._persistent_failure_is_local(
+            PersistentHandleError("resolve failed", frame={"type": "resolve_failed"}),
+        ))
+
+    def test_post_op_result_unavailable_is_not_local(self):
+        """Timeout / EOF / read failure after the op was delivered must NOT
+        fall back — the remote publish may have already run."""
+        self.assertFalse(ModalTransport._persistent_failure_is_local(
+            PersistentHandleError("timed out", frame={"type": "result_unavailable"}),
+        ))
+
+    def test_empty_frame_type_is_not_local(self):
+        """Unclassified failures are post-op by default: never fall back."""
+        self.assertFalse(ModalTransport._persistent_failure_is_local(
+            PersistentHandleError("boom", frame={}),
+        ))
+
+    def test_nonlocal_publish_failed_is_not_local(self):
+        self.assertFalse(ModalTransport._persistent_failure_is_local(
+            PersistentHandleError("publish failed", frame={"type": "publish_failed"}),
+        ))
+
+
+class TestPersistentPublishSingleInvocation(unittest.TestCase):
+    """One transport publish call must never invoke the remote method twice:
+    post-op persistent failures raise instead of falling back to a direct
+    re-publish; pre-op failures fall back to exactly one direct call."""
+
+    @staticmethod
+    def _transport(persistent_exc: BaseException | None, direct_calls: list) -> ModalTransport:
+        from unittest.mock import patch
+
+        class _Remote:
+            async def aio(self, *args, **kwargs):
+                direct_calls.append(1)
+                return {"status": "published", "generation": 9}
+
+        handle = type("H", (), {
+            "publish_restore_plan": type("F", (), {"remote": _Remote()})(),
+        })()
+        transport = ModalTransport(
+            v2_handle_factory=None,
+            handle_cache=HandleCache(),
+            persistent_handle_client=(
+                None if persistent_exc is None else _PersistentFailClient(persistent_exc)
+            ),
+        )
+        # Persistent mode requires v2_handle_factory=None; the direct fallback
+        # resolves via _v2_handle — stub it to return the fake handle.
+        patcher = patch.object(ModalTransport, "_v2_handle", lambda self, **kw: handle)
+        patcher.start()
+        transport._test_patcher = patcher  # type: ignore[attr-defined]
+        return transport
+
+    def tearDown(self):
+        patcher = getattr(self, "_test_patcher", None)
+        if patcher is not None:
+            patcher.stop()
+
+    def test_post_op_failure_raises_without_direct_call(self):
+        import os
+        direct_calls: list[int] = []
+        transport = self._transport(
+            PersistentHandleError("timed out", frame={"type": "result_unavailable"}),
+            direct_calls,
+        )
+        with patch.dict(os.environ, {"COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE": "1"}, clear=False):
+            with self.assertRaises(PersistentHandleError):
+                asyncio.run(transport.publish_restore_plan(
+                    {"workflow_hash": "wf"}, workspace={"id": "ws-1"},
+                ))
+        self.assertEqual(len(direct_calls), 0,
+                         "post-op failure must NOT re-publish through the direct path")
+
+    def test_pre_op_failure_falls_back_to_exactly_one_direct_call(self):
+        import os
+        direct_calls: list[int] = []
+        transport = self._transport(
+            PersistentHandleUnavailable("cannot connect to local handle owner"),
+            direct_calls,
+        )
+        with patch.dict(os.environ, {"COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE": "1"}, clear=False):
+            result = asyncio.run(transport.publish_restore_plan(
+                {"workflow_hash": "wf"}, workspace={"id": "ws-1"},
+            ))
+        self.assertEqual(result["generation"], 9)
+        self.assertEqual(len(direct_calls), 1,
+                         "pre-op failure falls back to exactly ONE direct call")

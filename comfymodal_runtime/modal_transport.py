@@ -212,12 +212,26 @@ class ModalTransport:
 
     @staticmethod
     def _persistent_failure_is_local(exc: BaseException) -> bool:
+        """Whether a persistent-IPC failure is safe to fall back to a direct
+        Modal call — i.e. the remote method can be guaranteed NOT to have
+        executed yet.
+
+        Pre-op failures (owner unreachable, handle resolution/auth failures,
+        proxy-internal errors before delivery, stream proxy read errors) fall
+        back: no remote side effect happened, so one direct call is exactly
+        one remote invocation.
+
+        Post-op failures (``result_unavailable``: result-read timeout, EOF,
+        or read failure AFTER the publish op was delivered) do NOT fall back:
+        the remote publish may have already executed, and a direct retry
+        would trigger ``publish_restore_plan`` a second time.
+        """
         if isinstance(exc, PersistentHandleUnavailable):
             return True
         if not isinstance(exc, PersistentHandleError):
             return False
         return str(exc.frame.get("type", "")) in {
-            "", "proxy_read_failed", "proxy_internal", "resolve_failed",
+            "proxy_read_failed", "proxy_internal", "resolve_failed",
             "auth_failed", "unknown_op",
         }
 
