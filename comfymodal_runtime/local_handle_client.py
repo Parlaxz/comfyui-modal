@@ -28,6 +28,12 @@ from typing import Any, Mapping
 
 IPC_STREAM_LIMIT = 128 * 1024 * 1024
 
+# Result-read budget for the one-shot ``publish_restore_plan`` op.  The
+# owner's publish covers handle resolution AND a remote Modal call that may
+# wait for container availability — far longer than the loopback connect
+# timeout.  Configurable via ``COMFYMODAL_LOCAL_HANDLE_PUBLISH_TIMEOUT``.
+DEFAULT_PUBLISH_TIMEOUT = 180.0
+
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
 
@@ -392,12 +398,20 @@ class PersistentHandleClient:
         auth_token: str = "",
         start_timeout: float = 30.0,
         connect_timeout: float = 10.0,
+        publish_timeout: float | None = None,
     ) -> None:
         self._repo_root = Path(repo_root) if repo_root else _default_repo_root()
         self._state_path = Path(state_path) if state_path else default_owner_state_path()
         self._auth_token = auth_token or secrets.token_urlsafe(32)
         self._start_timeout = start_timeout
         self._connect_timeout = connect_timeout
+        if publish_timeout is not None:
+            self._publish_timeout = float(publish_timeout)
+        else:
+            self._publish_timeout = float(
+                os.environ.get("COMFYMODAL_LOCAL_HANDLE_PUBLISH_TIMEOUT", "")
+                or DEFAULT_PUBLISH_TIMEOUT
+            )
         self._owner_process: subprocess.Popen[Any] | None = None
         self._owner_port: int | None = None
         self._owner_ready = False
@@ -610,6 +624,11 @@ class PersistentHandleClient:
 
         Awaitable; returns the authoritative publication result.  The owner
         retries publish once on a stale/deleted handle error.
+
+        Failures AFTER the op was delivered (result-read timeout, EOF, or
+        read failure) raise ``PersistentHandleError`` with frame type
+        ``result_unavailable`` — the remote publish may have already
+        executed, so callers must not re-publish.
         """
         await self._ensure_owner()
         key = self._ensure_token_id_in_key(key, workspace)
@@ -636,10 +655,16 @@ class PersistentHandleClient:
                 "request_id": str(request_id or ""),
             })
             while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=self._connect_timeout)
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=self._publish_timeout,
+                )
                 if not line:
-                    raise PersistentHandleUnavailable(
-                        "owner closed the connection before a result"
+                    # The op WAS delivered and the remote publish may have
+                    # already executed.  Classified as post-op so the
+                    # transport never re-publishes through the direct path.
+                    raise PersistentHandleError(
+                        "owner closed the connection before a result",
+                        frame={"type": "result_unavailable"},
                     )
                 frame = json.loads(line)
                 ftype = frame.get("frame")
@@ -658,9 +683,15 @@ class PersistentHandleClient:
                         frame=error,
                     )
         except asyncio.TimeoutError as exc:
-            raise PersistentHandleError(f"publish_restore_plan timed out: {exc}") from exc
+            raise PersistentHandleError(
+                f"publish_restore_plan timed out: {exc}",
+                frame={"type": "result_unavailable"},
+            ) from exc
         except (json.JSONDecodeError, ConnectionError, OSError) as exc:
-            raise PersistentHandleError(f"publish_restore_plan read failed: {exc}") from exc
+            raise PersistentHandleError(
+                f"publish_restore_plan read failed: {exc}",
+                frame={"type": "result_unavailable"},
+            ) from exc
         finally:
             try:
                 writer.close()
