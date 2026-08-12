@@ -58,6 +58,12 @@ if /i "!V2_IS_RESTORE_ONLY!"=="1" (
     REM Forced (not "if not defined") so a user's global production profile
     REM can never re-enable the production branch and wipe the eviction vars.
     set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+    REM Snapshot construction lifecycle marker: this deploy invocation is
+    REM the labeled/excluded snapshot construction.  The marker keeps the
+    REM active-next-profile publication available on the construction path;
+    REM normal restored generations (run_v2_single.bat) never set it and
+    REM skip the remote checker/setter entirely.
+    set "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION=1"
 )
 if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=production"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
@@ -194,6 +200,7 @@ echo restore_only_app=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!
 echo restore_only_run_count=!V2_RESTORE_ONLY_RUN_COUNT!
 echo restore_only_max_attempts=!V2_RESTORE_ONLY_MAX_ATTEMPTS!
 echo snapshot_exclude_unet=!COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET!
+echo snapshot_construction=!COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION!
 
 REM -- Modal CLI detection -----------------------------------------
 where modal >nul 2>nul

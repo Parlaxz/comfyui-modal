@@ -876,6 +876,73 @@ def _event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float
 # are imported from comfymodal_runtime.trace above.
 
 
+def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
+    """Run the parent-ComfyUI ``execution.validate_prompt`` (fail-closed).
+
+    Host-only, lazy imports only — module import must NOT import
+    ``execution``/``nodes``.  Returns the plan-carried validation proof
+    payload.  Raises ``RuntimeError`` when validation fails or raises, so an
+    invalid workflow never reaches dispatch.
+    """
+    import asyncio
+    import concurrent.futures
+    import execution  # parent ComfyUI module — lazy, host-only
+    from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION
+    try:
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _loop = None
+        _coro = execution.validate_prompt(prompt_id, workflow, None)
+        if _loop is not None and _loop.is_running():
+            # Running loop in the current thread (v2 dispatch runs on the
+            # ComfyUI event loop).  Blocking that loop via
+            # ``asyncio.run_coroutine_threadsafe(...).result()`` would stall it
+            # (the loop cannot progress while its own thread is blocked), so
+            # drive the coroutine on a fresh loop in a worker thread instead.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                _result = _pool.submit(lambda: asyncio.run(_coro)).result(timeout=120)
+            _valid, _error, _outputs, _node_errors = _result
+        else:
+            _valid, _error, _outputs, _node_errors = asyncio.run(_coro)
+    except Exception as _exc:
+        raise RuntimeError(f"plan validation failed (exception): {_exc}") from _exc
+    if not _valid:
+        _err_text = str(_error or {})[:300]
+        raise RuntimeError(f"plan validation failed (invalid workflow): {_err_text}")
+    return {
+        "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
+        "validated": bool(_valid),
+        "outputs_to_execute": sorted(str(o) for o in (_outputs or [])),
+        "node_errors": dict(_node_errors or {}),
+        "validated_workflow_hash": "",
+        "source": "host_validate_prompt",
+    }
+
+
+def _collect_plan_deployment_identity(request_metadata=None) -> dict:
+    """Best-effort deployment identity for the plan (never fabricated).
+
+    ``registry_fingerprint`` returns ``""`` when ``nodes`` is unavailable, so
+    ``complete`` is only ever True when every component is known.
+    """
+    import os
+    from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION, compute_registry_fingerprint
+    _meta = dict(request_metadata or {})
+    _dep = str(_meta.get("deployment_combined_hash", "") or "")
+    if not _dep:
+        _dep = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+    _gen = str(_meta.get("custom_node_generation", "") or "")
+    _reg = compute_registry_fingerprint()  # "" when nodes unavailable — ineligible, never fabricate
+    return {
+        "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
+        "deployment_combined_hash": _dep,
+        "custom_nodes_generation": _gen,
+        "registry_fingerprint": _reg,
+        "complete": bool(_dep and _gen and _reg),
+    }
+
+
 def build_execution_plan(
     workflow: dict,
     *,
@@ -891,6 +958,7 @@ def build_execution_plan(
     comfyui_root: str = "",
     trace: RuntimeTrace | None = None,
     validate: bool = True,
+    collect_validation_proof: bool = False,
 ) -> ExecutionPlan:
     """Normalize, validate, compile, and freeze one dispatch plan."""
     if trace:
@@ -917,7 +985,16 @@ def build_execution_plan(
         )
         dispatch_workflow = compiled.compiled_workflow
         report = dict(compiled.report)
+    # Step-1 plan-carried validation proof.  Runs AFTER the dispatch workflow
+    # is finalized but BEFORE the hash so the host hash is computed over the
+    # exact dict object frozen into the plan (validate_prompt coerces scalar
+    # inputs in place).  Fail-closed: any validation failure aborts the build.
+    _validation_payload: dict = {}
+    if collect_validation_proof:
+        _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
     dispatch_hash = prompt_sha256(dispatch_workflow)
+    if _validation_payload:
+        _validation_payload["validated_workflow_hash"] = dispatch_hash
     if report.get("enabled"):
         compiled_hash = str(report.get("compiled_workflow_hash", ""))
         if compiled_hash and compiled_hash != dispatch_hash:
@@ -963,6 +1040,9 @@ def build_execution_plan(
         "selected_gpu": gpu or "",
         "workspace_id": str((workspace or {}).get("id", "")),
     })
+    # Deployment identity is computed once and reused for the plan arg and the
+    # instrumentation line below (never recomputed twice).
+    _deployment_identity = _collect_plan_deployment_identity(request_metadata)
     plan = ExecutionPlan(
         workflow=dispatch_workflow,
         workflow_hash=dispatch_hash,
@@ -974,7 +1054,16 @@ def build_execution_plan(
         input_images=input_images or {},
         execution_options=options,
         request_metadata=metadata,
+        validation=_validation_payload,
+        deployment_identity=_deployment_identity,
     )
+    if _validation_payload:
+        print(
+            f"[v2.plan_proof] schema={_validation_payload.get('schema_version')} payload=yes "
+            f"validated={_validation_payload.get('validated')} outputs={len(_validation_payload.get('outputs_to_execute', []))} "
+            f"wf_hash={dispatch_hash[:16]} dep_complete={_deployment_identity.get('complete')}",
+            flush=True,
+        )
     if trace:
         trace.emit("plan_build_end", phase="local", metadata={
             "workflow_hash": plan.workflow_hash,
@@ -1248,29 +1337,43 @@ async def execute_plan(
                 _remove_profile_disk_entry(_profile_cache_key)
     elif profile_setter is not None:
         # ── Inherit no-op gate (default single-invocation V2 path) ──
-        # Requested effective profile is the deploy default ("inherit", a
-        # no-op in-container override) and no warmup-profile consumer is
-        # active (CPU-model snapshot, persistent CLIP cache, legacy V1
-        # warmup).  The remote container derives its seed from the request
-        # (invocation_plan) and never reads the volume-published
-        # active_next_profile.json, so the remote checker/setter calls here
-        # are pure pre-submission latency.  Skip them entirely — the profile
-        # path is a local no-op by design; explicit profile changes and
-        # active consumers still use the full path above.
         _noop_start_s = time.time()
         _container_default_profile = os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ).strip().lower()
-        runtime_trace.emit("active_profile_inherit_noop", phase="local", metadata={
-            "reason": "inherit_default_no_consumer",
+        _cpu_snapshot_enabled = 1 if os.environ.get(
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", ""
+        ).strip() == "1" else 0
+        _snapshot_build_phase = 1 if os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", ""
+        ).strip() == "1" else 0
+        # Lifecycle-accurate no-op: the requested profile is the deploy
+        # default (inherit — a no-op in-container override) and no warmup-
+        # profile consumer is active.  A CPU-model-snapshot deployment
+        # consumes active_next_profile.json only during snapshot
+        # CONSTRUCTION (startup, snap=True); normal restored generations
+        # (snap=False) derive all request state from invocation_plan and
+        # never read the volume record, so the remote checker/setter here
+        # is pure pre-submission latency.  Explicit profile changes and
+        # construction/consumer invocations still use the full path above.
+        _noop_reason = "post_snapshot" if _cpu_snapshot_enabled else "inherit_default_no_consumer"
+        _noop_decision = (
+            "skipped_post_snapshot_noop" if _cpu_snapshot_enabled
+            else "skipped_inherit_noop"
+        )
+        runtime_trace.emit("active_profile_skip_noop", phase="local", metadata={
+            "reason": _noop_reason,
             "requested_env_profile": _profile_requested_env,
             "container_default_profile": _container_default_profile,
             "checker_remote_call": 0,
             "setter_remote_call": 0,
             "override_applied": 0,
+            "snapshot_build_phase": _snapshot_build_phase,
+            "cpu_model_snapshot_enabled": _cpu_snapshot_enabled,
+            "consumer_requires_publication": 0,
         })
         runtime_trace.set_metadata(
-            active_profile_publish_decision="skipped_inherit_noop",
+            active_profile_publish_decision=_noop_decision,
             active_profile_stable_key="",
             active_profile_token="",
             local_active_profile_prepare_ms=0.0,
@@ -1291,20 +1394,26 @@ async def execute_plan(
             source_workflow_hash=plan.source_workflow_hash,
             model_stack=dict(plan.model_stack),
             prompt_summary=dict(plan.prompt_bundle),
-            profile_noop_reason="inherit_default_no_consumer",
+            profile_noop_reason=_noop_reason,
             profile_requested_env=_profile_requested_env,
             profile_container_default=_container_default_profile,
             profile_effective=_profile_requested_env,
             profile_override_applied=False,
+            snapshot_build_phase=_snapshot_build_phase,
+            cpu_model_snapshot_enabled=_cpu_snapshot_enabled,
+            consumer_requires_publication=0,
         )
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={
-            "decision": "skipped_inherit_noop",
-            "reason": "inherit_default_no_consumer",
+            "decision": _noop_decision,
+            "reason": _noop_reason,
         })
         print(
-            f"[active_profile.publish] decision=skipped_inherit_noop "
+            f"[active_profile.publish] decision={_noop_decision} "
             f"requested={_profile_requested_env or '(inherit)'} "
             f"container_default={_container_default_profile} "
+            f"cpu_model_snapshot={_cpu_snapshot_enabled} "
+            f"snapshot_build_phase={_snapshot_build_phase} "
+            f"consumer_requires_publication=0 "
             f"checker_remote=0 setter_remote=0 "
             f"active_profile_noop_ms={round((time.time() - _noop_start_s) * 1000, 2)}",
             flush=True,

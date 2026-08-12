@@ -185,8 +185,14 @@ def active_next_publication_required(env_profile: str | None = None) -> bool:
     """Whether the active-next warmup-profile publication is load-bearing.
 
     The volume-published ``active_next_profile.json`` is consumed only by:
-      * CPU-model-snapshot deployments (``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1``)
-        at container startup (``modal_app.startup`` → ``_cpu_snapshot_profile``),
+      * snapshot construction — ``COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION=1``
+        (deploy-side construction marker) keeps publication available on
+        the construction/warmup path, where the profile is read during
+        startup (``modal_app.startup`` → ``_cpu_snapshot_profile``).  The
+        deployment capability flag ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1``
+        alone does NOT require publication: post-snapshot restored
+        generations (``snap=False``) derive request state from
+        ``invocation_plan`` and never read the volume record.
       * legacy V1 restore preload (``ENABLE_WARMUP``) and persistent CLIP
         cache prompt-bundle reads (``COMFYMODAL_PERSISTENT_CLIP_CACHE``).
 
@@ -206,7 +212,14 @@ def active_next_publication_required(env_profile: str | None = None) -> bool:
         return True
     if os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
         return False
-    if os.environ.get("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "").strip() == "1":
+    # Snapshot construction is the only CPU-model-snapshot lifecycle phase
+    # that reads active_next_profile.json (startup / enter(snap=True) →
+    # _cpu_snapshot_profile).  Normal restored generations (enter(snap=False))
+    # derive request state from invocation_plan and never read the volume
+    # record, so COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1 alone must NOT force
+    # publication.  The deploy-side marker below is set only by snapshot
+    # construction/warmup invocations.
+    if os.environ.get("COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", "").strip() == "1":
         return True
     if env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
         return True
