@@ -10758,75 +10758,81 @@ class _ComfyAPIMixin:
                 )
                 return _sanitized
 
-        # Step 2: Volume state changed GÃ‡Ã¶ compute full content fingerprint
-        current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
-        current_fp_hash = custom_node_source_generation(
-            CUSTOM_NODES_PATH, fingerprint=current_fp
-        )
+        # Step 2: Content change detection without re-hashing the volume.
+        # Re-fingerprinting every source file of every custom node over the
+        # (cold) volume mount cost ~86s per fresh-container boot while the
+        # sync below is an idempotent symlink pass (~3s).  The persisted
+        # generation record is content-derived and maintained by the local
+        # volume sync / image build, so a fresh container (no prior
+        # in-process fingerprint) does not need to re-hash content at all.
+        # The in-process fingerprint comparison is kept only for warm-cache
+        # repeat calls within the same container session.
         last_fp = getattr(self, "_last_custom_node_source_fingerprint", None)
+        if last_fp is not None:
+            current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
+            if last_fp == current_fp:
+                node_count_fp = len(current_fp.get("nodes", []))
+                print(
+                    f"[comfyapp] custom_node_sync_skipped reason=source_fingerprint_unchanged "
+                    f"nodes={node_count_fp}"
+                )
+                _result = (
+                    {
+                        "created": [],
+                        "removed": [],
+                        "kept": [],
+                        "blocked": [],
+                        "skipped": True,
+                        "skip_reason": "source_fingerprint_unchanged",
+                    },
+                    cheap_state,
+                )
+                self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
+                # Sync the cached generation from the reloaded volume so
+                # observe_generations reflects current state even when the
+                # source fingerprint is unchanged across lifecycle boundaries.
+                try:
+                    _gen_rec_skip = _read_custom_nodes_generation_record()
+                    _gen_now_skip = (_gen_rec_skip or {}).get("generation", "") if _gen_rec_skip else ""
+                    if _gen_now_skip:
+                        self._custom_nodes_generation_seen = _gen_now_skip
+                except Exception:
+                    pass
+                return _result
 
-        if last_fp is not None and last_fp == current_fp:
-            node_count_fp = len(current_fp.get("nodes", []))
-            print(
-                f"[comfyapp] custom_node_sync_skipped reason=source_fingerprint_unchanged "
-                f"nodes={node_count_fp}"
-            )
-            _result = (
-                {
-                    "created": [],
-                    "removed": [],
-                    "kept": [],
-                    "blocked": [],
-                    "skipped": True,
-                    "skip_reason": "source_fingerprint_unchanged",
-                },
-                cheap_state,
-            )
-            self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
-            # Sync the cached generation from the reloaded volume so
-            # observe_generations reflects current state even when the
-            # source fingerprint is unchanged across lifecycle boundaries.
-            try:
-                _gen_rec_skip = _read_custom_nodes_generation_record()
-                _gen_now_skip = (_gen_rec_skip or {}).get("generation", "") if _gen_rec_skip else ""
-                if _gen_now_skip:
-                    self._custom_nodes_generation_seen = _gen_now_skip
-            except Exception:
-                pass
-            return _result
-
-        # Step 3: Content actually changed GÃ‡Ã¶ run the real sync
+        # Step 3: Run the idempotent sync (no content fingerprint on a
+        # fresh container).
         summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes, include_state=True)
         state = summary.pop("state", cheap_state)
-        node_count_fp = len(current_fp.get("nodes", []))
+        node_count = len(state)
         print(
-            f"[comfyapp] custom_node_sync_ran reason=source_fingerprint_changed "
-            f"nodes={node_count_fp}"
+            f"[comfyapp] custom_node_sync_ran reason=volume_managed "
+            f"nodes={node_count}"
         )
-        self._last_custom_node_source_fingerprint = current_fp
+        if last_fp is not None:
+            self._last_custom_node_source_fingerprint = current_fp
         _result = (summary, state)
         self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
-        # Record the generation so the fast path works on subsequent calls
-        # within the same container session.
-        # V2 actual-sync branch: when no generation record exists yet
-        # (e.g. first sync after a v2 restore), create one atomically
-        # so downstream identity consumers see a non-empty value.
-        # Uses the content-derived ``current_fp_hash`` (MD5 of the synced
-        # custom-node source fingerprint) as the generation so that
+        # Record the generation so identity consumers see a stable value.
+        # The record is content-derived and maintained by the local volume
+        # sync / image build; never rewrite an existing record here (the
+        # previous rewrite-if-different recomputed the full content
+        # fingerprint on every fresh container, the dominant cost of the
+        # slow snapshot startup).  Only when the record is missing (fresh
+        # volume) is the content generation computed once and persisted
+        # atomically, with a deterministic content-derived value so
         # concurrent containers syncing identical content converge on the
-        # same persisted value.  The atomic ``os.replace`` inside the
-        # write helper resolves any race, but with an identical generation
-        # the race is harmless by construction.
+        # same generation.
         try:
             _gen_rec = _read_custom_nodes_generation_record()
             _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
-            if _gen_now != current_fp_hash:
-                _gen_rec = _write_custom_nodes_generation_record_no_commit(
+            if not _gen_now:
+                _gen_now = custom_node_source_generation(CUSTOM_NODES_PATH)
+                _write_custom_nodes_generation_record_no_commit(
                     reason="actual_sync_created",
-                    generation=current_fp_hash,
+                    generation=_gen_now,
                 )
                 custom_nodes_vol.commit()
-                _gen_now = current_fp_hash
             if _gen_now:
                 self._custom_nodes_generation_seen = _gen_now
         except Exception:

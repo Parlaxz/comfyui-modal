@@ -7137,47 +7137,16 @@ class ModalRuntimeEntrypoint:
                             },
                             getattr(api, "_custom_nodes_state", ()),
                         )
+                    # Generation mismatch: the volume is authoritative and
+                    # differs from the image bake, so run the idempotent
+                    # full sync.  Deliberately no content re-fingerprinting
+                    # here: hashing every source file of every custom node
+                    # from the cold volume mount cost ~86s per snapshot
+                    # boot (custom_node_source_copy stage) while the sync
+                    # itself is a ~3s symlink pass.  The persisted
+                    # generation record is already content-derived and
+                    # maintained by the local volume sync / image build.
                     _fallback_reason = "generation_mismatch"
-                    try:
-                        _cn_vol_root = getattr(module, "CUSTOM_NODES_PATH", "")
-                        if _cn_vol_root and os.path.isdir(_cn_vol_root):
-                            _vol_gen = module.custom_node_source_generation(_cn_vol_root)
-                            if _baked_generation and _vol_gen == _baked_generation:
-                                module._write_custom_nodes_generation_record_no_commit(
-                                    reason="snapshot_reconcile_baked_exact",
-                                    generation=_vol_gen,
-                                )
-                                _cnv = getattr(module, "custom_nodes_vol", None)
-                                if _cnv is not None:
-                                    _cmt = getattr(_cnv, "commit", None)
-                                    if callable(_cmt):
-                                        _cmt()
-                                api._custom_nodes_generation_seen = _vol_gen
-                                print(
-                                    "[v2.custom_node_startup] "
-                                    "decision=snapshot_exact_skip callback_called=0 "
-                                    "reason=reconciled_volume_content_matches_baked "
-                                    f"source={_current_source} "
-                                    f"generation={_vol_gen[:16]}",
-                                    flush=True,
-                                )
-                                return (
-                                    {
-                                        "created": [],
-                                        "removed": [],
-                                        "kept": [],
-                                        "blocked": [],
-                                        "skipped": True,
-                                        "skip_reason": "snapshot_reconciled_exact_generation",
-                                    },
-                                    getattr(api, "_custom_nodes_state", ()),
-                                )
-                    except Exception as _reconcile_exc:
-                        print(
-                            f"[v2.custom_node_startup] reconcile_failed "
-                            f"error={type(_reconcile_exc).__name__}",
-                            flush=True,
-                        )
                 elif not _baked_generation:
                     _fallback_reason = "baked_generation_missing"
                 elif not _current_generation:
