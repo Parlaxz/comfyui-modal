@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
 import sys
 import time
@@ -109,8 +110,19 @@ class TestOperationCounts(unittest.TestCase):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
+        # Pin the effective env profile to production so the pre-submission
+        # profile checker/setter path always runs (the inherit no-op gate
+        # would otherwise skip setter invocation, breaking the pinned
+        # setter-invocation assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
@@ -373,6 +385,18 @@ class TestWorkspaceHandleIsolation(unittest.TestCase):
 
     def setUp(self):
         self.factory_call_count = [0]
+        # Pin the effective env profile to production so the full profile
+        # setter path runs (the inherit no-op gate would skip the setter,
+        # breaking the invoke_count assertion in test_isolation_in_execute_plan).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
 
     def _counting_factory(self, **kw):
         self.factory_call_count[0] += 1
@@ -843,8 +867,18 @@ class TestProfileAndRestoreDedup(unittest.TestCase):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs (the inherit no-op gate would skip the setter,
+        # breaking the setter-invocation assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
@@ -906,8 +940,18 @@ class TestBreakdownMetadataCorrectness(unittest.TestCase):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs and the second call is a real profile-prep cache
+        # hit (the inherit no-op gate would show profile_cache_hit=False).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
@@ -1340,8 +1384,18 @@ class TestFailedCallsNotCached(unittest.TestCase):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs (the inherit no-op gate would skip the failing
+        # setter entirely, breaking the reinvocation-count assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
