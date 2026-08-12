@@ -2,13 +2,18 @@
 
 When the effective requested env profile is the deploy default ``inherit``
 (no request-carried ``env_profile`` and no ``COMFYMODAL_V2_ENV_PROFILE``)
-AND no warmup-profile consumer is active (``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT``,
-``COMFYMODAL_PERSISTENT_CLIP_CACHE``, ``ENABLE_WARMUP``), the pre-submission
-profile checker/setter calls are SKIPPED entirely (decision
-``skipped_inherit_noop``, ``profile_setter_performed=False``).  The full
-checker/setter path still runs for explicit profile changes
-(``production``/``diagnostic``) or active consumer flags, and the Modal
-submission always happens regardless.
+AND no warmup-profile consumer is active (snapshot CONSTRUCTION marker
+``COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION``, ``COMFYMODAL_PERSISTENT_CLIP_CACHE``,
+``ENABLE_WARMUP``), the pre-submission profile checker/setter calls are
+SKIPPED entirely (decision ``skipped_inherit_noop``,
+``profile_setter_performed=False``).  A CPU-model-snapshot deployment
+(``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1``) also skips on normal restored
+generations (decision ``skipped_post_snapshot_noop``): only snapshot
+CONSTRUCTION reads ``active_next_profile.json``, so the deploy-side marker
+``COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION=1`` keeps the full path.  Explicit
+profile changes (``production``/``diagnostic``) and active consumers keep
+the full checker/setter path, and the Modal submission always happens
+regardless.
 
 Mirrors the style of ``test_v2_local_pre_submit_optimization.py``.
 """
@@ -136,6 +141,7 @@ class TestInheritNoopGate(unittest.TestCase):
             # Neutralize consumer flags that could leak from the host env.
             for _flag in (
                 "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION",
                 "COMFYMODAL_PERSISTENT_CLIP_CACHE",
                 "ENABLE_WARMUP",
                 "DISABLE_ACTIVE_NEXT_WRITE",
@@ -173,13 +179,13 @@ class TestInheritNoopGate(unittest.TestCase):
                         "noop gate must not add meaningful latency")
 
     def test_inherit_noop_emits_trace_event(self):
-        """The trace carries ``active_profile_inherit_noop`` and an
+        """The trace carries ``active_profile_skip_noop`` and an
         ``active_next_profile_end`` event with decision ``skipped_inherit_noop``."""
         trace = RuntimeTrace(request_id="inherit_noop_events", process="local")
         self._run_execute_plan(setter=_CountingSetter(), trace=trace)
 
         names = [e.name for e in trace.events]
-        self.assertIn("active_profile_inherit_noop", names)
+        self.assertIn("active_profile_skip_noop", names)
         end_events = [e for e in trace.events if e.name == "active_next_profile_end"]
         self.assertEqual(len(end_events), 1,
                          "exactly one active_next_profile_end event")
@@ -194,6 +200,9 @@ class TestInheritNoopGate(unittest.TestCase):
         output = captured.getvalue()
         self.assertIn("[active_profile.publish]", output)
         self.assertIn("decision=skipped_inherit_noop", output)
+        self.assertIn("cpu_model_snapshot=0", output)
+        self.assertIn("snapshot_build_phase=0", output)
+        self.assertIn("consumer_requires_publication=0", output)
 
     # ── explicit profile changes / consumers: full path kept ───────────────
 
@@ -210,14 +219,84 @@ class TestInheritNoopGate(unittest.TestCase):
         )
         self.assertEqual(setter.invoke_count, 1)
 
-    def test_inherit_with_cpu_snapshot_keeps_setter(self):
-        """inherit env + ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1`` consumer."""
+    def test_inherit_with_cpu_snapshot_post_snapshot_skips_checker_and_setter(self):
+        """inherit env + ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1`` (no
+        construction marker) is a post-snapshot restored generation: the
+        checker/setter are skipped (decision ``skipped_post_snapshot_noop``)
+        and submission proceeds."""
+        setter = _CountingSetter()
+        checker = _CountingChecker()
+        result = self._run_execute_plan(
+            setter=setter,
+            checker=checker,
+            env_extra={"COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1"},
+        )
+
+        self.assertEqual(setter.invoke_count, 0,
+                         "post-snapshot generation must never invoke the setter")
+        self.assertEqual(checker.invoke_count, 0,
+                         "post-snapshot generation must never invoke the checker")
+        self.assertTrue(self._stream_iterated,
+                        "submission stream must still be consumed")
+
+        md = result["trace"].get("metadata", {})
+        self.assertEqual(md.get("active_profile_publish_decision"),
+                         "skipped_post_snapshot_noop")
+        self.assertEqual(md.get("snapshot_build_phase"), 0)
+        self.assertEqual(md.get("cpu_model_snapshot_enabled"), 1)
+        self.assertEqual(md.get("consumer_requires_publication"), 0)
+        self.assertIs(md.get("profile_checker_performed"), False)
+        self.assertIs(md.get("profile_setter_performed"), False)
+        self.assertIs(md.get("profile_override_applied"), False)
+        total_ms = md.get("active_profile_total_ms", 9999)
+        self.assertLess(total_ms, 5000,
+                        "noop gate must not add meaningful latency")
+
+    def test_inherit_with_cpu_snapshot_construction_marker_keeps_setter(self):
+        """inherit env + CPU snapshot + ``COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION=1``
+        keeps the full publication path (snapshot construction reads the
+        volume-published profile during startup)."""
         setter = _CountingSetter()
         self._run_execute_plan(
             setter=setter,
-            env_extra={"COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1"},
+            env_extra={
+                "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1",
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": "1",
+            },
         )
         self.assertEqual(setter.invoke_count, 1)
+
+    def test_post_snapshot_decision_breakdown_line(self):
+        """A CPU-model-snapshot restored generation (no construction marker)
+        prints the post-snapshot no-op decision and lifecycle fields."""
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            self._run_execute_plan(
+                setter=_CountingSetter(),
+                env_extra={"COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1"},
+            )
+        output = captured.getvalue()
+        self.assertIn("decision=skipped_post_snapshot_noop", output)
+        self.assertIn("cpu_model_snapshot=1", output)
+        self.assertIn("snapshot_build_phase=0", output)
+        self.assertIn("consumer_requires_publication=0", output)
+
+    def test_request_carried_invocation_plan_still_submits(self):
+        """A normal restored-generation run (CPU snapshot, inherit, no
+        construction marker) still submits: the stream is consumed and no
+        publication reappears before submission."""
+        setter = _CountingSetter()
+        result = self._run_execute_plan(
+            setter=setter,
+            env_extra={"COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1"},
+        )
+        self.assertTrue(self._stream_iterated,
+                        "restored-generation submission must still happen")
+        md = result["trace"].get("metadata", {})
+        self.assertIs(md.get("profile_remote_call_performed"), False,
+                      "no remote publication may reappear before submission")
+        self.assertEqual(md.get("active_profile_publish_decision"),
+                         "skipped_post_snapshot_noop")
 
     def test_inherit_with_persistent_cache_keeps_setter(self):
         """inherit env + ``COMFYMODAL_PERSISTENT_CLIP_CACHE=1`` consumer."""
@@ -241,7 +320,8 @@ class TestInheritNoopGate(unittest.TestCase):
         """Request-carried ``inherit`` is a no-op override: even with the
         process env pinned to production the setter is skipped.  Deployments
         that need the volume-published active-next profile must set a
-        consumer flag (``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` etc.)."""
+        consumer flag (``COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION``,
+        ``COMFYMODAL_PERSISTENT_CLIP_CACHE``, ``ENABLE_WARMUP``)."""
         setter = _CountingSetter()
         self._run_execute_plan(
             setter=setter,
@@ -275,6 +355,7 @@ class TestActiveNextPublicationRequired(unittest.TestCase):
             for _key in (
                 "COMFYMODAL_V2_ENV_PROFILE",
                 "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION",
                 "COMFYMODAL_PERSISTENT_CLIP_CACHE",
                 "ENABLE_WARMUP",
                 "DISABLE_ACTIVE_NEXT_WRITE",
@@ -298,11 +379,48 @@ class TestActiveNextPublicationRequired(unittest.TestCase):
     def test_env_profile_diagnostic_true(self):
         self.assertIs(self._required({"COMFYMODAL_V2_ENV_PROFILE": "diagnostic"}), True)
 
-    def test_inherit_with_cpu_snapshot_true(self):
+    def test_inherit_with_cpu_snapshot_false(self):
+        """``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1`` alone does NOT require
+        publication: post-snapshot restored generations never read the
+        volume-published active-next profile."""
         self.assertIs(
             self._required({
                 "COMFYMODAL_V2_ENV_PROFILE": "inherit",
                 "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1",
+            }),
+            False,
+        )
+
+    def test_inherit_with_snapshot_construction_true(self):
+        """The deploy-side ``COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION=1`` marker
+        keeps publication on the snapshot construction path."""
+        self.assertIs(
+            self._required({
+                "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": "1",
+            }),
+            True,
+        )
+
+    def test_inherit_with_cpu_snapshot_and_construction_true(self):
+        """Snapshot construction with the capability flag present still
+        requires publication."""
+        self.assertIs(
+            self._required({
+                "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+                "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1",
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": "1",
+            }),
+            True,
+        )
+
+    def test_production_without_construction_true(self):
+        """An explicit production profile requires publication even when no
+        construction marker is set (explicit profile change wins)."""
+        self.assertIs(
+            self._required({
+                "COMFYMODAL_V2_ENV_PROFILE": "production",
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": "",
             }),
             True,
         )
