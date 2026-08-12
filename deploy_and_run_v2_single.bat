@@ -7,6 +7,7 @@ REM -- Pin environment variables ------------------------------------
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 if not defined COMFYMODAL_V2_GPU set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+if not defined COMFYMODAL_V2_RESTORE_ONLY_APP_NAME set "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 REM -- Variance-cold mode (explicit opt-in) -------------------------
 REM Uses a unique shadow app name ONLY for variance mode.  Normal and
 REM production modes keep the default identity above.
@@ -27,6 +28,37 @@ if /i "!V2_IS_VARIANCE!"=="1" (
     set "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS=1"
     set "COMFYMODAL_V2_UNET_PRETOUCH=!V2_PROFILE_PRETOUCH!"
 )
+REM -- UNET-absent snapshot restore-only mode (explicit opt-in) -----
+REM Uses a unique shadow app name deployed with
+REM COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1 (experiment identity/reporting
+REM gate only) so startup STILL constructs the full CLIP/UNET/VAE CPU
+REM snapshot with normal UNET dtype validation, then the strict clip_vae
+REM eviction retain role evicts the UNET (proving it dead via weakrefs)
+REM while fresh CLIP and VAE are reloaded back into the retained
+REM CpuSnapshotModels container before Modal captures the memory snapshot.
+REM Provider and region stay UNPINNED (COMFYMODAL_V2_CLOUD /
+REM COMFYMODAL_V2_REGION are never set here).  This deploy invocation is
+REM the LABELED/EXCLUDED snapshot construction: it exits after deploy and
+REM must NOT issue reuse probes.  The exactly-6 valid reuse probes are
+REM issued ONLY by run_v2_single.bat with V2_BENCHMARK_MODE=
+REM snapshot_restore_only.
+set "V2_IS_RESTORE_ONLY=0"
+if /i "!V2_BENCHMARK_MODE!"=="snapshot_restore_only" set "V2_IS_RESTORE_ONLY=1"
+if /i "!V2_IS_RESTORE_ONLY!"=="1" (
+    set "COMFYMODAL_V2_APP_NAME=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!"
+    set "V2_DEPLOY_IDENT=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!"
+    set "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1"
+    REM Evict the UNET payload before snapshot capture, retaining only
+    REM fresh CLIP+VAE in the kept container (restore idle 0).
+    set "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=1"
+    set "COMFYMODAL_V2_EVICT_RETAIN_ROLE=clip_vae"
+    set "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS=0"
+    REM Non-production env profile: the production snapshot invariant
+    REM requires a UNET object at restore time, which this mode excludes.
+    REM Forced (not "if not defined") so a user's global production profile
+    REM can never re-enable the production branch and wipe the eviction vars.
+    set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+)
 if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=production"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
     set "COMFYMODAL_V2_FULL_TRACE=0"
@@ -44,6 +76,8 @@ if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="diagnostic" if not defined COMFYMODAL_V2_D
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 if not defined COMFYMODAL_V2_CPU_MODEL_SNAPSHOT set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+if not defined COMFYMODAL_V2_NATIVE_FAST_DISK_UNET set "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=0"
+if not defined COMFYMODAL_V2_PUBLISH_RESTORE_PLAN set "COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=0"
 if not defined COMFYMODAL_V2_VAE_SNAPSHOT set "COMFYMODAL_V2_VAE_SNAPSHOT=1"
 if not defined COMFYMODAL_V2_CLIP_CONDITIONING_CACHE set "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE=1"
 if not defined COMFYMODAL_V2_UNET_ACTIVATION_MODE set "COMFYMODAL_V2_UNET_ACTIVATION_MODE=late"
@@ -51,6 +85,11 @@ if not defined COMFYMODAL_V2_VAE_ACTIVATION_MODE set "COMFYMODAL_V2_VAE_ACTIVATI
 if not defined COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE set "COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE=1"
 if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=1"
 if not defined V2_BENCHMARK_GAP_SECONDS set "V2_BENCHMARK_GAP_SECONDS=0"
+if not defined V2_VOLUME_READ_RUN_COUNT set "V2_VOLUME_READ_RUN_COUNT=3"
+if not defined V2_VOLUME_READ_GAP_SECONDS set "V2_VOLUME_READ_GAP_SECONDS=25"
+if not defined V2_RESTORE_ONLY_RUN_COUNT set "V2_RESTORE_ONLY_RUN_COUNT=6"
+if not defined V2_RESTORE_ONLY_MAX_ATTEMPTS set "V2_RESTORE_ONLY_MAX_ATTEMPTS=40"
+if not defined V2_RESTORE_ONLY_GAP_SECONDS set "V2_RESTORE_ONLY_GAP_SECONDS=30"
 if not defined COMFYMODAL_V2_THREAD_POLICY set "COMFYMODAL_V2_THREAD_POLICY=TBASE"
 if not defined COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER set "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0"
 if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=32768"
@@ -130,6 +169,8 @@ echo memory_request_mb=!COMFYMODAL_V2_MEMORY_MB!
 echo vae_policy=!COMFYMODAL_V2_VAE_POLICY!
 echo release_gpu_after_request=!COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST!
 echo cpu_model_snapshot=!COMFYMODAL_V2_CPU_MODEL_SNAPSHOT!
+echo native_fast_disk_unet=!COMFYMODAL_V2_NATIVE_FAST_DISK_UNET!
+echo publish_restore_plan=!COMFYMODAL_V2_PUBLISH_RESTORE_PLAN!
 echo vae_snapshot=!COMFYMODAL_V2_VAE_SNAPSHOT!
 echo clip_conditioning_cache=!COMFYMODAL_V2_CLIP_CONDITIONING_CACHE!
 echo unet_activation_mode=!COMFYMODAL_V2_UNET_ACTIVATION_MODE!
@@ -147,6 +188,12 @@ echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
 echo restore_torch_threads=!V2_PROFILE_THREADS!
 echo variance_pretouch=!V2_PROFILE_PRETOUCH!
 echo variance_mode=!V2_IS_VARIANCE!
+echo volume_read_run_count=!V2_VOLUME_READ_RUN_COUNT!
+echo restore_only_mode=!V2_IS_RESTORE_ONLY!
+echo restore_only_app=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!
+echo restore_only_run_count=!V2_RESTORE_ONLY_RUN_COUNT!
+echo restore_only_max_attempts=!V2_RESTORE_ONLY_MAX_ATTEMPTS!
+echo snapshot_exclude_unet=!COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET!
 
 REM -- Modal CLI detection -----------------------------------------
 where modal >nul 2>nul
@@ -346,7 +393,17 @@ REM contract of this script is never silently exceeded.  The variance-cold
 REM sequence (one request at a time, 25s gap, strict cold-identity proof)
 REM runs ONLY via the explicit opt-in V2_BENCHMARK_MODE=variance_cold.
 REM The four-condition round-robin matrix runs ONLY via the explicit
-REM opt-in V2_BENCHMARK_MODE=variance_matrix.
+REM opt-in V2_BENCHMARK_MODE=variance_matrix.  The mounted-Volume raw
+REM sequential-read benchmark (pure volume read speed, no model workload)
+REM runs ONLY via the explicit opt-in V2_BENCHMARK_MODE=volume_read.
+REM The UNET-absent snapshot restore-only mode is a snapshot CONSTRUCTION
+REM invocation: it deploys with COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1
+REM (identity/reporting gate), builds the full CLIP/UNET/VAE snapshot, then
+REM evicts the UNET via the clip_vae retain role (fresh CLIP+VAE kept in the
+REM retained container, unet proven dead) and exits WITHOUT issuing reuse
+REM probes (this invocation is labeled/excluded from the probe count).  The
+REM exactly-6 valid reuse probes are issued ONLY via run_v2_single.bat with
+REM V2_BENCHMARK_MODE=snapshot_restore_only.
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMFYMODAL_COMMAND_START_UNIX_MS=%%a"
 if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     echo === Running V2 variance-cold MATRIX - explicit opt-in ===
@@ -381,6 +438,24 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
         exit /b 1
     )
     echo === V2 host-characteristics cold study completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="volume_read" (
+    echo === Running V2 mounted-Volume raw sequential-read benchmark - explicit opt-in ===
+    python tools\benchmark_v2_direct.py --volume-read
+    if errorlevel 1 (
+        echo === ERROR: Volume-read benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 mounted-Volume raw sequential-read benchmark completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="snapshot_restore_only" (
+    echo ======================================================================
+    echo === V2 UNET-absent snapshot CONSTRUCTION invocation - labeled/excluded ===
+    echo === App deployed with COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1          ===
+    echo === Identity gate; UNET evicted via clip_vae retain before capture   ===
+    echo === This invocation issues NO reuse probes.                         ===
+    echo === Issue the exactly-6 valid reuse probes with:                    ===
+    echo ===   run_v2_single.bat with V2_BENCHMARK_MODE=snapshot_restore_only ===
+    echo ======================================================================
+    exit /b 0
 ) else (
     echo === Running V2 benchmark - single run by default ===
     python tools\benchmark_v2_direct.py

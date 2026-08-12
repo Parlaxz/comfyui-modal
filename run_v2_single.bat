@@ -6,6 +6,7 @@ chcp 65001 >nul
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 if not defined COMFYMODAL_V2_GPU set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+if not defined COMFYMODAL_V2_RESTORE_ONLY_APP_NAME set "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLOUD="
 if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=production"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
@@ -24,6 +25,8 @@ if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="diagnostic" if not defined COMFYMODAL_V2_D
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 if not defined COMFYMODAL_V2_CPU_MODEL_SNAPSHOT set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+if not defined COMFYMODAL_V2_NATIVE_FAST_DISK_UNET set "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=0"
+if not defined COMFYMODAL_V2_PUBLISH_RESTORE_PLAN set "COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=0"
 if not defined COMFYMODAL_V2_VAE_SNAPSHOT set "COMFYMODAL_V2_VAE_SNAPSHOT=1"
 if not defined COMFYMODAL_V2_CLIP_CONDITIONING_CACHE set "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE=1"
 if not defined COMFYMODAL_V2_UNET_ACTIVATION_MODE set "COMFYMODAL_V2_UNET_ACTIVATION_MODE=late"
@@ -31,6 +34,11 @@ if not defined COMFYMODAL_V2_VAE_ACTIVATION_MODE set "COMFYMODAL_V2_VAE_ACTIVATI
 if not defined COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE set "COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE=1"
 if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=1"
 if not defined V2_BENCHMARK_GAP_SECONDS set "V2_BENCHMARK_GAP_SECONDS=0"
+if not defined V2_VOLUME_READ_RUN_COUNT set "V2_VOLUME_READ_RUN_COUNT=3"
+if not defined V2_VOLUME_READ_GAP_SECONDS set "V2_VOLUME_READ_GAP_SECONDS=25"
+if not defined V2_RESTORE_ONLY_RUN_COUNT set "V2_RESTORE_ONLY_RUN_COUNT=6"
+if not defined V2_RESTORE_ONLY_MAX_ATTEMPTS set "V2_RESTORE_ONLY_MAX_ATTEMPTS=40"
+if not defined V2_RESTORE_ONLY_GAP_SECONDS set "V2_RESTORE_ONLY_GAP_SECONDS=30"
 if not defined COMFYMODAL_V2_THREAD_POLICY set "COMFYMODAL_V2_THREAD_POLICY=TBASE"
 if not defined COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER set "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0"
 if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=32768"
@@ -92,6 +100,8 @@ echo memory_request_mb=!COMFYMODAL_V2_MEMORY_MB!
 echo vae_policy=!COMFYMODAL_V2_VAE_POLICY!
 echo release_gpu_after_request=!COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST!
 echo cpu_model_snapshot=!COMFYMODAL_V2_CPU_MODEL_SNAPSHOT!
+echo native_fast_disk_unet=!COMFYMODAL_V2_NATIVE_FAST_DISK_UNET!
+echo publish_restore_plan=!COMFYMODAL_V2_PUBLISH_RESTORE_PLAN!
 echo vae_snapshot=!COMFYMODAL_V2_VAE_SNAPSHOT!
 echo clip_conditioning_cache=!COMFYMODAL_V2_CLIP_CONDITIONING_CACHE!
 echo unet_activation_mode=!COMFYMODAL_V2_UNET_ACTIVATION_MODE!
@@ -108,6 +118,10 @@ echo prefill_lanes=!V2_PROFILE_PREFILL!
 echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
 echo restore_torch_threads=!V2_PROFILE_THREADS!
 echo variance_pretouch=!V2_PROFILE_PRETOUCH!
+echo volume_read_run_count=!V2_VOLUME_READ_RUN_COUNT!
+echo restore_only_app=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!
+echo restore_only_run_count=!V2_RESTORE_ONLY_RUN_COUNT!
+echo snapshot_exclude_unet=!COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET!
 
 set "COMFYMODAL_COMMAND_START_UNIX_MS=!COMMAND_START_MS!"
 REM -- Benchmark invocation ------------------------------------------
@@ -117,7 +131,19 @@ REM V2_BENCHMARK_MODE=acceptance.  The variance-cold sequence (one request
 REM at a time, 25s gap, strict cold-identity proof) runs ONLY via the
 REM explicit opt-in V2_BENCHMARK_MODE=variance_cold.  The four-condition
 REM round-robin matrix runs ONLY via the explicit opt-in
-REM V2_BENCHMARK_MODE=variance_matrix.
+REM V2_BENCHMARK_MODE=variance_matrix.  The mounted-Volume raw
+REM sequential-read benchmark (pure volume read speed, no model workload)
+REM runs ONLY via the explicit opt-in V2_BENCHMARK_MODE=volume_read.
+REM The UNET-absent snapshot restore-only mode issues EXACTLY 6 valid
+REM reused-snapshot restore-only probes (V2_RESTORE_ONLY_RUN_COUNT) against
+REM the deployment built by deploy_and_run_v2_single.bat (that deploy
+REM invocation is the labeled/excluded snapshot construction, which builds
+REM the full CLIP/UNET/VAE snapshot and then evicts the UNET with the
+REM clip_vae retain role — keeping fresh CLIP+VAE in the retained container —
+REM before capture).  COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1 is the identity/
+REM reporting gate only.  Provider/region unpinned; the harness hard-stops
+REM at 6 valid, invalid probes never count, no beautification probes.  Runs
+REM ONLY via the explicit opt-in V2_BENCHMARK_MODE=snapshot_restore_only.
 if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     echo === Running V2 variance-cold MATRIX - explicit opt-in ===
     set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"
@@ -142,6 +168,23 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     set "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS=1"
     if not defined V2_VARIANCE_COLD_GAP_SECONDS set "V2_VARIANCE_COLD_GAP_SECONDS=25"
     python tools\benchmark_v2_direct.py --host-ab --teardown minimal
+) else if /i "!V2_BENCHMARK_MODE!"=="volume_read" (
+    echo === Running V2 mounted-Volume raw sequential-read benchmark - explicit opt-in ===
+    python tools\benchmark_v2_direct.py --volume-read
+) else if /i "!V2_BENCHMARK_MODE!"=="snapshot_restore_only" (
+    echo === Running V2 UNET-absent snapshot restore-only probes - explicit opt-in ===
+    set "COMFYMODAL_V2_APP_NAME=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!"
+    set "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1"
+    REM Identity/eviction contract mirrors the deploy invocation:
+    REM evict UNET before snapshot capture, retain CLIP+VAE in the kept
+    REM container, restore idle 0, inherit profile; never production.
+    set "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=1"
+    set "COMFYMODAL_V2_EVICT_RETAIN_ROLE=clip_vae"
+    set "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS=0"
+    REM Forced instead of "if not defined" so a user's global production profile
+    REM can never re-enable the production branch and wipe the eviction vars.
+    set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+    python tools\benchmark_v2_direct.py --snapshot-restore-only
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===

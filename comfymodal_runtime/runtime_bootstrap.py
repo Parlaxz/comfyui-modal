@@ -303,7 +303,7 @@ class BootstrapState:
     snapshot_model_identities: dict[str, str] = field(default_factory=dict)
     snapshot_seed_built: bool = False
     # Step 3 — seed attestation observability (source/topology, JSON-safe only)
-    snapshot_seed_source: str = ""                      # "publisher_plan" | "startup_minimal" | ""
+    snapshot_seed_source: str = ""  # "publisher_plan" | "startup_minimal" | "invocation_plan" | ""
     snapshot_seed_topology_available: bool = False
     snapshot_seed_schema_version: int = 0
     snapshot_seed_workflow_hash: str = ""
@@ -1459,7 +1459,29 @@ class RuntimeBootstrap:
         applies it to ``self.state`` when valid.  Returns ``True`` when a
         schema-v2 payload was hydrated.  Never raises — any failure is an
         honest fallback to the minimal seed.
+
+        When the opt-in remote publication flag
+        (``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN``, default "0") is DISABLED the
+        volume read is skipped entirely so a stale ``snapshot_seed.json`` left
+        over from an earlier publisher deployment can never emit
+        ``source=publisher_plan``.  The container then restores with
+        ``startup_minimal`` and the REQUEST derives its own seed from the
+        invocation plan (see ``ModalRuntimeEntrypoint`` request-time seed
+        derivation).  The flag=1 path keeps the legacy publisher hydration.
         """
+        from .execution_seed import publish_restore_plan_enabled
+
+        if not publish_restore_plan_enabled():
+            if trace:
+                trace.emit(
+                    "snapshot_seed_volume_read_skipped",
+                    phase="restore",
+                    metadata={
+                        "seed_source": "startup_minimal",
+                        "reason": "publish_restore_plan_disabled",
+                    },
+                )
+            return False
         from .execution_seed import (
             read_snapshot_seed_payload,
             snapshot_seed_observability,
@@ -1507,6 +1529,28 @@ class RuntimeBootstrap:
 
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
+        # ── V2 native fast-disk UNET: graph UNETLoader wrapper (flag-gated) ──
+        # With COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=0 the restore-time installer
+        # callers (external_model_lane_scope, coordinator lanes, bridge) never
+        # run, so the graph-time UNETLoader would execute an un-instrumented
+        # comfy.sd.load_diffusion_model.  Lazily install the flag-gated graph
+        # wrapper here; flag-off is a byte-identical no-op (no import, no
+        # call).  The env check mirrors _NATIVE_FAST_DISK_UNET so this block
+        # is inert unless the flag is on.
+        try:
+            if os.environ.get("COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "").strip().lower() in ("1", "true", "yes", "on"):
+                from .model_preload import _ensure_graph_unet_loader_wrapper_lazy
+                _gwl_status = _ensure_graph_unet_loader_wrapper_lazy(trace=trace)
+                if _gwl_status not in ("installed", "already_installed", "inert_flag_off"):
+                    print(
+                        f"[bootstrap] graph_unet_loader_wrapper status={_gwl_status} "
+                        "(belt-and-braces _ensure_core_wrappers will retry)",
+                        flush=True,
+                    )
+        except Exception as _gwl_exc:
+            # Surface, never mask: a flag-on install failure is printed and
+            # restore continues (the wrapper retries via _ensure_core_wrappers).
+            print(f"[bootstrap] graph_unet_loader_wrapper install error: {_gwl_exc}", flush=True)
         self.state.restore_started_at = time.time()
         # Phase 0/3 — capture identity/environment metadata at lifecycle entry
         if trace:

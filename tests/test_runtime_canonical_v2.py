@@ -615,9 +615,11 @@ class TestRestorePublisherWiring(unittest.TestCase):
         asyncio.run(run())
 
     def test_restore_publisher_not_called_when_omitted(self):
-        """When restore_publisher is None, no publication occurs: exactly one
-        restore_plan_publish_start/end pair is emitted and the terminal
-        marker records status=not_configured with honest cache/remote metadata."""
+        """When restore_publisher is None (the default no-publish path),
+        no publication occurs: the run emits the bounded
+        ``restore_publish_skipped`` marker with honest metadata and does NOT
+        emit ``restore_plan_publish_start/end`` (so ``restore_publish_ms``
+        renders absent downstream)."""
         async def stream(**kwargs):
             yield {"type": "result", "data": {"images": [], "outputs": {}}}
 
@@ -630,16 +632,21 @@ class TestRestorePublisherWiring(unittest.TestCase):
             trace = RuntimeTrace(request_id="no_pub", process="local")
             transport = ModalTransport(prompt_stream_fn=stream)
             result = await execute_plan(plan, transport=transport, trace=trace)
+            skipped_events = [e for e in trace.events if e.name == "restore_publish_skipped"]
             start_events = [e for e in trace.events if e.name == "restore_plan_publish_start"]
-            found_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
-            self.assertEqual(len(start_events), 1,
-                             "Must have exactly one restore_plan_publish_start event")
-            self.assertEqual(len(found_events), 1,
-                             "Must have exactly one restore_plan_publish_end event")
-            md = found_events[0].metadata
+            end_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
+            self.assertEqual(len(skipped_events), 1,
+                             "Must have exactly one restore_publish_skipped event")
+            self.assertEqual(len(start_events), 0,
+                             "No restore_plan_publish_start event on the no-publish path")
+            self.assertEqual(len(end_events), 0,
+                             "No restore_plan_publish_end event on the no-publish path")
+            md = skipped_events[0].metadata
             status = md.get("status") if hasattr(md, "get") else md.get("status")
-            self.assertEqual(status, "not_configured",
-                             f"status should be 'not_configured'. metadata={md} type={type(md)}")
+            self.assertEqual(status, "skipped", f"status should be 'skipped'. metadata={md} type={type(md)}")
+            reason = md.get("reason") if hasattr(md, "get") else md.get("reason")
+            self.assertEqual(reason, "flag_disabled",
+                             f"reason should be 'flag_disabled'. metadata={md} type={type(md)}")
             # Honest metadata: no remote publication was performed or simulated.
             self.assertFalse(trace._metadata.get("restore_remote_call_performed", False),
                              "no remote call must be recorded when publisher is None")
@@ -648,6 +655,9 @@ class TestRestorePublisherWiring(unittest.TestCase):
                 local_timing.get("restore_remote_call_performed"),
                 "no-publisher derived timing must not claim a remote call",
             )
+            # restore_publish_ms renders absent (no publish span exists).
+            self.assertIsNone(local_timing.get("restore_publish_ms"),
+                              "restore_publish_ms must be absent on the no-publish path")
         asyncio.run(run())
 
     def test_restore_plan_build_start_paired_with_end(self):

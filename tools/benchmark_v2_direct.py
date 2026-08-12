@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -19,6 +21,8 @@ if str(ROOT) not in sys.path:
 from canonical_execution import build_execution_plan, execute_plan
 from modal_client import check_active_warmup_profile, set_active_warmup_profile
 from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
 from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.runtime_shape import runtime_shape_config
@@ -53,6 +57,20 @@ RUN_COUNT = int(os.environ.get("V2_BENCHMARK_RUNS", "1"))
 GAP_SECONDS = float(os.environ.get("V2_BENCHMARK_GAP_SECONDS", "20"))
 _ABSENT_STR = "absent"
 
+
+def _resolve_restore_publisher(transport: ModalTransport, workspace: dict) -> Any | None:
+    """Construct the legacy remote restore-plan publisher ONLY when the
+    opt-in ``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN`` flag is truthy.
+
+    Default (unset / "0") returns ``None`` so ``execute_plan`` emits
+    ``restore_publish_skipped`` and performs EXACTLY ONE Modal submission
+    (``run_plan_stream``) with no blocking remote ``publish_restore_plan`` RPC
+    in the critical path.  Flag=1 keeps the legacy publisher for diagnostics.
+    """
+    if publish_restore_plan_enabled():
+        return RemoteRestorePlanPublisher(transport, workspace)
+    return None
+
 # ── Variance-cold mode (opt-in, never the default) ────────────────────────
 # Unique shadow app name used ONLY for variance mode.  Normal/production modes
 # keep the default APP_NAME identity above; this default is overridable only
@@ -86,6 +104,42 @@ MATRIX_SLOW_THRESHOLD_MS = float(
 MATRIX_RESTORE_SLOW_MS = 3000.0
 MATRIX_UNET_ACTIVATION_SLOW_MS = 3000.0
 MATRIX_CONDITION_LABEL = lambda diag, pretouch: f"diag{int(diag)}_pt{int(pretouch)}"
+
+# ── Mounted-Volume raw sequential-read benchmark (opt-in; never default) ────
+# Pure volume read speed of a mounted model file.  No graph execution, no
+# model loading, no GPU work, no hashing, no /tmp writes.
+VOLUME_READ_MODE = "volume_read"
+VOLUME_READ_RUN_COUNT = int(os.environ.get("V2_VOLUME_READ_RUN_COUNT", "3"))
+VOLUME_READ_GAP_SECONDS = float(
+    os.environ.get("V2_VOLUME_READ_GAP_SECONDS", "25")
+)
+VOLUME_READ_FILENAME = os.environ.get(
+    "V2_VOLUME_READ_FILENAME", "z_image_turbo_bf16.safetensors"
+)
+VOLUME_READ_CHUNK_BYTES = int(
+    os.environ.get("V2_VOLUME_READ_CHUNK_BYTES", str(8 * 1024 * 1024))
+)
+VOLUME_READ_PASS_LABELS = ("primary_mounted_volume", "warm_cache")
+
+# ── UNET-absent snapshot restore-only benchmark (opt-in; never default) ────
+# Six valid reused-snapshot restore-only probes against a deployment whose
+# CPU snapshot was constructed with COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1.
+# Each probe is a single remote call to the no-op
+# ``run_snapshot_restore_only_probe`` method; every probe is a candidate
+# (no beautification probes), invalid/DNF probes never count toward the
+# target, and the loop hard-stops as soon as EXACTLY ``RESTORE_ONLY_RUN_COUNT``
+# valid probes are collected (bounded by a total-attempt safety cap).
+RESTORE_ONLY_MODE = "snapshot_restore_only"
+RESTORE_ONLY_APP_NAME = os.environ.get(
+    "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME",
+    "stable-modal-comfy-v2-restore-only-shadow",
+)
+RESTORE_ONLY_RUN_COUNT = int(os.environ.get("V2_RESTORE_ONLY_RUN_COUNT", "6"))
+RESTORE_ONLY_MAX_ATTEMPTS = int(os.environ.get("V2_RESTORE_ONLY_MAX_ATTEMPTS", "40"))
+RESTORE_ONLY_GAP_SECONDS = float(
+    os.environ.get("V2_RESTORE_ONLY_GAP_SECONDS", "30")
+)
+RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 
 
 def _load_workspace() -> dict[str, Any]:
@@ -222,6 +276,17 @@ def _runtime_shape_observations(result: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _cpu_model_snapshot_enabled() -> bool:
+    """Return True when COMFYMODAL_V2_CPU_MODEL_SNAPSHOT is enabled.
+
+    Uses the shared ``env_flag`` semantics (``1``/``true``/``yes``/``on``).
+    When disabled, the deployment never constructs a CPU model snapshot, so
+    ``stored_snapshot_model_order`` is legitimately absent from the identity
+    metadata and the C8 runtime-shape validator must not demand it.
+    """
+    return env_flag("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT")
+
+
 def _validate_runtime_shape(
     result: dict[str, Any],
     identity: dict[str, Any],
@@ -284,11 +349,17 @@ def _validate_runtime_shape(
             metadata = event.get("metadata", {})
             if isinstance(metadata, dict) and metadata.get("status") == "ok":
                 stored_order = metadata.get("construction_order")
-    if stored_order != expected["snapshot_model_order"]:
-        failures.append(
-            f"stored snapshot order={stored_order!r} "
-            f"deployed={expected['snapshot_model_order']!r}"
-        )
+    # No-CPU-model-snapshot deployments (COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=0)
+    # never construct a snapshot model order, so a None stored order is the
+    # expected state and the artifact persists.  Exact order validation is
+    # retained whenever snapshots are enabled OR any concrete order is
+    # reported (an unexpected non-None order is never silently accepted).
+    if _cpu_model_snapshot_enabled() or stored_order is not None:
+        if stored_order != expected["snapshot_model_order"]:
+            failures.append(
+                f"stored snapshot order={stored_order!r} "
+                f"deployed={expected['snapshot_model_order']!r}"
+            )
     if failures:
         raise RuntimeError("C8 runtime-shape validation failed: " + "; ".join(failures))
     return {
@@ -952,7 +1023,7 @@ async def _run_one(
     result = await execute_plan(
         plan,
         transport=transport,
-        restore_publisher=_test_restore_publisher if _test_restore_publisher is not None else RemoteRestorePlanPublisher(transport, workspace),
+        restore_publisher=_test_restore_publisher if _test_restore_publisher is not None else _resolve_restore_publisher(transport, workspace),
         profile_setter=_test_profile_setter if _test_profile_setter is not None else set_active_warmup_profile,
         profile_checker=_test_profile_checker if _test_profile_checker is not None else check_active_warmup_profile,
         gpu=GPU,
@@ -2202,7 +2273,7 @@ async def _run_acceptance_sequence(
         print(f"[v2.acceptance] phase=execute_plan label={label}", flush=True)
         result = await execute_plan(
             plan, transport=transport,
-            restore_publisher=RemoteRestorePlanPublisher(transport, workspace),
+            restore_publisher=_resolve_restore_publisher(transport, workspace),
             profile_setter=set_active_warmup_profile,
             profile_checker=check_active_warmup_profile,
             gpu=_GPU, workspace=workspace, trace=runtime_trace,
@@ -4447,6 +4518,1526 @@ async def _run_variance_matrix(
     return summary
 
 
+def _volume_read_validity(attempt: dict[str, Any]) -> tuple[bool, list[str], bool]:
+    """Validity for one mounted-Volume read attempt.
+
+    Valid only when: no method error, stat size > 0, ``bytes_read`` equals
+    ``stat_size_bytes`` on BOTH passes, both pass timings are positive, and the
+    cold identity gate is satisfied whenever a freshness token is available.
+    Returns ``(valid, failures, cold_gate_available)``.
+    """
+    failures: list[str] = []
+    result = attempt.get("result") or {}
+    if attempt.get("error"):
+        failures.append(f"run error: {attempt['error']}")
+    status = result.get("status")
+    if status != "ok":
+        failures.append(f"method error: status={status!r} error={result.get('error') or 'none'}")
+    stat_size = result.get("stat_size_bytes")
+    if not isinstance(stat_size, int) or stat_size <= 0:
+        failures.append(f"stat_size_bytes invalid: {stat_size!r}")
+    passes = result.get("passes") or []
+    if len(passes) != 2:
+        failures.append(f"expected 2 passes, got {len(passes)}")
+    for p in passes:
+        label = p.get("label", "?")
+        if stat_size is not None and p.get("bytes_read") != stat_size:
+            failures.append(
+                f"{label}: bytes_read={p.get('bytes_read')} != stat_size={stat_size}"
+            )
+        wall_ms = p.get("wall_ms")
+        if not isinstance(wall_ms, (int, float)) or wall_ms <= 0:
+            failures.append(f"{label}: non-positive wall_ms={wall_ms!r}")
+    identity = attempt.get("identity") or {}
+    cold_gate_available = bool(_cold_identity_key(identity))
+    cold_check = attempt.get("cold_check") or {}
+    if cold_gate_available and not cold_check.get("cold"):
+        failures.append(
+            "cold identity gate failed: "
+            + "; ".join(str(f) for f in cold_check.get("failures", [])[:3])
+        )
+    return len(failures) == 0, failures, cold_gate_available
+
+
+def _volume_read_pass_stats(
+    records: list[dict[str, Any]], key: str, label: str,
+) -> dict[str, Any]:
+    """collect numeric values for one pass metric across valid attempts."""
+    values: list[float] = []
+    for r in records:
+        if not r.get("valid"):
+            continue
+        result = r.get("result") or {}
+        passes = result.get("passes") or []
+        for p in passes:
+            if p.get("label") != label:
+                continue
+            v = p.get(key)
+            if isinstance(v, (int, float)) and v > 0:
+                values.append(float(v))
+    return compute_stats(values)
+
+
+def _volume_read_summary(
+    records: list[dict[str, Any]],
+    *,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    valid = [r for r in records if r.get("valid")]
+    dnf = [r for r in records if r.get("dnf")]
+    cold = [r for r in records if (r.get("cold_check") or {}).get("cold")]
+    gate_available = [r for r in records if r.get("cold_gate_available")]
+    stat_size: int | None = None
+    for r in records:
+        result = r.get("result") or {}
+        if isinstance(result.get("stat_size_bytes"), int) and result["stat_size_bytes"] > 0:
+            stat_size = result["stat_size_bytes"]
+            break
+    return {
+        "mode": "volume_read",
+        "meta": meta or {},
+        "run_count": len(records),
+        "valid_count": len(valid),
+        "dnf_count": len(dnf),
+        "invalid_count": len(records) - len(valid) - len(dnf),
+        "cold_count": len(cold),
+        "cold_gate_available_count": len(gate_available),
+        "stat_size_bytes": stat_size,
+        "first_pass": {
+            "wall_ms": _volume_read_pass_stats(
+                records, "wall_ms", VOLUME_READ_PASS_LABELS[0],
+            ),
+            "decimal_GBps": _volume_read_pass_stats(
+                records, "decimal_GBps", VOLUME_READ_PASS_LABELS[0],
+            ),
+            "binary_GiBps": _volume_read_pass_stats(
+                records, "binary_GiBps", VOLUME_READ_PASS_LABELS[0],
+            ),
+        },
+        "warm_pass": {
+            "wall_ms": _volume_read_pass_stats(
+                records, "wall_ms", VOLUME_READ_PASS_LABELS[1],
+            ),
+            "decimal_GBps": _volume_read_pass_stats(
+                records, "decimal_GBps", VOLUME_READ_PASS_LABELS[1],
+            ),
+            "binary_GiBps": _volume_read_pass_stats(
+                records, "binary_GiBps", VOLUME_READ_PASS_LABELS[1],
+            ),
+        },
+        "runs": [{
+            "run_index": r["run_index"],
+            "run_id": r.get("run_id"),
+            "valid": r.get("valid"),
+            "dnf": r.get("dnf"),
+            "cold": bool((r.get("cold_check") or {}).get("cold")),
+            "cold_gate_available": r.get("cold_gate_available"),
+            "failures": r.get("failures"),
+            "identity": r.get("identity"),
+            "result": r.get("result"),
+        } for r in records],
+    }
+
+
+def _render_volume_read_table(summary: dict[str, Any]) -> str:
+    def _cell(stats: dict[str, Any]) -> str:
+        median = stats.get("median")
+        if median is None:
+            return "n/a"
+        return f"{median:.3f}"
+
+    meta = summary.get("meta") or {}
+    lines = [
+        "=== V2 mounted-Volume raw sequential-read benchmark ===",
+        f"file={meta.get('filename', '')} "
+        f"chunk={meta.get('chunk_bytes', '')} "
+        f"stat_size={summary.get('stat_size_bytes')} "
+        f"runs={summary.get('run_count')}",
+        f"valid={summary.get('valid_count')} "
+        f"invalid={summary.get('invalid_count')} "
+        f"dnf={summary.get('dnf_count')} "
+        f"cold={summary.get('cold_count')}",
+        "metric                    first(p50)   warm(p50)",
+        f"read_loop_wall_ms         {_cell(summary.get('first_pass', {}).get('wall_ms') or {}):>10}   {_cell(summary.get('warm_pass', {}).get('wall_ms') or {}):>10}",
+        f"decimal_GBps              {_cell(summary.get('first_pass', {}).get('decimal_GBps') or {}):>10}   {_cell(summary.get('warm_pass', {}).get('decimal_GBps') or {}):>10}",
+        f"binary_GiBps              {_cell(summary.get('first_pass', {}).get('binary_GiBps') or {}):>10}   {_cell(summary.get('warm_pass', {}).get('binary_GiBps') or {}):>10}",
+    ]
+    return "\n".join(lines)
+
+
+async def _run_volume_read(
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    run_count: int,
+    gap_seconds: float,
+    filename: str,
+    chunk_bytes: int,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+) -> dict[str, Any]:
+    """Run the mounted-Volume raw sequential-read benchmark.
+
+    One remote call per attempt against the existing V2 deployment.  Each
+    attempt returns two read passes (primary mounted-volume + immediate
+    warm-cache) with identity tokens; cold identity is validated with the
+    shared ``_validate_cold_identity`` gate.  Failed attempts are recorded DNF
+    (no hidden retries).  Writes per-attempt JSON + ``summary.json``.
+    """
+    os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
+    os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
+    os.environ["COMFYMODAL_V2_GPU"] = gpu
+    print(
+        f"[v2.volume_read] mode=start runs={run_count} gap={gap_seconds}s "
+        f"file={filename} chunk={chunk_bytes} app={app_name}",
+        flush=True,
+    )
+    handle = await asyncio.to_thread(
+        transport._v2_handle, workspace=workspace, gpu=gpu,
+    )
+    records: list[dict[str, Any]] = []
+    prev_identity: dict[str, Any] | None = None
+
+    for index in range(run_count):
+        _run_id = f"volume-read-{index}-{uuid.uuid4().hex[:8]}"
+        _req_id = f"v2-volume-read-{index}-{uuid.uuid4().hex[:12]}"
+        _start_ts = datetime.now(timezone.utc).isoformat()
+        artifact: dict[str, Any] = {
+            "run_index": index,
+            "run_id": _run_id,
+            "request_id": _req_id,
+            "mode": "volume_read",
+            "start_ts": _start_ts,
+            "target": {"app_name": app_name, "class_name": class_name, "gpu": gpu},
+            "config": {
+                "filename": filename,
+                "chunk_bytes": chunk_bytes,
+                "gap_seconds": gap_seconds,
+            },
+            "identity": {},
+            "cold_check": {},
+            "cold_gate_available": False,
+            "result": {},
+            "valid": False,
+            "dnf": False,
+            "failures": [],
+            "error": None,
+        }
+        identity: dict[str, Any] = {}
+        try:
+            fn = handle.run_volume_read_benchmark
+            remote = getattr(fn, "remote", None)
+            if remote is not None and callable(getattr(remote, "aio", None)):
+                result = remote.aio(
+                    request_id=_req_id, filename=filename, chunk_bytes=chunk_bytes,
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
+            elif asyncio.iscoroutinefunction(fn):
+                result = await fn(
+                    request_id=_req_id, filename=filename, chunk_bytes=chunk_bytes,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    fn, request_id=_req_id, filename=filename, chunk_bytes=chunk_bytes,
+                )
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not isinstance(result, dict):
+                raise RuntimeError(f"remote returned non-dict: {type(result).__name__}")
+            artifact["result"] = result
+            identity = result.get("identity") or {}
+            artifact["identity"] = identity
+            cold_check = _validate_cold_identity(
+                identity, run_index=index, pretouch=0, prev_identity=prev_identity,
+            )
+            artifact["cold_check"] = cold_check
+            artifact["cold_gate_available"] = bool(_cold_identity_key(identity))
+            valid, failures, _gate = _volume_read_validity(artifact)
+            artifact["valid"] = valid
+            artifact["failures"] = failures
+        except Exception as exc:  # noqa: BLE001
+            artifact["dnf"] = True
+            artifact["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            artifact["failures"] = [artifact["error"]]
+
+        artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
+        (output_dir / f"run_{index}.json").write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(artifact)
+
+        status = "DNF" if artifact["dnf"] else ("VALID" if artifact["valid"] else "INVALID")
+        print(
+            f"[v2.volume_read] run={index} status={status} "
+            f"cold={(artifact.get('cold_check') or {}).get('cold')} "
+            f"gate_available={artifact['cold_gate_available']} "
+            f"instance={identity.get('restored_instance_id', '')[:12]}",
+            flush=True,
+        )
+        if artifact["failures"]:
+            print(
+                f"[v2.volume_read] run={index} failures={artifact['failures']}",
+                flush=True,
+            )
+        if (artifact.get("cold_check") or {}).get("cold"):
+            prev_identity = identity
+        if index + 1 < run_count:
+            print(f"[v2.volume_read] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    meta = {
+        "mode": "volume_read",
+        "app_name": app_name,
+        "class_name": class_name,
+        "gpu": gpu,
+        "run_count": run_count,
+        "gap_seconds": gap_seconds,
+        "filename": filename,
+        "chunk_bytes": chunk_bytes,
+        "cold_identity": (
+            "variance-cold gate (restore_count==1, request_count==1, "
+            "restored_instance_id nonempty, fresh container token); "
+            "attempts without a freshness token never claim cold"
+        ),
+    }
+    summary = _volume_read_summary(records, meta=meta)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    print(_render_volume_read_table(summary), flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "run_count": summary["run_count"],
+        "valid_count": summary["valid_count"],
+        "invalid_count": summary["invalid_count"],
+        "dnf_count": summary["dnf_count"],
+        "cold_count": summary["cold_count"],
+    }, default=str), flush=True)
+    return summary
+
+
+def _restore_only_validity(attempt: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Validity for one UNET-absent snapshot restore-only probe.
+
+    Valid only when every decisive piece of evidence is present AND
+    consistent: UNET-absence invariant (``unet_present=0``, no retained
+    UNET payload, no reconstructed/snapshot UNET, exclusion gate on),
+    non-empty snapshot identity, cloud/region/gpu placement, cold restore
+    identity gate, container-observed Python restore timestamps (first
+    restored Python instruction, restore start/end, total), method-entry
+    timestamp, RSS, the locally captured dispatch timestamp, and the Modal
+    log-server pre-Python ``Restoring Function from memory snapshot.``
+    banner timestamp.  Any missing decisive timestamp/identity FAILS
+    validity — never inferred.  Returns ``(valid, failures)``.
+    """
+    failures: list[str] = []
+    result = attempt.get("result") or {}
+    if attempt.get("error"):
+        failures.append(f"run error: {attempt['error']}")
+    status = result.get("status")
+    if status != "ok":
+        failures.append(
+            f"method error: status={status!r} error={result.get('error') or 'none'}"
+        )
+    if result.get("mode") != RESTORE_ONLY_MODE:
+        failures.append(f"mode mismatch: {result.get('mode')!r} != {RESTORE_ONLY_MODE!r}")
+    invariant = result.get("invariant") or {}
+    if invariant.get("unet_present") != 0:
+        failures.append(
+            f"invariant.unet_present={invariant.get('unet_present')!r}, expected 0"
+        )
+    if invariant.get("retained_unet_payload") != 0:
+        failures.append(
+            f"invariant.retained_unet_payload={invariant.get('retained_unet_payload')!r}, expected 0"
+        )
+    if invariant.get("reconstructed_unet_present") != 0:
+        failures.append(
+            f"invariant.reconstructed_unet_present={invariant.get('reconstructed_unet_present')!r}, expected 0"
+        )
+    if invariant.get("snapshot_exclude_unet_gate") != 1:
+        failures.append(
+            f"invariant.snapshot_exclude_unet_gate={invariant.get('snapshot_exclude_unet_gate')!r}, expected 1"
+        )
+    # Retained-container evidence (clip_vae eviction retain role): the
+    # CpuSnapshotModels container must be present AND retained with
+    # unet=None, carrying fresh CLIP and VAE.
+    if invariant.get("cpu_snapshot_models_present") != 1:
+        failures.append(
+            "invariant.cpu_snapshot_models_present="
+            f"{invariant.get('cpu_snapshot_models_present')!r}, expected 1"
+        )
+    if invariant.get("container_retained") != 1:
+        failures.append(
+            f"invariant.container_retained={invariant.get('container_retained')!r}, "
+            "expected 1 (container retained with unet absent)"
+        )
+    if invariant.get("clip_present") != 1:
+        failures.append(
+            f"invariant.clip_present={invariant.get('clip_present')!r}, expected 1"
+        )
+    if invariant.get("vae_present") != 1:
+        failures.append(
+            f"invariant.vae_present={invariant.get('vae_present')!r}, expected 1"
+        )
+    snapshot_identity = str(result.get("snapshot_identity") or "")
+    if not snapshot_identity:
+        failures.append(
+            "snapshot_identity empty/absent (cannot tie the probe to one snapshot)"
+        )
+    placement = result.get("placement") or {}
+    for _k in ("cloud", "region", "gpu"):
+        if not str(placement.get(_k) or ""):
+            failures.append(f"placement.{_k} is empty/absent")
+    timing = result.get("restore_timing") or {}
+    resume_ns = _num(timing.get("remote_python_resume_wall_unix_ns"))
+    start_ns = _num(timing.get("restore_method_start_wall_unix_ns"))
+    end_ns = _num(timing.get("restore_method_end_wall_unix_ns"))
+    total_ms = _num(timing.get("restore_total_ms"))
+    if resume_ns is None or resume_ns <= 0:
+        failures.append(
+            "restore_timing.remote_python_resume_wall_unix_ns missing "
+            "(first Python restore instruction not directly observed)"
+        )
+    if start_ns is None or start_ns <= 0:
+        failures.append("restore_timing.restore_method_start_wall_unix_ns missing")
+    if end_ns is None or end_ns <= 0:
+        failures.append("restore_timing.restore_method_end_wall_unix_ns missing")
+    if total_ms is None or total_ms <= 0:
+        failures.append("restore_timing.restore_total_ms invalid")
+    entry_ns = _num(result.get("entry_wall_unix_ns"))
+    if entry_ns is None or entry_ns <= 0:
+        failures.append("entry_wall_unix_ns missing")
+    rss = result.get("rss") or {}
+    rss_val = _num(rss.get("rss_mib"))
+    if rss_val is None:
+        rss_val = _num(rss.get("status_vmrss_mib"))
+    if rss_val is None or rss_val <= 0:
+        failures.append("rss missing/unavailable")
+    identity = attempt.get("identity") or {}
+    restored_instance_id = str(identity.get("restored_instance_id") or "")
+    if not restored_instance_id:
+        failures.append("restored_instance_id empty/absent")
+    cold_check = attempt.get("cold_check") or {}
+    if not cold_check.get("cold"):
+        failures.append(
+            "cold identity gate failed: "
+            + "; ".join(str(f) for f in cold_check.get("failures", [])[:3])
+        )
+    banner_ms = attempt.get("banner_epoch_ms")
+    if banner_ms is None or _num(banner_ms) is None or _num(banner_ms) <= 0:
+        failures.append(
+            "banner_epoch_ms missing (Modal pre-Python 'Restoring Function "
+            "from memory snapshot.' not directly observed)"
+        )
+    dispatch_ms = attempt.get("dispatch_unix_ms")
+    if dispatch_ms is None or _num(dispatch_ms) is None or _num(dispatch_ms) <= 0:
+        failures.append("dispatch_unix_ms missing")
+    return len(failures) == 0, failures
+
+
+def _restore_only_intervals(attempt: dict[str, Any]) -> dict[str, Any]:
+    """Requested intervals for one probe (best-effort; None when underivable)."""
+    result = attempt.get("result") or {}
+    timing = result.get("restore_timing") or {}
+    resume_ns = _num(timing.get("remote_python_resume_wall_unix_ns"))
+    entry_ns = _num(result.get("entry_wall_unix_ns"))
+    banner_ms = _num(attempt.get("banner_epoch_ms"))
+    dispatch_ms = _num(attempt.get("dispatch_unix_ms"))
+
+    def _ms(ns: float | None) -> float | None:
+        if ns is None:
+            return None
+        return round(ns / 1_000_000.0, 3)
+
+    out: dict[str, Any] = {
+        "dispatch_to_banner_ms": (
+            round(banner_ms - dispatch_ms, 3)
+            if banner_ms is not None and dispatch_ms is not None else None
+        ),
+        "pre_python_restore_ms": (
+            round(_ms(resume_ns) - banner_ms, 3)
+            if resume_ns is not None and banner_ms is not None else None
+        ),
+        "python_restore_total_ms": _num(timing.get("restore_total_ms")),
+        "python_resume_to_method_entry_ms": (
+            round(_ms(entry_ns) - _ms(resume_ns), 3)
+            if entry_ns is not None and resume_ns is not None else None
+        ),
+        "banner_to_method_entry_ms": (
+            round(_ms(entry_ns) - banner_ms, 3)
+            if entry_ns is not None and banner_ms is not None else None
+        ),
+        "dispatch_to_method_entry_ms": (
+            round(_ms(entry_ns) - dispatch_ms, 3)
+            if entry_ns is not None and dispatch_ms is not None else None
+        ),
+    }
+    return out
+
+
+def _render_restore_only_table(summary: dict[str, Any]) -> str:
+    meta = summary.get("meta") or {}
+    lines = [
+        "=== V2 UNET-absent snapshot restore-only benchmark ===",
+        "app=%s gpu=%s target_valid=%s" % (
+            meta.get("app_name", ""), meta.get("gpu", ""), meta.get("target_valid", ""),
+        ),
+        "attempts=%s valid=%s invalid=%s dnf=%s target_reached=%s" % (
+            summary.get("attempt_count"), summary.get("valid_count"),
+            summary.get("invalid_count"), summary.get("dnf_count"),
+            summary.get("target_reached"),
+        ),
+        "run  status prePy_ms pyRestore_ms resume2entry_ms cloud/region",
+    ]
+    for r in summary.get("runs", []):
+        result = r.get("result") or {}
+        intervals = _restore_only_intervals(r)
+        placement = result.get("placement") or {}
+
+        def _cell_ms(key: str, width: int) -> str:
+            value = intervals.get(key)
+            if value is None:
+                return " " * width
+            try:
+                return f"{float(value):>{width}.3f}"
+            except (TypeError, ValueError):
+                return " " * width
+
+        status = "VALID" if r.get("valid") else ("DNF" if r.get("dnf") else "INVALID")
+        lines.append(
+            f"{r.get('run_index', '?'):<5} "
+            f"{status:<6} "
+            f"{_cell_ms('pre_python_restore_ms', 9)} "
+            f"{_cell_ms('python_restore_total_ms', 13)} "
+            f"{_cell_ms('python_resume_to_method_entry_ms', 16)} "
+            f"{placement.get('cloud', '')}/{placement.get('region', '')}"
+        )
+    return "\n".join(lines)
+
+
+# ── Restore-only banner log pairing ────────────────────────────────────────
+# The pre-Python ``Restoring Function from memory snapshot.`` banner lives in
+# the Modal SYSTEM/INFO log stream (api_pb2.FILE_DESCRIPTOR_INFO), while the
+# probe's own method-entry anchor is a stdout print.  The default
+# (UNSPECIFIED) log fetch sees stdout but not the platform system lines, so
+# banner retrieval must merge BOTH streams and pair the nearest strictly
+# preceding exact system banner to the request's own stdout anchor.
+_RESTORE_ONLY_SOURCE_STDOUT = 1      # api_pb2.FILE_DESCRIPTOR_STDOUT
+_RESTORE_ONLY_SOURCE_INFO = 3        # api_pb2.FILE_DESCRIPTOR_INFO
+_RESTORE_ONLY_LOG_RETRY_COUNT = 6
+_RESTORE_ONLY_BACKFILL_LIMIT = 6
+_RESTORE_ONLY_RUN_FILE_RE = re.compile(r"^run_(\d+)\.json$")
+
+
+def _restore_only_tasklog_entry(
+    item: Any, *, fallback_source: str,
+) -> dict[str, Any] | None:
+    """Convert one Modal TaskLogs item into a log entry dict.
+
+    Timestamp prefers ``timestamp_ns / 1e6`` (int64 wall ns) and falls back to
+    ``timestamp * 1000`` (float seconds).  The ``source`` label is derived from
+    the item's ``file_descriptor`` when present (system/INFO=3, stdout=1),
+    otherwise the fetch-specific *fallback_source*.  Returns ``None`` when no
+    usable timestamp or data is present.
+    """
+    ts_ns = getattr(item, "timestamp_ns", None)
+    ts = getattr(item, "timestamp", None)
+    epoch_ms: float | None = None
+    if isinstance(ts_ns, int) and ts_ns > 0:
+        epoch_ms = ts_ns / 1_000_000.0
+    elif isinstance(ts, (int, float)) and ts > 0:
+        epoch_ms = float(ts) * 1000.0
+    if epoch_ms is None:
+        return None
+    raw = getattr(item, "data", b"")
+    if isinstance(raw, str):
+        text = raw
+    else:
+        text = (raw or b"").decode("utf-8", "replace")
+    fd = getattr(item, "file_descriptor", None)
+    if fd == _RESTORE_ONLY_SOURCE_INFO:
+        source = "system_info"
+    elif fd == _RESTORE_ONLY_SOURCE_STDOUT:
+        source = "stdout"
+    else:
+        source = fallback_source or "unknown"
+    return {
+        "epoch_ms": epoch_ms,
+        "text": text,
+        "source": source,
+        "timestamp_ns": int(ts_ns or 0),
+        # Container correlation metadata preserved verbatim from the log item
+        # (best-effort; empty when the server does not populate them).
+        "container_id": str(getattr(item, "container_id", "") or ""),
+        "container_name": str(getattr(item, "container_name", "") or ""),
+    }
+
+
+def _merge_restore_only_entries(
+    entry_lists: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Merge per-source entry lists, dedupe, and sort ascending by timestamp.
+
+    Dedupe key is ``(timestamp_ns, text)`` when ns is present, else
+    ``(epoch_ms, text)``.  When one physical line appears in more than one
+    source fetch the system/INFO-tagged entry wins so the platform banner can
+    be matched as a system-source line.
+    """
+    _source_priority = {"system_info": 0, "unknown": 1, "stdout": 2}
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for entries in entry_lists or ():
+        for entry in entries or ():
+            if not isinstance(entry, dict) or entry.get("epoch_ms") is None:
+                continue
+            if (entry.get("timestamp_ns") or 0) > 0:
+                key = (int(entry["timestamp_ns"]), entry.get("text", ""))
+            else:
+                key = (round(float(entry["epoch_ms"]), 6), entry.get("text", ""))
+            previous = merged.get(key)
+            if previous is None or _source_priority.get(
+                entry.get("source", "unknown"), 9
+            ) < _source_priority.get(previous.get("source", "unknown"), 9):
+                merged[key] = entry
+    return sorted(
+        merged.values(), key=lambda e: (float(e["epoch_ms"]), e.get("text", ""))
+    )
+
+
+def _restore_only_banner_candidate_summary(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compact, JSON-safe summary of exact banner candidates for diagnostics."""
+    return [
+        {
+            "epoch_ms": round(float(e["epoch_ms"]), 3),
+            "timestamp_ns": int(e.get("timestamp_ns") or 0),
+            "source": e.get("source", ""),
+            "container_id": e.get("container_id", ""),
+            "text": (e.get("text") or "")[:160],
+        }
+        for e in candidates[:20]
+    ]
+
+
+def _pair_restore_only_banner(
+    entries: list[dict[str, Any]],
+    *,
+    anchor: str,
+    banner_text: str = RESTORE_ONLY_RESTORING_BANNER,
+    banner_source: str = "system_info",
+    dispatch_unix_ms: int | None = None,
+    remote_python_resume_wall_unix_ns: int | None = None,
+    task_scoped: bool = False,
+    container_task_id: str | None = None,
+) -> dict[str, Any]:
+    """Pair the probe's banner evidence within caller-supplied time bounds.
+
+    Standard mode (default) requires the request's stdout *anchor* and pairs
+    it to the nearest strictly preceding exact system banner.
+
+    Task-scoped mode (``task_scoped=True`` — used ONLY when the caller holds
+    the exact Modal ``container_task_id`` and the task-scoped system query
+    yielded exact banner lines) treats the system banner itself as direct
+    evidence correlated by that task id: the stdout anchor is NOT required
+    (``anchor_found`` is reported as observed).  The LATEST exact system
+    banner satisfying ``dispatch <= banner <= remote_python_resume`` is
+    selected; zero in-bounds candidates or multiple indistinguishable
+    candidates (identical timestamps) fail closed, and candidate diagnostics
+    are preserved on failure.  ``pair_status=paired_task_scoped`` and
+    ``correlation=container_task_id`` mark success.  Never infers.
+    """
+    if task_scoped:
+        return _pair_restore_only_banner_task_scoped(
+            entries,
+            anchor=anchor,
+            banner_text=banner_text,
+            banner_source=banner_source,
+            dispatch_unix_ms=dispatch_unix_ms,
+            remote_python_resume_wall_unix_ns=remote_python_resume_wall_unix_ns,
+            container_task_id=container_task_id,
+        )
+    idx = next(
+        (i for i, e in enumerate(entries) if anchor in (e.get("text") or "")),
+        None,
+    )
+    if idx is None:
+        return {
+            "banner_epoch_ms": None, "pair_status": "anchor_missing",
+            "anchor_found": False,
+        }
+    bi = max(
+        (
+            i for i in range(idx)
+            if (entries[i].get("source") or "") == banner_source
+            and (entries[i].get("text") or "").strip() == banner_text
+        ),
+        default=None,
+    )
+    if bi is None:
+        return {
+            "banner_epoch_ms": None, "pair_status": "banner_missing",
+            "anchor_found": True,
+        }
+    banner_ms = float(entries[bi]["epoch_ms"])
+    bounds_failures: list[str] = []
+    if dispatch_unix_ms is not None and banner_ms < float(dispatch_unix_ms):
+        bounds_failures.append(
+            f"banner {banner_ms:.3f}ms precedes dispatch {dispatch_unix_ms}ms"
+        )
+    if (
+        remote_python_resume_wall_unix_ns is not None
+        and remote_python_resume_wall_unix_ns > 0
+        and banner_ms > remote_python_resume_wall_unix_ns / 1_000_000.0
+    ):
+        bounds_failures.append(
+            f"banner {banner_ms:.3f}ms after python resume "
+            f"{remote_python_resume_wall_unix_ns / 1_000_000.0:.3f}ms"
+        )
+    if bounds_failures:
+        return {
+            "banner_epoch_ms": None, "pair_status": "bounds_failed",
+            "anchor_found": True, "banner_candidate_epoch_ms": round(banner_ms, 3),
+            "bounds_failures": bounds_failures,
+            "dispatch_unix_ms": dispatch_unix_ms,
+            "remote_python_resume_wall_unix_ns": remote_python_resume_wall_unix_ns,
+        }
+    return {
+        "banner_epoch_ms": round(banner_ms, 3),
+        "banner_log_line": (entries[bi].get("text") or "")[:160],
+        "banner_timestamp_ns": int(entries[bi].get("timestamp_ns") or 0),
+        "banner_source": entries[bi].get("source", ""),
+        "method_entry_epoch_ms": round(float(entries[idx]["epoch_ms"]), 3),
+        "method_entry_timestamp_ns": int(entries[idx].get("timestamp_ns") or 0),
+        "pair_status": "paired",
+        "anchor_found": True,
+        "bounds_checked": True,
+    }
+
+
+def _pair_restore_only_banner_task_scoped(
+    entries: list[dict[str, Any]],
+    *,
+    anchor: str,
+    banner_text: str,
+    banner_source: str,
+    dispatch_unix_ms: int | None,
+    remote_python_resume_wall_unix_ns: int | None,
+    container_task_id: str | None,
+) -> dict[str, Any]:
+    """Task-id-correlated banner pairing (no stdout anchor required).
+
+    Direct evidence: the system banner lines were returned by the task-scoped
+    ``LogsFilters(source=FILE_DESCRIPTOR_INFO, task_id=container_task_id,
+    search_text=banner)`` query, so they are correlated to this exact Modal
+    task/container.  The LATEST exact system banner inside
+    ``dispatch <= banner <= remote_python_resume`` is selected.  Zero
+    in-bounds candidates or multiple indistinguishable candidates (identical
+    timestamps) fail closed.  ``anchor_found`` is reported as observed, not
+    assumed.  Candidate diagnostics are always preserved on failure.
+    """
+    anchor_idx = next(
+        (i for i, e in enumerate(entries) if anchor in (e.get("text") or "")),
+        None,
+    )
+    anchor_found = anchor_idx is not None
+    candidates = [
+        e for e in entries
+        if (e.get("source") or "") == banner_source
+        and (e.get("text") or "").strip() == banner_text
+    ]
+    candidate_count = len(candidates)
+    diagnostics: dict[str, Any] = {
+        "correlation": container_task_id,
+        "candidate_count": candidate_count,
+        "anchor_found": anchor_found,
+        "banner_candidates": _restore_only_banner_candidate_summary(candidates),
+    }
+    if not candidates:
+        return {
+            "banner_epoch_ms": None,
+            "pair_status": "task_scoped_banner_missing",
+            **diagnostics,
+        }
+    bounded: list[dict[str, Any]] = []
+    bounds_failures: list[str] = []
+    for e in candidates:
+        banner_ms = float(e["epoch_ms"])
+        if dispatch_unix_ms is not None and banner_ms < float(dispatch_unix_ms):
+            bounds_failures.append(
+                f"banner {banner_ms:.3f}ms precedes dispatch {dispatch_unix_ms}ms"
+            )
+            continue
+        if (
+            remote_python_resume_wall_unix_ns is not None
+            and remote_python_resume_wall_unix_ns > 0
+            and banner_ms > remote_python_resume_wall_unix_ns / 1_000_000.0
+        ):
+            bounds_failures.append(
+                f"banner {banner_ms:.3f}ms after python resume "
+                f"{remote_python_resume_wall_unix_ns / 1_000_000.0:.3f}ms"
+            )
+            continue
+        bounded.append(e)
+    diagnostics["bounded_candidate_count"] = len(bounded)
+    diagnostics["bounds_failures"] = bounds_failures
+    if not bounded:
+        return {
+            "banner_epoch_ms": None,
+            "pair_status": "task_scoped_bounds_failed",
+            **diagnostics,
+        }
+    distinct_timestamps = {float(e["epoch_ms"]) for e in bounded}
+    diagnostics["distinct_timestamps"] = len(distinct_timestamps)
+    if len(bounded) > 1 and len(distinct_timestamps) != len(bounded):
+        return {
+            "banner_epoch_ms": None,
+            "pair_status": "task_scoped_candidates_indistinguishable",
+            **diagnostics,
+        }
+    selected = max(bounded, key=lambda e: float(e["epoch_ms"]))
+    return {
+        "banner_epoch_ms": round(float(selected["epoch_ms"]), 3),
+        "banner_log_line": (selected.get("text") or "")[:160],
+        "banner_timestamp_ns": int(selected.get("timestamp_ns") or 0),
+        "banner_source": selected.get("source", ""),
+        "banner_container_id": selected.get("container_id", ""),
+        "method_entry_epoch_ms": (
+            round(float(entries[anchor_idx]["epoch_ms"]), 3) if anchor_found else None
+        ),
+        "method_entry_timestamp_ns": (
+            int(entries[anchor_idx].get("timestamp_ns") or 0) if anchor_found else 0
+        ),
+        "pair_status": "paired_task_scoped",
+        "correlation": container_task_id,
+        "anchor_found": anchor_found,
+        "candidate_count": candidate_count,
+        "bounded_candidate_count": len(bounded),
+        "distinct_timestamps": len(distinct_timestamps),
+        "bounds_checked": True,
+        "banner_candidates": _restore_only_banner_candidate_summary(bounded),
+    }
+
+
+def _restore_only_log_window(
+    dispatch_unix_ms: int | None,
+    remote_python_resume_wall_unix_ns: int | None,
+    end_unix_ms: int | None = None,
+) -> tuple[Any, Any]:
+    """Tight explicit ``since``/``until`` bounds for restore-only log queries.
+
+    ``since`` = dispatch - 120s; ``until`` = Python resume + 120s, falling
+    back to the artifact end timestamp + 120s when resume is unavailable.
+    Returns ``(None, None)`` when no bound can be derived.
+    """
+    since_dt: Any = None
+    if dispatch_unix_ms is not None and dispatch_unix_ms > 0:
+        since_dt = datetime.fromtimestamp(
+            dispatch_unix_ms / 1000.0 - 120.0, tz=timezone.utc
+        )
+    until_ms: float | None = None
+    if (
+        remote_python_resume_wall_unix_ns is not None
+        and remote_python_resume_wall_unix_ns > 0
+    ):
+        until_ms = remote_python_resume_wall_unix_ns / 1_000_000.0 + 120_000.0
+    elif end_unix_ms is not None and end_unix_ms > 0:
+        until_ms = float(end_unix_ms) + 120_000.0
+    until_dt: Any = None
+    if until_ms is not None:
+        until_dt = datetime.fromtimestamp(until_ms / 1000.0, tz=timezone.utc)
+    return since_dt, until_dt
+
+
+async def _restore_only_tail_query(
+    client: Any,
+    app_id: str,
+    *,
+    since: Any,
+    until: Any,
+    fallback_source: str,
+    filters: Any = None,
+    n: int = 20000,
+) -> list[dict[str, Any]]:
+    """Run one bounded ``tail_logs`` query and convert items to log entries."""
+    from modal._logs import tail_logs  # noqa: PLC0415
+
+    entries: list[dict[str, Any]] = []
+    async for batch in tail_logs(
+        client, app_id, n, since=since, until=until, filters=filters,
+    ):
+        for item in batch.items:
+            entry = _restore_only_tasklog_entry(item, fallback_source=fallback_source)
+            if entry is not None:
+                entries.append(entry)
+    return entries
+
+
+async def _fetch_restore_only_banner_timing(
+    workspace: dict[str, Any],
+    app_name: str,
+    request_id: str,
+    *,
+    dispatch_unix_ms: int | None = None,
+    remote_python_resume_wall_unix_ns: int | None = None,
+    container_task_id: str | None = None,
+    end_unix_ms: int | None = None,
+) -> dict[str, Any]:
+    """Tail Modal app logs for THIS probe's pre-Python restore banner.
+
+    When *container_task_id* is available the queries are scoped to that task
+    with ``LogsFilters``: the stdout/default anchor query uses
+    ``task_id=container_task_id, search_text=<anchor>`` and the platform
+    banner query uses ``source=FILE_DESCRIPTOR_INFO, task_id=container_task_id,
+    search_text=<banner>``.  If the task-scoped system query returns no banner,
+    a bounded fallback queries ``source=FILE_DESCRIPTOR_INFO`` with only the
+    same tight time window and the banner ``search_text`` (no task filter).
+    Without *container_task_id* the legacy dual-stream (default + INFO) queries
+    run.  All queries use a tight explicit ``since`` = dispatch-120s and
+    ``until`` = Python resume + 120s (or artifact end + 120s), and fetch up to
+    20000 entries so historical lines are not displaced by newer logs.
+
+    Merged entries are sorted ascending (``timestamp_ns`` preferred) and the
+    probe's own ``request_method_entry`` stdout anchor is paired to the
+    nearest strictly preceding exact system banner.  When bounds are supplied
+    the banner must satisfy ``dispatch <= banner <= remote_python_resume`` —
+    the pairing fails closed otherwise.  Never infers a banner;
+    ``banner_epoch_ms`` is ``None`` on any failure.  The result records which
+    scope matched (``banner_scope``).
+    """
+    try:
+        import modal as _m
+        from modal.cli.app import resolve_app_identifier
+        from modal._logs import LogsFilters, tail_logs
+        from modal.client import _Client
+        from modal_proto import api_pb2  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[v2.restore_only] banner fetch unavailable: {type(exc).__name__}",
+            flush=True,
+        )
+        return {"banner_epoch_ms": None, "fetch_error": type(exc).__name__}
+    try:
+        client = await _Client.from_credentials(
+            workspace["token_id"], workspace["token_secret"],
+        )
+        app_id, _, _ = await resolve_app_identifier(app_name, None, client)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[v2.restore_only] banner fetch identity error: {type(exc).__name__}",
+            flush=True,
+        )
+        return {"banner_epoch_ms": None, "fetch_error": type(exc).__name__}
+    anchor = f"v2.restore_only_probe request_method_entry request_id={request_id}"
+    since_dt, until_dt = _restore_only_log_window(
+        dispatch_unix_ms, remote_python_resume_wall_unix_ns, end_unix_ms,
+    )
+    task_id = str(container_task_id or "").strip() or None
+    _n = 20000
+    last_paired: dict[str, Any] | None = None
+    for _attempt in range(_RESTORE_ONLY_LOG_RETRY_COUNT):
+        anchor_entries: list[dict[str, Any]] = []
+        banner_entries: list[dict[str, Any]] = []
+        banner_scope = "unscoped_only"
+        try:
+            if task_id is not None:
+                # Task-scoped anchor query (default source).
+                anchor_entries = await _restore_only_tail_query(
+                    client, app_id, since=since_dt, until=until_dt,
+                    fallback_source="stdout",
+                    filters=LogsFilters(task_id=task_id, search_text=anchor),
+                    n=_n,
+                )
+                # Task-scoped platform system banner query.
+                banner_entries = await _restore_only_tail_query(
+                    client, app_id, since=since_dt, until=until_dt,
+                    fallback_source="system_info",
+                    filters=LogsFilters(
+                        source=api_pb2.FILE_DESCRIPTOR_INFO,
+                        task_id=task_id,
+                        search_text=RESTORE_ONLY_RESTORING_BANNER,
+                    ),
+                    n=_n,
+                )
+                banner_scope = "task_scoped"
+                if not any(
+                    RESTORE_ONLY_RESTORING_BANNER in (e.get("text") or "")
+                    for e in banner_entries
+                ):
+                    # Bounded fallback: same tight window + banner search_text,
+                    # no task filter.
+                    banner_entries = await _restore_only_tail_query(
+                        client, app_id, since=since_dt, until=until_dt,
+                        fallback_source="system_info",
+                        filters=LogsFilters(
+                            source=api_pb2.FILE_DESCRIPTOR_INFO,
+                            search_text=RESTORE_ONLY_RESTORING_BANNER,
+                        ),
+                        n=_n,
+                    )
+                    banner_scope = "fallback_unscoped"
+            else:
+                # Legacy dual-stream queries (no task scoping available).
+                anchor_entries = await _restore_only_tail_query(
+                    client, app_id, since=since_dt, until=until_dt,
+                    fallback_source="stdout",
+                    n=_n,
+                )
+                banner_entries = await _restore_only_tail_query(
+                    client, app_id, since=since_dt, until=until_dt,
+                    fallback_source="system_info",
+                    filters=LogsFilters(source=api_pb2.FILE_DESCRIPTOR_INFO),
+                    n=_n,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[v2.restore_only] banner fetch tail error: {type(exc).__name__}",
+                flush=True,
+            )
+            return {"banner_epoch_ms": None, "fetch_error": type(exc).__name__}
+        merged = _merge_restore_only_entries([banner_entries, anchor_entries])
+        # Task-scoped pairing applies ONLY when the task-scoped INFO query
+        # itself yielded exact system banner lines (banner_scope=task_scoped):
+        # the banner is then direct evidence correlated by container_task_id
+        # and the stdout anchor is not required.  Fallback/unscoped scopes
+        # keep the anchor-requiring pairing.
+        paired = _pair_restore_only_banner(
+            merged,
+            anchor=anchor,
+            dispatch_unix_ms=dispatch_unix_ms,
+            remote_python_resume_wall_unix_ns=remote_python_resume_wall_unix_ns,
+            task_scoped=(task_id is not None and banner_scope == "task_scoped"),
+            container_task_id=task_id,
+        )
+        paired["sources_fetched"] = ["system_info", "stdout"]
+        paired["entry_count"] = len(merged)
+        paired["banner_scope"] = banner_scope
+        paired["container_task_id_scoped"] = int(task_id is not None)
+        paired["container_task_id_used"] = task_id or ""
+        last_paired = paired
+        if paired.get("pair_status") in (
+            "bounds_failed",
+            "task_scoped_bounds_failed",
+            "task_scoped_candidates_indistinguishable",
+        ):
+            print(
+                f"[v2.restore_only] banner pairing failed for "
+                f"request_id={request_id}: {paired.get('pair_status')} "
+                f"{paired.get('bounds_failures') or paired.get('distinct_timestamps')}",
+                flush=True,
+            )
+            return paired
+        if paired.get("banner_epoch_ms") is not None:
+            return paired
+        # Anchor or banner not yet ingested — bounded retry (no inference).
+        await asyncio.sleep(2.0)
+    if last_paired is not None:
+        # Preserve the real (fail-closed) pairing cause for observability.
+        return last_paired
+    print(
+        f"[v2.restore_only] banner pairing failed for request_id={request_id}",
+        flush=True,
+    )
+    return {
+        "banner_epoch_ms": None,
+        "pair_status": "unpaired_after_retries",
+        "anchor_found": None,
+        "sources_fetched": ["system_info", "stdout"],
+        "entry_count": 0,
+        "banner_scope": "none",
+        "container_task_id_scoped": int(task_id is not None),
+        "container_task_id_used": task_id or "",
+    }
+
+
+async def _run_snapshot_restore_only(
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+    *,
+    run_count: int,
+    max_attempts: int,
+    gap_seconds: float,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+) -> dict[str, Any]:
+    """UNET-absent snapshot restore-only benchmark.
+
+    Collects EXACTLY *run_count* valid reused-snapshot restore-only probes
+    against the deployed UNET-absent-snapshot app, with a hard stop the
+    moment the target is reached.  Each probe is one remote call to the
+    no-op ``run_snapshot_restore_only_probe`` method; every probe is a
+    candidate (no beautification/throwaway probes).  Invalid/DNF probes
+    never count toward the target and are preserved as artifacts.  A
+    total-attempt cap (*max_attempts*) bounds the loop — if the target is
+    not reached the benchmark returns non-zero (evidence insufficient).
+
+    Per probe the harness captures the local command dispatch timestamp,
+    then after the response tails the Modal app logs for the pre-Python
+    ``Restoring Function from memory snapshot.`` banner anchored to this
+    probe's own method-entry line.  A missing decisive timestamp/identity
+    fails that probe's validity — never inferred.  Writes per-attempt JSON,
+    ``summary.json`` and ``restore_only_report.json``.
+    """
+    os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
+    os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
+    os.environ["COMFYMODAL_V2_GPU"] = gpu
+    print(
+        f"[v2.restore_only] mode=start target_valid={run_count} "
+        f"max_attempts={max_attempts} gap={gap_seconds}s app={app_name}",
+        flush=True,
+    )
+    handle = await asyncio.to_thread(
+        transport._v2_handle, workspace=workspace, gpu=gpu,
+    )
+    records: list[dict[str, Any]] = []
+    prev_identity: dict[str, Any] | None = None
+    valid_count = 0
+
+    for index in range(max_attempts):
+        _run_id = f"restore-only-{index}-{uuid.uuid4().hex[:8]}"
+        _req_id = f"v2-restore-only-{index}-{uuid.uuid4().hex[:12]}"
+        _dispatch_wall_ms = int(time.time() * 1000)
+        artifact: dict[str, Any] = {
+            "run_index": index,
+            "run_id": _run_id,
+            "request_id": _req_id,
+            "mode": RESTORE_ONLY_MODE,
+            "dispatch_unix_ms": _dispatch_wall_ms,
+            "dispatch_iso": datetime.fromtimestamp(
+                _dispatch_wall_ms / 1000.0, tz=timezone.utc
+            ).isoformat(),
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "target": {"app_name": app_name, "class_name": class_name, "gpu": gpu},
+            "config": {
+                "target_valid": run_count,
+                "max_attempts": max_attempts,
+                "gap_seconds": gap_seconds,
+                "snapshot_exclude_unet": 1,
+                "evict_retain_role": "clip_vae",
+            },
+            "identity": {},
+            "cold_check": {},
+            "cold_gate_available": False,
+            "banner": {},
+            "banner_epoch_ms": None,
+            "result": {},
+            "valid": False,
+            "dnf": False,
+            "failures": [],
+            "error": None,
+        }
+        identity: dict[str, Any] = {}
+        try:
+            fn = handle.run_snapshot_restore_only_probe
+            remote = getattr(fn, "remote", None)
+            if remote is not None and callable(getattr(remote, "aio", None)):
+                result = remote.aio(request_id=_req_id)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            elif asyncio.iscoroutinefunction(fn):
+                result = await fn(request_id=_req_id)
+            else:
+                result = await asyncio.to_thread(fn, request_id=_req_id)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not isinstance(result, dict):
+                raise RuntimeError(f"remote returned non-dict: {type(result).__name__}")
+            artifact["result"] = result
+            identity = result.get("identity") or {}
+            artifact["identity"] = identity
+            cold_check = _validate_cold_identity(
+                identity, run_index=index, pretouch=0, prev_identity=prev_identity,
+            )
+            artifact["cold_check"] = cold_check
+            artifact["cold_gate_available"] = bool(_cold_identity_key(identity))
+            # Banner must satisfy dispatch <= banner <= Python-resume (when
+            # the resume wall timestamp is directly observed by the container).
+            # Task-scoped log queries are used when the container task id is
+            # present in the probe identity.
+            _resume_wall_ns = _num(
+                ((result or {}).get("restore_timing") or {})
+                .get("remote_python_resume_wall_unix_ns")
+            )
+            _task_id = str(identity.get("container_task_id") or "") or None
+            banner = await _fetch_restore_only_banner_timing(
+                workspace, app_name, _req_id,
+                dispatch_unix_ms=_dispatch_wall_ms,
+                remote_python_resume_wall_unix_ns=(
+                    int(_resume_wall_ns) if _resume_wall_ns is not None else None
+                ),
+                container_task_id=_task_id,
+            )
+            artifact["banner"] = banner
+            artifact["banner_epoch_ms"] = banner.get("banner_epoch_ms")
+            valid, failures = _restore_only_validity(artifact)
+            artifact["valid"] = valid
+            artifact["failures"] = failures
+            if valid:
+                valid_count += 1
+        except Exception as exc:  # noqa: BLE001
+            artifact["dnf"] = True
+            artifact["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            artifact["failures"] = [artifact["error"]]
+
+        artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
+        (output_dir / f"run_{index}.json").write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(artifact)
+        status = "DNF" if artifact["dnf"] else ("VALID" if artifact["valid"] else "INVALID")
+        print(
+            f"[v2.restore_only] attempt={index} status={status} "
+            f"valid_total={valid_count}/{run_count} "
+            f"cold={(artifact.get('cold_check') or {}).get('cold')} "
+            f"banner_ms={artifact.get('banner_epoch_ms')} "
+            f"instance={identity.get('restored_instance_id', '')[:12]}",
+            flush=True,
+        )
+        if artifact["failures"]:
+            print(
+                f"[v2.restore_only] attempt={index} failures={artifact['failures']}",
+                flush=True,
+            )
+        if artifact["valid"]:
+            prev_identity = identity
+        if valid_count >= run_count:
+            print(
+                f"[v2.restore_only] target reached: {valid_count} valid probes; "
+                "hard stop",
+                flush=True,
+            )
+            break
+        if index + 1 < max_attempts:
+            print(
+                f"[v2.restore_only] phase=gap seconds={gap_seconds}",
+                flush=True,
+            )
+            await asyncio.sleep(gap_seconds)
+
+    valid = [r for r in records if r.get("valid")]
+    summary: dict[str, Any] = {
+        "mode": RESTORE_ONLY_MODE,
+        "meta": {
+            "app_name": app_name,
+            "class_name": class_name,
+            "gpu": gpu,
+            "target_valid": run_count,
+            "max_attempts": max_attempts,
+            "gap_seconds": gap_seconds,
+            "snapshot_exclude_unet": 1,
+            "evict_retain_role": "clip_vae",
+            "provider_region_pinned": False,
+            "cold_identity": (
+                "restore-only gate: restore_count==1, request_count==1, "
+                "nonempty fresh restored_instance_id; invariant unet_present==0 "
+                "with no retained/reconstructed UNET payload; container present "
+                "and retained (container_retained==1) with clip_present==1 and "
+                "vae_present==1; the Modal pre-Python 'Restoring Function from "
+                "memory snapshot.' banner must be directly observed per probe; "
+                "any missing decisive timestamp/identity fails validity, never "
+                "inferred"
+            ),
+        },
+        "attempt_count": len(records),
+        "valid_count": len(valid),
+        "dnf_count": len([r for r in records if r.get("dnf")]),
+        "invalid_count": len(records) - len(valid) - len([r for r in records if r.get("dnf")]),
+        "target_reached": len(valid) >= run_count,
+        "runs": [{
+            "run_index": r["run_index"],
+            "run_id": r.get("run_id"),
+            "request_id": r.get("request_id"),
+            "valid": r.get("valid"),
+            "dnf": r.get("dnf"),
+            "cold": bool((r.get("cold_check") or {}).get("cold")),
+            "failures": r.get("failures"),
+            "dispatch_unix_ms": r.get("dispatch_unix_ms"),
+            "banner_epoch_ms": r.get("banner_epoch_ms"),
+            "intervals": _restore_only_intervals(r),
+            "identity": r.get("identity"),
+            "result": r.get("result"),
+        } for r in records],
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    (output_dir / "restore_only_report.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    print(_render_restore_only_table(summary), flush=True)
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "attempt_count": summary["attempt_count"],
+        "valid_count": summary["valid_count"],
+        "invalid_count": summary["invalid_count"],
+        "dnf_count": summary["dnf_count"],
+        "target_reached": summary["target_reached"],
+    }, default=str), flush=True)
+    return summary
+
+
+def _restore_only_load_attempts(output_dir: Path) -> list[tuple[int, dict[str, Any]]]:
+    """Load ``run_<n>.json`` restore-only artifacts in strict numeric order.
+
+    Only bare ``run_<digits>.json`` files are considered (backfilled copies
+    named ``backfilled_run_<n>.json`` never match).  Returns ``(index, artifact)``
+    pairs sorted by the numeric file index; a gap in the numeric sequence is
+    preserved so the caller can fail closed on an incomplete prefix.
+    """
+    indexed: list[tuple[int, dict[str, Any]]] = []
+    for f in output_dir.glob("run_*.json"):
+        match = _RESTORE_ONLY_RUN_FILE_RE.match(f.name)
+        if match is None:
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        indexed.append((int(match.group(1)), data))
+    indexed.sort(key=lambda pair: pair[0])
+    return indexed
+
+
+def _restore_only_end_unix_ms(artifact: dict[str, Any]) -> int | None:
+    """Best-effort artifact end epoch-ms for the tight ``until`` log bound.
+
+    Parses the artifact's ``end_ts`` (ISO UTC), falling back to ``start_ts``.
+    Returns ``None`` when neither is parseable.
+    """
+    for key in ("end_ts", "start_ts"):
+        raw = artifact.get(key)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                return int(datetime.fromisoformat(raw).timestamp() * 1000.0)
+            except ValueError:
+                continue
+    return None
+
+
+async def _backfill_snapshot_restore_only(
+    workspace: dict[str, Any],
+    source_dir: Path,
+    limit: int = _RESTORE_ONLY_BACKFILL_LIMIT,
+) -> dict[str, Any]:
+    """REPORT-ONLY backfill of an existing restore-only run directory.
+
+    Re-fetches banner evidence for the FIRST *limit* attempts (exactly indices
+    ``0..limit-1``) and re-runs ``_restore_only_validity``.  This is log
+    retrieval ONLY: it never creates a ``ModalTransport`` and never touches
+    remote function handles (no ``run_snapshot_restore_only_probe``, no
+    Function.remote/spawn).  The raw ``run_<n>.json`` artifacts are preserved
+    untouched; backfilled copies are written as ``backfilled_run_<n>.json``
+    plus a new ``backfilled_summary.json`` / ``backfilled_restore_only_report.json``
+    containing exactly *limit* selected records.
+
+    Raises ``RuntimeError`` when any of the first *limit* attempts cannot be
+    validated after backfill — later attempts are never substituted.
+    """
+    if limit < 1:
+        raise RuntimeError(f"restore-only backfill limit must be >= 1, got {limit}")
+    indexed = _restore_only_load_attempts(source_dir)
+    if len(indexed) < limit:
+        raise RuntimeError(
+            f"restore-only backfill requires at least {limit} source attempts, "
+            f"found {len(indexed)}"
+        )
+    selected = indexed[:limit]
+    selected_indices = [idx for idx, _ in selected]
+    if selected_indices != list(range(limit)):
+        raise RuntimeError(
+            "restore-only backfill requires the first source attempts to be "
+            f"exactly [0..{limit - 1}], got {selected_indices}"
+        )
+    excluded_indices = [idx for idx, _ in indexed[limit:]]
+    source_attempt_count = len(indexed)
+
+    app_name = ""
+    class_name = ""
+    gpu = ""
+    backfilled: list[dict[str, Any]] = []
+    for i, (run_index, artifact) in enumerate(selected):
+        target = artifact.get("target") or {}
+        if i == 0:
+            app_name = str(
+                target.get("app_name")
+                or os.environ.get("COMFYMODAL_V2_APP_NAME", RESTORE_ONLY_APP_NAME)
+            )
+            class_name = str(target.get("class_name") or CLASS_NAME)
+            gpu = str(target.get("gpu") or GPU)
+        request_id = str(artifact.get("request_id") or "")
+        dispatch_ms = _num(artifact.get("dispatch_unix_ms"))
+        resume_ns = _num(
+            ((artifact.get("result") or {}).get("restore_timing") or {})
+            .get("remote_python_resume_wall_unix_ns")
+        )
+        # Task-scoped log queries via the stored probe identity + a tight
+        # ``until`` bound derived from the artifact's own end timestamp.
+        _task_id = str((artifact.get("identity") or {}).get("container_task_id") or "") or None
+        _end_ms = _restore_only_end_unix_ms(artifact)
+        banner = await _fetch_restore_only_banner_timing(
+            workspace,
+            app_name,
+            request_id,
+            dispatch_unix_ms=int(dispatch_ms) if dispatch_ms is not None else None,
+            remote_python_resume_wall_unix_ns=(
+                int(resume_ns) if resume_ns is not None else None
+            ),
+            container_task_id=_task_id,
+            end_unix_ms=_end_ms,
+        )
+        copy_artifact = copy.deepcopy(artifact)
+        copy_artifact["banner"] = banner
+        copy_artifact["banner_epoch_ms"] = banner.get("banner_epoch_ms")
+        copy_artifact["backfilled"] = True
+        copy_artifact["backfill_source_file"] = f"run_{run_index}.json"
+        valid, failures = _restore_only_validity(copy_artifact)
+        copy_artifact["valid"] = valid
+        copy_artifact["failures"] = failures
+        if not valid:
+            # Persist full failure diagnostics BEFORE raising so the parent can
+            # inspect exactly why the attempt stayed invalid (banner fetch
+            # result, filters used, failures, bounds).
+            _diag: dict[str, Any] = {
+                "run_index": run_index,
+                "request_id": request_id,
+                "failures": failures,
+                "dispatch_unix_ms": dispatch_ms,
+                "remote_python_resume_wall_unix_ns": resume_ns,
+                "container_task_id": _task_id,
+                "end_unix_ms": _end_ms,
+                "banner": banner,
+                "backfilled_artifact": copy_artifact,
+            }
+            (source_dir / f"backfill_failure_attempt_{run_index}.json").write_text(
+                json.dumps(_diag, default=str, indent=2), encoding="utf-8"
+            )
+            raise RuntimeError(
+                f"restore-only backfill FAILED for attempt {run_index}: "
+                + "; ".join(failures)
+            )
+        (source_dir / f"backfilled_run_{run_index}.json").write_text(
+            json.dumps(copy_artifact, default=str, indent=2), encoding="utf-8"
+        )
+        backfilled.append(copy_artifact)
+
+    runs = [{
+        "run_index": r.get("run_index"),
+        "run_id": r.get("run_id"),
+        "request_id": r.get("request_id"),
+        "valid": r.get("valid"),
+        "dnf": r.get("dnf"),
+        "cold": bool((r.get("cold_check") or {}).get("cold")),
+        "failures": r.get("failures"),
+        "dispatch_unix_ms": r.get("dispatch_unix_ms"),
+        "banner_epoch_ms": r.get("banner_epoch_ms"),
+        "intervals": _restore_only_intervals(r),
+        "identity": r.get("identity"),
+        "result": r.get("result"),
+        "banner": r.get("banner"),
+    } for r in backfilled]
+
+    # Machine-readable distribution / cohort data over the six selected probes.
+    _interval_keys = (
+        "dispatch_to_banner_ms", "pre_python_restore_ms", "python_restore_total_ms",
+        "python_resume_to_method_entry_ms", "banner_to_method_entry_ms",
+        "dispatch_to_method_entry_ms",
+    )
+    distribution: dict[str, Any] = {}
+    for key in _interval_keys:
+        distribution[key] = compute_stats(
+            v for v in (_num(r["intervals"].get(key)) for r in runs) if v is not None
+        )
+    cohort: dict[str, Any] = {
+        "selected_count": len(runs),
+        "source_attempt_count": source_attempt_count,
+        "excluded_overrun_count": len(excluded_indices),
+        "banner_epoch_ms": compute_stats(
+            v for v in (_num(r.get("banner_epoch_ms")) for r in runs) if v is not None
+        ),
+        "dispatch_unix_ms": compute_stats(
+            v for v in (_num(r.get("dispatch_unix_ms")) for r in runs) if v is not None
+        ),
+    }
+
+    summary: dict[str, Any] = {
+        "mode": "snapshot_restore_only_backfill",
+        "meta": {
+            "app_name": app_name,
+            "class_name": class_name,
+            "gpu": gpu,
+            "target_valid": limit,
+            "limit": limit,
+            "source_attempt_count": source_attempt_count,
+            "selected_attempts": selected_indices,
+            "excluded_instrumentation_overrun_attempts": excluded_indices,
+            "protocol_note": (
+                f"Original run issued {source_attempt_count} probes because the "
+                "pre-fix banner fetcher used the default log source only and "
+                "never saw the Modal system/INFO 'Restoring Function from "
+                "memory snapshot.' lines, so every candidate was marked "
+                "invalid.  This backfill re-fetches system/INFO + stdout logs "
+                "(bounded; log retrieval only, no probe invocation) for the "
+                f"FIRST {limit} attempts "
+                f"[{selected_indices[0]}..{selected_indices[-1]}] and "
+                "re-validates them.  Attempts "
+                f"{excluded_indices} are excluded as instrumentation overrun "
+                "and are never substituted for the first six."
+            ),
+            "backfill": True,
+            "no_remote_invocation": True,
+            "source_dir": str(source_dir),
+            "raw_evidence_preserved": True,
+            "snapshot_exclude_unet": 1,
+            "evict_retain_role": "clip_vae",
+            "provider_region_pinned": False,
+            "cold_identity": (
+                "restore-only gate: restore_count==1, request_count==1, "
+                "nonempty fresh restored_instance_id; invariant unet_present==0 "
+                "with no retained/reconstructed UNET payload; container present "
+                "and retained (container_retained==1) with clip_present==1 and "
+                "vae_present==1; the Modal pre-Python 'Restoring Function from "
+                "memory snapshot.' system banner must be directly observed per "
+                "probe within dispatch <= banner <= python-resume; any missing "
+                "decisive timestamp/identity fails validity, never inferred"
+            ),
+        },
+        "attempt_count": len(backfilled),
+        "valid_count": len([r for r in backfilled if r.get("valid")]),
+        "dnf_count": 0,
+        "invalid_count": 0,
+        "target_reached": len(backfilled) == limit,
+        "source_attempt_count": source_attempt_count,
+        "selected_attempts": selected_indices,
+        "excluded_instrumentation_overrun_attempts": excluded_indices,
+        "distribution": distribution,
+        "cohort": cohort,
+        "runs": runs,
+    }
+    (source_dir / "backfilled_summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    (source_dir / "backfilled_restore_only_report.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    print(_render_restore_only_table(summary), flush=True)
+    print(json.dumps({
+        "output_dir": str(source_dir),
+        "mode": "snapshot_restore_only_backfill",
+        "source_attempt_count": source_attempt_count,
+        "selected_attempts": selected_indices,
+        "excluded_instrumentation_overrun_attempts": excluded_indices,
+        "valid_count": summary["valid_count"],
+        "target_reached": summary["target_reached"],
+    }, default=str), flush=True)
+    return summary
+
+
 async def _run_variance_cold(
     workflow: dict[str, Any],
     modal_options: dict[str, Any],
@@ -4745,6 +6336,9 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                variance_matrix: bool = False, transfer_ab: bool = False,
                region_ab: str | None = None, host_ab: bool = False,
                backing_ab: bool = False, provider_ab: bool = False,
+               volume_read: bool = False,
+               snapshot_restore_only: bool = False,
+               snapshot_restore_only_backfill: str | None = None,
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
                teardown: str = "full", pin_transfer: int = 0,
@@ -4766,12 +6360,97 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         _report_only_from_dir(_report_dir)
         return
 
+    # ── Restore-only BACKFILL (report-only; log retrieval, no probes) ─────
+    # Re-fetches system/INFO + stdout banner evidence for the FIRST six
+    # attempts of a prior restore-only run directory and re-validates them.
+    # Never creates ModalTransport / never invokes remote function handles.
+    # Exits nonzero unless exactly *limit* valid probes are recovered.
+    if snapshot_restore_only_backfill:
+        _bf_dir = Path(snapshot_restore_only_backfill)
+        if not _bf_dir.is_absolute():
+            _candidate = (
+                ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs"
+                / snapshot_restore_only_backfill
+            )
+            if _candidate.is_dir():
+                _bf_dir = _candidate
+        if not _bf_dir.is_dir():
+            raise RuntimeError(
+                "restore-only backfill directory not found: "
+                f"{snapshot_restore_only_backfill}"
+            )
+        _bf_workspace = _load_workspace()
+        _bf_limit = RESTORE_ONLY_RUN_COUNT if run_count is None else int(run_count)
+        _bf_summary = await _backfill_snapshot_restore_only(
+            _bf_workspace, _bf_dir, limit=_bf_limit,
+        )
+        if _bf_summary.get("valid_count") != _bf_limit:
+            raise RuntimeError(
+                "restore-only backfill incomplete: "
+                f"{_bf_summary.get('valid_count')}/{_bf_limit} valid"
+            )
+        return
+
     requested_shape = runtime_shape_config().identity_payload()
     shape_guard = _runtime_shape_guard(requested_shape)
     print(json.dumps({"runtime_shape": requested_shape, "guard": shape_guard}, sort_keys=True), flush=True)
     workspace = _load_workspace()
-    workflow, modal_options = _load_workflow()
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+
+    # ── Mounted-Volume raw sequential-read mode (explicit opt-in) ──────────
+    if volume_read:
+        _vr_app = os.environ.get("COMFYMODAL_V2_APP_NAME", APP_NAME) or APP_NAME
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _vr_app
+        _vr_gap = VOLUME_READ_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _vr_runs = VOLUME_READ_RUN_COUNT if run_count is None else int(run_count)
+        _vr_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"volume_read_{timestamp}"
+        _vr_dir.mkdir(parents=True, exist_ok=True)
+        await _run_volume_read(
+            workspace=workspace,
+            transport=ModalTransport(),
+            output_dir=_vr_dir,
+            run_count=_vr_runs,
+            gap_seconds=_vr_gap,
+            filename=VOLUME_READ_FILENAME,
+            chunk_bytes=VOLUME_READ_CHUNK_BYTES,
+            app_name=_vr_app,
+            class_name=CLASS_NAME,
+            gpu=GPU,
+        )
+        return
+
+    # ── UNET-absent snapshot restore-only mode (explicit opt-in) ───────────
+    # Exactly RESTORE_ONLY_RUN_COUNT (default 6) valid reused-snapshot probes
+    # against the deployment built with COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1,
+    # hard-stopped once reached; invalid probes never count; no
+    # beautification probes.  Provider/region unpinned by design.
+    if snapshot_restore_only:
+        _ro_app = (
+            os.environ.get("COMFYMODAL_V2_APP_NAME", RESTORE_ONLY_APP_NAME)
+            or RESTORE_ONLY_APP_NAME
+        )
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _ro_app
+        _ro_target = RESTORE_ONLY_RUN_COUNT if run_count is None else int(run_count)
+        _ro_max = RESTORE_ONLY_MAX_ATTEMPTS
+        if os.environ.get("V2_RESTORE_ONLY_MAX_ATTEMPTS"):
+            _ro_max = int(os.environ["V2_RESTORE_ONLY_MAX_ATTEMPTS"])
+        _ro_gap = RESTORE_ONLY_GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        _ro_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"restore_only_{timestamp}"
+        _ro_dir.mkdir(parents=True, exist_ok=True)
+        await _run_snapshot_restore_only(
+            workspace=workspace,
+            transport=ModalTransport(),
+            output_dir=_ro_dir,
+            run_count=_ro_target,
+            max_attempts=_ro_max,
+            gap_seconds=_ro_gap,
+            app_name=_ro_app,
+            class_name=CLASS_NAME,
+            gpu=GPU,
+        )
+        return
+
+    workflow, modal_options = _load_workflow()
     output_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"v2_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     transport = ModalTransport()
@@ -5139,6 +6818,52 @@ if __name__ == "__main__":
              "H2D and a 454-storage synthetic H2D (isolated, after the real "
              "transfer). Writes provider_ab_report.md.",
     )
+    _parser.add_argument(
+        "--volume-read",
+        action="store_true",
+        default=False,
+        help="Run the mounted-Volume raw sequential-read benchmark: pure "
+             "read speed of diffusion_models/"
+             "z_image_turbo_bf16.safetensors from the mounted models volume. "
+             "No graph execution, model loading, GPU work, hashing, or /tmp "
+             "writes.  Each attempt performs two buffered os.read passes "
+             "(primary + warm-cache).  V2_VOLUME_READ_RUN_COUNT (default 3) "
+             "controls attempts; a 25s cold gap is applied between attempts. "
+             "Opt-in; never the default.",
+    )
+    _parser.add_argument(
+        "--snapshot-restore-only",
+        action="store_true",
+        default=False,
+        help="Run the UNET-absent snapshot restore-only benchmark: exactly "
+             "V2_RESTORE_ONLY_RUN_COUNT (default 6) valid reused-snapshot "
+             "restore-only probes against the deployment built with "
+             "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1.  Every probe is a "
+             "candidate (no beautification probes); invalid/DNF probes never "
+             "count; the loop hard-stops as soon as the target of valid "
+             "probes is reached (bounded by V2_RESTORE_ONLY_MAX_ATTEMPTS, "
+             "default 40).  Per probe captures command dispatch timestamp, "
+             "the Modal pre-Python 'Restoring Function from memory snapshot.' "
+             "banner (via app-log tailing anchored to the probe's own "
+             "method-entry line), the container-observed first-Python-restore "
+             "timestamp, restore timing, method entry, identity and RSS.  A "
+             "missing decisive timestamp/identity fails that probe.  "
+             "Provider/region unpinned.  Opt-in; never the default.",
+    )
+    _parser.add_argument(
+        "--snapshot-restore-only-backfill",
+        default=None,
+        metavar="DIR",
+        help="REPORT-ONLY backfill for an existing restore-only run directory: "
+             "re-fetch system/INFO + stdout banner evidence for the FIRST "
+             "V2_RESTORE_ONLY_RUN_COUNT (default 6) attempts (indices 0..5), "
+             "re-run validity, and write backfilled_run_<n>.json copies plus "
+             "backfilled_summary.json / backfilled_restore_only_report.json.  "
+             "Log retrieval ONLY — never creates ModalTransport and never "
+             "invokes the remote probe.  Fails (nonzero exit) unless exactly "
+             "six valid probes are recovered; never substitutes later "
+             "attempts.  Opt-in; never the default.",
+    )
     _args = _parser.parse_args()
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
@@ -5157,6 +6882,12 @@ if __name__ == "__main__":
     _backing_ab = _args.backing_ab or (
         os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "backing_ab"
     )
+    _volume_read = _args.volume_read or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "volume_read"
+    )
+    _snapshot_restore_only = _args.snapshot_restore_only or (
+        os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "snapshot_restore_only"
+    )
     _provider_ab = _args.provider_ab or (
         os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "provider_ab"
     )
@@ -5172,6 +6903,9 @@ if __name__ == "__main__":
         host_ab=_host_ab,
         backing_ab=_backing_ab,
         provider_ab=_provider_ab,
+        volume_read=_volume_read,
+        snapshot_restore_only=_snapshot_restore_only,
+        snapshot_restore_only_backfill=_args.snapshot_restore_only_backfill,
         variance_pretouch=_variance_pretouch,
         report_only=_args.report_only,
         gap_seconds=_args.gap_seconds,
