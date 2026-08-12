@@ -1017,8 +1017,18 @@ class TestProfileCheckerMatchedBreakdown(unittest.TestCase):
     def setUp(self):
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # checker/setter path runs (the inherit no-op gate would skip the
+        # checker, printing profile_checker_matched=False).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
 

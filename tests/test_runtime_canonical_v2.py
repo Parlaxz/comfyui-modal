@@ -12,7 +12,7 @@ import asyncio
 import os
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from canonical_execution import (
     _reset_restore_publish_cache,
@@ -80,6 +80,21 @@ class TestBuildExecutionPlan(unittest.TestCase):
 
 
 class TestExecutePlan(unittest.TestCase):
+    def setUp(self):
+        # Pin the effective env profile to production for the duration of the
+        # class so the pre-submission profile checker/setter path always runs
+        # (the inherit no-op gate would otherwise skip setter invocation,
+        # breaking the pinned setter-invocation assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+
     def test_publishes_once_and_returns_one_stream_result(self):
         observed = {}
 
@@ -349,6 +364,20 @@ class TestExecutePlan(unittest.TestCase):
 
 
 class TestTraceMetadataMerge(unittest.TestCase):
+    def setUp(self):
+        # Pin the effective env profile to production so the profile setter
+        # path runs and its metadata/events merge into the result trace
+        # (the inherit no-op gate would skip the setter entirely).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+
     def test_local_events_and_metadata_merge_into_remote_trace(self):
         """Local RuntimeTrace events and metadata are merged into the remote
         result trace without discarding existing remote fields."""

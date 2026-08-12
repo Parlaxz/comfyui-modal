@@ -181,6 +181,40 @@ def _persistent_cache_enabled() -> bool:
     return env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE")
 
 
+def active_next_publication_required(env_profile: str | None = None) -> bool:
+    """Whether the active-next warmup-profile publication is load-bearing.
+
+    The volume-published ``active_next_profile.json`` is consumed only by:
+      * CPU-model-snapshot deployments (``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1``)
+        at container startup (``modal_app.startup`` → ``_cpu_snapshot_profile``),
+      * legacy V1 restore preload (``ENABLE_WARMUP``) and persistent CLIP
+        cache prompt-bundle reads (``COMFYMODAL_PERSISTENT_CLIP_CACHE``).
+
+    When the requested effective env profile is the deploy default
+    (``inherit``/empty — a no-op request override, never applied in the
+    container) and none of those consumers are active, the single-invocation
+    V2 container derives its seed from the request (``invocation_plan``) and
+    never reads the volume-published profile — the pre-submission remote
+    checker/setter calls are unnecessary.
+
+    *env_profile* overrides the process env value (used by callers that
+    resolve the request-carried profile first). Returns True when the
+    publication path must run (explicit profile change or active consumer).
+    """
+    _profile = (env_profile or os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit")).strip().lower()
+    if _profile not in ("", "inherit"):
+        return True
+    if os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
+        return False
+    if os.environ.get("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "").strip() == "1":
+        return True
+    if env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
+        return True
+    if os.environ.get("ENABLE_WARMUP", "").strip() not in ("", "0"):
+        return True
+    return False
+
+
 def _emit_publish_log(decision: str, stable_key_short: str) -> None:
     """Emit exactly one concise line per prepare call."""
     print(

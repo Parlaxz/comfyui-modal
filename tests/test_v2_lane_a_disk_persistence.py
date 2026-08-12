@@ -175,8 +175,18 @@ class TestDiskCacheWriteOnSuccess(unittest.TestCase):
 
     def setUp(self):
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs and writes the disk cache (the inherit no-op gate
+        # would skip the setter entirely and never persist a profile entry).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_all_cache_counters()
 
     def test_profile_cache_written_on_success(self):
@@ -556,8 +566,18 @@ class TestNoSensitiveData(unittest.TestCase):
 
     def setUp(self):
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # setter path actually writes the disk cache (the inherit no-op gate
+        # would skip the write, making the no-sensitive-data scan vacuous).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_all_cache_counters()
 
     def _scan_for_sensitive(self, entries: dict, label: str) -> list[str]:
@@ -736,8 +756,18 @@ class TestInvalidationReason(unittest.TestCase):
 
     def setUp(self):
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs (the inherit no-op gate would leave miss_reason
+        # empty and omit the disk-cache telemetry fields from the trace).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_all_cache_counters()
 
     def test_trace_metadata_has_miss_reason(self):

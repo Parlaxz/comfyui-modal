@@ -31,6 +31,7 @@ from production_workflow import (
 )
 # Note: modal_options are passed through without reconstructing model-loading policy.
 from warmup_profile import (
+    active_next_publication_required,
     compute_profile_identity_keys,
     prepare_active_next_profile,
 )
@@ -1041,7 +1042,16 @@ async def execute_plan(
     # ── Profile preparation (before restore publication / Modal submission) ──
     runtime_trace.emit("active_profile_prepare_start", phase="local")
     runtime_trace.emit("active_next_profile_start", phase="local")
-    if profile_setter is not None:
+    # Effective requested env profile: request-carried origin first, process
+    # env fallback (deploy default "inherit" is a no-op request override).
+    _profile_req_meta = plan.request_metadata if isinstance(plan.request_metadata, Mapping) else {}
+    _profile_origin = _profile_req_meta.get("request_origin_info", {})
+    _profile_requested_env = str(
+        _profile_origin.get("env_profile", "") if isinstance(_profile_origin, Mapping) else ""
+    ).strip().lower()
+    if not _profile_requested_env:
+        _profile_requested_env = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
+    if profile_setter is not None and active_next_publication_required(_profile_requested_env):
         # ── Profile prep cache identity keys ──
         _profile_ws_id = _workspace_identity(workspace)
         _profile_app_identity = _app_identity()
@@ -1236,6 +1246,69 @@ async def execute_plan(
                     _PROFILE_PREP_CACHE.pop(_profile_cache_key, None)
                 # Also remove from disk cache (invalidation)
                 _remove_profile_disk_entry(_profile_cache_key)
+    elif profile_setter is not None:
+        # ── Inherit no-op gate (default single-invocation V2 path) ──
+        # Requested effective profile is the deploy default ("inherit", a
+        # no-op in-container override) and no warmup-profile consumer is
+        # active (CPU-model snapshot, persistent CLIP cache, legacy V1
+        # warmup).  The remote container derives its seed from the request
+        # (invocation_plan) and never reads the volume-published
+        # active_next_profile.json, so the remote checker/setter calls here
+        # are pure pre-submission latency.  Skip them entirely — the profile
+        # path is a local no-op by design; explicit profile changes and
+        # active consumers still use the full path above.
+        _noop_start_s = time.time()
+        _container_default_profile = os.environ.get(
+            "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ).strip().lower()
+        runtime_trace.emit("active_profile_inherit_noop", phase="local", metadata={
+            "reason": "inherit_default_no_consumer",
+            "requested_env_profile": _profile_requested_env,
+            "container_default_profile": _container_default_profile,
+            "checker_remote_call": 0,
+            "setter_remote_call": 0,
+            "override_applied": 0,
+        })
+        runtime_trace.set_metadata(
+            active_profile_publish_decision="skipped_inherit_noop",
+            active_profile_stable_key="",
+            active_profile_token="",
+            local_active_profile_prepare_ms=0.0,
+            active_profile_remote_call=0,
+            active_profile_remote_ms=0.0,
+            active_profile_prepare_count=0,
+            profile_cache_hit=False,
+            profile_cache_lookup_ms=0.0,
+            profile_remote_call_performed=False,
+            profile_checker_performed=False,
+            profile_checker_matched=False,
+            profile_setter_performed=False,
+            active_profile_local_ms=0.0,
+            active_profile_cache_lookup_ms=0.0,
+            active_profile_checker_ms=0.0,
+            active_profile_setter_ms=0.0,
+            active_profile_total_ms=round((time.time() - _noop_start_s) * 1000, 2),
+            source_workflow_hash=plan.source_workflow_hash,
+            model_stack=dict(plan.model_stack),
+            prompt_summary=dict(plan.prompt_bundle),
+            profile_noop_reason="inherit_default_no_consumer",
+            profile_requested_env=_profile_requested_env,
+            profile_container_default=_container_default_profile,
+            profile_effective=_profile_requested_env,
+            profile_override_applied=False,
+        )
+        runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+            "decision": "skipped_inherit_noop",
+            "reason": "inherit_default_no_consumer",
+        })
+        print(
+            f"[active_profile.publish] decision=skipped_inherit_noop "
+            f"requested={_profile_requested_env or '(inherit)'} "
+            f"container_default={_container_default_profile} "
+            f"checker_remote=0 setter_remote=0 "
+            f"active_profile_noop_ms={round((time.time() - _noop_start_s) * 1000, 2)}",
+            flush=True,
+        )
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
     runtime_trace.emit("active_profile_prepare_end", phase="local")
