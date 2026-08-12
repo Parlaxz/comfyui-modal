@@ -1789,6 +1789,75 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
                              "every write of identical content must use the same generation")
 
 
+class TestSyncSkipsContentFingerprintWhenRecordExists(unittest.TestCase):
+    """A fresh container (no prior in-process fingerprint) must not re-hash
+    custom-node content when a content-derived generation record already
+    exists: that cold-volume fingerprint cost ~86s per snapshot boot while
+    the sync itself is an idempotent symlink pass (~3s)."""
+
+    def _make_api(self):
+        from comfyapp import _ComfyAPIMixin
+
+        class _MinimalSyncAPI(_ComfyAPIMixin):
+            pass
+
+        api = _MinimalSyncAPI()
+        api._custom_nodes_generation_seen = ""
+        api._custom_nodes_state = {}
+        api._custom_nodes_state_last_synced = None
+        api._last_custom_node_source_fingerprint = None  # fresh container
+        api._validation_cache = SimpleNamespace(
+            has=lambda _key, fingerprint=False: False,
+            get=lambda _key: None,
+            set=lambda _key, _value, fingerprint=False: None,
+        )
+        return api
+
+    def test_skips_fingerprint_and_keeps_record(self):
+        api = self._make_api()
+        fp_calls = []
+        writes = []
+
+        def _counting_fp(*_a, **_k):
+            fp_calls.append(1)
+            return {"nodes": []}
+
+        def _fail_write(reason="", generation=None):
+            writes.append(generation)
+            return {"generation": "should_not_be_called", "schema_version": 1}
+
+        with (
+            patch("comfyapp.custom_node_source_fingerprint", side_effect=_counting_fp),
+            patch("comfyapp.custom_node_volume_state", _fake_cn_volume_state),
+            patch("comfyapp.os.path.isdir", return_value=True),
+            patch("comfyapp.sync_custom_nodes_into_comfy",
+                  return_value={"created": [], "removed": [], "kept": [],
+                                "state": {"dummy": 1}}),
+            patch("comfyapp._read_custom_nodes_generation_record",
+                  return_value={"generation": "existing_content_gen", "schema_version": 1}),
+            patch("comfyapp._write_custom_nodes_generation_record_no_commit",
+                  side_effect=_fail_write),
+            patch("comfyapp.custom_nodes_vol"),
+            patch.dict("os.environ", {"COMFYMODAL_CUSTOM_NODE_GENERATION_FASTPATH": "0"}),
+        ):
+            summary, state = api._sync_custom_nodes_from_volume()
+
+        self.assertEqual(
+            fp_calls, [],
+            "content fingerprint must not be computed on a fresh container "
+            "when a generation record already exists",
+        )
+        self.assertEqual(
+            writes, [],
+            "an existing generation record must never be rewritten",
+        )
+        self.assertEqual(
+            api._custom_nodes_generation_seen, "existing_content_gen",
+            "generation seen must hydrate from the persisted record",
+        )
+        self.assertEqual(state, {"dummy": 1}, "sync must still run and return state")
+
+
 class TestGenerationWriteTempPathDistinct(unittest.TestCase):
     """The temp file path must be unique per invocation so concurrent
     writers cannot cause ``os.replace`` source-pathname collisions."""
