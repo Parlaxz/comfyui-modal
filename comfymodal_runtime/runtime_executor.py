@@ -3263,7 +3263,7 @@ def _build_sampling_wrapper() -> Callable:
             acquire_sampler_mutation_lane_at_sampling_start()
         except Exception:
             pass
-        trace.emit("sampling_start", phase="execution", metadata={
+        _sampling_start_event = trace.emit("sampling_start", phase="execution", metadata={
             "node_id": node_id,
             "node_class": node_class,
             "steps": steps,
@@ -3272,6 +3272,25 @@ def _build_sampling_wrapper() -> Callable:
             "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
         _sampler_boundary_line("sampling_start", start_meta)
+        # ── Gated deep sampling profile: begin AFTER the authoritative
+        # sampling_start event so the profile's setup window measures the same
+        # post-start bookkeeping the event pair measures.  Off path returns
+        # None immediately without importing/patching ComfyUI classes.
+        _deep_profile = None
+        try:
+            from comfymodal_runtime import sampling_deep_profile as _sdp
+            _deep_profile = _sdp.begin_sampling_profile(
+                trace,
+                level=_sdp.resolve_profile_level(),
+                node_id=node_id,
+                node_class=node_class,
+                steps=steps,
+                sampling_start_monotonic_ns=_sampling_start_event.monotonic_ns,
+                sampling_start_wall_unix_ns=_sampling_start_event.wall_unix_ns,
+                patcher=_patch,
+            )
+        except Exception:
+            _deep_profile = None
         # ── V2 VAE CPU page prefetch (sampling_start hook) ──────────────
         # CPU-only, bounded readiness work submitted through the bridge's
         # coordinator pool (never the mutation lane).  Disabled mode is a
@@ -3320,6 +3339,13 @@ def _build_sampling_wrapper() -> Callable:
 
         def _step_callback(*cb_args: Any, **cb_kwargs: Any) -> Any:
             nonlocal _first_step_fired
+            if _deep_profile is not None:
+                try:
+                    # Feed every callback index (including the final teardown
+                    # callback index) to the deep profile for step classification.
+                    _deep_profile.on_callback_index(cb_args[0] if cb_args else None)
+                except Exception:
+                    pass
             if not _first_step_fired:
                 _first_step_fired = True
                 try:
@@ -3359,18 +3385,61 @@ def _build_sampling_wrapper() -> Callable:
             with _sampler_wrapper_dedup_lock:
                 _sampler_wrapper_dedup.discard(dedup_key)
             duration_ms = round((time.monotonic_ns() - t0) / 1_000_000, 3)
-            trace.emit("sampling_end", phase="execution", metadata={
-                "node_id": node_id,
-                "node_class": node_class,
-                "duration_ms": duration_ms,
-                "steps": steps,
-                "source": "sampler_sample_wrapper",
-                "patcher_object_id": start_meta.get("patcher_object_id", ""),
-                "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
-            })
             _end_meta = dict(start_meta)
             _end_meta["duration_ms"] = duration_ms
-            _sampler_boundary_line("sampling_end", _end_meta)
+            # ── Authoritative sampling_end emission ──
+            # Guarded so a failure here (trace.emit or boundary line) cannot
+            # prevent the gated deep-profile finalization (and its patch/hook
+            # restoration) below, and cannot mask the original sampler
+            # exception propagating through this finally block.
+            _sampling_end_event = None
+            try:
+                _sampling_end_event = trace.emit("sampling_end", phase="execution", metadata={
+                    "node_id": node_id,
+                    "node_class": node_class,
+                    "duration_ms": duration_ms,
+                    "steps": steps,
+                    "source": "sampler_sample_wrapper",
+                    "patcher_object_id": start_meta.get("patcher_object_id", ""),
+                    "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
+                })
+                _sampler_boundary_line("sampling_end", _end_meta)
+            except Exception:
+                _sampling_end_event = None
+                try:
+                    print(
+                        "[v2.sampler_boundary] event=sampling_end emission failed; "
+                        "deep-profile finalization continues with current timestamps",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            # ── Gated deep sampling profile: finalize AFTER the authoritative
+            # sampling_end event (post-boundary diagnostic cleanup).  Guaranteed
+            # to run even when sampling_end emission failed above — patches and
+            # hooks are restored unconditionally.  Any blocks-mode CUDA event
+            # realization (single synchronize) happens here — never within
+            # sampling_start→sampling_end.
+            if _deep_profile is not None:
+                try:
+                    from comfymodal_runtime import sampling_deep_profile as _sdp
+                    if _sampling_end_event is not None:
+                        _end_mono = _sampling_end_event.monotonic_ns
+                        _end_wall = _sampling_end_event.wall_unix_ns
+                    else:
+                        # sampling_end emission failed: finalize with a safe
+                        # current timestamp; the profile records the warning.
+                        _end_mono = time.monotonic_ns()
+                        _end_wall = time.time_ns()
+                    _sdp.finalize_sampling_profile(
+                        _deep_profile,
+                        trace,
+                        sampling_end_monotonic_ns=_end_mono,
+                        sampling_end_wall_unix_ns=_end_wall,
+                        sampling_end_emission_failed=(_sampling_end_event is None),
+                    )
+                except Exception:
+                    pass
             # ── Sampler wait-on-activation variance (diagnostic-only) ──
             # Emits a dedicated event separating the sampler wait on
             # activation from sampling duration, using the existing

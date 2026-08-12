@@ -142,6 +142,12 @@ class TestDiskCacheBootstrap(unittest.TestCase):
 
         _reset_restore_publish_cache()
         self.assertNotIn(ck, _RESTORE_PUBLISH_CACHE)
+        # ``_reset_restore_publish_cache`` also wipes the disk mirror, so
+        # re-flush the entry before repopulating (mirrors a fresh process
+        # that still has the on-disk entry).
+        with _restore_disk_lock:
+            _restore_disk_cache[ck] = entry
+        _flush_restore_disk_cache()
         _populate_restore_cache_from_disk()
         self.assertIn(ck, _RESTORE_PUBLISH_CACHE)
 
@@ -458,6 +464,12 @@ class TestSubprocessSimulation(unittest.TestCase):
         _flush_restore_disk_cache()
 
         _reset_restore_publish_cache()
+        # ``_reset_restore_publish_cache`` also wipes the disk mirror, so
+        # re-flush the entry before repopulating (mirrors a fresh process
+        # that still has the on-disk entry).
+        with _restore_disk_lock:
+            _restore_disk_cache[ck] = _make_restore_disk_entry(ck)
+        _flush_restore_disk_cache()
         _populate_restore_cache_from_disk()
         self.assertIn(ck, _RESTORE_PUBLISH_CACHE)
 

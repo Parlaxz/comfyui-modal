@@ -8,12 +8,16 @@ Covers the request chokepoint ``ModalRuntimeEntrypoint._run_plan_stream_impl``:
     instances without bootstrap state degrade to ``None``/"".
   - A matching restore-time seed enables a ``match`` seed decision through
     the real executor consumption path.
-  - A missing seed remains a no-op (no decision recorded, execution runs).
-  - Workflow / deployment identity mismatch fails closed while execution
-    continues (a result event is still produced).
+  - On the default no-publish path (``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN``
+    disabled) a MISSING restore-time seed is derived from the request's own
+    plan (``seed_source=invocation_plan``) so loader/sampler cache seeding
+    still works; the derivation is recorded via the
+    ``snapshot_seed_request_derived`` trace event.
+  - On the opt-in publisher path (flag=1) a frozen seed is validated
+    fail-closed: workflow / deployment identity mismatch disables reuse while
+    execution continues.
   - Metadata hygiene: only the three identity keys are attached; shared
-    bootstrap state is never mutated; no v2 seed is rebuilt from
-    ``plan.workflow`` at request time; no workflow/output/tensor/request
+    bootstrap state is never mutated; no workflow/output/tensor/request
     state is persisted in metadata.
 
 Deterministic and CPU-only: no ComfyUI, no Modal, no CUDA imports.
@@ -21,6 +25,7 @@ Deterministic and CPU-only: no ComfyUI, no Modal, no CUDA imports.
 
 from __future__ import annotations
 
+import os
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -189,7 +194,11 @@ class TestSnapshotSeedRequestMetadata(unittest.IsolatedAsyncioTestCase):
             # Execution still ran to completion.
             self.assertTrue(any(m.get("type") == "result" for m in messages))
 
-    async def test_missing_seed_is_noop(self):
+    async def test_missing_seed_derives_request_seed_on_no_publish_path(self):
+        """On the default no-publish path, a missing restore-time seed is
+        derived from the REQUEST's own plan (seed_source=invocation_plan) so
+        loader/sampler cache seeding still works — never a fake
+        publisher_plan."""
         with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", ""):
             bootstrap = RuntimeBootstrap()  # default state: no frozen seed
             entrypoint, recorder = self._make_entrypoint(bootstrap)
@@ -197,16 +206,31 @@ class TestSnapshotSeedRequestMetadata(unittest.IsolatedAsyncioTestCase):
 
             ctx = recorder.captured_contexts[0]
             assert ctx is not None
-            # Key attached (as None) but no seed decision is recorded.
-            self.assertIsNone(ctx.metadata["snapshot_execution_seed"])
-            self.assertNotIn("snapshot_seed_decision", ctx.metadata)
-            self.assertFalse(ctx.metadata["pre_sampler_cache"].seed_reuse_enabled)
-            self.assertIsNone(ctx.metadata["pre_sampler_cache"].seed_decision)
+            # The request derived and hydrated its own seed from the plan.
+            seed = ctx.metadata["snapshot_execution_seed"]
+            self.assertIsNotNone(seed, "request must derive a seed on the no-publish path")
+            self.assertEqual(bootstrap.state.snapshot_seed_source, "invocation_plan")
+            self.assertTrue(bootstrap.state.snapshot_seed_topology_available)
+            # A request-owned seed always matches its own workflow.
+            decision = ctx.metadata["snapshot_seed_decision"]
+            self.assertEqual(decision["status"], "match")
+            self.assertTrue(decision["reuse_enabled"])
+            self.assertTrue(ctx.metadata["pre_sampler_cache"].seed_reuse_enabled)
+            # The derivation is recorded on the trace (observability proof).
+            derived = [e for e in ctx.trace.events if e.name == "snapshot_seed_request_derived"]
+            self.assertEqual(len(derived), 1)
+            self.assertEqual(derived[0].metadata.get("seed_source"), "invocation_plan")
             # Execution still ran to completion.
             self.assertTrue(any(m.get("type") == "result" for m in messages))
 
     async def test_workflow_mismatch_fails_closed_execution_continues(self):
-        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", ""):
+        """A frozen seed that mismatches the request workflow fails closed.
+
+        Runs on the opt-in publisher path (COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1)
+        where the request does NOT derive its own seed, so a genuinely foreign
+        frozen seed is validated fail-closed by the consumer."""
+        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", ""), \
+             patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False):
             bootstrap = self._bootstrap_with_frozen_seed()
             entrypoint, recorder = self._make_entrypoint(bootstrap)
             messages = await self._collect(entrypoint, _make_plan("wf-different"))
@@ -222,7 +246,12 @@ class TestSnapshotSeedRequestMetadata(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(m.get("type") == "result" for m in messages))
 
     async def test_deployment_mismatch_fails_closed_execution_continues(self):
-        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", ""):
+        """A frozen seed whose deployment identity differs fails closed.
+
+        Runs on the opt-in publisher path so the request keeps the frozen
+        seed and the consumer's deployment-hash validation is exercised."""
+        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", ""), \
+             patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False):
             bootstrap = self._bootstrap_with_frozen_seed()
             # Simulate a running deployment whose combined hash differs from
             # the one frozen into the snapshot seed.

@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import posixpath
+import stat
 import sys
 import threading
 import time
@@ -1069,6 +1070,35 @@ def _vae_snapshot_enabled() -> bool:
     return env_flag("COMFYMODAL_V2_VAE_SNAPSHOT")
 
 
+def _snapshot_exclude_unet_enabled() -> bool:
+    """Return True when ``COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET == '1'``.
+
+    Identity/reporting gate ONLY — it never controls construction, load,
+    or dtype validation and never weakens the production invariant.
+    Startup always builds the full CLIP/UNET/VAE CPU snapshot; the
+    UNET-absent snapshot is produced by the strict ``clip_vae`` eviction
+    retain role which evicts the UNET (proving it dead) while keeping
+    fresh CLIP/VAE in the retained container.  Never treated as on for any
+    other value (only ``1``/``true``/``yes``/``on``).
+    """
+    return env_flag("COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET")
+
+
+def _snapshot_is_clip_vae_unet_absent(models: Any) -> bool:
+    """True when *models* is the strict UNET-absent ``clip_vae`` retained CPU
+    snapshot: exclude-UNET identity gate active, retain role ``clip_vae``,
+    retained CLIP + VAE present, UNET absent."""
+    if models is None:
+        return False
+    return (
+        getattr(models, "unet", None) is None
+        and getattr(models, "clip", None) is not None
+        and getattr(models, "vae", None) is not None
+        and _snapshot_exclude_unet_enabled()
+        and _parse_evict_retain_role() == "clip_vae"
+    )
+
+
 def _safe_snapshot_identity(value: Any, role: str) -> str:
     if value is None:
         return "absent"
@@ -1082,7 +1112,16 @@ def production_snapshot_invariant(
     phase: str,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and report the production CLIP/UNET/VAE snapshot contract."""
+    """Validate and report the production CLIP/UNET/VAE snapshot contract.
+
+    The production expectation is unconditional: CLIP and UNET must always
+    be present, and VAE presence must match the model key's declared
+    ``vae_identity``.  ``COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET`` is an
+    experiment identity/reporting gate only — it never weakens this
+    invariant.  The restore-only deployment uses the ``inherit`` profile,
+    which skips the production gate entirely (status ``pass`` without
+    raising), so a UNET-absent container after eviction never trips it.
+    """
     profile_name = (profile or os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit")).strip().lower()
     clip = getattr(models, "clip", None) if models is not None else None
     unet = getattr(models, "unet", None) if models is not None else None
@@ -1093,9 +1132,11 @@ def production_snapshot_invariant(
     actual_vae = int(vae is not None)
     if profile_name == "production":
         vae_ok = actual_vae == expected_vae
-        status = "pass" if (actual_clip and actual_unet and vae_ok) else "fail"
+        unet_ok = actual_unet == 1
+        status = "pass" if (actual_clip and unet_ok and vae_ok) else "fail"
         reason = "models_present" if status == "pass" else (
-            f"missing_clip={1 - actual_clip};missing_unet={1 - actual_unet};"
+            f"missing_clip={1 - actual_clip};"
+            f"unet_present={actual_unet};expected_unet=1;"
             f"expected_vae={expected_vae};actual_vae={actual_vae}"
         )
     else:
@@ -1125,7 +1166,8 @@ def production_snapshot_invariant(
     if profile_name == "production":
         print(
             f"[v2.production_snapshot_invariant] "
-            f"expected_vae={expected_vae} actual_vae={actual_vae} status={status} "
+            f"expected_vae={expected_vae} actual_vae={actual_vae} "
+            f"expected_unet=1 actual_unet={actual_unet} status={status} "
             f"phase={phase}",
             flush=True,
         )
@@ -1628,6 +1670,13 @@ async def _read_v2_validation_certificate_async(
         return None, timings
 
 
+# Monotonic timestamp of the last runtime-state Volume reload during this
+# container session.  Snapshot-startup certificate retention skips its own
+# redundant Volume reload when the shared runtime-config Volume was already
+# reloaded moments earlier by bootstrap's reload_runtime_state stage.
+_RUNTIME_STATE_VOLUME_RELOADED_MONO: float = 0.0
+
+
 def _read_v2_validation_certificate_for_snapshot(
     cert_identity: str,
     *,
@@ -1666,8 +1715,22 @@ def _read_v2_validation_certificate_for_snapshot(
         volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
 
         _t0 = time.perf_counter()
-        volume.reload()
+        # The runtime-config Volume was already reloaded by bootstrap's
+        # reload_runtime_state stage earlier in this same startup.  A second
+        # Volume reload here costs ~10s on snapshot startup (remote metadata
+        # refresh) and adds no freshness within one container session, so skip
+        # it when the shared volume was reloaded recently.  Fall back to the
+        # explicit reload whenever the marker is missing or stale.
+        _cert_volume_reload_skipped = False
+        if _RUNTIME_STATE_VOLUME_RELOADED_MONO and (
+            time.monotonic() - _RUNTIME_STATE_VOLUME_RELOADED_MONO
+        ) < 900.0:
+            _cert_volume_reload_skipped = True
+        else:
+            volume.reload()
         timings["cert_volume_reload_ms"] = round((time.perf_counter() - _t0) * 1000, 3)
+        if _cert_volume_reload_skipped:
+            timings["cert_volume_reload_skipped"] = 1.0
 
         filename = _v2_cert_filename(cert_identity)
         _t1 = time.perf_counter()
@@ -2441,7 +2504,10 @@ def _parse_evict_retain_role() -> str:
 
     Use the raw environment value exactly — no strip, no lowercasing.
     Absent or empty → ``"none"``.
-    Exact ``"none"``, ``"clip"``, or ``"unet"`` accepted (case-sensitive).
+    Exact ``"none"``, ``"clip"``, ``"unet"``, or ``"clip_vae"`` accepted
+    (case-sensitive).  ``clip_vae`` is the strict restore-only retain role:
+    the UNET payload is evicted and proven dead while fresh CLIP and VAE are
+    reloaded back into the retained ``CpuSnapshotModels`` container.
     Uppercase, whitespace-wrapped, comma-separated, ``both``, ``1``, ``true``,
     or any other nonempty value → RuntimeError.
     Error message shows the raw malformed value without normalizing it.
@@ -2451,11 +2517,11 @@ def _parse_evict_retain_role() -> str:
     raw = os.environ.get("COMFYMODAL_V2_EVICT_RETAIN_ROLE", "")
     if not raw:
         return "none"
-    if raw in ("none", "clip", "unet"):
+    if raw in ("none", "clip", "unet", "clip_vae"):
         return raw
     raise RuntimeError(
         f"COMFYMODAL_V2_EVICT_RETAIN_ROLE={raw!r} is invalid; "
-        f"expected absent, empty, 'none', 'clip', or 'unet'"
+        f"expected absent, empty, 'none', 'clip', 'unet', or 'clip_vae'"
     )
 
 
@@ -4471,6 +4537,103 @@ async def _with_cgroup_sampler_cleanup(
             sampler.stop()
 
 
+# ── Mounted-Volume raw sequential-read benchmark (diagnostic; default OFF) ──
+# Pure volume read speed of a mounted model file.  Never executes graph work,
+# model/UNET parsing, mmap/AimDO, GPU code, hashing, or /tmp writes.
+_VOLUME_READ_CHUNK_BYTES = 8 * 1024 * 1024
+_VOLUME_READ_DEFAULT_FILENAME = "z_image_turbo_bf16.safetensors"
+_VOLUME_READ_DEFAULT_FOLDER = "diffusion_models"
+
+
+def _volume_read_resolve_path(
+    filename: str,
+    *,
+    models_root: str = MODELS_PATH,
+    folder: str = _VOLUME_READ_DEFAULT_FOLDER,
+) -> str:
+    """Resolve *filename* under *models_root*'s *folder* with strict guards.
+
+    Only a bare file name is accepted (no separators, no ``..``, no absolute
+    path).  The resolved real path must stay inside the real models root, the
+    file must exist and be a regular file.  Raises ValueError/FileNotFoundError.
+    """
+    name = str(filename or "").strip()
+    if not name:
+        raise ValueError("volume-read filename is empty")
+    if name in (".", "..") or name.startswith(("/", "\\")) or "\\" in name or "/" in name:
+        raise ValueError(f"volume-read filename must be a bare file name: {name!r}")
+    root_real = os.path.realpath(models_root)
+    folder_real = os.path.realpath(os.path.join(root_real, folder))
+    candidate = os.path.realpath(os.path.join(folder_real, name))
+    if not (candidate == folder_real or candidate.startswith(folder_real + os.sep)):
+        raise ValueError(
+            f"volume-read target escapes the models root: {candidate!r}"
+        )
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError(f"volume-read target is not a regular file: {candidate}")
+    return candidate
+
+
+def _volume_read_stat_size(path: str) -> int:
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"volume-read target is not a regular file: {path}")
+    return int(st.st_size)
+
+
+def _volume_read_rusage_snapshot() -> dict[str, int] | None:
+    """Best-effort rusage counters (ru_inblock/ru_oublock/ru_majflt/ru_minflt)."""
+    try:
+        import resource as _res
+
+        usage = _res.getrusage(_res.RUSAGE_SELF)
+        return {
+            "ru_inblock": int(usage.ru_inblock),
+            "ru_oublock": int(usage.ru_oublock),
+            "ru_majflt": int(usage.ru_majflt),
+            "ru_minflt": int(usage.ru_minflt),
+        }
+    except Exception:
+        return None
+
+
+def _volume_read_io_snapshot() -> dict[str, int] | None:
+    """Best-effort /proc/self/io read/write byte counters."""
+    try:
+        with open("/proc/self/io", "r", encoding="utf-8") as _fh:
+            raw = _fh.read()
+        counters: dict[str, int] = {}
+        for line in raw.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() in ("read_bytes", "write_bytes", "rchar", "wchar"):
+                counters[key.strip()] = int(value.strip())
+        return counters or None
+    except Exception:
+        return None
+
+
+def _volume_read_delta_snapshot(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if not before or not after:
+        return None
+    return {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in before}
+
+
+def _volume_read_rates(
+    bytes_read: int, wall_ns: int,
+) -> tuple[float | None, float | None]:
+    """decimal_GBps (bytes/1e9/s) and binary_GiBps (bytes/2**30/s)."""
+    seconds = wall_ns / 1_000_000_000.0
+    if seconds <= 0:
+        return None, None
+    return (
+        round(bytes_read / 1_000_000_000.0 / seconds, 3),
+        round(bytes_read / (2 ** 30) / seconds, 3),
+    )
+
+
 class ModalRuntimeEntrypoint:
     """Real v2 runtime facade backed by the existing ComfyUI executor."""
 
@@ -5347,16 +5510,22 @@ class ModalRuntimeEntrypoint:
         *,
         reload_unet_fn: Callable | None = None,
         reload_clip_fn: Callable | None = None,
+        reload_vae_fn: Callable | None = None,
         snap_ctx_cm: Callable | None = None,
         target_gpus: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """Evict BOTH CPU snapshot models unconditionally, then reload
-        the selected role (clip/unet/none) via stored loader closures.
+        the selected role (clip/unet/clip_vae/none) via stored loader
+        closures.
 
         Before eviction copies primitive metadata from the models.
         After full eviction succeeds, reloads exactly the selected role
         and stores the fresh object on ``_snapshot_eviction_retained_model``.
-        Normal snapshot model state/bridge/loader outputs/seed remain absent.
+        The strict ``clip_vae`` role instead keeps the ``CpuSnapshotModels``
+        metadata container: UNET is evicted and proven dead while fresh
+        CLIP and VAE are reloaded back onto the container (``unet`` stays
+        ``None``, no retained eviction slot, activation stays off).  Normal
+        snapshot model state/bridge/loader outputs/seed remain absent.
 
         Returns primitive metadata dict (no live objects).  Raises
         RuntimeError on any validation failure.
@@ -5394,17 +5563,36 @@ class ModalRuntimeEntrypoint:
         _retained_role = _parse_evict_retain_role()
         self._snapshot_eviction_retained_role = _retained_role
 
+        # Strict restore-only retain role: the VAE is also evicted/reloaded
+        # so the retained container carries fresh CLIP + VAE with unet=None.
+        _evict_vae = _retained_role == "clip_vae"
+        if _evict_vae:
+            _vae_obj = getattr(cpu_models, "vae", None)
+            _vae_id = str(id(_vae_obj)) if _vae_obj is not None else "none"
+            _vae_type = type(_vae_obj).__name__ if _vae_obj is not None else "none"
+            _vae_present = int(_vae_obj is not None)
+            _vae_ident = getattr(_model_key, "vae_identity", "absent")
+        else:
+            _vae_obj = None
+            _vae_id = "none"
+            _vae_type = "none"
+            _vae_present = 0
+            _vae_ident = "absent"
+
         # Primitive metadata dict for return (no live objects)
         _eviction_metadata: dict[str, Any] = {
             "model_key_unet_identity": _unet_ident,
             "model_key_clip_identity": _clip_ident,
             "model_key_clip_type": _clip_type_model,
+            "model_key_vae_identity": _vae_ident,
             "model_key_hash": _key_hash,
             "compute_policy": _compute_policy,
             "policy_version": _policy_version,
             "weight_dtype": _weight_dtype,
+            "retained_role": _retained_role,
             "unet_present": _unet_present,
             "clip_present": _clip_present,
+            "vae_present": _vae_present,
         }
         _effective_target_gpus = _model_target_gpus or target_gpus or ()
         if isinstance(_effective_target_gpus, (tuple, list)):
@@ -5418,10 +5606,14 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_metadata = {
             "clip_present": _clip_present,
             "unet_present": _unet_present,
+            "vae_present": _vae_present,
             "clip_type": _clip_type_name,
             "unet_type": _unet_type,
+            "vae_type": _vae_type,
             "clip_object_id": _clip_id,
             "unet_object_id": _unet_id,
+            "vae_object_id": _vae_id,
+            "model_key_vae_identity": _vae_ident,
             "cpu_snapshot_model_key_hash": _key_hash,
             "cpu_snapshot_compute_policy": _compute_policy,
             "cpu_snapshot_policy_version": _policy_version,
@@ -5506,6 +5698,15 @@ class ModalRuntimeEntrypoint:
                 )
         else:
             _clip_wr = None
+        if _evict_vae and _vae_obj is not None:
+            try:
+                _vae_wr = _wr.ref(_vae_obj)
+            except TypeError:
+                raise RuntimeError(
+                    f"weakref.ref unsupported for VAE object (type={_vae_type})"
+                )
+        else:
+            _vae_wr = None
 
         # ── 3. Capture bridge state, then clear it ──
         _diag = getattr(self._preload_bridge, "diagnostic_snapshot", lambda: {})()
@@ -5569,13 +5770,17 @@ class ModalRuntimeEntrypoint:
             import torch
             _loaded_records = getattr(_mm, "current_loaded_models", None)
             _free_memory = getattr(_mm, "free_memory", None)
+            _targets = tuple(o for o in (_unet_obj, _clip_obj) if o is not None)
+            if _evict_vae and _vae_obj is not None:
+                _targets = _targets + (_vae_obj,)
             if isinstance(_loaded_records, list) and callable(_free_memory):
                 _records = list(_loaded_records)
-                _targets = (_unet_obj, _clip_obj)
                 _comfy_owned_before = sum(
                     1 for _record in _records
-                    if getattr(_record, "model", None) is _unet_obj
-                    or getattr(_record, "model", None) is _clip_obj
+                    if any(
+                        getattr(_record, "model", None) is _target
+                        for _target in _targets
+                    )
                 )
                 _keep_loaded = [
                     _record for _record in _records
@@ -5590,8 +5795,10 @@ class ModalRuntimeEntrypoint:
                     _cleanup_models()
                 _comfy_owned_after = sum(
                     1 for _record in list(_loaded_records)
-                    if getattr(_record, "model", None) is _unet_obj
-                    or getattr(_record, "model", None) is _clip_obj
+                    if any(
+                        getattr(_record, "model", None) is _target
+                        for _target in _targets
+                    )
                 )
                 del _records, _targets, _keep_loaded
             else:
@@ -5602,7 +5809,7 @@ class ModalRuntimeEntrypoint:
                 _unload_model = getattr(_mm, "unload_model_and_clones", None)
                 if callable(_unload_model):
                     for _loaded_model in list(_loaded_models):
-                        if _loaded_model is _unet_obj or _loaded_model is _clip_obj:
+                        if any(_loaded_model is t for t in _targets):
                             _unload_model(
                                 _loaded_model,
                                 unload_additional_models=False,
@@ -5625,8 +5832,10 @@ class ModalRuntimeEntrypoint:
         _patcher_cleanup_errors = 0
         _patcher_tmp: Any = None
         _p: Any = None
-        for _model_obj in (_unet_obj, _clip_obj):
+        for _model_obj in (_unet_obj, _clip_obj, _vae_obj):
             if _model_obj is None:
+                continue
+            if not _evict_vae and _model_obj is _vae_obj:
                 continue
             # cleanup() on the model object itself (ModelPatcher instances)
             _patcher_tmp = getattr(_model_obj, "cleanup", None)
@@ -5674,8 +5883,20 @@ class ModalRuntimeEntrypoint:
         if cpu_models is not None:
             cpu_models.unet = None
             cpu_models.clip = None
-        self._cpu_snapshot_models = None
-        del cpu_models, _unet_obj, _clip_obj
+            if _evict_vae:
+                cpu_models.vae = None
+        if _retained_role == "clip_vae":
+            # Strict restore-only role: keep the CpuSnapshotModels metadata
+            # container (identity / policy / registries).  Model fields were
+            # nulled above; fresh CLIP/VAE are reloaded onto it in step 16.
+            _container_retained = cpu_models
+        else:
+            self._cpu_snapshot_models = None
+            _container_retained = None
+        del _unet_obj, _clip_obj
+        if _evict_vae:
+            del _vae_obj
+        del cpu_models
 
         # ── 9. gc.collect() x2 + memory ──
         _gc.collect()
@@ -5732,14 +5953,18 @@ class ModalRuntimeEntrypoint:
         # ── 12. Verify BOTH original weakrefs dead ──
         _unet_alive = _unet_wr() is not None if _unet_wr is not None else False
         _clip_alive = _clip_wr() is not None if _clip_wr is not None else False
+        _vae_alive = _vae_wr() is not None if _vae_wr is not None else False
         _original_unet_alive_flag = 1 if _unet_alive else 0
         _original_clip_alive_flag = 1 if _clip_alive else 0
-        if _unet_alive or _clip_alive:
+        _original_vae_alive_flag = 1 if _vae_alive else 0
+        if _unet_alive or _clip_alive or _vae_alive:
             _alive_parts = []
             if _unet_alive:
                 _alive_parts.append(f"UNET(id={_unet_id})")
             if _clip_alive:
                 _alive_parts.append(f"CLIP(id={_clip_id})")
+            if _vae_alive:
+                _alive_parts.append(f"VAE(id={_vae_id})")
             _alive_msg = "; ".join(_alive_parts)
             _known_ref_state = {
                 "bridge_active_preparation": _bridge_active_prep,
@@ -5865,16 +6090,21 @@ class ModalRuntimeEntrypoint:
         _floor_failures_flat: str = ""
 
         if _retained_role != "none":
-            if not all(c is not None for c in (reload_unet_fn, reload_clip_fn, snap_ctx_cm)):
+            _required_closures = (reload_unet_fn, reload_clip_fn, snap_ctx_cm)
+            if _retained_role == "clip_vae":
+                _required_closures = _required_closures + (reload_vae_fn,)
+            if not all(c is not None for c in _required_closures):
                 raise RuntimeError(
                     f"Eviction retain role is {_retained_role!r} but reload "
                     f"closures are missing (reload_unet_fn={reload_unet_fn is not None}, "
                     f"reload_clip_fn={reload_clip_fn is not None}, "
+                    f"reload_vae_fn={reload_vae_fn is not None}, "
                     f"snap_ctx_cm={snap_ctx_cm is not None})"
                 )
             import comfy.utils as _cu
             _MISSING = object()
             _mmap_orig = getattr(_cu, "DISABLE_MMAP", _MISSING)
+            _reloaded_vae: Any = None
             try:
                 with cast(ContextManager[Any], snap_ctx_cm()):
                     _cu.DISABLE_MMAP = True
@@ -5907,6 +6137,36 @@ class ModalRuntimeEntrypoint:
                             _reloaded_model = reload_clip_fn(
                                 _clip_name, _clip_type_str, "default"
                             )
+                    if _retained_role == "clip_vae":
+                        # Strict restore-only role: also reload a fresh VAE
+                        # under the same snapshot context + DISABLE_MMAP.
+                        if reload_vae_fn is None:
+                            raise RuntimeError(
+                                "clip_vae retention requires a reload_vae_fn closure"
+                            )
+                        if _vae_present == 0:
+                            raise RuntimeError(
+                                "clip_vae retention requires an original VAE but "
+                                "the snapshot container had none"
+                            )
+                        _vae_name = ""
+                        if isinstance(_normalized_profile, dict):
+                            _vae_name = _normalized_profile.get("vae", "")
+                        if not _vae_name:
+                            raise RuntimeError(
+                                f"reload VAE: normalized_profile has no 'vae' field"
+                            )
+                        _reloaded_vae = reload_vae_fn(_vae_name)
+                        if _reloaded_vae is None:
+                            raise RuntimeError(
+                                "Reloaded VAE is None after full eviction"
+                            )
+                        _original_vae_id = int(_vae_id) if _vae_id != "none" else 0
+                        if id(_reloaded_vae) == _original_vae_id:
+                            raise RuntimeError(
+                                f"Reloaded VAE has same id() as original "
+                                f"(id={_original_vae_id}) – not a fresh load"
+                            )
             finally:
                 if _mmap_orig is _MISSING:
                     delattr(_cu, "DISABLE_MMAP")
@@ -5926,26 +6186,76 @@ class ModalRuntimeEntrypoint:
                     f"(id={_original_selected_id}) – not a fresh load"
                 )
 
-            self._snapshot_eviction_retained_model = _reloaded_model
-            self._snapshot_eviction_retained_model_id = _reloaded_id
             _reloaded_type = type(_reloaded_model).__name__
-            self._snapshot_eviction_retained_model_type = _reloaded_type
-            _reload_ok = True
-
-            # Build storage registry on reloaded payload
-            try:
-                _reg = build_unique_storage_registry(_reloaded_model)
-                if _reg is not None:
-                    _ranges = getattr(_reg, "ranges", ()) or ()
-                    _storage_count = len(_ranges)
-                    _storage_total_bytes = getattr(_reg, "total_bytes", 0) or 0
+            if _retained_role == "clip_vae":
+                # Restore-only retain: keep the metadata container, assign the
+                # fresh CLIP/VAE back, keep unet=None and no retained slot.
+                _container_retained.clip = _reloaded_model
+                _container_retained.vae = _reloaded_vae
+                _container_retained.unet = None
+                self._snapshot_eviction_retained_model = None
+                self._snapshot_eviction_retained_model_id = 0
+                self._snapshot_eviction_retained_model_type = ""
+                self._cpu_snapshot_models_active = False
+                self._cpu_snapshot_unet_runtime_state = None
+                # ── Recompute CLIP/VAE storage registries + VAE policy metadata
+                #    using the current helpers (fail closed on failure) ──
+                try:
+                    _reg_clip = build_unique_storage_registry(_reloaded_model)
+                    self._cpu_snapshot_clip_storage_registry = _reg_clip
+                    _storage_count = len(getattr(_reg_clip, "ranges", ()) or ())
+                    _storage_total_bytes = getattr(_reg_clip, "total_bytes", 0) or 0
+                    _reg_vae = build_unique_storage_registry(_reloaded_vae)
+                    _storage_total_bytes += getattr(_reg_vae, "total_bytes", 0) or 0
                     _storage_total_mib = round(
                         float(_storage_total_bytes) / (1024.0 * 1024.0), 3
                     )
-            except Exception:
-                _storage_count = 0
-                _storage_total_bytes = 0
-                _storage_total_mib = 0.0
+                except Exception:
+                    self._cpu_snapshot_clip_storage_registry = None
+                    _storage_count = 0
+                    _storage_total_bytes = 0
+                    _storage_total_mib = 0.0
+                from .cpu_snapshot_models import (  # noqa: PLC0415
+                    _validate_vae_policy_metadata,
+                )
+                _vae_policy_rebuilt = {
+                    "vae_policy_mode": getattr(_container_retained, "vae_policy_mode", "v1"),
+                    "vae_policy_version": getattr(_container_retained, "vae_policy_version", 0),
+                    "vae_weight_dtype": getattr(_container_retained, "vae_weight_dtype", "bfloat16"),
+                    "vae_compute_dtype": getattr(_container_retained, "vae_compute_dtype", "bfloat16_native"),
+                    "vae_memory_format": getattr(_container_retained, "vae_memory_format", "contiguous"),
+                }
+                _vae_revalidation, _vae_re_registry = _validate_vae_policy_metadata(
+                    _reloaded_vae,
+                    _vae_policy_rebuilt,
+                    context="clip_vae eviction reload: ",
+                )
+                _container_retained.vae_validation_metadata = _vae_revalidation
+                _container_retained.vae_storage_registry = _vae_re_registry
+                _reload_ok = True
+            else:
+                self._snapshot_eviction_retained_model = _reloaded_model
+                self._snapshot_eviction_retained_model_id = _reloaded_id
+                self._snapshot_eviction_retained_model_type = _reloaded_type
+                _reload_ok = True
+
+            # Build storage registry on reloaded payload.  For clip_vae the
+            # combined CLIP+VAE storage was already computed above; skip the
+            # clip-only overwrite so the marker keeps the combined evidence.
+            if _retained_role != "clip_vae":
+                try:
+                    _reg = build_unique_storage_registry(_reloaded_model)
+                    if _reg is not None:
+                        _ranges = getattr(_reg, "ranges", ()) or ()
+                        _storage_count = len(_ranges)
+                        _storage_total_bytes = getattr(_reg, "total_bytes", 0) or 0
+                        _storage_total_mib = round(
+                            float(_storage_total_bytes) / (1024.0 * 1024.0), 3
+                        )
+                except Exception:
+                    _storage_count = 0
+                    _storage_total_bytes = 0
+                    _storage_total_mib = 0.0
 
             # RSS after reload
             _after_reload_mem = _collect_process_memory(fields=(
@@ -5976,7 +6286,7 @@ class ModalRuntimeEntrypoint:
             # Process RSS/smaps floors are noisy and must not abort startup.
             # Structural safety checks (missing closures, None reload, same id)
             # remain fatal above.
-            if _retained_role == "clip":
+            if _retained_role in ("clip", "clip_vae"):
                 if not (isinstance(_selected_reload_rss_rise_mib, (int, float)) and _selected_reload_rss_rise_mib >= 2048.0):
                     _floor_failures.append({
                         "floor": "rss_rise",
@@ -6071,6 +6381,20 @@ class ModalRuntimeEntrypoint:
             del _rw
         _floor_failures_count = len(_floor_failures)
         _rss_drop_str_ready = f"{_full_eviction_rss_drop_mib:.1f}" if isinstance(_full_eviction_rss_drop_mib, (int, float)) else "absent"
+        # clip_vae telemetry: the retained CpuSnapshotModels container carries
+        # fresh CLIP+VAE with unet=None; no retained eviction slot is used.
+        _clip_vae_retained = int(
+            _retained_role == "clip_vae"
+            and _reload_ok
+            and self._cpu_snapshot_models is not None
+            and getattr(self._cpu_snapshot_models, "unet", None) is None
+            and getattr(self._cpu_snapshot_models, "clip", None) is not None
+            and getattr(self._cpu_snapshot_models, "vae", None) is not None
+        )
+        _ready_clip_present = _clip_vae_retained
+        _ready_vae_present = _clip_vae_retained
+        _ready_unet_present = 0
+        _ready_container_present = _clip_vae_retained
         print(
             f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
             f"enabled=1 status=ready "
@@ -6083,12 +6407,14 @@ class ModalRuntimeEntrypoint:
             f"retained_weakref_alive={_retained_weakref_alive} "
             f"original_clip_alive_after_full_eviction=0 "
             f"original_unet_alive_after_full_eviction=0 "
+            f"original_vae_alive_after_full_eviction={_original_vae_alive_flag} "
             f"reloaded_model_present={_retained_model_present} "
             f"reloaded_model_id={_reloaded_id} "
             f"reloaded_model_is_new_object={int(_reload_ok)} "
-            f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-            f"normal_cpu_snapshot_models_present=0 "
-            f"clip_present=0 unet_present=0 "
+            f"clip_original_id={_clip_id} unet_original_id={_unet_id} vae_original_id={_vae_id} "
+            f"container_retained={_ready_container_present} "
+            f"normal_cpu_snapshot_models_present={_ready_container_present} "
+            f"clip_present={_ready_clip_present} vae_present={_ready_vae_present} unet_present={_ready_unet_present} "
             f"full_eviction_rss_drop_mib={_rss_drop_str_ready} "
             f"selected_reload_rss_rise_mib={_selected_reload_rss_rise_mib} "
             f"final_reduction_from_full_mib={_final_reduction_from_full_mib} "
@@ -6119,12 +6445,19 @@ class ModalRuntimeEntrypoint:
             "retained_model_present": _retained_model_present,
             "retained_model_id": _reloaded_id,
             "retained_model_type": _reloaded_type,
-            "retained_model_present": _retained_model_present,
             "reloaded_model_is_new_object": int(_reload_ok),
             "original_clip_alive_after_full_eviction": 0,
             "original_unet_alive_after_full_eviction": 0,
+            "original_vae_alive_after_full_eviction": _original_vae_alive_flag,
             "clip_original_id": _clip_id,
             "unet_original_id": _unet_id,
+            "vae_original_id": _vae_id,
+            # clip_vae restore-boundary evidence: container retained with
+            # fresh CLIP=1 VAE=1 and UNET=0 (no retained eviction slot).
+            "container_retained": _ready_container_present,
+            "retained_clip_present": _ready_clip_present,
+            "retained_vae_present": _ready_vae_present,
+            "retained_unet_present": _ready_unet_present,
             "full_eviction_rss_drop_mib": _full_eviction_rss_drop_mib,
             "selected_reload_rss_rise_mib": _selected_reload_rss_rise_mib,
             "final_reduction_from_full_mib": _final_reduction_from_full_mib,
@@ -6252,6 +6585,46 @@ class ModalRuntimeEntrypoint:
                 f"[v2.snapshot_model_eviction] stage=restore_release_retained "
                 f"retain_role=none "
                 f"status=not_present "
+                f"retained_model_id=0 "
+                f"retained_alive_after_release=0 "
+                f"rss_before_release_mib=absent "
+                f"rss_after_gc_mib=absent "
+                f"rss_after_trim_mib=absent "
+                f"rss_drop_mib=absent "
+                f"malloc_trim_status=absent "
+                f"malloc_trim_result=absent "
+                f"restore_release_start_wall_unix_ns={_release_start_ns} "
+                f"restore_release_end_wall_unix_ns={_release_end_ns} "
+                f"wall_unix_ns={_release_end_ns}",
+                flush=True,
+            )
+        elif _retained_role == "clip_vae":
+            # Strict restore-only retain: the CpuSnapshotModels container is
+            # the retained payload.  CLIP/VAE stay available in the container
+            # (unet=None) — no retained-slot release, no gc/trim, no raise.
+            # Emit restore-boundary evidence and return.
+            _retained_release_status = "container_retained"
+            _release_start_ns = time.time_ns()
+            _release_end_ns = _release_start_ns
+            _clip_avail = int(
+                _cpu_snap_models is not None
+                and getattr(_cpu_snap_models, "clip", None) is not None
+            )
+            _vae_avail = int(
+                _cpu_snap_models is not None
+                and getattr(_cpu_snap_models, "vae", None) is not None
+            )
+            _unet_avail = int(
+                _cpu_snap_models is not None
+                and getattr(_cpu_snap_models, "unet", None) is not None
+            )
+            print(
+                f"[v2.snapshot_model_eviction] stage=restore_release_retained "
+                f"retain_role=clip_vae "
+                f"status=container_retained "
+                f"container_present={_cpu_snap_models_present} "
+                f"clip_present={_clip_avail} vae_present={_vae_avail} unet_present={_unet_avail} "
+                f"retained_slot_release=0 "
                 f"retained_model_id=0 "
                 f"retained_alive_after_release=0 "
                 f"rss_before_release_mib=absent "
@@ -6451,6 +6824,16 @@ class ModalRuntimeEntrypoint:
             profile["vae"] = ""
         return profile
 
+    # NOTE: the failed writer's skip-UNET snapshot-construction helper
+    # (``_build_unet_excluded_*``) was removed during reconciliation.
+    # ``COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET`` is an experiment identity /
+    # reporting gate ONLY: startup unconditionally builds the full
+    # CLIP/UNET/VAE CPU snapshot via ``load_cpu_snapshot_models`` and runs
+    # the normal BF16/diffusion-model dtype validation.  The restore-only
+    # UNET-absent snapshot is produced by the strict ``clip_vae`` eviction
+    # retain role in ``_evict_snapshot_models``, which evicts the UNET and
+    # proves it dead while keeping fresh CLIP/VAE in the retained container.
+
     def _use_cpu_snapshot_models_on_bridge(
         self,
         model_key: Any,
@@ -6524,6 +6907,109 @@ class ModalRuntimeEntrypoint:
                 metadata={"stage": "request_time", "reason": _reason},
             )
 
+    def _retarget_cpu_snapshot_clip_vae_for_request(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        model_management: Any = None,
+    ) -> None:
+        """Retarget retained CLIP + VAE patcher devices for the UNET-absent
+        ``clip_vae`` container using the same model_management policy as normal
+        retargeting, without any UNET-dependent retargeting."""
+        models = self._cpu_snapshot_models
+        if models is None:
+            return
+        if model_management is None:
+            import comfy.model_management as model_management
+        _clip = getattr(models, "clip", None)
+        if _clip is None:
+            raise RuntimeError("clip_vae request-time activation requires a retained CLIP")
+        _clip_patcher = getattr(_clip, "patcher", None)
+        if _clip_patcher is None or not hasattr(_clip_patcher, "load_device"):
+            raise RuntimeError("retained CLIP patcher shape is unsupported")
+        _clip_patcher.load_device = model_management.text_encoder_device()
+        _clip_patcher.offload_device = model_management.text_encoder_offload_device()
+        _vae = getattr(models, "vae", None)
+        if _vae is not None:
+            _vae_patcher = getattr(_vae, "patcher", None)
+            if _vae_patcher is not None and hasattr(_vae_patcher, "load_device"):
+                _vae_patcher.load_device = model_management.vae_device()
+                _vae_patcher.offload_device = model_management.vae_offload_device()
+                if hasattr(_vae, "device"):
+                    try:
+                        _vae.device = _vae_patcher.load_device
+                    except Exception:
+                        pass
+        if trace is not None:
+            trace.emit(
+                "cpu_snapshot_models_retargeted",
+                phase="execution",
+                metadata={"stage": "request_time_clip_vae_only", "unet_present": 0},
+            )
+
+    def _activate_clip_vae_only_request_binding(
+        self,
+        *,
+        request_model_key: Any,
+        request_prefill_key: Any,
+        request_model_spec: Any,
+        trace: RuntimeTrace | None = None,
+    ) -> None:
+        """Request-time clip-only bridge activation for the UNET-absent
+        ``clip_vae`` CPU snapshot (CPU snapshot configured, exclude-UNET gate
+        active, retain role ``clip_vae``, retained CLIP + VAE present, UNET
+        absent).
+
+        Retargets the retained CLIP/VAE patcher devices (same policy as normal
+        retargeting, never UNET-dependent), publishes the exact retained CLIP
+        on the bridge via ``use_ready_clip`` (completed ``clip_future``, no
+        ``unet_future`` / no UNET lane), binds the exact retained VAE via
+        ``set_exact_vae``, and only then marks the snapshot active.  The graph
+        UNETLoader continues through the existing original-loader /
+        native-fast-disk fallback.  Raises on any failure (fail closed).
+        """
+        models = self._cpu_snapshot_models
+        if models is None or not _snapshot_is_clip_vae_unet_absent(models):
+            raise RuntimeError(
+                "clip_vae request-time activation requires the UNET-absent "
+                "clip_vae CPU snapshot container"
+            )
+        self._retarget_cpu_snapshot_clip_vae_for_request(trace=trace)
+        self._preload_bridge.use_ready_clip(
+            model_key=request_model_key,
+            prefill_key=request_prefill_key,
+            model_spec=request_model_spec,
+            clip=models.clip,
+            trace=trace,
+        )
+        try:
+            self._preload_bridge.set_exact_vae(getattr(models, "vae", None))
+        except Exception:
+            pass
+        # Activation is marked only AFTER the exact CLIP binding and exact VAE
+        # binding succeeded — any failure above raises before this line.
+        self._cpu_snapshot_models_active = True
+        print(
+            "[v2.cpu_snapshot_request] status=clip_vae_only_bind "
+            "clip_source=cpu_snapshot vae_source=cpu_snapshot unet_source=normal_loader "
+            f"clip_object_id={id(models.clip)} vae_object_id={id(getattr(models, 'vae', None))}",
+            flush=True,
+        )
+        if trace is not None:
+            trace.emit(
+                "cpu_snapshot_clip_vae_bind",
+                phase="execution",
+                metadata={
+                    "status": "ok",
+                    "clip_source": "cpu_snapshot",
+                    "vae_source": "cpu_snapshot",
+                    "unet_source": "normal_loader",
+                    "clip_object_id": str(id(models.clip)),
+                    "vae_object_id": str(id(getattr(models, "vae", None))),
+                    "unet_present": 0,
+                },
+            )
+
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
             return self._legacy_api
@@ -6585,6 +7071,8 @@ class ModalRuntimeEntrypoint:
             volume = getattr(module, "runtime_config_vol", None)
             if volume is not None:
                 volume.reload()
+            global _RUNTIME_STATE_VOLUME_RELOADED_MONO
+            _RUNTIME_STATE_VOLUME_RELOADED_MONO = time.monotonic()
 
         def sync_custom_nodes() -> Any:
             # The image already contains the production custom nodes.  Avoid
@@ -6609,6 +7097,20 @@ class ModalRuntimeEntrypoint:
                     _reload = getattr(_custom_nodes_volume, "reload", None)
                     if callable(_reload):
                         _reload()
+                try:
+                    _cn_diag_root = getattr(module, "CUSTOM_NODES_PATH", "")
+                    if _cn_diag_root and os.path.isdir(_cn_diag_root):
+                        _cn_diag = module.custom_node_filter_diagnostics(_cn_diag_root)
+                        print(
+                            "[v2.custom_node_filter] "
+                            f"total_source_dirs={_cn_diag['total_source_dirs']} "
+                            f"accepted_dirs={_cn_diag['accepted_dirs']} "
+                            f"duplicate_comfymodal_dirs={_cn_diag['duplicate_comfymodal_dirs']} "
+                            f"duplicate_names={_cn_diag['duplicate_names_bounded']}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
                 _current_generation, _current_source = (
                     module._resolve_custom_nodes_generation(
                         api=api, authoritative_only=True
@@ -6636,6 +7138,46 @@ class ModalRuntimeEntrypoint:
                             getattr(api, "_custom_nodes_state", ()),
                         )
                     _fallback_reason = "generation_mismatch"
+                    try:
+                        _cn_vol_root = getattr(module, "CUSTOM_NODES_PATH", "")
+                        if _cn_vol_root and os.path.isdir(_cn_vol_root):
+                            _vol_gen = module.custom_node_source_generation(_cn_vol_root)
+                            if _baked_generation and _vol_gen == _baked_generation:
+                                module._write_custom_nodes_generation_record_no_commit(
+                                    reason="snapshot_reconcile_baked_exact",
+                                    generation=_vol_gen,
+                                )
+                                _cnv = getattr(module, "custom_nodes_vol", None)
+                                if _cnv is not None:
+                                    _cmt = getattr(_cnv, "commit", None)
+                                    if callable(_cmt):
+                                        _cmt()
+                                api._custom_nodes_generation_seen = _vol_gen
+                                print(
+                                    "[v2.custom_node_startup] "
+                                    "decision=snapshot_exact_skip callback_called=0 "
+                                    "reason=reconciled_volume_content_matches_baked "
+                                    f"source={_current_source} "
+                                    f"generation={_vol_gen[:16]}",
+                                    flush=True,
+                                )
+                                return (
+                                    {
+                                        "created": [],
+                                        "removed": [],
+                                        "kept": [],
+                                        "blocked": [],
+                                        "skipped": True,
+                                        "skip_reason": "snapshot_reconciled_exact_generation",
+                                    },
+                                    getattr(api, "_custom_nodes_state", ()),
+                                )
+                    except Exception as _reconcile_exc:
+                        print(
+                            f"[v2.custom_node_startup] reconcile_failed "
+                            f"error={type(_reconcile_exc).__name__}",
+                            flush=True,
+                        )
                 elif not _baked_generation:
                     _fallback_reason = "baked_generation_missing"
                 elif not _current_generation:
@@ -6659,6 +7201,7 @@ class ModalRuntimeEntrypoint:
             snapshot_context = getattr(api, "_force_cpu_during_snapshot", None)
             if callable(snapshot_context):
                 with cast(ContextManager[Any], snapshot_context()):
+                    api._snapshot_backend_init = True
                     api._start_in_process_backend()
             else:
                 api._start_in_process_backend()
@@ -7246,6 +7789,12 @@ class ModalRuntimeEntrypoint:
                         try:
                             with cast(ContextManager[Any], _snap_ctx()):
                                 _comfy_utils.DISABLE_MMAP = True
+                                # Startup ALWAYS builds the full CLIP/UNET/VAE
+                                # snapshot.  COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET
+                                # is identity/reporting only and never skips
+                                # construction: the restore-only UNET-absent
+                                # snapshot is produced by the clip_vae eviction
+                                # retain role AFTER this normal build.
                                 _cpu_models = load_cpu_snapshot_models(
                                     cpu_profile,
                                     load_unet=_cpu_load_unet,
@@ -7307,7 +7856,8 @@ class ModalRuntimeEntrypoint:
                             # After snapshot UNET construction, verify ALL floating-
                             # point parameters have the expected effective dtype and
                             # are on CPU.  Rejects stale FP32 snapshots with a clear
-                            # RuntimeError — does not catch and suppress.
+                            # RuntimeError — does not catch and suppress.  This is
+                            # unconditional: the identity flag never disables it.
                             _snap_param_dist = {}
                             try:
                                 _unet_module = getattr(_cpu_models.unet, "model", None)
@@ -7546,6 +8096,7 @@ class ModalRuntimeEntrypoint:
                         _cpu_models, state,
                         reload_unet_fn=_cpu_load_unet,
                         reload_clip_fn=_cpu_load_clip,
+                        reload_vae_fn=_cpu_load_vae,
                         snap_ctx_cm=_snap_ctx,
                         target_gpus=_target_gpus,
                     )
@@ -8250,9 +8801,14 @@ class ModalRuntimeEntrypoint:
         # and skips bridge.prepare/background UNET submission.
         _cpu_snapshot_activated: bool = False
         self._lazy_init_snapshot_state()
+        # State guard (not the identity flag): activation requires a live
+        # UNET object in the CPU snapshot container.  After a clip_vae
+        # eviction the container carries CLIP/VAE only (unet=None), so this
+        # gate stays closed and never activates or reconstructs the UNET.
         if (
             _cpu_model_snapshot_enabled()
             and self._cpu_snapshot_models is not None
+            and getattr(self._cpu_snapshot_models, "unet", None) is not None
             and self._restore_plan is not None
         ):
             _cpu_snapshot_activate_error: str | None = None
@@ -9527,6 +10083,14 @@ class ModalRuntimeEntrypoint:
                     "action=request_time_activation",
                     flush=True,
                 )
+            elif _snapshot_is_clip_vae_unet_absent(_inactive_models):
+                _request_time_activation_required = True
+                print(
+                    "[v2.cpu_snapshot_request] status=present_but_inactive "
+                    f"clip_present={int(_inactive_clip)} unet_present={int(_inactive_unet)} "
+                    "action=clip_vae_only_request_activation",
+                    flush=True,
+                )
             else:
                 print(
                     "[v2.cpu_snapshot_request] status=present_but_inactive "
@@ -9559,6 +10123,9 @@ class ModalRuntimeEntrypoint:
                 if _role_report["compatible"]:
                     _flags = plan.execution_options.compatibility_flags
                     _bypass_snapshot_unet = isinstance(_flags, Mapping) and _flags.get("diagnostic_bypass_cpu_snapshot_unet") is True
+                    _clip_vae_only_bind = _snapshot_is_clip_vae_unet_absent(
+                        self._cpu_snapshot_models
+                    )
                     if _bypass_snapshot_unet:
                         if _request_time_activation_required:
                             self._retarget_cpu_snapshot_models_for_request(trace=trace)
@@ -9580,6 +10147,18 @@ class ModalRuntimeEntrypoint:
                             # the snapshot is now usable by this and later
                             # requests (UNET comes from the normal loader).
                             self._cpu_snapshot_models_active = True
+                    elif _clip_vae_only_bind:
+                        # UNET-absent clip_vae architecture: request-time
+                        # clip-only bridge activation (no UNET lane).
+                        self._activate_clip_vae_only_request_binding(
+                            request_model_key=request_model_key,
+                            request_prefill_key=request_prefill_key,
+                            request_model_spec=request_model_spec,
+                            trace=trace,
+                        )
+                        _unet_source = "normal_loader"
+                        _clip_source = "cpu_snapshot"
+                        _reason = "clip_vae_only"
                     else:
                         if _request_time_activation_required:
                             self._retarget_cpu_snapshot_models_for_request(trace=trace)
@@ -9746,7 +10325,8 @@ class ModalRuntimeEntrypoint:
                         )
                     else:
                         print(
-                            "[v2.cpu_snapshot_request] status=reused reason=ok",
+                            "[v2.cpu_snapshot_request] status=reused "
+                            f"reason={_reason}",
                             flush=True,
                         )
                     trace.emit(
@@ -9757,7 +10337,7 @@ class ModalRuntimeEntrypoint:
                             "reason": _reason,
                             "diagnostic_bypass_cpu_snapshot_unet": 1 if _bypass_snapshot_unet else 0,
                             "cpu_snapshot_clip_reused": 1,
-                            "cpu_snapshot_unet_reused": 0 if _bypass_snapshot_unet else 1,
+                            "cpu_snapshot_unet_reused": 0 if (_bypass_snapshot_unet or _clip_vae_only_bind) else 1,
                             "unet_source": _unet_source,
                             "clip_source": _clip_source,
                             "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
@@ -12867,6 +13447,276 @@ class ModalRuntimeEntrypoint:
             pass
         return result
 
+    def run_volume_read_benchmark(
+        self,
+        *,
+        request_id: str = "",
+        filename: str = _VOLUME_READ_DEFAULT_FILENAME,
+        chunk_bytes: int = _VOLUME_READ_CHUNK_BYTES,
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: raw mounted-models-Volume sequential-read speed.
+
+        Reads the target model file twice in this container with plain
+        buffered ``os.open``/``os.read`` (8 MiB chunks) until EOF, discarding
+        every buffer.  The first pass is the primary mounted-volume result;
+        the immediate second pass is the warm-cache ceiling.  Only the read
+        loops are timed (``time.monotonic_ns``).  No graph execution, no
+        UNET/model parsing or loading, no mmap/AimDO, no O_DIRECT, no
+        posix_fadvise, no hashing, no GPU work, no /tmp writes.
+
+        The path is resolved strictly under the mounted models root
+        (``diffusion_models/<filename>``); traversal, missing and non-regular
+        files are rejected.  Never raises — errors are recorded in the result.
+        """
+        start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._request_count = getattr(self, "_request_count", 0) + 1
+        identity = {
+            "restored_instance_id": getattr(self, "_restored_instance_id", ""),
+            "restore_count": int(getattr(self, "_restore_count", 0) or 0),
+            "request_count": int(getattr(self, "_request_count", 0) or 0),
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "app_name": APP_NAME,
+            "class_name": CLASS_NAME,
+            **_capture_remote_identity(),
+        }
+        result: dict[str, Any] = {
+            "status": "ok",
+            "mode": "volume_read",
+            "request_id": str(request_id or ""),
+            "graph_executed": False,
+            "model_loaded": False,
+            "gpu_touched": False,
+            "read_method": "os.read",
+            "destination": "discarded_userspace_buffer",
+            "start_ts": start_iso,
+            "identity": identity,
+            "passes": [],
+        }
+        try:
+            path = _volume_read_resolve_path(
+                str(filename or _VOLUME_READ_DEFAULT_FILENAME)
+            )
+            size_bytes = _volume_read_stat_size(path)
+            result["models_root"] = MODELS_PATH
+            result["models_volume"] = MODELS_VOLUME_NAME
+            result["folder"] = _VOLUME_READ_DEFAULT_FOLDER
+            result["filename"] = str(filename or _VOLUME_READ_DEFAULT_FILENAME)
+            result["resolved_path"] = path
+            result["stat_size_bytes"] = size_bytes
+            result["chunk_bytes"] = int(chunk_bytes)
+
+            rusage_before = _volume_read_rusage_snapshot()
+            io_before = _volume_read_io_snapshot()
+            for pass_index, label in enumerate(("primary_mounted_volume", "warm_cache")):
+                start_wall_ns = time.time_ns()
+                start_mono_ns = time.monotonic_ns()
+                fd = os.open(
+                    path,
+                    os.O_RDONLY | getattr(os, "O_BINARY", 0),
+                )
+                try:
+                    bytes_read = 0
+                    chunk_count = 0
+                    while True:
+                        buf = os.read(fd, int(chunk_bytes))
+                        if not buf:
+                            break
+                        bytes_read += len(buf)
+                        chunk_count += 1
+                finally:
+                    os.close(fd)
+                end_mono_ns = time.monotonic_ns()
+                end_wall_ns = time.time_ns()
+                wall_ns = end_mono_ns - start_mono_ns
+                decimal_GBps, binary_GiBps = _volume_read_rates(bytes_read, wall_ns)
+                result["passes"].append({
+                    "pass_index": pass_index,
+                    "label": label,
+                    "stat_size_bytes": size_bytes,
+                    "bytes_read": bytes_read,
+                    "chunk_count": chunk_count,
+                    "wall_ns": wall_ns,
+                    "wall_ms": round(wall_ns / 1_000_000.0, 3),
+                    "decimal_GBps": decimal_GBps,
+                    "binary_GiBps": binary_GiBps,
+                    "start_wall_unix_ns": start_wall_ns,
+                    "end_wall_unix_ns": end_wall_ns,
+                    "start_mono_ns": start_mono_ns,
+                    "end_mono_ns": end_mono_ns,
+                })
+            rusage_after = _volume_read_rusage_snapshot()
+            io_after = _volume_read_io_snapshot()
+            result["rusage_deltas"] = _volume_read_delta_snapshot(
+                rusage_before, rusage_after
+            )
+            result["io_deltas"] = _volume_read_delta_snapshot(io_before, io_after)
+            result["end_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        except Exception as exc:  # noqa: BLE001
+            result["status"] = "error"
+            result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            result["end_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return result
+
+    def run_snapshot_restore_only_probe(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY no-op restore probe for the UNET-absent snapshot arm.
+
+        Performs essentially nothing after method entry: it collects and
+        emits placement, identity, the exclusion-mode invariant, restore
+        timing, method-entry timestamps and RSS, then returns.  It never
+        loads or touches a UNET, never samples, never decodes the VAE, never
+        reads a Volume, and never triggers graph execution.  The returned
+        dict is the raw evidence the local harness validates for the
+        ``snapshot_restore_only`` benchmark (six valid reused-snapshot
+        probes).
+
+        The UNET-absence proof is fail-closed: every ``unet_*`` field is
+        reported only after reading the live container state
+        (``self._cpu_snapshot_models``, activation flag, retained runtime
+        state, retained eviction slot); a value can never be inferred.
+        The retained-container evidence (``clip_present`` / ``vae_present`` /
+        ``container_retained``) is read the same way, so the CLIP+VAE
+        presence of the clip_vae eviction retain role is directly observed.
+        ``restore_timing`` mirrors the container's own restore() record
+        (``self._restore_timing`` / ``_LATEST_LIFECYCLE_TIMING``), which
+        carries ``remote_python_resume_wall_unix_ns`` — the wall timestamp
+        of the literal first restored Python instruction.  Never raises.
+        """
+        entry_wall_ns: int = time.time_ns()
+        entry_mono_ns: int = time.monotonic_ns()
+        start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._request_count = getattr(self, "_request_count", 0) + 1
+        identity = {
+            "restored_instance_id": getattr(self, "_restored_instance_id", ""),
+            "restore_count": int(getattr(self, "_restore_count", 0) or 0),
+            "request_count": int(getattr(self, "_request_count", 0) or 0),
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "app_name": APP_NAME,
+            "class_name": CLASS_NAME,
+            **_capture_remote_identity(),
+        }
+        _models = getattr(self, "_cpu_snapshot_models", None)
+        _model_key = getattr(_models, "model_key", None) if _models is not None else None
+        _snapshot_identity = ""
+        if _model_key is not None:
+            try:
+                _snapshot_identity = str(getattr(_model_key, "stable_hash", "") or "")
+            except Exception:  # noqa: BLE001
+                _snapshot_identity = ""
+        _unet_obj = getattr(_models, "unet", None) if _models is not None else None
+        _clip_obj = getattr(_models, "clip", None) if _models is not None else None
+        _vae_obj = getattr(_models, "vae", None) if _models is not None else None
+        _retained_model = getattr(self, "_snapshot_eviction_retained_model", None)
+        _retained_unet_payload = int(
+            _unet_obj is not None
+            or _retained_model is not None
+            or getattr(self, "_cpu_snapshot_unet_runtime_state", None) is not None
+        )
+        _reconstructed_unet_present = int(
+            _unet_obj is not None
+            or bool(getattr(self, "_cpu_snapshot_models_active", False))
+            or _retained_model is not None
+        )
+        _container_retained = int(
+            _models is not None and _unet_obj is None
+        )
+        _clip_present = int(_clip_obj is not None)
+        _vae_present = int(_vae_obj is not None)
+        _eviction_retained_role = str(
+            getattr(self, "_snapshot_eviction_retained_role", "none") or "none"
+        )
+        _latest = _LATEST_LIFECYCLE_TIMING or {}
+        _rt = dict(self._restore_timing or {}) if self._restore_timing else _latest
+        _remote_resume_wall_ns = int(_rt.get("remote_python_resume_wall_unix_ns") or 0)
+        _restore_start_wall_ns = int(_rt.get("restore_method_start_wall_unix_ns") or 0)
+        _restore_end_wall_ns = int(_rt.get("restore_method_end_wall_unix_ns") or 0)
+        _restore_total_ms = _rt.get("restore_total_ms")
+        _restore_status = str(_rt.get("lifecycle_status") or "unknown")
+        _restore_session_id = str(_rt.get("restore_session_id") or "")
+        _restore_count = int(_rt.get("restore_count") or getattr(self, "_restore_count", 0) or 0)
+        _restored_instance_id = str(
+            _rt.get("restored_instance_id") or getattr(self, "_restored_instance_id", "") or ""
+        )
+        _container_session_id = str(
+            _rt.get("container_session_id") or self.container_session_id or _V2_CONTAINER_SESSION_ID
+        )
+        _rss: dict[str, Any] = {}
+        try:
+            from comfymodal_runtime.restore_state_probe import probe_process_memory  # noqa: PLC0415
+            _rss = probe_process_memory()
+        except Exception:  # noqa: BLE001
+            _rss = {"source": "unavailable"}
+        _placement = {
+            "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+            "region": os.environ.get("MODAL_REGION", ""),
+            "gpu": os.environ.get("COMFYMODAL_V2_GPU", ""),
+            "cpu_request": os.environ.get("COMFYMODAL_V2_CPU_REQUEST", ""),
+            "memory_request_mb": os.environ.get("COMFYMODAL_V2_MEMORY_MB", ""),
+        }
+        _result: dict[str, Any] = {
+            "status": "ok",
+            "mode": "snapshot_restore_only",
+            "request_id": str(request_id or ""),
+            "start_ts": start_iso,
+            "entry_wall_unix_ns": entry_wall_ns,
+            "entry_mono_ns": entry_mono_ns,
+            "end_wall_unix_ns": time.time_ns(),
+            "end_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "graph_executed": False,
+            "unet_loaded": False,
+            "vae_decoded": False,
+            "volume_read": False,
+            "placement": _placement,
+            "identity": identity,
+            "snapshot_identity": _snapshot_identity,
+            "snapshot_identity_source": "cpu_snapshot_models.model_key.stable_hash",
+            "invariant": {
+                "unet_present": int(_unet_obj is not None),
+                "retained_unet_payload": _retained_unet_payload,
+                "reconstructed_unet_present": _reconstructed_unet_present,
+                "cpu_snapshot_models_present": int(_models is not None),
+                "container_retained": _container_retained,
+                "clip_present": _clip_present,
+                "vae_present": _vae_present,
+                "cpu_snapshot_models_active": int(bool(getattr(self, "_cpu_snapshot_models_active", False))),
+                "snapshot_exclude_unet_gate": int(_snapshot_exclude_unet_enabled()),
+                "eviction_retained_role": _eviction_retained_role,
+                "retained_unet_runtime_state_present": int(
+                    getattr(self, "_cpu_snapshot_unet_runtime_state", None) is not None
+                ),
+                "retained_eviction_model_present": int(_retained_model is not None),
+                "model_key_unet_identity": str(getattr(_model_key, "unet_identity", "") or "") if _model_key is not None else "",
+            },
+            "restore_timing": {
+                "remote_python_resume_wall_unix_ns": _remote_resume_wall_ns,
+                "restore_method_start_wall_unix_ns": _restore_start_wall_ns,
+                "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
+                "restore_total_ms": _restore_total_ms,
+                "restore_session_id": _restore_session_id,
+                "restore_count": _restore_count,
+                "restored_instance_id": _restored_instance_id,
+                "container_session_id": _container_session_id,
+                "lifecycle_status": _restore_status,
+                "lifecycle_method": str(_rt.get("lifecycle_method") or ""),
+            },
+            "rss": _rss,
+        }
+        print(
+            f"[v2.restore_only_probe] request_method_entry request_id={request_id} "
+            f"restored_instance_id={_restored_instance_id[:16]} "
+            f"restore_count={_restore_count} "
+            f"unet_present={_result['invariant']['unet_present']} "
+            f"clip_present={_result['invariant']['clip_present']} "
+            f"vae_present={_result['invariant']['vae_present']} "
+            f"container_retained={_result['invariant']['container_retained']} "
+            f"entry_wall_unix_ns={entry_wall_ns}",
+            flush=True,
+        )
+        return _result
+
     def publish_restore_plan(
         self,
         plan_payload: Mapping[str, Any],
@@ -13007,6 +13857,133 @@ class ModalRuntimeEntrypoint:
         context.metadata["snapshot_execution_seed"] = snapshot_seed
         context.metadata["deployment_combined_hash"] = deployment_hash
         context.metadata["custom_node_generation"] = custom_node_generation
+
+    def _derive_request_snapshot_seed(self, plan: ExecutionPlan) -> dict[str, Any] | None:
+        """Derive a schema-v2 snapshot seed from the REQUEST's own plan.
+
+        Runs on the no-publish path (``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN``
+        disabled — the default).  The container restored with an honest
+        ``startup_minimal`` seed (the volume ``snapshot_seed.json`` read is
+        skipped when publication is disabled), so this request derives its own
+        seed from the invocation plan payload using the pure graph-analysis
+        builder (``build_invocation_seed_payload``) and hydrates it into
+        ``BootstrapState``.  ``_attach_snapshot_seed_metadata`` then attaches
+        the derived seed so ``_consume_seed_for_request`` / the executor seed
+        hook still receive a seed (preserving loader/sampler cache seeding).
+
+        This is a pure WARM-START ENRICHMENT, never a correctness requirement:
+        every consumer fails closed when the seed is absent or minimal.  When
+        the flag is enabled (legacy publisher path), when the container
+        already holds a topology-available seed matching this request's
+        workflow hash, or when derivation fails, no request seed is derived —
+        ``seed_source`` stays ``startup_minimal`` (never faked
+        ``publisher_plan``).
+
+        Returns observability metadata for the ``snapshot_seed_request_derived``
+        trace event, or ``None`` when no derivation was attempted/needed.
+        """
+        from .execution_seed import (
+            SEED_SOURCE_INVOCATION_PLAN,
+            SEED_SOURCE_STARTUP_MINIMAL,
+            build_invocation_seed_payload,
+            publish_restore_plan_enabled,
+            snapshot_seed_observability,
+        )
+
+        if publish_restore_plan_enabled():
+            # Legacy publisher path: the seed arrives via restore-time
+            # hydration or in-container publisher hydration.  Never derive
+            # from the request on this path.
+            return None
+        bootstrap = getattr(self, "bootstrap", None)
+        state = getattr(bootstrap, "state", None)
+        if state is None:
+            return None
+        workflow = getattr(plan, "workflow", None) or {}
+        if not isinstance(workflow, Mapping) or not workflow:
+            return {
+                "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                "topology_available": 0,
+                "reason": "empty_workflow",
+            }
+        try:
+            # A container that already holds a topology-available seed
+            # matching this request's workflow hash keeps it (a previous
+            # request derived it) — never rebuild/overwrite per request.
+            _existing = state.snapshot_execution_seed
+            _existing_hashes = {
+                h for h in (
+                    str(getattr(_existing, "workflow_hash", "") or ""),
+                    str(getattr(_existing, "source_workflow_hash", "") or ""),
+                ) if h
+            }
+            _req_hashes = {
+                h for h in (str(plan.workflow_hash or ""), str(plan.source_workflow_hash or "")) if h
+            }
+            if (
+                _existing is not None
+                and bool(state.snapshot_seed_topology_available)
+                and bool(_req_hashes & _existing_hashes)
+            ):
+                _obs = snapshot_seed_observability(_existing)
+                return {
+                    "topology_available": 1,
+                    "reused_existing": True,
+                    **_obs,
+                    # After **_obs: that helper hardcodes seed_source="".
+                    "seed_source": state.snapshot_seed_source or SEED_SOURCE_INVOCATION_PLAN,
+                }
+            deployment_hash = str(
+                _V2_DEPLOYMENT_COMBINED_HASH
+                or getattr(state, "deployment_combined_hash", "") or ""
+            )
+            custom_node_generation = str(
+                getattr(state, "snapshot_custom_node_generation", "")
+                or getattr(state, "custom_node_generation", "") or ""
+            )
+            payload = build_invocation_seed_payload(
+                workflow,
+                output_node_ids=tuple(getattr(plan, "output_node_ids", ()) or ()),
+                workflow_hash=str(plan.workflow_hash or ""),
+                source_workflow_hash=str(plan.source_workflow_hash or ""),
+                custom_node_generation=custom_node_generation,
+                deployment_combined_hash=deployment_hash,
+            )
+            if payload is None:
+                return {
+                    "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                    "topology_available": 0,
+                    "reason": "empty_workflow",
+                }
+            if not state.hydrate_snapshot_seed_payload(payload):
+                return {
+                    "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                    "topology_available": 0,
+                    "reason": "hydration_failed",
+                }
+            _obs = snapshot_seed_observability(state.snapshot_execution_seed)
+            print(
+                f"[v2.seed_restore] source=invocation_plan schema=2 "
+                f"topology_available=1 "
+                f"workflow_hash={state.snapshot_seed_workflow_hash[:16]} "
+                f"loader_nodes={_obs['loader_node_count']} "
+                f"sampler_nodes={_obs['sampler_node_count']} "
+                f"reachable_nodes={_obs['reachable_node_count']} "
+                f"static_signatures={_obs['static_signature_count']}",
+                flush=True,
+            )
+            return {
+                "topology_available": 1,
+                **_obs,
+                # After **_obs: that helper hardcodes seed_source="".
+                "seed_source": SEED_SOURCE_INVOCATION_PLAN,
+            }
+        except Exception:
+            return {
+                "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                "topology_available": 0,
+                "reason": "derive_error",
+            }
 
     def _run_terminal_cleanup_sync(
         self,
@@ -13342,6 +14319,16 @@ class ModalRuntimeEntrypoint:
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
 
+        # ── Request-owned snapshot seed (no-publish path) ──
+        # When COMFYMODAL_V2_PUBLISH_RESTORE_PLAN is disabled (the default),
+        # the request derives its own schema-v2 seed from the invocation plan
+        # (seed_source=invocation_plan) so loader/sampler cache seeding and
+        # topology enrichment still work without any remote restore-plan
+        # publication.  Fail-closed: any derivation failure leaves the
+        # container on the honest startup_minimal seed.  The observability
+        # result is emitted as a trace event once context.trace exists.
+        _request_seed_obs = self._derive_request_snapshot_seed(plan)
+
         # â”€â”€ Compute method entry gap before any trace output â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _method_entry_gap_results: dict[str, Any] = {}
         try:
@@ -13408,6 +14395,15 @@ class ModalRuntimeEntrypoint:
         # Step 3: attach frozen restore-time snapshot-seed metadata per request.
         # Defensive getattr — cold-unpickled instances may lack bootstrap state.
         self._attach_snapshot_seed_metadata(context)
+        # Emit the request-derived seed observability (no-publish path) so the
+        # artifact proves the request owned its own seed (invocation_plan) or
+        # honestly fell back to startup_minimal.
+        if isinstance(_request_seed_obs, dict):
+            context.trace.emit(
+                "snapshot_seed_request_derived",
+                phase="request",
+                metadata=dict(_request_seed_obs),
+            )
         context.trace.set_metadata(
             **identity,
             trace_id=context.trace.trace_id,
@@ -14138,6 +15134,8 @@ def _build_decorated_v2_class() -> type:
         "publish_restore_plan", "run_rehoming_experiment",
         "run_numa_experiment",
         "run_env_probe", "run_entry_probe", "exit",
+        "run_volume_read_benchmark",
+        "run_snapshot_restore_only_probe",
     )
     # Lifecycle / infrastructure / probe / no-graph methods.  Their dict
     # results must NOT receive a fabricated graph waterfall.  Any future Modal
@@ -14149,6 +15147,8 @@ def _build_decorated_v2_class() -> type:
         "run_env_probe", "run_entry_probe",
         "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
+        "run_volume_read_benchmark",
+        "run_snapshot_restore_only_probe",
     })
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -14242,6 +15242,16 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "run_numa_experiment", _modal.method()(cls.run_numa_experiment))
     setattr(cls, "run_env_probe", _modal.method()(cls.run_env_probe))
     setattr(cls, "run_entry_probe", _modal.method()(cls.run_entry_probe))
+    setattr(
+        cls,
+        "run_volume_read_benchmark",
+        _modal.method()(cls.run_volume_read_benchmark),
+    )
+    setattr(
+        cls,
+        "run_snapshot_restore_only_probe",
+        _modal.method()(cls.run_snapshot_restore_only_probe),
+    )
     return cls
 
 
@@ -14296,6 +15306,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         "cpu": spec.cpu,
         "memory": spec.memory,
         "timeout": spec.timeout,
+        "retries": 0,
         "min_containers": spec.min_containers,
         "scaledown_window": spec.scaledown_window,
         "volumes": _volumes,

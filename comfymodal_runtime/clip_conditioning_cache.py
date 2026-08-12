@@ -341,20 +341,44 @@ def _bytes_to_tensor(raw: bytes, dtype_str: str, shape: list[int]) -> Any:
     return _th.from_numpy(arr.copy()).contiguous()
 
 
-def _serialize_tensor_descriptor(tensor: Any, data_buf: bytearray, offset: int) -> tuple[int, dict[str, Any]]:
+def _serialize_tensor_descriptor(
+    tensor: Any,
+    data_buf: bytearray,
+    offset: int,
+    _diag: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    _mat_start = 0
+    if _diag is not None:
+        _mat_start = time.monotonic_ns()
     raw, dtype_str, shape = _tensor_to_bytes(tensor)
+    if _diag is not None:
+        _diag["materialize_ms"] = _diag.get("materialize_ms", 0.0) + round(
+            (time.monotonic_ns() - _mat_start) / 1_000_000, 3
+        )
+        _diag["materialize_bytes"] = _diag.get("materialize_bytes", 0) + len(raw)
     length = len(raw)
     data_buf.extend(raw)
+    _ck_start = 0
+    if _diag is not None:
+        _ck_start = time.monotonic_ns()
+    checksum = hashlib.sha256(raw).hexdigest()
+    if _diag is not None:
+        _diag["checksum_ms"] = _diag.get("checksum_ms", 0.0) + round(
+            (time.monotonic_ns() - _ck_start) / 1_000_000, 3
+        )
     return length, {
         "dtype": dtype_str,
         "shape": shape,
         "offset": offset,
         "byte_length": length,
-        "checksum": hashlib.sha256(raw).hexdigest(),
+        "checksum": checksum,
     }
 
 
-def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
+def serialize_conditioning(
+    value: Any,
+    _diag: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bytes] | None:
     """Serialize one CLIPTextEncode output into ``(header, data_bytes)``.
 
     The native conditioning value is ``[[tensor, {"pooled": pooled}], ...]``.
@@ -364,6 +388,9 @@ def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
 
     global _LAST_SERIALIZE_ERROR
     _LAST_SERIALIZE_ERROR = ""
+    _ser_start = 0
+    if _diag is not None:
+        _ser_start = time.monotonic_ns()
     try:
         result_container = "list"
         if isinstance(value, tuple):
@@ -382,7 +409,7 @@ def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
             meta = entry[1] if len(entry) > 1 else {}
             if not isinstance(cond, _th.Tensor):
                 return None
-            _, cond_desc = _serialize_tensor_descriptor(cond, data_buf, len(data_buf))
+            _, cond_desc = _serialize_tensor_descriptor(cond, data_buf, len(data_buf), _diag=_diag)
             meta_out: list[dict[str, Any]] = []
             if not isinstance(meta, dict):
                 return None
@@ -390,7 +417,7 @@ def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
                 if not isinstance(mk, str):
                     return None
                 if isinstance(mv, _th.Tensor):
-                    _, mv_desc = _serialize_tensor_descriptor(mv, data_buf, len(data_buf))
+                    _, mv_desc = _serialize_tensor_descriptor(mv, data_buf, len(data_buf), _diag=_diag)
                     meta_out.append({"key": mk, "kind": "tensor", **mv_desc})
                 elif isinstance(mv, (str, int, float, bool, type(None))):
                     meta_out.append({"key": mk, "kind": "raw", "value": mv})
@@ -404,15 +431,28 @@ def serialize_conditioning(value: Any) -> tuple[dict[str, Any], bytes] | None:
                     return None
             entries_out.append({"cond": cond_desc, "meta": meta_out})
         data = bytes(data_buf)
+        _pk_start = 0
+        if _diag is not None:
+            _pk_start = time.monotonic_ns()
+        payload_checksum = hashlib.sha256(data).hexdigest()
+        if _diag is not None:
+            _diag["checksum_ms"] = _diag.get("checksum_ms", 0.0) + round(
+                (time.monotonic_ns() - _pk_start) / 1_000_000, 3
+            )
         header = {
             "format": FORMAT_NAME,
             "schema_version": SCHEMA_VERSION,
             "format_version": FORMAT_VERSION,
             "result_container": result_container,
             "byte_length": len(data),
-            "payload_checksum": hashlib.sha256(data).hexdigest(),
+            "payload_checksum": payload_checksum,
             "conditioning": {"entries": entries_out},
         }
+        if _diag is not None:
+            _diag["serialize_ms"] = _diag.get("serialize_ms", 0.0) + round(
+                (time.monotonic_ns() - _ser_start) / 1_000_000, 3
+            )
+            _diag["serialized_payload_bytes"] = _diag.get("serialized_payload_bytes", 0) + len(data)
         return header, data
     except Exception as exc:
         _LAST_SERIALIZE_ERROR = f"{type(exc).__name__}:{exc}"[:160]
@@ -506,21 +546,35 @@ def deserialize_conditioning(header: Mapping[str, Any], data: bytes) -> Any:
 # ── Storage (atomic, bounded, deterministic LRU) ────────────────────────
 
 
-def _atomic_write(path: str, data: bytes) -> None:
+def _atomic_write(path: str, data: bytes, _diag: dict[str, Any] | None = None) -> None:
     tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    _fsync_ms = 0.0
+    _fsync_count = 0
     try:
         with open(tmp, "wb") as f:
             f.write(data)
             f.flush()
             try:
+                _fs_start = 0
+                if _diag is not None:
+                    _fs_start = time.monotonic_ns()
                 os.fsync(f.fileno())
+                if _diag is not None:
+                    _fsync_ms += round((time.monotonic_ns() - _fs_start) / 1_000_000, 3)
+                    _fsync_count += 1
             except OSError:
                 pass
         os.replace(tmp, path)
         try:
             directory_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
             try:
+                _fs_start = 0
+                if _diag is not None:
+                    _fs_start = time.monotonic_ns()
                 os.fsync(directory_fd)
+                if _diag is not None:
+                    _fsync_ms += round((time.monotonic_ns() - _fs_start) / 1_000_000, 3)
+                    _fsync_count += 1
             finally:
                 os.close(directory_fd)
         except OSError:
@@ -531,10 +585,13 @@ def _atomic_write(path: str, data: bytes) -> None:
                 os.remove(tmp)
         except OSError:
             pass
+    if _diag is not None:
+        _diag["fsync_ms"] = _diag.get("fsync_ms", 0.0) + _fsync_ms
+        _diag["fsync_count"] = _diag.get("fsync_count", 0) + _fsync_count
 
 
-def _atomic_write_text(path: str, text: str) -> None:
-    _atomic_write(path, text.encode("utf-8"))
+def _atomic_write_text(path: str, text: str, _diag: dict[str, Any] | None = None) -> None:
+    _atomic_write(path, text.encode("utf-8"), _diag=_diag)
 
 
 class ExactConditioningCache:
@@ -549,6 +606,7 @@ class ExactConditioningCache:
         self._lock = threading.RLock()
         self._commit_hook: Any = None
         self._last_store_reason = ""
+        self._diag = threading.local()
         os.makedirs(self._entries_dir, exist_ok=True)
 
     # ── Commit hook (registered by the Modal prompt-cache volume owner) ──
@@ -566,10 +624,15 @@ class ExactConditioningCache:
             pass
 
     # ── Manifest ────────────────────────────────────────────────────────
-    def _read_manifest(self) -> dict[str, Any]:
+    def _read_manifest(self, _diag: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
             with open(self._manifest_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                _text = f.read()
+            if _diag is not None:
+                _diag["manifest_read_bytes"] = _diag.get("manifest_read_bytes", 0) + len(
+                    _text.encode("utf-8")
+                )
+            data = json.loads(_text)
             if not isinstance(data, dict):
                 raise ValueError("manifest_not_dict")
             if data.get("schema_version") != SCHEMA_VERSION:
@@ -586,13 +649,15 @@ class ExactConditioningCache:
                 "entries": [],
             }
 
-    def _write_manifest_atomic(self, manifest: dict[str, Any]) -> None:
+    def _write_manifest_atomic(self, manifest: dict[str, Any], _diag: dict[str, Any] | None = None) -> None:
         manifest["schema_version"] = SCHEMA_VERSION
         manifest["format_version"] = FORMAT_VERSION
-        _atomic_write_text(
-            self._manifest_path,
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-        )
+        _text = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        if _diag is not None:
+            _diag["manifest_bytes_written"] = _diag.get("manifest_bytes_written", 0) + len(
+                _text.encode("utf-8")
+            )
+        _atomic_write_text(self._manifest_path, _text, _diag=_diag)
 
     def _entry_paths(self, key_hash: str) -> tuple[str, str]:
         return (
@@ -600,7 +665,7 @@ class ExactConditioningCache:
             os.path.join(self._entries_dir, f"{key_hash}.data.bin"),
         )
 
-    def _remove_unindexed_files(self, manifest: Mapping[str, Any]) -> None:
+    def _remove_unindexed_files(self, manifest: Mapping[str, Any]) -> int:
         indexed = {
             str(entry.get("key_hash", ""))
             for entry in manifest.get("entries", [])
@@ -609,7 +674,8 @@ class ExactConditioningCache:
         try:
             names = os.listdir(self._entries_dir)
         except OSError:
-            return
+            return 0
+        _removed = 0
         for name in names:
             if name.endswith(".header.json"):
                 key_hash = name[:-len(".header.json")]
@@ -621,8 +687,10 @@ class ExactConditioningCache:
                 continue
             try:
                 os.remove(os.path.join(self._entries_dir, name))
+                _removed += 1
             except OSError:
                 pass
+        return _removed
 
     # ── Lookup ──────────────────────────────────────────────────────────
     def _reload_volume(self) -> None:
@@ -650,14 +718,44 @@ class ExactConditioningCache:
         unchanged encode path."""
         hits: dict[int, Any] = {}
         misses: list[dict[str, Any]] = []
+        diag: dict[str, Any] = {
+            "lock_wait_ms": 0.0,
+            "volume_reload_ms": 0.0,
+            "manifest_read_ms": 0.0,
+            "manifest_read_bytes": 0,
+            "manifest_entries": 0,
+            "key_build_digest_ms": 0.0,
+            "entry_lookup_ms": 0.0,
+            "header_bytes_read": 0,
+            "data_bytes_read": 0,
+            "lru_touch_ms": 0.0,
+            "entries_requested": len(entries),
+            "hit_count": 0,
+            "miss_count": 0,
+            "total_ms": 0.0,
+            "residual_ms": 0.0,
+        }
+        _t0 = time.monotonic_ns()
         if not entries:
+            diag["total_ms"] = 0.0
+            self._diag.lookup = diag
             return hits, misses, 0, 0
         try:
+            _kb_start = time.monotonic_ns()
             base_components = build_exact_key_components(base_ctx)
+            diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
             if not _base_key_missing(base_components):
-                with self._lock:
+                _lw_start = time.monotonic_ns()
+                self._lock.acquire()
+                diag["lock_wait_ms"] = round((time.monotonic_ns() - _lw_start) / 1_000_000, 3)
+                try:
+                    _vr_start = time.monotonic_ns()
                     self._reload_volume()
-                    manifest = self._read_manifest()
+                    diag["volume_reload_ms"] = round((time.monotonic_ns() - _vr_start) / 1_000_000, 3)
+                    _mr_start = time.monotonic_ns()
+                    manifest = self._read_manifest(_diag=diag)
+                    diag["manifest_read_ms"] = round((time.monotonic_ns() - _mr_start) / 1_000_000, 3)
+                    diag["manifest_entries"] = len(manifest.get("entries", []))
                     manifest_entries = {
                         str(e.get("key_hash", "")): e
                         for e in manifest.get("entries", [])
@@ -665,14 +763,19 @@ class ExactConditioningCache:
                     }
                     touched_digests: set[str] = set()
                     for index, entry in enumerate(entries):
+                        _kb_start = time.monotonic_ns()
                         ctx = _merge_entry_context(base_ctx, entry)
                         components = build_exact_key_components(ctx)
                         missing = _key_usable(components)
                         if missing:
+                            diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
                             misses.append(dict(entry))
                             continue
                         digest = exact_key_digest(components)
-                        value = self._lookup_entry(components, digest, manifest_entries)
+                        diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
+                        _el_start = time.monotonic_ns()
+                        value = self._lookup_entry(components, digest, manifest_entries, _diag=diag)
+                        diag["entry_lookup_ms"] += round((time.monotonic_ns() - _el_start) / 1_000_000, 3)
                         if value is None:
                             misses.append(dict(entry))
                         else:
@@ -684,7 +787,11 @@ class ExactConditioningCache:
                             }
                             touched_digests.add(digest)
                     if touched_digests:
+                        _lt_start = time.monotonic_ns()
                         self._persist_lru_touch(manifest_entries, touched_digests)
+                        diag["lru_touch_ms"] = round((time.monotonic_ns() - _lt_start) / 1_000_000, 3)
+                finally:
+                    self._lock.release()
             else:
                 missing = _base_key_missing(base_components)
                 _log_decision(
@@ -696,6 +803,20 @@ class ExactConditioningCache:
         except Exception as exc:
             _log_decision("miss_error", reason=f"{type(exc).__name__}:{exc}"[:120])
             misses = [dict(e) for e in entries]
+        diag["hit_count"] = len(hits)
+        diag["miss_count"] = len(misses)
+        diag["total_ms"] = round((time.monotonic_ns() - _t0) / 1_000_000, 3)
+        _children = (
+            (diag["lock_wait_ms"] or 0.0)
+            + diag["volume_reload_ms"]
+            + diag["manifest_read_ms"]
+            + diag["key_build_digest_ms"]
+            + diag["entry_lookup_ms"]
+            + diag["lru_touch_ms"]
+        )
+        diag["measured_children_ms"] = round(_children, 3)
+        diag["residual_ms"] = round(diag["total_ms"] - _children, 3)
+        self._diag.lookup = diag
         return hits, misses, len(hits), len(misses)
 
     def _lookup_entry(
@@ -703,6 +824,7 @@ class ExactConditioningCache:
         components: Mapping[str, Any],
         digest: str,
         manifest_entries: Mapping[str, Any],
+        _diag: dict[str, Any] | None = None,
     ) -> Any:
         """Validate and deserialize one entry.  Every mismatch is a miss."""
         if digest not in manifest_entries:
@@ -712,7 +834,12 @@ class ExactConditioningCache:
             if not os.path.isfile(header_path) or not os.path.isfile(data_path):
                 return None
             with open(header_path, "r", encoding="utf-8") as f:
-                header = json.load(f)
+                header_text = f.read()
+            if _diag is not None:
+                _diag["header_bytes_read"] = _diag.get("header_bytes_read", 0) + len(
+                    header_text.encode("utf-8")
+                )
+            header = json.loads(header_text)
             if not isinstance(header, Mapping):
                 return None
             if header.get("format") != FORMAT_NAME:
@@ -731,6 +858,8 @@ class ExactConditioningCache:
                 return None
             with open(data_path, "rb") as f:
                 data = f.read()
+            if _diag is not None:
+                _diag["data_bytes_read"] = _diag.get("data_bytes_read", 0) + len(data)
             if int(manifest_entries[digest].get("byte_length", -1)) != len(data):
                 return None
             value = deserialize_conditioning(header, data)
@@ -763,15 +892,18 @@ class ExactConditioningCache:
         except Exception:
             pass
 
-    def _enforce_bounds(self, manifest: dict[str, Any], keep_digest: str) -> None:
+    def _enforce_bounds(self, manifest: dict[str, Any], keep_digest: str) -> tuple[int, int]:
         """Enforce the entry and byte caps with deterministic LRU eviction.
 
         Evicts the entry with the smallest ``last_access_seq``; ties are
         broken by ``key_hash`` so eviction order is deterministic.  The
         just-written entry is never evicted when it is the only entry.
+        Returns ``(evicted_count, evicted_bytes)``.
         """
         entries = manifest.get("entries", [])
         total_bytes = sum(int(e.get("byte_length", 0) or 0) for e in entries)
+        _evicted = 0
+        _evicted_bytes = 0
         while len(entries) > self._max_entries or total_bytes > self._max_bytes:
             oldest = min(
                 entries,
@@ -787,9 +919,12 @@ class ExactConditioningCache:
                         os.remove(path)
                 except OSError:
                     pass
+            _evicted += 1
+            _evicted_bytes += int(oldest.get("byte_length", 0) or 0)
             total_bytes -= int(oldest.get("byte_length", 0) or 0)
             entries.remove(oldest)
         manifest["entries"] = entries
+        return _evicted, _evicted_bytes
 
     # ── Store (synchronous so the miss_stored log follows the atomic store) ─
     def store_entry(
@@ -799,27 +934,100 @@ class ExactConditioningCache:
         value: Any,
     ) -> bool:
         """Atomically store *value* after the unchanged encode completes."""
+        diag = getattr(self._diag, "store", None)
+        if not diag:
+            diag = {
+                "store_calls": 0,
+                "store_failed": 0,
+                "key_build_digest_ms": 0.0,
+                "serialize_ms": 0.0,
+                "materialize_ms": 0.0,
+                "materialize_bytes": 0,
+                "checksum_ms": 0.0,
+                "serialized_payload_bytes": 0,
+                "compression": "none",
+                "safetensors": False,
+                "lock_wait_ms": 0.0,
+                "lock_held_ms": 0.0,
+                "data_write_ms": 0.0,
+                "payload_bytes_written": 0,
+                "header_write_ms": 0.0,
+                "header_bytes": 0,
+                "header_bytes_written": 0,
+                "manifest_read_ms": 0.0,
+                "manifest_read_bytes": 0,
+                "manifest_write_ms": 0.0,
+                "manifest_bytes_written": 0,
+                "bounds_ms": 0.0,
+                "evicted_count": 0,
+                "evicted_bytes": 0,
+                "unindexed_sweep_ms": 0.0,
+                "unindexed_files_removed": 0,
+                "commit_ms": 0.0,
+                "fsync_ms": 0.0,
+                "fsync_count": 0,
+                "stored_ok": 0,
+                "total_ms": 0.0,
+                "residual_ms": 0.0,
+            }
+            self._diag.store = diag
+        _t0 = time.monotonic_ns()
         try:
             self._last_store_reason = ""
+            _kb_start = time.monotonic_ns()
             ctx = _merge_entry_context(base_ctx, entry)
             components = build_exact_key_components(ctx)
             missing = _key_usable(components)
             if missing:
+                diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
                 self._last_store_reason = f"key:{missing}"
-                return False
+                return self._store_diag_close(diag, _t0, ok=False)
             digest = exact_key_digest(components)
-            return self._process_value(components, digest, value)
+            diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
+            _ok = self._process_value(components, digest, value, _diag=diag)
+            return self._store_diag_close(diag, _t0, ok=_ok)
         except Exception as exc:
             self._last_store_reason = f"store_exception:{type(exc).__name__}:{exc}"[:160]
-            return False
+            return self._store_diag_close(diag, _t0, ok=False)
+
+    def _store_diag_close(self, diag: dict[str, Any], _t0: int, *, ok: bool) -> bool:
+        diag["store_calls"] = diag.get("store_calls", 0) + 1
+        if not ok:
+            diag["store_failed"] = diag.get("store_failed", 0) + 1
+        diag["total_ms"] = diag.get("total_ms", 0.0) + round((time.monotonic_ns() - _t0) / 1_000_000, 3)
+        _children = (
+            (diag.get("key_build_digest_ms") or 0.0)
+            + (diag.get("serialize_ms") or 0.0)
+            + (diag.get("lock_wait_ms") or 0.0)
+            + (diag.get("data_write_ms") or 0.0)
+            + (diag.get("header_write_ms") or 0.0)
+            + (diag.get("manifest_read_ms") or 0.0)
+            + (diag.get("bounds_ms") or 0.0)
+            + (diag.get("manifest_write_ms") or 0.0)
+            + (diag.get("unindexed_sweep_ms") or 0.0)
+            + (diag.get("commit_ms") or 0.0)
+        )
+        diag["measured_children_ms"] = round(_children, 3)
+        diag["residual_ms"] = round(diag.get("total_ms", 0.0) - _children, 3)
+        return ok
+
+    def latest_lookup_diagnostics(self) -> dict[str, Any]:
+        diag = getattr(self._diag, "lookup", None)
+        return dict(diag) if diag else {}
+
+    def pop_store_diagnostics(self) -> dict[str, Any]:
+        diag = getattr(self._diag, "store", None)
+        self._diag.store = {}
+        return dict(diag) if diag else {}
 
     def _process_value(
         self,
         components: Mapping[str, Any],
         digest: str,
         value: Any,
+        _diag: dict[str, Any] | None = None,
     ) -> bool:
-        header, data = serialize_conditioning(value)
+        header, data = serialize_conditioning(value, _diag=_diag)
         if header is None:
             self._last_store_reason = _LAST_SERIALIZE_ERROR or "serialization_failed"
             return False
@@ -830,7 +1038,7 @@ class ExactConditioningCache:
         header["key_components"] = components
         header["model_identity"] = _model_identity_block(components)
         header["created_at"] = time.time()
-        return self._write_entry(components, header, data)
+        return self._write_entry(components, header, data, _diag=_diag)
 
     @property
     def last_store_reason(self) -> str:
@@ -841,19 +1049,43 @@ class ExactConditioningCache:
         components: Mapping[str, Any],
         header: Mapping[str, Any],
         data: bytes,
+        _diag: dict[str, Any] | None = None,
     ) -> bool:
         digest = str(header.get("key_hash", ""))
         if not digest:
             return False
+        if _diag is None:
+            _diag = {}
         header_path, data_path = self._entry_paths(digest)
-        with self._lock:
+        _lw_start = time.monotonic_ns()
+        self._lock.acquire()
+        _diag["lock_wait_ms"] = _diag.get("lock_wait_ms", 0.0) + round(
+            (time.monotonic_ns() - _lw_start) / 1_000_000, 3
+        )
+        _held_start = time.monotonic_ns()
+        try:
             # Atomic data blob first, then the header, then the manifest.
-            _atomic_write(data_path, data)
-            _atomic_write_text(
-                header_path,
-                json.dumps(header, sort_keys=True, separators=(",", ":")),
+            _dw_start = time.monotonic_ns()
+            _atomic_write(data_path, data, _diag=_diag)
+            _diag["data_write_ms"] = _diag.get("data_write_ms", 0.0) + round(
+                (time.monotonic_ns() - _dw_start) / 1_000_000, 3
             )
-            manifest = self._read_manifest()
+            _diag["payload_bytes_written"] = _diag.get("payload_bytes_written", 0) + len(data)
+            _header_json = json.dumps(header, sort_keys=True, separators=(",", ":"))
+            _diag["header_bytes"] = len(_header_json.encode("utf-8"))
+            _hw_start = time.monotonic_ns()
+            _atomic_write_text(header_path, _header_json, _diag=_diag)
+            _diag["header_write_ms"] = _diag.get("header_write_ms", 0.0) + round(
+                (time.monotonic_ns() - _hw_start) / 1_000_000, 3
+            )
+            _diag["header_bytes_written"] = _diag.get("header_bytes_written", 0) + len(
+                _header_json.encode("utf-8")
+            )
+            _mr_start = time.monotonic_ns()
+            manifest = self._read_manifest(_diag=_diag)
+            _diag["manifest_read_ms"] = _diag.get("manifest_read_ms", 0.0) + round(
+                (time.monotonic_ns() - _mr_start) / 1_000_000, 3
+            )
             next_seq = int(manifest.get("next_seq", 0) or 0) + 1
             existing = [e for e in manifest["entries"] if e.get("key_hash") == digest]
             if existing:
@@ -872,11 +1104,36 @@ class ExactConditioningCache:
                     "created_at": time.time(),
                 })
             manifest["next_seq"] = next_seq
-            self._enforce_bounds(manifest, keep_digest=digest)
-            self._write_manifest_atomic(manifest)
-            self._remove_unindexed_files(manifest)
+            _eb_start = time.monotonic_ns()
+            _evicted, _evicted_bytes = self._enforce_bounds(manifest, keep_digest=digest)
+            _diag["bounds_ms"] = _diag.get("bounds_ms", 0.0) + round(
+                (time.monotonic_ns() - _eb_start) / 1_000_000, 3
+            )
+            _diag["evicted_count"] = _diag.get("evicted_count", 0) + _evicted
+            _diag["evicted_bytes"] = _diag.get("evicted_bytes", 0) + _evicted_bytes
+            _mw_start = time.monotonic_ns()
+            self._write_manifest_atomic(manifest, _diag=_diag)
+            _diag["manifest_write_ms"] = _diag.get("manifest_write_ms", 0.0) + round(
+                (time.monotonic_ns() - _mw_start) / 1_000_000, 3
+            )
+            _sw_start = time.monotonic_ns()
+            _removed = self._remove_unindexed_files(manifest)
+            _diag["unindexed_sweep_ms"] = _diag.get("unindexed_sweep_ms", 0.0) + round(
+                (time.monotonic_ns() - _sw_start) / 1_000_000, 3
+            )
+            _diag["unindexed_files_removed"] = _diag.get("unindexed_files_removed", 0) + _removed
+            _cm_start = time.monotonic_ns()
             self._commit()
-        return True
+            _diag["commit_ms"] = _diag.get("commit_ms", 0.0) + round(
+                (time.monotonic_ns() - _cm_start) / 1_000_000, 3
+            )
+            _diag["stored_ok"] = _diag.get("stored_ok", 0) + 1
+            return True
+        finally:
+            _diag["lock_held_ms"] = _diag.get("lock_held_ms", 0.0) + round(
+                (time.monotonic_ns() - _held_start) / 1_000_000, 3
+            )
+            self._lock.release()
 
 
 def _model_identity_block(components: Mapping[str, Any]) -> dict[str, Any]:

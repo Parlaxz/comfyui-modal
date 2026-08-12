@@ -1221,6 +1221,8 @@ _SENTINEL_MODEL_PATCHER_LOAD = "_comfy_modal_model_patcher_load_wrapper"
 _SENTINEL_MODEL_PATCHER_LOAD_LIST = "_comfy_modal_model_patcher_load_list_wrapper"
 _SENTINEL_MODEL_PATCHER_PATCH_WEIGHT = "_comfy_modal_model_patcher_patch_weight_wrapper"
 _SENTINEL_CAST_TO_DEVICE = "_comfy_modal_cast_to_device_wrapper"
+_SENTINEL_CLIP_SPAN = "_comfy_modal_clip_span_wrapper"
+_SENTINEL_CLIP_FORWARD = "_comfy_modal_clip_forward_wrapper"
 
 _read_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
@@ -1241,6 +1243,11 @@ _deep_tl_depth: ContextVar[int] = ContextVar("_deep_tl_depth", default=0)
 _clip_depth: ContextVar[int] = ContextVar("_clip_depth", default=0)
 _clip_subfn_depth: ContextVar[int] = ContextVar("_clip_subfn_depth", default=0)
 _clip_constructor_depth: ContextVar[int] = ContextVar("_clip_constructor_depth", default=0)
+_clip_tokenize_depth: ContextVar[int] = ContextVar("_clip_tokenize_depth", default=0)
+_clip_gpu_prepare_depth: ContextVar[int] = ContextVar("_clip_gpu_prepare_depth", default=0)
+_clip_raw_encode_depth: ContextVar[int] = ContextVar("_clip_raw_encode_depth", default=0)
+_clip_forward_depth: ContextVar[int] = ContextVar("_clip_forward_depth", default=0)
+_clip_scheduled_depth: ContextVar[int] = ContextVar("_clip_scheduled_depth", default=0)
 
 # ModelPatcher.load aggregate-timing breakdown contexts
 _model_patcher_load_depth: ContextVar[int] = ContextVar("_model_patcher_load_depth", default=0)
@@ -3268,6 +3275,812 @@ def _install_shared_convert_old_quants_wrapper() -> str:
     return "installed"
 
 
+# ── V2 native fast-disk UNET loader (COMFYMODAL_V2_NATIVE_FAST_DISK_UNET) ─
+# Opt-in, default OFF: when inactive the UNET load path is exactly legacy.
+# When active, the existing live wrappers (model_config.get_model,
+# nn.Module.to, the ModelPatcher constructor, and the per-instance
+# load_model_weights wrapper) cooperate to defer exactly ONE eligible first
+# UNET ``model.to(cuda)`` call — the call native
+# ``comfy.sd.load_diffusion_model_state_dict`` performs between ModelPatcher
+# construction and ``load_model_weights`` (``model.to(offload_device)`` with
+# offload == load == CUDA under HIGH_VRAM).  The deferred REAL original
+# ``model.to`` is replayed AFTER ``load_model_weights(assign=True)`` has
+# BOUND the disk state-dict tensors directly onto the constructed parameters
+# (no intermediate CPU copy), so the model makes a single pass to CUDA.
+#
+# Fast ordering (all guards green at load time):
+#   native model construction -> native plain ModelPatcher ->
+#   original load_model_weights(assign=True) [bind] ->
+#   exactly one REAL original model.to(target) -> continue native path.
+# Any failed guard replays the deferred original ``model.to(target)`` BEFORE
+# invoking the original ``load_model_weights`` with its ORIGINAL assign
+# value, preserving the legacy order and exceptions exactly.  The deferral
+# record is removed on every success/failure path; no CLIP/VAE/other model
+# or subsequent ``.to`` call is ever affected.  ModelPatcher fields and
+# bookkeeping are never altered.
+
+_NATIVE_FAST_DISK_UNET: bool = env_flag("COMFYMODAL_V2_NATIVE_FAST_DISK_UNET")
+
+_FAST_DISK_UNET_LOCK: RLock = RLock()
+_FAST_DISK_UNET_DEFERRALS: dict[int, dict[str, Any]] = {}
+_FAST_DISK_UNET_DEFERRALS_MAX = 16
+
+# Event names for the fast-disk loader — unambiguous, distinct from the
+# existing unet_model_to_* / unet_load_model_weights_* ownership.
+_EVENT_FAST_DISK_DEFER = "unet_fast_disk_defer"
+_EVENT_FAST_DISK_SKIP = "unet_fast_disk_skip"
+_EVENT_FAST_DISK_BIND_START = "unet_fast_disk_bind_start"
+_EVENT_FAST_DISK_BIND_END = "unet_fast_disk_bind_end"
+_EVENT_FAST_DISK_TO_START = "unet_fast_disk_to_start"
+_EVENT_FAST_DISK_TO_END = "unet_fast_disk_to_end"
+_EVENT_FAST_DISK_COMPLETE = "unet_fast_disk_complete"
+
+
+def _fast_disk_trace(lane_trace: Any) -> Any:
+    try:
+        return getattr(lane_trace, "_trace", None)
+    except Exception:
+        return None
+
+
+def _fast_disk_device_key(dev: Any) -> tuple[str, int] | None:
+    """Normalize a device to ``(type, index)`` (cuda == cuda:0; a bare cuda
+    index defaults to 0 so it can never mismatch cuda:0 falsely)."""
+    try:
+        import torch as _torch_dk
+        if dev is None:
+            return None
+        d = dev if isinstance(dev, _torch_dk.device) else _torch_dk.device(str(dev))
+        _index = d.index
+        if _index is None:
+            _index = 0
+        return (d.type, _index)
+    except Exception:
+        return None
+
+
+def _fast_disk_high_vram() -> bool:
+    """True when ComfyUI's live VRAM state is HIGH_VRAM.  Reads the live
+    module via ``sys.modules`` (never a fresh import) so an injected/test
+    module is always honored.  Never raises."""
+    try:
+        import sys as _sys_fd
+        _mm_fd = _sys_fd.modules.get("comfy.model_management")
+        if _mm_fd is None:
+            return False
+        _vs = getattr(_mm_fd, "vram_state", None)
+        _high = getattr(_mm_fd, "VRAMState", None)
+        if _vs is not None and _high is not None:
+            return bool(_vs == _high.HIGH_VRAM)
+        _fn = getattr(_mm_fd, "unet_offload_device", None)
+        if callable(_fn):
+            try:
+                _dev = _fn()
+                import torch as _torch_ov
+                if isinstance(_dev, _torch_ov.device):
+                    return _dev.type != "cpu"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _fast_disk_torch_future_enabled() -> bool:
+    """True when torch swap/overwrite module-params-on-conversion is enabled."""
+    try:
+        import torch.__future__ as _tf
+        for _name in (
+            "get_swap_module_params_on_conversion",
+            "get_overwrite_module_params_on_conversion",
+        ):
+            _fn = getattr(_tf, _name, None)
+            if callable(_fn):
+                try:
+                    if bool(_fn()):
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+
+def _fast_disk_model_is_cpu_resident(model: Any) -> bool:
+    """True when no parameter/buffer of *model* is on CUDA yet."""
+    if model is None:
+        return False
+    try:
+        for _t in model.parameters():
+            _dev = str(getattr(getattr(_t, "device", None), "type", "") or "").lower()
+            if _dev == "cuda":
+                return False
+        for _b in model.buffers():
+            _dev = str(getattr(getattr(_b, "device", None), "type", "") or "").lower()
+            if _dev == "cuda":
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _fast_disk_model_config_evidence(model_config: Any) -> dict[str, Any]:
+    """Snapshot the model-config guards that must be false for the fast path."""
+    evidence: dict[str, Any] = {
+        "quant_config_present": False,
+        "custom_operations_present": False,
+        "fp8_optimization": False,
+        "force_channels_last": False,
+    }
+    try:
+        evidence["quant_config_present"] = (
+            getattr(model_config, "quant_config", None) is not None
+        )
+    except Exception:
+        pass
+    try:
+        evidence["custom_operations_present"] = (
+            getattr(model_config, "custom_operations", None) is not None
+        )
+    except Exception:
+        pass
+    try:
+        _opts = getattr(model_config, "optimizations", None)
+        if isinstance(_opts, Mapping):
+            evidence["fp8_optimization"] = bool(_opts.get("fp8", False))
+    except Exception:
+        pass
+    try:
+        import sys as _sys_cl
+        _mm_cl = _sys_cl.modules.get("comfy.model_management")
+        if _mm_cl is not None:
+            _fn = getattr(_mm_cl, "force_channels_last", None)
+            if callable(_fn):
+                evidence["force_channels_last"] = bool(_fn())
+    except Exception:
+        pass
+    return evidence
+
+
+def _fast_disk_record_model(record: dict[str, Any]) -> Any:
+    """Resolve the live model from a deferral record (weakref)."""
+    try:
+        _ref = record.get("model_ref")
+        if _ref is None:
+            return record.get("model")
+        _m = _ref()
+        return _m
+    except Exception:
+        return None
+
+
+def _fast_disk_record_for(model: Any) -> dict[str, Any] | None:
+    """Live-record lookup keyed by ``id(model)`` with identity verification."""
+    if model is None:
+        return None
+    with _FAST_DISK_UNET_LOCK:
+        record = _FAST_DISK_UNET_DEFERRALS.get(id(model))
+    if record is None:
+        return None
+    _live = _fast_disk_record_model(record)
+    if _live is None or _live is not model:
+        return None
+    return record
+
+
+def _fast_disk_drop_record(model: Any) -> None:
+    if model is None:
+        return
+    with _FAST_DISK_UNET_LOCK:
+        _FAST_DISK_UNET_DEFERRALS.pop(id(model), None)
+
+
+def _fast_disk_new_record(
+    model: Any, model_config: Any, lane_trace: Any,
+) -> dict[str, Any]:
+    """Open a fast-disk deferral window (bounded, weakref-keyed)."""
+    import weakref as _weakref
+    record: dict[str, Any] = {
+        "model_ref": _weakref.ref(model),
+        "model_object_id": str(id(model)),
+        "status": "constructed",
+        "lane_trace": lane_trace,
+        "patcher": None,
+        "model_config_evidence": _fast_disk_model_config_evidence(model_config),
+        "to_args": None,
+        "to_kwargs": None,
+        "original_to": None,
+        "target": None,
+        "timings": {
+            "get_model_wall_ms": None,
+            "ctor_wall_ms": None,
+            "bind_wall_ms": None,
+            "to_wall_ms": None,
+            "to_device_ms": None,
+            "to_device_ms_label": "unavailable",
+        },
+    }
+    with _FAST_DISK_UNET_LOCK:
+        _FAST_DISK_UNET_DEFERRALS[id(model)] = record
+        if len(_FAST_DISK_UNET_DEFERRALS) > _FAST_DISK_UNET_DEFERRALS_MAX:
+            _excess = len(_FAST_DISK_UNET_DEFERRALS) - _FAST_DISK_UNET_DEFERRALS_MAX
+            for _stale in list(_FAST_DISK_UNET_DEFERRALS.keys())[:_excess]:
+                _FAST_DISK_UNET_DEFERRALS.pop(_stale, None)
+    return record
+
+
+def _fast_disk_open_window(
+    model: Any, model_config: Any, lane_trace: Any, *, get_model_wall_ms: float | None,
+) -> None:
+    """Open the window after model construction (UNET lane, flag on).
+
+    No-op for non-Base models / already-CUDA models so CLIP/VAE/other
+    loads are never touched.
+    """
+    if model is None:
+        return
+    if not callable(getattr(model, "load_model_weights", None)):
+        return
+    if not _fast_disk_model_is_cpu_resident(model):
+        return
+    record = _fast_disk_record_for(model)
+    if record is None:
+        record = _fast_disk_new_record(model, model_config, lane_trace)
+    record["timings"]["get_model_wall_ms"] = get_model_wall_ms
+
+
+def _fast_disk_record_patcher(patcher: Any, *, duration_ms: float | None = None) -> None:
+    """Record the exact patcher when a fast-disk window is open for its model."""
+    model = getattr(patcher, "model", None)
+    if model is None:
+        return
+    if _fast_disk_record_for(model) is None:
+        return
+    is_dynamic = False
+    try:
+        _fn = getattr(patcher, "is_dynamic", None)
+        is_dynamic = bool(_fn()) if callable(_fn) else False
+    except Exception:
+        pass
+    patcher_info: dict[str, Any] = {
+        "object_id": str(id(patcher)),
+        "type_module": type(patcher).__module__,
+        "type_name": type(patcher).__name__,
+        "is_dynamic": is_dynamic,
+        "load_device": getattr(patcher, "load_device", None),
+        "offload_device": getattr(patcher, "offload_device", None),
+    }
+    with _FAST_DISK_UNET_LOCK:
+        _rec = _FAST_DISK_UNET_DEFERRALS.get(id(model))
+        if _rec is None:
+            return
+        _rec["patcher"] = patcher_info
+        if duration_ms is not None:
+            _rec["timings"]["ctor_wall_ms"] = duration_ms
+
+
+def _fast_disk_resolve_to_target(
+    args: tuple[Any, ...], kwargs: dict[str, Any],
+) -> Any | None:
+    """Resolve the device target of a ``Module.to`` call (None when not a
+    device move)."""
+    device_arg = None
+    if args:
+        device_arg = args[0]
+    elif "device" in kwargs:
+        device_arg = kwargs["device"]
+    if device_arg is None:
+        return None
+    try:
+        import torch as _torch_tg
+        if isinstance(device_arg, _torch_tg.device):
+            return device_arg
+        if isinstance(device_arg, str):
+            return _torch_tg.device(device_arg)
+        if isinstance(device_arg, int):
+            return _torch_tg.device("cuda", device_arg)
+    except Exception:
+        return None
+    return None
+
+
+def _fast_disk_guard_to(
+    record: dict[str, Any], target: Any,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Every load-time guard for deferring the first UNET model.to() call.
+
+    Returns ``(ok, reason, evidence)``.  Fails closed on any unmet guard;
+    the caller then runs the real ``to()`` through the legacy path.
+    """
+    evidence: dict[str, Any] = {}
+    if target is None:
+        return False, "target_unresolved", evidence
+    _target_type = str(getattr(target, "type", "") or "").lower()
+    if _target_type != "cuda":
+        return False, f"target_not_cuda:{_target_type or 'none'}", evidence
+    evidence["target"] = str(target)
+    if not _fast_disk_high_vram():
+        return False, "not_high_vram", evidence
+    evidence["vram"] = "HIGH_VRAM"
+    with _FAST_DISK_UNET_LOCK:
+        patcher = dict(record.get("patcher") or {})
+    evidence["patcher"] = {
+        "class": f"{patcher.get('type_module', '')}.{patcher.get('type_name', '')}",
+        "is_dynamic": bool(patcher.get("is_dynamic", False)),
+    }
+    if not patcher:
+        return False, "patcher_unrecorded", evidence
+    if patcher.get("is_dynamic"):
+        return False, "dynamic_patcher", evidence
+    if (
+        patcher.get("type_name") != "ModelPatcher"
+        or patcher.get("type_module") != "comfy.model_patcher"
+    ):
+        return False, "patcher_not_plain_model_patcher", evidence
+    _tgt_key = _fast_disk_device_key(target)
+    _load_key = _fast_disk_device_key(patcher.get("load_device"))
+    _off_key = _fast_disk_device_key(patcher.get("offload_device"))
+    # Exact device guard: the plain patcher's load_device, offload_device,
+    # and the deferred target must ALL be equal AND all CUDA/non-CPU.  An
+    # OR/partial agreement is insufficient — any mismatch fails closed.
+    if (
+        _tgt_key is None
+        or _load_key is None
+        or _off_key is None
+        or _tgt_key != _load_key
+        or _load_key != _off_key
+    ):
+        return False, "deferred_target_mismatch", evidence
+    if _tgt_key[0] != "cuda":
+        return False, "deferred_target_not_cuda", evidence
+    evidence["load_device"] = str(patcher.get("load_device"))
+    evidence["offload_device"] = str(patcher.get("offload_device"))
+    evidence["target_device"] = str(target)
+    _mc = dict(record.get("model_config_evidence") or {})
+    evidence["model_config_evidence"] = _mc
+    if _mc.get("quant_config_present"):
+        return False, "quant_config_present", evidence
+    if _mc.get("custom_operations_present"):
+        return False, "custom_operations_present", evidence
+    if _mc.get("fp8_optimization"):
+        return False, "fp8_optimization", evidence
+    if _mc.get("force_channels_last"):
+        return False, "force_channels_last", evidence
+    if _fast_disk_torch_future_enabled():
+        return False, "torch_swap_module_params_future", evidence
+    if not _fast_disk_model_is_cpu_resident(_fast_disk_record_model(record)):
+        return False, "model_not_cpu_resident", evidence
+    evidence["torch_future"] = "disabled"
+    return True, "ok", evidence
+
+
+def _fast_disk_guard_bind(
+    record: dict[str, Any], args: tuple[Any, ...], kwargs: dict[str, Any],
+) -> tuple[bool, str, dict[str, Any]]:
+    """Bind-time guards over the state-dict values.
+
+    All prefix-matching state-dict entries must be exact plain
+    ``torch.Tensor`` values with a uniform source dtype equal to the
+    constructed diffusion-model parameter dtype, and the recorded patcher
+    must still be the exact plain non-dynamic ModelPatcher.  Returns
+    ``(ok, reason, evidence)``.
+    """
+    evidence: dict[str, Any] = {}
+    model = _fast_disk_record_model(record)
+    if model is None:
+        return False, "model_missing", evidence
+    with _FAST_DISK_UNET_LOCK:
+        patcher = dict(record.get("patcher") or {})
+    if not patcher or patcher.get("is_dynamic"):
+        return False, "dynamic_patcher", evidence
+    sd = args[0] if args else kwargs.get("sd")
+    unet_prefix = args[1] if len(args) > 1 else kwargs.get("unet_prefix", "")
+    if not isinstance(sd, Mapping):
+        return False, "sd_not_mapping", evidence
+    try:
+        import torch as _torch_fd
+    except Exception:
+        return False, "torch_unavailable", evidence
+    _first_param_dtype = None
+    for _p in model.parameters():
+        _first_param_dtype = getattr(_p, "dtype", None)
+        break
+    if _first_param_dtype is None:
+        return False, "no_model_parameters", evidence
+    evidence["param_dtype"] = str(_first_param_dtype)
+    _prefix = str(unet_prefix or "")
+    _dtypes: set = set()
+    _tensor_count = 0
+    _elem_count = 0
+    for _k, _v in sd.items():
+        if not str(_k).startswith(_prefix):
+            continue
+        if type(_v) is not _torch_fd.Tensor:
+            return False, "non_plain_tensor_sd", evidence
+        _dev_type = str(getattr(getattr(_v, "device", None), "type", "") or "").lower()
+        if _dev_type != "cpu":
+            return False, "sd_tensor_not_cpu", evidence
+        _dtypes.add(_v.dtype)
+        _tensor_count += 1
+        try:
+            _elem_count += int(_v.numel())
+        except Exception:
+            pass
+        if len(_dtypes) > 1:
+            return False, "sd_dtype_not_uniform", evidence
+    if _tensor_count == 0:
+        return False, "no_prefix_sd_tensors", evidence
+    _only_dtype = next(iter(_dtypes))
+    if _only_dtype != _first_param_dtype:
+        return False, f"sd_dtype_mismatch:{_only_dtype}!={_first_param_dtype}", evidence
+    evidence["sd_tensor_count"] = _tensor_count
+    evidence["sd_dtype"] = str(_only_dtype)
+    evidence["sd_elem_count"] = _elem_count
+    return True, "ok", evidence
+
+
+def _fast_disk_parameter_accounting(model: Any) -> dict[str, Any]:
+    """Cheap parameter metadata accounting — never hashes 12.31 GB."""
+    accounting: dict[str, Any] = {
+        "param_count": 0,
+        "parameter_bytes": 0,
+        "dtype_distribution": {},
+        "device_distribution": {},
+        "cpu_param_count": 0,
+        "cpu_buffer_count": 0,
+    }
+    if model is None:
+        return accounting
+    try:
+        for _p in model.parameters():
+            accounting["param_count"] += 1
+            try:
+                accounting["parameter_bytes"] += int(_p.numel()) * int(_p.element_size())
+            except Exception:
+                pass
+            _dt = str(getattr(_p, "dtype", "")) or "unknown"
+            accounting["dtype_distribution"][_dt] = (
+                accounting["dtype_distribution"].get(_dt, 0) + 1
+            )
+            _dev = str(getattr(getattr(_p, "device", None), "type", "") or "").lower() or "unknown"
+            accounting["device_distribution"][_dev] = (
+                accounting["device_distribution"].get(_dev, 0) + 1
+            )
+            if _dev == "cpu":
+                accounting["cpu_param_count"] += 1
+    except Exception:
+        pass
+    try:
+        for _b in model.buffers():
+            _dev = str(getattr(getattr(_b, "device", None), "type", "") or "").lower() or "unknown"
+            if _dev == "cpu":
+                accounting["cpu_buffer_count"] += 1
+    except Exception:
+        pass
+    return accounting
+
+
+def _fast_disk_print_proof(
+    record: dict[str, Any], *, decision: str, reason: str, stage: str,
+    model: Any = None,
+) -> None:
+    try:
+        # *model* may be passed explicitly when the record was already
+        # dropped (complete event) — the live model still exists, so the
+        # accounting is always valid after cleanup.
+        _live = model if model is not None else _fast_disk_record_model(record)
+        _accounting = _fast_disk_parameter_accounting(_live)
+        with _FAST_DISK_UNET_LOCK:
+            _patcher = dict(record.get("patcher") or {})
+        _patcher_class = (
+            f"{_patcher.get('type_module', '')}.{_patcher.get('type_name', '')}"
+            if _patcher else "none"
+        )
+        _t = record.get("timings") or {}
+        print(
+            f"[v2.native_fast_disk_unet] decision={decision} reason={reason or 'ok'} "
+            f"stage={stage} "
+            f"patcher_class={_patcher_class} patcher_dynamic={int(bool(_patcher.get('is_dynamic', False)))} "
+            f"param_count={_accounting['param_count']} "
+            f"parameter_bytes={_accounting['parameter_bytes']} "
+            f"dtype_distribution={_accounting['dtype_distribution']} "
+            f"device_distribution={_accounting['device_distribution']} "
+            f"cpu_params={_accounting['cpu_param_count']} "
+            f"cpu_buffers={_accounting['cpu_buffer_count']} "
+            f"get_model_ms={_t.get('get_model_wall_ms')} "
+            f"ctor_ms={_t.get('ctor_wall_ms')} "
+            f"bind_ms={_t.get('bind_wall_ms')} "
+            f"to_wall_ms={_t.get('to_wall_ms')} "
+            f"to_device_ms={_t.get('to_device_ms')} "
+            f"to_device_ms_label={_t.get('to_device_ms_label', 'unavailable')}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+_FAST_DISK_EVENT_BY_DECISION: dict[str, str] = {
+    "defer": _EVENT_FAST_DISK_DEFER,
+    "skip": _EVENT_FAST_DISK_SKIP,
+    "complete": _EVENT_FAST_DISK_COMPLETE,
+}
+
+
+def _fast_disk_emit_event(
+    record: dict[str, Any], lane_trace: Any, *,
+    decision: str, reason: str, stage: str,
+    extra_meta: dict[str, Any] | None = None,
+    model: Any = None,
+) -> None:
+    """Emit one fast-disk decision event (defer/skip/complete) + proof line.
+
+    The ``complete`` decision carries the full accounting/proof fields and
+    accepts the live *model* explicitly so it stays valid even after the
+    deferral record has been dropped.
+    """
+    trace = _fast_disk_trace(lane_trace)
+    _event = _FAST_DISK_EVENT_BY_DECISION.get(decision)
+    _target = record.get("target")
+    _t = record.get("timings") or {}
+    _meta: dict[str, Any] = {
+        "decision": decision,
+        "reason": reason or "ok",
+        "stage": stage,
+        "target": str(_target) if _target is not None else "",
+        "get_model_ms": _t.get("get_model_wall_ms"),
+        "ctor_ms": _t.get("ctor_wall_ms"),
+    }
+    if decision == "complete":
+        _accounting = _fast_disk_parameter_accounting(
+            model if model is not None else _fast_disk_record_model(record)
+        )
+        with _FAST_DISK_UNET_LOCK:
+            _patcher = dict(record.get("patcher") or {})
+        _meta.update({
+            "patcher_class": (
+                f"{_patcher.get('type_module', '')}.{_patcher.get('type_name', '')}"
+                if _patcher else "none"
+            ),
+            "patcher_dynamic": bool(_patcher.get("is_dynamic", False)),
+            "native_assign": False,
+            "bind_assign": True,
+            "bind_ms": _t.get("bind_wall_ms"),
+            "to_wall_ms": _t.get("to_wall_ms"),
+            "to_device_ms": _t.get("to_device_ms"),
+            "to_device_ms_label": _t.get("to_device_ms_label", "unavailable"),
+            **_accounting,
+        })
+    if extra_meta:
+        _meta.update(dict(extra_meta))
+    if trace is not None and _event is not None:
+        trace.emit(_event, phase="restore", metadata=_meta)
+    _fast_disk_print_proof(
+        record, decision=decision, reason=reason, stage=stage, model=model,
+    )
+
+
+def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
+    """Replay the deferred REAL original ``model.to(target)`` exactly once.
+
+    Measures the Python wall (enqueue) time and, when CUDA supports events,
+    an explicitly synchronized/device measurement for the real transfer.
+    Emits ``unet_fast_disk_to_start/end`` with the labels.  Returns the
+    original ``to()`` result (normally the module itself).
+    """
+    model = _fast_disk_record_model(record)
+    original_to = record.get("original_to")
+    to_args = record.get("to_args") or ()
+    to_kwargs = record.get("to_kwargs") or {}
+    target = record.get("target")
+    if model is None or original_to is None:
+        return model
+    trace = _fast_disk_trace(lane_trace)
+    _start_ns = time.monotonic_ns()
+    _torch_rp = None
+    _ev_start = None
+    _ev_end = None
+    try:
+        import torch as _torch_rp_import
+        _torch_rp = _torch_rp_import
+        _cuda = getattr(_torch_rp, "cuda", None)
+        if (
+            _cuda is not None
+            and callable(getattr(_cuda, "is_available", None))
+            and _cuda.is_available()
+            and target is not None
+            and str(getattr(target, "type", "") or "") == "cuda"
+            and getattr(_cuda, "Event", None) is not None
+        ):
+            _ev_start = _cuda.Event(enable_timing=True)
+            _ev_end = _cuda.Event(enable_timing=True)
+            _ev_start.record()
+    except Exception:
+        _torch_rp = None
+        _ev_start = _ev_end = None
+    _device_ms: float | None = None
+    if trace is not None:
+        trace.emit(_EVENT_FAST_DISK_TO_START, phase="restore", metadata={
+            "target": str(target) if target is not None else "",
+            "measurement": (
+                "wall_and_synchronized_device"
+                if (_ev_start is not None and _ev_end is not None)
+                else "wall_only"
+            ),
+        })
+    try:
+        return original_to(model, *to_args, **to_kwargs)
+    finally:
+        _wall_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+        if _ev_start is not None and _ev_end is not None and _torch_rp is not None:
+            try:
+                _ev_end.record()
+                _torch_rp.cuda.synchronize()
+                _device_ms = round(float(_ev_start.elapsed_time(_ev_end)), 3)
+            except Exception:
+                _device_ms = None
+        record["timings"]["to_wall_ms"] = _wall_ms
+        record["timings"]["to_device_ms"] = _device_ms
+        record["timings"]["to_device_ms_label"] = (
+            "synchronized_device" if _device_ms is not None else "unavailable"
+        )
+        if trace is not None:
+            trace.emit(_EVENT_FAST_DISK_TO_END, phase="restore", metadata={
+                "target": str(target) if target is not None else "",
+                "wall_ms": _wall_ms,
+                "device_ms": _device_ms,
+                "device_ms_label": record["timings"]["to_device_ms_label"],
+                "measurement": (
+                    "wall_and_synchronized_device"
+                    if _device_ms is not None
+                    else "wall_only"
+                ),
+            })
+
+
+def _fast_disk_maybe_defer_to(
+    model: Any, args: tuple[Any, ...], kwargs: dict[str, Any],
+    lane_trace: Any, original_to: Callable[..., Any],
+) -> str:
+    """Attempt to defer exactly one eligible first UNET model.to() call.
+
+    Returns ``"deferred"`` (the real original to() is replayed later by the
+    load_model_weights wrapper), ``"skip"`` (a guard failed or the window
+    closed — the caller runs the real to() through the legacy path), or
+    ``"no_window"`` (no fast-disk window — legacy path, no fast-disk
+    events).
+    """
+    record = _fast_disk_record_for(model)
+    if record is None:
+        return "no_window"
+    with _FAST_DISK_UNET_LOCK:
+        status = record.get("status")
+    if status == "deferred":
+        # Safety net (not the native flow): a second to() before the bind.
+        # Replay the deferred real to() and close the window; the current
+        # to() then runs through the legacy path.
+        _fast_disk_emit_event(record, lane_trace, decision="skip",
+                              reason="second_to_before_bind", stage="to",
+                              extra_meta={"status": "deferred"})
+        try:
+            _fast_disk_replay_to(record, lane_trace)
+        finally:
+            _fast_disk_drop_record(model)
+        return "skip"
+    if status != "constructed":
+        return "no_window"
+    target = _fast_disk_resolve_to_target(args, kwargs)
+    _ok, _reason, _evidence = _fast_disk_guard_to(record, target)
+    if not _ok:
+        _fast_disk_emit_event(record, lane_trace, decision="skip",
+                              reason=_reason, stage="to", extra_meta=_evidence)
+        _fast_disk_drop_record(model)
+        return "skip"
+    with _FAST_DISK_UNET_LOCK:
+        record["to_args"] = args
+        record["to_kwargs"] = dict(kwargs)
+        record["original_to"] = original_to
+        record["target"] = target
+        record["status"] = "deferred"
+    _fast_disk_emit_event(record, lane_trace, decision="defer", reason="ok",
+                          stage="to", extra_meta=_evidence)
+    return "deferred"
+
+
+def _fast_disk_handle_bind(
+    model: Any, load_weights: Callable[..., Any], args: tuple[Any, ...],
+    kwargs: dict[str, Any], lane_trace: Any,
+) -> Any:
+    """Run the bind-then-replay fast path when a deferred to() exists.
+
+    Returns the load result when the fast path handled the call, or None
+    when no deferral window exists (the legacy path runs unchanged).
+
+    Fast ordering (all guards green):
+      original load_model_weights(assign=True)  -> bind
+      exactly one REAL original model.to(target) -> replay
+    Any failed guard replays the deferred real model.to(target) BEFORE
+    invoking the original load_model_weights with its ORIGINAL assign
+    value, preserving the legacy order and exceptions exactly.  The
+    deferral record is always removed on every path.
+    """
+    record = _fast_disk_record_for(model)
+    if record is None:
+        return None
+    with _FAST_DISK_UNET_LOCK:
+        status = record.get("status")
+    if status != "deferred":
+        # No deferred to(): nothing to replay.  Close any stale window and
+        # let the legacy path run unchanged.
+        _fast_disk_drop_record(model)
+        return None
+    trace = _fast_disk_trace(lane_trace)
+    original_assign = kwargs.get("assign", False)
+
+    def _legacy_replay_then_load(reason: str, evidence: dict[str, Any]) -> Any:
+        """Guard failure: legacy ordering — deferred real to() first, then
+        the original load_model_weights with its ORIGINAL assign value."""
+        _fast_disk_emit_event(record, lane_trace, decision="skip",
+                              reason=reason, stage="bind", extra_meta=evidence)
+        try:
+            _fast_disk_replay_to(record, lane_trace)
+        finally:
+            _fast_disk_drop_record(model)
+        return load_weights(*args, **kwargs)
+
+    _ok, _reason, _evidence = _fast_disk_guard_bind(record, args, kwargs)
+    if not _ok:
+        return _legacy_replay_then_load(_reason, _evidence)
+    if original_assign is not False:
+        return _legacy_replay_then_load(
+            f"native_assign_not_false:{original_assign!r}",
+            {"native_assign": repr(original_assign)},
+        )
+
+    # ── Fast path: bind with assign=True, then replay the real to() ──
+    if trace is not None:
+        trace.emit(_EVENT_FAST_DISK_BIND_START, phase="restore", metadata={
+            "decision": "bind",
+            "native_assign": False,
+            "bind_assign": True,
+        })
+    _bind_start_ns = time.monotonic_ns()
+    try:
+        _bind_kwargs = dict(kwargs)
+        _bind_kwargs["assign"] = True
+        result = load_weights(*args, **_bind_kwargs)
+    except BaseException:
+        # The bind failed.  Restore the legacy ordering (replay the deferred
+        # real to()) so the model state is as close as possible to the native
+        # failure point, then re-raise the ORIGINAL exception.  Cleanup runs
+        # on every path.
+        try:
+            try:
+                _fast_disk_replay_to(record, lane_trace)
+            except BaseException:
+                pass
+        finally:
+            _fast_disk_drop_record(model)
+        raise
+    record["timings"]["bind_wall_ms"] = round(
+        (time.monotonic_ns() - _bind_start_ns) / 1_000_000, 3
+    )
+    if trace is not None:
+        trace.emit(_EVENT_FAST_DISK_BIND_END, phase="restore", metadata={
+            "decision": "bind",
+            "bind_wall_ms": record["timings"]["bind_wall_ms"],
+        })
+    # Exactly one REAL original model.to(target).
+    try:
+        _fast_disk_replay_to(record, lane_trace)
+    finally:
+        _fast_disk_drop_record(model)
+    # The complete event/proof runs AFTER the record cleanup, so it receives
+    # the live model explicitly — the accounting stays valid.
+    _fast_disk_emit_event(record, lane_trace, decision="complete", reason="ok",
+                          stage="load_model_weights", model=model)
+    return result
+
+
 # ── UNET model construction wrappers ────────────────────────────────
 # Wrap ModelPatcher/CoreModelPatcher constructors and model.to() so
 # model-construction children are captured in measured_direct_children_ms.
@@ -3282,6 +4095,14 @@ def _make_model_patcher_constructor_wrapper(original):
     ``_clip_cpu_prepare_children`` — they are nested inside
     ``load_text_encoder_state_dicts`` which is the direct measured owner.
     UNET-lane spans are recorded into ``_child_durations`` as before.
+
+    Literal timing ownership: the constructor duration ends immediately
+    after the native ``__init__`` returns.  The existing
+    ``ensure_sampling_timing_wrapper`` and ``register_unet_forward_probe``
+    helpers execute AFTER that span (never inside it), so their cost is
+    never attributed to the literal ModelPatcher constructor.  Under
+    ``COMFYMODAL_V2_NATIVE_FAST_DISK_UNET`` the exact patcher is also
+    recorded for the fast-disk deferral window (UNET lane only).
     """
     import functools as _ft
 
@@ -3295,11 +4116,38 @@ def _make_model_patcher_constructor_wrapper(original):
             lane._trace.emit("unet_model_patcher_constructor_start", phase="restore")
         elif emit_clip:
             lane._trace.emit("clip_model_patcher_constructor_start", phase="restore")
+        _success = False
+        result = None
+        _ctor_dur_ms: float | None = None
         try:
             result = original(self, *args, **kwargs)
-            # Install SAMPLER_SAMPLE wrapper via the shared helper.
-            # The helper itself emits a concise exception-type line and returns
-            # False on failure — never silently swallows installation failure.
+            _success = True
+        finally:
+            # ── Literal constructor timing ownership ──────────────────
+            # The duration ends immediately after the native __init__
+            # returns.  Helper installation below (ensure_sampling_timing_
+            # wrapper / register_unet_forward_probe) runs AFTER this span.
+            if emit_unet:
+                _ctor_dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("unet_model_patcher_constructor_end", phase="restore", metadata={
+                    "duration_ms": _ctor_dur_ms})
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(("model_patcher_constructor", _ctor_dur_ms))
+            elif emit_clip:
+                _ctor_dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("clip_model_patcher_constructor_end", phase="restore", metadata={
+                    "duration_ms": _ctor_dur_ms})
+                # NOT recorded into _clip_cpu_prepare_children — nested inside
+                # load_text_encoder_state_dicts which is the direct measured owner.
+        if _success:
+            # ── V2 native fast-disk UNET: record the exact patcher ──
+            if _NATIVE_FAST_DISK_UNET and emit_unet:
+                _fast_disk_record_patcher(self, duration_ms=_ctor_dur_ms)
+            # Helpers execute AFTER the measured constructor span (never
+            # inside it).  The SAMPLER_SAMPLE helper emits a concise
+            # exception-type line and returns False on failure — never
+            # silently swallows installation failure.
             if hasattr(self, "model_options"):
                 from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
                 ensure_sampling_timing_wrapper(self)
@@ -3311,33 +4159,36 @@ def _make_model_patcher_constructor_wrapper(original):
                 _reg_unet(self, source="model_patcher_constructor")
             except Exception:
                 pass
-            return result
-        finally:
-            if emit_unet:
-                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
-                lane._trace.emit("unet_model_patcher_constructor_end", phase="restore", metadata={
-                    "duration_ms": _dur_ms})
-                _children = _child_durations.get()
-                if _children is not None:
-                    _children.append(("model_patcher_constructor", _dur_ms))
-            elif emit_clip:
-                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
-                lane._trace.emit("clip_model_patcher_constructor_end", phase="restore", metadata={
-                    "duration_ms": _dur_ms})
-                # NOT recorded into _clip_cpu_prepare_children — nested inside
-                # load_text_encoder_state_dicts which is the direct measured owner.
+        return result
     setattr(wrapper, _SENTINEL_MODEL_PATCHER, True)
     return wrapper
 
 
 def _make_model_to_wrapper(original):
-    """Wrap ``model.to(...)`` with UNET-lane guard for direct ownership measurement."""
+    """Wrap ``model.to(...)`` with UNET-lane guard for direct ownership measurement.
+
+    Under ``COMFYMODAL_V2_NATIVE_FAST_DISK_UNET`` (default off) the wrapper
+    additionally defers exactly ONE eligible first UNET ``model.to(cuda)``
+    call — the one native ``load_diffusion_model_state_dict`` performs
+    between ModelPatcher construction and ``load_model_weights``.  The
+    deferred REAL original ``model.to`` is replayed by the per-instance
+    ``load_model_weights`` wrapper AFTER the bind.  When no fast-disk
+    window is open (or the flag is off) the wrapper behaves exactly as
+    before.
+    """
     import functools as _ft
 
     @_ft.wraps(original)
     def wrapper(self, *args: Any, **kwargs: Any) -> Any:
         lane = _ACTIVE_LANE_TRACE.get()
         emit = (lane is not None and lane._lane == "UNET")
+        # ── V2 native fast-disk UNET: try to defer exactly one to() ──
+        if emit and _NATIVE_FAST_DISK_UNET:
+            _decision = _fast_disk_maybe_defer_to(self, args, kwargs, lane, original)
+            if _decision == "deferred":
+                # The deferred real original to() is replayed after the bind
+                # (load_model_weights wrapper).  Module.to returns self.
+                return self
         _fn_start_ns = time.monotonic_ns() if emit else 0
         if emit:
             lane._trace.emit("unet_model_to_start", phase="restore")
@@ -4295,6 +5146,195 @@ def _install_cast_to_device_wrapper(*, mm_module: Any, trace: RuntimeTrace | Non
     return "installed"
 
 
+def _capture_cuda_memory_no_init() -> dict[str, Any]:
+    result: dict[str, Any] = {"cuda_initialized": False, "cuda_no_sync": True}
+    try:
+        import torch as _torch
+        if _torch.cuda.is_initialized():
+            result["cuda_initialized"] = True
+            result["cuda_allocated_bytes"] = int(_torch.cuda.memory_allocated())
+            result["cuda_reserved_bytes"] = int(_torch.cuda.memory_reserved())
+    except Exception:
+        pass
+    return result
+
+
+def _clip_span_snapshot(*, with_cuda: bool) -> dict[str, Any]:
+    snap: dict[str, Any] = {
+        "wall_unix_ns": time.time_ns(),
+        "counters": _capture_phase_counters(),
+        "pagefaults": _PageFaultSnapshot.now(),
+    }
+    if with_cuda:
+        snap["cuda"] = _capture_cuda_memory_no_init()
+    return snap
+
+
+def _clip_span_end_metadata(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    _deltas = _phase_counter_deltas(before["counters"], after["counters"])
+    _self_pf = _pagefault_delta(before["pagefaults"], after["pagefaults"])
+    return {
+        "duration_ms": _deltas.get("wall_ms"),
+        "thread_cpu_ms": _deltas.get("thread_cpu_ms"),
+        "process_cpu_ms": _deltas.get("process_cpu_ms"),
+        "thread_minor_faults": _deltas.get("minor_faults"),
+        "thread_major_faults": _deltas.get("major_faults"),
+        "process_minor_faults": _self_pf.get("minor_faults"),
+        "process_major_faults": _self_pf.get("major_faults"),
+    }
+
+
+def _clip_cuda_delta_metadata(
+    before: dict[str, Any] | None, after: dict[str, Any] | None,
+) -> dict[str, Any]:
+    _before = before or {}
+    _after = after or {}
+    _meta: dict[str, Any] = {
+        "cuda_no_sync": True,
+        "cuda_initialized_before": bool(_before.get("cuda_initialized", False)),
+        "cuda_initialized_after": bool(_after.get("cuda_initialized", False)),
+    }
+    if _meta["cuda_initialized_before"] and _meta["cuda_initialized_after"]:
+        _meta["cuda_allocated_before_bytes"] = _before.get("cuda_allocated_bytes", 0)
+        _meta["cuda_allocated_after_bytes"] = _after.get("cuda_allocated_bytes", 0)
+        _meta["cuda_allocated_delta_bytes"] = (
+            _after.get("cuda_allocated_bytes", 0) - _before.get("cuda_allocated_bytes", 0)
+        )
+        _meta["cuda_reserved_before_bytes"] = _before.get("cuda_reserved_bytes", 0)
+        _meta["cuda_reserved_after_bytes"] = _after.get("cuda_reserved_bytes", 0)
+        _meta["cuda_reserved_delta_bytes"] = (
+            _after.get("cuda_reserved_bytes", 0) - _before.get("cuda_reserved_bytes", 0)
+        )
+    return _meta
+
+
+def _active_clip_span_trace() -> RuntimeTrace | None:
+    trace = _ACTIVE_REQUEST_TRACE.get()
+    if trace is not None:
+        return trace
+    lane = _ACTIVE_LANE_TRACE.get()
+    if lane is not None:
+        return getattr(lane, "_trace", None)
+    return None
+
+
+def _make_clip_span_wrapper(
+    span_name: str,
+    depth_var: ContextVar[int],
+    original: Callable[..., Any],
+    *,
+    with_cuda: bool = False,
+    pre_hook: Callable[[tuple[Any, ...], dict[str, Any]], None] | None = None,
+) -> Callable[..., Any]:
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        before = depth_var.get()
+        depth_var.set(before + 1)
+        trace = _active_clip_span_trace()
+        emit = before == 0 and trace is not None
+        _before = _clip_span_snapshot(with_cuda=with_cuda) if emit else None
+        _status = "ok"
+        if emit and trace is not None:
+            trace.emit_at(
+                f"{span_name}_start",
+                wall_unix_ns=_before["wall_unix_ns"],
+                monotonic_ns=_before["counters"]["mono_ns"],
+                phase="execution",
+                metadata={"clip_span": span_name},
+            )
+        if emit and pre_hook is not None:
+            try:
+                pre_hook(args, kwargs)
+            except Exception:
+                pass
+        try:
+            return original(*args, **kwargs)
+        except BaseException:
+            _status = "error"
+            raise
+        finally:
+            after = depth_var.get()
+            depth_var.set(after - 1)
+            if emit and trace is not None:
+                _after = _clip_span_snapshot(with_cuda=with_cuda)
+                _meta = _clip_span_end_metadata(_before, _after)
+                if with_cuda:
+                    _meta.update(_clip_cuda_delta_metadata(_before.get("cuda"), _after.get("cuda")))
+                _meta["status"] = _status
+                trace.emit_at(
+                    f"{span_name}_end",
+                    wall_unix_ns=_after["wall_unix_ns"],
+                    monotonic_ns=_after["counters"]["mono_ns"],
+                    phase="execution",
+                    metadata=_meta,
+                )
+
+    setattr(wrapper, _SENTINEL_CLIP_SPAN, True)
+    return wrapper
+
+
+def _ensure_clip_forward_wrapper(clip: Any) -> str:
+    csm = getattr(clip, "cond_stage_model", None)
+    if csm is None:
+        return "unavailable"
+    _cls = type(csm)
+    _orig = getattr(_cls, "encode_token_weights", None)
+    if not callable(_orig):
+        return "unavailable"
+    if getattr(_orig, _SENTINEL_CLIP_FORWARD, False):
+        return "already_installed"
+    _wrapped = _make_clip_span_wrapper(
+        "clip_forward", _clip_forward_depth, _orig, with_cuda=True,
+    )
+    setattr(_wrapped, _SENTINEL_CLIP_FORWARD, True)
+    setattr(_cls, "encode_token_weights", _wrapped)
+    return "installed"
+
+
+def _clip_raw_encode_pre_hook(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    clip = args[0] if args else None
+    if clip is not None:
+        _ensure_clip_forward_wrapper(clip)
+
+
+def _install_clip_span_wrappers(
+    sd_mod: Any = None, trace: RuntimeTrace | None = None,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if sd_mod is None:
+        sd_mod = _get_live_module("comfy.sd")
+    if sd_mod is None:
+        return result
+    CLIP_cls = getattr(sd_mod, "CLIP", None)
+    if CLIP_cls is None:
+        return result
+    _specs = (
+        ("clip_tokenize", "tokenize", _clip_tokenize_depth, False, None),
+        ("clip_gpu_prepare", "load_model", _clip_gpu_prepare_depth, True, None),
+        ("clip_raw_encode", "encode_from_tokens", _clip_raw_encode_depth, False, _clip_raw_encode_pre_hook),
+        ("clip_scheduled_conditioning", "encode_from_tokens_scheduled", _clip_scheduled_depth, False, None),
+    )
+    with _wrappers_lock:
+        for span_name, method_name, depth_var, with_cuda, pre_hook in _specs:
+            _orig = getattr(CLIP_cls, method_name, None)
+            if not callable(_orig):
+                result[span_name] = "unavailable"
+                continue
+            if getattr(_orig, _SENTINEL_CLIP_SPAN, False):
+                result[span_name] = "already_installed"
+                continue
+            setattr(
+                CLIP_cls, method_name,
+                _make_clip_span_wrapper(
+                    span_name, depth_var, _orig, with_cuda=with_cuda, pre_hook=pre_hook,
+                ),
+            )
+            result[span_name] = "installed"
+    return result
+
+
 def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     """Idempotent per-component installation using live modules.
 
@@ -4345,6 +5385,8 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     _clip_result = _install_clip_wrapper(trace=trace)
     result["comfy.sd.load_clip"] = _clip_result
 
+    result.update(_install_clip_span_wrappers(trace=trace))
+
     # Emit diagnostic events when a trace is available.
     if trace is not None:
         for component, status in result.items():
@@ -4364,6 +5406,11 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
 
     # Install NextDiT forward pre-hook for forward-probe diagnostics.
     result["nextdit_forward_pre_hook"] = "installed" if install_nextdit_forward_pre_hook() else "unavailable"
+
+    # Belt-and-braces: existing lane/bridge paths that run _ensure_core_wrappers
+    # also install the flag-gated graph-time UNET loader wrapper (idempotent;
+    # inert when the flag is off).
+    result["graph_unet_loader"] = _install_graph_unet_loader_wrapper(trace=trace)
 
     return result
 
@@ -4497,6 +5544,7 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
         lane._trace.emit("unet_model_config_get_model_start", phase="restore")
         _nest_before = _unet_subfn_nesting_depth.get()
         _unet_subfn_nesting_depth.set(_nest_before + 1)
+        model = None
         try:
             model = get_model(*args, **kwargs)
             _instrument_unet_model_weights(model, lane)
@@ -4508,6 +5556,15 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
             children = _child_durations.get()
             if _nest_before == 0 and children is not None:
                 children.append(("model_config_get_model", duration_ms))
+            # ── V2 native fast-disk UNET: open the deferral window ──
+            # The existing get_model span remains the model-construction
+            # Python-wall attribution; the window lets the later nn.Module.to
+            # and per-instance load_model_weights wrappers defer exactly one
+            # eligible first to().  No-op when the flag is off.
+            if _NATIVE_FAST_DISK_UNET and model is not None:
+                _fast_disk_open_window(
+                    model, model_config, lane, get_model_wall_ms=duration_ms,
+                )
 
     setattr(wrapped_get_model, _SENTINEL_SUBFN, True)
     try:
@@ -4528,6 +5585,15 @@ def _instrument_unet_model_weights(model: Any, lane: "ModelLaneTrace") -> None:
         _nest_before = _unet_subfn_nesting_depth.get()
         _unet_subfn_nesting_depth.set(_nest_before + 1)
         try:
+            # ── V2 native fast-disk UNET: bind-then-replay when a deferred
+            # to() exists.  Returns the result when the fast path handled the
+            # call; None means the legacy path runs unchanged. ──
+            if _NATIVE_FAST_DISK_UNET:
+                _fast_result = _fast_disk_handle_bind(
+                    model, load_weights, args, kwargs, lane,
+                )
+                if _fast_result is not None:
+                    return _fast_result
             return load_weights(*args, **kwargs)
         finally:
             _unet_subfn_nesting_depth.set(_nest_before)
@@ -4667,6 +5733,121 @@ def _ensure_unet_decompose_wrappers(trace: RuntimeTrace | None = None) -> dict[s
         result.update(subfn_result)
         _unet_decompose_ensure_done = True
         return result
+
+
+# ── V2 native fast-disk UNET: graph-time UNETLoader wrapper ──────────────
+# With COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=0 the restore-time wrapper
+# installers (external_model_lane_scope, coordinator lanes, V2LoaderBridge
+# via CPU-snapshot activation) never run, so the graph-time UNETLoader would
+# execute an un-instrumented ``comfy.sd.load_diffusion_model`` and the
+# flag-gated fast-disk hooks (get_model window, patcher record, nn.Module.to
+# defer, load_model_weights bind) plus ``register_unet_forward_probe`` /
+# ``ensure_sampling_timing_wrapper`` (installed by the ModelPatcher ctor
+# wrapper) would never engage.  This wrapper closes that gap: it wraps the
+# live ``comfy.sd.load_diffusion_model`` (flag-gated, sentinel-idempotent,
+# coexisting with any pre-existing wrapper such as comfyapp's
+# ``_cached_load_diff``) and, for the duration of each graph load, ensures
+# the instrumentation installers ran and binds a UNET lane to the current
+# request trace.
+
+_SENTINEL_GRAPH_UNET_LOADER = "_comfy_modal_graph_unet_loader_wrapper"
+_graph_unet_loader_wrapper_installed: bool = False
+
+
+def _install_graph_unet_loader_wrapper(trace: RuntimeTrace | None = None) -> str:
+    """Install the graph-time UNETLoader wrapper on ``comfy.sd.load_diffusion_model``.
+
+    Gated on ``_NATIVE_FAST_DISK_UNET`` (flag off = inert no-op; the live
+    function is never touched, so flag-off behavior is byte-identical).
+    Idempotent via ``_SENTINEL_GRAPH_UNET_LOADER`` and the module-level
+    ``_graph_unet_loader_wrapper_installed`` flag; coexists with any
+    pre-existing wrapper on the live function (e.g. comfyapp's
+    ``_cached_load_diff``) by wrapping whatever is currently the outermost
+    callable.  Returns a status string:
+    ``"inert_flag_off"`` / ``"already_installed"`` / ``"unavailable"`` /
+    ``"installed"``.
+
+    The wrapper body, for each graph-time UNET load:
+      (a) calls ``_ensure_core_wrappers(trace)`` then
+          ``_ensure_unet_decompose_wrappers(trace)`` — both idempotent;
+          install order matters, so the ensures run BEFORE the lane is set;
+      (b) when no UNET lane is already active, binds a ``ModelLaneTrace``
+          (lane="UNET", phase="execution") to the current request trace for
+          the duration of the call, restoring the previous ContextVar token
+          in ``finally``;
+      (c) invokes the original ``load_diffusion_model`` and returns its
+          result.
+    """
+    if not _NATIVE_FAST_DISK_UNET:
+        return "inert_flag_off"
+    global _graph_unet_loader_wrapper_installed
+    if _graph_unet_loader_wrapper_installed:
+        return "already_installed"
+    sd_mod = _get_live_module("comfy.sd")
+    if sd_mod is None:
+        return "unavailable"
+    original = getattr(sd_mod, "load_diffusion_model", None)
+    if not callable(original):
+        return "unavailable"
+    if getattr(original, _SENTINEL_GRAPH_UNET_LOADER, False):
+        _graph_unet_loader_wrapper_installed = True
+        return "already_installed"
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        # (a) instrumentation installers first — both idempotent.  Install
+        # order matters: ensure BEFORE the lane is set so the wrappers' own
+        # install events do not land inside the load lane.
+        _request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _ensure_core_wrappers(trace=_request_trace)
+        _ensure_unet_decompose_wrappers(trace=_request_trace)
+        # (b) bind a UNET lane to the current request trace when no UNET
+        # lane is already active; restore the previous token in finally.
+        # Lane binding requires a live request trace — when it is None the
+        # wrapper degrades to the safe legacy path (original called directly,
+        # no instrumentation, no crash).
+        _active_lane = _ACTIVE_LANE_TRACE.get()
+        _token = None
+        if (
+            _request_trace is not None
+            and (_active_lane is None or getattr(_active_lane, "_lane", None) != "UNET")
+        ):
+            _lane_trace = ModelLaneTrace(
+                _request_trace, "UNET", phase="execution", expected_read_count=1,
+            )
+            _token = _ACTIVE_LANE_TRACE.set(_lane_trace)
+        try:
+            # (c) invoke the original and return its result.
+            return original(*args, **kwargs)
+        finally:
+            if _token is not None:
+                _ACTIVE_LANE_TRACE.reset(_token)
+
+    setattr(wrapper, _SENTINEL_GRAPH_UNET_LOADER, True)
+    sd_mod.load_diffusion_model = wrapper
+    _graph_unet_loader_wrapper_installed = True
+    return "installed"
+
+
+def _ensure_graph_unet_loader_wrapper_lazy(trace: RuntimeTrace | None = None) -> str:
+    """Flag-gated lazy install for ``runtime_bootstrap.restore``.
+
+    Attempts the install once; when ``comfy.sd`` is not yet importable it
+    retries once after a tiny bounded yield, then reports ``"unavailable"``
+    so the belt-and-braces ``_ensure_core_wrappers`` line retries once the
+    module is live.  Flag off returns ``"inert_flag_off"`` without touching
+    anything.  Never masks a flag-on install failure (it re-raises).
+    """
+    try:
+        _status = _install_graph_unet_loader_wrapper(trace=trace)
+        if _status == "unavailable":
+            time.sleep(0.01)
+            _status = _install_graph_unet_loader_wrapper(trace=trace)
+        return _status
+    except Exception:
+        if not _NATIVE_FAST_DISK_UNET:
+            return "inert_flag_off"
+        raise
 
 
 # ── Phase 1-2: state machine and mutation lane ──────────────────────
@@ -8113,9 +9294,16 @@ class V2LoaderBridge:
                 _cc_ctx = _build_clip_conditioning_cache_context(
                     self, clip=clip, trace=trace, request_id=_request_id,
                 )
+                _cc_lookup_start = time.monotonic_ns()
                 _cc_key_info = conditioning_cache_key_summary(_cc_ctx, filtered)
                 _cc_hits, _cc_miss_entries, _cc_hit_count, _cc_miss_count = (
                     _cc_cache_svc.lookup_many(_cc_ctx, filtered)
+                )
+                _cc_lookup_wall_ms = round(
+                    (time.monotonic_ns() - _cc_lookup_start) / 1_000_000, 3
+                )
+                _cc_lookup_diag = dict(
+                    getattr(_cc_cache_svc, "latest_lookup_diagnostics", lambda: {})() or {}
                 )
                 if trace:
                     trace.emit(
@@ -8125,6 +9313,8 @@ class V2LoaderBridge:
                             "hit_count": _cc_hit_count,
                             "miss_count": _cc_miss_count,
                             "entry_count": len(filtered),
+                            "lookup_wall_ms": _cc_lookup_wall_ms,
+                            "lookup_diagnostics": _cc_lookup_diag,
                         },
                     )
                 for _cc_index, _cc_value in _cc_hits.items():
@@ -8162,6 +9352,18 @@ class V2LoaderBridge:
                                 "entry_count": len(filtered),
                             },
                         )
+                if _cc_miss_count > 0:
+                    log_conditioning_cache_decision(
+                        "miss", key_hash=_cc_key_info["key_hash"],
+                        identity_status=_cc_key_info["identity_status"],
+                        schema_version=_cc_key_info["schema_version"],
+                        validation_scope=_cc_key_info["validation_scope"],
+                        hit_count=_cc_hit_count,
+                        miss_count=_cc_miss_count,
+                        entries=len(filtered),
+                        lookup_wall_ms=_cc_lookup_wall_ms,
+                        request_id=_request_id or "absent",
+                    )
             # The existing activation hooks run only when the encode loop
             # will actually run (miss or partial).  On an exact hit the
             # activation was already scheduled above with
@@ -8206,6 +9408,8 @@ class V2LoaderBridge:
             results: dict[tuple[int, str], Any] = dict(_cc_hit_results)
             _cc_stored = 0
             _cc_encode_calls = 0
+            _cc_cache_store_wall_ms = 0.0
+            _cc_cache_store_calls = 0
             if not _cc_exact_hit:
                 record_clip_encode_start(_request_id, _encode_start)
                 if trace:
@@ -8225,7 +9429,13 @@ class V2LoaderBridge:
                         _cc_encode_calls += 1
                         results[(id(clip), text)] = result
                         if _cc_cache_svc is not None:
-                            if _cc_cache_svc.store_entry(_cc_ctx, entry, result):
+                            _cc_store_start_ns = time.monotonic_ns()
+                            _cc_store_ok = _cc_cache_svc.store_entry(_cc_ctx, entry, result)
+                            _cc_cache_store_calls += 1
+                            _cc_cache_store_wall_ms += max(
+                                0, time.monotonic_ns() - _cc_store_start_ns
+                            ) / 1_000_000
+                            if _cc_store_ok:
                                 _cc_stored += 1
                     except Exception as exc:
                         if trace:
@@ -8233,6 +9443,16 @@ class V2LoaderBridge:
                                        phase="execution",
                                        metadata={"error": str(exc)[:200],
                                                  "text_length": len(text)})
+            _cc_encode_loop_wall_ms: float | None = None
+            if not _cc_exact_hit:
+                _cc_encode_loop_wall_ms = round(
+                    max(0, time.monotonic_ns() - _encode_start["mono_ns"]) / 1_000_000, 3
+                )
+            _cc_store_diag: dict[str, Any] = {}
+            if _cc_cache_svc is not None:
+                _cc_store_diag = dict(
+                    getattr(_cc_cache_svc, "pop_store_diagnostics", lambda: {})() or {}
+                )
             if _cc_stored:
                 _cc_stored_key_info = conditioning_cache_key_summary(
                     _cc_ctx, _cc_miss_entries
@@ -8241,6 +9461,10 @@ class V2LoaderBridge:
                     "miss_stored", key_hash=_cc_stored_key_info["key_hash"],
                     identity_status=_cc_stored_key_info["identity_status"],
                     encode_calls=_cc_encode_calls,
+                    encode_loop_wall_ms=_cc_encode_loop_wall_ms,
+                    cache_store_wall_ms=round(_cc_cache_store_wall_ms, 3),
+                    cache_store_calls=_cc_cache_store_calls,
+                    store_diagnostics=_cc_store_diag,
                     schema_version=_cc_stored_key_info["schema_version"],
                     validation_scope=_cc_stored_key_info["validation_scope"],
                     stored=_cc_stored,
@@ -8259,6 +9483,10 @@ class V2LoaderBridge:
                             "validation_scope": _cc_stored_key_info["validation_scope"],
                             "stored_count": _cc_stored,
                             "encode_calls": _cc_encode_calls,
+                            "encode_loop_wall_ms": _cc_encode_loop_wall_ms,
+                            "cache_store_wall_ms": round(_cc_cache_store_wall_ms, 3),
+                            "cache_store_calls": _cc_cache_store_calls,
+                            "store_diagnostics": _cc_store_diag,
                         },
                     )
             elif _cc_cache_svc is not None and trace:
@@ -8268,6 +9496,10 @@ class V2LoaderBridge:
                     metadata={
                         "decision": "miss_not_stored",
                         "encode_calls": _cc_encode_calls,
+                        "encode_loop_wall_ms": _cc_encode_loop_wall_ms,
+                        "cache_store_wall_ms": round(_cc_cache_store_wall_ms, 3),
+                        "cache_store_calls": _cc_cache_store_calls,
+                        "store_diagnostics": _cc_store_diag,
                         "entry_count": len(_cc_miss_entries),
                         "reason": getattr(_cc_cache_svc, "last_store_reason", ""),
                     },
@@ -8827,7 +10059,48 @@ class V2LoaderBridge:
         _req_wd = request.get("weight_dtype", "default")
         # Resolve effective dtype for diagnostic logging (shared resolver)
         _eff_dtype, _eff_label = resolve_unet_effective_dtype(_req_wd)
-        result = self._invoke_original("UNETLoader", kwargs)
+        _loader_trace = _ACTIVE_REQUEST_TRACE.get() or self._trace
+        _loader_start_wall_ns = time.time_ns()
+        _loader_start_mono_ns = time.monotonic_ns()
+
+        def _emit_unet_loader_end(status: str) -> None:
+            _end_wall_ns = time.time_ns()
+            _end_mono_ns = time.monotonic_ns()
+            if _loader_trace is not None:
+                _loader_trace.emit_at(
+                    "unet_loader_end",
+                    wall_unix_ns=_end_wall_ns,
+                    monotonic_ns=_end_mono_ns,
+                    phase="restore",
+                    metadata={
+                        "status": status,
+                        "unet_identity": model_key.unet_identity,
+                        "requested_weight_dtype": _req_wd,
+                        "wall_ms": round(
+                            max(0, _end_mono_ns - _loader_start_mono_ns) / 1_000_000, 3
+                        ),
+                        "request_id": str(getattr(_loader_trace, "request_id", None) or ""),
+                    },
+                )
+
+        if _loader_trace is not None:
+            _loader_trace.emit_at(
+                "unet_loader_start",
+                wall_unix_ns=_loader_start_wall_ns,
+                monotonic_ns=_loader_start_mono_ns,
+                phase="restore",
+                metadata={
+                    "unet_identity": model_key.unet_identity,
+                    "requested_weight_dtype": _req_wd,
+                    "request_id": str(getattr(_loader_trace, "request_id", None) or ""),
+                },
+            )
+        try:
+            result = self._invoke_original("UNETLoader", kwargs)
+        except Exception:
+            _emit_unet_loader_end("error")
+            raise
+        _emit_unet_loader_end("ok")
         unet = result[0] if isinstance(result, (tuple, list)) and result else result
 
         # ── Emit normal_loader_ready state (print + trace) ──────────────

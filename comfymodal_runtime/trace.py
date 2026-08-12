@@ -689,8 +689,21 @@ def _build_local_submission_breakdown(
         ("plan_materialization_to_active_profile_ms", _plan_mat_to_active_profile_ms),
         ("active_profile_ms", _active_profile_ms),
         ("restore_plan_build_ms", _restore_plan_build_ms),
-        ("restore_publish_ms", _restore_publish_ms),
-        ("restore_publish_to_transport_entry_ms", _restore_pub_to_transport_entry_ms),
+    ])
+    # The restore-publish span is part of the sequential child accounting ONLY
+    # when a publish was actually attempted (its start/end events exist).  On
+    # the default no-publish path (COMFYMODAL_V2_PUBLISH_RESTORE_PLAN disabled)
+    # execute_plan emits ``restore_publish_skipped`` and no
+    # ``restore_plan_publish_start/end`` events, so ``restore_publish_ms`` and
+    # ``restore_publish_to_transport_entry_ms`` render absent and are excluded
+    # from the measured-children sum — the (zero) publish gap lands in the
+    # residual and reconciliation stays complete.
+    if _event_mono_ns(trace, "restore_plan_publish_start") is not None:
+        _child_keys.extend([
+            ("restore_publish_ms", _restore_publish_ms),
+            ("restore_publish_to_transport_entry_ms", _restore_pub_to_transport_entry_ms),
+        ])
+    _child_keys.extend([
         ("transport_entry_to_handle_lookup_ms", _transport_entry_to_handle_lookup_ms),
         ("handle_lookup_ms", _handle_lookup_ms),
         ("payload_materialization_ms", _payload_materialization_prep_ms),

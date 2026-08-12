@@ -42,6 +42,7 @@ from workflow_metadata import (
     summarize_prompt_fields,
 )
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, stable_hash
+from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import (
     RestorePlan,
@@ -1269,6 +1270,13 @@ async def execute_plan(
     # workflow is empty, publication is unavailable, or persistence fails,
     # restore() falls back to a minimal startup seed — never guessed and
     # never claiming seeded parity.
+    #
+    # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN (default "0") disables the remote
+    # publication: on that path the seed payload is labelled
+    # ``seed_source=invocation_plan`` (the REQUEST derives its own seed on
+    # the container side) and the local persistence below never claims
+    # ``publisher_plan``.  When the flag is "1" the payload keeps the legacy
+    # ``publisher_plan`` label for the diagnostic publisher path.
     _seed_payload_ctx: dict[str, Any] = {
         "built": 0, "topology_available": 0, "schema_version": 0,
         "persisted": 0, "error": "",
@@ -1277,10 +1285,18 @@ async def execute_plan(
     _seed_obs_fields: dict[str, Any] = {}
     try:
         from comfymodal_runtime.execution_seed import (
+            build_invocation_seed_payload,
             build_snapshot_seed_payload,
             snapshot_seed_observability,
         )
 
+        # The payload label follows the DESTINATION: when a publisher is
+        # configured the payload is published remotely and keeps the legacy
+        # ``publisher_plan`` label; when publication is skipped (default
+        # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN path passes restore_publisher=None)
+        # the payload is labelled ``invocation_plan`` and only persisted
+        # locally — never claiming a publisher-side seed.
+        _publish_enabled = restore_publisher is not None
         _seed_req_meta = plan.request_metadata or {}
         _seed_cn_gen = str(
             _seed_req_meta.get("custom_node_generation", "") if hasattr(_seed_req_meta, "get") else ""
@@ -1290,7 +1306,10 @@ async def execute_plan(
         )
         if not _seed_dep_hash:
             _seed_dep_hash = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
-        _seed_payload = build_snapshot_seed_payload(
+        _seed_builder = (
+            build_snapshot_seed_payload if _publish_enabled else build_invocation_seed_payload
+        )
+        _seed_payload = _seed_builder(
             _canonical_workflow,
             output_node_ids=plan.output_node_ids,
             workflow_hash=plan.workflow_hash,
@@ -1305,6 +1324,10 @@ async def execute_plan(
                 "topology_available": 1,
                 "schema_version": int(_seed_payload.get("schema_version", 0) or 0),
                 **_seed_obs_fields,
+                # NOTE: must come AFTER **_seed_obs_fields — that helper
+                # hardcodes seed_source="" (it derives observability from the
+                # seed object only); the payload-level source wins here.
+                "seed_source": str(_seed_payload.get("seed_source", "") or ""),
             })
     except Exception as _seed_exc:
         _seed_payload_ctx["error"] = f"{type(_seed_exc).__name__}: {str(_seed_exc)[:120]}"
@@ -1557,18 +1580,43 @@ async def execute_plan(
                 runtime_trace.set_metadata(restore_publish_generation=observed_generation)
             runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
-        # Dry-run / no remote publisher configured — persist the seed to the
-        # local .runtime_state path (existing local-observability behavior).
-        # No remote publication is performed or simulated: the publish
-        # markers bound the local not-configured handling and carry an honest
-        # status so downstream breakdown consumers can attribute the gap.
-        runtime_trace.emit("restore_plan_publish_start", phase="local",
-                           metadata={"status": "not_configured"})
+        # ── Publish skipped (no remote publisher configured) ──
+        # Default production path: COMFYMODAL_V2_PUBLISH_RESTORE_PLAN is unset
+        # (or "0"), so no remote ``publish_restore_plan`` RPC is performed.
+        # Emit a bounded marker so the artifact proves the skip:
+        #   * one trace event ``restore_publish_skipped``
+        #   * one console line ``[v2.restore_publish] skipped ...``
+        # ``restore_plan_publish_start/end`` are NOT emitted here, so
+        # ``restore_publish_ms`` / ``restore_publish_to_transport_entry_ms``
+        # render absent downstream (never a misleading tiny span).
+        # The seed payload (labelled ``invocation_plan`` on this path) is
+        # still persisted to the local .runtime_state path (existing
+        # local-observability behavior) — a local write only, never a remote
+        # RPC.
+        _restore_skip_reason = (
+            "flag_disabled"
+            if not publish_restore_plan_enabled()
+            else "publisher_not_configured"
+        )
+        runtime_trace.emit(
+            "restore_publish_skipped",
+            phase="local",
+            metadata={
+                "reason": _restore_skip_reason,
+                "restore_remote_call_performed": False,
+                "status": "skipped",
+            },
+        )
         runtime_trace.set_metadata(
             restore_publish_cache_skipped=None,
             restore_publish_cache_hit=False,
             restore_remote_call_performed=False,
-            restore_publish_status="not_configured",
+            restore_publish_status="skipped",
+            restore_publish_skip_reason=_restore_skip_reason,
+        )
+        print(
+            f"[v2.restore_publish] skipped reason={_restore_skip_reason}",
+            flush=True,
         )
         if _seed_payload is not None:
             try:
@@ -1577,12 +1625,11 @@ async def execute_plan(
                 _seed_payload_ctx["persisted"] = 1 if _seed_persisted else 0
             except Exception:
                 _seed_payload_ctx["persisted"] = 0
-        runtime_trace.emit("restore_plan_publish_end", phase="local",
-                           metadata={"status": "not_configured"})
 
     if _seed_payload is not None and _seed_payload_ctx.get("persisted"):
+        _seed_source_label = str(_seed_payload.get("seed_source", "") or "unknown")
         print(
-            f"[v2.seed_build] source=publisher_plan schema=2 "
+            f"[v2.seed_build] source={_seed_source_label} schema=2 "
             f"topology_available=1 persisted=1 "
             f"workflow_hash={str(_seed_payload.get('workflow_hash', ''))[:16]} "
             f"loader_nodes={_seed_obs_fields.get('loader_node_count', 0)} "

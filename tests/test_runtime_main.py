@@ -452,13 +452,16 @@ class TestModalTransport(unittest.TestCase):
             observed["kwargs"] = kwargs
             yield {"type": "result", "data": {"ok": True}}
 
-        def publish(payload):
+        # The current transport invokes publish_restore_plan via the handle's
+        # ``publish_restore_plan.remote.aio(...)`` (the older plain-callable
+        # shape was replaced).
+        async def publish(payload, snapshot_seed=None):
             observed["restore_plan"] = payload
             return {"status": "published", "generation": 3}
 
         handle = SimpleNamespace(
             run_plan_stream=SimpleNamespace(remote_gen=SimpleNamespace(aio=remote_stream)),
-            publish_restore_plan=SimpleNamespace(remote=publish),
+            publish_restore_plan=SimpleNamespace(remote=SimpleNamespace(aio=publish)),
         )
 
         async def run():
@@ -510,9 +513,9 @@ class TestModalTransport(unittest.TestCase):
 
     def test_v2_handle_cache_key_includes_cloud(self):
         from comfymodal_runtime.modal_transport import HandleCacheKey
-        key = HandleCacheKey("ws", "app", "cls", "rtx-pro-6000", cloud="gcp")
+        key = HandleCacheKey("ws", "app", "cls", environment="", gpu="rtx-pro-6000", cloud="gcp")
         self.assertEqual(key.cloud, "gcp")
-        key2 = HandleCacheKey("ws", "app", "cls", "rtx-pro-6000")
+        key2 = HandleCacheKey("ws", "app", "cls", environment="", gpu="rtx-pro-6000")
         self.assertEqual(key2.cloud, "")
 
     def test_resolve_environment_returns_empty_when_unset(self):
@@ -535,12 +538,14 @@ class TestModalTransport(unittest.TestCase):
             os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
             os.environ.pop("MODAL_ENVIRONMENT", None)
 
-    def test_resolve_environment_falls_back_to_modal_environment(self):
-        """Only MODAL_ENVIRONMENT set -> that value."""
+    def test_resolve_environment_ignores_modal_environment(self):
+        """Only COMFYMODAL_V2_ENVIRONMENT is honored — ambient
+        MODAL_ENVIRONMENT is intentionally NOT consulted ("" is returned so
+        SDK lookups use the default deployed environment)."""
         os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
         os.environ["MODAL_ENVIRONMENT"] = "shared-prod"
         try:
-            self.assertEqual(ModalTransport._resolve_environment(), "shared-prod")
+            self.assertEqual(ModalTransport._resolve_environment(), "")
         finally:
             os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
             os.environ.pop("MODAL_ENVIRONMENT", None)
@@ -548,9 +553,9 @@ class TestModalTransport(unittest.TestCase):
     def test_v2_handle_cache_key_includes_environment(self):
         """HandleCacheKey.environment is set and included in equality."""
         from comfymodal_runtime.modal_transport import HandleCacheKey
-        key_a = HandleCacheKey("ws", "app", "cls", "gpu", environment="staging")
-        key_b = HandleCacheKey("ws", "app", "cls", "gpu", environment="prod")
-        key_default = HandleCacheKey("ws", "app", "cls", "gpu")
+        key_a = HandleCacheKey("ws", "app", "cls", environment="staging")
+        key_b = HandleCacheKey("ws", "app", "cls", environment="prod")
+        key_default = HandleCacheKey("ws", "app", "cls")
         self.assertEqual(key_a.environment, "staging")
         self.assertEqual(key_b.environment, "prod")
         self.assertEqual(key_default.environment, "")
@@ -562,14 +567,14 @@ class TestModalTransport(unittest.TestCase):
         transport = ModalTransport()
         # Directly populate the cache with two different environment keys
         from comfymodal_runtime.modal_transport import HandleCacheKey
-        k1 = HandleCacheKey("ws", "app", "Cls", "gpu", environment="staging")
-        k2 = HandleCacheKey("ws", "app", "Cls", "gpu", environment="prod")
+        k1 = HandleCacheKey("ws", "app", "Cls", environment="staging")
+        k2 = HandleCacheKey("ws", "app", "Cls", environment="prod")
         transport.handle_cache.put(k1, "handle-staging")
         transport.handle_cache.put(k2, "handle-prod")
         self.assertEqual(transport.handle_cache.get(k1), "handle-staging")
         self.assertEqual(transport.handle_cache.get(k2), "handle-prod")
         self.assertIsNone(transport.handle_cache.get(
-            HandleCacheKey("ws", "app", "Cls", "gpu")
+            HandleCacheKey("ws", "app", "Cls")
         ))
 
     def test_configure_runtime_does_not_set_install_requirements_true(self):

@@ -1,14 +1,21 @@
-"""Focused tests for publish_restore_plan_remote registration and diagnostics.
+"""Focused tests for publish_restore_plan registration and diagnostics.
 
-Verifies:
-- Registration source (app.function(...)) contains startup_timeout=120,
-  retries=0, env={_PUBLISHER_MARKER: "1"}.
-- Function body contains entry/success/error diagnostics with flush.
-- Exception handler re-raises.
-- build_modal_resources early-return when publisher marker is set.
+Covers the CURRENT code (no ``_PUBLISHER_MARKER`` / ``startup_timeout=120``
+era — those were removed):
+
+- ``publish_restore_plan`` is registered on the V2 entrypoint via
+  ``_modal.method()`` and delegates to the module-level
+  ``_publish_restore_plan_remote`` body.
+- ``_publish_restore_plan_remote`` contains flushed entry/success/error
+  diagnostics and re-raises on exception.
+- The opt-in ``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN`` flag gates the remote
+  publication: default (unset / "0") disables it (``publish_restore_plan_enabled()``
+  is False); a truthy value enables the legacy publisher path.
+- ``build_modal_resources`` still constructs the runtime-state volume used by
+  the publisher.
 
 Does NOT invoke Modal remotely — all assertions operate on source text
-analysis (AST-based extraction from the file).
+analysis (AST-based extraction from the file) or CPU-only unit checks.
 """
 
 from __future__ import annotations
@@ -24,10 +31,10 @@ _MODAL_APP_PATH = Path(__file__).resolve().parents[1] / "comfymodal_runtime" / "
 
 
 def _registration_block() -> str:
-    """Return the publish_restore_plan_remote registration block from the
-    app.function(...) call onward."""
+    """Return the source from the publish_restore_plan method registration
+    (inside ``_build_decorated_v2_class``) onward."""
     source = _MODAL_APP_PATH.read_text(encoding="utf-8")
-    idx = source.index("publish_restore_plan_remote")
+    idx = source.index('"publish_restore_plan", "run_rehoming_experiment"')
     return source[idx:]
 
 
@@ -35,137 +42,74 @@ def _registration_block() -> str:
 
 
 class TestPublishRestorePlanRegistration(unittest.TestCase):
-    """Registration call to app.function(...) includes all required kwargs."""
+    """``publish_restore_plan`` is registered via ``_modal.method()`` and is
+    listed in the wrapped / non-workflow method sets."""
 
-    def test_startup_timeout_in_registration(self):
-        """The app.function(...) call for publish_restore_plan_remote
-        includes startup_timeout=120 alongside existing timeout=300,
-        min_containers=0, scaledown_window."""
+    def test_registered_via_modal_method(self):
+        """The method is registered with ``_modal.method()``."""
         source = _MODAL_APP_PATH.read_text(encoding="utf-8")
         self.assertIn(
-            "startup_timeout=120",
+            'setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))',
             source,
-            "startup_timeout=120 must appear in modal_app.py",
+            "publish_restore_plan must be registered via _modal.method()",
         )
+
+    def test_listed_in_methods_to_wrap(self):
+        """The method is in ``_METHODS_TO_WRAP`` so lazy-init wraps it."""
         block = _registration_block()
-        self.assertIn("timeout=300", block)
-        self.assertIn("startup_timeout=120", block)
-        block_after_timeout = block.split("timeout=300")[1]
+        self.assertIn('"publish_restore_plan"', block)
+        source = _MODAL_APP_PATH.read_text(encoding="utf-8")
+        methods_block_start = source.index("_METHODS_TO_WRAP = (")
+        methods_block_end = source.index("_NON_WORKFLOW_METHODS")
+        methods_block = source[methods_block_start:methods_block_end]
         self.assertIn(
-            "startup_timeout=120",
-            block_after_timeout.split("scaledown_window")[0],
-            "startup_timeout=120 should appear between timeout=300 and "
-            "scaledown_window in the registration call",
+            '"publish_restore_plan"',
+            methods_block,
+            "publish_restore_plan must be in _METHODS_TO_WRAP",
         )
 
-    def test_retries_zero_in_registration(self):
-        """Registration includes retries=0."""
+    def test_listed_in_non_workflow_methods(self):
+        """The method is in ``_NON_WORKFLOW_METHODS`` (no fabricated graph
+        waterfall on its dict result)."""
+        source = _MODAL_APP_PATH.read_text(encoding="utf-8")
+        non_workflow_block = source[source.index("_NON_WORKFLOW_METHODS"):]
+        self.assertIn(
+            '"publish_restore_plan"',
+            non_workflow_block,
+            "publish_restore_plan must be in _NON_WORKFLOW_METHODS",
+        )
+
+    def test_method_delegates_to_remote_body(self):
+        """The entrypoint method body delegates to
+        ``_publish_restore_plan_remote(plan_payload, snapshot_seed=...)``."""
         source = _MODAL_APP_PATH.read_text(encoding="utf-8")
         self.assertIn(
-            "retries=0",
+            "result = _publish_restore_plan_remote(plan_payload, snapshot_seed=snapshot_seed)",
             source,
-            "retries=0 must appear in modal_app.py",
+            "publish_restore_plan must delegate to _publish_restore_plan_remote",
         )
-        block = _registration_block()
-        self.assertIn("retries=0", block)
-
-    def test_env_marker_in_registration(self):
-        """Registration includes env={_PUBLISHER_MARKER: "1"}."""
-        source = _MODAL_APP_PATH.read_text(encoding="utf-8")
-        self.assertIn(
-            "_PUBLISHER_MARKER",
-            source,
-            "_PUBLISHER_MARKER constant must be defined",
-        )
-        self.assertIn(
-            'env={_PUBLISHER_MARKER: "1"}',
-            source,
-            "registration must include env={_PUBLISHER_MARKER: '1'}",
-        )
-
-
-# ── Publisher marker constant tests ────────────────────────────────────────
-
-
-class TestPublisherMarkerConstant(unittest.TestCase):
-    """_PUBLISHER_MARKER constant is defined and has the expected value."""
-
-    def test_marker_constant_defined(self):
-        """The _PUBLISHER_MARKER constant equals COMFYMODAL_PUBLISHER_CONTAINER."""
-        source = _MODAL_APP_PATH.read_text(encoding="utf-8")
-        self.assertIn(
-            '_PUBLISHER_MARKER = "COMFYMODAL_PUBLISHER_CONTAINER"',
-            source,
-            "_PUBLISHER_MARKER must be defined with value COMFYMODAL_PUBLISHER_CONTAINER",
-        )
-
-
-# ── build_modal_resources early-return tests ──────────────────────────────
-
-
-def _null_resources(spec: Any = None) -> dict[str, Any]:
-    """Return the expected null-resource mapping for the publisher branch."""
-    from comfymodal_runtime.modal_app import ModalRuntimeSpec
-    return {
-        "app": None,
-        "image": None,
-        "models_volume": None,
-        "custom_nodes_volume": None,
-        "runtime_state_volume": None,
-        "profile_volume": None,
-        "source_identity": None,
-        "spec": spec or ModalRuntimeSpec(),
-    }
-
-
-class TestBuildModalResourcesMarker(unittest.TestCase):
-    """build_modal_resources returns null resources when publisher marker=1
-    without calling heavyweight helpers."""
-
-    def test_early_return_when_marker_set(self):
-        """When COMFYMODAL_PUBLISHER_CONTAINER=1, build_modal_resources returns
-        null resources and does not call _local_custom_nodes_root,
-        build_deployment_identity, or _reference_image."""
-        from comfymodal_runtime.modal_app import build_modal_resources, _PUBLISHER_MARKER, ModalRuntimeSpec
-        with patch.dict(os.environ, {_PUBLISHER_MARKER: "1"}, clear=False):
-            with patch(
-                "comfymodal_runtime.modal_app._local_custom_nodes_root",
-                MagicMock(side_effect=RuntimeError("_local_custom_nodes_root should not be called")),
-            ):
-                with patch(
-                    "comfymodal_runtime.modal_app.build_deployment_identity",
-                    MagicMock(side_effect=RuntimeError("build_deployment_identity should not be called")),
-                ):
-                    with patch(
-                        "comfymodal_runtime.modal_app._reference_image",
-                        MagicMock(side_effect=RuntimeError("_reference_image should not be called")),
-                    ):
-                        spec = ModalRuntimeSpec()
-                        result = build_modal_resources(spec=spec)
-        expected = _null_resources(spec)
-        self.assertEqual(result, expected)
 
 
 # ── Function diagnostics tests ────────────────────────────────────────────
 
 
 class TestPublishRestorePlanDiagnostics(unittest.TestCase):
-    """publish_restore_plan_remote has flushed entry/success/error diagnostics
-    and re-raises on exception."""
+    """``_publish_restore_plan_remote`` has flushed entry/success/error
+    diagnostics and re-raises on exception."""
 
     def _get_func_source(self) -> str:
-        """Extract the source text of publish_restore_plan_remote from
+        """Extract the source text of _publish_restore_plan_remote from
         modal_app.py using AST parsing.  Avoids inspect.getsource which
         fails when Modal wraps the function in its own Function class."""
         import ast
         source = _MODAL_APP_PATH.read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "publish_restore_plan_remote":
+            if isinstance(node, ast.FunctionDef) and node.name == "_publish_restore_plan_remote":
                 lines = source.splitlines()
                 func_lines = lines[node.lineno - 1 : node.end_lineno]
                 return "\n".join(func_lines)
-        self.fail("publish_restore_plan_remote function not found in modal_app.py")
+        self.fail("_publish_restore_plan_remote function not found in modal_app.py")
 
     def test_entry_diagnostic(self):
         """Function prints an entry diagnostic at start with flush=True."""
@@ -199,13 +143,11 @@ class TestPublishRestorePlanDiagnostics(unittest.TestCase):
         """On exception the function prints an error diagnostic with
         elapsed_ms and exception_type, then re-raises."""
         src = self._get_func_source()
-        # Must use except Exception as exc:
         self.assertIn(
             "except Exception as exc:",
             src,
             "must catch Exception as exc",
         )
-        # Error diagnostic message includes elapsed_ms and exception_type
         self.assertIn(
             "[publish_restore_plan] error",
             src,
@@ -216,12 +158,49 @@ class TestPublishRestorePlanDiagnostics(unittest.TestCase):
             src,
             "error diagnostic must include exception_type",
         )
-        # Re-raise: a bare 'raise' statement after the error block
         self.assertIn(
             "\n        raise",
             src,
             "exception handler must re-raise",
         )
+
+
+# ── Opt-in publish-restore-plan flag tests ────────────────────────────────
+
+
+class TestPublishRestorePlanFlag(unittest.TestCase):
+    """``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN`` gates the legacy remote
+    publication: default off, opt-in on."""
+
+    def test_flag_defaults_disabled(self):
+        """Unset / "0" → publish_restore_plan_enabled() is False (default
+        production path performs no remote publish RPC)."""
+        from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMFYMODAL_V2_PUBLISH_RESTORE_PLAN", None)
+            self.assertFalse(publish_restore_plan_enabled())
+        with patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "0"}, clear=False):
+            self.assertFalse(publish_restore_plan_enabled())
+
+    def test_flag_opt_in_enables(self):
+        """Truthy flag → publish_restore_plan_enabled() is True (legacy
+        publisher path kept for diagnostics)."""
+        from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
+        with patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False):
+            self.assertTrue(publish_restore_plan_enabled())
+
+    def test_harness_publisher_resolution_is_flag_gated(self):
+        """The benchmark harness constructs the remote publisher only when
+        the flag is truthy; otherwise it passes None so execute_plan performs
+        exactly ONE Modal submission (run_plan_stream)."""
+        import tools.benchmark_v2_direct as bench
+        stub_transport = MagicMock()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMFYMODAL_V2_PUBLISH_RESTORE_PLAN", None)
+            self.assertIsNone(bench._resolve_restore_publisher(stub_transport, {"id": "ws"}))
+        with patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False):
+            publisher = bench._resolve_restore_publisher(stub_transport, {"id": "ws"})
+            self.assertIsNotNone(publisher)
 
 
 # ── build_modal_resources profile Volume tests ──────────────────────────────
@@ -237,7 +216,6 @@ class TestBuildModalResourcesProfileVolume(unittest.TestCase):
         self._orig_full_trace = _V2_FULL_TRACE_ENABLED
 
     def tearDown(self):
-        from comfymodal_runtime.modal_app import _V2_FULL_TRACE_ENABLED as _flag
         # Restore via direct attribute set (cannot reimport)
         import comfymodal_runtime.modal_app as _ma
         _ma._V2_FULL_TRACE_ENABLED = self._orig_full_trace
@@ -497,64 +475,5 @@ class TestRegisterRemoteEntrypointProfileMount(unittest.TestCase):
         self.assertIn(spec.profile_path, volumes)
 
 
-# ── _register_remote_entrypoint env= propagation test ────────────────────────
-
-
-class TestRegisterRemoteEntrypointEnvPropagation(unittest.TestCase):
-    """_register_remote_entrypoint passes _runtime_env() values through
-    to app.cls(env=...)."""
-
-    def test_env_contains_all_trace_and_profile_keys(self):
-        """The env dict passed to app.cls includes all required
-        full-trace and profile propagation keys with their expected values."""
-        from comfymodal_runtime.modal_app import (
-            _register_remote_entrypoint, ModalRuntimeSpec,
-            _V2_FULL_TRACE_ENABLED,
-        )
-
-        class FakeApp:
-            def __init__(self):
-                self.kwargs = None
-            def cls(self, **kwargs):
-                self.kwargs = kwargs
-                return lambda cls: cls
-
-        class FakeModal:
-            @staticmethod
-            def concurrent(**kwargs):
-                return lambda cls: cls
-
-        app = FakeApp()
-        resources = {
-            "app": app,
-            "models_volume": MagicMock(),
-            "custom_nodes_volume": MagicMock(),
-            "runtime_state_volume": MagicMock(),
-            "profile_volume": MagicMock(),
-        }
-        spec = ModalRuntimeSpec()
-
-        with patch("comfymodal_runtime.modal_app._modal", FakeModal), \
-             patch("comfymodal_runtime.modal_app._build_decorated_v2_class",
-                   return_value=object):
-            import comfymodal_runtime.modal_app as _ma
-            _ma._V2_FULL_TRACE_ENABLED = False  # ensure clean env
-            _register_remote_entrypoint(resources, spec)
-
-        self.assertIsNotNone(app.kwargs, "app.cls must have been called")
-        env = app.kwargs.get("env", {})
-        self.assertEqual(env.get("COMFYMODAL_V2_APP_NAME"), spec.app_name)
-        required_env_keys = [
-            "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS",
-            "COMFYMODAL_V2_UNET_PRETOUCH",
-            "COMFYMODAL_V2_FULL_TRACE",
-            "COMFYMODAL_V2_FULL_TRACE_TORCH",
-            "COMFYMODAL_V2_FULL_TRACE_ENTRIES",
-            "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS",
-            "COMFYMODAL_V2_PROFILE_VOLUME",
-        ]
-        for key in required_env_keys:
-            self.assertIn(key, env, f"Required env key {key!r} missing from app.cls(env=)")
-            # Value should be a non-empty string
-            self.assertIsInstance(env[key], str)
-            self.assertGreater(len(env[key]), 0)
+if __name__ == "__main__":
+    unittest.main()

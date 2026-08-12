@@ -6348,6 +6348,51 @@ _CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
     r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
     re.IGNORECASE,
 )
+_COMFYMODAL_CANONICAL_NODE_NAME = "comfyui-modal"
+_COMFYMODAL_DUPLICATE_TYPO_NAMES = frozenset({"comyui-modal-pagesfile-probe"})
+
+
+def _is_comfymodal_duplicate_dir(node_name: str, node_path: str) -> str | None:
+    """Return a reason string when *node_path* is another copy/worktree of the
+    canonical ComfyModal plugin, else None.
+
+    Verification is repo-specific, never name-only:
+    - git worktree registration pointing at the canonical checkout
+    - the canonical git remote URL
+    - canonical plugin content markers (comfyapp.py + comfymodal_runtime/)
+    """
+    if node_name == _COMFYMODAL_CANONICAL_NODE_NAME:
+        return None
+    if node_name in _COMFYMODAL_DUPLICATE_TYPO_NAMES:
+        return "comfymodal_duplicate_typo"
+    try:
+        git_path = os.path.join(node_path, ".git")
+        if os.path.isfile(git_path):
+            with open(git_path, "r", encoding="utf-8", errors="replace") as _f:
+                _line = (_f.read(512) or "").strip()
+            if _line.lower().startswith("gitdir:"):
+                _gd = _line.split(":", 1)[1].strip()
+                if not os.path.isabs(_gd):
+                    _gd = os.path.join(node_path, _gd)
+                _norm = os.path.normpath(_gd).replace("\\", "/")
+                if ".git/worktrees/" in _norm and "comfyui-modal" in _norm:
+                    return "comfymodal_duplicate_worktree"
+        elif os.path.isdir(git_path):
+            _cfg = os.path.join(git_path, "config")
+            if os.path.isfile(_cfg):
+                with open(_cfg, "r", encoding="utf-8", errors="replace") as _f:
+                    _cfg_text = _f.read(4096)
+                if "comfyui-modal.git" in _cfg_text:
+                    return "comfymodal_duplicate_worktree"
+        if (
+            os.path.isfile(os.path.join(node_path, "comfyapp.py"))
+            and os.path.isdir(os.path.join(node_path, "comfymodal_runtime"))
+            and os.path.isfile(os.path.join(node_path, "comfymodal_runtime", "modal_app.py"))
+        ):
+            return "comfymodal_duplicate_worktree"
+    except Exception:
+        return None
+    return None
 _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
     ".git/",
     "__pycache__/",
@@ -6463,6 +6508,9 @@ def _custom_node_filter_reason(node_name: str, node_path: str) -> str | None:
         return "generated_or_environment_directory"
     if _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_name):
         return "local_agent_or_worktree_clone"
+    duplicate_reason = _is_comfymodal_duplicate_dir(node_name, node_path)
+    if duplicate_reason is not None:
+        return duplicate_reason
     return None
 
 
@@ -6500,6 +6548,40 @@ def _diagnose_custom_node_selection(cn_root: str) -> None:
         elif os.path.isdir(node_path):
             print(f"[comfyapp.custom_node_filter] action=deny name={node_name} reason={reason}")
     print("[comfyapp.custom_node_filter] end")
+
+
+def custom_node_filter_diagnostics(cn_root: str) -> dict:
+    """Return bounded counts of the canonical custom-node filter for a root."""
+    result = {
+        "total_source_dirs": 0,
+        "accepted_dirs": 0,
+        "duplicate_comfymodal_dirs": 0,
+        "duplicate_names_bounded": "[]",
+    }
+    if not os.path.isdir(cn_root):
+        return result
+    dup_names: list[str] = []
+    accepted = 0
+    total = 0
+    for node_name in sorted(os.listdir(cn_root)):
+        node_path = os.path.join(cn_root, node_name)
+        if not os.path.isdir(node_path) or os.path.islink(node_path):
+            continue
+        total += 1
+        reason = _custom_node_filter_reason(node_name, node_path)
+        if reason in ("comfymodal_duplicate_worktree", "comfymodal_duplicate_typo"):
+            dup_names.append(node_name)
+        elif reason is None:
+            accepted += 1
+    result["total_source_dirs"] = total
+    result["accepted_dirs"] = accepted
+    result["duplicate_comfymodal_dirs"] = len(dup_names)
+    _bounded = dup_names[:20]
+    _shown = ",".join(_bounded)
+    if len(dup_names) > 20:
+        _shown += ",..."
+    result["duplicate_names_bounded"] = f"[{_shown}]"
+    return result
 
 
 def _custom_node_image_ignore_patterns(node_name: str) -> list[str]:
@@ -7525,6 +7607,20 @@ _V2_RUNTIME_ENV = {
     "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
     "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
     "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
+    # Native fast-disk UNET (opt-in, default OFF).  Baked into the V2
+    # container image from the caller's environment at deploy time so that
+    # $env:COMFYMODAL_V2_NATIVE_FAST_DISK_UNET='1' before
+    # deploy_and_run_v2_single.bat activates it in the deployed container.
+    "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": os.environ.get(
+        "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "0"
+    ),
+    # Sampling deep profile level (opt-in, default off).  Baked into the V2
+    # container image from the caller's environment at deploy time the same
+    # way the native-fast-disk flag is baked; the profiler itself is
+    # untouched and still resolves its own env/file flag at runtime.
+    "COMFYMODAL_SAMPLING_DEEP_PROFILE": os.environ.get(
+        "COMFYMODAL_SAMPLING_DEEP_PROFILE", "off"
+    ),
 }
 _V2_RUNTIME_ENV.update(runtime_shape_config().environment())
 
@@ -7631,6 +7727,24 @@ _image_base = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
 if not _INSIDE_MODAL_CONTAINER:
     _syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
     _cn_copy_layer_count = 0
+    # Verified ComfyModal duplicate worktrees/typo copies must never be baked
+    # into the image: ComfyUI would import them as extra custom nodes, inflating
+    # snapshot startup (2,398 registered nodes in the baseline).  The canonical
+    # filter above is the single source of truth for the duplicate set.
+    _duplicate_node_names = sorted(
+        name for name in os.listdir(_LOCAL_CUSTOM_NODES)
+        if _custom_node_filter_reason(
+            name, os.path.join(_LOCAL_CUSTOM_NODES, name)
+        ) in ("comfymodal_duplicate_worktree", "comfymodal_duplicate_typo")
+    ) if os.path.isdir(_LOCAL_CUSTOM_NODES) else []
+    if _duplicate_node_names:
+        _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS.extend(
+            f"{_dup_name}/" for _dup_name in _duplicate_node_names
+        )
+        print(
+            f"[comfyapp] custom_node_filter: excluding ComfyModal duplicate dirs "
+            f"from image ({len(_duplicate_node_names)}): {_duplicate_node_names}"
+        )
     if CUSTOM_NODE_COPY_MODE == "combined":
         _image_base = _image_base.add_local_dir(
             _LOCAL_CUSTOM_NODES,
@@ -10706,7 +10820,7 @@ class _ComfyAPIMixin:
         try:
             _gen_rec = _read_custom_nodes_generation_record()
             _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
-            if not _gen_now:
+            if _gen_now != current_fp_hash:
                 _gen_rec = _write_custom_nodes_generation_record_no_commit(
                     reason="actual_sync_created",
                     generation=current_fp_hash,
@@ -17546,6 +17660,8 @@ class _ComfyAPIMixin:
         """
         t0 = time.time()
         _stage = time.time()
+        # V2 snapshot-only pre-import profiling marks (real boundaries only)
+        _pre_import_marks: list[tuple[str, float]] = [("entry", time.perf_counter())]
 
         # GÃ¶Ã‡GÃ¶Ã‡ Match comfy launch CWD GÃ‡Ã¶ ComfyUI modules use relative path
         #    resolution (e.g. ``from utils.install_util import ...``). GÃ¶Ã‡GÃ¶Ã‡
@@ -17556,6 +17672,7 @@ class _ComfyAPIMixin:
 
         # Line-buffered stdout so container logs are not delayed
         sys.stdout.reconfigure(line_buffering=True)
+        _pre_import_marks.append(("path_setup", time.perf_counter()))
         self._log_profile("inproc_chdir_cwd", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -17573,6 +17690,7 @@ class _ComfyAPIMixin:
         import comfy.utils
         import execution
         import nodes
+        _pre_import_marks.append(("core_import", time.perf_counter()))
 
         # GÃ¶Ã‡GÃ¶Ã‡ Generic entrypoint traceback collector GÃ¶Ã‡GÃ¶Ã‡
         # ComfyUI's load_custom_node catches entrypoint exceptions at
@@ -17632,8 +17750,10 @@ class _ComfyAPIMixin:
                 return result
             _comfy_logging.Logger.warning = _patched_logger_warning
             _comfy_logging.Logger._comfy_modal_warning_patched = True
+        _pre_import_marks.append(("logging_patch", time.perf_counter()))
 
         import server as comfy_server
+        _pre_import_marks.append(("server_import", time.perf_counter()))
         self._log_profile("inproc_imports", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -17645,6 +17765,7 @@ class _ComfyAPIMixin:
         if PROFILING_ENABLED or _resolve_runtime_flag('model_mgmt_profile', '0'):
             self._patch_model_clone_profiling(comfy.model_patcher)
             self._patch_model_management_profiling(comfy.model_management)
+        _pre_import_marks.append(("model_management", time.perf_counter()))
         self._log_profile("inproc_patch", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -17687,6 +17808,7 @@ class _ComfyAPIMixin:
                 return _orig_get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
             execution.get_input_data = _patched_get_input_data
             execution._comfy_modal_sync_cache_patched = True
+        _pre_import_marks.append(("execution_patch", time.perf_counter()))
 
         # GÃ¶Ã‡GÃ¶Ã‡ DummyServer: minimal PromptServer that doesn't bind a port GÃ¶Ã‡GÃ¶Ã‡
         event_loop = asyncio.new_event_loop()
@@ -17727,6 +17849,7 @@ class _ComfyAPIMixin:
         self._dummy_server = dummy
         self._event_loop = event_loop
         self._log_profile("inproc_executor_init", ram_gb=total_ram_gb, cache_gb=cache_ram_gb, duration_ms=self._profile_ms(_stage))
+        _pre_import_marks.append(("server_executor_init", time.perf_counter()))
         _stage = time.time()
 
         # GÃ¶Ã‡GÃ¶Ã‡ Wire up send_sync for execution-progress logging GÃ¶Ã‡GÃ¶Ã‡
@@ -17784,10 +17907,69 @@ class _ComfyAPIMixin:
             })
 
         comfy.utils.set_progress_bar_global_hook(_progress_hook)
+        _pre_import_marks.append(("progress_hook", time.perf_counter()))
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
+        # V2 snapshot-only per-custom-node import timing: wraps ComfyUI's
+        # load_custom_node boundary (never edits third-party node source).
+        _snapshot_import_times: list[tuple[float, str, str]] = []
+        if getattr(self, "_snapshot_backend_init", False):
+            _orig_load_custom_node = nodes.load_custom_node
+
+            async def _timed_load_custom_node(
+                module_path: str,
+                ignore=set(),
+                module_parent: str = "custom_nodes",
+            ) -> bool:
+                if module_parent != "custom_nodes":
+                    return await _orig_load_custom_node(
+                        module_path, ignore=ignore, module_parent=module_parent
+                    )
+                _t0 = time.perf_counter()
+                _status = "error"
+                try:
+                    _ok = await _orig_load_custom_node(
+                        module_path, ignore=ignore, module_parent=module_parent
+                    )
+                    _status = "ok" if _ok else "error"
+                    return _ok
+                finally:
+                    _dur_ms = round((time.perf_counter() - _t0) * 1000, 3)
+                    _name = os.path.basename(module_path.rstrip("/\\")) or module_path
+                    _snapshot_import_times.append((_dur_ms, _name, _status))
+                    print(
+                        f"[v2.custom_node_import_timing] name={_name} "
+                        f"duration_ms={_dur_ms} status={_status}",
+                        flush=True,
+                    )
+
+            nodes.load_custom_node = _timed_load_custom_node
+        _pre_import_marks.append(("wrapper_setup", time.perf_counter()))
         _custom_import_wall_ns = time.time_ns()
         _custom_import_mono_ns = time.monotonic_ns()
+        if getattr(self, "_snapshot_backend_init", False):
+            try:
+                _pre_total_ms = round(
+                    (time.perf_counter() - _pre_import_marks[0][1]) * 1000, 3
+                )
+                _pre_parts: list[str] = []
+                _pre_sum_ms = 0.0
+                for _idx in range(1, len(_pre_import_marks)):
+                    _part_ms = round(
+                        (_pre_import_marks[_idx][1] - _pre_import_marks[_idx - 1][1]) * 1000, 3
+                    )
+                    _pre_sum_ms += _part_ms
+                    _pre_parts.append(f"{_pre_import_marks[_idx][0]}_ms={_part_ms}")
+                _pre_residual_ms = round(max(0.0, _pre_total_ms - _pre_sum_ms), 3)
+                print(
+                    "[v2.backend_pre_custom_import] "
+                    f"total_ms={_pre_total_ms} "
+                    + " ".join(_pre_parts)
+                    + f" residual_ms={_pre_residual_ms}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         print(
             f"[v2.startup_stage] stage=custom_node_import event=start "
             f"wall_unix_ns={_custom_import_wall_ns} monotonic_ns={_custom_import_mono_ns}",
@@ -17802,6 +17984,24 @@ class _ComfyAPIMixin:
             "slow_import_summary_source=comfyui.nodes.init_external_custom_nodes",
             flush=True,
         )
+        if getattr(self, "_snapshot_backend_init", False) and _snapshot_import_times:
+            try:
+                _import_total_ms = round(
+                    sum(_entry[0] for _entry in _snapshot_import_times), 3
+                )
+                _top_ten = sorted(_snapshot_import_times, reverse=True)[:10]
+                _top_ten_str = ",".join(
+                    f"{_entry[1]}={_entry[0]}ms" for _entry in _top_ten
+                )
+                print(
+                    f"[v2.custom_node_import_summary] total_ms={_import_total_ms} "
+                    f"node_count={len(_snapshot_import_times)} "
+                    f"slowest=[{_top_ten_str}]",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            self._snapshot_backend_init = False
         self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
 
@@ -18792,6 +18992,14 @@ class _ComfyAPIMixin:
 
     def _init_unet_cache(self):
         """Initialise instance-level UNET ModelPatcher cache."""
+        # Fast-disk snapshot activation can reach the patched graph loader
+        # without first running ``_start_production_restore_unet``, so the
+        # actual-load registry (``_actual_load_locks`` and its required
+        # companion ``_actual_load_futures``) may not be initialised yet.
+        # ``_init_actual_load_registry`` is hasattr-guarded and idempotent,
+        # so this is a safe no-op when already set.  Gate-OFF behaviour is
+        # unaffected: this only establishes instance attribute defaults.
+        self._init_actual_load_registry()
         if not hasattr(self, '_unet_object_cache'):
             self._unet_object_cache: dict[tuple, object] = {}
             self._unet_cache_hits = 0
@@ -23680,6 +23888,7 @@ def _register_gpu_classes():
             cpu=profile["cpu"],
             memory=profile["memory"],
             timeout=3600,
+            retries=0,
             min_containers=0,
             # Scale down quickly to avoid holding GPU resources when idle
             scaledown_window=4,
