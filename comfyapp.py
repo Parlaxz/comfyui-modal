@@ -159,6 +159,65 @@ THIRD_PARTY_LOG_ALLOWLIST = [] if not _OPTIMIZATIONS_AVAILABLE else THIRD_PARTY_
 PROMPT_BUNDLE_SCHEMA_VERSION = 1 if not _OPTIMIZATIONS_AVAILABLE else PROMPT_BUNDLE_SCHEMA_VERSION
 CUSTOM_NODE_GENERATION_SCHEMA_VERSION = 1 if not _OPTIMIZATIONS_AVAILABLE else CUSTOM_NODE_GENERATION_SCHEMA_VERSION
 
+# ── V2 optimization diagnostics (measurement-only; gated off by default) ──
+# Mirrors the fail-open import style used above for comfymodal_runtime.
+try:
+    from comfymodal_runtime.optimization_diagnostics import (
+        opt_diag_enabled as _opt_diag_enabled,
+        emit_opt as _opt_emit,
+    )
+except Exception:
+    _opt_diag_enabled = lambda: False  # type: ignore
+    _opt_emit = lambda *a, **k: None  # type: ignore
+
+# ── V2 experiment registry (Experiments 3/6) — fail-open when absent. ─────
+try:
+    from comfymodal_runtime.v2_experiments import (
+        png_compress_level as _v2_png_compress_level,
+        restore_total_vram_frozen_enabled as _v2_restore_total_vram_frozen_enabled,
+        experiment_line as _v2_experiment_line,
+        resolve_experiment as _v2_resolve_experiment,
+    )
+except Exception:
+    _v2_png_compress_level = lambda: 6  # type: ignore
+    _v2_restore_total_vram_frozen_enabled = lambda: False  # type: ignore
+    _v2_experiment_line = lambda _s: ""  # type: ignore
+    _v2_resolve_experiment = lambda _n: None  # type: ignore
+
+# One-time per-process experiment logs (Experiments 3/6).
+_PNG_EXPERIMENT_LOGGED = False
+_RESTORE_MEMORY_EXPERIMENT_LOGGED = False
+_PNG_EXPERIMENT_LOCK = threading.Lock()
+_RESTORE_MEMORY_EXPERIMENT_LOCK = threading.Lock()
+
+
+def _png_experiment_log_once() -> None:
+    """Print the canonical ``[v2.experiment]`` line once per process when the
+    PNG level-1 arm is first exercised.  Never raises."""
+    global _PNG_EXPERIMENT_LOGGED
+    with _PNG_EXPERIMENT_LOCK:
+        if _PNG_EXPERIMENT_LOGGED:
+            return
+        _PNG_EXPERIMENT_LOGGED = True
+    try:
+        print(_v2_experiment_line(_v2_resolve_experiment("png_encode")), flush=True)
+    except Exception:
+        pass
+
+
+def _restore_memory_experiment_log_once() -> None:
+    """Print the canonical ``[v2.experiment]`` line once per process when the
+    frozen-VRAM (optimized) restore_memory arm ran.  Never raises."""
+    global _RESTORE_MEMORY_EXPERIMENT_LOGGED
+    with _RESTORE_MEMORY_EXPERIMENT_LOCK:
+        if _RESTORE_MEMORY_EXPERIMENT_LOGGED:
+            return
+        _RESTORE_MEMORY_EXPERIMENT_LOGGED = True
+    try:
+        print(_v2_experiment_line(_v2_resolve_experiment("restore_memory")), flush=True)
+    except Exception:
+        pass
+
 # Process-wide waterfall recorder (per-request usage preferred)
 _WATERFALL = WaterfallRecorder()
 
@@ -457,6 +516,66 @@ def _is_authorized_production_direct_sink_request(prompt_id: str, node_id: str) 
 # ComfyModalProductionImageComparerOutput can use them.
 
 
+# ── V2 PNG/output-encode decomposition diagnostics (measurement-only) ──
+# Bounded module-level stores; no runtime policy/behavior impact when the
+# COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS gate is off (all no-ops).
+_OPT_ENCODE_DIAG_MAX_ENTRIES = 8
+_OPT_ENCODE_DIAG = []
+_OPT_CLAMP_PENDING_MAX_ENTRIES = 16
+_OPT_CLAMP_PENDING = {}
+
+
+def _opt_diag_append(diag_list, entry, cap):
+    """Append *entry* to a bounded diagnostics list, dropping the oldest."""
+    diag_list.append(entry)
+    if len(diag_list) > cap:
+        del diag_list[: len(diag_list) - cap]
+
+
+def _opt_active_trace():
+    """Return the active ``RuntimeTrace`` via model_preload's ContextVar.
+
+    ``request_execution_trace_scope`` (comfymodal_runtime/model_preload.py)
+    sets ``_ACTIVE_REQUEST_TRACE`` for the duration of a prompt execution;
+    the encode node runs synchronously inside that scope on the v2 path.
+    Falls back to the ``request_execution_trace_scope`` form.  All access is
+    guarded — an unreachable trace yields ``None`` and emission is skipped.
+    """
+    try:
+        from comfymodal_runtime import model_preload as _mp
+    except Exception:
+        return None
+    try:
+        return _mp._ACTIVE_REQUEST_TRACE.get()
+    except Exception:
+        pass
+    try:
+        return _mp.request_execution_trace_scope.get()
+    except Exception:
+        return None
+
+
+def _opt_active_request_id():
+    """Return the current request id when a request trace is reachable."""
+    _tr = _opt_active_trace()
+    if _tr is None:
+        return None
+    try:
+        return getattr(_tr, "request_id", None) or None
+    except Exception:
+        return None
+
+
+def _opt_clamp_pending_store(tensor_id, clamp_entry):
+    """Store clamp timings keyed by the clamped tensor's id (bounded)."""
+    _OPT_CLAMP_PENDING[tensor_id] = clamp_entry
+    if len(_OPT_CLAMP_PENDING) > _OPT_CLAMP_PENDING_MAX_ENTRIES:
+        for _k in list(_OPT_CLAMP_PENDING)[
+            : len(_OPT_CLAMP_PENDING) - _OPT_CLAMP_PENDING_MAX_ENTRIES
+        ]:
+            _OPT_CLAMP_PENDING.pop(_k, None)
+
+
 def encode_image_tensor_batch(
     images_t,
     output_format="original",
@@ -471,6 +590,27 @@ def encode_image_tensor_batch(
     import io as _io
     from PIL import Image as _PILImage
 
+    # ── V2 png_encode experiment (default level 6 = PIL default; level 1 B) ──
+    # compress_level only changes the compression ratio — PNG is lossless at
+    # every level, so decoded pixels are byte-identical.
+    _png_level = _v2_png_compress_level()
+
+    # ── V2 output-encode decomposition (measurement-only, gated) ──
+    _opt_on = _opt_diag_enabled()
+    _opt_trace = _opt_active_trace() if _opt_on else None
+    _opt_req_id = (
+        getattr(_opt_trace, "request_id", None) if _opt_trace is not None else None
+    )
+    # Clamp timings captured by the preceding _clamp_image_tensor call; the
+    # clamped tensor object flows directly from it into this function.
+    _opt_clamp = _OPT_CLAMP_PENDING.pop(id(images_t), None) if _opt_on else None
+    if _opt_clamp is None:
+        _opt_clamp = {
+            "gpu_to_cpu_ms": None,
+            "clamp_scale_ms": None,
+            "dtype_convert_ms": None,
+        }
+
     B, H, W, C = images_t.shape
     fmt_meta = _FORMAT_META.get(output_format, _FORMAT_META["original"])
     ext = fmt_meta["ext"]
@@ -478,20 +618,36 @@ def encode_image_tensor_batch(
 
     entries = []
     for batch_idx in range(B):
+        _opt_batch_t0 = time.monotonic_ns() if _opt_on else None
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         arr = images_t[batch_idx].numpy()
+        _opt_numpy_view_ms = (
+            round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+            if _opt_t0 is not None else None
+        )
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         if output_format == "jpeg" and arr.shape[-1] == 4:
             from PIL import Image as _PILImg
             pil_img = _PILImg.fromarray(arr, mode="RGBA")
+            _opt_pil_create_ms = (
+                round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+                if _opt_t0 is not None else None
+            )
             bg = _PILImg.new("RGB", pil_img.size, (255, 255, 255))
             bg.paste(pil_img, mask=pil_img.split()[3])
             pil_img = bg
         else:
             mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
             pil_img = _PILImage.fromarray(arr, mode=mode)
+            _opt_pil_create_ms = (
+                round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+                if _opt_t0 is not None else None
+            )
 
         out_buf = _io.BytesIO()
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         if output_format == "original":
-            pil_img.save(out_buf, format="PNG")
+            pil_img.save(out_buf, format="PNG", compress_level=_png_level)
         elif output_format == "webp_lossless":
             method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
             pil_img.save(out_buf, format="WEBP", lossless=True, method=method)
@@ -504,11 +660,54 @@ def encode_image_tensor_batch(
                 pil_img = bg
             pil_img.save(out_buf, format="JPEG", quality=quality)
         else:
-            pil_img.save(out_buf, format="PNG")
+            pil_img.save(out_buf, format="PNG", compress_level=_png_level)
+        _opt_png_compress_ms = (
+            round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+            if _opt_t0 is not None else None
+        )
 
         out_buf.seek(0)
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         raw_bytes = out_buf.read()
+        _opt_raw_bytes_ms = (
+            round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+            if _opt_t0 is not None else None
+        )
+        if _opt_on:
+            _opt_entry = {
+                "request_id": _opt_req_id,
+                "batch_index": batch_idx,
+                "gpu_to_cpu_ms": _opt_clamp.get("gpu_to_cpu_ms"),
+                "clamp_scale_ms": _opt_clamp.get("clamp_scale_ms"),
+                "dtype_convert_ms": _opt_clamp.get("dtype_convert_ms"),
+                "numpy_view_ms": _opt_numpy_view_ms,
+                "pil_create_ms": _opt_pil_create_ms,
+                "png_compress_ms": _opt_png_compress_ms,
+                "raw_bytes_ms": _opt_raw_bytes_ms,
+                "total_ms": round((time.monotonic_ns() - _opt_batch_t0) / 1_000_000, 3),
+                "width": W,
+                "height": H,
+                "channels": C,
+                "output_bytes": len(raw_bytes),
+                "compress_level": _png_level,
+                "backend": "PIL",
+                "optimizer": False,
+            }
+            _opt_diag_append(_OPT_ENCODE_DIAG, _opt_entry, _OPT_ENCODE_DIAG_MAX_ENTRIES)
+            _opt_emit(
+                _opt_trace,
+                "output_encode_decomposition",
+                phase="execution",
+                metadata=_opt_entry,
+            )
+            print(f"[v2.opt.output_encode] total_ms={_opt_entry['total_ms']} "
+                  f"png_compress_ms={_opt_entry['png_compress_ms']} "
+                  f"gpu_to_cpu_ms={_opt_entry['gpu_to_cpu_ms']}")
         entries.append((raw_bytes, ext, mime_type))
+    # ── V2 png_encode experiment: log the arm once per process.  Baseline
+    # level 6 is PIL's default and logs nothing (it IS the default; no noise).
+    if _png_level != 6:
+        _png_experiment_log_once()
     return entries, ext, mime_type, W, H
 
 
@@ -522,15 +721,45 @@ def _clamp_image_tensor(images):
     gracefully by detecting the actual value range and avoiding double-scaling.
     """
     import torch
+    _opt_on = _opt_diag_enabled()
+    _opt_t0 = time.monotonic_ns() if _opt_on else None
     images_t = images.detach().cpu()
+    _opt_gpu_to_cpu_ms = (
+        round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+        if _opt_t0 is not None else None
+    )
     if images_t.dtype == torch.uint8:
-        return images_t.contiguous()
+        _result = images_t.contiguous()
+        if _opt_on:
+            _opt_clamp_pending_store(id(_result), {
+                "gpu_to_cpu_ms": _opt_gpu_to_cpu_ms,
+                "clamp_scale_ms": 0.0,
+                "dtype_convert_ms": 0.0,
+            })
+        return _result
+    _opt_t0 = time.monotonic_ns() if _opt_on else None
     images_t = images_t.float()
     if float(images_t.max()) <= 1.0:
         images_t.clamp_(0.0, 1.0).mul_(255.0)
     else:
         images_t.clamp_(0.0, 255.0)
-    return images_t.to(torch.uint8)
+    _opt_clamp_scale_ms = (
+        round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+        if _opt_t0 is not None else None
+    )
+    _opt_t0 = time.monotonic_ns() if _opt_on else None
+    _result = images_t.to(torch.uint8)
+    _opt_dtype_convert_ms = (
+        round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+        if _opt_t0 is not None else None
+    )
+    if _opt_on:
+        _opt_clamp_pending_store(id(_result), {
+            "gpu_to_cpu_ms": _opt_gpu_to_cpu_ms,
+            "clamp_scale_ms": _opt_clamp_scale_ms,
+            "dtype_convert_ms": _opt_dtype_convert_ms,
+        })
+    return _result
 
 
 def _collect_production_request_params(req):
@@ -3379,12 +3608,27 @@ def _safe_listdir(path: str) -> list[str]:
 # and environment files/directories must never change the persisted
 # generation, so identical baked/runtime canonical content produces an
 # identical generation regardless of mtime or build artifacts.
+#
+# INVARIANT: this set MUST remain a superset of
+# ``__init__._CUSTOM_NODE_SYNC_EXCLUDE_DIRS`` (the deploy-time volume-sync
+# archive filter).  Anything the archive drops on the way to the Volume would
+# otherwise make the extracted Volume tree fingerprint differ from the local
+# tree fingerprint, breaking baked == persisted parity (the V2
+# ``generation_mismatch`` proof failure).  Keep both sets in lockstep.
 _CUSTOM_NODE_GENERATED_DIRS = frozenset({
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     ".ipynb_checkpoints", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".tox", ".eggs", ".cache", "wheelhouse", "wheels", "build", "dist",
     "tests", "test", "examples", "benchmarks", "benchmark", "traces",
     "logs", "scripts", ".github",
+    # ── Superset of __init__._CUSTOM_NODE_SYNC_EXCLUDE_DIRS (archive filter) ──
+    # These are dropped from the volume-sync archive, so they must never
+    # participate in the fingerprint either.
+    "output", "test-results", "playwright-report",
+    ".playwright-mcp", ".experiments", ".run_history",
+    "benchmark_runs", "benchmark_logs", "optimization_logs",
+    ".comfymodal_experiments", ".custom_node_requirements", ".baked_custom_node_deps",
+    ".presets", ".preset_blobs",
 })
 _CUSTOM_NODE_GENERATED_FILE_SUFFIXES = (
     ".log", ".tmp", ".trace", ".jsonl", ".whl",
@@ -5115,6 +5359,15 @@ def _complete_active_model_read(canonical_key: str) -> None:
             "wall_ms": entry.get("active_read_wall_ms"),
             "thread_cpu_ms": entry.get("active_read_thread_cpu_ms"),
             "process_cpu_ms": entry.get("active_read_process_cpu_ms"),
+            # ── Start/end boundaries for the waterfall "Checkpoint read" row ──
+            # The engine (v2_waterfall._request_detail_stages) reads
+            # start_wall_unix_ns/start_monotonic_ns and end_wall_unix_ns/
+            # end_monotonic_ns from these records to build the real read span
+            # instead of falling back to the H2D .to() pair.  All units are ns.
+            "start_wall_unix_ns": entry.get("start_wall_unix_ns"),
+            "start_monotonic_ns": entry.get("start_monotonic_ns"),
+            "end_wall_unix_ns": _complete_wall_ns,
+            "end_monotonic_ns": _complete_now_ns,
         })
         if len(_COMPLETED_ACTIVE_READS) > 256:
             del _COMPLETED_ACTIVE_READS[:-256]
@@ -7499,6 +7752,14 @@ GPU_PROFILES = {
     "high_mem": {"cpu": 4, "memory": 32768, "target_inputs": 1, "max_inputs": 1},
 }
 
+# Authoritative ComfyUI core for Step-3 host<->image parity: the upstream
+# v0.24.0 tag commit the local validation checkout is pinned to
+# (Comfy-Org/ComfyUI, lightweight tag v0.24.0).  comfy-cli 1.3.7's default
+# "nightly" install clones master WITHOUT a tag checkout, so the image must
+# be re-pinned explicitly; the string change also busts the image layer hash
+# so a new pin always triggers a rebuild of the affected layers.
+_COMFYUI_PINNED_COMMIT = "f49bdb655707b97952dcef40e12e5af1f08d2007"
+
 SAGEATTENTION_GIT_REF = "v2.2.0"
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
@@ -7534,6 +7795,14 @@ _image_base = (
     .pip_install("comfy-cli==1.3.7", "httpx>=0.27.0")
     .run_commands(
         "comfy --skip-prompt install --nvidia",
+        gpu="a10g",
+    )
+    # Pin ComfyUI to the exact authoritative commit (comfy-cli's default
+    # nightly install leaves the checkout on an unpinned master snapshot).
+    .run_commands(
+        "git -C /root/comfy/ComfyUI fetch --depth=1 origin " + _COMFYUI_PINNED_COMMIT + " && "
+        "git -C /root/comfy/ComfyUI checkout --force " + _COMFYUI_PINNED_COMMIT + " && "
+        "git -C /root/comfy/ComfyUI log -1 --format='pinned=%H'",
         gpu="a10g",
     )
     # Force CUDA 13.0 PyTorch after comfy install (which may install older CUDA build)
@@ -20020,10 +20289,30 @@ class _ComfyAPIMixin:
 
         comfy.cli_args.args.cpu = False
         comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
-        comfy.model_management.total_vram = (
-            comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
-            / (1024 * 1024)
-        )
+        # ── V2 restore_memory experiment (deployment-level, default baseline) ──
+        # When the optimized arm is active and a frozen GPU-capacity snapshot
+        # exists, skip the torch.cuda.mem_get_info round trip entirely — the
+        # frozen value is the SAME physical total VRAM of the deployment GPU
+        # (nvidia-smi memory.total == mem_get_info()[1] on the same GPU).
+        from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
+        _frozen_vram = apply_frozen_total_vram_or_none()
+        if _frozen_vram is not None:
+            comfy.model_management.total_vram = _frozen_vram
+            if _opt_diag_enabled():
+                print(f"[v2.opt.gpu_state] total_memory_ms=frozen:{_frozen_vram:.0f}")
+            _restore_memory_experiment_log_once()
+        else:
+            # ── V2 Python-restore decomposition (measurement-only, gated) ──
+            _opt_t0 = time.monotonic_ns() if _opt_diag_enabled() else None
+            comfy.model_management.total_vram = (
+                comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
+                / (1024 * 1024)
+            )
+            if _opt_t0 is not None:
+                _opt_total_memory_ms = round(
+                    (time.monotonic_ns() - _opt_t0) / 1_000_000, 3
+                )
+                print(f"[v2.opt.gpu_state] total_memory_ms={_opt_total_memory_ms}")
         comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
         comfy.model_management.DISABLE_SMART_MEMORY = False
         if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
@@ -20727,10 +21016,21 @@ class _ComfyAPIMixin:
                       f"at_ms_from_restore_start={__stages['gpu_state_start_ms_from_restore_start']}")
                 import comfy.model_management
                 import psutil
-                comfy.model_management.total_vram = (
-                    comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
-                    / (1024 * 1024)
-                )
+                # ── V2 restore_memory experiment (same frozen-VRAM arm as the
+                #    CPU-only restore path).  Frozen value is semantically equal
+                #    to mem_get_info()[1] on the same deployment GPU. ──
+                from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
+                _frozen_vram = apply_frozen_total_vram_or_none()
+                if _frozen_vram is not None:
+                    comfy.model_management.total_vram = _frozen_vram
+                    if _opt_diag_enabled():
+                        print(f"[v2.opt.gpu_state] total_memory_ms=frozen:{_frozen_vram:.0f}")
+                    _restore_memory_experiment_log_once()
+                else:
+                    comfy.model_management.total_vram = (
+                        comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
+                        / (1024 * 1024)
+                    )
                 comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
                 __stages["gpu_state_ms"] = self._profile_ms(_s)
                 __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)

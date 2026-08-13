@@ -1,0 +1,867 @@
+Function 'ModalRuntimeEntrypointV2.*' (fu-MfOo4odwqImqM9laS0CtVW) is waiting to be scheduled on a GPU_RTX_PRO_6000 worker. We are actively working on acquiring more capacity for your workload.. Relaxing requirements (cpu=12, memory=32.8GiB) may lead to faster scheduling
+Function 'ModalRuntimeEntrypointV2.*' (fu-MfOo4odwqImqM9laS0CtVW) is waiting to be scheduled on a GPU_RTX_PRO_6000 worker. We are actively working on acquiring more capacity for your workload.. Relaxing requirements (cpu=12, memory=32.8GiB) may lead to faster scheduling
+Function 'ModalRuntimeEntrypointV2.*' (fu-MfOo4odwqImqM9laS0CtVW) is waiting to be scheduled on a GPU_RTX_PRO_6000 worker. We are actively working on acquiring more capacity for your workload.. Relaxing requirements (cpu=12, memory=32.8GiB) may lead to faster scheduling
+Restoring Function from memory snapshot.
+[v2.startup_stage] stage=post_snapshot_restore event=start wall_unix_ns=1786507964691615754 monotonic_ns=27871440887583
+[v2.snapshot_timing] snapshot_callback_age_at_restore_ms=27830660.225 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=unavailable request_latency_included=0 source=snapshot_callback_return_to_restore_start
+[v2.snapshot_model_eviction] stage=restore_observed marker=1 cpu_snapshot_models_present=1 clip_present=1 unet_present=0 retained_role=clip_vae retained_model_id=0 retained_model_type= rss_after_restore_mib=11293.3828125 native_thread_count=46 torch_intraop=12 torch_interop=14 wall_unix_ns=1786507964918747070
+[v2.snapshot_model_eviction] stage=restore_release_retained retain_role=clip_vae status=container_retained container_present=1 clip_present=1 vae_present=1 unet_present=0 retained_slot_release=0 retained_model_id=0 retained_alive_after_release=0 rss_before_release_mib=absent rss_after_gc_mib=absent rss_after_trim_mib=absent rss_drop_mib=absent malloc_trim_status=absent malloc_trim_result=absent restore_release_start_wall_unix_ns=1786507964918882023 restore_release_end_wall_unix_ns=1786507964918882023 wall_unix_ns=1786507964918882023
+[v2.residency_config] enabled=0
+[v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=11579.3 process_maxrss_mib=35690.0 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.runtime_shape] stage=after_restore runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+[comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 2140.1ms
+[restore.cuda_context] available=1 device_index=0 device=NVIDIA RTX PRO 6000 Blackwell Server Edition sync_ms=2.963 total_ms=3.079
+[v2.sage_restore] decision=snapshot_exact_skip discovery_called=0 verify_ms=0.059
+[v2.custom_node_restore] decision=snapshot_exact_skip callback_called=0 source=instance check_ms=0.201
+[v2.startup_stage] stage=snapshot_execution_seed event=start wall_unix_ns=1786507971432277172 monotonic_ns=27878181551334
+[v2.seed_restore] source=publisher_plan schema=2 topology_available=1 workflow_hash=3ab7f1d3377c3d22 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.startup_stage] stage=snapshot_execution_seed event=end wall_unix_ns=1786507971466091175 monotonic_ns=27878215363036 duration_ms=33.812
+[v2.generation_identity] method=restore custom_nodes_generation='f12a52e8fdab958ed67c51fa…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47310297280720 deployment_combined_hash=e5e9b2e187b12818
+[v2.prefill_config] env=critical parsed=critical cpu_snapshot_active=0
+[v2.restore_breakdown] bootstrap_ms=4593.214 unet_cache_patch_ms=None clip_prepare_submit_ms=None clip_worker_wait_ms=None unet_spec_extract_ms=None bg_unet_submit_ms=None restore_finalize_ms=0.105
+[v2.clip_stages] worker_queue_ms=None load_torch_file_ms=None read_to_ready_ms=None post_read_cpu_prepare_ms=None gpu_wait_ms=None gpu_commit_ms=None read_end_to_ready_ms=None worker_total_ms=None worker_close_wait_ms=None restore_finalization_ms=0.105
+[v2.restoration_identity] restored_instance_id=5710dda82ef14a1f81f4fa263932a6ed restore_session_id=bd189a33ff144e17aee5d7b54fe32218 container_session_id=0e3b5f5011f0456e modal_task_id=ta-01KZT2R58MYQ3XP1BBMFVTPKRR modal_image_id=im-c6kv4IAVG8V1a2bAWRRegc modal_cloud=CLOUD_PROVIDER_GCP modal_region=us-central1 pid=2 hostname=modal restore_total_ms=6547.965 remote_python_resume_wall_unix_ns=1786507964691581440 restore_method_start_wall_unix_ns=1786507964691581440 restore_method_end_wall_unix_ns=1786507971466952704 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success 
+[v2.lifecycle] method=restore snap=False container_session=0e3b5f5011f0456e restore_count=1 restore_total_ms=6547.965 remote_python_resume_wall_unix_ns=1786507964691581440 restore_method_start_wall_unix_ns=1786507964691581440 restore_method_end_wall_unix_ns=1786507971466952704 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success status=restored
+[v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=13133.4 process_maxrss_mib=35690.0 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+[v2.startup_stage] stage=post_snapshot_restore event=end wall_unix_ns=1786507971473211077 monotonic_ns=27878222482728 duration_ms=6781.595
+[v2.startup_stage] stage=first_remote_method_entry event=entry wall_unix_ns=1786507971513144081 monotonic_ns=27878262415653
+[v2.env_profile] effective_profile=inherit container_profile=inherit request_override=inherit request_override_applied=0 source=request-inherit-noop
+[v2.local_submission_breakdown.remote] request_id=v2-benchmark-0-b2d996d6fd50 local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=16.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=absent payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=16.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=15346 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.runtime_shape] stage=request_entry runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=48 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+[v2.method_entry_gap] restore_to_method_ms=39.968 first_line_to_running_log_ms=7.262 same_process=True identity_mismatch_reasons=none remote_python_resume_wall_unix_ns=1786507964691581440 restore_method_start_wall_unix_ns=1786507964691581440 restore_method_end_wall_unix_ns=1786507971466952704 modal_method_entry_wall_unix_ns=1786507971513131264 restore_end_to_modal_method_ms=46.177
+[v2.snapshot_timing] snapshot_callback_age_at_restore_ms=27830660.225 snapshot_callback_to_command_start_ms=27691552.296 command_start_to_restore_start_ms=139107.581 request_latency_included=0_for_callback_age
+[v2.host_memory] stage=prompt_executor_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=13135.5 process_maxrss_mib=35690.0 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.cpu_snapshot_models] cpu_snapshot_models_present=1 clip_present=1 unet_present=0 cpu_snapshot_active=0
+[v2.cpu_snapshot_request] status=present_but_inactive clip_present=1 unet_present=0 action=never_serve_inactive_patchers
+[v2.snapshot_activation_invariant] profile=inherit models_container_present=1 clip_present=1 unet_present=0 snapshot_enabled_by_config=1 cpu_snapshot_active=0 loader_bridge_active=0 execution_prefill_allowed=1 status=pass reason=ok
+[v2.execution_prefill] snapshot_active=0 env_raw=critical scheduled=0
+[v2.exec] res4lyf_dummy_init_disabled=1 reported_injected=1 actual_injected=1
+[preflight.model_reads] restore_preload_active=0 selected_clip=/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors
+[v2.generation_identity] custom_nodes_generation='f12a52e8fdab958ed67c51fa…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47310297280720 deployment_combined_hash=e5e9b2e187b12818
+[v2.cert] decision=snapshot_fallback reason=snapshot_cert_invalid identity=2ed9b17f4973b476
+[v2.cert] cache_evict reason= identity=2ed9b17f4973b476
+[v2.cert] hit=0 identity=2ed9b17f4973b476
+[dep_manifest] loaded identity=ed4c098193ccca33... load_ms=0.5
+[v2.dependency_validation] source=persistent_manifest identity_match=1 prompt_structure_validation_ms=0.11 deployment_hash_resolution_ms=0.01 baked_manifest_read_ms=56.13 custom_node_generation_read_ms=23.97 manifest_load_ms=0.78 cheap_check_ms=0.06 manifest_identity_check_ms=0.06 fallback_validation_called=0 fallback_fingerprint_ms=0.0 fallback_validation_ms=0.0 fingerprint_ms=0.0 full_validation_ms=0.0 refresh_performed=0 preflight_total_ms=81.15 deployment_hash=e5e9b2e187b12818 baked_dependency_hash=be68be1945de2a29 custom_nodes_generation=f12a52e8fdab958e repair_mode=fail_fast stored_manifest_identity=ed4c098193ccca33 computed_manifest_identity=ed4c098193ccca33 miss_component= reason=manifest_identity_match
+[comfyapp] preflight result: {'valid_prompt': True, 'dependency_prepared': True, 'repair_mode': 'fail_fast', 'dependency_reason': 'manifest_identity_match'}
+[v2.host_memory] stage=peak_execution current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=13140.4 process_maxrss_mib=35690.0 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.startup_stage] stage=first_prompt_executor_invocation event=start wall_unix_ns=1786507972212921984 monotonic_ns=27878962193650
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/vae/ae.safetensors active_read_id=bcc8954d1a434a1e restored_instance_id=5710dda82ef14a1f81f4fa263932a6ed restore_session_id=bd189a33ff144e17aee5d7b54fe32218 request_id=v2-benchmark-0-b2d996d6fd50 start_wall_unix_ns=1786507972554877440 start_monotonic_ns=27879304148412 start_thread_time_ns=38040000000 start_process_time_ns=117090000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=6192 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/vae/ae.safetensors active_read_id=bcc8954d1a434a1e restored_instance_id=5710dda82ef14a1f restore_session_id=bd189a33ff144e17aee5d7b54fe32218 complete_wall_unix_ns=1786507973458290432 complete_monotonic_ns=27880207559638 complete_thread_time_ns=38880000000 complete_process_time_ns=118010000000 complete_native_tid=2 wall_ms=903.411 thread_cpu_ms=840.0 process_cpu_ms=920.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=6192
+[v2.active_read_diag] active_read_id=bcc8954d1a434a1e owner=graph_loader request_id=v2-benchmark-0-b2d996d6fd50 restore_session_id=bd189a33ff144e17aee5d7b54fe32218 path_hash=4c78afa4b05fac11 wall_ms=903.411 thread_cpu_ms=840.0 process_cpu_ms=920.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/text_encoders/qwen_3_4b.safetensors active_read_id=0f59e52a3a3141a6 restored_instance_id=5710dda82ef14a1f81f4fa263932a6ed restore_session_id=bd189a33ff144e17aee5d7b54fe32218 request_id=v2-benchmark-0-b2d996d6fd50 start_wall_unix_ns=1786507973698792960 start_monotonic_ns=27880448062768 start_thread_time_ns=39110000000 start_process_time_ns=119450000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=6158 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/text_encoders/qwen_3_4b.safetensors active_read_id=0f59e52a3a3141a6 restored_instance_id=5710dda82ef14a1f restore_session_id=bd189a33ff144e17aee5d7b54fe32218 complete_wall_unix_ns=1786507976183834880 complete_monotonic_ns=27882933104685 complete_thread_time_ns=41420000000 complete_process_time_ns=122050000000 complete_native_tid=2 wall_ms=2485.042 thread_cpu_ms=2310.0 process_cpu_ms=2600.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=6158
+[v2.active_read_diag] active_read_id=0f59e52a3a3141a6 owner=graph_loader request_id=v2-benchmark-0-b2d996d6fd50 restore_session_id=bd189a33ff144e17aee5d7b54fe32218 path_hash=18da7c5b6a0c3132 wall_ms=2485.042 thread_cpu_ms=2310.0 process_cpu_ms=2600.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[v2.cpu_owner] operation=load_models_gpu role=CLIP wall_ms=629.080 process_cpu_ms=690.000 effective_cores=1.097 native_threads_start=52 native_threads_peak=53 native_threads_end=52
+[v2.cpu_owner] operation=CLIP.encode_from_tokens role=CLIP wall_ms=1148.925 process_cpu_ms=1210.000 effective_cores=1.053 native_threads_start=51 native_threads_peak=53 native_threads_end=51
+[v2.cpu_owner] operation=CLIPTextEncode role=CLIP wall_ms=1159.399 process_cpu_ms=1220.000 effective_cores=1.052 native_threads_start=50 native_threads_peak=53 native_threads_end=50
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/diffusion_models/z_image_turbo_bf16.s active_read_id=a892a69457cf4271 restored_instance_id=5710dda82ef14a1f81f4fa263932a6ed restore_session_id=bd189a33ff144e17aee5d7b54fe32218 request_id=v2-benchmark-0-b2d996d6fd50 start_wall_unix_ns=1786507979126356224 start_monotonic_ns=27885875626753 start_thread_time_ns=43690000000 start_process_time_ns=137990000000 native_tid=2 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=6178 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/diffusion_models/z_image_turbo_bf16.s active_read_id=a892a69457cf4271 restored_instance_id=5710dda82ef14a1f restore_session_id=bd189a33ff144e17aee5d7b54fe32218 complete_wall_unix_ns=1786507981727514112 complete_monotonic_ns=27888476783300 complete_thread_time_ns=46100000000 complete_process_time_ns=140740000000 complete_native_tid=2 wall_ms=2601.157 thread_cpu_ms=2410.0 process_cpu_ms=2750.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=6178
+[v2.active_read_diag] active_read_id=a892a69457cf4271 owner=graph_loader request_id=v2-benchmark-0-b2d996d6fd50 restore_session_id=bd189a33ff144e17aee5d7b54fe32218 path_hash=8d2256b3cff6bbd2 wall_ms=2601.157 thread_cpu_ms=2410.0 process_cpu_ms=2750.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+WARNING:root:[FeatureInjLatent] Reference latent: shape=torch.Size([1, 16, 240, 136])
+standard
+[v2.sampler_boundary] event=sampler_lane_requested sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta blocking_owner=absent
+[v2.sampler_boundary] event=sampler_lane_acquired sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta wait_ms=0.085 blocking_owner=absent
+[CacheDiT] Transformer class: NextDiT (module: comfy.ldm.lumina.model)
+[v2.cpu_owner] operation=load_models_gpu role=other wall_ms=29.568 process_cpu_ms=30.000 effective_cores=1.015 native_threads_start=50 native_threads_peak=51 native_threads_end=50
+(RES4LYF) rk_type: res_2s
+
+[1A  0%|          | 0/8 [00:00<?, ?it/s]WARNING:root:[FeatureInjLatent] step=1 | progress=0.00 | eff_str=0.250 | no mask
+WARNING:root:[FeatureInjLatent] step=2 | progress=0.01 | eff_str=0.214 | no mask
+
+[1A 12%|█▎        | 1/8 [00:01<00:11,  1.62s/it]WARNING:root:[FeatureInjLatent] step=3 | progress=0.03 | eff_str=0.178 | no mask
+
+[1A 25%|██▌       | 2/8 [00:02<00:07,  1.22s/it]
+[1A 38%|███▊      | 3/8 [00:03<00:04,  1.14it/s]
+[1A 50%|█████     | 4/8 [00:03<00:02,  1.39it/s]
+[1A 62%|██████▎   | 5/8 [00:03<00:01,  1.58it/s]
+[1A 75%|███████▌  | 6/8 [00:04<00:01,  1.74it/s]
+[1A 88%|████████▊ | 7/8 [00:04<00:00,  1.86it/s]
+[1A100%|██████████| 8/8 [00:05<00:00,  1.94it/s]
+[1A100%|██████████| 8/8 [00:05<00:00,  1.49it/s]
+[v2.cpu_owner] operation=load_models_gpu role=other wall_ms=59.573 process_cpu_ms=180.000 effective_cores=3.021 native_threads_start=51 native_threads_peak=52 native_threads_end=51
+[production.rgthree.encode] side=b (B-only) shape=(1, 1920, 1088, 3) dtype=torch.uint8
+[production.rgthree] node_id=107 a_count=0 b_count=1 encoded_unique=1 logical_outputs=1 return_a=0 temp_files_written=0 encode_ms=575.2
+[v2.startup_stage] stage=first_prompt_executor_invocation event=end wall_unix_ns=1786507993249225117 monotonic_ns=27899998496840 duration_ms=21036.303
+[v2.pre_sampler_stages] request_id=v2-benchmark-0-b2d996d6fd50 restored_instance_id=5710dda82ef14a1f81f4fa263932a6ed restore_session_id=bd189a33ff144e17aee5d7b54fe32218 container_session_id=0e3b5f5011f0456e modal_input_id=in-01KZT2M5WX2G4XESGYKADPVPWT:1786507827101-0 modal_task_id=ta-01KZT2R58MYQ3XP1BBMFVTPKRR pid=2 boot_id=69478d8f-6485-4148-9acc-002022939354 hostname=modal total_nodes=43 first_output_node=935:931:easy imageSize first_executing_node=987:Any Switch (rgthree) sampler_stage_status=unavailable method_entry_to_graph_start_ms=21.645 graph_setup_ms=678.053 certificate_ms=119.972 cert_identity_build_ms=0.022 cert_cache_hit=0 cert_volume_reload_ms=119.417 cert_file_read_ms=0.317 cert_json_parse_validate_ms=0.0 cert_total_ms=119.756 legacy_preflight_ms=83.038 prompt_validation_ms=469.716 certificate_skipped_preflight=0 certificate_skipped_prompt_validation=0 preflight_ms=83.0 validation_ms=469.802 missing_node_repair_ms=0.636 production_registry_setup_ms=0.042 production_registry_profile_setup_ms=0.042 pregraph_setup_ms=0.346 executor_reset_ms=0.077 sampler_lane_wait_ms=0.057 residual_before_invoke_ms=1.345 method_entry_to_runtime_configuration_ms=21.601 call_to_exec_start_ms=0.534 exec_start_to_cached_ms=79.198 cached_to_first_executing_ms=188.814 call_to_cached_ms=79.732 call_to_first_node_ms=268.546 first_node_to_clip_ms=1215.666 clip_to_sampler_node_ms=11636.431 sampler_node_to_sampler_start_ms=absent sampler_node_to_lane_acquired_ms=0.112 lane_acquired_to_actual_stage_ms=absent pre_sampler_total_ms=absent measured_children_ms=13794.568 residual_ms=absent reconciliation_status=absent_total add_message=True send_sync=True has_sampler=True sampler_count=1 lane_acquired=True
+[v2.startup_stage] stage=first_durable_result event=ready wall_unix_ns=1786507993259214320 monotonic_ns=27900008485933 output_persisted=1
+[v2.output] hashes=1 base64_encode=0 base64_decode=0 commit_ms=0.0 overlap_ms=0.0 serialized_bytes=2188
+[v2.cert] write identity=2ed9b17f4973b476 status=committed
+[v2.cert] snapshot_retained_updated reason=request_write identity=2ed9b17f4973b476
+[v2.host_memory] stage=result_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=14618.9 process_maxrss_mib=35690.0 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.activation_diagnosis] request_id=v2-benchmark-0-b2d996d6fd50 cpu_snapshot_active=False execution_prefill_scheduled=False residency_diagnostics_enabled=0 clip_encode_calls=absent clip_encode_graph_calls=absent clip_encode_prefill_calls=absent clip_encode_wall_ms=absent clip_encode_graph_wall_ms=absent clip_encode_prefill_wall_ms=absent clip_encode_process_cpu_ms=absent load_models_gpu_calls=0 unet_gpu_load_calls=0 load_models_gpu_wall_ms=0 activation_receipt_count=0 gpu_allocated_delta_bytes=absent cpu_peak_cores=11.951 cpu_above_16_ms=0.0 cpu_above_19_ms=0.0 cpu_longest_above_19_ms=absent cpu_overlap_graph_clip_ms=0.0 cpu_overlap_prefill_clip_ms=0.0 cpu_overlap_gpu_load_ms=0.0 clip_to_sampler_node_ms=11636.431 sampler_node_to_sampler_start_ms=absent diagnostic_accounted_ms=absent diagnostic_unattributed_ms=absent restore_requested_torch_intraop_threads=absent restore_actual_torch_intraop_threads=12 restore_torch_interop_threads=14 restore_torch_thread_limit_status=baseline_passthrough
+[v2.process_cpu_spike] status=ok peak_effective_cores=11.951 duration_above_16_ms=0.000 duration_above_19_ms=0.000 longest_above_19_ms=0.000 sample_count=357
+[v2.remote_request_origin.remote] request_id=v2-benchmark-0-b2d996d6fd50 trigger_source=benchmark ui_trigger_unix_ms=1786507825584 local_receive_unix_ns=1786507825585683200 modal_generator_create_start_unix_ns=1786507825598683300 modal_submission_attempt_unix_ns=absent modal_generator_created_unix_ns=absent modal_first_iteration_start_unix_ns=absent modal_first_remote_event_unix_ns=absent modal_method_entry_unix_ns=1786507971513131264 prompt_executor_invoke_start_unix_ns=1786507972212744960 trigger_to_dispatch_ms=1.683 dispatch_to_modal_entry_ms=None modal_entry_to_executor_ms=699.62 trigger_to_executor_ms=146628.745 modal_input_id=in-01KZT2M5WX2G4XESGYKADPVPWT:1786507827101-0 modal_task_id=ta-01KZT2R58MYQ3XP1BBMFVTPKRR
+[v2.critical_path] python_resume_to_restore_enter_ms=0.0 restore_total_ms=6547.965 restore_exit_to_run_enter_ms=46.177 run_enter_to_plan_received_ms=16.032 plan_received_to_executor_invoke_ms=683.588 executor_invoke_to_first_node_ms=268.42 first_node_to_sampler_node_ms=12852.105 sampler_node_to_sampler_start_ms=absent pre_sampler_unattributed_ms=absent
+[v2.cgroup_cpu_spike] status=unavailable reason=no readable cpu.stat candidates=/sys/fs/cgroup/cpu.stat errors=resolve_cgroup_v2_base: returned no readable cgroup base;probe2 path=/sys/fs/cgroup/cpu.stat: FileNotFoundError: [Errno 2] No such file or directory: '/sys/fs/cgroup/cpu.stat';parse_proc_cgroup: no unified 0:: entry
+[v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+V2 COLD WATERFALL - remote benchmark run 1
+Request: v2-benchmark-0-b2d996d6fd50  Instance: 5710dda82ef14a1f81f4fa263932a6ed  GPU: ['RTX-PRO-6000']  Fresh: YES
+
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+ # | Stage                                          | Duration |     Cum. |      % | Relative wall time
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+  1 | Local preparation                              |     0.002s |     0.002s |   0.001% | +                                    
+  2 | Modal handle and submission                    |          - |          - |       - |                                      
+  3 | Pre-Python Modal scheduling (command to Pyt... |          - |          - |       - |                                      
+  4 | Application restore                            |     6.775s |     6.777s |   4.011% | #                                    
+  5 | Restore-to-method entry                        |     0.046s |     6.823s |   0.027% | =                                    
+  6 | ~ Method entry to UNET ownership claim         |          - |          - |       - |                                      
+  7 | ~ UNET claim to ready (worker load)            |          - |          - |       - |                                      
+  8 | Remote method setup                            |     0.700s |     7.523s |   0.414% | #                                    
+  9 |   detail: method entry to graph start          |     0.022s |          - |   0.013% |                                      
+ 10 |   detail: method entry to runtime configura... |     0.022s |          - |   0.013% |                                      
+ 11 |   detail: runtime configuration                |     0.000s |          - |   0.000% |                                      
+ 12 |   detail: graph setup                          |     0.678s |          - |   0.401% |                                      
+ 13 |   detail: certificate                          |     0.120s |          - |   0.071% |                                      
+ 14 |   detail: preflight                            |     0.083s |          - |   0.049% |                                      
+ 15 |   detail: validation                           |     0.470s |          - |   0.278% |                                      
+ 16 |   detail: legacy runtime resolution            |     0.000s |          - |   0.000% |                                      
+ 17 |   detail: preload check                        |     0.001s |          - |   0.001% |                                      
+ 18 |   detail: missing-node repair                  |     0.001s |          - |   0.000% |                                      
+ 19 |   detail: production registry setup            |     0.000s |          - |   0.000% |                                      
+ 20 |   detail: pregraph setup                       |     0.000s |          - |   0.000% |                                      
+ 21 |   detail: executor reset                       |     0.000s |          - |   0.000% |                                      
+ 22 |   detail: residual before executor invoke      |     0.001s |          - |   0.001% |                                      
+ 23 |   detail: pre-sampler total                    |          - |          - |       - |                                      
+ 24 |   detail: measured pre-sampler children        |    13.795s |          - |   8.167% |                                      
+ 25 |   detail: pre-sampler residual                 |          - |          - |       - |                                      
+ 26 |   detail: UNET quiesce wait (diagnostic)       |          - |          - |       - |                                      
+ 27 |   detail: UNET transfer queue delay            |          - |          - |       - |                                      
+ 28 |   detail: UNET synchronized transfer           |          - |          - |       - |                                      
+ 29 |   detail: Model read: graph_loader [4c78afa... |     0.903s |          - |   0.535% |                                      
+ 30 |   detail: Model read: graph_loader [18da7c5... |     2.485s |          - |   1.471% |                                      
+ 31 |   detail: Model read: graph_loader [8d2256b... |     2.601s |          - |   1.540% |                                      
+ 32 | PromptExecutor/cache setup                     |     0.269s |     7.791s |   0.159% | #                                    
+ 33 |   detail: PromptExecutor invoke to execution   |     0.001s |          - |   0.000% |                                      
+ 34 |   detail: execution to cached                  |     0.079s |          - |   0.047% |                                      
+ 35 |   detail: cached to first node                 |     0.189s |          - |   0.112% |                                      
+ 36 |   detail: graph/prefill activity               |          - |          - |       - |                                      
+ 37 |   detail: CPU owner: load_models_gpu [CLIP]    |     0.629s |          - |   0.372% |                                      
+ 38 |   detail: CPU owner: CLIP.encode_from_token... |     1.149s |          - |   0.680% |                                      
+ 39 |   detail: CPU owner: CLIPTextEncode [CLIP]     |     1.159s |          - |   0.686% |                                      
+ 40 |   detail: CPU owner: load_models_gpu [other]   |     0.030s |          - |   0.018% |                                      
+ 41 |   detail: CPU owner: load_models_gpu [other]   |     0.060s |          - |   0.035% |                                      
+ 42 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+ 43 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.000% |                                      
+ 44 |   detail: Node: SimpleMath+                    |     0.000s |          - |   0.000% |                                      
+ 45 |   detail: Node: ImpactSwitch                   |     0.070s |          - |   0.042% |                                      
+ 46 |   detail: Node: VAELoader                      |     1.142s |          - |   0.676% |                                      
+ 47 |   detail: Node: ClownOptions_ExtraOptions_Beta |     0.000s |          - |   0.000% |                                      
+ 48 |   detail: Node: ImpactIfNone                   |     0.000s |          - |   0.000% |                                      
+ 49 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 50 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+ 51 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 52 |   detail: Node: PrimitiveStringMultiline       |     0.000s |          - |   0.000% |                                      
+ 53 |   detail: Node: JoinStrings                    |     0.000s |          - |   0.000% |                                      
+ 54 |   detail: Node: CLIPLoader                     |     4.265s |          - |   2.525% |                                      
+ 55 |   detail: Node: CLIPTextEncode                 |     1.160s |          - |   0.687% |                                      
+ 56 |   detail: Node: ConditioningZeroOut            |     0.001s |          - |   0.000% |                                      
+ 57 |   detail: Node: PairConditioningSetProperties  |     0.000s |          - |   0.000% |                                      
+ 58 |   detail: Node: UNETLoader                     |     6.160s |          - |   3.647% |                                      
+ 59 |   detail: Node: ModelSamplingAuraFlow          |     0.003s |          - |   0.002% |                                      
+ 60 |   detail: Node: CacheDiT_Model_Optimizer       |     0.000s |          - |   0.000% |                                      
+ 61 |   detail: Node: PathchSageAttentionKJ          |     0.000s |          - |   0.000% |                                      
+ 62 |   detail: Node: easy float                     |     0.000s |          - |   0.000% |                                      
+ 63 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.000% |                                      
+ 64 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+ 65 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+ 66 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+ 67 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+ 68 |   detail: Node: EmptyImage                     |     0.001s |          - |   0.001% |                                      
+ 69 |   detail: Node: ImageRotate                    |     0.000s |          - |   0.000% |                                      
+ 70 |   detail: Node: ImpactSwitch                   |     0.042s |          - |   0.025% |                                      
+ 71 |   detail: Node: easy imageSize                 |     0.000s |          - |   0.000% |                                      
+ 72 |   detail: Node: EmptySD3LatentImage            |     0.001s |          - |   0.000% |                                      
+ 73 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+ 74 |   detail: Node: LGNoiseInjectionLatent         |     0.001s |          - |   0.000% |                                      
+ 75 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+ 76 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 77 |   detail: Node: StringToCombo|LP               |     0.000s |          - |   0.000% |                                      
+ 78 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 79 |   detail: Node: ClownsharKSampler_Beta         |     6.460s |          - |   3.825% |                                      
+ 80 |   detail: Node: VAEDecode                      |     0.879s |          - |   0.520% |                                      
+ 81 |   detail: Node: Any Switch (rgthree)           |     0.001s |          - |   0.000% |                                      
+ 82 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+ 83 |   detail: Node: ComfyModalProductionImageCo... |     0.576s |          - |   0.341% |                                      
+ 84 | First node to CLIP                             |     1.216s |     9.007s |   0.720% | #                                    
+ 85 | CLIP to sampler node                           |    11.636s |    20.644s |   6.889% | ###                                  
+ 86 | Sampler graph-join wait                        |          - |          - |       - |                                      
+ 87 | Sampler node to sampling                       |     1.751s |    22.395s |   1.037% | #                                    
+ 88 |   detail: sampler lane wait                    |     0.000s |          - |   0.000% |                                      
+ 89 |   detail: sampler node to lane acquired        |     0.000s |          - |   0.000% |                                      
+ 90 |   detail: lane acquired to actual stage        |          - |          - |       - |                                      
+ 91 | Sampling                                       |     3.753s |    26.148s |   2.222% | #                                    
+ 92 | Post-sampling transition                       |     0.956s |    27.104s |   0.566% | #                                    
+ 93 | VAE                                            |     0.879s |    27.983s |   0.520% | #                                    
+ 94 | Output persistence                             |     0.586s |    28.569s |   0.347% | #                                    
+ 95 |   detail: output encode                        |          - |          - |       - |                                      
+ 96 |   detail: output commit                        |          - |          - |       - |                                      
+ 97 | Remote result handoff                          |          - |          - |       - |                                      
+ 98 | Remote/local return                            |     1.229s |    29.798s |   0.728% | +                                    
+ 99 | Captured timeline gaps / residual              |   139.107s |   168.905s |  82.358% | ==============================       
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+    | ACCOUNTED     |    29.798s |            |  17.642% | .....................................
+    | RECONCILIATION |   139.107s |            |            | .....................................
+    | COMMAND -> RESPONSE |   168.905s |            |  100.0% | #####################################
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+Warnings:
+  - captured residual excluded from accounted: 139106.681ms unaccounted
+  - reconciliation exceeds tolerance: 139106.681ms > 844.524ms
+Building image im-v9D5VhutNFoy0HSwJQSE9o
+
+=> Step 0: FROM base
+
+=> Step 1: ENV TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache
+
+=> Step 2: ENV TORCHINDUCTOR_FX_GRAPH_CACHE=1
+
+=> Step 3: ENV TRITON_CACHE_DIR=/tmp/triton_cache
+
+=> Step 4: ENV TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1
+
+=> Step 5: ENV TORCHINDUCTOR_COMPILE_THREADS=1
+
+=> Step 6: ENV COMFYMODAL_ENABLE_TORCH_COMPILE=0
+
+=> Step 7: ENV COMFYMODAL_ENABLE_GPU_SNAPSHOT=0
+
+=> Step 8: ENV COMFYMODAL_WARMUP_TEXT=warmup
+
+=> Step 9: ENV COMFYMODAL_SAGE_RUNTIME_MODE=baked_cuda
+
+=> Step 10: ENV COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE=0
+
+=> Step 11: ENV COMFYMODAL_PRELOAD_MODE=clip_only
+
+=> Step 12: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_UNET=0
+
+=> Step 13: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP=1
+
+=> Step 14: ENV COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE=1
+
+=> Step 15: ENV COMFYMODAL_EXACT_CLIP_PREFILL=1
+
+=> Step 16: ENV COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=1
+
+=> Step 17: ENV COMFYMODAL_SAFETENSORS_READ_MODE=normal
+
+=> Step 18: ENV COMFYMODAL_RUNTIME=1
+
+=> Step 19: ENV PROMPT_ASYNC_PRELOAD=0
+
+=> Step 20: ENV PROMPT_PRELOAD_WORKERS=2
+
+=> Step 21: ENV PROMPT_ASYNC_ACTUAL_LOAD=1
+
+=> Step 22: ENV PROMPT_ASYNC_ACTUAL_LOAD_UNET=1
+
+=> Step 23: ENV ACTUAL_LOAD_MODE=unet_vae_only
+
+=> Step 24: ENV DISABLE_CACHEDIT_FOR_Z_IMAGE=0
+
+=> Step 25: ENV DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=0
+
+=> Step 26: ENV COMFYMODAL_REQUIREMENTS_REPAIR_MODE=fail_fast
+
+=> Step 27: ENV COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0
+
+=> Step 28: ENV COMFYMODAL_PRELOAD_MAX_TOTAL_GB=12
+
+=> Step 29: ENV COMFYMODAL_PRELOAD_MAX_FILE_GB=10
+
+=> Step 30: ENV COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS=0.5
+
+=> Step 31: ENV COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS=10
+
+=> Step 32: ENV COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY=0
+
+=> Step 33: ENV COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=0
+
+=> Step 34: ENV COMFYMODAL_RESTORE_BACKGROUND_UNET=0
+
+=> Step 35: ENV COMFYMODAL_V2_RUNTIME_REVISION=6618a3590c28010a
+
+=> Step 36: ENV COMFYMODAL_V2_PREFILL_LANES=critical
+
+=> Step 37: ENV COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=1
+
+=> Step 38: ENV COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+
+=> Step 39: ENV COMFYMODAL_V2_THREAD_POLICY=TBASE
+
+=> Step 40: ENV COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0
+
+=> Step 41: ENV COMFYMODAL_V2_CPU_REQUEST=12
+
+=> Step 42: ENV COMFYMODAL_V2_MEMORY_REQUEST=32768
+
+=> Step 43: ENV COMFYMODAL_V2_MEMORY_MB=32768
+
+=> Step 44: ENV COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT=f504e296c398bdcb2c4c07e2
+Saving image...
+Terminating task due to error: could not read bytes for base index BlobHash("379985c88583c9cb3929c76609dc706c83f530fc710f442d96f3862b026968c1"): timeout
+Runner failed with exit code: -1
+Building image im-v9D5VhutNFoy0HSwJQSE9o
+
+=> Step 0: FROM base
+
+=> Step 1: ENV TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache
+
+=> Step 2: ENV TORCHINDUCTOR_FX_GRAPH_CACHE=1
+
+=> Step 3: ENV TRITON_CACHE_DIR=/tmp/triton_cache
+
+=> Step 4: ENV TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1
+
+=> Step 5: ENV TORCHINDUCTOR_COMPILE_THREADS=1
+
+=> Step 6: ENV COMFYMODAL_ENABLE_TORCH_COMPILE=0
+
+=> Step 7: ENV COMFYMODAL_ENABLE_GPU_SNAPSHOT=0
+
+=> Step 8: ENV COMFYMODAL_WARMUP_TEXT=warmup
+
+=> Step 9: ENV COMFYMODAL_SAGE_RUNTIME_MODE=baked_cuda
+
+=> Step 10: ENV COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE=0
+
+=> Step 11: ENV COMFYMODAL_PRELOAD_MODE=clip_only
+
+=> Step 12: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_UNET=0
+
+=> Step 13: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP=1
+
+=> Step 14: ENV COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE=1
+
+=> Step 15: ENV COMFYMODAL_EXACT_CLIP_PREFILL=1
+
+=> Step 16: ENV COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=1
+
+=> Step 17: ENV COMFYMODAL_SAFETENSORS_READ_MODE=normal
+
+=> Step 18: ENV COMFYMODAL_RUNTIME=1
+
+=> Step 19: ENV PROMPT_ASYNC_PRELOAD=0
+
+=> Step 20: ENV PROMPT_PRELOAD_WORKERS=2
+
+=> Step 21: ENV PROMPT_ASYNC_ACTUAL_LOAD=1
+
+=> Step 22: ENV PROMPT_ASYNC_ACTUAL_LOAD_UNET=1
+
+=> Step 23: ENV ACTUAL_LOAD_MODE=unet_vae_only
+
+=> Step 24: ENV DISABLE_CACHEDIT_FOR_Z_IMAGE=0
+
+=> Step 25: ENV DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=0
+
+=> Step 26: ENV COMFYMODAL_REQUIREMENTS_REPAIR_MODE=fail_fast
+
+=> Step 27: ENV COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0
+
+=> Step 28: ENV COMFYMODAL_PRELOAD_MAX_TOTAL_GB=12
+
+=> Step 29: ENV COMFYMODAL_PRELOAD_MAX_FILE_GB=10
+
+=> Step 30: ENV COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS=0.5
+
+=> Step 31: ENV COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS=10
+
+=> Step 32: ENV COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY=0
+
+=> Step 33: ENV COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=0
+
+=> Step 34: ENV COMFYMODAL_RESTORE_BACKGROUND_UNET=0
+
+=> Step 35: ENV COMFYMODAL_V2_RUNTIME_REVISION=6618a3590c28010a
+
+=> Step 36: ENV COMFYMODAL_V2_PREFILL_LANES=critical
+
+=> Step 37: ENV COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=1
+
+=> Step 38: ENV COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+
+=> Step 39: ENV COMFYMODAL_V2_THREAD_POLICY=TBASE
+
+=> Step 40: ENV COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0
+
+=> Step 41: ENV COMFYMODAL_V2_CPU_REQUEST=12
+
+=> Step 42: ENV COMFYMODAL_V2_MEMORY_REQUEST=32768
+
+=> Step 43: ENV COMFYMODAL_V2_MEMORY_MB=32768
+
+=> Step 44: ENV COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT=f504e296c398bdcb2c4c07e2
+Saving image...
+Image saved, took 2.15s
+
+Built image im-v9D5VhutNFoy0HSwJQSE9o in 3.38s
+
+
+Building image im-rZXWm4DR954oFeqRwdxlcO
+
+=> Step 0: FROM base
+
+=> Step 1: COPY . /
+Saving image...
+Image saved, took 2.76s
+
+Built image im-rZXWm4DR954oFeqRwdxlcO in 23.62s
+
+
+Building image im-fopBG65UjVS6vwA7IAPqUf
+
+=> Step 0: FROM base
+
+=> Step 1: COPY . /
+Saving image...
+Image saved, took 2.11s
+
+Built image im-fopBG65UjVS6vwA7IAPqUf in 3.58s
+
+
+Creating CPU memory snapshot for Function.
+[v2.startup_stage] stage=container_python_import event=start wall_unix_ns=1786514309285832021 monotonic_ns=1389788822
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[exact_prefill.remote] enabled=1 source=env
+[timing_trace] module loaded __file__=/root/timing_trace.py TRACE_VERSION=2.0.0
+[timing_trace] module directory in sys.path: /root
+[modal-client] 2026-08-12T05:58:32+0000 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*
+[v2.region_pin] region=unpinned cloud=unpinned source=COMFYMODAL_V2_REGION/COMFYMODAL_V2_CLOUD
+[v2.startup_stage] stage=snap_true_enter event=start wall_unix_ns=1786514312672715125 monotonic_ns=4776671075
+[v2.startup_stage] stage=container_python_import event=end wall_unix_ns=1786514312672786562 monotonic_ns=4776741971 duration_ms=3386.953
+[v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=121.8 process_maxrss_mib=130.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.runtime_shape] stage=image_runtime_initialization runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=13 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+[v2.startup_stage] stage=snap_true_enter event=end wall_unix_ns=1786514315485508501 monotonic_ns=7589463887 duration_ms=2812.793
+[v2.snapshot_target] static_fingerprint=3378579908274910dc43d104f59142e27d0dac2b3037457ac4622f41acb3e621 app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 gpu=RTX-PRO-6000 cpu=12 memory=32768 runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 snapshot_model_order=O0
+[v2.snapshot_runtime] image_id=im-fopBG65UjVS6vwA7IAPqUf cloud=CLOUD_PROVIDER_GCP region=us-east4 container_session_id=aad499e898f94807
+[v2.manager] network_mode=offline configs=1
+[v2.startup_stage] stage=custom_node_source_copy event=start wall_unix_ns=1786514315607765631 monotonic_ns=7711721095
+[v2.custom_node_filter] total_source_dirs=38 accepted_dirs=24 duplicate_comfymodal_dirs=13 duplicate_names=[comfyui-modal-c1-c5-c6-c8-tail,comfyui-modal-east1-composition,comfyui-modal-exact-clip-conditioning-cache,comfyui-modal-memory-regression-fix,comfyui-modal-pagesfile-probe,comfyui-modal-persistent-modal-handle,comfyui-modal-persistent-submission-v2,comfyui-modal-restore-structure,comfyui-modal-sub13-diagnostic,comfyui-modal-teardown-billing-tail,comfyui-modal-vae-runtime-path,comfyui-modal-vae-snapshot-seed,comyui-modal-pagesfile-probe]
+[v2.custom_node_startup] decision=fallback_full_sync callback_called=1 reason=generation_mismatch baked_generation=b361040f206414d1 current_generation=f12a52e8fdab958e
+[comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-CacheDiT stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-CacheDiT.2.1786514315853137685
+[comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-Flux2Klein-Enhancer stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-Flux2Klein-Enhancer.2.1786514315855660999
+[comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-KJNodes stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-KJNodes.2.1786514315857728159
+[comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-SeedVR2_VideoUpscaler stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-SeedVR2_VideoUpscaler.2.1786514315864361381
+[comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI_LayerStyle stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI_LayerStyle.2.1786514315881548354
+[comfyapp] sync: staged real directory for deferred cleanup name=RES4LYF stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/RES4LYF.2.1786514315965645130
+[comfyapp] sync: staged real directory for deferred cleanup name=cg-use-everywhere stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/cg-use-everywhere.2.1786514317834452795
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-custom-scripts stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-custom-scripts.2.1786514317839736897
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-detail-daemon stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-detail-daemon.2.1786514317845047701
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-easy-use stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-easy-use.2.1786514317846061779
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-impact-pack stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-impact-pack.2.1786514317860714117
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-levelpixel stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-levelpixel.2.1786514317871394300
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-lora-manager stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-lora-manager.2.1786514317874842344
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-manager stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-manager.2.1786514317956478364
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-modal stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-modal.2.1786514317969837017
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui-workflow-encrypt stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-workflow-encrypt.2.1786514318308141929
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui_controlnet_aux stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_controlnet_aux.2.1786514318309506361
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui_essentials stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_essentials.2.1786514318360341941
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui_fill-nodes stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_fill-nodes.2.1786514318361236078
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui_image_metadata_extension stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_image_metadata_extension.2.1786514318389911613
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui_lg_samplingutils stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_lg_samplingutils.2.1786514318395144250
+[comfyapp] sync: staged real directory for deferred cleanup name=comfyui_sam3 stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_sam3.2.1786514318400557644
+[comfyapp] sync: staged real directory for deferred cleanup name=masquerade-nodes-comfyui stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/masquerade-nodes-comfyui.2.1786514318470328026
+[comfyapp] sync: staged real directory for deferred cleanup name=rgthree-comfy stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/rgthree-comfy.2.1786514318471315012
+[comfyapp] sync_custom_nodes_into_comfy: created=24 kept=0 removed=0 blocked=0 volume_dirs=24
+[comfyapp] custom_node_sync_ran reason=volume_managed nodes=24
+[v2.startup_stage] stage=custom_node_source_copy event=end wall_unix_ns=1786514318488885942 monotonic_ns=10592842066 duration_ms=2881.121
+[v2.startup_stage] stage=comfyui_path_startup event=start wall_unix_ns=1786514318489048438 monotonic_ns=10593003832
+[v2.startup_stage] stage=comfyui_path_startup event=end wall_unix_ns=1786514318489129646 monotonic_ns=10593085010 duration_ms=0.081
+[v2.startup_stage] stage=backend_startup event=start wall_unix_ns=1786514318489175960 monotonic_ns=10593131314
+[v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=13 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+[comfyapp] total_ram=707.7G  cache_ram=24.0G
+[v2.startup_stage] stage=custom_node_import event=start wall_unix_ns=1786514323854202573 monotonic_ns=15958158546
+⚠️  SeedVR2 optimizations check: SageAttention ❌ | Flash Attention ❌ | Triton ✅
+💡 Optional: pip install sageattention flash-attn
+⚠️ Memory check failed: No GPU backend available (CUDA/MPS) - No available backend!
+WARNING:root:Traceback (most recent call last):
+  File "/root/comfy/ComfyUI/nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/__init__.py", line 7, in <module>
+    from .src.interfaces import comfy_entrypoint, SeedVR2Extension
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/interfaces/__init__.py", line 8, in <module>
+    from .video_upscaler import SeedVR2VideoUpscaler
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/interfaces/video_upscaler.py", line 10, in <module>
+    from ..utils.downloads import download_weight
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/utils/downloads.py", line 14, in <module>
+    from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/utils/model_registry.py", line 14, in <module>
+    from ..models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/models/video_vae_v3/modules/attn_video_vae.py", line 20, in <module>
+    from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/__init__.py", line 1, in <module>
+    from .autoencoder_asym_kl import AsymmetricAutoencoderKL
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/autoencoder_asym_kl.py", line 23, in <module>
+    from .vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution, Encoder, MaskConditionDecoder
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/vae.py", line 25, in <module>
+    from ..unets.unet_2d_blocks import (
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/__init__.py", line 6, in <module>
+    from .unet_2d import UNet2DModel
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/unet_2d.py", line 24, in <module>
+    from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 36, in <module>
+    from ..transformers.dual_transformer_2d import DualTransformer2DModel
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/__init__.py", line 20, in <module>
+    from .transformer_bria import BriaTransformer2DModel
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_bria.py", line 14, in <module>
+    from ..attention_dispatch import dispatch_attention_fn
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/attention_dispatch.py", line 92, in <module>
+    from sageattention import (
+  File "/usr/local/lib/python3.11/site-packages/sageattention/__init__.py", line 1, in <module>
+    from .core import sageattn, sageattn_varlen
+  File "/usr/local/lib/python3.11/site-packages/sageattention/core.py", line 47, in <module>
+    from .quant import per_block_int8 as per_block_int8_cuda
+  File "/usr/local/lib/python3.11/site-packages/sageattention/quant.py", line 20, in <module>
+    from . import _fused
+  File "/root/comfyapp.py", line 17529, in find_spec
+    raise ImportError(
+ImportError: [comfyapp] blocked CUDA module import 'sageattention._fused' during snap=True to keep snapshot clean
+
+WARNING:root:Cannot import /root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler module for custom nodes: [comfyapp] blocked CUDA module import 'sageattention._fused' during snap=True to keep snapshot clean
+(RES4LYF) Init
+(RES4LYF) Importing beta samplers.
+(RES4LYF) Importing legacy samplers.
+[34m[ComfyUI-Easy-Use] server: [0mv1.3.6 [92mLoaded[0m
+[34m[ComfyUI-Easy-Use] web root: [0m/__modal/volumes/vo-gSWkJxeCT6oiPT4QRz6P0v/comfyui-easy-use/web_version/v2 [92mLoaded[0m
+WARNING:root:[Impact Pack] custom_wildcards path not found: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-impact-pack\custom_wildcards. Using default path.
+WARNING:/root/comfy/ComfyUI/custom_nodes/comfyui-lora-manager.py.config:No valid embeddings folders found in ComfyUI configuration
+WARNING:root:[ComfyUI-Manager] Some features are restricted due to your ComfyUI being outdated.
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+### ComfyUI-Workflow-Encrypt: Copy .js from '/root/comfy/ComfyUI/custom_nodes/comfyui-workflow-encrypt/js/comfyui-workflow-encrypt.js' to '/root/comfy/ComfyUI/web/extensions/comfyui-workflow-encrypt'
+[36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using ckpts path: /__modal/volumes/vo-gSWkJxeCT6oiPT4QRz6P0v/comfyui_controlnet_aux/ckpts[0m
+[36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using symlinks: False[0m
+[36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using ort providers: ['CUDAExecutionProvider', 'DirectMLExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider', 'CoreMLExecutionProvider'][0m
+DWPose: Onnxruntime with acceleration providers detected
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+LOADED 5 FONTS
+
+
+███╗   ███╗ █████╗  ██████╗██╗  ██╗██╗███╗   ██╗███████╗               
+████╗ ████║██╔══██╗██╔════╝██║  ██║██║████╗  ██║██╔════╝               
+██╔████╔██║███████║██║     ███████║██║██╔██╗ ██║█████╗                 
+██║╚██╔╝██║██╔══██║██║     ██╔══██║██║██║╚██╗██║██╔══╝                 
+██║ ╚═╝ ██║██║  ██║╚██████╗██║  ██║██║██║ ╚████║███████╗               
+╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝               
+                                                                       
+██████╗ ███████╗██╗     ██╗   ██╗███████╗██╗ ██████╗ ███╗   ██╗███████╗
+██╔══██╗██╔════╝██║     ██║   ██║██╔════╝██║██╔═══██╗████╗  ██║██╔════╝
+██║  ██║█████╗  ██║     ██║   ██║███████╗██║██║   ██║██╔██╗ ██║███████╗
+██║  ██║██╔══╝  ██║     ██║   ██║╚════██║██║██║   ██║██║╚██╗██║╚════██║
+██████╔╝███████╗███████╗╚██████╔╝███████║██║╚██████╔╝██║ ╚████║███████║
+╚═════╝ ╚══════╝╚══════╝ ╚═════╝ ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
+                                                                       
+
+
+/usr/local/lib/python3.11/site-packages/sam3/model/sam3_video_inference.py:835: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+/usr/local/lib/python3.11/site-packages/sam3/model/sam3_video_inference.py:943: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+[92m[rgthree-comfy] Loaded 48 exciting nodes. 🎉[0m
+
+[33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+[0m
+[v2.startup_stage] stage=custom_node_import event=end wall_unix_ns=1786514342965479467 monotonic_ns=35069433671 duration_ms=19111.275 slow_import_summary_source=comfyui.nodes.init_external_custom_nodes
+[comfyapp] custom_node_import_health: registered=2398 volume_syncable=24 comfy_entries=28 comfy_symlinks=24 failures=0 snapshot_deferred=0
+[comfyapp] custom_node_import_health: volume_dirs=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+[comfyapp] custom_node_import_health: comfy_volume_symlink_dirs=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+[comfyapp] sage_policy module=model_optimization_nodes.py found=True patched=True baked_cuda_available=False duration=3.7ms
+[comfyapp] in-process backend initialized in 24.492s
+[v2.startup_stage] stage=backend_startup event=end wall_unix_ns=1786514342985215901 monotonic_ns=35089171744 duration_ms=24496.04
+[v2.sage_snapshot] action=discover_and_patch module=/root/comfy/ComfyUI/custom_nodes/ComfyUI-KJNodes.nodes.model_optimization_nodes target=patch_kjnodes_get_sage_func.<locals>.wrapped_get_sage_func mode=patched_at_snapshot version=comfymodal-sage-v1
+[v2.generation_identity] method=startup custom_nodes_generation='f12a52e8fdab958ed67c51fa…' raw_empty=false source=instance runtime_state_generation='' api_object_id=46808622863248 deployment_combined_hash=e39f3cb9701d9b5b
+[v2.startup_stage] stage=certificate_snapshot_retention event=start wall_unix_ns=1786514342989466072 monotonic_ns=35093421555
+[v2.cert_snapshot] status=fallback reason=cert_file_missing
+[v2.startup_stage] stage=certificate_snapshot_retention event=end wall_unix_ns=1786514342995600853 monotonic_ns=35099556766 duration_ms=6.135 status=fallback reason=cert_file_missing
+[v2.startup_stage] stage=dependency_validation event=start wall_unix_ns=1786514342995685377 monotonic_ns=35099640750
+[v2.startup_stage] stage=baked_manifest_read event=start wall_unix_ns=1786514342995707418 monotonic_ns=35099662821
+[v2.startup_stage] stage=baked_manifest_read event=end wall_unix_ns=1786514342996025243 monotonic_ns=35099981366 duration_ms=0.319
+[dep_manifest] persisted identity=aaafcd43edb9ee79... combined_hash=e39f3cb9701d9b5b... elapsed_ms=557.6
+[v2.dep_manifest] startup build/persist done in 558.1ms identity=aaafcd43edb9ee79 combined_hash=e39f3cb9701d9b5b cn_gen=f12a52e8fdab958e repair_mode=fail_fast baked_ok=1 ident_ok=1
+[v2.startup_stage] stage=dependency_validation event=end wall_unix_ns=1786514343553794425 monotonic_ns=35657750603 duration_ms=558.11
+[v2.deployment_proof] schema=1 complete=False reason=generation_mismatch dep_hash=e39f3cb9701d9b5b baked_gen=b361040f206414d1 gen_ok=0 reg_fp=True dep_identity=True repair_mode=n/a
+[comfyapp] snapshot_preload_profile source=none - no warmup profile configured
+[v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=35 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+[v2.startup_stage] stage=clip_snapshot_load event=start wall_unix_ns=1786514343562387082 monotonic_ns=35666342499
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/text_encoders/qwen_3_4b.safetensors active_read_id=9093463d28414a01 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786514343563488000 start_monotonic_ns=35667442751 start_thread_time_ns=20200000000 start_process_time_ns=23510000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=104 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/text_encoders/qwen_3_4b.safetensors active_read_id=9093463d28414a01 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786514345511734528 complete_monotonic_ns=37615688451 complete_thread_time_ns=21520000000 complete_process_time_ns=42660000000 complete_native_tid=2 wall_ms=1948.246 thread_cpu_ms=1320.0 process_cpu_ms=19150.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=104
+[v2.active_read_diag] active_read_id=9093463d28414a01 owner=graph_loader request_id= restore_session_id= path_hash=18da7c5b6a0c3132 wall_ms=1948.246 thread_cpu_ms=1320.0 process_cpu_ms=19150.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[v2.startup_stage] stage=clip_snapshot_load event=end wall_unix_ns=1786514346157033167 monotonic_ns=38260989970 duration_ms=2594.647
+[v2.startup_stage] stage=unet_snapshot_load event=start wall_unix_ns=1786514346702036926 monotonic_ns=38805992347
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/diffusion_models/z_image_turbo_bf16.s active_read_id=740d396ad3af478d restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786514346703981824 start_monotonic_ns=38807936476 start_thread_time_ns=22660000000 start_process_time_ns=48530000000 native_tid=2 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=1334 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/diffusion_models/z_image_turbo_bf16.s active_read_id=740d396ad3af478d restored_instance_id= restore_session_id= complete_wall_unix_ns=1786514349630133760 complete_monotonic_ns=41734086184 complete_thread_time_ns=24140000000 complete_process_time_ns=74780000000 complete_native_tid=2 wall_ms=2926.15 thread_cpu_ms=1480.0 process_cpu_ms=26250.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=1334
+[v2.active_read_diag] active_read_id=740d396ad3af478d owner=graph_loader request_id= restore_session_id= path_hash=8d2256b3cff6bbd2 wall_ms=2926.15 thread_cpu_ms=1480.0 process_cpu_ms=26250.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[v2.startup_stage] stage=unet_snapshot_load event=end wall_unix_ns=1786514350001446468 monotonic_ns=42105403043 duration_ms=3299.411
+[v2.startup_stage] stage=vae_snapshot_load event=start wall_unix_ns=1786514350539758009 monotonic_ns=42643713371
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/vae/ae.safetensors active_read_id=18f7b493c5e543ff restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786514350541294336 start_monotonic_ns=42645248900 start_thread_time_ns=25010000000 start_process_time_ns=79050000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=1079 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/vae/ae.safetensors active_read_id=18f7b493c5e543ff restored_instance_id= restore_session_id= complete_wall_unix_ns=1786514350593967872 complete_monotonic_ns=42697921968 complete_thread_time_ns=25060000000 complete_process_time_ns=79540000000 complete_native_tid=2 wall_ms=52.673 thread_cpu_ms=50.0 process_cpu_ms=490.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=1079
+[v2.active_read_diag] active_read_id=18f7b493c5e543ff owner=graph_loader request_id= restore_session_id= path_hash=4c78afa4b05fac11 wall_ms=52.673 thread_cpu_ms=50.0 process_cpu_ms=490.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[v2.startup_stage] stage=vae_snapshot_load event=end wall_unix_ns=1786514350640043886 monotonic_ns=42744000228 duration_ms=100.287
+[v2.vae_snapshot] status=retained vae_identity=ae.safetensors object_type=VAE object_id=46812300737680 vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 storage_bytes=167639366 floating_parameter_count=244 mismatched_parameter_buffer_count=0
+[v2.unet_runtime_state] stage=snapshot_created unet_identity=z_image_turbo_bf16.safetensors requested_weight_dtype=default effective_snapshot_weight_dtype=bfloat16 effective_snapshot_compute_dtype=bfloat16 effective_snapshot_manual_cast_dtype=none effective_weight_dtype=bfloat16 dtype_resolution_source=target_gpu_policy target_gpus=RTX-PRO-6000 state={"current_device":"cpu","diffusion_model_object_id":"46813185616272","diffusion_model_type":"NextDiT","effective_snapshot_compute_dtype":"bfloat16","effective_snapshot_manual_cast_dtype":"none","first_buffer_device":"absent","first_buffer_dtype":"absent","first_parameter_device":"cpu","first_parameter_dtype":"torch.bfloat16","forward_module":"NextDiT","forward_qualname":"NextDiT.forward","load_device":"cpu","loaded_models_member":"absent","manual_cast_dtype":"absent","model_dtype":"torch.bfloat16","model_loaded_weight_memory":"0","model_lowvram":"False","model_lowvram_patch_counter":"0","model_object_id":"46813185616656","model_options_keys":["transformer_options"],"model_type":"Lumina2","object_patch_count":0,"offload_device":"cpu","param_distribution":{"param_count":453,"param_dev_dtype_count":{"cpu|torch.bfloat16":453},"param_dev_dtype_numel":{"cpu|torch.bfloat16":6154908736},"param_distribution_hash":"96e377c80251860d5549077cedd369a544935a81bfbda9128343843e9dd54c80","total_param_numel":6154908736},"patch_count":0,"patcher_object_id":"46811877416912","patcher_type":"ModelPatcher","transformer_options_keys":[],"weight_dtype":"absent"}
+[v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=24494.5 process_maxrss_mib=35686.4 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.startup_stage] stage=cachedit_preparation event=start wall_unix_ns=1786514351717889644 monotonic_ns=43821846165
+[cachedit.startup] preimport transformers version=4.55.2 path=/usr/local/lib/python3.11/site-packages/transformers/__init__.py
+[cachedit.startup] preimport diffusers version=0.36.0 path=/usr/local/lib/python3.11/site-packages/diffusers/__init__.py
+/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_kandinsky.py:168: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.float32)
+/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_kandinsky.py:272: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.float32)
+[cachedit.startup] preimport cache_dit version=1.2.3 path=/usr/local/lib/python3.11/site-packages/cache_dit/__init__.py
+[cachedit.startup] cache_dit metadata={'__version__': '1.2.3', 'top_level_classes': ['BasicCacheConfig', 'BlockAdapter', 'CacheType', 'CalibratorConfig', 'DBCacheConfig', 'DBPruneConfig', 'FoCaCalibratorConfig', 'ForwardPattern', 'ParallelismBackend', 'ParallelismConfig', 'ParamsModifier', 'PatchFunctor', 'ProfilerContext', 'TaylorSeerCalibratorConfig']}
+[v2.startup_stage] stage=cachedit_preparation event=end wall_unix_ns=1786514352475721082 monotonic_ns=44579677106 duration_ms=757.831
+[cachedit.startup] preimport ok transformers=4.55.2 diffusers=0.36.0 cache_dit=1.2.3 cache_dit_info={'__version__': '1.2.3', 'top_level_classes': ['BasicCacheConfig', 'BlockAdapter', 'CacheType', 'CalibratorConfig', 'DBCacheConfig', 'DBPruneConfig', 'FoCaCalibratorConfig', 'ForwardPattern', 'ParallelismBackend', 'ParallelismConfig', 'ParamsModifier', 'PatchFunctor', 'ProfilerContext', 'TaylorSeerCalibratorConfig']}
+[v2.snapshot_pools] stage=before_snapshot_capture legacy_threads_joined=0 legacy_worker_refs_removed=0 coordinator_closed=1 native_thread_count=46
+[v2.snapshot_model_eviction_memory] stage=full_models_loaded vm_rss_mib=24521.09375 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=14 loaded_module_count=10404
+[v2.snapshot_model_eviction_memory] stage=after_full_eviction vm_rss_mib=16252.015625 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=14 loaded_module_count=10404
+[v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=full_eviction_complete retain_role=clip_vae clip_original_id=46811857079184 unet_original_id=46811877416912 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 full_eviction_rss_drop_mib=8269.1 rss_before_mib=24521.09375 rss_after_eviction_mib=16252.015625 malloc_trim_status=applied malloc_trim_result=1
+[v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+[v2.startup_stage] stage=clip_snapshot_load event=start wall_unix_ns=1786514354165783301 monotonic_ns=46269739714
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/text_encoders/qwen_3_4b.safetensors active_read_id=7d29a7dd85174c53 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786514354167352320 start_monotonic_ns=46271306576 start_thread_time_ns=28430000000 start_process_time_ns=83460000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=104 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/text_encoders/qwen_3_4b.safetensors active_read_id=7d29a7dd85174c53 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786514354773748992 complete_monotonic_ns=46877702051 complete_thread_time_ns=29010000000 complete_process_time_ns=90410000000 complete_native_tid=2 wall_ms=606.395 thread_cpu_ms=580.0 process_cpu_ms=6950.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=104
+[v2.active_read_diag] active_read_id=7d29a7dd85174c53 owner=graph_loader request_id= restore_session_id= path_hash=18da7c5b6a0c3132 wall_ms=606.395 thread_cpu_ms=580.0 process_cpu_ms=6950.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[v2.startup_stage] stage=clip_snapshot_load event=end wall_unix_ns=1786514355434971280 monotonic_ns=47538928404 duration_ms=1269.189
+[v2.startup_stage] stage=vae_snapshot_load event=start wall_unix_ns=1786514355435114958 monotonic_ns=47539070352
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/vae/ae.safetensors active_read_id=d65ef01f140a4ff5 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786514355436606976 start_monotonic_ns=47540561070 start_thread_time_ns=29640000000 start_process_time_ns=95970000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=1079 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/vae/ae.safetensors active_read_id=d65ef01f140a4ff5 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786514355492239104 complete_monotonic_ns=47596191689 complete_thread_time_ns=29700000000 complete_process_time_ns=96580000000 complete_native_tid=2 wall_ms=55.631 thread_cpu_ms=60.0 process_cpu_ms=610.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=1079
+[v2.active_read_diag] active_read_id=d65ef01f140a4ff5 owner=graph_loader request_id= restore_session_id= path_hash=4c78afa4b05fac11 wall_ms=55.631 thread_cpu_ms=60.0 process_cpu_ms=610.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[v2.startup_stage] stage=vae_snapshot_load event=end wall_unix_ns=1786514355535553481 monotonic_ns=47639509625 duration_ms=100.439
+[v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=non_fatal_floor_failure retain_role=clip_vae floor=final_reduction threshold_mib=4096 actual_mib=-1776.4 actual_bytes=? selected_reload_rss_rise_mib=10045.5 final_reduction_from_full_mib=-1776.4 selected_storage_total_bytes=8380214928 after_full_eviction_rss_mib=16252.015625 after_selected_reload_rss_mib=26297.53515625 full_models_rss_mib=24521.09375 malloc_trim_status=applied malloc_trim_result=1
+[v2.snapshot_model_eviction_memory] stage=after_selected_reload vm_rss_mib=26297.53515625 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=14 loaded_module_count=10404
+[v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=ready floor_failures=1 floor_failures_details=final_reduction=-1776.4 retain_role=clip_vae retained_model_present=0 retained_model_id=46812301118992 retained_model_type=CLIP retained_weakref_alive=1 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 original_vae_alive_after_full_eviction=0 reloaded_model_present=0 reloaded_model_id=46812301118992 reloaded_model_is_new_object=1 clip_original_id=46811857079184 unet_original_id=46811877416912 vae_original_id=46812300737680 container_retained=1 normal_cpu_snapshot_models_present=1 clip_present=1 vae_present=1 unet_present=0 full_eviction_rss_drop_mib=8269.1 selected_reload_rss_rise_mib=10045.5 final_reduction_from_full_mib=-1776.4 selected_storage_count=399 selected_storage_total_bytes=8380214928 selected_storage_total_mib=7991.996 full_models_rss_mib=24521.09375 after_full_eviction_rss_mib=16252.015625 after_selected_reload_rss_mib=26297.53515625 bridge_active_preparation=0 bridge_active_preparation_before_clear=0 snapshot_loader_output_count=0 snapshot_seed_present=0 native_threads=46 torch_intraop=12 torch_interop=14 patcher_cleanup_count=3 patcher_detach_count=3 patcher_cleanup_errors=0 malloc_trim_status=applied malloc_trim_result=1
+[v2.startup_stage] stage=vae_preparation event=start wall_unix_ns=1786514355598731105 monotonic_ns=47702687099 status=skipped reason=vae_not_part_of_cpu_snapshot
+[v2.startup_stage] stage=vae_preparation event=end wall_unix_ns=1786514355598793758 monotonic_ns=47702749153 status=skipped reason=vae_not_part_of_cpu_snapshot duration_ms=0.0
+[v2.startup_stage] stage=snapshot_startup_callback event=return wall_unix_ns=1786514355598828630 monotonic_ns=47702784004 status=ready
+[v2.lifecycle] method=startup snap=True container_session=aad499e898f94807 restore_total_ms=39043.103 status=ready
+Snapshot created. Restoring Function from memory snapshot.
+Restoring Function from memory snapshot.
+[v2.startup_stage] stage=post_snapshot_restore event=start wall_unix_ns=1786514378447479107 monotonic_ns=70551437702
+[v2.snapshot_timing] snapshot_callback_age_at_restore_ms=22848.713 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=unavailable request_latency_included=0 source=snapshot_callback_return_to_restore_start
+[v2.snapshot_model_eviction] stage=restore_observed marker=1 cpu_snapshot_models_present=1 clip_present=1 unet_present=0 retained_role=clip_vae retained_model_id=0 retained_model_type= rss_after_restore_mib=11477.0234375 native_thread_count=46 torch_intraop=12 torch_interop=14 wall_unix_ns=1786514378458608909
+[v2.snapshot_model_eviction] stage=restore_release_retained retain_role=clip_vae status=container_retained container_present=1 clip_present=1 vae_present=1 unet_present=0 retained_slot_release=0 retained_model_id=0 retained_alive_after_release=0 rss_before_release_mib=absent rss_after_gc_mib=absent rss_after_trim_mib=absent rss_drop_mib=absent malloc_trim_status=absent malloc_trim_result=absent restore_release_start_wall_unix_ns=1786514378458701174 restore_release_end_wall_unix_ns=1786514378458701174 wall_unix_ns=1786514378458701174
+[v2.residency_config] enabled=0
+[v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=11762.9 process_maxrss_mib=35686.4 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.runtime_shape] stage=after_restore runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+[comfyapp] gpu_state restored vram=97250MB ram=724642MB vram_state=VRAMState.HIGH_VRAM in 165.3ms
+[restore.cuda_context] available=1 device_index=0 device=NVIDIA RTX PRO 6000 Blackwell Server Edition sync_ms=71.314 total_ms=71.439
+[v2.sage_restore] decision=snapshot_exact_skip discovery_called=0 verify_ms=0.036
+[v2.custom_node_restore] decision=snapshot_exact_skip callback_called=0 source=instance check_ms=0.148
+[v2.startup_stage] stage=snapshot_execution_seed event=start wall_unix_ns=1786514378848277159 monotonic_ns=70952238654
+[v2.seed_restore] source=startup_minimal schema=2 topology_available=0 workflow_hash= loader_signatures=0
+[v2.startup_stage] stage=snapshot_execution_seed event=end wall_unix_ns=1786514378850457503 monotonic_ns=70954416458 duration_ms=2.178
+[v2.generation_identity] method=restore custom_nodes_generation='f12a52e8fdab958ed67c51fa…' raw_empty=false source=instance runtime_state_generation='' api_object_id=46808622863248 deployment_combined_hash=e39f3cb9701d9b5b
+[v2.prefill_config] env=critical parsed=critical cpu_snapshot_active=0
+[v2.restore_breakdown] bootstrap_ms=372.293 unet_cache_patch_ms=None clip_prepare_submit_ms=None clip_worker_wait_ms=None unet_spec_extract_ms=None bg_unet_submit_ms=None restore_finalize_ms=0.098
+[v2.clip_stages] worker_queue_ms=None load_torch_file_ms=None read_to_ready_ms=None post_read_cpu_prepare_ms=None gpu_wait_ms=None gpu_commit_ms=None read_end_to_ready_ms=None worker_total_ms=None worker_close_wait_ms=None restore_finalization_ms=0.098
+[v2.restoration_identity] restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df container_session_id=aad499e898f94807 modal_task_id=ta-01KZT8SVEK7JH2QN8CE0N4WHPR modal_image_id=im-fopBG65UjVS6vwA7IAPqUf modal_cloud=CLOUD_PROVIDER_GCP modal_region=us-east4 pid=2 hostname=modal restore_total_ms=392.075 remote_python_resume_wall_unix_ns=1786514378447443200 restore_method_start_wall_unix_ns=1786514378447443200 restore_method_end_wall_unix_ns=1786514378850836224 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success 
+[v2.lifecycle] method=restore snap=False container_session=aad499e898f94807 restore_count=1 restore_total_ms=392.075 remote_python_resume_wall_unix_ns=1786514378447443200 restore_method_start_wall_unix_ns=1786514378447443200 restore_method_end_wall_unix_ns=1786514378850836224 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success status=restored
+[v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=13317.1 process_maxrss_mib=35686.4 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+[v2.startup_stage] stage=post_snapshot_restore event=end wall_unix_ns=1786514378853172415 monotonic_ns=70957129850 duration_ms=405.692
+[v2.startup_stage] stage=first_remote_method_entry event=entry wall_unix_ns=1786514378861923143 monotonic_ns=70965881788
+[v2.env_profile] effective_profile=inherit container_profile=inherit request_override=inherit request_override_applied=0 source=request-inherit-noop
+[v2.local_submission_breakdown.remote] request_id=v2-benchmark-0-53a0a669c975 local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=47.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=absent payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=47.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=15678 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.seed_restore] source=invocation_plan schema=2 topology_available=1 workflow_hash=dabf819d1604b03a loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.runtime_shape] stage=request_entry runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=48 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+[v2.method_entry_gap] restore_to_method_ms=8.768 first_line_to_running_log_ms=6.853 same_process=True identity_mismatch_reasons=none remote_python_resume_wall_unix_ns=1786514378447443200 restore_method_start_wall_unix_ns=1786514378447443200 restore_method_end_wall_unix_ns=1786514378850836224 modal_method_entry_wall_unix_ns=1786514378861916160 restore_end_to_modal_method_ms=11.072
+[v2.snapshot_timing] snapshot_callback_age_at_restore_ms=22848.713 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=77012.443 request_latency_included=0_for_callback_age
+[v2.host_memory] stage=prompt_executor_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=13318.2 process_maxrss_mib=35686.4 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.cpu_snapshot_models] cpu_snapshot_models_present=1 clip_present=1 unet_present=0 cpu_snapshot_active=0
+[v2.cpu_snapshot_request] status=present_but_inactive clip_present=1 unet_present=0 action=clip_vae_only_request_activation
+[v2.cpu_snapshot_request] status=clip_vae_only_bind clip_source=cpu_snapshot vae_source=cpu_snapshot unet_source=normal_loader clip_object_id=46812301118992 vae_object_id=46812301029776
+[v2.cpu_snapshot_request] status=reused reason=clip_vae_only
+[v2.unet_identity_chain] stage=snapshot request_id=v2-benchmark-0-53a0a669c975 unet_object_id=0
+[v2.unet_identity_chain] stage=bridge request_id=v2-benchmark-0-53a0a669c975 unet_object_id=0
+[v2.snapshot_activation_invariant] profile=inherit models_container_present=1 clip_present=1 unet_present=0 snapshot_enabled_by_config=1 cpu_snapshot_active=1 loader_bridge_active=1 execution_prefill_allowed=0 status=pass reason=ok
+[v2.execution_prefill] snapshot_active=1 env_raw=critical scheduled=1
+[v2.execution_unet] scheduled=1 snapshot_unet_absent=1 request_id=v2-benchmark-0-53a0a669c975
+[v2.plan_proof] schema=0 payload=no validated=False outputs=0 out_ids= wf_hash=dabf819d1604b03a recomputed=dabf819d1604b03a match=True dep_complete=False consumed=False cert_decision=legacy
+[v2.plan_proof] parity proof_present=1 proof_complete=0 proof_valid=0 dep_match=0 gen_match=1 reg_match=0 dep_proof_match=0 eligible=0 reason=plan_identity_incomplete,snapshot_proof_incomplete,snapshot_proof_invalid_or_unsupported,deployment_hash_mismatch,registry_fingerprint_mismatch,dependency_proof_mismatch consumed=False
+[v2.exec] res4lyf_dummy_init_disabled=1 reported_injected=1 actual_injected=1
+[preflight.model_reads] restore_preload_active=0 selected_clip=/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors
+[v2.generation_identity] custom_nodes_generation='f12a52e8fdab958ed67c51fa…' raw_empty=false source=instance runtime_state_generation='' api_object_id=46808622863248 deployment_combined_hash=e39f3cb9701d9b5b
+[v2.cert] decision=snapshot_fallback reason=snapshot_cert_invalid identity=ad3507cd70451efd
+[v2.cert] cache_evict reason= identity=ad3507cd70451efd
+[v2.clip_conditioning_cache] event=mode flag=COMFYMODAL_V2_CLIP_CONDITIONING_CACHE enabled=1 root=/root/prompt_cache_vol/exact_conditioning max_entries=64 max_bytes=536870912
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/diffusion_models/z_image_turbo_bf16.s active_read_id=606e769f11944554 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df request_id= start_wall_unix_ns=1786514378897025792 start_monotonic_ns=71000975913 start_thread_time_ns=0 start_process_time_ns=98050000000 native_tid=75 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=2979 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[v2.clip_conditioning_cache] decision=miss key_hash=04bbc41a3f38abae28731ef6981d6e8de2779ca27ba65197d81a4a82a6a17ed2 identity_status=valid schema_version=1 validation_scope=clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs hit_count=0 miss_count=1 entries=1 lookup_wall_ms=197.053 request_id=v2-benchmark-0-53a0a669c975
+[v2.unet_early_activation] event=mode mode=late env_raw=late restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df
+[v2.cert] hit=0 identity=ad3507cd70451efd
+[dep_manifest] loaded identity=aaafcd43edb9ee79... load_ms=10.7
+[v2.dependency_validation] source=persistent_manifest identity_match=1 prompt_structure_validation_ms=0.09 deployment_hash_resolution_ms=0.01 baked_manifest_read_ms=14.75 custom_node_generation_read_ms=5.24 manifest_load_ms=10.93 cheap_check_ms=0.05 manifest_identity_check_ms=0.05 fallback_validation_called=0 fallback_fingerprint_ms=0.0 fallback_validation_ms=0.0 fingerprint_ms=0.0 full_validation_ms=0.0 refresh_performed=0 preflight_total_ms=31.17 deployment_hash=e39f3cb9701d9b5b baked_dependency_hash=be68be1945de2a29 custom_nodes_generation=f12a52e8fdab958e repair_mode=fail_fast stored_manifest_identity=aaafcd43edb9ee79 computed_manifest_identity=aaafcd43edb9ee79 miss_component= reason=manifest_identity_match
+[comfyapp] preflight result: {'valid_prompt': True, 'dependency_prepared': True, 'repair_mode': 'fail_fast', 'dependency_reason': 'manifest_identity_match'}
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=absent restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=not_observed gpu_allocated_before=0 gpu_reserved_before=0
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=absent restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=modelpatcher model_count=1 caller_classification=not_observed wall_ms=6.104 gpu_allocated_after=0 gpu_allocated_delta_bytes=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-JaN9Wogtp8SLfaDX7Vxz2d/diffusion_models/z_image_turbo_bf16.s active_read_id=606e769f11944554 restored_instance_id=3ef16c9ac49042d4 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df complete_wall_unix_ns=1786514379863759872 complete_monotonic_ns=71967713858 complete_thread_time_ns=850000000 complete_process_time_ns=99740000000 complete_native_tid=75 wall_ms=966.738 thread_cpu_ms=850.0 process_cpu_ms=1690.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=2979
+[v2.active_read_diag] active_read_id=606e769f11944554 owner=graph_loader request_id= restore_session_id=46b3e4e00374430b9bb529ae9b90d9df path_hash=8d2256b3cff6bbd2 wall_ms=966.738 thread_cpu_ms=850.0 process_cpu_ms=1690.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=75
+[v2.plan_proof] decision=legacy_validation_fallback consumed=0 reason=plan_identity_incomplete,snapshot_proof_incomplete,snapshot_proof_invalid_or_unsupported,deployment_hash_mismatch,registry_fingerprint_mismatch,dependency_proof_mismatch,unsupported_validation_schema,validation_not_validated,validation_hash_mismatch,empty_outputs
+[v2.host_memory] stage=peak_execution current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=25964.8 process_maxrss_mib=35686.4 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.startup_stage] stage=first_prompt_executor_invocation event=start wall_unix_ns=1786514379942194388 monotonic_ns=72046149691
+[v2.native_fast_disk_unet] decision=defer reason=ok stage=to patcher_class=comfy.model_patcher.ModelPatcher patcher_dynamic=0 param_count=453 parameter_bytes=12309817472 dtype_distribution={'torch.bfloat16': 453} device_distribution={'cpu': 453} cpu_params=453 cpu_buffers=1 get_model_ms=270.817 ctor_ms=0.384 bind_ms=None to_wall_ms=None to_device_ms=None to_device_ms_label=unavailable
+[v2.vae_early_activation] event=mode mode=sampling_end env_raw=sampling_end restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df
+[v2.native_fast_disk_unet] decision=complete reason=ok stage=load_model_weights patcher_class=comfy.model_patcher.ModelPatcher patcher_dynamic=0 param_count=453 parameter_bytes=12309817472 dtype_distribution={'torch.bfloat16': 453} device_distribution={'cuda': 453} cpu_params=0 cpu_buffers=0 get_model_ms=270.817 ctor_ms=0.384 bind_ms=66.87 to_wall_ms=2007.408 to_device_ms=2009.98 to_device_ms_label=synchronized_device
+[v2.unet_runtime_state] stage=normal_loader_ready unet_identity=z_image_turbo_bf16.safetensors requested_weight_dtype=default effective_weight_dtype=default state={"current_device":"cuda:0","diffusion_model_object_id":"46812285123536","diffusion_model_type":"NextDiT","first_buffer_device":"absent","first_buffer_dtype":"absent","first_parameter_device":"cuda:0","first_parameter_dtype":"torch.bfloat16","forward_module":"NextDiT","forward_qualname":"NextDiT.forward","load_device":"cuda:0","loaded_models_member":"0","manual_cast_dtype":"absent","model_dtype":"torch.bfloat16","model_loaded_weight_memory":"0","model_lowvram":"False","model_lowvram_patch_counter":"0","model_object_id":"46812285098064","model_options_keys":["transformer_options"],"model_type":"Lumina2","object_patch_count":0,"offload_device":"cuda:0","patch_count":0,"patcher_object_id":"46813185663632","patcher_type":"ModelPatcher","transformer_options_keys":["wrappers"],"weight_dtype":"absent"}
+[v2.clip_conditioning_cache] decision=miss_stored key_hash=04bbc41a3f38abae28731ef6981d6e8de2779ca27ba65197d81a4a82a6a17ed2 identity_status=valid encode_calls=1 encode_loop_wall_ms=3452.453 cache_store_wall_ms=8.845 cache_store_calls=1 store_diagnostics={'store_calls': 1, 'store_failed': 0, 'key_build_digest_ms': 0.162, 'serialization_ms': 8.198, 'materialize_ms': 3.766, 'checksum_ms': 3.129, 'serialized_payload_bytes': 3125640, 'enqueue_ms': 0.404, 'lock_wait_ms': 0.0, 'total_ms': 8.82, 'measured_children_ms': 8.767, 'residual_ms': 0.053, 'store_reason': '', 'materialize_bytes': 3125640, 'enqueued': 1, 'persisted': 0, 'persist_failed': 0, 'commit_failed': 0, 'queue_depth': 1, 'queue_deduped': 0, 'queue_full_dropped': 0, 'batch_size': 0, 'batch_count': 0, 'persistence_queue_wait_ms': 0.0, 'file_write_ms': 0.0, 'manifest_ms': 0.0, 'reload_ms': 0.0, 'commit_ms': 0.0, 'unindexed_files_removed': 0, 'last_flush_ms': 0.0, 'last_flush_status': '', 'flush_count': 0, 'fallback_sync_stores': 0} schema_version=1 validation_scope=clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs enqueued=1 persisted=0 persist_failed=0 entries=1 request_id=v2-benchmark-0-53a0a669c975
+[v2.cpu_owner] operation=CLIPTextEncode role=CLIP wall_ms=2366.170 process_cpu_ms=3240.000 effective_cores=1.369 native_threads_start=52 native_threads_peak=53 native_threads_end=53
+WARNING:root:[FeatureInjLatent] Reference latent: shape=torch.Size([1, 16, 240, 136])
+standard
+[v2.sampler_boundary] event=sampler_lane_requested sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta blocking_owner=absent
+[v2.sampler_boundary] event=sampler_lane_acquired sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta wait_ms=0.055 blocking_owner=absent
+[CacheDiT] Transformer class: NextDiT (module: comfy.ldm.lumina.model)
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=UNET model_count=1 contains_registered_unet=1 caller_classification=graph_model_loading gpu_allocated_before=12436717568 gpu_reserved_before=13113491456
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=UNET model_count=1 caller_classification=graph_model_loading wall_ms=58.67 gpu_allocated_after=12436721664 gpu_allocated_delta_bytes=4096
+[v2.cpu_owner] operation=load_models_gpu role=other wall_ms=60.653 process_cpu_ms=200.000 effective_cores=3.297 native_threads_start=53 native_threads_peak=54 native_threads_end=53
+[v2.unet_identity_chain] check=stage_pair stage_a=bridge stage_b=sampler request_id=v2-benchmark-0-53a0a669c975 patcher_a_object_id=46813185663632 diffusion_a_object_id=46812285123536 patcher_b_object_id=46812002192144 diffusion_b_object_id=46812285123536 ok=1 reason=ok
+[v2.unet_gpu_residency] sampler_wrapper_before_sample request_id=v2-benchmark-0-53a0a669c975 enforce=0 status=gpu_resident unet_object_id=46812002192144 parameter_count=453 gpu_parameter_count=453 cpu_parameter_count=0 meta_parameter_count=0 unknown_parameter_count=0 gpu_parameter_fraction=1.0 load_device=cuda:0 current_device=absent diffusion_model_current_device=absent model_cache_size=2 unet_in_model_cache=1 gpu_allocated_bytes=12441473024 gpu_reserved_bytes=12899581952
+[v2.sampler_stall_watchdog] stage=armed request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 sampler_node_id=1242 sampler_class=ClownsharKSampler_Beta patcher_object_id=46812002192144 diffusion_model_object_id=46812285123536 unet_object_id=46812002192144 first_forward_timeout_s=5.0 first_step_timeout_s=15.0
+[v2.sampler_boundary] event=sampling_start request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=46812002192144 diffusion_model_object_id=46812285123536 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12441473024 gpu_reserved_bytes=12899581952
+(RES4LYF) rk_type: res_2s
+
+[v2.unet_forward_boundary] event=first_unet_forward request_id=v2-benchmark-0-53a0a669c975 diffusion_model_object_id=46812285123536 patcher_object_id=46813185663632 model_object_id=46812285098064 x_device=cuda:0 x_dtype=torch.bfloat16 elapsed_ms=96.213
+[v2.sampler_parity] UNET weight_dtype=torch.bfloat16 UNET compute_dtype=torch.bfloat16 manual_cast_dtype=None CacheDiT target=NextDiT CacheDiT attachment_count=1 CacheDiT fallback=0
+[1A  0%|          | 0/8 [00:00<?, ?it/s]WARNING:root:[FeatureInjLatent] step=1 | progress=0.00 | eff_str=0.250 | no mask
+WARNING:root:[FeatureInjLatent] step=2 | progress=0.01 | eff_str=0.214 | no mask
+[v2.sampler_boundary] event=first_sampler_step request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=46812002192144 diffusion_model_object_id=46812285123536 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12441473024 gpu_reserved_bytes=12899581952
+
+[1A 12%|█▎        | 1/8 [00:01<00:07,  1.10s/it]WARNING:root:[FeatureInjLatent] step=3 | progress=0.03 | eff_str=0.178 | no mask
+
+[1A 25%|██▌       | 2/8 [00:02<00:05,  1.01it/s]
+[1A 38%|███▊      | 3/8 [00:02<00:03,  1.33it/s]
+[1A 50%|█████     | 4/8 [00:02<00:02,  1.57it/s]
+[1A 62%|██████▎   | 5/8 [00:03<00:01,  1.74it/s]
+[1A 75%|███████▌  | 6/8 [00:03<00:01,  1.88it/s]
+[1A 88%|████████▊ | 7/8 [00:04<00:00,  1.97it/s]
+[1A100%|██████████| 8/8 [00:04<00:00,  2.04it/s]100%|██████████| 8/8 [00:04<00:00,  1.68it/s]
+[v2.sampler_boundary] event=sampling_end request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=46812002192144 diffusion_model_object_id=46812285123536 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12441473024 gpu_reserved_bytes=12899581952 duration_ms=4787.906
+[v2.vae_early_activation] event=scheduled request_id=v2-benchmark-0-53a0a669c975 mode=sampling_end trigger=sampling_end key_hash=df8d2f24ad1ae6ac5af0ea26 source=snapshot_vae vae_identity_hash=dd8f11d04333e24d vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 torch=2.12.0+cu130 cuda=13.0 arch=x86_64 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df
+[v2.vae_early_activation] event=load_start request_id=v2-benchmark-0-53a0a669c975 mode=sampling_end key_hash=df8d2f24ad1ae6ac5af0ea26 source=snapshot_vae vae_object_id=46812301029776 vae_patcher_object_id=46813185826384
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=absent restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=restore_vae_preparation gpu_allocated_before=12476392960 gpu_reserved_before=14873001984
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=absent restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=modelpatcher model_count=1 caller_classification=restore_vae_preparation wall_ms=617.75 gpu_allocated_after=12646500352 gpu_allocated_delta_bytes=170107392
+[v2.vae_early_activation] event=terminal request_id=v2-benchmark-0-53a0a669c975 mode=sampling_end key_hash=df8d2f24ad1ae6ac5af0ea26 status=ready reason=ok error=absent transfer_count=1 vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 source=snapshot_vae
+[v2.vae_early_activation] event=consumed request_id=v2-benchmark-0-53a0a669c975 mode=sampling_end key_hash=df8d2f24ad1ae6ac5af0ea26 join_wait_ms=31.124 status=ready source=snapshot_vae
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=graph_model_loading gpu_allocated_before=12646500352 gpu_reserved_before=12943622144
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df roles=modelpatcher model_count=1 caller_classification=graph_model_loading wall_ms=21.878 gpu_allocated_after=12646500352 gpu_allocated_delta_bytes=0
+[production.rgthree.encode] side=b (B-only) shape=(1, 1920, 1088, 3) dtype=torch.uint8
+[production.rgthree] node_id=107 a_count=0 b_count=1 encoded_unique=1 logical_outputs=1 return_a=0 temp_files_written=0 encode_ms=590.4
+[v2.startup_stage] stage=first_prompt_executor_invocation event=end wall_unix_ns=1786514389138709949 monotonic_ns=81242665265 duration_ms=9196.516
+[v2.pre_sampler_stages] request_id=v2-benchmark-0-53a0a669c975 restored_instance_id=3ef16c9ac49042d4b7b49bb47441a584 restore_session_id=46b3e4e00374430b9bb529ae9b90d9df container_session_id=aad499e898f94807 modal_input_id=in-01KZT8SS8G6208BTKAB86CC0KT:1786514302224-0 modal_task_id=ta-01KZT8SVEK7JH2QN8CE0N4WHPR pid=2 boot_id=48c1cec9-dae5-441c-a3fc-7ab704ff7069 hostname=modal total_nodes=43 first_output_node=935:931:easy imageSize first_executing_node=987:Any Switch (rgthree) sampler_stage_status=sampler_active method_entry_to_graph_start_ms=15.772 graph_setup_ms=1064.469 certificate_ms=225.14 cert_identity_build_ms=0.028 cert_cache_hit=0 cert_volume_reload_ms=224.39 cert_file_read_ms=0.475 cert_json_parse_validate_ms=0.0 cert_total_ms=224.893 legacy_preflight_ms=38.922 prompt_validation_ms=779.072 certificate_skipped_preflight=0 certificate_skipped_prompt_validation=0 preflight_ms=38.875 validation_ms=779.138 missing_node_repair_ms=0.322 production_registry_setup_ms=0.033 production_registry_profile_setup_ms=0.033 pregraph_setup_ms=0.295 executor_reset_ms=0.067 sampler_lane_wait_ms=0.046 residual_before_invoke_ms=1.718 method_entry_to_runtime_configuration_ms=15.716 call_to_exec_start_ms=0.276 exec_start_to_cached_ms=45.655 cached_to_first_executing_ms=147.782 call_to_cached_ms=45.93 call_to_first_node_ms=193.712 first_node_to_clip_ms=67.09 clip_to_sampler_node_ms=2418.739 sampler_node_to_sampler_start_ms=109.335 sampler_node_to_lane_acquired_ms=0.07 lane_acquired_to_actual_stage_ms=109.266 pre_sampler_total_ms=3869.089 measured_children_ms=3832.694 residual_ms=36.395 reconciliation_status=ok add_message=True send_sync=True has_sampler=True sampler_count=1 lane_acquired=True
+[v2.startup_stage] stage=first_durable_result event=ready wall_unix_ns=1786514389145788239 monotonic_ns=81249743546 output_persisted=1
+[v2.output] hashes=1 base64_encode=0 base64_decode=0 commit_ms=0.0 commit_status=skipped overlap_ms=0.0 serialized_bytes=2209
+[v2.cert] write identity=ad3507cd70451efd status=committed
+[v2.cert] snapshot_retained_updated reason=request_write identity=ad3507cd70451efd
+[v2.host_memory] stage=result_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=15124.0 process_maxrss_mib=35686.4 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[v2.activation_diagnosis] request_id=v2-benchmark-0-53a0a669c975 cpu_snapshot_active=True execution_prefill_scheduled=True residency_diagnostics_enabled=0 clip_encode_calls=1 clip_encode_graph_calls=0 clip_encode_prefill_calls=1 clip_encode_wall_ms=3438.06 clip_encode_graph_wall_ms=0 clip_encode_prefill_wall_ms=3438.06 clip_encode_process_cpu_ms=5280.0 load_models_gpu_calls=2 unet_gpu_load_calls=1 load_models_gpu_wall_ms=80.548 activation_receipt_count=4 gpu_allocated_delta_bytes=4096 cpu_peak_cores=absent cpu_above_16_ms=absent cpu_above_19_ms=absent cpu_longest_above_19_ms=absent cpu_overlap_graph_clip_ms=absent cpu_overlap_prefill_clip_ms=absent cpu_overlap_gpu_load_ms=absent clip_to_sampler_node_ms=2418.739 sampler_node_to_sampler_start_ms=109.335 diagnostic_accounted_ms=absent diagnostic_unattributed_ms=absent restore_requested_torch_intraop_threads=absent restore_actual_torch_intraop_threads=12 restore_torch_interop_threads=14 restore_torch_thread_limit_status=baseline_passthrough
+[v2.process_cpu_spike] status=ok peak_effective_cores=7.874 duration_above_16_ms=0.000 duration_above_19_ms=0.000 longest_above_19_ms=0.000 sample_count=202
+[v2.remote_request_origin.remote] request_id=v2-benchmark-0-53a0a669c975 trigger_source=benchmark ui_trigger_unix_ms=1786514302016 local_receive_unix_ns=1786514302016547584 modal_generator_create_start_unix_ns=1786514302074547100 modal_submission_attempt_unix_ns=absent modal_generator_created_unix_ns=absent modal_first_iteration_start_unix_ns=absent modal_first_remote_event_unix_ns=absent modal_method_entry_unix_ns=1786514378861916160 prompt_executor_invoke_start_unix_ns=1786514379942123776 trigger_to_dispatch_ms=0.548 dispatch_to_modal_entry_ms=None modal_entry_to_executor_ms=1080.213 trigger_to_executor_ms=77926.124 modal_input_id=in-01KZT8SS8G6208BTKAB86CC0KT:1786514302224-0 modal_task_id=ta-01KZT8SVEK7JH2QN8CE0N4WHPR
+[v2.critical_path] python_resume_to_restore_enter_ms=0.0 restore_total_ms=392.075 restore_exit_to_run_enter_ms=11.072 run_enter_to_plan_received_ms=14.036 plan_received_to_executor_invoke_ms=1066.177 executor_invoke_to_first_node_ms=193.547 first_node_to_sampler_node_ms=2485.898 sampler_node_to_sampler_start_ms=109.335 pre_sampler_unattributed_ms=absent
+[v2.cgroup_cpu_spike] status=unavailable reason=no readable cpu.stat candidates=/sys/fs/cgroup/cpu.stat errors=resolve_cgroup_v2_base: returned no readable cgroup base;probe2 path=/sys/fs/cgroup/cpu.stat: FileNotFoundError: [Errno 2] No such file or directory: '/sys/fs/cgroup/cpu.stat';parse_proc_cgroup: no unified 0:: entry
+[v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+V2 COLD WATERFALL - remote benchmark run 1
+Request: v2-benchmark-0-53a0a669c975  Instance: 3ef16c9ac49042d4b7b49bb47441a584  GPU: ['RTX-PRO-6000']  Fresh: YES
+
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+ # | Stage                                          | Duration |     Cum. |      % | Relative wall time
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+  1 | Local preparation                              |     0.001s |     0.001s |   0.001% | +                                    
+  2 | Modal handle and submission                    |          - |          - |       - |                                      
+  3 | Pre-Python Modal scheduling (command to Pyt... |          - |          - |       - |                                      
+  4 | Application restore                            |     0.403s |     0.404s |   0.459% | #                                    
+  5 | Restore-to-method entry                        |     0.011s |     0.415s |   0.013% | =                                    
+  6 | ~ Method entry to UNET ownership claim         |          - |          - |       - |                                      
+  7 | ~ UNET claim to ready (worker load)            |          - |          - |       - |                                      
+  8 | Remote method setup                            |     1.080s |     1.495s |   1.230% | #                                    
+  9 |   detail: method entry to graph start          |     0.016s |          - |   0.018% |                                      
+ 10 |   detail: method entry to runtime configura... |     0.016s |          - |   0.018% |                                      
+ 11 |   detail: runtime configuration                |     0.000s |          - |   0.000% |                                      
+ 12 |   detail: graph setup                          |     1.064s |          - |   1.212% |                                      
+ 13 |   detail: certificate                          |     0.225s |          - |   0.256% |                                      
+ 14 |   detail: preflight                            |     0.039s |          - |   0.044% |                                      
+ 15 |   detail: validation                           |     0.779s |          - |   0.887% |                                      
+ 16 |   detail: legacy runtime resolution            |     0.000s |          - |   0.000% |                                      
+ 17 |   detail: preload check                        |     0.001s |          - |   0.001% |                                      
+ 18 |   detail: missing-node repair                  |     0.000s |          - |   0.000% |                                      
+ 19 |   detail: production registry setup            |     0.000s |          - |   0.000% |                                      
+ 20 |   detail: pregraph setup                       |     0.000s |          - |   0.000% |                                      
+ 21 |   detail: executor reset                       |     0.000s |          - |   0.000% |                                      
+ 22 |   detail: residual before executor invoke      |     0.002s |          - |   0.002% |                                      
+ 23 |   detail: pre-sampler total                    |     3.869s |          - |   4.405% |                                      
+ 24 |   detail: measured pre-sampler children        |     3.833s |          - |   4.363% |                                      
+ 25 |   detail: pre-sampler residual                 |     0.036s |          - |   0.041% |                                      
+ 26 |   detail: UNET quiesce wait (diagnostic)       |          - |          - |       - |                                      
+ 27 |   detail: UNET transfer queue delay            |          - |          - |       - |                                      
+ 28 |   detail: UNET synchronized transfer           |          - |          - |       - |                                      
+ 29 | PromptExecutor/cache setup                     |     0.194s |     1.689s |   0.221% | #                                    
+ 30 |   detail: PromptExecutor invoke to execution   |     0.000s |          - |   0.000% |                                      
+ 31 |   detail: execution to cached                  |     0.046s |          - |   0.052% |                                      
+ 32 |   detail: cached to first node                 |     0.148s |          - |   0.168% |                                      
+ 33 |   detail: graph/prefill activity               |          - |          - |       - |                                      
+ 34 |   detail: CPU owner: CLIPTextEncode [CLIP]     |     2.366s |          - |   2.694% |                                      
+ 35 |   detail: CPU owner: load_models_gpu [other]   |     0.061s |          - |   0.069% |                                      
+ 36 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+ 37 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.000% |                                      
+ 38 |   detail: Node: SimpleMath+                    |     0.000s |          - |   0.000% |                                      
+ 39 |   detail: Node: ImpactSwitch                   |     0.063s |          - |   0.072% |                                      
+ 40 |   detail: Node: VAELoader                      |     0.001s |          - |   0.001% |                                      
+ 41 |   detail: Node: ClownOptions_ExtraOptions_Beta |     0.000s |          - |   0.000% |                                      
+ 42 |   detail: Node: ImpactIfNone                   |     0.000s |          - |   0.000% |                                      
+ 43 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 44 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+ 45 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 46 |   detail: Node: PrimitiveStringMultiline       |     0.000s |          - |   0.000% |                                      
+ 47 |   detail: Node: JoinStrings                    |     0.000s |          - |   0.000% |                                      
+ 48 |   detail: Node: CLIPLoader                     |     0.001s |          - |   0.002% |                                      
+ 49 |   detail: Node: CLIPTextEncode                 |     2.367s |          - |   2.695% |                                      
+ 50 |   detail: Node: ConditioningZeroOut            |     0.006s |          - |   0.006% |                                      
+ 51 |   detail: Node: PairConditioningSetProperties  |     0.000s |          - |   0.000% |                                      
+ 52 |   detail: Node: UNETLoader                     |     0.001s |          - |   0.001% |                                      
+ 53 |   detail: Node: ModelSamplingAuraFlow          |     0.002s |          - |   0.003% |                                      
+ 54 |   detail: Node: CacheDiT_Model_Optimizer       |     0.000s |          - |   0.000% |                                      
+ 55 |   detail: Node: PathchSageAttentionKJ          |     0.000s |          - |   0.000% |                                      
+ 56 |   detail: Node: easy float                     |     0.000s |          - |   0.000% |                                      
+ 57 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.000% |                                      
+ 58 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+ 59 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+ 60 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+ 61 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+ 62 |   detail: Node: EmptyImage                     |     0.007s |          - |   0.008% |                                      
+ 63 |   detail: Node: ImageRotate                    |     0.001s |          - |   0.001% |                                      
+ 64 |   detail: Node: ImpactSwitch                   |     0.030s |          - |   0.034% |                                      
+ 65 |   detail: Node: easy imageSize                 |     0.000s |          - |   0.000% |                                      
+ 66 |   detail: Node: EmptySD3LatentImage            |     0.001s |          - |   0.001% |                                      
+ 67 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+ 68 |   detail: Node: LGNoiseInjectionLatent         |     0.001s |          - |   0.001% |                                      
+ 69 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+ 70 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 71 |   detail: Node: StringToCombo|LP               |     0.000s |          - |   0.000% |                                      
+ 72 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 73 |   detail: Node: ClownsharKSampler_Beta         |     0.115s |          - |   0.131% |                                      
+ 74 | First node to CLIP                             |     0.067s |     1.756s |   0.076% | #                                    
+ 75 | CLIP to sampler node                           |     2.419s |     4.175s |   2.754% | #                                    
+ 76 | Sampler graph-join wait                        |          - |          - |       - |                                      
+ 77 | Sampler node to sampling                       |     0.109s |     4.284s |   0.124% | #                                    
+ 78 |   detail: sampler lane wait                    |     0.000s |          - |   0.000% |                                      
+ 79 |   detail: sampler node to lane acquired        |     0.000s |          - |   0.000% |                                      
+ 80 |   detail: lane acquired to actual stage        |     0.109s |          - |   0.124% |                                      
+ 81 | Sampling                                       |     4.788s |     9.072s |   5.451% | ##                                   
+ 82 | Post-sampling transition                       |     0.590s |     9.662s |   0.671% | #                                    
+ 83 | VAE                                            |     0.439s |    10.100s |   0.499% | #                                    
+ 84 | Output persistence                             |     0.598s |    10.698s |   0.681% | #                                    
+ 85 |   detail: output encode                        |          - |          - |       - |                                      
+ 86 |   detail: output commit                        |          - |          - |       - |                                      
+ 87 | Remote result handoff                          |          - |          - |       - |                                      
+ 88 | Remote/local return                            |     0.708s |    11.406s |   0.806% | +                                    
+ 89 | Captured timeline gaps / residual              |    76.432s |    87.838s |  87.015% | ================================     
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+    | ACCOUNTED     |    11.406s |            |  12.985% | .....................................
+    | RECONCILIATION |    76.432s |            |            | .....................................
+    | COMMAND -> RESPONSE |    87.838s |            |  100.0% | #####################################
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+Warnings:
+  - captured residual excluded from accounted: 76431.631ms unaccounted
+  - reconciliation exceeds tolerance: 76431.631ms > 439.189ms

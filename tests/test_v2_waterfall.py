@@ -91,7 +91,8 @@ def test_complete_trace_has_required_non_overlapping_rows_and_reconciles():
     )
     assert [stage.key for stage in report.stages] == [
         "local_preparation", "modal_handle_submission", "modal_scheduling",
-        "application_restore", "restore_to_method_entry", "method_entry_to_unet_claim",
+        "pre_python_snapshot_restore", "application_restore", "restore_to_method_entry",
+        "method_entry_to_unet_claim",
         "unet_claim_to_ready", "remote_method_setup",
         "prompt_executor_cache_setup", "first_node_to_clip", "clip_to_sampler_node",
         "sampler_graph_join_wait", "sampler_node_to_sampling", "sampling", "post_sampling_transition", "vae", "output_persistence",
@@ -100,17 +101,18 @@ def test_complete_trace_has_required_non_overlapping_rows_and_reconciles():
     assert all(not stage.overlaps for stage in report.stages)
     assert report.reconciliation_ms is not None
     assert report.total_ms is not None
-    assert abs(report.reconciliation_ms) <= max(50, report.total_ms * 0.005)
+    assert abs(report.reconciliation_ms) <= max(25, report.total_ms * 0.0025)
     assert report.identity["fresh"] is True
 
 
 def test_missing_values_are_unavailable_not_zero():
     report = build_waterfall(result={"trace": {"events": []}}, timing={}, wall_ms=100)
-    assert all(stage.duration_ms is None for stage in report.stages if stage.key != "captured_timeline_gap")
-    assert next(stage for stage in report.stages if stage.key == "captured_timeline_gap").duration_ms == 100.0
+    assert all(stage.duration_ms is None for stage in report.stages)
+    assert "residual" not in {stage.key for stage in report.stages}
+    assert report.residual_ms == 100.0
     output = render_waterfall(report, terminal_columns=132)
     assert "-" in output
-    assert "Captured timeline gaps / residual" in output
+    assert "Residual (unattributed)" not in output
 
 
 def test_cross_process_uses_wall_and_same_process_uses_monotonic():
@@ -232,13 +234,95 @@ def test_request_origin_and_residual_close_accounting_gap():
         response_received_unix_ns=30000 * 1_000_000,
     )
     residual_stages = {stage.key: stage for stage in residual_report.stages}
-    assert residual_stages["captured_timeline_gap"].duration_ms == 29000.0
+    assert "residual" not in residual_stages
+    assert residual_report.residual_ms == 29000.0
     # The generic residual is the UNATTRIBUTED gap, not a measured stage:
     # it must NOT be folded into the accounted total or fabricated into a
     # perfect reconciliation (accounted == total, reconciliation == 0).
     assert residual_report.accounted_ms != residual_report.total_ms
     assert residual_report.reconciliation_ms != 0.0
     assert any("reconciliation" in warning or "unaccounted" in warning for warning in residual_report.warnings)
+
+
+def test_modal_restore_begin_boundary_splits_scheduling_and_pre_python_restore():
+    """With the Modal platform restore-begin boundary available (from the
+    result dict), modal_scheduling is the submission → restore-begin span and
+    pre_python_snapshot_restore is the restore-begin → python_resume span.
+    The report flags nothing and the platform stage carries the modal_app_log
+    provenance."""
+    result = _complete_result()
+    result["modal_restore_begin_wall_unix_ns"] = 3500 * 1_000_000
+    report = build_waterfall(
+        result=result,
+        timing={},
+        wall_ms=12100,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=13100 * 1_000_000,
+    )
+    stages = {stage.key: stage for stage in report.stages}
+    scheduling = stages["modal_scheduling"]
+    assert scheduling.duration_ms == 2490.0  # restore_begin(3500) - submission(1010)
+    assert scheduling.provenance == "modal_app_log"
+    assert "modal_restore_begin_unavailable" not in report.boundary_flags
+    pre_python = stages["pre_python_snapshot_restore"]
+    assert pre_python.duration_ms == 500.0  # python_resume(4000) - restore_begin(3500)
+    assert pre_python.status == "measured"
+    # Anchored on the Modal app-log restore-begin boundary.
+    assert pre_python.provenance == "modal_app_log"
+
+
+def test_missing_restore_begin_flags_combined_scheduling_interval():
+    """Without the restore-begin boundary the report flags
+    modal_restore_begin_unavailable, modal_scheduling spans submission →
+    python_resume (combined), and pre_python_snapshot_restore is a localized
+    unavailable (never a fabricated zero or global residual)."""
+    report = build_waterfall(
+        result=_complete_result(),
+        timing={},
+        wall_ms=12100,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=13100 * 1_000_000,
+    )
+    stages = {stage.key: stage for stage in report.stages}
+    scheduling = stages["modal_scheduling"]
+    assert "modal_restore_begin_unavailable" in report.boundary_flags
+    assert scheduling.duration_ms == 2990.0  # python_resume(4000) - submission(1010)
+    assert "submission_to_python_resume_ms" in scheduling.source_fields
+    pre_python = stages["pre_python_snapshot_restore"]
+    assert pre_python.status == "unavailable"
+    assert pre_python.duration_ms is None
+    assert "modal_restore_begin_unavailable" in pre_python.source_fields
+
+
+def test_waterfall_report_reconciliation_fields_and_wide_render():
+    """The report carries residual/reconciliation/controllable/platform walls,
+    the wide render shows provenance in the Source column, and the boundary
+    flags render with their combined-interval explanation."""
+    report = build_waterfall(
+        result=_complete_result(),
+        timing={},
+        wall_ms=12100,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=13100 * 1_000_000,
+    )
+    assert report.residual_ms == 0.0 or report.residual_ms is not None
+    assert report.reconciliation_status in ("OK", "EXCEEDS_TOLERANCE")
+    assert report.platform_wall_ms is not None
+    assert report.controllable_wall_ms is not None
+    rendered = render_waterfall(report, terminal_columns=180)
+    assert "TOP-LEVEL ACCOUNTED" in rendered
+    assert "GLOBAL RESIDUAL" in rendered
+    assert "RESIDUAL %" in rendered
+    assert "RECONCILIATION STATUS" in rendered
+    assert "CONTROLLABLE APPLICATION WALL" in rendered
+    assert "PLATFORM/MODAL WALL" in rendered
+    assert "Boundary flags:" in rendered
+    assert "modal_restore_begin_unavailable" in rendered
+    assert "modal_scheduling covers submission->python_resume combined" in rendered
+    # Wide render includes provenance in the source column.
+    assert "remote_trace/" in rendered or "host_trace/" in rendered or "modal_app_log/" in rendered
+    # ASCII-only output even with flags/labels.
+    assert all(ord(character) < 128 for character in rendered)
 
 
 def test_structured_diagnostics_are_rendered_as_nested_detail_rows():
@@ -328,7 +412,8 @@ def test_generic_residual_reflects_real_gap_not_perfect_reconciliation():
     )
     assert report.total_ms == 10000.0
     stages = {stage.key: stage for stage in report.stages}
-    assert stages["captured_timeline_gap"].duration_ms is not None
+    assert "residual" not in stages
+    assert report.residual_ms is not None
     assert report.accounted_ms is not None
     assert report.accounted_ms != report.total_ms
     assert report.reconciliation_ms is not None
@@ -338,7 +423,7 @@ def test_generic_residual_reflects_real_gap_not_perfect_reconciliation():
     assert isinstance(accounted_ms, float)
     assert isinstance(total_ms, float)
     assert isinstance(reconciliation_ms, float)
-    assert abs(reconciliation_ms - stages["captured_timeline_gap"].duration_ms) < 1e-6
+    assert abs(reconciliation_ms - report.residual_ms) < 1e-6
     assert abs(reconciliation_ms - (total_ms - accounted_ms)) < 1e-6
     assert any("reconciliation exceeds tolerance" in warning for warning in report.warnings)
 
@@ -358,7 +443,7 @@ def _build_baseline_report(row: dict):
 
 
 def test_three_baseline_rows_reconcile_within_tolerance():
-    """Each sanitized baseline row reconciles within max(50ms, 0.5% total) with
+    """Each sanitized baseline row reconciles within max(25ms, 0.25% total) with
     the platform row populated, restore counted exactly once, and restore-to-
     method-entry separate.  Fixture totals and exact supplied source values are
     asserted verbatim — not merely self-consistency."""
@@ -388,7 +473,7 @@ def test_three_baseline_rows_reconcile_within_tolerance():
         # Each row reconciles within tolerance (platform is accounted, not
         # leaked into the generic residual).
         assert report.reconciliation_ms is not None
-        assert abs(report.reconciliation_ms) <= max(50.0, report.total_ms * 0.005), (
+        assert abs(report.reconciliation_ms) <= max(25.0, report.total_ms * 0.0025), (
             f"{row['request_id']}: reconciliation {report.reconciliation_ms}ms "
             f"exceeds tolerance for total {report.total_ms}ms"
         )
@@ -430,7 +515,7 @@ def test_three_baseline_rows_reconcile_within_tolerance():
         assert "dispatch_to_modal_entry_ms" not in stages["modal_handle_submission"].source_fields
 
         # Known platform time is never assigned to the generic residual.
-        residual = stages.get("captured_timeline_gap")
+        residual = stages.get("residual")
         if residual is not None and residual.duration_ms is not None:
             assert abs(residual.duration_ms - expected_platform) > 1e-9
 
@@ -656,6 +741,11 @@ def test_serialized_waterfall_dict_contract():
         "run_label", "request_id", "identity",
         "total_ms", "accounted_ms", "reconciliation_ms", "tolerance_ms",
         "warnings", "stages", "details",
+        "residual_ms", "residual_pct", "reconciliation_status",
+        "controllable_wall_ms", "platform_wall_ms", "boundary_flags",
+        "scheduling_ms", "total_wall_ms", "command_response_ms",
+        "partial_waterfall", "partial_flags",
+        "pre_python_interval_ms", "pre_python_interval_classification",
     }
     assert data["run_label"] == "remote normal run"
     assert data["request_id"] == "request-1"

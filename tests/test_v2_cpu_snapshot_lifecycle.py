@@ -3176,7 +3176,7 @@ class CpuSnapshotRequestTimeActivationTests(unittest.TestCase):
         invariant = next(line for line in lines if line.startswith("[v2.snapshot_activation_invariant]"))
         self.assertIn("status=pass", invariant)
         self.assertIn("reason=ok", invariant)
-        self.assertIn("cpu_snapshot_active=1", invariant)
+        self.assertIn("cpu_snapshot_container_active=1", invariant)
         prefill = next(line for line in lines if line.startswith("[v2.execution_prefill]"))
         self.assertIn("snapshot_active=1", prefill)
         self.assertIn("scheduled=0", prefill)

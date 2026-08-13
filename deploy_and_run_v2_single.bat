@@ -243,6 +243,14 @@ if "!V1_EXISTS!"=="1" (
     REM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     echo === V1 comfyui already deployed. Deploying V2 only ===
 
+    REM -- Publish local custom nodes to the Volume so baked == persisted at snapshot construction --
+    echo === Publishing custom nodes to Volume for V2 generation parity ===
+    python tools\publish_custom_nodes_volume.py
+    if errorlevel 1 (
+        echo === ERROR: custom-node Volume publication failed ===
+        exit /b 1
+    )
+
     set "V2_LOG=%TEMP%\_v2dpl_%RANDOM%.txt"
     !MODAL_CLI! deploy -m comfymodal_runtime.modal_app --name "!COMFYMODAL_V2_APP_NAME!" > "!V2_LOG!" 2>&1
     set "V2_EXIT=!errorlevel!"
@@ -274,6 +282,13 @@ if "!V1_EXISTS!"=="1" (
 
     if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
     echo === V2 deploy verified OK ===
+    REM -- Record the ACTUAL baked deployment identity (container readback) so plan builds carry the exact deployed hash --
+    echo === Recording baked deployment identity ===
+    python tools\record_deployment_identity.py
+    if errorlevel 1 (
+        echo === ERROR: deployment identity record failed ===
+        exit /b 1
+    )
 
 ) else (
 
@@ -385,6 +400,39 @@ if "!V1_EXISTS!"=="1" (
     if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
 
     echo === V1 and V2 deploys both verified OK ===
+
+    REM -- Publish local custom nodes to the Volume so baked == persisted at snapshot construction --
+    REM V1 is now deployed and verified, so the V1 remote sync function is reachable.
+    echo === Publishing custom nodes to Volume for V2 generation parity ===
+    python tools\publish_custom_nodes_volume.py
+    if errorlevel 1 (
+        echo === ERROR: custom-node Volume publication failed ===
+        exit /b 1
+    )
+
+    REM -- Re-deploy V2 so snapshot construction sees the freshly published Volume --
+    REM V2 was deployed above while the Volume generation record was still stale.
+    set "V2_RELOG=%TEMP%\_v2rdpl_%RANDOM%.txt"
+    !MODAL_CLI! deploy -m comfymodal_runtime.modal_app --name "!COMFYMODAL_V2_APP_NAME!" > "!V2_RELOG!" 2>&1
+    set "V2_REEXIT=!errorlevel!"
+    echo.
+    echo === V2 re-deploy log after Volume publish ===
+    type "!V2_RELOG!"
+    echo.
+    if !V2_REEXIT! neq 0 (
+        echo === ERROR: V2 re-deploy after Volume publish failed with exit code !V2_REEXIT! ===
+        if defined V2_RELOG if exist "!V2_RELOG!" del /q "!V2_RELOG!"
+        exit /b !V2_REEXIT!
+    )
+    if defined V2_RELOG if exist "!V2_RELOG!" del /q "!V2_RELOG!"
+    echo === V2 re-deploy after Volume publish verified OK ===
+    REM -- Record the ACTUAL baked deployment identity (container readback) so plan builds carry the exact deployed hash --
+    echo === Recording baked deployment identity ===
+    python tools\record_deployment_identity.py
+    if errorlevel 1 (
+        echo === ERROR: deployment identity record failed ===
+        exit /b 1
+    )
 )
 
 if /i "!COMFYMODAL_DEPLOY_ONLY!"=="1" (

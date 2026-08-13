@@ -38,6 +38,49 @@ class TransportError(RuntimeError):
     pass
 
 
+# Variant A persistence registry: definitive remote persistence outcome per
+# prompt, recorded by the shielded background drain after the caller has
+# already broken out of the stream on the result event.
+_PERSISTENCE_STATUS_BY_PROMPT: dict[str, dict] = {}
+
+
+def get_persistence_status(prompt_id: str) -> dict | None:
+    """Return a copy of the recorded persistence outcome for *prompt_id*.
+
+    Returns ``None`` when no record exists (e.g. the stream ran to natural
+    completion without a deferred commit, or no drain observed the remote's
+    terminal ``persistence`` event).
+    """
+    record = _PERSISTENCE_STATUS_BY_PROMPT.get(str(prompt_id))
+    if record is None:
+        return None
+    return dict(record)
+
+
+def record_persistence_status(request_id: str, event: Mapping[str, Any]) -> dict | None:
+    """Record a remote ``persistence`` event for *request_id*.
+
+    Shared recorder for consumers that observe the terminal persistence
+    event outside the shielded drain (e.g. the legacy
+    ``modal_client.run_prompt_stream`` path, which consumes the stream to
+    natural completion).  Normalizes the event exactly like the drain and
+    returns the stored record (or None when the event has no status).
+    """
+    if not isinstance(event, dict) or event.get("type") != "persistence":
+        return None
+    status = str(event.get("status", ""))
+    if not status:
+        return None
+    record = {
+        "status": status,
+        "commit_ms": float(event.get("commit_ms", 0.0) or 0.0),
+        "detail": str(event.get("detail", "")),
+        "skipped": bool(event.get("skipped", False)),
+    }
+    _PERSISTENCE_STATUS_BY_PROMPT[str(request_id)] = record
+    return record
+
+
 async def _aclose_iterator(iterator: Any) -> None:
     """Best-effort explicit close of an inner remote async iterator/generator.
 
@@ -62,6 +105,71 @@ async def _aclose_iterator(iterator: Any) -> None:
     except Exception:
         # Cleanup is best-effort: never let it mask the result/exception.
         pass
+
+
+def _spawn_persistence_drain(
+    iterator: Any,
+    *,
+    request_id: str,
+    runtime_trace: Any | None,
+) -> asyncio.Task:
+    """Spawn a shielded background task that drains *iterator* to natural
+    completion, recording the remote's final persistence event.
+
+    The task is owned by the running event loop (create_task keeps a
+    strong reference), so it survives the caller's request scope.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def _shielded_drain() -> None:
+        # asyncio.shield() returns a Future on Python 3.11+, so it cannot be
+        # passed directly to create_task; awaiting it inside a coroutine keeps
+        # the drain shielded from cancellation while remaining a coroutine.
+        await asyncio.shield(
+            _drain_persistence_iterator(
+                iterator,
+                request_id=request_id,
+                runtime_trace=runtime_trace,
+            )
+        )
+
+    return loop.create_task(_shielded_drain())
+
+
+async def _drain_persistence_iterator(
+    iterator: Any,
+    *,
+    request_id: str,
+    runtime_trace: Any | None,
+) -> None:
+    """Consume *iterator* to completion; record persistence outcome.
+
+    Never raises.  If the remote yields a ``persistence`` event, record
+    its status into the module registry keyed by *request_id* and emit a
+    local trace marker.  Always best-effort acloses the iterator at the
+    end.
+    """
+    try:
+        async for event in iterator:
+            if isinstance(event, dict) and event.get("type") == "persistence":
+                record = {
+                    "status": str(event.get("status", "")),
+                    "commit_ms": float(event.get("commit_ms", 0.0) or 0.0),
+                    "detail": str(event.get("detail", "")),
+                    "skipped": bool(event.get("skipped", False)),
+                }
+                _PERSISTENCE_STATUS_BY_PROMPT[str(request_id)] = record
+                if runtime_trace is not None:
+                    runtime_trace.emit(
+                        "deferred_commit_end",
+                        phase="local",
+                        metadata=dict(record),
+                    )
+    except Exception:
+        # Drain is best-effort observability; never let it propagate.
+        pass
+    finally:
+        await _aclose_iterator(iterator)
 
 
 @dataclass(frozen=True)
@@ -410,6 +518,7 @@ class ModalTransport:
         _persistent_mode = False
         _persistent_client: Any = None
         _direct_retry_done = False
+        _stream_exhausted = False
         try:
             if fn is not None:
                 # V1-compatible stream path — measure plan serialization
@@ -861,6 +970,7 @@ class ModalTransport:
                         attach_waterfall(
                             _fe_data,
                             run_label="modal_transport run_prompt_stream",
+                            print_render=False,
                         )
                 yield first_event
                 async for event in _iterator:
@@ -872,8 +982,10 @@ class ModalTransport:
                             attach_waterfall(
                                 _rdata,
                                 run_label="modal_transport run_prompt_stream",
+                                print_render=False,
                             )
                     yield event
+                _stream_exhausted = True
             else:
                 result = await stream if inspect.isawaitable(stream) else stream
                 if isinstance(result, dict):
@@ -885,14 +997,23 @@ class ModalTransport:
                             run_label="modal_transport run_prompt_stream",
                         )
                     yield {"type": "result", "data": result}
+                    _stream_exhausted = True
         except Exception as exc:
             raise TransportError(str(exc)) from exc
         finally:
-            # Close the inner remote generator after the result is fully
-            # yielded, on exception, or on cancellation (finally always runs).
-            # Best-effort: never delays/changes the yielded result and never
-            # masks the original outcome.
-            await _aclose_iterator(_iterator)
+            if _iterator is not None and not _stream_exhausted:
+                # Variant A: caller finished early (result received).  Drain the
+                # remaining stream in the background so the remote generator runs
+                # to completion (deferred commit) and its terminal persistence
+                # event is observed.  Shielded: cancellation of this request must
+                # not kill the drain.
+                self._drain_task = _spawn_persistence_drain(
+                    _iterator,
+                    request_id=request_id,
+                    runtime_trace=runtime_trace,
+                )
+            else:
+                await _aclose_iterator(_iterator)
 
     async def run_checkpoint_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
         fn = self.checkpoint_stream_fn

@@ -18,7 +18,7 @@ Production-mode evidence (no experimental diagnostics enabled):
 - GPU residency: ``unet_first_cuda_op`` x_device=cuda:0 with
   model_identity=cpu_snapshot.
 - FULL snapshot retained: ``snapshot_activation_invariant``
-  (clip_present/unet_present/cpu_snapshot_active == 1, status=pass) +
+  (clip_present/unet_present/cpu_snapshot_container_active == 1, status=pass) +
   stored_snapshot_model_order.
 
 Usage:
@@ -236,10 +236,13 @@ def validate_run(rec: dict[str, Any], seen_instances: set[str], seen_tasks: set[
         failures.append("stored_snapshot_model_order missing (FULL snapshot proof)")
 
     inv = rec["snapshot_invariant"]
-    if inv.get("clip_present") != 1 or inv.get("unet_present") != 1 or inv.get("cpu_snapshot_active") != 1:
+    # Renamed diagnostic field; fall back to the legacy key so artifacts
+    # recorded before the rename still parse.
+    inv_container_active = inv.get("cpu_snapshot_container_active", inv.get("cpu_snapshot_active"))
+    if inv.get("clip_present") != 1 or inv.get("unet_present") != 1 or inv_container_active != 1:
         failures.append(
             f"snapshot_activation_invariant incomplete: clip={inv.get('clip_present')} "
-            f"unet={inv.get('unet_present')} active={inv.get('cpu_snapshot_active')} "
+            f"unet={inv.get('unet_present')} active={inv_container_active} "
             f"status={inv.get('status')} reason={inv.get('reason')}"
         )
     if str(inv.get("status") or "") != "pass":
@@ -525,7 +528,7 @@ def main() -> None:
 - restore_count == 1 and request_count == 1: all {len(records)} runs
 - unique restored instance + container/task per run: all {len(records)} runs
 - cloud == aws: all {len(records)} runs (regions recorded per run)
-- FULL snapshot retained: snapshot_activation_invariant clip/unet present + cpu_snapshot_active + status=pass, stored_snapshot_model_order=O0: all {len(records)} runs
+- FULL snapshot retained: snapshot_activation_invariant clip/unet present + cpu_snapshot_container_active + status=pass, stored_snapshot_model_order=O0: all {len(records)} runs
 - TWO-LANE activation exactly once (UNET_EARLY_ACTIVATION lane pass == 1, sampler join owner == 1, prefill unet_skipped=false/unet_resolved=true): all {len(records)} runs
 - no duplicate full UNET H2D (restore-phase-only snapshot load, retained patcher identity continuity, first-forward < 3 s): all {len(records)} runs
 - GPU/cache residency (first UNET forward on cuda:0 with model_identity=cpu_snapshot): all {len(records)} runs

@@ -144,6 +144,91 @@ if _PREFILL_LANE_MODE not in ("critical", "all", "none"):
     _PREFILL_LANE_MODE = "critical"
 _PREFILL_CRITICAL_ROLES: frozenset[str] = frozenset({"positive", "negative"})
 
+# ── Execution-phase UNET H2D delay (experiment gate) ──────────────────
+# ``COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS``: delay the native
+# fast-disk H2D replay by N milliseconds measured from the execution-unet
+# lane worker start (≈ prefill scheduling).  0 (default) = immediate H2D —
+# the proven baseline.  The delay applies ONLY when the load runs on the
+# execution lane (lane-start marker set below); the graph-time path and
+# every other configuration are unaffected.  The goal is to give the CLIP
+# forward a contention-free head start while the UNET still completes
+# before graph demand.
+try:
+    _EXECUTION_UNET_H2D_DELAY_MS: float = max(
+        0.0, float(os.environ.get("COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS", "0"))
+    )
+except (TypeError, ValueError):
+    _EXECUTION_UNET_H2D_DELAY_MS = 0.0
+# Monotonic start of the current request's execution-unet lane worker,
+# captured in ``V2LoaderBridge.schedule_execution_unet``'s callback entry.
+# ``None`` when no execution lane ran (graph-time fast-disk path) — in that
+# case the H2D delay never applies and behavior is byte-for-byte unchanged.
+_EXECUTION_UNET_LANE_START_MONO: int | None = None
+# Milestone event fired at the OUTERMOST real CLIP forward start (the
+# ``clip_forward`` span).  The H2D delay applies only when the forward is
+# actually running — a cache-hit request (no forward, no encode) never
+# pays the delay.  Cleared per request at the execution-unet lane start.
+_CLIP_FORWARD_STARTED = threading.Event()
+
+# ── Optimization diagnostics (measurement-only; off by default) ───────
+# COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS gates every ``opt_*`` event
+# emitted by this module.  When unset (the default), every probe below is
+# a no-op and zero runtime behavior changes.  The module imports nothing
+# heavy, and the import is guarded so diagnostics can never break startup.
+try:
+    from .optimization_diagnostics import (
+        OptCudaInterval,
+        OptTransferProbe,
+        emit_opt,
+        opt_diag_enabled,
+        opt_stream_info,
+        sync_cuda_allowed,
+        wall_overlap_ms,
+    )
+except Exception:  # pragma: no cover - diagnostics must never break the runtime
+    OptCudaInterval = None  # type: ignore[assignment]
+    OptTransferProbe = None  # type: ignore[assignment]
+    opt_stream_info = lambda: {}  # type: ignore[assignment]
+    wall_overlap_ms = lambda *a, **k: {}  # type: ignore[assignment]
+    sync_cuda_allowed = lambda: False  # type: ignore[assignment]
+    emit_opt = lambda *a, **k: None  # type: ignore[assignment]
+    opt_diag_enabled = lambda: False  # type: ignore[assignment]
+
+_OPT_DIAG: bool = bool(opt_diag_enabled())
+# Measurement windows shared across lanes (diag-gated; ``None`` until
+# captured).  Read defensively via ``globals().get`` so tests and other
+# modules never break on a missing variable.
+_OPT_UNET_H2D_MONO: tuple[int, int] | None = None
+_OPT_UNET_H2D_DEVICE_MS: float | None = None
+_OPT_CLIP_FORWARD_MONO: tuple[int, int] | None = None
+_OPT_UNET_READY_MONO_NS: int | None = None
+_OPT_UNET_DEMAND_MONO_NS: int | None = None
+
+# ── V2 A/B experiments (Experiment 1 unet_transfer / Experiment 2
+# vae_overlap) ─────────────────────────────────────────────────────────
+# Accessors come from ``comfymodal_runtime.v2_experiments`` (the unified
+# experiment registry).  Imported defensively: if the module is ever absent
+# every accessor falls back to its default so the runtime stays
+# byte-for-byte on the baseline arm (default OFF).
+try:
+    from .v2_experiments import (
+        emit_experiment_selection,
+        experiment_line,
+        resolve_experiment,
+        unet_pinned_staging_enabled,
+        unet_staging_chunk_mb,
+        vae_early_start_ms,
+        vae_expected_sampling_ms,
+    )
+except Exception:  # pragma: no cover - experiments must never break the runtime
+    emit_experiment_selection = lambda *a, **k: None  # type: ignore[assignment]
+    experiment_line = lambda *a, **k: ""  # type: ignore[assignment]
+    resolve_experiment = lambda *a, **k: None  # type: ignore[assignment]
+    unet_pinned_staging_enabled = lambda: False  # type: ignore[assignment]
+    unet_staging_chunk_mb = lambda: 512  # type: ignore[assignment]
+    vae_early_start_ms = lambda: 0  # type: ignore[assignment]
+    vae_expected_sampling_ms = lambda: 4900  # type: ignore[assignment]
+
 # ── Page-fault delta tracking for model-path instrumentation ─────
 # Uses resource.getrusage (RUSAGE_SELF) to measure major/minor page
 # faults around actual first access to restored CLIP/UNET CPU state.
@@ -2081,6 +2166,45 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
     return wrapper
 
 
+def _opt_vae_h2d_capture(models: list[Any]) -> dict[str, Any]:
+    """Best-effort pre-commit VAE storage summary (measurement-only).
+
+    Runs BEFORE the lane's GPU commit so parameter devices are still the
+    CPU source.  Sums storage bytes over each patcher's parameter tensors
+    and reports pinning + source device.  Guarded end-to-end; returns a
+    plain JSON-safe dict.
+    """
+    _bytes = 0
+    _count = 0
+    _pinned = False
+    _source_device = ""
+    try:
+        for _m in models or ():
+            _patched = getattr(_m, "model", _m)
+            _params = getattr(_patched, "parameters", None)
+            if not callable(_params):
+                continue
+            for _p in _params():
+                try:
+                    _st = _p.untyped_storage()
+                    _bytes += int(_st.nbytes())
+                except Exception:
+                    _bytes += int(_p.numel() * _p.element_size())
+                if not _source_device:
+                    _source_device = str(getattr(_p, "device", ""))
+                if not _pinned:
+                    _pinned = bool(getattr(_p, "is_pinned", lambda: False)())
+                _count += 1
+    except Exception:
+        pass
+    return {
+        "bytes": int(_bytes),
+        "parameter_count": int(_count),
+        "pinned": bool(_pinned),
+        "source_device": str(_source_device),
+    }
+
+
 def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap ``comfy.model_management.load_models_gpu`` to emit commit events.
 
@@ -2106,6 +2230,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _model_identity_hash = ""
         _pf_h2d_before: _PageFaultSnapshot | None = None
         _h2d_metric_name: str = ""
+        # LANE 4 (measurement-only): pre-commit VAE storage summary.
+        _vae_h2d_before: dict[str, Any] | None = None
         # Exclusive-ownership join outcome (graph path; None when not applicable).
         _ownership_join: dict[str, Any] | None = None
         # Activation diagnostics record (captured on outermost entry)
@@ -2255,6 +2381,10 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 if _PAGEFAULT_TRACKING:
                     _pf_h2d_before = _PageFaultSnapshot.now()
                     _h2d_metric_name = "clip_h2d_ms" if lane._lane == "CLIP" else "unet_h2d_ms"
+                # LANE 4 (measurement-only): pre-commit VAE storage summary
+                # (source device/pinning must be captured before the move).
+                if _OPT_DIAG and lane._lane == "VAE":
+                    _vae_h2d_before = _opt_vae_h2d_capture(models)
                 # Compute metadata for lane-owned commit events
                 _lane_start_ns = time.monotonic_ns()
                 _lane_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
@@ -2449,6 +2579,22 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                 "caller_classification": _caller,
                             },
                         )
+                    # LANE 4 (measurement-only): VAE lane H2D transfer facts
+                    if _vae_h2d_before is not None:
+                        try:
+                            emit_opt(lane._trace, "vae_h2d_transfer", phase=lane._phase, metadata={
+                                "lane": lane._lane,
+                                "bytes": int(_vae_h2d_before["bytes"]),
+                                "total_mib": round(int(_vae_h2d_before["bytes"]) / (1 << 20), 3),
+                                "parameter_count": int(_vae_h2d_before["parameter_count"]),
+                                "pinned": bool(_vae_h2d_before["pinned"]),
+                                "source_device": str(_vae_h2d_before["source_device"]),
+                                "device_ms": round((_lane_end_ns - _lane_start_ns) / 1_000_000, 3),
+                                "stream": opt_stream_info(),
+                                "caller_classification": _caller,
+                            })
+                        except Exception:
+                            pass
                     lane.gpu_commit_end(
                         host_wall_duration_ms=round((_lane_end_ns - _lane_start_ns) / 1_000_000, 3),
                         thread_cpu_duration_ms=round((_lane_thread_end_ns - _lane_thread_start_ns) / 1_000_000, 3) if _lane_thread_end_ns is not None and _lane_thread_start_ns is not None else None,
@@ -3875,6 +4021,116 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
     if model is None or original_to is None:
         return model
     trace = _fast_disk_trace(lane_trace)
+    # ── Experiment 1 (unet_transfer, B arm): bounded pinned-staging ────
+    # Default OFF (COMFYMODAL_V2_UNET_PINNED_STAGING unset): the code path
+    # below is byte-for-byte the original A path.  When enabled, the B arm
+    # is eligible ONLY when the target is a cuda device, ``to_kwargs``
+    # requests no dtype/memory-format conversion (the model is already
+    # BF16 in RAM — raw-byte copies would be wrong under dtype conversion),
+    # and CUDA is available.  Any eligibility failure falls back silently
+    # to the exact original A path with a logged line.
+    _staging: bool = False
+    _chunk_mb: int = 512
+    _staging_eligible: bool = False
+    _staging_reason: str = ""
+    try:
+        _staging = bool(unet_pinned_staging_enabled())
+    except Exception:
+        _staging = False
+    if _staging:
+        try:
+            _chunk_mb = max(1, int(unet_staging_chunk_mb() or 512))
+        except Exception:
+            _chunk_mb = 512
+        _target_type = str(getattr(target, "type", "") or "")
+        _no_dtype_conv = (
+            "dtype" not in to_kwargs and "memory_format" not in to_kwargs
+        )
+        _cuda_avail = False
+        try:
+            import torch as _torch_stg
+            _cuda_avail = bool(_torch_stg.cuda.is_available())
+        except Exception:
+            _cuda_avail = False
+        if _target_type != "cuda":
+            _staging_reason = "target_not_cuda"
+        elif not _no_dtype_conv:
+            _staging_reason = "dtype_conversion_requested"
+        elif not _cuda_avail:
+            _staging_reason = "cuda_unavailable"
+        else:
+            _staging_eligible = True
+        if not _staging_eligible:
+            print(
+                f"{experiment_line(resolve_experiment('unet_transfer'))} "
+                f"effective=baseline fallback={_staging_reason}",
+                flush=True,
+            )
+    # ── Execution-phase H2D delay (experiment gate) ───────────────────
+    # Hold the deferred H2D replay until (lane_start + delay) so the CLIP
+    # forward gets a contention-free head start.  The budget is measured
+    # from the execution-unet lane worker start (deterministic, in-thread)
+    # and never applies when no execution lane ran (lane marker None —
+    # graph-time path, byte-for-byte unchanged).  Zero/negative delay is
+    # the proven immediate-start baseline.  The sleep sits OUTSIDE the
+    # measured to_wall_ms window (before _start_ns below).
+    _h2d_waited_ms: float = 0.0
+    if _EXECUTION_UNET_H2D_DELAY_MS > 0:
+        _lane_start = _EXECUTION_UNET_LANE_START_MONO
+        if _lane_start is not None and _CLIP_FORWARD_STARTED.is_set():
+            _deadline_ns = _lane_start + int(
+                _EXECUTION_UNET_H2D_DELAY_MS * 1_000_000
+            )
+            _remaining_s = (_deadline_ns - time.monotonic_ns()) / 1_000_000_000
+            if _remaining_s > 0:
+                _h2d_wait_start_ns = time.monotonic_ns()
+                if trace is not None:
+                    trace.emit("unet_h2d_delay_start", phase="restore", metadata={
+                        "delay_ms": _EXECUTION_UNET_H2D_DELAY_MS,
+                        "remaining_ms": round(_remaining_s * 1000, 3),
+                    })
+                time.sleep(_remaining_s)
+                _h2d_waited_ms = round(
+                    (time.monotonic_ns() - _h2d_wait_start_ns) / 1_000_000, 3
+                )
+                if trace is not None:
+                    trace.emit("unet_h2d_delay_end", phase="restore", metadata={
+                        "delay_ms": _EXECUTION_UNET_H2D_DELAY_MS,
+                        "waited_ms": _h2d_waited_ms,
+                    })
+    # ── LANE 1 (measurement-only): UNET fast-disk H2D transfer probe ──
+    # OptTransferProbe aggregates per-parameter tensor stats, host-side
+    # effect deltas, stream identity, and a CUDA-event interval that is
+    # realized via the existing ``finally`` synchronize below (reused —
+    # never an extra sync).  Pure instrumentation; no runtime behavior
+    # change.  All no-ops when COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS is
+    # unset.
+    _opt_h2d_probe = None
+    if _OPT_DIAG:
+        try:
+            # Experiment 1: reflect the pinned-staging B arm when active
+            # (copy_api matches the staging metrics label, non_blocking True).
+            _opt_h2d_probe = OptTransferProbe(
+                trace or lane_trace,
+                phase="restore",
+                metadata={
+                    "target": str(target) if target is not None else "",
+                    "non_blocking": True if _staging_eligible else False,
+                    "copy_api": (
+                        "pinned_staging_chunked_copy_"
+                        if _staging_eligible
+                        else "module.to (per-parameter async copy chain)"
+                    ),
+                    "source_kind": "pageable_cpu",
+                },
+            )
+            _opt_h2d_probe.begin(model)
+        except Exception:
+            _opt_h2d_probe = None
+    # Experiment 1 B-arm outcome trackers (used by the finally below; the
+    # plain A path keeps both at their defaults).
+    _staging_used: bool = False
+    _staging_metrics: dict[str, Any] | None = None
     _start_ns = time.monotonic_ns()
     _torch_rp = None
     _ev_start = None
@@ -3908,6 +4164,36 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
             ),
         })
     try:
+        if _staging_eligible:
+            _staging_metrics = None
+            try:
+                from .unet_pinned_staging import transfer_module_via_pinned_staging
+                _staging_metrics = transfer_module_via_pinned_staging(
+                    model, target_device=target, chunk_mb=_chunk_mb,
+                    trace=trace, phase="restore",
+                )
+            except Exception as _stg_exc:
+                _staging_metrics = None
+                print(
+                    f"{experiment_line(resolve_experiment('unet_transfer'))} "
+                    f"effective=baseline fallback=staging_exception:{type(_stg_exc).__name__}",
+                    flush=True,
+                )
+            if _staging_metrics is not None and _staging_metrics.get("fallback") is None:
+                _staging_used = True
+                # Parameters are already on CUDA: the real to() is a no-op
+                # but preserves its side effects byte-for-byte.
+                return original_to(model, *to_args, **to_kwargs)
+            _staging_reason = (
+                str(_staging_metrics.get("fallback", ""))
+                if _staging_metrics is not None
+                else "staging_unavailable"
+            )
+            print(
+                f"{experiment_line(resolve_experiment('unet_transfer'))} "
+                f"effective=baseline fallback={_staging_reason}",
+                flush=True,
+            )
         return original_to(model, *to_args, **to_kwargs)
     finally:
         _wall_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
@@ -3915,16 +4201,41 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
             try:
                 _ev_end.record()
                 _torch_rp.cuda.synchronize()
-                _device_ms = round(float(_ev_start.elapsed_time(_ev_end)), 3)
+                if not _staging_used:
+                    _device_ms = round(float(_ev_start.elapsed_time(_ev_end)), 3)
             except Exception:
                 _device_ms = None
+        if _staging_used and _staging_metrics is not None:
+            # B arm: the truthful device measurement comes from the staging
+            # metrics' CUDA events (the to() no-op measures ~0).
+            _device_ms = _staging_metrics.get("cuda_event_ms")
+            record["timings"]["to_device_ms_label"] = "synchronized_device"
+        else:
+            record["timings"]["to_device_ms_label"] = (
+                "synchronized_device" if _device_ms is not None else "unavailable"
+            )
+        # ── LANE 1 probe realization (reuses the synchronize above) ──
+        if _opt_h2d_probe is not None:
+            try:
+                _opt_h2d_probe.end(model)
+                _opt_h2d_probe.emit("unet_h2d_transfer")
+                global _OPT_UNET_H2D_MONO, _OPT_UNET_H2D_DEVICE_MS
+                _OPT_UNET_H2D_MONO = (_start_ns, time.monotonic_ns())
+                _OPT_UNET_H2D_DEVICE_MS = _device_ms
+            except Exception:
+                _opt_h2d_probe = None
         record["timings"]["to_wall_ms"] = _wall_ms
         record["timings"]["to_device_ms"] = _device_ms
-        record["timings"]["to_device_ms_label"] = (
-            "synchronized_device" if _device_ms is not None else "unavailable"
-        )
+        if _staging_used:
+            try:
+                # Unified experiment metadata, once per request on the B arm.
+                emit_experiment_selection(
+                    trace or lane_trace, resolve_experiment("unet_transfer")
+                )
+            except Exception:
+                pass
         if trace is not None:
-            trace.emit(_EVENT_FAST_DISK_TO_END, phase="restore", metadata={
+            _end_meta = {
                 "target": str(target) if target is not None else "",
                 "wall_ms": _wall_ms,
                 "device_ms": _device_ms,
@@ -3934,7 +4245,29 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
                     if _device_ms is not None
                     else "wall_only"
                 ),
-            })
+            }
+            if _staging_used and _staging_metrics is not None:
+                _end_meta.update({
+                    "experiment": "unet_transfer",
+                    "arm": "pinned_staging",
+                    "copy_api": _staging_metrics.get(
+                        "copy_api", "pinned_staging_chunked_copy_"
+                    ),
+                    "non_blocking": True,
+                    "stream": _staging_metrics.get("stream", ""),
+                    "stream_priority": _staging_metrics.get("stream_priority"),
+                    "source_pinned_fraction": _staging_metrics.get(
+                        "source_pinned_fraction", 0.0
+                    ),
+                    "staging_alloc_bytes": _staging_metrics.get("staging_alloc_bytes"),
+                    "peak_staging_bytes": _staging_metrics.get("peak_staging_bytes"),
+                    "chunk_mb": _staging_metrics.get("chunk_mb"),
+                    "chunk_count": _staging_metrics.get("chunk_count"),
+                    "copied_params": _staging_metrics.get("copied_params"),
+                    "copied_buffers": _staging_metrics.get("copied_buffers"),
+                    "gbps": _staging_metrics.get("gbps"),
+                })
+            trace.emit(_EVENT_FAST_DISK_TO_END, phase="restore", metadata=_end_meta)
 
 
 def _fast_disk_maybe_defer_to(
@@ -5236,6 +5569,11 @@ def _make_clip_span_wrapper(
         emit = before == 0 and trace is not None
         _before = _clip_span_snapshot(with_cuda=with_cuda) if emit else None
         _status = "ok"
+        if emit and span_name == "clip_forward":
+            # Real outermost CLIP forward begins: fire the milestone used
+            # by the execution-unet H2D delay gate (a cache-hit request
+            # never reaches this point, so the delay never applies there).
+            _CLIP_FORWARD_STARTED.set()
         if emit and trace is not None:
             trace.emit_at(
                 f"{span_name}_start",
@@ -5249,6 +5587,21 @@ def _make_clip_span_wrapper(
                 pre_hook(args, kwargs)
             except Exception:
                 pass
+        # ── LANE 2 (measurement-only): CLIP forward CUDA chronology ──
+        # A deferred CUDA-event interval around the real forward.  NEVER
+        # synchronizes on the critical sampling path by default — device
+        # duration is realized only when the explicit sync env gate
+        # (COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA) is set; otherwise only the
+        # wall window is recorded for the overlap analysis.
+        _opt_clip_interval = None
+        _opt_clip_start_ns = None
+        if emit and span_name == "clip_forward" and _OPT_DIAG:
+            _opt_clip_start_ns = time.monotonic_ns()
+            try:
+                _opt_clip_interval = OptCudaInterval()
+                _opt_clip_interval.begin()
+            except Exception:
+                _opt_clip_interval = None
         try:
             return original(*args, **kwargs)
         except BaseException:
@@ -5257,6 +5610,27 @@ def _make_clip_span_wrapper(
         finally:
             after = depth_var.get()
             depth_var.set(after - 1)
+            # ── LANE 2 (measurement-only): publish the CLIP forward window ──
+            if (
+                emit
+                and span_name == "clip_forward"
+                and _opt_clip_interval is not None
+                and _opt_clip_start_ns is not None
+            ):
+                try:
+                    _opt_clip_interval.end(realize=bool(sync_cuda_allowed()))
+                    global _OPT_CLIP_FORWARD_MONO
+                    _opt_clip_end_ns = time.monotonic_ns()
+                    _OPT_CLIP_FORWARD_MONO = (_opt_clip_start_ns, _opt_clip_end_ns)
+                    emit_opt(trace, "clip_forward_cuda", phase="execution", metadata={
+                        "clip_span": span_name,
+                        "wall_ms": round((_opt_clip_end_ns - _opt_clip_start_ns) / 1_000_000, 3),
+                        "cuda_event_ms": _opt_clip_interval.elapsed_ms,
+                        "realized": bool(_opt_clip_interval.elapsed_ms is not None),
+                        "sync_cuda_allowed": bool(sync_cuda_allowed()),
+                    })
+                except Exception:
+                    pass
             if emit and trace is not None:
                 _after = _clip_span_snapshot(with_cuda=with_cuda)
                 _meta = _clip_span_end_metadata(_before, _after)
@@ -6171,6 +6545,14 @@ class ModelLaneTrace:
             "done_event_set": self._done_event_set,
             **metadata,
         })
+        # ── LANE 9 (measurement-only): UNET readiness milestone ──
+        # Consumed by ``_consume_model_impl`` at graph_unet_demand to
+        # compute the readiness slack (early = positive, sampler-wait =
+        # negative).  UNET lane only — CLIP/VAE readiness is not the
+        # subject of the slack analysis.
+        if self._lane == "UNET" and _OPT_DIAG:
+            global _OPT_UNET_READY_MONO_NS
+            _OPT_UNET_READY_MONO_NS = time.monotonic_ns()
 
     def failed(self, **metadata: Any) -> None:
         self._close_cpu_prepare(status="error")
@@ -8116,6 +8498,39 @@ class ModelPreloadCoordinator:
             )
             return prep.prefill_future
 
+    def schedule_execution_unet(
+        self,
+        callback: Callable[[], Any],
+        preparation: RestorePreparation | None = None,
+        *,
+        trace: RuntimeTrace | None = None,
+    ) -> Future[Any] | None:
+        """Schedule execution-phase UNET preparation work (single-flight).
+
+        Mirrors ``schedule_prefill``: atomically checks whether
+        ``preparation.unet_future`` is already set and, only when None,
+        submits *callback* (the bridge ``_load_unet``) to the worker pool.
+        The critical section is minimised to the check-and-set so the
+        non-reentrant thread-pool code path never runs while holding the
+        lock.  The graph consumer later joins the same future through the
+        existing ``wait_unet``, so the native fast-disk UNET construction
+        overlaps the execution-phase CLIP prefill instead of running on
+        the graph thread.  Returns the future (new or existing), or None
+        when no active preparation exists.
+        """
+        prep = preparation or self._require_active()
+        # Atomic check-and-set — lock scope is minimal, never held across
+        # the *submit* call (which itself may try to reacquire the lock
+        # via _ensure_pool).
+        with self._pool_lock:
+            if prep.unet_future is not None:
+                return prep.unet_future
+            prep.unet_future = self._submit(
+                "unet", callback, prep, trace,
+                phase="execution", expected_read_count=1,
+            )
+            return prep.unet_future
+
     def schedule_vae_activation(
         self,
         callback: Callable[[], Any],
@@ -9406,7 +9821,7 @@ class V2LoaderBridge:
             # ── Phase B: actual encode (wall / thread / process CPU) ──
             _encode_start = _capture_phase_counters()
             results: dict[tuple[int, str], Any] = dict(_cc_hit_results)
-            _cc_stored = 0
+            _cc_enqueued = 0
             _cc_encode_calls = 0
             _cc_cache_store_wall_ms = 0.0
             _cc_cache_store_calls = 0
@@ -9436,7 +9851,7 @@ class V2LoaderBridge:
                                 0, time.monotonic_ns() - _cc_store_start_ns
                             ) / 1_000_000
                             if _cc_store_ok:
-                                _cc_stored += 1
+                                _cc_enqueued += 1
                     except Exception as exc:
                         if trace:
                             trace.emit("execution_prefill_encode_error",
@@ -9453,7 +9868,7 @@ class V2LoaderBridge:
                 _cc_store_diag = dict(
                     getattr(_cc_cache_svc, "pop_store_diagnostics", lambda: {})() or {}
                 )
-            if _cc_stored:
+            if _cc_enqueued:
                 _cc_stored_key_info = conditioning_cache_key_summary(
                     _cc_ctx, _cc_miss_entries
                 )
@@ -9467,7 +9882,9 @@ class V2LoaderBridge:
                     store_diagnostics=_cc_store_diag,
                     schema_version=_cc_stored_key_info["schema_version"],
                     validation_scope=_cc_stored_key_info["validation_scope"],
-                    stored=_cc_stored,
+                    enqueued=_cc_enqueued,
+                    persisted=_cc_store_diag.get("persisted", 0),
+                    persist_failed=_cc_store_diag.get("persist_failed", 0),
                     entries=len(filtered),
                     request_id=_request_id or "absent",
                 )
@@ -9481,7 +9898,10 @@ class V2LoaderBridge:
                             "identity_status": _cc_stored_key_info["identity_status"],
                             "schema_version": _cc_stored_key_info["schema_version"],
                             "validation_scope": _cc_stored_key_info["validation_scope"],
-                            "stored_count": _cc_stored,
+                            "stored_count": _cc_enqueued,
+                            "enqueued_count": _cc_enqueued,
+                            "persisted_count": _cc_store_diag.get("persisted", 0),
+                            "persist_failed_count": _cc_store_diag.get("persist_failed", 0),
                             "encode_calls": _cc_encode_calls,
                             "encode_loop_wall_ms": _cc_encode_loop_wall_ms,
                             "cache_store_wall_ms": round(_cc_cache_store_wall_ms, 3),
@@ -9569,6 +9989,94 @@ class V2LoaderBridge:
         #   lane (priority ``UNET > CLIP > prefill > VAE > sampler``), so
         #   concurrent UNET GPU commits are serialised through the lane.
         self.coordinator.schedule_prefill(_execution_prefill, prep, trace=trace)
+        return True
+
+    def schedule_execution_unet(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        request_id: str = "",
+    ) -> bool:
+        """Schedule execution-phase native fast-disk UNET preparation.
+
+        Called right after ``schedule_execution_prefill`` in
+        ``_run_in_process`` so the native fast-disk UNET construction
+        (file read + bind + single H2D pass) overlaps the CLIP prefill
+        instead of running on the graph thread when the graph reaches
+        UNETLoader.  The graph consumer joins exactly this prepared
+        future through the existing ``_consume_unet`` →
+        ``coordinator.wait_unet`` path — one construction, one
+        ModelPatcher, one file read, one H2D per request.
+
+        Single-flight and idempotent: when
+        ``preparation.unet_future`` is already set (restore-time UNET
+        lane, retained CPU-snapshot UNET, or an earlier call) this is a
+        no-op that returns True.  Every guard failure returns False and
+        leaves the existing graph-time fallback (bridge miss → original
+        loader with all native fast-disk guards/fallbacks) unchanged.
+        A worker failure surfaces at graph demand: ``_consume_model_impl``
+        turns it into ``_LOADER_MISS`` exactly as before.
+
+        Returns True when UNET preparation was scheduled (or was already
+        prepared), False when skipped.
+        """
+        prep = self._preparation
+        _request_id = str(
+            request_id or (trace.request_id if trace is not None else "")
+        )
+        if prep is None:
+            if trace:
+                trace.emit("unet_execution_skip", phase="execution",
+                           metadata={"request_id": _request_id,
+                                     "reason": "missing_preparation"})
+            return False
+        if prep.unet_future is not None:
+            if trace:
+                trace.emit("unet_execution_schedule", phase="execution",
+                           metadata={"request_id": _request_id,
+                                     "reason": "already_prepared",
+                                     "unet_future_done": bool(prep.unet_future.done())})
+            return True
+        if self._model_key is None or not self._model_key.unet_identity:
+            if trace:
+                trace.emit("unet_execution_skip", phase="execution",
+                           metadata={"request_id": _request_id,
+                                     "reason": "no_unet_identity"})
+            return False
+        if not self._request_list("unet"):
+            if trace:
+                trace.emit("unet_execution_skip", phase="execution",
+                           metadata={"request_id": _request_id,
+                                     "reason": "no_unet_request"})
+            return False
+        if trace:
+            trace.emit("unet_execution_schedule", phase="execution",
+                       metadata={"request_id": _request_id,
+                                 "reason": "schedule",
+                                 "unet_identity_hash": stable_hash(self._model_key.unet_identity)})
+        _prep = prep
+        _key = self._model_key
+
+        def _execution_unet() -> Any:
+            """Internal UNET prefill callback — runs in coordinator's pool.
+
+            Uses the exact bridge restore lane loader (``_load_unet``) so
+            the native fast-disk machinery, guards and fallbacks apply
+            unchanged; the graph joins this future via ``wait_unet``.
+            """
+            global _EXECUTION_UNET_LANE_START_MONO
+            _EXECUTION_UNET_LANE_START_MONO = time.monotonic_ns()
+            _CLIP_FORWARD_STARTED.clear()
+            try:
+                return self._load_unet(_key)
+            finally:
+                # The marker is request-scoped: clear it once the lane is
+                # terminal so a later request (or a graph-time fast-disk
+                # path in another configuration) never inherits a stale
+                # delay anchor.
+                _EXECUTION_UNET_LANE_START_MONO = None
+
+        self.coordinator.schedule_execution_unet(_execution_unet, _prep, trace=trace)
         return True
 
     @staticmethod
@@ -10459,6 +10967,13 @@ class V2LoaderBridge:
                     "valid": False, "reason": "", "join_wait_ms": 0.0, "vae": None}
         _demand_ns = time.monotonic_ns()
         _state["join_demand_mono_ns"] = _demand_ns
+        # ── LANE 4 (measurement-only): VAE join-demand milestone ──
+        if _rt is not None and _OPT_DIAG:
+            emit_opt(_rt, "vae_join_demand", phase="execution", metadata={
+                "request_id": _request_id,
+                "key_hash": _state.get("key_hash", ""),
+                "join_demand_mono_ns": _demand_ns,
+            })
         _future = _state["future"]
         try:
             _future.result()
@@ -10471,6 +10986,15 @@ class V2LoaderBridge:
         _join_wait_ms = round((time.monotonic_ns() - _demand_ns) / 1_000_000, 3)
         _state["join_completed_mono_ns"] = time.monotonic_ns()
         _state["join_wait_ms"] = _join_wait_ms
+        # ── LANE 4 (measurement-only): VAE join-completed milestone ──
+        if _rt is not None and _OPT_DIAG:
+            emit_opt(_rt, "vae_join_completed", phase="execution", metadata={
+                "request_id": _request_id,
+                "key_hash": _state.get("key_hash", ""),
+                "join_completed_mono_ns": _state.get("join_completed_mono_ns"),
+                "worker_started_mono_ns": _state.get("worker_started_mono_ns"),
+                "join_wait_ms": _join_wait_ms,
+            })
         with _VAE_ACTIVATION_LOCK:
             _status = _state.get("status", "")
             _terminal = bool(_state.get("terminal", False))
@@ -10659,6 +11183,36 @@ class V2LoaderBridge:
         if self._trace:
             self._trace.emit(f"graph_{diagnostics_prefix}_demand", phase="execution",
                              metadata=dict(demand_metadata))
+            # ── LANE 9 (measurement-only): UNET readiness slack ──
+            # Positive slack = UNET ready before graph demand (early);
+            # negative = the sampler waits for the UNET.  ``None`` when no
+            # readiness marker has been recorded yet this process.
+            if lane == "UNET" and _OPT_DIAG:
+                global _OPT_UNET_DEMAND_MONO_NS
+                _opt_demand_ns = time.monotonic_ns()
+                _OPT_UNET_DEMAND_MONO_NS = _opt_demand_ns
+                _opt_ready_ns = globals().get("_OPT_UNET_READY_MONO_NS")
+                if _opt_ready_ns is not None:
+                    emit_opt(self._trace, "unet_readiness", phase="execution", metadata={
+                        "slack_ms": round((_opt_ready_ns - _opt_demand_ns) / 1_000_000, 3),
+                        "ready_mono_ns": _opt_ready_ns,
+                        "demand_mono_ns": _opt_demand_ns,
+                    })
+                # ── LANE 2 (measurement-only): UNET H2D vs CLIP overlap ──
+                _opt_h2d_mono = globals().get("_OPT_UNET_H2D_MONO")
+                _opt_clip_mono = globals().get("_OPT_CLIP_FORWARD_MONO")
+                if _opt_h2d_mono is not None and _opt_clip_mono is not None:
+                    try:
+                        _opt_overlap = dict(wall_overlap_ms(
+                            _opt_h2d_mono[0], _opt_h2d_mono[1],
+                            _opt_clip_mono[0], _opt_clip_mono[1],
+                        ))
+                    except Exception:
+                        _opt_overlap = {}
+                    _opt_overlap["unet_device_ms"] = globals().get("_OPT_UNET_H2D_DEVICE_MS")
+                    _opt_overlap["ready_mono_ns"] = _opt_ready_ns
+                    _opt_overlap["demand_mono_ns"] = _opt_demand_ns
+                    emit_opt(self._trace, "unet_clip_overlap", phase="execution", metadata=_opt_overlap)
             model_demand_meta: dict[str, Any] = {"lane": lane}
             if not skip_loader_class:
                 model_demand_meta["loader_class"] = loader_class
@@ -14823,6 +15377,16 @@ _EVENT_VAE_EA_CANCELLED = "vae_early_activation_cancelled"
 _EVENT_VAE_EA_FALLBACK = "vae_early_activation_fallback"
 _EVENT_VAE_EA_RECONCILIATION = "vae_early_activation_reconciliation"
 
+# Experiment 2 (vae_overlap) worker failure statuses: the sampling_end
+# scheduler (exact A path) is allowed to resubmit when the early-start B arm
+# ended in one of these terminal states.
+_VAE_EA_FAILURE_STATUSES = frozenset({"failed", "precopy_failed", "cancelled"})
+# Set at the authoritative sampling_end boundary (release_sampler_
+# mutation_lane_at_sampling_end, BEFORE the sampler lane release) so the
+# Experiment 2 early-start VAE worker can proceed to its narrow lane bind
+# without polling.  The mutation lane itself is the real safety barrier.
+_VAE_SAMPLING_END_EVENT = threading.Event()
+
 
 def _resolve_vae_activation_mode(raw: str) -> str:
     """Normalize a ``COMFYMODAL_V2_VAE_ACTIVATION_MODE`` value.
@@ -15342,6 +15906,15 @@ def _run_early_vae_activation(
     with _VAE_ACTIVATION_LOCK:
         state["status"] = "running"
         state["worker_started_mono_ns"] = time.monotonic_ns()
+    _worker_started_mono_ns = state.get("worker_started_mono_ns") or time.monotonic_ns()
+    # ── LANE 4 (measurement-only): VAE worker-start milestone ──
+    if trace is not None and _OPT_DIAG:
+        emit_opt(trace, "vae_worker_started", phase="execution", metadata={
+            "request_id": request_id,
+            "key_hash": key_hash,
+            "mode": mode,
+            "worker_started_mono_ns": _worker_started_mono_ns,
+        })
     if vae is None:
         return _vae_activation_terminal(
             state, trace, request_id, status="skipped", reason="no_vae_object"
@@ -15470,6 +16043,13 @@ def release_sampler_mutation_lane_at_sampling_end(
     lane = _get_mutation_lane()
     if lane.owner != "sampler":
         return False
+    # Experiment 2 (vae_overlap, B arm): signal the early-start VAE worker
+    # that the authoritative sampling_end boundary was reached.  Set BEFORE
+    # the lane release: the worker can only mutate the model after it
+    # acquires the lane as owner "VAE", which blocks until this release, so
+    # the event can never allow a mutation before the sampler actually
+    # released the lane.
+    _VAE_SAMPLING_END_EVENT.set()
     lane.release("sampler")
     if trace is not None:
         trace.emit("sampler_lane_released_at_sampling_end", phase="execution", metadata={
@@ -15532,11 +16112,27 @@ def schedule_vae_early_activation_at_sampling_end(
     model_key = getattr(bridge, "_model_key", None)
     if prep is None or model_key is None or not getattr(model_key, "vae_identity", ""):
         return False
-    # Idempotent: a scheduled future for this request is never rescheduled.
+    # Idempotent: a scheduled future for this request is never rescheduled —
+    # EXCEPT the Experiment 2 (vae_overlap) fallback: when the early-start B
+    # arm FAILED (status failed/precopy_failed/cancelled) a standard resubmit
+    # here recreates the activation so the exact sampling_end A path runs.
     with _VAE_ACTIVATION_LOCK:
         _existing = _VAE_ACTIVATION_STATE.get(_request_id)
         if _existing is not None:
-            return bool(_existing.get("future") is not None)
+            _existing_future = _existing.get("future")
+            _existing_status = str(_existing.get("status", "") or "")
+            if (
+                _existing_future is not None
+                and _existing_status not in _VAE_EA_FAILURE_STATUSES
+            ):
+                return True
+            if (
+                _existing_status in _VAE_EA_FAILURE_STATUSES
+                and _existing_future is None
+            ):
+                # Dropped B-arm state with no future: pop it and continue
+                # (the standard path below re-creates the state fresh).
+                _VAE_ACTIVATION_STATE.pop(_request_id, None)
         _state = _vae_activation_new_state(_request_id)
         _state["status"] = "resolving"
         _state["sampling_end_mono_ns"] = time.monotonic_ns()
@@ -15588,6 +16184,459 @@ def schedule_vae_early_activation_at_sampling_end(
         trigger="sampling_end",
         sampling_end_duration_ms=duration_ms,
     )
+
+
+# ── Experiment 2 (vae_overlap, B arm): transfer-only early-start ───────
+# Default OFF (COMFYMODAL_V2_VAE_EARLY_START_MS=0): the scheduler below
+# returns False immediately and every behavior is byte-for-byte unchanged.
+# When enabled, the VAE's CPU parameters are pre-copied to CUDA on a side
+# stream DURING sampling (no lane, no model mutation), then rebound under
+# the mutation lane strictly after the sampler released it at sampling_end.
+
+_VAE_SIDE_STREAM: Any = None
+
+
+def _vae_side_stream() -> Any:
+    """Lazily-created dedicated CUDA stream for the early-start VAE pre-copy."""
+    global _VAE_SIDE_STREAM
+    if _VAE_SIDE_STREAM is None:
+        import torch as _torch_vss
+        _VAE_SIDE_STREAM = _torch_vss.cuda.Stream()
+    return _VAE_SIDE_STREAM
+
+
+def _run_vae_early_start_worker(
+    bridge: "V2LoaderBridge",
+    *,
+    prep: RestorePreparation,
+    trace: RuntimeTrace | None,
+    request_id: str,
+    state: dict[str, Any],
+    vae: Any,
+    source: str,
+    key_hash: str,
+    sampling_start_mono_ns: int,
+    offset_ms: float,
+    expected_ms: float,
+    future: Any,
+) -> dict[str, Any]:
+    """Experiment 2 (vae_overlap, B arm) transfer-only early-start worker.
+
+    Runs on the ``comfymodal-vae-early-start`` daemon thread:
+
+    Phase 0 — worker-started milestone (matches the sampling_end worker).
+    Phase 1 (pre-copy; NO lane, NO model mutation): wait until roughly
+        ``sampling_start + expected_ms - offset_ms`` (bounded; the sampling-
+        end event wakes it early when sampling finished sooner), then copy
+        each CPU parameter/buffer of the VAE's inner model to CUDA on the
+        dedicated side stream.  The pairs ``(param, gpu_tensor)`` are
+        collected WITHOUT assigning anything — the model is never mutated
+        here and the lane is never touched.
+    Phase 2 — wait for the authoritative sampling-end event (bounded).
+    Phase 3 (narrow lane bind): acquire the mutation lane as owner "VAE"
+        (strictly after the sampler released it at sampling_end), rebind
+        ``param.data``/buffer ``.data``, populate the activation evidence
+        (mirroring ``_run_early_vae_activation``'s terminal), emit the
+        load_end/terminal/reconciliation events, and complete the future.
+
+    The ONLY model mutation is the phase-3 ``.data`` rebinding under the
+    lane, which happens strictly after the sampler released the lane — no
+    concurrent model mutation is possible.  Any failure marks the state
+    failed and lets the unchanged sampling_end A path resubmit.
+    """
+    _worker_started_mono_ns = time.monotonic_ns()
+    with _VAE_ACTIVATION_LOCK:
+        state["worker_started_mono_ns"] = _worker_started_mono_ns
+    # ── Phase 0: worker-started milestone ──
+    if trace is not None and _OPT_DIAG:
+        emit_opt(trace, "vae_worker_started", phase="execution", metadata={
+            "request_id": request_id,
+            "key_hash": key_hash,
+            "mode": _VAE_ACTIVATION_MODE,
+            "worker_started_mono_ns": _worker_started_mono_ns,
+        })
+    # ── Phase 1: bounded pre-copy (NO lane, NO model mutation) ──
+    # The scheduler ran at the sampling START boundary, so
+    # ``sampling_start_mono_ns`` approximates the true sampling start
+    # (documented).  ``delay = expected_ms - offset_ms``; sleeping for the
+    # remaining margin keeps the transfer inside the sampling window.
+    _delay_s = (max(0.0, float(expected_ms or 0.0) - float(offset_ms or 0.0))) / 1000.0
+    if _delay_s > 0:
+        _VAE_SAMPLING_END_EVENT.wait(_delay_s)
+    _precopy_start_ns = time.monotonic_ns()
+    _stream = _vae_side_stream()
+    _copied: list[tuple[Any, Any]] = []
+    _total_bytes = 0
+    try:
+        _inner = getattr(vae, "model", None)
+        if _inner is None:
+            _inner_patcher = getattr(getattr(vae, "patcher", None), "model", None)
+            if _inner_patcher is not None:
+                _inner = _inner_patcher
+        if _inner is None:
+            _inner = vae
+        if trace is not None:
+            trace.emit(_EVENT_VAE_EA_LOAD_START, phase="execution", metadata={
+                "mode": _VAE_ACTIVATION_MODE,
+                "trigger": "early_start",
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "source": source,
+            })
+        print(
+            f"[v2.vae_early_activation] event=load_start "
+            f"request_id={request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
+            f"trigger=early_start key_hash={key_hash} source={source or 'absent'} "
+            f"vae_object_id={state.get('vae_object_id', '')}",
+            flush=True,
+        )
+        try:
+            _params = list(_inner.parameters() or ())
+        except Exception:
+            _params = []
+        try:
+            _buffers = list(_inner.buffers() or ())
+        except Exception:
+            _buffers = []
+        import torch as _torch_es
+        with _torch_es.cuda.stream(_stream):
+            for _t in _params:
+                if getattr(_t, "device", _torch_es.device("cpu")).type != "cuda":
+                    _copied.append((_t, _t.detach().to(device="cuda", non_blocking=True)))
+            for _t in _buffers:
+                if getattr(_t, "device", _torch_es.device("cpu")).type != "cuda":
+                    _copied.append((_t, _t.detach().to(device="cuda", non_blocking=True)))
+        _total_bytes = sum(
+            int(_t.element_size()) * _t.numel() for _t, _g in _copied
+        )
+        _precopy_wall_ms = round((time.monotonic_ns() - _precopy_start_ns) / 1_000_000, 3)
+        if trace is not None and _OPT_DIAG:
+            emit_opt(trace, "vae_precopy", phase="execution", metadata={
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "bytes": _total_bytes,
+                "tensors": len(_copied),
+                "wall_ms": _precopy_wall_ms,
+                "stream": str(_stream),
+            })
+    except Exception as exc:
+        with _VAE_ACTIVATION_LOCK:
+            state["terminal"] = True
+            state["status"] = "failed"
+            state["reason"] = "precopy_failed"
+            state["error"] = str(exc)[:200]
+            state["terminal_mono_ns"] = time.monotonic_ns()
+        if not future.done():
+            future.set_result(None)
+        if trace is not None:
+            trace.emit(_EVENT_VAE_EA_FAILED, phase="execution", metadata={
+                "mode": _VAE_ACTIVATION_MODE,
+                "trigger": "early_start",
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "status": "failed",
+                "reason": "precopy_failed",
+                "error": str(exc)[:200] or None,
+            })
+        print(
+            f"{experiment_line(resolve_experiment('vae_overlap'))} "
+            f"effective=baseline fallback=precopy_failed",
+            flush=True,
+        )
+        return {"status": "failed", "reason": "precopy_failed"}
+    # ── Phase 2: wait for the authoritative sampling_end boundary ──
+    _phase2_start_ns = time.monotonic_ns()
+    _VAE_SAMPLING_END_EVENT.wait(timeout=60.0)
+    _join_wait_ms = round((time.monotonic_ns() - _phase2_start_ns) / 1_000_000, 3)
+    # ── Phase 3: narrow lane bind (the ONLY model mutation) ──
+    if state.get("cancelled") or state.get("terminal"):
+        if not future.done():
+            future.set_result(None)
+        return {"status": "cancelled", "reason": "request_finalized"}
+    try:
+        import torch as _torch_p3
+        # Ensure the async side-stream pre-copy is visible before binding.
+        _torch_p3.cuda.current_stream().wait_stream(_stream)
+    except Exception:
+        pass
+    _lane = _get_mutation_lane()
+    _lane_acquired = False
+    try:
+        _lane.acquire("VAE", timeout=60.0)
+        _lane_acquired = True
+        # Rebinding .data preserves the parameter/buffer objects in place —
+        # identical values/dtype/layout/device semantics as a .to() move.
+        for _t, _g in _copied:
+            _t.data = _g
+        state["transfer_count"] = 1 if _copied else 0
+        # Evidence — mirror ``_run_early_vae_activation``'s terminal fields.
+        _first_dev = ""
+        _first_dtype = ""
+        if _copied:
+            _first_dev = str(_copied[0][1].device)
+            _first_dtype = str(_copied[0][1].dtype)
+        if not _first_dev:
+            _first_dev = _module_device(_inner) or str(
+                (state.get("key") or {}).get("device", "") or ""
+            )
+        if not _first_dtype:
+            _first_dtype = str(
+                (state.get("key") or {}).get("compute_dtype", "") or ""
+            )
+        state["cache_present"] = True
+        state["current_device"] = _first_dev
+        state["load_device"] = _first_dev
+        state["observed_compute_dtype"] = _first_dtype
+        state["compute_dtype"] = _first_dtype
+        state["loaded_bytes"] = _total_bytes
+        state["model_bytes"] = _total_bytes
+        state["residency_status"] = "gpu_resident"
+        _vae_activation_terminal(
+            state, trace, request_id, status="ready", reason="ok",
+            transfer_count=state["transfer_count"],
+        )
+        if not future.done():
+            future.set_result(True)
+        if trace is not None:
+            trace.emit("vae_early_activation_load_end", phase="execution", metadata={
+                "mode": _VAE_ACTIVATION_MODE,
+                "trigger": "early_start",
+                "request_id": request_id,
+                "key_hash": key_hash,
+                "source": source,
+                "load_wall_ms": round(_precopy_wall_ms, 3),
+            })
+            trace.emit(_EVENT_VAE_EA_RECONCILIATION, phase="execution", metadata={
+                "request_id": request_id,
+                "mode": _VAE_ACTIVATION_MODE,
+                "trigger": "early_start",
+                "key_hash": key_hash,
+                "status": "ready",
+                "terminal": True,
+                "join_wait_ms": round(_join_wait_ms, 3),
+                "lane_wait_ms": 0.0,
+                "load_wall_ms": round(_precopy_wall_ms, 3),
+                "transfer_count": state.get("transfer_count", 0),
+                "cache_present": True,
+                "residency_status": "gpu_resident",
+                "vae_object_id": state.get("vae_object_id", ""),
+                "vae_resolution_source": source,
+                "vae_policy_version": state.get("vae_policy_version", 0),
+                "vae_weight_dtype": state.get("vae_weight_dtype", ""),
+                "vae_compute_dtype": state.get("vae_compute_dtype", ""),
+                "vae_memory_format": state.get("vae_memory_format", ""),
+                "vae_prefetch_mode": state.get("vae_prefetch_mode", ""),
+                "c5_impl_version": state.get("c5_impl_version", ""),
+                "torch_version": state.get("torch_version", ""),
+                "cuda_version": state.get("cuda_version", ""),
+                "arch_identifier": state.get("arch_identifier", ""),
+                "sampling_end_mono_ns": state.get("sampling_end_mono_ns", 0),
+                "sampling_end_duration_ms": state.get("sampling_end_duration_ms", 0.0),
+                "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+            })
+        return {"status": "ready", "reason": "ok"}
+    except Exception as exc:
+        with _VAE_ACTIVATION_LOCK:
+            if not state.get("terminal", False):
+                state["terminal"] = True
+                state["status"] = "failed"
+                state["reason"] = "lane_bind_failed"
+                state["error"] = str(exc)[:200]
+                state["terminal_mono_ns"] = time.monotonic_ns()
+        if not future.done():
+            future.set_result(None)
+        print(
+            f"{experiment_line(resolve_experiment('vae_overlap'))} "
+            f"effective=baseline fallback=lane_bind_failed",
+            flush=True,
+        )
+        return {"status": "failed", "reason": "lane_bind_failed"}
+    finally:
+        if _lane_acquired:
+            try:
+                _lane.release("VAE")
+            except Exception:
+                pass
+
+
+def schedule_vae_early_start_at_sampling_start(
+    bridge: "V2LoaderBridge",
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+    sampler_node_id: str = "",
+    sampler_node_class: str = "",
+) -> bool:
+    """Experiment 2 (vae_overlap, B arm): schedule the transfer-only VAE
+    early-start at the authoritative sampling START boundary.
+
+    Default OFF (``vae_early_start_ms() <= 0``): returns False immediately
+    and NO behavior changes (the baseline arm).  When sampling_end mode is
+    off everything is a no-op.  Any failure returns False and lets the
+    unchanged sampling_end path run (exact A behavior).
+
+    The worker pre-copies the VAE's CPU parameters to CUDA on a side stream
+    while sampling runs (no lane, no model mutation), then waits for the
+    sampling-end boundary and performs a narrow lane-bound ``.data`` rebind
+    strictly after the sampler released the mutation lane.
+    """
+    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+        return False
+    _offset_ms = float(vae_early_start_ms() or 0)
+    if _offset_ms <= 0:
+        return False
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    if not _request_id:
+        return False
+    if bridge is None:
+        return False
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None or not getattr(model_key, "vae_identity", ""):
+        return False
+    # Idempotent: a request with an already-scheduled activation future is
+    # never scheduled twice (covers the sampling_end scheduler racing in).
+    with _VAE_ACTIVATION_LOCK:
+        _existing = _VAE_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and _existing.get("future") is not None:
+            return True
+    _future = Future()
+    _state = _vae_activation_new_state(_request_id)
+    _sampling_start_mono_ns = time.monotonic_ns()
+    # Resolve the exact VAE object via the bridge adapter (read-only).
+    try:
+        _vae, _source = bridge.resolve_vae_object(trace=trace)
+    except Exception as exc:
+        if not _future.done():
+            _future.set_result(None)
+        _vae_activation_terminal(
+            _state, trace, _request_id, status="failed",
+            reason="resolution_failed", error=str(exc)[:200],
+        )
+        return False
+    if _vae is None:
+        if not _future.done():
+            _future.set_result(None)
+        _vae_activation_terminal(
+            _state, trace, _request_id, status="failed",
+            reason="no_vae_resolution",
+        )
+        return False
+    _key_components, _key_hash = _build_vae_activation_key(
+        mode=_VAE_ACTIVATION_MODE,
+        model_key=model_key,
+        request_id=_request_id,
+        vae=_vae,
+        source=_source,
+        sampling_end_mono_ns=_sampling_start_mono_ns,
+    )
+    # Populate the state exactly like the standard scheduler does.
+    _state["owner"] = "early_start"
+    _state["trigger"] = "early_start"
+    _state["mode"] = _VAE_ACTIVATION_MODE
+    _state["key"] = _key_components
+    _state["key_hash"] = _key_hash
+    _state["vae"] = _vae
+    _state["vae_object_id"] = _key_components.get("vae_object_id", "")
+    _state["vae_patcher_object_id"] = _key_components.get("vae_patcher_object_id", "")
+    _state["vae_resolution_source"] = _source
+    _state["vae_identity"] = _key_components.get("vae_identity", "")
+    _state["vae_policy_version"] = _key_components.get("vae_policy_version", 0)
+    _state["vae_weight_dtype"] = _key_components.get("vae_weight_dtype", "")
+    _state["vae_compute_dtype"] = _key_components.get("vae_compute_dtype", "")
+    _state["vae_memory_format"] = _key_components.get("vae_memory_format", "")
+    _state["vae_prefetch_mode"] = _key_components.get("vae_prefetch_mode", "")
+    _state["c5_impl_version"] = _key_components.get("c5_impl_version", "")
+    _state["torch_version"] = _key_components.get("torch_version", "")
+    _state["cuda_version"] = _key_components.get("cuda_version", "")
+    _state["arch_identifier"] = _key_components.get("arch_identifier", "")
+    _state["sampling_end_mono_ns"] = 0  # early-start: not applicable
+    _state["status"] = "scheduled"
+    _state["future"] = _future
+    _state["submitted_mono_ns"] = time.monotonic_ns()
+    # Emit the scheduled event + concise line (mirror _vae_activation_submit).
+    if trace is not None:
+        trace.emit(_EVENT_VAE_EA_SCHEDULED, phase="execution", metadata={
+            "mode": _VAE_ACTIVATION_MODE,
+            "trigger": "early_start",
+            "request_id": _request_id,
+            "key_hash": _key_hash,
+            "source": _source,
+            "vae_object_id": _key_components.get("vae_object_id", ""),
+            "vae_patcher_object_id": _key_components.get("vae_patcher_object_id", ""),
+            "vae_policy_version": _key_components.get("vae_policy_version", 0),
+            "vae_weight_dtype": _key_components.get("vae_weight_dtype", ""),
+            "vae_compute_dtype": _key_components.get("vae_compute_dtype", ""),
+            "vae_memory_format": _key_components.get("vae_memory_format", ""),
+            "vae_prefetch_mode": _key_components.get("vae_prefetch_mode", ""),
+            "c5_impl_version": _key_components.get("c5_impl_version", ""),
+            "torch_version": _key_components.get("torch_version", ""),
+            "cuda_version": _key_components.get("cuda_version", ""),
+            "arch_identifier": _key_components.get("arch_identifier", ""),
+            "vae_identity_hash": stable_hash(str(model_key.vae_identity))[:16],
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+    print(
+        f"[v2.vae_early_activation] event=scheduled "
+        f"request_id={_request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
+        f"trigger=early_start key_hash={_key_hash} source={_source or 'absent'} "
+        f"vae_identity_hash={stable_hash(str(model_key.vae_identity))[:16]} "
+        f"vae_policy_version={_key_components.get('vae_policy_version', 0)} "
+        f"vae_weight_dtype={_key_components.get('vae_weight_dtype', '') or 'absent'} "
+        f"vae_compute_dtype={_key_components.get('vae_compute_dtype', '') or 'absent'} "
+        f"vae_memory_format={_key_components.get('vae_memory_format', '') or 'absent'} "
+        f"vae_prefetch_mode={_key_components.get('vae_prefetch_mode', '') or 'absent'} "
+        f"c5_impl_version={_key_components.get('c5_impl_version', '') or 'absent'} "
+        f"torch={_key_components.get('torch_version', '') or 'absent'} "
+        f"cuda={_key_components.get('cuda_version', '') or 'absent'} "
+        f"arch={_key_components.get('arch_identifier', '') or 'absent'} "
+        f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+        f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+        flush=True,
+    )
+    # Spawn ONE daemon worker thread.
+    _thread = Thread(
+        target=_run_vae_early_start_worker,
+        kwargs={
+            "bridge": bridge,
+            "prep": prep,
+            "trace": trace,
+            "request_id": _request_id,
+            "state": _state,
+            "vae": _vae,
+            "source": _source,
+            "key_hash": _key_hash,
+            "sampling_start_mono_ns": _sampling_start_mono_ns,
+            "offset_ms": _offset_ms,
+            "expected_ms": float(vae_expected_sampling_ms() or 0),
+            "future": _future,
+        },
+        name="comfymodal-vae-early-start",
+        daemon=True,
+    )
+    _thread.start()
+    # Store the per-request state (idempotent re-check under the lock).
+    with _VAE_ACTIVATION_LOCK:
+        _existing = _VAE_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and _existing.get("future") is not None:
+            if not _future.done():
+                _future.set_result(None)
+            return True
+        _VAE_ACTIVATION_STATE[_request_id] = _state
+    _vae_activation_trim()
+    # Unified experiment metadata (prints the canonical [v2.experiment] line).
+    try:
+        if trace is not None:
+            emit_experiment_selection(
+                trace, resolve_experiment("vae_overlap"),
+            )
+    except Exception:
+        pass
+    return True
 
 
 def _vae_activation_submit(

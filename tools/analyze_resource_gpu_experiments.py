@@ -193,7 +193,7 @@ def analyze_run(path: Path, expect_gpu: str | None = None) -> dict[str, Any]:
             "status": invariant.get("status"),
             "clip_present": invariant.get("clip_present"),
             "unet_present": invariant.get("unet_present"),
-            "cpu_snapshot_active": invariant.get("cpu_snapshot_active"),
+            "cpu_snapshot_container_active": invariant.get("cpu_snapshot_container_active", invariant.get("cpu_snapshot_active")),
             "reason": invariant.get("reason"),
             "stored_snapshot_model_order": invariant.get("stored_snapshot_model_order")
             or (data.get("runtime_shape") or {}).get("snapshot_model_order"),

@@ -139,7 +139,7 @@ REM reused-snapshot restore-only probes (V2_RESTORE_ONLY_RUN_COUNT) against
 REM the deployment built by deploy_and_run_v2_single.bat (that deploy
 REM invocation is the labeled/excluded snapshot construction, which builds
 REM the full CLIP/UNET/VAE snapshot and then evicts the UNET with the
-REM clip_vae retain role — keeping fresh CLIP+VAE in the retained container —
+REM clip_vae retain role ??? keeping fresh CLIP+VAE in the retained container ???
 REM before capture).  COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1 is the identity/
 REM reporting gate only.  Provider/region unpinned; the harness hard-stops
 REM at 6 valid, invalid probes never count, no beautification probes.  Runs
@@ -188,7 +188,7 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
-    python tools\benchmark_v2_direct.py
+    python tools\benchmark_v2_direct.py %*
 )
 set "BENCHMARK_EXIT_CODE=!errorlevel!"
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_END_MS=%%a"

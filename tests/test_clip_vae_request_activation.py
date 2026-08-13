@@ -252,7 +252,7 @@ class TestClipVaeRequestActivation:
 
 
 class TestActivationInvariant:
-    """Invariant reports active clip-only bind: cpu_snapshot_active=1,
+    """Invariant reports active clip-only bind: cpu_snapshot_container_active=1,
     loader_bridge_active=1, unet_present=0, clip present, VAE bound."""
 
     def test_invariant_reports_clip_vae_active_state(self):
@@ -265,7 +265,7 @@ class TestActivationInvariant:
             rec = ma.ModalRuntimeEntrypoint._enforce_snapshot_activation_invariant(
                 entry, request_id="cv-invariant", trace=None,
             )
-        assert rec["cpu_snapshot_active"] == 1
+        assert rec["cpu_snapshot_container_active"] == 1
         assert rec["loader_bridge_active"] == 1
         assert rec["unet_present"] == 0
         assert rec["clip_present"] == 1
