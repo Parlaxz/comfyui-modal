@@ -36,9 +36,11 @@ def _attach_waterfall_for_graph(result, *, run_label):
     Only graph workflow result / timing payloads are finalized; non-graph
     payloads (checkpoint summaries, asset reads, health, canary, restore-only,
     NUMA, rehoming probes) never receive fabricated graph stages.
+    Host-side fallback attach: the remote container already prints the
+    waterfall render, so this suppresses the duplicate host render.
     """
     if is_graph_result(result):
-        attach_waterfall(result, run_label=run_label)
+        attach_waterfall(result, run_label=run_label, print_render=False)
 
 
 def _short_hash(h: str) -> str:
@@ -554,6 +556,22 @@ async def run_prompt_stream(
                     _attach_waterfall_for_graph(
                         _rdata, run_label="modal_client run_prompt_stream",
                     )
+            if isinstance(msg, dict) and msg.get("type") == "persistence":
+                # Variant A: record the remote's definitive persistence
+                # outcome (deferred commit) so the asset route / history can
+                # distinguish pending, ok, and failed states after the caller
+                # already received the result.
+                try:
+                    from comfymodal_runtime.modal_transport import record_persistence_status
+                    _persist_key = str(
+                        (trace or {}).get("prompt_id")
+                        or (trace or {}).get("request_id")
+                        or ""
+                    )
+                    if _persist_key:
+                        record_persistence_status(_persist_key, msg)
+                except Exception:
+                    pass
             yield msg
     except TimeoutError:
         raise TimeoutError(

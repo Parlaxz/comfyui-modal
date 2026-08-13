@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -612,6 +613,195 @@ class ExecutionOptions:
         return result
 
 
+# Schema version for the plan-carried host-side validation proof payload
+# (ExecutionPlan.validation).  Bump on any incompatible change to the
+# payload shape consumed by instrumentation/tooling.
+VALIDATION_PROOF_SCHEMA_VERSION = 1
+
+# Schema version for the canonical deployment-static proof frozen into
+# BootstrapState at snapshot creation (executor-side, never consumed by
+# decisions in Step 2).
+DEPLOYMENT_PROOF_SCHEMA_VERSION = 1
+
+
+def compute_registry_fingerprint(class_mappings=None, *, roots=None) -> str:
+    """Deterministic SHA-256 over the custom-node class registry.
+
+    Pure and lazy: ``nodes`` is imported only when ``class_mappings`` is not
+    supplied.  When *roots* is a non-empty iterable of directory paths, only
+    classes whose module file lives under one of the roots are included, so a
+    consistent deployment layout yields the same fingerprint across host and
+    container despite different absolute paths.  Modules that cannot be
+    resolved (``sys.modules`` miss) are included conservatively.  File paths
+    are never part of the hash input (path-independent).  Returns ``""``
+    (ineligible — never fabricate identity) when the registry is unavailable,
+    empty, or cannot be enumerated.
+    """
+    if class_mappings is None:
+        try:
+            import nodes
+        except Exception:
+            return ""
+        class_mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", None) or {}
+    _norm_roots: tuple[str, ...] = ()
+    if roots is not None:
+        _norm_roots = tuple(
+            os.path.normpath(str(r))
+            for r in roots
+            if str(r or "").strip()
+        )
+    try:
+        entries = []
+        for _name in sorted(str(k) for k in class_mappings.keys()):
+            _cls = class_mappings[_name]
+            if _norm_roots:
+                _mod = sys.modules.get(getattr(_cls, "__module__", ""))
+                if _mod is not None:
+                    _file = str(getattr(_mod, "__file__", "") or "")
+                    if _file:
+                        _norm_file = os.path.normpath(_file)
+                        if not any(
+                            _norm_file == _root or _norm_file.startswith(_root + os.sep)
+                            for _root in _norm_roots
+                        ):
+                            continue
+                # module not resolvable -> include the class conservatively
+            entries.append(f"{_name}={getattr(_cls, '__module__', '')}.{getattr(_cls, '__qualname__', '')}")
+        if not entries:
+            return ""
+        return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def evaluate_plan_snapshot_parity(plan_identity: Mapping | None, snapshot_proof: Mapping | None) -> dict:
+    """Exact-match matrix between plan-carried deployment identity and the
+    frozen snapshot proof.  Never consumed by decisions in Step 2.
+
+    The AUTHORITATIVE registry axis is the workflow-relevant registry proof:
+    the plan must carry a complete per-class canonical-identity proof for the
+    workflow's own class set and that proof must match the snapshot's registry
+    manifest for exactly those classes.  The legacy full-registry fingerprint
+    equality is still computed but only as DIAGNOSTIC (``registry_fingerprint_match``).
+    """
+    # Lazy import keeps this module stdlib-only at import time.
+    from comfymodal_runtime.registry_proof import evaluate_workflow_registry_parity
+    _plan = dict(plan_identity or {})
+    _proof = dict(snapshot_proof or {})
+    _dep_match = bool(_plan.get("deployment_combined_hash") and _proof.get("deployment_combined_hash")
+                      and _plan["deployment_combined_hash"] == _proof["deployment_combined_hash"])
+    _gen_match = bool(_plan.get("custom_nodes_generation") and _proof.get("custom_nodes_generation")
+                      and _plan["custom_nodes_generation"] == _proof["custom_nodes_generation"])
+    _reg_parity = evaluate_workflow_registry_parity(_plan.get("registry_proof"), _proof.get("registry_manifest"))
+    _reg_match = bool(_plan.get("registry_proof_complete")) and bool(_reg_parity.get("workflow_registry_match"))
+    # Legacy full-registry fingerprint equality — DIAGNOSTIC ONLY (never an
+    # eligibility blocker).
+    _reg_full_match = bool(_plan.get("registry_fingerprint") and _proof.get("registry_fingerprint")
+                           and _plan["registry_fingerprint"] == _proof["registry_fingerprint"])
+    _dep_proof_match = bool(_plan.get("dependency_manifest_identity") and _proof.get("dependency_manifest_identity")
+                            and _plan["dependency_manifest_identity"] == _proof["dependency_manifest_identity"])
+    _schema_ok = bool(_proof.get("schema_version") and _proof.get("valid"))
+    _eligible = bool(_plan.get("complete") and _proof.get("complete") and _schema_ok
+                     and _dep_match and _gen_match and _reg_match and _dep_proof_match)
+    _reasons = []
+    if not _plan.get("complete"):
+        _reasons.append("plan_identity_incomplete")
+    if not _proof.get("complete"):
+        _reasons.append("snapshot_proof_incomplete")
+    if not _schema_ok:
+        _reasons.append("snapshot_proof_invalid_or_unsupported")
+    if not _dep_match:
+        _reasons.append("deployment_hash_mismatch")
+    if not _gen_match:
+        _reasons.append("custom_nodes_generation_mismatch")
+    if not _reg_match:
+        _reasons.append("workflow_registry_mismatch")
+    if not _dep_proof_match:
+        _reasons.append("dependency_proof_mismatch")
+    return {
+        "plan_validation_schema": _plan.get("schema_version", 0),
+        "plan_deployment_complete": bool(_plan.get("complete", False)),
+        "snapshot_proof_present": bool(_proof),
+        "snapshot_proof_complete": bool(_proof.get("complete", False)),
+        "snapshot_proof_valid": bool(_proof.get("valid", False)),
+        "deployment_hash_match": _dep_match,
+        "custom_nodes_generation_match": _gen_match,
+        # Full-registry fingerprint equality — DIAGNOSTIC only now.
+        "registry_fingerprint_match": _reg_full_match,
+        # Workflow-relevant registry proof parity — the AUTHORITATIVE axis.
+        "workflow_registry_match": _reg_match,
+        "registry_parity_reason": str(_reg_parity.get("reason", "") or ""),
+        "registry_parity_counts": {
+            k: _reg_parity.get(k)
+            for k in ("workflow_class_count", "host_proved_count", "snapshot_proved_count",
+                      "missing_host_total", "missing_snapshot_total", "identity_mismatch_total")
+        },
+        "dependency_proof_match": _dep_proof_match,
+        "future_fast_path_eligible": _eligible,
+        "future_fast_path_ineligible_reason": ",".join(_reasons) if not _eligible else "",
+    }
+
+
+def evaluate_plan_validation_consumption(
+    parity: Mapping | None,
+    plan_validation: Mapping | None,
+    *,
+    workflow_hash_match: bool,
+    validation_hash_match: bool,
+    structure_ok: bool,
+    outputs_nonempty: bool,
+) -> dict:
+    """Final Step-3 decision: may plan-carried validation be consumed?
+
+    Pure and decision-free for tests; modal_app applies it.  Never trusts the
+    plan-provided workflow hash (the caller passes the recompute result).
+    """
+    _pv = dict(plan_validation or {})
+    _parity = dict(parity or {})
+    _schema_ok = _pv.get("schema_version") == VALIDATION_PROOF_SCHEMA_VERSION
+    _validated = bool(_pv.get("validated", False))
+    _parity_eligible = bool(_parity.get("future_fast_path_eligible", False))
+    _eligible = bool(
+        _parity_eligible and _schema_ok and _validated
+        and validation_hash_match and workflow_hash_match
+        and structure_ok and outputs_nonempty
+    )
+    _reasons = []
+    if not _parity_eligible:
+        _reasons.append(_parity.get("future_fast_path_ineligible_reason") or "parity_ineligible")
+    if not _schema_ok:
+        _reasons.append("unsupported_validation_schema")
+    if not _validated:
+        _reasons.append("validation_not_validated")
+    if not validation_hash_match:
+        _reasons.append("validation_hash_mismatch")
+    if not workflow_hash_match:
+        _reasons.append("workflow_hash_mismatch")
+    if not structure_ok:
+        _reasons.append("structure_check_failed")
+    if not outputs_nonempty:
+        _reasons.append("empty_outputs")
+    return {"eligible": _eligible, "ineligible_reason": ",".join(_reasons) if not _eligible else ""}
+
+
+def apply_repair_invalidation(consumed: bool, reason: str) -> tuple[bool, str]:
+    """Oracle Gate-2: a missing-node repair invalidates a consumed plan-proof.
+
+    Returns the post-repair ``(consumed, reason)`` pair.  Pure and testable;
+    the runtime applies it so the plan-proof state is cleared before the
+    legacy re-validation path runs.
+    """
+    if consumed:
+        return (False, str(reason or "repair_changed"))
+    return (consumed, str(reason or ""))
+
+
+def should_write_validation_cert(scheduled: bool, preflight_ran: bool) -> bool:
+    """A validation certificate is written only when scheduled AND preflight
+    actually ran (never on a cert/plan-proof skip)."""
+    return bool(scheduled and preflight_ran)
+
+
 @dataclass(frozen=True)
 class ExecutionPlan:
     schema_version: int = 1
@@ -625,6 +815,11 @@ class ExecutionPlan:
     input_images: Mapping[str, str] = field(default_factory=dict)
     execution_options: ExecutionOptions = field(default_factory=ExecutionOptions)
     request_metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Step-1 plan-carried workflow-validation proof + deployment identity.
+    # Carried and instrumented only — never consumed by the container's
+    # validation/certificate decision path.
+    validation: Mapping[str, Any] = field(default_factory=dict)
+    deployment_identity: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workflow", _freeze(self.workflow or {}))
@@ -633,6 +828,8 @@ class ExecutionPlan:
         object.__setattr__(self, "prompt_bundle", _freeze(self.prompt_bundle or {}))
         object.__setattr__(self, "input_images", _freeze(self.input_images or {}))
         object.__setattr__(self, "request_metadata", _freeze(self.request_metadata or {}))
+        object.__setattr__(self, "validation", _freeze(self.validation or {}))
+        object.__setattr__(self, "deployment_identity", _freeze(self.deployment_identity or {}))
         if not isinstance(self.execution_options, ExecutionOptions):
             object.__setattr__(self, "execution_options", ExecutionOptions.from_dict(self.execution_options))
         output_ids = self.output_node_ids
@@ -658,6 +855,8 @@ class ExecutionPlan:
             input_images=source.get("input_images", {}),
             execution_options=ExecutionOptions.from_dict(source.get("execution_options", {})),
             request_metadata=source.get("request_metadata", {}),
+            validation=dict(source.get("validation") or {}),
+            deployment_identity=dict(source.get("deployment_identity") or {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -673,6 +872,8 @@ class ExecutionPlan:
             "input_images": _thaw(self.input_images),
             "execution_options": self.execution_options.to_dict(),
             "request_metadata": _thaw(self.request_metadata),
+            "validation": _thaw(self.validation) if self.validation else {},
+            "deployment_identity": _thaw(self.deployment_identity) if self.deployment_identity else {},
         }
 
 

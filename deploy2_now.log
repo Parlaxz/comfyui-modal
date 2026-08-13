@@ -1,0 +1,786 @@
+﻿2026-08-12 11:20:36-05:00 [v2.snapshot_model_eviction] stage=restore_release_retained retain_role=clip_vae status=container_retained container_present=1 clip_present=1 vae_present=1 unet_present=0 retained_slot_release=0 retained_model_id=0 retained_alive_after_release=0 rss_before_release_mib=absent rss_after_gc_mib=absent rss_after_trim_mib=absent rss_drop_mib=absent malloc_trim_status=absent malloc_trim_result=absent restore_release_start_wall_unix_ns=1786551636391026562 restore_release_end_wall_unix_ns=1786551636391026562 wall_unix_ns=1786551636391026562
+2026-08-12 11:20:36-05:00 [v2.residency_config] enabled=0
+2026-08-12 11:20:36-05:00 [v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=11452.7 process_maxrss_mib=35801.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:20:36-05:00 [v2.runtime_shape] stage=after_restore runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+2026-08-12 11:20:36-05:00 [v2.opt.gpu_state] total_memory_ms=253.48
+2026-08-12 11:20:36-05:00 [comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 255.6ms
+2026-08-12 11:20:36-05:00 [restore.cuda_context] available=1 device_index=0 device=NVIDIA RTX PRO 6000 Blackwell Server Edition sync_ms=89.691 total_ms=89.868
+2026-08-12 11:20:36-05:00 [v2.sage_restore] decision=snapshot_exact_skip discovery_called=0 verify_ms=0.042
+2026-08-12 11:20:37-05:00 [v2.custom_node_restore] decision=snapshot_exact_skip callback_called=0 source=instance check_ms=0.186
+2026-08-12 11:20:37-05:00 [v2.startup_stage] stage=snapshot_execution_seed event=start wall_unix_ns=1786551637465680301 monotonic_ns=101341319307
+2026-08-12 11:20:37-05:00 [v2.seed_restore] source=startup_minimal schema=2 topology_available=0 workflow_hash= loader_signatures=0
+2026-08-12 11:20:37-05:00 [v2.startup_stage] stage=snapshot_execution_seed event=end wall_unix_ns=1786551637466929421 monotonic_ns=101342569016 duration_ms=1.25
+2026-08-12 11:20:37-05:00 [v2.generation_identity] method=restore custom_nodes_generation='667f5c299d7f4b2e54ffaf7c…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47394749240144 deployment_combined_hash=0210e87964498a71
+2026-08-12 11:20:37-05:00 [v2.prefill_config] env=critical parsed=critical cpu_snapshot_container_active=0 native_fast_disk_unet_execution_active=0
+2026-08-12 11:20:37-05:00 [v2.restore_breakdown] bootstrap_ms=1053.808 unet_cache_patch_ms=None clip_prepare_submit_ms=None clip_worker_wait_ms=None unet_spec_extract_ms=None bg_unet_submit_ms=None restore_finalize_ms=0.094
+2026-08-12 11:20:37-05:00 [v2.clip_stages] worker_queue_ms=None load_torch_file_ms=None read_to_ready_ms=None post_read_cpu_prepare_ms=None gpu_wait_ms=None gpu_commit_ms=None read_end_to_ready_ms=None worker_total_ms=None worker_close_wait_ms=None restore_finalization_ms=0.094
+2026-08-12 11:20:37-05:00 [v2.restoration_identity] restored_instance_id=ace6fbf48d8d4bb39ac59b6f6072917d restore_session_id=aaa14e27ab74478e9e63fcb986d6ddb5 container_session_id=a0a1f2509bdc47c1 modal_task_id=ta-01KZVC9ZYXVZ6BQB43N0V26SQR modal_image_id=im-stGerxYgZllqDfXM2TaTfL modal_cloud=CLOUD_PROVIDER_GCP modal_region=us-central1 pid=2 hostname=modal restore_total_ms=1076.434 remote_python_resume_wall_unix_ns=1786551635286414336 restore_method_start_wall_unix_ns=1786551635286414336 restore_method_end_wall_unix_ns=1786551637467534080 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success 
+2026-08-12 11:20:37-05:00 [v2.lifecycle] method=restore snap=False container_session=a0a1f2509bdc47c1 restore_count=1 restore_total_ms=1076.434 remote_python_resume_wall_unix_ns=1786551635286414336 restore_method_start_wall_unix_ns=1786551635286414336 restore_method_end_wall_unix_ns=1786551637467534080 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success status=restored
+2026-08-12 11:20:37-05:00 [v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=12999.2 process_maxrss_mib=35801.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:20:37-05:00 [v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+2026-08-12 11:20:37-05:00 [v2.startup_stage] stage=post_snapshot_restore event=end wall_unix_ns=1786551637470310509 monotonic_ns=101345949624 duration_ms=1080.211
+2026-08-12 11:20:37-05:00 [v2.restore_only_probe] request_method_entry request_id=v2-restore-only-0-cd72578e00f7 restored_instance_id=ace6fbf48d8d4bb3 restore_count=1 unet_present=0 clip_present=1 vae_present=1 container_retained=1 entry_wall_unix_ns=1786551637504974467
+2026-08-12 11:20:49-05:00 [v2.clip_conditioning_cache] event=mode flag=COMFYMODAL_V2_CLIP_CONDITIONING_CACHE enabled=1 root=/root/prompt_cache_vol/exact_conditioning max_entries=64 max_bytes=536870912
+2026-08-12 11:31:18-05:00 Function 'ModalRuntimeEntrypointV2.*' (fu-xjIsj5XkfF18HqyQZSHqZT) is waiting to be scheduled on a GPU_RTX_PRO_6000 worker. We are actively working on acquiring more capacity for your workload.. Relaxing requirements (cpu=12, memory=32.8GiB) may lead to faster scheduling
+2026-08-12 11:31:37-05:00 Creating CPU memory snapshot for Function.
+2026-08-12 11:31:44-05:00 [v2.startup_stage] stage=container_python_import event=start wall_unix_ns=1786552304276305735 monotonic_ns=1888273442
+2026-08-12 11:31:46-05:00 [critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+2026-08-12 11:31:46-05:00 [exact_prefill.remote] enabled=1 source=env
+2026-08-12 11:31:46-05:00 [timing_trace] module loaded __file__=/root/timing_trace.py TRACE_VERSION=2.0.0
+2026-08-12 11:31:46-05:00 [timing_trace] module directory in sys.path: /root
+2026-08-12 11:31:46-05:00 [modal-client] 2026-08-12T16:31:46+0000 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*
+2026-08-12 11:31:46-05:00 [v2.region_pin] region=unpinned cloud=unpinned source=COMFYMODAL_V2_REGION/COMFYMODAL_V2_CLOUD
+2026-08-12 11:31:46-05:00 [v2.startup_stage] stage=snap_true_enter event=start wall_unix_ns=1786552306519194617 monotonic_ns=4131162072
+2026-08-12 11:31:46-05:00 [v2.startup_stage] stage=container_python_import event=end wall_unix_ns=1786552306519518515 monotonic_ns=4131485263 duration_ms=2243.212
+2026-08-12 11:31:46-05:00 [v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=120.3 process_maxrss_mib=130.2 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:31:49-05:00 [v2.runtime_shape] stage=image_runtime_initialization runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=13 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 28}
+2026-08-12 11:31:49-05:00 [v2.startup_stage] stage=snap_true_enter event=end wall_unix_ns=1786552309736221586 monotonic_ns=7348188271 duration_ms=3217.026
+2026-08-12 11:31:49-05:00 [v2.snapshot_target] static_fingerprint=a3294d2a1d837bf249a6344cc2507136fb475dcd8beb09d984ab252bd32ce7cb app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 gpu=RTX-PRO-6000 cpu=12 memory=32768 runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 snapshot_model_order=O0
+2026-08-12 11:31:49-05:00 [v2.snapshot_runtime] image_id=im-stGerxYgZllqDfXM2TaTfL cloud=CLOUD_PROVIDER_AWS region=eu-central-1 container_session_id=98754b0555f24aa5
+2026-08-12 11:31:49-05:00 [v2.manager] network_mode=offline configs=1
+2026-08-12 11:31:50-05:00 [v2.startup_stage] stage=custom_node_source_copy event=start wall_unix_ns=1786552310440409973 monotonic_ns=8052377110
+2026-08-12 11:31:50-05:00 [v2.custom_node_filter] total_source_dirs=39 accepted_dirs=24 duplicate_comfymodal_dirs=14 duplicate_names=[comfyui-modal-aws-rtx6000,comfyui-modal-c1-c5-c6-c8-tail,comfyui-modal-east1-composition,comfyui-modal-exact-clip-conditioning-cache,comfyui-modal-memory-regression-fix,comfyui-modal-pagesfile-probe,comfyui-modal-persistent-modal-handle,comfyui-modal-persistent-submission-v2,comfyui-modal-restore-structure,comfyui-modal-sub13-diagnostic,comfyui-modal-teardown-billing-tail,comfyui-modal-vae-runtime-path,comfyui-modal-vae-snapshot-seed,comyui-modal-pagesfile-probe]
+2026-08-12 11:31:50-05:00 [v2.custom_node_startup] decision=fallback_full_sync callback_called=1 reason=generation_mismatch baked_generation=f397bcd530dc6e10 current_generation=667f5c299d7f4b2e
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-CacheDiT stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-CacheDiT.2.1786552311328349566
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-Flux2Klein-Enhancer stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-Flux2Klein-Enhancer.2.1786552311330305245
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-KJNodes stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-KJNodes.2.1786552311333589809
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI-SeedVR2_VideoUpscaler stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI-SeedVR2_VideoUpscaler.2.1786552311341963156
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=ComfyUI_LayerStyle stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/ComfyUI_LayerStyle.2.1786552311362315581
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=RES4LYF stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/RES4LYF.2.1786552311421591483
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=cg-use-everywhere stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/cg-use-everywhere.2.1786552311581027419
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-custom-scripts stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-custom-scripts.2.1786552311587742272
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-detail-daemon stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-detail-daemon.2.1786552311592762256
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-easy-use stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-easy-use.2.1786552311593840100
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-impact-pack stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-impact-pack.2.1786552311614331997
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-levelpixel stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-levelpixel.2.1786552311622175736
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-lora-manager stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-lora-manager.2.1786552311625788205
+2026-08-12 11:31:51-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-manager stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-manager.2.1786552311756822148
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-modal stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-modal.2.1786552311769661790
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui-workflow-encrypt stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui-workflow-encrypt.2.1786552312203009667
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui_controlnet_aux stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_controlnet_aux.2.1786552312203977323
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui_essentials stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_essentials.2.1786552312265552302
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui_fill-nodes stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_fill-nodes.2.1786552312267433913
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui_image_metadata_extension stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_image_metadata_extension.2.1786552312331824450
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui_lg_samplingutils stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_lg_samplingutils.2.1786552312340273152
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=comfyui_sam3 stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/comfyui_sam3.2.1786552312344979676
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=masquerade-nodes-comfyui stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/masquerade-nodes-comfyui.2.1786552312423196912
+2026-08-12 11:31:52-05:00 [comfyapp] sync: staged real directory for deferred cleanup name=rgthree-comfy stale_path=/root/comfy/ComfyUI/.comfymodal_stale_custom_nodes/rgthree-comfy.2.1786552312424516710
+2026-08-12 11:31:52-05:00 [comfyapp] sync_custom_nodes_into_comfy: created=24 kept=0 removed=0 blocked=0 volume_dirs=24
+2026-08-12 11:31:52-05:00 [comfyapp] custom_node_sync_ran reason=volume_managed nodes=24
+2026-08-12 11:31:52-05:00 [v2.startup_stage] stage=custom_node_source_copy event=end wall_unix_ns=1786552312454149369 monotonic_ns=10066117608 duration_ms=2013.74
+2026-08-12 11:31:52-05:00 [v2.startup_stage] stage=comfyui_path_startup event=start wall_unix_ns=1786552312454373454 monotonic_ns=10066340162
+2026-08-12 11:31:52-05:00 [v2.startup_stage] stage=comfyui_path_startup event=end wall_unix_ns=1786552312454520851 monotonic_ns=10066487566 duration_ms=0.147
+2026-08-12 11:31:52-05:00 [v2.startup_stage] stage=backend_startup event=start wall_unix_ns=1786552312454594168 monotonic_ns=10066560895
+2026-08-12 11:31:52-05:00 [v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=13 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 28}
+2026-08-12 11:32:00-05:00 [comfyapp] total_ram=1024.0G  cache_ram=24.0G
+2026-08-12 11:32:00-05:00 [v2.startup_stage] stage=custom_node_import event=start wall_unix_ns=1786552320887670320 monotonic_ns=18499637663
+2026-08-12 11:32:03-05:00 ⚠️  SeedVR2 optimizations check: SageAttention ❌ | Flash Attention ❌ | Triton ✅
+2026-08-12 11:32:03-05:00 💡 Optional: pip install sageattention flash-attn
+2026-08-12 11:32:03-05:00 ⚠️ Memory check failed: No GPU backend available (CUDA/MPS) - No available backend!
+2026-08-12 11:32:05-05:00 WARNING:root:Traceback (most recent call last):
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/nodes.py", line 2212, in load_custom_node
+2026-08-12 11:32:05-05:00     module_spec.loader.exec_module(module)
+2026-08-12 11:32:05-05:00   File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+2026-08-12 11:32:05-05:00   File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/__init__.py", line 7, in <module>
+2026-08-12 11:32:05-05:00     from .src.interfaces import comfy_entrypoint, SeedVR2Extension
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/interfaces/__init__.py", line 8, in <module>
+2026-08-12 11:32:05-05:00     from .video_upscaler import SeedVR2VideoUpscaler
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/interfaces/video_upscaler.py", line 10, in <module>
+2026-08-12 11:32:05-05:00     from ..utils.downloads import download_weight
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/utils/downloads.py", line 14, in <module>
+2026-08-12 11:32:05-05:00     from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/utils/model_registry.py", line 14, in <module>
+2026-08-12 11:32:05-05:00     from ..models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
+2026-08-12 11:32:05-05:00   File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/models/video_vae_v3/modules/attn_video_vae.py", line 20, in <module>
+2026-08-12 11:32:05-05:00     from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/__init__.py", line 1, in <module>
+2026-08-12 11:32:05-05:00     from .autoencoder_asym_kl import AsymmetricAutoencoderKL
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/autoencoder_asym_kl.py", line 23, in <module>
+2026-08-12 11:32:05-05:00     from .vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution, Encoder, MaskConditionDecoder
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/vae.py", line 25, in <module>
+2026-08-12 11:32:05-05:00     from ..unets.unet_2d_blocks import (
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/__init__.py", line 6, in <module>
+2026-08-12 11:32:05-05:00     from .unet_2d import UNet2DModel
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/unet_2d.py", line 24, in <module>
+2026-08-12 11:32:05-05:00     from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 36, in <module>
+2026-08-12 11:32:05-05:00     from ..transformers.dual_transformer_2d import DualTransformer2DModel
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/__init__.py", line 20, in <module>
+2026-08-12 11:32:05-05:00     from .transformer_bria import BriaTransformer2DModel
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_bria.py", line 14, in <module>
+2026-08-12 11:32:05-05:00     from ..attention_dispatch import dispatch_attention_fn
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/diffusers/models/attention_dispatch.py", line 92, in <module>
+2026-08-12 11:32:05-05:00     from sageattention import (
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/sageattention/__init__.py", line 1, in <module>
+2026-08-12 11:32:05-05:00     from .core import sageattn, sageattn_varlen
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/sageattention/core.py", line 47, in <module>
+2026-08-12 11:32:05-05:00     from .quant import per_block_int8 as per_block_int8_cuda
+2026-08-12 11:32:05-05:00   File "/usr/local/lib/python3.11/site-packages/sageattention/quant.py", line 20, in <module>
+2026-08-12 11:32:05-05:00     from . import _fused
+2026-08-12 11:32:05-05:00   File "/root/comfyapp.py", line 17701, in find_spec
+2026-08-12 11:32:05-05:00     raise ImportError(
+2026-08-12 11:32:05-05:00 ImportError: [comfyapp] blocked CUDA module import 'sageattention._fused' during snap=True to keep snapshot clean
+2026-08-12 11:32:05-05:00 
+2026-08-12 11:32:05-05:00 WARNING:root:Cannot import /root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler module for custom nodes: [comfyapp] blocked CUDA module import 'sageattention._fused' during snap=True to keep snapshot clean
+2026-08-12 11:32:07-05:00 (RES4LYF) Init
+2026-08-12 11:32:07-05:00 (RES4LYF) Importing beta samplers.
+2026-08-12 11:32:07-05:00 (RES4LYF) Importing legacy samplers.
+2026-08-12 11:32:07-05:00 [34m[ComfyUI-Easy-Use] server: [0mv1.3.6 [92mLoaded[0m
+2026-08-12 11:32:07-05:00 [34m[ComfyUI-Easy-Use] web root: [0m/__modal/volumes/vo-pVpvw9S4nu5dgSv2CguK9F/comfyui-easy-use/web_version/v2 [92mLoaded[0m
+2026-08-12 11:32:08-05:00 WARNING:root:[Impact Pack] custom_wildcards path not found: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-impact-pack\custom_wildcards. Using default path.
+2026-08-12 11:32:08-05:00 WARNING:/root/comfy/ComfyUI/custom_nodes/comfyui-lora-manager.py.config:No valid loras folders found in ComfyUI configuration
+2026-08-12 11:32:08-05:00 WARNING:/root/comfy/ComfyUI/custom_nodes/comfyui-lora-manager.py.config:No valid embeddings folders found in ComfyUI configuration
+2026-08-12 11:32:09-05:00 WARNING:root:[ComfyUI-Manager] Some features are restricted due to your ComfyUI being outdated.
+2026-08-12 11:32:09-05:00 [exact_prefill.local] enabled=1 source=env
+2026-08-12 11:32:09-05:00 [comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+2026-08-12 11:32:09-05:00 ### ComfyUI-Workflow-Encrypt: Copy .js from '/root/comfy/ComfyUI/custom_nodes/comfyui-workflow-encrypt/js/comfyui-workflow-encrypt.js' to '/root/comfy/ComfyUI/web/extensions/comfyui-workflow-encrypt'
+2026-08-12 11:32:09-05:00 [36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using ckpts path: /__modal/volumes/vo-pVpvw9S4nu5dgSv2CguK9F/comfyui_controlnet_aux/ckpts[0m
+2026-08-12 11:32:10-05:00 [36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using symlinks: False[0m
+2026-08-12 11:32:10-05:00 [36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using ort providers: ['CUDAExecutionProvider', 'DirectMLExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider', 'CoreMLExecutionProvider'][0m
+2026-08-12 11:32:10-05:00 DWPose: Onnxruntime with acceleration providers detected
+2026-08-12 11:32:15-05:00 warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+2026-08-12 11:32:15-05:00 LOADED 5 FONTS
+2026-08-12 11:32:16-05:00 
+2026-08-12 11:32:16-05:00 
+2026-08-12 11:32:16-05:00 ███╗   ███╗ █████╗  ██████╗██╗  ██╗██╗███╗   ██╗███████╗               
+2026-08-12 11:32:16-05:00 ████╗ ████║██╔══██╗██╔════╝██║  ██║██║████╗  ██║██╔════╝               
+2026-08-12 11:32:16-05:00 ██╔████╔██║███████║██║     ███████║██║██╔██╗ ██║█████╗                 
+2026-08-12 11:32:16-05:00 ██║╚██╔╝██║██╔══██║██║     ██╔══██║██║██║╚██╗██║██╔══╝                 
+2026-08-12 11:32:16-05:00 ██║ ╚═╝ ██║██║  ██║╚██████╗██║  ██║██║██║ ╚████║███████╗               
+2026-08-12 11:32:16-05:00 ╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝               
+2026-08-12 11:32:16-05:00                                                                        
+2026-08-12 11:32:16-05:00 ██████╗ ███████╗██╗     ██╗   ██╗███████╗██╗ ██████╗ ███╗   ██╗███████╗
+2026-08-12 11:32:16-05:00 ██╔══██╗██╔════╝██║     ██║   ██║██╔════╝██║██╔═══██╗████╗  ██║██╔════╝
+2026-08-12 11:32:16-05:00 ██║  ██║█████╗  ██║     ██║   ██║███████╗██║██║   ██║██╔██╗ ██║███████╗
+2026-08-12 11:32:16-05:00 ██║  ██║██╔══╝  ██║     ██║   ██║╚════██║██║██║   ██║██║╚██╗██║╚════██║
+2026-08-12 11:32:16-05:00 ██████╔╝███████╗███████╗╚██████╔╝███████║██║╚██████╔╝██║ ╚████║███████║
+2026-08-12 11:32:16-05:00 ╚═════╝ ╚══════╝╚══════╝ ╚═════╝ ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
+2026-08-12 11:32:16-05:00                                                                        
+2026-08-12 11:32:16-05:00 
+2026-08-12 11:32:16-05:00 
+2026-08-12 11:32:16-05:00 /usr/local/lib/python3.11/site-packages/sam3/model/sam3_video_inference.py:835: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+2026-08-12 11:32:16-05:00   @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+2026-08-12 11:32:16-05:00 /usr/local/lib/python3.11/site-packages/sam3/model/sam3_video_inference.py:943: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+2026-08-12 11:32:16-05:00   @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+2026-08-12 11:32:16-05:00 
+2026-08-12 11:32:16-05:00 [92m[rgthree-comfy] Loaded 48 epic nodes. 🎉[0m
+2026-08-12 11:32:16-05:00 
+2026-08-12 11:32:16-05:00 [33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+2026-08-12 11:32:16-05:00 [0m
+2026-08-12 11:32:16-05:00 [v2.startup_stage] stage=custom_node_import event=end wall_unix_ns=1786552336945604919 monotonic_ns=34557569492 duration_ms=16057.932 slow_import_summary_source=comfyui.nodes.init_external_custom_nodes
+2026-08-12 11:32:17-05:00 [comfyapp] custom_node_import_health: registered=2410 volume_syncable=24 comfy_entries=28 comfy_symlinks=24 failures=0 snapshot_deferred=0
+2026-08-12 11:32:17-05:00 [comfyapp] custom_node_import_health: volume_dirs=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+2026-08-12 11:32:17-05:00 [comfyapp] custom_node_import_health: comfy_volume_symlink_dirs=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+2026-08-12 11:32:17-05:00 [comfyapp] sage_policy module=model_optimization_nodes.py found=True patched=True baked_cuda_available=False duration=5.5ms
+2026-08-12 11:32:17-05:00 [comfyapp] in-process backend initialized in 24.568s
+2026-08-12 11:32:17-05:00 [v2.startup_stage] stage=backend_startup event=end wall_unix_ns=1786552337031093885 monotonic_ns=34643061584 duration_ms=24576.501
+2026-08-12 11:32:17-05:00 [v2.sage_snapshot] action=discover_and_patch module=/root/comfy/ComfyUI/custom_nodes/ComfyUI-KJNodes.nodes.model_optimization_nodes target=patch_kjnodes_get_sage_func.<locals>.wrapped_get_sage_func mode=patched_at_snapshot version=comfymodal-sage-v1
+2026-08-12 11:32:17-05:00 [v2.generation_identity] method=startup custom_nodes_generation='667f5c299d7f4b2e54ffaf7c…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47583261332688 deployment_combined_hash=0210e87964498a71
+2026-08-12 11:32:17-05:00 [v2.startup_stage] stage=certificate_snapshot_retention event=start wall_unix_ns=1786552337047307125 monotonic_ns=34659273993
+2026-08-12 11:32:17-05:00 [v2.cert_snapshot] status=fallback reason=seed_missing
+2026-08-12 11:32:17-05:00 [v2.startup_stage] stage=certificate_snapshot_retention event=end wall_unix_ns=1786552337047599031 monotonic_ns=34659566084 duration_ms=0.292 status=fallback reason=seed_missing
+2026-08-12 11:32:17-05:00 [v2.startup_stage] stage=dependency_validation event=start wall_unix_ns=1786552337047707737 monotonic_ns=34659674625
+2026-08-12 11:32:17-05:00 [v2.startup_stage] stage=baked_manifest_read event=start wall_unix_ns=1786552337047748846 monotonic_ns=34659715654
+2026-08-12 11:32:17-05:00 [v2.startup_stage] stage=baked_manifest_read event=end wall_unix_ns=1786552337048109717 monotonic_ns=34660076433 duration_ms=0.361
+2026-08-12 11:32:18-05:00 [dep_manifest] persisted identity=6c32629e43724ee8... combined_hash=0210e87964498a71... elapsed_ms=1501.6
+2026-08-12 11:32:18-05:00 [v2.dep_manifest] startup build/persist done in 1502.1ms identity=6c32629e43724ee8 combined_hash=0210e87964498a71 cn_gen=667f5c299d7f4b2e repair_mode=fail_fast baked_ok=1 ident_ok=1
+2026-08-12 11:32:18-05:00 [v2.startup_stage] stage=dependency_validation event=end wall_unix_ns=1786552338549890932 monotonic_ns=36161858710 duration_ms=1502.184
+2026-08-12 11:32:18-05:00 [v2.deployment_proof] schema=1 complete=False reason=generation_mismatch dep_hash=0210e87964498a71 baked_gen=f397bcd530dc6e10 gen_ok=0 reg_fp=True dep_identity=True repair_mode=n/a
+2026-08-12 11:32:18-05:00 [comfyapp] snapshot_preload_profile source=none - no warmup profile configured
+2026-08-12 11:32:18-05:00 [v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=35 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 28}
+2026-08-12 11:32:18-05:00 [v2.startup_stage] stage=clip_snapshot_load event=start wall_unix_ns=1786552338563456663 monotonic_ns=36175423382
+2026-08-12 11:32:18-05:00 [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=6fc1440e127f4458 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786552338565550592 start_monotonic_ns=36177516362 start_thread_time_ns=30450000000 start_process_time_ns=34160000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=102 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+2026-08-12 11:32:22-05:00 [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=6fc1440e127f4458 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786552342093897728 complete_monotonic_ns=39705862375 complete_thread_time_ns=31910000000 complete_process_time_ns=60460000000 complete_native_tid=2 wall_ms=3528.346 thread_cpu_ms=1460.0 process_cpu_ms=26300.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=102
+2026-08-12 11:32:22-05:00 [v2.active_read_diag] active_read_id=6fc1440e127f4458 owner=graph_loader request_id= restore_session_id= path_hash=18da7c5b6a0c3132 wall_ms=3528.346 thread_cpu_ms=1460.0 process_cpu_ms=26300.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+2026-08-12 11:32:23-05:00 [v2.startup_stage] stage=clip_snapshot_load event=end wall_unix_ns=1786552343029576768 monotonic_ns=40641544294 duration_ms=4466.121
+2026-08-12 11:32:23-05:00 [v2.startup_stage] stage=unet_snapshot_load event=start wall_unix_ns=1786552343492642163 monotonic_ns=41104608808
+2026-08-12 11:32:23-05:00 [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=73f37dcd4fa24efa restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786552343497593344 start_monotonic_ns=41109558355 start_thread_time_ns=33250000000 start_process_time_ns=67510000000 native_tid=2 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=1318 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+2026-08-12 11:32:28-05:00 [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=73f37dcd4fa24efa restored_instance_id= restore_session_id= complete_wall_unix_ns=1786552348644173568 complete_monotonic_ns=46256137835 complete_thread_time_ns=35250000000 complete_process_time_ns=104840000000 complete_native_tid=2 wall_ms=5146.579 thread_cpu_ms=2000.0 process_cpu_ms=37330.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=1318
+2026-08-12 11:32:28-05:00 [v2.active_read_diag] active_read_id=73f37dcd4fa24efa owner=graph_loader request_id= restore_session_id= path_hash=8d2256b3cff6bbd2 wall_ms=5146.579 thread_cpu_ms=2000.0 process_cpu_ms=37330.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+2026-08-12 11:32:29-05:00 [v2.startup_stage] stage=unet_snapshot_load event=end wall_unix_ns=1786552349311541705 monotonic_ns=46923509566 duration_ms=5818.901
+2026-08-12 11:32:29-05:00 [v2.startup_stage] stage=vae_snapshot_load event=start wall_unix_ns=1786552349911264543 monotonic_ns=47523231222
+2026-08-12 11:32:29-05:00 [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=cc98a1bce73344e2 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786552349915980800 start_monotonic_ns=47527946254 start_thread_time_ns=36470000000 start_process_time_ns=111660000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=1073 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+2026-08-12 11:32:30-05:00 [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=cc98a1bce73344e2 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786552350055693568 complete_monotonic_ns=47667658090 complete_thread_time_ns=36580000000 complete_process_time_ns=112680000000 complete_native_tid=2 wall_ms=139.712 thread_cpu_ms=110.0 process_cpu_ms=1020.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=1073
+2026-08-12 11:32:30-05:00 [v2.active_read_diag] active_read_id=cc98a1bce73344e2 owner=graph_loader request_id= restore_session_id= path_hash=4c78afa4b05fac11 wall_ms=139.712 thread_cpu_ms=110.0 process_cpu_ms=1020.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+2026-08-12 11:32:30-05:00 [v2.startup_stage] stage=vae_snapshot_load event=end wall_unix_ns=1786552350130933912 monotonic_ns=47742901192 duration_ms=219.67
+2026-08-12 11:32:31-05:00 [v2.vae_snapshot] status=retained vae_identity=ae.safetensors object_type=VAE object_id=47586619734928 vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 storage_bytes=167639366 floating_parameter_count=244 mismatched_parameter_buffer_count=0
+2026-08-12 11:32:31-05:00 [v2.unet_runtime_state] stage=snapshot_created unet_identity=z_image_turbo_bf16.safetensors requested_weight_dtype=default effective_snapshot_weight_dtype=bfloat16 effective_snapshot_compute_dtype=bfloat16 effective_snapshot_manual_cast_dtype=none effective_weight_dtype=bfloat16 dtype_resolution_source=target_gpu_policy target_gpus=RTX-PRO-6000 state={"current_device":"cpu","diffusion_model_object_id":"47587822576912","diffusion_model_type":"NextDiT","effective_snapshot_compute_dtype":"bfloat16","effective_snapshot_manual_cast_dtype":"none","first_buffer_device":"absent","first_buffer_dtype":"absent","first_parameter_device":"cpu","first_parameter_dtype":"torch.bfloat16","forward_module":"NextDiT","forward_qualname":"NextDiT.forward","load_device":"cpu","loaded_models_member":"absent","manual_cast_dtype":"absent","model_dtype":"torch.bfloat16","model_loaded_weight_memory":"0","model_lowvram":"False","model_lowvram_patch_counter":"0","model_object_id":"47587822577232","model_options_keys":["transformer_options"],"model_type":"Lumina2","object_patch_count":0,"offload_device":"cpu","param_distribution":{"param_count":453,"param_dev_dtype_count":{"cpu|torch.bfloat16":453},"param_dev_dtype_numel":{"cpu|torch.bfloat16":6154908736},"param_distribution_hash":"96e377c80251860d5549077cedd369a544935a81bfbda9128343843e9dd54c80","total_param_numel":6154908736},"patch_count":0,"patcher_object_id":"47586501078288","patcher_type":"ModelPatcher","transformer_options_keys":[],"weight_dtype":"absent"}
+2026-08-12 11:32:31-05:00 [v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=24342.9 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:32:31-05:00 [v2.startup_stage] stage=cachedit_preparation event=start wall_unix_ns=1786552351259269196 monotonic_ns=48871236314
+2026-08-12 11:32:31-05:00 [cachedit.startup] preimport transformers version=4.55.2 path=/usr/local/lib/python3.11/site-packages/transformers/__init__.py
+2026-08-12 11:32:31-05:00 [cachedit.startup] preimport diffusers version=0.36.0 path=/usr/local/lib/python3.11/site-packages/diffusers/__init__.py
+2026-08-12 11:32:32-05:00 /usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_kandinsky.py:168: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+2026-08-12 11:32:32-05:00   @torch.autocast(device_type="cuda", dtype=torch.float32)
+2026-08-12 11:32:32-05:00 /usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_kandinsky.py:272: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+2026-08-12 11:32:32-05:00   @torch.autocast(device_type="cuda", dtype=torch.float32)
+2026-08-12 11:32:33-05:00 [cachedit.startup] preimport cache_dit version=1.2.3 path=/usr/local/lib/python3.11/site-packages/cache_dit/__init__.py
+2026-08-12 11:32:33-05:00 [cachedit.startup] cache_dit metadata={'__version__': '1.2.3', 'top_level_classes': ['BasicCacheConfig', 'BlockAdapter', 'CacheType', 'CalibratorConfig', 'DBCacheConfig', 'DBPruneConfig', 'FoCaCalibratorConfig', 'ForwardPattern', 'ParallelismBackend', 'ParallelismConfig', 'ParamsModifier', 'PatchFunctor', 'ProfilerContext', 'TaylorSeerCalibratorConfig']}
+2026-08-12 11:32:33-05:00 [v2.startup_stage] stage=cachedit_preparation event=end wall_unix_ns=1786552353082827779 monotonic_ns=50694794913 duration_ms=1823.559
+2026-08-12 11:32:33-05:00 [cachedit.startup] preimport ok transformers=4.55.2 diffusers=0.36.0 cache_dit=1.2.3 cache_dit_info={'__version__': '1.2.3', 'top_level_classes': ['BasicCacheConfig', 'BlockAdapter', 'CacheType', 'CalibratorConfig', 'DBCacheConfig', 'DBPruneConfig', 'FoCaCalibratorConfig', 'ForwardPattern', 'ParallelismBackend', 'ParallelismConfig', 'ParamsModifier', 'PatchFunctor', 'ProfilerContext', 'TaylorSeerCalibratorConfig']}
+2026-08-12 11:32:33-05:00 [v2.snapshot_pools] stage=before_snapshot_capture legacy_threads_joined=0 legacy_worker_refs_removed=0 coordinator_closed=1 native_thread_count=46
+2026-08-12 11:32:33-05:00 [v2.snapshot_model_eviction_memory] stage=full_models_loaded vm_rss_mib=24370.49609375 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=28 loaded_module_count=10451
+2026-08-12 11:32:33-05:00 [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=insufficient_rss_drop clip_original_id=47586493698704 unet_original_id=47586501078288 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 bridge_active_preparation=0 bridge_active_preparation_before_clear=0 rss_before_mib=24370.49609375 rss_after_gc_mib=17016.9140625 rss_after_trim_mib=16245.22265625 full_eviction_rss_drop_mib=8125.3 anonymous_before_mib=absent anonymous_after_mib=absent private_dirty_before_mib=absent private_dirty_after_mib=absent malloc_trim_status=applied malloc_trim_result=1
+2026-08-12 11:32:33-05:00 [v2.snapshot_model_eviction_memory] stage=after_full_eviction vm_rss_mib=16245.22265625 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=28 loaded_module_count=10451
+2026-08-12 11:32:33-05:00 [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=full_eviction_complete retain_role=clip_vae clip_original_id=47586493698704 unet_original_id=47586501078288 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 full_eviction_rss_drop_mib=8125.3 rss_before_mib=24370.49609375 rss_after_eviction_mib=16245.22265625 malloc_trim_status=applied malloc_trim_result=1
+2026-08-12 11:32:33-05:00 [v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 28}
+2026-08-12 11:32:33-05:00 [v2.startup_stage] stage=clip_snapshot_load event=start wall_unix_ns=1786552353975989614 monotonic_ns=51587956690
+2026-08-12 11:32:33-05:00 [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=101e21efff4b471e restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786552353979500544 start_monotonic_ns=51591466203 start_thread_time_ns=40300000000 start_process_time_ns=117390000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=102 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+2026-08-12 11:32:34-05:00 [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=101e21efff4b471e restored_instance_id= restore_session_id= complete_wall_unix_ns=1786552354776957696 complete_monotonic_ns=52388922894 complete_thread_time_ns=41070000000 complete_process_time_ns=126620000000 complete_native_tid=2 wall_ms=797.457 thread_cpu_ms=770.0 process_cpu_ms=9230.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=102
+2026-08-12 11:32:34-05:00 [v2.active_read_diag] active_read_id=101e21efff4b471e owner=graph_loader request_id= restore_session_id= path_hash=18da7c5b6a0c3132 wall_ms=797.457 thread_cpu_ms=770.0 process_cpu_ms=9230.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+2026-08-12 11:32:35-05:00 [v2.startup_stage] stage=clip_snapshot_load event=end wall_unix_ns=1786552355679749298 monotonic_ns=53291716683 duration_ms=1703.76
+2026-08-12 11:32:35-05:00 [v2.startup_stage] stage=vae_snapshot_load event=start wall_unix_ns=1786552355679889079 monotonic_ns=53291855731
+2026-08-12 11:32:35-05:00 [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=af6af5206b684e0d restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786552355683051776 start_monotonic_ns=53295016945 start_thread_time_ns=41940000000 start_process_time_ns=133420000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=1073 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+2026-08-12 11:32:35-05:00 [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=af6af5206b684e0d restored_instance_id= restore_session_id= complete_wall_unix_ns=1786552355732685312 complete_monotonic_ns=53344650858 complete_thread_time_ns=41990000000 complete_process_time_ns=133910000000 complete_native_tid=2 wall_ms=49.634 thread_cpu_ms=50.0 process_cpu_ms=490.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=1073
+2026-08-12 11:32:35-05:00 [v2.active_read_diag] active_read_id=af6af5206b684e0d owner=graph_loader request_id= restore_session_id= path_hash=4c78afa4b05fac11 wall_ms=49.634 thread_cpu_ms=50.0 process_cpu_ms=490.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+2026-08-12 11:32:35-05:00 [v2.startup_stage] stage=vae_snapshot_load event=end wall_unix_ns=1786552355778235717 monotonic_ns=53390202867 duration_ms=98.347
+2026-08-12 11:32:35-05:00 [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=non_fatal_floor_failure retain_role=clip_vae floor=full_eviction_rss_drop threshold_mib=8192 actual_mib=8125.3 actual_bytes=? selected_reload_rss_rise_mib=9704.1 final_reduction_from_full_mib=-1578.8 selected_storage_total_bytes=8380214928 after_full_eviction_rss_mib=16245.22265625 after_selected_reload_rss_mib=25949.30078125 full_models_rss_mib=24370.49609375 malloc_trim_status=applied malloc_trim_result=1
+2026-08-12 11:32:35-05:00 [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=non_fatal_floor_failure retain_role=clip_vae floor=final_reduction threshold_mib=4096 actual_mib=-1578.8 actual_bytes=? selected_reload_rss_rise_mib=9704.1 final_reduction_from_full_mib=-1578.8 selected_storage_total_bytes=8380214928 after_full_eviction_rss_mib=16245.22265625 after_selected_reload_rss_mib=25949.30078125 full_models_rss_mib=24370.49609375 malloc_trim_status=applied malloc_trim_result=1
+2026-08-12 11:32:35-05:00 [v2.snapshot_model_eviction_memory] stage=after_selected_reload vm_rss_mib=25949.30078125 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=28 loaded_module_count=10451
+2026-08-12 11:32:35-05:00 [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=ready floor_failures=2 floor_failures_details=full_eviction_rss_drop=8125.3;final_reduction=-1578.8 retain_role=clip_vae retained_model_present=0 retained_model_id=47586588529680 retained_model_type=CLIP retained_weakref_alive=1 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 original_vae_alive_after_full_eviction=0 reloaded_model_present=0 reloaded_model_id=47586588529680 reloaded_model_is_new_object=1 clip_original_id=47586493698704 unet_original_id=47586501078288 vae_original_id=47586619734928 container_retained=1 normal_cpu_snapshot_models_present=1 clip_present=1 vae_present=1 unet_present=0 full_eviction_rss_drop_mib=8125.3 selected_reload_rss_rise_mib=9704.1 final_reduction_from_full_mib=-1578.8 selected_storage_count=399 selected_storage_total_bytes=8380214928 selected_storage_total_mib=7991.996 full_models_rss_mib=24370.49609375 after_full_eviction_rss_mib=16245.22265625 after_selected_reload_rss_mib=25949.30078125 bridge_active_preparation=0 bridge_active_preparation_before_clear=0 snapshot_loader_output_count=0 snapshot_seed_present=0 native_threads=46 torch_intraop=12 torch_interop=28 patcher_cleanup_count=3 patcher_detach_count=3 patcher_cleanup_errors=0 malloc_trim_status=applied malloc_trim_result=1
+2026-08-12 11:32:35-05:00 [v2.startup_stage] stage=vae_preparation event=start wall_unix_ns=1786552355826907461 monotonic_ns=53438874952 status=skipped reason=vae_not_part_of_cpu_snapshot
+2026-08-12 11:32:35-05:00 [v2.startup_stage] stage=vae_preparation event=end wall_unix_ns=1786552355827019061 monotonic_ns=53438985780 status=skipped reason=vae_not_part_of_cpu_snapshot duration_ms=0.0
+2026-08-12 11:32:35-05:00 [v2.snapshot_manifest] stage=before_capture rss_kb=26573108 hwm_kb=None vmsize_kb=29989084 mappings=2884 anon=704 file=2180 native_threads=None py_threads=2 modules=10452 fds=15 children=0 gc_objects=1225915 executors=0 image=im-stGerxYgZllqDfXM2TaTfL cloud=CLOUD_PROVIDER_AWS region=eu-central-1
+2026-08-12 11:32:35-05:00 [v2.startup_stage] stage=snapshot_startup_callback event=return wall_unix_ns=1786552355999718298 monotonic_ns=53611684932 status=ready
+2026-08-12 11:32:35-05:00 [v2.lifecycle] method=startup snap=True container_session=98754b0555f24aa5 restore_total_ms=44736.746 status=ready
+2026-08-12 11:32:57-05:00 Snapshot created. Restoring Function from memory snapshot.
+2026-08-12 11:32:58-05:00 Restoring Function from memory snapshot.
+2026-08-12 11:33:02-05:00 [v2.snapshot_manifest] stage=first_restored_line rss_kb=11400836 hwm_kb=None vmsize_kb=18238004 mappings=2714 anon=534 file=2180 native_threads=None py_threads=2 modules=10452 fds=15 children=0 gc_objects=1218064 executors=0 image=im-stGerxYgZllqDfXM2TaTfL cloud=CLOUD_PROVIDER_AWS region=eu-central-1
+2026-08-12 11:33:02-05:00 [v2.startup_stage] stage=post_snapshot_restore event=start wall_unix_ns=1786552382044492850 monotonic_ns=79656461300
+2026-08-12 11:33:02-05:00 [v2.snapshot_timing] snapshot_callback_age_at_restore_ms=26044.824 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=unavailable request_latency_included=0 source=snapshot_callback_return_to_restore_start
+2026-08-12 11:33:02-05:00 [v2.snapshot_model_eviction] stage=restore_observed marker=1 cpu_snapshot_models_present=1 clip_present=1 unet_present=0 retained_role=clip_vae retained_model_id=0 retained_model_type= rss_after_restore_mib=11427.140625 native_thread_count=46 torch_intraop=12 torch_interop=28 wall_unix_ns=1786552382045850156
+2026-08-12 11:33:02-05:00 [v2.snapshot_model_eviction] stage=restore_release_retained retain_role=clip_vae status=container_retained container_present=1 clip_present=1 vae_present=1 unet_present=0 retained_slot_release=0 retained_model_id=0 retained_alive_after_release=0 rss_before_release_mib=absent rss_after_gc_mib=absent rss_after_trim_mib=absent rss_drop_mib=absent malloc_trim_status=absent malloc_trim_result=absent restore_release_start_wall_unix_ns=1786552382045931868 restore_release_end_wall_unix_ns=1786552382045931868 wall_unix_ns=1786552382045931868
+2026-08-12 11:33:02-05:00 [v2.residency_config] enabled=0
+2026-08-12 11:33:02-05:00 [v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=11427.1 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:02-05:00 [v2.runtime_shape] stage=after_restore runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+2026-08-12 11:33:02-05:00 [v2.opt.gpu_state] total_memory_ms=336.431
+2026-08-12 11:33:02-05:00 [comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 339.2ms
+2026-08-12 11:33:02-05:00 [restore.cuda_context] available=1 device_index=0 device=NVIDIA RTX PRO 6000 Blackwell Server Edition sync_ms=182.119 total_ms=182.253
+2026-08-12 11:33:02-05:00 [v2.sage_restore] decision=snapshot_exact_skip discovery_called=0 verify_ms=0.016
+2026-08-12 11:33:03-05:00 [v2.custom_node_restore] decision=snapshot_exact_skip callback_called=0 source=instance check_ms=0.15
+2026-08-12 11:33:03-05:00 [v2.startup_stage] stage=snapshot_execution_seed event=start wall_unix_ns=1786552383643326418 monotonic_ns=81255293102
+2026-08-12 11:33:03-05:00 [v2.seed_restore] source=startup_minimal schema=2 topology_available=0 workflow_hash= loader_signatures=0
+2026-08-12 11:33:03-05:00 [v2.startup_stage] stage=snapshot_execution_seed event=end wall_unix_ns=1786552383644538665 monotonic_ns=81256505363 duration_ms=1.212
+2026-08-12 11:33:03-05:00 [v2.generation_identity] method=restore custom_nodes_generation='667f5c299d7f4b2e54ffaf7c…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47583261332688 deployment_combined_hash=0210e87964498a71
+2026-08-12 11:33:03-05:00 [v2.prefill_config] env=critical parsed=critical cpu_snapshot_container_active=0 native_fast_disk_unet_execution_active=0
+2026-08-12 11:33:03-05:00 [v2.restore_breakdown] bootstrap_ms=1567.834 unet_cache_patch_ms=None clip_prepare_submit_ms=None clip_worker_wait_ms=None unet_spec_extract_ms=None bg_unet_submit_ms=None restore_finalize_ms=0.087
+2026-08-12 11:33:03-05:00 [v2.clip_stages] worker_queue_ms=None load_torch_file_ms=None read_to_ready_ms=None post_read_cpu_prepare_ms=None gpu_wait_ms=None gpu_commit_ms=None read_end_to_ready_ms=None worker_total_ms=None worker_close_wait_ms=None restore_finalization_ms=0.087
+2026-08-12 11:33:03-05:00 [v2.restoration_identity] restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 container_session_id=98754b0555f24aa5 modal_task_id=ta-01KZVD183W3Q2989ZAGVHJYPDR modal_image_id=im-stGerxYgZllqDfXM2TaTfL modal_cloud=CLOUD_PROVIDER_AWS modal_region=eu-central-1 pid=2 hostname=modal restore_total_ms=1598.966 remote_python_resume_wall_unix_ns=1786552380909942784 restore_method_start_wall_unix_ns=1786552380909942784 restore_method_end_wall_unix_ns=1786552383644957184 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success 
+2026-08-12 11:33:03-05:00 [v2.lifecycle] method=restore snap=False container_session=98754b0555f24aa5 restore_count=1 restore_total_ms=1598.966 remote_python_resume_wall_unix_ns=1786552380909942784 restore_method_start_wall_unix_ns=1786552380909942784 restore_method_end_wall_unix_ns=1786552383644957184 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success status=restored
+2026-08-12 11:33:03-05:00 [v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=12973.5 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:03-05:00 [v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+2026-08-12 11:33:03-05:00 [v2.startup_stage] stage=post_snapshot_restore event=end wall_unix_ns=1786552383647744771 monotonic_ns=81259711383 duration_ms=1603.25
+2026-08-12 11:33:03-05:00 [v2.startup_stage] stage=first_remote_method_entry event=entry wall_unix_ns=1786552383751126724 monotonic_ns=81363093284
+2026-08-12 11:33:03-05:00 [v2.env_profile] effective_profile=inherit container_profile=inherit request_override=inherit request_override_applied=0 source=request-inherit-noop
+2026-08-12 11:33:03-05:00 [v2.local_submission_breakdown.remote] request_id=v2-benchmark-0-5d2b331b552a local_receive_to_worker_start_ms=14891.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=14891.0 worker_queue_ms=0.0 plan_build_ms=47.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=absent payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=15016.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=15528 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+2026-08-12 11:33:03-05:00 [v2.seed_restore] source=invocation_plan schema=2 topology_available=1 workflow_hash=2e43d4c0ba3b82c0 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+2026-08-12 11:33:03-05:00 [v2.runtime_shape] stage=request_entry runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=48 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+2026-08-12 11:33:03-05:00 [v2.method_entry_gap] restore_to_method_ms=103.392 first_line_to_running_log_ms=12.153 same_process=True identity_mismatch_reasons=none remote_python_resume_wall_unix_ns=1786552380909942784 restore_method_start_wall_unix_ns=1786552380909942784 restore_method_end_wall_unix_ns=1786552383644957184 modal_method_entry_wall_unix_ns=1786552383751115264 restore_end_to_modal_method_ms=106.157
+2026-08-12 11:33:03-05:00 [v2.snapshot_timing] snapshot_callback_age_at_restore_ms=26044.824 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=182969.943 command_start_to_python_resume_ms=182969.943 command_start_to_restore_end_ms=185704.957 request_latency_included=0_for_callback_age
+2026-08-12 11:33:03-05:00 [v2.host_memory] stage=prompt_executor_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=12973.8 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:03-05:00 [v2.cpu_snapshot_models] cpu_snapshot_models_present=1 clip_present=1 unet_present=0 cpu_snapshot_active=0
+2026-08-12 11:33:03-05:00 [v2.cpu_snapshot_request] status=present_but_inactive clip_present=1 unet_present=0 action=clip_vae_only_request_activation
+2026-08-12 11:33:03-05:00 [v2.cpu_snapshot_request] status=clip_vae_only_bind clip_source=cpu_snapshot vae_source=cpu_snapshot unet_source=normal_loader clip_object_id=47586588529680 vae_object_id=47586469321744
+2026-08-12 11:33:03-05:00 [v2.cpu_snapshot_request] status=reused reason=clip_vae_only
+2026-08-12 11:33:03-05:00 [v2.unet_identity_chain] stage=snapshot request_id=v2-benchmark-0-5d2b331b552a unet_object_id=0
+2026-08-12 11:33:03-05:00 [v2.unet_identity_chain] stage=bridge request_id=v2-benchmark-0-5d2b331b552a unet_object_id=0
+2026-08-12 11:33:03-05:00 [v2.snapshot_activation_invariant] profile=inherit models_container_present=1 clip_present=1 unet_present=0 snapshot_enabled_by_config=1 cpu_snapshot_container_active=1 loader_bridge_active=1 execution_prefill_allowed=0 status=pass reason=ok
+2026-08-12 11:33:03-05:00 [v2.execution_prefill] snapshot_active=1 env_raw=critical scheduled=1
+2026-08-12 11:33:03-05:00 [v2.execution_unet] scheduled=1 snapshot_unet_absent=1 request_id=v2-benchmark-0-5d2b331b552a
+2026-08-12 11:33:03-05:00 [v2.plan_proof] schema=0 payload=no validated=False outputs=0 out_ids= wf_hash=2e43d4c0ba3b82c0 recomputed=2e43d4c0ba3b82c0 match=True dep_complete=True consumed=False cert_decision=legacy
+2026-08-12 11:33:03-05:00 [v2.plan_proof] parity proof_present=1 proof_complete=0 proof_valid=0 dep_match=0 gen_match=1 reg_match=0 dep_proof_match=0 eligible=0 reason=snapshot_proof_incomplete,snapshot_proof_invalid_or_unsupported,deployment_hash_mismatch,registry_fingerprint_mismatch,dependency_proof_mismatch consumed=False
+2026-08-12 11:33:03-05:00 [v2.exec] res4lyf_dummy_init_disabled=1 reported_injected=1 actual_injected=1
+2026-08-12 11:33:03-05:00 [preflight.model_reads] restore_preload_active=0 selected_clip=/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors
+2026-08-12 11:33:03-05:00 [v2.generation_identity] custom_nodes_generation='667f5c299d7f4b2e54ffaf7c…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47583261332688 deployment_combined_hash=0210e87964498a71
+2026-08-12 11:33:03-05:00 [v2.cert] decision=snapshot_fallback reason=snapshot_cert_invalid identity=6e5fbd5ccad7d416
+2026-08-12 11:33:03-05:00 [v2.clip_conditioning_cache] event=mode flag=COMFYMODAL_V2_CLIP_CONDITIONING_CACHE enabled=1 root=/root/prompt_cache_vol/exact_conditioning max_entries=64 max_bytes=536870912[v2.cert] cache_evict reason= identity=6e5fbd5ccad7d416
+2026-08-12 11:33:03-05:00 
+2026-08-12 11:33:03-05:00 [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=438f2dcb505647ae restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 request_id= start_wall_unix_ns=1786552383807546624 start_monotonic_ns=81419512438 start_thread_time_ns=10000000 start_process_time_ns=136760000000 native_tid=76 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=2966 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+2026-08-12 11:33:03-05:00 [v2.clip_conditioning_cache] decision=miss key_hash=b71037003ebe9e6e36b9185453827078860da442345904794999d7d2377efc46 identity_status=valid schema_version=1 validation_scope=clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs hit_count=0 miss_count=1 entries=1 lookup_wall_ms=0.817 request_id=v2-benchmark-0-5d2b331b552a
+2026-08-12 11:33:03-05:00 [v2.unet_early_activation] event=mode mode=late env_raw=late restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076
+2026-08-12 11:33:04-05:00 [v2.gpu_load_boundary] event=load_models_gpu_start request_id=absent restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=not_observed gpu_allocated_before=0 gpu_reserved_before=0[v2.cert] hit=0 identity=6e5fbd5ccad7d416
+2026-08-12 11:33:04-05:00 
+2026-08-12 11:33:04-05:00 [v2.gpu_load_boundary] event=load_models_gpu_end request_id=absent restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=modelpatcher model_count=1 caller_classification=not_observed wall_ms=10.96 gpu_allocated_after=0 gpu_allocated_delta_bytes=0
+2026-08-12 11:33:04-05:00 [dep_manifest] loaded identity=6c32629e43724ee8... load_ms=34.5
+2026-08-12 11:33:04-05:00 [v2.dependency_validation] source=persistent_manifest identity_match=1 prompt_structure_validation_ms=0.08 deployment_hash_resolution_ms=0.01 baked_manifest_read_ms=59.19 custom_node_generation_read_ms=32.94 manifest_load_ms=34.59 cheap_check_ms=0.05 manifest_identity_check_ms=0.05 fallback_validation_called=0 fallback_fingerprint_ms=0.0 fallback_validation_ms=0.0 fingerprint_ms=0.0 full_validation_ms=0.0 refresh_performed=0 preflight_total_ms=126.89 deployment_hash=0210e87964498a71 baked_dependency_hash=be68be1945de2a29 custom_nodes_generation=667f5c299d7f4b2e repair_mode=fail_fast stored_manifest_identity=6c32629e43724ee8 computed_manifest_identity=6c32629e43724ee8 miss_component= reason=manifest_identity_match
+2026-08-12 11:33:04-05:00 [comfyapp] preflight result: {'valid_prompt': True, 'dependency_prepared': True, 'repair_mode': 'fail_fast', 'dependency_reason': 'manifest_identity_match'}
+2026-08-12 11:33:05-05:00 [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=438f2dcb505647ae restored_instance_id=de8685d33f0b4cdb restore_session_id=d5c241d2987b44a88c08429dfddd5076 complete_wall_unix_ns=1786552385886503936 complete_monotonic_ns=83498469142 complete_thread_time_ns=1930000000 complete_process_time_ns=140540000000 complete_native_tid=76 wall_ms=2078.957 thread_cpu_ms=1920.0 process_cpu_ms=3780.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=2966
+2026-08-12 11:33:05-05:00 [v2.active_read_diag] active_read_id=438f2dcb505647ae owner=graph_loader request_id= restore_session_id=d5c241d2987b44a88c08429dfddd5076 path_hash=8d2256b3cff6bbd2 wall_ms=2078.957 thread_cpu_ms=1920.0 process_cpu_ms=3780.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=76
+2026-08-12 11:33:05-05:00 [v2.plan_proof] decision=legacy_validation_fallback consumed=0 reason=snapshot_proof_incomplete,snapshot_proof_invalid_or_unsupported,deployment_hash_mismatch,registry_fingerprint_mismatch,dependency_proof_mismatch,unsupported_validation_schema,validation_not_validated,validation_hash_mismatch,empty_outputs
+2026-08-12 11:33:05-05:00 [v2.host_memory] stage=peak_execution current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=25703.2 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:05-05:00 [v2.startup_stage] stage=first_prompt_executor_invocation event=start wall_unix_ns=1786552385997181828 monotonic_ns=83609148430
+2026-08-12 11:33:06-05:00 [v2.vae_early_activation] event=mode mode=sampling_end env_raw=sampling_end restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076
+2026-08-12 11:33:06-05:00 [v2.native_fast_disk_unet] decision=defer reason=ok stage=to patcher_class=comfy.model_patcher.ModelPatcher patcher_dynamic=0 param_count=453 parameter_bytes=12309817472 dtype_distribution={'torch.bfloat16': 453} device_distribution={'cpu': 453} cpu_params=453 cpu_buffers=1 get_model_ms=317.109 ctor_ms=0.189 bind_ms=None to_wall_ms=None to_device_ms=None to_device_ms_label=unavailable
+2026-08-12 11:33:10-05:00 [v2.native_fast_disk_unet] decision=complete reason=ok stage=load_model_weights patcher_class=comfy.model_patcher.ModelPatcher patcher_dynamic=0 param_count=453 parameter_bytes=12309817472 dtype_distribution={'torch.bfloat16': 453} device_distribution={'cuda': 453} cpu_params=0 cpu_buffers=0 get_model_ms=317.109 ctor_ms=0.189 bind_ms=40.503 to_wall_ms=4133.268 to_device_ms=4132.908 to_device_ms_label=synchronized_device
+2026-08-12 11:33:10-05:00 [v2.unet_runtime_state] stage=normal_loader_ready unet_identity=z_image_turbo_bf16.safetensors requested_weight_dtype=default effective_weight_dtype=default state={"current_device":"cuda:0","diffusion_model_object_id":"47587357399888","diffusion_model_type":"NextDiT","first_buffer_device":"absent","first_buffer_dtype":"absent","first_parameter_device":"cuda:0","first_parameter_dtype":"torch.bfloat16","forward_module":"NextDiT","forward_qualname":"NextDiT.forward","load_device":"cuda:0","loaded_models_member":"0","manual_cast_dtype":"absent","model_dtype":"torch.bfloat16","model_loaded_weight_memory":"0","model_lowvram":"False","model_lowvram_patch_counter":"0","model_object_id":"47586621974544","model_options_keys":["transformer_options"],"model_type":"Lumina2","object_patch_count":0,"offload_device":"cuda:0","patch_count":0,"patcher_object_id":"47586494151696","patcher_type":"ModelPatcher","transformer_options_keys":["wrappers"],"weight_dtype":"absent"}
+2026-08-12 11:33:11-05:00 Restoring Function from memory snapshot.
+2026-08-12 11:33:11-05:00 [v2.clip_conditioning_cache] decision=miss_stored key_hash=b71037003ebe9e6e36b9185453827078860da442345904794999d7d2377efc46 identity_status=valid encode_calls=1 encode_loop_wall_ms=7140.067 cache_store_wall_ms=9.529 cache_store_calls=1 store_diagnostics={'store_calls': 1, 'store_failed': 0, 'key_build_digest_ms': 0.22, 'serialization_ms': 8.726, 'materialize_ms': 2.073, 'checksum_ms': 3.274, 'serialized_payload_bytes': 2900184, 'enqueue_ms': 0.515, 'lock_wait_ms': 0.0, 'total_ms': 9.499, 'measured_children_ms': 9.465, 'residual_ms': 0.034, 'store_reason': '', 'materialize_bytes': 2900184, 'enqueued': 1, 'persisted': 0, 'persist_failed': 0, 'commit_failed': 0, 'queue_depth': 1, 'queue_deduped': 0, 'queue_full_dropped': 0, 'batch_size': 0, 'batch_count': 0, 'persistence_queue_wait_ms': 0.0, 'file_write_ms': 0.0, 'manifest_ms': 0.0, 'reload_ms': 0.0, 'commit_ms': 0.0, 'unindexed_files_removed': 0, 'last_flush_ms': 0.0, 'last_flush_status': '', 'flush_count': 0, 'fallback_sync_stores': 0} schema_version=1 validation_scope=clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs enqueued=1 persisted=0 persist_failed=0 entries=1 request_id=v2-benchmark-0-5d2b331b552a
+2026-08-12 11:33:11-05:00 [v2.cpu_owner] operation=CLIPTextEncode role=CLIP wall_ms=4899.877 process_cpu_ms=6090.000 effective_cores=1.243 native_threads_start=52 native_threads_peak=53 native_threads_end=53
+2026-08-12 11:33:11-05:00 standard
+2026-08-12 11:33:11-05:00 WARNING:root:[FeatureInjLatent] Reference latent: shape=torch.Size([1, 16, 240, 136])
+2026-08-12 11:33:11-05:00 [v2.sampler_boundary] event=sampler_lane_requested sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta blocking_owner=absent
+2026-08-12 11:33:11-05:00 [v2.sampler_boundary] event=sampler_lane_acquired sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta wait_ms=0.775 blocking_owner=absent
+2026-08-12 11:33:11-05:00 [CacheDiT] Transformer class: NextDiT (module: comfy.ldm.lumina.model)
+2026-08-12 11:33:11-05:00 [v2.gpu_load_boundary] event=load_models_gpu_start request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=UNET model_count=1 contains_registered_unet=1 caller_classification=graph_model_loading gpu_allocated_before=12438589952 gpu_reserved_before=13155434496
+2026-08-12 11:33:11-05:00 [v2.gpu_load_boundary] event=load_models_gpu_end request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=UNET model_count=1 caller_classification=graph_model_loading wall_ms=99.541 gpu_allocated_after=12438594048 gpu_allocated_delta_bytes=4096
+2026-08-12 11:33:11-05:00 [v2.cpu_owner] operation=load_models_gpu role=other wall_ms=100.793 process_cpu_ms=120.000 effective_cores=1.191 native_threads_start=53 native_threads_peak=54 native_threads_end=53
+2026-08-12 11:33:11-05:00 [v2.unet_identity_chain] check=stage_pair stage_a=bridge stage_b=sampler request_id=v2-benchmark-0-5d2b331b552a patcher_a_object_id=47586494151696 diffusion_a_object_id=47587357399888 patcher_b_object_id=47586715848016 diffusion_b_object_id=47587357399888 ok=1 reason=ok
+2026-08-12 11:33:11-05:00 [v2.unet_gpu_residency] sampler_wrapper_before_sample request_id=v2-benchmark-0-5d2b331b552a enforce=0 status=gpu_resident unet_object_id=47586715848016 parameter_count=453 gpu_parameter_count=453 cpu_parameter_count=0 meta_parameter_count=0 unknown_parameter_count=0 gpu_parameter_fraction=1.0 load_device=cuda:0 current_device=absent diffusion_model_current_device=absent model_cache_size=2 unet_in_model_cache=1 gpu_allocated_bytes=12443368960 gpu_reserved_bytes=13155434496
+2026-08-12 11:33:11-05:00 [v2.sampler_stall_watchdog] stage=armed request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 sampler_node_id=1242 sampler_class=ClownsharKSampler_Beta patcher_object_id=47586715848016 diffusion_model_object_id=47587357399888 unet_object_id=47586715848016 first_forward_timeout_s=5.0 first_step_timeout_s=15.0
+2026-08-12 11:33:11-05:00 [v2.sampler_boundary] event=sampling_start request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=47586715848016 diffusion_model_object_id=47587357399888 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12443368960 gpu_reserved_bytes=13155434496
+2026-08-12 11:33:11-05:00 (RES4LYF) rk_type: res_2s
+2026-08-12 11:33:11-05:00 
+2026-08-12 11:33:11-05:00 [v2.unet_forward_boundary] event=first_unet_forward request_id=v2-benchmark-0-5d2b331b552a diffusion_model_object_id=47587357399888 patcher_object_id=47586494151696 model_object_id=47586621974544 x_device=cuda:0 x_dtype=torch.bfloat16 elapsed_ms=204.119
+2026-08-12 11:33:11-05:00 [v2.sampler_parity] UNET weight_dtype=torch.bfloat16 UNET compute_dtype=torch.bfloat16 manual_cast_dtype=None CacheDiT target=NextDiT CacheDiT attachment_count=1 CacheDiT fallback=0
+2026-08-12 11:33:11-05:00 [1A
+  0%|          | 0/8 [00:00<?, ?it/s]
+2026-08-12 11:33:12-05:00 WARNING:root:[FeatureInjLatent] step=1 | progress=0.00 | eff_str=0.250 | no mask
+2026-08-12 11:33:12-05:00 WARNING:root:[FeatureInjLatent] step=2 | progress=0.01 | eff_str=0.214 | no mask
+2026-08-12 11:33:12-05:00 [v2.sampler_boundary] event=first_sampler_step request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=47586715848016 diffusion_model_object_id=47587357399888 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12443368960 gpu_reserved_bytes=13155434496
+2026-08-12 11:33:12-05:00 
+2026-08-12 11:33:12-05:00 [1A
+ 12%|█▎        | 1/8 [00:01<00:09,  1.36s/it]
+2026-08-12 11:33:13-05:00 WARNING:root:[FeatureInjLatent] step=3 | progress=0.03 | eff_str=0.178 | no mask
+2026-08-12 11:33:13-05:00 
+2026-08-12 11:33:13-05:00 [1A
+ 25%|██▌       | 2/8 [00:02<00:06,  1.10s/it]
+2026-08-12 11:33:14-05:00 
+2026-08-12 11:33:14-05:00 [1A
+2026-08-12 11:33:14-05:00  38%|███▊      | 3/8 [00:02<00:04,  1.23it/s]
+2026-08-12 11:33:14-05:00 [1A
+ 50%|█████     | 4/8 [00:03<00:02,  1.47it/s]
+2026-08-12 11:33:15-05:00 
+2026-08-12 11:33:15-05:00 [1A
+2026-08-12 11:33:15-05:00  62%|██████▎   | 5/8 [00:03<00:01,  1.65it/s]
+2026-08-12 11:33:15-05:00 [1A
+ 75%|███████▌  | 6/8 [00:04<00:01,  1.81it/s]
+2026-08-12 11:33:16-05:00 
+2026-08-12 11:33:16-05:00 [1A
+2026-08-12 11:33:16-05:00  88%|████████▊ | 7/8 [00:04<00:00,  1.92it/s]
+2026-08-12 11:33:16-05:00 [1A
+2026-08-12 11:33:16-05:00 100%|██████████| 8/8 [00:05<00:00,  2.01it/s]
+2026-08-12 11:33:16-05:00 100%|██████████| 8/8 [00:05<00:00,  1.58it/s]
+2026-08-12 11:33:16-05:00 [v2.sampler_boundary] event=sampling_end request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=47586715848016 diffusion_model_object_id=47587357399888 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12443368960 gpu_reserved_bytes=13155434496 duration_ms=5094.765
+2026-08-12 11:33:16-05:00 [v2.vae_early_activation] event=scheduled request_id=v2-benchmark-0-5d2b331b552a mode=sampling_end trigger=sampling_end key_hash=35282ff77c906f542810413a source=snapshot_vae vae_identity_hash=dd8f11d04333e24d vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 torch=2.12.0+cu130 cuda=13.0 arch=x86_64 restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076
+2026-08-12 11:33:16-05:00 [v2.vae_early_activation] event=load_start request_id=v2-benchmark-0-5d2b331b552a mode=sampling_end key_hash=35282ff77c906f542810413a source=snapshot_vae vae_object_id=47586469321744 vae_patcher_object_id=47586500295376
+2026-08-12 11:33:16-05:00 [v2.gpu_load_boundary] event=load_models_gpu_start request_id=absent restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=restore_vae_preparation gpu_allocated_before=12478479872 gpu_reserved_before=14967373824
+2026-08-12 11:33:17-05:00 [v2.gpu_load_boundary] event=load_models_gpu_end request_id=absent restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=modelpatcher model_count=1 caller_classification=restore_vae_preparation wall_ms=560.468 gpu_allocated_after=12648925184 gpu_allocated_delta_bytes=170445312
+2026-08-12 11:33:17-05:00 [v2.vae_early_activation] event=terminal request_id=v2-benchmark-0-5d2b331b552a mode=sampling_end key_hash=35282ff77c906f542810413a status=ready reason=ok error=absent transfer_count=1 vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 source=snapshot_vae
+2026-08-12 11:33:17-05:00 [v2.vae_early_activation] event=consumed request_id=v2-benchmark-0-5d2b331b552a mode=sampling_end key_hash=35282ff77c906f542810413a join_wait_ms=41.311 status=ready source=snapshot_vae
+2026-08-12 11:33:17-05:00 [v2.gpu_load_boundary] event=load_models_gpu_start request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=graph_model_loading gpu_allocated_before=12648925184 gpu_reserved_before=14967373824
+2026-08-12 11:33:17-05:00 [v2.gpu_load_boundary] event=load_models_gpu_end request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 roles=modelpatcher model_count=1 caller_classification=graph_model_loading wall_ms=28.45 gpu_allocated_after=12648925184 gpu_allocated_delta_bytes=0
+2026-08-12 11:33:17-05:00 [production.rgthree.encode] side=b (B-only) shape=(1, 1920, 1088, 3) dtype=torch.uint8
+2026-08-12 11:33:18-05:00 [v2.opt.output_encode] total_ms=620.712 png_compress_ms=605.755 gpu_to_cpu_ms=0.008
+2026-08-12 11:33:18-05:00 [production.rgthree] node_id=107 a_count=0 b_count=1 encoded_unique=1 logical_outputs=1 return_a=0 temp_files_written=0 encode_ms=626.2
+2026-08-12 11:33:18-05:00 [v2.startup_stage] stage=first_prompt_executor_invocation event=end wall_unix_ns=1786552398435725010 monotonic_ns=96047691668 duration_ms=12438.543
+2026-08-12 11:33:18-05:00 [v2.pre_sampler_stages] request_id=v2-benchmark-0-5d2b331b552a restored_instance_id=de8685d33f0b4cdb97f5ad3d59ec5808 restore_session_id=d5c241d2987b44a88c08429dfddd5076 container_session_id=98754b0555f24aa5 modal_input_id=in-01KZVCYVQGMKMZDJAYPFJQ7JBE:1786552217328-0 modal_task_id=ta-01KZVD183W3Q2989ZAGVHJYPDR pid=2 boot_id=83466225-c375-4ea8-ae4e-a10f987b576b hostname=modal total_nodes=43 first_output_node=107:ComfyModalProductionImageComparerOutput first_executing_node=987:Any Switch (rgthree) sampler_stage_status=sampler_active method_entry_to_graph_start_ms=28.459 graph_setup_ms=2217.564 certificate_ms=300.331 cert_identity_build_ms=0.015 cert_cache_hit=0 cert_volume_reload_ms=289.278 cert_file_read_ms=10.028 cert_json_parse_validate_ms=0.0 cert_total_ms=299.321 legacy_preflight_ms=174.04 prompt_validation_ms=1716.752 certificate_skipped_preflight=0 certificate_skipped_prompt_validation=0 preflight_ms=173.99 validation_ms=1716.805 missing_node_repair_ms=0.133 production_registry_setup_ms=0.033 production_registry_profile_setup_ms=0.033 pregraph_setup_ms=0.295 executor_reset_ms=0.058 sampler_lane_wait_ms=0.11 residual_before_invoke_ms=1.238 method_entry_to_runtime_configuration_ms=28.398 call_to_exec_start_ms=0.394 exec_start_to_cached_ms=54.296 cached_to_first_executing_ms=128.346 call_to_cached_ms=54.69 call_to_first_node_ms=183.035 first_node_to_clip_ms=5.602 clip_to_sampler_node_ms=5021.643 sampler_node_to_sampler_start_ms=197.91 sampler_node_to_lane_acquired_ms=0.791 lane_acquired_to_actual_stage_ms=197.119 pre_sampler_total_ms=7654.189 measured_children_ms=7599.855 residual_ms=54.334 reconciliation_status=ok add_message=True send_sync=True has_sampler=True sampler_count=1 lane_acquired=True
+2026-08-12 11:33:18-05:00 [v2.opt.output_delivery] hash_ms=1.569 descriptor_ms=None
+2026-08-12 11:33:18-05:00 [v2.opt.output_delivery] hash_ms=1.569 descriptor_ms=0.026
+2026-08-12 11:33:18-05:00 [v2.startup_stage] stage=first_durable_result event=ready wall_unix_ns=1786552398455683327 monotonic_ns=96067649948 output_persisted=1
+2026-08-12 11:33:18-05:00 [v2.output] hashes=1 base64_encode=0 base64_decode=0 commit_ms=0.0 commit_status=pending overlap_ms=0.0 serialized_bytes=2214
+2026-08-12 11:33:20-05:00 [v2.cert] write identity=6e5fbd5ccad7d416 status=committed
+2026-08-12 11:33:20-05:00 [v2.cert] snapshot_retained_updated reason=request_write identity=6e5fbd5ccad7d416
+2026-08-12 11:33:21-05:00 [v2.host_memory] stage=result_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=14609.6 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:21-05:00 [v2.activation_diagnosis] request_id=v2-benchmark-0-5d2b331b552a cpu_snapshot_container_active=True execution_prefill_scheduled=True residency_diagnostics_enabled=0 clip_encode_calls=1 clip_encode_graph_calls=0 clip_encode_prefill_calls=1 clip_encode_wall_ms=7118.992 clip_encode_graph_wall_ms=0 clip_encode_prefill_wall_ms=7118.992 clip_encode_process_cpu_ms=10200.0 load_models_gpu_calls=2 unet_gpu_load_calls=1 load_models_gpu_wall_ms=127.991 activation_receipt_count=4 gpu_allocated_delta_bytes=4096 cpu_peak_cores=absent cpu_above_16_ms=absent cpu_above_19_ms=absent cpu_longest_above_19_ms=absent cpu_overlap_graph_clip_ms=absent cpu_overlap_prefill_clip_ms=absent cpu_overlap_gpu_load_ms=absent clip_to_sampler_node_ms=5021.643 sampler_node_to_sampler_start_ms=197.91 diagnostic_accounted_ms=absent diagnostic_unattributed_ms=absent restore_requested_torch_intraop_threads=absent restore_actual_torch_intraop_threads=12 restore_torch_interop_threads=28 restore_torch_thread_limit_status=baseline_passthrough
+2026-08-12 11:33:21-05:00 [v2.process_cpu_spike] status=ok peak_effective_cores=5.692 duration_above_16_ms=0.000 duration_above_19_ms=0.000 longest_above_19_ms=0.000 sample_count=322
+2026-08-12 11:33:21-05:00 [v2.remote_request_origin.remote] request_id=v2-benchmark-0-5d2b331b552a trigger_source=benchmark ui_trigger_unix_ms=1786552198448 local_receive_unix_ns=1786552198448015104 modal_generator_create_start_unix_ns=1786552213465296400 modal_submission_attempt_unix_ns=absent modal_generator_created_unix_ns=absent modal_first_iteration_start_unix_ns=absent modal_first_remote_event_unix_ns=absent modal_method_entry_unix_ns=1786552383751115264 prompt_executor_invoke_start_unix_ns=1786552385997111040 trigger_to_dispatch_ms=0.015 dispatch_to_modal_entry_ms=None modal_entry_to_executor_ms=2245.998 trigger_to_executor_ms=187549.111 modal_input_id=in-01KZVCYVQGMKMZDJAYPFJQ7JBE:1786552217328-0 modal_task_id=ta-01KZVD183W3Q2989ZAGVHJYPDR
+2026-08-12 11:33:21-05:00 [v2.critical_path] python_resume_to_restore_enter_ms=0.0 restore_total_ms=1598.966 restore_exit_to_run_enter_ms=106.157 run_enter_to_plan_received_ms=22.03 plan_received_to_executor_invoke_ms=2223.968 executor_invoke_to_first_node_ms=182.949 first_node_to_sampler_node_ms=5027.199 sampler_node_to_sampler_start_ms=197.91 pre_sampler_unattributed_ms=absent
+2026-08-12 11:33:21-05:00 [v2.cgroup_cpu_spike] status=unavailable reason=no readable cpu.stat candidates=/sys/fs/cgroup/cpu.stat errors=resolve_cgroup_v2_base: returned no readable cgroup base;probe2 path=/sys/fs/cgroup/cpu.stat: FileNotFoundError: [Errno 2] No such file or directory: '/sys/fs/cgroup/cpu.stat';parse_proc_cgroup: no unified 0:: entry
+2026-08-12 11:33:21-05:00 [v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+2026-08-12 11:33:21-05:00 V2 COLD WATERFALL - remote benchmark run 1
+2026-08-12 11:33:21-05:00 Request: v2-benchmark-0-5d2b331b552a  Instance: de8685d33f0b4cdb97f5ad3d59ec5808  GPU: ['RTX-PRO-6000']  Fresh: YES
+2026-08-12 11:33:21-05:00 
+2026-08-12 11:33:21-05:00 +-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+2026-08-12 11:33:21-05:00  # | Stage                                          | Duration |     Cum. |      % | Relative wall time
+2026-08-12 11:33:21-05:00 +-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+2026-08-12 11:33:21-05:00   1 | Local preparation                              |     0.000s |     0.000s |   0.000% | +                                    
+2026-08-12 11:33:21-05:00   2 | Modal handle and submission                    |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00   3 | Modal scheduling before snapshot restore be... |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00   4 | Modal pre-Python snapshot restoration          |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00   5 | Python/application restore                     |     2.735s |     2.735s |   1.350% | #                                    
+2026-08-12 11:33:21-05:00   6 | Restore-to-method entry                        |     0.106s |     2.841s |   0.052% | #                                    
+2026-08-12 11:33:21-05:00   7 | ~ Method entry to UNET ownership claim         |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00   8 | ~ UNET claim to ready (worker load)            |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00   9 |   detail: Checkpoint read                      |     4.141s |          - |   2.044% |                                      
+2026-08-12 11:33:21-05:00  10 |   detail: Read end ? construction done         |     0.317s |          - |   0.157% |                                      
+2026-08-12 11:33:21-05:00  11 |   detail: Bind                                 |     0.041s |          - |   0.020% |                                      
+2026-08-12 11:33:21-05:00  12 |   detail: Synchronized H2D                     |     4.133s |          - |   2.040% |                                      
+2026-08-12 11:33:21-05:00  13 |   detail: H2D end ? UNET ready                 |     0.002s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  14 |   detail: UNET ready ? sampler demand          |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  15 |   detail: Sampler demand ? join complete       |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  16 |   detail: Join complete ? sampling             |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  17 | Remote method setup                            |     2.246s |     5.087s |   1.109% | #                                    
+2026-08-12 11:33:21-05:00  18 |   detail: method entry to graph start          |     0.028s |          - |   0.014% |                                      
+2026-08-12 11:33:21-05:00  19 |   detail: method entry to runtime configura... |     0.028s |          - |   0.014% |                                      
+2026-08-12 11:33:21-05:00  20 |   detail: runtime configuration                |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  21 |   detail: graph setup                          |     2.218s |          - |   1.095% |                                      
+2026-08-12 11:33:21-05:00  22 |   detail: certificate                          |     0.300s |          - |   0.148% |                                      
+2026-08-12 11:33:21-05:00  23 |   detail: preflight                            |     0.174s |          - |   0.086% |                                      
+2026-08-12 11:33:21-05:00  24 |   detail: validation                           |     1.717s |          - |   0.847% |                                      
+2026-08-12 11:33:21-05:00  25 |   detail: legacy runtime resolution            |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  26 |   detail: preload check                        |     0.003s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  27 |   detail: missing-node repair                  |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  28 |   detail: production registry setup            |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  29 |   detail: pregraph setup                       |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  30 |   detail: executor reset                       |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  31 |   detail: residual before executor invoke      |     0.001s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  32 |   detail: pre-sampler total                    |     7.654s |          - |   3.778% |                                      
+2026-08-12 11:33:21-05:00  33 |   detail: measured pre-sampler children        |     7.600s |          - |   3.751% |                                      
+2026-08-12 11:33:21-05:00  34 |   detail: pre-sampler residual                 |     0.054s |          - |   0.027% |                                      
+2026-08-12 11:33:21-05:00  35 |   detail: UNET quiesce wait (diagnostic)       |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  36 |   detail: UNET transfer queue delay            |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  37 |   detail: UNET synchronized transfer           |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  38 |   detail: UNET scheduled ? worker start        |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  39 |   detail: Worker start ? checkpoint read start |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  40 | PromptExecutor/cache setup                     |     0.183s |     5.270s |   0.090% | #                                    
+2026-08-12 11:33:21-05:00  41 |   detail: PromptExecutor invoke to execution   |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  42 |   detail: execution to cached                  |     0.054s |          - |   0.027% |                                      
+2026-08-12 11:33:21-05:00  43 |   detail: cached to first node                 |     0.128s |          - |   0.063% |                                      
+2026-08-12 11:33:21-05:00  44 |   detail: graph/prefill activity               |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  45 |   detail: CPU owner: CLIPTextEncode [CLIP]     |     4.900s |          - |   2.419% |                                      
+2026-08-12 11:33:21-05:00  46 |   detail: CPU owner: load_models_gpu [other]   |     0.101s |          - |   0.050% |                                      
+2026-08-12 11:33:21-05:00  47 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  48 |   detail: Node: VAELoader                      |     0.003s |          - |   0.002% |                                      
+2026-08-12 11:33:21-05:00  49 |   detail: Node: ClownOptions_ExtraOptions_Beta |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  50 |   detail: Node: ImpactIfNone                   |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  51 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  52 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  53 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  54 |   detail: Node: PrimitiveStringMultiline       |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  55 |   detail: Node: JoinStrings                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  56 |   detail: Node: CLIPLoader                     |     0.001s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  57 |   detail: Node: CLIPTextEncode                 |     4.900s |          - |   2.419% |                                      
+2026-08-12 11:33:21-05:00  58 |   detail: Node: ConditioningZeroOut            |     0.003s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  59 |   detail: Node: PairConditioningSetProperties  |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  60 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  61 |   detail: Node: SimpleMath+                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  62 |   detail: Node: ImpactSwitch                   |     0.059s |          - |   0.029% |                                      
+2026-08-12 11:33:21-05:00  63 |   detail: Node: UNETLoader                     |     0.004s |          - |   0.002% |                                      
+2026-08-12 11:33:21-05:00  64 |   detail: Node: ModelSamplingAuraFlow          |     0.002s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  65 |   detail: Node: CacheDiT_Model_Optimizer       |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  66 |   detail: Node: PathchSageAttentionKJ          |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  67 |   detail: Node: easy float                     |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  68 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  69 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  70 |   detail: Node: StringToCombo|LP               |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  71 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  72 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  73 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  74 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  75 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  76 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  77 |   detail: Node: EmptyImage                     |     0.005s |          - |   0.002% |                                      
+2026-08-12 11:33:21-05:00  78 |   detail: Node: ImageRotate                    |     0.002s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  79 |   detail: Node: ImpactSwitch                   |     0.040s |          - |   0.020% |                                      
+2026-08-12 11:33:21-05:00  80 |   detail: Node: easy imageSize                 |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  81 |   detail: Node: EmptySD3LatentImage            |     0.001s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  82 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  83 |   detail: Node: LGNoiseInjectionLatent         |     0.001s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  84 |   detail: Node: ClownsharKSampler_Beta         |     0.209s |          - |   0.103% |                                      
+2026-08-12 11:33:21-05:00  85 |   detail: PromptExecutor internal/unattributed |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  86 | First node to CLIP                             |     0.006s |     5.276s |   0.003% | #                                    
+2026-08-12 11:33:21-05:00  87 | CLIP to sampler node                           |     5.022s |    10.297s |   2.479% | #                                    
+2026-08-12 11:33:21-05:00  88 | Sampler graph-join wait                        |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  89 | Sampler node to sampling                       |     0.197s |    10.495s |   0.097% | #                                    
+2026-08-12 11:33:21-05:00  90 |   detail: sampler lane wait                    |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  91 |   detail: sampler node to lane acquired        |     0.001s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  92 |   detail: lane acquired to actual stage        |     0.197s |          - |   0.097% |                                      
+2026-08-12 11:33:21-05:00  93 | Sampling                                       |     5.095s |    15.589s |   2.515% | #                                    
+2026-08-12 11:33:21-05:00  94 | Post-sampling transition                       |     0.526s |    16.116s |   0.260% | #                                    
+2026-08-12 11:33:21-05:00  95 |   detail: Sampling end ? VAE scheduled         |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  96 |   detail: VAE scheduled ? worker/load start    |     0.005s |          - |   0.003% |                                      
+2026-08-12 11:33:21-05:00  97 | VAE                                            |     0.781s |    16.896s |   0.385% | #                                    
+2026-08-12 11:33:21-05:00  98 |   detail: VAE load/H2D                         |     0.562s |          - |   0.277% |                                      
+2026-08-12 11:33:21-05:00  99 |   detail: VAE ready ? consumed                 |     0.000s |          - |   0.000% |                                      
+2026-08-12 11:33:21-05:00  100 |   detail: Consumed ? decode start              |    INVALID |          - |       - |                                      
+2026-08-12 11:33:21-05:00  101 | Output encode / descriptor                     |     0.647s |    17.544s |   0.320% | #                                    
+2026-08-12 11:33:21-05:00  102 |   detail: output encode                        |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  103 |   detail: output commit                        |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  104 |   detail: VAE end ? output encode start        |     0.001s |          - |   0.001% |                                      
+2026-08-12 11:33:21-05:00  105 |   detail: PNG encode                           |     0.630s |          - |   0.311% |                                      
+2026-08-12 11:33:21-05:00  106 |   detail: Descriptor/materialization           |     0.017s |          - |   0.009% |                                      
+2026-08-12 11:33:21-05:00  107 | Remote result handoff                          |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  108 |   detail: Remote result emitted                |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  109 |   detail: Deferred persistence after yield     |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  110 | Remote/local return                            |     2.576s |    20.119s |   1.271% | +                                    
+2026-08-12 11:33:21-05:00  111 |   detail: Local receipt ? caller return        |          - |          - |       - |                                      
+2026-08-12 11:33:21-05:00  112 | Residual (unattributed)                        |   182.465s |   202.584s |  90.069% | =================================    
+2026-08-12 11:33:21-05:00 +-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+2026-08-12 11:33:21-05:00     | ACCOUNTED     |    20.119s |            |   9.931% | .....................................
+2026-08-12 11:33:21-05:00     | RECONCILIATION |   182.465s |            |            | .....................................
+2026-08-12 11:33:21-05:00     | COMMAND -> RESPONSE |   202.584s |            |  100.0% | #####################################
+2026-08-12 11:33:21-05:00     | TOP-LEVEL ACCOUNTED |    20.119s |            |   9.931% | .....................................
+2026-08-12 11:33:21-05:00     | GLOBAL RESIDUAL |   182.465s |            |            | .....................................
+2026-08-12 11:33:21-05:00     | RESIDUAL %     |    90.069% |            |            | .....................................
+2026-08-12 11:33:21-05:00     | RECONCILIATION STATUS | EXCEEDS_TOLERANCE |            |            | .....................................
+2026-08-12 11:33:21-05:00     | CONTROLLABLE APPLICATION WALL |    20.119s |            |            | .....................................
+2026-08-12 11:33:21-05:00     | PLATFORM/MODAL WALL |     0.000s |            |            | .....................................
+2026-08-12 11:33:21-05:00 Boundary flags: modal_restore_begin_unavailable (modal_scheduling covers submission->python_resume combined), submission_boundary_unavailable (submission boundary absent; scheduling spans cannot start at the local submit)
+2026-08-12 11:33:21-05:00 +-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+2026-08-12 11:33:21-05:00 Warnings:
+2026-08-12 11:33:21-05:00   - global residual 182464.877ms (90.07%) of command-to-response unaccounted
+2026-08-12 11:33:21-05:00   - reconciliation exceeds tolerance: 182464.877ms > 506.461ms
+2026-08-12 11:33:32-05:00 [v2.snapshot_manifest] stage=first_restored_line rss_kb=11400836 hwm_kb=None vmsize_kb=18238004 mappings=2714 anon=534 file=2180 native_threads=None py_threads=2 modules=10452 fds=15 children=0 gc_objects=1218064 executors=0 image=im-stGerxYgZllqDfXM2TaTfL cloud=CLOUD_PROVIDER_AWS region=eu-central-1
+2026-08-12 11:33:32-05:00 [v2.startup_stage] stage=post_snapshot_restore event=start wall_unix_ns=1786552412320345678 monotonic_ns=109932313607
+2026-08-12 11:33:32-05:00 [v2.snapshot_timing] snapshot_callback_age_at_restore_ms=56320.671 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=unavailable request_latency_included=0 source=snapshot_callback_return_to_restore_start
+2026-08-12 11:33:32-05:00 [v2.snapshot_model_eviction] stage=restore_observed marker=1 cpu_snapshot_models_present=1 clip_present=1 unet_present=0 retained_role=clip_vae retained_model_id=0 retained_model_type= rss_after_restore_mib=11427.140625 native_thread_count=46 torch_intraop=12 torch_interop=28 wall_unix_ns=1786552412321187565
+2026-08-12 11:33:32-05:00 [v2.snapshot_model_eviction] stage=restore_release_retained retain_role=clip_vae status=container_retained container_present=1 clip_present=1 vae_present=1 unet_present=0 retained_slot_release=0 retained_model_id=0 retained_alive_after_release=0 rss_before_release_mib=absent rss_after_gc_mib=absent rss_after_trim_mib=absent rss_drop_mib=absent malloc_trim_status=absent malloc_trim_result=absent restore_release_start_wall_unix_ns=1786552412321279769 restore_release_end_wall_unix_ns=1786552412321279769 wall_unix_ns=1786552412321279769
+2026-08-12 11:33:32-05:00 [v2.residency_config] enabled=0
+2026-08-12 11:33:32-05:00 [v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=11427.1 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:32-05:00 [v2.runtime_shape] stage=after_restore runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=28 actual_torch_intraop_threads=12 actual_torch_interop_threads=28 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+2026-08-12 11:33:32-05:00 [v2.opt.gpu_state] total_memory_ms=482.852
+2026-08-12 11:33:32-05:00 [comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 485.4ms
+2026-08-12 11:33:33-05:00 [restore.cuda_context] available=1 device_index=0 device=NVIDIA RTX PRO 6000 Blackwell Server Edition sync_ms=433.245 total_ms=433.365
+2026-08-12 11:33:33-05:00 [v2.sage_restore] decision=snapshot_exact_skip discovery_called=0 verify_ms=0.02
+2026-08-12 11:33:34-05:00 [v2.custom_node_restore] decision=snapshot_exact_skip callback_called=0 source=instance check_ms=0.161
+2026-08-12 11:33:34-05:00 [v2.startup_stage] stage=snapshot_execution_seed event=start wall_unix_ns=1786552414177484490 monotonic_ns=111789451023
+2026-08-12 11:33:34-05:00 [v2.seed_restore] source=startup_minimal schema=2 topology_available=0 workflow_hash= loader_signatures=0
+2026-08-12 11:33:34-05:00 [v2.startup_stage] stage=snapshot_execution_seed event=end wall_unix_ns=1786552414179873022 monotonic_ns=111791839576 duration_ms=2.389
+2026-08-12 11:33:34-05:00 [v2.generation_identity] method=restore custom_nodes_generation='667f5c299d7f4b2e54ffaf7c…' raw_empty=false source=instance runtime_state_generation='' api_object_id=47583261332688 deployment_combined_hash=0210e87964498a71
+2026-08-12 11:33:34-05:00 [v2.prefill_config] env=critical parsed=critical cpu_snapshot_container_active=0 native_fast_disk_unet_execution_active=0
+2026-08-12 11:33:34-05:00 [v2.restore_breakdown] bootstrap_ms=1824.841 unet_cache_patch_ms=None clip_prepare_submit_ms=None clip_worker_wait_ms=None unet_spec_extract_ms=None bg_unet_submit_ms=None restore_finalize_ms=0.116
+2026-08-12 11:33:34-05:00 [v2.clip_stages] worker_queue_ms=None load_torch_file_ms=None read_to_ready_ms=None post_read_cpu_prepare_ms=None gpu_wait_ms=None gpu_commit_ms=None read_end_to_ready_ms=None worker_total_ms=None worker_close_wait_ms=None restore_finalization_ms=0.116
+2026-08-12 11:33:34-05:00 [v2.restoration_identity] restored_instance_id=dbb19078fda04c04b5a0271dc5bfa2db restore_session_id=d8588a7b65dd4972af7fbf7dfb0c048c container_session_id=98754b0555f24aa5 modal_task_id=ta-01KZVD41114QRG26Z0TFGFWENR modal_image_id=im-stGerxYgZllqDfXM2TaTfL modal_cloud=CLOUD_PROVIDER_AWS modal_region=eu-central-1 pid=2 hostname=modal restore_total_ms=1859.003 remote_python_resume_wall_unix_ns=1786552407518383104 restore_method_start_wall_unix_ns=1786552407518383104 restore_method_end_wall_unix_ns=1786552414180342016 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success 
+2026-08-12 11:33:34-05:00 [v2.lifecycle] method=restore snap=False container_session=98754b0555f24aa5 restore_count=1 restore_total_ms=1859.003 remote_python_resume_wall_unix_ns=1786552407518383104 restore_method_start_wall_unix_ns=1786552407518383104 restore_method_end_wall_unix_ns=1786552414180342016 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success status=restored
+2026-08-12 11:33:34-05:00 [v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=12973.5 process_maxrss_mib=35821.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+2026-08-12 11:33:34-05:00 [v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.12.0+cu130
+2026-08-12 11:33:34-05:00 [v2.startup_stage] stage=post_snapshot_restore event=end wall_unix_ns=1786552414183316627 monotonic_ns=111795283019 duration_ms=1862.969
+2026-08-12 11:33:46-05:00 [v2.clip_conditioning_cache] event=mode flag=COMFYMODAL_V2_CLIP_CONDITIONING_CACHE enabled=1 root=/root/prompt_cache_vol/exact_conditioning max_entries=64 max_bytes=536870912
+2026-08-12 13:18:20-05:00 Building image im-nlBLNx403DsT48ovij1FIG
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 0: FROM base
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 1: ENV TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 2: ENV TORCHINDUCTOR_FX_GRAPH_CACHE=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 3: ENV TRITON_CACHE_DIR=/tmp/triton_cache
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 4: ENV TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 5: ENV TORCHINDUCTOR_COMPILE_THREADS=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 6: ENV COMFYMODAL_ENABLE_TORCH_COMPILE=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 7: ENV COMFYMODAL_ENABLE_GPU_SNAPSHOT=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 8: ENV COMFYMODAL_WARMUP_TEXT=warmup
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 9: ENV COMFYMODAL_SAGE_RUNTIME_MODE=baked_cuda
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 10: ENV COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 11: ENV COMFYMODAL_PRELOAD_MODE=clip_only
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 12: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_UNET=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 13: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 14: ENV COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 15: ENV COMFYMODAL_EXACT_CLIP_PREFILL=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 16: ENV COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 17: ENV COMFYMODAL_SAFETENSORS_READ_MODE=normal
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 18: ENV COMFYMODAL_RUNTIME=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 19: ENV PROMPT_ASYNC_PRELOAD=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 20: ENV PROMPT_PRELOAD_WORKERS=2
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 21: ENV PROMPT_ASYNC_ACTUAL_LOAD=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 22: ENV PROMPT_ASYNC_ACTUAL_LOAD_UNET=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 23: ENV ACTUAL_LOAD_MODE=unet_vae_only
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 24: ENV DISABLE_CACHEDIT_FOR_Z_IMAGE=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 25: ENV DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 26: ENV COMFYMODAL_REQUIREMENTS_REPAIR_MODE=fail_fast
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 27: ENV COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 28: ENV COMFYMODAL_PRELOAD_MAX_TOTAL_GB=12
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 29: ENV COMFYMODAL_PRELOAD_MAX_FILE_GB=10
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 30: ENV COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS=0.5
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 31: ENV COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS=10
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 32: ENV COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 33: ENV COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 34: ENV COMFYMODAL_RESTORE_BACKGROUND_UNET=0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 35: ENV COMFYMODAL_V2_RUNTIME_REVISION=18e573e5979826ce
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 36: ENV COMFYMODAL_V2_PREFILL_LANES=critical
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 37: ENV COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=1
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 38: ENV COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 39: ENV COMFYMODAL_V2_THREAD_POLICY=TBASE
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 40: ENV COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 41: ENV COMFYMODAL_V2_CPU_REQUEST=12
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 42: ENV COMFYMODAL_V2_MEMORY_REQUEST=32768
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 43: ENV COMFYMODAL_V2_MEMORY_MB=32768
+2026-08-12 13:18:21-05:00 
+2026-08-12 13:18:21-05:00 => Step 44: ENV COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT=f504e296c398bdcb2c4c07e2
+2026-08-12 13:18:21-05:00 Saving image...
+2026-08-12 13:18:25-05:00 Image saved, took 3.87s
+2026-08-12 13:18:25-05:00 
+2026-08-12 13:18:25-05:00 Built image im-nlBLNx403DsT48ovij1FIG in 4.79s
+2026-08-12 13:18:25-05:00 
+2026-08-12 13:18:25-05:00 
+2026-08-12 13:19:53-05:00 Building image im-AS3LJmbOjlSTAIkk0anCLu
+2026-08-12 13:20:00-05:00 
+2026-08-12 13:20:00-05:00 => Step 0: FROM base
+2026-08-12 13:20:00-05:00 
+2026-08-12 13:20:00-05:00 => Step 1: COPY . /
+2026-08-12 13:20:02-05:00 Saving image...
+2026-08-12 13:20:05-05:00 Image saved, took 3.28s
+2026-08-12 13:20:05-05:00 
+2026-08-12 13:20:05-05:00 Built image im-AS3LJmbOjlSTAIkk0anCLu in 11.93s
+2026-08-12 13:20:05-05:00 
+2026-08-12 13:20:05-05:00 
+2026-08-12 13:20:07-05:00 Building image im-UQO6MLdtepi0in1C6hVpKu
+2026-08-12 13:20:08-05:00 
+2026-08-12 13:20:08-05:00 => Step 0: FROM base
+2026-08-12 13:20:08-05:00 
+2026-08-12 13:20:08-05:00 => Step 1: COPY . /
+2026-08-12 13:20:09-05:00 Saving image...
+2026-08-12 13:20:12-05:00 Image saved, took 2.51s
+2026-08-12 13:20:12-05:00 
+2026-08-12 13:20:12-05:00 Built image im-UQO6MLdtepi0in1C6hVpKu in 4.03s
+2026-08-12 13:20:12-05:00 
+2026-08-12 13:20:12-05:00 
+2026-08-12 14:47:51-05:00 Building image im-61QGQtkXL8t7TCh6Vfn44V
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 0: FROM base
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 1: ENV TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 2: ENV TORCHINDUCTOR_FX_GRAPH_CACHE=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 3: ENV TRITON_CACHE_DIR=/tmp/triton_cache
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 4: ENV TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 5: ENV TORCHINDUCTOR_COMPILE_THREADS=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 6: ENV COMFYMODAL_ENABLE_TORCH_COMPILE=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 7: ENV COMFYMODAL_ENABLE_GPU_SNAPSHOT=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 8: ENV COMFYMODAL_WARMUP_TEXT=warmup
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 9: ENV COMFYMODAL_SAGE_RUNTIME_MODE=baked_cuda
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 10: ENV COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 11: ENV COMFYMODAL_PRELOAD_MODE=clip_only
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 12: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_UNET=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 13: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 14: ENV COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 15: ENV COMFYMODAL_EXACT_CLIP_PREFILL=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 16: ENV COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 17: ENV COMFYMODAL_SAFETENSORS_READ_MODE=normal
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 18: ENV COMFYMODAL_RUNTIME=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 19: ENV PROMPT_ASYNC_PRELOAD=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 20: ENV PROMPT_PRELOAD_WORKERS=2
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 21: ENV PROMPT_ASYNC_ACTUAL_LOAD=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 22: ENV PROMPT_ASYNC_ACTUAL_LOAD_UNET=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 23: ENV ACTUAL_LOAD_MODE=unet_vae_only
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 24: ENV DISABLE_CACHEDIT_FOR_Z_IMAGE=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 25: ENV DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 26: ENV COMFYMODAL_REQUIREMENTS_REPAIR_MODE=fail_fast
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 27: ENV COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 28: ENV COMFYMODAL_PRELOAD_MAX_TOTAL_GB=12
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 29: ENV COMFYMODAL_PRELOAD_MAX_FILE_GB=10
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 30: ENV COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS=0.5
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 31: ENV COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS=10
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 32: ENV COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 33: ENV COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 34: ENV COMFYMODAL_RESTORE_BACKGROUND_UNET=0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 35: ENV COMFYMODAL_V2_RUNTIME_REVISION=a00fa0fe6468e253
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 36: ENV COMFYMODAL_V2_PREFILL_LANES=critical
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 37: ENV COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=1
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 38: ENV COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 39: ENV COMFYMODAL_V2_THREAD_POLICY=TBASE
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 40: ENV COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 41: ENV COMFYMODAL_V2_CPU_REQUEST=12
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 42: ENV COMFYMODAL_V2_MEMORY_REQUEST=32768
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 43: ENV COMFYMODAL_V2_MEMORY_MB=32768
+2026-08-12 14:47:52-05:00 
+2026-08-12 14:47:52-05:00 => Step 44: ENV COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT=f504e296c398bdcb2c4c07e2
+2026-08-12 14:47:53-05:00 Saving image...
+2026-08-12 14:48:00-05:00 Image saved, took 7.02s
+2026-08-12 14:48:00-05:00 
+2026-08-12 14:48:00-05:00 Built image im-61QGQtkXL8t7TCh6Vfn44V in 9.06s
+2026-08-12 14:48:00-05:00 
+2026-08-12 14:48:00-05:00 
+2026-08-12 14:48:32-05:00 Building image im-8yY4YjFo1qBDkTNRN6qXc3
+2026-08-12 14:48:37-05:00 
+2026-08-12 14:48:37-05:00 => Step 0: FROM base
+2026-08-12 14:48:37-05:00 
+2026-08-12 14:48:37-05:00 => Step 1: COPY . /
+2026-08-12 14:48:38-05:00 Saving image...
+2026-08-12 14:48:41-05:00 Image saved, took 2.83s
+2026-08-12 14:48:41-05:00 
+2026-08-12 14:48:41-05:00 Built image im-8yY4YjFo1qBDkTNRN6qXc3 in 9.03s
+2026-08-12 14:48:41-05:00 
+2026-08-12 14:48:41-05:00 
+2026-08-12 14:48:43-05:00 Building image im-rnVdUO2VCIiM1cObxMxqxn
+2026-08-12 14:48:44-05:00 
+2026-08-12 14:48:44-05:00 => Step 0: FROM base
+2026-08-12 14:48:44-05:00 
+2026-08-12 14:48:44-05:00 => Step 1: COPY . /
+2026-08-12 14:48:44-05:00 Saving image...
+2026-08-12 14:48:48-05:00 Image saved, took 3.16s
+2026-08-12 14:48:48-05:00 
+2026-08-12 14:48:48-05:00 Built image im-rnVdUO2VCIiM1cObxMxqxn in 4.66s
+2026-08-12 14:48:48-05:00 
+2026-08-12 14:48:48-05:00 

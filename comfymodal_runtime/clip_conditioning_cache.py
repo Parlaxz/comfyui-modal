@@ -34,10 +34,25 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping as ABCMapping
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .env import env_flag
+
+# ── Experiment 5 (conditioning_hit) accessors — fail-open when the
+#    v2_experiments registry is absent so the cache never breaks imports. ──
+try:
+    from .v2_experiments import (
+        conditioning_async_lru_enabled as _conditioning_async_lru_enabled,
+        experiment_line as _v2_experiment_line,
+        resolve_experiment as _v2_resolve_experiment,
+    )
+except Exception:
+    _conditioning_async_lru_enabled = lambda: False  # type: ignore
+    _v2_experiment_line = lambda _s: ""  # type: ignore
+    _v2_resolve_experiment = lambda _n: None  # type: ignore
 
 # ── Env surface (opt-in; all defaults preserve current behavior) ────────
 ENV_ENABLED = "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE"
@@ -45,6 +60,15 @@ ENV_ENABLED_LEGACY = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE"
 ENV_ROOT = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_ROOT"
 ENV_MAX_ENTRIES = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_ENTRIES"
 ENV_MAX_BYTES = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_BYTES"
+# Throttle interval (seconds) for the persistence WORKER's reload-before-
+# batch, the ONLY Volume reload in the cache.  The lookup path performs zero
+# Volume RPCs.  <=0 means "reload at most once per process".
+ENV_RELOAD_INTERVAL_S = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_RELOAD_INTERVAL_S"
+# Bound on the background persistence queue (entries awaiting a batch write).
+ENV_MAX_QUEUE = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_QUEUE"
+# Bound on the background LRU-touch queue (touched digests awaiting a
+# coalesced manifest rewrite) — Experiment 5 async_lru arm.
+ENV_MAX_LRU_QUEUE = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_LRU_QUEUE"
 
 SCHEMA_VERSION = 1
 FORMAT_VERSION = 1
@@ -53,6 +77,8 @@ FORMAT_NAME = "comfymodal_exact_clip_conditioning"
 _DEFAULT_ROOT = "/root/prompt_cache_vol/exact_conditioning"
 _DEFAULT_MAX_ENTRIES = 64
 _DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+_DEFAULT_RELOAD_INTERVAL_S = 15.0
+_DEFAULT_MAX_QUEUE = 256
 
 # Key components that must be non-empty for the cache to be usable.  When
 # any of these is unavailable from request metadata the lookup/store fails
@@ -77,6 +103,87 @@ _KEY_VALIDATION_SCOPE = (
 _LOG_EMITTED = False
 _LOG_LOCK = threading.Lock()
 _LAST_SERIALIZE_ERROR = ""
+
+# Experiment 5 (conditioning_hit async_lru) one-time per-process logs.
+_LRU_EXPERIMENT_LOGGED = False
+_LRU_SYNC_FALLBACK_LOGGED = False
+
+
+def _lru_experiment_log_once() -> None:
+    """Print the canonical ``[v2.experiment]`` line once per process when the
+    async_lru arm is first exercised.  Never raises."""
+    global _LRU_EXPERIMENT_LOGGED
+    with _LOG_LOCK:
+        if _LRU_EXPERIMENT_LOGGED:
+            return
+        _LRU_EXPERIMENT_LOGGED = True
+    try:
+        _sel = _v2_resolve_experiment("conditioning_hit")  # type: ignore[arg-type]
+        print(_v2_experiment_line(_sel), flush=True)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+
+def _lru_sync_fallback_log_once() -> None:
+    """Log once per process when the LRU worker could not be started and a
+    touch fell back to the synchronous manifest rewrite.  Never raises."""
+    global _LRU_SYNC_FALLBACK_LOGGED
+    with _LOG_LOCK:
+        if _LRU_SYNC_FALLBACK_LOGGED:
+            return
+        _LRU_SYNC_FALLBACK_LOGGED = True
+    try:
+        print(
+            "[cache.lru] worker_start_failed falling_back_to_sync_touch",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+try:  # measurement-only diagnostics must never break the cache path
+    from .optimization_diagnostics import opt_diag_enabled
+except Exception:  # pragma: no cover - diagnostics absent => off
+    opt_diag_enabled = lambda: False
+
+_OPT_DIAG = opt_diag_enabled()
+"""Frozen measurement-only gate (off by default)."""
+
+_OPT_LAST_LOOKUP_DIAG_MAX = 8
+_OPT_LAST_LOOKUP_DIAG: dict[str, dict[str, Any]] = {}
+_OPT_LAST_LOOKUP_DIAG_LOCK = threading.Lock()
+_OPT_LOOKUP_DIAG_SEQ = 0
+
+
+def _opt_store_last_lookup_diag(diag: Mapping[str, Any], request_id: Any) -> None:
+    """Bounded store of the most recent measurement-only lookup diag.
+
+    Keyed by request id + a monotonic sequence counter; the oldest entry
+    is evicted beyond ``_OPT_LAST_LOOKUP_DIAG_MAX``.  No-op when
+    diagnostics are off (the dict then stays empty).
+    """
+    if not _OPT_DIAG:
+        return
+    global _OPT_LOOKUP_DIAG_SEQ
+    with _OPT_LAST_LOOKUP_DIAG_LOCK:
+        _OPT_LOOKUP_DIAG_SEQ += 1
+        _key = f"{_s(request_id)}:{_OPT_LOOKUP_DIAG_SEQ}"
+        _OPT_LAST_LOOKUP_DIAG[_key] = dict(diag)
+        while len(_OPT_LAST_LOOKUP_DIAG) > _OPT_LAST_LOOKUP_DIAG_MAX:
+            _OPT_LAST_LOOKUP_DIAG.pop(next(iter(_OPT_LAST_LOOKUP_DIAG)))
+
+
+def opt_last_lookup_diag() -> dict[str, Any] | None:
+    """Return the most recent measurement-only lookup diag, else ``None``.
+
+    Intended for tests / orchestrator trace attachment; never affects
+    cache behavior.  Always ``None`` when diagnostics are off.
+    """
+    if not _OPT_DIAG:
+        return None
+    with _OPT_LAST_LOOKUP_DIAG_LOCK:
+        if not _OPT_LAST_LOOKUP_DIAG:
+            return None
+        return dict(next(reversed(list(_OPT_LAST_LOOKUP_DIAG.values()))))
 
 
 def _log_once(flag_name: str, **kv: Any) -> None:
@@ -328,17 +435,32 @@ def _tensor_to_bytes(tensor: Any) -> tuple[bytes, str, list[int]]:
     return raw, _tensor_dtype_to_str(t.dtype), list(t.shape)
 
 
-def _bytes_to_tensor(raw: bytes, dtype_str: str, shape: list[int]) -> Any:
+def _bytes_to_tensor(
+    raw: bytes,
+    dtype_str: str,
+    shape: list[int],
+    *,
+    _diag: dict[str, Any] | None = None,
+) -> Any:
     import numpy as _np
     import torch as _th
 
+    _rb_start = 0
+    if _diag is not None:
+        _rb_start = time.monotonic_ns()
     dtype = _torch_dtype_for(dtype_str)
     if dtype == _th.bfloat16:
         arr = _np.frombuffer(raw, dtype=_np.int16).reshape(list(shape))
-        return _th.from_numpy(arr.copy()).contiguous().view(_th.bfloat16)
-    np_dtype = _numpy_dtype_for(dtype)
-    arr = _np.frombuffer(raw, dtype=np_dtype).reshape(list(shape))
-    return _th.from_numpy(arr.copy()).contiguous()
+        result = _th.from_numpy(arr.copy()).contiguous().view(_th.bfloat16)
+    else:
+        np_dtype = _numpy_dtype_for(dtype)
+        arr = _np.frombuffer(raw, dtype=np_dtype).reshape(list(shape))
+        result = _th.from_numpy(arr.copy()).contiguous()
+    if _diag is not None:
+        _diag["deser_tensor_rebuild_ms"] = _diag.get("deser_tensor_rebuild_ms", 0.0) + round(
+            (time.monotonic_ns() - _rb_start) / 1_000_000, 3
+        )
+    return result
 
 
 def _serialize_tensor_descriptor(
@@ -459,7 +581,12 @@ def serialize_conditioning(
         return None
 
 
-def _deserialize_tensor_descriptor(desc: Mapping[str, Any], data: bytes) -> Any:
+def _deserialize_tensor_descriptor(
+    desc: Mapping[str, Any],
+    data: bytes,
+    *,
+    _diag: dict[str, Any] | None = None,
+) -> Any:
     if not isinstance(desc, Mapping):
         return None
     try:
@@ -479,21 +606,41 @@ def _deserialize_tensor_descriptor(desc: Mapping[str, Any], data: bytes) -> Any:
     raw = data[offset:offset + byte_length]
     if len(raw) != byte_length:
         return None
+    _sha_start = 0
+    if _diag is not None:
+        _sha_start = time.monotonic_ns()
     if checksum and hashlib.sha256(raw).hexdigest() != checksum:
         return None
+    if _diag is not None:
+        _diag["deser_tensor_sha_ms"] = _diag.get("deser_tensor_sha_ms", 0.0) + round(
+            (time.monotonic_ns() - _sha_start) / 1_000_000, 3
+        )
     try:
-        tensor = _bytes_to_tensor(raw, dtype, shape)
+        tensor = _bytes_to_tensor(raw, dtype, shape, _diag=_diag)
     except Exception:
         return None
     if str(tensor.dtype) != dtype:
         return None
     if list(tensor.shape) != shape:
         return None
+    if _diag is not None:
+        _diag["deser_tensor_count"] = _diag.get("deser_tensor_count", 0) + 1
+        _diag["deser_tensors_bytes"] = _diag.get("deser_tensors_bytes", 0) + byte_length
     return tensor
 
 
-def deserialize_conditioning(header: Mapping[str, Any], data: bytes) -> Any:
-    """Rebuild a conditioning value from the header + data blob, or None."""
+def deserialize_conditioning(
+    header: Mapping[str, Any],
+    data: bytes,
+    *,
+    _diag: dict[str, Any] | None = None,
+) -> Any:
+    """Rebuild a conditioning value from the header + data blob, or None.
+
+    ``_diag`` is measurement-only: when provided, brackets the payload
+    checksum and the per-entry result assembly.  Default ``None`` keeps
+    behavior byte-for-byte identical.
+    """
     try:
         if not isinstance(header, Mapping):
             return None
@@ -506,17 +653,27 @@ def deserialize_conditioning(header: Mapping[str, Any], data: bytes) -> Any:
         if int(header.get("byte_length", -1)) != len(data):
             return None
         payload_checksum = str(header.get("payload_checksum", ""))
+        _pk_start = 0
+        if _diag is not None:
+            _pk_start = time.monotonic_ns()
         if payload_checksum and hashlib.sha256(data).hexdigest() != payload_checksum:
             return None
+        if _diag is not None:
+            _diag["deser_payload_sha_ms"] = _diag.get("deser_payload_sha_ms", 0.0) + round(
+                (time.monotonic_ns() - _pk_start) / 1_000_000, 3
+            )
         cond = header.get("conditioning") or {}
         entries = cond.get("entries") or []
         if not isinstance(entries, list) or not entries:
             return None
+        _mat_start = 0
+        if _diag is not None:
+            _mat_start = time.monotonic_ns()
         result = []
         for e in entries:
             if not isinstance(e, Mapping):
                 return None
-            cond_tensor = _deserialize_tensor_descriptor(e.get("cond"), data)
+            cond_tensor = _deserialize_tensor_descriptor(e.get("cond"), data, _diag=_diag)
             if cond_tensor is None:
                 return None
             meta_dict: dict[str, Any] = {}
@@ -525,7 +682,7 @@ def deserialize_conditioning(header: Mapping[str, Any], data: bytes) -> Any:
                     return None
                 key = str(mv.get("key", ""))
                 if mv.get("kind") == "tensor":
-                    mt = _deserialize_tensor_descriptor(mv, data)
+                    mt = _deserialize_tensor_descriptor(mv, data, _diag=_diag)
                     if mt is None:
                         return None
                     meta_dict[key] = mt
@@ -534,6 +691,10 @@ def deserialize_conditioning(header: Mapping[str, Any], data: bytes) -> Any:
                 else:
                     return None
             result.append([cond_tensor, meta_dict])
+        if _diag is not None:
+            _diag["deser_materialize_ms"] = _diag.get("deser_materialize_ms", 0.0) + round(
+                (time.monotonic_ns() - _mat_start) / 1_000_000, 3
+            )
         if header.get("result_container") == "tuple":
             return (result,)
         if header.get("result_container") != "list":
@@ -594,10 +755,56 @@ def _atomic_write_text(path: str, text: str, _diag: dict[str, Any] | None = None
     _atomic_write(path, text.encode("utf-8"), _diag=_diag)
 
 
+@dataclass
+class _PendingEntry:
+    """Immutable queued payload handed from the foreground to the persistence
+    thread.  ``data`` is materialized bytes, ``header`` and ``components``
+    are plain dicts — nothing references live tensors, so crossing threads is
+    safe."""
+
+    components: dict[str, Any]
+    header: dict[str, Any]
+    data: bytes
+    enqueue_mono_ns: float = 0.0
+
+
+def _detect_mounted(root: str) -> bool:
+    """Auto-detect whether *root* (or an ancestor) lives on a mounted volume.
+
+    Walks up from the cache root; the first ``os.path.ismount()`` hit wins.
+    In local-only / unmounted mode this returns False so the persistence
+    thread issues ZERO reload/commit RPCs.
+    """
+    path = root
+    while True:
+        try:
+            if os.path.ismount(path):
+                return True
+        except OSError:
+            return False
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 class ExactConditioningCache:
     """File-backed bounded LRU for exact CLIP conditioning entries."""
 
-    def __init__(self, root_dir: str, max_entries: int, max_bytes: int) -> None:
+    def __init__(
+        self,
+        root_dir: str,
+        max_entries: int,
+        max_bytes: int,
+        mounted: bool | None = None,
+    ) -> None:
         self._root = root_dir
         self._max_entries = max(1, int(max_entries))
         self._max_bytes = max(1, int(max_bytes))
@@ -605,8 +812,76 @@ class ExactConditioningCache:
         self._manifest_path = os.path.join(self._root, "manifest.json")
         self._lock = threading.RLock()
         self._commit_hook: Any = None
+        self._reload_hook: Any = None
         self._last_store_reason = ""
-        self._diag = threading.local()
+        # True when the cache root lives on a mounted volume (or an ancestor
+        # does).  When False the persistence thread skips commit/reload
+        # entirely (local-only mode → ZERO Volume RPCs).
+        if mounted is None:
+            mounted = _detect_mounted(self._root)
+        self._mounted = bool(mounted)
+        # Throttled reload state (Stage 2).
+        self._reload_interval_s = _env_float(ENV_RELOAD_INTERVAL_S, _DEFAULT_RELOAD_INTERVAL_S)
+        self._last_reload_mono: float | None = None
+        self._reload_once_done = False
+        # Background persistence queue + worker (Stages 1/3).
+        self._queue_cond = threading.Condition(self._lock)
+        self._pending: deque[_PendingEntry] = deque()
+        self._pending_keys: set[str] = set()
+        self._max_queue = max(1, int(_env_int(ENV_MAX_QUEUE, _DEFAULT_MAX_QUEUE)))
+        self._closing = False
+        self._worker: threading.Thread | None = None
+        self._worker_broken = False
+        self._worker_exited = False
+        self._dirty_since_commit = False
+        # Experiment 5 (conditioning_hit async_lru): bounded background LRU-
+        # touch queue + worker.  LRU state is PURE eviction/recency metadata —
+        # ``_lookup_entry`` never reads ``last_access_seq`` and only
+        # ``_enforce_bounds`` consumes it — so a dropped/queued touch can
+        # never change a hit/miss outcome.  Default arm (sync_lru) never
+        # touches any of this state.
+        self._pending_lru: set[str] = set()
+        self._lru_cond = threading.Condition(self._lock)
+        self._lru_worker: threading.Thread | None = None
+        self._lru_closing = False
+        self._max_lru_queue = max(
+            16, min(65536, _env_int(ENV_MAX_LRU_QUEUE, 1024))
+        )
+        self._lru_diag: dict[str, Any] = {
+            "lru_async_enqueued": 0,
+            "lru_async_batches": 0,
+            "lru_async_batch_size": 0,
+            "lru_async_persist_ms": 0.0,
+            "lru_async_dropped": 0,
+            "lru_async_failed": 0,
+            "lru_async_flush_count": 0,
+        }
+        # Shared thread-safe diagnostics (replaces the old threading.local()).
+        self._diag_lock = threading.Lock()
+        self._lookup_diag: dict[str, Any] | None = None
+        self._store_diag: dict[str, Any] | None = None
+        self._worker_diag: dict[str, Any] = {
+            "enqueued": 0,
+            "persisted": 0,
+            "persist_failed": 0,
+            "commit_failed": 0,
+            "queue_depth": 0,
+            "queue_deduped": 0,
+            "queue_full_dropped": 0,
+            "batch_size": 0,
+            "batch_count": 0,
+            "persistence_queue_wait_ms": 0.0,
+            "file_write_ms": 0.0,
+            "manifest_ms": 0.0,
+            "reload_ms": 0.0,
+            "commit_ms": 0.0,
+            "lock_wait_ms": 0.0,
+            "unindexed_files_removed": 0,
+            "last_flush_ms": 0.0,
+            "last_flush_status": "",
+            "flush_count": 0,
+            "fallback_sync_stores": 0,
+        }
         os.makedirs(self._entries_dir, exist_ok=True)
 
     # ── Commit hook (registered by the Modal prompt-cache volume owner) ──
@@ -614,14 +889,60 @@ class ExactConditioningCache:
         with self._lock:
             self._commit_hook = hook
 
-    def _commit(self) -> None:
+    # ── Reload hook (test seam; production leaves it None) ──────────────
+    def set_reload_hook(self, hook: Any) -> None:
+        with self._lock:
+            self._reload_hook = hook
+
+    def _commit(self) -> bool:
+        """Run the registered commit hook.  Returns True when there is
+        nothing to commit or the commit succeeded; False on hook failure.
+        Never raises.  In local-only/unmounted mode this is a no-op (ZERO
+        Volume RPCs) even when a hook is registered."""
+        if not self._mounted:
+            return True
         hook = self._commit_hook
         if hook is None:
-            return
+            return True
         try:
             hook()
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            _log_decision("persist_commit_error", reason=f"{type(exc).__name__}:{exc}"[:120])
+            return False
+
+    def _maybe_reload(self) -> None:
+        """Throttled Modal volume reload (called under ``self._lock``).
+
+        Skips entirely in local-only/unmounted mode and when no Modal volume
+        is in play (no reload/commit hook registered).  Otherwise reloads at
+        most once per ``_reload_interval_s`` (or once per process when the
+        interval is <= 0).  Any failure fails closed to a miss.
+        """
+        if not self._mounted:
+            return
+        if self._reload_hook is None and self._commit_hook is None:
+            return
+        now = time.monotonic()
+        if self._reload_interval_s <= 0:
+            if self._reload_once_done:
+                return
+            self._reload_once_done = True
+        elif self._last_reload_mono is not None:
+            if now - self._last_reload_mono < self._reload_interval_s:
+                return
+        _rl_start = time.monotonic_ns()
+        try:
+            if self._reload_hook is not None:
+                self._reload_hook()
+            else:
+                self._reload_volume()
+        finally:
+            self._last_reload_mono = time.monotonic()
+            self._accumulate_worker(
+                "reload_ms",
+                round((time.monotonic_ns() - _rl_start) / 1_000_000, 3),
+            )
 
     # ── Manifest ────────────────────────────────────────────────────────
     def _read_manifest(self, _diag: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -729,6 +1050,7 @@ class ExactConditioningCache:
             "header_bytes_read": 0,
             "data_bytes_read": 0,
             "lru_touch_ms": 0.0,
+            "lru_touch_mode": "sync",
             "entries_requested": len(entries),
             "hit_count": 0,
             "miss_count": 0,
@@ -738,7 +1060,7 @@ class ExactConditioningCache:
         _t0 = time.monotonic_ns()
         if not entries:
             diag["total_ms"] = 0.0
-            self._diag.lookup = diag
+            self._set_lookup_diag(diag)
             return hits, misses, 0, 0
         try:
             _kb_start = time.monotonic_ns()
@@ -749,9 +1071,11 @@ class ExactConditioningCache:
                 self._lock.acquire()
                 diag["lock_wait_ms"] = round((time.monotonic_ns() - _lw_start) / 1_000_000, 3)
                 try:
-                    _vr_start = time.monotonic_ns()
-                    self._reload_volume()
-                    diag["volume_reload_ms"] = round((time.monotonic_ns() - _vr_start) / 1_000_000, 3)
+                    # NOTE: the lookup path performs ZERO Volume RPCs.  The
+                    # only reload is the worker's throttled reload-before-
+                    # batch inside _persist_batch(), which runs off the
+                    # foreground path.  ``volume_reload_ms`` stays ~0.0 so
+                    # downstream consumers keep reading the key.
                     _mr_start = time.monotonic_ns()
                     manifest = self._read_manifest(_diag=diag)
                     diag["manifest_read_ms"] = round((time.monotonic_ns() - _mr_start) / 1_000_000, 3)
@@ -790,6 +1114,12 @@ class ExactConditioningCache:
                         _lt_start = time.monotonic_ns()
                         self._persist_lru_touch(manifest_entries, touched_digests)
                         diag["lru_touch_ms"] = round((time.monotonic_ns() - _lt_start) / 1_000_000, 3)
+                        # In async mode ``lru_touch_ms`` measures ONLY the
+                        # bounded enqueue cost; the coalesced manifest rewrite
+                        # happens on the background LRU worker.
+                        diag["lru_touch_mode"] = (
+                            "async" if _conditioning_async_lru_enabled() else "sync"
+                        )
                 finally:
                     self._lock.release()
             else:
@@ -816,7 +1146,16 @@ class ExactConditioningCache:
         )
         diag["measured_children_ms"] = round(_children, 3)
         diag["residual_ms"] = round(diag["total_ms"] - _children, 3)
-        self._diag.lookup = diag
+        if _OPT_DIAG and hits:
+            _hit_read_bytes = diag["data_bytes_read"] + diag["header_bytes_read"]
+            diag["hit_read_bytes"] = _hit_read_bytes
+            _total_s = diag["total_ms"] / 1000.0
+            diag["hit_read_mbps"] = (
+                round(_hit_read_bytes / 1e6 / _total_s, 3) if _total_s > 0 else None
+            )
+            diag["cold_vs_warm_hint"] = "unknown"
+            _opt_store_last_lookup_diag(diag, base_ctx.get("request_id"))
+        self._set_lookup_diag(diag)
         return hits, misses, len(hits), len(misses)
 
     def _lookup_entry(
@@ -833,15 +1172,32 @@ class ExactConditioningCache:
         try:
             if not os.path.isfile(header_path) or not os.path.isfile(data_path):
                 return None
+            _hdr_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _hdr_start = time.monotonic_ns()
             with open(header_path, "r", encoding="utf-8") as f:
                 header_text = f.read()
             if _diag is not None:
                 _diag["header_bytes_read"] = _diag.get("header_bytes_read", 0) + len(
                     header_text.encode("utf-8")
                 )
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_header_open_read_ms"] = _diag.get(
+                    "entry_header_open_read_ms", 0.0
+                ) + round((time.monotonic_ns() - _hdr_start) / 1_000_000, 3)
+            _hp_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _hp_start = time.monotonic_ns()
             header = json.loads(header_text)
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_header_parse_ms"] = _diag.get(
+                    "entry_header_parse_ms", 0.0
+                ) + round((time.monotonic_ns() - _hp_start) / 1_000_000, 3)
             if not isinstance(header, Mapping):
                 return None
+            _hv_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _hv_start = time.monotonic_ns()
             if header.get("format") != FORMAT_NAME:
                 return None
             if header.get("schema_version") != SCHEMA_VERSION:
@@ -856,25 +1212,47 @@ class ExactConditioningCache:
                 return None
             if header.get("model_identity") != _model_identity_block(components):
                 return None
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_header_validate_ms"] = _diag.get(
+                    "entry_header_validate_ms", 0.0
+                ) + round((time.monotonic_ns() - _hv_start) / 1_000_000, 3)
+            _d_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _d_start = time.monotonic_ns()
             with open(data_path, "rb") as f:
                 data = f.read()
             if _diag is not None:
                 _diag["data_bytes_read"] = _diag.get("data_bytes_read", 0) + len(data)
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_data_open_read_ms"] = _diag.get(
+                    "entry_data_open_read_ms", 0.0
+                ) + round((time.monotonic_ns() - _d_start) / 1_000_000, 3)
+                _diag["entry_data_bytes"] = len(data)
             if int(manifest_entries[digest].get("byte_length", -1)) != len(data):
                 return None
-            value = deserialize_conditioning(header, data)
+            _de_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _de_start = time.monotonic_ns()
+            value = deserialize_conditioning(
+                header, data, _diag=_diag if _OPT_DIAG else None
+            )
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_deserialize_ms"] = _diag.get(
+                    "entry_deserialize_ms", 0.0
+                ) + round((time.monotonic_ns() - _de_start) / 1_000_000, 3)
             if value is None:
                 return None
             return value
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    def _persist_lru_touch(
-        self,
-        manifest_entries: Mapping[str, Any],
-        touched_digests: set[str],
-    ) -> None:
-        """Rewrite the manifest with bumped access sequence numbers."""
+    def _persist_lru_touch_sync(self, touched_digests: set[str]) -> None:
+        """Rewrite the manifest with bumped access sequence numbers (A path).
+
+        Runs on the foreground request thread under ``self._lock``.  LRU
+        state is eviction/recency metadata only — a failure here must never
+        change a hit/miss outcome, so it is swallowed.
+        """
         try:
             with self._lock:
                 manifest = self._read_manifest()
@@ -891,6 +1269,144 @@ class ExactConditioningCache:
                 self._write_manifest_atomic(manifest)
         except Exception:
             pass
+
+    def _persist_lru_touch(
+        self,
+        manifest_entries: Mapping[str, Any],
+        touched_digests: set[str],
+    ) -> None:
+        """Rewrite the manifest with bumped access sequence numbers.
+
+        Experiment 5 (conditioning_hit): when the async_lru arm is active the
+        touch is enqueued into the bounded background LRU queue instead of a
+        synchronous re-read + 2-fsync atomic rewrite on the foreground request
+        thread.  The sync path (A) stays byte-for-byte when the flag is off.
+        LRU metadata is PURE eviction/recency state — hits never depend on it
+        (``_lookup_entry`` never reads ``last_access_seq``), so queueing the
+        touch is always correct.
+        """
+        if _conditioning_async_lru_enabled():
+            self._enqueue_lru_touch(touched_digests)
+            return
+        self._persist_lru_touch_sync(touched_digests)
+
+    def _enqueue_lru_touch(self, touched_digests) -> None:
+        """Boundedly enqueue one touch for the background LRU worker.
+
+        Caller may hold ``self._lock`` (RLock).  Duplicates are merged; the
+        queue is bounded by ``_max_lru_queue`` (drops beyond it are counted,
+        never raised).  If the worker cannot be started the digests drain
+        back into a synchronous touch so recency is not lost.
+        """
+        _lru_experiment_log_once()
+        _fallback: set[str] = set()
+        with self._lock:
+            if self._lru_closing:
+                return
+            added = 0
+            for d in touched_digests:
+                if d not in self._pending_lru:
+                    if len(self._pending_lru) >= self._max_lru_queue:
+                        self._lru_diag["lru_async_dropped"] += 1
+                        continue
+                    self._pending_lru.add(d)
+                    added += 1
+            if added:
+                self._lru_diag["lru_async_enqueued"] += added
+                self._lru_cond.notify()
+            self._ensure_lru_worker()
+            if self._lru_worker is None or not self._lru_worker.is_alive():
+                # Worker could not be started in this environment — drain the
+                # queue back into the synchronous touch (mirrors the store
+                # path's ``need_sync`` fallback).
+                _fallback = set(self._pending_lru)
+                self._pending_lru.clear()
+        if _fallback:
+            _lru_sync_fallback_log_once()
+            self._persist_lru_touch_sync(_fallback)
+
+    def _ensure_lru_worker(self) -> None:
+        """Lazily start (or respawn) the background LRU-touch thread.
+
+        Caller must hold ``self._lock`` (via ``self._lru_cond``).  Double-start
+        is impossible: the alive-check and the assignment both happen under the
+        RLock.  On start failure the caller falls back to the synchronous
+        touch for that call (counted + logged once).
+        """
+        if self._lru_closing:
+            return
+        if self._lru_worker is not None and self._lru_worker.is_alive():
+            return
+        try:
+            worker = threading.Thread(
+                target=self._lru_loop,
+                name="comfymodal-exact-conditioning-lru",
+                daemon=False,
+            )
+            worker.start()
+            self._lru_worker = worker
+        except Exception:
+            self._lru_diag["lru_async_failed"] += 1
+
+    def _lru_loop(self) -> None:
+        """Background LRU-touch loop.  Never lets an exception escape."""
+        try:
+            while True:
+                with self._lru_cond:
+                    while not self._pending_lru and not self._lru_closing:
+                        self._lru_cond.wait(timeout=0.5)
+                    if not self._pending_lru and self._lru_closing:
+                        break
+                    batch = set(self._pending_lru)
+                    self._pending_lru.clear()
+                if batch:
+                    self._persist_lru_batch(batch)
+        except Exception as exc:
+            with self._lru_cond:
+                self._lru_diag["lru_async_failed"] += 1
+            try:
+                print(f"[cache.lru] async touch failed: {type(exc).__name__}: {exc}"[:160], flush=True)
+            except Exception:
+                pass
+
+    def _persist_lru_batch(self, batch: set[str]) -> None:
+        """One coalesced manifest rewrite bumping recency for *batch*.
+
+        Same mutation as ``_persist_lru_touch_sync`` (read once, bump
+        ``next_seq``/``last_access_seq``, atomic rewrite) but run off the
+        foreground thread.  ``self._lock`` (RLock) makes the read-modify-
+        write atomic.  Never raises; a failure only costs eviction-order
+        recency, never cache correctness.
+        """
+        _start = time.monotonic_ns()
+        try:
+            with self._lock:
+                manifest = self._read_manifest()
+                next_seq = int(manifest.get("next_seq", 0) or 0)
+                for existing in manifest.get("entries", []):
+                    key_hash = str(existing.get("key_hash", ""))
+                    if key_hash in batch:
+                        next_seq += 1
+                        existing["last_access_seq"] = max(
+                            int(existing.get("last_access_seq", 0) or 0),
+                            next_seq,
+                        )
+                manifest["next_seq"] = next_seq
+                self._write_manifest_atomic(manifest)
+        except Exception as exc:
+            with self._lru_cond:
+                self._lru_diag["lru_async_failed"] += 1
+            try:
+                print(f"[cache.lru] async touch failed: {type(exc).__name__}: {exc}"[:160], flush=True)
+            except Exception:
+                pass
+            return
+        with self._lru_cond:
+            self._lru_diag["lru_async_batches"] += 1
+            self._lru_diag["lru_async_batch_size"] = len(batch)
+            self._lru_diag["lru_async_persist_ms"] += round(
+                (time.monotonic_ns() - _start) / 1_000_000, 3
+            )
 
     def _enforce_bounds(self, manifest: dict[str, Any], keep_digest: str) -> tuple[int, int]:
         """Enforce the entry and byte caps with deterministic LRU eviction.
@@ -926,69 +1442,440 @@ class ExactConditioningCache:
         manifest["entries"] = entries
         return _evicted, _evicted_bytes
 
-    # ── Store (synchronous so the miss_stored log follows the atomic store) ─
+    # ── Store (synchronous serialize → enqueue; file writes, manifest
+    #    mutation, fsync and commit all belong to the background persistence
+    #    worker — the miss_stored log therefore reports enqueued, with
+    #    persisted/persist_failed read back from the shared worker counters) ──
     def store_entry(
         self,
         base_ctx: Mapping[str, Any],
         entry: Mapping[str, Any],
         value: Any,
     ) -> bool:
-        """Atomically store *value* after the unchanged encode completes."""
-        diag = getattr(self._diag, "store", None)
-        if not diag:
-            diag = {
-                "store_calls": 0,
-                "store_failed": 0,
-                "key_build_digest_ms": 0.0,
-                "serialize_ms": 0.0,
-                "materialize_ms": 0.0,
-                "materialize_bytes": 0,
-                "checksum_ms": 0.0,
-                "serialized_payload_bytes": 0,
-                "compression": "none",
-                "safetensors": False,
-                "lock_wait_ms": 0.0,
-                "lock_held_ms": 0.0,
-                "data_write_ms": 0.0,
-                "payload_bytes_written": 0,
-                "header_write_ms": 0.0,
-                "header_bytes": 0,
-                "header_bytes_written": 0,
-                "manifest_read_ms": 0.0,
-                "manifest_read_bytes": 0,
-                "manifest_write_ms": 0.0,
-                "manifest_bytes_written": 0,
-                "bounds_ms": 0.0,
-                "evicted_count": 0,
-                "evicted_bytes": 0,
-                "unindexed_sweep_ms": 0.0,
-                "unindexed_files_removed": 0,
-                "commit_ms": 0.0,
-                "fsync_ms": 0.0,
-                "fsync_count": 0,
-                "stored_ok": 0,
-                "total_ms": 0.0,
-                "residual_ms": 0.0,
-            }
-            self._diag.store = diag
+        """Serialize *value* and enqueue it for background persistence.
+
+        Returns True when the immutable payload was accepted into the
+        bounded persistence queue (or deduped against an already-queued
+        entry).  Returns False when the cache is shutting down, the queue is
+        full, or serialization/validation failed — every failure fails
+        closed to a future miss.  Never performs file/manifest/fsync/commit
+        work on this thread.  Never raises.
+        """
+        diag = self._store_entry_diag()
         _t0 = time.monotonic_ns()
         try:
-            self._last_store_reason = ""
+            self._set_last_store_reason("")
             _kb_start = time.monotonic_ns()
             ctx = _merge_entry_context(base_ctx, entry)
             components = build_exact_key_components(ctx)
             missing = _key_usable(components)
             if missing:
                 diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
-                self._last_store_reason = f"key:{missing}"
+                self._set_last_store_reason(f"key:{missing}")
+                diag["store_reason"] = self.last_store_reason
                 return self._store_diag_close(diag, _t0, ok=False)
             digest = exact_key_digest(components)
             diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
-            _ok = self._process_value(components, digest, value, _diag=diag)
+            payload = self._process_value(components, digest, value, _diag=diag)
+            if payload is None:
+                diag["store_reason"] = self.last_store_reason
+                return self._store_diag_close(diag, _t0, ok=False)
+            _ok = self._enqueue(payload, diag=diag)
+            diag["store_reason"] = self.last_store_reason
             return self._store_diag_close(diag, _t0, ok=_ok)
         except Exception as exc:
-            self._last_store_reason = f"store_exception:{type(exc).__name__}:{exc}"[:160]
+            self._set_last_store_reason(f"store_exception:{type(exc).__name__}:{exc}"[:160])
+            diag["store_reason"] = self.last_store_reason
             return self._store_diag_close(diag, _t0, ok=False)
+
+    def _enqueue(
+        self,
+        payload: _PendingEntry,
+        diag: dict[str, Any] | None = None,
+    ) -> bool:
+        """Append one immutable payload to the bounded persistence queue.
+
+        Dedupes by ``key_hash`` (identical deterministic content), enforces
+        the queue bound, and lazily starts the persistence worker.  Never
+        raises.  Returns True when the entry is accepted (or already
+        queued); False on queue-full or shutdown.
+        """
+        _enq_start = time.monotonic_ns()
+        _lw_start = time.monotonic_ns()
+        digest = str(payload.header.get("key_hash", ""))
+        need_sync = False
+        with self._queue_cond:
+            if diag is not None:
+                diag["lock_wait_ms"] = diag.get("lock_wait_ms", 0.0) + round(
+                    (time.monotonic_ns() - _lw_start) / 1_000_000, 3
+                )
+            if self._closing:
+                self._set_last_store_reason("shutting_down")
+                if diag is not None:
+                    diag["enqueue_ms"] = diag.get("enqueue_ms", 0.0) + round(
+                        (time.monotonic_ns() - _enq_start) / 1_000_000, 3
+                    )
+                return False
+            if digest and digest in self._pending_keys:
+                self._accumulate_worker("queue_deduped", 1)
+                self._set_last_store_reason("queue_deduped")
+                if diag is not None:
+                    diag["enqueue_ms"] = diag.get("enqueue_ms", 0.0) + round(
+                        (time.monotonic_ns() - _enq_start) / 1_000_000, 3
+                    )
+                return True
+            if len(self._pending) >= self._max_queue:
+                self._accumulate_worker("queue_full_dropped", 1)
+                self._set_last_store_reason("queue_full")
+                if diag is not None:
+                    diag["enqueue_ms"] = diag.get("enqueue_ms", 0.0) + round(
+                        (time.monotonic_ns() - _enq_start) / 1_000_000, 3
+                    )
+                return False
+            payload.enqueue_mono_ns = time.monotonic_ns()
+            self._pending.append(payload)
+            if digest:
+                self._pending_keys.add(digest)
+            self._accumulate_worker("enqueued", 1)
+            self._set_last_store_reason("")
+            self._set_worker("queue_depth", len(self._pending))
+            self._ensure_worker()
+            if self._worker_broken and self._worker is None:
+                # Fallback: worker could not be started in this environment —
+                # remove the entry from the queue and persist synchronously.
+                need_sync = True
+                try:
+                    self._pending.remove(payload)
+                    self._pending_keys.discard(digest)
+                except ValueError:
+                    pass
+                self._set_worker("queue_depth", len(self._pending))
+            self._queue_cond.notify()
+        if need_sync:
+            self._accumulate_worker("fallback_sync_stores", 1)
+            self._persist_batch([payload])
+        if diag is not None:
+            diag["enqueue_ms"] = diag.get("enqueue_ms", 0.0) + round(
+                (time.monotonic_ns() - _enq_start) / 1_000_000, 3
+            )
+        return True
+
+    def _ensure_worker(self) -> None:
+        """Lazily start (or respawn after death) the persistence thread.
+
+        Caller must hold ``self._queue_cond``.  Double-start is impossible:
+        the alive-check and the assignment both happen under the queue
+        condition's RLock.  If the thread cannot be started in this
+        environment the cache degrades to synchronous single-entry persists.
+        """
+        if self._worker_broken or self._closing:
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return
+        try:
+            worker = threading.Thread(
+                target=self._persistence_loop,
+                name="comfymodal-exact-conditioning-persist",
+                daemon=False,
+            )
+            worker.start()
+            self._worker = worker
+        except Exception as exc:
+            self._worker_broken = True
+            _log_decision(
+                "persist_worker_start_failed",
+                reason=f"{type(exc).__name__}:{exc}"[:120],
+            )
+
+    def _persistence_loop(self) -> None:
+        """Background persistence loop.  Never lets an exception escape."""
+        try:
+            while True:
+                with self._queue_cond:
+                    while not self._pending and not self._closing:
+                        self._queue_cond.wait(timeout=0.5)
+                    if not self._pending and self._closing:
+                        break
+                    batch = [self._pending.popleft() for _ in range(len(self._pending))]
+                    for payload in batch:
+                        self._pending_keys.discard(
+                            str(payload.header.get("key_hash", ""))
+                        )
+                    self._set_worker("queue_depth", len(self._pending))
+                if batch:
+                    self._persist_batch(batch)
+            # Worker-exit path (closing): one final commit if a batch was
+            # written but its coalesced commit is still pending.  Runs
+            # outside the RLock.  flush() is the backstop when this fails.
+            if self._dirty_since_commit:
+                if self._commit():
+                    self._dirty_since_commit = False
+                else:
+                    self._accumulate_worker("commit_failed", 1)
+                    _log_decision(
+                        "persist_commit_failed",
+                        reason="worker_final_commit_failed",
+                    )
+        except Exception as exc:
+            _log_decision(
+                "persist_worker_error",
+                reason=f"{type(exc).__name__}:{exc}"[:120],
+            )
+        finally:
+            self._worker_exited = True
+            with self._queue_cond:
+                self._queue_cond.notify_all()
+
+    def _persist_batch(self, batch: list[_PendingEntry]) -> None:
+        """Persist one batch: reload-before-batch, atomic file + manifest
+        writes, bounds, unindexed sweep (all under the RLock) then ONE
+        coalesced commit outside the RLock.  Never raises."""
+        if not batch:
+            return
+        n = len(batch)
+        # Cumulative queue-wait accounting (now - enqueue_mono_ns per entry).
+        _now_ns = time.monotonic_ns()
+        self._accumulate_worker(
+            "persistence_queue_wait_ms",
+            round(sum((_now_ns - p.enqueue_mono_ns) for p in batch) / 1_000_000, 3),
+        )
+        _lw_start = time.monotonic_ns()
+        try:
+            with self._lock:
+                self._accumulate_worker(
+                    "lock_wait_ms",
+                    round((time.monotonic_ns() - _lw_start) / 1_000_000, 3),
+                )
+                _rl_start = time.monotonic_ns()
+                self._maybe_reload()
+                self._accumulate_worker(
+                    "reload_ms",
+                    round((time.monotonic_ns() - _rl_start) / 1_000_000, 3),
+                )
+                _fw_start = time.monotonic_ns()
+                manifest = self._read_manifest()
+                next_seq = int(manifest.get("next_seq", 0) or 0)
+                entries_by_hash: dict[str, Any] = {
+                    str(e.get("key_hash", "")): e
+                    for e in manifest.get("entries", [])
+                    if isinstance(e, Mapping) and e.get("key_hash")
+                }
+                last_digest = ""
+                for payload in batch:
+                    digest = str(payload.header.get("key_hash", ""))
+                    last_digest = digest
+                    header_path, data_path = self._entry_paths(digest)
+                    # Atomic data blob first, then the header, then the manifest.
+                    _atomic_write(data_path, payload.data)
+                    _header_json = json.dumps(
+                        payload.header, sort_keys=True, separators=(",", ":")
+                    )
+                    _atomic_write_text(header_path, _header_json)
+                    next_seq += 1
+                    created_at = payload.header.get("created_at", time.time())
+                    existing = entries_by_hash.get(digest)
+                    if existing is not None:
+                        # SAFE max() bump — a stale manifest must never
+                        # regress an entry's LRU sequence.
+                        existing["key_hash"] = digest
+                        existing["byte_length"] = len(payload.data)
+                        existing["last_access_seq"] = max(
+                            int(existing.get("last_access_seq", 0) or 0),
+                            next_seq,
+                        )
+                        existing["created_at"] = created_at
+                    else:
+                        entry = {
+                            "key_hash": digest,
+                            "byte_length": len(payload.data),
+                            "last_access_seq": next_seq,
+                            "created_at": created_at,
+                        }
+                        manifest["entries"].append(entry)
+                        entries_by_hash[digest] = entry
+                manifest["next_seq"] = next_seq
+                self._accumulate_worker(
+                    "file_write_ms",
+                    round((time.monotonic_ns() - _fw_start) / 1_000_000, 3),
+                )
+                self._enforce_bounds(manifest, keep_digest=last_digest)
+                _mw_start = time.monotonic_ns()
+                self._write_manifest_atomic(manifest)
+                self._accumulate_worker(
+                    "manifest_ms",
+                    round((time.monotonic_ns() - _mw_start) / 1_000_000, 3),
+                )
+                _removed = self._remove_unindexed_files(manifest)
+                self._accumulate_worker("unindexed_files_removed", _removed)
+                self._dirty_since_commit = True
+            # ── LEAVE the RLock before the commit RPC ─────────────────────
+            _cm_start = time.monotonic_ns()
+            commit_ok = self._commit()
+            self._accumulate_worker(
+                "commit_ms",
+                round((time.monotonic_ns() - _cm_start) / 1_000_000, 3),
+            )
+            if commit_ok:
+                self._dirty_since_commit = False
+            else:
+                self._accumulate_worker("commit_failed", 1)
+                _log_decision(
+                    "persist_commit_failed",
+                    reason="batch_commit_failed",
+                    batch_size=n,
+                )
+            self._accumulate_worker("persisted", n)
+            self._set_worker("batch_size", n)
+            self._accumulate_worker("batch_count", 1)
+        except Exception as exc:
+            self._accumulate_worker("persist_failed", n)
+            _log_decision(
+                "persist_failed",
+                reason=f"{type(exc).__name__}:{exc}"[:120],
+                batch_size=n,
+            )
+
+    def flush(self, timeout: float) -> dict[str, Any]:
+        """Bounded teardown flush.  Idempotent.
+
+        Signals the worker to drain, joins it within *timeout* seconds, then
+        drains any entries the worker never processed and performs ONE final
+        explicit commit when the mount is still dirty (a worker batch was
+        written without a successful coalesced commit).  Never holds the
+        RLock across the commit hook.  Returns a diagnostics dict.
+        """
+        _f0 = time.monotonic_ns()
+        status = "ok"
+        drained_count = 0
+        final_commit_ms = 0.0
+        # ── Experiment 5 (conditioning_hit async_lru) teardown ─────────────
+        # Drain the background LRU-touch queue synchronously (ONE coalesced
+        # manifest rewrite) and stop the LRU worker, BEFORE the store join.
+        # LRU recency metadata is eviction-only, so this is best-effort,
+        # bounded, and idempotent — it never extends the store teardown
+        # budget beyond a short join guard.
+        with self._lru_cond:
+            self._lru_closing = True
+            lru_batch = set(self._pending_lru)
+            self._pending_lru.clear()
+            self._lru_cond.notify_all()
+        if lru_batch:
+            self._persist_lru_batch(lru_batch)
+            with self._lru_cond:
+                self._lru_diag["lru_async_flush_count"] += 1
+        lru_worker = self._lru_worker
+        if lru_worker is not None and lru_worker.is_alive():
+            lru_worker.join(min(timeout, 2.0))
+        with self._queue_cond:
+            self._closing = True
+            self._queue_cond.notify_all()
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+            if worker.is_alive():
+                status = "timeout"
+                _log_decision(
+                    "flush_timeout",
+                    reason="worker_join_timeout_modal_shutdown_commit_backstop",
+                )
+                _flush_ms = round((time.monotonic_ns() - _f0) / 1_000_000, 3)
+                self._record_flush(_flush_ms, status, 0, 0.0)
+                return self._flush_diag(_flush_ms, status, 0, 0.0)
+        # Worker exited (or never started): drain any queue remnant the
+        # worker never processed (e.g. it crashed mid-request).  Payloads
+        # are materialized bytes — safe to persist on this thread.
+        with self._queue_cond:
+            pending = list(self._pending)
+            if pending:
+                self._pending.clear()
+                for payload in pending:
+                    self._pending_keys.discard(
+                        str(payload.header.get("key_hash", ""))
+                    )
+                self._set_worker("queue_depth", 0)
+            self._queue_cond.notify_all()
+        if pending:
+            self._persist_batch(pending)
+            drained_count = len(pending)
+        if self._dirty_since_commit:
+            _cm_start = time.monotonic_ns()
+            commit_ok = self._commit()
+            final_commit_ms = round((time.monotonic_ns() - _cm_start) / 1_000_000, 3)
+            if commit_ok:
+                self._dirty_since_commit = False
+            else:
+                self._accumulate_worker("commit_failed", 1)
+                _log_decision(
+                    "flush_final_commit_failed",
+                    reason="final_commit_failed",
+                )
+        _flush_ms = round((time.monotonic_ns() - _f0) / 1_000_000, 3)
+        self._record_flush(_flush_ms, status, drained_count, final_commit_ms)
+        return self._flush_diag(_flush_ms, status, drained_count, final_commit_ms)
+
+    def _record_flush(
+        self, flush_ms: float, status: str, drained_count: int, final_commit_ms: float
+    ) -> None:
+        with self._diag_lock:
+            self._worker_diag["flush_count"] = self._worker_diag.get("flush_count", 0) + 1
+            self._worker_diag["last_flush_ms"] = flush_ms
+            self._worker_diag["last_flush_status"] = status
+            self._worker_diag["drained_count"] = drained_count
+            self._worker_diag["final_commit_ms"] = final_commit_ms
+
+    def _flush_diag(
+        self, flush_ms: float, status: str, drained_count: int, final_commit_ms: float
+    ) -> dict[str, Any]:
+        return {
+            "flush_ms": flush_ms,
+            "flush_status": status,
+            "flush_count": self._worker_diag.get("flush_count", 0),
+            "drained_count": drained_count,
+            "final_commit_ms": final_commit_ms,
+            "closing": self._closing,
+            "worker_exited": self._worker_exited,
+        }
+
+    # ── Shared thread-safe diagnostics ──────────────────────────────────
+    def _store_entry_diag(self) -> dict[str, Any]:
+        """Fresh PER-CALL store diagnostics dict — never the shared dict.
+
+        ``store_entry`` accumulates into this private copy; ``_store_diag_close``
+        merges it into the shared ``_store_diag`` under ``_diag_lock``.  This
+        keeps concurrent foreground store calls (coordinator pool workers)
+        from racing on the shared structure.
+        """
+        return {
+            "store_calls": 0,
+            "store_failed": 0,
+            "key_build_digest_ms": 0.0,
+            "serialization_ms": 0.0,
+            "materialize_ms": 0.0,
+            "checksum_ms": 0.0,
+            "serialized_payload_bytes": 0,
+            "enqueue_ms": 0.0,
+            "lock_wait_ms": 0.0,
+            "total_ms": 0.0,
+            "measured_children_ms": 0.0,
+            "residual_ms": 0.0,
+            "store_reason": "",
+        }
+
+    def _set_lookup_diag(self, diag: dict[str, Any]) -> None:
+        with self._diag_lock:
+            self._lookup_diag = dict(diag)
+
+    def _accumulate_worker(self, key: str, amount: Any) -> None:
+        with self._diag_lock:
+            self._worker_diag[key] = self._worker_diag.get(key, 0) + amount
+
+    def _set_worker(self, key: str, value: Any) -> None:
+        with self._diag_lock:
+            self._worker_diag[key] = value
+
+    def _set_last_store_reason(self, reason: str) -> None:
+        with self._diag_lock:
+            self._last_store_reason = reason
 
     def _store_diag_close(self, diag: dict[str, Any], _t0: int, *, ok: bool) -> bool:
         diag["store_calls"] = diag.get("store_calls", 0) + 1
@@ -997,28 +1884,53 @@ class ExactConditioningCache:
         diag["total_ms"] = diag.get("total_ms", 0.0) + round((time.monotonic_ns() - _t0) / 1_000_000, 3)
         _children = (
             (diag.get("key_build_digest_ms") or 0.0)
-            + (diag.get("serialize_ms") or 0.0)
+            + (diag.get("serialization_ms") or 0.0)
+            + (diag.get("enqueue_ms") or 0.0)
             + (diag.get("lock_wait_ms") or 0.0)
-            + (diag.get("data_write_ms") or 0.0)
-            + (diag.get("header_write_ms") or 0.0)
-            + (diag.get("manifest_read_ms") or 0.0)
-            + (diag.get("bounds_ms") or 0.0)
-            + (diag.get("manifest_write_ms") or 0.0)
-            + (diag.get("unindexed_sweep_ms") or 0.0)
-            + (diag.get("commit_ms") or 0.0)
         )
         diag["measured_children_ms"] = round(_children, 3)
         diag["residual_ms"] = round(diag.get("total_ms", 0.0) - _children, 3)
+        # Merge the per-call private dict into the shared structure under
+        # the lock so concurrent foreground store calls never race.
+        with self._diag_lock:
+            if self._store_diag is None:
+                self._store_diag = self._store_entry_diag()
+            shared = self._store_diag
+            for key, value in diag.items():
+                if key in shared and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    shared[key] = shared[key] + value
+                else:
+                    shared[key] = value
         return ok
 
     def latest_lookup_diagnostics(self) -> dict[str, Any]:
-        diag = getattr(self._diag, "lookup", None)
-        return dict(diag) if diag else {}
+        # Snapshot the LRU counters under ``_lru_cond`` FIRST, then the lookup
+        # diag under ``_diag_lock`` — never nest the other way around, because
+        # the store path already acquires ``_lock`` -> ``_diag_lock``.
+        with self._lru_cond:
+            lru_diag = dict(self._lru_diag)
+        with self._diag_lock:
+            diag = self._lookup_diag
+            result = dict(diag) if diag else {}
+        # Experiment 5 (conditioning_hit async_lru): merge the cumulative
+        # LRU-worker counters so callers can see async touch activity.
+        result.update(lru_diag)
+        return result
 
     def pop_store_diagnostics(self) -> dict[str, Any]:
-        diag = getattr(self._diag, "store", None)
-        self._diag.store = {}
-        return dict(diag) if diag else {}
+        """Pop the foreground per-request store diag merged with a snapshot
+        of the cumulative worker diag (worker keys win on collision), then
+        reset the foreground diag.  Worker counters stay cumulative.
+        Returns {} when there was no foreground store activity."""
+        with self._diag_lock:
+            store = self._store_diag
+            self._store_diag = None
+            worker = dict(self._worker_diag)
+        if store is None:
+            return {}
+        merged = dict(store)
+        merged.update(worker)
+        return merged
 
     def _process_value(
         self,
@@ -1026,114 +1938,36 @@ class ExactConditioningCache:
         digest: str,
         value: Any,
         _diag: dict[str, Any] | None = None,
-    ) -> bool:
-        header, data = serialize_conditioning(value, _diag=_diag)
-        if header is None:
-            self._last_store_reason = _LAST_SERIALIZE_ERROR or "serialization_failed"
-            return False
+    ) -> _PendingEntry | None:
+        """Synchronous serialize + stamp step.  Returns the immutable
+        payload (components/header/data) or None (fail closed)."""
+        _serialized = serialize_conditioning(value, _diag=_diag)
+        if _diag is not None and _diag.get("serialize_ms"):
+            _diag["serialization_ms"] = _diag.get("serialization_ms", 0.0) + _diag.pop(
+                "serialize_ms", 0.0
+            )
+        if _serialized is None:
+            self._set_last_store_reason(_LAST_SERIALIZE_ERROR or "serialization_failed")
+            return None
+        header, data = _serialized
         if len(data) > self._max_bytes:
-            self._last_store_reason = "entry_exceeds_byte_cap"
-            return False
+            self._set_last_store_reason("entry_exceeds_byte_cap")
+            return None
         header["key_hash"] = digest
         header["key_components"] = components
         header["model_identity"] = _model_identity_block(components)
         header["created_at"] = time.time()
-        return self._write_entry(components, header, data, _diag=_diag)
+        return _PendingEntry(
+            components=dict(components),
+            header=header,
+            data=data,
+            enqueue_mono_ns=0.0,  # stamped at actual enqueue time
+        )
 
     @property
     def last_store_reason(self) -> str:
-        return self._last_store_reason
-
-    def _write_entry(
-        self,
-        components: Mapping[str, Any],
-        header: Mapping[str, Any],
-        data: bytes,
-        _diag: dict[str, Any] | None = None,
-    ) -> bool:
-        digest = str(header.get("key_hash", ""))
-        if not digest:
-            return False
-        if _diag is None:
-            _diag = {}
-        header_path, data_path = self._entry_paths(digest)
-        _lw_start = time.monotonic_ns()
-        self._lock.acquire()
-        _diag["lock_wait_ms"] = _diag.get("lock_wait_ms", 0.0) + round(
-            (time.monotonic_ns() - _lw_start) / 1_000_000, 3
-        )
-        _held_start = time.monotonic_ns()
-        try:
-            # Atomic data blob first, then the header, then the manifest.
-            _dw_start = time.monotonic_ns()
-            _atomic_write(data_path, data, _diag=_diag)
-            _diag["data_write_ms"] = _diag.get("data_write_ms", 0.0) + round(
-                (time.monotonic_ns() - _dw_start) / 1_000_000, 3
-            )
-            _diag["payload_bytes_written"] = _diag.get("payload_bytes_written", 0) + len(data)
-            _header_json = json.dumps(header, sort_keys=True, separators=(",", ":"))
-            _diag["header_bytes"] = len(_header_json.encode("utf-8"))
-            _hw_start = time.monotonic_ns()
-            _atomic_write_text(header_path, _header_json, _diag=_diag)
-            _diag["header_write_ms"] = _diag.get("header_write_ms", 0.0) + round(
-                (time.monotonic_ns() - _hw_start) / 1_000_000, 3
-            )
-            _diag["header_bytes_written"] = _diag.get("header_bytes_written", 0) + len(
-                _header_json.encode("utf-8")
-            )
-            _mr_start = time.monotonic_ns()
-            manifest = self._read_manifest(_diag=_diag)
-            _diag["manifest_read_ms"] = _diag.get("manifest_read_ms", 0.0) + round(
-                (time.monotonic_ns() - _mr_start) / 1_000_000, 3
-            )
-            next_seq = int(manifest.get("next_seq", 0) or 0) + 1
-            existing = [e for e in manifest["entries"] if e.get("key_hash") == digest]
-            if existing:
-                entry = existing[0]
-                entry.update({
-                    "key_hash": digest,
-                    "byte_length": len(data),
-                    "last_access_seq": next_seq,
-                    "created_at": time.time(),
-                })
-            else:
-                manifest["entries"].append({
-                    "key_hash": digest,
-                    "byte_length": len(data),
-                    "last_access_seq": next_seq,
-                    "created_at": time.time(),
-                })
-            manifest["next_seq"] = next_seq
-            _eb_start = time.monotonic_ns()
-            _evicted, _evicted_bytes = self._enforce_bounds(manifest, keep_digest=digest)
-            _diag["bounds_ms"] = _diag.get("bounds_ms", 0.0) + round(
-                (time.monotonic_ns() - _eb_start) / 1_000_000, 3
-            )
-            _diag["evicted_count"] = _diag.get("evicted_count", 0) + _evicted
-            _diag["evicted_bytes"] = _diag.get("evicted_bytes", 0) + _evicted_bytes
-            _mw_start = time.monotonic_ns()
-            self._write_manifest_atomic(manifest, _diag=_diag)
-            _diag["manifest_write_ms"] = _diag.get("manifest_write_ms", 0.0) + round(
-                (time.monotonic_ns() - _mw_start) / 1_000_000, 3
-            )
-            _sw_start = time.monotonic_ns()
-            _removed = self._remove_unindexed_files(manifest)
-            _diag["unindexed_sweep_ms"] = _diag.get("unindexed_sweep_ms", 0.0) + round(
-                (time.monotonic_ns() - _sw_start) / 1_000_000, 3
-            )
-            _diag["unindexed_files_removed"] = _diag.get("unindexed_files_removed", 0) + _removed
-            _cm_start = time.monotonic_ns()
-            self._commit()
-            _diag["commit_ms"] = _diag.get("commit_ms", 0.0) + round(
-                (time.monotonic_ns() - _cm_start) / 1_000_000, 3
-            )
-            _diag["stored_ok"] = _diag.get("stored_ok", 0) + 1
-            return True
-        finally:
-            _diag["lock_held_ms"] = _diag.get("lock_held_ms", 0.0) + round(
-                (time.monotonic_ns() - _held_start) / 1_000_000, 3
-            )
-            self._lock.release()
+        with self._diag_lock:
+            return self._last_store_reason
 
 
 def _model_identity_block(components: Mapping[str, Any]) -> dict[str, Any]:

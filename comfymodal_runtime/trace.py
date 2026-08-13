@@ -466,6 +466,19 @@ LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
 """Canonical ordered field list for [v2.local_submission_breakdown].
 Each entry is (dict_key, fmt_key) where fmt_key is the printed field name."""
 
+# Compact breakdown mode.  Set COMFYMODAL_V2_COMPACT_BREAKDOWN=1 to print only
+# the present (non-None) fields plus absent_count=N instead of every field with
+# "absent".  Default off keeps the historical all-fields-with-absent rendering
+# that the pinned tests rely on.
+_COMPACT_BREAKDOWN: bool = (
+    os.environ.get("COMFYMODAL_V2_COMPACT_BREAKDOWN", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+# Sane one-line cap for compact breakdown output (safety net for very wide
+# breakdown dicts such as the host-side final line with ~63 fields).
+_COMPACT_BREAKDOWN_MAX_LINE_CHARS = 4096
+
 
 def _fmt_or_absent(v: Any) -> str:
     """Format a value for one-line summary: numeric values (including 0.0)
@@ -484,17 +497,29 @@ def _emit_breakdown_line(prefix: str, breakdown: dict[str, Any],
     """Print one canonical breakdown line using *prefix* and *field_keys*.
 
     When *field_keys* is None, uses LOCAL_SUBMISSION_FIELD_KEYS.
-    Only fields present in the breakdown dict are printed.
+    Default (COMFYMODAL_V2_COMPACT_BREAKDOWN unset) prints every field with
+    ``absent`` for missing values, exactly one line.  In compact mode only
+    present (non-None) fields are printed plus ``absent_count=N``; the line
+    still starts with the same prefix, keeps field ordering (request_id
+    first), is exactly one line, and is capped at a sane length.
     """
     keys = field_keys if field_keys is not None else LOCAL_SUBMISSION_FIELD_KEYS
     parts = [f"{prefix}"]
+    absent_count = 0
     for dk, fk in keys:
         v = breakdown.get(dk)
         if v is not None:
             parts.append(f"{fk}={_fmt_or_absent(v)}")
-        else:
+        elif not _COMPACT_BREAKDOWN:
             parts.append(f"{fk}={_ABSENT_STR}")
-    print(" ".join(parts), flush=True)
+        else:
+            absent_count += 1
+    if _COMPACT_BREAKDOWN:
+        parts.append(f"absent_count={absent_count}")
+    _line = " ".join(parts)
+    if _COMPACT_BREAKDOWN and len(_line) > _COMPACT_BREAKDOWN_MAX_LINE_CHARS:
+        _line = _line[:_COMPACT_BREAKDOWN_MAX_LINE_CHARS - 3] + "..."
+    print(_line, flush=True)
 
 
 def _build_local_submission_breakdown(

@@ -35,6 +35,16 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 from .contracts import ExecutionPlan, SnapshotExecutionSeed
 from .trace import RuntimeTrace
 
+# Optimization diagnostics (measurement-only; frozen at import time).  All
+# new opt_* instrumentation in this module is gated on opt_diag_enabled() so
+# there is zero behavior change when COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS
+# is unset.  The try/except keeps a failed import from breaking the runtime.
+try:
+    from .optimization_diagnostics import opt_diag_enabled, emit_opt
+except Exception:  # pragma: no cover - diagnostics must never break imports
+    opt_diag_enabled = lambda: False  # type: ignore[assignment]
+    emit_opt = lambda *a, **k: None  # type: ignore[assignment]
+
 
 # ── Pre-sampler cache / orchestration component ──────────────────────────
 
@@ -2437,6 +2447,21 @@ def install_pre_sampler_hooks() -> None:
                     self, prompt, prompt_id, extra_data, execute_outputs,
                 )
 
+            # Capture the active request trace at ENTRY (the request scope is
+            # provably active here) so the finally-block decomposition emit
+            # below does not depend on the contextvar still being resolvable
+            # after the full execution completes.  Measurement-only; no-op
+            # when diagnostics are off or no trace is active.
+            _opt_entry_trace = None
+            if opt_diag_enabled():
+                try:
+                    from comfymodal_runtime.model_preload import (
+                        _ACTIVE_REQUEST_TRACE as _opt_art_cv_entry,
+                    )
+                    _opt_entry_trace = _opt_art_cv_entry.get()
+                except Exception:
+                    _opt_entry_trace = None
+
             # Capture the live prompt dict for class_type lookup
             state["_prompt"] = prompt
 
@@ -2448,6 +2473,8 @@ def install_pre_sampler_hooks() -> None:
             # start time and let the per-node hooks capture residual work.
             _t_start = time.perf_counter_ns()
             state["_exec_async_start_ns"] = _t_start
+            if opt_diag_enabled():
+                state["opt_exec_async_entry_mono_ns"] = time.monotonic_ns()
 
             try:
                 return await _orig_exec_async(
@@ -2545,6 +2572,76 @@ def install_pre_sampler_hooks() -> None:
                 # ── Emit exactly one line ──────────────────────────────────
                 _emit_pre_sampler_line(state)
 
+                # ── Optimization-diag: executor decomposition ─────────────
+                # One aggregated opt_ event decomposing the execution_start →
+                # execution_cached window (and the cached→first-stage lag)
+                # into named sub-spans.  Measurement-only; gated.  The trace
+                # is reached via the same per-request mechanism the sampling
+                # wrapper uses (_ACTIVE_REQUEST_TRACE contextvar); when no
+                # trace is active this is a silent no-op.
+                if opt_diag_enabled():
+                    # Prefer the trace captured at execute_async entry (the
+                    # request scope is provably active there); fall back to
+                    # re-reading the contextvar for callers that reach this
+                    # block without going through the entry capture.
+                    _opt_trace = _opt_entry_trace
+                    if _opt_trace is None:
+                        try:
+                            from comfymodal_runtime.model_preload import (
+                                _ACTIVE_REQUEST_TRACE as _opt_art_cv,
+                            )
+                            _opt_trace = _opt_art_cv.get()
+                        except Exception:
+                            _opt_trace = None
+                    if _opt_trace is not None:
+                        _decomp_meta: dict[str, Any] = {}
+                        _entry_mono = state.get("opt_exec_async_entry_mono_ns")
+                        _gather_end_mono = state.get("opt_exec_cache_gather_end_mono_ns")
+                        if _entry_mono is not None and _gather_end_mono is not None:
+                            _total_ms = round(
+                                max(0, _gather_end_mono - _entry_mono) / 1_000_000, 3
+                            )
+                        else:
+                            _total_ms = round(_total_wall_ms, 3)
+                        _decomp_meta["total_ms"] = _total_ms
+                        _span_keys = (
+                            "opt_exec_set_prompt_ms",
+                            "opt_exec_clean_unused_ms",
+                            "opt_exec_cache_gather_ms",
+                            "opt_exec_cache_execution_ms",
+                            "opt_exec_cleanup_gc_ms",
+                            "opt_exec_dynamic_prompt_ms",
+                            "opt_exec_topo_walk_ms",
+                            "opt_exec_stage_ms",
+                        )
+                        _measured_sum = 0.0
+                        for _sk in _span_keys:
+                            _v = state.get(_sk)
+                            if _v is None:
+                                _decomp_meta[_sk[len("opt_exec_"):]] = None
+                                continue
+                            _val = round(float(_v), 3)
+                            _decomp_meta[_sk[len("opt_exec_"):]] = _val
+                            _measured_sum += _val
+                        _decomp_meta["stage_count"] = state.get("opt_exec_stage_count")
+                        _fs_mono = state.get("opt_exec_first_stage_mono_ns")
+                        if _fs_mono is not None and _gather_end_mono is not None:
+                            _decomp_meta["first_stage_lag_ms"] = round(
+                                max(0, _fs_mono - _gather_end_mono) / 1_000_000, 3
+                            )
+                        else:
+                            _decomp_meta["first_stage_lag_ms"] = None
+                        _decomp_meta["measured_sum_ms"] = round(_measured_sum, 3)
+                        _decomp_meta["residual_ms"] = round(
+                            max(0.0, _total_ms - _measured_sum), 3
+                        )
+                        emit_opt(
+                            _opt_trace,
+                            "executor_decomposition",
+                            phase="execution",
+                            metadata=_decomp_meta,
+                        )
+
         _execution.PromptExecutor.execute_async = _patched_exec_async
 
     # ── 5. comfy_execution.caching.HierarchicalCache.get (cache lookup) ─
@@ -2574,9 +2671,203 @@ def install_pre_sampler_hooks() -> None:
                 else:
                     state.setdefault("_cache_miss_count", 0)
                     state["_cache_miss_count"] += 1
+                if opt_diag_enabled():
+                    # Split the asyncio.gather cache walk (which happens
+                    # BEFORE first node execution) from cache lookups that
+                    # occur during node execution.  first_node_id is set by
+                    # _patched_exec_node on the first node entry, so the
+                    # gather phase is exactly the pre-first-node window.
+                    if state.get("first_node_id") is None:
+                        state["opt_exec_cache_gather_ms"] = (
+                            state.get("opt_exec_cache_gather_ms", 0.0) + _elapsed
+                        )
+                        # Last gather-phase completion proxies the
+                        # execution_cached boundary (cleanup_models_gc and
+                        # add_message("execution_cached") immediately follow).
+                        state["opt_exec_cache_gather_end_mono_ns"] = time.monotonic_ns()
+                    else:
+                        state["opt_exec_cache_execution_ms"] = (
+                            state.get("opt_exec_cache_execution_ms", 0.0) + _elapsed
+                        )
             return result
 
         _HCache.get = _patched_cache_get
+
+        # ── 5a. HierarchicalCache.set_prompt (cache keying) ───────────────
+        _orig_cache_set_prompt = getattr(_HCache, "set_prompt", None)
+        if _orig_cache_set_prompt is not None:
+            _ORIGINAL_FUNCTIONS["HierarchicalCache.set_prompt"] = _orig_cache_set_prompt
+
+            async def _patched_cache_set_prompt(self, dynprompt, node_ids, is_changed_cache):
+                state = _instrumentation_var.get()
+                if state is None or not opt_diag_enabled():
+                    return await _orig_cache_set_prompt(
+                        self, dynprompt, node_ids, is_changed_cache
+                    )
+                _t0 = time.perf_counter_ns()
+                try:
+                    return await _orig_cache_set_prompt(
+                        self, dynprompt, node_ids, is_changed_cache
+                    )
+                finally:
+                    _elapsed = _ns_ms(_t0)
+                    if state is not None:
+                        state["opt_exec_set_prompt_ms"] = (
+                            state.get("opt_exec_set_prompt_ms", 0.0) + _elapsed
+                        )
+                        state["opt_exec_set_prompt_count"] = (
+                            state.get("opt_exec_set_prompt_count", 0) + 1
+                        )
+
+            _HCache.set_prompt = _patched_cache_set_prompt
+
+        # ── 5b. HierarchicalCache.clean_unused (per-cache cleanup) ────────
+        _orig_cache_clean_unused = getattr(_HCache, "clean_unused", None)
+        if _orig_cache_clean_unused is not None:
+            _ORIGINAL_FUNCTIONS["HierarchicalCache.clean_unused"] = _orig_cache_clean_unused
+
+            def _patched_cache_clean_unused(self):
+                state = _instrumentation_var.get()
+                if state is None or not opt_diag_enabled():
+                    return _orig_cache_clean_unused(self)
+                _t0 = time.perf_counter_ns()
+                try:
+                    return _orig_cache_clean_unused(self)
+                finally:
+                    _elapsed = _ns_ms(_t0)
+                    if state is not None:
+                        state["opt_exec_clean_unused_ms"] = (
+                            state.get("opt_exec_clean_unused_ms", 0.0) + _elapsed
+                        )
+                        state["opt_exec_clean_unused_count"] = (
+                            state.get("opt_exec_clean_unused_count", 0) + 1
+                        )
+
+            _HCache.clean_unused = _patched_cache_clean_unused
+
+        # ── 5c. TopologicalSort.add_node (recursive graph walk) ───────────
+        try:
+            from comfy_execution.graph import TopologicalSort as _TopoSort
+        except ImportError:
+            _TopoSort = None
+
+        if _TopoSort is not None:
+            _orig_topo_add_node = getattr(_TopoSort, "add_node", None)
+            if _orig_topo_add_node is not None:
+                _ORIGINAL_FUNCTIONS["TopologicalSort.add_node"] = _orig_topo_add_node
+
+                def _patched_topo_add_node(self, node_unique_id, include_lazy=False, subgraph_nodes=None):
+                    state = _instrumentation_var.get()
+                    if state is None or not opt_diag_enabled():
+                        return _orig_topo_add_node(
+                            self, node_unique_id,
+                            include_lazy=include_lazy, subgraph_nodes=subgraph_nodes,
+                        )
+                    _t0 = time.perf_counter_ns()
+                    try:
+                        return _orig_topo_add_node(
+                            self, node_unique_id,
+                            include_lazy=include_lazy, subgraph_nodes=subgraph_nodes,
+                        )
+                    finally:
+                        _elapsed = _ns_ms(_t0)
+                        if state is not None:
+                            state["opt_exec_topo_walk_ms"] = (
+                                state.get("opt_exec_topo_walk_ms", 0.0) + _elapsed
+                            )
+                            state["opt_exec_topo_nodes"] = (
+                                state.get("opt_exec_topo_nodes", 0) + 1
+                            )
+
+                _TopoSort.add_node = _patched_topo_add_node
+
+        # ── 5d. ExecutionList.stage_node_execution (staging loop) ─────────
+        try:
+            from comfy_execution.graph import ExecutionList as _ExecList
+        except ImportError:
+            _ExecList = None
+
+        if _ExecList is not None:
+            _orig_stage_node = getattr(_ExecList, "stage_node_execution", None)
+            if _orig_stage_node is not None:
+                _ORIGINAL_FUNCTIONS["ExecutionList.stage_node_execution"] = _orig_stage_node
+
+                async def _patched_stage_node_execution(self):
+                    state = _instrumentation_var.get()
+                    if state is None or not opt_diag_enabled():
+                        return await _orig_stage_node(self)
+                    _t0 = time.perf_counter_ns()
+                    # First-stage boundary: the moment the staging loop starts
+                    # pulling the first node (entry, not completion).
+                    if "opt_exec_first_stage_mono_ns" not in state:
+                        state["opt_exec_first_stage_mono_ns"] = time.monotonic_ns()
+                    try:
+                        return await _orig_stage_node(self)
+                    finally:
+                        _elapsed = _ns_ms(_t0)
+                        if state is not None:
+                            state["opt_exec_stage_ms"] = (
+                                state.get("opt_exec_stage_ms", 0.0) + _elapsed
+                            )
+                            state["opt_exec_stage_count"] = (
+                                state.get("opt_exec_stage_count", 0) + 1
+                            )
+
+                _ExecList.stage_node_execution = _patched_stage_node_execution
+
+        # ── 5e. cleanup_models_gc (right before execution_cached) ─────────
+        # Lives on comfy.model_management in this ComfyUI version (called as
+        # comfy.model_management.cleanup_models_gc() in execute_async); also
+        # accept an execution-module binding for compatibility.
+        _orig_cleanup_gc = getattr(_execution, "cleanup_models_gc", None)
+        _cleanup_gc_target = _execution
+        if _orig_cleanup_gc is None:
+            _orig_cleanup_gc = getattr(_mm, "cleanup_models_gc", None)
+            _cleanup_gc_target = _mm
+        if _orig_cleanup_gc is not None:
+            _ORIGINAL_FUNCTIONS["cleanup_models_gc"] = _orig_cleanup_gc
+
+            def _patched_cleanup_models_gc():
+                state = _instrumentation_var.get()
+                if state is None or not opt_diag_enabled():
+                    return _orig_cleanup_gc()
+                _t0 = time.perf_counter_ns()
+                try:
+                    return _orig_cleanup_gc()
+                finally:
+                    _elapsed = _ns_ms(_t0)
+                    if state is not None:
+                        state["opt_exec_cleanup_gc_ms"] = (
+                            state.get("opt_exec_cleanup_gc_ms", 0.0) + _elapsed
+                        )
+
+            _cleanup_gc_target.cleanup_models_gc = _patched_cleanup_models_gc
+
+        # ── 5f. DynamicPrompt.__init__ (graph construction) ───────────────
+        _dp_cls = getattr(_execution, "DynamicPrompt", None)
+        if _dp_cls is not None:
+            _orig_dp_init = getattr(_dp_cls, "__init__", None)
+            if _orig_dp_init is not None:
+                _ORIGINAL_FUNCTIONS["DynamicPrompt.__init__"] = _orig_dp_init
+
+                def _patched_dynamic_prompt_init(self, original_prompt):
+                    state = _instrumentation_var.get()
+                    if state is None or not opt_diag_enabled():
+                        return _orig_dp_init(self, original_prompt)
+                    _t0 = time.perf_counter_ns()
+                    try:
+                        return _orig_dp_init(self, original_prompt)
+                    finally:
+                        _elapsed = _ns_ms(_t0)
+                        if state is not None:
+                            state["opt_exec_dynamic_prompt_ms"] = (
+                                state.get("opt_exec_dynamic_prompt_ms", 0.0) + _elapsed
+                            )
+                            state["opt_exec_dynamic_prompt_count"] = (
+                                state.get("opt_exec_dynamic_prompt_count", 0) + 1
+                            )
+
+                _dp_cls.__init__ = _patched_dynamic_prompt_init
 
     # ── 6. execution.resolve_map_node_over_list_results (future wait) ───
     _orig_resolve = getattr(_execution, "resolve_map_node_over_list_results", None)
@@ -2655,6 +2946,53 @@ def uninstall_pre_sampler_hooks() -> None:
     _orig_resolve = _ORIGINAL_FUNCTIONS.get("resolve_map_node_over_list_results")
     if _orig_resolve is not None:
         _execution.resolve_map_node_over_list_results = _orig_resolve
+
+    # Restore optimization-diag hooks (5a-5f)
+    _orig_cache_set_prompt = _ORIGINAL_FUNCTIONS.get("HierarchicalCache.set_prompt")
+    if _orig_cache_set_prompt is not None:
+        try:
+            from comfy_execution.caching import HierarchicalCache as _HCache
+            _HCache.set_prompt = _orig_cache_set_prompt
+        except (ImportError, AttributeError):
+            pass
+
+    _orig_cache_clean_unused = _ORIGINAL_FUNCTIONS.get("HierarchicalCache.clean_unused")
+    if _orig_cache_clean_unused is not None:
+        try:
+            from comfy_execution.caching import HierarchicalCache as _HCache
+            _HCache.clean_unused = _orig_cache_clean_unused
+        except (ImportError, AttributeError):
+            pass
+
+    _orig_topo_add_node = _ORIGINAL_FUNCTIONS.get("TopologicalSort.add_node")
+    if _orig_topo_add_node is not None:
+        try:
+            from comfy_execution.graph import TopologicalSort as _TopoSort
+            _TopoSort.add_node = _orig_topo_add_node
+        except (ImportError, AttributeError):
+            pass
+
+    _orig_stage_node = _ORIGINAL_FUNCTIONS.get("ExecutionList.stage_node_execution")
+    if _orig_stage_node is not None:
+        try:
+            from comfy_execution.graph import ExecutionList as _ExecList
+            _ExecList.stage_node_execution = _orig_stage_node
+        except (ImportError, AttributeError):
+            pass
+
+    _orig_cleanup_gc = _ORIGINAL_FUNCTIONS.get("cleanup_models_gc")
+    if _orig_cleanup_gc is not None:
+        # Restore whichever module currently holds the patched binding.
+        if getattr(_execution, "cleanup_models_gc", None) is not _orig_cleanup_gc:
+            _execution.cleanup_models_gc = _orig_cleanup_gc
+        if getattr(_mm, "cleanup_models_gc", None) is not _orig_cleanup_gc:
+            _mm.cleanup_models_gc = _orig_cleanup_gc
+
+    _orig_dp_init = _ORIGINAL_FUNCTIONS.get("DynamicPrompt.__init__")
+    if _orig_dp_init is not None:
+        _dp_cls = getattr(_execution, "DynamicPrompt", None)
+        if _dp_cls is not None:
+            _dp_cls.__init__ = _orig_dp_init
 
     # Restore encode_from_tokens hook
     _orig_encode = _ORIGINAL_FUNCTIONS.get("encode_from_tokens")
@@ -3263,6 +3601,29 @@ def _build_sampling_wrapper() -> Callable:
             acquire_sampler_mutation_lane_at_sampling_start()
         except Exception:
             pass
+        # ── Experiment 2 (vae_overlap, B arm): VAE early-start scheduling ──
+        # Transfer-only overlap: the worker pre-copies the VAE CPU params to
+        # CUDA on a side stream during sampling (no lane, no model mutation),
+        # then rebinds under the mutation lane strictly after the sampler
+        # releases it at sampling_end.  Default OFF: vae_early_start_ms()==0
+        # makes the scheduler a no-op (exact baseline behavior).  Same style
+        # as the sampling_end hook below — failures are silent.
+        try:
+            from comfymodal_runtime.model_preload import (
+                current_v2_loader_bridge,
+                schedule_vae_early_start_at_sampling_start,
+            )
+            _vae_early_bridge = current_v2_loader_bridge()
+            if _vae_early_bridge is not None:
+                schedule_vae_early_start_at_sampling_start(
+                    _vae_early_bridge,
+                    trace=trace,
+                    request_id=str(getattr(trace, "request_id", "") or ""),
+                    sampler_node_id=node_id,
+                    sampler_node_class=node_class,
+                )
+        except Exception:
+            pass
         _sampling_start_event = trace.emit("sampling_start", phase="execution", metadata={
             "node_id": node_id,
             "node_class": node_class,
@@ -3272,6 +3633,33 @@ def _build_sampling_wrapper() -> Callable:
             "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
         _sampler_boundary_line("sampling_start", start_meta)
+        # ── LANE 9: UNET readiness vs sampling-start demand slack ─────────
+        # Diagnostic-only: reports how early/late the retained UNET was ready
+        # relative to actual sampling start.  Positive slack_ms means the UNET
+        # was ready BEFORE the sampler demanded it (early); negative means the
+        # sampler started while the UNET was still being prepared.  Gated on
+        # opt_diag_enabled(); never changes runtime policy.
+        if opt_diag_enabled():
+            _ready_mono_ns = None
+            try:
+                from . import model_preload as _mp
+                _ready_mono_ns = getattr(_mp, "_OPT_UNET_READY_MONO_NS", None)
+            except Exception:
+                _ready_mono_ns = None
+            _sampling_start_mono_ns = time.monotonic_ns()
+            _slack_ms = None
+            if isinstance(_ready_mono_ns, (int, float)):
+                _slack_ms = round((_ready_mono_ns - _sampling_start_mono_ns) / 1_000_000, 3)
+            emit_opt(
+                trace,
+                "sampler_demand_slack",
+                phase="execution",
+                metadata={
+                    "ready_mono_ns": _ready_mono_ns,
+                    "sampling_start_mono_ns": _sampling_start_mono_ns,
+                    "slack_ms": _slack_ms,
+                },
+            )
         # ── Gated deep sampling profile: begin AFTER the authoritative
         # sampling_start event so the profile's setup window measures the same
         # post-start bookkeeping the event pair measures.  Off path returns

@@ -229,7 +229,13 @@ class ModalClientFallbackTests(unittest.TestCase):
 
 class CanonicalExecuteFallbackTests(unittest.TestCase):
     def test_execute_plan_local_fallback_present(self):
-        self.assertIn('attach_waterfall(result, run_label="canonical execute_plan")', CANONICAL)
+        # The host-side fallback suppresses its duplicate render: the remote
+        # container already printed the waterfall, so the call passes
+        # print_render=False.
+        self.assertIn(
+            'attach_waterfall(result, run_label="canonical execute_plan", print_render=False)',
+            CANONICAL,
+        )
         self.assertIn("result[\"trace\"] = remote_trace", CANONICAL)
 
     def test_execute_modal_prompt_local_fallback_present(self):

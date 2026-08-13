@@ -24,8 +24,39 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from .contracts import SnapshotExecutionSeed
 from .trace import RuntimeTrace
 from .variance_diagnostics import variance_stage
+from .optimization_diagnostics import emit_opt, opt_diag_enabled
 
 _log = logging.getLogger(__name__)
+
+# ── Measurement-only restore decomposition state ────────────────────────
+# Everything below is gated by COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS (off by
+# default; see optimization_diagnostics).  Only ``opt_``-prefixed trace events
+# are emitted; no runtime policy/decision/behavior changes.
+_OPT_SEED_READ_MS: dict[int, float] = {}
+"""Bounded module-level accumulator of seed-payload file-read durations (ms).
+
+Populated by ``_try_hydrate_snapshot_seed_payload`` (which may not always
+have a trace in scope) and consumed by the aggregated
+``opt_restore_decomposition`` event emitted at the end of ``restore``.
+Keyed by an insertion counter and pruned to the newest
+``_OPT_SEED_READ_MS_MAX`` entries so memory stays flat.
+"""
+_OPT_SEED_READ_MS_MAX = 8
+_OPT_SEED_READ_COUNT = 0
+
+
+def _opt_record_seed_read_ms(duration_ms: float) -> None:
+    """Record one seed-read duration into the bounded accumulator."""
+    global _OPT_SEED_READ_COUNT
+    _OPT_SEED_READ_MS[_OPT_SEED_READ_COUNT] = round(float(duration_ms), 3)
+    _OPT_SEED_READ_COUNT += 1
+    while len(_OPT_SEED_READ_MS) > _OPT_SEED_READ_MS_MAX:
+        _OPT_SEED_READ_MS.pop(next(iter(_OPT_SEED_READ_MS)))
+
+
+def _opt_seed_read_sum_ms() -> float:
+    """Sum of recorded seed-read durations (0.0 when none recorded)."""
+    return round(sum(_OPT_SEED_READ_MS.values()), 3)
 
 
 def _emit_startup_stage(
@@ -328,6 +359,11 @@ class BootstrapState:
     dependency_scan_call_count: int = 0
     dependency_validation_call_count: int = 0
     dependency_manifest_build_call_count: int = 0
+    # -- Step-2 canonical deployment-static validation proof (frozen at
+    # snapshot creation; marked stale at restore on custom-node drift).
+    # Instrumentation only — never consumed by validation/certificate
+    # decisions in Step 2.
+    snapshot_validation_proof: dict[str, Any] = field(default_factory=dict)
 
     def has_prescan_identity(self) -> bool:
         """Backward-compatible diagnostic — checks frozen prescan identity."""
@@ -545,6 +581,16 @@ class BootstrapState:
         self.snapshot_cert_retained = False
         self.snapshot_cert_reason = str(reason or "")
         self.snapshot_cert_timings = {}
+
+    def freeze_validation_proof(self, proof: dict[str, Any]) -> None:
+        self.snapshot_validation_proof = dict(proof or {})
+
+    def mark_validation_proof_stale(self, reason: str) -> None:
+        _p = dict(self.snapshot_validation_proof or {})
+        if _p:
+            _p["valid"] = False
+            _p["invalid_reason"] = str(reason or "stale")
+            self.snapshot_validation_proof = _p
 
     def set_graph_trimming_evidence(
         self, *, removable_ids: list[str], trimming_possible: bool,
@@ -1493,7 +1539,20 @@ class RuntimeBootstrap:
         try:
             import os as _os
 
+            # Measurement-only bracket of just the payload file read.  The
+            # duration is emitted as opt_restore_seed_read_ms and accumulated
+            # into the module-level bounded dict for opt_restore_decomposition.
+            _opt_seed_read_t0 = time.perf_counter()
             payload = read_snapshot_seed_payload(root=_os.path.dirname(path))
+            _opt_seed_read_ms = round((time.perf_counter() - _opt_seed_read_t0) * 1000, 3)
+            if opt_diag_enabled():
+                _opt_record_seed_read_ms(_opt_seed_read_ms)
+            emit_opt(
+                trace,
+                "restore_seed_read_ms",
+                phase="restore",
+                metadata={"duration_ms": _opt_seed_read_ms, "seed_payload_path": path},
+            )
             if payload is None:
                 return False
             if not self.state.hydrate_snapshot_seed_payload(payload):
@@ -1529,6 +1588,17 @@ class RuntimeBootstrap:
 
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
+        # ── Measurement-only decomposition state (inert unless
+        # COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS is set) ──────────────────
+        _opt_fastdisk_wrapper_ms: float | None = None
+        _opt_metadata_ms: float | None = None
+        _opt_sage_identity_read_ms: float | None = None
+        _opt_prescan_identity_ms: float | None = None
+        _opt_custom_node_check_ms: float | None = None
+        # No gc.collect() call exists anywhere inside restore(); the GC
+        # barrier gap is therefore recorded as a constant 0.0 (kept explicit
+        # so opt_restore_decomposition lists every intended gap slot).
+        _opt_gc_ms: float = 0.0
         # ── V2 native fast-disk UNET: graph UNETLoader wrapper (flag-gated) ──
         # With COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=0 the restore-time installer
         # callers (external_model_lane_scope, coordinator lanes, bridge) never
@@ -1537,6 +1607,7 @@ class RuntimeBootstrap:
         # wrapper here; flag-off is a byte-identical no-op (no import, no
         # call).  The env check mirrors _NATIVE_FAST_DISK_UNET so this block
         # is inert unless the flag is on.
+        _opt_fd_t0 = time.perf_counter()
         try:
             if os.environ.get("COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "").strip().lower() in ("1", "true", "yes", "on"):
                 from .model_preload import _ensure_graph_unet_loader_wrapper_lazy
@@ -1551,7 +1622,15 @@ class RuntimeBootstrap:
             # Surface, never mask: a flag-on install failure is printed and
             # restore continues (the wrapper retries via _ensure_core_wrappers).
             print(f"[bootstrap] graph_unet_loader_wrapper install error: {_gwl_exc}", flush=True)
+        _opt_fastdisk_wrapper_ms = round((time.perf_counter() - _opt_fd_t0) * 1000, 3)
+        emit_opt(
+            trace,
+            "restore_fastdisk_wrapper_ms",
+            phase="restore",
+            metadata={"duration_ms": _opt_fastdisk_wrapper_ms},
+        )
         self.state.restore_started_at = time.time()
+        _opt_metadata_t0 = time.perf_counter()
         # Phase 0/3 — capture identity/environment metadata at lifecycle entry
         if trace:
             self.state.modal_task_id = os.environ.get("MODAL_TASK_ID", "")
@@ -1568,6 +1647,13 @@ class RuntimeBootstrap:
                     "modal_region": self.state.modal_region,
                 },
             )
+        _opt_metadata_ms = round((time.perf_counter() - _opt_metadata_t0) * 1000, 3)
+        emit_opt(
+            trace,
+            "restore_metadata_ms",
+            phase="restore",
+            metadata={"duration_ms": _opt_metadata_ms},
+        )
         try:
             # ── 1. restore_gpu_state ──
             def _do_restore_gpu_state():
@@ -1608,10 +1694,20 @@ class RuntimeBootstrap:
             _sage_verify_ok = False
             _sage_verify_ms = 0.0
             if self.state.snapshot_sage_identity:
+                # Measurement-only bracket: the identity READ only; the verify
+                # duration below (_sage_verify_ms) is kept as-is.
+                _opt_sage_read_t0 = time.perf_counter()
                 _sage_current_identity = (
                     self.read_current_custom_node_identity()
                     if self.read_current_custom_node_identity is not None
                     else {}
+                )
+                _opt_sage_identity_read_ms = round((time.perf_counter() - _opt_sage_read_t0) * 1000, 3)
+                emit_opt(
+                    trace,
+                    "restore_sage_identity_read_ms",
+                    phase="restore",
+                    metadata={"duration_ms": _opt_sage_identity_read_ms},
                 )
                 _sage_t0 = time.perf_counter()
                 _sage_verify_ok = bool(
@@ -1700,8 +1796,18 @@ class RuntimeBootstrap:
                 _do_reload_models()
 
             # Lane B: restore prescan identity from persisted record
+            # (measurement-only bracket; the function is a no-op fallback
+            # when no prescan record exists — it is still timed).
+            _opt_prescan_t0 = time.perf_counter()
             if self.read_current_custom_node_identity is None:
                 self._restore_prescan_identity()
+            _opt_prescan_identity_ms = round((time.perf_counter() - _opt_prescan_t0) * 1000, 3)
+            emit_opt(
+                trace,
+                "restore_prescan_identity_ms",
+                phase="restore",
+                metadata={"duration_ms": _opt_prescan_identity_ms},
+            )
 
             # ── Lane B: custom-node restore fast path (authoritative-only) ──
             # Reads current authoritative-only identity and compares schema,
@@ -1744,7 +1850,28 @@ class RuntimeBootstrap:
                 _current_source = "prescan_identity"
                 _skipped_cn_sync = True
 
+            # Step-2: a fallback full-sync means the snapshot's canonical
+            # deployment-static proof no longer describes the current custom
+            # node set — mark it stale (instrumentation only, no decision
+            # changes; the exact-skip branch above never marks stale).
+            if _cn_fallback_reason:
+                self.state.mark_validation_proof_stale(f"custom_node_{_cn_fallback_reason}")
+
             _check_ms = round((time.perf_counter() - _check_start) * 1000, 3)
+            # Measurement-only: attach the already-computed identity-check
+            # duration to the decomposition (reused, not re-bracketed).
+            _opt_custom_node_check_ms = _check_ms
+            emit_opt(
+                trace,
+                "restore_custom_node_check_ms",
+                phase="restore",
+                metadata={
+                    "duration_ms": _check_ms,
+                    "decision": _cn_decision,
+                    "skipped_sync": int(bool(_skipped_cn_sync)),
+                    "fallback_reason": _cn_fallback_reason,
+                },
+            )
 
             with variance_stage(trace, stage="custom_node_sync", phase="restore"):
                 if _skipped_cn_sync:
@@ -1790,6 +1917,12 @@ class RuntimeBootstrap:
                             self._persist_custom_node_identity_record()
                         except Exception as _pexc:
                             print(f"[bootstrap] identity_publish_after_sync error: {_pexc}", flush=True)
+                        # Step-2: the re-frozen identity records post-sync
+                        # state, so the frozen proof is stale by definition
+                        # when a fallback sync ran (guarded on reason — the
+                        # exact-skip path never reaches here).
+                        if _cn_fallback_reason:
+                            self.state.mark_validation_proof_stale(f"custom_node_{_cn_fallback_reason}")
                 else:
                     self.state.custom_node_generation = self.state.snapshot_custom_node_generation
 
@@ -1870,6 +2003,71 @@ class RuntimeBootstrap:
                 )
                 durations = trace.durations_ms()
                 self.state.stage_durations.update(durations)
+                if opt_diag_enabled():
+                    # ── Aggregated opt_restore_decomposition (measurement only) ──
+                    # Closes the untimed gaps between the already-timed
+                    # variance_stage sub-stages so the restore bootstrap can be
+                    # decomposed to ~100%.  Stage ms come from the same
+                    # durations_ms() mapping Agent 1's _restore_timing consumes;
+                    # absent stages (e.g. skipped sage_policy / custom_node_sync)
+                    # are reported as None.
+                    _stage_ms_map = {
+                        "restore_gpu_state": "restore_gpu_state_ms",
+                        "cuda_init": "cuda_init_ms",
+                        "sage_policy": "sage_policy_ms",
+                        "reload_runtime_state": "runtime_state_ms",
+                        "reload_models": "models_ms",
+                        "sync_custom_nodes": "custom_node_sync_ms",
+                        "observe_generations": "generation_observe_ms",
+                        "v2_startup_snapshot_execution_seed": "snapshot_seed_ms",
+                    }
+                    _dec_meta: dict[str, Any] = {}
+                    _measured_sum_ms = 0.0
+                    for _trace_key, _out_key in _stage_ms_map.items():
+                        _val = durations.get(_trace_key)
+                        if isinstance(_val, (int, float)):
+                            _dec_meta[_out_key] = round(float(_val), 3)
+                            _measured_sum_ms += _dec_meta[_out_key]
+                        else:
+                            _dec_meta[_out_key] = None
+                    _gap_fields = {
+                        "fastdisk_wrapper_ms": _opt_fastdisk_wrapper_ms,
+                        "metadata_ms": _opt_metadata_ms,
+                        "sage_identity_read_ms": _opt_sage_identity_read_ms,
+                        "sage_verify_ms": _sage_verify_ms,
+                        "prescan_identity_ms": _opt_prescan_identity_ms,
+                        "custom_node_check_ms": _opt_custom_node_check_ms,
+                        "seed_read_ms": _opt_seed_read_sum_ms(),
+                        "gc_ms": _opt_gc_ms,
+                    }
+                    for _out_key, _val in _gap_fields.items():
+                        if isinstance(_val, (int, float)):
+                            _dec_meta[_out_key] = round(float(_val), 3)
+                            _measured_sum_ms += _dec_meta[_out_key]
+                        else:
+                            _dec_meta[_out_key] = None
+                    _bootstrap_total_ms = round((time.perf_counter() - started) * 1000, 3)
+                    _dec_meta["bootstrap_total_ms"] = _bootstrap_total_ms
+                    _dec_meta["measured_sum_ms"] = round(_measured_sum_ms, 3)
+                    _dec_meta["residual_ms"] = round(
+                        max(_bootstrap_total_ms - _measured_sum_ms, 0.0), 3
+                    )
+                    _dec_meta["coverage_pct"] = (
+                        round(_measured_sum_ms / _bootstrap_total_ms * 100.0, 2)
+                        if _bootstrap_total_ms > 0
+                        else None
+                    )
+                    _dec_meta["composition_notes"] = (
+                        "seed_read_ms is measured inside the snapshot_seed stage "
+                        "(only non-zero when COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1); "
+                        "gc_ms is a constant 0.0 (no gc.collect() inside restore)"
+                    )
+                    emit_opt(
+                        trace,
+                        "restore_decomposition",
+                        phase="restore",
+                        metadata=_dec_meta,
+                    )
             return self.state
         except Exception as exc:
             self.state.errors.append(str(exc))

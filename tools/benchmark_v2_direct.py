@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import copy
 import json
 import os
@@ -18,11 +19,37 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Parent-ComfyUI root the plan builder needs: ``build_execution_plan`` lazily
+# imports ``execution`` (validation proof) and ``nodes`` (registry fingerprint)
+# from the parent ComfyUI tree, which is NOT on this harness's sys.path.  Add
+# it when available so the plan carries the same proof payload and registry
+# surface the production v2 dispatch builds with.  Env override wins; the
+# fallback derives from the repo layout (repo_root.parent.parent).  Fully
+# guarded - a wrong/missing root degrades gracefully, never crashes.
+_COMFYUI_ROOT_DIR = os.environ.get(
+    "COMFYMODAL_V2_COMFYUI_ROOT",
+    str(ROOT.parent.parent),
+)
+try:
+    if (
+        _COMFYUI_ROOT_DIR
+        and os.path.isdir(_COMFYUI_ROOT_DIR)
+        and os.path.isfile(os.path.join(_COMFYUI_ROOT_DIR, "execution.py"))
+        and _COMFYUI_ROOT_DIR not in sys.path
+    ):
+        sys.path.insert(0, _COMFYUI_ROOT_DIR)
+except Exception:
+    pass
+
 from canonical_execution import build_execution_plan, execute_plan
 from modal_client import check_active_warmup_profile, set_active_warmup_profile
 from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
 from comfymodal_runtime.env import env_flag
 from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
+from comfymodal_runtime.modal_restore_boundary import (
+    extract_restore_begin_from_result,
+    parse_modal_restore_begin,
+)
 from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.runtime_shape import runtime_shape_config
@@ -47,6 +74,24 @@ from tools.variance_report import (
     _num,
 )
 
+# Experiment-result persistence is optional: the harness must still run when
+# the module cannot be imported (per-run saves are re-imported defensively).
+try:
+    from comfymodal_runtime.experiment_result_store import (
+        build_run_record,
+        save_experiment_run,
+        write_campaign_manifest,
+    )
+except Exception as _exp_import_exc:  # noqa: BLE001
+    build_run_record = None
+    save_experiment_run = None
+    write_campaign_manifest = None
+    print(
+        f"[v2.experiment] experiment_result_store import failed; "
+        f"experiment persistence disabled: {_exp_import_exc}",
+        flush=True,
+    )
+
 
 WORKFLOW_PATH = ROOT / "latest_benchmark_workflow.json"
 WORKSPACES_PATH = ROOT / ".modal_workspaces.json"
@@ -56,6 +101,48 @@ GPU = os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")
 RUN_COUNT = int(os.environ.get("V2_BENCHMARK_RUNS", "1"))
 GAP_SECONDS = float(os.environ.get("V2_BENCHMARK_GAP_SECONDS", "20"))
 _ABSENT_STR = "absent"
+
+# ── Experiment-result persistence (V2 A/B campaign) ─────────────────────
+# argparse namespace (populated in ``__main__``) and the per-run records
+# accumulated across the multi-run loop.  Both are additive: the harness runs
+# unchanged when the campaign flags/records are unused.
+_EXPERIMENT_ARGS: Any | None = None
+_EXPERIMENT_RECORDS: list[dict[str, Any]] = []
+
+# ── Experiment arm → request-origin env translation (V2 A/B campaign) ──
+# Request-level experiment arms are applied PER-REQUEST by translating
+# --experiment/--arm into the allowlisted request-origin env keys the
+# remote runtime consumes (modal_app._apply_request_variance_diagnostics).
+# Baseline arms translate to no overrides (deployment defaults apply).
+_EXPERIMENT_ORIGIN_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
+    ("unet_transfer", "pinned_staging"): {"unet_pinned_staging": "1"},
+    ("vae_overlap", "early_250"): {"vae_early_start_ms": "250"},
+    ("vae_overlap", "early_500"): {"vae_early_start_ms": "500"},
+    ("vae_overlap", "early_750"): {"vae_early_start_ms": "750"},
+    ("vae_overlap", "early_1000"): {"vae_early_start_ms": "1000"},
+    ("png_encode", "level1"): {"png_compress_level": "1"},
+    ("conditioning_hit", "async_lru"): {"conditioning_async_lru": "1"},
+}
+
+
+def _experiment_origin_overrides() -> dict[str, str]:
+    """Translate the campaign --experiment/--arm args into request-origin
+    env overrides (bounded allowlist keys only; baseline -> {})."""
+    args = globals().get("_EXPERIMENT_ARGS")
+    if args is None:
+        return {}
+    experiment = str(getattr(args, "experiment", "") or "")
+    arm = str(getattr(args, "arm", "") or "")
+    return dict(_EXPERIMENT_ORIGIN_OVERRIDES.get((experiment, arm), {}))
+
+# Plan-carried validation proof collection (plan-validation feature; default
+# ON = harness behavior unchanged).  Explicitly disable with
+# COMFYMODAL_V2_PLAN_VALIDATION_PROOF=0 when the local node registry cannot
+# mirror the container (e.g. custom-node deps missing locally) and the run is
+# measurement-only.
+_PLAN_VALIDATION_PROOF = env_flag(
+    "COMFYMODAL_V2_PLAN_VALIDATION_PROOF", default=True
+)
 
 
 def _resolve_restore_publisher(transport: ModalTransport, workspace: dict) -> Any | None:
@@ -70,6 +157,130 @@ def _resolve_restore_publisher(transport: ModalTransport, workspace: dict) -> An
     if publish_restore_plan_enabled():
         return RemoteRestorePlanPublisher(transport, workspace)
     return None
+
+
+_NODE_REGISTRY_READY = False
+
+
+async def _ensure_full_node_registry() -> bool:
+    """Mirror the ComfyUI server startup: load comfy_extras + custom nodes.
+
+    Standalone plan construction needs the same node registry the server has
+    (production builds run inside the server).  Called once per process before
+    any plan build; never raises — returns readiness.
+    """
+    global _NODE_REGISTRY_READY
+    if _NODE_REGISTRY_READY:
+        return True
+    try:
+        # Bulletproof pre-lock: pin the REAL ComfyUI ``utils`` package into
+        # sys.modules by explicit file path, immune to sys.path shadowing.
+        # ``import nodes`` itself inserts ``<ComfyUI root>\comfy`` at
+        # sys.path[0] (ComfyUI nodes.py:23); after that a plain ``import
+        # utils`` resolves to ``comfy\utils.py`` (a module, not the ``utils``
+        # package) and every ``utils.install_util`` import fails.  Pinning by
+        # path BEFORE ``import nodes`` keeps the real package in sys.modules
+        # so even ``import nodes``'s transitive imports and every later node
+        # import see it (comfyui-impact-pack / RES4LYF need it).
+        import importlib.util as _ilu
+        _utils_init = os.path.join(_COMFYUI_ROOT_DIR, "utils", "__init__.py")
+        if os.path.isfile(_utils_init):
+            _utils_spec = _ilu.spec_from_file_location("utils", _utils_init)
+            _utils_mod = _ilu.module_from_spec(_utils_spec)
+            sys.modules["utils"] = _utils_mod
+            if _utils_spec.loader is not None:
+                _utils_spec.loader.exec_module(_utils_mod)
+            import utils.install_util  # noqa: F401
+        else:
+            raise RuntimeError(f"ComfyUI utils package not found at {_utils_init}")
+        import nodes
+        # Mirror main.py:470 — construct a PromptServer BEFORE loading custom
+        # nodes so packs that decorate ``@PromptServer.instance.routes`` at
+        # import time (Impact Pack impact_server.py, RES4LYF res4lyf.py,
+        # comfyui-manager, etc.) can register.  ``PromptServer.instance`` is
+        # only assigned inside ``PromptServer.__init__`` (server.py:205); the
+        # real server sets it in main.py:470 before ``nodes.init_extra_nodes``
+        # (main.py:476).  Network-free mirror: ``front_end_root`` points at the
+        # local web dir so ``FrontendManager.init_frontend`` is skipped
+        # (server.py:239-243), manager is disabled, and no socket is bound
+        # (the real server binds later via start()).
+        import server
+        from comfy.cli_args import args as _cli_args
+        for _field, _value in (
+            ("enable_compress_response_body", False),
+            ("enable_cors_header", None),
+            ("disable_api_nodes", False),
+            ("enable_manager", False),
+            ("max_upload_size", 100),
+            ("front_end_root", os.path.join(_COMFYUI_ROOT_DIR, "web")),
+            ("enable_assets", False),
+        ):
+            setattr(_cli_args, _field, _value)
+        _prompt_server = server.PromptServer(asyncio.get_running_loop())
+        print(
+            f"[v2.harness] prompt_server_mirror instance_set={server.PromptServer.instance is _prompt_server}",
+            flush=True,
+        )
+        await nodes.init_extra_nodes(init_custom_nodes=True, init_api_nodes=True)
+        # Mirror comfyapp's manual registration of the comfyui-modal
+        # production output classes (comfyapp.py:18186-18188 — the server
+        # registers them after init_extra_nodes; init_extra_nodes never does).
+        # We do NOT ``import comfyapp`` here: its module body resolves Modal
+        # volumes via ``modal.Volume.from_name(...)`` (comfyapp.py lines
+        # 8088/8093/8099/8126 — network/API calls) and builds GPU classes at
+        # import time, which is unsafe/heavy in the harness.  Instead extract
+        # ONLY the two class statements via AST (their methods are never
+        # executed host-side) so ``__module__`` stays ``comfyapp`` for
+        # registry-fingerprint parity with the container.
+        try:
+            # Register a lightweight ``comfyapp`` module stub BEFORE the AST
+            # extraction so per-class canonical-identity resolution
+            # (comfymodal_runtime.registry_proof) can resolve the module file
+            # for the AST-registered production classes.  ``__file__`` points
+            # at the repo's real comfyapp.py so the file-content hash used in
+            # the canonical identity matches the container's comfyapp.py.
+            import sys as _sys
+            import types as _types
+            if "comfyapp" not in _sys.modules:
+                _comfyapp_stub = _types.ModuleType("comfyapp")
+                _comfyapp_stub.__file__ = str(Path(ROOT) / "comfyapp.py")
+                _sys.modules["comfyapp"] = _comfyapp_stub
+            import ast as _ast
+            _comfyapp_src = Path(ROOT / "comfyapp.py").read_text(encoding="utf-8-sig")
+            _comfyapp_tree = _ast.parse(_comfyapp_src)
+            _prod_class_names = {
+                "ComfyModalProductionOutput",
+                "ComfyModalProductionImageComparerOutput",
+            }
+            _class_stmts = [
+                _n for _n in _comfyapp_tree.body
+                if isinstance(_n, _ast.ClassDef) and _n.name in _prod_class_names
+            ]
+            _ns: dict = {"__name__": "comfyapp"}
+            for _stmt in _class_stmts:
+                exec(
+                    compile(_ast.Module(body=[_stmt], type_ignores=[]), "comfyapp.py", "exec"),
+                    _ns,
+                )
+            for _cls_name in sorted(_prod_class_names):
+                _cls = _ns.get(_cls_name)
+                if _cls is not None:
+                    nodes.NODE_CLASS_MAPPINGS[_cls_name] = _cls
+            print(
+                f"[v2.harness] production_output_registered "
+                f"output={'ComfyModalProductionOutput' in nodes.NODE_CLASS_MAPPINGS} "
+                f"comparer={'ComfyModalProductionImageComparerOutput' in nodes.NODE_CLASS_MAPPINGS}",
+                flush=True,
+            )
+        except Exception as _reg_exc:
+            print(f"[v2.harness] production_output_registration_failed error={_reg_exc}", flush=True)
+        _count = len(getattr(nodes, "NODE_CLASS_MAPPINGS", {}) or {})
+        _NODE_REGISTRY_READY = True
+        print(f"[v2.harness] node_registry_initialized classes={_count}", flush=True)
+    except Exception as _exc:
+        _NODE_REGISTRY_READY = False
+        print(f"[v2.harness] node_registry_init_failed error={type(_exc).__name__}: {_exc}", flush=True)
+    return _NODE_REGISTRY_READY
 
 # ── Variance-cold mode (opt-in, never the default) ────────────────────────
 # Unique shadow app name used ONLY for variance mode.  Normal/production modes
@@ -617,7 +828,13 @@ def _timing(
         "output_collection_ms": deltas.get("output_collection_total_ms", output_collection_ms),
         "snapshot_callback_age_at_restore_ms": restore.get("snapshot_callback_age_at_restore_ms") if isinstance(restore, dict) else result.get("snapshot_callback_age_at_restore_ms"),
         "snapshot_callback_to_command_start_ms": result.get("snapshot_callback_to_command_start_ms"),
-        "command_start_to_restore_start_ms": result.get("command_start_to_restore_start_ms"),
+        # Prefer the truthfully-named field; fall back to the legacy name
+        # (identical semantics: command_start -> python resume).
+        "command_start_to_restore_start_ms": (
+            result.get("command_start_to_python_resume_ms")
+            if result.get("command_start_to_python_resume_ms") is not None
+            else result.get("command_start_to_restore_start_ms")
+        ),
         "local_timing": _local_timing,
         "restore_breakdown": restore_breakdown,
         "early_activation_total_ms": _ea_total_ms,
@@ -648,6 +865,318 @@ def _capture_ts() -> tuple[int, int]:
     Cross-process correlation uses wall_unix_ns only.
     """
     return (int(time.time() * 1_000_000_000), time.monotonic_ns())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Modal snapshot-restore-begin boundary ingestion (instrumentation ONLY)
+#
+# The Modal platform boundary "Restoring Function from memory snapshot" (the
+# scheduler handing the restored container to the not-yet-resumed Python
+# process) is NOT visible in-process — it is only fetchable via the Modal app
+# log.  These helpers resolve it (result-carried value first, else a Modal app
+# log tail) and rebuild the run's waterfall with it.  Every path degrades
+# gracefully when the boundary or log fetch is unavailable; no runtime
+# behavior changes.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _await_async_helper(coro_factory: Any) -> Any:
+    """Run an async helper to completion from a possibly-async context.
+
+    Uses ``asyncio.run`` when no loop is running; otherwise executes the
+    coroutine on its own fresh loop in a worker thread so the caller's loop is
+    never blocked by itself.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+        return _pool.submit(asyncio.run, coro_factory()).result()
+
+
+async def _fetch_modal_restore_begin_logs_async(
+    app_name: str,
+    *,
+    max_lines: int = 20000,
+    since: Any = None,
+    until: Any = None,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """Tail the Modal app log for the snapshot-restore-begin platform line.
+
+    Mirrors ``tools/fetch_matrix_stage_lines.py``: reads the active workspace
+    credentials from ``ROOT/.modal_workspaces.json``, resolves the app
+    identifier, and tails the app log.  Returns structured records as
+    ``[{"timestamp": <epoch seconds float>, "message": str, "task_id": str}]``.
+
+    Raises on any failure (missing credentials file, import, resolve, tail,
+    or timeout) — callers must treat a raise as "boundary unavailable".
+    """
+    if not WORKSPACES_PATH.is_file():
+        raise FileNotFoundError(f"workspace credentials not found: {WORKSPACES_PATH}")
+    _ws = json.loads(WORKSPACES_PATH.read_text(encoding="utf-8"))
+    _aid = _ws.get("active_workspace_id")
+    _entry = next(
+        (w for w in _ws.get("workspaces", []) if w.get("id") == _aid),
+        None,
+    )
+    if _entry is None or not _entry.get("token_id") or not _entry.get("token_secret"):
+        raise RuntimeError("active Modal workspace has no credentials")
+
+    import modal  # noqa: F401, PLC0415  (lazy — module imports without Modal)
+    from modal.cli.app import resolve_app_identifier  # noqa: PLC0415
+    from modal._logs import tail_logs  # noqa: PLC0415
+    from modal.client import _Client  # noqa: PLC0415
+
+    client = await _Client.from_credentials(_entry["token_id"], _entry["token_secret"])
+    app_id, _, _ = await resolve_app_identifier(app_name, None, client)
+
+    async def _collect() -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        async for batch in tail_logs(
+            client, app_id, max_lines, since=since, until=until,
+        ):
+            for item in batch.items:
+                ts = getattr(item, "timestamp", None)
+                if ts is None:
+                    continue
+                raw = getattr(item, "data", b"")
+                text = raw if isinstance(raw, str) else (raw or b"").decode("utf-8", "replace")
+                records.append({
+                    "timestamp": float(ts),
+                    "message": text,
+                    "task_id": str(getattr(item, "task_id", "") or ""),
+                })
+        return records
+
+    return await asyncio.wait_for(_collect(), timeout=timeout)
+
+
+def _result_app_name(result: Any) -> str:
+    """Best-effort app name from the result identity / trace metadata."""
+    if not isinstance(result, dict):
+        return ""
+    identity = result.get("identity")
+    if isinstance(identity, dict) and identity.get("app_name"):
+        return str(identity["app_name"])
+    trace = result.get("trace")
+    if isinstance(trace, dict):
+        metadata = trace.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("app_name"):
+            return str(metadata["app_name"])
+    return ""
+
+
+def _result_task_identity(result: Any) -> str:
+    """Run task identity: prefer modal_task_id / container_task_id.
+
+    Read from ``result["identity"]`` first, then trace metadata.
+    """
+    if not isinstance(result, dict):
+        return ""
+    identity = result.get("identity")
+    if isinstance(identity, dict):
+        for key in ("modal_task_id", "container_task_id"):
+            value = identity.get(key)
+            if value:
+                return str(value)
+    trace = result.get("trace")
+    if isinstance(trace, dict):
+        metadata = trace.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("modal_task_id", "container_task_id"):
+                value = metadata.get(key)
+                if value:
+                    return str(value)
+    return ""
+
+
+def resolve_modal_restore_begin(
+    result: Any,
+    timing: Any = None,
+    *,
+    log_lines: Any = None,
+    task_id: str = "",
+    window_start_unix_ns: int | None = None,
+    window_end_unix_ns: int | None = None,
+) -> int | None:
+    """Resolve the Modal snapshot-restore-begin boundary (ns) for one run.
+
+    1. ``extract_restore_begin_from_result`` first — no log fetch when the
+       value is already carried in the result/timing dicts.
+    2. When *log_lines* is ``None``, tail the Modal app log for the platform
+       ``Restoring Function from memory snapshot`` line (lazy Modal import via
+       ``_fetch_modal_restore_begin_logs_async``; on ANY failure print
+       ``modal_restore_begin_unavailable: log fetch failed`` and return
+       ``None``).
+    3. Otherwise parse *log_lines* via ``parse_modal_restore_begin`` with the
+       run's task identity (prefer the result's ``modal_task_id`` /
+       ``container_task_id``) and the caller-supplied wall window.
+
+    Always returns ``None`` when the boundary is unavailable — never raises.
+    """
+    value = extract_restore_begin_from_result(result, timing)
+    if value is not None:
+        return int(value)
+    if log_lines is None:
+        app_name = _result_app_name(result) or os.environ.get(
+            "COMFYMODAL_V2_APP_NAME", ""
+        )
+        try:
+            log_lines = _await_async_helper(
+                lambda: _fetch_modal_restore_begin_logs_async(app_name)
+            )
+        except Exception as exc:  # noqa: BLE001
+            print("modal_restore_begin_unavailable: log fetch failed", flush=True)
+            return None
+    if not task_id:
+        task_id = _result_task_identity(result)
+    parsed = parse_modal_restore_begin(
+        log_lines,
+        task_id=task_id,
+        window_start_unix_ns=window_start_unix_ns,
+        window_end_unix_ns=window_end_unix_ns,
+    )
+    return parsed["modal_restore_begin_wall_unix_ns"]
+
+
+def reconcile_waterfall_local(
+    result: dict[str, Any],
+    timing: Any = None,
+    *,
+    command_start_unix_ms: int | None = None,
+    response_received_unix_ns: int | None = None,
+    wall_ms: float | None = None,
+    log_lines: Any = None,
+    task_id: str = "",
+    run_label: str = "",
+    existing_waterfall: Any = None,
+) -> dict[str, Any] | None:
+    """Rebuild the run's waterfall with the Modal restore-begin boundary.
+
+    Instrumentation/reporting ONLY.  Resolves the restore-begin boundary
+    (result dicts first, else the Modal app log via
+    ``resolve_modal_restore_begin``), rebuilds the waterfall with
+    ``build_waterfall`` plus the resolved boundary (guarded with an
+    ``inspect.signature`` check for the ``modal_restore_begin_wall_unix_ns``
+    kwarg), stores ``result["waterfall_local"]`` (never touching
+    ``result["waterfall"]``), and prints a reconciliation block including an
+    OLD-vs-NEW comparison against *existing_waterfall* (the remote-built
+    waterfall).  Every failure mode degrades gracefully — the run path is
+    never affected.
+    """
+    try:
+        import inspect  # noqa: PLC0415
+        _params = inspect.signature(build_waterfall).parameters
+        if "modal_restore_begin_wall_unix_ns" not in _params:
+            return None
+    except (TypeError, ValueError):
+        return None
+    window_start_ns = (
+        int(command_start_unix_ms) * 1_000_000
+        if command_start_unix_ms is not None else None
+    )
+    window_end_ns = (
+        int(response_received_unix_ns)
+        if response_received_unix_ns is not None else None
+    )
+    restore_begin = resolve_modal_restore_begin(
+        result,
+        timing,
+        log_lines=log_lines,
+        task_id=task_id,
+        window_start_unix_ns=window_start_ns,
+        window_end_unix_ns=window_end_ns,
+    )
+    try:
+        rebuilt = build_waterfall(
+            result=result,
+            timing=timing,
+            wall_ms=wall_ms,
+            command_start_unix_ms=command_start_unix_ms,
+            response_received_unix_ns=response_received_unix_ns,
+            run_label=run_label,
+            modal_restore_begin_wall_unix_ns=restore_begin,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"WATERFALL RECONCILIATION (local rebuild) failed: {type(exc).__name__}",
+            flush=True,
+        )
+        return None
+    rebuilt_dict = waterfall_to_dict(rebuilt)
+    if isinstance(result, dict):
+        result["waterfall_local"] = rebuilt_dict
+
+    def _num(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _fmt(value: float | None) -> str:
+        return f"{value:.1f}" if value is not None else "-"
+
+    total = _num(rebuilt.total_ms)
+    accounted = _num(rebuilt.accounted_ms)
+    residual = _num(rebuilt.residual_ms)
+    if residual is None:
+        # Fall back to the accounted/reconciliation fields when the rebuilt
+        # report predates residual_ms.
+        residual = _num(rebuilt.reconciliation_ms)
+    residual_pct = _num(rebuilt.residual_pct)
+    if residual_pct is None and residual is not None and total and total > 0:
+        residual_pct = residual / total * 100.0
+    status = (
+        rebuilt.reconciliation_status
+        or (
+            "OK"
+            if (
+                rebuilt.reconciliation_ms is not None
+                and rebuilt.tolerance_ms is not None
+                and abs(rebuilt.reconciliation_ms) <= rebuilt.tolerance_ms
+            )
+            else "EXCEEDS_TOLERANCE"
+        )
+    )
+    controllable = _num(rebuilt.controllable_wall_ms)
+    platform = _num(rebuilt.platform_wall_ms)
+    unavailable = (
+        "yes"
+        if "modal_restore_begin_unavailable" in (rebuilt.boundary_flags or ())
+        else "no"
+    )
+
+    print("WATERFALL RECONCILIATION (local rebuild)", flush=True)
+    print(f"  command_to_response_ms            {_fmt(total)}", flush=True)
+    print(f"  top_level_accounted_ms            {_fmt(accounted)}", flush=True)
+    print(f"  global_residual_ms                {_fmt(residual)}", flush=True)
+    print(f"  global_residual_pct               {_fmt(residual_pct)}", flush=True)
+    print(f"  reconciliation_status             {status}", flush=True)
+    print(f"  controllable_application_wall_ms  {_fmt(controllable)}", flush=True)
+    print(f"  platform_wall_ms                  {_fmt(platform)}", flush=True)
+    print(f"  modal_restore_begin_unavailable   {unavailable}", flush=True)
+
+    old_accounted: float | None = None
+    old_residual: float | None = None
+    if isinstance(existing_waterfall, dict):
+        old_accounted = _num(existing_waterfall.get("accounted_ms"))
+        old_residual = _num(existing_waterfall.get("residual_ms"))
+        if old_residual is None:
+            old_residual = _num(existing_waterfall.get("reconciliation_ms"))
+    print(
+        "  OLD vs NEW accounted_ms %s -> %s | residual_ms %s -> %s" % (
+            _fmt(old_accounted),
+            _fmt(accounted),
+            _fmt(old_residual),
+            _fmt(residual),
+        ),
+        flush=True,
+    )
+    return rebuilt_dict
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -920,7 +1449,24 @@ async def _run_one(
     }
     if _extra_origin:
         request_origin_info.update(_extra_origin)
+    # Request-level experiment arms (unet_transfer / vae_overlap /
+    # png_encode / conditioning_hit) travel as allowlisted request-origin
+    # env keys so the container applies the arm per-request.  Baseline arms
+    # add nothing (deployment defaults apply).  restore_memory is
+    # deployment-level and never travels per-request.
+    _experiment_origin = _experiment_origin_overrides()
+    if _experiment_origin:
+        request_origin_info.update(_experiment_origin)
     prompt_id = _req_id  # request_id == prompt_id
+
+    # Mirror the ComfyUI server's full node registry before any plan build:
+    # a base-only registry would reject comfy_extras nodes at validation and
+    # fingerprint the wrong surface.
+    if not await _ensure_full_node_registry():
+        raise RuntimeError(
+            "[v2.harness] node registry initialization failed; "
+            "cannot build an authoritative plan validation proof"
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Prefix timestamp capture: worker_start → plan_build_start
@@ -1008,6 +1554,8 @@ async def _run_one(
                           "__request_origin_info__": request_origin_info},
         trace=runtime_trace,
         validate=False,
+        collect_validation_proof=_PLAN_VALIDATION_PROOF,
+        comfyui_root=_COMFYUI_ROOT_DIR,
     )
 
     _mode = "bypass" if bypass_cpu_snapshot_unet else "reuse"
@@ -1079,6 +1627,31 @@ async def _run_one(
         run_label=f"run {index + 1}",
     )
     artifact["waterfall"] = waterfall_to_dict(_waterfall)
+    # ── Local waterfall rebuild with the Modal restore-begin boundary ──
+    # Instrumentation/reporting ONLY: rebuilds the waterfall with the platform
+    # "Restoring Function from memory snapshot" boundary (result-carried value
+    # first, else a Modal app log tail), stores it as ``waterfall_local``
+    # (never touching the remote-built ``waterfall``) and prints a
+    # reconciliation block.  Every failure degrades gracefully.
+    try:
+        reconcile_waterfall_local(
+            result,
+            artifact["timing"],
+            command_start_unix_ms=_command_start_ms,
+            response_received_unix_ns=_response_wall_ns,
+            wall_ms=wall_ms,
+            run_label=f"run {index + 1} (local reconcile)",
+            existing_waterfall=artifact["waterfall"],
+        )
+    except Exception as _reconcile_exc:  # noqa: BLE001
+        print(
+            f"WATERFALL RECONCILIATION (local rebuild) unavailable: "
+            f"{type(_reconcile_exc).__name__}",
+            flush=True,
+        )
+    artifact["waterfall_local"] = (
+        result.get("waterfall_local") if isinstance(result, dict) else None
+    )
     (output_dir / f"run_{index}.json").write_text(
         json.dumps(artifact, default=str, indent=2), encoding="utf-8"
     )
@@ -1104,6 +1677,42 @@ async def _run_one(
             json.dumps(artifact, default=str, indent=2), encoding="utf-8"
         )
 
+    # ── Experiment-result persistence (V2 A/B campaign) ────────────────
+    # Deterministic per-run record: best-effort, additive, never touches the
+    # existing run file or the artifact.  One save per run.
+    try:
+        from comfymodal_runtime.experiment_result_store import build_run_record, save_experiment_run
+        _exp_args = globals().get("_EXPERIMENT_ARGS")
+        _exp_role = (
+            getattr(_exp_args, "run_role", "sample")
+            if _exp_args is not None else "sample"
+        ) or "sample"
+        _run_index_attr = (
+            getattr(_exp_args, "run_index", None) if _exp_args is not None else None
+        )
+        _record = build_run_record(
+            artifact,
+            request_id=artifact.get("request_id", artifact.get("prompt_id", "")),
+            experiment=(getattr(_exp_args, "experiment", "") if _exp_args is not None else "") or "",
+            arm=(getattr(_exp_args, "arm", "") if _exp_args is not None else "") or "",
+            run_ordinal=(
+                int(_run_index_attr) if _run_index_attr is not None else index + 1
+            ),
+            run_role=_exp_role,
+            retained=(_exp_role != "validation_discard"),
+            discard_reason=(
+                "first_post_snapshot_run" if _exp_role == "validation_discard" else ""
+            ),
+        )
+        _saved = save_experiment_run(_record, output_dir=output_dir)
+        globals()["_EXPERIMENT_RECORDS"].append(_record)
+        print(f"[v2.experiment] saved={_saved}", flush=True)
+    except Exception as _exc:  # noqa: BLE001
+        print(
+            f"[v2.experiment] save skipped: {type(_exc).__name__}: {_exc}",
+            flush=True,
+        )
+
     print(json.dumps({
         "run_index": index,
         "request_id": prompt_id,
@@ -1112,7 +1721,12 @@ async def _run_one(
         "timing": artifact["timing"],
     }, default=str))
     if not _defer_waterfall:
-        print(render_waterfall(_waterfall), flush=True)
+        # Prefer the host-reconciled rebuild (TOTAL WALL denominator) when it
+        # exists; the remote-built report stays available in the artifact.
+        _print_waterfall = artifact.get("waterfall_local") or _waterfall
+        if artifact.get("waterfall_local"):
+            print("WATERFALL (host-reconciled)", flush=True)
+        print(render_waterfall(_print_waterfall), flush=True)
     return artifact
 
 
@@ -1463,9 +2077,16 @@ def _extract_acceptance_timing(
     timing["snapshot_callback_to_command_start_ms"] = result.get(
         "snapshot_callback_to_command_start_ms", _trace_meta.get("snapshot_callback_to_command_start_ms")
     )
-    timing["command_start_to_restore_start_ms"] = result.get(
-        "command_start_to_restore_start_ms", _trace_meta.get("command_start_to_restore_start_ms")
-    )
+    # Prefer the truthfully-named command_start_to_python_resume_ms; fall back
+    # to the legacy command_start_to_restore_start_ms (same semantics).
+    _python_resume_val = result.get("command_start_to_python_resume_ms")
+    if _python_resume_val is None:
+        _python_resume_val = _trace_meta.get("command_start_to_python_resume_ms")
+    if _python_resume_val is None:
+        _python_resume_val = result.get(
+            "command_start_to_restore_start_ms", _trace_meta.get("command_start_to_restore_start_ms")
+        )
+    timing["command_start_to_restore_start_ms"] = _python_resume_val
 
     # sampling_ms
     _ss = _event_mono_ns(result, "sampling_start")
@@ -1516,6 +2137,9 @@ def _extract_acceptance_timing(
             _commit_ms = _asset_meta.get("commit_ms") or _asset_meta.get("output_volume_commit_ms")
             if isinstance(_commit_ms, (int, float)):
                 timing["output_commit_ms"] = round(float(_commit_ms), 3)
+            elif _asset_meta.get("commit_status") == "pending":
+                timing["output_commit_ms"] = None
+                timing["commit_pending"] = True
 
     return timing
 
@@ -1677,9 +2301,18 @@ def _check_acceptance(
         if not isinstance(_oenc, (int, float)):
             failures.append(f"{run_label}: output_encode_ms missing/absent ({_oenc})")
 
-        # output_commit_ms must be present (0.0 is valid — means zero latency)
+        # output_commit_ms may be absent when the commit is deferred
+        # (commit_status pending/skipped, or timing.commit_pending set) —
+        # 0.0 is valid (means zero latency).
         _oc = timing.get("output_commit_ms")
-        if _oc is None:
+        _ocd = _ev_result.get("output_diagnostics") if isinstance(_ev_result, dict) else None
+        if not isinstance(_ocd, dict):
+            _ocd = result.get("output_diagnostics") if isinstance(result, dict) else None
+        _commit_deferred = (
+            timing.get("commit_pending") is True
+            or (isinstance(_ocd, dict) and _ocd.get("commit_status") in ("pending", "skipped"))
+        )
+        if _oc is None and not _commit_deferred:
             failures.append(f"{run_label}: output_commit_ms missing/absent")
 
         # clip_preparation_timings_ms: structured dict from _restore_timing keys.
@@ -2044,7 +2677,13 @@ def _extract_acceptance_timing_scoped(
         "asset_fetch_ms": None,
         "snapshot_callback_age_at_restore_ms": restore_timing.get("snapshot_callback_age_at_restore_ms"),
         "snapshot_callback_to_command_start_ms": result.get("snapshot_callback_to_command_start_ms"),
-        "command_start_to_restore_start_ms": result.get("command_start_to_restore_start_ms"),
+        # Prefer the truthfully-named field; fall back to the legacy name
+        # (identical semantics: command_start -> python resume).
+        "command_start_to_restore_start_ms": (
+            result.get("command_start_to_python_resume_ms")
+            if result.get("command_start_to_python_resume_ms") is not None
+            else result.get("command_start_to_restore_start_ms")
+        ),
         "sampler_node_id": None,
         "sampler_class_type": None,
         "sampler_identification_source": "unavailable",
@@ -2131,8 +2770,11 @@ def _extract_acceptance_timing_scoped(
               or _od.get("output_commit_overlap_ms"))
         if isinstance(cm, (int, float)) and cm >= 0:
             timing["output_commit_ms"] = round(float(cm), 3)
+        if _od.get("commit_status") == "pending":
+            timing["output_commit_ms"] = None
+            timing["commit_pending"] = True
     # Fallback: check output_persist_end metadata directly
-    if timing["output_commit_ms"] is None:
+    if timing["output_commit_ms"] is None and not timing.get("commit_pending"):
         for ev in events:
             if ev.get("name") == "output_persist_end":
                 meta = ev.get("metadata", {})
@@ -2254,6 +2896,14 @@ async def _run_acceptance_sequence(
         _cid_end_ts = (int(time.time() * 1_000_000_000), time.monotonic_ns())
         runtime_trace.emit_at("client_id_generation_end",
             wall_unix_ns=_cid_end_ts[0], monotonic_ns=_cid_end_ts[1], phase="local")
+        # Mirror the ComfyUI server's full node registry before any plan build:
+        # a base-only registry would reject comfy_extras nodes at validation
+        # and fingerprint the wrong surface.
+        if not await _ensure_full_node_registry():
+            raise RuntimeError(
+                "[v2.harness] node registry initialization failed; "
+                "cannot build an authoritative plan validation proof"
+            )
         _bep_call_ts = (int(time.time() * 1_000_000_000), time.monotonic_ns())
         runtime_trace.emit_at("build_execution_plan_call_start",
             wall_unix_ns=_bep_call_ts[0], monotonic_ns=_bep_call_ts[1], phase="local")
@@ -2265,6 +2915,8 @@ async def _run_acceptance_sequence(
             request_metadata={"benchmark_run_index": index, "benchmark_app": _APP_NAME,
                               "__request_origin_info__": request_origin_info},
             trace=runtime_trace, validate=False,
+            collect_validation_proof=_PLAN_VALIDATION_PROOF,
+            comfyui_root=_COMFYUI_ROOT_DIR,
         )
         _ep_call_wall_ns, _ep_call_mono_ns = (int(time.time() * 1_000_000_000), time.monotonic_ns())
         runtime_trace.emit_at("execute_plan_call_start",
@@ -2355,7 +3007,12 @@ async def _run_acceptance_sequence(
         (output_dir / f"run_{label}.json").write_text(
             json.dumps(artifact, default=str, indent=2), encoding="utf-8"
         )
-        print(render_waterfall(_waterfall), flush=True)
+        # Prefer the host-reconciled rebuild when present (acceptance does not
+        # currently reconcile, so this falls back to the remote-built dict).
+        _print_waterfall = artifact.get("waterfall_local") or artifact["waterfall"]
+        if artifact.get("waterfall_local"):
+            print("WATERFALL (host-reconciled)", flush=True)
+        print(render_waterfall(_print_waterfall), flush=True)
         return artifact, _req_id
 
     # ══════════════════════════════════════════════════════════════════════
@@ -6631,12 +7288,39 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         } for item in artifacts],
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, default=str, indent=2), encoding="utf-8")
-    _reports = [item["waterfall"] for item in artifacts if item.get("waterfall")]
+    # Prefer the host-reconciled rebuild (TOTAL WALL denominator) when present;
+    # the remote-built partial stays available in the artifact under "waterfall".
+    _report_sources = []
+    for _item in artifacts:
+        if _item.get("waterfall_local"):
+            _report_sources.append(("reconciled", _item["waterfall_local"]))
+        elif _item.get("waterfall"):
+            _report_sources.append(("remote", _item["waterfall"]))
+    _reports = [report for _source, report in _report_sources]
+    _reconciled_count = sum(1 for _source, _ in _report_sources if _source == "reconciled")
     print(json.dumps({"output_dir": str(output_dir), **summary}, default=str, indent=2))
     if len(_reports) == 1:
+        if _reconciled_count == 1:
+            print("WATERFALL (host-reconciled)", flush=True)
         print(render_waterfall(_reports[0]), flush=True)
     elif len(_reports) > 1:
         print(render_comparison(_reports), flush=True)
+
+    # ── Campaign manifest (deterministic experiment persistence) ───────
+    # Best-effort: collects every per-run record saved above into one
+    # campaign_manifest.json.  Never affects the run results or exit path.
+    try:
+        from comfymodal_runtime.experiment_result_store import write_campaign_manifest
+        _records = globals().get("_EXPERIMENT_RECORDS") or []
+        if _records:
+            _manifest_path = write_campaign_manifest(_records, output_dir=output_dir)
+            print(f"[v2.experiment] campaign manifest={_manifest_path}", flush=True)
+    except Exception as _manifest_exc:  # noqa: BLE001
+        print(
+            f"[v2.experiment] campaign manifest skipped: "
+            f"{type(_manifest_exc).__name__}: {_manifest_exc}",
+            flush=True,
+        )
 
     # Signal failure if any trace handoff failed (run files are preserved)
     if trace_errors:
@@ -6864,7 +7548,30 @@ if __name__ == "__main__":
              "six valid probes are recovered; never substitutes later "
              "attempts.  Opt-in; never the default.",
     )
+    _parser.add_argument(
+        "--experiment",
+        default="",
+        help="V2 A/B campaign experiment label stored in every persisted "
+             "experiment record (default: '').",
+    )
+    _parser.add_argument(
+        "--arm",
+        default="",
+        help="V2 A/B campaign arm label (e.g. pinned_staging) stored in every "
+             "persisted experiment record (default: '').",
+    )
+    _parser.add_argument(
+        "--run-role",
+        choices=("sample", "validation_discard", "probe"),
+        default="sample",
+        help="Role of every run in this invocation for campaign persistence: "
+             "sample (retained), validation_discard (discarded), or probe "
+             "(default: sample).",
+    )
     _args = _parser.parse_args()
+
+    # Campaign persistence args must be reachable from _run_one/main.
+    _EXPERIMENT_ARGS = _args
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
 

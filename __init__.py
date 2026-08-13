@@ -1155,11 +1155,21 @@ def _utc_now_iso() -> str:
 
 
 def _save_deploy_state(version: str | None, fingerprint: str | None, deployed_at: str | None = None, deployment_command: str | None = None) -> None:
+    # Step-3: persist the host-side canonical deployment combined hash so plan
+    # construction reads it back without any request-time filesystem scan.
+    # Computed once via the same mirror the container uses; never breaks
+    # deploy bookkeeping on failure.
+    try:
+        from canonical_execution import _compute_host_deployment_combined_hash as _dp_hash_fn
+        _dp_hash = _dp_hash_fn()
+    except Exception:
+        _dp_hash = ""
     payload = {
         "comfyapp_version": version,
         "custom_nodes_fingerprint": fingerprint,
         "deployed_at": deployed_at,
         "deployment_command": deployment_command,
+        "deployment_combined_hash": _dp_hash,
     }
     with open(_DEPLOY_STATE_JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -2446,6 +2456,7 @@ async def _execute_job(item: tuple, item_id: int):
                 comfyui_root=_COMFYUI_ROOT,
                 trace=_v2_trace,
                 validate=False,
+                collect_validation_proof=True,
             )
             _v2_trace.set_metadata(
                 workflow_hash_prefix=_v2_plan.workflow_hash[:12],
@@ -2637,20 +2648,32 @@ async def _execute_job(item: tuple, item_id: int):
             def _remote_fetch_fn(backend_path: str, asset_id: str) -> bytes:
                 from modal_client import read_output_asset as _read_asset
                 import asyncio
-                try:
-                    _loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    _loop = None
-                _coro = _read_asset(backend_path, expected_sha256=asset_id, gpu=_remote_fetch_gpu, workspace=_remote_fetch_workspace)
-                if _loop is not None and _loop.is_running():
-                    _future = asyncio.run_coroutine_threadsafe(_coro, _loop)
-                    _result = _future.result(timeout=120)
-                else:
-                    _result = asyncio.run(_coro)
-                _data = _result.get("data", b"") if isinstance(_result, dict) else b""
-                if not isinstance(_data, bytes):
-                    raise TypeError("remote fetch returned unexpected type")
-                return _data
+                _last_exc = None
+                for _attempt in range(3):
+                    try:
+                        try:
+                            _loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            _loop = None
+                        _coro = _read_asset(backend_path, expected_sha256=asset_id, gpu=_remote_fetch_gpu, workspace=_remote_fetch_workspace)
+                        if _loop is not None and _loop.is_running():
+                            _future = asyncio.run_coroutine_threadsafe(_coro, _loop)
+                            _result = _future.result(timeout=120)
+                        else:
+                            _result = asyncio.run(_coro)
+                        _data = _result.get("data", b"") if isinstance(_result, dict) else b""
+                        if not isinstance(_data, bytes):
+                            raise TypeError("remote fetch returned unexpected type")
+                        return _data
+                    except FileNotFoundError as _exc:
+                        # Variant A: the remote's Volume commit may still be in
+                        # flight.  Retry within a bounded window before surfacing
+                        # the miss; the caller downgrades OSError to a save
+                        # warning, so a final re-raise preserves that behavior.
+                        _last_exc = _exc
+                        if _attempt < 2:
+                            time.sleep(0.25 if _attempt == 0 else 0.5)
+                raise _last_exc
 
             delivery = _materialize_v2_result(
                 result,
@@ -6664,22 +6687,47 @@ if _server:
             workspace = _workspace_or_400(workspace_id)
             if not workspace:
                 return web.json_response({"status": "error", "message": "asset workspace unavailable"}, status=404)
+            # Variant A: the remote delivers the result before its Volume
+            # commit completes.  Tolerate a bounded in-flight window below.
+            from comfymodal_runtime.modal_transport import get_persistence_status
             started = time.perf_counter()
-            try:
-                from modal_client import read_output_asset
-                remote = await read_output_asset(
-                    backend_path,
-                    expected_sha256=str(record.get("content_hash", "")),
-                    gpu=gpu or None,
-                    workspace=workspace,
-                )
-                data = remote.get("data", b"") if isinstance(remote, dict) else b""
-                if not isinstance(data, bytes):
-                    raise TypeError("remote asset payload is not bytes")
-            except FileNotFoundError:
-                return web.json_response({"status": "error", "message": "asset file missing"}, status=404)
-            except Exception as exc:
-                return web.json_response({"status": "error", "message": f"asset fetch failed: {exc}"}, status=502)
+            max_attempts = 5
+            backoff_s = [0.25, 0.5, 1.0, 1.5, 1.5]
+            data = None
+            fetch_error = None
+            for attempt in range(max_attempts):
+                try:
+                    from modal_client import read_output_asset
+                    remote = await read_output_asset(
+                        backend_path,
+                        expected_sha256=str(record.get("content_hash", "")),
+                        gpu=gpu or None,
+                        workspace=workspace,
+                    )
+                    data = remote.get("data", b"") if isinstance(remote, dict) else b""
+                    if not isinstance(data, bytes):
+                        raise TypeError("remote asset payload is not bytes")
+                    break
+                except FileNotFoundError:
+                    # Variant A: the generating container's Volume commit may still be
+                    # in flight.  Check the persistence registry for a definitive
+                    # failure; otherwise retry within a bounded window.
+                    _ps = get_persistence_status(str(record.get("cell_key", "")))
+                    if _ps is not None and _ps.get("status") == "failed":
+                        return web.json_response(
+                            {"status": "error", "message": "asset persistence failed", "detail": str(_ps.get("detail", ""))},
+                            status=503,
+                        )
+                    fetch_error = "missing"
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(backoff_s[attempt])
+                except Exception as exc:
+                    fetch_error = exc
+                    break
+            if data is None:
+                if fetch_error == "missing":
+                    return web.json_response({"status": "error", "message": "asset file missing"}, status=404)
+                return web.json_response({"status": "error", "message": f"asset fetch failed: {fetch_error}"}, status=502)
             fetch_ms = round((time.perf_counter() - started) * 1000.0, 3)
             print(f"[comfymodal.asset] asset_id={asset_id[:12]} source=modal bytes={len(data)} fetch_ms={fetch_ms}")
             return web.Response(

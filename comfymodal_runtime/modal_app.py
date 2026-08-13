@@ -31,14 +31,22 @@ from typing import Any, AsyncIterator, Callable, ContextManager, Iterator, Mappi
 from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
 from .contracts import (
+    DEPLOYMENT_PROOF_SCHEMA_VERSION,
+    VALIDATION_PROOF_SCHEMA_VERSION,
     DeploymentIdentity,
     ExecutionPlan,
     ModelRestoreKey,
     RestorePlan,
     SnapshotExecutionSeed,
     _thaw,
+    apply_repair_invalidation,
+    compute_registry_fingerprint,
+    evaluate_plan_snapshot_parity,
+    evaluate_plan_validation_consumption,
+    should_write_validation_cert,
     stable_hash,
 )
+from . import contracts as _contracts_mod
 from .deployment_spec import build_deployment_identity
 from .env import (
     env_flag,
@@ -412,6 +420,13 @@ _V2_VALIDATION_CERT_ENABLED: bool = env_flag("COMFYMODAL_V2_VALIDATION_CERT", de
 _V2_CERT_SCHEMA_VERSION: int = 2
 _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 
+# Quiet console mode.  Set COMFYMODAL_V2_QUIET=1 to suppress the per-request
+# repeat diagnostic one-liners ([v2.method_entry_gap], per-request
+# [v2.host_memory]/[v2.gpu_allocation] repeats, unavailable fallbacks, ...).
+# Artifacts/trace writes are never suppressed; when unset every line prints
+# exactly as before.
+_QUIET: bool = env_flag("COMFYMODAL_V2_QUIET", default=False)
+
 # Pre-computed deployment identity hash for certificate identity.
 # Populated at module level once during import.
 _V2_DEPLOYMENT_COMBINED_HASH: str = ""
@@ -503,11 +518,25 @@ _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("minimal_teardown", "COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN"),
     ("pin_unet_transfer", "COMFYMODAL_V2_PIN_UNET_TRANSFER"),
     ("unet_quiesced_transfer", "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER"),
+    ("png_compress_level", "COMFYMODAL_V2_PNG_COMPRESS_LEVEL"),
+    ("vae_early_start_ms", "COMFYMODAL_V2_VAE_EARLY_START_MS"),
+    ("unet_pinned_staging", "COMFYMODAL_V2_UNET_PINNED_STAGING"),
+    ("conditioning_async_lru", "COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU"),
 )
 _REQUEST_DIAG_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUEST_DIAG_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
 _REQUEST_OBSERVABILITY_MODES = frozenset({"full", "production", "off"})
 _REQUEST_DIAG_STRING_MAX = 64
+# Integer-typed request-carried diagnostic env keys and their bounded value
+# ranges.  Values within a range are normalized to int-strings and applied;
+# everything else is skipped.  The restored env value is re-validated by the
+# v2_experiments parsers against the experiment's allowed arm set when it is
+# consumed, so an in-range-but-unarmed value (e.g. PNG level 3) still falls
+# back to the experiment default with a logged error.
+_REQUEST_DIAG_INT_RANGES: dict[str, tuple[int, int]] = {
+    "COMFYMODAL_V2_PNG_COMPRESS_LEVEL": (1, 6),
+    "COMFYMODAL_V2_VAE_EARLY_START_MS": (0, 1000),
+}
 
 
 def _normalize_request_diag_env_value(value: Any) -> str | None:
@@ -533,6 +562,36 @@ def _normalize_request_diag_env_value(value: Any) -> str | None:
     return None
 
 
+def _normalize_request_diag_int_value(
+    value: Any,
+    int_range: tuple[int, int],
+) -> str | None:
+    """Return a bounded int-string for an integer-typed request-carried
+    diagnostic value, or ``None`` when the value is not an int (or digit-only
+    string) within ``int_range``.
+
+    Booleans are rejected so int-typed env keys cannot be smuggled as truth
+    tokens.  The restored env value is re-validated by the v2_experiments
+    parsers against the experiment's allowed arm set when consumed.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if int_range[0] <= value <= int_range[1]:
+            return str(value)
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or len(raw) > _REQUEST_DIAG_STRING_MAX:
+            return None
+        if not raw.isdigit():
+            return None
+        parsed = int(raw)
+        if int_range[0] <= parsed <= int_range[1]:
+            return str(parsed)
+    return None
+
+
 def _apply_request_variance_diagnostics(
     request_origin_info: Mapping[str, Any],
 ) -> dict[str, str]:
@@ -540,7 +599,9 @@ def _apply_request_variance_diagnostics(
 
     Returns a dict mapping env-var name -> normalized applied value for the
     keys that were present and valid.  Boolean-typed keys accept only the
-    standard truth/false tokens; the observability mode accepts only the
+    standard truth/false tokens; integer-typed keys (see
+    ``_REQUEST_DIAG_INT_RANGES``) accept int values and digit-only strings
+    within their bounded range; the observability mode accepts only the
     bounded mode set.  Unknown keys, non-scalars, and out-of-allowlist values
     are never applied.  Never touches model/restore-plan identity or workflow.
     """
@@ -548,16 +609,21 @@ def _apply_request_variance_diagnostics(
     for origin_key, env_name in _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST:
         if origin_key not in request_origin_info:
             continue
-        normalized = _normalize_request_diag_env_value(
-            request_origin_info.get(origin_key)
-        )
-        if normalized is None:
-            continue
-        if env_name == "COMFYMODAL_V2_OBSERVABILITY_MODE":
-            if normalized not in _REQUEST_OBSERVABILITY_MODES:
+        raw_value = request_origin_info.get(origin_key)
+        int_range = _REQUEST_DIAG_INT_RANGES.get(env_name)
+        if int_range is not None:
+            normalized = _normalize_request_diag_int_value(raw_value, int_range)
+            if normalized is None:
                 continue
-        elif normalized not in (_REQUEST_DIAG_BOOL_TRUE | _REQUEST_DIAG_BOOL_FALSE):
-            continue
+        else:
+            normalized = _normalize_request_diag_env_value(raw_value)
+            if normalized is None:
+                continue
+            if env_name == "COMFYMODAL_V2_OBSERVABILITY_MODE":
+                if normalized not in _REQUEST_OBSERVABILITY_MODES:
+                    continue
+            elif normalized not in (_REQUEST_DIAG_BOOL_TRUE | _REQUEST_DIAG_BOOL_FALSE):
+                continue
         os.environ[env_name] = normalized
         applied[env_name] = normalized
     return applied
@@ -2941,6 +3007,28 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": os.environ.get(
             "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET", "0"
         ),
+        # Snapshot-construction marker (deploy-time only).  Explicit
+        # passthrough so the construction container activates the
+        # content-verified custom-node generation reconciliation and emits the
+        # [v2.custom_node_generation_parity] event; without it the flag is
+        # silently dropped and parity instrumentation never fires.
+        "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", "0"
+        ),
+        # Restore-memory experiment B arm (deployment-level).  Explicit
+        # passthrough so a deployment baked with this flag actually reaches
+        # the container; without it `_runtime_env` silently drops the key and
+        # the frozen-total-VRAM restore arm would silently run the baseline.
+        "COMFYMODAL_V2_RESTORE_TOTAL_VRAM_FROZEN": os.environ.get(
+            "COMFYMODAL_V2_RESTORE_TOTAL_VRAM_FROZEN", "0"
+        ),
+        # One authoritative state-root for the restore-memory arm: the runtime
+        # state volume mount path (same in construction and request containers).
+        "COMFYMODAL_V2_STATE_VOLUME_ROOT": RUNTIME_STATE_PATH,
+        # Console verbosity (host-deploy-selectable): when 1 the container
+        # suppresses repeated per-request identity/unavailable console lines
+        # (artifacts keep all data).  Default 0 = current behavior.
+        "COMFYMODAL_V2_QUIET": os.environ.get("COMFYMODAL_V2_QUIET", "0"),
         "COMFYMODAL_V2_RESOURCE_TELEMETRY": os.environ.get(
             "COMFYMODAL_V2_RESOURCE_TELEMETRY", "0"
         ),
@@ -2955,6 +3043,22 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": os.environ.get(
             "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET", ""
+        ),
+        # Execution-phase UNET H2D delay (experiment gate; default 0 =
+        # immediate H2D).  Explicit passthrough so a deployment baked with
+        # a delay reaches the container; without it the container silently
+        # runs the immediate baseline.
+        "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS": os.environ.get(
+            "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS", "0"
+        ),
+        # Optimization diagnostics (measurement only; default off).  Explicit
+        # passthrough so a deployment baked with the flag reaches the
+        # container; without it the container silently runs uninstrumented.
+        "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS", "0"
+        ),
+        "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
+            "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
         ),
         # Native page-readiness candidate — off (empty) by default so
         # current production behavior is unchanged until explicitly set to
@@ -3295,6 +3399,11 @@ def _resolve_cgroup_v2_base(
     Returns ``(resolved_cgroup_base, mount_point)`` on success, ``None`` on any
     error.  The resolved path includes the mount point and the cgroup relative
     path joined together (e.g. ``/sys/fs/cgroup/user.slice/job-123``).
+
+    The mountinfo match is lenient, aligned with the runtime's other resolvers
+    (full_execution_trace / resource_telemetry): the mount type must contain
+    ``cgroup2``, OR be a ``cgroup`` mount at ``/sys/fs/cgroup`` (hybrid v1/v2
+    systems).  The LAST ``0::`` entry of ``/proc/self/cgroup`` is used.
     """
     mount_point: str | None = None
     try:
@@ -3309,12 +3418,15 @@ def _resolve_cgroup_v2_base(
                     separator is not None
                     and separator >= 5
                     and separator + 1 < len(parts)
-                    and parts[separator + 1] == "cgroup2"
                 ):
                     candidate = _unescape_mountinfo_field(parts[4])
-                    if candidate.startswith("/"):
-                        mount_point = candidate
-                        break
+                    fstype = parts[separator + 1]
+                    if "cgroup2" in fstype or (
+                        "cgroup" in fstype and candidate == "/sys/fs/cgroup"
+                    ):
+                        if candidate.startswith("/"):
+                            mount_point = candidate
+                            break
     except Exception:
         return None
     if not mount_point:
@@ -3326,8 +3438,8 @@ def _resolve_cgroup_v2_base(
             for line in f:
                 stripped = line.strip()
                 if stripped.startswith("0::"):
+                    # Last matching line wins (kept from the original parser).
                     cgroup_rel = stripped[3:]
-                    break
     except Exception:
         return None
     if cgroup_rel is None:
@@ -3644,11 +3756,16 @@ def _numeric_value(value: Any, fallback: Any = "absent") -> Any:
 # ── GPU allocation reporting (remote runtime capabilities) ─────────────
 
 
-def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, Any]:
+def _detect_gpu_allocation(
+    requested_gpu_order: tuple[str, ...],
+    print_line: bool = True,
+) -> dict[str, Any]:
     """Detect actual GPU runtime capabilities and emit ``[v2.gpu_allocation]``.
 
     Uses ``torch`` and ``nvidia-smi``-equivalent introspection to report
-    the GPU that was actually allocated.  Never raises.
+    the GPU that was actually allocated.  Never raises.  ``print_line=False``
+    suppresses the console line (per-request quiet repeats) while the caller
+    still receives (and stores) the artifact.
     """
     info: dict[str, Any] = {
         "gpu_requested_order": ",".join(requested_gpu_order),
@@ -3666,12 +3783,13 @@ def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, An
             info["cuda_version"] = torch.version.cuda or ""
     except Exception:
         pass
-    # Print one-line summary
-    _fmt = {k: v for k, v in info.items() if v is not None}
-    _line = " ".join(
-        f"{k}={v}" for k, v in sorted(_fmt.items())
-    )
-    print(f"[v2.gpu_allocation] {_line}", flush=True)
+    if print_line:
+        # Print one-line summary
+        _fmt = {k: v for k, v in info.items() if v is not None}
+        _line = " ".join(
+            f"{k}={v}" for k, v in sorted(_fmt.items())
+        )
+        print(f"[v2.gpu_allocation] {_line}", flush=True)
     return info
 
 
@@ -3733,7 +3851,6 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
                 _stripped = _line.strip()
                 if _stripped.startswith("0::"):
                     _cgroup_rel = _stripped[3:]
-                    break
     except Exception as exc:
         errors.append(f"parse_proc_cgroup: {type(exc).__name__}: {exc}")
     if _cgroup_rel is None:
@@ -3750,6 +3867,20 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
             )
             if path is not None:
                 return path, candidates, errors
+
+    # Probe 4: lenient-resolver hybrid mount base.  The resolver now also
+    # matches a ``cgroup`` (v1) mount at /sys/fs/cgroup; when that yields a
+    # base the strict fstype=="cgroup2" match missed, probe its cpu.stat.
+    # The shared _probe helper de-duplicates paths already probed above.
+    try:
+        base4 = _resolve_cgroup_v2_base()
+    except Exception as exc:
+        errors.append(f"resolve_cgroup_v2_base_hybrid: {type(exc).__name__}: {exc}")
+        base4 = None
+    if base4 is not None:
+        path = _probe(posixpath.join(base4[0], "cpu.stat"), "probe4")
+        if path is not None:
+            return path, candidates, errors
 
     return None, candidates, errors
 
@@ -3770,8 +3901,13 @@ def _read_cgroup_cpu_usage_usec(cpu_stat_path: str) -> int | None:
     return None
 
 
-def _emit_cgroup_spike_summary(peak: float, intervals: list[dict[str, Any]]) -> None:
+def _emit_cgroup_spike_summary(
+    peak: float,
+    intervals: list[dict[str, Any]],
+    source: str = "cgroup",
+) -> None:
     parts = [
+        f"source={source}",
         f"peak_effective_cores={peak:.3f}",
         f"interval_count={len(intervals)}",
     ]
@@ -3801,6 +3937,34 @@ def _emit_cgroup_cpu_unavailable(
     print(
         f"[v2.cgroup_cpu_spike] status=unavailable "
         f"reason={reason} candidates={candidate_text} errors={error_text}",
+        flush=True,
+    )
+
+
+# Once-per-process gate: the cgroup CPU unavailable line is emitted at most
+# once per process (a Modal worker with no readable cgroup filesystem would
+# otherwise repeat the identical diagnostics on every request).  COMFYMODAL_V2_QUIET
+# suppresses it entirely.
+_CGROUP_CPU_UNAVAILABLE_EMITTED = False
+
+
+def _emit_cgroup_cpu_unavailable_once(reason: str) -> None:
+    """Emit a compact cgroup-CPU unavailable line at most once per process.
+
+    The reason is capped at 120 characters total (the long candidates/errors
+    text is dropped — it adds no per-request value on an unresolvable host).
+    """
+    global _CGROUP_CPU_UNAVAILABLE_EMITTED
+    if _CGROUP_CPU_UNAVAILABLE_EMITTED:
+        return
+    _CGROUP_CPU_UNAVAILABLE_EMITTED = True
+    if _QUIET:
+        return
+    _reason = reason or "no readable cgroup cpu.stat"
+    if len(_reason) > 120:
+        _reason = _reason[:117] + "..."
+    print(
+        f"[v2.cgroup_cpu_spike] status=unavailable reason={_reason}",
         flush=True,
     )
 
@@ -3846,10 +4010,17 @@ class _CgroupCpuSampler:
         self._failure_reason: str | None = None
         self._prev_usage_usec: int | None = None
         self._prev_mono_ns: int | None = None
+        self._prev_process_ns: int | None = None
+        # When no cgroup cpu.stat is readable (e.g. Modal/gVisor), the sampler
+        # falls back to process-CPU sampling so requests still produce
+        # measured [v2.cgroup_cpu_spike] data.
+        self._source = (
+            "cgroup" if self._cpu_stat_path is not None else "process_cpu_fallback"
+        )
         self._stop_timed_out = False
 
     def start(self) -> None:
-        if not self._cpu_stat_path or self._thread is not None:
+        if self._thread is not None:
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -3872,16 +4043,20 @@ class _CgroupCpuSampler:
         return self._phase
 
     def _sample(self) -> None:
-        if not self._cpu_stat_path:
+        # Prefer the resolved cgroup cpu.stat; honor a manually assigned
+        # _cgroup_base override (kept for the sampler unit tests).
+        cpu_stat_path = self._cpu_stat_path or getattr(self, "_cgroup_base", None)
+        if not cpu_stat_path:
+            self._sample_process_fallback()
             return
         try:
-            usage_usec = _read_cgroup_cpu_usage_usec(self._cpu_stat_path)
+            usage_usec = _read_cgroup_cpu_usage_usec(cpu_stat_path)
         except Exception as exc:
             self._failure_reason = f"read_error: {type(exc).__name__}: {exc}"
             return
         if usage_usec is None:
             self._failure_reason = (
-                f"read_error: {self._cpu_stat_path}: missing usage_usec"
+                f"read_error: {cpu_stat_path}: missing usage_usec"
             )
             return
         now_mono_ns = time.monotonic_ns()
@@ -3911,6 +4086,45 @@ class _CgroupCpuSampler:
             self._prev_usage_usec = usage_usec
             self._prev_mono_ns = now_mono_ns
 
+    def _sample_process_fallback(self) -> None:
+        """Process-CPU sampling fallback (same pattern as _ProcessCpuSampler).
+
+        Used when no readable cgroup cpu.stat exists (e.g. Modal/gVisor), so
+        the request still produces measured effective-cores samples.  Falls
+        back to wall-clock vs ``time.process_time_ns()`` deltas.
+        """
+        try:
+            now_mono_ns = time.monotonic_ns()
+            now_process_ns = time.process_time_ns()
+        except Exception as exc:
+            self._failure_reason = f"sample_error: {type(exc).__name__}: {exc}"
+            return
+        now_unix_ns = time.time_ns()
+        with self._lock:
+            if self._prev_mono_ns is not None and self._prev_process_ns is not None:
+                delta_wall_ns = now_mono_ns - self._prev_mono_ns
+                delta_process_ns = now_process_ns - self._prev_process_ns
+                effective_cores = (
+                    max(0.0, delta_process_ns / delta_wall_ns)
+                    if delta_wall_ns > 0
+                    else 0.0
+                )
+            else:
+                effective_cores = 0.0
+            self._samples.append(
+                _CgroupCpuSample(
+                    timestamp_unix_ns=now_unix_ns,
+                    elapsed_request_ms=round(
+                        (now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0,
+                        3,
+                    ),
+                    effective_cgroup_cores=round(effective_cores, 3),
+                    phase=self._current_phase(),
+                )
+            )
+            self._prev_mono_ns = now_mono_ns
+            self._prev_process_ns = now_process_ns
+
     def set_phase_source(self, source: Callable[[], str]) -> None:
         self._phase_source = source
 
@@ -3927,12 +4141,18 @@ class _CgroupCpuSampler:
                 reason_parts.append(self._failure_reason)
             if not reason_parts:
                 reason_parts.append("zero_samples")
-            _emit_cgroup_cpu_unavailable(
-                reason=" | ".join(reason_parts),
-                candidates=self._resolution_candidates,
-                errors=self._resolution_errors + (
-                    [self._failure_reason] if self._failure_reason else []
-                ),
+            # Compact, once-per-process unavailable line (the long
+            # candidates/errors text only adds noise on unresolvable hosts).
+            _emit_cgroup_cpu_unavailable_once(" | ".join(reason_parts))
+            return
+        if self._source == "process_cpu_fallback":
+            # Measured process-CPU fallback data: keep the same spike summary
+            # shape but mark the source so consumers know it is not cgroup
+            # accounting.
+            _emit_cgroup_spike_summary(
+                self.compute_peak_cores(),
+                self.compute_spike_intervals(),
+                source="process_cpu_fallback",
             )
             return
         _emit_cgroup_spike_summary(
@@ -4118,6 +4338,12 @@ def _summarize_cgroup_interval(
 # Calculates overlap intervals for graph CLIP, execution-prefill CLIP,
 # and request-path load_models_gpu only.
 
+# Once-per-process gate: with COMFYMODAL_V2_QUIET the insufficient-samples
+# unavailable line is emitted at most once per process instead of every
+# request.  When the flag is unset every request still prints (unchanged).
+_PROCESS_CPU_UNAVAILABLE_EMITTED = False
+
+
 class _ProcessCpuSampler:
     """Process-time-based CPU utilization sampler.
 
@@ -4192,6 +4418,11 @@ class _ProcessCpuSampler:
         samples = self._snapshot()
         if len(samples) < 2:
             _reason = "insufficient_samples" if self._failure_reason is None else self._failure_reason
+            if _QUIET:
+                global _PROCESS_CPU_UNAVAILABLE_EMITTED
+                if _PROCESS_CPU_UNAVAILABLE_EMITTED:
+                    return
+                _PROCESS_CPU_UNAVAILABLE_EMITTED = True
             print(
                 f"[v2.process_cpu_spike] status=unavailable reason={_reason} "
                 f"sample_count={len(samples)}",
@@ -4500,6 +4731,16 @@ def _persist_v2_dependency_manifest(
     _mft_identity = _manifest.get("identity", "")
     _mft_ident_match = bool(_mft_identity)
     _manifest_ms = round((time.time() - _t0) * 1000, 1)
+    # Step-2: expose the manifest writer's identity on the bootstrap state so
+    # the snapshot proof freeze can reference the exact manifest identity.
+    # Instrumentation only — the preflight decision guard additionally checks
+    # the companion dependency_manifest_* fields (still empty here), so the
+    # request-path dependency preflight skip remains unchanged.
+    if _mft_identity:
+        try:
+            state.dependency_manifest_identity = _mft_identity
+        except Exception:
+            pass
 
     # 7. Fail closed in production if identity is missing (volume commit failure, etc.)
     if _is_production and not _mft_ident_match:
@@ -4634,6 +4875,80 @@ def _volume_read_rates(
     )
 
 
+def _resolve_comfyui_root() -> str:
+    """Resolve the container ComfyUI root.
+
+    Source mirrors the deployment-proof freeze block (``bootstrap.config``
+    -> ``comfyui_root``, falling back to the canonical
+    ``/root/comfy/ComfyUI``); an explicit ``COMFYMODAL_V2_COMFYUI_ROOT`` env
+    override wins when present.
+    """
+    return str(
+        os.environ.get("COMFYMODAL_V2_COMFYUI_ROOT", "") or "/root/comfy/ComfyUI"
+    )
+
+
+def _registry_manifest_roots() -> list[str]:
+    """Roots for path-independent registry identity, symmetric with the host
+    (canonical_execution): [comfyui_root, repo_root, comfyapp-file dir]."""
+    _roots: list[str] = []
+    try:
+        from comfymodal_runtime import contracts as _c
+        _repo = os.path.dirname(os.path.dirname(os.path.abspath(_c.__file__)))
+        if _repo:
+            _roots.append(str(_repo))
+    except Exception:
+        pass
+    _cfr = _resolve_comfyui_root()
+    if _cfr and os.path.isdir(_cfr):
+        _roots.append(_cfr)
+    try:
+        import comfyapp as _ca
+        _f = getattr(_ca, "__file__", "")
+        if _f and os.path.isdir(os.path.dirname(os.path.abspath(_f))):
+            _roots.append(os.path.dirname(os.path.abspath(_f)))
+    except Exception:
+        pass
+    return [r for r in dict.fromkeys(_roots) if r]
+
+
+def _lf_sha256_bytes(data: bytes) -> str:
+    """sha256 of ``data`` with LF line-ending normalization (CRLF/CR == LF)."""
+    return hashlib.sha256(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+
+
+def _file_sha256_lf(path: str) -> str:
+    """LF-normalized sha256 of the file at ``path``, or ``""`` if unreadable."""
+    try:
+        with open(path, "rb") as fh:
+            return _lf_sha256_bytes(fh.read())
+    except Exception:
+        return ""
+
+
+def _git_rev_parse_head(repo_root: str) -> str:
+    """Best-effort ``git -C <repo_root> rev-parse HEAD`` (guarded, 10s timeout).
+
+    Subprocess is imported lazily and every failure (git missing, not a git
+    repo, timeout, error exit) yields ``""`` — diagnostics never raise.
+    """
+    if not repo_root:
+        return ""
+    try:
+        import subprocess  # noqa: PLC0415
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return str(proc.stdout or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 class ModalRuntimeEntrypoint:
     """Real v2 runtime facade backed by the existing ComfyUI executor."""
 
@@ -4669,6 +4984,9 @@ class ModalRuntimeEntrypoint:
         self._request_gpu_release_lock = threading.Lock()
         self._request_gpu_release_done = False
         self._request_gpu_release_request_id = ""
+        self._deferred_commit_task = None
+        self._deferred_commit_diag = None
+        self._deferred_commit_pending = False
         self._terminal_response_delivered = False
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
@@ -4895,6 +5213,22 @@ class ModalRuntimeEntrypoint:
                 )
 
             self._run_teardown_stage("legacy_request_workers", stop_legacy_workers)
+
+            # Exact-conditioning cache flush: signal the background
+            # persistence worker, join within the standard budget, drain any
+            # queue remnant, and issue one final explicit commit when the
+            # mounted volume is still dirty.  Modal's shutdown snapshot +
+            # commit remains the durability backstop.
+            def flush_conditioning_cache() -> None:
+                try:
+                    from .clip_conditioning_cache import get_exact_conditioning_cache as _get_ccc
+                    _svc = _get_ccc()
+                    if _svc is not None and hasattr(_svc, "flush"):
+                        _svc.flush(timeout=_PRELOAD_WORKER_JOIN_BUDGET_S)
+                except Exception:
+                    pass
+
+            self._run_teardown_stage("conditioning_cache_flush", flush_conditioning_cache)
 
             # Shutdown-hook fallback: flush any production cleanup that was
             # deferred for a stream cancelled before its terminal event.  This
@@ -5498,6 +5832,12 @@ class ModalRuntimeEntrypoint:
             self._request_gpu_release_done = False
         if not hasattr(self, "_request_gpu_release_request_id"):
             self._request_gpu_release_request_id = ""
+        if not hasattr(self, "_deferred_commit_task"):
+            self._deferred_commit_task = None
+        if not hasattr(self, "_deferred_commit_diag"):
+            self._deferred_commit_diag = None
+        if not hasattr(self, "_deferred_commit_pending"):
+            self._deferred_commit_pending = False
         if not hasattr(self, "_terminal_response_delivered"):
             self._terminal_response_delivered = False
         if not hasattr(self, "_unet_backing_evidence"):
@@ -7084,6 +7424,13 @@ class ModalRuntimeEntrypoint:
             _current_generation = ""
             _current_source = "unavailable"
             _fallback_reason = "identity_unavailable"
+            # Construction-time parity mode: the deploy bat sets this flag ONLY
+            # for the construction invocation; restores and ordinary requests
+            # never set it, so the closure below stays O(1) and behaves exactly
+            # as before outside construction (no hashing, no record writes).
+            _construction = os.environ.get(
+                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
             try:
                 _baked_manifest = module.load_baked_custom_node_dependency_manifest()
                 _baked_generation = str(
@@ -7126,6 +7473,31 @@ class ModalRuntimeEntrypoint:
                             f"generation={_current_generation[:16]}",
                             flush=True,
                         )
+                        if _construction:
+                            # Fast-path parity event only: keep this branch O(1)
+                            # (no content hashing; actuals stay "").  The
+                            # persisted record is not rewritten here — the
+                            # deploy-time publication lane owns the volume
+                            # mirror.  The proof still fails closed when
+                            # baked != persisted.
+                            try:
+                                from comfymodal_runtime.custom_node_parity import (
+                                    build_parity_report,
+                                    format_parity_line,
+                                )
+                                _parity_report = build_parity_report(
+                                    baked_generation=_baked_generation,
+                                    persisted_generation=_current_generation,
+                                    pre_sync_actual_generation="",
+                                    post_sync_actual_generation="",
+                                    persisted_source=_current_source,
+                                    sync_performed=False,
+                                    sync_direction="none",
+                                    sync_reason="exact_match",
+                                )
+                                print(format_parity_line(_parity_report), flush=True)
+                            except Exception:
+                                pass
                         return (
                             {
                                 "created": [],
@@ -7161,6 +7533,85 @@ class ModalRuntimeEntrypoint:
                 f"current_generation={_current_generation[:16]}",
                 flush=True,
             )
+            if _construction:
+                # Construction-time parity reconciliation (content-verified).
+                # Hashes the custom-nodes source tree before and after the
+                # volume->container symlink sync so a stale persisted record
+                # can be repaired ONLY when the post-sync ACTUAL tree matches
+                # the image-baked generation.  Never blesses different code.
+                _parity_pre_sync_actual = ""
+                try:
+                    _parity_pre_sync_actual = str(
+                        module.custom_node_source_generation(module.CUSTOM_NODES_PATH)
+                        or ""
+                    )
+                except Exception:
+                    _parity_pre_sync_actual = ""
+                _sync_result = api._sync_custom_nodes_from_volume()
+                _parity_post_sync_actual = ""
+                try:
+                    _parity_post_sync_actual = str(
+                        module.custom_node_source_generation(module.CUSTOM_NODES_PATH)
+                        or ""
+                    )
+                except Exception:
+                    _parity_post_sync_actual = ""
+                # Content-verified stale-record repair: only when the post-sync
+                # ACTUAL tree generation is non-empty and differs from the
+                # persisted record AND equals the baked generation (i.e. the
+                # volume tree genuinely matches the deployed source; never
+                # bless different code).
+                if (
+                    _parity_post_sync_actual
+                    and _parity_post_sync_actual == _baked_generation
+                ):
+                    try:
+                        _rec = module._read_custom_nodes_generation_record() or {}
+                        if (
+                            str(_rec.get("generation", "") or "")
+                            != _parity_post_sync_actual
+                        ):
+                            module._write_custom_nodes_generation_record_no_commit(
+                                reason="v2_construction_reconcile",
+                                generation=_parity_post_sync_actual,
+                            )
+                            _vol = getattr(module, "custom_nodes_vol", None)
+                            if _vol is not None and callable(
+                                getattr(_vol, "commit", None)
+                            ):
+                                _vol.commit()
+                            _api_obj = api
+                            if _api_obj is not None:
+                                try:
+                                    _api_obj._custom_nodes_generation_seen = (
+                                        _parity_post_sync_actual
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                # Parity event: emitted ONLY during construction so the deploy
+                # log records baked vs persisted vs actual-tree generations
+                # and the predicted proof-freeze outcome (gen_ok=1).
+                try:
+                    from comfymodal_runtime.custom_node_parity import (
+                        build_parity_report,
+                        format_parity_line,
+                    )
+                    _parity_report = build_parity_report(
+                        baked_generation=_baked_generation,
+                        persisted_generation=_current_generation,
+                        pre_sync_actual_generation=_parity_pre_sync_actual,
+                        post_sync_actual_generation=_parity_post_sync_actual,
+                        persisted_source=_current_source,
+                        sync_performed=True,
+                        sync_direction="volume_to_container",
+                        sync_reason=_fallback_reason or "generation_mismatch",
+                    )
+                    print(format_parity_line(_parity_report), flush=True)
+                except Exception:
+                    pass
+                return _sync_result
             return api._sync_custom_nodes_from_volume()
 
         def install_requirements() -> Any:
@@ -7577,6 +8028,110 @@ class ModalRuntimeEntrypoint:
                         started=_dependency_started,
                         trace=trace,
                     )
+
+            # ── Step-2 canonical deployment-static proof (frozen at snapshot) ──
+            # Freeze a deployment-static validation proof into BootstrapState so
+            # the restore-time custom-node fast path and request-time diagnostics
+            # can prove host↔snapshot parity.  Instrumentation only — never
+            # consumed by certificate/preflight/validation decisions.
+            try:
+                _dp_module = self._legacy_module
+                if _dp_module is not None:
+                    try:
+                        _dp_baked_mft = _dp_module.load_baked_custom_node_dependency_manifest() or {}
+                    except Exception:
+                        _dp_baked_mft = {}
+                    if not isinstance(_dp_baked_mft, dict):
+                        _dp_baked_mft = {}
+                    _dp_baked_gen = str(_dp_baked_mft.get("production_custom_node_generation", "") or "")
+                    _dp_observed_gen = str(getattr(state, "custom_node_generation", "") or "")
+                    _dp_gen_ok = bool(_dp_baked_gen and _dp_observed_gen and _dp_baked_gen == _dp_observed_gen)
+                    _dp_dep_hash = str(_V2_DEPLOYMENT_COMBINED_HASH or "")
+                    if not _dp_dep_hash:
+                        _dp_dep_hash = str(getattr(state, "deployment_combined_hash", "") or "")
+                    try:
+                        _dp_boot_cfg = getattr(self.bootstrap, "config", None)
+                        _dp_comfyui_root = str(getattr(_dp_boot_cfg, "comfyui_root", "") or "")
+                    except Exception:
+                        _dp_comfyui_root = ""
+                    if not _dp_comfyui_root:
+                        _dp_comfyui_root = "/root/comfy/ComfyUI"
+                    try:
+                        _dp_custom_nodes_root = str(
+                            getattr(_dp_module, "CUSTOM_NODES_PATH", "") or CUSTOM_NODES_PATH
+                        )
+                    except Exception:
+                        _dp_custom_nodes_root = CUSTOM_NODES_PATH
+                    try:
+                        _dp_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(_contracts_mod.__file__)))
+                    except Exception:
+                        _dp_repo_root = ""
+                    try:
+                        _dp_reg_fp = compute_registry_fingerprint(
+                            roots=[_dp_comfyui_root, _dp_custom_nodes_root, _dp_repo_root],
+                        )
+                    except Exception:
+                        _dp_reg_fp = ""
+                    # Workflow-relevant registry manifest (per-class canonical
+                    # identity over ALL registered classes).  Diagnostic only —
+                    # per-class misses matter only for workflow-relevant
+                    # classes at request time, so manifest completeness is NOT
+                    # required for the snapshot proof itself.
+                    _dp_reg_manifest = {}
+                    try:
+                        from comfymodal_runtime.registry_proof import build_registry_manifest
+                        _dp_reg_manifest = build_registry_manifest(
+                            roots=_registry_manifest_roots(),
+                        )
+                    except Exception:
+                        _dp_reg_manifest = {}
+                    try:
+                        _dp_repair_mode = str(_dp_module._resolve_requirements_repair_mode() or "")
+                    except Exception:
+                        _dp_repair_mode = ""
+                    _dp_dep_identity = str(getattr(state, "dependency_manifest_identity", "") or "")
+                    _dp_missing = []
+                    if not _dp_dep_hash:
+                        _dp_missing.append("deployment_hash_unavailable")
+                    if not _dp_baked_gen:
+                        _dp_missing.append("baked_generation_unavailable")
+                    if not _dp_gen_ok:
+                        _dp_missing.append("generation_mismatch")
+                    if not _dp_reg_fp:
+                        _dp_missing.append("registry_fingerprint_unavailable")
+                    if not _dp_dep_identity:
+                        _dp_missing.append("dependency_identity_unavailable")
+                    _dp_complete = bool(
+                        _dp_dep_hash and _dp_baked_gen and _dp_gen_ok and _dp_reg_fp and _dp_dep_identity
+                    )
+                    _dp_proof = {
+                        "schema_version": DEPLOYMENT_PROOF_SCHEMA_VERSION,
+                        "deployment_combined_hash": _dp_dep_hash,
+                        "custom_nodes_generation": _dp_baked_gen,
+                        "generation_matches_observed": _dp_gen_ok,
+                        "registry_fingerprint": _dp_reg_fp,
+                        "registry_manifest": _dp_reg_manifest,
+                        "registry_manifest_class_count": int(len((_dp_reg_manifest or {}).get("classes", {}) or {})),
+                        "dependency_manifest_identity": _dp_dep_identity,
+                        "repair_mode": _dp_repair_mode,
+                        "complete": _dp_complete,
+                        "valid": _dp_complete,
+                        "invalid_reason": ",".join(_dp_missing) if _dp_missing else "",
+                        "source": "snapshot_startup",
+                    }
+                    state.freeze_validation_proof(_dp_proof)
+                    print(
+                        f"[v2.deployment_proof] schema={DEPLOYMENT_PROOF_SCHEMA_VERSION} "
+                        f"complete={_dp_complete} reason={_dp_proof['invalid_reason'] or 'ok'} "
+                        f"dep_hash={_dp_dep_hash[:16] if _dp_dep_hash else '<empty>'} "
+                        f"baked_gen={_dp_baked_gen[:16] if _dp_baked_gen else '<empty>'} "
+                        f"gen_ok={int(_dp_gen_ok)} reg_fp={bool(_dp_reg_fp)} "
+                        f"dep_identity={bool(_dp_dep_identity)} repair_mode={_dp_repair_mode or 'n/a'}",
+                        flush=True,
+                    )
+            except Exception as _dp_exc:
+                # Non-fatal: proof freeze must never break startup.
+                print(f"[v2.deployment_proof] status=failed error={_dp_exc}", flush=True)
 
             # Request-specific startup certificates are no longer built from a
             # shared current plan.  The actual request validates its workflow
@@ -8117,6 +8672,17 @@ class ModalRuntimeEntrypoint:
                     model_ctx=getattr(self, "_cpu_snapshot_models", None),
                     extra={"lifecycle": "startup", "snap": "True"},
                 )
+        except Exception:
+            pass
+
+        # ── Restore-memory experiment: freeze snapshot GPU capacity ────────
+        # The restore_memory_arm lane (parallel change) may freeze the
+        # GPU-capacity snapshot at build time so restore-time VRAM accounting
+        # stays consistent.  Optional and non-fatal: if the module is absent
+        # or raises, snapshot startup must still proceed.
+        try:
+            from comfymodal_runtime.restore_memory_arm import maybe_freeze_snapshot_gpu_capacity
+            maybe_freeze_snapshot_gpu_capacity()
         except Exception:
             pass
 
@@ -9503,9 +10069,17 @@ class ModalRuntimeEntrypoint:
                 # Fall through to the existing preload branch.
         # ── Prefill-configuration diagnostic (after CPU snapshot state is final) ──
         _prefill_env_raw = os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical")
+        # Container-level snapshot flag (cpu_snapshot_container_active) is
+        # distinct from the native fast-disk UNET execution lane: that lane is
+        # scheduled per request in _run_in_process (see _execution_unet_scheduled),
+        # so it is never active at restore time and reports 0 here.
+        _native_fast_disk_unet_execution_active = int(
+            bool(locals().get("_execution_unet_scheduled", 0))
+        )
         print(
             f"[v2.prefill_config] env={_prefill_env_raw} parsed={_PREFILL_LANE_MODE} "
-            f"cpu_snapshot_active={int(bool(_cpu_snapshot_activated))}",
+            f"cpu_snapshot_container_active={int(bool(_cpu_snapshot_activated))} "
+            f"native_fast_disk_unet_execution_active={_native_fast_disk_unet_execution_active}",
             flush=True,
         )
         try:
@@ -10472,6 +11046,38 @@ class ModalRuntimeEntrypoint:
             )
         )
 
+        # ── Execution-phase native fast-disk UNET preparation ──────────
+        # Schedule immediately after the CLIP prefill so the native
+        # fast-disk UNET construction (file read + bind + single H2D
+        # pass) overlaps the prefill encode instead of running on the
+        # graph thread when the graph reaches UNETLoader.  The graph
+        # consumer joins exactly this prepared future through the
+        # existing bridge wait_unet path (one construction/read/H2D per
+        # request).  Idempotent: when the preparation already has a UNET
+        # future (restore-time UNET lane or retained CPU-snapshot UNET)
+        # the bridge method is a no-op.  Gate: only for the integrated
+        # configuration (active CPU snapshot WITHOUT a retained UNET —
+        # the graph would otherwise fast-disk load it at UNETLoader).
+        # In every other configuration the bridge keeps its existing
+        # ownership: retained-snapshot UNET (future present), full
+        # restore-time UNET lane (future present), or the legacy
+        # background UNET defer (no snapshot — never touched here, so
+        # exactly one UNET construction/load per request is preserved).
+        _snapshot_models = self._cpu_snapshot_models
+        _snapshot_unet_absent = bool(
+            _cpu_snapshot_active
+            and _snapshot_models is not None
+            and getattr(_snapshot_models, "unet", None) is None
+        )
+        _execution_unet_scheduled = False
+        if _snapshot_unet_absent:
+            _execution_unet_scheduled = bool(
+                self._preload_bridge.schedule_execution_unet(
+                    trace=trace,
+                    request_id=str(context.request_id),
+                )
+            )
+
         print(
             "[v2.execution_prefill] "
             f"snapshot_active={int(_cpu_snapshot_active)} "
@@ -10479,10 +11085,22 @@ class ModalRuntimeEntrypoint:
             f"scheduled={int(_execution_prefill_scheduled)}",
             flush=True,
         )
+        print(
+            "[v2.execution_unet] "
+            f"scheduled={int(_execution_unet_scheduled)} "
+            f"snapshot_unet_absent={int(_snapshot_unet_absent)} "
+            f"request_id={context.request_id}",
+            flush=True,
+        )
         # Carry prefill booleans on trace metadata for _execute_v2_prompt_executor
+        # NOTE: _cpu_snapshot_active below is the container-level snapshot flag;
+        # it is distinct from the native fast-disk UNET execution lane
+        # (see _execution_unet_scheduled).
         trace.set_metadata(
             _cpu_snapshot_active=_cpu_snapshot_active,
             _execution_prefill_scheduled=_execution_prefill_scheduled,
+            _execution_unet_scheduled=_execution_unet_scheduled,
+            _execution_unet_gate=_snapshot_unet_absent,
         )
         try:
             with request_execution_trace_scope(trace):
@@ -10587,13 +11205,14 @@ class ModalRuntimeEntrypoint:
                 result["_restore_timing"] = dict(_rt)
             result["_snapshot_target_fingerprint"] = _snapshot_target_fingerprint()
             result["phase_durations_ms"] = trace.export_phase_durations()
-            _report_host_memory("result_complete")
+            if not _QUIET:
+                _report_host_memory("result_complete")
             # ── Activation diagnosis: read from result (assembled by _execute_v2_prompt_executor) ──
             _ad_from_result = result.get("trace", {}).get("activation_diagnosis") if isinstance(result.get("trace"), dict) else None
             if isinstance(_ad_from_result, dict):
                 _ad_fields: list[str] = []
                 _AD_FIELD_SPEC = (
-                    "request_id", "cpu_snapshot_active", "execution_prefill_scheduled",
+                    "request_id", "cpu_snapshot_container_active", "execution_prefill_scheduled",
                     "residency_diagnostics_enabled",
                     "clip_encode_calls", "clip_encode_graph_calls", "clip_encode_prefill_calls",
                     "clip_encode_wall_ms", "clip_encode_graph_wall_ms",
@@ -10613,8 +11232,17 @@ class ModalRuntimeEntrypoint:
                     "restore_torch_interop_threads",
                     "restore_torch_thread_limit_status",
                 )
+                # The activation-diagnosis state dict is built by model_preload
+                # (container-level snapshot flag), which still writes the legacy
+                # key cpu_snapshot_active; read it as fallback so the renamed
+                # print field keeps the identical value.
+                _AD_FIELD_LEGACY_KEYS = {
+                    "cpu_snapshot_container_active": "cpu_snapshot_active",
+                }
                 for _f in _AD_FIELD_SPEC:
                     _v = _ad_from_result.get(_f)
+                    if _v is None and _f in _AD_FIELD_LEGACY_KEYS:
+                        _v = _ad_from_result.get(_AD_FIELD_LEGACY_KEYS[_f])
                     _ad_fields.append(f"{_f}={_v if _v is not None else 'absent'}")
                 print(f"[v2.activation_diagnosis] {' '.join(_ad_fields)}", flush=True)
             # Stop process CPU sampler at result completion
@@ -10693,7 +11321,7 @@ class ModalRuntimeEntrypoint:
 
         Emits exactly one ``[v2.snapshot_activation_invariant]`` line with the
         fields: profile, models_container_present, clip_present, unet_present,
-        snapshot_enabled_by_config, cpu_snapshot_active, loader_bridge_active,
+        snapshot_enabled_by_config, cpu_snapshot_container_active, loader_bridge_active,
         execution_prefill_allowed, status, reason.
 
         Fails clearly (RuntimeError) when the production profile has BOTH
@@ -10712,13 +11340,13 @@ class ModalRuntimeEntrypoint:
             snapshot_enabled_by_config = _cpu_model_snapshot_enabled()
         except Exception:
             snapshot_enabled_by_config = False
-        cpu_snapshot_active = bool(getattr(self, "_cpu_snapshot_models_active", False))
+        cpu_snapshot_container_active = bool(getattr(self, "_cpu_snapshot_models_active", False))
         _bridge = getattr(self, "_preload_bridge", None)
         loader_bridge_active = bool(
             _bridge is not None
             and getattr(_bridge, "_preparation", None) is not None
         )
-        execution_prefill_allowed = not cpu_snapshot_active
+        execution_prefill_allowed = not cpu_snapshot_container_active
         status = "pass"
         reason = "ok"
         if (
@@ -10726,7 +11354,7 @@ class ModalRuntimeEntrypoint:
             and models_container_present
             and clip_present
             and unet_present
-            and not cpu_snapshot_active
+            and not cpu_snapshot_container_active
         ):
             status = "fail"
             reason = "production_models_present_but_inactive"
@@ -10736,7 +11364,7 @@ class ModalRuntimeEntrypoint:
                 f"clip_present={int(clip_present)} "
                 f"unet_present={int(unet_present)} "
                 f"snapshot_enabled_by_config={int(snapshot_enabled_by_config)} "
-                f"cpu_snapshot_active={int(cpu_snapshot_active)} "
+                f"cpu_snapshot_container_active={int(cpu_snapshot_container_active)} "
                 f"loader_bridge_active={int(loader_bridge_active)} "
                 f"execution_prefill_allowed={int(execution_prefill_allowed)} "
                 f"status={status} "
@@ -10754,7 +11382,7 @@ class ModalRuntimeEntrypoint:
             f"clip_present={int(clip_present)} "
             f"unet_present={int(unet_present)} "
             f"snapshot_enabled_by_config={int(snapshot_enabled_by_config)} "
-            f"cpu_snapshot_active={int(cpu_snapshot_active)} "
+            f"cpu_snapshot_container_active={int(cpu_snapshot_container_active)} "
             f"loader_bridge_active={int(loader_bridge_active)} "
             f"execution_prefill_allowed={int(execution_prefill_allowed)} "
             f"status={status} "
@@ -10768,7 +11396,7 @@ class ModalRuntimeEntrypoint:
                 "clip_present": int(clip_present),
                 "unet_present": int(unet_present),
                 "snapshot_enabled_by_config": int(snapshot_enabled_by_config),
-                "cpu_snapshot_active": int(cpu_snapshot_active),
+                "cpu_snapshot_container_active": int(cpu_snapshot_container_active),
                 "loader_bridge_active": int(loader_bridge_active),
                 "execution_prefill_allowed": int(execution_prefill_allowed),
                 "status": status,
@@ -10780,7 +11408,7 @@ class ModalRuntimeEntrypoint:
             "clip_present": int(clip_present),
             "unet_present": int(unet_present),
             "snapshot_enabled_by_config": int(snapshot_enabled_by_config),
-            "cpu_snapshot_active": int(cpu_snapshot_active),
+            "cpu_snapshot_container_active": int(cpu_snapshot_container_active),
             "loader_bridge_active": int(loader_bridge_active),
             "execution_prefill_allowed": int(execution_prefill_allowed),
             "status": status,
@@ -10953,6 +11581,110 @@ class ModalRuntimeEntrypoint:
             raise RuntimeError("execution cancelled before PromptExecutor start")
 
         workflow = _thaw(plan.workflow)
+        # ── Step-1 plan-carried validation proof: instrumentation only, never consumed ──
+        _pp = plan.validation if isinstance(plan.validation, Mapping) else {}
+        _pp_schema = _pp.get("schema_version", 0) if _pp else 0
+        _pp_validated = bool(_pp.get("validated", False))
+        _pp_outputs = list(_pp.get("outputs_to_execute", []) or [])
+        _pp_out_ids = ",".join(str(o) for o in _pp_outputs[:4])
+        _pp_dep = plan.deployment_identity if isinstance(plan.deployment_identity, Mapping) else {}
+        _pp_dep_complete = bool(_pp_dep.get("complete", False))
+        _pp_recomputed = ""
+        _pp_hash_match = False
+        try:
+            from workflow_metadata import prompt_sha256 as _pp_sha
+            _pp_recomputed = _pp_sha(_thaw(plan.workflow))
+            _pp_hash_match = bool(_pp_recomputed) and _pp_recomputed == plan.workflow_hash
+        except Exception:
+            pass
+        print(
+            f"[v2.plan_proof] schema={_pp_schema} payload={'yes' if _pp else 'no'} "
+            f"validated={_pp_validated} outputs={len(_pp_outputs)} out_ids={_pp_out_ids} "
+            f"wf_hash={str(plan.workflow_hash)[:16]} recomputed={str(_pp_recomputed)[:16] or 'n/a'} "
+            f"match={_pp_hash_match} dep_complete={_pp_dep_complete} consumed=False "
+            f"cert_decision=legacy",
+            flush=True,
+        )
+        trace.emit("plan_validation_payload", phase="setup", metadata={
+            "schema_version": _pp_schema, "payload_present": bool(_pp),
+            "validated": _pp_validated, "outputs_count": len(_pp_outputs),
+            "outputs_ids": _pp_out_ids, "workflow_hash": plan.workflow_hash,
+            "recomputed_hash": _pp_recomputed, "hash_match": _pp_hash_match,
+            "deployment_complete": _pp_dep_complete, "consumed": False,
+        })
+        # ── Step-2 canonical deployment-static parity (instrumentation only) ──
+        _pp_proof: dict = {}
+        _pp_bs_state = getattr(getattr(self, "bootstrap", None), "state", None)
+        if _pp_bs_state is not None:
+            _pp_proof = dict(getattr(_pp_bs_state, "snapshot_validation_proof", {}) or {})
+        _pp_parity = evaluate_plan_snapshot_parity(plan.deployment_identity, _pp_proof)
+        # ── Workflow-relevant registry parity line (diagnostic) ──
+        # Rebuild the full parity result for the workflow's own class set
+        # (the plan's registry_proof vs the snapshot's registry_manifest).
+        _pp_reg_parity = _pp_parity.get("registry_parity_counts", {})
+        _pp_reg_full: dict = {}
+        try:
+            from comfymodal_runtime.registry_proof import (
+                evaluate_workflow_registry_parity,
+                format_registry_parity_line,
+            )
+            _pp_reg_full = evaluate_workflow_registry_parity(
+                (plan.deployment_identity or {}).get("registry_proof"),
+                (_pp_proof or {}).get("registry_manifest"),
+            )
+            print(format_registry_parity_line(_pp_reg_full), flush=True)
+        except Exception:
+            if not _QUIET:
+                print("[v2.plan_proof.registry] unavailable", flush=True)
+        print(
+            f"[v2.plan_proof] parity proof_present={int(_pp_parity['snapshot_proof_present'])} "
+            f"proof_complete={int(_pp_parity['snapshot_proof_complete'])} "
+            f"proof_valid={int(_pp_parity['snapshot_proof_valid'])} "
+            f"dep_match={int(_pp_parity['deployment_hash_match'])} "
+            f"gen_match={int(_pp_parity['custom_nodes_generation_match'])} "
+            f"wf_reg_match={int(_pp_parity['workflow_registry_match'])} "
+            f"reg_full_match={int(_pp_parity['registry_fingerprint_match'])} "
+            f"dep_proof_match={int(_pp_parity['dependency_proof_match'])} "
+            f"eligible={int(_pp_parity['future_fast_path_eligible'])} "
+            f"reason={_pp_parity['future_fast_path_ineligible_reason'] or 'ok'} "
+            f"consumed=False",
+            flush=True,
+        )
+        _pp_parity_trace_meta = dict(_pp_parity)
+        _pp_parity_trace_meta["workflow_registry_match"] = bool(_pp_parity.get("workflow_registry_match", False))
+        _pp_parity_trace_meta["registry_fingerprint_match"] = bool(_pp_parity.get("registry_fingerprint_match", False))
+        _pp_parity_trace_meta["registry_parity_reason"] = str(_pp_parity.get("registry_parity_reason", "") or "")[:120]
+        trace.emit("plan_snapshot_parity", phase="setup", metadata=_pp_parity_trace_meta)
+        # ── Step-3 plan-proof trust gate (decision recorded, applied below) ──
+        _plan_proof_consumed = False
+        _plan_proof_reason = ""
+        _plan_proof_outputs: list[str] = []
+        _plan_proof_node_errors: dict = {}
+        _pp_validation = plan.validation if isinstance(plan.validation, Mapping) else {}
+        _pp_schema_ok = bool(_pp_validation.get("schema_version") == VALIDATION_PROOF_SCHEMA_VERSION)
+        _pp_validated_ok = bool(_pp_validation.get("validated", False))
+        _pp_vh_match = bool(
+            _pp_validation.get("validated_workflow_hash")
+            and _pp_validation.get("validated_workflow_hash") == plan.workflow_hash
+        )
+        _pp_outputs_raw = list(_pp_validation.get("outputs_to_execute", []) or [])
+        _pp_outputs_nonempty = bool(_pp_outputs_raw)
+        _pp_structure_ok = False
+        try:
+            _pp_structure_fn = getattr(self._legacy_module, "assert_valid_api_prompt_structure", None)
+            if callable(_pp_structure_fn):
+                _pp_structure_fn(workflow)
+                _pp_structure_ok = True
+        except Exception:
+            _pp_structure_ok = False
+        _pp_gate = evaluate_plan_validation_consumption(
+            _pp_parity, _pp_validation,
+            workflow_hash_match=_pp_hash_match,
+            validation_hash_match=_pp_vh_match,
+            structure_ok=_pp_structure_ok,
+            outputs_nonempty=_pp_outputs_nonempty,
+        )
+        _pp_eligible = bool(_pp_gate["eligible"])
         _res4lyf_reported = int(plan.production_report.get("res4lyf_options_injected_count", 0) or 0)
         _res4lyf_injected_ids = [
             str(node_id)
@@ -11014,6 +11746,24 @@ class ModalRuntimeEntrypoint:
         outputs_to_execute: list[str] = []
         node_errors: dict[str, Any] = {}
 
+        # ── Step-3 plan-proof trust gate: apply on exact eligibility ──
+        # Skip certificate lookup/Volume RPC, deployment-static preflight,
+        # remote execution.validate_prompt, and certificate writeback.  The
+        # complete legacy path remains the fallback (gate ineligible -> the
+        # existing branches below run unchanged).  Gate 2 / missing-node
+        # repair still run and clear the consumed proof if repair changes
+        # node availability.
+        if _pp_eligible:
+            _plan_proof_consumed = True
+            _v2_cert_preflight_skip = True
+            _v2_cert_hit = True
+            outputs_to_execute = list(_pp_outputs_raw)
+            node_errors = dict(_pp_validation.get("node_errors", {}) or {})
+            trace.emit("certificate_read_outcome", phase="setup", metadata={
+                "cert_source": "plan_validation", "cert_decision": "plan_validation_fast_path",
+                "hit": True, "preflight_skip": True, "consumed": True,
+            })
+
         # Diagnostic timing fields for certificate, preflight, and validation.
         _diag_cert_identity_build_ms: float = 0.0
         _diag_cert_cache_hit: bool = False
@@ -11055,8 +11805,9 @@ class ModalRuntimeEntrypoint:
 
             # Try cert lookup before preflight -- only eligible when the
             # deployment identity, repair mode, and custom-nodes generation
-            # are all complete and recognised.
-            if _V2_VALIDATION_CERT_ENABLED:
+            # are all complete and recognised.  Step-3: the plan-proof fast
+            # path (fully eligible) skips the certificate subsystem entirely.
+            if _V2_VALIDATION_CERT_ENABLED and not _pp_eligible:
                 _cert_wf_hash = plan.workflow_hash or ""
                 if _cert_wf_hash:
                     _v2_dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
@@ -11428,6 +12179,12 @@ class ModalRuntimeEntrypoint:
                 _v2_cert_preflight_skip = False
                 outputs_to_execute = []
                 node_errors = {}
+                # Step-3: a missing-node repair invalidates any consumed
+                # plan-proof — the plan-carried validation is stale after node
+                # availability changed (Oracle Gate 2).
+                _plan_proof_consumed, _plan_proof_reason = apply_repair_invalidation(
+                    _plan_proof_consumed, "repair_changed"
+                )
                 _cache_key_inval = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                 _V2_CERT_PROCESS_CACHE.pop(_cache_key_inval, None)
                 _bs_gate2 = getattr(getattr(self, "bootstrap", None), "state", None)
@@ -11531,6 +12288,32 @@ class ModalRuntimeEntrypoint:
         if not valid:
             detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
             raise RuntimeError(f"Workflow validation failed: {detail}")
+        # ── Step-3 plan-proof decision instrumentation ──
+        if _plan_proof_consumed:
+            print(
+                f"[v2.plan_proof] decision=plan_validation_fast_path consumed=1 "
+                f"workflow_hash_match={int(_pp_hash_match)} validation_hash_match={int(_pp_vh_match)} "
+                f"plan_complete={int(_pp_parity['plan_deployment_complete'])} "
+                f"snapshot_complete={int(_pp_parity['snapshot_proof_complete'])} "
+                f"snapshot_valid={int(_pp_parity['snapshot_proof_valid'])} "
+                f"dep_match={int(_pp_parity['deployment_hash_match'])} "
+                f"gen_match={int(_pp_parity['custom_nodes_generation_match'])} "
+                f"wf_reg_match={int(_pp_parity['workflow_registry_match'])} "
+                f"dependency_match={int(_pp_parity['dependency_proof_match'])} "
+                f"repair_changed=0 outputs_nonempty={int(_pp_outputs_nonempty)} "
+                f"eligible=1", flush=True,
+            )
+        else:
+            print(
+                f"[v2.plan_proof] decision=legacy_validation_fallback consumed=0 "
+                f"reason={_plan_proof_reason or (_pp_gate['ineligible_reason'] or 'not_eligible')}",
+                flush=True,
+            )
+        trace.emit("plan_proof_decision", phase="setup", metadata={
+            "consumed": _plan_proof_consumed,
+            "decision": "plan_validation_fast_path" if _plan_proof_consumed else "legacy_validation_fallback",
+            "reason": _plan_proof_reason or (_pp_gate['ineligible_reason'] or "not_eligible"),
+        })
         trace.emit("pregraph_setup_start", phase="execution", metadata={
             "prompt_id": prompt_id,
         })
@@ -11909,7 +12692,8 @@ class ModalRuntimeEntrypoint:
                            metadata={"reason": "send_sync_unavailable"})
 
             # T5: immediately before prompt executor invocation
-            _report_host_memory("peak_execution")
+            if not _QUIET:
+                _report_host_memory("peak_execution")
             _t5_wall_ns = int(time.time() * 1_000_000_000)
             _t5_mono_ns = time.monotonic_ns()
             _t5_perf_ns = time.perf_counter_ns()
@@ -12197,6 +12981,10 @@ class ModalRuntimeEntrypoint:
             _cert_ms = self._interval_from_trace(trace, "certificate_reload_start", "certificate_reload_end")
             _preflight_ms = self._interval_from_trace(trace, "preflight_start", "preflight_end")
             _validation_ms = self._interval_from_trace(trace, "prompt_validation_start", "prompt_validation_end")
+            # Step-3: on the plan-proof fast path there are no certificate /
+            # preflight / validation intervals — report 0.0 rather than None.
+            if _plan_proof_consumed:
+                _cert_ms = _preflight_ms = _validation_ms = 0.0
             _pregraph_ms = self._interval_from_trace(trace, "pregraph_setup_start", "pregraph_setup_end")
             _exec_reset_ms = self._interval_from_trace(trace, "executor_reset_start", "executor_reset_end")
             _sampler_lane_ms = self._interval_from_trace(trace, "sampler_lane_wait_start", "sampler_lane_wait_end")
@@ -12608,9 +13396,18 @@ class ModalRuntimeEntrypoint:
                 "hashes": selected.output_hash_count,
                 "serialized_bytes": result.get("output_diagnostics", {}).get("serialized_result_bytes", 0),
             })
+            # Variant A: do NOT await the commit here — the result event must
+            # be yielded first.  Stash the commit task + diag per-request; the
+            # generator tail (_finalize_deferred_commit) awaits it and yields
+            # a definitive persistence event.
             if _asset_commit_task is not None:
-                _asset_commit_diag = await _asset_commit_task
-                _asset_diag.update(_asset_commit_diag)
+                self._deferred_commit_task = _asset_commit_task
+                self._deferred_commit_diag = _asset_diag
+                self._deferred_commit_pending = True
+            else:
+                self._deferred_commit_task = None
+                self._deferred_commit_diag = _asset_diag
+                self._deferred_commit_pending = True
             if not getattr(self, "_v2_first_durable_result_seen", False):
                 self._v2_first_durable_result_seen = True
                 _v2_startup_stage(
@@ -12628,6 +13425,7 @@ class ModalRuntimeEntrypoint:
                 "output_asset_write_ms": _asset_diag.get("write_ms", 0.0),
                 "output_volume_commit_ms": _asset_diag.get("commit_ms", 0.0),
                 "output_commit_overlap_ms": round(_overlap_ns / 1_000_000, 3),
+                "commit_status": "pending" if _asset_commit_task is not None else "skipped",
                 "output_hash_count": selected.output_hash_count,
                 "base64_encode_count": selected.base64_encode_count,
                 "base64_decode_count": selected.base64_decode_count,
@@ -12666,6 +13464,7 @@ class ModalRuntimeEntrypoint:
                 f"base64_encode={result['output_diagnostics']['base64_encode_count']} "
                 f"base64_decode={result['output_diagnostics']['base64_decode_count']} "
                 f"commit_ms={result['output_diagnostics']['output_volume_commit_ms']} "
+                f"commit_status={result['output_diagnostics'].get('commit_status', 'none')} "
                 f"overlap_ms={result['output_diagnostics']['output_commit_overlap_ms']} "
                 f"serialized_bytes={result['output_diagnostics']['serialized_result_bytes']}",
                 flush=True,
@@ -12717,7 +13516,7 @@ class ModalRuntimeEntrypoint:
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
             # Only write when preflight actually ran (not on cert skip).
-            if _v2_schedule_cert_write and _v2_preflight_ran:
+            if should_write_validation_cert(_v2_schedule_cert_write, _v2_preflight_ran):
                 _cert_write_ok = await _write_v2_validation_certificate(
                     _v2_cert_identity,
                     outputs_to_execute,
@@ -13210,6 +14009,140 @@ class ModalRuntimeEntrypoint:
         commit_task = asyncio.create_task(commit_volume())
         return dataclasses.replace(attempt, items=tuple(persisted)), commit_task, diag
 
+    async def _finalize_deferred_commit(self, *, request_id: str = "") -> dict | None:
+        """Variant A finalizer: await the stashed asset commit AFTER the result
+        event was already yielded, then emit the definitive persistence event.
+
+        Idempotent (consumes the stash on first call) and MUST never raise —
+        a failure here must not mask the terminal result or an in-flight
+        exception.  Returns a ``{"type": "persistence", ...}`` event for the
+        local drain, or ``None`` when nothing was pending (already finalized).
+        """
+        if not getattr(self, "_deferred_commit_pending", False):
+            return None
+        task = getattr(self, "_deferred_commit_task", None)
+        self._deferred_commit_task = None
+        self._deferred_commit_pending = False
+        _diag_holder = getattr(self, "_deferred_commit_diag", None)
+        _td = getattr(self, "_teardown_diagnostics", None)
+        _dc_trace = getattr(self, "_lifecycle_trace", None)
+
+        def _dc_trace_event(name: str, *, wall_ns: int, mono_ns: int,
+                            status: str, commit_ms: float, detail: str) -> dict:
+            """Build one waterfall-visible trace event (deferred_commit_*).
+
+            Emitted onto the live lifecycle trace when available so the event
+            also lands in the next trace merge, and always returned as a plain
+            serializable dict for post-hoc attachment to the already-yielded
+            result trace (the v2_waterfall ``output_deferred_commit`` row reads
+            result["trace"]["events"] by these names).
+            """
+            _meta = {
+                "status": status,
+                "commit_ms": commit_ms,
+                "detail": detail,
+                "request_id": request_id,
+            }
+            if _dc_trace is not None:
+                _evt = _dc_trace.emit_at(
+                    name,
+                    process="remote",
+                    phase="output",
+                    wall_unix_ns=wall_ns,
+                    monotonic_ns=mono_ns,
+                    metadata=_meta,
+                )
+                return _evt.to_dict()
+            return {
+                "name": name,
+                "process": "remote",
+                "phase": "output",
+                "wall_unix_ns": wall_ns,
+                "monotonic_ns": mono_ns,
+                "request_id": request_id,
+                "metadata": _meta,
+            }
+
+        _dc_trace_events: list[dict] = []
+        if task is None:
+            # Cache-hit / no commit needed: nothing to await, definitive event.
+            if _td is not None:
+                _td.emit(
+                    "deferred_commit_end",
+                    status="ok",
+                    commit_ms=0.0,
+                    detail="no commit needed",
+                    request_id=request_id,
+                )
+            _dc_skip_wall_ns = time.time_ns()
+            _dc_skip_mono_ns = time.monotonic_ns()
+            _dc_trace_events.append(_dc_trace_event(
+                "deferred_commit_start",
+                wall_ns=_dc_skip_wall_ns, mono_ns=_dc_skip_mono_ns,
+                status="ok", commit_ms=0.0, detail="no commit needed",
+            ))
+            _dc_trace_events.append(_dc_trace_event(
+                "deferred_commit_end",
+                wall_ns=_dc_skip_wall_ns, mono_ns=_dc_skip_mono_ns,
+                status="ok", commit_ms=0.0, detail="no commit needed",
+            ))
+            return {
+                "type": "persistence",
+                "status": "ok",
+                "commit_ms": 0.0,
+                "detail": "no commit needed",
+                "skipped": True,
+                "_trace_events": _dc_trace_events,
+            }
+        if _td is not None:
+            _td.emit("deferred_commit_start", request_id=request_id)
+        _dc_start_wall_ns = time.time_ns()
+        _dc_start_mono_ns = time.monotonic_ns()
+        status = "ok"
+        commit_ms = 0.0
+        detail = ""
+        try:
+            _diag = await task
+            commit_ms = float((_diag or {}).get("commit_ms", 0.0) or 0.0)
+            if isinstance(_diag_holder, dict) and isinstance(_diag, dict):
+                _diag_holder.update(_diag)
+        except asyncio.CancelledError as exc:
+            status = "failed"
+            detail = str(exc)[:200]
+            print(f"[output_delivery] deferred commit failed: {detail}", flush=True)
+        except Exception as exc:
+            status = "failed"
+            detail = str(exc)[:200]
+            print(f"[output_delivery] deferred commit failed: {detail}", flush=True)
+        _dc_end_wall_ns = time.time_ns()
+        _dc_end_mono_ns = time.monotonic_ns()
+        if _td is not None:
+            _td.emit(
+                "deferred_commit_end",
+                status=status,
+                commit_ms=commit_ms,
+                detail=detail,
+                request_id=request_id,
+            )
+        _dc_trace_events.append(_dc_trace_event(
+            "deferred_commit_start",
+            wall_ns=_dc_start_wall_ns, mono_ns=_dc_start_mono_ns,
+            status=status, commit_ms=commit_ms, detail=detail,
+        ))
+        _dc_trace_events.append(_dc_trace_event(
+            "deferred_commit_end",
+            wall_ns=_dc_end_wall_ns, mono_ns=_dc_end_mono_ns,
+            status=status, commit_ms=commit_ms, detail=detail,
+        ))
+        return {
+            "type": "persistence",
+            "status": status,
+            "commit_ms": commit_ms,
+            "detail": detail,
+            "skipped": False,
+            "_trace_events": _dc_trace_events,
+        }
+
     def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
         reload_volume = getattr(volume, "reload", None)
@@ -13525,6 +14458,85 @@ class ModalRuntimeEntrypoint:
             result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
             result["end_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         return result
+
+    @(_modal.method() if _modal is not None else (lambda f: f))
+    def get_deployment_identity_static(self) -> dict[str, Any]:
+        """O(1) static deployment identity readback used by the deploy-time
+        identity record tool.  Never touches GPU state; runs after container
+        enter."""
+        try:
+            from comfymodal_runtime import modal_app as _mod
+
+            _deployment_combined_hash = str(
+                getattr(_mod, "_V2_DEPLOYMENT_COMBINED_HASH", "") or ""
+            )
+            custom_nodes_generation = ""
+            _legacy = getattr(self, "_legacy_module", None)
+            if _legacy is not None:
+                try:
+                    _mft = _legacy.load_baked_custom_node_dependency_manifest() or {}
+                    custom_nodes_generation = str(
+                        _mft.get("production_custom_node_generation", "") or ""
+                    )
+                except Exception:  # noqa: BLE001
+                    custom_nodes_generation = ""
+            comfyui_version = ""
+            try:
+                import comfyui_version as _cv  # noqa: PLC0415
+                comfyui_version = str(getattr(_cv, "__version__", "") or "")
+            except Exception:  # noqa: BLE001
+                comfyui_version = ""
+            if not comfyui_version:
+                try:
+                    import comfy as _comfy  # noqa: PLC0415
+                    comfyui_version = str(getattr(_comfy, "__version__", "") or "")
+                except Exception:  # noqa: BLE001
+                    comfyui_version = ""
+            registry_manifest: dict[str, Any] = {}
+            try:
+                from comfymodal_runtime.registry_proof import (  # noqa: PLC0415
+                    build_registry_manifest,
+                )
+                registry_manifest = build_registry_manifest(
+                    roots=_registry_manifest_roots(),
+                ) or {}
+            except Exception:  # noqa: BLE001
+                registry_manifest = {}
+            if not isinstance(registry_manifest, dict):
+                registry_manifest = {}
+            # Diagnostics: container ComfyUI git commit and LF-normalized
+            # core-module content hashes (host tool compares these).
+            _diag_cfr = _resolve_comfyui_root()
+            _diag_commit = _git_rev_parse_head(_diag_cfr) if _diag_cfr else ""
+            _diag_core_sha: dict[str, str] = {}
+            for _name in ("nodes.py", "execution.py"):
+                _diag_core_sha[_name] = (
+                    _file_sha256_lf(os.path.join(_diag_cfr, _name)) if _diag_cfr else ""
+                )
+            return {
+                "deployment_combined_hash": _deployment_combined_hash,
+                "custom_nodes_generation": custom_nodes_generation,
+                "comfyui_version": comfyui_version,
+                "registry_manifest": registry_manifest,
+                "registry_manifest_class_count": len(
+                    (registry_manifest or {}).get("classes", {}) or {}
+                ),
+                "comfyui_commit": _diag_commit,
+                "core_module_sha256s": _diag_core_sha,
+                "source": "container_readback",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "deployment_combined_hash": "",
+                "custom_nodes_generation": "",
+                "comfyui_version": "",
+                "registry_manifest": {},
+                "registry_manifest_class_count": 0,
+                "comfyui_commit": "",
+                "core_module_sha256s": {"nodes.py": "", "execution.py": ""},
+                "source": "container_readback",
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
 
     def run_snapshot_restore_only_probe(
         self,
@@ -14069,6 +15081,9 @@ class ModalRuntimeEntrypoint:
             self._terminal_response_delivered = False
             self._terminal_cleanup_done = False
             self._post_stream_release_done = False
+            self._deferred_commit_task = None
+            self._deferred_commit_diag = None
+            self._deferred_commit_pending = False
         terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
@@ -14136,6 +15151,10 @@ class ModalRuntimeEntrypoint:
                         )
                     except Exception:
                         pass
+            try:
+                await self._finalize_deferred_commit(request_id=request_id)
+            except Exception:
+                pass
             if diagnostics is not None:
                 diagnostics.emit("request_terminal_end")
 
@@ -14262,7 +15281,9 @@ class ModalRuntimeEntrypoint:
         if _command_start_ms_for_age is None:
             _command_start_ms_for_age = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
         _snapshot_callback_to_command_start_ms: float | None = None
+        # legacy name; semantics = command_start to python resume (post_snapshot_restore start)
         _command_start_to_restore_start_ms: float | None = None
+        _command_start_to_restore_end_ms: float | None = None
         if isinstance(_callback_wall_for_age, (int, float)) and isinstance(_command_start_ms_for_age, (int, float)):
             _value = float(_command_start_ms_for_age) * 1_000_000.0 - float(_callback_wall_for_age)
             if _value >= 0:
@@ -14271,11 +15292,19 @@ class ModalRuntimeEntrypoint:
             _value = float(_restore_start_wall_for_age) - float(_command_start_ms_for_age) * 1_000_000.0
             if _value >= 0:
                 _command_start_to_restore_start_ms = round(_value / 1_000_000.0, 3)
+        _restore_end_wall_for_age = _restore_timing_for_age.get("restore_method_end_wall_unix_ns")
+        if isinstance(_restore_end_wall_for_age, (int, float)) and isinstance(_command_start_ms_for_age, (int, float)):
+            _value = float(_restore_end_wall_for_age) - float(_command_start_ms_for_age) * 1_000_000.0
+            if _value >= 0:
+                _command_start_to_restore_end_ms = round(_value / 1_000_000.0, 3)
         _snapshot_age_at_restore = _restore_timing_for_age.get("snapshot_callback_age_at_restore_ms")
         context_snapshot_age = {
             "snapshot_callback_age_at_restore_ms": _snapshot_age_at_restore,
             "snapshot_callback_to_command_start_ms": _snapshot_callback_to_command_start_ms,
             "command_start_to_restore_start_ms": _command_start_to_restore_start_ms,
+            # Truthful name for the legacy field above (same value).
+            "command_start_to_python_resume_ms": _command_start_to_restore_start_ms,
+            "command_start_to_restore_end_ms": _command_start_to_restore_end_ms,
         }
 
         # â”€â”€ Re-emit local submission breakdown from client â”€â”€â”€â”€â”€â”€
@@ -14486,25 +15515,27 @@ class ModalRuntimeEntrypoint:
                 _restore_end_to_modal_ms = str(round(
                     (_method_first_line_ns - _rt_end_mono) / 1_000_000, 3
                 ))
-        print(
-            f"[v2.method_entry_gap] "
-            f"restore_to_method_ms={_method_entry_gap_results.get('restore_return_to_method_first_line_ms')} "
-            f"first_line_to_running_log_ms={_first_line_to_now_ms} "
-            f"same_process={_method_entry_gap_results.get('same_process')} "
-            f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'} "
-            f"remote_python_resume_wall_unix_ns={_resume_wall_from_timing} "
-            f"restore_method_start_wall_unix_ns={_restore_start_wall_from_timing} "
-            f"restore_method_end_wall_unix_ns={_restore_end_wall_from_timing} "
-            f"modal_method_entry_wall_unix_ns={_method_first_line_wall_ns} "
-            f"restore_end_to_modal_method_ms={_restore_end_to_modal_ms}",
-            flush=True,
-        )
-        print(
-            "[v2.snapshot_timing] "
-            + " ".join(f"{key}={value if value is not None else 'unavailable'}" for key, value in context_snapshot_age.items())
-            + " request_latency_included=0_for_callback_age",
-            flush=True,
-        )
+        if not _QUIET:
+            print(
+                f"[v2.method_entry_gap] "
+                f"restore_to_method_ms={_method_entry_gap_results.get('restore_return_to_method_first_line_ms')} "
+                f"first_line_to_running_log_ms={_first_line_to_now_ms} "
+                f"same_process={_method_entry_gap_results.get('same_process')} "
+                f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'} "
+                f"remote_python_resume_wall_unix_ns={_resume_wall_from_timing} "
+                f"restore_method_start_wall_unix_ns={_restore_start_wall_from_timing} "
+                f"restore_method_end_wall_unix_ns={_restore_end_wall_from_timing} "
+                f"modal_method_entry_wall_unix_ns={_method_first_line_wall_ns} "
+                f"restore_end_to_modal_method_ms={_restore_end_to_modal_ms}",
+                flush=True,
+            )
+        if not _QUIET or any(v is not None for v in context_snapshot_age.values()):
+            print(
+                "[v2.snapshot_timing] "
+                + " ".join(f"{key}={value if value is not None else 'unavailable'}" for key, value in context_snapshot_age.items())
+                + " request_latency_included=0_for_callback_age",
+                flush=True,
+            )
 
         # â”€â”€ Normal trace setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._request_count = getattr(self, "_request_count", 0) + 1
@@ -14867,27 +15898,28 @@ class ModalRuntimeEntrypoint:
                 _dispatch_to_entry = _t2_t4_ms
                 _entry_to_exec = _t4_t5_ms       # same as method_entry_to_prompt_executor
                 _trig_to_exec = _t0_t5_ms        # same as run_trigger_to_prompt_executor
-                print(
-                    f"[v2.remote_request_origin.remote] "
-                    f"request_id={_t4_request} "
-                    f"trigger_source={_trig_src} "
-                    f"ui_trigger_unix_ms={self._fmt_or_absent(_t0_wall)} "
-                    f"local_receive_unix_ns={self._fmt_or_absent(_t1_wall_ns)} "
-                    f"modal_generator_create_start_unix_ns={self._fmt_or_absent(_gen_create_start_wall_ns)} "
-                    f"modal_submission_attempt_unix_ns={self._fmt_or_absent(_t2_wall_ns)} "
-                    f"modal_generator_created_unix_ns={self._fmt_or_absent(_t3_wall_ns)} "
-                    f"modal_first_iteration_start_unix_ns={self._fmt_or_absent(_first_iter_start_wall_ns)} "
-                    f"modal_first_remote_event_unix_ns={self._fmt_or_absent(_first_remote_event_wall_ns)} "
-                    f"modal_method_entry_unix_ns={_t4_wall} "
-                    f"prompt_executor_invoke_start_unix_ns={self._fmt_or_absent(_t5_wall_ns)} "
-                    f"trigger_to_dispatch_ms={_trig_to_dispatch} "
-                    f"dispatch_to_modal_entry_ms={_dispatch_to_entry} "
-                    f"modal_entry_to_executor_ms={_entry_to_exec} "
-                    f"trigger_to_executor_ms={_trig_to_exec} "
-                    f"modal_input_id={_modal_input_id} "
-                    f"modal_task_id={_modal_task_id}",
-                    flush=True,
-                )
+                if not _QUIET:
+                    print(
+                        f"[v2.remote_request_origin.remote] "
+                        f"request_id={_t4_request} "
+                        f"trigger_source={_trig_src} "
+                        f"ui_trigger_unix_ms={self._fmt_or_absent(_t0_wall)} "
+                        f"local_receive_unix_ns={self._fmt_or_absent(_t1_wall_ns)} "
+                        f"modal_generator_create_start_unix_ns={self._fmt_or_absent(_gen_create_start_wall_ns)} "
+                        f"modal_submission_attempt_unix_ns={self._fmt_or_absent(_t2_wall_ns)} "
+                        f"modal_generator_created_unix_ns={self._fmt_or_absent(_t3_wall_ns)} "
+                        f"modal_first_iteration_start_unix_ns={self._fmt_or_absent(_first_iter_start_wall_ns)} "
+                        f"modal_first_remote_event_unix_ns={self._fmt_or_absent(_first_remote_event_wall_ns)} "
+                        f"modal_method_entry_unix_ns={_t4_wall} "
+                        f"prompt_executor_invoke_start_unix_ns={self._fmt_or_absent(_t5_wall_ns)} "
+                        f"trigger_to_dispatch_ms={_trig_to_dispatch} "
+                        f"dispatch_to_modal_entry_ms={_dispatch_to_entry} "
+                        f"modal_entry_to_executor_ms={_entry_to_exec} "
+                        f"trigger_to_executor_ms={_trig_to_exec} "
+                        f"modal_input_id={_modal_input_id} "
+                        f"modal_task_id={_modal_task_id}",
+                        flush=True,
+                    )
                 _critical_path_data = data.pop("_v2_critical_path_data", {})
                 if not isinstance(_critical_path_data, Mapping):
                     _critical_path_data = {}
@@ -14945,7 +15977,8 @@ class ModalRuntimeEntrypoint:
                 # hardware (torch device properties) on every result payload.
                 try:
                     data["gpu_allocation"] = _detect_gpu_allocation(
-                        _MODAL_RESOURCES.get("spec", ModalRuntimeSpec()).gpu
+                        _MODAL_RESOURCES.get("spec", ModalRuntimeSpec()).gpu,
+                        print_line=not _QUIET,
                     )
                 except Exception:
                     pass
@@ -14984,6 +16017,30 @@ class ModalRuntimeEntrypoint:
                         flush=True,
                     )
             yield event
+
+        # Variant A: the asset commit completes after the result event was
+        # already delivered.  Yield a definitive persistence event so the
+        # local drain can record the final state.  The Modal container
+        # entrypoint drives this generator to exhaustion even when the client
+        # closed the stream, so this tail WILL run.
+        _deferred_commit_event = await self._finalize_deferred_commit(request_id=request_id)
+        if _deferred_commit_event is not None:
+            # The deferred commit runs AFTER the result event was already
+            # yielded, so its trace events cannot be part of the result trace
+            # that the waterfall builder read at build time.  Attach them
+            # post-hoc to the same channel the builder consumes
+            # (result["trace"]["events"]) so any downstream rebuild
+            # (e.g. benchmark host reconciliation) sees the real span for the
+            # "Deferred persistence after yield" row.
+            _dc_trace_events = _deferred_commit_event.get("_trace_events") or []
+            _result_data = locals().get("data")
+            if _dc_trace_events and isinstance(_result_data, dict):
+                _result_trace = _result_data.get("trace")
+                if isinstance(_result_trace, dict) and isinstance(_result_trace.get("events"), list):
+                    _result_trace["events"].extend(
+                        evt for evt in _dc_trace_events if isinstance(evt, dict)
+                    )
+            yield _deferred_commit_event
 
     async def run_prompt_stream(
         self,
@@ -15092,6 +16149,9 @@ def _build_decorated_v2_class() -> type:
         self._snapshot_eviction_retained_model_type = ""
         self._snapshot_eviction_retained_release_status = "not_run"
         self._v2_pending_production_cleanup: dict[str, Any] | None = None
+        self._deferred_commit_task = None
+        self._deferred_commit_diag = None
+        self._deferred_commit_pending = False
         self._init_teardown_diagnostics()
         self._v2_initialized = True
 

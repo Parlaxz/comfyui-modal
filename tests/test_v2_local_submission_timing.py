@@ -3082,6 +3082,12 @@ class TestTransportIteratorCleanup(unittest.TestCase):
                 trace={"prompt_id": "aclose-empty"},
             ):
                 pass
+            # Variant A: an immediately-ended stream is handed to the shielded
+            # background drain (which closes the iterator at its end), so the
+            # inner aclose is no longer synchronous — join the drain first.
+            drain = getattr(transport, "_drain_task", None)
+            if drain is not None:
+                await asyncio.wait_for(drain, timeout=5.0)
             self.assertEqual(gen.aclose_calls, 1,
                              "inner iterator must be closed when the stream ends immediately")
 
@@ -3113,6 +3119,13 @@ class TestTransportIteratorCleanup(unittest.TestCase):
                     trace={"prompt_id": "aclose-exc"},
                 ):
                     pass
+            # Variant A: the failed stream is handed to the shielded background
+            # drain (which swallows the error and closes the iterator at its
+            # end), so the inner aclose is no longer synchronous — join the
+            # drain before asserting.
+            drain = getattr(transport, "_drain_task", None)
+            if drain is not None:
+                await asyncio.wait_for(drain, timeout=5.0)
             self.assertEqual(_FailingGen.aclose_calls, 1,
                              "inner iterator must be closed when the stream raises")
 
@@ -3138,6 +3151,11 @@ class TestTransportIteratorCleanup(unittest.TestCase):
             # this fix targets).  Closing the transport generator must
             # deterministically close the inner remote iterator.
             await stream.aclose()  # type: ignore[attr-defined]
+            # Variant A: early-stop cleanup runs in the shielded background
+            # drain, so join it before asserting the inner aclose.
+            drain = getattr(transport, "_drain_task", None)
+            if drain is not None:
+                await asyncio.wait_for(drain, timeout=5.0)
             self.assertEqual(gen.aclose_calls, 1,
                              "inner iterator must be closed when the transport generator is closed")
 

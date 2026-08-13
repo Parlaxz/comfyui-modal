@@ -42,7 +42,12 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
-from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, stable_hash
+from comfymodal_runtime.contracts import (
+    VALIDATION_PROOF_SCHEMA_VERSION,
+    ExecutionOptions,
+    ExecutionPlan,
+    stable_hash,
+)
 from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import (
@@ -52,6 +57,7 @@ from comfymodal_runtime.restore_plan import (
     derive_prefill_key,
 )
 from comfymodal_runtime.trace import (
+    LOCAL_SUBMISSION_FIELD_KEYS,
     RuntimeTrace,
     _build_local_submission_breakdown,
     _emit_breakdown_line,
@@ -872,8 +878,196 @@ def _event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float
     return None
 
 
+# ── Host-side transport boundary helpers ────────────────────────────────
+# modal_transport emits the generator/submission/result boundaries as
+# RuntimeTrace events (with wall_unix_ns + monotonic_ns) and a metadata
+# backfill.  These pure helpers read the LAST occurrence of a named event
+# from the merged trace so the local prints can surface boundaries that
+# never landed in the origin dict.  All return None when unavailable so
+# callers can render a literal "absent".
+
+
+def _host_boundary_event(trace: RuntimeTrace | None, event_name: str) -> Any | None:
+    """Return the LAST event named *event_name* in *trace*, or None.
+
+    Last occurrence wins: the merged trace may contain lifecycle/startup
+    events from earlier requests, and the most recent one is the boundary
+    for the current request.
+    """
+    if trace is None:
+        return None
+    last: Any | None = None
+    for event in getattr(trace, "events", ()):
+        if getattr(event, "name", None) == event_name:
+            last = event
+    return last
+
+
+def _host_boundary_wall_ns(trace: RuntimeTrace | None, event_name: str) -> int | None:
+    """Return the wall_unix_ns of the last *event_name* event, or None."""
+    event = _host_boundary_event(trace, event_name)
+    value = getattr(event, "wall_unix_ns", None) if event is not None else None
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def _host_boundary_field(
+    trace: RuntimeTrace | None,
+    event_name: str,
+    ref_wall_ns: Any = None,
+) -> float | None:
+    """Return ms from *ref_wall_ns* to the last *event_name* wall time.
+
+    Pure helper used to surface host-side transport boundaries in the
+    [v2.request_origin] / [v2.local_submission_breakdown] prints.  Returns
+    None when the event or reference boundary is missing, or when the
+    ordering is negative (event wall before the reference).
+    """
+    event_wall = _host_boundary_wall_ns(trace, event_name)
+    if event_wall is None or not isinstance(ref_wall_ns, (int, float)):
+        return None
+    delta_ns = event_wall - int(ref_wall_ns)
+    if delta_ns < 0:
+        return None
+    return round(delta_ns / 1_000_000, 3)
+
+
+# Host-side transport boundary fields appended to the canonical
+# [v2.local_submission_breakdown] field map by the local emitter.
+_HOST_BOUNDARY_FIELD_KEYS: tuple[tuple[str, str], ...] = (
+    ("modal_submission_attempt_unix_ns", "modal_submission_attempt_unix_ns"),
+    ("modal_generator_created_unix_ns", "modal_generator_created_unix_ns"),
+    ("modal_first_iteration_start_unix_ns", "modal_first_iteration_start_unix_ns"),
+    ("modal_first_remote_event_unix_ns", "modal_first_remote_event_unix_ns"),
+    ("dispatch_to_modal_entry_ms", "dispatch_to_modal_entry_ms"),
+    ("local_receive_to_actual_submission_ms", "local_receive_to_actual_submission_ms"),
+    ("local_receive_to_result_return_ms", "local_receive_to_result_return_ms"),
+)
+
+
 # _strict_event_span_ms, _event_mono_ns, _derived_mono_delta_ms
 # are imported from comfymodal_runtime.trace above.
+
+
+# ── Step-2 baked custom-node dependency manifest (host-side reader) ──────
+# The deploy tooling writes the canonical (immutable) custom-node dependency
+# manifest into the repo's ``.baked_custom_node_deps/`` directory.  The
+# container bakes the same artifact into the image (comfyapp reads it from
+# ``BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH``).  The host reader below consumes
+# the same deploy-generated artifact so plan identity provenance matches the
+# snapshot-side freeze.  Reads are pure file I/O — no Modal/network/Volume.
+_BAKED_CUSTOM_NODE_DEPS_LOCAL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".baked_custom_node_deps",
+    "custom_node_deps_baked.json",
+)
+
+
+def _read_baked_custom_node_manifest() -> dict:
+    """Return the deploy-generated baked custom-node dependency manifest."""
+    try:
+        with open(_BAKED_CUSTOM_NODE_DEPS_LOCAL, "r", encoding="utf-8") as _f:
+            import json
+            _m = json.load(_f)
+        return _m if isinstance(_m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_baked_custom_node_generation() -> str:
+    """Canonical custom-node generation from the deploy-generated manifest."""
+    return str(_read_baked_custom_node_manifest().get("production_custom_node_generation", "") or "")
+
+
+def _host_requirements_repair_mode() -> str:
+    """Mirror the container's repair-mode resolution (comfyapp).
+
+    ``_resolve_requirements_repair_mode()`` reads ``COMFYMODAL_REQUIREMENTS_REPAIR_MODE``
+    (default ``fail_fast``) and normalizes to the allowed set.  Mirroring the
+    container exactly is required so the host-computed dependency manifest
+    identity matches the snapshot-frozen one when the deployment envs agree.
+    """
+    import os
+    _mode = str(os.environ.get("COMFYMODAL_REQUIREMENTS_REPAIR_MODE", "fail_fast") or "fail_fast").strip().lower()
+    if _mode not in ("off", "fail_fast", "dev"):
+        _mode = "fail_fast"
+    return _mode
+
+
+# ── Step-3 host-side canonical deployment combined hash ──────────────────
+# Mirrors the container's ``_V2_DEPLOYMENT_COMBINED_HASH`` (modal_app.py:
+# ``build_modal_resources`` + the module-level ``stable_hash`` wrapper) from
+# pure modules so the plan carries the same deployment identity the container
+# froze into its snapshot proof.  Computed at most once per process — a
+# repo-wide filesystem scan is NEVER performed per request.  Returns "" when
+# the mirror cannot be reproduced (never fabricated).
+_HOST_DEPLOYMENT_HASH_COMPUTED: str | None = None
+
+
+def _compute_host_deployment_combined_hash() -> str:
+    global _HOST_DEPLOYMENT_HASH_COMPUTED
+    if _HOST_DEPLOYMENT_HASH_COMPUTED is not None:
+        return _HOST_DEPLOYMENT_HASH_COMPUTED
+    try:
+        from comfymodal_runtime.deployment_spec import build_deployment_identity
+        from comfymodal_runtime.runtime_shape import runtime_shape_config
+        from comfymodal_runtime.contracts import stable_hash as _stable_hash
+        # Mirror build_modal_resources: runtime_root = the comfymodal_runtime
+        # dir, custom_root = env COMFYMODAL_LOCAL_CUSTOM_NODES or the repo
+        # root (this file lives at the repo root).
+        _repo_root = os.path.dirname(os.path.abspath(__file__))
+        _runtime_root = os.path.join(_repo_root, "comfymodal_runtime")
+        _explicit = os.environ.get("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
+        _custom_root = _explicit if _explicit else _repo_root
+        # The container call passes no dependency_hash (defaults to "").
+        _identity = build_deployment_identity(
+            runtime_root=_runtime_root,
+            custom_node_paths=[_custom_root],
+        )
+        _payload = runtime_shape_config().identity_payload()
+        _HOST_DEPLOYMENT_HASH_COMPUTED = _stable_hash({
+            "source_combined_hash": _identity.combined_hash,
+            "runtime_shape": _payload,
+        })
+    except Exception:
+        _HOST_DEPLOYMENT_HASH_COMPUTED = ""
+    return _HOST_DEPLOYMENT_HASH_COMPUTED
+
+
+def _read_persisted_deployment_combined_hash() -> str:
+    """Read the deploy-bookkeeping ``.deployed_state.json`` hash (repo root).
+
+    Written by ``__init__._save_deploy_state`` at deploy time via the same
+    host mirror.  Missing file/key → "".
+    """
+    try:
+        import json
+        _path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".deployed_state.json"
+        )
+        with open(_path, "r", encoding="utf-8") as _f:
+            _m = json.load(_f)
+        return str((_m or {}).get("deployment_combined_hash", "") or "")
+    except Exception:
+        return ""
+
+
+# ── Step-2 host validation memoization ───────────────────────────────────
+# ``execution.validate_prompt`` runs once per (workflow, deployment identity).
+# Identical subsequent builds reuse the cached payload.  Simple bounded dict;
+# a full clear is used as the documented eviction policy.  Exceptions are
+# never cached (fail-closed unchanged).
+_PLAN_VALIDATION_MEMO_MAX = 64
+_PLAN_VALIDATION_MEMO: dict = {}
+
+
+def _memo_key_plan_validation(workflow_hash: str, dep_identity: dict) -> tuple:
+    return (
+        workflow_hash,
+        str(dep_identity.get("deployment_combined_hash", "")),
+        str(dep_identity.get("custom_nodes_generation", "")),
+        stable_hash(dep_identity.get("registry_proof") or {}),
+        VALIDATION_PROOF_SCHEMA_VERSION,
+    )
 
 
 def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
@@ -920,26 +1114,105 @@ def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
     }
 
 
-def _collect_plan_deployment_identity(request_metadata=None) -> dict:
+def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str = "", workflow=None) -> dict:
     """Best-effort deployment identity for the plan (never fabricated).
 
     ``registry_fingerprint`` returns ``""`` when ``nodes`` is unavailable, so
-    ``complete`` is only ever True when every component is known.
+    ``complete`` is only ever True when every component is known.  The
+    ``custom_nodes_generation`` is taken from the deploy-generated baked
+    manifest (canonical), falling back to ``request_metadata`` when the baked
+    artifact is absent.  ``dependency_manifest_identity`` mirrors the shared
+    identity builder the container's manifest writer uses; it is carried
+    separately for parity and never affects ``complete`` (Step-1 semantics).
+
+    Deployment hash fail-closed: the authoritative value comes only from
+    ``request_metadata`` → env ``COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH`` →
+    persisted ``.deployed_state.json``.  The host mirror
+    (``_compute_host_deployment_combined_hash``) is DIAGNOSTIC only and never
+    grants identity when the baked value is unknown.
+
+    Registry proof: when ``workflow`` is provided, a per-class canonical
+    identity proof over exactly the workflow's class set is built
+    (``registry_proof``).  It is the Step-3 registry-parity authority;
+    ``registry_proof_complete`` fails closed (False) whenever ``workflow`` is
+    None or the proof cannot be built.
     """
     import os
     from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION, compute_registry_fingerprint
     _meta = dict(request_metadata or {})
     _dep = str(_meta.get("deployment_combined_hash", "") or "")
+    _dep_source = "metadata"
     if not _dep:
         _dep = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
-    _gen = str(_meta.get("custom_node_generation", "") or "")
-    _reg = compute_registry_fingerprint()  # "" when nodes unavailable — ineligible, never fabricate
+        _dep_source = "env"
+    if not _dep:
+        _dep = _read_persisted_deployment_combined_hash()
+        _dep_source = "persisted"
+    if not _dep:
+        # NO host-mirror fallback for the authoritative value: the mirror must
+        # not grant identity when the actual baked value is unknown.
+        _dep_source = "unavailable"
+    # Host mirror recomputation — DIAGNOSTIC ONLY, never used in ``complete``.
+    _host_mirror_dep = _compute_host_deployment_combined_hash()
+    _baked = _read_baked_custom_node_manifest()
+    _gen = str(_baked.get("production_custom_node_generation", "") or "")
+    if not _gen:
+        _gen = str(_meta.get("custom_node_generation", "") or "")
+    _overall = str(_baked.get("overall_dependency_hash", "") or "")
+    _repair = _host_requirements_repair_mode()
+    _dep_identity = ""
+    if _dep and _gen and _overall:
+        from comfymodal_runtime.dependency_manifest import (
+            DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+            build_identity,
+        )
+        _dep_identity = build_identity(
+            combined_hash=_dep,
+            custom_node_fingerprint={"overall_dependency_hash": _overall},
+            custom_node_generation=_gen,
+            repair_mode=_repair,
+            schema_version=DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+        )
+    # Root-filtered registry fingerprint.  repo_root = the comfyui-modal dir
+    # (this file lives at the repo root); custom_nodes_dir = parent of
+    # repo_root.  If roots derivation is impossible, fall back to the full
+    # registry (no roots).  Diagnostic only (Step-3 parity uses the
+    # workflow-relevant registry_proof instead).
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
+    _custom_nodes_dir = os.path.dirname(_repo_root)
+    _roots = [r for r in (str(comfyui_root or ""), _custom_nodes_dir, _repo_root) if r]
+    if _roots:
+        _reg = compute_registry_fingerprint(roots=_roots)
+    else:
+        _reg = compute_registry_fingerprint()  # full registry fallback
+    # Workflow-relevant registry proof (per-class canonical identity over
+    # exactly the workflow's class set).  Fails closed when workflow is None.
+    # Roots = [comfyui_root, repo_root] — deliberately NOT ``_custom_nodes_dir``
+    # (root-set symmetry: the container derives custom-node relpaths from its
+    # comfyui root, so both sides must use [comfyui_root, repo_root];
+    # including custom_nodes_dir would produce asymmetric shortest-paths).
+    _reg_proof = {}
+    if workflow:
+        try:
+            from comfymodal_runtime.registry_proof import build_workflow_registry_proof
+            _reg_proof = build_workflow_registry_proof(
+                workflow,
+                roots=[r for r in (str(comfyui_root or ""), _repo_root) if r],
+            )
+        except Exception:
+            _reg_proof = {}
+    _reg_proof_complete = bool(_reg_proof.get("complete", False))
     return {
         "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
         "deployment_combined_hash": _dep,
+        "deployment_combined_hash_source": _dep_source,
+        "host_mirror_deployment_combined_hash": str(_host_mirror_dep or ""),
         "custom_nodes_generation": _gen,
         "registry_fingerprint": _reg,
-        "complete": bool(_dep and _gen and _reg),
+        "registry_proof": _reg_proof,
+        "registry_proof_complete": _reg_proof_complete,
+        "dependency_manifest_identity": _dep_identity,
+        "complete": bool(_dep and _gen and _reg_proof_complete),
     }
 
 
@@ -985,13 +1258,37 @@ def build_execution_plan(
         )
         dispatch_workflow = compiled.compiled_workflow
         report = dict(compiled.report)
-    # Step-1 plan-carried validation proof.  Runs AFTER the dispatch workflow
-    # is finalized but BEFORE the hash so the host hash is computed over the
-    # exact dict object frozen into the plan (validate_prompt coerces scalar
-    # inputs in place).  Fail-closed: any validation failure aborts the build.
+    # Deployment identity is computed ONCE up-front: it feeds the host-side
+    # validation memo key AND the plan arg / instrumentation line below
+    # (never recomputed twice).  ``dispatch_workflow`` is finalized above.
+    _deployment_identity = _collect_plan_deployment_identity(
+        request_metadata, comfyui_root, workflow=dispatch_workflow
+    )
+    # Step-1/Step-2 plan-carried validation proof.  Runs AFTER the dispatch
+    # workflow is finalized but BEFORE the hash so the host hash is computed
+    # over the exact dict object frozen into the plan (validate_prompt coerces
+    # scalar inputs in place).  Fail-closed: any validation failure aborts the
+    # build and exceptions are never cached.  The memo key uses the RAW
+    # dispatch hash (documented coercion nuance: on a miss validation coerces
+    # inputs and the hash then covers the coerced dict; on a hit the payload's
+    # validated_workflow_hash is reset below so plan.workflow_hash ==
+    # validated_workflow_hash holds by construction in both cases).
     _validation_payload: dict = {}
+    _validation_memo_state = "off"
     if collect_validation_proof:
-        _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+        _memo_key = _memo_key_plan_validation(
+            prompt_sha256(dispatch_workflow), _deployment_identity
+        )
+        _cached = _PLAN_VALIDATION_MEMO.get(_memo_key)
+        if _cached is not None:
+            _validation_payload = dict(_cached)
+            _validation_memo_state = "hit"
+        else:
+            _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+            if len(_PLAN_VALIDATION_MEMO) >= _PLAN_VALIDATION_MEMO_MAX:
+                _PLAN_VALIDATION_MEMO.clear()  # simple documented eviction
+            _PLAN_VALIDATION_MEMO[_memo_key] = dict(_validation_payload)
+            _validation_memo_state = "miss"
     dispatch_hash = prompt_sha256(dispatch_workflow)
     if _validation_payload:
         _validation_payload["validated_workflow_hash"] = dispatch_hash
@@ -1040,9 +1337,6 @@ def build_execution_plan(
         "selected_gpu": gpu or "",
         "workspace_id": str((workspace or {}).get("id", "")),
     })
-    # Deployment identity is computed once and reused for the plan arg and the
-    # instrumentation line below (never recomputed twice).
-    _deployment_identity = _collect_plan_deployment_identity(request_metadata)
     plan = ExecutionPlan(
         workflow=dispatch_workflow,
         workflow_hash=dispatch_hash,
@@ -1061,7 +1355,9 @@ def build_execution_plan(
         print(
             f"[v2.plan_proof] schema={_validation_payload.get('schema_version')} payload=yes "
             f"validated={_validation_payload.get('validated')} outputs={len(_validation_payload.get('outputs_to_execute', []))} "
-            f"wf_hash={dispatch_hash[:16]} dep_complete={_deployment_identity.get('complete')}",
+            f"wf_hash={dispatch_hash[:16]} dep_complete={_deployment_identity.get('complete')} "
+            f"reg_proof={int(bool(_deployment_identity.get('registry_proof_complete')))} "
+            f"memo={'hit' if _validation_memo_state == 'hit' else 'miss'}",
             flush=True,
         )
     if trace:
@@ -1850,6 +2146,16 @@ async def execute_plan(
     if not isinstance(result, dict):
         raise RuntimeError("execution plan stream ended without result")
     runtime_trace.emit("remote_return_start", process="local", phase="transport")
+    # Host-side result-receipt boundary: captures the exact wall/mono instant
+    # the local executor received the remote result (before any post-merge
+    # processing below).  emit_at preserves the cross-process wall clock.
+    runtime_trace.emit_at(
+        "local_result_received",
+        process="local",
+        phase="transport",
+        wall_unix_ns=time.time_ns(),
+        monotonic_ns=time.monotonic_ns(),
+    )
 
     # ── Merge local trace into remote result without dropping remote evidence ──
     raw_remote_trace = result.get("trace")
@@ -2077,6 +2383,21 @@ async def execute_plan(
             _remote_modal_method_entry_ns = _raw_ts["t4_modal_method_entry_wall_unix_ns"]
         if _remote_prompt_executor_invoke_start_ns is None and _raw_ts.get("t5_prompt_executor_invoke_start_wall_unix_ns") is not None:
             _remote_prompt_executor_invoke_start_ns = _raw_ts["t5_prompt_executor_invoke_start_wall_unix_ns"]
+
+    # ── Host-boundary tier: merged trace event walls ──
+    # modal_transport emits modal_generator_created / modal_submission_attempt /
+    # modal_first_iteration_start / modal_first_remote_event as trace events
+    # with wall_unix_ns (plus a metadata backfill).  The local prints must
+    # surface these boundaries even when the origin dict never carried the
+    # wall-ns keys — read the LAST occurrence from the merged trace.
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _host_boundary_wall_ns(merged_trace, "modal_submission_attempt")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _host_boundary_wall_ns(merged_trace, "modal_generator_created")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _host_boundary_wall_ns(merged_trace, "modal_first_iteration_start")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _host_boundary_wall_ns(merged_trace, "modal_first_remote_event")
 
     # ── Fifth-tier fallback: merged trace event metadata ──
     # Inspect merged trace events for modal_method_entry / remote_method_entry
@@ -2325,6 +2646,62 @@ async def execute_plan(
     _stage_attribution_residual_ms["reconciliation_status"] = _reconciliation_status
     _stage_attribution_residual_ms.setdefault("overlap_error", "")
 
+    # ── Host-side result-receipt boundary (additive; see #2) ──────────
+    # local_result_received was emitted via emit_at at the result break
+    # point (wall + mono captured together).  Read it from the merged trace
+    # (last occurrence) and derive the return-side deltas.
+    _local_result_received_event = _host_boundary_event(merged_trace, "local_result_received")
+    _local_result_received_wall_ns: Any = None
+    _local_result_received_mono_ns: Any = None
+    if _local_result_received_event is not None:
+        _evt_wall = getattr(_local_result_received_event, "wall_unix_ns", None)
+        _evt_mono = getattr(_local_result_received_event, "monotonic_ns", None)
+        if isinstance(_evt_wall, (int, float)):
+            _local_result_received_wall_ns = int(_evt_wall)
+        if isinstance(_evt_mono, (int, float)):
+            _local_result_received_mono_ns = int(_evt_mono)
+    _local_receive_to_result_return_ms: Any = None
+    if _local_result_received_wall_ns is not None and isinstance(_t1_wall_ns, (int, float)):
+        _delta_return_ns = _local_result_received_wall_ns - int(_t1_wall_ns)
+        if _delta_return_ns >= 0:
+            _local_receive_to_result_return_ms = round(_delta_return_ns / 1_000_000, 3)
+    # execute_plan "return" wall captured at the local_timing assembly
+    # boundary (finalization of the result for return; the remaining
+    # statements are diagnostic prints only).
+    _exec_exit_wall_ns = time.time_ns()
+    _result_received_to_return_ms: Any = None
+    if _local_result_received_wall_ns is not None:
+        _delta_return_ns = _exec_exit_wall_ns - _local_result_received_wall_ns
+        if _delta_return_ns >= 0:
+            _result_received_to_return_ms = round(_delta_return_ns / 1_000_000, 3)
+    # dispatch → remote modal entry (actual submission → first method entry).
+    _dispatch_to_modal_entry_ms: Any = None
+    for _entry_name in ("remote_method_entry", "modal_method_entry", "run_plan_method_first_line"):
+        _dispatch_to_modal_entry_ms = _host_boundary_field(
+            merged_trace, _entry_name, _local_modal_submission_attempt_ns,
+        )
+        if _dispatch_to_modal_entry_ms is not None:
+            break
+    if _dispatch_to_modal_entry_ms is None:
+        _dispatch_to_modal_entry_ms = _transport_meta.get("dispatch_to_modal_entry_ms")
+    if _dispatch_to_modal_entry_ms is None:
+        _dispatch_to_modal_entry_ms = _origin.get("dispatch_to_modal_entry_ms")
+    # passthrough modal_restore_begin_wall_unix_ns — forwarded only; never
+    # computed here (a separate lane feeds it into the result/timing dicts).
+    _modal_restore_begin_wall_unix_ns: Any = None
+    _mrb_timing = result.get("_restore_timing") if isinstance(result, dict) else None
+    if not isinstance(_mrb_timing, dict):
+        _mrb_timing = {}
+    for _mrb_val in (
+        (result.get("modal_restore_begin_wall_unix_ns") if isinstance(result, dict) else None),
+        _mrb_timing.get("modal_restore_begin_wall_unix_ns"),
+        _origin.get("modal_restore_begin_wall_unix_ns"),
+        _transport_meta.get("modal_restore_begin_wall_unix_ns"),
+    ):
+        if _mrb_val is not None:
+            _modal_restore_begin_wall_unix_ns = _mrb_val
+            break
+
     # Flatten key stage-attribution fields directly under local_timing
     # (benchmark consumers read these top-level keys). Nested dict kept for compat.
     _sar = _stage_attribution_residual_ms
@@ -2357,6 +2734,12 @@ async def execute_plan(
         "modal_method_entry_to_executor_ms": _modal_method_entry_to_executor_ms,
         "submission_to_remote_python_resume_ms": _submission_to_remote_python_resume_ms,
         "unexplained_pre_remote_ms": _unexplained_pre_remote_ms,
+        # Host-side result-receipt boundary (additive; existing keys untouched)
+        "local_result_received_wall_ns": _local_result_received_wall_ns,
+        "local_result_received_mono_ns": _local_result_received_mono_ns,
+        "local_receive_to_result_return_ms": _local_receive_to_result_return_ms,
+        "result_received_to_return_ms": _result_received_to_return_ms,
+        "modal_restore_begin_wall_unix_ns": _modal_restore_begin_wall_unix_ns,
     }
     result["local_timing"] = _local_summary
     def _fmt_bd(v: Any) -> str:
@@ -2369,9 +2752,14 @@ async def execute_plan(
         f"trigger_source={_origin.get('trigger_source', 'unknown')} "
         f"local_prompt_enqueued_unix_ns={_origin.get('local_prompt_enqueued_wall_ns')} "
         f"local_prompt_ack_ready_unix_ns={_origin.get('local_prompt_ack_ready_wall_ns')} "
-        f"modal_generator_created_unix_ns={_transport_meta.get('modal_generator_created_wall_ns')} "
-        f"modal_submission_attempt_unix_ns={_transport_meta.get('modal_submission_attempt_wall_ns')} "
+        f"modal_generator_created_unix_ns={_fmt_bd(_local_modal_gen_created_ns)} "
+        f"modal_submission_attempt_unix_ns={_fmt_bd(_local_modal_submission_attempt_ns)} "
         f"modal_first_event_received_unix_ns={_transport_meta.get('modal_first_event_received_wall_ns')} "
+        f"modal_first_iteration_start_unix_ns={_fmt_bd(_local_modal_first_iter_start_ns)} "
+        f"modal_first_remote_event_unix_ns={_fmt_bd(_local_modal_first_remote_event_ns)} "
+        f"dispatch_to_modal_entry_ms={_fmt_bd(_dispatch_to_modal_entry_ms)} "
+        f"local_receive_to_actual_submission_ms={_fmt_bd(_t1_to_submission_ms)} "
+        f"local_receive_to_result_return_ms={_fmt_bd(_local_receive_to_result_return_ms)} "
         f"t0_to_t1_ms={_t0_to_t1_ms} t1_to_queue_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
         f"local_receive_to_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
         f"queue_wait_before_worker_ms={_origin.get('queue_wait_before_worker_ms')} "
@@ -2488,13 +2876,29 @@ async def execute_plan(
         transport_meta=_transport_meta,
         plan_to_dict_count=1,
     )
-    _emit_breakdown_line("[v2.local_submission_breakdown.final]", _breakdown)
+    # ── Host-side transport boundaries (surfaced from merged trace events +
+    #    metadata backfill; rendered "absent" when missing) ──
+    _breakdown["modal_submission_attempt_unix_ns"] = _local_modal_submission_attempt_ns
+    _breakdown["modal_generator_created_unix_ns"] = _local_modal_gen_created_ns
+    _breakdown["modal_first_iteration_start_unix_ns"] = _local_modal_first_iter_start_ns
+    _breakdown["modal_first_remote_event_unix_ns"] = _local_modal_first_remote_event_ns
+    _breakdown["dispatch_to_modal_entry_ms"] = _dispatch_to_modal_entry_ms
+    _breakdown["local_receive_to_actual_submission_ms"] = _t1_to_submission_ms
+    _breakdown["local_receive_to_result_return_ms"] = _local_receive_to_result_return_ms
+    _emit_breakdown_line(
+        "[v2.local_submission_breakdown.final]",
+        _breakdown,
+        field_keys=LOCAL_SUBMISSION_FIELD_KEYS + _HOST_BOUNDARY_FIELD_KEYS,
+    )
     result["trace"] = remote_trace
     # Local fallback: finalize a waterfall if the remote path omitted one.
     # Idempotent — an existing valid remote report is preserved unchanged.
     try:
         from comfymodal_runtime.v2_waterfall import attach_waterfall
-        attach_waterfall(result, run_label="canonical execute_plan")
+        # Host-side fallback attach: the remote container already prints the
+        # waterfall render, and the host re-renders the reconciled table
+        # elsewhere, so suppress this duplicate render.
+        attach_waterfall(result, run_label="canonical execute_plan", print_render=False)
     except Exception:  # noqa: BLE001
         pass
     return result

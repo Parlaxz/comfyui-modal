@@ -32,6 +32,36 @@ _base64_counter_cb: contextvars.ContextVar[Callable[[str], None] | None] = (
     contextvars.ContextVar("_base64_counter_cb", default=None)
 )
 
+# ── V2 output-delivery decomposition diagnostics (measurement-only) ──
+# Gated on COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS (off by default); bounded
+# store, no policy/decision/behavior changes when the gate is off.
+from .optimization_diagnostics import opt_diag_enabled  # noqa: E402
+
+_OPT_OUTPUT_DELIVERY_DIAG_MAX_ENTRIES = 8
+_OPT_OUTPUT_DELIVERY_DIAG: list = []
+
+
+def _opt_output_delivery_append(entry: dict) -> None:
+    """Append *entry* to the bounded diagnostics list, dropping the oldest."""
+    _OPT_OUTPUT_DELIVERY_DIAG.append(entry)
+    if len(_OPT_OUTPUT_DELIVERY_DIAG) > _OPT_OUTPUT_DELIVERY_DIAG_MAX_ENTRIES:
+        del _OPT_OUTPUT_DELIVERY_DIAG[
+            : len(_OPT_OUTPUT_DELIVERY_DIAG) - _OPT_OUTPUT_DELIVERY_DIAG_MAX_ENTRIES
+        ]
+
+
+def _opt_output_delivery_print() -> None:
+    """Print the latest hash/descriptor measurements (gated, JSON-safe)."""
+    _hash_ms = next(
+        (e.get("hash_ms") for e in reversed(_OPT_OUTPUT_DELIVERY_DIAG) if "hash_ms" in e),
+        None,
+    )
+    _descriptor_ms = next(
+        (e.get("descriptor_ms") for e in reversed(_OPT_OUTPUT_DELIVERY_DIAG) if "descriptor_ms" in e),
+        None,
+    )
+    print(f"[v2.opt.output_delivery] hash_ms={_hash_ms} descriptor_ms={_descriptor_ms}")
+
 
 @contextlib.contextmanager
 def base64_counting_scope(attempt: Attempt) -> Iterator[None]:
@@ -223,6 +253,7 @@ def build_asset_descriptor_list(
 
     No base64 data is computed or included — this is the pure metadata path.
     """
+    _opt_t0 = time.monotonic_ns() if opt_diag_enabled() else None
     descriptors: list[AssetDescriptor] = []
     for item in attempt.items:
         # Use content_sha256 from _item_from_entry (pre-computed).
@@ -253,6 +284,11 @@ def build_asset_descriptor_list(
             generation=generation,
             thumbnail_identity=thumb_id,
         ))
+    if _opt_t0 is not None:
+        _opt_output_delivery_append(
+            {"descriptor_ms": round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)}
+        )
+        _opt_output_delivery_print()
     return descriptors
 
 
@@ -389,7 +425,15 @@ def _import_output_saver_helpers():
 
 def _hash_raw_bytes(raw: bytes) -> str:
     """SHA-256 hex digest of raw bytes."""
-    return hashlib.sha256(raw).hexdigest()
+    if not opt_diag_enabled():
+        return hashlib.sha256(raw).hexdigest()
+    _opt_t0 = time.monotonic_ns()
+    _digest = hashlib.sha256(raw).hexdigest()
+    _opt_output_delivery_append(
+        {"hash_ms": round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)}
+    )
+    _opt_output_delivery_print()
+    return _digest
 
 
 def _measure_json_bytes(payload: dict) -> int:
