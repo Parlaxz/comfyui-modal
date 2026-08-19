@@ -68,8 +68,13 @@ from .restore_plan import (
 from .runtime_bootstrap import BootstrapConfig, BootstrapState, RuntimeBootstrap
 from .runtime_executor import (
     ExecutionContext,
+    RemoteCancellationError,
+    RemoteCancelWatcher,
     RuntimeExecutor,
     apply_snapshot_seed_to_executor,
+    build_remote_cancel_terminal_event,
+    combine_cancel_predicate,
+    guard_remote_cancel_stream,
     pre_sampler_instrumentation_scope,
     set_lock_wait_ms,
     _attach_structured_report,
@@ -347,6 +352,46 @@ _V2_IMPORT_START_WALL_NS: int = time.time_ns()
 _V2_IMPORT_START_MONO_NS: int = time.monotonic_ns()
 _V2_STARTUP_CALLBACK_RETURN: dict[str, Any] = {}
 
+# ── Conditioning-prefetch launch evidence (RUN-1 gate remediation) ──────
+# Request-scoped evidence of whether the plan-time conditioning prefetch was
+# SCHEDULED, stamped by modal_app at the launch site in
+# _run_plan_stream_impl (after ExecutionPlan.from_dict).  The model_preload
+# lane reads this dict (see the demand-time lookup diagnostics in
+# model_preload.maybe_prefetch_conditioning / the
+# [v2.conditioning_exact_hit_breakdown] emission) so `prefetch_requested` /
+# `prefetch_source` are TRUTHFUL even when the prefetch was skipped
+# (unavailable / env-off).  Key layout per request_id:
+#   _CONDITIONING_PREFETCH_EVIDENCE[request_id] = {
+#       "requested": int,   # 1 = this request asked for a prefetch attempt
+#       "env": str,         # COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH value
+#       "scheduled": int,   # 1 = daemon thread actually started
+#       "reason": str,      # "thread_started" | "unavailable"
+#   }
+# Bounded: keyed by request_id, newest entry wins, and the oldest entry is
+# evicted past _CONDITIONING_PREFETCH_EVIDENCE_MAX (LRU-ish).  All access is
+# serialized through _CONDITIONING_PREFETCH_EVIDENCE_LOCK.
+_CONDITIONING_PREFETCH_EVIDENCE: dict[str, dict[str, Any]] = {}
+_CONDITIONING_PREFETCH_EVIDENCE_LOCK = threading.Lock()
+_CONDITIONING_PREFETCH_EVIDENCE_MAX = 256
+
+
+def _set_conditioning_prefetch_evidence(request_id: str, **fields: Any) -> None:
+    """Record bounded launch-site evidence for the conditioning prefetch.
+
+    Never raises.  No-op when the request id is empty.  Evicts the oldest
+    entry (insertion order) when the dict exceeds the max bound.
+    """
+    try:
+        _rid = str(request_id or "")
+        if not _rid:
+            return
+        with _CONDITIONING_PREFETCH_EVIDENCE_LOCK:
+            _CONDITIONING_PREFETCH_EVIDENCE[_rid] = dict(fields)
+            while len(_CONDITIONING_PREFETCH_EVIDENCE) > _CONDITIONING_PREFETCH_EVIDENCE_MAX:
+                _CONDITIONING_PREFETCH_EVIDENCE.pop(next(iter(_CONDITIONING_PREFETCH_EVIDENCE)))
+    except Exception:
+        pass
+
 
 def _v2_startup_stage(
     stage: str,
@@ -471,6 +516,11 @@ _RESIDENCY_DIAGNOSTICS_ENABLED: bool = observability_gate(
 _V2_FULL_TRACE_ENABLED: bool = observability_gate(
     "COMFYMODAL_V2_FULL_TRACE", "full_trace",
 )
+# C9 queue-depth shadow image extras (Batch C9, default OFF).  When set to
+# '1' at deploy time the V2 image additionally installs the external loader
+# packages benchmarked by the C9 queue-depth probe (runai-model-streamer,
+# fastsafetensors).  Unset => the production image is unchanged.
+_V2_C9QD_EXTRAS_ENABLED: bool = env_flag("COMFYMODAL_V2_C9QD_EXTRAS", default=False)
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
@@ -522,6 +572,18 @@ _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("vae_early_start_ms", "COMFYMODAL_V2_VAE_EARLY_START_MS"),
     ("unet_pinned_staging", "COMFYMODAL_V2_UNET_PINNED_STAGING"),
     ("conditioning_async_lru", "COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU"),
+    ("prompt_signature_cache", "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE"),
+    ("conditioning_cache_prefetch", "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH"),
+    # E28 per-run loader/cast tuning (Targets B/C): allowlisted so the
+    # integrated campaign can tune threads/blocks/cast-once per request
+    # without a redeploy.  The runtime parsers bound the values again.
+    ("clip_fastsafe_threads", "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"),
+    ("clip_fastsafe_block_bytes", "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES"),
+    ("clip_fastsafe_bbuf_kb", "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB"),
+    ("unet_fastsafe_threads", "COMFYMODAL_V2_UNET_FASTSAFE_THREADS"),
+    ("unet_fastsafe_block_bytes", "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES"),
+    ("unet_fastsafe_bbuf_kb", "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB"),
+    ("clip_fp32_cast_once", "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"),
 )
 _REQUEST_DIAG_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUEST_DIAG_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
@@ -536,6 +598,12 @@ _REQUEST_DIAG_STRING_MAX = 64
 _REQUEST_DIAG_INT_RANGES: dict[str, tuple[int, int]] = {
     "COMFYMODAL_V2_PNG_COMPRESS_LEVEL": (1, 6),
     "COMFYMODAL_V2_VAE_EARLY_START_MS": (0, 1000),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": (1, 32),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": (1024 * 1024, 2 * 1024 * 1024 * 1024),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": (16 * 1024, 4 * 1024 * 1024),
+    "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": (1, 32),
+    "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": (1024 * 1024, 2 * 1024 * 1024 * 1024),
+    "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": (16 * 1024, 4 * 1024 * 1024),
 }
 
 
@@ -2934,6 +3002,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ),
+        "COMFYMODAL_V2_ATOMIC_PROFILE": os.environ.get(
+            "COMFYMODAL_V2_ATOMIC_PROFILE", ""
+        ),
         "COMFYMODAL_V2_OBSERVABILITY_MODE": os.environ.get(
             "COMFYMODAL_V2_OBSERVABILITY_MODE", ""
         ),
@@ -2962,6 +3033,33 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_VAE_PREFETCH_MODE": os.environ.get(
             "COMFYMODAL_V2_VAE_PREFETCH_MODE", "off"
+        ),
+        # ── E25/E26 VAE early activation (sampling_end overlap) ─────────
+        # The mutation-lane-bound VAE early-start pre-copies the VAE CPU
+        # params to CUDA on a side stream while sampling runs (no lane, no
+        # model mutation) and rebinds ``.data`` strictly after the sampler
+        # releases the lane.  E26: the production default is REVERTED to the
+        # canonical late/safe mode (the E25 sampling_end/250 default produced
+        # no critical-path win — observed 874.7/964.8 ms vs 838.8 ms
+        # baseline).  The experiment remains available behind the explicit
+        # COMFYMODAL_V2_VAE_ACTIVATION_MODE=sampling_end /
+        # COMFYMODAL_V2_VAE_EARLY_START_MS flags.
+        "COMFYMODAL_V2_VAE_ACTIVATION_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_ACTIVATION_MODE", "late"
+        ),
+        "COMFYMODAL_V2_VAE_EARLY_START_MS": os.environ.get(
+            "COMFYMODAL_V2_VAE_EARLY_START_MS", "0"
+        ),
+        # ── E25/E26 proven-ready GPU-load fast return (production default) ──
+        # When ON, a graph-thread load_models_gpu for a registered UNET that
+        # the fastsafetensors/execution lane already bound + validated on
+        # CUDA skips ComfyUI's ModelPatcher.load bookkeeping.  Fail-closed
+        # (see model_preload._all_models_proven_cuda_resident).  E26:
+        # promoted to the production default (repeat positive evidence:
+        # joint-ready → sampling-start ~124 → ~66-71 ms); scoped to the
+        # proven execution-UNET path and never monkey-patches unrelated loads.
+        "COMFYMODAL_V2_GPU_FAST_RETURN": os.environ.get(
+            "COMFYMODAL_V2_GPU_FAST_RETURN", "1"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -2993,6 +3091,13 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # pre-capture / first-restored-line manifests are never produced.
         "COMFYMODAL_V2_SNAPSHOT_MANIFEST": os.environ.get(
             "COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0"
+        ),
+        # Capture-time allocator hygiene (diagnostic only; default off).
+        # Explicit passthrough so a shadow deployment baked with this flag
+        # reaches the container; without this it silently defaults to off and
+        # the pre-capture gc/malloc_trim hygiene record is never produced.
+        "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE", "0"
         ),
         # Lean production snapshot arm (diagnostic A/B; default off).
         # Deferred in modal_app/model_preload at import time when on.
@@ -3029,6 +3134,19 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # suppresses repeated per-request identity/unavailable console lines
         # (artifacts keep all data).  Default 0 = current behavior.
         "COMFYMODAL_V2_QUIET": os.environ.get("COMFYMODAL_V2_QUIET", "0"),
+        # V2 optimization flags (measurement/behavior gates; default ON so a
+        # deployment not explicitly setting either flag arms the memo/prefetch
+        # hooks — set "0" to run the uninstrumented baseline).  Explicit
+        # passthrough so a deployment baked with either flag reaches the
+        # container; without it the container silently runs the uninstrumented
+        # baseline and the plan-time signature-memo / conditioning-prefetch
+        # hooks never arm.
+        "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE": os.environ.get(
+            "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE", "1"
+        ),
+        "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": os.environ.get(
+            "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1"
+        ),
         "COMFYMODAL_V2_RESOURCE_TELEMETRY": os.environ.get(
             "COMFYMODAL_V2_RESOURCE_TELEMETRY", "0"
         ),
@@ -3057,8 +3175,183 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS", "0"
         ),
+        # ── E25 speculative CLIP hydration (default ON when the direct-GPU
+        # fastsafetensors CLIP path is enabled; explicit passthrough so a
+        # deployment can bake it off without code changes). ──
+        "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": os.environ.get(
+            "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1"
+        ),
         "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
             "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
+        ),
+        # Batch C6 read/H2D probe gate (measurement only; default off).
+        # Explicit passthrough so a deployment baked with "probe" reaches
+        # the container; without it the container silently runs baseline.
+        "COMFYMODAL_V2_UNET_READ_H2D_PIPELINE": os.environ.get(
+            "COMFYMODAL_V2_UNET_READ_H2D_PIPELINE", ""
+        ),
+        # Production pinned-ring UNET fast path (ZImage only; default off).
+        # Explicit passthrough so a deployment baked with the flag reaches
+        # the container; without it the container silently runs baseline.
+        "COMFYMODAL_V2_UNET_PINNED_RING": os.environ.get(
+            "COMFYMODAL_V2_UNET_PINNED_RING", ""
+        ),
+        # CUDA-loader salvage mechanism probe gate (measurement only; default
+        # off).  Explicit passthrough so the probe can be invoked on a shadow
+        # deployment via the standalone run_unet_mechanism_probe function;
+        # without it the key silently drops and the probe is unreachable.
+        "COMFYMODAL_V2_UNET_SALVAGE_PROBE": os.environ.get(
+            "COMFYMODAL_V2_UNET_SALVAGE_PROBE", ""
+        ),
+        # V2 meta-direct UNET loader gate (measurement A/B; default off).
+        # Explicit passthrough so a deployment baked with the flag reaches
+        # the container; without it the container silently runs baseline.
+        "COMFYMODAL_V2_UNET_META_DIRECT": os.environ.get(
+            "COMFYMODAL_V2_UNET_META_DIRECT", ""
+        ),
+        # V2 fastsafetensors UNET loader gate (Batch C9 production
+        # integration; default off).  Explicit passthrough so a deployment
+        # baked with the flag reaches the container; without it the
+        # container silently runs the native fast-disk baseline.
+        "COMFYMODAL_V2_UNET_FASTSAFETENSORS": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFETENSORS", ""
+        ),
+        "COMFYMODAL_V2_C9QD_EXTRAS": os.environ.get(
+            "COMFYMODAL_V2_C9QD_EXTRAS", "0"
+        ),
+        # E17 final cold-loader assembly.  Both behavior gates remain
+        # production-off; the bounded prewarm settings are forwarded so an
+        # explicitly enabled deployment uses the same limits in the remote
+        # request container.
+        "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": os.environ.get(
+            "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION", "0"
+        ),
+        "COMFYMODAL_V2_FAST_COLD_COMMIT_WAIT_MS": os.environ.get(
+            "COMFYMODAL_V2_FAST_COLD_COMMIT_WAIT_MS", "10000"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM", "0"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB", "0"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS", "0"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_JOIN_MS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_JOIN_MS", "1000"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS", "1000"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS", "4"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB", "8"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_SAFETY_RESERVE_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_SAFETY_RESERVE_MB", "2048"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_PINNED_RESERVE_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_PINNED_RESERVE_MB", "512"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_RAM_FALLBACK_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_RAM_FALLBACK_MB", "512"
+        ),
+        "COMFYMODAL_V2_STAGED_SAFETENSORS": os.environ.get(
+            "COMFYMODAL_V2_STAGED_SAFETENSORS", "0"
+        ),
+        "COMFYMODAL_V2_STAGED_PRODUCERS": os.environ.get(
+            "COMFYMODAL_V2_STAGED_PRODUCERS", "4"
+        ),
+        "COMFYMODAL_V2_STAGED_POOL_MB": os.environ.get(
+            "COMFYMODAL_V2_STAGED_POOL_MB", "1024"
+        ),
+        "COMFYMODAL_V2_STAGED_BUCKET_MB": os.environ.get(
+            "COMFYMODAL_V2_STAGED_BUCKET_MB", "256"
+        ),
+        "COMFYMODAL_V2_STAGED_CPU_CAST": os.environ.get(
+            "COMFYMODAL_V2_STAGED_CPU_CAST", "1"
+        ),
+        "COMFYMODAL_V2_STAGED_ASYNC_H2D": os.environ.get(
+            "COMFYMODAL_V2_STAGED_ASYNC_H2D", "1"
+        ),
+        "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS": os.environ.get(
+            "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS", "0"
+        ),
+        "COMFYMODAL_V2_STAGED_SOURCE_ORDER": os.environ.get(
+            "COMFYMODAL_V2_STAGED_SOURCE_ORDER", "0"
+        ),
+        # D-phase runtime flags (Phase-D integration gate).  Explicit
+        # passthrough so a deployment baked with these flags reaches the
+        # container; without them the container silently runs baseline via
+        # env_flag()/observability_gate() defaults.  Defaults below match
+        # the container-side env_flag defaults.
+        "COMFYMODAL_V2_CLIP_FAST_HYDRATION": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FAST_HYDRATION", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": os.environ.get(
+            "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_COLD_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": os.environ.get(
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": os.environ.get(
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA", "0"
+        ),
+        "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": os.environ.get(
+            "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION", "0"
+        ),
+        "COMFYMODAL_V2_SCOPED_CUDA_READINESS": os.environ.get(
+            "COMFYMODAL_V2_SCOPED_CUDA_READINESS", "0"
+        ),
+        "COMFYMODAL_V2_INPUT_TYPES_WARM": os.environ.get(
+            "COMFYMODAL_V2_INPUT_TYPES_WARM", "1"
+        ),
+        "COMFYMODAL_V2_UNET_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_UNET_FORENSICS", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": os.environ.get(
+            "COMFYMODAL_V2_CLIP_STAGED_HYDRATION", "0"
+        ),
+        "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS": os.environ.get(
+            "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS", "0"
+        ),
+        # E27 telemetry gates (Target E Gantt + E27 forensics).  Default 0 so
+        # production behavior is unchanged; explicitly opt-in at deploy/run.
+        "COMFYMODAL_V2_GANTT_TELEMETRY": os.environ.get(
+            "COMFYMODAL_V2_GANTT_TELEMETRY", "0"
+        ),
+        "COMFYMODAL_V2_E27_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_E27_FORENSICS", "0"
+        ),
+        # E28 loader-tuning + cast-once env keys (Targets B/C).  Defaults
+        # preserve the E28 winning production configuration; the cast-once
+        # experiment defaults OFF and is opt-in per deploy/run.
+        "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS", "8"
+        ),
+        "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES", "67108864"
+        ),
+        "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB", "524288"
+        ),
+        "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFE_THREADS", "8"
+        ),
+        "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES", "268435456"
+        ),
+        "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB", "524288"
+        ),
+        "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE", "0"
         ),
         # Native page-readiness candidate — off (empty) by default so
         # current production behavior is unchanged until explicitly set to
@@ -3105,7 +3398,7 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
             "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH", "64"
         ),
         "COMFYMODAL_V2_FULL_TRACE_TORCH": os.environ.get(
-            "COMFYMODAL_V2_FULL_TRACE_TORCH", "1"
+            "COMFYMODAL_V2_FULL_TRACE_TORCH", "0"
         ),
         "COMFYMODAL_V2_PROFILE_VOLUME": os.environ.get(
             "COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles"
@@ -3311,6 +3604,17 @@ def _reference_image() -> Any:
         # Install viztracer before add_local_python_source when full-trace is enabled
         if _V2_FULL_TRACE_ENABLED:
             image = image.pip_install("viztracer==1.1.1")
+        # fastsafetensors is required by the D-phase UNET/CLIP fastsafetensors
+        # runtime paths (runtime-gated by COMFYMODAL_V2_UNET_FASTSAFETENSORS /
+        # COMFYMODAL_V2_CLIP_FAST_HYDRATION), so image content changes do NOT
+        # change runtime behavior when those flags are off.
+        image = image.pip_install("fastsafetensors==0.3.3")
+        # Batch C9 queue-depth shadow extras (default off; production image
+        # unchanged when COMFYMODAL_V2_C9QD_EXTRAS is unset).
+        if _V2_C9QD_EXTRAS_ENABLED:
+            image = image.pip_install(
+                "runai-model-streamer==0.16.1",
+            )
         for module_name in V2_SOURCE_MODULES:
             image = image.add_local_python_source(module_name)
         return image
@@ -4949,6 +5253,226 @@ def _git_rev_parse_head(repo_root: str) -> str:
     return ""
 
 
+def _stamp_remote_result_emit(
+    data: dict[str, Any],
+    event: Mapping[str, Any],
+    context_trace: Any,
+    *,
+    request_id: str,
+) -> None:
+    """Capture the remote result emission boundary immediately before yield.
+
+    Pure timing-only result assembly: sets ``data["remote_result_emit_*"]`` and
+    records a ``remote_result_emit`` trace event on the live trace AND in the
+    already-serialized ``data["trace"]["events"]`` so the yielded result
+    carries it before any consumer reads it.  Never changes result content
+    semantics and never claims a caller-visible response time.
+    """
+    emit_wall_ns = time.time_ns()
+    emit_mono_ns = time.monotonic_ns()
+    data["remote_result_emit_wall_unix_ns"] = emit_wall_ns
+    data["remote_result_emit_mono_ns"] = emit_mono_ns
+    # ── E25: handoff attribution scaffolding ──
+    # The 1820 ms remote_result_emit -> local_result_received window mixes
+    # (a) application-side serialization of the result dict, (b) Modal
+    # generator-frame transport, and (c) local deserialization.  Capture the
+    # payload byte count (the descriptor-mode result carries NO raw image
+    # bytes — the 3.13 MB PNG is fetched separately through the persisted
+    # asset path) so the host can attribute the transport cost to the actual
+    # serialized payload size rather than the image bytes.
+    _handoff_payload_bytes = 0
+    try:
+        _od = data.get("output_diagnostics")
+        if isinstance(_od, Mapping):
+            _srb = _od.get("serialized_result_bytes")
+            if isinstance(_srb, (int, float)) and _srb > 0:
+                _handoff_payload_bytes = int(_srb)
+        if _handoff_payload_bytes <= 0:
+            try:
+                _measured = _measure_json_bytes(data)
+                if isinstance(_measured, (int, float)) and _measured > 0:
+                    _handoff_payload_bytes = int(_measured)
+            except Exception:
+                pass
+    except Exception:
+        _handoff_payload_bytes = 0
+    data["remote_handoff_payload_bytes"] = _handoff_payload_bytes
+    meta = {
+        "request_id": request_id,
+        "event_type": event.get("type", "") if isinstance(event, Mapping) else "",
+        "clock_scope": "cross_process",
+        "clock_precision": "wall_clock",
+        "handoff_payload_bytes": _handoff_payload_bytes,
+        "handoff_payload_has_inline_images": 0,
+    }
+    try:
+        if context_trace is not None:
+            context_trace.emit_at(
+                "remote_result_emit",
+                wall_unix_ns=emit_wall_ns,
+                monotonic_ns=emit_mono_ns,
+                process="remote",
+                phase="method",
+                metadata=meta,
+            )
+    except Exception:
+        pass
+    trace_dict = data.get("trace")
+    if isinstance(trace_dict, dict) and isinstance(trace_dict.get("events"), list):
+        trace_dict["events"].append({
+            "name": "remote_result_emit",
+            "process": "remote",
+            "phase": "method",
+            "wall_unix_ns": emit_wall_ns,
+            "monotonic_ns": emit_mono_ns,
+            "request_id": request_id,
+            "container_session_id": trace_dict.get("container_session_id", ""),
+            "trace_id": trace_dict.get("trace_id", ""),
+            "metadata": dict(meta),
+        })
+
+
+def _stamp_terminal_cleanup(
+    event: dict[str, Any],
+    *,
+    start_wall_ns: int,
+    start_mono_ns: int,
+    end_wall_ns: int,
+    end_mono_ns: int,
+    request_id: str,
+) -> None:
+    """Attach the terminal-cleanup timing window to the terminal event data.
+
+    Pure timing-only: sets ``terminal_cleanup_start/end_wall_unix_ns`` and
+    ``terminal_cleanup_start/end_mono_ns`` on ``event["data"]`` (falling back
+    to the event dict itself) so host reconciliation can derive
+    ``remote_cleanup_ms`` (same-process mono diff) and
+    ``transport_after_cleanup_ms`` (local_result_received_wall minus
+    terminal_cleanup_end_wall_unix_ns).  Never changes result semantics and
+    never adds an RPC.
+    """
+    target = event.get("data")
+    if not isinstance(target, dict):
+        target = event
+    target["terminal_cleanup_start_wall_unix_ns"] = start_wall_ns
+    target["terminal_cleanup_start_mono_ns"] = start_mono_ns
+    target["terminal_cleanup_end_wall_unix_ns"] = end_wall_ns
+    target["terminal_cleanup_end_mono_ns"] = end_mono_ns
+
+
+def _last_png_encode_info_meta() -> dict[str, Any]:
+    """Return additive, format-neutral metadata from the last output encode.
+
+    Used to enrich the existing ``output_encode_end`` trace event with PNG
+    encode info that the host reads from the trace artifact (container stdout
+    never reaches the benchmark capture).  comfyapp may not be importable on
+    every path, so every access is guarded.  Additive only — never raises.
+    """
+    try:
+        from comfyapp import get_last_output_encode_info
+    except Exception:
+        try:
+            from comfyapp import get_last_png_encode_info as get_last_output_encode_info
+        except Exception:
+            return {}
+    try:
+        info = get_last_output_encode_info()
+    except Exception:
+        return {}
+    if not isinstance(info, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    _cl = info.get("compress_level")
+    _ms = info.get("png_compress_ms")
+    if isinstance(_cl, int):
+        meta["compress_level"] = _cl
+    if isinstance(_ms, (int, float)):
+        meta["png_compress_ms"] = round(float(_ms), 3)
+    for _key in ("codec", "format", "quality", "encoded_bytes", "conversion_fallback"):
+        if _key in info and info[_key] is not None:
+            meta[_key] = info[_key]
+    _codec_ms = info.get("output_codec_ms")
+    if isinstance(_codec_ms, (int, float)):
+        meta["output_codec_ms"] = round(float(_codec_ms), 3)
+    return meta
+
+
+def _should_run_posthoc_output_conversion(attempt: Any, output_format: str) -> bool:
+    """Return whether a collected result still needs byte conversion."""
+    return bool(
+        getattr(attempt, "success", False)
+        and getattr(attempt, "strategy", "") != "direct_output_sink"
+        and output_format != "original"
+    )
+
+
+def _e19_atomic_profile_active() -> bool:
+    return (
+        os.environ.get("COMFYMODAL_V2_ATOMIC_PROFILE", "").strip()
+        == "E19_FINAL_COLD_LOADER"
+    )
+
+
+def unet_snapshot_execution_contract(
+    models: Any,
+    *,
+    fastsafetensors_enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Describe the post-restore UNET state that E19 can actually exercise."""
+    container_present = models is not None
+    unet_present = bool(container_present and getattr(models, "unet", None) is not None)
+    fastsafe = (
+        env_flag("COMFYMODAL_V2_UNET_FASTSAFETENSORS")
+        if fastsafetensors_enabled is None
+        else bool(fastsafetensors_enabled)
+    )
+    return {
+        "snapshot_container_present": container_present,
+        "snapshot_unet_weights_present": unet_present,
+        "snapshot_unet_weights_absent": bool(container_present and not unet_present),
+        "meta_skeleton_present": bool(
+            container_present and getattr(models, "unet_meta", None) is not None
+        ),
+        "fastsafe_first_demand_eligible": bool(
+            container_present and not unet_present and fastsafe
+        ),
+        "expected_unet_execution_identity": (
+            "fastsafetensors"
+            if container_present and not unet_present and fastsafe
+            else "cpu_snapshot"
+            if unet_present
+            else "unavailable"
+        ),
+        "cpu_snapshot_execution_allowed_for_e19": bool(unet_present),
+    }
+
+
+def resolve_post_executor_cancel(
+    cancelled: Callable[[], bool] | None,
+    executor_success: bool,
+) -> str | None:
+    """Completion-first verdict checked after PromptExecutor returns.
+
+    Returns the error message to raise when a confirmed remote cancel should
+    reclassify a NON-successful execution, or ``None`` when execution should
+    proceed to output collection.  A SUCCESSFUL PromptExecutor completion
+    always wins over a late watcher cancel: once the executor finished
+    successfully, a cancel message arriving afterwards must never discard the
+    produced outputs.  Only a non-successful execution may be reclassified as
+    cancelled, so the normal no-cancel path (successful completion) is
+    unchanged.
+    """
+    if executor_success:
+        return None
+    try:
+        if cancelled is not None and cancelled():
+            return "execution cancelled after PromptExecutor completion"
+    except Exception:
+        # A raising cancel callback must never mask the completion path.
+        pass
+    return None
+
+
 class ModalRuntimeEntrypoint:
     """Real v2 runtime facade backed by the existing ComfyUI executor."""
 
@@ -5511,6 +6035,18 @@ class ModalRuntimeEntrypoint:
                         callback()
                     except Exception as exc:
                         errors.append(type(exc).__name__)
+                # ── E25: close an unconsumed speculative CLIP hydration lane
+                # so a request that never demanded the CLIP never leaks GPU
+                # tensors (owners closed + empty_cache).  Idempotent; a lane
+                # already consumed at demand time is gone from the store.
+                try:
+                    from comfymodal_runtime.speculative_clip_hydration import (
+                        close_speculative_clip_lane,
+                    )
+
+                    close_speculative_clip_lane(request_key)
+                except Exception:
+                    pass
                 if errors:
                     raise RuntimeError(",".join(errors))
 
@@ -5853,6 +6389,7 @@ class ModalRuntimeEntrypoint:
         reload_vae_fn: Callable | None = None,
         snap_ctx_cm: Callable | None = None,
         target_gpus: tuple[str, ...] | None = None,
+        trace: Any = None,
     ) -> dict[str, Any]:
         """Evict BOTH CPU snapshot models unconditionally, then reload
         the selected role (clip/unet/clip_vae/none) via stored loader
@@ -6215,6 +6752,31 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_metadata["patcher_detach_count"] = _patcher_detach_count
         self._snapshot_eviction_metadata["patcher_cleanup_errors"] = _patcher_cleanup_errors
 
+        # ── 7.75. Freeze D3 clip manifest before eviction ──
+        # Capture a deep-copied plain-data copy of the frozen fast-hydration
+        # manifest (plus the excluded-marker state) from the ORIGINAL clip so
+        # the clip_vae retain reload can re-apply the D3 exclusion to the fresh
+        # full-weight CLIP before the memory-snapshot fork.  The deep copy
+        # keeps no reference to the clip object or its tensors, so the weakref
+        # death checks below still prove the original object is gone.
+        _frozen_clip_manifest: Any = None
+        _frozen_clip_manifest_eligible = False
+        _frozen_clip_excluded = False
+        try:
+            from . import clip_fast_hydration as _cfh
+            _frozen_clip_manifest_raw = _cfh.get_clip_manifest(_clip_obj)
+            if _frozen_clip_manifest_raw is not None:
+                _frozen_clip_manifest = copy.deepcopy(_frozen_clip_manifest_raw)
+                _frozen_clip_manifest_eligible = bool(
+                    _frozen_clip_manifest.get("eligible")
+                )
+            _frozen_clip_excluded = bool(_cfh.clip_weights_excluded(_clip_obj))
+            del _frozen_clip_manifest_raw, _cfh
+        except Exception:
+            _frozen_clip_manifest = None
+            _frozen_clip_manifest_eligible = False
+            _frozen_clip_excluded = False
+
         # ── 8. Clear runtime/storage registries and self attrs ──
         self._cpu_snapshot_unet_runtime_state = None
         self._cpu_snapshot_unet_storage_registry = None
@@ -6555,6 +7117,100 @@ class ModalRuntimeEntrypoint:
                     _storage_count = 0
                     _storage_total_bytes = 0
                     _storage_total_mib = 0.0
+                # ── D3 eviction reconcile: re-apply the frozen snapshot
+                #    exclusion to the fresh reloaded CLIP so the memory-snapshot
+                #    fork carries the same excluded/manifest/demand-wrapper state
+                #    the ORIGINAL clip had at capture (the fresh full-weight
+                #    CLIP above has no manifest and no wrapper).  Only active
+                #    when a frozen eligible manifest existed AND a D3 flag is
+                #    on; otherwise the full-weight CLIP is retained untouched
+                #    (native encode path).  The existing full-model storage
+                #    registry above stays as the eviction experiment's metrics;
+                #    a post-strip registry is recomputed below to match the
+                #    final snapshot payload.
+                _reconcile_status = "skipped"
+                _reconcile_params = 0
+                _reconcile_bytes = 0
+                _reconcile_wrapper = "not_attempted"
+                try:
+                    from .clip_fast_hydration_wiring import (  # noqa: PLC0415
+                        _emit,
+                        clip_fast_hydration_enabled,
+                        clip_snapshot_exclude_weights_enabled,
+                        maybe_install_clip_fh_demand,
+                    )
+                    if (
+                        _frozen_clip_manifest_eligible
+                        and _frozen_clip_manifest is not None
+                        and (
+                            clip_fast_hydration_enabled()
+                            or clip_snapshot_exclude_weights_enabled()
+                        )
+                    ):
+                        from . import clip_fast_hydration as _cfh
+                        _cfh.attach_clip_manifest(_reloaded_model, _frozen_clip_manifest)
+                        _reconcile_strip = bool(
+                            _frozen_clip_excluded
+                            or clip_snapshot_exclude_weights_enabled()
+                        )
+                        if _reconcile_strip:
+                            _reconcile_stats = _cfh.strip_clip_weights(_reloaded_model)
+                            _reconcile_params = int(
+                                _reconcile_stats.get("params_replaced", 0) or 0
+                            )
+                            _reconcile_bytes = int(
+                                _reconcile_stats.get("payload_bytes_removed", 0) or 0
+                            )
+                            # Post-strip CLIP storage registry so the stored
+                            # registry matches the final (stripped) payload.
+                            try:
+                                _reg_clip_post = build_unique_storage_registry(
+                                    _reloaded_model
+                                )
+                                self._cpu_snapshot_clip_storage_registry = _reg_clip_post
+                            except Exception:
+                                self._cpu_snapshot_clip_storage_registry = None
+                        _install_ret = maybe_install_clip_fh_demand(
+                            _container_retained, trace=trace
+                        )
+                        _reconcile_wrapper = str(
+                            _install_ret.get("status", "unknown")
+                            if isinstance(_install_ret, dict)
+                            else _install_ret
+                        )
+                        _reconcile_status = (
+                            "excluded_after_eviction_reload"
+                            if _reconcile_strip
+                            else "manifest_reattached"
+                        )
+                        _emit(
+                            trace,
+                            "clip_fh_eviction_reconcile",
+                            {
+                                "status": _reconcile_status,
+                                "params_replaced": _reconcile_params,
+                                "payload_bytes_removed": _reconcile_bytes,
+                                "manifest_eligible": int(_frozen_clip_manifest_eligible),
+                                "wrapper_installed": _reconcile_wrapper,
+                                "clip_reloaded_fresh": 1,
+                            },
+                        )
+                        print(
+                            f"[v2.clip_fh] eviction_reconcile status={_reconcile_status} "
+                            f"wrapper_installed={_reconcile_wrapper} "
+                            f"manifest_eligible={int(_frozen_clip_manifest_eligible)} "
+                            f"params_replaced={_reconcile_params} "
+                            f"payload_bytes_removed={_reconcile_bytes} "
+                            f"clip_reloaded_fresh=1",
+                            flush=True,
+                        )
+                except Exception as _reconcile_exc:
+                    self._cpu_snapshot_clip_storage_registry = None
+                    print(
+                        f"[v2.clip_fh] eviction reconcile skipped: "
+                        f"{type(_reconcile_exc).__name__}: {str(_reconcile_exc)[:160]}",
+                        flush=True,
+                    )
                 from .cpu_snapshot_models import (  # noqa: PLC0415
                     _validate_vae_policy_metadata,
                 )
@@ -7349,6 +8005,262 @@ class ModalRuntimeEntrypoint:
                     "unet_present": 0,
                 },
             )
+
+    # ── E25 pre-graph exact-identity cache ───────────────────────────────
+    # Reuses the pure plan-receipt derivations (model key / prefill key /
+    # model spec / invocation-seed payload) across requests with identical
+    # workflow/model/runtime identity.  The identity key contains every
+    # input that can affect the derived values; request-specific inputs
+    # (seed, prompt text, conditioning, request IDs) are never part of the
+    # key.  Fail-closed: any cache miss/exception falls back to the exact
+    # original derivation path.  The cache is bounded and cleared whenever
+    # the request identity differs from the cached identity.
+    def _pre_graph_cache_identity_key(
+        self,
+        plan: Any,
+        *,
+        include_workflow_hash: bool = True,
+    ) -> str:
+        try:
+            wf_hash = str(getattr(plan, "workflow_hash", "") or "")
+            src_wf_hash = str(getattr(plan, "source_workflow_hash", "") or "")
+            model_stack_hash = ""
+            try:
+                _stack = getattr(plan, "model_stack", None)
+                if _stack:
+                    import json as _json
+
+                    model_stack_hash = _json.dumps(
+                        dict(_stack), sort_keys=True, default=str
+                    )
+            except Exception:
+                model_stack_hash = ""
+            deploy_hash = str(
+                _V2_DEPLOYMENT_COMBINED_HASH
+                or getattr(getattr(getattr(self, "bootstrap", None), "state", None), "deployment_combined_hash", "")
+                or ""
+            )
+            node_gen = str(
+                getattr(getattr(getattr(self, "bootstrap", None), "state", None), "snapshot_custom_node_generation", "")
+                or getattr(getattr(getattr(self, "bootstrap", None), "state", None), "custom_node_generation", "")
+                or ""
+            )
+            parts = [
+                ("wf", wf_hash if include_workflow_hash else ""),
+                ("src", src_wf_hash if include_workflow_hash else ""),
+                ("stack", model_stack_hash),
+                ("deploy", deploy_hash),
+                ("nodegen", node_gen),
+            ]
+            raw = "\x1f".join(f"{k}={v}" for k, v in parts)
+            try:
+                import hashlib as _hashlib
+
+                return "e25pg:" + _hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            except Exception:
+                return "e25pg:raw:" + raw
+        except Exception:
+            return ""
+
+    def _cached_pre_graph_derivations(
+        self,
+        plan: Any,
+        *,
+        workflow: Any,
+        model_stack: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Compute-or-reuse the plan-receipt derivations under the exact
+        identity key.  Returns (request_model_key, request_prefill_key,
+        request_model_spec); on any cache/identity failure the ORIGINAL
+        derivation path runs (fail-closed)."""
+        try:
+            from comfymodal_runtime.pre_graph_cache import (
+                get_pre_graph_cache,
+                with_cache,
+            )
+
+            _identity = self._pre_graph_cache_identity_key(plan)
+            if not _identity:
+                # Identity unavailable — derive directly.
+                return (
+                    derive_model_key(workflow),
+                    derive_prefill_key(derive_model_key(workflow), workflow),
+                    build_restore_model_spec(workflow, model_stack),
+                )
+            _cached = get_pre_graph_cache()
+
+            def _compute_key() -> Any:
+                return derive_model_key(workflow)
+
+            def _compute_prefill(_key: Any) -> Any:
+                return derive_prefill_key(_key, workflow)
+
+            def _compute_spec(_key: Any) -> Any:
+                return build_restore_model_spec(workflow, model_stack)
+
+            request_model_key = with_cache(_cached, _identity + ":key", _compute_key)
+            request_prefill_key = with_cache(
+                _cached, _identity + ":prefill", lambda: _compute_prefill(request_model_key)
+            )
+            request_model_spec = with_cache(
+                _cached, _identity + ":spec", lambda: _compute_spec(request_model_key)
+            )
+            return request_model_key, request_prefill_key, request_model_spec
+        except Exception:
+            # Fail-closed: original derivation path.
+            return (
+                derive_model_key(workflow),
+                derive_prefill_key(derive_model_key(workflow), workflow),
+                build_restore_model_spec(workflow, model_stack),
+            )
+
+    def _maybe_schedule_execution_unet_at_plan_receipt(
+        self,
+        plan: Any,
+        *,
+        request_id: str = "",
+    ) -> bool:
+        """Batch-A G1: start the execution-phase fast-disk UNET lane at plan receipt.
+
+        Hoists the existing ``schedule_execution_unet`` submit from
+        ``_run_in_process`` (after graph start + CPU-snapshot binding block)
+        to immediately after ``ExecutionPlan.from_dict`` so the checkpoint
+        read/construct/bind/H2D chain starts ~70-110 ms earlier on healthy
+        runs.  Uses the SAME identity derivation (``derive_model_key`` /
+        ``derive_prefill_key`` / ``build_restore_model_spec``) and the SAME
+        snapshot-unet-absent container predicate as the binding block, and
+        submits through the existing single-flight bridge scheduler — no new
+        threads, pools, H2D paths, or futures.
+
+        Hard gate: runs ONLY when the container definitively has no retained
+        snapshot UNET (``_cpu_snapshot_models.unet is None``), the request
+        identity is role-compatible with the snapshot spec, and a
+        present-but-inactive container has a retained CLIP to activate.
+        Retained-UNET, legacy, ambiguous, or mismatched configurations skip
+        early and behave exactly as before.
+
+        The derived identity is stashed on the instance so the binding block
+        REUSES it (single source of truth); the binding block's cheap
+        re-derivation check only diagnoses divergence (the downstream
+        sampler verification stays authoritative).
+
+        Failure semantics: every failure path here is best-effort and returns
+        False without raising; the later ``_run_in_process`` schedule remains
+        as the safety path and any early worker failure still surfaces at
+        graph demand exactly as today.
+        """
+        # Reset request-scoped stash first: never reuse a previous request's
+        # derivation even when this request is not eligible.
+        self._plan_receipt_request_model_key = None
+        self._plan_receipt_request_prefill_key = None
+        self._plan_receipt_request_model_spec = None
+        self._plan_receipt_trace = None
+        try:
+            self._lazy_init_snapshot_state()
+            models = self._cpu_snapshot_models
+            if models is None:
+                # Legacy / no-snapshot container: the existing legacy
+                # background UNET defer owns UNET.  Never schedule early.
+                return False
+            if getattr(models, "unet", None) is not None:
+                # Retained CPU-snapshot UNET: the binding block serves it.
+                # Later scheduling / early-activation behavior unchanged.
+                return False
+            # Present-but-inactive containers are activated at request time
+            # ONLY when a retained CLIP can be published; a partial container
+            # with no retained CLIP hits the never-serve path (bridge clear).
+            if not self._cpu_snapshot_models_active and getattr(models, "clip", None) is None:
+                return False
+            workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
+            model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
+            # ── E25: exact-identity cached derivation ──
+            request_model_key, request_prefill_key, request_model_spec = (
+                self._cached_pre_graph_derivations(
+                    plan, workflow=workflow, model_stack=model_stack
+                )
+            )
+            if not request_model_key.unet_identity:
+                return False
+            # Role-match gate mirrors the binding block: when incompatible the
+            # binding block clears the bridge / raises in production — an early
+            # read would be wasted there.
+            role_report = _canonical_role_match_report(
+                request_model_spec=request_model_spec,
+                snapshot_model_spec=getattr(models, "model_spec", None),
+            )
+            if not role_report.get("compatible"):
+                return False
+            self._plan_receipt_request_model_key = request_model_key
+            self._plan_receipt_request_prefill_key = request_prefill_key
+            self._plan_receipt_request_model_spec = request_model_spec
+            bridge = self._preload_bridge
+            _prev = bridge._preparation
+            _prev_inflight = bool(
+                _prev is not None
+                and _prev.unet_future is not None
+                and not _prev.unet_future.done()
+            )
+            if _prev is None or bridge._model_key is None or not _prev_inflight:
+                # Publish the minimum bridge state needed by the existing
+                # execution-UNET lane: a clip-less preparation with the
+                # plan-derived identity.  This also drops any stale
+                # previous-request (done) future so every request gets its
+                # own lane.  The binding block later reuses this identity and
+                # replaces the preparation with the retained CLIP published;
+                # the in-flight UNET future is carried over there.
+                bridge._init_ready_preparation(
+                    model_key=request_model_key,
+                    prefill_key=request_prefill_key,
+                    model_spec=request_model_spec,
+                    trace=None,
+                )
+            else:
+                # An in-flight UNET lane already exists (another scheduler);
+                # respect single-flight and never replace it.
+                return False
+            # Create the request trace here (before any lane submit) so the
+            # lane's worker events land in the request trace; the context
+            # created later reuses it via _plan_receipt_trace.
+            self._plan_receipt_trace = RuntimeTrace(
+                request_id=str(request_id or ""),
+                process="remote",
+            )
+            self._plan_receipt_trace.emit(
+                "unet_execution_plan_receipt_schedule",
+                phase="execution",
+                metadata={
+                    "request_id": str(request_id or ""),
+                    "unet_identity_hash": request_model_key.stable_hash[:16],
+                    "snapshot_unet_absent": 1,
+                    "snapshot_active": int(bool(self._cpu_snapshot_models_active)),
+                    "role_compatible": 1,
+                },
+            )
+            scheduled = bool(
+                bridge.schedule_execution_unet(
+                    trace=self._plan_receipt_trace,
+                    request_id=str(request_id or ""),
+                )
+            )
+            if scheduled:
+                print(
+                    "[v2.execution_unet] scheduled=1 via=plan_receipt "
+                    f"request_id={request_id}",
+                    flush=True,
+                )
+            return scheduled
+        except Exception as _g1_exc:
+            # Best-effort: never raise at plan receipt.  Any failure falls
+            # back to the existing _run_in_process scheduling path.
+            try:
+                print(
+                    "[v2.execution_unet] plan_receipt_schedule_skipped "
+                    f"reason=error:{type(_g1_exc).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return False
 
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
@@ -8504,6 +9416,13 @@ class ModalRuntimeEntrypoint:
 
                         self._cpu_snapshot_models = _cpu_models
                         self._cpu_snapshot_models_active = False
+                        try:
+                            from .clip_fast_hydration_wiring import maybe_install_clip_fh_demand
+                            from .clip_fast_hydration_wiring import maybe_prepare_clip_snapshot_exclusion
+                            maybe_prepare_clip_snapshot_exclusion(_cpu_models, trace=trace)
+                            maybe_install_clip_fh_demand(_cpu_models, trace=trace)
+                        except Exception as _clip_fh_exc:
+                            print(f"[v2.clip_fh] startup prepare skipped: {type(_clip_fh_exc).__name__}", flush=True)
                         _cpu_snap_ok = True
                         _created_duration_ms = round((time.perf_counter() - _cpu_snapshot_perf_start) * 1000.0, 2)
                         trace.emit(
@@ -8623,6 +9542,7 @@ class ModalRuntimeEntrypoint:
                         reload_vae_fn=_cpu_load_vae,
                         snap_ctx_cm=_snap_ctx,
                         target_gpus=_target_gpus,
+                        trace=trace,
                     )
                     # _evict_snapshot_models already clears self._cpu_snapshot_models.
                     # Delete any local alias to assist gc:
@@ -8667,11 +9587,13 @@ class ModalRuntimeEntrypoint:
         try:
             if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
                 from .snapshot_build_manifest import capture_snapshot_manifest
-                capture_snapshot_manifest(
+                _manifest_record = capture_snapshot_manifest(
                     "before_capture",
                     model_ctx=getattr(self, "_cpu_snapshot_models", None),
                     extra={"lifecycle": "startup", "snap": "True"},
                 )
+                if isinstance(_manifest_record, dict):
+                    _restore_timing["snapshot_manifest"] = _manifest_record
         except Exception:
             pass
 
@@ -8683,6 +9605,42 @@ class ModalRuntimeEntrypoint:
         try:
             from comfymodal_runtime.restore_memory_arm import maybe_freeze_snapshot_gpu_capacity
             maybe_freeze_snapshot_gpu_capacity()
+        except Exception:
+            pass
+
+        # ── Runtime-state construction baseline (Batch B) ────────────────
+        # Freeze generation + content manifest AFTER every correctness-
+        # relevant runtime-state write (prescan_custom_nodes.json,
+        # gpu_capacity_frozen.json) and BEFORE snapshot capture, so the
+        # restore-time guard can skip the remote Volume reload on an exact
+        # match.  Fail-closed: any write error leaves the baseline empty
+        # and the restore performs the reload as before.
+        try:
+            _rs_baseline = self.bootstrap.finalize_runtime_state_generation(
+                trace=trace, reason="construction"
+            )
+            if _rs_baseline:
+                _restore_timing["runtime_state_generation_baseline"] = _rs_baseline
+        except Exception:
+            pass
+
+        # ── Capture-time allocator hygiene (diagnostic; default off) ──────
+        # R2a: gc.collect() + malloc_trim(0) immediately before the snapshot
+        # capture boundary so freed anonymous heap is returned to the OS
+        # before Modal serializes the process.  Shadow-validation only:
+        # never enabled on default production runs
+        # (COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE).
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_capture_hygiene import run_capture_hygiene
+                _hygiene_event = run_capture_hygiene(
+                    manifest_captured=(
+                        os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower()
+                        in {"1", "true", "yes", "on"}
+                    ),
+                )
+                if isinstance(_hygiene_event, dict):
+                    _restore_timing["snapshot_capture_hygiene"] = _hygiene_event
         except Exception:
             pass
 
@@ -8699,6 +9657,20 @@ class ModalRuntimeEntrypoint:
         )
         _restore_timing["snapshot_startup_callback_return_wall_unix_ns"] = _startup_return_wall_ns
         _restore_timing["snapshot_startup_callback_return_mono_ns"] = _startup_return_mono_ns
+        # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+        # Snapshot-capture ready-return boundary: record the container clip
+        # state just before the startup callback returns ready.  After model
+        # eviction the clip may be the fresh reloaded instance — this captures
+        # whichever object is live at the boundary.
+        try:
+            from .clip_fast_hydration_wiring import clip_state_checkpoint
+            clip_state_checkpoint(
+                trace,
+                "capture_pre_snapshot_return",
+                getattr(self, "_cpu_snapshot_models", None),
+            )
+        except Exception:
+            pass
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -8946,6 +9918,32 @@ class ModalRuntimeEntrypoint:
         remote_python_resume_mono_ns: int = time.monotonic_ns()
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        # ── E27 Follow-Up A: restore-timeline boundary markers ──────────
+        # Captured on the shared remote monotonic axis (gated on the Gantt
+        # telemetry flag so the normal path is unchanged).  These answer the
+        # "earliest CLIP timeline" target on the real restored container:
+        #   first executable restore line, frozen-manifest availability,
+        #   CUDA init start/ready, restore reconcile, demand.
+        try:
+            from .gantt_telemetry import gantt_enabled, register_gantt_span
+
+            if gantt_enabled():
+                register_gantt_span(
+                    "restore_first_line",
+                    start_mono_ns=remote_python_resume_mono_ns,
+                    end_mono_ns=remote_python_resume_mono_ns,
+                    lane="RESTORE",
+                    metadata={"kind": "point"},
+                )
+                register_gantt_span(
+                    "restore_reconcile_start",
+                    start_mono_ns=remote_python_resume_mono_ns,
+                    end_mono_ns=remote_python_resume_mono_ns,
+                    lane="RESTORE",
+                    metadata={"kind": "point"},
+                )
+        except Exception:
+            pass
         # ── Snapshot-build manifest at the FIRST restored Python line ─────
         # (diagnostic only; default off — never enabled on measured runs).
         # Same capture as startup's ``before_capture`` so the two manifests
@@ -8994,7 +9992,104 @@ class ModalRuntimeEntrypoint:
         # _restore_eviction_boundary uses getattr defaults so is safe
         # before lazy_init on older unpickled instances.
         self._restore_eviction_boundary()
+        # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+        # Retained-model handling (eviction boundary restore) completed; the
+        # clip below is the retained snapshot clip at this early restore point.
+        try:
+            from .clip_fast_hydration_wiring import clip_state_checkpoint
+            clip_state_checkpoint(
+                getattr(self, "_lifecycle_trace", None),
+                "restore_after_retained_model_handling",
+                getattr(self, "_cpu_snapshot_models", None),
+            )
+        except Exception:
+            pass
         self._lazy_init_snapshot_state()
+        # ── E27 Follow-Up A: frozen-manifest-available marker ─────────────
+        # Records the exact restore-time instant the CLIP fast-hydration
+        # manifest becomes observable on the real restored container (the
+        # "earliest source I/O legal" boundary on the shared mono axis).
+        try:
+            from .gantt_telemetry import gantt_enabled, register_gantt_span
+
+            if gantt_enabled():
+                _manifest_ok = False
+                try:
+                    from .clip_fast_hydration_wiring import (
+                        cfh,
+                        resolve_capture_clip,
+                    )
+                    _clip, _src = resolve_capture_clip(
+                        getattr(self, "_cpu_snapshot_models", None)
+                    )
+                    if _clip is not None:
+                        _state = cfh.clip_hydration_state(_clip)
+                        _manifest_ok = bool(
+                            (_state or {}).get("manifest_present", False)
+                        )
+                except Exception:
+                    _manifest_ok = False
+                register_gantt_span(
+                    "clip_manifest_available",
+                    start_mono_ns=time.monotonic_ns(),
+                    end_mono_ns=time.monotonic_ns(),
+                    lane="RESTORE",
+                    metadata={"kind": "point", "manifest_present": int(_manifest_ok)},
+                )
+        except Exception:
+            pass
+        # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+        # First restore instruction boundary: the snapshot models object that
+        # is about to be handed to the CLIP fast-hydration demand install.
+        try:
+            from .clip_fast_hydration_wiring import clip_state_checkpoint
+            clip_state_checkpoint(
+                getattr(self, "_lifecycle_trace", None),
+                "restore_first_instruction",
+                getattr(self, "_cpu_snapshot_models", None),
+            )
+        except Exception:
+            pass
+        try:
+            from .clip_fast_hydration_wiring import maybe_install_clip_fh_demand
+            maybe_install_clip_fh_demand(
+                getattr(self, "_cpu_snapshot_models", None),
+                trace=getattr(self, "_lifecycle_trace", None),
+            )
+        except Exception as _clip_fh_exc:
+            print(f"[v2.clip_fh] restore install skipped: {type(_clip_fh_exc).__name__}", flush=True)
+        # ── E28: launch the speculative CLIP lane at the EARLIEST legal
+        # restore-time point ──
+        # The frozen manifest is available right after lazy snapshot init
+        # (~+18-37 ms after remote Python resume — measured in E27 Follow-Up
+        # A).  Start the direct-GPU CLIP read NOW (restore-time lifecycle,
+        # not plan receipt) so it waits only on the minimum CUDA readiness
+        # condition.  The plan-receipt path later reconciles the identity.
+        # Best-effort and fail-closed: never blocks restore, never raises.
+        try:
+            from .speculative_clip_hydration import (
+                start_restore_time_clip_lane,
+                speculative_clip_hydration_enabled,
+            )
+
+            if speculative_clip_hydration_enabled():
+                _restore_clip_holder = getattr(self, "_cpu_snapshot_models", None)
+                _restore_clip_obj = (
+                    getattr(_restore_clip_holder, "clip", None)
+                    if _restore_clip_holder is not None
+                    else None
+                )
+                start_restore_time_clip_lane(
+                    clip=_restore_clip_obj,
+                    cpu_models=_restore_clip_holder,
+                    trace=getattr(self, "_lifecycle_trace", None),
+                    release_callback=None,
+                )
+        except Exception as _e28_lane_exc:
+            print(
+                f"[v2.clip_fh] restore-time lane skipped: {type(_e28_lane_exc).__name__}",
+                flush=True,
+            )
         if _is_production_profile():
             production_snapshot_invariant(
                 getattr(self, "_cpu_snapshot_models", None),
@@ -9049,16 +10144,30 @@ class ModalRuntimeEntrypoint:
         _restore_end_wall_ns: int | None = None
         _restore_end_mono_ns: int | None = None
         _restore_perf_start = time.perf_counter()
+        # ── [v2.restore_deep] leaf-segment stamp store (bounded, additive) ──
+        # Captures monotonic_ns stamps around the currently-unattributed leaf
+        # segments of the restore critical path; consumed once at the
+        # [v2.restore_deep] emission near the tail of restore().  Every stamp
+        # capture is individually guarded and must never raise.
+        _rd_deep: dict[str, Any] = {}
         # Continue with standard restore preamble
         print(
             "[v2.residency_config] "
             f"enabled={int(_RESIDENCY_DIAGNOSTICS_ENABLED)}",
             flush=True,
         )
+        try:
+            _rd_deep["host_memory_probe_start_ns"] = time.monotonic_ns()
+        except Exception:
+            pass
         self._cgroup_sampler = _CgroupCpuSampler(time.monotonic_ns())
         self._cgroup_sampler.set_phase("restore")
         self._cgroup_sampler.start()
         _report_host_memory("restore_start")
+        try:
+            _rd_deep["host_memory_probe_end_ns"] = time.monotonic_ns()
+        except Exception:
+            pass
         # Reset per-request counter so first request after every fresh restore
         # is exactly 1.  Snapshotted state cannot carry request count.
         self._request_count = 0
@@ -9069,13 +10178,87 @@ class ModalRuntimeEntrypoint:
         _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = 0.0
         _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = 0.0
         try:
+            try:
+                _rd_deep["identity_capture_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             identity = _capture_remote_identity()
+            try:
+                _rd_deep["identity_capture_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
+            try:
+                _rd_deep["configure_runtime_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             self._configure_runtime()
+            try:
+                _rd_deep["configure_runtime_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             trace = RuntimeTrace(process="remote")
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
             trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
+            # ── Advisory folder-listing warm (off the critical path) ───────
+            # The first request's cached→first-node topo walk pays a cold
+            # Modal-volume recursive_search per registered folder whenever the
+            # prompt-signature memo skips the normal add_keys warm-up.  Warm
+            # those listings in a daemon thread here so the first request's
+            # topo walk starts warm.  Best-effort and NEVER raises: if the
+            # warm is incomplete the request simply pays the original cost.
+            # On completion the evidence is attached to the restore trace
+            # metadata (host-visible) and to the restore timing dict.
+            try:
+                from comfymodal_runtime.execution_warm import (
+                    warm_registered_folders as _warm_registered_folders,
+                )
+
+                def _run_folder_warm():
+                    try:
+                        _fw_count, _fw_ms = _warm_registered_folders()
+                    except Exception:
+                        return
+                    try:
+                        trace.set_metadata(
+                            folder_warm_ms=_fw_ms,
+                            folder_warm_folders=_fw_count,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._restore_folder_warm_evidence = {
+                            "folder_warm_ms": _fw_ms,
+                            "folder_warm_folders": _fw_count,
+                        }
+                    except Exception:
+                        pass
+                    try:
+                        _rt = self._restore_timing
+                        if isinstance(_rt, dict):
+                            _rt["folder_warm_ms"] = _fw_ms
+                            _rt["folder_warm_folders"] = _fw_count
+                    except Exception:
+                        pass
+
+                threading.Thread(
+                    target=_run_folder_warm,
+                    daemon=True,
+                    name="comfymodal-folder-warm",
+                ).start()
+            except Exception:
+                # Unimportable / thread-start failure — advisory only; the
+                # request pays the original cold lookup cost (no impact).
+                pass
+            try:
+                _rd_deep["torch_thread_apply_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             _thread_shape = self._apply_torch_thread_limit(trace=trace)
+            try:
+                _rd_deep["torch_thread_apply_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             _v2_container_restore_count += 1
             self._restore_count = _v2_container_restore_count
             restore_session_id = uuid.uuid4().hex
@@ -9085,6 +10268,10 @@ class ModalRuntimeEntrypoint:
             _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
             os.environ["COMFYMODAL_RESTORED_INSTANCE_ID"] = restored_instance_id
             set_model_load_identity(restored_instance_id, restore_session_id)
+            try:
+                _rd_deep["teardown_diag_setup_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             self._teardown_diagnostics.set_identity(
                 container_session_id=self.container_session_id,
                 restored_instance_id=restored_instance_id,
@@ -9092,6 +10279,10 @@ class ModalRuntimeEntrypoint:
                 modal_task_id=identity.get("container_task_id", ""),
                 modal_container_id=identity.get("modal_container_id", ""),
             )
+            try:
+                _rd_deep["teardown_diag_setup_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             if identity.get("modal_input_id"):
                 os.environ["COMFYMODAL_INPUT_ID"] = str(identity["modal_input_id"])
             if identity.get("modal_container_id"):
@@ -9122,12 +10313,28 @@ class ModalRuntimeEntrypoint:
                     _full_trace_started = False
             # Legacy identity: rename old container_session_id internally
             legacy_container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+            _resource_id_dict = _resource_identity()
+            # Surface explicit CPU-request / GPU-type aliases (additive; reuse
+            # the values _resource_identity already computes — no new
+            # computation).  "memory_mb" already carries the RAM request;
+            # "cpu" / "gpu" exist, and "cpu_request" / "gpu_type" are the
+            # request-shaped alias keys surfaced for consumers that read them.
+            if "cpu_request" not in _resource_id_dict:
+                _cpu_val = _resource_id_dict.get("cpu")
+                if isinstance(_cpu_val, (int, float)) or (
+                    isinstance(_cpu_val, str) and _cpu_val
+                ):
+                    _resource_id_dict["cpu_request"] = _cpu_val
+            if "gpu_type" not in _resource_id_dict:
+                _gpu_list = _resource_id_dict.get("gpu")
+                if isinstance(_gpu_list, (list, tuple)) and _gpu_list:
+                    _resource_id_dict["gpu_type"] = str(_gpu_list[0])
             trace.set_metadata(
                 trace_id=trace.trace_id,
                 restored_instance_id=restored_instance_id,
                 restore_session_id=restore_session_id,
                 legacy_container_session_id=legacy_container_session_id,
-                **_resource_identity(),
+                **_resource_id_dict,
             )
             trace.emit(
                 "remote_method_entry",
@@ -9166,9 +10373,29 @@ class ModalRuntimeEntrypoint:
                 # Clear process-local caches from previous restore cycle
                 _RES4LYF_PREPARED.clear()
                 _CACHEDIT_PREPARED.clear()
+                try:
+                    _rd_deep["bootstrap_restore_start_ns"] = time.monotonic_ns()
+                except Exception:
+                    pass
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
+                # ── D6 restore-side lifecycle checkpoint (default-OFF) ──
+                # gpu-state/bootstrap restore completed: record the retained
+                # snapshot clip state at this restore point.
+                try:
+                    from .clip_fast_hydration_wiring import clip_state_checkpoint
+                    clip_state_checkpoint(
+                        trace,
+                        "restore_after_gpu_state",
+                        getattr(self, "_cpu_snapshot_models", None),
+                    )
+                except Exception:
+                    pass
+                try:
+                    _rd_deep["bootstrap_restore_end_ns"] = time.monotonic_ns()
+                except Exception:
+                    pass
 
                 # [v2.generation_identity] bootstrap diagnostic
                 _boot_cn_gen = str(state.custom_node_generation or "")
@@ -10089,6 +11316,10 @@ class ModalRuntimeEntrypoint:
             _unet_deferred_meta: dict[str, Any] = {}
             _defer_api = None if _cpu_snapshot_activated else (self._load_legacy_runtime() if self._restore_plan else None)
 
+            try:
+                _rd_deep["preload_bridge_prep_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             if self._restore_plan is not None:
                 trace.emit("preload_submission_start", phase="restore", metadata={
                     "restore_plan_generation": str(self._restore_plan.generation),
@@ -10305,6 +11536,10 @@ class ModalRuntimeEntrypoint:
                     ),
                 },
             )
+            try:
+                _rd_deep["preload_bridge_prep_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # ── 12. restore_finalization ──
             def _do_restore_finalization():
@@ -10326,7 +11561,10 @@ class ModalRuntimeEntrypoint:
                 )
                 restore_end_wall_ns_local = int(time.time() * 1_000_000_000)
                 restore_end_mono_ns_local = time.monotonic_ns()
-                restore_timing_local: dict[str, Any] = {
+                restore_timing_local: dict[str, Any] = dict(
+                    getattr(self, "_restore_timing", None) or {}
+                )
+                restore_timing_local.update({
                     "restore_total_ms": restore_total_ms_local,
                     "restore_session_id": restore_session_id,
                     "restored_instance_id": restored_instance_id,
@@ -10345,7 +11583,7 @@ class ModalRuntimeEntrypoint:
                     "snapshot_callback_age_at_restore_ms": _snapshot_callback_age_at_restore_ms,
                     "snapshot_startup_callback_return_wall_unix_ns": _callback_return.get("wall_unix_ns"),
                     "snapshot_startup_callback_return_mono_ns": _callback_return.get("monotonic_ns"),
-                }
+                })
                 if state.stage_durations:
                     for _stage, _dur_ms in state.stage_durations.items():
                         if _dur_ms is not None and _dur_ms > 0:
@@ -10365,6 +11603,15 @@ class ModalRuntimeEntrypoint:
                     for _stage, _dur_ms in _RESTORE_STAGE_TIMERS.items():
                         if _stage not in _REQUIRED_RESTORE_STAGES and _dur_ms > 0:
                             restore_timing_local[f"{_stage}_ms"] = round(_dur_ms, 3)
+                # Merge the advisory folder-warm evidence (recorded by the
+                # background daemon thread when it completed) into the final
+                # timing dict so the keys reach the host even when the thread
+                # finished after the trace serialization boundary.
+                _fw_ev = getattr(self, "_restore_folder_warm_evidence", None)
+                if isinstance(_fw_ev, dict):
+                    for _fw_key in ("folder_warm_ms", "folder_warm_folders"):
+                        if _fw_key in _fw_ev and _fw_key not in restore_timing_local:
+                            restore_timing_local[_fw_key] = _fw_ev[_fw_key]
                 self._restore_timing = restore_timing_local
                 _LATEST_LIFECYCLE_TIMING = restore_timing_local
                 trace_local.emit("v2_restore_finalize_end", phase="restore")
@@ -10376,6 +11623,10 @@ class ModalRuntimeEntrypoint:
                     restore_end_mono_ns_local,
                 )
 
+            try:
+                _rd_deep["restore_finalize_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             (
                 trace,
                 restore_total_ms,
@@ -10410,6 +11661,70 @@ class ModalRuntimeEntrypoint:
                 f"restore_finalize_ms={_brk.get('restore_finalize_ms')}",
                 flush=True,
             )
+            # ── [v2.restore_deep] leaf-segment attribution (additive) ──
+            # Emitted ONCE per restore, right after restore_breakdown.  Measures
+            # the currently-unattributed leaf segments of the restore critical
+            # path from _rd_deep monotonic stamps.  Each value is in ms, rounded
+            # to 3; a leaf without a valid stamp pair is reported as "absent"
+            # (never faked as 0).  residual_ms (present only when
+            # restore_total_ms is available) = restore_total − sum(present
+            # children).  Bounded: never raises, single line, flush=True.
+            try:
+                _rd_emit_ns = time.monotonic_ns()
+                _rd_values: dict[str, Any] = {}
+                _rd_pairs = (
+                    ("identity_capture_ms", "identity_capture_start_ns", "identity_capture_end_ns"),
+                    ("configure_runtime_ms", "configure_runtime_start_ns", "configure_runtime_end_ns"),
+                    ("torch_thread_apply_ms", "torch_thread_apply_start_ns", "torch_thread_apply_end_ns"),
+                    ("host_memory_probe_ms", "host_memory_probe_start_ns", "host_memory_probe_end_ns"),
+                    ("teardown_diag_setup_ms", "teardown_diag_setup_start_ns", "teardown_diag_setup_end_ns"),
+                    ("bootstrap_restore_ms", "bootstrap_restore_start_ns", "bootstrap_restore_end_ns"),
+                    ("preload_bridge_prep_ms", "preload_bridge_prep_start_ns", "preload_bridge_prep_end_ns"),
+                    ("restore_finalize_ms", "restore_finalize_start_ns", "_rd_emit_ns"),
+                )
+                for _rd_key, _rd_s_key, _rd_e_key in _rd_pairs:
+                    _rd_s_v = _rd_deep.get(_rd_s_key)
+                    _rd_e_v = _rd_deep.get(_rd_e_key)
+                    if _rd_e_key == "_rd_emit_ns":
+                        _rd_e_v = _rd_emit_ns
+                    if isinstance(_rd_s_v, int) and isinstance(_rd_e_v, int) and _rd_e_v >= _rd_s_v:
+                        _rd_values[_rd_key] = round((_rd_e_v - _rd_s_v) / 1_000_000, 3)
+                    else:
+                        _rd_values[_rd_key] = None
+                _rd_parts: list[str] = []
+                _rd_children_sum = 0.0
+                for _rd_key in (
+                    "identity_capture_ms", "configure_runtime_ms", "torch_thread_apply_ms",
+                    "host_memory_probe_ms", "teardown_diag_setup_ms", "bootstrap_restore_ms",
+                    "preload_bridge_prep_ms", "restore_finalize_ms",
+                ):
+                    _rd_v = _rd_values.get(_rd_key)
+                    if isinstance(_rd_v, (int, float)):
+                        _rd_parts.append(f"{_rd_key}={_rd_v}")
+                        _rd_children_sum += _rd_v
+                    else:
+                        _rd_parts.append(f"{_rd_key}=absent")
+                if isinstance(restore_total_ms, (int, float)):
+                    _rd_residual = round(float(restore_total_ms) - round(_rd_children_sum, 3), 3)
+                    _rd_parts.append(f"residual_ms={_rd_residual}")
+                print(f"[v2.restore_deep] " + " ".join(_rd_parts), flush=True)
+            except Exception:
+                pass
+            # Attach the advisory folder-warm evidence to the restore trace
+            # metadata when the background thread completed after the final
+            # serialization boundary (belt-and-braces for the host channel;
+            # the thread itself normally sets these keys at completion).
+            try:
+                _fw_ev = getattr(self, "_restore_folder_warm_evidence", None)
+                if isinstance(_fw_ev, dict):
+                    _fw_missing = {
+                        k: v for k, v in _fw_ev.items()
+                        if k in ("folder_warm_ms", "folder_warm_folders")
+                    }
+                    if _fw_missing:
+                        trace.set_metadata(**_fw_missing)
+            except Exception:
+                pass
             print(
                 f"[v2.clip_stages] "
                 f"worker_queue_ms={_clip.get('worker_queue_ms')} "
@@ -10561,7 +11876,24 @@ class ModalRuntimeEntrypoint:
             self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
+        _orchestration_request_id = str(
+            getattr(trace, "request_id", "") or context.request_id or ""
+        )
         trace.set_metadata(observability_mode=observability_mode())
+        try:
+            from comfymodal_runtime.fast_cold_orchestration import (
+                attach_trace,
+                begin_request,
+            )
+
+            begin_request(
+                _orchestration_request_id,
+                model_spec=getattr(plan, "model_spec", None),
+                trace=trace,
+            )
+            attach_trace(_orchestration_request_id, trace)
+        except Exception:
+            pass
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
         trace.emit("runtime_config_end", phase="execution")
@@ -10598,6 +11930,19 @@ class ModalRuntimeEntrypoint:
             f"cpu_snapshot_active={int(bool(self._cpu_snapshot_models_active))}",
             flush=True,
         )
+        if _e19_atomic_profile_active():
+            _e19_snapshot_contract = unet_snapshot_execution_contract(
+                _snapshot_models_for_request
+            )
+            trace.emit(
+                "e19_unet_snapshot_contract",
+                phase="execution",
+                metadata=dict(_e19_snapshot_contract),
+            )
+            if not _e19_snapshot_contract["snapshot_unet_weights_absent"]:
+                raise RuntimeError(
+                    "E19 requires snapshot UNET weights absent before request demand"
+                )
         # ── Present-but-inactive → request-time activation ──────────────
         # On a cold run, restore() executes without a plan, so the
         # restore-time activation (validate + retarget + publish the retained
@@ -10654,9 +11999,38 @@ class ModalRuntimeEntrypoint:
             try:
                 workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
                 model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
-                request_model_key = derive_model_key(workflow)
-                request_prefill_key = derive_prefill_key(request_model_key, workflow)
-                request_model_spec = build_restore_model_spec(workflow, model_stack)
+                # ── Single source of truth (Batch-A G1) ──
+                # Reuse the plan-receipt derivation when available (the G1
+                # early-schedule path derives the same key/spec from the same
+                # plan); otherwise derive here exactly as before.  The cheap
+                # re-derivation below only diagnoses divergence — the
+                # downstream sampler identity verification stays the
+                # authoritative runtime check.
+                request_model_key = getattr(self, "_plan_receipt_request_model_key", None)
+                if request_model_key is None:
+                    # ── E25: exact-identity cached derivation (falls back to
+                    # the original inline derivation on any cache failure) ──
+                    (
+                        request_model_key,
+                        request_prefill_key,
+                        request_model_spec,
+                    ) = self._cached_pre_graph_derivations(
+                        plan, workflow=workflow, model_stack=model_stack
+                    )
+                else:
+                    request_prefill_key = getattr(self, "_plan_receipt_request_prefill_key", None)
+                    request_model_spec = getattr(self, "_plan_receipt_request_model_spec", None)
+                    try:
+                        _recheck_key = derive_model_key(workflow)
+                        if _recheck_key != request_model_key:
+                            print(
+                                "[v2.g1_identity_guard] plan_receipt_key!=binding_key "
+                                f"plan_hash={request_model_key.stable_hash[:16]} "
+                                f"binding_hash={_recheck_key.stable_hash[:16]}",
+                                flush=True,
+                            )
+                    except Exception:
+                        pass
                 snapshot_key = self._cpu_snapshot_models.model_key
                 snapshot_spec = self._cpu_snapshot_models.model_spec
                 _role_report = _canonical_role_match_report(
@@ -10789,6 +12163,19 @@ class ModalRuntimeEntrypoint:
                                     )
                                 except Exception:
                                     pass
+                                # ── D6 restore-side lifecycle checkpoint ──
+                                # (default-OFF diagnostics) bridge binding
+                                # completed on the request-time activation path:
+                                # record the served snapshot clip state.
+                                try:
+                                    from .clip_fast_hydration_wiring import clip_state_checkpoint
+                                    clip_state_checkpoint(
+                                        trace,
+                                        "restore_after_cpu_snapshot_bridge",
+                                        self._cpu_snapshot_models,
+                                    )
+                                except Exception:
+                                    pass
                                 _rt_state.snapshot_model_identities = {
                                     "unet": str(
                                         getattr(request_model_key, "unet_identity", "") or ""
@@ -10882,6 +12269,11 @@ class ModalRuntimeEntrypoint:
                             "cpu_snapshot_clip_reused": 1,
                             "cpu_snapshot_unet_reused": 0 if (_bypass_snapshot_unet or _clip_vae_only_bind) else 1,
                             "unet_source": _unet_source,
+                            "unet_loader_execution_identity": (
+                                "cpu_snapshot"
+                                if _unet_source == "cpu_snapshot"
+                                else "normal_loader"
+                            ),
                             "clip_source": _clip_source,
                             "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
                             "clip_object_type": type(self._cpu_snapshot_models.clip).__name__,
@@ -10889,6 +12281,18 @@ class ModalRuntimeEntrypoint:
                             "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
                         },
                     )
+                    # ── D6 restore-side lifecycle checkpoint (default-OFF) ──
+                    # Request-time activation completed: the snapshot models
+                    # are validated + bound.  Record the served clip state.
+                    try:
+                        from .clip_fast_hydration_wiring import clip_state_checkpoint
+                        clip_state_checkpoint(
+                            trace,
+                            "restore_after_snapshot_model_validation",
+                            self._cpu_snapshot_models,
+                        )
+                    except Exception:
+                        pass
                 else:
                     # Model identity differs — clear bridge and deactivate.
                     if _is_production_profile():
@@ -11038,6 +12442,7 @@ class ModalRuntimeEntrypoint:
         # falling back to the original loader.  schedule_execution_prefill
         # is idempotent (a second call is a no-op), so no duplicate
         # construction happens when a restore already scheduled prefill.
+        trace.emit("execution_prefill_schedule_start", phase="execution")
         _execution_prefill_scheduled = bool(
             self._preload_bridge.schedule_execution_prefill(
                 trace=trace,
@@ -11045,6 +12450,7 @@ class ModalRuntimeEntrypoint:
                 activation_diagnostic_state=_activation_diagnostic_state,
             )
         )
+        trace.emit("execution_prefill_schedule_end", phase="execution")
 
         # ── Execution-phase native fast-disk UNET preparation ──────────
         # Schedule immediately after the CLIP prefill so the native
@@ -11139,6 +12545,12 @@ class ModalRuntimeEntrypoint:
             # preparation into the execution trace so they are not lost.
             self._preload_bridge.drain_worker_events(trace)
             self._preload_bridge.close_workers()
+            try:
+                from comfymodal_runtime.fast_cold_orchestration import finalize_request
+
+                finalize_request(_orchestration_request_id, trace)
+            except Exception:
+                pass
             _completed_diagnosis = (
                 result.get("trace", {}).get("activation_diagnosis")
                 if isinstance(result.get("trace"), dict)
@@ -11290,6 +12702,12 @@ class ModalRuntimeEntrypoint:
             # are terminal before draining diagnostics (same ordering as
             # success path: join first, then drain).
             self._preload_bridge.close_workers()
+            try:
+                from comfymodal_runtime.fast_cold_orchestration import finalize_request
+
+                finalize_request(_orchestration_request_id, trace)
+            except Exception:
+                pass
             self._join_legacy_background_threads(api)
             # Drain bg diagnostics on exception path too
             try:
@@ -11582,6 +13000,8 @@ class ModalRuntimeEntrypoint:
 
         workflow = _thaw(plan.workflow)
         # ── Step-1 plan-carried validation proof: instrumentation only, never consumed ──
+        # Batch-D5: plan-proof computation start.
+        trace.emit("plan_proof_start", phase="setup")
         _pp = plan.validation if isinstance(plan.validation, Mapping) else {}
         _pp_schema = _pp.get("schema_version", 0) if _pp else 0
         _pp_validated = bool(_pp.get("validated", False))
@@ -12358,6 +13778,7 @@ class ModalRuntimeEntrypoint:
                         "enabled": True,
                         "prompt_id": prompt_id,
                         "output_format": legacy_options.get("output_format", "original"),
+                        "output_mode": legacy_options.get("output_mode", "original"),
                         "quality": legacy_options.get("quality", 75),
                         "webp_lossless_compression": legacy_options.get(
                             "webp_lossless_compression", "balanced"
@@ -12591,6 +14012,7 @@ class ModalRuntimeEntrypoint:
                                         )
                                         trace.emit("output_encode_end", phase="execution", metadata={
                                             "duration_ms": _enc_dur,
+                                            **_last_png_encode_info_meta(),
                                         })
                                 # First sampler-related node
                                 if ("first_sampler_node" not in _milestones
@@ -12780,6 +14202,21 @@ class ModalRuntimeEntrypoint:
                     pass
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
+                    # ── Task-1 opt-signature memo identity stash ──
+                    # Stash the plan identity BEFORE execution so the
+                    # executor's memo lookup can correlate this request with
+                    # any persisted prompt-signature memo entries.  Pure
+                    # instrumentation; never raises on the execution path.
+                    try:
+                        _pre_sampler_state["opt_exec_signature_memo_identity"] = {
+                            "workflow_hash": plan.workflow_hash,
+                            "source_workflow_hash": plan.source_workflow_hash,
+                            "deployment_combined_hash": (plan.deployment_identity or {}).get("deployment_combined_hash", ""),
+                            "custom_node_generation": (plan.deployment_identity or {}).get("custom_nodes_generation", ""),
+                            "registry_proof": (plan.deployment_identity or {}).get("registry_proof") or {},
+                        }
+                    except Exception:
+                        pass
                     if callable(execute_async):
                         execute_result = execute_async(**execute_kwargs)
                         if inspect.isawaitable(execute_result):
@@ -12935,6 +14372,116 @@ class ModalRuntimeEntrypoint:
             if _first_sampler_ns is not None and _sampling_start_ns is not None:
                 _sampler_node_to_sampler_start_ms = round((_sampling_start_ns - _first_sampler_ns) / 1_000_000, 3)
                 _pre_sampler_state["sampler_node_to_sampler_start_ms"] = _sampler_node_to_sampler_start_ms
+            # ── Prompt-executor breakdown enrichment (additive) ──
+            # Remote stdout never reaches the benchmark capture, so the same
+            # opt_exec_* sub-spans the stdout breakdown line renders are also
+            # attached to this event's metadata.  Only real (non-None) values
+            # are emitted; missing keys are omitted.  The event name and all
+            # existing metadata keys are unchanged.
+            _breakdown: dict[str, Any] = {}
+            try:
+                _bd_state = _pre_sampler_state if isinstance(_pre_sampler_state, dict) else {}
+                _bd_spec = (
+                    ("dynamic_prompt_ms", "opt_exec_dynamic_prompt_ms"),
+                    ("is_changed_ms", "opt_exec_is_changed_ms"),
+                    ("signature_keys_total_ms", "opt_exec_signature_keys_total_ms"),
+                    ("seed_apply_ms", "opt_exec_seed_apply_ms"),
+                    ("clean_unused_ms", "opt_exec_clean_unused_ms"),
+                    ("cache_gather_ms", "opt_exec_cache_gather_ms"),
+                    ("cleanup_gc_ms", "opt_exec_cleanup_gc_ms"),
+                    ("c2f_topo_walk_ms", "opt_exec_topo_walk_ms"),
+                    ("c2f_topo_input_info_ms", "opt_exec_topo_input_info_ms"),
+                    ("c2f_stage_ms", "opt_exec_stage_ms"),
+                )
+                for _bd_key, _bd_state_key in _bd_spec:
+                    _bd_val = _bd_state.get(_bd_state_key)
+                    if _bd_val is None:
+                        continue
+                    try:
+                        _breakdown[_bd_key] = round(float(_bd_val), 3)
+                    except (TypeError, ValueError):
+                        continue
+                # c2f_topo_other_ms: sub-split residual of the topo walk
+                # (topo_walk − topo_input_info).  Diagnostic decomposition only;
+                # never joins the c2f children reconciliation (which the host
+                # formatter keeps as topo, stage, prefix).
+                _bd_topo = _bd_state.get("opt_exec_topo_walk_ms")
+                _bd_topo_input = _bd_state.get("opt_exec_topo_input_info_ms")
+                if _bd_topo is not None and _bd_topo_input is not None:
+                    try:
+                        _breakdown["c2f_topo_other_ms"] = round(
+                            max(0.0, float(_bd_topo) - float(_bd_topo_input)), 3
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                # c2f_first_node_prefix_ms is the REAL post-staging remainder:
+                # first-executing-node minus the first stage_node_execution
+                # COMPLETION stamp (opt_exec_stage_end_mono_ns, recorded by
+                # runtime_executor).  The old full-window form
+                # (first_executing_node_monotonic_ns − execution_cached) was
+                # the entire cached→first-node parent, double-counting
+                # topo_walk + stage (RUN-1 emitted c2f_residual_ms=-138.269).
+                # Omitted entirely when the stage-end stamp is unavailable.
+                _bd_stage_end_mono = _bd_state.get("opt_exec_stage_end_mono_ns")
+                if _first_exec_node_ns is not None and _bd_stage_end_mono is not None:
+                    try:
+                        _breakdown["c2f_first_node_prefix_ms"] = round(
+                            max(0, int(_first_exec_node_ns) - int(_bd_stage_end_mono))
+                            / 1_000_000,
+                            3,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                # Task-1 opt-signature memo evidence (additive; same source as
+                # the [v2.prompt_executor_breakdown] stdout line).  The
+                # executor patch records these under opt_exec_signature_memo_*;
+                # breakdown-line names are signature_cache_*.  Each field is
+                # emitted only when its state key is present — absent keys are
+                # never fabricated (the host formatter reads this metadata
+                # dict, so the host-visible line now carries the Task-1 fields
+                # whenever the container line does).
+                _bd_sig_spec = (
+                    ("signature_cache_requested", "opt_exec_signature_memo_requested"),
+                    ("signature_cache_eligible", "opt_exec_signature_memo_eligible"),
+                    ("signature_cache_hit", "opt_exec_signature_memo_hit"),
+                    ("signature_cache_source", "opt_exec_signature_memo_source"),
+                    ("signature_cache_key_hash", "opt_exec_signature_memo_key_hash"),
+                    ("signature_cache_fallback", "opt_exec_signature_memo_fallback"),
+                    ("signature_reuse_ms", "opt_exec_signature_reuse_ms"),
+                )
+                for _bd_sig_key, _bd_sig_state_key in _bd_sig_spec:
+                    if _bd_sig_state_key not in _bd_state:
+                        continue
+                    _bd_sig_val = _bd_state.get(_bd_sig_state_key)
+                    if _bd_sig_val is None:
+                        continue
+                    if _bd_sig_key == "signature_reuse_ms":
+                        try:
+                            _breakdown[_bd_sig_key] = round(float(_bd_sig_val), 3)
+                        except (TypeError, ValueError):
+                            continue
+                    else:
+                        # Keep native types (bool/str/int) so the host sees the
+                        # same truthy/string values as the stdout breakdown line.
+                        _breakdown[_bd_sig_key] = _bd_sig_val
+                # Topo-lazy deterministic fast path (cached→first-node fix) —
+                # additive evidence mirroring the [v2.prompt_executor_breakdown]
+                # stdout line (topo_lazy_hits = memoized get_input_info calls,
+                # topo_lazy_pending = persisted entries this request).  Each
+                # field is emitted only when its state key is present.
+                _bd_topo_lazy_spec = (
+                    ("topo_lazy_hits", "opt_exec_topo_lazy_hit_count"),
+                    ("topo_lazy_pending", "opt_exec_topo_lazy_saved_count"),
+                )
+                for _bd_tl_key, _bd_tl_state_key in _bd_topo_lazy_spec:
+                    if _bd_tl_state_key not in _bd_state:
+                        continue
+                    _bd_tl_val = _bd_state.get(_bd_tl_state_key)
+                    if _bd_tl_val is None:
+                        continue
+                    _breakdown[_bd_tl_key] = _bd_tl_val
+            except Exception:
+                _breakdown = {}
             if _milestones:
                 trace.emit("prompt_executor_milestones", phase="execution", metadata={
                     "executor_call_to_execution_start_ms": _exec_st_val,
@@ -12964,7 +14511,34 @@ class ModalRuntimeEntrypoint:
                     "first_clip_encode_node_monotonic_ns": _first_clip_ns,
                     "first_sampler_node_monotonic_ns": _first_sampler_ns,
                     "sampling_start_monotonic_ns": _sampling_start_ns,
+                    # Additive breakdown: opt_exec_* sub-spans from the
+                    # per-request instrumentation state (only real values).
+                    "breakdown": _breakdown,
                 })
+
+            # ── Bounded instrumentation: prompt-executor breakdown ─────────
+            # One stdout-only line decomposing execution_start→cached and
+            # cached→first-node into the captured opt_exec_* sub-spans.
+            # No trace event is emitted here (trace-whitelist unchanged);
+            # values missing from state render "absent" and residuals
+            # reconcile exactly as parent − sum(children).  Bounded: never
+            # raises and adds no new whitelisted trace events.
+            try:
+                from comfymodal_runtime.runtime_executor import (
+                    build_prompt_executor_breakdown_line,
+                )
+                print(
+                    build_prompt_executor_breakdown_line(
+                        request_id=str(context.request_id),
+                        exec_to_cached_ms=_exec_to_cache,
+                        cached_to_first_node_ms=_cache_to_node,
+                        state=_pre_sampler_state,
+                        executing_mono_ns=_first_ns,
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
 
             # â”€â”€ Classify sampler stage from authoritative sampler evidence â”€â”€
             _sampler_stage_status: str = "awaiting_classification"
@@ -13241,11 +14815,21 @@ class ModalRuntimeEntrypoint:
                 phase="execution",
                 metadata={"elapsed_ms": round((time.time() - started) * 1000.0, 3)},
             )
-            if context.cancelled and context.cancelled():
-                raise RuntimeError("execution cancelled after PromptExecutor completion")
-            if getattr(executor, "success", True) is False:
+            # Completion-first post-executor gate: a SUCCESSFUL PromptExecutor
+            # completion always wins over a late watcher cancel (a cancel
+            # message arriving after completion must never discard the produced
+            # outputs).  Only a non-successful execution may be reclassified as
+            # cancelled by a confirmed remote cancel.
+            _executor_success = getattr(executor, "success", True) is not False
+            _post_executor_cancel_msg = resolve_post_executor_cancel(
+                context.cancelled, _executor_success,
+            )
+            if _post_executor_cancel_msg is not None:
+                raise RuntimeError(_post_executor_cancel_msg)
+            if not _executor_success:
                 raise RuntimeError(self._executor_error_message(executor))
 
+            _stage13_output_collect_start_mono_ns = time.monotonic_ns()
             trace.emit("output_collect_start", phase="output")
             registry = pop_outputs(prompt_id) if production_enabled and callable(pop_outputs) else {}
             if not isinstance(registry, Mapping):
@@ -13295,8 +14879,20 @@ class ModalRuntimeEntrypoint:
                 if production_enabled:
                     raise RuntimeError("v2 production execution produced no materializable output")
                 selected = Attempt(strategy="none", success=False, error="no output")
-            output_format = str(legacy_options.get("output_format", "original") or "original")
-            if selected.success and selected.strategy != "direct_output_sink" and output_format != "original":
+            _raw_output_format = legacy_options.get("output_format", "original")
+            output_format = _contracts_mod.normalize_output_format(_raw_output_format)
+            _quality_default = (
+                _contracts_mod.DEFAULT_PREVIEW_QUALITY
+                if str(_raw_output_format or "").strip().lower() == "webp"
+                else _contracts_mod.DEFAULT_OUTPUT_QUALITY
+            )
+            _output_quality = _contracts_mod.normalize_quality(
+                legacy_options.get("quality"), default=_quality_default
+            )
+            _lossless_method = _contracts_mod.normalize_webp_lossless_compression(
+                legacy_options.get("webp_lossless_compression", "balanced")
+            )
+            if _should_run_posthoc_output_conversion(selected, output_format):
                 trace.emit(
                     "output_conversion_start",
                     phase="output",
@@ -13309,10 +14905,8 @@ class ModalRuntimeEntrypoint:
                     converted = convert_output_items(
                         list(selected.items),
                         output_format=output_format,
-                        quality=int(legacy_options.get("quality", 75) or 75),
-                        webp_lossless_compression=str(
-                            legacy_options.get("webp_lossless_compression", "balanced")
-                        ),
+                        quality=_output_quality,
+                        webp_lossless_compression=_lossless_method,
                     )
                 except ConversionFailedError as exc:
                     # The registry path is already encoded by the production
@@ -13345,7 +14939,7 @@ class ModalRuntimeEntrypoint:
                     )
                 if selected_index is not None:
                     attempts[selected_index] = selected
-                _conv_ok = selected.success and selected.strategy != "direct_output_sink" and output_format != "original"
+                _conv_ok = _should_run_posthoc_output_conversion(selected, output_format)
                 trace.emit(
                     "output_conversion_end",
                     phase="output",
@@ -13368,10 +14962,12 @@ class ModalRuntimeEntrypoint:
                 ) if _milestones.get("output_encode_started") else 0.0
                 trace.emit("output_encode_end", phase="execution", metadata={
                     "duration_ms": _enc_dur,
+                    **_last_png_encode_info_meta(),
                 })
             # output_persist_start/end: wraps actual volume persistence + descriptor
             # construction.  Distinguished from output_encode_start/end which wrap
             # the actual image encoding inside the executor (ComfyModalProductionOutput).
+            _stage13_persist_start_mono_ns = time.monotonic_ns()
             trace.emit("output_persist_start", phase="output", metadata={
                 "prompt_id": prompt_id,
                 "strategy": selected.strategy,
@@ -13379,16 +14975,19 @@ class ModalRuntimeEntrypoint:
             })
             _descriptor_start_mono_ns = time.monotonic_ns()
             selected, _asset_commit_task, _asset_diag = await self._persist_output_assets(selected)
+            _stage13_asset_write_end_mono_ns = time.monotonic_ns()
             if selected_index is not None:
                 attempts[selected_index] = selected
             if _asset_commit_task is not None:
                 await asyncio.sleep(0)
             with base64_counting_scope(selected):
                 result = attempt_to_descriptor_result(
-                selected,
-                generation=_snapshot_target_fingerprint(),
-                legacy_data=False,
-            )
+                    selected,
+                    generation=_snapshot_target_fingerprint(),
+                    legacy_data=False,
+                    output_mode=getattr(plan.execution_options, "output_mode", "original"),
+                    variant=getattr(plan.execution_options, "output_mode", "original"),
+                )
             _descriptor_end_mono_ns = time.monotonic_ns()
             trace.emit("output_persist_end", phase="output", metadata={
                 "duration_ms": round((_descriptor_end_mono_ns - _descriptor_start_mono_ns) / 1_000_000, 3),
@@ -13421,7 +15020,32 @@ class ModalRuntimeEntrypoint:
                 min(_commit_end, _descriptor_end_mono_ns) -
                 max(_commit_start, _descriptor_start_mono_ns)
             ) if _commit_start and _commit_end else 0
+            _codec_meta = [
+                item.conversion_meta
+                for item in selected.items
+                if item.conversion_meta is not None
+            ]
+            _codec_names = sorted({meta.codec for meta in _codec_meta if meta.codec})
+            _codec_quality = sorted({meta.quality for meta in _codec_meta if meta.quality is not None})
+            _codec_methods = sorted({
+                meta.webp_lossless_compression
+                for meta in _codec_meta
+                if meta.webp_lossless_compression
+            })
             result["output_diagnostics"] = {
+                "codec": _codec_names[0] if len(_codec_names) == 1 else _codec_names,
+                "quality": _codec_quality[0] if len(_codec_quality) == 1 else _codec_quality,
+                "webp_lossless_compression": (
+                    _codec_methods[0] if len(_codec_methods) == 1 else _codec_methods
+                ),
+                "output_codec_ms": round(
+                    sum(meta.output_codec_ms for meta in _codec_meta), 3
+                ),
+                "encoded_bytes": sum(meta.encoded_bytes for meta in _codec_meta),
+                "source_bytes": sum(meta.source_bytes for meta in _codec_meta),
+                "conversion_fallback": any(
+                    meta.conversion_fallback for meta in _codec_meta
+                ),
                 "output_asset_write_ms": _asset_diag.get("write_ms", 0.0),
                 "output_volume_commit_ms": _asset_diag.get("commit_ms", 0.0),
                 "output_commit_overlap_ms": round(_overlap_ns / 1_000_000, 3),
@@ -13438,6 +15062,7 @@ class ModalRuntimeEntrypoint:
                     "total_items": attempt.total_items,
                     "total_raw_bytes": attempt.total_raw_bytes,
                     "total_base64_bytes": attempt.total_base64_bytes,
+                    "total_conversion_time_ms": attempt.total_conversion_time_ms,
                     "error": attempt.error,
                     "metrics": dict(attempt.metrics),
                 }
@@ -13639,6 +15264,17 @@ class ModalRuntimeEntrypoint:
                 if isinstance(result["trace"], dict):
                     result["trace"]["activation_diagnosis"] = _ad
 
+            # ── Stage-13 decomposition boundaries (diagnostics; additive) ──
+            # Raw same-process monotonic stamps consumed by
+            # _run_plan_stream_impl to build output_stage13_breakdown.
+            # _descriptor_end_mono_ns was captured at the persist block above.
+            result["_stage13_boundaries"] = {
+                "output_collect_start_mono_ns": _stage13_output_collect_start_mono_ns,
+                "persist_start_mono_ns": _stage13_persist_start_mono_ns,
+                "asset_write_end_mono_ns": _stage13_asset_write_end_mono_ns,
+                "descriptor_end_mono_ns": _descriptor_end_mono_ns,
+                "exec_result_ready_mono_ns": time.monotonic_ns(),
+            }
             return result
         finally:
             if _seed_hook_restore is not None:
@@ -13868,6 +15504,18 @@ class ModalRuntimeEntrypoint:
                     f"fallback_reason=apply_error:{type(_seed_apply_exc).__name__}",
                     flush=True,
                 )
+            # ── Prompt-executor breakdown: capture seed-apply total into the
+            # per-request instrumentation state so the exec→cached window
+            # decomposition can include it.  Measurement-only; no-op when no
+            # instrumentation scope is active or total_ms is unavailable.
+            try:
+                from comfymodal_runtime.runtime_executor import _inst_state as _peb_inst_state
+                _peb_state = _peb_inst_state()
+                _peb_total = _seed_apply.get("total_ms")
+                if _peb_state is not None and _peb_total is not None:
+                    _peb_state["opt_exec_seed_apply_ms"] = float(_peb_total)
+            except Exception:
+                pass
             trace.emit(
                 "executor_seed_apply_end",
                 phase="execution",
@@ -14026,6 +15674,10 @@ class ModalRuntimeEntrypoint:
         _diag_holder = getattr(self, "_deferred_commit_diag", None)
         _td = getattr(self, "_teardown_diagnostics", None)
         _dc_trace = getattr(self, "_lifecycle_trace", None)
+        # Internal deferred-commit trace events are carried separately (never
+        # on the public persistence event dict) to keep the user-visible event
+        # shape stable; the yield site reads this stash for the trace merge.
+        self._deferred_commit_trace_events: list[dict] = []
 
         def _dc_trace_event(name: str, *, wall_ns: int, mono_ns: int,
                             status: str, commit_ms: float, detail: str) -> dict:
@@ -14086,13 +15738,13 @@ class ModalRuntimeEntrypoint:
                 wall_ns=_dc_skip_wall_ns, mono_ns=_dc_skip_mono_ns,
                 status="ok", commit_ms=0.0, detail="no commit needed",
             ))
+            self._deferred_commit_trace_events = list(_dc_trace_events)
             return {
                 "type": "persistence",
                 "status": "ok",
                 "commit_ms": 0.0,
                 "detail": "no commit needed",
                 "skipped": True,
-                "_trace_events": _dc_trace_events,
             }
         if _td is not None:
             _td.emit("deferred_commit_start", request_id=request_id)
@@ -14134,13 +15786,13 @@ class ModalRuntimeEntrypoint:
             wall_ns=_dc_end_wall_ns, mono_ns=_dc_end_mono_ns,
             status=status, commit_ms=commit_ms, detail=detail,
         ))
+        self._deferred_commit_trace_events = list(_dc_trace_events)
         return {
             "type": "persistence",
             "status": status,
             "commit_ms": commit_ms,
             "detail": detail,
             "skipped": False,
-            "_trace_events": _dc_trace_events,
         }
 
     def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
@@ -14253,6 +15905,7 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET",
             "COMFYMODAL_V2_RESOURCE_TELEMETRY",
             "COMFYMODAL_V2_ENV_PROFILE",
+            "COMFYMODAL_V2_ATOMIC_PROFILE",
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
             "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
             "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE",
@@ -14271,12 +15924,57 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST",
             "COMFYMODAL_V2_PREFILL_LANES",
             "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET",
+            "COMFYMODAL_V2_UNET_FASTSAFETENSORS",
+            "COMFYMODAL_V2_CLIP_FAST_HYDRATION",
+            "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS",
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS",
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST",
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA",
+            "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION",
+            "COMFYMODAL_V2_SCOPED_CUDA_READINESS",
+            "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS",
+            "COMFYMODAL_V2_INPUT_TYPES_WARM",
+            "COMFYMODAL_V2_UNET_FORENSICS",
+            "COMFYMODAL_V2_STAGED_SAFETENSORS",
+            "COMFYMODAL_V2_STAGED_SOURCE_ORDER",
+            "COMFYMODAL_V2_STAGED_PRODUCERS",
+            "COMFYMODAL_V2_STAGED_POOL_MB",
+            "COMFYMODAL_V2_STAGED_BUCKET_MB",
+            "COMFYMODAL_V2_STAGED_CPU_CAST",
+            "COMFYMODAL_V2_STAGED_ASYNC_H2D",
+            "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS",
+            "COMFYMODAL_V2_CLIP_STAGED_HYDRATION",
+            "COMFYMODAL_V2_C9QD_EXTRAS",
+            "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS",
+            "COMFYMODAL_V2_GANTT_TELEMETRY",
+            "COMFYMODAL_V2_E27_FORENSICS",
+            "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS",
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES",
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB",
+            "COMFYMODAL_V2_UNET_FASTSAFE_THREADS",
+            "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES",
+            "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB",
+            "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE",
         )
         env = {key: os.environ.get(key, "") for key in keys}
         env["MODAL_CLOUD_PROVIDER"] = os.environ.get("MODAL_CLOUD_PROVIDER", "")
         env["MODAL_REGION"] = os.environ.get("MODAL_REGION", "")
         env["MODAL_IMAGE_ID"] = os.environ.get("MODAL_IMAGE_ID", "")
         env["COMFYMODAL_V2_APP_NAME"] = os.environ.get("COMFYMODAL_V2_APP_NAME", "")
+        # Capability read: does the deployed code carry the fastsafetensors
+        # loader gate AND is it enabled?  Proves both env delivery and that
+        # the branch exists in the deployed source.
+        try:
+            from comfymodal_runtime.model_preload import _fs_flag_value, _fs_pipeline_enabled
+            env["_comfymodal_fs_flag_value"] = str(_fs_flag_value())
+            env["_comfymodal_fs_pipeline_enabled"] = "1" if _fs_pipeline_enabled() else "0"
+        except Exception as _exc_fs_probe:
+            env["_comfymodal_fs_capability_error"] = (
+                f"{type(_exc_fs_probe).__name__}: {str(_exc_fs_probe)[:120]}")
         result: dict[str, Any] = {
             "status": "ok",
             "request_id": str(request_id or ""),
@@ -14471,6 +16169,7 @@ class ModalRuntimeEntrypoint:
                 getattr(_mod, "_V2_DEPLOYMENT_COMBINED_HASH", "") or ""
             )
             custom_nodes_generation = ""
+            overall_dependency_hash = ""
             _legacy = getattr(self, "_legacy_module", None)
             if _legacy is not None:
                 try:
@@ -14478,8 +16177,12 @@ class ModalRuntimeEntrypoint:
                     custom_nodes_generation = str(
                         _mft.get("production_custom_node_generation", "") or ""
                     )
+                    overall_dependency_hash = str(
+                        _mft.get("overall_dependency_hash", "") or ""
+                    )
                 except Exception:  # noqa: BLE001
                     custom_nodes_generation = ""
+                    overall_dependency_hash = ""
             comfyui_version = ""
             try:
                 import comfyui_version as _cv  # noqa: PLC0415
@@ -14516,6 +16219,7 @@ class ModalRuntimeEntrypoint:
             return {
                 "deployment_combined_hash": _deployment_combined_hash,
                 "custom_nodes_generation": custom_nodes_generation,
+                "overall_dependency_hash": overall_dependency_hash,
                 "comfyui_version": comfyui_version,
                 "registry_manifest": registry_manifest,
                 "registry_manifest_class_count": len(
@@ -14523,17 +16227,22 @@ class ModalRuntimeEntrypoint:
                 ),
                 "comfyui_commit": _diag_commit,
                 "core_module_sha256s": _diag_core_sha,
+                "atomic_profile": os.environ.get(
+                    "COMFYMODAL_V2_ATOMIC_PROFILE", ""
+                ),
                 "source": "container_readback",
             }
         except Exception as exc:  # noqa: BLE001
             return {
                 "deployment_combined_hash": "",
                 "custom_nodes_generation": "",
+                "overall_dependency_hash": "",
                 "comfyui_version": "",
                 "registry_manifest": {},
                 "registry_manifest_class_count": 0,
                 "comfyui_commit": "",
                 "core_module_sha256s": {"nodes.py": "", "execution.py": ""},
+                "atomic_profile": "",
                 "source": "container_readback",
                 "error": f"{type(exc).__name__}: {str(exc)[:300]}",
             }
@@ -14696,6 +16405,319 @@ class ModalRuntimeEntrypoint:
             f"entry_wall_unix_ns={entry_wall_ns}",
             flush=True,
         )
+        return _result
+
+    def run_unet_mechanism_probe(
+        self,
+        model_name: str,
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY measurement probe for the V2 CUDA-loader salvage
+        experiment (``comfymodal_runtime.unet_salvage_probe``).
+
+        Resolves *model_name* under ``diffusion_models`` via the top-level
+        ``folder_paths`` (``get_full_path_or_raise`` with a
+        ``get_full_path`` fallback) and runs the full measurement-only
+        mechanism battery (``run_unet_mechanism_probes``) against the
+        resolved path.  The probe never loads a live model, never mutates
+        production loader state, and always returns a JSON-safe dict (never
+        raises).  Invoked from a shadow deployment as::
+
+            modal.Function.lookup(APP, "run_unet_mechanism_probe").remote(unet_name)
+
+        Every OS/Linux-only capability (os.preadv / os.posix_fadvise / GDS /
+        cudaHostRegister) degrades to a named ``skipped``/``error`` entry.
+        """
+        _model_name = str(model_name or "")
+        _resolved = ""
+        try:
+            import folder_paths as _fp_usp
+            _resolver = getattr(_fp_usp, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_usp, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _resolved = _resolver("diffusion_models", _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.unet_salvage_probe import (  # noqa: PLC0415
+                run_unet_mechanism_probes,
+            )
+            _result = run_unet_mechanism_probes(str(_resolved))
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["model_name"] = _model_name
+        _result["resolved_path"] = str(_resolved)
+        return _result
+
+    def run_unet_qd_probe(
+        self,
+        model_name: str,
+        mode: str = "evidence",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY measurement battery for the C9 Modal Volume
+        queue-depth shootout (``comfymodal_runtime.unet_qd_probe``).
+
+        Resolves *model_name* under ``diffusion_models`` (same resolver as
+        ``run_unet_mechanism_probe``) and runs the measurement-only battery:
+
+          mode="structural": env + file + header reconcile + one QD1 256 MiB
+              preadv config + external-loader import checks (cheap paid gate);
+          mode="evidence": native mmap baseline, sequential preadv full-file,
+              the bounded QD x block screen, full-file QD2/4/8 (+QD16 when
+              still scaling), warm-QD1 cache control, one storage->pinned->
+              async-GPU transfer phase, and the external loader battery
+              (Run:ai Model Streamer / fastsafetensors, when installed in the
+              image) with full validity checking.
+
+        The probe never loads a live model, never mutates production loader
+        state, and always returns a JSON-safe dict (never raises).  Invoked
+        from a shadow deployment as::
+
+            modal.Function.lookup(APP, "run_unet_qd_probe").remote(
+                unet_name, "evidence")
+
+        Every OS/Linux-only capability (os.preadv / /proc / resource /
+        pin_memory) degrades to a named ``skipped``/``error`` entry.
+        """
+        _model_name = str(model_name or "")
+        _mode = str(mode or "evidence")
+        _resolved = ""
+        try:
+            import folder_paths as _fp_qdp
+            _resolver = getattr(_fp_qdp, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_qdp, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _resolved = _resolver("diffusion_models", _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.unet_qd_probe import (  # noqa: PLC0415
+                run_unet_qd_probe_battery,
+            )
+            _result = run_unet_qd_probe_battery(str(_resolved), mode=_mode)
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["model_name"] = _model_name
+        _result["mode"] = _mode
+        _result["resolved_path"] = str(_resolved)
+        return _result
+
+    def run_clip_qd_probe(
+        self,
+        model_name: str,
+        mode: str = "evidence",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY measurement battery for the C9 queue-depth shootout
+        applied to a CLIP/text-encoder file (Batch E27 Target A).
+
+        Resolves *model_name* under ``text_encoders`` and runs the same
+        measurement-only QD battery as ``run_unet_qd_probe`` (the battery is
+        file-generic: mmap baseline, sequential preadv, QD x block screen,
+        full-file QD2/4/8, warm control, GPU transfer phase, external loaders).
+        Never loads a live model, never mutates production state, always
+        returns a JSON-safe dict.
+        """
+        _model_name = str(model_name or "")
+        _mode = str(mode or "evidence")
+        _resolved = ""
+        try:
+            import folder_paths as _fp_qdp
+            _resolver = getattr(_fp_qdp, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_qdp, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _resolved = _resolver("text_encoders", _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.unet_qd_probe import (  # noqa: PLC0415
+                run_unet_qd_probe_battery,
+            )
+            _result = run_unet_qd_probe_battery(str(_resolved), mode=_mode)
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+            _result["probe"] = "clip_qd"
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["model_name"] = _model_name
+        _result["mode"] = _mode
+        _result["resolved_path"] = str(_resolved)
+        return _result
+
+    def run_e27_followup_probe(
+        self,
+        kind: str,
+        model_name: str = "",
+        *,
+        device: str = "cuda:0",
+        cells: list[dict[str, Any]] | None = None,
+        control_first: bool = True,
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY E27 Follow-Up A probe battery (measurement only).
+
+        ``kind`` selects the battery:
+
+        * ``enumerate_dtypes`` — exact per-dtype tensor/byte enumeration of
+          a real safetensors header (model_name under ``text_encoders``).
+        * ``fastsafe_screen`` — the fastsafetensors threads x max_copy_block
+          screening matrix against a real model file (model_name under
+          ``diffusion_models`` or ``text_encoders``; ``device`` default
+          ``cuda:0``).  Cell 0 is the first model-payload access in this
+          container; every buffer is closed at cell end (probe-only).
+        * ``resident_clip_dtypes`` — inspect the hydrated snapshot CLIP
+          model's resident dtype distribution (no model_name needed).
+
+        Never loads a live production model, never mutates production loader
+        state, always returns a JSON-safe dict (never raises).
+        """
+        _kind = str(kind or "")
+        _model_name = str(model_name or "")
+        if _kind == "resident_clip_dtypes":
+            try:
+                from comfymodal_runtime.e27_followup_probe import (  # noqa: PLC0415
+                    inspect_resident_clip_dtypes,
+                )
+                return {
+                    "status": "ok",
+                    "probe": "resident_clip_dtypes",
+                    **inspect_resident_clip_dtypes(
+                        getattr(self, "_cpu_snapshot_models", None)
+                    ),
+                }
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "probe": "resident_clip_dtypes",
+                    "error": f"{type(exc).__name__}:{str(exc)[:200]}",
+                }
+        _resolved = ""
+        try:
+            import folder_paths as _fp_e27
+
+            _resolver = getattr(_fp_e27, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_e27, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "kind": _kind,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _folder = (
+                "diffusion_models"
+                if _kind == "fastsafe_screen" and _model_name.startswith("z_image")
+                else "text_encoders"
+            )
+            _resolved = _resolver(_folder, _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "kind": _kind,
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "kind": _kind,
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.e27_followup_probe import (  # noqa: PLC0415
+                enumerate_safetensors_dtypes,
+                run_fastsafe_firsttouch_screen,
+            )
+
+            if _kind == "enumerate_dtypes":
+                _result = enumerate_safetensors_dtypes(str(_resolved))
+                _result["probe"] = "enumerate_dtypes"
+            elif _kind == "fastsafe_screen":
+                _result = run_fastsafe_firsttouch_screen(
+                    str(_resolved),
+                    device=str(device),
+                    cells=cells,
+                    control_first=control_first,
+                )
+                _result["probe"] = "fastsafe_screen"
+            else:
+                _result = {
+                    "status": "error",
+                    "kind": _kind,
+                    "error": f"unknown_kind:{_kind}",
+                }
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "kind": _kind,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["kind"] = _kind
+        _result["model_name"] = _model_name
+        _result["resolved_path"] = str(_resolved)
         return _result
 
     def publish_restore_plan(
@@ -14922,14 +16944,45 @@ class ModalRuntimeEntrypoint:
                 getattr(state, "snapshot_custom_node_generation", "")
                 or getattr(state, "custom_node_generation", "") or ""
             )
-            payload = build_invocation_seed_payload(
-                workflow,
-                output_node_ids=tuple(getattr(plan, "output_node_ids", ()) or ()),
-                workflow_hash=str(plan.workflow_hash or ""),
-                source_workflow_hash=str(plan.source_workflow_hash or ""),
-                custom_node_generation=custom_node_generation,
-                deployment_combined_hash=deployment_hash,
+            # ── E25: exact-identity cache for the pure seed payload builder.
+            # The payload is a pure function of (workflow, output_node_ids,
+            # workflow_hash, source_workflow_hash, custom_node_generation,
+            # deployment_combined_hash) — all captured in the identity key.
+            # Only the PAYLOAD is cached; hydration of mutable container state
+            # (``state.hydrate_snapshot_seed_payload``) always runs on the
+            # caller thread, exactly as before.  Fail-closed: any cache
+            # failure falls back to the original inline build.
+            _seed_cache_identity = self._pre_graph_cache_identity_key(
+                plan, include_workflow_hash=True
             )
+            _seed_cache_key = f"{_seed_cache_identity}:seed_payload:{str(plan.output_node_ids or ())}"
+            try:
+                from comfymodal_runtime.pre_graph_cache import (
+                    get_pre_graph_cache,
+                    with_cache,
+                )
+
+                payload = with_cache(
+                    get_pre_graph_cache(),
+                    _seed_cache_key,
+                    lambda: build_invocation_seed_payload(
+                        workflow,
+                        output_node_ids=tuple(getattr(plan, "output_node_ids", ()) or ()),
+                        workflow_hash=str(plan.workflow_hash or ""),
+                        source_workflow_hash=str(plan.source_workflow_hash or ""),
+                        custom_node_generation=custom_node_generation,
+                        deployment_combined_hash=deployment_hash,
+                    ),
+                )
+            except Exception:
+                payload = build_invocation_seed_payload(
+                    workflow,
+                    output_node_ids=tuple(getattr(plan, "output_node_ids", ()) or ()),
+                    workflow_hash=str(plan.workflow_hash or ""),
+                    source_workflow_hash=str(plan.source_workflow_hash or ""),
+                    custom_node_generation=custom_node_generation,
+                    deployment_combined_hash=deployment_hash,
+                )
             if payload is None:
                 return {
                     "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
@@ -15049,6 +17102,8 @@ class ModalRuntimeEntrypoint:
         *,
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
+        control_queue: Any = None,
+        control_partition: Any = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self._lazy_init_snapshot_state()
         self._resource_tel = None
@@ -15084,12 +17139,29 @@ class ModalRuntimeEntrypoint:
             self._deferred_commit_task = None
             self._deferred_commit_diag = None
             self._deferred_commit_pending = False
+        # ── Cooperative remote-cancel bridge (per-invocation watcher) ─────
+        # One daemon watcher per invocation polls the hydrated control Queue
+        # partition while execution is busy.  It is stopped/joined boundedly in
+        # the finally below (and again by the executor-stream guard inside the
+        # impl), so it can never outlive the invocation.  Only started when a
+        # control queue is supplied — the no-cancel path is unchanged.
+        _remote_watcher: RemoteCancelWatcher | None = None
+        if control_queue is not None:
+            _remote_watcher = RemoteCancelWatcher(
+                control_queue,
+                control_partition,
+                request_id=request_id,
+            )
+            _remote_watcher.start()
         terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
                 plan_payload, request_id=request_id, cancelled=cancelled,
+                control_queue=control_queue,
+                control_partition=control_partition,
+                _remote_cancel_watcher=_remote_watcher,
             ):
-                if not terminal_started and event.get("type") in {"result", "error"}:
+                if not terminal_started and event.get("type") in {"result", "error", "cancelled"}:
                     terminal_started = True
                     self._terminal_response_delivered = True
                     if diagnostics is not None:
@@ -15098,9 +17170,26 @@ class ModalRuntimeEntrypoint:
                             "request_terminal_start",
                             terminal_status=str(event.get("type", "unknown")),
                         )
+                    # ── Terminal cleanup window stamps (Batch-A B) ──
+                    # Start immediately before the synchronous cleanup so the
+                    # host can separate app-side cleanup from platform result
+                    # transport (remote_cleanup_ms / transport_after_cleanup_ms).
+                    # Pure timing, rides the existing result data.
+                    _cleanup_start_wall_ns = time.time_ns()
+                    _cleanup_start_mono_ns = time.monotonic_ns()
                     self._run_terminal_cleanup_sync(
                         diagnostics=diagnostics,
                         request_id=request_id,
+                    )
+                    _cleanup_end_wall_ns = time.time_ns()
+                    _cleanup_end_mono_ns = time.monotonic_ns()
+                    _stamp_terminal_cleanup(
+                        event,
+                        start_wall_ns=_cleanup_start_wall_ns,
+                        start_mono_ns=_cleanup_start_mono_ns,
+                        end_wall_ns=_cleanup_end_wall_ns,
+                        end_mono_ns=_cleanup_end_mono_ns,
+                        request_id=str(request_id or ""),
                     )
                 yield event
         except Exception as exc:
@@ -15108,22 +17197,40 @@ class ModalRuntimeEntrypoint:
                 terminal_started = True
                 if diagnostics is not None:
                     diagnostics.emit("request_terminal_start", terminal_status="exception")
+                _cleanup_start_wall_ns = time.time_ns()
+                _cleanup_start_mono_ns = time.monotonic_ns()
                 self._run_terminal_cleanup_sync(
                     diagnostics=diagnostics,
                     request_id=request_id,
                 )
-            yield {
-                "type": "error",
-                "phase": "setup_failed",
-                "message": (
-                    f"run_plan_stream failed: {type(exc).__name__}: {exc}"
-                ),
-                "request_id": request_id or "",
-            }
+                _cleanup_end_wall_ns = time.time_ns()
+                _cleanup_end_mono_ns = time.monotonic_ns()
+                _err_event = {
+                    "type": "error",
+                    "phase": "setup_failed",
+                    "message": (
+                        f"run_plan_stream failed: {type(exc).__name__}: {exc}"
+                    ),
+                    "request_id": request_id or "",
+                }
+                _stamp_terminal_cleanup(
+                    _err_event,
+                    start_wall_ns=_cleanup_start_wall_ns,
+                    start_mono_ns=_cleanup_start_mono_ns,
+                    end_wall_ns=_cleanup_end_wall_ns,
+                    end_mono_ns=_cleanup_end_mono_ns,
+                    request_id=str(request_id or ""),
+                )
+                yield _err_event
         finally:
             # Capture whether a real terminal result/error event was produced
             # BEFORE the forced generator_closed fallback below mutates the flag.
             _terminal_was_yielded = terminal_started
+            # Stop the remote-cancel watcher (idempotent: the executor-stream
+            # guard already joined it; this covers early setup failures and
+            # streams closed before the executor ran).
+            if _remote_watcher is not None:
+                _remote_watcher.stop_and_join()
             if not getattr(self, "_terminal_cleanup_done", False):
                 # Cleanup did not run synchronously at terminal identification
                 # (e.g. the stream was cancelled/closed before any terminal
@@ -15164,6 +17271,9 @@ class ModalRuntimeEntrypoint:
         *,
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
+        control_queue: Any = None,
+        control_partition: Any = None,
+        _remote_cancel_watcher: RemoteCancelWatcher | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # ── TRUE METHOD FIRST LINE (before any identity or trace exists) ──
         _method_first_line_ns = time.monotonic_ns()
@@ -15317,6 +17427,557 @@ class ModalRuntimeEntrypoint:
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
 
+        try:
+            from comfymodal_runtime.fast_cold_orchestration import begin_request
+
+            begin_request(
+                str(getattr(plan, "request_id", "") or _t4_request_id or request_id),
+                model_spec=getattr(plan, "model_spec", None),
+            )
+        except Exception:
+            pass
+
+        # ── Batch-A G1: start the execution-phase fast-disk UNET lane at
+        # plan receipt ──
+        # The model identity and the snapshot-unet-absent decision are both
+        # derivable the moment the plan exists; submitting the EXISTING
+        # single-flight execution-UNET lane here (instead of later in
+        # _run_in_process) starts the checkpoint read ~70-110 ms earlier on
+        # healthy runs.  Hard-gated (snapshot UNET definitively absent +
+        # role-match compatible) and fully idempotent: the later schedule
+        # call in _run_in_process becomes a no-op.  Best-effort: never raises.
+        # Batch-D5 request-schedule bracket start.
+        _setup_schedule_start_ns = time.monotonic_ns()
+        self._maybe_schedule_execution_unet_at_plan_receipt(
+            plan,
+            request_id=str(_t4_request_id or request_id),
+        )
+
+        # ── E25/E26/E28: speculative CLIP hydration lane at plan receipt ──
+        # The exact model identity (model key + loader spec + workflow/
+        # deployment identity) is known as soon as the plan is deserialized.
+        # E28: the lane was ALREADY started at restore-time (frozen manifest);
+        # this site RECONCILES its identity to the request and re-keys it.
+        # When no restore-time lane exists (gate/legacy), this starts the
+        # direct-GPU fastsafetensors CLIP file read now so the hydration is
+        # hidden under the pre-graph setup window.  The BIND stays at demand
+        # time in the authoritative hydrator; the lane is fail-closed and
+        # single-flight, and any unconsumed lane is closed at request end.
+        #
+        # E26: the lane resolves its absolute CLIP source paths from the
+        # FROZEN MANIFEST attached to the retained CLIP object (the same
+        # manifest the demand hydrator verifies against) — never a
+        # folder_paths scan on the fast path.  The lane also carries a
+        # release callback: when the speculative CLIP source read finishes
+        # (success OR failure) the CLIP-first/UNET-second coordinator is
+        # notified to release UNET source prefetch, so a failed speculative
+        # read can never delay UNET.
+        _speculative_clip_request_id = str(_t4_request_id or request_id)
+        try:
+            from comfymodal_runtime.speculative_clip_hydration import (
+                reconcile_restore_time_lane,
+            )
+
+            _spec_model_key = getattr(self, "_plan_receipt_request_model_key", None)
+            _spec_model_spec = getattr(self, "_plan_receipt_request_model_spec", None)
+            if _spec_model_key is not None and _spec_model_spec is not None:
+                _spec_wf_hash = str(getattr(plan, "workflow_hash", "") or "")
+                _spec_deploy_hash = str(
+                    _V2_DEPLOYMENT_COMBINED_HASH
+                    or getattr(
+                        getattr(getattr(self, "bootstrap", None), "state", None),
+                        "deployment_combined_hash", "",
+                    )
+                    or ""
+                )
+                _spec_node_gen = str(
+                    getattr(
+                        getattr(getattr(self, "bootstrap", None), "state", None),
+                        "snapshot_custom_node_generation", "",
+                    )
+                    or getattr(
+                        getattr(getattr(self, "bootstrap", None), "state", None),
+                        "custom_node_generation", "",
+                    )
+                    or ""
+                )
+                # The retained CPU-snapshot CLIP object carries the frozen
+                # manifest (absolute capture-time source paths + size/mtime +
+                # key_shapes + pipeline).  ``_lazy_init_snapshot_state`` has
+                # already run inside the G1 schedule above.
+                _spec_cpu_models = getattr(self, "_cpu_snapshot_models", None)
+                _spec_clip_obj = getattr(_spec_cpu_models, "clip", None) if _spec_cpu_models is not None else None
+
+                def _release_unet_prefetch() -> None:
+                    """CLIP-first/UNET-second release: start UNET source
+                    prefetch once the speculative CLIP source read has
+                    definitively finished (success or failure).  Idempotent;
+                    never raises."""
+                    try:
+                        from comfymodal_runtime.fast_cold_orchestration import (
+                            get_controller,
+                        )
+
+                        _ctrl = get_controller(_speculative_clip_request_id)
+                        if _ctrl is not None:
+                            _ctrl.on_speculative_clip_done()
+                    except Exception:
+                        pass
+
+                _started_lane = reconcile_restore_time_lane(
+                    request_id=_speculative_clip_request_id,
+                    model_key=_spec_model_key,
+                    model_spec=_spec_model_spec,
+                    workflow_hash=_spec_wf_hash,
+                    deployment_hash=_spec_deploy_hash,
+                    custom_node_generation=_spec_node_gen,
+                    trace=getattr(self, "_plan_receipt_trace", None),
+                    clip=_spec_clip_obj,
+                    cpu_models=_spec_cpu_models,
+                    release_callback=_release_unet_prefetch,
+                )
+                if _started_lane is None:
+                    # Fail-open: the lane could not start (e.g. no frozen
+                    # manifest).  Ownership was claimed by the controller;
+                    # release it so the normal checkpoint-prewarm /
+                    # demand path is unchanged and UNET is never gated.
+                    _release_unet_prefetch()
+        except Exception:
+            # Best-effort: never raise at plan receipt.
+            pass
+
+        # ── Task-1 prompt-signature memo: early priming at plan receipt ──
+        # Module-guarded, idempotent: load_store_from_disk loads exactly once
+        # (the executor patch also lazy-loads on demand).  This is purely an
+        # early priming step off the critical path.
+        try:
+            from comfymodal_runtime.prompt_signature_cache import load_store_from_disk
+            load_store_from_disk()
+        except Exception:
+            pass
+
+        # ── Task-2 conditioning prefetch: launch off the critical path ──
+        # Best-effort, never raises, never on the coordinator pool.  The
+        # function internally gates on COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH
+        # and fails closed when disabled.
+        _cc_prefetch_req_id = str(getattr(plan, "request_id", "") or "") or str(request_id or "")
+        _cc_prefetch_env = os.environ.get("COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1")
+        _cc_prefetch_scheduled = 0
+        _cc_prefetch_reason = "unavailable"
+        try:
+            from comfymodal_runtime.model_preload import maybe_prefetch_conditioning as _maybe_prefetch
+            if callable(_maybe_prefetch):
+                _cc_prefetch_scheduled = 1
+                _cc_prefetch_reason = "thread_started"
+                threading.Thread(
+                    target=_maybe_prefetch, args=(plan,),
+                    kwargs={"request_id": _cc_prefetch_req_id},
+                    daemon=True, name="comfymodal-conditioning-prefetch",
+                ).start()
+        except Exception:
+            # Unimportable / not callable / thread start failed — keep the
+            # truthful "unavailable" evidence below (never fabricate).
+            _cc_prefetch_scheduled = 0
+            _cc_prefetch_reason = "unavailable"
+        # Truthful request-scoped evidence for the demand-time lookup diag.
+        # model_preload reads _CONDITIONING_PREFETCH_EVIDENCE (keyed by
+        # request_id → {requested, env, scheduled, reason}) so
+        # prefetch_requested/prefetch_source are observable even when the
+        # prefetch was skipped.
+        try:
+            _set_conditioning_prefetch_evidence(
+                _cc_prefetch_req_id,
+                requested=1,
+                env=_cc_prefetch_env,
+                scheduled=_cc_prefetch_scheduled,
+                reason=_cc_prefetch_reason,
+            )
+        except Exception:
+            pass
+        try:
+            if _cc_prefetch_scheduled:
+                print(
+                    f"[v2.conditioning_prefetch] "
+                    f"request_id={_cc_prefetch_req_id} "
+                    f"requested=1 env={_cc_prefetch_env} "
+                    f"scheduled=1 thread=started",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[v2.conditioning_prefetch] "
+                    f"request_id={_cc_prefetch_req_id} "
+                    f"requested=1 scheduled=0 reason={_cc_prefetch_reason}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+        # ── Task-1 input-types warm: launch off the critical path ───────
+        # Advisory INPUT_TYPES() pre-warm for the classes in THIS plan.  When
+        # the prompt-signature memo skips the normal add_keys warm-up, the
+        # first topo walk pays cold class_def.INPUT_TYPES() (+ cold folder
+        # listings for loader inputs).  Warming them here — before execution —
+        # lets the request-scoped get_input_info memo in runtime_executor
+        # serve warm values for every link.  Best-effort, never raises; if
+        # the warm is incomplete the request pays the original cost.  The
+        # daemon thread's completion evidence is printed (container stdout)
+        # and attached to the request trace metadata for host re-emission.
+        _itw_req_id = str(getattr(plan, "request_id", "") or "") or str(request_id or "")
+        _itw_scheduled = 0
+        _itw_reason = "unavailable"
+        _itw_disabled_by_env = False
+        try:
+            from comfymodal_runtime.execution_warm import (
+                warm_classes_input_types as _warm_classes_input_types,
+            )
+            _itw_prompt = getattr(plan, "prompt", None)
+            if not isinstance(_itw_prompt, dict):
+                # ExecutionPlan carries the node dict as ``workflow`` (frozen);
+                # plan_payload is the raw request payload fallback.
+                _itw_prompt = _thaw(getattr(plan, "workflow", None)) if hasattr(plan, "workflow") else {}
+            if isinstance(_itw_prompt, dict) and callable(_warm_classes_input_types):
+                # ── Task B diagnostic toggle ─────────────────────────────
+                # Env absent/unset → warm stays enabled (prior behavior
+                # unchanged).  Explicit 0/false/off disables the warm thread
+                # and records truthful disabled evidence instead.
+                _itw_enabled = env_flag(
+                    "COMFYMODAL_V2_INPUT_TYPES_WARM", default=True
+                )
+                if not _itw_enabled:
+                    _itw_disabled_by_env = True
+                    _itw_reason = "COMFYMODAL_V2_INPUT_TYPES_WARM=0"
+                    try:
+                        _itw_disabled_trace = getattr(
+                            self, "_plan_receipt_trace", None
+                        )
+                    except Exception:
+                        _itw_disabled_trace = None
+                    try:
+                        if _itw_disabled_trace is not None:
+                            _itw_disabled_trace.set_metadata(
+                                input_types_warm_enabled=False,
+                                input_types_warm_reason="COMFYMODAL_V2_INPUT_TYPES_WARM=0",
+                            )
+                    except Exception:
+                        pass
+                    if _itw_disabled_trace is None:
+                        # Fallback to the closure-style guard (context is not
+                        # yet bound at the scheduling site — best-effort).
+                        try:
+                            _it_trace = context.trace
+                            if _it_trace is not None:
+                                _it_trace.set_metadata(
+                                    input_types_warm_enabled=False,
+                                    input_types_warm_reason="COMFYMODAL_V2_INPUT_TYPES_WARM=0",
+                                )
+                        except Exception:
+                            pass
+                else:
+                    # Forensics: scheduling-site stamps (same clock domains as
+                    # the worker stamps inside the thread below).
+                    _itw_scheduled_mono_ns = time.monotonic_ns()
+                    _itw_scheduled_wall_unix_ns = time.time_ns()
+
+                    def _run_input_types_warm():
+                        # Worker start stamp (first instruction).
+                        _itw_worker_start_mono_ns = time.monotonic_ns()
+                        _itw_worker_start_cpu = None
+                        try:
+                            _itw_worker_start_cpu = time.thread_time()
+                        except Exception:
+                            _itw_worker_start_cpu = None
+                        try:
+                            _itc_count, _itc_ms = _warm_classes_input_types(_itw_prompt)
+                        except Exception:
+                            return
+                        # Worker end stamp.
+                        _itw_worker_end_mono_ns = time.monotonic_ns()
+                        _itw_worker_end_cpu = None
+                        try:
+                            _itw_worker_end_cpu = time.thread_time()
+                        except Exception:
+                            _itw_worker_end_cpu = None
+                        # CPU time over the warm call (None on any failure).
+                        _itw_cpu_ms = None
+                        try:
+                            if (
+                                _itw_worker_start_cpu is not None
+                                and _itw_worker_end_cpu is not None
+                            ):
+                                _itw_cpu_ms = round(
+                                    max(0.0, _itw_worker_end_cpu - _itw_worker_start_cpu)
+                                    * 1000.0,
+                                    3,
+                                )
+                        except Exception:
+                            _itw_cpu_ms = None
+                        # wall_ms = the existing warm wall duration under a
+                        # clearer name (same number as input_types_warm_ms).
+                        _itw_wall_ms = _itc_ms
+                        # cpu_affinity_count: CPUs this process may run on.
+                        # effective_cores: cpu_ms/wall_ms-derived utilization.
+                        # Prefer the shared trace helpers when available;
+                        # otherwise fall back to the local inline computation.
+                        _itw_cpu_affinity_count = 0
+                        _itw_effective_cores = None
+                        try:
+                            from comfymodal_runtime.trace import (
+                                cpu_affinity_count as _cpu_affinity_count,
+                                effective_cores_from as _effective_cores_from,
+                            )
+                            _itw_cpu_affinity_count = _cpu_affinity_count()
+                            _itw_effective_cores = _effective_cores_from(
+                                _itw_cpu_ms, _itw_wall_ms
+                            )
+                        except Exception:
+                            # Shared helper unavailable — inline fallbacks.
+                            try:
+                                _itw_cpu_affinity_count = len(os.sched_getaffinity(0))
+                            except Exception:
+                                try:
+                                    _itw_cpu_affinity_count = os.cpu_count() or 0
+                                except Exception:
+                                    _itw_cpu_affinity_count = 0
+                            try:
+                                if (
+                                    _itw_cpu_ms is not None
+                                    and _itw_wall_ms is not None
+                                    and _itw_wall_ms > 0
+                                ):
+                                    _itw_effective_cores = round(
+                                        _itw_cpu_ms / _itw_wall_ms, 3
+                                    )
+                                else:
+                                    _itw_effective_cores = None
+                            except Exception:
+                                _itw_effective_cores = None
+
+                        # Cross-thread forensic registry (guarded; the registry
+                        # is being added concurrently — degrade gracefully when
+                        # not importable or on any failure).
+                        _itw_overlap_meta_ms = None
+                        _itw_overlap_fastsafe_ms = None
+                        _itw_worker_started_observed = False
+                        _itw_overlap_scope = "unavailable"
+                        _itw_registry_request_id = None
+                        try:
+                            _itw_trace = context.trace
+                        except Exception:
+                            _itw_trace = None
+                        try:
+                            if _itw_trace is not None:
+                                _itw_registry_request_id = getattr(
+                                    _itw_trace, "request_id", None
+                                )
+                            else:
+                                _itw_plan_trace = getattr(
+                                    self, "_plan_receipt_trace", None
+                                )
+                                if _itw_plan_trace is not None:
+                                    _itw_registry_request_id = getattr(
+                                        _itw_plan_trace, "request_id", None
+                                    )
+                        except Exception:
+                            _itw_registry_request_id = None
+                        try:
+                            from comfymodal_runtime.trace import (
+                                register_forensic_interval as _register_forensic_interval,
+                                forensic_intervals as _forensic_intervals,
+                                forensic_overlap_ms as _forensic_overlap_ms,
+                            )
+
+                            _register_forensic_interval(
+                                "input_types_warm",
+                                start_mono_ns=_itw_worker_start_mono_ns,
+                                end_mono_ns=_itw_worker_end_mono_ns,
+                                cpu_ms=_itw_cpu_ms,
+                                metadata={
+                                    "request_id": _itw_registry_request_id,
+                                    "warm_ms": _itw_wall_ms,
+                                    "classes": _itc_count,
+                                    "cpu_affinity_count": _itw_cpu_affinity_count,
+                                    "effective_cores": _itw_effective_cores,
+                                },
+                            )
+                            try:
+                                _itw_all_intervals = _forensic_intervals()
+                            except Exception:
+                                _itw_all_intervals = None
+
+                            def _itw_lookup_interval(name):
+                                try:
+                                    if isinstance(_itw_all_intervals, dict):
+                                        return _itw_all_intervals.get(name)
+                                    if isinstance(
+                                        _itw_all_intervals, (list, tuple)
+                                    ):
+                                        for _item in _itw_all_intervals:
+                                            if (
+                                                isinstance(_item, dict)
+                                                and _item.get("name") == name
+                                            ):
+                                                return _item
+                                except Exception:
+                                    return None
+                                return None
+
+                            def _itw_overlap_with(name):
+                                # (overlap_ms, started_observed, scope).
+                                try:
+                                    _worker = _itw_lookup_interval(name)
+                                    if not isinstance(_worker, dict):
+                                        return None, False, "unavailable"
+                                    _worker_meta = _worker.get("metadata") or {}
+                                    _worker_req = _worker_meta.get("request_id")
+                                    _worker_end = _worker.get("end_mono_ns")
+                                    if (
+                                        _itw_registry_request_id is not None
+                                        and _worker_req is not None
+                                        and _worker_req == _itw_registry_request_id
+                                    ):
+                                        if _worker_end is None:
+                                            # Exists but still running.
+                                            return None, True, "partial"
+                                        _worker_start = _worker.get("start_mono_ns")
+                                        if (
+                                            isinstance(_worker_start, int)
+                                            and isinstance(_worker_end, int)
+                                        ):
+                                            return (
+                                                _forensic_overlap_ms(
+                                                    _itw_worker_start_mono_ns,
+                                                    _itw_worker_end_mono_ns,
+                                                    _worker_start,
+                                                    _worker_end,
+                                                ),
+                                                True,
+                                                "complete",
+                                            )
+                                        return None, True, "complete"
+                                    # Missing interval or request mismatch.
+                                    return None, True, "unavailable"
+                                except Exception:
+                                    return None, True, "unavailable"
+
+                            _itw_oa_ms, _itw_worker_a_started, _itw_scope_a = (
+                                _itw_overlap_with("fastsafe_worker_a")
+                            )
+                            _itw_of_ms, _itw_worker_b_started, _itw_scope_b = (
+                                _itw_overlap_with("fastsafe_worker_b")
+                            )
+                            _itw_overlap_meta_ms = _itw_oa_ms
+                            _itw_overlap_fastsafe_ms = _itw_of_ms
+                            _itw_worker_started_observed = (
+                                _itw_worker_a_started or _itw_worker_b_started
+                            )
+                            if (
+                                _itw_scope_a == "partial"
+                                or _itw_scope_b == "partial"
+                            ):
+                                _itw_overlap_scope = "partial"
+                            elif (
+                                _itw_scope_a == "complete"
+                                and _itw_scope_b == "complete"
+                            ):
+                                _itw_overlap_scope = "complete"
+                            elif (
+                                _itw_scope_a == "unavailable"
+                                and _itw_scope_b == "unavailable"
+                            ):
+                                _itw_overlap_scope = "unavailable"
+                            else:
+                                # Mixed complete/unavailable picture.
+                                _itw_overlap_scope = "partial"
+                        except Exception:
+                            # Registry unavailable/failed — degrade gracefully;
+                            # overlap keys stay None.
+                            _itw_overlap_scope = "unavailable"
+
+                        try:
+                            print(
+                                f"[v2.input_types_warm] "
+                                f"request_id={_itw_req_id} "
+                                f"classes={_itc_count} wall_ms={_itc_ms} "
+                                f"cpu_ms={_itw_cpu_ms} "
+                                f"eff_cores={_itw_effective_cores} "
+                                f"aff_cpus={_itw_cpu_affinity_count} "
+                                f"overlap_meta_ms={_itw_overlap_meta_ms} "
+                                f"overlap_fastsafe_ms={_itw_overlap_fastsafe_ms}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            _it_trace = context.trace
+                            if _it_trace is not None:
+                                _it_trace.set_metadata(
+                                    input_types_warm_ms=_itc_ms,
+                                    input_types_warm_classes=_itc_count,
+                                    input_types_warm_cpu_ms=_itw_cpu_ms,
+                                    input_types_warm_wall_ms=_itw_wall_ms,
+                                    input_types_warm_effective_cores=(
+                                        _itw_effective_cores
+                                    ),
+                                    input_types_warm_cpu_affinity_count=(
+                                        _itw_cpu_affinity_count
+                                    ),
+                                    input_types_warm_scheduled_mono_ns=(
+                                        _itw_scheduled_mono_ns
+                                    ),
+                                    input_types_warm_scheduled_wall_unix_ns=(
+                                        _itw_scheduled_wall_unix_ns
+                                    ),
+                                    input_types_warm_worker_started_observed=(
+                                        _itw_worker_started_observed
+                                    ),
+                                    input_types_warm_overlap_meta_ms=(
+                                        _itw_overlap_meta_ms
+                                    ),
+                                    input_types_warm_overlap_fastsafe_ms=(
+                                        _itw_overlap_fastsafe_ms
+                                    ),
+                                    input_types_warm_overlap_scope=(
+                                        _itw_overlap_scope
+                                    ),
+                                )
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_run_input_types_warm,
+                        daemon=True,
+                        name="comfymodal-input-types-warm",
+                    ).start()
+                    _itw_scheduled = 1
+                    _itw_reason = "thread_started"
+        except Exception:
+            # Unimportable / not callable / thread-start failure — keep the
+            # truthful "unavailable" evidence below (never fabricate).
+            _itw_scheduled = 0
+            _itw_reason = "unavailable"
+        try:
+            if _itw_scheduled:
+                print(
+                    f"[v2.input_types_warm] "
+                    f"request_id={_itw_req_id} scheduled=1 thread=started",
+                    flush=True,
+                )
+            elif _itw_disabled_by_env:
+                print(
+                    f"[v2.input_types_warm] "
+                    f"request_id={_itw_req_id} disabled reason={_itw_reason}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[v2.input_types_warm] "
+                    f"request_id={_itw_req_id} scheduled=0 reason={_itw_reason}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
         # ── Request-owned snapshot seed (no-publish path) ──
         # When COMFYMODAL_V2_PUBLISH_RESTORE_PLAN is disabled (the default),
         # the request derives its own schema-v2 seed from the invocation plan
@@ -15326,6 +17987,8 @@ class ModalRuntimeEntrypoint:
         # container on the honest startup_minimal seed.  The observability
         # result is emitted as a trace event once context.trace exists.
         _request_seed_obs = self._derive_request_snapshot_seed(plan)
+        # Batch-D5 request-schedule bracket end.
+        _setup_schedule_end_ns = time.monotonic_ns()
 
         # â”€â”€ Compute method entry gap before any trace output â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _method_entry_gap_results: dict[str, Any] = {}
@@ -15385,10 +18048,38 @@ class ModalRuntimeEntrypoint:
                           "modal_method_entry_mono_ns": _method_first_line_ns}}
         ]
 
+        # ── Cooperative remote-cancel bridge: per-invocation watcher ───────
+        # run_plan_stream owns the watcher lifecycle (started before this impl,
+        # stopped in its finally).  A direct impl caller may still supply a
+        # control_queue without a watcher; in that case create one here — the
+        # executor-stream guard (guard_remote_cancel_stream) stops it in its
+        # finally when the stream ends for any reason.
+        _remote_watcher = _remote_cancel_watcher
+        if _remote_watcher is None and control_queue is not None:
+            _remote_watcher = RemoteCancelWatcher(
+                control_queue,
+                control_partition,
+                request_id=request_id,
+            )
+            _remote_watcher.start()
+        _remote_cancel_event = (
+            _remote_watcher.cancel_event if _remote_watcher is not None else None
+        )
+
         context = ExecutionContext(
             request_id=_t4_request_id or request_id,
-            cancelled=cancelled,
-            trace=RuntimeTrace(request_id=_t4_request_id or request_id, process="remote"),
+            # Combine the host `cancelled` callback with the watcher event so
+            # every existing boundary check observes a confirmed remote cancel
+            # too.  The no-cancel path (both absent) returns the original value.
+            cancelled=combine_cancel_predicate(cancelled, _remote_cancel_event),
+            remote_cancel_event=_remote_cancel_event,
+            # Batch-A G1: reuse the plan-receipt trace (created when the early
+            # UNET lane was scheduled) so lane worker events share one request
+            # trace; otherwise create the trace here as before.
+            trace=(
+                getattr(self, "_plan_receipt_trace", None)
+                or RuntimeTrace(request_id=_t4_request_id or request_id, process="remote")
+            ),
         )
         # Step 3: attach frozen restore-time snapshot-seed metadata per request.
         # Defensive getattr — cold-unpickled instances may lack bootstrap state.
@@ -15581,6 +18272,17 @@ class ModalRuntimeEntrypoint:
                 restore_session_id=(self._restore_timing or {}).get("restore_session_id", ""),
                 legacy_container_session_id=_auth_cid,
                 request_origin_info=_request_origin_info,
+                # ── E27 Gantt axis origin (same-process monotonic clock) ──
+                remote_python_resume_mono_ns=(self._restore_timing or {}).get(
+                    "remote_python_resume_mono_ns"
+                ),
+                restore_method_start_mono_ns=(self._restore_timing or {}).get(
+                    "restore_method_start_mono_ns"
+                ),
+                restore_method_end_mono_ns=(self._restore_timing or {}).get(
+                    "restore_method_end_mono_ns"
+                ),
+                modal_method_entry_mono_ns=_method_first_line_ns,
                 **_resource_identity(),
             )
             if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
@@ -15645,7 +18347,45 @@ class ModalRuntimeEntrypoint:
                     "workflow_hash": plan.workflow_hash,
                 },
             )
+            # ── E27: method-setup span + earliest memory boundary (gated) ──
+            # Captures the request-accept memory state and a method-setup
+            # span that the Gantt renderer consumes.  No-op unless
+            # COMFYMODAL_V2_E27_FORENSICS is set.
+            try:
+                from .e27_forensics import (
+                    e27_forensics_enabled,
+                    snapshot_e27_memory,
+                )
+                from .gantt_telemetry import register_gantt_span
+
+                if e27_forensics_enabled():
+                    snapshot_e27_memory(
+                        context.trace,
+                        "request_accept",
+                        request_id=_t4_request_id or request_id,
+                    )
+                    register_gantt_span(
+                        "method_setup",
+                        start_mono_ns=_method_first_line_ns,
+                        end_mono_ns=time.monotonic_ns(),
+                        lane="MAIN",
+                        metadata={"request_id": _t4_request_id or request_id},
+                    )
+            except Exception:
+                pass
             context.trace.emit("run_plan_trace_setup_end", phase="method")
+            context.trace.emit(
+                "remote_setup_schedule",
+                phase="method",
+                metadata={
+                    "schedule_start_mono_ns": int(_setup_schedule_start_ns),
+                    "schedule_end_mono_ns": int(_setup_schedule_end_ns),
+                    "schedule_ms": round((_setup_schedule_end_ns - _setup_schedule_start_ns) / 1_000_000, 3),
+                    "cc_prefetch_scheduled": int(_cc_prefetch_scheduled),
+                    "input_types_warm_scheduled": int(_itw_scheduled),
+                    "seed_derived": int(bool(_request_seed_obs)),
+                },
+            )
 
         # â”€â”€ First status yield â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _plan_received_mono_ns = time.monotonic_ns()
@@ -15656,7 +18396,11 @@ class ModalRuntimeEntrypoint:
             "request_id": request_id,
             "trace_id": context.trace.trace_id if context.trace else "",
         }
-        _execution_stream = self.executor.stream(plan, context=context)
+        _execution_stream = guard_remote_cancel_stream(
+            self.executor.stream(plan, context=context),
+            watcher=_remote_watcher,
+            request_id=request_id,
+        )
         async for event in _execution_stream:
             if event.get("type") == "error" and _full_trace_claimed:
                 try:
@@ -15747,7 +18491,22 @@ class ModalRuntimeEntrypoint:
                 data.update(context_snapshot_age)
                 _legacy_read_drain = getattr(self._legacy_module, "_drain_completed_active_read_diagnostics", None)
                 if callable(_legacy_read_drain):
-                    _active_read_records = _legacy_read_drain(_t4_request_id or request_id)
+                    # Pass exact restore identities alongside the request_id so
+                    # records without a request_id (lifecycle/preload reads)
+                    # still associate via restored_instance_id +
+                    # restore_session_id, while request-tagged records are
+                    # consumed only by their exact request.
+                    _drain_restored_instance_id = str(
+                        getattr(self, "_restored_instance_id", "") or ""
+                    )
+                    _drain_restore_session_id = str(
+                        (self._restore_timing or {}).get("restore_session_id", "") or ""
+                    )
+                    _active_read_records = _legacy_read_drain(
+                        _t4_request_id or request_id,
+                        restored_instance_id=_drain_restored_instance_id,
+                        restore_session_id=_drain_restore_session_id,
+                    )
                     if _active_read_records:
                         _structured_report = data.get("pre_sampler_structured_report")
                         _structured_report = dict(_structured_report) if isinstance(_structured_report, Mapping) else {}
@@ -15756,6 +18515,7 @@ class ModalRuntimeEntrypoint:
                 _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
                 if _rt is not None and "_restore_timing" not in data:
                     data["_restore_timing"] = dict(_rt)
+                _stage13_interval_start_mono_ns = time.monotonic_ns()
                 # â”€â”€ Request-origin summary (T0â€“T5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Gather raw wall timestamps from origin info + local captures
                 _t4_wall = _method_first_line_wall_ns
@@ -15858,6 +18618,10 @@ class ModalRuntimeEntrypoint:
                 # Embed raw timestamps + intervals + clock scope in result data
                 data["request_id"] = _t4_request
                 data["trigger_source"] = _trig_src
+                # Legitimate input ID for the host transport: learned from the
+                # yielded result event metadata (Modal SDK 1.4.3 exposes no
+                # generator input_id attribute).
+                data["modal_input_id"] = str(identity.get("modal_input_id", ""))
                 data["raw_timestamps"] = {
                     "t0_ui_trigger_wall_unix_ns": _t0_wall_ns,
                     "t1_local_receive_wall_unix_ns": _t1_wall_ns,
@@ -15868,6 +18632,20 @@ class ModalRuntimeEntrypoint:
                     "modal_first_remote_event_wall_unix_ns": _first_remote_event_wall_ns,
                     "t4_modal_method_entry_wall_unix_ns": _t4_wall,
                     "t5_prompt_executor_invoke_start_wall_unix_ns": _t5_wall_ns,
+                    # Request-scoped restore raw fields for host reconcile:
+                    # submission -> python resume stays a combined interval
+                    # (no fabricated platform split), and these raw fields let
+                    # the host compute it against THIS request's session rather
+                    # than any stale global fallback.
+                    "remote_python_resume_wall_unix_ns": (
+                        _rt.get("remote_python_resume_wall_unix_ns") if isinstance(_rt, dict) else None
+                    ),
+                    "restored_instance_id": (
+                        _rt.get("restored_instance_id", "") if isinstance(_rt, dict) else ""
+                    ),
+                    "restore_session_id": (
+                        _rt.get("restore_session_id", "") if isinstance(_rt, dict) else ""
+                    ),
                 }
                 data["intervals_ms"] = {
                     "run_trigger_to_local_receive_ms": _t0_t1_ms,
@@ -15889,6 +18667,7 @@ class ModalRuntimeEntrypoint:
                     "run_trigger_to_modal_entry": _t0_t4_scope,
                     "run_trigger_to_prompt_executor": _t0_t5_scope,
                 }
+                _stage13_interval_end_mono_ns = time.monotonic_ns()
 
                 _modal_input_id = identity.get("modal_input_id", "")
                 _modal_task_id = identity.get("container_task_id", "")
@@ -15962,6 +18741,7 @@ class ModalRuntimeEntrypoint:
                     _cgroup_sampler.report()
                     self._cgroup_sampler = None
                     _cgroup_sampler = None
+                _stage13_resource_start_mono_ns = time.monotonic_ns()
                 if getattr(self, "_resource_tel", None) is not None:
                     try:
                         from .resource_telemetry import build_stage_boundaries
@@ -15982,6 +18762,8 @@ class ModalRuntimeEntrypoint:
                     )
                 except Exception:
                     pass
+                _stage13_resource_end_mono_ns = time.monotonic_ns()
+                _stage13_waterfall_start_mono_ns = time.monotonic_ns()
                 _is_benchmark = str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}
                 try:
                     _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
@@ -16016,6 +18798,87 @@ class ModalRuntimeEntrypoint:
                         f"[v2.waterfall] status=error error_type={type(_waterfall_exc).__name__}",
                         flush=True,
                     )
+                _stage13_waterfall_end_mono_ns = time.monotonic_ns()
+                # ── E27 ASCII Gantt telemetry (Target E; gated, additive) ──
+                # Renders the FULL REQUEST + MODEL-READY ZOOM views from the
+                # same remote monotonic axis as the structured trace.  No-op
+                # unless COMFYMODAL_V2_GANTT_TELEMETRY is set; never alters
+                # the result payload or the generation path.
+                try:
+                    from .gantt_telemetry import (
+                        emit_gantt_records,
+                        collect_gantt_report,
+                    )
+                    from .e27_forensics import (
+                        cast_account_summary,
+                        e27_forensics_enabled,
+                        forward_cast_account_summary,
+                        clip_forward_decomposition,
+                    )
+
+                    _gantt_trace = getattr(context, "trace", None) or (
+                        data.get("trace") if isinstance(data, dict) else None
+                    )
+                    if _gantt_trace is not None:
+                        emit_gantt_records(
+                            _gantt_trace,
+                            request_id=_t4_request_id or request_id,
+                        )
+                        _gantt_report = collect_gantt_report(_gantt_trace)
+                        if isinstance(data, dict) and _gantt_report.get("spans"):
+                            data["gantt_telemetry"] = _gantt_report
+                        # E27: cast-account summary (Target D evidence).
+                        if e27_forensics_enabled():
+                            _casts = cast_account_summary()
+                            if isinstance(data, dict) and _casts.get("operations"):
+                                data["e27_cast_account"] = _casts
+                            # E27 Follow-Up A: forward-cast (real cast path)
+                            # summary + CLIP-forward decomposition.
+                            _fwd = forward_cast_account_summary()
+                            if isinstance(data, dict) and (
+                                _fwd.get("weight_casts")
+                                or _fwd.get("bias_casts")
+                                or _fwd.get("other_casts")
+                            ):
+                                data["e27_forward_cast_account"] = _fwd
+                            _fwd_decomp = clip_forward_decomposition(_gantt_trace)
+                            if isinstance(data, dict) and _fwd_decomp.get(
+                                "clip_forward_ms"
+                            ) is not None:
+                                data["e27_clip_forward_decomposition"] = _fwd_decomp
+                except Exception:
+                    pass
+                # ── Remote result emission boundary ─────────────────
+                # Captured as close as possible to the actual result yield so
+                # the host can measure the true remote emit -> local receipt
+                # interval (instead of inferring a multi-second output tail).
+                # Additive only: no yielded-data semantics change.
+                _stamp_remote_result_emit(
+                    data,
+                    event,
+                    getattr(context, "trace", None),
+                    request_id=_t4_request_id or request_id,
+                )
+                # ── Stage-13 decomposition (diagnostics; additive only) ──
+                # Fine-grained "Output encode / descriptor" children so the
+                # integrated run can prove whether any child exceeds the
+                # >50 ms effort threshold.  Parent window = output_collect_start
+                # -> remote_result_emit; children tile it; reconciliation is
+                # reported, never enforced.
+                try:
+                    from .stage13_breakdown import build_stage13_breakdown
+                    _s13_boundaries = data.pop("_stage13_boundaries", None) or {}
+                    if isinstance(_s13_boundaries, dict):
+                        _s13_boundaries.setdefault("emit_mono_ns", data.get("remote_result_emit_mono_ns"))
+                        _s13_boundaries["interval_start_mono_ns"] = _stage13_interval_start_mono_ns
+                        _s13_boundaries["interval_end_mono_ns"] = _stage13_interval_end_mono_ns
+                        _s13_boundaries["resource_start_mono_ns"] = _stage13_resource_start_mono_ns
+                        _s13_boundaries["resource_end_mono_ns"] = _stage13_resource_end_mono_ns
+                        _s13_boundaries["waterfall_start_mono_ns"] = _stage13_waterfall_start_mono_ns
+                        _s13_boundaries["waterfall_end_mono_ns"] = _stage13_waterfall_end_mono_ns
+                        data["output_stage13_breakdown"] = build_stage13_breakdown(_s13_boundaries)
+                except Exception:
+                    pass
             yield event
 
         # Variant A: the asset commit completes after the result event was
@@ -16031,8 +18894,9 @@ class ModalRuntimeEntrypoint:
             # post-hoc to the same channel the builder consumes
             # (result["trace"]["events"]) so any downstream rebuild
             # (e.g. benchmark host reconciliation) sees the real span for the
-            # "Deferred persistence after yield" row.
-            _dc_trace_events = _deferred_commit_event.get("_trace_events") or []
+            # "Deferred persistence after yield" row.  The events are carried
+            # separately (instance stash) — never on the public event dict.
+            _dc_trace_events = getattr(self, "_deferred_commit_trace_events", None) or []
             _result_data = locals().get("data")
             if _dc_trace_events and isinstance(_result_data, dict):
                 _result_trace = _result_data.get("trace")
@@ -16165,6 +19029,10 @@ def _build_decorated_v2_class() -> type:
         "run_env_probe", "run_entry_probe", "exit",
         "run_volume_read_benchmark",
         "run_snapshot_restore_only_probe",
+        "run_unet_mechanism_probe",
+        "run_unet_qd_probe",
+        "run_clip_qd_probe",
+        "run_e27_followup_probe",
     )
     # Lifecycle / infrastructure / probe / no-graph methods.  Their dict
     # results must NOT receive a fabricated graph waterfall.  Any future Modal
@@ -16178,6 +19046,10 @@ def _build_decorated_v2_class() -> type:
         "publish_restore_plan",
         "run_volume_read_benchmark",
         "run_snapshot_restore_only_probe",
+        "run_unet_mechanism_probe",
+        "run_unet_qd_probe",
+        "run_clip_qd_probe",
+        "run_e27_followup_probe",
     })
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -16280,6 +19152,26 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_snapshot_restore_only_probe",
         _modal.method()(cls.run_snapshot_restore_only_probe),
+    )
+    setattr(
+        cls,
+        "run_unet_mechanism_probe",
+        _modal.method()(cls.run_unet_mechanism_probe),
+    )
+    setattr(
+        cls,
+        "run_unet_qd_probe",
+        _modal.method()(cls.run_unet_qd_probe),
+    )
+    setattr(
+        cls,
+        "run_clip_qd_probe",
+        _modal.method()(cls.run_clip_qd_probe),
+    )
+    setattr(
+        cls,
+        "run_e27_followup_probe",
+        _modal.method()(cls.run_e27_followup_probe),
     )
     return cls
 

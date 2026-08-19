@@ -66,6 +66,39 @@ except ImportError:
     pass
 
 
+# ---------------------------------------------------------------------------
+# Deterministic fake comfy modules
+#
+# The code under test (``modal_app._load_cpu_snapshot_unet``,
+# ``resolve_unet_effective_dtype``) executes ``import comfy.sd`` /
+# ``import comfy.memory_management`` / ``import comfy.cli_args`` /
+# ``import folder_paths``.  In a fresh process those imports fail unless the
+# tests install fakes; if a *real* ComfyUI is importable (e.g. a prior suite
+# polluted the process) the same imports resolve to the real package and the
+# tests would behave differently.  Installing the parent ``comfy`` package
+# (with ``__path__``) together with leaf fakes in ``sys.modules`` makes the
+# resolution identical in BOTH environments.
+# ---------------------------------------------------------------------------
+
+
+def _fake_comfy_parent():
+    """Return a fake ``comfy`` package so ``import comfy.<sub>`` resolves to
+    the sys.modules fakes whether or not a real ComfyUI is importable."""
+    import types
+    mod = types.ModuleType("comfy")
+    mod.__path__ = []  # mark as a package
+    return mod
+
+
+def _fake_aimdo_memory_management(aimdo_enabled=True):
+    """Return a fake ``comfy.memory_management`` module carrying aimdo_enabled."""
+    import types
+    mm = types.ModuleType("comfy.memory_management")
+    mm.aimdo_enabled = aimdo_enabled
+    return mm
+
+
+
 class _FakeTensor:
     """Minimal tensor stub for device attribute checks."""
     def __init__(self, device="cpu", is_meta=False):
@@ -531,25 +564,48 @@ class TestModelSpec(unittest.TestCase):
 
     def test_unet_effective_dtype_explicit_bf16(self):
         """Explicit bf16 CLI override remains bf16."""
+        import types as _types
         import unittest.mock as mock
-        import comfy.cli_args
-        with mock.patch.object(comfy.cli_args.args, "bf16_unet", True):
-            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
-            import torch
-            eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("T4",))
-            self.assertIs(eff_dtype, torch.bfloat16)
-            self.assertEqual(eff_label, "bfloat16")
+        # Install a deterministic fake comfy.cli_args so this test does not
+        # depend on whether a real ComfyUI is importable in this process.
+        # NOTE: ``args`` must be a plain namespace (not a MagicMock) so the
+        # ``getattr(_ca.args, "fp32_unet", False)`` probe returns the default
+        # instead of an auto-created truthy attribute.
+        _cli = _types.ModuleType("comfy.cli_args")
+        _cli.args = _types.SimpleNamespace()
+        _comfy = _fake_comfy_parent()
+        _comfy.cli_args = _cli  # bare `import comfy.cli_args` binds `comfy`
+        with mock.patch.dict(sys.modules, {
+            "comfy": _comfy,
+            "comfy.cli_args": _cli,
+        }):
+            import comfy.cli_args
+            with mock.patch.object(comfy.cli_args.args, "bf16_unet", True, create=True):
+                from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+                import torch
+                eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("T4",))
+                self.assertIs(eff_dtype, torch.bfloat16)
+                self.assertEqual(eff_label, "bfloat16")
 
     def test_unet_effective_dtype_explicit_fp32(self):
         """Explicit fp32 CLI override remains fp32 even on BF16-capable GPU."""
+        import types as _types
         import unittest.mock as mock
-        import comfy.cli_args
-        with mock.patch.object(comfy.cli_args.args, "fp32_unet", True):
-            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
-            import torch
-            eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("RTX-PRO-6000",))
-            self.assertIs(eff_dtype, torch.float32)
-            self.assertEqual(eff_label, "float32")
+        _cli = _types.ModuleType("comfy.cli_args")
+        _cli.args = _types.SimpleNamespace()
+        _comfy = _fake_comfy_parent()
+        _comfy.cli_args = _cli
+        with mock.patch.dict(sys.modules, {
+            "comfy": _comfy,
+            "comfy.cli_args": _cli,
+        }):
+            import comfy.cli_args
+            with mock.patch.object(comfy.cli_args.args, "fp32_unet", True, create=True):
+                from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+                import torch
+                eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("RTX-PRO-6000",))
+                self.assertIs(eff_dtype, torch.float32)
+                self.assertEqual(eff_label, "float32")
 
     def test_unet_effective_dtype_no_new_flag_needed(self):
         """Default env (no COMFYMODAL_V2_GPU set) works — policy uses V2_DEFAULT_GPU."""
@@ -2125,6 +2181,8 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
         with patch.dict(
             sys.modules,
             {
+                "comfy": _fake_comfy_parent(),
+                "comfy.memory_management": _fake_aimdo_memory_management(),
                 "comfy.sd": fake_sd,
                 "folder_paths": fake_folder_paths,
             },
@@ -2166,6 +2224,8 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
         with patch.dict(
             sys.modules,
             {
+                "comfy": _fake_comfy_parent(),
+                "comfy.memory_management": _fake_aimdo_memory_management(),
                 "comfy.sd": fake_sd,
                 "folder_paths": fake_folder_paths,
             },
@@ -2310,6 +2370,10 @@ class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
         fake_sd.load_diffusion_model = tracking_load
 
         with patch.dict(sys.modules, {
+            # Install the parent package so `import comfy.sd` / 
+            # `import comfy.memory_management` resolve to these fakes whether
+            # or not a real ComfyUI is importable in this process.
+            "comfy": _fake_comfy_parent(),
             "comfy.memory_management": mm,
             "comfy.sd": fake_sd,
             "folder_paths": fake_fp,
@@ -2336,6 +2400,7 @@ class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
         )
 
         with patch.dict(sys.modules, {
+            "comfy": _fake_comfy_parent(),
             "comfy.memory_management": mm,
             "comfy.sd": fake_sd,
             "folder_paths": fake_fp,
@@ -2360,6 +2425,7 @@ class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
         fake_sd, fake_fp = self._make_fake_sd_and_folder_paths()
 
         with patch.dict(sys.modules, {
+            "comfy": _fake_comfy_parent(),
             "comfy.memory_management": mm,
             "comfy.sd": fake_sd,
             "folder_paths": fake_fp,
@@ -2945,18 +3011,33 @@ class TestConstructionSelectionAndExceptionRestoration(unittest.TestCase):
     """_load_cpu_snapshot_unet construction selection and exception restoration."""
 
     def setUp(self):
-        # Install fake model_management in sys.modules
+        # Install fake model_management in sys.modules, plus a fake parent
+        # ``comfy`` package and ``comfy.memory_management`` so the code under
+        # test resolves deterministic fakes whether or not a real ComfyUI is
+        # importable in this process.
         self._mm = _FakeMMForContext()
         self._orig_mm = sys.modules.get("comfy.model_management")
         sys.modules["comfy.model_management"] = self._mm
+        self._orig_comfy = sys.modules.get("comfy")
+        self._orig_memmm = sys.modules.get("comfy.memory_management")
         self._orig_cm = sys.modules.get("comfy.sd")
         self._orig_fp = sys.modules.get("folder_paths")
+        sys.modules["comfy"] = _fake_comfy_parent()
+        sys.modules["comfy.memory_management"] = _fake_aimdo_memory_management()
 
     def tearDown(self):
         if self._orig_mm is not None:
             sys.modules["comfy.model_management"] = self._orig_mm
         else:
             sys.modules.pop("comfy.model_management", None)
+        if self._orig_comfy is not None:
+            sys.modules["comfy"] = self._orig_comfy
+        else:
+            sys.modules.pop("comfy", None)
+        if self._orig_memmm is not None:
+            sys.modules["comfy.memory_management"] = self._orig_memmm
+        else:
+            sys.modules.pop("comfy.memory_management", None)
         if self._orig_cm is not None:
             sys.modules["comfy.sd"] = self._orig_cm
         else:

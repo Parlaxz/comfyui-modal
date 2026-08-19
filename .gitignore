@@ -37,6 +37,14 @@ playwright/.cache/
 .studio_presets.json
 .studio_snapshots.json
 .studio_backends.json
+# Studio workflow-domain state (user-local, not committed)
+.studio_workflows.json
+.studio_workflow_versions.json
+.studio_workflow_mappings.json
+.studio_workflow_presets.json
+.studio_model_library.json
+.studio_custom_nodes.json
+.studio_workflow_compatibility.json
 .deploy_warmup_state.json
 .run_history/
 # Studio output images (generated at runtime, not source)

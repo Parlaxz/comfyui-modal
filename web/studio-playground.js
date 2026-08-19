@@ -12,7 +12,8 @@ import {
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioPreset, getStudioRunStatus, stopExperiment, getModalConfig } from "./studio-backend-api.js";
+import { runStudioPreset, getStudioRunStatus, stopExperiment, listModels } from "./studio-backend-api.js";
+import { loadModalOptions } from "./studio-output-preferences.js";
 
 import {
   getVisibleControlsForPreset,
@@ -36,25 +37,17 @@ import {
   setCarouselCleared,
   isCarouselCleared,
 } from "./studio-playground-state.js";
-import { createScopedTracker } from "./comfymodal-progress.js";
+import {
+  createPlaygroundRunController,
+  projectRunToLegacy,
+  LEGACY_TERMINAL_STATUSES,
+} from "./studio-playground-run.js";
 import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 
-async function buildStudioModalOptions(apiBase) {
-  const config = await getModalConfig(apiBase);
-  const saved = window._comfyModalOutputOptions || {};
-  const mode = (config && config.execution_mode) || window._comfyModalExecutionMode || "v2";
-  window._comfyModalExecutionMode = mode;
-  return {
-    execution_mode: mode,
-    output_format: config && config.output_format !== undefined ? config.output_format : (saved.output_format || "original"),
-    quality: config && config.quality !== undefined ? config.quality : (saved.quality || 75),
-    webp_lossless_compression: config && config.webp_lossless_compression !== undefined
-      ? config.webp_lossless_compression : (saved.webp_lossless_compression || "balanced"),
-    auto_save_local: config && config.auto_save_local !== undefined ? !!config.auto_save_local : !!saved.auto_save_local,
-    save_folder: config && config.save_folder !== undefined ? config.save_folder : (saved.save_folder || ""),
-    save_metadata_sidecar: config && config.save_metadata_sidecar !== undefined
-      ? config.save_metadata_sidecar !== false : saved.save_metadata_sidecar !== false,
-  };
+export async function buildStudioModalOptions(apiBase) {
+  const options = await loadModalOptions(apiBase);
+  if (typeof window !== "undefined") window._comfyModalExecutionMode = options.execution_mode;
+  return options;
 }
 import { el, createZoomableImageEl, createImagePreviewOverlay } from "./studio-ui.js";
 
@@ -112,11 +105,11 @@ function _startPolling(container, state, context, actions, runState) {
     // Finite timeout: if deadline exceeded, transition to error
     if (Date.now() >= deadline) {
       _stopPolling(state);
-      if (actions && actions.setRunState) {
-        actions.setRunState({
-          status: "error",
-          message: "Experiment timed out after 5 minutes.",
-        });
+      var ctrl = _getRunController(state, actions);
+      if (ctrl && ctrl.getRunId()) {
+        ctrl.applyLocalError("Experiment timed out after 5 minutes.");
+      } else if (actions && actions.setRunState) {
+        actions.setRunState({ status: "error", message: "Experiment timed out after 5 minutes." });
       }
       return;
     }
@@ -125,18 +118,17 @@ function _startPolling(container, state, context, actions, runState) {
     try {
       data = await getStudioRunStatus(apiBase, experimentId);
     } catch (err) {
-      // Transient fetch error — stay in waiting state until deadline
-      if (actions && actions.setRunState) {
-        actions.setRunState({ status: "waiting", experimentId });
-      }
+      // Transient fetch error — keep current state until deadline
+      var _c0 = _getRunController(state, actions);
+      if (_c0 && _c0.getRunId()) return;
+      if (actions && actions.setRunState) actions.setRunState({ status: "waiting", experimentId });
       return;
     }
 
     if (!data) {
-      // Null/empty response — stay in waiting state
-      if (actions && actions.setRunState) {
-        actions.setRunState({ status: "waiting", experimentId });
-      }
+      var _c1 = _getRunController(state, actions);
+      if (_c1 && _c1.getRunId()) return;
+      if (actions && actions.setRunState) actions.setRunState({ status: "waiting", experimentId });
       return;
     }
 
@@ -144,7 +136,10 @@ function _startPolling(container, state, context, actions, runState) {
     if (data.status && data.status !== "ok") {
       _stopPolling(state);
       const errMsg = (data.message || data.error || "Run failed.").substring(0, 200);
-      if (actions && actions.setRunState) {
+      var ctrl2 = _getRunController(state, actions);
+      if (ctrl2 && ctrl2.getRunId()) {
+        ctrl2.applyLocalError(errMsg);
+      } else if (actions && actions.setRunState) {
         actions.setRunState({ status: "error", message: errMsg });
       }
       return;
@@ -152,27 +147,68 @@ function _startPolling(container, state, context, actions, runState) {
 
     // Unknown experiment (no definition yet or invalid id)
     if (!data.definition && (!data.snapshot || Object.keys(data.snapshot).length === 0)) {
-      // Experiment not yet available — stay in waiting / submitted state
-      if (actions && actions.setRunState) {
-        actions.setRunState({ status: "waiting", experimentId });
-      }
+      var _c2 = _getRunController(state, actions);
+      if (_c2 && _c2.getRunId()) return;
+      if (actions && actions.setRunState) actions.setRunState({ status: "waiting", experimentId });
       return;
     }
 
     const snapshot = data.snapshot || {};
-    const status = snapshot.overall_status || snapshot.status || data.state || "";
-    const counters = snapshot.counters || {};
     const events = data.events || [];
+    const counters = snapshot.counters || {};
+    const completedCellCount = counters.completed || 0;
+    const totalCells = snapshot.total_cells || 0;
+    const _pollCellOutputs = _buildCellOutputMap(events, apiBase);
 
-    // Check for explicit terminal event evidence in the journal
+    // Result association / grid data (extracted from the raw journal).
+    let _primaryOutput = null;
+    for (const ev of events) {
+      if (ev.type !== "cell.completed" || !ev.payload) continue;
+      const payload = ev.payload || {};
+      if (payload.primary_asset_id) {
+        _primaryOutput = apiBase + "/assets/" + encodeURIComponent(payload.primary_asset_id);
+        break;
+      }
+      if (payload.output_paths && payload.output_paths.length > 0) {
+        _primaryOutput = apiBase + "/studio/outputs/" + encodeURIComponent(payload.output_paths[0]);
+        break;
+      }
+    }
+    const extras = {
+      experimentId: experimentId,
+      _snapshot: snapshot,
+      _events: events,
+      _cellOutputs: _pollCellOutputs,
+      completedCells: completedCellCount,
+      totalCells: totalCells,
+      hasHistory: completedCellCount > 0 || events.some(function (ev) { return ev.type === "cell.completed"; }),
+      primaryOutput: _primaryOutput,
+    };
+    if (completedCellCount > 0 && totalCells > 0) {
+      extras.cellProgress = completedCellCount + "/" + totalCells;
+    }
+    const _ctrl = _getRunController(state, actions);
+    if (_ctrl && _ctrl.getRunId()) {
+      // Canonical single-run path: lifecycle state is owned by the controller.
+      _ctrl.applySnapshot(data, extras);
+      // Terminal reached — stop polling (duplicate polls are no-ops anyway).
+      if (_ctrl.isTerminal()) _stopPolling(state);
+      return;
+    }
+
+    // ── Legacy cascade (experiment-mode runs) ─────────────────────────
+    // Experiment submissions never call the canonical beginRun; they set
+    // runState directly and the grid reads _snapshot/_events/_cellOutputs
+    // from it. Preserve the original status cascade here so experiment
+    // mode keeps working unchanged while single runs stay canonical.
+    // Terminal semantics stay honest: cancelled/stopped map to "canceled",
+    // never to "completed".
+    const status = snapshot.overall_status || snapshot.status || data.state || "";
     const hasTerminalEvent = events.some(function (ev) {
       return ev.type === "experiment.completed" ||
              ev.type === "experiment.stopped" ||
              ev.type === "experiment.cancelled";
     });
-
-    // Check for explicit error events in the journal (safety net for
-    // scheduler failures that may not yet be reflected in snapshot status)
     const errorEvents = events.filter(function (ev) {
       return ev.type === "experiment.error" || ev.type === "experiment.failed_fatal";
     });
@@ -180,28 +216,12 @@ function _startPolling(container, state, context, actions, runState) {
     const lastErrorMsg = hasExplicitErrorEvent
       ? (errorEvents[errorEvents.length - 1].payload || {}).error || ""
       : "";
-
-    // Cell-level completion evidence
-    const completedCellCount = counters.completed || 0;
-    const totalCells = snapshot.total_cells || 0;
-    const cellCompletedEvents = events.filter(function (ev) {
-      return ev.type === "cell.completed";
-    }).length;
-    const hasCellCompletionEvidence = completedCellCount > 0 || cellCompletedEvents > 0;
-
-    // Build cell output URL map from cell.completed events so the grid
-    // can show individual thumbnails in their correct axis position.
-    var _pollCellOutputs = _buildCellOutputMap(events, apiBase);
+    const hasCellCompletionEvidence = completedCellCount > 0 ||
+      events.some(function (ev) { return ev.type === "cell.completed"; });
 
     if (status === "queued") {
       if (actions && actions.setRunState) {
-        actions.setRunState({
-          status: "queued",
-          experimentId,
-          _snapshot: snapshot,
-          _events: events,
-          _cellOutputs: _pollCellOutputs,
-        });
+        actions.setRunState({ status: "queued", experimentId, _snapshot: snapshot, _events: events, _cellOutputs: _pollCellOutputs });
       }
     } else if (status === "in_progress" || status === "running") {
       const progressState = {
@@ -214,58 +234,33 @@ function _startPolling(container, state, context, actions, runState) {
       if (completedCellCount > 0 && totalCells > 0) {
         progressState.cellProgress = completedCellCount + "/" + totalCells;
       }
-      if (actions && actions.setRunState) {
-        actions.setRunState(progressState);
-      }
+      if (actions && actions.setRunState) actions.setRunState(progressState);
     } else if (status === "completed" || status === "succeeded" || status === "cancelled" || status === "stopped") {
-      // Terminal success/cancelled/stopped state.  When evidence exists
-      // (completed cells or a terminal event in the journal), extract
-      // outputs and mark completed with full snapshot/events/cellOutputs
-      // so the grid viewport renders partial results after cancellation.
       if (hasCellCompletionEvidence || hasTerminalEvent) {
         _stopPolling(state);
-        // Extract output evidence from cell.completed events
-        const outputEvents = events.filter(function (ev) {
-          return ev.type === "cell.completed" && ev.payload;
-        });
-        let primaryOutput = null;
-        for (const ev of outputEvents) {
-          const payload = ev.payload || {};
-          if (payload.primary_asset_id) {
-            primaryOutput = apiBase + "/assets/" + encodeURIComponent(payload.primary_asset_id);
-            break;
-          }
-          if (payload.output_paths && payload.output_paths.length > 0) {
-            const outputFilename = payload.output_paths[0];
-            primaryOutput = apiBase + "/studio/outputs/" + encodeURIComponent(outputFilename);
-            break;
-          }
-        }
         if (actions && actions.setRunState) {
           actions.setRunState({
-            status: "completed",
+            status: status === "completed" || status === "succeeded" ? "completed" : "canceled",
             experimentId: experimentId,
-            completedCells: completedCellCount || cellCompletedEvents,
+            completedCells: completedCellCount,
             totalCells: totalCells,
-            primaryOutput: primaryOutput,
-            hasHistory: true,
+            primaryOutput: _primaryOutput,
+            hasHistory: hasCellCompletionEvidence,
             _snapshot: snapshot,
             _events: events,
             _cellOutputs: _pollCellOutputs,
           });
         }
       } else if (status === "completed" || status === "succeeded") {
-        // Completed but no evidence yet — stay in current state,
-        // bounded by the 5-minute POLL_TIMEOUT_MS above.
-        // (Existing behavior: snapshot may be populated on next poll.)
+        // Completed but no evidence yet — stay in current state, bounded by
+        // the 5-minute POLL_TIMEOUT_MS above.
       } else {
-        // cancelled/stopped without evidence — still a terminal event.
-        // Stop polling and show as completed with no cell data so the
-        // grid does not hang indefinitely.
+        // cancelled/stopped without evidence — honest canceled terminal,
+        // never "completed" (the run was not successful).
         _stopPolling(state);
         if (actions && actions.setRunState) {
           actions.setRunState({
-            status: "completed",
+            status: "canceled",
             experimentId: experimentId,
             completedCells: 0,
             totalCells: totalCells || 0,
@@ -281,30 +276,18 @@ function _startPolling(container, state, context, actions, runState) {
       _stopPolling(state);
       const errMsg = (lastErrorMsg || snapshot.error || data.message || data.error || "Run failed.").substring(0, 200);
       if (actions && actions.setRunState) {
-        actions.setRunState({
-          status: "error",
-          message: errMsg,
-          experimentId: experimentId,
-        });
+        actions.setRunState({ status: "error", message: errMsg, experimentId: experimentId });
       }
     } else if (status === "draft" || !status) {
-      // Safety net: if there are explicit error events even while status
-      // shows draft/unknown, surface the error terminal state
       if (hasExplicitErrorEvent) {
         _stopPolling(state);
         const errMsg = (lastErrorMsg || "Run failed.").substring(0, 200);
         if (actions && actions.setRunState) {
-          actions.setRunState({
-            status: "error",
-            message: errMsg,
-            experimentId: experimentId,
-          });
+          actions.setRunState({ status: "error", message: errMsg, experimentId: experimentId });
         }
-      } else {
+      } else if (actions && actions.setRunState) {
         // Still being set up — stay in waiting
-        if (actions && actions.setRunState) {
-          actions.setRunState({ status: "waiting", experimentId });
-        }
+        actions.setRunState({ status: "waiting", experimentId });
       }
     }
   }, POLL_INTERVAL_MS);
@@ -628,6 +611,14 @@ export async function hydratePlayground(state, context) {
   if (targetPresetId) {
     saveSelection(targetPresetId, featureId);
   }
+
+  // 8. Kick off the modern workflow selector init (idempotent — it is also
+  // started from renderControlPanel; this covers hydration-only renders).
+  try {
+    initWorkflowRun(state, context);
+  } catch (e) {
+    // Never block legacy hydration on the workflow selector.
+  }
 }
 
 // ── Main Playground renderer ─────────────────────────────────────────────
@@ -733,6 +724,7 @@ function renderControlPanel(state, context) {
 
   // Actions for state mutations (called by event handlers)
   const actions = buildActions(state, context);
+  if (state.playground) state.playground._runActions = actions;
   const apiBase = (context && context.apiBase) || "/comfymodal";
 
   // Hydrate: restore saved state.
@@ -791,6 +783,11 @@ function renderControlPanel(state, context) {
 
   // ── Backend Selector ───────────────────────────────────────────────
   panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
+
+  // ── Workflow Selector (modern workflow-driven runs) ────────────────
+  // Separate container rendered after the legacy selector row so legacy
+  // test-ids/order stay intact. Empty-state only until a workflow is chosen.
+  panel.appendChild(renderWorkflowSelector(state, context, actions));
 
   // ── Preset-driven Controls ─────────────────────────────────────────
   const controlsContainer = el("div", { class: "comfymodal-studio-controls", "data-testid": "controls-container" });
@@ -1060,7 +1057,7 @@ function buildActions(state, context) {
       // change, but preserve in-flight states to prevent duplicate submits.
       const currentRunState = state.playground && state.playground.runState;
       const isTerminalState = currentRunState
-        && (currentRunState.status === "completed" || currentRunState.status === "error");
+        && LEGACY_TERMINAL_STATUSES.indexOf(currentRunState.status) !== -1;
       if (isTerminalState) {
         state.playground.runState = null;
         if (context && context.setPage) {
@@ -1167,7 +1164,7 @@ function buildActions(state, context) {
       const newStatus = runState && runState.status;
 
       // Dispose scoped tracker and clean up local timer on terminal states
-      if (runState && (newStatus === "completed" || newStatus === "error")) {
+      if (runState && newStatus && LEGACY_TERMINAL_STATUSES.indexOf(newStatus) !== -1) {
         if (state.playground && state.playground.runState) {
           delete state.playground.runState._localStartTime;
           delete state.playground.runState._cancelling;
@@ -1177,7 +1174,7 @@ function buildActions(state, context) {
         _disposeScopedTracker(state);
       }
 
-      if (runState && newStatus === "completed") {
+      if (runState && newStatus === "completed" && prevStatus !== "completed") {
         // A new run completed — re-enable the carousel synchronously so
         // subsequent re-renders and page loads show recent runs again.
         // Done BEFORE the async refresh so the flag does not persist and
@@ -1351,6 +1348,928 @@ function renderBackendSelector(state, actions, context) {
   });
 
   return container;
+}
+
+// ── Workflow Run Selector (modern workflow-driven runs) ───────────────────
+//
+// Renders a Workflow / Version / Preset selector backed by the frozen
+// web/studio-workflow-run.js logic module. When a workflow+version is
+// selected, the Run button is gated by resolveRunnable() and runs through
+// the canonical controller with a workflow payload (buildRunPayload).
+// When NO workflow is selected the legacy backend-preset path is untouched.
+//
+// The section renders into a dedicated container owned by this module;
+// async loads only ever re-render that container (plus the Run button
+// gating), never the whole page, so user typing in the mapped controls is
+// not clobbered by in-flight fetches.
+
+let _workflowModelLibraryCache = null;
+let _workflowModelLibraryCacheKey = "";
+
+function _isModernRunSelected(state) {
+  const store = state && state.playground && state.playground._workflowRun;
+  return !!(store && store.workflowId && store.workflowVersionId);
+}
+
+function _workflowOptionLabel(w) {
+  const name = (w && w.name) ? w.name : "Unnamed workflow";
+  if (w && w.version_count != null) {
+    return name + " (" + w.version_count + " version" + (w.version_count === 1 ? "" : "s") + ")";
+  }
+  if (w && w.latest_version_number != null) {
+    return name + " (v" + w.latest_version_number + ")";
+  }
+  return name;
+}
+
+function _workflowVersionOptionLabel(v) {
+  const label = "v" + (v && v.version_number != null ? v.version_number : "?");
+  const created = (v && v.created_at) ? _workflowShortDate(v.created_at) : "";
+  return created ? label + " \u00b7 " + created : label;
+}
+
+function _workflowShortDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  try {
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  } catch (e) {
+    return String(iso);
+  }
+}
+
+async function _loadWorkflowModelLibrary(state, apiBase) {
+  try {
+    if (_workflowModelLibraryCacheKey === apiBase && _workflowModelLibraryCache) {
+      if (state && state.playground) state.playground._workflowModelLibrary = _workflowModelLibraryCache;
+      return _workflowModelLibraryCache;
+    }
+    const data = await listModels(apiBase);
+    const records = (data && Array.isArray(data.models)) ? data.models : [];
+    _workflowModelLibraryCache = records;
+    _workflowModelLibraryCacheKey = apiBase;
+    if (state && state.playground) state.playground._workflowModelLibrary = records;
+    return records;
+  } catch (e) {
+    if (state && state.playground) state.playground._workflowModelLibrary = [];
+    return [];
+  }
+}
+
+/**
+ * True when the selected workflow/version declares a non-empty model
+ * compatibility contract. With no declared contract every enum model is
+ * treated as compatible (no suffix, no gating).
+ */
+function _workflowHasModelContract(store) {
+  const ctx = store && store.runContext;
+  if (!ctx) return false;
+  const wf = ctx.workflow || {};
+  const ver = ctx.version || {};
+  const wfModels = Array.isArray(wf.compatible_models) ? wf.compatible_models : [];
+  const verModels = Array.isArray(ver.compatible_models) ? ver.compatible_models : [];
+  return wfModels.length > 0 || verModels.length > 0;
+}
+
+/**
+ * The currently-selected model filename that is known-incompatible with the
+ * version's compatibility contract, or null. Only a schema enum value that
+ * the user selected AND that modelCompatibility classified compatible=false
+ * qualifies; with no declared contract nothing is incompatible.
+ */
+function _selectedIncompatibleModel(store, wf, compat) {
+  if (!compat || !compat.byFilename) return null;
+  if (!_workflowHasModelContract(store)) return null;
+  const schema = wf.getControlSchema(store);
+  const values = (store.controlValues && typeof store.controlValues === "object") ? store.controlValues : {};
+  for (const entry of Object.values(schema)) {
+    if (!entry || typeof entry !== "object") continue;
+    const enumOptions = Array.isArray(entry.enum_options) ? entry.enum_options : [];
+    if (!enumOptions.length) continue;
+    const selected = values[entry.semantic_role];
+    if (selected === undefined || selected === null) continue;
+    const key = String(selected);
+    if (!enumOptions.some((o) => String(o) === key)) continue;
+    const c = compat.byFilename[key];
+    if (c && c.compatible === false) return key;
+  }
+  return null;
+}
+
+/**
+ * Gating wrapper: frozen resolveRunnable() reasons + the incompatible-model
+ * contribution. Known incompatible models must not silently execute, so Run
+ * stays disabled while one is selected.
+ */
+function _resolveWorkflowRunnable(store, wf, modelRecords) {
+  const base = wf.resolveRunnable(store);
+  if (!base.runnable) return base;
+  const compat = wf.modelCompatibility(store, modelRecords || []);
+  const incompatible = _selectedIncompatibleModel(store, wf, compat);
+  if (!incompatible) return base;
+  return {
+    runnable: false,
+    reasons: base.reasons.concat(["model '" + incompatible + "' is not compatible with this workflow version"]),
+  };
+}
+
+function _workflowGatingInfo(store, wf, state) {
+  if (!store) return { text: "Select a workflow", color: "" };
+  if (store.statusLine) return { text: store.statusLine, color: "#d9a441" };
+  if (store.status === "error") return { text: store.error || "Load error", color: "#f87171" };
+  if (!store.workflowId) return { text: "Select a workflow", color: "" };
+  if (!store.workflowVersionId) return { text: "Select a version", color: "" };
+  if (store.status === "loading" || !wf || !store.runContext) {
+    return { text: store.status === "loading" ? "Loading\u2026" : "Loading workflow\u2026", color: "" };
+  }
+  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
+  const { runnable, reasons } = _resolveWorkflowRunnable(store, wf, modelRecords);
+  if (runnable) return { text: "Ready to run", color: "var(--color-success)" };
+  return { text: reasons.length ? reasons.join("; ") : "Not runnable", color: "#d9a441" };
+}
+
+function _workflowSelectEl(state, actions, context) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const select = el("select", {
+    class: "comfymodal-input comfymodal-studio-select",
+    "data-testid": "workflow-selector",
+  });
+  if (!store) {
+    select.appendChild(el("option", { value: "", text: "Loading\u2026", disabled: true, selected: true }));
+    select.disabled = true;
+    return select;
+  }
+  const placeholder = el("option", { value: "", text: "Select a workflow\u2026", disabled: true });
+  if (!store.workflowId) placeholder.selected = true;
+  select.appendChild(placeholder);
+  (store.library || []).forEach((w) => {
+    const opt = el("option", { value: String(w.workflow_id), text: _workflowOptionLabel(w) });
+    if (store.workflowId && String(store.workflowId) === String(w.workflow_id)) opt.selected = true;
+    select.appendChild(opt);
+  });
+  select.disabled = (store.library || []).length === 0;
+  select.addEventListener("change", () => {
+    _handleWorkflowChange(state, context, actions, select.value);
+  });
+  return select;
+}
+
+function _workflowVersionSelectEl(state, actions, context) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const select = el("select", {
+    class: "comfymodal-input comfymodal-studio-select",
+    "data-testid": "workflow-version-selector",
+  });
+  if (!store || !store.workflowId) {
+    select.appendChild(el("option", { value: "", text: "No workflow selected", disabled: true, selected: true }));
+    select.disabled = true;
+    return select;
+  }
+  const placeholder = el("option", { value: "", text: "Select a version\u2026", disabled: true });
+  if (!store.workflowVersionId) placeholder.selected = true;
+  select.appendChild(placeholder);
+  (store.versions || []).forEach((v) => {
+    const opt = el("option", { value: String(v.workflow_version_id), text: _workflowVersionOptionLabel(v) });
+    if (store.workflowVersionId && String(store.workflowVersionId) === String(v.workflow_version_id)) opt.selected = true;
+    select.appendChild(opt);
+  });
+  select.disabled = !store.workflowId || (store.versions || []).length === 0;
+  select.addEventListener("change", () => {
+    _handleVersionChange(state, context, actions, select.value);
+  });
+  return select;
+}
+
+function _workflowPresetSelectEl(state, actions, context) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const select = el("select", {
+    class: "comfymodal-input comfymodal-studio-select",
+    "data-testid": "workflow-preset-selector",
+  });
+  if (!store || !store.workflowVersionId) {
+    select.appendChild(el("option", { value: "", text: "No version selected", disabled: true, selected: true }));
+    select.disabled = true;
+    return select;
+  }
+  const placeholder = el("option", { value: "", text: "Select a preset\u2026", disabled: true });
+  if (!store.presetId) placeholder.selected = true;
+  select.appendChild(placeholder);
+  (store.presets || []).forEach((p) => {
+    const opt = el("option", { value: String(p.preset_id), text: p.name || "Unnamed preset" });
+    if (store.presetId && String(store.presetId) === String(p.preset_id)) opt.selected = true;
+    select.appendChild(opt);
+  });
+  select.disabled = !store.workflowVersionId || (store.presets || []).length === 0;
+  select.addEventListener("change", () => {
+    _handlePresetChange(state, context, actions, select.value);
+  });
+  return select;
+}
+
+function _workflowGatingLineEl(state, wf, context) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const info = _workflowGatingInfo(store, wf, state);
+  const line = el("div", {
+    "data-testid": "workflow-run-gating",
+    class: "comfymodal-studio-control-note",
+    style: "font-size:var(--font-size-xs);color:var(--color-text-muted);margin-top:4px;",
+  });
+  if (info.color) line.style.color = info.color;
+  line.textContent = info.text;
+  if (store && !store.workflowId) {
+    // Empty-state link to the Workflows page (legacy layout untouched).
+    line.appendChild(document.createTextNode(" "));
+    const link = el("a", {
+      text: "Open Workflows",
+      style: "color:var(--color-accent);cursor:pointer;",
+      onclick: (e) => {
+        e.preventDefault();
+        if (context && context.setPage) context.setPage("workflows");
+      },
+    });
+    line.appendChild(link);
+  }
+  return line;
+}
+
+function _workflowControlRow(entry, schemaEntry, store, wf, state, actions, context, compat) {
+  const role = entry.semantic_role;
+  const group = el("div", {
+    class: "comfymodal-studio-control-group",
+    "data-testid": "workflow-control-" + role,
+  });
+  group.appendChild(el("label", { class: "comfymodal-studio-control-label", text: role }));
+
+  const current = (store.controlValues && typeof store.controlValues === "object") ? store.controlValues : {};
+  const hasValue = Object.prototype.hasOwnProperty.call(current, role);
+  const value = hasValue ? current[role] : undefined;
+  const kind = schemaEntry.control_kind || "string";
+  const enumOptions = Array.isArray(schemaEntry.enum_options) ? schemaEntry.enum_options : [];
+  const hasEnums = enumOptions.length > 0;
+  // With no declared compatibility contract every enum model is treated as
+  // compatible (no suffix, no gating).
+  const hasModelContract = _workflowHasModelContract(store);
+
+  // DOM→store round-trip: preserve falsy values verbatim. Number inputs only
+  // convert to Number when the schema kind is integer/float; selects produce
+  // the exact option string (including "" if an option is empty string).
+  function commit(rawValue) {
+    store.setControlValue(role, rawValue);
+    const schema = wf.getControlSchema(store);
+    const validation = wf.validateMappedValues(store.controlValues || {}, schema);
+    store.setControlValues(validation.values);
+    const reasons = validation.errors && validation.errors.length
+      ? validation.errors.map((e) => e.message)
+      : [];
+    // Known incompatible models must not silently execute: mirror the reason
+    // in the store so every gating consumer sees it.
+    const incompatible = _selectedIncompatibleModel(store, wf, compat);
+    if (incompatible) {
+      reasons.push("model '" + incompatible + "' is not compatible with this workflow version");
+    }
+    store.setReasons(reasons);
+    _syncWorkflowGating(state, context, actions);
+  }
+
+  let input = null;
+
+  if (kind === "enum" || hasEnums) {
+    input = el("select", {
+      class: "comfymodal-input comfymodal-studio-select",
+      "data-testid": "workflow-input-" + role,
+    });
+    enumOptions.forEach((opt) => {
+      let text = String(opt);
+      if (hasModelContract && compat && compat.byFilename && Object.prototype.hasOwnProperty.call(compat.byFilename, String(opt))) {
+        const c = compat.byFilename[String(opt)];
+        if (c && c.compatible === false) {
+          text = String(opt) + " (incompatible)";
+        } else if (c && c.installed === false) {
+          text = String(opt) + " (missing)";
+        }
+      }
+      const option = el("option", { value: String(opt), text: text });
+      if (value !== undefined && String(value) === String(opt)) option.selected = true;
+      input.appendChild(option);
+    });
+    input.addEventListener("change", () => commit(input.value));
+  } else if (kind === "boolean") {
+    input = el("input", {
+      type: "checkbox",
+      class: "comfymodal-input comfymodal-studio-checkbox",
+      "data-testid": "workflow-input-" + role,
+    });
+    input.checked = value === true || value === 1 || value === "1" || value === "true";
+    input.addEventListener("change", () => commit(input.checked));
+  } else if (kind === "integer") {
+    input = el("input", {
+      type: "number",
+      step: "1",
+      min: schemaEntry.minimum != null ? String(schemaEntry.minimum) : "",
+      max: schemaEntry.maximum != null ? String(schemaEntry.maximum) : "",
+      class: "comfymodal-input comfymodal-studio-number-input",
+      value: value !== undefined && value !== null ? String(value) : "",
+      "data-testid": "workflow-input-" + role,
+    });
+    input.addEventListener("input", () => {
+      const raw = input.value;
+      const parsed = parseInt(raw, 10);
+      commit(raw === "" || Number.isNaN(parsed) ? raw : parsed);
+    });
+  } else if (kind === "number") {
+    input = el("input", {
+      type: "number",
+      step: schemaEntry.step != null ? String(schemaEntry.step) : "any",
+      min: schemaEntry.minimum != null ? String(schemaEntry.minimum) : "",
+      max: schemaEntry.maximum != null ? String(schemaEntry.maximum) : "",
+      class: "comfymodal-input comfymodal-studio-number-input",
+      value: value !== undefined && value !== null ? String(value) : "",
+      "data-testid": "workflow-input-" + role,
+    });
+    input.addEventListener("input", () => {
+      const raw = input.value;
+      const parsed = parseFloat(raw);
+      commit(raw === "" || Number.isNaN(parsed) ? raw : parsed);
+    });
+  } else if (kind === "multiline") {
+    input = el("textarea", {
+      class: "comfymodal-input comfymodal-studio-textarea",
+      value: value !== undefined && value !== null ? String(value) : "",
+      "data-testid": "workflow-input-" + role,
+    });
+    input.addEventListener("input", () => commit(input.value));
+  } else if (kind === "file" || kind === "image") {
+    // Read-only display of the current filename (upload is out of scope);
+    // the value stays whatever the preset/graph declared.
+    input = el("input", {
+      type: "text",
+      class: "comfymodal-input comfymodal-studio-text-input",
+      value: value !== undefined && value !== null ? String(value) : "",
+      disabled: true,
+      title: "File selection is out of scope — the current value comes from the preset/graph.",
+      "data-testid": "workflow-input-" + role,
+    });
+    group.appendChild(el("span", {
+      class: "comfymodal-studio-control-note",
+      text: "File selection is out of scope — value preserved from preset/graph.",
+      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+    }));
+  } else {
+    input = el("input", {
+      type: "text",
+      class: "comfymodal-input comfymodal-studio-text-input",
+      value: value !== undefined && value !== null ? String(value) : "",
+      "data-testid": "workflow-input-" + role,
+    });
+    input.addEventListener("input", () => commit(input.value));
+  }
+
+  if (input) group.appendChild(input);
+  return group;
+}
+
+function _renderWorkflowMappedControls(container, state, context, actions) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+  if (!store || !wf || !store.runContext || !store.runContext.mapping) return;
+  const entries = Array.isArray(store.runContext.mapping.entries) ? store.runContext.mapping.entries : [];
+  const schema = wf.getControlSchema(store);
+  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
+  const compat = wf.modelCompatibility(store, modelRecords);
+  entries.forEach((entry) => {
+    const role = entry && entry.semantic_role;
+    if (!role || !Object.prototype.hasOwnProperty.call(schema, role)) return;
+    const row = _workflowControlRow(entry, schema[role], store, wf, state, actions, context, compat);
+    if (row) container.appendChild(row);
+  });
+}
+
+function _populateWorkflowSelector(container, state, context, actions) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+
+  container.appendChild(_workflowSelectEl(state, actions, context));
+  container.appendChild(_workflowVersionSelectEl(state, actions, context));
+  container.appendChild(_workflowPresetSelectEl(state, actions, context));
+  container.appendChild(_workflowGatingLineEl(state, wf, context));
+
+  if (store && store.handoff) {
+    container.appendChild(el("div", {
+      "data-testid": "workflow-handoff-notice",
+      class: "comfymodal-studio-control-note",
+      text: "from Workflows",
+      style: "font-size:var(--font-size-xs);color:var(--color-accent);margin-top:2px;",
+    }));
+  }
+  if (store && store.handoffError) {
+    container.appendChild(el("div", {
+      "data-testid": "workflow-handoff-error",
+      class: "comfymodal-studio-empty-state",
+      text: store.handoffError,
+      style: "font-size:var(--font-size-xs);color:#f87171;margin-top:4px;",
+    }));
+  }
+
+  const controlsBox = el("div", { "data-testid": "workflow-mapped-controls" });
+  _renderWorkflowMappedControls(controlsBox, state, context, actions);
+  container.appendChild(controlsBox);
+}
+
+function _rerenderWorkflowSection(state, context, actions) {
+  const container = document.querySelector('[data-testid="workflow-selector-section"]');
+  if (!container) return;
+  _populateWorkflowSelector(container, state, context, actions);
+  _syncRunButtonGating(state, context, actions);
+}
+
+function _syncWorkflowGating(state, context, actions) {
+  const line = document.querySelector('[data-testid="workflow-run-gating"]');
+  if (line) {
+    const store = state && state.playground && state.playground._workflowRun;
+    const wf = state && state.playground && state.playground._workflowRunModule;
+    const info = _workflowGatingInfo(store, wf, state);
+    line.style.color = info.color ? info.color : "";
+    line.textContent = info.text;
+  }
+  _syncRunButtonGating(state, context, actions);
+}
+
+function renderWorkflowSelector(state, context, actions) {
+  const container = el("div", {
+    class: "comfymodal-studio-workflow-selector",
+    "data-testid": "workflow-selector-section",
+  });
+  _populateWorkflowSelector(container, state, context, actions);
+  if (!(state && state.playground && state.playground._workflowInitPromise)) {
+    initWorkflowRun(state, context, actions);
+  } else if (
+    state.playground._workflowRunModule &&
+    state.playground._workflowRun
+  ) {
+    const pending = _peekWorkflowHandoff(state.playground._workflowRunModule);
+    if (pending && pending.workflowId) {
+      _applyWorkflowHandoff(
+        state, context, actions,
+        state.playground._workflowRunModule,
+        state.playground._workflowRun,
+        pending
+      )
+        .then(() => _rerenderWorkflowSection(state, context, actions))
+        .catch(() => {});
+    }
+  }
+  return container;
+}
+
+// ── Workflow run init / selection flows ───────────────────────────────────
+
+function _peekWorkflowHandoff(wf) {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const key = wf && wf.PERSISTENCE_KEYS && wf.PERSISTENCE_KEYS.workflowHandoff;
+    if (!key) return null;
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function initWorkflowRun(state, context, actions) {
+  const pg = state && state.playground;
+  if (!pg) return;
+  if (pg._workflowInitPromise) return pg._workflowInitPromise;
+  const promise = (async () => {
+    try {
+      const wf = await import("./studio-workflow-run.js");
+      const store = wf.createWorkflowRunStore();
+      pg._workflowRun = store;
+      pg._workflowRunModule = wf;
+      const apiBase = (context && context.apiBase) || "/comfymodal";
+
+      // The library must be present for resolveHandoffSelection and the
+      // saved-selection restore to validate the requested entities.
+      await wf.loadWorkflowLibrary(apiBase, store);
+
+      // a) One-shot handoff from the Workflows page. The frozen
+      //    resolveHandoffSelection validates against loaded data (library,
+      //    versions, presets), so the referenced workflow is selected first
+      //    (populating versions + presets) and only then is the one-shot
+      //    handoff consumed + validated. Detected via a peek because
+      //    takeWorkflowHandoff consumes the value exactly once.
+      const pendingHandoff = _peekWorkflowHandoff(wf);
+      if (pendingHandoff && pendingHandoff.workflowId) {
+        await _applyWorkflowHandoff(state, context, actions, wf, store, pendingHandoff);
+        _rerenderWorkflowSection(state, context, actions);
+        return;
+      }
+
+      // b) Restore the persisted workflow selection.
+      const saved = wf.loadWorkflowSelection();
+      if (saved && saved.workflowId) {
+        await _restoreWorkflowSelection(state, context, actions, wf, store, saved);
+        _rerenderWorkflowSection(state, context, actions);
+        return;
+      }
+
+      // c) No handoff / saved selection: library only. Run stays on the
+      //    legacy preset path until the user selects a workflow.
+      store.setStatus("ready");
+      _rerenderWorkflowSection(state, context, actions);
+    } catch (err) {
+      // Never let init failures break the page or trip console guards.
+      console.debug("[comfymodal workflow] init failed", err && err.message);
+    }
+  })();
+  pg._workflowInitPromise = promise;
+  return promise;
+}
+
+/** Clear a broken handoff/selection: keep the loaded library, drop ids. */
+function _failWorkflowHandoff(wf, store, error) {
+  store.handoffError = error;
+  store.setHandoff(null);
+  store.setReasons([error]);
+  store.setWorkflowId("");
+  store.setVersionId("");
+  store.setPresetId("");
+  store.setWorkflowName("");
+  store.setPresetName("");
+  store.setRunContext(null);
+  store.controlValues = {};
+  store.setStatus("idle");
+  store.setError("");
+  wf.clearWorkflowSelection();
+  // The one-shot handoff is consumed exactly once even on failure.
+  try { wf.takeWorkflowHandoff(); } catch (e) { /* ignore */ }
+}
+
+async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const missing = "Requested workflow/version/preset no longer available";
+
+  const wfRes = await wf.selectWorkflow(apiBase, store, handoff.workflowId);
+  if (!wfRes.ok) {
+    _failWorkflowHandoff(wf, store, wfRes.error || missing);
+    return;
+  }
+  if (handoff.workflowVersionId) {
+    const verExists = (store.versions || []).some((v) => String(v.workflow_version_id) === String(handoff.workflowVersionId));
+    if (!verExists) {
+      _failWorkflowHandoff(wf, store, missing);
+      return;
+    }
+    const verRes = await wf.selectVersion(apiBase, store, handoff.workflowVersionId);
+    if (!verRes.ok) {
+      _failWorkflowHandoff(wf, store, verRes.error || missing);
+      return;
+    }
+  }
+  if (handoff.presetId) {
+    const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(handoff.presetId));
+    if (!presetExists) {
+      _failWorkflowHandoff(wf, store, missing);
+      return;
+    }
+    const preRes = await wf.selectPreset(apiBase, store, handoff.presetId);
+    if (!preRes.ok) {
+      _failWorkflowHandoff(wf, store, preRes.error || missing);
+      return;
+    }
+  }
+
+  // Consume + validate the one-shot handoff against the now-loaded data.
+  const h = wf.resolveHandoffSelection(store);
+  if (!h || !h.ok) {
+    _failWorkflowHandoff(wf, store, (h && h.error) || missing);
+    return;
+  }
+  store.handoffError = null;
+  await _loadWorkflowModelLibrary(state, apiBase);
+  wf.saveWorkflowSelection({
+    workflowId: store.workflowId,
+    workflowVersionId: store.workflowVersionId,
+    presetId: store.presetId,
+    workflowName: store.workflowName || "",
+    presetName: store.presetName || "",
+  });
+}
+
+async function _restoreWorkflowSelection(state, context, actions, wf, store, saved) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const workflow = (store.library || []).find((w) => String(w.workflow_id) === String(saved.workflowId));
+  if (!workflow) {
+    store.statusLine = "Saved workflow is no longer available";
+    store.setStatus("idle");
+    store.setReasons([]);
+    wf.clearWorkflowSelection();
+    return;
+  }
+  const wfRes = await wf.selectWorkflow(apiBase, store, saved.workflowId);
+  if (!wfRes.ok) {
+    store.statusLine = wfRes.error || "Saved workflow is no longer available";
+    wf.clearWorkflowSelection();
+    return;
+  }
+  if (saved.workflowVersionId) {
+    const verExists = (store.versions || []).some((v) => String(v.workflow_version_id) === String(saved.workflowVersionId));
+    if (!verExists) {
+      // Keep the workflow selected; never silently substitute a version.
+      store.statusLine = "Requested version no longer available";
+      store.setVersionId("");
+      store.setPresetId("");
+      store.setPresetName("");
+      store.controlValues = {};
+      store.setStatus("ready");
+      store.setReasons(["Requested version no longer available"]);
+      return;
+    }
+    const verRes = await wf.selectVersion(apiBase, store, saved.workflowVersionId);
+    if (!verRes.ok) {
+      store.statusLine = verRes.error || "Requested version no longer available";
+      return;
+    }
+  }
+  if (saved.presetId) {
+    const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(saved.presetId));
+    if (!presetExists) {
+      // Keep the workflow/version; never silently substitute a preset.
+      store.statusLine = "Requested preset no longer available";
+      store.setPresetId("");
+      store.setPresetName("");
+      store.setStatus("ready");
+      store.setReasons(["Requested preset no longer available"]);
+      return;
+    }
+    const preRes = await wf.selectPreset(apiBase, store, saved.presetId);
+    if (!preRes.ok) {
+      store.statusLine = preRes.error || "Requested preset no longer available";
+      return;
+    }
+  }
+  await _loadWorkflowModelLibrary(state, apiBase);
+}
+
+async function _handleWorkflowChange(state, context, actions, workflowId) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+  if (!store || !wf || !workflowId) return;
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  store.handoffError = null;
+  const result = await wf.selectWorkflow(apiBase, store, workflowId);
+  await _loadWorkflowModelLibrary(state, apiBase);
+  if (result && result.ok) {
+    wf.saveWorkflowSelection({
+      workflowId: store.workflowId,
+      workflowVersionId: store.workflowVersionId,
+      presetId: store.presetId,
+      workflowName: store.workflowName || "",
+      presetName: store.presetName || "",
+    });
+  }
+  _rerenderWorkflowSection(state, context, actions);
+}
+
+async function _handleVersionChange(state, context, actions, versionId) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+  if (!store || !wf || !versionId) return;
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  store.handoffError = null;
+  const result = await wf.selectVersion(apiBase, store, versionId);
+  if (result && result.ok) {
+    wf.saveWorkflowSelection({
+      workflowId: store.workflowId,
+      workflowVersionId: store.workflowVersionId,
+      presetId: store.presetId,
+      workflowName: store.workflowName || "",
+      presetName: store.presetName || "",
+    });
+  }
+  _rerenderWorkflowSection(state, context, actions);
+}
+
+async function _handlePresetChange(state, context, actions, presetId) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+  if (!store || !wf) return;
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  store.handoffError = null;
+  const result = await wf.selectPreset(apiBase, store, presetId || "");
+  if (result && result.ok) {
+    wf.saveWorkflowSelection({
+      workflowId: store.workflowId,
+      workflowVersionId: store.workflowVersionId,
+      presetId: store.presetId,
+      workflowName: store.workflowName || "",
+      presetName: store.presetName || "",
+    });
+  }
+  _rerenderWorkflowSection(state, context, actions);
+}
+
+// ── Run button gating (modern mode) ───────────────────────────────────────
+
+function _applyModernRunButtonState(state, context, actions, btn, reason) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+  if (!store || !wf) return;
+  // Never clobber an in-flight run's button state.
+  const runState = state && state.playground && state.playground.runState;
+  if (runState && runState.status && LEGACY_TERMINAL_STATUSES.indexOf(runState.status) === -1) return;
+  if (reason) while (reason.firstChild) reason.removeChild(reason.firstChild);
+  const g = _workflowGatingInfo(store, wf, state);
+  if (store.status === "loading" || store.status === "error" || !store.runContext) {
+    btn.disabled = true;
+    btn.textContent = "Run";
+    btn.title = g.text;
+    // Modern gating owns the primary button: never leave a stale legacy
+    // onclick on the visible Run button while a modern selection is active.
+    btn.onclick = null;
+    if (reason && g.text) {
+      reason.appendChild(el("p", {
+        text: g.text,
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
+    return;
+  }
+  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
+  const { runnable, reasons } = _resolveWorkflowRunnable(store, wf, modelRecords);
+  if (!runnable) {
+    btn.disabled = true;
+    btn.textContent = "Run";
+    btn.title = reasons.length ? reasons.join("; ") : "Not runnable";
+    // See above — no competing legacy onclick while gated in modern mode.
+    btn.onclick = null;
+    if (reason && reasons.length) {
+      reason.appendChild(el("p", {
+        text: reasons.join("; "),
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = "Run";
+  btn.title = "";
+  btn.onclick = function () {
+    btn.disabled = true;
+    btn.textContent = "Running\u2026";
+    _modernRunSubmit(state, context, actions, btn);
+  };
+}
+
+// The primary Run button is rendered by renderRunButton inside the control
+// panel's run section. Resolve it by test-id, but prefer the VISIBLE instance:
+// an unscoped document.querySelector can land on a stale/hidden duplicate
+// earlier in DOM order and leave the visible button on its legacy onclick.
+function _resolvePrimaryRunButton() {
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-testid="run-btn"]'));
+  if (nodes.length === 0) return null;
+  for (var i = 0; i < nodes.length; i++) {
+    if (nodes[i].offsetParent !== null) return nodes[i];
+  }
+  return nodes[0];
+}
+
+function _syncRunButtonGating(state, context, actions) {
+  if (!_isModernRunSelected(state)) return;
+  const btn = _resolvePrimaryRunButton();
+  if (!btn) return;
+  const section = btn.closest(".comfymodal-studio-run-section");
+  const reason = section ? section.querySelector(".comfymodal-studio-disabled-reason") : null;
+  _applyModernRunButtonState(state, context, actions, btn, reason);
+}
+
+// ── Modern run submission ─────────────────────────────────────────────────
+
+async function _modernRunSubmit(state, context, actions, btn) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const wf = state && state.playground && state.playground._workflowRunModule;
+  if (!store || !wf) {
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    return;
+  }
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  var ctrl = _getRunController(state, actions);
+  if (!ctrl) {
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    return;
+  }
+
+  // Known incompatible models must never execute, even on a forced click.
+  // Gating mirrors the Run-button state; this is a defensive re-check so a
+  // terminal-state re-run cannot bypass the disabled button.
+  const _modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
+  const _gated = _resolveWorkflowRunnable(store, wf, _modelRecords);
+  if (!_gated.runnable) {
+    const _reasonText = (_gated.reasons && _gated.reasons.length)
+      ? _gated.reasons[0]
+      : "Workflow is not runnable";
+    ctrl.beginRun();
+    ctrl.mark("submit_entered");
+    ctrl.applyLocalError(_reasonText);
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    _syncRunButtonGating(state, context, actions);
+    return;
+  }
+
+  ctrl.mark("submit_entered");
+
+  // Put determinate sampler fields into running state BEFORE the remote call
+  // (mirrors the legacy handler). beginRun must precede any applyLocalError.
+  var _modernSteps = store.controlValues && store.controlValues.steps;
+  var _runMaxSteps = (_modernSteps != null && Number(_modernSteps) > 0) ? Number(_modernSteps) : 0;
+  ctrl.beginRun({ samplerMaximum: _runMaxSteps });
+
+  // Cold-path guard: selection normally preloads run-context; refetch only
+  // when it is missing (rare). Measured via performance.now.
+  if (!store.runContext && store.workflowVersionId) {
+    ctrl.mark("validation_start");
+    var _coldT0 = performance.now();
+    const ctxResult = await wf.loadRunContext(apiBase, store, store.workflowId, store.workflowVersionId);
+    console.debug("[comfymodal workflow] run-context cold load took " + (performance.now() - _coldT0).toFixed(1) + "ms");
+    ctrl.mark("validation_end");
+    if (!ctxResult.ok || !store.runContext) {
+      ctrl.applyLocalError("Workflow context unavailable; reselect the workflow");
+      if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+      return;
+    }
+    _rerenderWorkflowSection(state, context, actions);
+  }
+
+  const schema = wf.getControlSchema(store);
+
+  ctrl.mark("validation_start");
+  const presetObj = (store.presets || []).find(function (p) {
+    return String(p.preset_id) === String(store.presetId || "");
+  }) || null;
+  const merged = wf.mergePresetAndOverrides(presetObj, store.controlValues || {}, schema);
+  ctrl.mark("validation_end");
+  if (merged.errors && merged.errors.length) {
+    ctrl.applyLocalError(merged.errors[0].message);
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    return;
+  }
+
+  // Clear previous output so canvas shows live progress immediately
+  if (state && state.playground) {
+    state.playground.lastRunOutput = null;
+    state.playground._selectedRun = null;
+  }
+  if (state && state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
+  _startLocalElapsedTimer(state, context);
+
+  const modalOptions = await buildStudioModalOptions(apiBase);
+
+  // Capture client-side timestamps at press time (top-level `trace` for server)
+  var t0_perf_ms = performance.now();
+  var t0_now = Date.now();
+
+  ctrl.mark("build_start");
+  const payload = wf.buildRunPayload(apiBase, store, modalOptions, {
+    t0_perf_ms: t0_perf_ms,
+    t0_perf_now_ms: t0_now,
+    t0_client_press_ms: t0_now,
+  });
+  ctrl.mark("build_end");
+
+  ctrl.mark("http_invoked");
+  const result = await runStudioPreset(apiBase, payload);
+  ctrl.mark("backend_ack");
+
+  if (result && result.status === "ok") {
+    // ── Direct run: result is already completed, no polling ──────────
+    if (_handleDirectRunResult(result, state, context, actions, merged.values)) {
+      return;
+    }
+    // ── Scheduler path: submission, start polling ───────────────────
+    var _inlineSteps = merged.values && merged.values.steps;
+    if (ctrl) {
+      ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
+      ctrl.applySubmission({
+        experimentId: result.experimentId || result.runId || "",
+        samplerMaximum: (_inlineSteps != null && Number(_inlineSteps) > 0) ? Number(_inlineSteps) : 0,
+      });
+      ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
+    }
+    _startLocalElapsedTimer(state, context);
+  } else {
+    const errMsg = (result && result.message) || "Run failed.";
+    if (result && result.error_code) {
+      console.error("[Studio run] execution failed", {
+        error_code: result.error_code,
+        error: result.error || null,
+      });
+    }
+    if (ctrl) ctrl.applyLocalError(errMsg);
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+  }
 }
 
 // ── Info Hint helper ─────────────────────────────────────────────────────
@@ -1672,6 +2591,42 @@ function _disposeScopedTracker(state) {
   if (state.playground) state.playground._scopedTracker = null;
 }
 
+// ── Canonical run controller (single lifecycle authority) ────────────────
+// Lazily created once per page; beginRun() on every Run click allocates a
+// fresh canonical runId. The canonical store drives runState via a pure
+// projection; legacy lifecycle fields are outputs, never independent inputs.
+function _getRunController(state, actions) {
+  if (!state.playground) return null;
+  if (actions) state.playground._runActions = actions;
+  if (state.playground._runController) return state.playground._runController;
+  var ctrl = createPlaygroundRunController();
+  state.playground._runController = ctrl;
+  ctrl.subscribe(function (run, extras) {
+    if (!run || !state.playground) return;
+    var legacy = projectRunToLegacy(run, extras);
+    var prev = state.playground.runState;
+    var prevStatus = prev && prev.status;
+    if (prev && prevStatus === legacy.status) {
+      // Same status: silent merge + DOM patch, no re-render/side effects.
+      // Preserve non-null prev values over null legacy values (e.g. the
+      // expected sampler maximum hint until real sampler telemetry lands).
+      var merged = { ...prev };
+      for (var k in legacy) {
+        if (legacy[k] === null && merged[k] !== null && merged[k] !== undefined) continue;
+        merged[k] = legacy[k];
+      }
+      state.playground.runState = merged;
+      _domPatchProgress(state);
+    } else {
+      var act = state.playground._runActions;
+      if (act && act.setRunState) act.setRunState(legacy);
+    }
+    state.playground._runDiagnostics = ctrl.getDiagnostics();
+    try { window.__studioLastRunDiagnostics = ctrl.getDiagnostics(); } catch (e) {}
+  });
+  return ctrl;
+}
+
 function _startLocalElapsedTimer(state, context) {
   var _existing = state.playground && state.playground._localElapsedTimer;
   if (_existing) { clearInterval(_existing); if (state.playground) state.playground._localElapsedTimer = null; }
@@ -1692,7 +2647,7 @@ function _startLocalElapsedTimer(state, context) {
       if (state.playground) state.playground._localElapsedTimer = null;
       return;
     }
-    if (_rs2.status === "completed" || _rs2.status === "error") {
+    if (LEGACY_TERMINAL_STATUSES.indexOf(_rs2.status) !== -1) {
       clearInterval(_timer);
       delete _rs2._localStartTime;
       if (state.playground) state.playground._localElapsedTimer = null;
@@ -1713,72 +2668,6 @@ function _startLocalElapsedTimer(state, context) {
   }, 250);
 
   if (state.playground) state.playground._localElapsedTimer = _timer;
-}
-
-function _createAndStartScopedTracker(state, context, runId, experimentId) {
-  // Dispose any existing scoped tracker first
-  _disposeScopedTracker(state);
-
-  var api = (context && context.comfyApi) || (context && context.api);
-  // If no api available, cannot create scoped tracker — polling will handle progress
-  if (!api || typeof api.addEventListener !== "function") return null;
-
-  var tracker = createScopedTracker(api, { runId: runId, experimentId: experimentId, promptId: null });
-  state.playground._scopedTracker = tracker;
-
-  // Subscribe tracker updates to runState
-  tracker.onProgress(function (s) {
-    var rs = state.playground.runState || {};
-    // Scoped tracker only produces updates for OUR run — no isInFlight guard needed
-    if (!rs.status) return;
-
-    // Map tracker stage to runState status
-    var mappedStatus = rs.status;
-    if (s.stage === "startup") mappedStatus = "in_progress";
-    else if (s.stage === "generating") mappedStatus = "in_progress";
-    else if (s.stage === "done") mappedStatus = "completed";
-    else if (s.stage === "error") mappedStatus = "error";
-    else if (s.stage === "idle" && rs.status !== "submitted") return;
-
-    // Always apply tracker snapshot fields to runState (no guard — prevents
-    // stale display after status stabilizes to "in_progress")
-    rs.overallPercent = s.overallPercent;
-    rs.completedNodes = s.completedNodes;
-    rs.totalNodes = s.totalNodes;
-    rs.samplerStep = s.samplerStep;
-    rs.samplerMaximum = s.samplerMaximum;
-    rs.samplerPercent = s.samplerPercent;
-    // elapsedMs is handled by local timer (preserves original press timestamp)
-    rs.queuePosition = s.queuePosition;
-    rs.currentNodeLabel = s.currentNodeLabel;
-    rs.stage = s.stage;
-    rs.message = s.message;
-    rs.error = s.error;
-
-    var statusChanged = mappedStatus !== rs.status;
-    if (statusChanged) {
-      rs.status = mappedStatus;
-    }
-
-    // Trigger re-render on terminal states (dispose tracker) or meaningful
-    // status transitions.  Intermediate progress uses DOM-targeted patching
-    // to avoid 4-8Hz full page teardown.
-    if (mappedStatus === "completed" || mappedStatus === "error") {
-      // Dispose scoped tracker on terminal state
-      delete rs._localStartTime;
-      _disposeScopedTracker(state);
-      if (context && context.setPage) context.setPage("playground");
-    } else if (statusChanged) {
-      // Meaningful status transition (submitted→in_progress, etc.) — full rerender
-      if (context && context.setPage) context.setPage("playground");
-    } else {
-      // Intermediate progress: DOM-targeted patch, no full re-render
-      _domPatchProgress(state);
-    }
-  });
-
-  tracker.start();
-  return tracker;
 }
 
 /**
@@ -1886,14 +2775,10 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
     }
   }
 
-  // Dispose scoped tracker — no polling needed for direct run
-  _disposeScopedTracker(state);
-
-  if (actions && actions.setRunState) {
-    actions.setRunState({
-      status: "completed",
-      runId: result.runId || result.runHistoryId || result.experimentId || "",
-      experimentId: result.experimentId || result.runId || "",
+  var ctrl = _getRunController(state, actions);
+  if (ctrl) {
+    ctrl.applyDirectResult(result, {
+      experimentId: result.experimentId || result.runId || meta.experiment_id || "",
       runHistoryId: result.runHistoryId || result.runId || "",
       primaryOutput: primaryOutput,
       hasHistory: true,
@@ -1903,11 +2788,10 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
       _directMeta: result.meta || null,
     });
   }
-
   return true;
 }
 
-async function doRunSubmit(state, context, actions) {
+async function doRunSubmit(state, context, actions, clickedBtn) {
   // T0: request identity origin (literal first line, before any workflow prep)
   const requestId = crypto.randomUUID();
   const ui_run_triggered_wall_unix_ms = Date.now();
@@ -1921,23 +2805,38 @@ async function doRunSubmit(state, context, actions) {
     browser_time_origin_ms: browser_time_origin_ms,
   };
 
+  // ── Modern workflow mode: never fall back to the legacy preset path ──
+  // Prefer the actually-clicked button; fall back to the visible primary
+  // run button (never an unscoped first-match that could be hidden/stale).
+  if (_isModernRunSelected(state)) {
+    var _modernBtn = clickedBtn || _resolvePrimaryRunButton();
+    await _modernRunSubmit(state, context, actions, _modernBtn);
+    return;
+  }
+
   const apiBase = (context && context.apiBase) || "/comfymodal";
+  var ctrl = _getRunController(state, actions);
+  if (!ctrl) return;
+  ctrl.beginRun();
+  ctrl.mark("submit_entered");
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const selectedId = state.playground && state.playground.selectedBackendId;
   if (!selectedId) return;
 
   const { listPresets } = await import("./studio-backend-api.js");
+  ctrl.mark("build_start");
   const presets = await listPresets(apiBase) || [];
   const preset = presets.find(function (p) { return (p.id || p.label || "") === selectedId; });
   if (!preset) return;
+  ctrl.mark("build_end");
 
   const controls = buildEffectiveControls(state, preset, currentFeatureId);
 
+  ctrl.mark("validation_start");
   const validationError = validateControls(controls, preset);
+  ctrl.mark("validation_end");
   if (validationError) {
-    if (actions && actions.setRunState) {
-      actions.setRunState({ status: "error", message: validationError });
-    }
+    ctrl.applyLocalError(validationError);
     return;
   }
   const modalOptions = await buildStudioModalOptions(apiBase);
@@ -1951,9 +2850,6 @@ async function doRunSubmit(state, context, actions) {
   var _runSteps = controls.steps;
   var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
   if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
-  if (actions && actions.setRunState) {
-    actions.setRunState({ status: "running", samplerStep: 0, samplerMaximum: _runMaxSteps });
-  }
   // Start local elapsed timer immediately on press
   _startLocalElapsedTimer(state, context);
 
@@ -1961,6 +2857,7 @@ async function doRunSubmit(state, context, actions) {
   const t0_perf_ms = performance.now();
   const t0_now = Date.now();
 
+  ctrl.mark("http_invoked");
   const result = await runStudioPreset(apiBase, {
     presetId: preset.id || selectedId,
     featureId: currentFeatureId,
@@ -1977,6 +2874,7 @@ async function doRunSubmit(state, context, actions) {
       request_id: requestId,
     },
   });
+  ctrl.mark("backend_ack");
 
   if (result && result.status === "ok") {
     // ── Direct run: result is already completed, no polling ──────────
@@ -1985,32 +2883,17 @@ async function doRunSubmit(state, context, actions) {
     }
 
     // ── Scheduler path: result is a submission, start polling ───────
-    // Dispose any previous scoped tracker before creating new one
-    _disposeScopedTracker(state);
-
     // Derive initial sampler maximum from submitted steps control
     var _submittedSteps = controls.steps;
-    var _initialSamplerMax = (_submittedSteps != null && Number(_submittedSteps) > 0) ? Number(_submittedSteps) : 0;
+    ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
+    ctrl.applySubmission({
+      experimentId: result.experimentId || result.runId || "",
+      samplerMaximum: (_submittedSteps != null && Number(_submittedSteps) > 0) ? Number(_submittedSteps) : 0,
+    });
+    ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
 
-    if (actions && actions.setRunState) {
-      actions.setRunState({
-        status: "submitted",
-        runId: result.runId || result.experimentId,
-        experimentId: result.experimentId,
-        samplerStep: 0,
-        samplerMaximum: _initialSamplerMax,
-      });
-    }
-
-    // Restart local elapsed timer after dispose; preserves original _localStartTime
+    // Restart local elapsed timer; preserves original _localStartTime
     _startLocalElapsedTimer(state, context);
-
-    // Create scoped tracker for this run's execution events
-    _createAndStartScopedTracker(
-      state, context,
-      result.runId || result.experimentId,
-      result.experimentId
-    );
   } else {
     const errMsg = (result && result.message) || "Run failed.";
     if (result && result.error_code) {
@@ -2019,9 +2902,7 @@ async function doRunSubmit(state, context, actions) {
         error: result.error || null,
       });
     }
-    if (actions && actions.setRunState) {
-      actions.setRunState({ status: "error", message: errMsg });
-    }
+    ctrl.applyLocalError(errMsg);
   }
 }
 
@@ -2168,7 +3049,7 @@ function renderRunButton(state, context, actions) {
     // the new submission enters flight (setRunState("running") clears the
     // completed state and triggers re-render).
     btn.onclick = function () {
-      doRunSubmit(state, context, actions);
+      doRunSubmit(state, context, actions, btn);
     };
     return container;
   }
@@ -2201,7 +3082,24 @@ function renderRunButton(state, context, actions) {
     reason.appendChild(dismissBtn);
     // Retry button re-uses the Run button's existing onclick setup
     btn.onclick = function () {
-      doRunSubmit(state, context, actions);
+      doRunSubmit(state, context, actions, btn);
+    };
+    return container;
+  }
+
+  if (runState && (runState.status === "canceled" || runState.status === "interrupted")) {
+    const _canceled = runState.status === "canceled";
+    btn.disabled = false;
+    btn.textContent = "Run";
+    btn.title = _canceled ? "Run was canceled. Click to run again." : "Run was interrupted. Click to run again.";
+    const msgEl = el("p", {
+      "data-testid": "run-status-message",
+      style: "font-size:var(--font-size-sm);color:#d9a441;margin:4px 0 0;",
+    });
+    msgEl.textContent = _canceled ? "Run canceled." : "Run interrupted.";
+    reason.appendChild(msgEl);
+    btn.onclick = function () {
+      doRunSubmit(state, context, actions, btn);
     };
     return container;
   }
@@ -2210,6 +3108,13 @@ function renderRunButton(state, context, actions) {
   getRuntimePresets({ apiBase }).then((presets) => {
     if (!container.isConnected) return;
     while (reason.firstChild) reason.removeChild(reason.firstChild);
+
+    // Modern workflow mode: gating is driven by the workflow run store.
+    // Never fall back to the legacy preset path when a workflow is selected.
+    if (_isModernRunSelected(state)) {
+      _applyModernRunButtonState(state, context, actions, btn, reason);
+      return;
+    }
 
     if (!presets || presets.length === 0) {
       btn.disabled = true;
@@ -2284,9 +3189,12 @@ function renderRunButton(state, context, actions) {
       btn.onclick = async () => {
         btn.disabled = true;
         btn.textContent = "Running\u2026";
+        var ctrl = _getRunController(state, actions);
 
         // Build controls early so sampler fields are available for running state
+        if (ctrl) ctrl.mark("build_start");
         const controls = buildEffectiveControls(state);
+        if (ctrl) ctrl.mark("build_end");
 
         // Clear previous output so canvas shows live progress immediately
         state.playground.lastRunOutput = null;
@@ -2295,7 +3203,7 @@ function renderRunButton(state, context, actions) {
         // Put determinate sampler fields into running state BEFORE remote call
         var _runSteps = controls.steps;
         var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
-        if (actions && actions.setRunState) actions.setRunState({ status: "running", samplerStep: 0, samplerMaximum: _runMaxSteps });
+        if (ctrl) ctrl.beginRun({ samplerMaximum: _runMaxSteps });
         // Start local elapsed timer immediately on press
         _startLocalElapsedTimer(state, context);
 
@@ -2303,9 +3211,7 @@ function renderRunButton(state, context, actions) {
         if (validationError) {
           btn.disabled = false;
           btn.textContent = "Run";
-          if (actions && actions.setRunState) {
-            actions.setRunState({ status: "error", message: validationError });
-          }
+          if (ctrl) ctrl.applyLocalError(validationError);
           return;
         }
         const modalOptions = await buildStudioModalOptions(apiBase);
@@ -2314,6 +3220,7 @@ function renderRunButton(state, context, actions) {
         var t0_perf_ms = performance.now();
         var t0_now = Date.now();
 
+        if (ctrl) ctrl.mark("http_invoked");
         const result = await runStudioPreset(apiBase, {
           presetId: preset.id || selectedId,
           featureId: currentFeatureId,
@@ -2328,6 +3235,7 @@ function renderRunButton(state, context, actions) {
             t0_client_press_ms: t0_now,
           },
         });
+        if (ctrl) ctrl.mark("backend_ack");
 
         if (result && result.status === "ok") {
           // ── Direct run: result is already completed, no polling ──
@@ -2336,42 +3244,31 @@ function renderRunButton(state, context, actions) {
           }
 
           // ── Scheduler path: submission, start polling ────────────
-          // Dispose any previous scoped tracker before creating new one
-          _disposeScopedTracker(state);
-
-          // Derive initial sampler maximum from submitted steps control
           var _inlineSteps = controls.steps;
-          var _inlineSamplerMax = (_inlineSteps != null && Number(_inlineSteps) > 0) ? Number(_inlineSteps) : 0;
-
-          if (actions && actions.setRunState) {
-            actions.setRunState({
-              status: "submitted",
-              runId: result.runId || result.experimentId,
-              experimentId: result.experimentId,
-              samplerStep: 0,
-              samplerMaximum: _inlineSamplerMax,
+          if (ctrl) {
+            ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
+            ctrl.applySubmission({
+              experimentId: result.experimentId || result.runId || "",
+              samplerMaximum: (_inlineSteps != null && Number(_inlineSteps) > 0) ? Number(_inlineSteps) : 0,
             });
+            ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
           }
 
-          // Restart local elapsed timer after dispose; preserves original _localStartTime
+          // Restart local elapsed timer; preserves original _localStartTime
           _startLocalElapsedTimer(state, context);
-
-          // Create scoped tracker for this run's execution events
-          _createAndStartScopedTracker(
-            state, context,
-            result.runId || result.experimentId,
-            result.experimentId
-          );
         } else {
           const errMsg = (result && result.message) || "Run failed.";
-          if (actions && actions.setRunState) {
-            actions.setRunState({ status: "error", message: errMsg });
-          }
+          if (ctrl) ctrl.applyLocalError(errMsg);
         }
       };
     }
   }).catch(() => {
     if (!container.isConnected) return;
+    if (_isModernRunSelected(state)) {
+      while (reason.firstChild) reason.removeChild(reason.firstChild);
+      _applyModernRunButtonState(state, context, actions, btn, reason);
+      return;
+    }
     while (reason.firstChild) reason.removeChild(reason.firstChild);
     reason.appendChild(el("p", {
       text: "Could not load presets.",
@@ -2396,7 +3293,7 @@ function renderProgressSection(state, context) {
   });
 
   const runState = state.playground && state.playground.runState;
-  if (!runState || runState.status === "completed" || runState.status === "error") {
+  if (!runState || LEGACY_TERMINAL_STATUSES.indexOf(runState.status) !== -1) {
     // Show completed/error state in metadata section instead
     return section;
   }
@@ -2491,7 +3388,7 @@ function renderRunningConfigPanel(state) {
   // Only show during active runs with a captured config snapshot
   if (!config || !runState) return panel;
   var rs = runState.status;
-  var isActive = rs && rs !== "completed" && rs !== "error" && rs !== "idle";
+  var isActive = rs && rs !== "idle" && LEGACY_TERMINAL_STATUSES.indexOf(rs) === -1;
   if (!isActive) return panel;
   panel.classList.add("is-visible");
 
@@ -2841,7 +3738,7 @@ function _formatTotalExperimentTime(runState, snapshot, events, entries) {
   }
 
   // ── Priority 3: live elapsed when active ──
-  var isTerminal = runState.status === "completed" || runState.status === "error";
+  var isTerminal = LEGACY_TERMINAL_STATUSES.indexOf(runState.status) !== -1;
   if (runState.elapsedMs != null && !isTerminal) {
     var el = Number(runState.elapsedMs);
     if (!isNaN(el) && el > 0) return _formatDuration(el);
@@ -3970,6 +4867,8 @@ function _domPatchProgress(state) {
     else if (rs.status === "running") stageLabel = "Running";
     else if (rs.status === "submitted") stageLabel = "Submitted";
     else if (rs.status === "waiting") stageLabel = "Waiting";
+    else if (rs.status === "canceled") stageLabel = "Canceled";
+    else if (rs.status === "interrupted") stageLabel = "Interrupted";
     stageEl.textContent = "Stage: " + stageLabel;
   }
 
@@ -4265,9 +5164,8 @@ function renderCanvas(state, context) {
     canvas.appendChild(img);
     const runState = state.playground && state.playground.runState;
     const hasActiveRun = runState && runState.status
-      && runState.status !== "completed"
-      && runState.status !== "error"
-      && runState.status !== "idle";
+      && runState.status !== "idle"
+      && LEGACY_TERMINAL_STATUSES.indexOf(runState.status) === -1;
     const hasCanvasSelection = state.playground && state.playground._selectedRun;
     if (hasActiveRun && hasCanvasSelection) {
       canvas.appendChild(renderLiveReturnControl(state, context));

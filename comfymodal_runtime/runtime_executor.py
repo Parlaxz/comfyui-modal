@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import inspect
 import os
+import queue
 import threading
 import time
 
@@ -33,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 
 from .contracts import ExecutionPlan, SnapshotExecutionSeed
+from .env import env_flag
 from .trace import RuntimeTrace
 
 # Optimization diagnostics (measurement-only; frozen at import time).  All
@@ -44,6 +46,44 @@ try:
 except Exception:  # pragma: no cover - diagnostics must never break imports
     opt_diag_enabled = lambda: False  # type: ignore[assignment]
     emit_opt = lambda *a, **k: None  # type: ignore[assignment]
+
+# Prompt-signature memoization (V2 optimization, Task 1).  PURE advisory
+# accelerator: any import failure, read failure, identity mismatch, or
+# is_changed drift falls back to the ORIGINAL add_keys computation — never
+# raises, never weakens correctness.  The module is stdlib-only so a failed
+# import here is the only failure mode that matters, and it is swallowed.
+try:
+    from .prompt_signature_cache import (
+        apply_memo_hit as _psc_apply_memo_hit,
+        build_node_memo_entry as _psc_build_node_memo_entry,
+        canonical_inputs_hash as _psc_canonical_inputs_hash,
+        get_store as _psc_get_store,
+        load_store_from_disk as _psc_load_store_from_disk,
+        memo_entry_source as _psc_memo_entry_source,
+        memo_identity as _psc_memo_identity,
+        memo_path as _psc_memo_path,
+        persist_store as _psc_persist_store,
+        set_store as _psc_set_store,
+        topo_lazy_get as _psc_topo_lazy_get,
+        topo_lazy_pending_count as _psc_topo_lazy_pending_count,
+        topo_lazy_persist as _psc_topo_lazy_persist,
+        topo_lazy_set as _psc_topo_lazy_set,
+    )
+except Exception:  # pragma: no cover - memoization must never break the runtime
+    _psc_apply_memo_hit = None  # type: ignore[assignment]
+    _psc_build_node_memo_entry = None  # type: ignore[assignment]
+    _psc_canonical_inputs_hash = None  # type: ignore[assignment]
+    _psc_get_store = None  # type: ignore[assignment]
+    _psc_load_store_from_disk = None  # type: ignore[assignment]
+    _psc_memo_entry_source = None  # type: ignore[assignment]
+    _psc_memo_identity = None  # type: ignore[assignment]
+    _psc_memo_path = None  # type: ignore[assignment]
+    _psc_persist_store = None  # type: ignore[assignment]
+    _psc_set_store = None  # type: ignore[assignment]
+    _psc_topo_lazy_get = None  # type: ignore[assignment]
+    _psc_topo_lazy_pending_count = None  # type: ignore[assignment]
+    _psc_topo_lazy_persist = None  # type: ignore[assignment]
+    _psc_topo_lazy_set = None  # type: ignore[assignment]
 
 
 # ── Pre-sampler cache / orchestration component ──────────────────────────
@@ -1683,6 +1723,74 @@ def _ns_ms(ns_start: int) -> float:
     return round((time.perf_counter_ns() - ns_start) / 1_000_000, 3)
 
 
+# ExecutionResult status codes (ComfyUI execution.py): SUCCESS = 0,
+# FAILURE = 1, PENDING = 2.  Derived from the existing return tuple of
+# _orig_exec_node — never guessed.  Cancellation cannot tell us the node's
+# state, so it maps to UNKNOWN.
+_NODE_OUTCOME_COMPLETE = "COMPLETE"
+_NODE_OUTCOME_PENDING = "PENDING"
+_NODE_OUTCOME_ERROR = "ERROR"
+_NODE_OUTCOME_UNKNOWN = "UNKNOWN"
+
+
+def _derive_pass_outcome(
+    result: Any,
+    *,
+    raised: bool = False,
+    cancelled: bool = False,
+) -> str:
+    """Derive a node pass outcome from the existing execute() return value.
+
+    ComfyUI's ``execution.execute`` returns ``(ExecutionResult, ...)`` with
+    ``SUCCESS=0``, ``FAILURE=1``, ``PENDING=2``.  PENDING is reported only
+    when the returned status says so (lazy discovery passes, pending async
+    tasks, subgraph expansion) — never inferred.  Any other shape is UNKNOWN.
+    """
+    if cancelled:
+        return _NODE_OUTCOME_UNKNOWN
+    if raised:
+        return _NODE_OUTCOME_ERROR
+    if not isinstance(result, tuple) or not result:
+        return _NODE_OUTCOME_UNKNOWN
+    status = result[0]
+    value = getattr(status, "value", status)
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value == 0:
+            return _NODE_OUTCOME_COMPLETE
+        if value == 2:
+            return _NODE_OUTCOME_PENDING
+        if value == 1:
+            return _NODE_OUTCOME_ERROR
+        return _NODE_OUTCOME_UNKNOWN
+    name = str(getattr(status, "name", "")).upper()
+    if name in ("SUCCESS",):
+        return _NODE_OUTCOME_COMPLETE
+    if name in ("PENDING",):
+        return _NODE_OUTCOME_PENDING
+    if name in ("FAILURE", "ERROR"):
+        return _NODE_OUTCOME_ERROR
+    return _NODE_OUTCOME_UNKNOWN
+
+
+def _clip_node_interval(
+    start_ns: int,
+    end_ns: int,
+    cutoff_ns: int | None,
+) -> tuple[float, int]:
+    """Return ``(elapsed_ms, effective_end_ns)`` honoring the sampling-start
+    cutoff.  ``cutoff_ns`` is a ``time.perf_counter_ns()`` timestamp captured
+    at sampling_start.  A node that started after the cutoff contributes 0;
+    a node truncated mid-window ends exactly at the cutoff so its record's
+    ``end_perf_ns`` aligns with sampling_start.  Never inflates when the node
+    finished before the cutoff."""
+    if cutoff_ns is not None:
+        if cutoff_ns <= start_ns:
+            return 0.0, start_ns
+        if cutoff_ns < end_ns:
+            return round((cutoff_ns - start_ns) / 1_000_000, 3), cutoff_ns
+    return round((end_ns - start_ns) / 1_000_000, 3), end_ns
+
+
 def _fmt_or_absent(v: Any) -> str:
     if v is None:
         return _PRE_SAMPLER_ABSENT_STR
@@ -2026,7 +2134,8 @@ def _attach_structured_report(result: dict[str, Any], state: dict[str, Any]) -> 
     Adds the following keys to ``result["pre_sampler_structured_report"]``:
 
     * ``per_node_timings`` — every pre-sampler node with ``node_id``,
-      ``class_type``, ``duration_ms``
+      ``class_type``, ``duration_ms``, ``start_perf_ns``, ``end_perf_ns``,
+      ``pass_outcome``
     * ``clip_text_encode_nodes`` — complete wall time per CLIPTextEncode node
     * ``clip_raw_encode_ms`` — aggregate underlying ``CLIP.encode_from_tokens``
       wall time
@@ -2117,6 +2226,323 @@ def _emit_pre_sampler_line(state: dict[str, Any]) -> None:
     for f in fields:
         parts.append(f"{f}={_fmt_or_absent(state.get(f))}")
     print(" ".join(parts), flush=True)
+
+
+# ── Prompt-executor breakdown (pure, testable) ──────────────────────────
+# Bounded instrumentation: decomposes the execution_start → execution_cached
+# window and the execution_cached → first-"executing" window into the
+# opt_exec_* sub-spans captured by install_pre_sampler_hooks.  Pure function
+# (no I/O, no ComfyUI imports) so tests can drive it with synthetic state.
+
+_PROMPT_EXEC_BREAKDOWN_FIELDS = (
+    "exec_to_cached_ms", "dynamic_prompt_ms", "is_changed_ms",
+    "signature_keys_ms", "seed_apply_ms", "clean_unused_ms",
+    "cache_gather_ms", "cleanup_gc_ms", "residual_ms",
+    "c2f_cached_to_first_node_ms", "c2f_topo_walk_ms", "c2f_stage_ms",
+    "c2f_first_node_prefix_ms", "c2f_residual_ms",
+    # Sub-split of c2f_topo_walk_ms (additive; each renders "absent" when the
+    # per-request state lacks it): the measured per-link INPUT_TYPES() time
+    # (c2f_topo_input_info_ms) and the topo-walk remainder outside that
+    # (c2f_topo_other_ms = c2f_topo_walk_ms − c2f_topo_input_info_ms).  These
+    # are a diagnostic decomposition of the topo walk; they do NOT join the
+    # c2f children reconciliation (children stay topo, stage, prefix).
+    "c2f_topo_input_info_ms", "c2f_topo_other_ms",
+    # Prompt-signature memoization (Task 1, V2 optimization) — additive;
+    # every field renders "absent" when the per-request state lacks it.
+    "signature_cache_requested", "signature_cache_eligible",
+    "signature_cache_hit", "signature_cache_source",
+    "signature_cache_key_hash", "signature_cache_fallback",
+    "signature_reuse_ms",
+    # Topo-lazy deterministic fast path (cached→first-node fix) — additive
+    # evidence: topo_lazy_hits = persisted-lazy memoized get_input_info calls
+    # this request; topo_lazy_pending = lazy entries persisted this request.
+    "topo_lazy_hits", "topo_lazy_pending",
+)
+
+
+def build_prompt_executor_breakdown_line(
+    *,
+    request_id: str | None,
+    exec_to_cached_ms: float | None,
+    cached_to_first_node_ms: float | None,
+    state: Mapping[str, Any] | None,
+    executing_mono_ns: int | None = None,
+) -> str:
+    """Build the single ``[v2.prompt_executor_breakdown]`` stdout line.
+
+    ``state`` is the per-request instrumentation dict (the same object
+    modal_app captures via ``pre_sampler_instrumentation_scope``).  Every
+    value renders ``key=value`` with ``absent`` when missing.
+    ``signature_keys_ms`` is derived as add_keys total minus is_changed so
+    the pair reconciles exactly.  ``residual_ms`` is computed exactly as
+    ``exec_to_cached_ms`` minus the sum of the PRESENT rendered child values
+    (children rounded to 3 decimals first; absent children are implicitly
+    part of the residual — the residual is emitted whenever at least one
+    child is present); ``c2f_residual_ms`` likewise for the cached→first-node
+    window.  ``c2f_first_node_prefix_ms`` is the monotonic span from the
+    first ``stage_node_execution`` COMPLETION (``opt_exec_stage_end_mono_ns``)
+    to the ``executing`` event — the post-staging prologue before the first
+    node runs, never the full cached→first-node window (which would
+    double-count topo_walk + stage).      ``c2f_topo_input_info_ms`` /
+    ``c2f_topo_other_ms`` are a diagnostic SUB-SPLIT of ``c2f_topo_walk_ms``
+    (per-link ``INPUT_TYPES()`` time vs the topo-walk remainder; ``other`` is
+    emitted only when both inputs are present) — they do NOT join the c2f
+    children reconciliation, which stays ``[topo, stage, prefix]``.
+    ``topo_lazy_hits`` / ``topo_lazy_pending`` are additive evidence for the
+    persisted-topo-lazy deterministic fast path (memoized get_input_info
+    calls vs entries persisted this request); absent when the per-request
+    state lacks them.
+    """
+    state = state if state is not None else {}
+
+    def _num(v: Any) -> float | None:
+        if v is None:
+            return None
+        try:
+            return round(float(v), 3)
+        except (TypeError, ValueError):
+            return None
+
+    # ── execution_start → execution_cached window ─────────────────────────
+    _dynamic = _num(state.get("opt_exec_dynamic_prompt_ms"))
+    _is_changed = _num(state.get("opt_exec_is_changed_ms"))
+    _sig_total = _num(state.get("opt_exec_signature_keys_total_ms"))
+    if _sig_total is not None and _is_changed is not None:
+        _signature = round(max(0.0, _sig_total - _is_changed), 3)
+    else:
+        _signature = None
+    _seed = _num(state.get("opt_exec_seed_apply_ms"))
+    _clean = _num(state.get("opt_exec_clean_unused_ms"))
+    _gather = _num(state.get("opt_exec_cache_gather_ms"))
+    _gc = _num(state.get("opt_exec_cleanup_gc_ms"))
+
+    _exec_children = [
+        c for c in [_dynamic, _is_changed, _signature, _seed, _clean, _gather, _gc]
+        if c is not None
+    ]
+    _exec_parent = _num(exec_to_cached_ms)
+    # residual_ms: emitted whenever the parent is present AND at least one
+    # child key is present.  Absent children are implicitly part of the
+    # residual (e.g. seed_apply absent → residual = parent − sum(present)),
+    # so the residual is never hidden by a single missing child.
+    _residual = None
+    if _exec_parent is not None and _exec_children:
+        _exec_sum = sum(_exec_children)
+        _residual = round(_exec_parent - _exec_sum, 3)
+
+    # ── execution_cached → first-node window ──────────────────────────────
+    _topo = _num(state.get("opt_exec_topo_walk_ms"))
+    _stage = _num(state.get("opt_exec_stage_ms"))
+    # Sub-split of the topo walk (diagnostic decomposition only — never joins
+    # the c2f children reconciliation below): measured per-link INPUT_TYPES()
+    # time vs the topo-walk remainder.
+    _topo_input_info = _num(state.get("opt_exec_topo_input_info_ms"))
+    _topo_other: float | None = None
+    if _topo is not None and _topo_input_info is not None:
+        _topo_other = round(max(0.0, _topo - _topo_input_info), 3)
+    # Real post-staging remainder: first-executing-node minus the first
+    # stage_node_execution COMPLETION stamp.  Never the full window (that
+    # would double-count topo_walk + stage, yielding negative c2f residuals
+    # like the -138.269 seen on RUN 1).  Omitted when the stamp is missing.
+    _stage_end_mono = state.get("opt_exec_stage_end_mono_ns")
+    _c2f_prefix: float | None = None
+    if executing_mono_ns is not None and _stage_end_mono is not None:
+        try:
+            _c2f_prefix = round(
+                max(0, int(executing_mono_ns) - int(_stage_end_mono)) / 1_000_000, 3
+            )
+        except (TypeError, ValueError):
+            _c2f_prefix = None
+
+    _c2f_children = [c for c in [_topo, _stage, _c2f_prefix] if c is not None]
+    _c2f_parent = _num(cached_to_first_node_ms)
+    # c2f_residual_ms: same partial-children rule as the exec window.
+    _c2f_residual = None
+    if _c2f_parent is not None and _c2f_children:
+        _c2f_sum = sum(_c2f_children)
+        _c2f_residual = round(_c2f_parent - _c2f_sum, 3)
+
+    parts = ["[v2.prompt_executor_breakdown]"]
+    parts.append(f"request_id={_fmt_or_absent(request_id)}")
+    for _key, _value in (
+        ("exec_to_cached_ms", _exec_parent),
+        ("dynamic_prompt_ms", _dynamic),
+        ("is_changed_ms", _is_changed),
+        ("signature_keys_ms", _signature),
+        ("seed_apply_ms", _seed),
+        ("clean_unused_ms", _clean),
+        ("cache_gather_ms", _gather),
+        ("cleanup_gc_ms", _gc),
+        ("residual_ms", _residual),
+        ("c2f_cached_to_first_node_ms", _c2f_parent),
+        ("c2f_topo_walk_ms", _topo),
+        ("c2f_topo_input_info_ms", _topo_input_info),
+        ("c2f_topo_other_ms", _topo_other),
+        ("c2f_stage_ms", _stage),
+        ("c2f_first_node_prefix_ms", _c2f_prefix),
+        ("c2f_residual_ms", _c2f_residual),
+        # Prompt-signature memoization (Task 1, V2 optimization) — additive
+        # fields rendered from the per-request state; absent when unavailable.
+        ("signature_cache_requested", state.get("opt_exec_signature_memo_requested")),
+        ("signature_cache_eligible", state.get("opt_exec_signature_memo_eligible")),
+        ("signature_cache_hit", state.get("opt_exec_signature_memo_hit")),
+        ("signature_cache_source", state.get("opt_exec_signature_memo_source")),
+        ("signature_cache_key_hash", state.get("opt_exec_signature_memo_key_hash")),
+        ("signature_cache_fallback", state.get("opt_exec_signature_memo_fallback")),
+        ("signature_reuse_ms", _num(state.get("opt_exec_signature_reuse_ms"))),
+        # Topo-lazy deterministic fast path (cached→first-node fix) —
+        # additive evidence; absent when the per-request state lacks it.
+        ("topo_lazy_hits", state.get("opt_exec_topo_lazy_hit_count")),
+        ("topo_lazy_pending", state.get("opt_exec_topo_lazy_saved_count")),
+    ):
+        parts.append(f"{_key}={_fmt_or_absent(_value)}")
+    return " ".join(parts)
+
+
+# ── Prompt-signature memoization (Task 1, V2 optimization) ───────────────
+# Advisory-only accelerator for CacheKeySetInputSignature.add_keys (the
+# ~1.34s signature_keys_ms cost).  Gated on the COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE
+# env flag AND a complete per-request memo identity stashed by the modal_app
+# integration lane under state["opt_exec_signature_memo_identity"].
+# Every failure falls back to the ORIGINAL computation — never raises, never
+# weakens correctness.  All helper functions are pure/testable (the write-back
+# duck-types the CacheKeySetInputSignature instance).
+
+
+def _signature_memo_enabled() -> bool:
+    """Env gate: COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE (default-enabled).
+
+    Exact semantics: **unset → enabled** (the production default; the memo
+    becomes the normal first-request path), ``"0"`` → disabled (original
+    ``add_keys`` computation always runs), ``"1"`` → enabled.  Explicit
+    non-truth tokens parse through the shared ``env_flag`` parser exactly
+    like every other V2 flag.  The ``_psc_memo_path is None`` guard keeps a
+    failed ``prompt_signature_cache`` import (the only failure mode that
+    matters) from ever arming the memo.
+    """
+    if _psc_memo_path is None:
+        return False
+    return env_flag("COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE", default=True)
+
+
+def _memo_plan_from_state(state: dict[str, Any]) -> str | None:
+    """Return the memo identity_hash when a memo attempt is possible.
+
+    Returns ``None`` (original path) when the flag is off, the state carries
+    no identity, or the identity is incomplete.  Records the memo state
+    fields (eligible / hit / source / key_hash / fallback) on ``state`` so
+    the breakdown line can render them.  Never raises.
+    """
+    if not _signature_memo_enabled():
+        state.setdefault("opt_exec_signature_memo_eligible", False)
+        state.setdefault("opt_exec_signature_memo_hit", False)
+        state.setdefault("opt_exec_signature_memo_source", "none")
+        state.setdefault("opt_exec_signature_memo_fallback", "")
+        return None
+    # One-time lazy disk load (module-guarded) so the executor also works
+    # standalone; the modal_app lane calling load_store_from_disk at plan
+    # receipt is the same guarded no-op on subsequent calls.
+    _psc_load_store_from_disk(_psc_memo_path())
+    _identity = state.get("opt_exec_signature_memo_identity")
+    if not isinstance(_identity, dict) or not _identity:
+        state["opt_exec_signature_memo_eligible"] = False
+        state["opt_exec_signature_memo_hit"] = False
+        state["opt_exec_signature_memo_source"] = "none"
+        state["opt_exec_signature_memo_fallback"] = "missing_identity"
+        return None
+    _ident = _psc_memo_identity(
+        workflow_hash=_identity.get("workflow_hash", ""),
+        source_workflow_hash=_identity.get("source_workflow_hash", ""),
+        deployment_combined_hash=_identity.get("deployment_combined_hash", ""),
+        custom_node_generation=_identity.get("custom_node_generation", ""),
+        registry_proof=_identity.get("registry_proof"),
+    )
+    if not _ident.get("complete"):
+        state["opt_exec_signature_memo_eligible"] = False
+        state["opt_exec_signature_memo_hit"] = False
+        state["opt_exec_signature_memo_source"] = "none"
+        state["opt_exec_signature_memo_fallback"] = "incomplete_identity"
+        return None
+    state["opt_exec_signature_memo_eligible"] = True
+    state["opt_exec_signature_memo_key_hash"] = _ident["identity_hash"]
+    return _ident["identity_hash"]
+
+
+async def _memo_write_back(self, node_ids, identity_hash, state):
+    """Build per-node memo entries from a completed ORIGINAL add_keys pass.
+
+    Runs only on the compute-miss request (bounded: one atomic file write of
+    ~10-100KB; fsync ~10-50ms is acceptable on the compute-miss request).
+    Every failure is swallowed — the memo simply stays unpopulated.
+    """
+    _t0 = time.perf_counter_ns()
+    try:
+        _changed = False
+        for _nid in node_ids:
+            if _nid not in self.keys:
+                continue
+            try:
+                _node = self.dynprompt.get_node(_nid)
+                _isc = await self.is_changed_cache.get(_nid)
+                _entry = _psc_build_node_memo_entry(
+                    class_type=_node.get("class_type", ""),
+                    is_changed_value=_isc,
+                    signature_value=self.keys[_nid],
+                    inputs_hash=_psc_canonical_inputs_hash(_node.get("inputs") or {}),
+                )
+            except Exception:
+                continue
+            _existing = _psc_get_store(identity_hash)
+            if not isinstance(_existing, dict):
+                _existing = {"nodes": {}}
+            _nodes = _existing.get("nodes")
+            if not isinstance(_nodes, dict):
+                _nodes = {}
+            _nodes[str(_nid)] = _entry
+            _existing["nodes"] = _nodes
+            _psc_set_store(identity_hash, _existing)
+            _changed = True
+        if _changed:
+            _psc_persist_store()
+    finally:
+        _elapsed = _ns_ms(_t0)
+        state["opt_exec_signature_memo_saved_ms"] = (
+            state.get("opt_exec_signature_memo_saved_ms", 0.0) + _elapsed
+        )
+
+
+def _persist_topo_lazy(state: dict[str, Any]) -> None:
+    """Persist the request's accumulated topo-lazy entries (advisory).
+
+    Uses the identity_hash already stashed by the add_keys memo patch
+    (``state["opt_exec_signature_memo_key_hash"]``) so a RUN-1 compute-miss
+    persists the topo_lazy section under the SAME key the signature-memo
+    nodes section uses — and RUN-2/3 memo-hit runs replay both without any
+    cold ``INPUT_TYPES`` / folder-listing cost.  Reads
+    ``state["opt_exec_topo_lazy_pending"]`` (``{(class_type, input_name):
+    lazy}`` accumulated by the get_input_info patch) and records the persist
+    elapsed + saved entry count on ``state`` for evidence.  All failures are
+    swallowed — never raises, never weakens the original path.
+    """
+    try:
+        _identity = state.get("opt_exec_signature_memo_key_hash")
+        if not isinstance(_identity, str) or not _identity:
+            return
+        _pending = state.get("opt_exec_topo_lazy_pending")
+        if not isinstance(_pending, dict) or not _pending:
+            return
+        _t0 = time.perf_counter_ns()
+        for (_ct, _iname), _lazy in _pending.items():
+            if _psc_topo_lazy_set is not None:
+                _psc_topo_lazy_set(_identity, _ct, _iname, _lazy)
+        if _psc_topo_lazy_persist is not None:
+            _psc_topo_lazy_persist(_identity)
+        _elapsed = _ns_ms(_t0)
+        state["opt_exec_topo_lazy_saved_ms"] = _elapsed
+        if _psc_topo_lazy_pending_count is not None:
+            state["opt_exec_topo_lazy_saved_count"] = _psc_topo_lazy_pending_count(_identity)
+    except Exception:
+        pass
 
 
 def install_pre_sampler_hooks() -> None:
@@ -2233,31 +2659,52 @@ def install_pre_sampler_hooks() -> None:
                 _cpu_node_timer = _CpuTimer("CLIPTextEncode", "CLIP")
                 _cpu_node_timer.__enter__()
 
+            # Capture execution result/outcome state for per-node pass outcome
+            _result: Any = None
+            _raised = False
+            _cancelled = False
+
             try:
-                return await _orig_exec_node(*args, **kwargs)
+                _result = await _orig_exec_node(*args, **kwargs)
+                return _result
+            except asyncio.CancelledError:
+                _cancelled = True
+                raise
+            except BaseException:
+                _raised = True
+                raise
             finally:
                 if _cpu_node_timer is not None:
                     _cpu_node_timer.__exit__()
-                _elapsed = _ns_ms(_t0)
+                _t_end = time.perf_counter_ns()
                 _current_node_context.reset(_ctx_token)
                 _encode_from_tokens_active.reset(_encode_ctx_token)
 
                 # ── Hard cutoff at authoritative sampling_start ──────────────
                 cutoff_ns = _sampling_cutoff_perf_ns.get()
-                if cutoff_ns is not None:
-                    if cutoff_ns > _t0:
-                        # Clip: node contribution stops at sampling_start
-                        _clipped_elapsed = round(
-                            (cutoff_ns - _t0) / 1_000_000, 3
-                        )
-                        _clipped = _elapsed - _clipped_elapsed > 0.001
-                        _elapsed = _clipped_elapsed
-                    else:
-                        # Node started after sampling already began — skip
-                        _elapsed = 0.0
-                        _clipped = False
-                else:
-                    _clipped = False
+                _elapsed, _end_perf = _clip_node_interval(_t0, _t_end, cutoff_ns)
+                _clipped = _end_perf < _t_end
+
+                # Attribute resolve waits overlapping this node's wall window:
+                # resolve runs inside execute; monotonic_ns == perf_counter_ns on
+                # Linux/Modal so intersection is valid (earlier windows are the
+                # previous node's, later windows are kept for re-check).
+                _dep_wait_ns = 0
+                _res_windows = state.get("_resolve_wait_windows")
+                if _res_windows:
+                    _kept: list[dict] = []
+                    for _rw in _res_windows:
+                        _ws = int(_rw.get("start_mono_ns") or 0)
+                        _we = int(_rw.get("end_mono_ns") or 0)
+                        if _we <= _t0 or _ws >= _end_perf:
+                            continue  # belongs to another node (earlier or later)
+                        _ov = min(_we, _end_perf) - max(_ws, _t0)
+                        if _ov > 0:
+                            _dep_wait_ns += _ov
+                        if _we > _end_perf:
+                            _kept.append(_rw)  # window extends past this node; re-check later
+                    state["_resolve_wait_windows"] = _kept
+                _dep_wait_ms = round(_dep_wait_ns / 1_000_000.0, 3)
 
                 if _elapsed > 0:
                     state["node_execution_ms"] = state.get("node_execution_ms", 0.0) + _elapsed
@@ -2269,6 +2716,12 @@ def install_pre_sampler_hooks() -> None:
                         "node_id": node_id,
                         "class_type": node_class,
                         "duration_ms": round(_elapsed, 3),
+                        "start_perf_ns": int(_t0),
+                        "end_perf_ns": int(_end_perf),
+                        "dependency_wait_wall": _dep_wait_ms,
+                        "pass_outcome": _derive_pass_outcome(
+                            _result, raised=_raised, cancelled=_cancelled
+                        ),
                     })
 
                     # Record as clipped when the measurement was truncated
@@ -2671,24 +3124,26 @@ def install_pre_sampler_hooks() -> None:
                 else:
                     state.setdefault("_cache_miss_count", 0)
                     state["_cache_miss_count"] += 1
-                if opt_diag_enabled():
-                    # Split the asyncio.gather cache walk (which happens
-                    # BEFORE first node execution) from cache lookups that
-                    # occur during node execution.  first_node_id is set by
-                    # _patched_exec_node on the first node entry, so the
-                    # gather phase is exactly the pre-first-node window.
-                    if state.get("first_node_id") is None:
-                        state["opt_exec_cache_gather_ms"] = (
-                            state.get("opt_exec_cache_gather_ms", 0.0) + _elapsed
-                        )
-                        # Last gather-phase completion proxies the
-                        # execution_cached boundary (cleanup_models_gc and
-                        # add_message("execution_cached") immediately follow).
-                        state["opt_exec_cache_gather_end_mono_ns"] = time.monotonic_ns()
-                    else:
-                        state["opt_exec_cache_execution_ms"] = (
-                            state.get("opt_exec_cache_execution_ms", 0.0) + _elapsed
-                        )
+                # Split the asyncio.gather cache walk (which happens
+                # BEFORE first node execution) from cache lookups that
+                # occur during node execution.  first_node_id is set by
+                # _patched_exec_node on the first node entry, so the
+                # gather phase is exactly the pre-first-node window.
+                # Capture is unconditional (bounded measurement); the
+                # aggregate executor_decomposition trace-event emission
+                # stays gated on opt_diag_enabled() below.
+                if state.get("first_node_id") is None:
+                    state["opt_exec_cache_gather_ms"] = (
+                        state.get("opt_exec_cache_gather_ms", 0.0) + _elapsed
+                    )
+                    # Last gather-phase completion proxies the
+                    # execution_cached boundary (cleanup_models_gc and
+                    # add_message("execution_cached") immediately follow).
+                    state["opt_exec_cache_gather_end_mono_ns"] = time.monotonic_ns()
+                else:
+                    state["opt_exec_cache_execution_ms"] = (
+                        state.get("opt_exec_cache_execution_ms", 0.0) + _elapsed
+                    )
             return result
 
         _HCache.get = _patched_cache_get
@@ -2700,7 +3155,7 @@ def install_pre_sampler_hooks() -> None:
 
             async def _patched_cache_set_prompt(self, dynprompt, node_ids, is_changed_cache):
                 state = _instrumentation_var.get()
-                if state is None or not opt_diag_enabled():
+                if state is None:
                     return await _orig_cache_set_prompt(
                         self, dynprompt, node_ids, is_changed_cache
                     )
@@ -2728,7 +3183,7 @@ def install_pre_sampler_hooks() -> None:
 
             def _patched_cache_clean_unused(self):
                 state = _instrumentation_var.get()
-                if state is None or not opt_diag_enabled():
+                if state is None:
                     return _orig_cache_clean_unused(self)
                 _t0 = time.perf_counter_ns()
                 try:
@@ -2758,7 +3213,7 @@ def install_pre_sampler_hooks() -> None:
 
                 def _patched_topo_add_node(self, node_unique_id, include_lazy=False, subgraph_nodes=None):
                     state = _instrumentation_var.get()
-                    if state is None or not opt_diag_enabled():
+                    if state is None:
                         return _orig_topo_add_node(
                             self, node_unique_id,
                             include_lazy=include_lazy, subgraph_nodes=subgraph_nodes,
@@ -2778,6 +3233,24 @@ def install_pre_sampler_hooks() -> None:
                             state["opt_exec_topo_nodes"] = (
                                 state.get("opt_exec_topo_nodes", 0) + 1
                             )
+                            # ── Topo-lazy persistence (once per request) ──
+                            # The top-level walk (defaults include_lazy=False,
+                            # subgraph_nodes=None — the FIRST add_node the
+                            # executor issues per output node) is the last
+                            # chance to flush the lazy flags the get_input_info
+                            # patch accumulated into
+                            # state["opt_exec_topo_lazy_pending"].  Write them
+                            # under the SAME identity_hash as the signature
+                            # memo so RUN-2/3 memo-hit runs replay both
+                            # sections deterministically.  Advisory, never
+                            # raises, sentinel-guarded against repeats.
+                            if (
+                                not include_lazy
+                                and subgraph_nodes is None
+                                and not state.get("opt_exec_topo_lazy_persisted")
+                            ):
+                                state["opt_exec_topo_lazy_persisted"] = True
+                                _persist_topo_lazy(state)
 
                 _TopoSort.add_node = _patched_topo_add_node
 
@@ -2794,7 +3267,7 @@ def install_pre_sampler_hooks() -> None:
 
                 async def _patched_stage_node_execution(self):
                     state = _instrumentation_var.get()
-                    if state is None or not opt_diag_enabled():
+                    if state is None:
                         return await _orig_stage_node(self)
                     _t0 = time.perf_counter_ns()
                     # First-stage boundary: the moment the staging loop starts
@@ -2812,6 +3285,17 @@ def install_pre_sampler_hooks() -> None:
                             state["opt_exec_stage_count"] = (
                                 state.get("opt_exec_stage_count", 0) + 1
                             )
+                            # First-stage END boundary (complement to the entry
+                            # stamp above): the moment the first node was staged
+                            # and ready to execute.  c2f_first_node_prefix_ms is
+                            # derived as first-executing-node MINUS this stamp —
+                            # the true post-staging remainder, NOT the full
+                            # cached→first-node window (which would double-count
+                            # topo_walk + stage).  Capture is unconditional and
+                            # bounded; on the first call only, to stay paired
+                            # with opt_exec_first_stage_mono_ns.
+                            if "opt_exec_stage_end_mono_ns" not in state:
+                                state["opt_exec_stage_end_mono_ns"] = time.monotonic_ns()
 
                 _ExecList.stage_node_execution = _patched_stage_node_execution
 
@@ -2829,7 +3313,7 @@ def install_pre_sampler_hooks() -> None:
 
             def _patched_cleanup_models_gc():
                 state = _instrumentation_var.get()
-                if state is None or not opt_diag_enabled():
+                if state is None:
                     return _orig_cleanup_gc()
                 _t0 = time.perf_counter_ns()
                 try:
@@ -2852,7 +3336,7 @@ def install_pre_sampler_hooks() -> None:
 
                 def _patched_dynamic_prompt_init(self, original_prompt):
                     state = _instrumentation_var.get()
-                    if state is None or not opt_diag_enabled():
+                    if state is None:
                         return _orig_dp_init(self, original_prompt)
                     _t0 = time.perf_counter_ns()
                     try:
@@ -2868,6 +3352,228 @@ def install_pre_sampler_hooks() -> None:
                             )
 
                 _dp_cls.__init__ = _patched_dynamic_prompt_init
+
+        # ── 5g. execution.IsChangedCache.get (IS_CHANGED evaluation) ──────
+        # Node-signature IS_CHANGED / fingerprint_inputs invocations happen
+        # inside CacheKeySetInputSignature.add_keys (caching.py
+        # get_immediate_node_signature → is_changed_cache.get).  Captured
+        # unconditionally (bounded measurement) so the
+        # prompt_executor_breakdown line can split signature-key build vs
+        # IS_CHANGED evaluation; no trace event is emitted here.
+        _isc_cls = getattr(_execution, "IsChangedCache", None)
+        if _isc_cls is not None:
+            _orig_isc_get = getattr(_isc_cls, "get", None)
+            if _orig_isc_get is not None:
+                _ORIGINAL_FUNCTIONS["IsChangedCache.get"] = _orig_isc_get
+                _installed_execution_hooks = True
+
+                async def _patched_is_changed_get(self, node_id):
+                    state = _instrumentation_var.get()
+                    if state is None:
+                        return await _orig_isc_get(self, node_id)
+                    _t0 = time.perf_counter_ns()
+                    try:
+                        return await _orig_isc_get(self, node_id)
+                    finally:
+                        _elapsed = _ns_ms(_t0)
+                        if state is not None:
+                            state["opt_exec_is_changed_ms"] = (
+                                state.get("opt_exec_is_changed_ms", 0.0) + _elapsed
+                            )
+                            state["opt_exec_is_changed_count"] = (
+                                state.get("opt_exec_is_changed_count", 0) + 1
+                            )
+
+                _isc_cls.get = _patched_is_changed_get
+
+        # ── 5h. CacheKeySetInputSignature.add_keys (signature-key build) ──
+        # Total time building input-signature cache keys, which NESTEDLY
+        # includes the is_changed_ms above (5g).  The breakdown line derives
+        # signature_keys_ms = add_keys total − is_changed_ms so the pair
+        # reconciles exactly.  Capture is unconditional; measurement-only.
+        try:
+            from comfy_execution.caching import CacheKeySetInputSignature as _SigKeySet
+        except ImportError:
+            _SigKeySet = None
+
+        if _SigKeySet is not None:
+            _orig_sig_add_keys = getattr(_SigKeySet, "add_keys", None)
+            if _orig_sig_add_keys is not None:
+                _ORIGINAL_FUNCTIONS["CacheKeySetInputSignature.add_keys"] = _orig_sig_add_keys
+
+                async def _patched_sig_add_keys(self, node_ids):
+                    state = _instrumentation_var.get()
+                    if state is None:
+                        return await _orig_sig_add_keys(self, node_ids)
+                    _t0 = time.perf_counter_ns()
+                    try:
+                        if state is not None:
+                            state["opt_exec_signature_memo_requested"] = _signature_memo_enabled()
+                        _memo_plan = None
+                        if state is not None:
+                            _memo_plan = _memo_plan_from_state(state)
+                        if _memo_plan is not None:
+                            _memo_t0 = time.perf_counter_ns()
+                            _hit, _reason = await _psc_apply_memo_hit(
+                                keys=self.keys,
+                                subcache_keys=self.subcache_keys,
+                                node_ids=node_ids,
+                                get_node=self.dynprompt.get_node,
+                                has_node=self.dynprompt.has_node,
+                                get_is_changed=self.is_changed_cache.get,
+                                identity_hash=_memo_plan,
+                            )
+                            if _hit:
+                                # Full memo hit: skip the original computation
+                                # entirely; the memo reconstructed the exact
+                                # keys the original would have produced.
+                                state["opt_exec_signature_memo_hit"] = True
+                                state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_memo_plan)
+                                state["opt_exec_signature_memo_fallback"] = ""
+                                state["opt_exec_signature_reuse_ms"] = (
+                                    state.get("opt_exec_signature_reuse_ms", 0.0)
+                                    + _ns_ms(_memo_t0)
+                                )
+                                return None
+                            state["opt_exec_signature_memo_hit"] = False
+                            state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_memo_plan)
+                            state["opt_exec_signature_memo_fallback"] = _reason or "no_entry"
+                        _result = await _orig_sig_add_keys(self, node_ids)
+                        if _memo_plan is not None and state is not None:
+                            await _memo_write_back(self, node_ids, _memo_plan, state)
+                        return _result
+                    finally:
+                        _elapsed = _ns_ms(_t0)
+                        if state is not None:
+                            state["opt_exec_signature_keys_total_ms"] = (
+                                state.get("opt_exec_signature_keys_total_ms", 0.0) + _elapsed
+                            )
+                            state["opt_exec_signature_keys_count"] = (
+                                state.get("opt_exec_signature_keys_count", 0) + 1
+                            )
+
+                _SigKeySet.add_keys = _patched_sig_add_keys
+
+        # ── 5i. TopologicalSort.get_input_info (per-input INPUT_TYPES memo) ─
+        # The dominant sub-span of the topo walk (the cached→first-node
+        # 1177ms root cause on memo-hit runs): add_node → get_input_info →
+        # class_def.INPUT_TYPES() → (for loader inputs) a cold
+        # folder_paths.get_filename_list recursive_search on the Modal
+        # volume.  TWO advisory layers, both fail-closed:
+        #   (a) REQUEST-SCOPED memo keyed (class_type, input_name) → result
+        #       triple: within one request the node registry and volume
+        #       folder listings cannot change, so a repeat lookup would redo
+        #       cold Modal-volume I/O for identical inputs.  The memo lives in
+        #       per-request state — never module-global — so folder contents
+        #       changing BETWEEN requests is fully respected (the exact reason
+        #       ComfyUI core itself does not cache INPUT_TYPES).
+        #   (b) PERSISTED topo-lazy: when the signature-memo identity is
+        #       stashed (state["opt_exec_signature_memo_key_hash"]) and the
+        #       store carries a lazy flag for (class_type, input_name), the
+        #       walk needs ONLY extra_info["lazy"] (a structural property of
+        #       the class INPUT_TYPES spec) — so the memoized triple
+        #       (None, None, {"lazy": bool}) is returned WITHOUT calling
+        #       INPUT_TYPES.  Deterministic on memo-hit runs (no race with the
+        #       advisory warm daemon threads).  Original-path calls extract
+        #       the lazy flag and ACCUMULATE it into
+        #       state["opt_exec_topo_lazy_pending"] for one persist per
+        #       request (see _persist_topo_lazy).
+        # Measurement-only: accumulates the timed original-call total under
+        # opt_exec_topo_input_info_ms/count (memo hits are microseconds and
+        # stay inside the topo_walk parent); topo_lazy memo hits bump
+        # opt_exec_topo_lazy_hit_count.  Never raises.
+        if _TopoSort is not None:
+            _orig_topo_get_input_info = getattr(_TopoSort, "get_input_info", None)
+            if _orig_topo_get_input_info is not None:
+                _ORIGINAL_FUNCTIONS["TopologicalSort.get_input_info"] = _orig_topo_get_input_info
+
+                def _patched_topo_get_input_info(self, unique_id, input_name):
+                    state = _instrumentation_var.get()
+                    if state is None:
+                        return _orig_topo_get_input_info(self, unique_id, input_name)
+                    _class_type = ""
+                    try:
+                        _node = self.dynprompt.get_node(unique_id)
+                        if isinstance(_node, dict):
+                            _class_type = _node.get("class_type", "") or ""
+                    except Exception:
+                        _class_type = ""
+                    if _class_type:
+                        _memo_key = (_class_type, input_name)
+                        # (a) Request-scoped memo (repeat-call collapse).
+                        try:
+                            _memo = state.get("opt_exec_topo_input_info_memo")
+                            if isinstance(_memo, dict) and _memo_key in _memo:
+                                return _memo[_memo_key]
+                        except Exception:
+                            pass
+                        # (b) Persisted topo-lazy fast path (deterministic).
+                        try:
+                            _ident = state.get("opt_exec_signature_memo_key_hash")
+                            if (
+                                isinstance(_ident, str)
+                                and _ident
+                                and _psc_topo_lazy_get is not None
+                            ):
+                                _lazy = _psc_topo_lazy_get(_ident, _class_type, input_name)
+                                if isinstance(_lazy, bool):
+                                    state["opt_exec_topo_lazy_hit_count"] = (
+                                        state.get("opt_exec_topo_lazy_hit_count", 0) + 1
+                                    )
+                                    _lazy_result = (None, None, {"lazy": _lazy})
+                                    try:
+                                        _memo = state.get("opt_exec_topo_input_info_memo")
+                                        if _memo is None:
+                                            _memo = {}
+                                            state["opt_exec_topo_input_info_memo"] = _memo
+                                        _memo[_memo_key] = _lazy_result
+                                    except Exception:
+                                        pass
+                                    return _lazy_result
+                        except Exception:
+                            pass
+                    _t0 = time.perf_counter_ns()
+                    try:
+                        _result = _orig_topo_get_input_info(self, unique_id, input_name)
+                    finally:
+                        _elapsed = _ns_ms(_t0)
+                        if state is not None:
+                            state["opt_exec_topo_input_info_ms"] = (
+                                state.get("opt_exec_topo_input_info_ms", 0.0) + _elapsed
+                            )
+                            state["opt_exec_topo_input_info_count"] = (
+                                state.get("opt_exec_topo_input_info_count", 0) + 1
+                            )
+                    if _class_type:
+                        try:
+                            _memo = state.get("opt_exec_topo_input_info_memo")
+                            if _memo is None:
+                                _memo = {}
+                                state["opt_exec_topo_input_info_memo"] = _memo
+                            _memo[_memo_key] = _result
+                        except Exception:
+                            pass
+                        # Accumulate the lazy flag for the one-per-request
+                        # topo-lazy persist (dedupe via the pending dict key).
+                        try:
+                            _extra = (
+                                _result[2]
+                                if isinstance(_result, tuple) and len(_result) >= 3
+                                else None
+                            )
+                            _lazy = False
+                            if isinstance(_extra, dict):
+                                _lazy = bool(_extra.get("lazy"))
+                            _pending = state.get("opt_exec_topo_lazy_pending")
+                            if _pending is None:
+                                _pending = {}
+                                state["opt_exec_topo_lazy_pending"] = _pending
+                            _pending[(_class_type, input_name)] = _lazy
+                        except Exception:
+                            pass
+                    return _result
+
+                _TopoSort.get_input_info = _patched_topo_get_input_info
 
     # ── 6. execution.resolve_map_node_over_list_results (future wait) ───
     _orig_resolve = getattr(_execution, "resolve_map_node_over_list_results", None)
@@ -2885,11 +3591,21 @@ def install_pre_sampler_hooks() -> None:
                 for r in results
             )
             _t0 = time.perf_counter_ns()
+            _res_win_start_ns = time.monotonic_ns()
             try:
                 return await _orig_resolve(results)
             finally:
                 _elapsed = _ns_ms(_t0)
                 if state is not None:
+                    _res_win_end_ns = time.monotonic_ns()
+                    _res_windows = state.setdefault("_resolve_wait_windows", [])
+                    _res_windows.append({
+                        "start_mono_ns": int(_res_win_start_ns),
+                        "end_mono_ns": int(_res_win_end_ns),
+                        "wait_ms": round(_elapsed, 3),
+                    })
+                    if len(_res_windows) > 1000:
+                        state["_resolve_wait_windows"] = _res_windows[-500:]
                     state["future_wait_ms"] = state.get("future_wait_ms", 0.0) + _elapsed
                     state.setdefault("_fw_count", 0)
                     state["_fw_count"] += 1
@@ -2972,6 +3688,14 @@ def uninstall_pre_sampler_hooks() -> None:
         except (ImportError, AttributeError):
             pass
 
+    _orig_topo_get_input_info = _ORIGINAL_FUNCTIONS.get("TopologicalSort.get_input_info")
+    if _orig_topo_get_input_info is not None:
+        try:
+            from comfy_execution.graph import TopologicalSort as _TopoSort
+            _TopoSort.get_input_info = _orig_topo_get_input_info
+        except (ImportError, AttributeError):
+            pass
+
     _orig_stage_node = _ORIGINAL_FUNCTIONS.get("ExecutionList.stage_node_execution")
     if _orig_stage_node is not None:
         try:
@@ -2993,6 +3717,21 @@ def uninstall_pre_sampler_hooks() -> None:
         _dp_cls = getattr(_execution, "DynamicPrompt", None)
         if _dp_cls is not None:
             _dp_cls.__init__ = _orig_dp_init
+
+    # Restore breakdown hooks (5g, 5h)
+    _orig_isc_get = _ORIGINAL_FUNCTIONS.get("IsChangedCache.get")
+    if _orig_isc_get is not None:
+        _isc_cls = getattr(_execution, "IsChangedCache", None)
+        if _isc_cls is not None:
+            _isc_cls.get = _orig_isc_get
+
+    _orig_sig_add_keys = _ORIGINAL_FUNCTIONS.get("CacheKeySetInputSignature.add_keys")
+    if _orig_sig_add_keys is not None:
+        try:
+            from comfy_execution.caching import CacheKeySetInputSignature as _SigKeySet
+            _SigKeySet.add_keys = _orig_sig_add_keys
+        except (ImportError, AttributeError):
+            pass
 
     # Restore encode_from_tokens hook
     _orig_encode = _ORIGINAL_FUNCTIONS.get("encode_from_tokens")
@@ -3050,12 +3789,331 @@ class ExecutionContext:
     cancelled: Callable[[], bool] | None = None
     progress: Callable[[dict[str, Any]], Any] | None = None
     trace: RuntimeTrace | None = None
+    remote_cancel_event: threading.Event | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Auto-create a request-scoped PreSamplerCache unless caller supplied one."""
         if "pre_sampler_cache" not in self.metadata:
             self.metadata["pre_sampler_cache"] = PreSamplerCache(trace=self.trace)
+
+
+class RemoteCancellationError(Exception):
+    """Internal marker: a confirmed cooperative remote cancel was observed and
+    execution has actually stopped.
+
+    Raised by the ``RuntimeExecutor`` stream/execute layers instead of turning
+    a confirmed cancel into a generic ``error`` event, so the request bridge
+    can emit an explicit ``cancelled`` terminal event.  Never raised on the
+    no-cancel path and never used to represent shutdown/stream-close, which
+    keep their existing error behavior.
+    """
+
+
+def _remote_cancel_confirmed(ctx: ExecutionContext | None) -> bool:
+    """True when *ctx* carries a set cooperative remote-cancel event.
+
+    The event is set only by the per-invocation remote-cancel watcher after it
+    received a matching ``cancel`` control message.  A legacy host ``cancelled``
+    callback never sets it, so shutdown/stream-close can never be mistaken for
+    a confirmed user cancellation.
+    """
+    ev = getattr(ctx, "remote_cancel_event", None) if ctx is not None else None
+    return ev is not None and ev.is_set()
+
+
+def combine_cancel_predicate(
+    cancelled: Callable[[], bool] | None,
+    remote_cancel_event: threading.Event | None,
+) -> Callable[[], bool] | None:
+    """Combine a host ``cancelled`` callback with the watcher cancel event.
+
+    Returns ``None`` when both are absent (the no-cancel path is unchanged and
+    returns the original callback object when only the callback exists, so
+    existing boundary checks keep working).  The combined predicate is True
+    when either the existing callback OR the watcher event fires.  A raising
+    callback never blocks the watcher signal.
+    """
+    if remote_cancel_event is None:
+        return cancelled
+    if cancelled is None:
+        return lambda: remote_cancel_event.is_set()
+
+    def _combined() -> bool:
+        try:
+            if cancelled():
+                return True
+        except Exception:
+            pass
+        return remote_cancel_event.is_set()
+
+    return _combined
+
+
+def _is_primitive_dict(msg: Mapping[str, Any]) -> bool:
+    """True when every value in *msg* is a scalar primitive (or ``None``).
+
+    Non-primitive values (dicts, lists, objects) are rejected so the watcher
+    accepts only plain, serializable control messages.
+    """
+    for value in msg.values():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            continue
+        return False
+    return True
+
+
+def _is_queue_poll_timeout(exc: BaseException) -> bool:
+    """True when *exc* is a queue poll timeout (transient — keep polling).
+
+    Modal's sync ``Queue.get(block=True, timeout=...)`` raises the stdlib
+    ``queue.Empty`` on timeout; the in-process test fakes raise
+    ``TimeoutError``.  Any OTHER exception is treated as a persistent queue
+    failure that polling cannot resolve, so the watcher stops instead of
+    silently spinning forever.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(exc, queue.Empty)
+
+
+def _default_interrupt_fn(value: bool) -> None:
+    """ComfyUI native interrupt seam (lazily resolved, never raises).
+
+    Exists as a module-level indirection so tests can patch it and so a
+    missing ``comfy.model_management`` never breaks the watcher thread.
+    """
+    try:
+        import comfy.model_management as _model_management
+    except Exception:
+        return
+    try:
+        _model_management.interrupt_current_processing(value)
+    except Exception:
+        pass
+
+
+class RemoteCancelWatcher:
+    """Per-invocation cooperative remote-cancel watcher (bridge).
+
+    Runs exactly one daemon thread per invocation that polls the hydrated
+    Modal control Queue (``get(block=True, timeout=poll_timeout,
+    partition=partition)``) while the synchronous/async PromptExecutor
+    sampling is busy.  Only primitive dict messages with ``type == 'cancel'``
+    and a matching attempt identity are accepted; anything else is ignored.
+
+    On a match the watcher:
+      * preserves the matched message's ``reason`` (``cancel_reason``),
+      * sets a local thread-safe cancel Event (``cancel_event`` /
+        ``cancel_confirmed``), and
+      * calls ComfyUI's native ``comfy.model_management.interrupt_current_processing(True)``
+        so active sampling stops through the standard interruption path at
+        concurrency=1 (never a flag-only boundary stop).
+
+    All Queue access happens exclusively inside the watcher thread — the hot
+    execution path never touches the Queue.  ``stop_and_join`` is idempotent
+    and bounded: the stop Event wakes the poll within one poll timeout.
+    A non-timeout queue failure is recorded on ``queue_error`` and stops the
+    watcher — it must never spin forever on a persistent channel failure
+    (only poll timeouts keep polling).
+    """
+
+    def __init__(
+        self,
+        control_queue: Any,
+        partition: Any = None,
+        *,
+        request_id: str = "",
+        poll_timeout: float = 0.5,
+        interrupt_fn: Callable[[bool], Any] | None = None,
+    ) -> None:
+        self._queue = control_queue
+        self._partition = partition
+        self._request_id = str(request_id or "")
+        self._poll_timeout = float(poll_timeout)
+        self._interrupt_fn = interrupt_fn
+        self._cancel_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._cancel_reason = ""
+        self._queue_error: BaseException | None = None
+        self._expected_partitions = frozenset(
+            str(v) for v in (partition,) if v is not None and isinstance(v, (str, int))
+        )
+        self._expected_identities = frozenset(
+            str(v)
+            for v in (partition, self._request_id)
+            if v is not None and isinstance(v, (str, int))
+        )
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Local thread-safe cancel Event set once a matching cancel is seen."""
+        return self._cancel_event
+
+    @property
+    def cancel_confirmed(self) -> bool:
+        """True once a matching ``cancel`` control message was received."""
+        return self._cancel_event.is_set()
+
+    @property
+    def cancel_reason(self) -> str:
+        """The ``reason`` carried by the matched cancel message (``""`` when
+        the message had none, or no match has been observed)."""
+        return self._cancel_reason
+
+    @property
+    def queue_error(self) -> BaseException | None:
+        """Persistent queue failure that stopped the watcher (``None`` when
+        the watcher is healthy, was stopped normally, or timed out polling)."""
+        return self._queue_error
+
+    @property
+    def thread_alive(self) -> bool:
+        t = self._thread
+        return t is not None and t.is_alive()
+
+    def start(self) -> "RemoteCancelWatcher":
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"comfymodal-remote-cancel-watcher-{self._request_id[-8:] or 'x'}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def stop_and_join(self, timeout: float = 2.0) -> None:
+        """Set the stop flag and join the watcher thread (bounded, idempotent)."""
+        self._stop_event.set()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=timeout)
+        self._thread = None
+
+    # ── internals ─────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    msg = self._queue.get(
+                        block=True,
+                        timeout=self._poll_timeout,
+                        partition=self._partition,
+                    )
+                except Exception as exc:
+                    if _is_queue_poll_timeout(exc):
+                        # Normal poll timeout: re-check stop and keep polling.
+                        continue
+                    # A persistent queue failure cannot be resolved by polling
+                    # forever: surface it and stop the watcher instead of
+                    # silently spinning.
+                    self._queue_error = exc
+                    print(
+                        f"[v2.remote_cancel] watcher={self._request_id or self._partition} "
+                        f"status=queue_error type={type(exc).__name__} message={exc}",
+                        flush=True,
+                    )
+                    break
+                if self._stop_event.is_set():
+                    break
+                if self._is_matching_cancel(msg):
+                    self._cancel_reason = str(msg.get("reason", "") or "")
+                    self._cancel_event.set()
+                    self._interrupt()
+                    break  # confirmed: this invocation's watcher is done
+        except Exception:
+            pass
+
+    def _is_matching_cancel(self, msg: Any) -> bool:
+        if not isinstance(msg, dict):
+            return False
+        if msg.get("type") != "cancel":
+            return False
+        if not _is_primitive_dict(msg):
+            return False
+        # Partition identity: when the message carries an explicit partition it
+        # must match this invocation's control partition (the transport builds
+        # cancel messages as ``{"type": "cancel", "partition": ..., "reason"}``).
+        msg_partition = msg.get("partition")
+        if msg_partition is not None:
+            if not self._expected_partitions or str(msg_partition) not in self._expected_partitions:
+                return False
+        # Attempt identity: an explicit attempt id must match when present.
+        attempt_id = msg.get("attempt_id")
+        if attempt_id is None:
+            # Partition-scoped delivery is the identity when the message
+            # carries no explicit attempt id.
+            return True
+        return str(attempt_id) in self._expected_identities
+
+    def _interrupt(self) -> None:
+        fn = self._interrupt_fn if self._interrupt_fn is not None else _default_interrupt_fn
+        try:
+            fn(True)
+        except Exception:
+            pass
+
+
+def build_remote_cancel_terminal_event(
+    request_id: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """Fixed-protocol terminal event for a confirmed cooperative remote cancel.
+
+    Emitted ONLY when the watcher received a matching ``cancel`` message and
+    execution has actually returned/stopped.  ``confirmed`` is always True.
+    ``reason`` preserves the matched message's ``reason`` when present; the
+    generic ``"remote_cancel"`` label is used only when the message carried
+    none, so a shutdown-scoped cancel (``reason="shutdown"``) stays
+    distinguishable in the terminal event.
+    """
+    return {
+        "type": "cancelled",
+        "request_id": str(request_id or ""),
+        "reason": reason or "remote_cancel",
+        "confirmed": True,
+    }
+
+
+async def guard_remote_cancel_stream(
+    stream: AsyncIterator[dict[str, Any]],
+    *,
+    watcher: RemoteCancelWatcher | None,
+    request_id: str = "",
+) -> AsyncIterator[dict[str, Any]]:
+    """Wrap an executor event stream with the remote-cancel terminal bridge.
+
+    A watcher-confirmed cancel surfaces as an explicit ``cancelled`` terminal
+    event (instead of a generic ``error`` event or an unclassified
+    cancellation) carrying the matched message's ``reason``.  Unconfirmed
+    cancellations — shutdown, stream-close, legacy host callback — propagate
+    unchanged, and the no-cancel path is identical.  Stops the watcher
+    (bounded join) when the wrapped stream ends for any reason: normal
+    completion, confirmed cancel, or failure.
+    """
+    try:
+        async for event in stream:
+            yield event
+    except asyncio.CancelledError:
+        if watcher is not None and watcher.cancel_confirmed:
+            yield build_remote_cancel_terminal_event(
+                request_id, reason=watcher.cancel_reason
+            )
+            return
+        raise
+    except RemoteCancellationError:
+        if watcher is not None and watcher.cancel_confirmed:
+            yield build_remote_cancel_terminal_event(
+                request_id, reason=watcher.cancel_reason
+            )
+            return
+        raise
+    finally:
+        if watcher is not None:
+            watcher.stop_and_join()
 
 
 class RuntimeExecutor:
@@ -3172,6 +4230,10 @@ class RuntimeExecutor:
                 attach_pre_sampler_critical_path(result, plan, cache)
             return result
         except Exception as exc:
+            if _remote_cancel_confirmed(ctx):
+                # A confirmed cooperative remote cancel must never fall through
+                # to the compatibility fallback or surface as a generic error.
+                raise RemoteCancellationError(str(exc)) from exc
             if (
                 diagnostics.selected == "in_process"
                 and self.allow_compatibility_fallback
@@ -3246,6 +4308,11 @@ class RuntimeExecutor:
                 attach_pre_sampler_critical_path(payload, plan, cache)
             yield {"type": "result", "data": payload}
         except Exception as exc:
+            if _remote_cancel_confirmed(ctx):
+                # Confirmed cooperative remote cancel: never surface as a
+                # generic error event.  The request bridge converts the marker
+                # into an explicit ``cancelled`` terminal event.
+                raise RemoteCancellationError(str(exc)) from exc
             yield {"type": "error", "message": str(exc), "backend": diagnostics.to_dict()}
         finally:
             diagnostics.elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
@@ -3632,6 +4699,14 @@ def _build_sampling_wrapper() -> Callable:
             "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
             "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
+        # ── Host hardware telemetry: sampling-start resource snapshot ──
+        # Silent no-op when the telemetry module is not deployed (guarded
+        # import).  Never raises, never alters sampling timing.
+        try:
+            from comfymodal_runtime import host_hardware_telemetry as _hht
+            _hht.capture_resource_snapshot("sampling_start", trace)
+        except Exception:
+            pass
         _sampler_boundary_line("sampling_start", start_meta)
         # ── LANE 9: UNET readiness vs sampling-start demand slack ─────────
         # Diagnostic-only: reports how early/late the retained UNET was ready
@@ -3724,6 +4799,20 @@ def _build_sampling_wrapper() -> Callable:
         # latent_image, denoise_mask, disable_pbar).  The callback fires once
         # per completed step.  The first invocation emits first_sampler_step.
         _first_step_fired = False
+        # ── E25: scoped first-step-window instrumentation ──────────────
+        # Optional low-overhead decomposition of the 1.07 s pre-first-step
+        # window (sampling_start -> first_sampler_step).  Emits one event per
+        # sub-boundary when COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS is on;
+        # gated to zero cost when off.  No global synchronization is added
+        # solely for timing — all stamps are monotonic wall reads.
+        if opt_diag_enabled():
+            try:
+                trace.emit("sampler_first_step_window_start", phase="execution", metadata={
+                    "node_id": node_id,
+                    "sampling_start_mono_ns": _sampling_start_event.monotonic_ns,
+                })
+            except Exception:
+                pass
 
         def _step_callback(*cb_args: Any, **cb_kwargs: Any) -> Any:
             nonlocal _first_step_fired
@@ -3737,6 +4826,25 @@ def _build_sampling_wrapper() -> Callable:
             if not _first_step_fired:
                 _first_step_fired = True
                 try:
+                    # ── E25: scoped first-step decomposition (gated) ──
+                    # Emits the sub-boundary stamps of the first-step window
+                    # so the next remote run can split the 1.07 s into
+                    # setup-vs-compute without global synchronization.
+                    if opt_diag_enabled():
+                        _now_ns = time.monotonic_ns()
+                        trace.emit("sampler_first_step_callback", phase="execution", metadata={
+                            "node_id": node_id,
+                            "first_step_mono_ns": _now_ns,
+                            "first_step_window_ms": round(
+                                (_now_ns - _sampling_start_event.monotonic_ns) / 1_000_000, 3
+                            ),
+                            "decomposition": (
+                                "wrapper_setup_ms + dispatch_to_first_forward_ms + "
+                                "first_forward_wall_ms + callback_tail_ms "
+                                "(correlate sampler_wrapper_setup_done / "
+                                "unet_first_cuda_op / unet_first_cuda_forward_complete)"
+                            ),
+                        })
                     trace.emit("first_sampler_step", phase="execution", metadata={
                         "node_id": node_id,
                         "node_class": node_class,
@@ -3747,6 +4855,29 @@ def _build_sampling_wrapper() -> Callable:
                     _sampler_boundary_line("first_sampler_step", dict(start_meta))
                     from comfymodal_runtime.model_preload import mark_first_sampler_step
                     mark_first_sampler_step(str(trace.request_id))
+                    # ── sampling_first_step mode: VAE early activation hook ──
+                    # Experimental trigger at the first completed sampler step
+                    # (the earliest sampling-underway boundary): the scheduler
+                    # reuses the Experiment 2 transfer-only worker, which
+                    # pre-copies the VAE CPU params/buffers to CUDA on a side
+                    # stream during sampling and rebinds .data under the
+                    # mutation lane strictly after sampling_end.  No-op in
+                    # every other mode; failures stay silent (never breaks
+                    # the sampler callback).
+                    from comfymodal_runtime.model_preload import (
+                        current_v2_loader_bridge,
+                        schedule_vae_early_activation_at_first_step,
+                    )
+                    _first_step_bridge = current_v2_loader_bridge()
+                    if _first_step_bridge is not None:
+                        schedule_vae_early_activation_at_first_step(
+                            _first_step_bridge,
+                            trace=trace,
+                            request_id=str(getattr(trace, "request_id", "") or ""),
+                            sampler_node_id=node_id,
+                            sampler_node_class=node_class,
+                            first_step_mono_ns=time.monotonic_ns(),
+                        )
                 except Exception:
                     pass
             if _orig_callback is not None:
@@ -3765,6 +4896,29 @@ def _build_sampling_wrapper() -> Callable:
                 args = args[:3] + (_step_callback,) + args[4:]
 
         try:
+            # ── E25: wrapper-setup-complete boundary (gated) ──────────
+            # The window sampling_start -> here is sampler/wrapper setup
+            # (scheduler/sigma/noise/latent prep, callback install).  The
+            # subsequent first UNET forward is stamped separately by the
+            # unet_forward_probe (unet_first_cuda_op enter /
+            # unet_first_cuda_forward_complete exit), so the pre-first-step
+            # window decomposes into:
+            #   wrapper_setup  = sampling_start -> this stamp
+            #   first_forward  = this stamp -> unet_first_cuda_op enter
+            #                     (scheduler dispatch to model invocation)
+            #   forward_wall   = unet_first_cuda_op -> forward_complete
+            #   callback_tail  = forward_complete -> first_sampler_step
+            if opt_diag_enabled():
+                try:
+                    trace.emit("sampler_wrapper_setup_done", phase="execution", metadata={
+                        "node_id": node_id,
+                        "setup_done_mono_ns": time.monotonic_ns(),
+                        "wrapper_setup_ms": round(
+                            (time.monotonic_ns() - _sampling_start_event.monotonic_ns) / 1_000_000, 3
+                        ),
+                    })
+                except Exception:
+                    pass
             return executor(*args, **kwargs)
         finally:
             # Request-scoped cleanup: drop the in-flight dedup key so the set
@@ -3802,6 +4956,22 @@ def _build_sampling_wrapper() -> Callable:
                     )
                 except Exception:
                     pass
+            # ── E27: memory boundary at sampling end (gated, aggregated) ──
+            try:
+                from comfymodal_runtime.e27_forensics import (
+                    e27_forensics_enabled,
+                    snapshot_e27_memory,
+                )
+
+                if e27_forensics_enabled():
+                    snapshot_e27_memory(
+                        trace,
+                        "sampling_end",
+                        node_id=node_id,
+                        duration_ms=duration_ms,
+                    )
+            except Exception:
+                pass
             # ── Gated deep sampling profile: finalize AFTER the authoritative
             # sampling_end event (post-boundary diagnostic cleanup).  Guaranteed
             # to run even when sampling_end emission failed above — patches and

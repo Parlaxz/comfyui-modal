@@ -1039,7 +1039,7 @@ class TestBreakdownIntact(unittest.TestCase):
         from comfymodal_runtime.trace import _build_local_submission_breakdown
         source = inspect.getsource(_build_local_submission_breakdown)
         for field in ("handle_cache_hit", "created_modal_client",
-                       "performed_cls_from_name", "constructed_class_instance"):
+                       "performed_cls_from_name", "constructed_instance"):
             self.assertIn(field, source,
                           f"Breakdown must reference {field}")
 
@@ -1739,3 +1739,20 @@ class TestTwoIdenticalExecutionsSkipBothRemoteOps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

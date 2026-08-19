@@ -11,9 +11,20 @@
 // master list page. Run Experiment may be disabled with a precise reason.
 
 import { CONTROL_DEFS, getRecommendedSteps, getRecommendedStepsStatus, getLastFiniteSeed, cryptoRandomSeed } from "./studio-feature-registry.js";
-import { getRuntimePresets } from "./studio-backend.js";
 import { runStudioExperiment, stopExperiment } from "./studio-backend-api.js";
 import { getAxisEligibilityForPresets } from "./studio-preset-capabilities.js";
+import {
+  runExperimentV2,
+  getExperimentV2Status,
+  cancelExperimentV2,
+  resumeExperiment,
+  retryCell,
+} from "./studio-backend-api.js";
+import {
+  createExperimentRunController,
+  formatExperimentProgress,
+} from "./studio-playground-run.js";
+import { loadModalOptions } from "./studio-output-preferences.js";
 
 // ── Experiment toggle ────────────────────────────────────────────────────
 
@@ -122,7 +133,10 @@ export function renderCompareBackends(state, actions, context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
 
-  getRuntimePresets({ apiBase }).then((presets) => {
+  // Lazy import keeps this module Node-importable for deterministic tests
+  // (studio-backend.js pulls ComfyUI-only modules through its own graph).
+  import("./studio-backend.js").then(({ getRuntimePresets }) => {
+    return getRuntimePresets({ apiBase }).then((presets) => {
     while (mainCollapsible.content.firstChild) mainCollapsible.content.removeChild(mainCollapsible.content.firstChild);
 
     // Update main summary count
@@ -260,6 +274,7 @@ export function renderCompareBackends(state, actions, context) {
       mainCollapsible.content.appendChild(ungroupedCollapsible.summary);
       mainCollapsible.content.appendChild(ungroupedCollapsible.content);
     }
+    });   // end getRuntimePresets().then
   }).catch(function () {
     var errorMsg = document.createElement("p");
     errorMsg.className = "comfymodal-studio-empty-state";
@@ -1308,7 +1323,828 @@ export function getExperimentPresetIds(state) {
   return [...new Set(allIds.filter(Boolean))];
 }
 
+// ── Modern Experiment V2 (D5) ────────────────────────────────────────────
+//
+// The modern surface submits ONE definition to POST /studio/experiment-v2
+// (runExperimentV2) and owns exactly one createExperimentRunController per
+// experiment.  The controller lives on state.playground._experimentController
+// (never recreated on re-render); only the active experiment id is persisted
+// so reopen/reload rebuilds the same fixed cell list without resubmitting.
+// Legacy run/cancel rendering above is retained for existing flows.
+//
+// Popup close / navigation only detaches or disposes — it never cancels.
+
+const MODERN_EXPERIMENT_ACTIVE_KEY = "comfymodal.studio.experiment.active.v1";
+const MODERN_POLL_INTERVAL_MS = 3000;
+const MODERN_TERMINAL_STATUSES = ["completed", "completed_with_failures", "failed", "canceled", "interrupted"];
+
+const MODERN_EXPERIMENT_STATUS_LABELS = {
+  queued: "Queued",
+  running: "Running",
+  completed: "Completed",
+  completed_with_failures: "Completed with failures",
+  failed: "Failed",
+  canceled: "Canceled",
+  interrupted: "Interrupted",
+};
+
+/** Module-scoped context cache (apiBase + ComfyUI event bus). */
+let _modernContext = { apiBase: "/comfymodal" };
+/** Live modern run-section mounts; kept in sync by the controller. */
+const _experimentMounts = new Set();
+
+function _firstStr() {
+  for (var i = 0; i < arguments.length; i++) {
+    var v = arguments[i];
+    if (v != null && String(v).trim() !== "") return String(v);
+  }
+  return "";
+}
+
+function _modernExperimentId() {
+  var rand = "";
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      rand = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+    }
+  } catch (e) {}
+  if (!rand) rand = Math.random().toString(36).slice(2, 14);
+  return "exp_v2_" + rand;
+}
+
+/**
+ * Resolve the workflow/version/preset the modern experiment should run from.
+ * Values are used verbatim when state supplies them — never inferred later.
+ */
+export function resolveModernWorkflowSelection(state) {
+  var pg = (state && state.playground) || {};
+  var store = pg._workflowRun && typeof pg._workflowRun === "object" ? pg._workflowRun : {};
+  var runContext = store.runContext && typeof store.runContext === "object" ? store.runContext : {};
+  var workflowSnapshot = {};
+  if (runContext.workflow_json && typeof runContext.workflow_json === "object") workflowSnapshot = runContext.workflow_json;
+  else if (runContext.api_prompt && typeof runContext.api_prompt === "object") workflowSnapshot = runContext.api_prompt;
+  else if (runContext.workflow && typeof runContext.workflow === "object") workflowSnapshot = runContext.workflow;
+  return {
+    workflowId: _firstStr(store.workflowId, pg.workflowId),
+    workflowVersionId: _firstStr(store.workflowVersionId, pg.workflowVersionId),
+    presetId: _firstStr(store.presetId, pg.workflowPresetId),
+    workflowName: _firstStr(store.workflowName, pg.workflowName),
+    presetName: _firstStr(store.presetName, pg.presetName),
+    workflowSnapshot: workflowSnapshot,
+  };
+}
+
+/** Resolve control defaults: CONTROL_DEFS → preset defaults → workflow
+ * control values → explicit user edits. */
+function _resolveModernControls(pg) {
+  var resolved = {};
+  for (var id in CONTROL_DEFS) {
+    if (Object.prototype.hasOwnProperty.call(CONTROL_DEFS, id) && CONTROL_DEFS[id].defaultValue !== undefined) {
+      resolved[id] = CONTROL_DEFS[id].defaultValue;
+    }
+  }
+  var presetDefaults = (pg._currentPreset && pg._currentPreset.defaults) || {};
+  for (var pk in presetDefaults) {
+    if (Object.prototype.hasOwnProperty.call(presetDefaults, pk)) resolved[pk] = presetDefaults[pk];
+  }
+  var workflowStore = pg._workflowRun && typeof pg._workflowRun === "object" ? pg._workflowRun : {};
+  var controlValues = workflowStore.controlValues || {};
+  for (var ck in controlValues) {
+    if (Object.prototype.hasOwnProperty.call(controlValues, ck) && controlValues[ck] != null) resolved[ck] = controlValues[ck];
+  }
+  var userControls = pg.controls || {};
+  for (var uk in userControls) {
+    if (Object.prototype.hasOwnProperty.call(userControls, uk)) resolved[uk] = userControls[uk];
+  }
+  return resolved;
+}
+
+/** Cartesian product of enabled axis values in fixed axis order. */
+function _axisCombinations(enabledAxes) {
+  var results = [];
+  function walk(i, acc) {
+    if (i >= enabledAxes.length) { results.push(acc); return; }
+    var axis = enabledAxes[i];
+    var vals = Array.isArray(axis.values) ? axis.values : [];
+    if (vals.length === 0) { walk(i + 1, acc); return; }
+    for (var vi = 0; vi < vals.length; vi++) {
+      walk(i + 1, acc.concat([{ controlId: axis.controlId, value: vals[vi] }]));
+    }
+  }
+  walk(0, []);
+  return results;
+}
+
+/**
+ * Build the fixed ordered cell list for a modern experiment definition.
+ * Cells are keyed by stable cell_id (cell_0..cell_N-1) in generation order;
+ * never reordered by completion.  Axis labels/values and the resolved
+ * workflow/version/preset are baked per cell.
+ */
+export function buildModernExperimentCells(opts) {
+  var o = opts && typeof opts === "object" ? opts : {};
+  var experimentId = o.experimentId || "";
+  var axes = Array.isArray(o.axes) ? o.axes : [];
+  var selection = o.selection || {};
+  var resolved = o.resolved || {};
+  var basePrompt = o.prompt != null ? o.prompt : "";
+  var baseNegative = o.negativePrompt != null ? o.negativePrompt : "";
+  var snapshot = o.workflowSnapshot && typeof o.workflowSnapshot === "object" ? o.workflowSnapshot : {};
+  var combos = _axisCombinations(axes);
+  var cells = [];
+  combos.forEach(function (combo, i) {
+    var axisLabels = {};
+    var axisValues = {};
+    var controlOverrides = {};
+    var promptText = basePrompt;
+    var negativeText = baseNegative;
+    combo.forEach(function (entry) {
+      var def = CONTROL_DEFS[entry.controlId] || {};
+      var label = def.label || entry.controlId;
+      axisLabels[label] = String(entry.value);
+      axisValues[entry.controlId] = entry.value;
+      if (entry.controlId === "prompt") promptText = String(entry.value);
+      else if (entry.controlId === "negative_prompt") negativeText = String(entry.value);
+      else controlOverrides[entry.controlId] = entry.value;
+    });
+    var cellId = "cell_" + i;
+    cells.push({
+      cell_id: cellId,
+      generation_id: "gen_" + experimentId + "_" + i,
+      workflow_id: selection.workflowId || null,
+      workflow_version_id: selection.workflowVersionId || null,
+      preset_id: selection.presetId || null,
+      axis_labels: axisLabels,
+      axis_values: axisValues,
+      workflow_snapshot: snapshot,
+      immutable_request: {
+        experiment_id: experimentId,
+        cell_id: cellId,
+        prompt_text: promptText,
+        negative_prompt_text: negativeText,
+        controls: Object.assign({}, resolved, controlOverrides),
+        source: "studio_experiment_v2",
+      },
+    });
+  });
+  return cells;
+}
+
+/**
+ * Build the ONE modern experiment definition from the current axes/controls
+ * and resolved workflow/version/preset.  No concurrency field (the global
+ * default is backend/settings-owned).  Axes are request-generation
+ * convenience only.
+ */
+export function buildModernExperimentDefinition(state, context) {
+  var pg = (state && state.playground) || {};
+  var featureId = pg.featureId || "txt2img";
+  var selection = resolveModernWorkflowSelection(state);
+  var axes = pg.experimentAxes && typeof pg.experimentAxes === "object" ? pg.experimentAxes : {};
+  var enabledAxes = Object.keys(axes)
+    .filter(function (c) {
+      return axes[c] && axes[c].enabled && Array.isArray(axes[c].values) && axes[c].values.length > 0;
+    })
+    .map(function (c) { return { controlId: c, values: axes[c].values }; });
+  var resolved = _resolveModernControls(pg);
+  var prompt = pg.controls && pg.controls.prompt != null ? pg.controls.prompt : (resolved.prompt != null ? resolved.prompt : "");
+  var negativePrompt = pg.controls && pg.controls.negative_prompt != null
+    ? pg.controls.negative_prompt
+    : (resolved.negative_prompt != null ? resolved.negative_prompt : "");
+  var experimentId = _modernExperimentId();
+  var axisNames = enabledAxes.map(function (a) { return a.controlId; });
+  var definitionAxes = {};
+  enabledAxes.forEach(function (axis) {
+    // The modern planner expands every definition.axes entry. Do not send
+    // disabled draft axes or the client-only `enabled` flag to that seam.
+    definitionAxes[axis.controlId] = { values: axis.values.slice() };
+  });
+  var definition = {
+    name: "Studio Experiment: " + featureId,
+    feature_id: featureId,
+    axis_labels: { x: axisNames[0] || "", y: axisNames[1] || "" },
+    axes: definitionAxes,
+    defaults: resolved,
+    prompts: [{ text: prompt, negative: negativePrompt }],
+    workflows: selection.workflowId
+      ? [{
+          workflow_id: selection.workflowId,
+          workflow_version_id: selection.workflowVersionId || "",
+          preset_id: selection.presetId || "",
+          workflow_name: selection.workflowName || "",
+          preset_name: selection.presetName || "",
+        }]
+      : [],
+  };
+  if (context && context.modalOptions && typeof context.modalOptions === "object") {
+    definition.modal_options = { ...context.modalOptions };
+  }
+  return {
+    experiment_id: experimentId,
+    name: definition.name,
+    definition: definition,
+  };
+}
+
+export function modernExperimentCanRun(state) {
+  var selection = resolveModernWorkflowSelection(state);
+  return !!(selection.workflowId && selection.workflowVersionId);
+}
+
+/**
+ * Which experiment run surface should mount in experiment mode:
+ *   - "modern": a modern Workflow/Version is selected, or an active/persisted
+ *     modern experiment id exists → the D5 section (never the legacy button).
+ *   - "legacy": legacy preset-only experiment flow (existing renderer).
+ */
+export function experimentRunSurface(state) {
+  if (modernExperimentCanRun(state)) return "modern";
+  var pg = state && state.playground;
+  if (pg && pg._activeExperimentId) return "modern";
+  try {
+    if (loadActiveExperimentId()) return "modern";
+  } catch (e) { /* ignore */ }
+  return "legacy";
+}
+
+export function modernExperimentDisabledReason(state) {
+  var selection = resolveModernWorkflowSelection(state);
+  if (!selection.workflowId) return "Select a Workflow and Version to run a modern experiment.";
+  if (!selection.workflowVersionId) return "Select a Workflow Version to run a modern experiment.";
+  return "";
+}
+
+/** Canonical status label for chips; canceled/interrupted/failed distinct. */
+export function experimentStatusLabel(status) {
+  return MODERN_EXPERIMENT_STATUS_LABELS[status]
+    || (status != null ? String(status) : "Queued");
+}
+
+export function isTerminalModernStatus(status) {
+  return MODERN_TERMINAL_STATUSES.indexOf(status) !== -1;
+}
+
+export function canResumeModernExperiment(status, cells) {
+  // Only an actively RUNNING experiment suppresses Resume.  A "queued"
+  // aggregate with queued/not-started cells IS resume-eligible; failed cells
+  // are never resumed (they require per-cell Retry).
+  if (status === "running") return false;
+  return (Array.isArray(cells) ? cells : []).some(function (c) {
+    return c && (c.status === "interrupted" || c.status === "queued");
+  });
+}
+
+export function getResumeEligibleCellCount(status, cells) {
+  if (!canResumeModernExperiment(status, cells)) return 0;
+  return (Array.isArray(cells) ? cells : []).reduce(function (n, c) {
+    return n + (c && (c.status === "interrupted" || c.status === "queued") ? 1 : 0);
+  }, 0);
+}
+
+export function canRetryModernCell(cell) {
+  return !!(cell && cell.status === "failed");
+}
+
+// ── Active experiment id persistence (reload/reopen) ─────────────────────
+
+export function loadActiveExperimentId() {
+  try {
+    var raw = localStorage.getItem(MODERN_EXPERIMENT_ACTIVE_KEY);
+    if (raw) {
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.experimentId === "string" && parsed.experimentId) {
+        return parsed.experimentId;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return "";
+}
+
+export function persistActiveExperimentId(experimentId) {
+  try {
+    if (experimentId) {
+      localStorage.setItem(MODERN_EXPERIMENT_ACTIVE_KEY, JSON.stringify({ experimentId: String(experimentId) }));
+    } else {
+      localStorage.removeItem(MODERN_EXPERIMENT_ACTIVE_KEY);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+export function clearActiveExperimentId() {
+  persistActiveExperimentId("");
+}
+
+// ── Controller lifecycle ─────────────────────────────────────────────────
+
+/**
+ * Get the ONE per-experiment controller, creating it once.  Re-render never
+ * creates a second controller.  Returns null when no active experiment id.
+ */
+export function getModernExperimentController(state, context) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  var ctx = context || _modernContext;
+  var apiBase = (ctx && ctx.apiBase) || "/comfymodal";
+  var id = pg._activeExperimentId || "";
+  if (!id) return null;
+  var existing = pg._experimentController;
+  if (existing && String(existing.getExperimentId()) === id) return existing;
+  if (existing && typeof existing.dispose === "function") {
+    try { existing.dispose(); } catch (e) {}
+  }
+  pg._experimentController = null;
+  var controller = createExperimentRunController({
+    experimentId: id,
+    apiBase: apiBase,
+    actions: {
+      cancel: (eid) => cancelExperimentV2(apiBase, eid),
+      resume: (eid) => resumeExperiment(apiBase, eid),
+      retryCell: (eid, cellId) => retryCell(apiBase, eid, cellId),
+    },
+  });
+  controller.subscribe(function () { _updateExperimentSectionMounts(state); });
+  pg._experimentController = controller;
+  return controller;
+}
+
+/**
+ * Fetch the modern status endpoint and reconcile the controller.  The status
+ * response wraps detail under `item`; the controller consumes the unwrapped
+ * payload.
+ */
+export async function refreshModernExperimentStatus(state, context) {
+  var ctx = context || _modernContext;
+  var pg = state && state.playground;
+  var experimentId = pg && pg._activeExperimentId;
+  if (!experimentId) return null;
+  var apiBase = (ctx && ctx.apiBase) || "/comfymodal";
+  var controller = getModernExperimentController(state, ctx);
+  if (!controller) return null;
+  try {
+    var data = await getExperimentV2Status(apiBase, experimentId);
+    var payload = data && data.item && typeof data.item === "object" ? data.item : data;
+    if (payload && typeof payload === "object") controller.reconcile(payload);
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+export function stopModernExperimentPolling(state) {
+  var pg = state && state.playground;
+  if (pg && pg._experimentPollTimer != null) {
+    clearInterval(pg._experimentPollTimer);
+    pg._experimentPollTimer = null;
+  }
+}
+
+export function startModernExperimentPolling(state, context) {
+  stopModernExperimentPolling(state);
+  var ctx = context || _modernContext;
+  var pg = state && state.playground;
+  if (!pg || !pg._activeExperimentId) return;
+  var apiBase = (ctx && ctx.apiBase) || "/comfymodal";
+  var timer = setInterval(async function () {
+    var s = state && state.playground;
+    if (!s || !s._activeExperimentId || state.activePage !== "playground") {
+      stopModernExperimentPolling(state);
+      return;
+    }
+    var controller = getModernExperimentController(state, ctx);
+    if (!controller) { stopModernExperimentPolling(state); return; }
+    try {
+      var data = await getExperimentV2Status(apiBase, s._activeExperimentId);
+      var payload = data && data.item && typeof data.item === "object" ? data.item : data;
+      if (payload && typeof payload === "object") controller.reconcile(payload);
+      var st = controller.getState();
+      if (isTerminalModernStatus(st.status)) stopModernExperimentPolling(state);
+    } catch (e) { /* transient poll error — keep polling */ }
+  }, MODERN_POLL_INTERVAL_MS);
+  if (state && state.playground) state.playground._experimentPollTimer = timer;
+}
+
+/**
+ * Attach the controller to the existing ComfyUI event source (if available)
+ * and start modern status polling.  Reopen/reload with an existing id rebuilds
+ * the same fixed cell list without submitting again.
+ */
+export function attachModernExperiment(state, actions, context) {
+  var ctx = context || _modernContext;
+  if (context) _modernContext = context;
+  var pg = state && state.playground;
+  var experimentId = pg && pg._activeExperimentId;
+  if (!experimentId) return null;
+  var controller = getModernExperimentController(state, ctx);
+  if (!controller) return null;
+  var source = (ctx && ctx.comfyApi) || (ctx && ctx.api);
+  controller.attach(source);
+  startModernExperimentPolling(state, ctx);
+  refreshModernExperimentStatus(state, ctx);
+  return controller;
+}
+
+/**
+ * Popup close / navigation: only detach the event source, stop polling and
+ * drop mounts.  Never cancels the experiment.
+ */
+export function detachModernExperiment(state, actions) {
+  stopModernExperimentPolling(state);
+  var pg = state && state.playground;
+  var controller = pg && pg._experimentController;
+  if (controller && typeof controller.detachEventSource === "function") {
+    try { controller.detachEventSource(); } catch (e) {}
+  }
+  _experimentMounts.clear();
+  return controller;
+}
+
+/** Full dispose (still never cancels). */
+export function disposeModernExperiment(state, actions) {
+  stopModernExperimentPolling(state);
+  var pg = state && state.playground;
+  var controller = pg && pg._experimentController;
+  if (controller && typeof controller.dispose === "function") {
+    try { controller.dispose(); } catch (e) {}
+  }
+  if (pg) pg._experimentController = null;
+  _experimentMounts.clear();
+}
+
+/**
+ * Submit exactly one modern definition via runExperimentV2.  Guarded against
+ * double-submit while an experiment is active.
+ */
+export async function executeModernExperimentRun(state, actions, context) {
+  var pg = state && state.playground;
+  if (!pg) return { status: "error", message: "Playground state unavailable." };
+  var ctx = context || _modernContext;
+  var existing = pg._experimentController;
+  if (existing) {
+    var st = existing.getState();
+    if (st.status === "running" || st.status === "queued") {
+      return { status: "ok", guarded: true, message: "Experiment already active." };
+    }
+  }
+  var apiBase = (ctx && ctx.apiBase) || "/comfymodal";
+  var modalOptions = await loadModalOptions(apiBase);
+  var payload = buildModernExperimentDefinition(state, Object.assign({}, ctx || {}, {
+    modalOptions: modalOptions,
+  }));
+  var result;
+  try {
+    result = await runExperimentV2(apiBase, payload);
+  } catch (e) {
+    return { status: "error", message: (e && e.message) || "Experiment submission failed." };
+  }
+  if (!result || result.status !== "ok" || !result.experiment_id) {
+    return {
+      status: "error",
+      message: (result && (result.message || result.detail)) || "Experiment submission failed.",
+    };
+  }
+  var experimentId = result.experiment_id;
+  pg._activeExperimentId = experimentId;
+  persistActiveExperimentId(experimentId);
+  var controller = getModernExperimentController(state, ctx);
+  if (controller && result.item && typeof result.item === "object") {
+    controller.reconcile(result.item);
+  }
+  attachModernExperiment(state, actions, ctx);
+  return {
+    status: "ok",
+    experimentId: experimentId,
+    cellCount: (result.item && result.item.total) || result.total || 0,
+  };
+}
+
+// ── Modern run section rendering ─────────────────────────────────────────
+
+function _mountSignature(st) {
+  if (!st) return "";
+  return [
+    st.status || "",
+    st.total || 0,
+    JSON.stringify(st.counts || {}),
+    (Array.isArray(st.cells) ? st.cells : []).map(function (c) {
+      return (c.cellId || "") + ":" + (c.status || "") + ":" + (c.thumbUrl ? "t" : "-")
+        + ":" + (c.attemptId || "") + ":" + (c.error ? "e" : "-");
+    }).join("|"),
+  ].join("~");
+}
+
+function _updateExperimentSectionMounts(state) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  Array.from(_experimentMounts).forEach(function (mount) {
+    if (!mount.isConnected) { _experimentMounts.delete(mount); return; }
+    try { _syncExperimentMount(mount, state); } catch (e) { /* isolated */ }
+  });
+}
+
+export function renderModernCellTile(cell, index, state, actions, context) {
+  var ctx = context || _modernContext;
+  var cellId = (cell && cell.cellId) || "cell_" + index;
+  var status = (cell && cell.status) || "queued";
+  var tile = document.createElement("div");
+  tile.className = "comfymodal-studio-experiment-v2-cell " + status;
+  tile.setAttribute("data-testid", "experiment-v2-cell-" + cellId);
+  tile.setAttribute("data-cell-id", cellId);
+  tile.setAttribute("data-cell-status", status);
+
+  if (cell && cell.thumbUrl) {
+    var img = document.createElement("img");
+    img.className = "comfymodal-studio-experiment-v2-cell-thumb";
+    img.src = cell.thumbUrl;
+    img.alt = "Cell " + cellId;
+    img.loading = "lazy";
+    tile.appendChild(img);
+  } else {
+    var empty = document.createElement("div");
+    empty.className = "comfymodal-studio-experiment-v2-cell-empty";
+    empty.textContent = status === "queued" ? "Queued" : "No image";
+    tile.appendChild(empty);
+  }
+
+  var chip = document.createElement("span");
+  chip.className = "comfymodal-studio-history-v2-chip status-" + status;
+  chip.textContent = experimentStatusLabel(status);
+  tile.appendChild(chip);
+
+  var meta = document.createElement("div");
+  meta.className = "comfymodal-studio-experiment-v2-cell-meta";
+  meta.textContent = modernCellMetaText(cell) || "Cell " + cellId;
+  tile.appendChild(meta);
+
+  // Sampler and workflow progress stay in separate slots.
+  if (cell && cell.sampler && cell.sampler.step != null) {
+    var samp = document.createElement("div");
+    samp.className = "comfymodal-studio-experiment-v2-cell-sampler";
+    samp.setAttribute("data-testid", "experiment-v2-cell-sampler-" + cellId);
+    var sampMax = cell.sampler.max != null ? cell.sampler.max : "?";
+    samp.textContent = "Sampling " + cell.sampler.step + "/" + sampMax;
+    tile.appendChild(samp);
+  }
+  if (cell && cell.progress && cell.progress.completedNodes != null) {
+    var prog = document.createElement("div");
+    prog.className = "comfymodal-studio-experiment-v2-cell-workflow";
+    prog.setAttribute("data-testid", "experiment-v2-cell-workflow-" + cellId);
+    var progTotal = cell.progress.totalNodes != null ? cell.progress.totalNodes : "?";
+    prog.textContent = "Workflow " + cell.progress.completedNodes + "/" + progTotal;
+    tile.appendChild(prog);
+  }
+
+  if (canRetryModernCell(cell)) {
+    var retryBtn = document.createElement("button");
+    retryBtn.className = "comfymodal-secondary-btn";
+    retryBtn.setAttribute("data-testid", "experiment-v2-cell-retry-" + cellId);
+    retryBtn.textContent = "Retry";
+    retryBtn.addEventListener("click", function () {
+      if (retryBtn.disabled) return;
+      var ctrl = getModernExperimentController(state, ctx);
+      if (!ctrl) return;
+      retryBtn.disabled = true;
+      retryBtn.textContent = "Retrying\u2026";
+      ctrl.retryCell(cellId).then(function () {
+        refreshModernExperimentStatus(state, ctx);
+      });
+    });
+    tile.appendChild(retryBtn);
+  }
+
+  if (cell && cell.error) {
+    var err = document.createElement("div");
+    err.className = "comfymodal-studio-experiment-v2-cell-error";
+    err.textContent = String(cell.error).substring(0, 120);
+    tile.appendChild(err);
+  }
+
+  return tile;
+}
+
+export function modernCellMetaText(cell) {
+  if (!cell || typeof cell !== "object") return "";
+  var parts = [];
+  // Prefer resolved names (workflow_name/preset_name) over raw ids; ids are
+  // the fallback when the status endpoint only supplies them.
+  var wfName = cell.workflowName || cell.workflowId || "";
+  var wfVersion = cell.workflowVersionId || "";
+  var presetName = cell.presetName || cell.presetId || "";
+  var wfParts = [wfName, wfVersion, presetName].filter(Boolean);
+  if (wfParts.length > 0) parts.push(wfParts.join(" \u00b7 "));
+  return parts.join(" \u00b7 ");
+}
+
+function _renderModernGridInto(gridEl, cells, state, actions, context) {
+  (Array.isArray(cells) ? cells : []).forEach(function (cell, index) {
+    gridEl.appendChild(renderModernCellTile(cell, index, state, actions, context));
+  });
+}
+
+function _syncExperimentMount(mount, state) {
+  var pg = state && state.playground;
+  var experimentId = pg && pg._activeExperimentId ? pg._activeExperimentId : "";
+  var controller = pg && pg._experimentController;
+  var st = controller ? controller.getState() : null;
+  var sig = _mountSignature(st);
+  if (mount._experimentSignature === sig && mount._experimentId === experimentId) return;
+  mount._experimentSignature = sig;
+  mount._experimentId = experimentId;
+
+  var hasActive = !!experimentId;
+
+  var submitBtn = mount.querySelector('[data-testid="modern-experiment-submit-btn"]');
+  var reasonEl = mount.querySelector('[data-testid="modern-experiment-reason"]');
+  if (submitBtn) {
+    var active = st && (st.status === "running" || st.status === "queued");
+    if (active) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = st.status === "queued" ? "Queued\u2026" : "Running\u2026";
+      if (reasonEl) reasonEl.textContent = "";
+    } else {
+      var canRun = modernExperimentCanRun(state);
+      submitBtn.disabled = !canRun;
+      submitBtn.textContent = "Run Experiment";
+      if (reasonEl) reasonEl.textContent = canRun ? "" : modernExperimentDisabledReason(state);
+    }
+  }
+
+  var progressEl = mount.querySelector('[data-testid="experiment-v2-progress"]');
+  if (progressEl) {
+    if (hasActive && st) {
+      progressEl.style.display = "";
+      progressEl.textContent = formatExperimentProgress(st.counts, st.total);
+    } else {
+      progressEl.style.display = "none";
+      progressEl.textContent = "";
+    }
+  }
+
+  var gridEl = mount.querySelector('[data-testid="experiment-v2-grid"]');
+  if (gridEl) {
+    while (gridEl.firstChild) gridEl.removeChild(gridEl.firstChild);
+    if (hasActive && st) {
+      gridEl.style.display = "";
+      _renderModernGridInto(gridEl, st.cells, state, null, _modernContext);
+    } else {
+      gridEl.style.display = "none";
+    }
+  }
+
+  var cancelBtn = mount.querySelector('[data-testid="modern-experiment-cancel-btn"]');
+  var resumeBtn = mount.querySelector('[data-testid="modern-experiment-resume-btn"]');
+  var actionNote = mount.querySelector('[data-testid="experiment-v2-action-note"]');
+  if (cancelBtn) {
+    var cancellable = st && (st.status === "running" || st.status === "queued");
+    cancelBtn.style.display = hasActive && cancellable ? "" : "none";
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = "Cancel";
+  }
+  if (resumeBtn) {
+    var eligible = hasActive && st && canResumeModernExperiment(st.status, st.cells);
+    resumeBtn.style.display = eligible ? "" : "none";
+    resumeBtn.disabled = false;
+    resumeBtn.textContent = "Resume";
+  }
+  if (actionNote) actionNote.textContent = "";
+}
+
+export function renderModernExperimentSection(state, actions, context) {
+  var ctx = context || _modernContext;
+  if (context) _modernContext = context;
+
+  var container = document.createElement("div");
+  container.className = "comfymodal-studio-experiment-v2-section";
+  container.setAttribute("data-testid", "experiment-v2-section");
+
+  var heading = document.createElement("h4");
+  heading.className = "comfymodal-studio-block-heading";
+  heading.textContent = "Experiment Run (V2)";
+  container.appendChild(heading);
+
+  var submitRow = document.createElement("div");
+  submitRow.className = "comfymodal-studio-experiment-v2-run-row";
+
+  var submitBtn = document.createElement("button");
+  submitBtn.className = "comfymodal-primary-btn";
+  submitBtn.setAttribute("data-testid", "modern-experiment-submit-btn");
+  submitBtn.textContent = "Run Experiment";
+  submitBtn.addEventListener("click", function () {
+    if (submitBtn.disabled) return;
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Running\u2026";
+    executeModernExperimentRun(state, actions, ctx).then(function (result) {
+      if (result && result.status !== "ok" && actions && actions.setRunState) {
+        actions.setRunState({ status: "error", message: result.message || "Experiment submission failed." });
+      }
+    });
+  });
+  submitRow.appendChild(submitBtn);
+
+  var reasonEl = document.createElement("p");
+  reasonEl.className = "comfymodal-studio-experiment-v2-reason";
+  reasonEl.setAttribute("data-testid", "modern-experiment-reason");
+  reasonEl.style.fontSize = "var(--font-size-sm)";
+  reasonEl.style.color = "var(--color-text-secondary)";
+  reasonEl.style.margin = "4px 0 0";
+  submitRow.appendChild(reasonEl);
+  container.appendChild(submitRow);
+
+  var progressEl = document.createElement("div");
+  progressEl.className = "comfymodal-studio-experiment-v2-progress";
+  progressEl.setAttribute("data-testid", "experiment-v2-progress");
+  progressEl.setAttribute("aria-live", "polite");
+  container.appendChild(progressEl);
+
+  var gridEl = document.createElement("div");
+  gridEl.className = "comfymodal-studio-experiment-v2-grid";
+  gridEl.setAttribute("data-testid", "experiment-v2-grid");
+  container.appendChild(gridEl);
+
+  var actionRow = document.createElement("div");
+  actionRow.className = "comfymodal-studio-experiment-v2-actions";
+
+  var cancelBtn = document.createElement("button");
+  cancelBtn.className = "comfymodal-destructive-btn";
+  cancelBtn.setAttribute("data-testid", "modern-experiment-cancel-btn");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", function () {
+    if (cancelBtn.disabled) return;
+    var ctrl = getModernExperimentController(state, ctx);
+    if (!ctrl) return;
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = "Cancelling\u2026";
+    ctrl.cancel().then(function () {
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = "Cancel";
+      refreshModernExperimentStatus(state, ctx);
+    });
+  });
+  actionRow.appendChild(cancelBtn);
+
+  var resumeBtn = document.createElement("button");
+  resumeBtn.className = "comfymodal-secondary-btn";
+  resumeBtn.setAttribute("data-testid", "modern-experiment-resume-btn");
+  resumeBtn.textContent = "Resume";
+  resumeBtn.addEventListener("click", function () {
+    if (resumeBtn.disabled) return;
+    var ctrl = getModernExperimentController(state, ctx);
+    if (!ctrl) return;
+    resumeBtn.disabled = true;
+    resumeBtn.textContent = "Resuming\u2026";
+    ctrl.resume().then(function () {
+      resumeBtn.disabled = false;
+      resumeBtn.textContent = "Resume";
+      refreshModernExperimentStatus(state, ctx);
+    });
+  });
+  actionRow.appendChild(resumeBtn);
+
+  var actionNote = document.createElement("span");
+  actionNote.className = "comfymodal-studio-history-v2-action-note";
+  actionNote.setAttribute("data-testid", "experiment-v2-action-note");
+  actionNote.setAttribute("aria-live", "polite");
+  actionRow.appendChild(actionNote);
+  container.appendChild(actionRow);
+
+  _experimentMounts.add(container);
+
+  // Reopen/reload with an existing id: rebuild the same fixed cell list and
+  // reattach without submitting again.
+  var pg = state && state.playground;
+  if (pg && !pg._activeExperimentId) {
+    var persistedId = loadActiveExperimentId();
+    if (persistedId) pg._activeExperimentId = persistedId;
+  }
+  attachModernExperiment(state, actions, ctx);
+  _syncExperimentMount(container, state);
+  return container;
+}
+
 // ── Full experiment mode renderer ────────────────────────────────────────
+
+let _experimentSurfaceWatcher = null;
+let _experimentSurfaceHost = null;
+
+/**
+ * Mount exactly ONE run surface into the host:
+ *   - "modern"  → the D5 section (runExperimentV2 + controller, fixed grid,
+ *                 no concurrency payload). The legacy button is NOT mounted.
+ *   - "legacy"  → the existing legacy experiment run renderer/visual layout.
+ * Workflow/Version selection does not re-render the control panel, so a small
+ * self-clearing watcher swaps the surface when the state flips (no double
+ * submit buttons in either state).
+ */
+function _mountExperimentRunSurface(host, state, actions, context) {
+  var surface = experimentRunSurface(state);
+  if (host._experimentSurface === surface) return;
+  host._experimentSurface = surface;
+  while (host.firstChild) host.removeChild(host.firstChild);
+  if (surface === "modern") {
+    host.appendChild(renderModernExperimentSection(state, actions, context || {}));
+  } else {
+    host.appendChild(renderExperimentRunButton(state, actions, context));
+  }
+}
 
 export function renderExperimentMode(state, actions, context) {
   const container = document.createElement("div");
@@ -1321,10 +2157,37 @@ export function renderExperimentMode(state, actions, context) {
   // Matrix Summary block
   container.appendChild(renderMatrixSummary(state, actions));
 
-  // Run Experiment button — inside the experiment block so it's visible
-  // alongside the experiment controls, not buried at the bottom of the
-  // entire control panel.
-  container.appendChild(renderExperimentRunButton(state, actions, context));
+  // Exactly one run surface (legacy preset flow OR the modern V2 section) —
+  // never two experiment submit buttons for modern state.
+  const surfaceHost = document.createElement("div");
+  surfaceHost.className = "comfymodal-studio-experiment-run-surface";
+  surfaceHost.setAttribute("data-testid", "experiment-run-surface");
+  container.appendChild(surfaceHost);
+
+  _mountExperimentRunSurface(surfaceHost, state, actions, context || {});
+
+  // Workflow/Version selection updates state without re-rendering the control
+  // panel, so re-evaluate the surface until the host detaches.
+  if (_experimentSurfaceWatcher) {
+    clearInterval(_experimentSurfaceWatcher);
+    _experimentSurfaceWatcher = null;
+  }
+  _experimentSurfaceHost = surfaceHost;
+  _experimentSurfaceWatcher = setInterval(function () {
+    const host = _experimentSurfaceHost;
+    if (!host || !host.isConnected) {
+      // Playground navigation / popup close: detach the modern controller
+      // (event listeners + polling) without cancelling, preserving the
+      // controller and active experiment id for reopen.  Never dispose here —
+      // only the explicit disposeModernExperiment does that.
+      detachModernExperiment(state, actions);
+      clearInterval(_experimentSurfaceWatcher);
+      _experimentSurfaceWatcher = null;
+      _experimentSurfaceHost = null;
+      return;
+    }
+    _mountExperimentRunSurface(host, state, actions, context || {});
+  }, 1200);
 
   // Reset to Default button — resets all experiment controls and axes to preset defaults
   if (actions && actions.resetToDefaults) {

@@ -797,6 +797,68 @@ class RunHistoryService:
     def _lock_for(self, run_id: str) -> threading.Lock:
         return self._run_locks.acquire(run_id)
 
+    def _v2_try_mirror_record(self, meta_obj: dict) -> None:
+        """Best-effort mirror of a legacy record into History V2 (never raises)."""
+        try:
+            from history_v2_writer import get_writer
+            writer = get_writer()
+            if writer is None:
+                return
+            run_id = str(meta_obj.get("run_id", ""))
+            if not run_id:
+                return
+            timings: dict = {}
+            timing_path = self._root / run_id / "timing.json"
+            if timing_path.is_file():
+                try:
+                    parsed = json.loads(timing_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        timings = parsed
+                except Exception:
+                    timings = {}
+            writer.record_run(
+                run_id=run_id,
+                kind=str(meta_obj.get("kind", "")),
+                status=str(meta_obj.get("status", "running")),
+                prompt_id=str(meta_obj.get("prompt_id", "")),
+                workflow_hash=str(meta_obj.get("workflow_hash", "")),
+                meta=meta_obj.get("extra") or {},
+                timings=timings,
+                output_path=str(meta_obj.get("output_path", "")),
+                started_at=meta_obj.get("started_at"),
+            )
+        except Exception as exc:
+            print(f"[comfyui-modal.history-v2] mirror record failed: {type(exc).__name__}: {exc}")
+
+    def _v2_try_mirror_update(self, run_id: str, meta_obj: dict) -> None:
+        """Best-effort mirror of a legacy update into History V2 (never raises)."""
+        try:
+            from history_v2_writer import get_writer
+            writer = get_writer()
+            if writer is None:
+                return
+            timings: dict = {}
+            timing_path = self._root / run_id / "timing.json"
+            if timing_path.is_file():
+                try:
+                    parsed = json.loads(timing_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        timings = parsed
+                except Exception:
+                    timings = {}
+            writer.update_run(
+                run_id,
+                status=str(meta_obj.get("status", "")),
+                meta=meta_obj.get("extra") or {},
+                output_path=str(meta_obj.get("output_path", "")),
+                timings=timings,
+                completed_at=meta_obj.get("completed_at"),
+                workflow_hash=str(meta_obj.get("workflow_hash", "")),
+                primary_asset_id=str(meta_obj.get("primary_asset_id", "") or ""),
+            )
+        except Exception as exc:
+            print(f"[comfyui-modal.history-v2] mirror update failed: {type(exc).__name__}: {exc}")
+
     def record_run(
         self,
         *,
@@ -844,6 +906,7 @@ class RunHistoryService:
             _atomic_write_json(timing_path, timings)
         # Phase 7: upsert into summary index (best-effort, never blocks caller)
         self._index_try_upsert(meta_obj, str(meta_path))
+        self._v2_try_mirror_record(meta_obj)
         return meta_obj
 
     def update_run(
@@ -927,6 +990,7 @@ class RunHistoryService:
 
         # Phase 7: upsert into summary index (best-effort, never blocks caller)
         self._index_try_upsert(meta_obj, str(meta_path))
+        self._v2_try_mirror_update(run_id, meta_obj)
         return meta_obj
 
     def _merge_timing_summary(self, run_dir: Path, meta_obj: dict) -> dict:

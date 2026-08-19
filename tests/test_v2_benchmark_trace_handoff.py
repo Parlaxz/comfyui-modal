@@ -686,7 +686,7 @@ class TestDeployV2FullTraceOnlyBatchFile(unittest.TestCase):
             'set "COMFYMODAL_V2_GPU=rtx-pro-6000"',
             'set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"',
             'set "COMFYMODAL_V2_FULL_TRACE=1"',
-            'set "COMFYMODAL_V2_FULL_TRACE_TORCH=1"',
+            'set "COMFYMODAL_V2_FULL_TRACE_TORCH=0"',
             'set "COMFYMODAL_V2_FULL_TRACE_ENTRIES=8000000"',
             'set "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS=50"',
             'set "COMFYMODAL_V2_PROFILE_VOLUME=comfymodal-v2-profiles"',

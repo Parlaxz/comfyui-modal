@@ -2048,8 +2048,12 @@ class FullExecutionTraceSession:
         if self._torch_profiler_active or self._torch_profiler is not None:
             return
         _start_thread_id = threading.get_ident()
-        # Disabled when COMFYMODAL_V2_FULL_TRACE_TORCH is "0"
-        if os.environ.get(_ENV_TORCH, "1") == "0":
+        # Torch/Kineto shutdown can block request terminalization on some
+        # CUDA/runtime combinations, so it is explicitly opt-in.  The rest
+        # of the full trace remains enabled when this optional lane is off.
+        if os.environ.get(_ENV_TORCH, "0").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
             print(
                 f"[v2.full_trace] stage=start_torch_profiler "
                 f"status=skipped reason=torch_disabled "

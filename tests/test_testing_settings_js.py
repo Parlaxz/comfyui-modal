@@ -63,10 +63,13 @@ class ModalShellSettingsTests(unittest.TestCase):
             self.skipTest("web/modal-testing.js missing")
 
     def test_dispatches_to_settings_tab(self):
-        # The shell should have a mountSettingsTab function or call the
-        # settings module.
-        self.assertIn("mountSettingsTab", self.m.text)
+        # The Studio shell mounts via mountStudioShell; settings dispatch
+        # goes through the comfymodal.open-section bridge (scrolls to the
+        # matching [data-section=...]) and the pageMap legacy-tab mapping.
+        self.assertIn("mountStudioShell", self.m.text)
         self.assertIn("TAB_SETTINGS", self.m.text)
+        self.assertIn("comfymodal.open-section", self.m.text)
+        self.assertIn('[data-section="', self.m.text)
 
     def test_settings_tab_no_longer_shows_placeholder_message(self):
         # Phase 11 wires up the settings tab; the old placeholder

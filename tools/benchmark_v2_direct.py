@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+import time
+
+# ── Host boot origin (V2 host submission timeline breakdown) ─────────────
+# The FIRST line executed after the stdlib ``time`` import — before the heavy
+# import block below — so ``command_start → python_first_line`` measures the
+# interpreter boot plus every startup import that precedes this line.
+# Benchmark-only instrumentation.
+_PYTHON_FIRST_LINE_NS: int = time.time_ns()
+# Mono counterpart for same-process deltas.
+_PYTHON_FIRST_LINE_MONO_NS: int = time.monotonic_ns()
+
 import argparse
 import asyncio
 import concurrent.futures
@@ -13,7 +24,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+from collections.abc import Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -41,7 +53,12 @@ try:
 except Exception:
     pass
 
-from canonical_execution import build_execution_plan, execute_plan
+from canonical_execution import (
+    build_execution_plan,
+    execute_plan,
+    prompt_sha256,
+    resolve_dispatch_workflow_hash,
+)
 from modal_client import check_active_warmup_profile, set_active_warmup_profile
 from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
 from comfymodal_runtime.env import env_flag
@@ -53,7 +70,7 @@ from comfymodal_runtime.modal_restore_boundary import (
 from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.runtime_shape import runtime_shape_config
-from comfymodal_runtime.trace import RuntimeTrace
+from comfymodal_runtime.trace import RuntimeTrace, _build_local_submission_breakdown
 from production_workflow import normalize_production_options
 from tools.v2_waterfall import (
     build_waterfall,
@@ -122,6 +139,29 @@ _EXPERIMENT_ORIGIN_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     ("vae_overlap", "early_1000"): {"vae_early_start_ms": "1000"},
     ("png_encode", "level1"): {"png_compress_level": "1"},
     ("conditioning_hit", "async_lru"): {"conditioning_async_lru": "1"},
+    # ── E28 per-run tuning arms (Targets B/C) ──
+    # Loader threads/blocks and the FP32 cast-once experiment travel as
+    # request-origin env so the integrated campaign can A/B them per request
+    # against one deployment.  Baseline arms apply no override (deployment
+    # defaults = the E28 winning production configuration).
+    ("e28_clip_loader", "t8_b64"): {"clip_fastsafe_threads": "8",
+                                     "clip_fastsafe_block_bytes": str(64 * 1024 * 1024)},
+    ("e28_clip_loader", "t8_b32"): {"clip_fastsafe_threads": "8",
+                                     "clip_fastsafe_block_bytes": str(32 * 1024 * 1024)},
+    ("e28_clip_loader", "t8_b128"): {"clip_fastsafe_threads": "8",
+                                      "clip_fastsafe_block_bytes": str(128 * 1024 * 1024)},
+    ("e28_clip_loader", "t4_b64"): {"clip_fastsafe_threads": "4",
+                                     "clip_fastsafe_block_bytes": str(64 * 1024 * 1024)},
+    ("e28_unet_loader", "t8_b256"): {"unet_fastsafe_threads": "8",
+                                      "unet_fastsafe_block_bytes": str(256 * 1024 * 1024)},
+    ("e28_unet_loader", "t8_b128"): {"unet_fastsafe_threads": "8",
+                                      "unet_fastsafe_block_bytes": str(128 * 1024 * 1024)},
+    ("e28_unet_loader", "t8_b64"): {"unet_fastsafe_threads": "8",
+                                     "unet_fastsafe_block_bytes": str(64 * 1024 * 1024)},
+    ("e28_unet_loader", "t4_b256"): {"unet_fastsafe_threads": "4",
+                                      "unet_fastsafe_block_bytes": str(256 * 1024 * 1024)},
+    ("e28_fp32_cast_once", "on"): {"clip_fp32_cast_once": "1"},
+    ("e28_fp32_cast_once", "off"): {"clip_fp32_cast_once": "0"},
 }
 
 
@@ -144,6 +184,14 @@ _PLAN_VALIDATION_PROOF = env_flag(
     "COMFYMODAL_V2_PLAN_VALIDATION_PROOF", default=True
 )
 
+# Bounded budget for joining the transport's post-result persistence drain at
+# the end of each benchmark run.  The remote trailing persistence event arrives
+# promptly after the result; this budget is ample for that arrival while still
+# guaranteeing teardown never blocks indefinitely (timeout -> clean cancel).
+_PERSISTENCE_DRAIN_JOIN_TIMEOUT = float(
+    os.environ.get("COMFYMODAL_V2_PERSISTENCE_DRAIN_JOIN_TIMEOUT", "15")
+)
+
 
 def _resolve_restore_publisher(transport: ModalTransport, workspace: dict) -> Any | None:
     """Construct the legacy remote restore-plan publisher ONLY when the
@@ -160,6 +208,14 @@ def _resolve_restore_publisher(transport: ModalTransport, workspace: dict) -> An
 
 
 _NODE_REGISTRY_READY = False
+# Registry-init boundary stamps (benchmark-only instrumentation): captured on
+# the FIRST actual init only — never on the idempotent short-circuit — so
+# ``node_registry_init_ms`` measures the full node-registry load cost that the
+# (D1-fixed) local_receive → worker_start gap was previously attributed to;
+# the registry now preloads once in ``main`` and is reported separately as
+# ``node_registry_preload_ms``.
+_NODE_REGISTRY_START_NS: int | None = None
+_NODE_REGISTRY_END_NS: int | None = None
 
 
 async def _ensure_full_node_registry() -> bool:
@@ -169,9 +225,10 @@ async def _ensure_full_node_registry() -> bool:
     (production builds run inside the server).  Called once per process before
     any plan build; never raises — returns readiness.
     """
-    global _NODE_REGISTRY_READY
+    global _NODE_REGISTRY_READY, _NODE_REGISTRY_START_NS, _NODE_REGISTRY_END_NS
     if _NODE_REGISTRY_READY:
         return True
+    _NODE_REGISTRY_START_NS = time.time_ns()
     try:
         # Bulletproof pre-lock: pin the REAL ComfyUI ``utils`` package into
         # sys.modules by explicit file path, immune to sys.path shadowing.
@@ -276,11 +333,56 @@ async def _ensure_full_node_registry() -> bool:
             print(f"[v2.harness] production_output_registration_failed error={_reg_exc}", flush=True)
         _count = len(getattr(nodes, "NODE_CLASS_MAPPINGS", {}) or {})
         _NODE_REGISTRY_READY = True
+        _NODE_REGISTRY_END_NS = time.time_ns()
         print(f"[v2.harness] node_registry_initialized classes={_count}", flush=True)
     except Exception as _exc:
         _NODE_REGISTRY_READY = False
         print(f"[v2.harness] node_registry_init_failed error={type(_exc).__name__}: {_exc}", flush=True)
     return _NODE_REGISTRY_READY
+
+
+def _registry_proof_store_covers(
+    workflow: dict,
+    *,
+    modal_options: dict[str, Any] | None = None,
+    production_options: dict[str, Any] | None = None,
+) -> bool:
+    """True when a persisted registry-proof/validation store entry covers
+    *workflow* under the current deploy-frozen identity.
+
+    D1 zero-gap fast path: when covered, plan construction reuses persisted
+    fingerprint/proof/validation payloads and the full node-registry import is
+    skipped.  When COMFYMODAL_V2_PLAN_VALIDATION_PROOF is disabled the
+    validation payload is not required (the proof payload is sufficient).
+    Fail-closed: any lookup/mismatch → False (caller falls back to the full
+    registry load).
+
+    The lookup key is the DISPATCH workflow hash — the hash the store is
+    saved under (``build_execution_plan`` compiles the production workflow,
+    so the dispatch hash differs from ``prompt_sha256(source)`` whenever
+    production compile rewrites the dict).  Computed via
+    ``resolve_dispatch_workflow_hash`` (pure dict work; never imports the
+    registry), mirroring the same inputs the plan build receives."""
+    try:
+        from comfymodal_runtime.registry_proof_store import lookup as _sl
+        _lookup_hash = resolve_dispatch_workflow_hash(
+            workflow,
+            modal_options=modal_options,
+            production_options=production_options,
+        )
+        _entry = _sl(
+            workflow_hash=_lookup_hash,
+            comfyui_root=str(_COMFYUI_ROOT_DIR or ""),
+        )
+    except Exception:
+        return False
+    if not isinstance(_entry, dict):
+        return False
+    if not (_entry.get("registry_fingerprint") or _entry.get("registry_proof")):
+        return False
+    if _PLAN_VALIDATION_PROOF and not _entry.get("validation"):
+        return False
+    return True
 
 # ── Variance-cold mode (opt-in, never the default) ────────────────────────
 # Unique shadow app name used ONLY for variance mode.  Normal/production modes
@@ -376,6 +478,1146 @@ def _load_workflow() -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(modal_options, dict):
         modal_options = {}
     return workflow, modal_options
+
+
+def _apply_unique_prompt_suffix(workflow: dict[str, Any], suffix: str) -> int:
+    """Append a unique token to every literal prompt-text source so the
+    exact-conditioning cache key is unique per run (deterministic miss).
+
+    Mutates ``workflow`` in place.  Only text-bearing leaf inputs are
+    touched: ``PrimitiveStringMultiline.inputs.value`` and any
+    ``*TextEncode*`` node's LITERAL ``inputs.text`` string.  A node-link
+    list (e.g. ``["80", 0]``) is not a literal string and is left
+    untouched, so wire-fed encodes (CLIPTextEncode -> JoinStrings ->
+    PrimitiveStringMultiline) are covered once at the primitive source.
+    Loader/model nodes and all other inputs are never modified.  Returns
+    the number of text sources modified (0 when the suffix is empty).
+    """
+    suffix = str(suffix or "").strip()
+    if not suffix:
+        return 0
+    modified = 0
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        inputs = node.get("inputs")
+        if not isinstance(class_type, str) or not isinstance(inputs, dict):
+            continue
+        if class_type == "PrimitiveStringMultiline":
+            value = inputs.get("value")
+            if isinstance(value, str):
+                inputs["value"] = f"{value} {suffix}"
+                modified += 1
+        elif "TextEncode" in class_type:
+            text = inputs.get("text")
+            if isinstance(text, str):
+                inputs["text"] = f"{text} {suffix}"
+                modified += 1
+    return modified
+
+
+def _conditioning_cache_nonce_arg() -> str:
+    """The active ``--conditioning-cache-nonce`` value ('' when unused).
+
+    Read from the module-level ``_EXPERIMENT_ARGS`` namespace (populated in
+    ``__main__``) exactly like ``_experiment_origin_overrides`` — the
+    established pattern for reaching CLI args from deep call sites.  Safe
+    under module import (namespace is None -> '').
+    """
+    args = globals().get("_EXPERIMENT_ARGS")
+    if args is None:
+        return ""
+    return str(getattr(args, "conditioning_cache_nonce", "") or "").strip()
+
+
+def _resolve_nonce_target_app() -> str:
+    """Resolve the deployment a conditioning-cache-nonce measurement targets.
+
+    The nonce is a request-scoped, semantic-neutral cache-isolation token.  It
+    only yields a meaningful cold measurement against the D1-primed deployment
+    recorded in ``.deployed_state.json`` (the deployment whose snapshot /
+    identity / proof store were established).  The transport resolves the
+    handle by ``COMFYMODAL_V2_APP_NAME`` and, when unset, falls back to the
+    legacy default app (``stable-modal-comfy-v2-shadow``) — the D10 failure
+    class: a nonce-carrying request silently targeted an OLD deployment whose
+    baked runtime predates the nonce key isolation, so the fresh nonce never
+    entered the cache key and a warm canonical entry served
+    ``exact_hit/encode_calls=0``.
+
+    Behavior:
+      * nonce inactive                    -> '' (no-op; legacy behavior unchanged)
+      * env app unset + primed identity   -> set ``COMFYMODAL_V2_APP_NAME`` to the
+        primed app_name and return it (fail closed against the legacy default)
+      * env app set + == primed           -> return it
+      * env app set + != primed           -> raise (fail closed: a nonce against
+        a different deployment is not a valid measurement)
+      * no primed identity available      -> raise (fail closed: cannot know
+        which deployment the nonce measurement is authorized against)
+
+    Request-scoped: only runs when a nonce is active; never touches
+    workflow/prompt/seed/model inputs; no global sticky state.
+    """
+    if not _conditioning_cache_nonce_arg():
+        return ""
+    primed = ""
+    try:
+        from comfymodal_runtime.registry_proof_store import deployed_state_path
+        import json as _json
+
+        _state = _json.loads(deployed_state_path().read_text(encoding="utf-8"))
+        primed = str((_state or {}).get("app_name", "") or "").strip()
+    except Exception:
+        primed = ""
+    if not primed:
+        raise RuntimeError(
+            "[v2.nonce_target] conditioning-cache nonce requires a D1-primed "
+            "deployment identity (.deployed_state.json app_name); none found"
+        )
+    _env_app = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+    if _env_app and _env_app != primed:
+        raise RuntimeError(
+            f"[v2.nonce_target] COMFYMODAL_V2_APP_NAME={_env_app!r} does not match "
+            f"the D1-primed deployment {primed!r}; refusing a nonce measurement "
+            "against the wrong deployment"
+        )
+    if not _env_app:
+        os.environ["COMFYMODAL_V2_APP_NAME"] = primed
+        print(f"[v2.nonce_target] app={primed} source=d1_primed_identity", flush=True)
+    return primed
+
+
+def _benchmark_origin_extra(
+    unique_prompt_suffix: str, conditioning_cache_nonce: str
+) -> dict[str, Any] | None:
+    """Request-origin extras for the default benchmark loop.
+
+    Merges the two semantic vehicles onto one origin dict; empty values add
+    no keys, so the request origin is byte-identical when neither option is
+    used.  ``conditioning_cache_nonce`` is a semantic-neutral cache-key
+    isolation token (never touches the workflow), while ``unique_prompt_suffix``
+    keeps its existing semantics unchanged.
+    """
+    extra: dict[str, Any] = {}
+    if unique_prompt_suffix:
+        extra["unique_prompt_suffix"] = str(unique_prompt_suffix)
+    if conditioning_cache_nonce:
+        extra["conditioning_cache_nonce"] = str(conditioning_cache_nonce)
+    return extra or None
+
+
+# ── D6 fast-path deploy-profile validation (atomic opt-in gate) ─────────
+# ``deploy_and_run_v2_single.bat`` force-sets these 8 values under
+# ``V2_D6_FASTPATH_VALIDATION=1`` (1/true/yes/on).  ``--verify-d6-profile``
+# compares the EFFECTIVE values — read from ``modal_app._runtime_env()``, the
+# exact dict the deployment bakes — against the profile's expected map,
+# aborting the launcher BEFORE ``modal deploy`` when they drift.  These maps
+# MUST match the launcher profile block and the test suite.
+D6_FASTPATH_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "1",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+    "COMFYMODAL_V2_UNET_FORENSICS": "0",
+}
+# The launcher pins these when the profile is absent (production/default
+# behavior unchanged) — the ``--verify-d6-profile`` gate is a trivial no-op
+# PASS in that mode.
+D6_PRODUCTION_DEFAULTS: dict[str, str] = {
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "0",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+    "COMFYMODAL_V2_UNET_FORENSICS": "0",
+}
+# D10 integration-validation profile (Phase-D integration batch):
+# identical to the D6 fast-path profile EXCEPT
+# COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA=0.  The D6 run's SYNC_CUDA=1
+# installs a global torch.cuda.synchronize wrapper plus a CUDA-event realize
+# around every ModelPatcher.load/partially_load — INTRUSIVE on the request
+# critical path (D10 Part-1 measurement-integrity audit).  D10 keeps the
+# structural diagnostics (state checkpoints, hydration events, cast
+# counters/histograms) while leaving synchronization to production semantics
+# only.  MUST match the launcher profile block and the test suite.
+D10_FASTPATH_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+    "COMFYMODAL_V2_UNET_FORENSICS": "0",
+}
+
+E19_FINAL_COLD_LOADER_PROFILE_NAME = "E19_FINAL_COLD_LOADER"
+E19_FINAL_COLD_LOADER_SELECTOR = "V2_E19_FINAL_COLD_LOADER"
+
+E22_PREFETCH_OFF_SELECTOR = "V2_E22_PREFETCH_OFF"
+E22_PREFETCH_ON_SELECTOR = "V2_E22_PREFETCH_ON"
+E22_A_B_EXEMPT_KEYS: frozenset[str] = frozenset({"COMFYMODAL_V2_CHECKPOINT_PREWARM"})
+E22_ARM_ALLOWED_PREWARM_VALUES: frozenset[str] = frozenset({"0", "1"})
+E19_FINAL_COLD_LOADER_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_ATOMIC_PROFILE": E19_FINAL_COLD_LOADER_PROFILE_NAME,
+    "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+    "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": "1",
+    "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT": "1",
+    "COMFYMODAL_V2_EVICT_RETAIN_ROLE": "clip_vae",
+    "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS": "0",
+    "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "1",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM": "1",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": "4",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": "8",
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+    "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": "1",
+    "COMFYMODAL_V2_SCOPED_CUDA_READINESS": "1",
+    "COMFYMODAL_V2_STAGED_SAFETENSORS": "0",
+    "COMFYMODAL_V2_C9QD_EXTRAS": "0",
+    "COMFYMODAL_V2_STAGED_SOURCE_ORDER": "0",
+    "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+    "COMFYMODAL_V2_UNET_FORENSICS": "0",
+}
+
+# ── E25 whole-critical-path-compression validation profile ──────────────
+# Atomic opt-in selector ``V2_E25_VALIDATION`` (1/true/yes/on).  Inherits the
+# proven E19 final cold-loader architecture EXACTLY (E19 selector must be
+# active) and changes ONLY the E25 validation flags:
+#   * speculative CLIP hydration ON (COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION=1)
+#   * proven-ready GPU fast return ON (COMFYMODAL_V2_GPU_FAST_RETURN=1)
+#   * optimization diagnostics ON (COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS=1)
+# E26 correction: the VAE early activation (sampling_end/250) is NO LONGER a
+# production default — the selector uses the canonical late/safe mode.  The
+# experiment remains available behind the explicit flags.  Run count is
+# hard-gated to 1 (see _e25_validate_run_count).
+E25_VALIDATION_SELECTOR = "V2_E25_VALIDATION"
+E25_VALIDATION_PROFILE_NAME = "E25_VALIDATION"
+E25_VALIDATION_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "1",
+    "COMFYMODAL_V2_GPU_FAST_RETURN": "1",
+    "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": "1",
+    "COMFYMODAL_V2_VAE_ACTIVATION_MODE": "late",
+    "COMFYMODAL_V2_VAE_EARLY_START_MS": "0",
+}
+
+
+# ── E26 concrete cold-wins validation profile ──────────────────────────
+# Atomic opt-in selector ``V2_E26_VALIDATION`` (1/true/yes/on).  Inherits the
+# proven E19 final cold-loader architecture EXACTLY (E19 selector must be
+# active) and sets the E26 flags:
+#   * E26 speculative CLIP hydration with frozen-manifest absolute paths ON
+#   * proven-ready GPU fast return — production-enabled (default ON)
+#   * checkpoint prewarm ON (coordinated CLIP-first/UNET-second schedule)
+#   * UNET fastsafetensors ON, snapshot-excluded UNET ON, D15 ON
+#   * VAE early activation OFF — canonical late/safe production mode
+#   * optimization diagnostics ON
+# Run count is hard-gated to exactly 1 per run (see _e26_validate_run_count);
+# a cycle uses two separate runs on the same deployment.
+E26_VALIDATION_SELECTOR = "V2_E26_VALIDATION"
+E26_VALIDATION_PROFILE_NAME = "E26_VALIDATION"
+E26_VALIDATION_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "1",
+    "COMFYMODAL_V2_GPU_FAST_RETURN": "1",
+    "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": "1",
+    "COMFYMODAL_V2_VAE_ACTIVATION_MODE": "late",
+    "COMFYMODAL_V2_VAE_EARLY_START_MS": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM": "1",
+}
+
+
+def _e26_profile_active() -> bool:
+    raw = os.environ.get(E26_VALIDATION_SELECTOR, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+# ── E28 critical-path implementation validation profile ──────────────────
+# Atomic opt-in selector ``V2_E28_VALIDATION`` (1/true/yes/on).  Inherits the
+# proven E19 final cold-loader architecture EXACTLY (E19 selector must be
+# active) and adds the E28 production optimizations:
+#   * earliest restore-time CLIP lane (speculative CLIP ON)
+#   * tuned direct-GPU loader configs — CLIP T8/B64MiB and UNET T8/B256MiB
+#     are now the CODE DEFAULTS (E27 Follow-Up A first-touch winners), so no
+#     extra env is required; the env keys are verified as present with the
+#     default values
+#   * multi-window readable Gantt + E27 forensics telemetry ON
+#   * FP32 cast-once OFF (experimental; opt-in per request via the
+#     e28_fp32_cast_once experiment arm)
+# Run count is hard-gated to exactly 1 per run (see _e28_validate_run_count);
+# a cycle uses two separate runs on the same deployment.
+E28_VALIDATION_SELECTOR = "V2_E28_VALIDATION"
+E28_VALIDATION_PROFILE_NAME = "E28_VALIDATION"
+E28_VALIDATION_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "1",
+    "COMFYMODAL_V2_GPU_FAST_RETURN": "1",
+    "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": "1",
+    "COMFYMODAL_V2_VAE_ACTIVATION_MODE": "late",
+    "COMFYMODAL_V2_VAE_EARLY_START_MS": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM": "1",
+    "COMFYMODAL_V2_GANTT_TELEMETRY": "1",
+    "COMFYMODAL_V2_E27_FORENSICS": "1",
+}
+E28_LOADER_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": "8",
+    "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": str(64 * 1024 * 1024),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": str(512 * 1024),
+    "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": "8",
+    "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": str(256 * 1024 * 1024),
+    "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": str(512 * 1024),
+    "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "0",
+}
+
+
+def _e28_profile_active() -> bool:
+    raw = os.environ.get(E28_VALIDATION_SELECTOR, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _e28_validate_run_count() -> None:
+    """Hard single-run guard for the E28 validation selector.
+
+    When the E28 selector is active, both the explicit ``--run-count`` AND
+    ``V2_BENCHMARK_RUNS`` must resolve to exactly ``1`` and a conditioning
+    nonce must be present (fresh-cache requirement).  Refuses paid execution
+    otherwise, BEFORE any Modal invocation.  A validation cycle runs exactly
+    two separate requests (--run-count 1 twice) on the same deployment.
+    """
+    if not _e28_profile_active():
+        return
+    _runs = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+    if _runs != "1":
+        print(
+            "=== ERROR: E28 validation requires V2_BENCHMARK_RUNS=1, "
+            f"got {_runs!r}; refusing paid execution ===",
+            flush=True,
+        )
+        sys.exit(1)
+    _nonce = os.environ.get("COMFYMODAL_V2_CONDITIONING_NONCE", "").strip()
+    if not _nonce:
+        print(
+            "=== ERROR: E28 validation requires a fresh conditioning nonce "
+            "(V2_E28_CONDITIONING_NONCE); refusing paid execution ===",
+            flush=True,
+        )
+        sys.exit(1)
+
+
+def verify_e28_validation_profile() -> tuple[bool, dict[str, Any]]:
+    """Fail-fast local check of the E28 validation profile.
+
+    Requires the E19 selector active (exact E19 base) plus the E28
+    validation flags equal to ``E28_VALIDATION_PROFILE`` and the E28 loader
+    defaults equal to ``E28_LOADER_PROFILE``.  Fails closed on any conflict
+    (D6/D10/E10) or mismatch.  Reads the effective values from
+    ``_runtime_env()`` — the exact dict the deployment bakes.
+    """
+    if not _e28_profile_active():
+        return False, {
+            "profile": E28_VALIDATION_PROFILE_NAME,
+            "active": False,
+            "validation": "FAIL",
+            "error": f"{E28_VALIDATION_SELECTOR} is not active",
+        }
+    if not _e19_profile_active():
+        return False, {
+            "profile": E28_VALIDATION_PROFILE_NAME,
+            "active": True,
+            "validation": "FAIL",
+            "error": f"E28 validation requires {E19_FINAL_COLD_LOADER_SELECTOR}=1",
+        }
+    if _d6_profile_active() or _d10_profile_active() or _e10_profile_active():
+        return False, {
+            "profile": E28_VALIDATION_PROFILE_NAME,
+            "active": True,
+            "validation": "FAIL",
+            "error": "E28 validation cannot combine with D6/D10/E10 atomic profiles",
+        }
+    details: dict[str, Any] = {
+        "profile": E28_VALIDATION_PROFILE_NAME,
+        "active": True,
+    }
+    ok = True
+    try:
+        from comfymodal_runtime.modal_app import _runtime_env
+        effective = _runtime_env()
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        for _key in (tuple(E28_VALIDATION_PROFILE) + tuple(E28_LOADER_PROFILE)
+                     + tuple(E19_FINAL_COLD_LOADER_PROFILE)):
+            details[_key] = "unavailable"
+        details["validation"] = "FAIL"
+        details["error"] = f"{type(exc).__name__}: {exc}"
+        return False, details
+    # E19 base must be exact.
+    for _key, _expected in E19_FINAL_COLD_LOADER_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    # E28 validation flags must be exact.
+    for _key, _expected in E28_VALIDATION_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    # E28 loader defaults must be exact (the winning production config).
+    for _key, _expected in E28_LOADER_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    details["validation"] = "PASS" if ok else "FAIL"
+    if not ok:
+        details["error"] = "profile mismatch (see per-key values)"
+    return ok, details
+
+
+def _e26_validate_run_count() -> None:
+    """Hard single-run guard for the E26 validation selector.
+
+    When the E26 selector is active, both the explicit ``--run-count`` AND
+    ``V2_BENCHMARK_RUNS`` must resolve to exactly ``1`` and a conditioning
+    nonce must be present (fresh-cache requirement).  Refuses paid execution
+    otherwise, BEFORE any Modal invocation.  A validation cycle runs exactly
+    two separate requests (--run-count 1 twice) on the same deployment.
+    """
+    if not _e26_profile_active():
+        return
+    _runs = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+    if _runs != "1":
+        print(
+            "=== ERROR: E26 validation requires V2_BENCHMARK_RUNS=1, "
+            f"got {_runs!r}; refusing paid execution ===",
+            flush=True,
+        )
+        sys.exit(1)
+    _nonce = os.environ.get("COMFYMODAL_V2_CONDITIONING_NONCE", "").strip()
+    if not _nonce:
+        print(
+            "=== ERROR: E26 validation requires a fresh conditioning nonce "
+            "(V2_E26_CONDITIONING_NONCE); refusing paid execution ===",
+            flush=True,
+        )
+        sys.exit(1)
+
+
+def verify_e26_validation_profile() -> tuple[bool, dict[str, Any]]:
+    """Fail-fast local check of the E26 validation profile.
+
+    Requires the E19 selector active (exact E19 base) plus the E26
+    validation flags equal to ``E26_VALIDATION_PROFILE``.  Fails closed on
+    any conflict (D6/D10/E10) or mismatch.  Reads the effective values from
+    ``_runtime_env()`` — the exact dict the deployment bakes.
+    """
+    if not _e26_profile_active():
+        return False, {
+            "profile": E26_VALIDATION_PROFILE_NAME,
+            "active": False,
+            "validation": "FAIL",
+            "error": f"{E26_VALIDATION_SELECTOR} is not active",
+        }
+    if not _e19_profile_active():
+        return False, {
+            "profile": E26_VALIDATION_PROFILE_NAME,
+            "active": True,
+            "validation": "FAIL",
+            "error": f"E26 validation requires {E19_FINAL_COLD_LOADER_SELECTOR}=1",
+        }
+    if _d6_profile_active() or _d10_profile_active() or _e10_profile_active():
+        return False, {
+            "profile": E26_VALIDATION_PROFILE_NAME,
+            "active": True,
+            "validation": "FAIL",
+            "error": "E26 validation cannot combine with D6/D10/E10 atomic profiles",
+        }
+    details: dict[str, Any] = {
+        "profile": E26_VALIDATION_PROFILE_NAME,
+        "active": True,
+    }
+    ok = True
+    try:
+        from comfymodal_runtime.modal_app import _runtime_env
+        effective = _runtime_env()
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        for _key in tuple(E26_VALIDATION_PROFILE) + tuple(E19_FINAL_COLD_LOADER_PROFILE):
+            details[_key] = "unavailable"
+        details["validation"] = "FAIL"
+        details["error"] = f"{type(exc).__name__}: {exc}"
+        return False, details
+    # E19 base must be exact.
+    for _key, _expected in E19_FINAL_COLD_LOADER_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    # E26 validation flags must be exact.
+    for _key, _expected in E26_VALIDATION_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    details["validation"] = "PASS" if ok else "FAIL"
+    if not ok:
+        details["error"] = "profile mismatch (see per-key values)"
+    return ok, details
+
+
+def _e25_profile_active() -> bool:
+    raw = os.environ.get(E25_VALIDATION_SELECTOR, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _e25_validate_run_count() -> None:
+    """Hard single-run guard for the E25 validation selector.
+
+    Mirrors the E22 hard protection: when the E25 selector is active, both the
+    explicit ``--run-count`` AND ``V2_BENCHMARK_RUNS`` must resolve to exactly
+    ``1`` and a conditioning nonce must be present (fresh-cache requirement).
+    Refuses paid execution otherwise, BEFORE any Modal invocation.
+    """
+    if not _e25_profile_active():
+        return
+    _runs = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+    if _runs != "1":
+        print(
+            "=== ERROR: E25 validation requires V2_BENCHMARK_RUNS=1, "
+            f"got {_runs!r}; refusing paid execution ===",
+            flush=True,
+        )
+        sys.exit(1)
+    _nonce = os.environ.get("COMFYMODAL_V2_CONDITIONING_NONCE", "").strip()
+    if not _nonce:
+        print(
+            "=== ERROR: E25 validation requires a fresh conditioning nonce "
+            "(V2_E25_CONDITIONING_NONCE); refusing paid execution ===",
+            flush=True,
+        )
+        sys.exit(1)
+
+
+def verify_e25_validation_profile() -> tuple[bool, dict[str, Any]]:
+    """Fail-fast local check of the E25 validation profile.
+
+    Requires the E19 selector active (exact E19 base) plus the five E25
+    validation flags equal to ``E25_VALIDATION_PROFILE``.  Fails closed on any
+    conflict (D6/D10/E10) or mismatch.  Reads the effective values from
+    ``_runtime_env()`` — the exact dict the deployment bakes.
+    """
+    if not _e25_profile_active():
+        return False, {
+            "profile": E25_VALIDATION_PROFILE_NAME,
+            "active": False,
+            "validation": "FAIL",
+            "error": f"{E25_VALIDATION_SELECTOR} is not active",
+        }
+    if not _e19_profile_active():
+        return False, {
+            "profile": E25_VALIDATION_PROFILE_NAME,
+            "active": True,
+            "validation": "FAIL",
+            "error": f"E25 validation requires {E19_FINAL_COLD_LOADER_SELECTOR}=1",
+        }
+    if _d6_profile_active() or _d10_profile_active() or _e10_profile_active():
+        return False, {
+            "profile": E25_VALIDATION_PROFILE_NAME,
+            "active": True,
+            "validation": "FAIL",
+            "error": "E25 validation cannot combine with D6/D10/E10 atomic profiles",
+        }
+    details: dict[str, Any] = {
+        "profile": E25_VALIDATION_PROFILE_NAME,
+        "active": True,
+    }
+    ok = True
+    try:
+        from comfymodal_runtime.modal_app import _runtime_env
+        effective = _runtime_env()
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        for _key in tuple(E25_VALIDATION_PROFILE) + tuple(E19_FINAL_COLD_LOADER_PROFILE):
+            details[_key] = "unavailable"
+        details["validation"] = "FAIL"
+        details["error"] = f"{type(exc).__name__}: {exc}"
+        return False, details
+    # E19 base must be exact.
+    for _key, _expected in E19_FINAL_COLD_LOADER_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    # E25 validation flags must be exact (VAE early-start 250, NOT the parity 0).
+    for _key, _expected in E25_VALIDATION_PROFILE.items():
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if _got != _expected:
+            ok = False
+    details["validation"] = "PASS" if ok else "FAIL"
+    return ok, details
+
+
+def evaluate_e19_structural_gate(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail closed on runtime execution proof, never on enabled flags alone."""
+    checks = {
+        "atomic_profile_exact": evidence.get("atomic_profile")
+        == E19_FINAL_COLD_LOADER_PROFILE_NAME,
+        "snapshot_unet_weights_absent": evidence.get(
+            "snapshot_unet_weights_present"
+        ) is False,
+        "fresh_restore": evidence.get("fresh_restore") is True,
+        "clip_execution_identity": evidence.get("clip_loader_execution_identity")
+        == "fastsafetensors_direct_gpu",
+        "unet_execution_identity": evidence.get("unet_loader_execution_identity")
+        == "fastsafetensors",
+        "clip_fallback_zero": evidence.get("clip_fallback_count") == 0,
+        "unet_fallback_zero": evidence.get("unet_fallback_count") == 0,
+        "clip_source_fence": evidence.get("clip_source_fence_valid") is True,
+        "unet_source_fence": evidence.get("unet_source_fence_valid") is True,
+        "clip_workers_retired": evidence.get("clip_workers_alive_at_demand_start")
+        == 0,
+        "unet_workers_retired": evidence.get("unet_workers_alive_at_demand_start")
+        == 0,
+        "prefetch_demand_collision_absent": evidence.get(
+            "prefetch_and_demand_overlap_detected"
+        ) is False,
+        "unet_gpu_overlap_absent": evidence.get(
+            "unet_gpu_overlap_with_clip_critical"
+        ) is False
+        and evidence.get("unet_gpu_overlap_with_clip_critical_ms") == 0,
+        "clip_copy_event_recorded": evidence.get("clip_copy_event_recorded") is True,
+        "clip_copy_event_waited": evidence.get("clip_copy_event_waited") is True
+        or evidence.get("clip_copy_event_waited_at") is not None,
+        "unet_copy_event_recorded": evidence.get("unet_copy_event_recorded") is True,
+        "unet_copy_event_waited": evidence.get("unet_copy_event_waited") is True
+        or evidence.get("unet_copy_event_waited_at") is not None,
+        "clip_ready_emitted": evidence.get("clip_ready_at") is not None,
+        "unet_ready_emitted": evidence.get("unet_ready_at") is not None,
+        "model_readiness_gate_emitted": evidence.get(
+            "model_readiness_status"
+        ) == "KNOWN"
+        and evidence.get("model_readiness_gate_ms") is not None,
+        "canonical_output_sha_match": evidence.get("canonical_output_sha_match")
+        is True,
+    }
+    failures = sorted(name for name, passed in checks.items() if not passed)
+    return {
+        "valid": not failures,
+        "checks": checks,
+        "failures": failures,
+        "clip_forward_health": evidence.get("clip_forward_health", "UNKNOWN"),
+        "enabled_flag_counts_as_execution_proof": False,
+    }
+_D6_PROFILE_KEYS: tuple[str, ...] = tuple(D6_FASTPATH_PROFILE)
+
+E10_BUCKET_FIRST_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_STAGED_SAFETENSORS": "1",
+    "COMFYMODAL_V2_STAGED_PRODUCERS": "4",
+    "COMFYMODAL_V2_STAGED_POOL_MB": "1024",
+    "COMFYMODAL_V2_STAGED_BUCKET_MB": "256",
+    "COMFYMODAL_V2_STAGED_CPU_CAST": "1",
+    "COMFYMODAL_V2_STAGED_ASYNC_H2D": "1",
+    "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS": "1",
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+    "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": "1",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
+    "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": "1",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+    "COMFYMODAL_V2_UNET_FORENSICS": "0",
+    "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": "0",
+}
+
+
+def _e10_profile_active() -> bool:
+    raw = os.environ.get("V2_E10_BUCKET_FIRST_VALIDATION", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _e19_profile_active() -> bool:
+    raw = os.environ.get(E19_FINAL_COLD_LOADER_SELECTOR, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _e22_arm_active() -> str:
+    """Return the E22 arm label ('off'|'on'|'') if an E22 arm selector is active."""
+    if os.environ.get(E22_PREFETCH_OFF_SELECTOR, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "off"
+    if os.environ.get(E22_PREFETCH_ON_SELECTOR, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "on"
+    return ""
+
+
+def _profile_value(raw: Any) -> str:
+    value = str(raw or "").strip()
+    return "0" if value == "" else value
+
+
+def verify_e10_bucket_first_profile() -> tuple[bool, dict[str, Any]]:
+    """Verify the exact local runtime env baked by the E10 B deploy."""
+    details: dict[str, Any] = {
+        "profile": "e10_bucket_first",
+        "active": _e10_profile_active(),
+    }
+    if not details["active"]:
+        details["validation"] = "FAIL"
+        details["error"] = "V2_E10_BUCKET_FIRST_VALIDATION is not active"
+        return False, details
+    try:
+        from comfymodal_runtime.modal_app import _runtime_env
+        effective = _runtime_env()
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        details["validation"] = "FAIL"
+        details["error"] = f"{type(exc).__name__}: {exc}"
+        return False, details
+    ok = True
+    for key, expected in E10_BUCKET_FIRST_PROFILE.items():
+        got = _profile_value(effective.get(key))
+        details[key] = got
+        if got != expected:
+            ok = False
+    details["validation"] = "PASS" if ok else "FAIL"
+    return ok, details
+
+
+def _run_e10_profile_cli() -> int:
+    ok, details = verify_e10_bucket_first_profile()
+    print("[v2.e10_bucket_first_profile]", flush=True)
+    print(f"profile={details.get('profile', 'e10_bucket_first')}", flush=True)
+    for key, expected in E10_BUCKET_FIRST_PROFILE.items():
+        print(
+            f"{key}={details.get(key, 'unavailable')} expected={expected}",
+            flush=True,
+        )
+    print(f"validation={details.get('validation', 'FAIL')}", flush=True)
+    if details.get("error"):
+        print(f"error={details['error']}", flush=True)
+    return 0 if ok else 1
+
+
+async def _run_e10_remote_profile_cli() -> int:
+    """Read the deployed container env before any E10 graph submission."""
+    if not _e10_profile_active():
+        print("[v2.e10_remote_profile] validation=FAIL", flush=True)
+        print("error=V2_E10_BUCKET_FIRST_VALIDATION is not active", flush=True)
+        return 1
+    try:
+        workspace = _load_workspace()
+        transport = ModalTransport()
+        handle = await asyncio.to_thread(
+            transport._v2_handle, workspace=workspace, gpu=GPU,
+        )
+        fn = getattr(handle, "run_env_probe", None)
+        if fn is None:
+            raise RuntimeError("deployed container has no run_env_probe method")
+        remote = getattr(fn, "remote", None)
+        if remote is not None and callable(getattr(remote, "aio", None)):
+            probe = remote.aio(request_id="v2-e10-profile-probe")
+            if asyncio.iscoroutine(probe):
+                probe = await probe
+        elif asyncio.iscoroutinefunction(fn):
+            probe = await fn(request_id="v2-e10-profile-probe")
+        else:
+            probe = await asyncio.to_thread(fn, request_id="v2-e10-profile-probe")
+        if asyncio.iscoroutine(probe):
+            probe = await probe
+        if not isinstance(probe, dict):
+            raise RuntimeError(f"run_env_probe returned {type(probe).__name__}")
+        remote_env = probe.get("env", {})
+        if not isinstance(remote_env, dict):
+            raise RuntimeError("run_env_probe env payload is not a mapping")
+        failures: list[str] = []
+        for key, expected in E10_BUCKET_FIRST_PROFILE.items():
+            got = _profile_value(remote_env.get(key))
+            print(f"{key}={got} expected={expected}", flush=True)
+            if got != expected:
+                failures.append(f"{key}: got {got!r}, expected {expected!r}")
+        expected_app = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+        remote_app = str(remote_env.get("COMFYMODAL_V2_APP_NAME", "") or "").strip()
+        if expected_app and remote_app != expected_app:
+            failures.append(
+                f"COMFYMODAL_V2_APP_NAME: got {remote_app!r}, expected {expected_app!r}"
+            )
+        print(f"probe_provider={probe.get('provider', '')}", flush=True)
+        print(f"probe_region={probe.get('region', '')}", flush=True)
+        print(f"validation={'PASS' if not failures else 'FAIL'}", flush=True)
+        for failure in failures:
+            print(f"failure={failure}", flush=True)
+        return 0 if not failures else 1
+    except Exception as exc:  # noqa: BLE001 - fail closed before graph spend
+        print("[v2.e10_remote_profile] validation=FAIL", flush=True)
+        print(f"error={type(exc).__name__}: {exc}", flush=True)
+        return 1
+
+
+def _d6_profile_active() -> bool:
+    """True when ``V2_D6_FASTPATH_VALIDATION`` is 1/true/yes/on
+    (case-insensitive) in the current environment."""
+    raw = os.environ.get("V2_D6_FASTPATH_VALIDATION", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _d10_profile_active() -> bool:
+    """True when ``V2_D10_INTEGRATION_VALIDATION`` is 1/true/yes/on
+    (case-insensitive) in the current environment.  D10 takes precedence
+    over D6 when both are set (the verifier is profile-aware)."""
+    raw = os.environ.get("V2_D10_INTEGRATION_VALIDATION", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _d6_normalize(raw: Any) -> str:
+    """Normalize one effective flag value for comparison/reporting.
+
+    The ``COMFYMODAL_V2_UNET_FASTSAFETENSORS`` passthrough in ``_runtime_env``
+    defaults to '' (empty = off) for an unset local var; the launcher pins it
+    to "0".  Both mean the flag is OFF, so an empty/absent value is reported
+    and compared as "0".  Any other value is preserved verbatim.
+    """
+    value = str(raw or "")
+    value = value.strip()
+    return "0" if value == "" else value
+
+
+def verify_d6_fastpath_profile() -> tuple[bool, dict[str, Any]]:
+    """Fail-fast local check of the D6/D10/E19 deploy profile against the
+    ACTUAL ``comfymodal_runtime.modal_app._runtime_env()`` construction.
+
+    FOUR-MODE CONTRACT:
+      * D10 profile active (``V2_D10_INTEGRATION_VALIDATION`` = 1/true/yes/on):
+        the eight fast-path flags MUST equal ``D10_FASTPATH_PROFILE``
+        (1,1,1,1,1,0,1,0) — SYNC_CUDA=0 for measurement integrity.
+      * D6 profile active (``V2_D6_FASTPATH_VALIDATION`` = 1/true/yes/on):
+        the eight flags MUST equal ``D6_FASTPATH_PROFILE`` (1,1,1,1,1,1,1,0).
+      * Neither active: the eight flags MUST equal ``D6_PRODUCTION_DEFAULTS``
+        (0,0,0,0,0,0,1,0) — the values the launcher pins when no profile is
+        opted in, so the launcher's always-on verify call is a trivial no-op
+        gate in default mode while enforcing the exact profile when opted in.
+      * E19 profile active (``V2_E19_FINAL_COLD_LOADER`` = 1/true/yes/on):
+        every E19 loader, transport, orchestration, and safety flag MUST equal
+        ``E19_FINAL_COLD_LOADER_PROFILE``.  E19 cannot be combined with D6,
+        D10, or E10.
+
+    The effective values are read from ``_runtime_env()`` itself — the exact
+    dict the deployment bakes — never from the raw process env (with no spec
+    argument, matching the deployment path's default spec).  ``_runtime_env``
+    is imported lazily so module import stays light.  Returns ``(ok, details)``
+    where ``details`` carries the effective values + ``validation`` =
+    ``"PASS"``/``"FAIL"`` (+ an ``error`` field when the import/call raised).
+    """
+    d10 = _d10_profile_active()
+    d6 = _d6_profile_active()
+    e10 = _e10_profile_active()
+    e19 = _e19_profile_active()
+    if e19:
+        expected = dict(E19_FINAL_COLD_LOADER_PROFILE)
+        profile_label = E19_FINAL_COLD_LOADER_PROFILE_NAME
+        profile_keys = tuple(expected)
+    elif d10:
+        expected = dict(D10_FASTPATH_PROFILE)
+        profile_label = "d10_integration_validation"
+        profile_keys = _D6_PROFILE_KEYS
+    elif d6:
+        expected = dict(D6_FASTPATH_PROFILE)
+        profile_label = "fastpath_validation"
+        profile_keys = _D6_PROFILE_KEYS
+    else:
+        expected = dict(D6_PRODUCTION_DEFAULTS)
+        profile_label = "default"
+        profile_keys = _D6_PROFILE_KEYS
+    details: dict[str, Any] = {
+        "profile": profile_label,
+        "active": bool(e19 or d10 or d6),
+    }
+    try:
+        from comfymodal_runtime.modal_app import _runtime_env
+        effective = _runtime_env()
+    except Exception as _d6_exc:  # noqa: BLE001 - fail closed
+        for _key in profile_keys:
+            details[_key] = "unavailable"
+        details["validation"] = "FAIL"
+        details["error"] = f"{type(_d6_exc).__name__}: {_d6_exc}"
+        return False, details
+    e22_arm = _e22_arm_active()
+    ok = True
+    for _key in profile_keys:
+        _got = _d6_normalize(effective.get(_key))
+        details[_key] = _got
+        if e19 and e22_arm and _key in E22_A_B_EXEMPT_KEYS:
+            if _got not in E22_ARM_ALLOWED_PREWARM_VALUES:
+                ok = False
+            elif e22_arm == "off" and _got != "0":
+                ok = False
+                details["error"] = f"arm=off requires CHECKPOINT_PREWARM=0, got {_got}"
+            elif e22_arm == "on" and _got != "1":
+                ok = False
+                details["error"] = f"arm=on requires CHECKPOINT_PREWARM=1, got {_got}"
+        else:
+            if _got != expected[_key]:
+                ok = False
+    details["e22_arm"] = e22_arm or None
+    if e19:
+        _conflicts = []
+        if d10:
+            _conflicts.append("V2_D10_INTEGRATION_VALIDATION")
+        if d6:
+            _conflicts.append("V2_D6_FASTPATH_VALIDATION")
+        if e10:
+            _conflicts.append("V2_E10_BUCKET_FIRST_VALIDATION")
+        if _conflicts:
+            ok = False
+            details["error"] = (
+                f"{E19_FINAL_COLD_LOADER_PROFILE_NAME} cannot combine with "
+                + ", ".join(_conflicts)
+            )
+    details["validation"] = "PASS" if ok else "FAIL"
+    return ok, details
+
+
+def verify_e22_arm_profile() -> tuple[bool, dict[str, Any]]:
+    """Verify E22 arm profile: E19 atomic profile + arm-specific CHECKPOINT_PREWARM."""
+    e22_arm = _e22_arm_active()
+    if not e22_arm:
+        return False, {
+            "profile": E19_FINAL_COLD_LOADER_PROFILE_NAME,
+            "active": False,
+            "validation": "FAIL",
+            "error": "no E22 arm selector active (need V2_E22_PREFETCH_OFF or V2_E22_PREFETCH_ON)",
+        }
+    if not _e19_profile_active():
+        return False, {
+            "profile": E19_FINAL_COLD_LOADER_PROFILE_NAME,
+            "active": False,
+            "validation": "FAIL",
+            "error": f"E22 arm requires {E19_FINAL_COLD_LOADER_SELECTOR}=1",
+        }
+    return verify_d6_fastpath_profile()
+
+
+def verify_e19_final_cold_loader_profile() -> tuple[bool, dict[str, Any]]:
+    """Verify that the explicit E19 selector is active and exact."""
+    if not _e19_profile_active():
+        return False, {
+            "profile": E19_FINAL_COLD_LOADER_PROFILE_NAME,
+            "active": False,
+            "validation": "FAIL",
+            "error": f"{E19_FINAL_COLD_LOADER_SELECTOR} is not active",
+        }
+    return verify_d6_fastpath_profile()
+
+
+def _run_d6_verify_cli() -> int:
+    """Print the bounded atomic-profile block and return its gate exit code."""
+    ok, details = verify_d6_fastpath_profile()
+    print("[v2.d6_deploy_profile]", flush=True)
+    print(f"profile={details.get('profile', 'default')}", flush=True)
+    if details.get("profile") == E19_FINAL_COLD_LOADER_PROFILE_NAME:
+        _profile_keys = tuple(E19_FINAL_COLD_LOADER_PROFILE)
+        _atomic_name = E19_FINAL_COLD_LOADER_PROFILE_NAME
+    elif details.get("profile") == "d10_integration_validation":
+        _profile_keys = tuple(D10_FASTPATH_PROFILE)
+        _atomic_name = "D10_INTEGRATION_VALIDATION"
+    elif details.get("profile") == "fastpath_validation":
+        _profile_keys = tuple(D6_FASTPATH_PROFILE)
+        _atomic_name = "D6_FASTPATH_VALIDATION"
+    else:
+        _profile_keys = tuple(D6_PRODUCTION_DEFAULTS)
+        _atomic_name = "PRODUCTION_DEFAULT"
+    print(f"ATOMIC_PROFILE={_atomic_name}", flush=True)
+    for _key in _profile_keys:
+        _short = _key.removeprefix("COMFYMODAL_V2_").lower()
+        print(f"{_short}={details.get(_key, 'unavailable')}", flush=True)
+    print(f"validation={details.get('validation', 'FAIL')}", flush=True)
+    if details.get("error"):
+        print(f"error={details['error']}", flush=True)
+    if ok:
+        print("PROFILE ACCEPTED", flush=True)
+        if details.get("profile") == E19_FINAL_COLD_LOADER_PROFILE_NAME:
+            print("DEPLOY COMMAND CONSTRUCTED", flush=True)
+            print(
+                "DEPLOY_COMMAND=modal deploy -m "
+                "comfymodal_runtime.modal_app",
+                flush=True,
+            )
+            print("EPHEMERAL_PATH_USED=NO", flush=True)
+    else:
+        print("PROFILE REJECTED", flush=True)
+    return 0 if ok else 1
+
+
+def _deployment_state_atomic_profile_matches(
+    state: Mapping[str, Any], expected: str
+) -> bool:
+    """Require fresh state proof when a concrete atomic profile is selected."""
+    if not expected:
+        return True
+    return str(state.get("atomic_profile") or "").strip() == expected
+
+
+def _run_run_preflight_cli(nonce: str = "") -> int:
+    """Fail-fast local preflight for ``run_v2_single.bat`` BEFORE Modal submission.
+
+    Verifies the request-side environment matches the D1-primed deployed
+    identity recorded in ``.deployed_state.json`` (app, class, deployment
+    identity, runtime shape, D1 proof coverage, run count) so a canonical
+    request can never silently target a legacy/wrong deployment (the D10
+    failure class: fresh nonce against an old app -> warm exact_hit with
+    encode_calls=0).  Local-only: no Modal calls, no spend.  Exits 0=PASS /
+    1=FAIL; the run batch aborts before submission on FAIL.
+    """
+    _row = lambda key, value: print(f"{key}={value}", flush=True)  # noqa: E731
+    failures: list[str] = []
+    state: dict = {}
+    try:
+        from comfymodal_runtime.registry_proof_store import deployed_state_path as _dsp
+        state = json.loads(_dsp().read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    if not isinstance(state, dict) or not state:
+        failures.append("deployed state unavailable (.deployed_state.json missing or empty)")
+
+    _app = str(state.get("app_name") or "").strip()
+    _identity = str(state.get("deployment_combined_hash") or "").strip()
+    _class = str(state.get("class_name") or "").strip()
+    _shape_fp = str(state.get("runtime_shape_fingerprint") or "").strip()
+    _shape_recorded = int(state.get("runtime_shape_recorded") or 0)
+    _cpu = int(state.get("cpu_request") or 0)
+    _mem = int(state.get("memory_request") or 0)
+    _base_cpu = int(state.get("baseline_cpu_request") or 0)
+    _base_mem = int(state.get("baseline_memory_request") or 0)
+    _state_atomic_profile = str(state.get("atomic_profile") or "").strip()
+    _expected_atomic_profile = str(
+        os.environ.get("COMFYMODAL_V2_ATOMIC_PROFILE", "") or ""
+    ).strip()
+    if _e19_profile_active():
+        _expected_atomic_profile = E19_FINAL_COLD_LOADER_PROFILE_NAME
+
+    _env_app = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+    _env_class = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "").strip()
+    _env_cpu = os.environ.get("COMFYMODAL_V2_CPU_REQUEST", "").strip()
+    _env_mem = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "").strip()
+    _env_base_cpu = os.environ.get("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "").strip()
+    _env_base_mem = os.environ.get("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", "").strip()
+    _runs = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+
+    # Planned runtime-shape fingerprint from THIS request environment.
+    _planned_fp = ""
+    try:
+        from comfymodal_runtime.runtime_shape import runtime_shape_config
+        _planned_fp = runtime_shape_config().runtime_shape_fingerprint
+    except Exception:
+        _planned_fp = ""
+
+    # Nonce target-app resolution (fail closed; D10 guard).
+    _nonce_target = ""
+    if nonce:
+        try:
+            _nonce_target = _resolve_nonce_target_app()
+        except Exception as exc:
+            failures.append(f"nonce target app resolution failed: {exc}")
+
+    # D1 proof coverage under the current deploy-frozen identity (mirrors the
+    # prime path exactly: same workflow, same production-options normalization).
+    _covered = False
+    try:
+        _workflow, _modal_options = _load_workflow()
+        _opts = normalize_production_options(_modal_options)
+        _covered = _registry_proof_store_covers(
+            _workflow,
+            modal_options=_modal_options,
+            production_options=_opts if _opts.get("enabled") else None,
+        )
+    except Exception:
+        _covered = False
+
+    if not _app:
+        failures.append("deployed app_name empty (identity not recorded)")
+    if not _identity:
+        failures.append("deployed deployment_combined_hash empty")
+    if not _class:
+        failures.append("deployed class_name empty")
+    if not _deployment_state_atomic_profile_matches(
+        state, _expected_atomic_profile
+    ):
+        failures.append(
+            "deployed atomic profile mismatch: "
+            f"requested={_expected_atomic_profile or '<unset>'} "
+            f"deployed={_state_atomic_profile or '<missing>'}"
+        )
+    if _env_app != _app:
+        failures.append(
+            f"target app mismatch: requested={_env_app or '<unset>'} deployed={_app}"
+        )
+    if _env_class != _class:
+        failures.append(
+            f"target class mismatch: requested={_env_class or '<unset>'} deployed={_class}"
+        )
+    if not _shape_recorded or not _shape_fp:
+        failures.append("deployed runtime-shape not recorded (deploy identity record predates shape fields)")
+    elif not _planned_fp:
+        failures.append("planned runtime-shape fingerprint unavailable")
+    elif _planned_fp != _shape_fp:
+        failures.append(f"runtime-shape fingerprint mismatch: planned={_planned_fp} deployed={_shape_fp}")
+    if _env_cpu and str(_cpu) and _env_cpu != str(_cpu):
+        failures.append(f"cpu mismatch: requested={_env_cpu} deployed={_cpu}")
+    if _env_mem and str(_mem) and _env_mem != str(_mem):
+        failures.append(f"memory mismatch: requested={_env_mem} deployed={_mem}")
+    if _env_base_cpu and str(_base_cpu) and _env_base_cpu != str(_base_cpu):
+        failures.append(f"baseline cpu mismatch: requested={_env_base_cpu} deployed={_base_cpu}")
+    if _env_base_mem and str(_base_mem) and _env_base_mem != str(_base_mem):
+        failures.append(f"baseline memory mismatch: requested={_env_base_mem} deployed={_base_mem}")
+    if not _covered:
+        failures.append("D1 registry-proof store does not cover the deployment/workflow")
+    if nonce:
+        if not _nonce_target:
+            failures.append("nonce target app could not be resolved")
+        elif _nonce_target != _app:
+            failures.append(f"nonce target app {_nonce_target!r} != deployed app {_app!r}")
+        if _runs and _runs != "1":
+            failures.append(f"nonce measurement requires V2_BENCHMARK_RUNS=1, got {_runs!r}")
+
+    _final = "PASS" if not failures else "FAIL"
+    print("[v2.run_preflight]", flush=True)
+    _row("TARGET_APP", _env_app or "<unset>")
+    _row("TARGET_CLASS", _env_class or "<unset>")
+    _row("TARGET_DEPLOYMENT", _identity[:24] if _identity else "<empty>")
+    _row("TARGET_MATCH", "YES" if (_env_app and _env_app == _app) else "NO")
+    _row(
+        "ATOMIC_PROFILE",
+        f"{_expected_atomic_profile or '<none>'} == deployed "
+        f"{_state_atomic_profile or '<missing>'}",
+    )
+    _row(
+        "CPU",
+        f"{_env_cpu or '?'} == deployed {_cpu or '?'}",
+    )
+    _row(
+        "MEMORY",
+        f"{_env_mem or '?'} == deployed {_mem or '?'}",
+    )
+    _row(
+        "BASELINE_CPU",
+        f"{_env_base_cpu or '?'} == deployed {_base_cpu or '?'}",
+    )
+    _row(
+        "BASELINE_MEMORY",
+        f"{_env_base_mem or '?'} == deployed {_base_mem or '?'}",
+    )
+    _row("RUNTIME_FINGERPRINT", f"{_planned_fp or '?'} == deployed {_shape_fp or '?'}")
+    _row("D1_PROOF_COVERS", str(_covered).lower())
+    _row("RUN_COUNT", _runs or "<unset>")
+    for _f in failures:
+        print(f"failure={_f}", flush=True)
+    _row("FINAL_REQUEST_PREFLIGHT", _final)
+    return 0 if _final == "PASS" else 1
 
 
 def _identity(result: dict[str, Any]) -> dict[str, Any]:
@@ -867,6 +2109,46 @@ def _capture_ts() -> tuple[int, int]:
     return (int(time.time() * 1_000_000_000), time.monotonic_ns())
 
 
+# ── Inter-run intentional cooldown instrumentation (D1 local-dispatch) ──
+# The deliberate cold-spacing sleep between benchmark runs is bracketed with
+# wall+monotonic stamps and recorded explicitly so command→response accounting
+# can attribute it (goal 4: separate explicit cooldown metric).  The wait
+# happens BETWEEN runs — it always precedes the next run's
+# benchmark_iteration_selected stamp, so it is NEVER inside a measured
+# trigger→submission window.
+_COLD_WAITS: list[dict[str, Any]] = []
+
+
+async def _intentional_cold_wait(seconds: float) -> dict[str, Any]:
+    """Bracket one deliberate inter-run cooldown sleep; record + print it.
+
+    Uses `asyncio.sleep` internally (not time.sleep) so the event loop stays
+    responsive and tests can patch `tools.benchmark_v2_direct.asyncio.sleep`.
+    Returns the record; appends it to _COLD_WAITS.
+    """
+    _start = _capture_ts()
+    await asyncio.sleep(seconds)
+    _end = _capture_ts()
+    _waited_ms = round((_end[1] - _start[1]) / 1_000_000.0, 3)
+    _record = {
+        "start_wall_unix_ns": _start[0],
+        "end_wall_unix_ns": _end[0],
+        "start_mono_ns": _start[1],
+        "end_mono_ns": _end[1],
+        "requested_seconds": float(seconds),
+        "waited_mono_ms": _waited_ms,
+    }
+    _COLD_WAITS.append(_record)
+    print(
+        f"[v2.harness] intentional_cold_wait start_wall_unix_ns={_start[0]} "
+        f"start_mono_ns={_start[1]} end_wall_unix_ns={_end[0]} "
+        f"end_mono_ns={_end[1]} requested_seconds={float(seconds)} "
+        f"waited_mono_ms={_waited_ms}",
+        flush=True,
+    )
+    return _record
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Modal snapshot-restore-begin boundary ingestion (instrumentation ONLY)
 #
@@ -1058,13 +2340,18 @@ def reconcile_waterfall_local(
     Instrumentation/reporting ONLY.  Resolves the restore-begin boundary
     (result dicts first, else the Modal app log via
     ``resolve_modal_restore_begin``), rebuilds the waterfall with
-    ``build_waterfall`` plus the resolved boundary (guarded with an
-    ``inspect.signature`` check for the ``modal_restore_begin_wall_unix_ns``
-    kwarg), stores ``result["waterfall_local"]`` (never touching
-    ``result["waterfall"]``), and prints a reconciliation block including an
+    ``build_waterfall`` using the FINAL result (merged host trace + final
+    ``local_timing``) plus the actual host response/caller-return boundary,
+    stores ``result["waterfall_local"]`` (the full host-reconciled report the
+    console strongly prefers), and prints a reconciliation block including an
     OLD-vs-NEW comparison against *existing_waterfall* (the remote-built
-    waterfall).  Every failure mode degrades gracefully — the run path is
-    never affected.
+    waterfall).
+
+    A remote raw artifact marked ``partial_waterfall=True`` NEVER blocks the
+    host rebuild: when the existing ``result["waterfall"]`` is partial, it is
+    replaced with the host-rebuilt full report (the remote partial cannot be
+    the final valid report).  Every failure mode degrades gracefully — the
+    run path is never affected.
     """
     try:
         import inspect  # noqa: PLC0415
@@ -1106,8 +2393,55 @@ def reconcile_waterfall_local(
         )
         return None
     rebuilt_dict = waterfall_to_dict(rebuilt)
+    # Cross-process clock-skew correction (measurement only; never gates app
+    # behavior): container wall clocks can drift ahead of the host clock by
+    # ~100 ms+, inflating the container-side accounted window by exactly the
+    # skew.  When the host's result-receipt wall stamp is EARLIER than the
+    # container's result-emit stamp, the negative difference is that skew.
+    # Removing it from the residual restores the reconciliation to the true
+    # window; the correction is recorded so acceptance blocks can attribute
+    # the delta to platform clock variance instead of app behavior.
+    try:
+        _lt = (timing or {}).get("local_timing") if isinstance(timing, dict) else None
+        if isinstance(_lt, dict):
+            _emit = _lt.get("remote_result_emit_wall_unix_ns")
+            _receipt = _lt.get("local_result_received_wall_ns")
+            if isinstance(_emit, (int, float)) and isinstance(_receipt, (int, float)):
+                _skew_ms = round((_receipt - _emit) / 1_000_000, 6)
+                if _skew_ms < 0:
+                    _skew_corr = round(abs(_skew_ms), 3)
+                    _res = rebuilt_dict.get("residual_ms")
+                    _tol = rebuilt_dict.get("tolerance_ms")
+                    if isinstance(_res, (int, float)) and _tol is not None:
+                        _corr_res = round(_res + _skew_corr, 3)
+                        if abs(_corr_res) <= float(_tol):
+                            rebuilt_dict["residual_ms"] = _corr_res
+                            rebuilt_dict["reconciliation_ms"] = _corr_res
+                            rebuilt_dict["reconciliation_status"] = "OK"
+                            rebuilt_dict["clock_skew_correction_ms"] = _skew_corr
+                            _warns = rebuilt_dict.get("warnings")
+                            if isinstance(_warns, list):
+                                _warns.append(
+                                    f"clock skew correction {_skew_corr}ms applied "
+                                    "(container clock ahead of host; residual restored)"
+                                )
+    except Exception:  # noqa: BLE001
+        pass
     if isinstance(result, dict):
         result["waterfall_local"] = rebuilt_dict
+        # A remote raw artifact marked partial must never be the final valid
+        # report: the host rebuild replaces it in place when it is partial.
+        _existing = result.get("waterfall")
+        if (
+            isinstance(_existing, dict)
+            and _existing.get("partial_waterfall") is True
+        ):
+            result["waterfall"] = rebuilt_dict
+            print(
+                "WATERFALL RECONCILIATION (local rebuild) replaced remote "
+                "PARTIAL report with the full host-reconciled report",
+                flush=True,
+            )
 
     def _num(value: Any) -> float | None:
         if value is None or isinstance(value, bool):
@@ -1409,6 +2743,919 @@ async def _handle_full_trace_artifact(
     return download_meta
 
 
+def _merge_deferred_commit_trace_events(result: dict[str, Any], runtime_trace: Any) -> None:
+    """Merge deferred-commit trace events into the result trace.
+
+    The transport drain emits ``deferred_commit_start``/``deferred_commit_end``
+    onto the local *runtime_trace* AFTER execute_plan returned (post-result,
+    post-yield).  The result trace is a serialized snapshot taken before that,
+    so re-merge those events here — additively and idempotently — so the
+    structured artifact carries the deferred persistence evidence for host
+    reconciliation.  Never alters the result/output descriptor semantics and
+    never adds their duration to caller-visible stages.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("trace"), dict):
+        return
+    result_trace = result["trace"]
+    if not isinstance(result_trace.get("events"), list):
+        return
+    existing = result_trace["events"]
+    existing_keys = {
+        (str(evt.get("name", "")), int(evt.get("wall_unix_ns", 0)), int(evt.get("monotonic_ns", 0)))
+        for evt in existing
+        if isinstance(evt, dict)
+    }
+    for evt in getattr(runtime_trace, "events", ()):
+        if getattr(evt, "name", "") not in ("deferred_commit_start", "deferred_commit_end"):
+            continue
+        try:
+            serialized = evt.to_dict()
+        except Exception:
+            continue
+        key = (
+            str(serialized.get("name", "")),
+            int(serialized.get("wall_unix_ns", 0)),
+            int(serialized.get("monotonic_ns", 0)),
+        )
+        if key not in existing_keys:
+            existing.append(serialized)
+            existing_keys.add(key)
+
+
+# ── Host-side provenance re-emission (RUN-1 gate) ─────────────────────────
+# Remote (Modal container) stdout never reaches the captured benchmark log,
+# so after every completed run the host re-emits the prompt-executor /
+# conditioning-cache breakdowns and the PNG provenance from the run artifact.
+# Each formatter below is pure and defensive: a missing event or malformed
+# payload yields ``None`` (skipped by the caller) and never raises.
+
+_PE_EXEC_CHILD_KEYS = (
+    "dynamic_prompt_ms",
+    "is_changed_ms",
+    "seed_apply_ms",
+    "clean_unused_ms",
+    "cache_gather_ms",
+    "cleanup_gc_ms",
+)
+_PE_C2F_CHILD_KEYS = (
+    "c2f_topo_walk_ms",
+    "c2f_stage_ms",
+    "c2f_first_node_prefix_ms",
+)
+_CC_OPT_FIELD_KEYS = (
+    "entry_header_open_read_ms",
+    "entry_header_parse_ms",
+    "entry_header_validate_ms",
+    "entry_data_open_read_ms",
+    "entry_deserialize_ms",
+    "deser_payload_sha_ms",
+    "deser_tensor_sha_ms",
+    "deser_tensor_rebuild_ms",
+    "deser_materialize_ms",
+    "deser_tensor_count",
+    "deser_tensors_bytes",
+    "hit_read_bytes",
+    "hit_read_mbps",
+)
+
+# Every key the [v2.prompt_executor_breakdown] host line already renders (or
+# consumes for a derived field).  Pass-through extras skip these so the fixed
+# field order stays byte-identical and nothing is ever duplicated.
+_PE_EMITTED_KEYS = frozenset({
+    "request_id",
+    "exec_to_cached_ms",
+    "dynamic_prompt_ms",
+    "is_changed_ms",
+    "signature_keys_ms",
+    # Consumed by the signature_keys_ms derivation (never emitted itself).
+    "signature_keys_total_ms",
+    "seed_apply_ms",
+    "clean_unused_ms",
+    "cache_gather_ms",
+    "cleanup_gc_ms",
+    "residual_ms",
+    "c2f_cached_to_first_node_ms",
+    "c2f_topo_walk_ms",
+    "c2f_topo_input_info_ms",
+    "c2f_topo_other_ms",
+    "c2f_stage_ms",
+    "c2f_first_node_prefix_ms",
+    "c2f_residual_ms",
+})
+
+# Every key the [v2.conditioning_exact_hit_breakdown] host line already
+# renders.  Includes BOTH the emitted output names AND their lookup_diagnostics
+# source names (several source keys are renamed on emit — e.g.
+# key_build_digest_ms → key_build_ms, header_bytes_read → header_bytes,
+# measured_children_ms → children_ms) so the pass-through never duplicates a
+# field that was already handled.
+_CC_EMITTED_KEYS = frozenset({
+    "request_id",
+    "decision",
+    "lookup_wall_ms",
+    # Emitted output names.
+    "total_ms",
+    "key_build_ms",
+    "lock_wait_ms",
+    "manifest_read_ms",
+    "manifest_bytes",
+    "manifest_entries",
+    "entry_lookup_ms",
+    "header_bytes",
+    "data_bytes",
+    "lru_touch_ms",
+    "lru_touch_mode",
+    "children_ms",
+    "residual_ms",
+    # lookup_diagnostics source names (renamed on emit).
+    "key_build_digest_ms",
+    "manifest_read_bytes",
+    "header_bytes_read",
+    "data_bytes_read",
+    "measured_children_ms",
+    *_CC_OPT_FIELD_KEYS,
+})
+
+
+
+def _fmt_v2_metric(value: Any) -> str:
+    """Format a single host-provenance metric for a print line.
+
+    ``None`` → ``absent``; ints stay integral; floats round to 3 decimals;
+    non-numeric values (e.g. ``lru_touch_mode``) pass through unchanged.
+    """
+    if value is None:
+        return _ABSENT_STR
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    try:
+        return str(round(float(value), 3))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _host_trace_events(artifact: Any) -> list[Any] | None:
+    """Return the remote full-trace event list from the artifact.
+
+    Resolves both layouts seen in practice:
+      - ``artifact["full_trace"]["events"]`` (experiment record), and
+      - ``artifact["result"]["trace"]["events"]`` (raw ``_run_one`` artifact).
+    ``None`` when neither carries an event list.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    trace = artifact.get("full_trace")
+    if isinstance(trace, dict) and isinstance(trace.get("events"), list):
+        return trace["events"]
+    result = artifact.get("result")
+    if isinstance(result, dict):
+        trace = result.get("trace")
+        if isinstance(trace, dict) and isinstance(trace.get("events"), list):
+            return trace["events"]
+    return None
+
+
+def _host_output_descriptor(artifact: Any) -> list[Any] | None:
+    """Return the output-descriptor list from the artifact.
+
+    Resolves both layouts seen in practice:
+      - ``artifact["output_descriptor"]`` (experiment record), and
+      - ``artifact["result"]["asset_descriptors"]`` / ``result["output_descriptor"]``
+        (raw ``_run_one`` artifact).
+    ``None`` when neither carries a list.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    descriptor = artifact.get("output_descriptor")
+    if isinstance(descriptor, list):
+        return descriptor
+    result = artifact.get("result")
+    if isinstance(result, dict):
+        for key in ("asset_descriptors", "output_descriptor"):
+            descriptor = result.get(key)
+            if isinstance(descriptor, list):
+                return descriptor
+    return None
+
+
+def _find_host_trace_event_metadata(
+    artifact: Any, name: str, *, prefer_key: str | None = None
+) -> dict[str, Any] | None:
+    """Return the metadata dict of a remote full-trace event named *name*.
+
+    Defaults to the FIRST matching event's metadata (unchanged behavior).
+    When *prefer_key* is given, scan ALL matching events and return the first
+    whose metadata carries a non-``None`` value for *prefer_key*, falling back
+    to the first matching metadata when none does.  This guards against
+    duplicate events where a metadata-less legacy ``timing_trace``
+    reconstruction shadows the populated remote event (observed for
+    ``output_encode_end``: the legacy stage ``t8c_output_encode_end`` is
+    rebuilt as a bare event with ``metadata={}`` while the remote execution
+    event carries ``duration_ms`` / ``compress_level`` / ``png_compress_ms``).
+
+    ``None`` when the artifact, the trace, the events list, the named event or
+    its metadata is absent (so callers can never raise on a missing event).
+    """
+    events = _host_trace_events(artifact)
+    if events is None:
+        return None
+    fallback: dict[str, Any] | None = None
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("name") != name:
+            continue
+        metadata = event.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if prefer_key is None:
+            return metadata
+        if fallback is None:
+            fallback = metadata
+        if metadata.get(prefer_key) is not None:
+            return metadata
+    return fallback if prefer_key is not None else None
+
+
+def _host_extra_fields(source: Any, emitted: frozenset[str]) -> str:
+    """Generic new-key pass-through for the host provenance lines (RUN-1 gate).
+
+    Appends ``key=<formatted value>`` for every scalar key in *source* that is
+    not already emitted/handled by the fixed field set, in sorted order — so
+    ANY new metadata key (e.g. Task-1 ``signature_cache_*``, Task-2
+    ``prefetch_*`` / ``manifest_memory_hit`` / ``payload_memory_hit`` /
+    ``normal_lookup_fallback``, and future fields from parallel lanes)
+    automatically appears on the emitted line after the existing fixed fields.
+
+    Rules (documented):
+      - ``None`` / non-scalar (dict/list) values are OMITTED entirely — only
+        the KNOWN fixed fields may render ``absent``, never unknown keys.
+      - One level of nesting is flattened: a sub-dict whose entries are all
+        scalars (e.g. a future ``lookup_diagnostics["prefetch"]`` sub-dict)
+        has its entries promoted to the top level so nested keys still
+        surface as ``key=value``.  Sub-keys that collide with an already
+        emitted/handled key are skipped.
+      - Keys already emitted by the fixed field list (or consumed for a
+        derived field) are never duplicated.
+
+    Returns ``""`` when nothing is appended, so the fixed-field output stays
+    byte-identical when no new keys are present.
+    """
+    if not isinstance(source, dict):
+        return ""
+    flat: dict[str, Any] = {}
+    for key, value in source.items():
+        if key in emitted:
+            continue
+        if (
+            isinstance(value, dict)
+            and value
+            and all(not isinstance(v, (dict, list)) for v in value.values())
+        ):
+            for sub_key, sub_value in value.items():
+                if sub_key not in emitted and sub_key not in flat:
+                    flat[sub_key] = sub_value
+            continue
+        flat[key] = value
+    extras: list[str] = []
+    for key in sorted(flat):
+        if key in emitted:
+            continue
+        value = flat[key]
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        extras.append(f"{key}={_fmt_v2_metric(value)}")
+    return " ".join(extras)
+
+
+def format_host_prompt_executor_breakdown(artifact: Any) -> str | None:
+    """Render the ``[v2.prompt_executor_breakdown]`` host line.
+
+    Parents come from the ``prompt_executor_milestones`` event metadata
+    (``execution_start_to_cached_ms``, ``cached_to_first_node_ms``); the
+    breakdown children come from ``metadata["breakdown"]`` (added by the
+    remote-enrichment lane).  Missing children render as ``absent``; each
+    residual is emitted whenever the parent is present AND at least one child
+    key is present (absent children are implicitly part of the residual), so
+    e.g. a missing ``seed_apply_ms`` no longer hides ``residual_ms``.
+    """
+    metadata = _find_host_trace_event_metadata(artifact, "prompt_executor_milestones")
+    if metadata is None:
+        return None
+    request_id = str(artifact.get("request_id", "")) if isinstance(artifact, dict) else ""
+    exec_to_cached_ms = metadata.get("execution_start_to_cached_ms")
+    c2f_cached_to_first_node_ms = metadata.get("cached_to_first_node_ms")
+    if exec_to_cached_ms is None and c2f_cached_to_first_node_ms is None:
+        return None
+    breakdown = metadata.get("breakdown")
+    if not isinstance(breakdown, dict):
+        breakdown = {}
+
+    def _child(key: str) -> str:
+        return _fmt_v2_metric(breakdown.get(key))
+
+    # Derived child: signature_keys_ms = signature_keys_total_ms - is_changed_ms.
+    sig_total = _num(breakdown.get("signature_keys_total_ms"))
+    is_changed = _num(breakdown.get("is_changed_ms"))
+    if sig_total is not None and is_changed is not None:
+        signature_keys_ms = _fmt_v2_metric(sig_total - is_changed)
+    else:
+        signature_keys_ms = _ABSENT_STR
+
+    # residual_ms: emitted whenever the parent is present AND at least one
+    # exec-to-cached child key is present (absent children are implicitly part
+    # of the residual — a missing seed_apply_ms must not hide it).
+    exec_children = [_num(breakdown.get(key)) for key in _PE_EXEC_CHILD_KEYS]
+    exec_present = [child for child in exec_children if child is not None]
+    exec_parent = _num(exec_to_cached_ms)
+    signature_derived = (sig_total - is_changed) if (sig_total is not None and is_changed is not None) else None
+    if exec_parent is not None and (exec_present or signature_derived is not None):
+        exec_sum = float(sum(exec_present))
+        if signature_derived is not None:
+            exec_sum += signature_derived
+        residual_ms = _fmt_v2_metric(round(exec_parent, 3) - round(exec_sum, 3))
+    else:
+        residual_ms = _ABSENT_STR
+
+    # c2f children + c2f residual_ms (same partial-children rule).
+    c2f_children = [_num(breakdown.get(key)) for key in _PE_C2F_CHILD_KEYS]
+    c2f_present = [child for child in c2f_children if child is not None]
+    c2f_parent = _num(c2f_cached_to_first_node_ms)
+    if c2f_parent is not None and c2f_present:
+        c2f_sum = sum(float(child) for child in c2f_present)
+        c2f_residual_ms = _fmt_v2_metric(
+            round(c2f_parent, 3) - round(c2f_sum, 3)
+        )
+    else:
+        c2f_residual_ms = _ABSENT_STR
+
+    # Pass-through: ANY new metadata["breakdown"] key (signature_cache_* etc.)
+    # is appended after the fixed fields, in sorted order, when present.
+    _extra_tail = _host_extra_fields(breakdown, _PE_EMITTED_KEYS)
+    return (
+        "[v2.prompt_executor_breakdown] "
+        f"request_id={request_id} "
+        f"exec_to_cached_ms={_fmt_v2_metric(exec_to_cached_ms)} "
+        f"dynamic_prompt_ms={_child('dynamic_prompt_ms')} "
+        f"is_changed_ms={_child('is_changed_ms')} "
+        f"signature_keys_ms={signature_keys_ms} "
+        f"seed_apply_ms={_child('seed_apply_ms')} "
+        f"clean_unused_ms={_child('clean_unused_ms')} "
+        f"cache_gather_ms={_child('cache_gather_ms')} "
+        f"cleanup_gc_ms={_child('cleanup_gc_ms')} "
+        f"residual_ms={residual_ms} "
+        f"c2f_cached_to_first_node_ms={_fmt_v2_metric(c2f_cached_to_first_node_ms)} "
+        f"c2f_topo_walk_ms={_child('c2f_topo_walk_ms')} "
+        f"c2f_topo_input_info_ms={_child('c2f_topo_input_info_ms')} "
+        f"c2f_topo_other_ms={_child('c2f_topo_other_ms')} "
+        f"c2f_stage_ms={_child('c2f_stage_ms')} "
+        f"c2f_first_node_prefix_ms={_child('c2f_first_node_prefix_ms')} "
+        f"c2f_residual_ms={c2f_residual_ms}"
+    ) + (f" {_extra_tail}" if _extra_tail else "")
+
+
+def format_host_conditioning_breakdown(artifact: Any) -> str | None:
+    """Render the ``[v2.conditioning_exact_hit_breakdown]`` host line.
+
+    Lookup metrics come from the ``clip_conditioning_cache_lookup`` event
+    (top-level ``lookup_wall_ms`` + ``lookup_diagnostics`` dict) and the
+    decision from the ``clip_conditioning_cache_decision`` event.  Opt-gated
+    deserialization / read fields are appended only when present.  Any NEW
+    ``lookup_diagnostics`` key (Task-2 prefetch / in-memory-cache fields,
+    future fields) is appended generically via ``_host_extra_fields``.
+    """
+    metadata = _find_host_trace_event_metadata(artifact, "clip_conditioning_cache_lookup")
+    if metadata is None:
+        return None
+    request_id = str(artifact.get("request_id", "")) if isinstance(artifact, dict) else ""
+    diagnostics = metadata.get("lookup_diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    decision_metadata = _find_host_trace_event_metadata(
+        artifact, "clip_conditioning_cache_decision"
+    )
+    decision = (
+        decision_metadata.get("decision")
+        if isinstance(decision_metadata, dict)
+        else None
+    )
+
+    parts = [
+        "[v2.conditioning_exact_hit_breakdown]",
+        f"request_id={request_id}",
+        f"decision={_fmt_v2_metric(decision)}",
+        f"lookup_wall_ms={_fmt_v2_metric(metadata.get('lookup_wall_ms'))}",
+        f"total_ms={_fmt_v2_metric(diagnostics.get('total_ms'))}",
+        f"key_build_ms={_fmt_v2_metric(diagnostics.get('key_build_digest_ms'))}",
+        f"lock_wait_ms={_fmt_v2_metric(diagnostics.get('lock_wait_ms'))}",
+        f"manifest_read_ms={_fmt_v2_metric(diagnostics.get('manifest_read_ms'))}",
+        f"manifest_bytes={_fmt_v2_metric(diagnostics.get('manifest_read_bytes'))}",
+        f"manifest_entries={_fmt_v2_metric(diagnostics.get('manifest_entries'))}",
+        f"entry_lookup_ms={_fmt_v2_metric(diagnostics.get('entry_lookup_ms'))}",
+        f"header_bytes={_fmt_v2_metric(diagnostics.get('header_bytes_read'))}",
+        f"data_bytes={_fmt_v2_metric(diagnostics.get('data_bytes_read'))}",
+        f"lru_touch_ms={_fmt_v2_metric(diagnostics.get('lru_touch_ms'))}",
+        f"lru_touch_mode={_fmt_v2_metric(diagnostics.get('lru_touch_mode'))}",
+        f"children_ms={_fmt_v2_metric(diagnostics.get('measured_children_ms'))}",
+        f"residual_ms={_fmt_v2_metric(diagnostics.get('residual_ms'))}",
+    ]
+    for key in _CC_OPT_FIELD_KEYS:
+        if diagnostics.get(key) is not None:
+            parts.append(f"{key}={_fmt_v2_metric(diagnostics.get(key))}")
+    # Pass-through: ANY new lookup_diagnostics key (Task-2 prefetch_*,
+    # manifest_memory_hit, payload_memory_hit, normal_lookup_fallback,
+    # prefetch_reason, and future fields) is appended after the fixed fields,
+    # in sorted order, when present — mirroring the remote emitter which also
+    # appends "only when present in the lookup diagnostics".
+    _extra_tail = _host_extra_fields(diagnostics, _CC_EMITTED_KEYS)
+    if _extra_tail:
+        parts.append(_extra_tail)
+    return " ".join(parts)
+
+
+def _host_trace_metadata(artifact: Any) -> dict[str, Any] | None:
+    """Return the remote full-trace METADATA dict from the artifact.
+
+    Resolves both layouts seen in practice:
+      - ``artifact["full_trace"]["metadata"]`` (experiment record), and
+      - ``artifact["result"]["trace"]["metadata"]`` (raw ``_run_one`` artifact).
+    ``None`` when neither carries a metadata dict.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    trace = artifact.get("full_trace")
+    if isinstance(trace, dict) and isinstance(trace.get("metadata"), dict):
+        return trace["metadata"]
+    result = artifact.get("result")
+    if isinstance(result, dict):
+        trace = result.get("trace")
+        if isinstance(trace, dict) and isinstance(trace.get("metadata"), dict):
+            return trace["metadata"]
+    return None
+
+
+def _host_restore_timing(artifact: Any) -> dict[str, Any] | None:
+    """Return the ``_restore_timing`` dict from the artifact, if present.
+
+    Covers both layouts: ``artifact["_restore_timing"]`` and
+    ``artifact["result"]["_restore_timing"]``.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    timing = artifact.get("_restore_timing")
+    if isinstance(timing, dict):
+        return timing
+    result = artifact.get("result")
+    if isinstance(result, dict) and isinstance(result.get("_restore_timing"), dict):
+        return result["_restore_timing"]
+    return None
+
+
+def format_host_folder_warm(artifact: Any) -> str | None:
+    """Render the ``[v2.folder_warm]`` host line from restore trace metadata.
+
+    Reads ``folder_warm_ms`` / ``folder_warm_folders`` from the trace-level
+    metadata keys set by the container's advisory folder-listing warm (with a
+    fallback to the ``_restore_timing`` dict when the trace serialization
+    raced the daemon thread).  Missing keys render ``absent``; the line is
+    skipped entirely when neither channel carries any folder-warm evidence.
+    """
+    metadata = _host_trace_metadata(artifact)
+    meta = dict(metadata) if isinstance(metadata, dict) else {}
+    if not any(k in meta for k in ("folder_warm_ms", "folder_warm_folders")):
+        timing = _host_restore_timing(artifact)
+        if isinstance(timing, dict):
+            for key in ("folder_warm_ms", "folder_warm_folders"):
+                if key not in meta and timing.get(key) is not None:
+                    meta[key] = timing[key]
+    if not any(k in meta for k in ("folder_warm_ms", "folder_warm_folders")):
+        return None
+    request_id = str(artifact.get("request_id", "")) if isinstance(artifact, dict) else ""
+    return (
+        "[v2.folder_warm] "
+        f"request_id={request_id} "
+        f"folder_warm_ms={_fmt_v2_metric(meta.get('folder_warm_ms'))} "
+        f"folder_warm_folders={_fmt_v2_metric(meta.get('folder_warm_folders'))}"
+    )
+
+
+def format_host_input_types_warm(artifact: Any) -> str | None:
+    """Render the ``[v2.input_types_warm]`` host line from trace metadata.
+
+    Reads ``input_types_warm_ms`` / ``input_types_warm_classes`` from the
+    trace-level metadata keys set by the container's advisory per-plan
+    ``INPUT_TYPES()`` warm.  Missing keys render ``absent``; the line is
+    skipped entirely when neither key is present.
+    """
+    metadata = _host_trace_metadata(artifact)
+    meta = dict(metadata) if isinstance(metadata, dict) else {}
+    if not any(k in meta for k in ("input_types_warm_ms", "input_types_warm_classes")):
+        return None
+    request_id = str(artifact.get("request_id", "")) if isinstance(artifact, dict) else ""
+    return (
+        "[v2.input_types_warm] "
+        f"request_id={request_id} "
+        f"input_types_warm_ms={_fmt_v2_metric(meta.get('input_types_warm_ms'))} "
+        f"input_types_warm_classes={_fmt_v2_metric(meta.get('input_types_warm_classes'))}"
+    )
+
+
+def format_host_png_output(artifact: Any) -> str | None:
+    """Render the ``[v2.png_output]`` host line.
+
+    Encoder metrics come from the ``output_encode_end`` event (optional
+    ``compress_level`` / ``png_compress_ms`` are omitted when absent); the
+    provenance fields come from ``artifact["output_descriptor"][0]``.
+    """
+    # The remote trace may carry BOTH a populated execution event and a
+    # metadata-less legacy timing_trace reconstruction of the same event
+    # (from the legacy stage map).  Prefer the populated event regardless of
+    # order so encoder metrics never vanish behind the empty duplicate.
+    metadata = _find_host_trace_event_metadata(
+        artifact, "output_encode_end", prefer_key="duration_ms"
+    )
+    if metadata is None:
+        return None
+    request_id = str(artifact.get("request_id", "")) if isinstance(artifact, dict) else ""
+    descriptor = _host_output_descriptor(artifact)
+    if not descriptor:
+        return None
+    entry = descriptor[0]
+    if not isinstance(entry, dict):
+        return None
+
+    parts = ["[v2.png_output]", f"request_id={request_id}"]
+    compress_level = metadata.get("compress_level")
+    if compress_level is not None:
+        parts.append(f"compress_level={_fmt_v2_metric(compress_level)}")
+    png_encode_ms = metadata.get("duration_ms")
+    if png_encode_ms is not None:
+        parts.append(f"png_encode_ms={_fmt_v2_metric(png_encode_ms)}")
+    png_compress_ms = metadata.get("png_compress_ms")
+    if png_compress_ms is not None:
+        parts.append(f"png_compress_ms={_fmt_v2_metric(png_compress_ms)}")
+    parts.extend([
+        f"width={_fmt_v2_metric(entry.get('width'))}",
+        f"height={_fmt_v2_metric(entry.get('height'))}",
+        f"bytes={_fmt_v2_metric(entry.get('byte_count'))}",
+        f"sha={_fmt_v2_metric(entry.get('asset_id'))}",
+    ])
+    return " ".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Host submission timeline breakdown (V2 pass 2 — instrumentation ONLY)
+#
+# The repeatable ~17.16s "Modal handle and submission" waterfall stage is
+#   local_receive → modal_submission_attempt
+# (v2_waterfall.py stage bounds 752-768).  PROVEN root cause (RUN 3):
+#   local_receive_to_worker_start_ms=17093
+# — the ``await _ensure_full_node_registry()`` call inside ``_run_one`` loads
+# the FULL ComfyUI node registry (2192 classes: nodes + comfy_extras +
+# custom nodes + PromptServer mirror) before the first plan build.  Only
+# ~65ms is plan build (63ms) + handle lookup / generator create (2ms,
+# persistent IPC hit).  Modal platform time is only ~5.32s (scheduling
+# 1.596s + pre-Python restore 3.722s).
+#
+# D1 FIX (local-dispatch preload): the registry is now preloaded ONCE in
+# ``main`` before the run loop, so run-1 local_receive→worker_start is ~0
+# (the ``_run_one`` await short-circuits via the ``_NODE_REGISTRY_READY`` fast
+# path) and the preload cost is reported as the explicit harness-setup metric
+# ``node_registry_preload_ms`` — never inside a per-run submission window.
+# ``build_host_submission_breakdown_line`` therefore gates the three in-window
+# registry intervals to ``absent`` and reports the preload separately.
+#
+# This is BENCHMARK-ONLY instrumentation: production runs inside a long-lived
+# ComfyUI server whose node registry is already preloaded at startup, so the
+# per-run registry-init cost does not exist there.
+#
+# Scheduling provenance (scheduling_ms / scheduling_source):
+#   scheduling_ms = modal_restore_begin_wall_unix_ns − modal_submission_attempt_wall_unix_ns
+# where restore-begin is resolved by ``resolve_modal_restore_begin``:
+#   result_carried — ``extract_restore_begin_from_result`` found the boundary
+#                     already carried in the result/timing/local_timing dicts
+#   modal_app_log   — resolved from the Modal app-log line
+#                     "restoring function from memory snapshot"
+#                     (``_fetch_modal_restore_begin_logs_async``)
+#   unavailable     — neither source produced a boundary; the report's
+#                     modal_scheduling stage then covers the fused
+#                     submission → python_resume interval instead (and the
+#                     boundary flag modal_restore_begin_unavailable is set)
+# The interval includes Modal admission / queue / placement and the
+# scheduler→restore handoff; it EXCLUDES pre-Python snapshot restore
+# (restore-begin → python resume) and all Python-side restore work (decomposed
+# separately in [v2.restore_breakdown], which lives in modal_app).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_HOST_SUBMISSION_BOUNDARY_SOURCE = "first_anext"
+"""The modal_submission_attempt event is captured at the first ``__anext__``
+of the lazy remote generator — the TRUE Modal submit boundary (not the
+``remote_gen(...)`` call, which only constructs the lazy generator)."""
+
+
+def build_host_submission_breakdown_line(
+    artifact: Any,
+    *,
+    command_start_unix_ms: int | None = None,
+    python_first_line_ns: int | None = None,
+    local_receive_wall_ns: int | None = None,
+    node_registry_start_ns: int | None = None,
+    node_registry_end_ns: int | None = None,
+    scheduling_ms: float | None = None,
+    scheduling_source: str = "unavailable",
+) -> str:
+    """Build the single-line ``[v2.host_submission_breakdown]`` record.
+
+    Pure and defensive: every missing stamp renders ``absent`` (never 0,
+    never a crash).  Existing measured values are reused from the run's
+    ``local_timing`` dict where they exist; only intervals that no existing
+    breakdown covers are recomputed from the merged trace events (read-only).
+    Always returns a string — callers wrap the print in try/except.
+    """
+    if not isinstance(artifact, dict):
+        artifact = {}
+    request_id = str(artifact.get("request_id", ""))
+    events = _host_trace_events(artifact) or []
+
+    def _event_wall(name: str) -> int | None:
+        for event in events:
+            if not isinstance(event, dict) or event.get("name") != name:
+                continue
+            value = event.get("wall_unix_ns")
+            if isinstance(value, (int, float)):
+                return int(value)
+        return None
+
+    local_timing = artifact.get("local_timing")
+    if not isinstance(local_timing, dict):
+        result = artifact.get("result")
+        if isinstance(result, dict) and isinstance(result.get("local_timing"), dict):
+            local_timing = result["local_timing"]
+    if not isinstance(local_timing, dict):
+        local_timing = {}
+
+    def _ms(begin: Any, end: Any) -> float | None:
+        """Wall-clock interval in ms; missing/negative/non-numeric → None."""
+        if begin is None or end is None or isinstance(begin, bool) or isinstance(end, bool):
+            return None
+        try:
+            delta_ns = int(end) - int(begin)
+        except (TypeError, ValueError):
+            return None
+        if delta_ns < 0:
+            return None
+        return round(delta_ns / 1_000_000.0, 3)
+
+    def _existing(key: str) -> float | None:
+        """Reuse an existing measured local_timing value (absent/invalid → None)."""
+        value = local_timing.get(key)
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return None
+
+    worker_start_wall = _event_wall("worker_start")
+    plan_build_call_start_wall = _event_wall("build_execution_plan_call_start")
+    execute_plan_call_start_wall = _event_wall("execute_plan_call_start")
+    transport_entry_wall = _event_wall("transport_entry")
+    handle_lookup_start_wall = _event_wall("modal_handle_lookup_start")
+    handle_lookup_end_wall = _event_wall("modal_handle_lookup_end")
+    payload_serialize_start_wall = _event_wall("modal_payload_serialize_start")
+    payload_serialize_end_wall = _event_wall("modal_payload_serialize_end")
+    generator_create_start_wall = _event_wall("modal_generator_create_start")
+    generator_created_wall = _event_wall("modal_generator_created")
+    submission_attempt_wall = _event_wall("modal_submission_attempt")
+    first_remote_event_wall = _event_wall("modal_first_remote_event")
+
+    command_start_ns = None
+    if command_start_unix_ms is not None and not isinstance(command_start_unix_ms, bool):
+        try:
+            command_start_ns = int(command_start_unix_ms) * 1_000_000
+        except (TypeError, ValueError):
+            command_start_ns = None
+
+    # Interpreter-boot + pre-run stamps (no pre-existing breakdown covers
+    # these; absent whenever the corresponding stamp was never captured).
+    command_start_to_python_first_line_ms = _ms(command_start_ns, python_first_line_ns)
+    python_first_line_to_local_receive_ms = _ms(python_first_line_ns, local_receive_wall_ns)
+    # D1 preload gating: when the full node registry was preloaded in ``main``
+    # BEFORE this run's local_receive stamp, the registry intervals no longer
+    # sit inside the per-run window — they render absent and the preload is
+    # reported separately as node_registry_preload_ms (harness setup, never
+    # scheduling; C3 semantics preserved).
+    _registry_preloaded_before_receive = (
+        isinstance(node_registry_end_ns, int)
+        and not isinstance(node_registry_end_ns, bool)
+        and isinstance(local_receive_wall_ns, int)
+        and not isinstance(local_receive_wall_ns, bool)
+        and int(node_registry_end_ns) <= int(local_receive_wall_ns)
+    )
+    local_receive_to_registry_start_ms = (
+        None if _registry_preloaded_before_receive else _ms(local_receive_wall_ns, node_registry_start_ns)
+    )
+    node_registry_init_ms = (
+        None if _registry_preloaded_before_receive else _ms(node_registry_start_ns, node_registry_end_ns)
+    )
+    registry_end_to_worker_start_ms = (
+        None if _registry_preloaded_before_receive else _ms(node_registry_end_ns, worker_start_wall)
+    )
+    node_registry_preload_ms = (
+        _ms(node_registry_start_ns, node_registry_end_ns) if _registry_preloaded_before_receive else None
+    )
+
+    # Existing measured values are authoritative; event-derived fallbacks fill
+    # only the gaps the local_submission_breakdown does not cover.
+    worker_start_to_plan_build_start_ms = (
+        _existing("worker_start_to_plan_build_ms")
+        or _ms(worker_start_wall, plan_build_call_start_wall)
+    )
+    plan_build_ms = _existing("plan_build_ms")
+    plan_build_to_transport_entry_ms = _ms(execute_plan_call_start_wall, transport_entry_wall)
+    transport_entry_to_handle_lookup_ms = (
+        _existing("transport_entry_to_handle_lookup_ms")
+        or _ms(transport_entry_wall, handle_lookup_start_wall)
+    )
+    handle_lookup_ms = (
+        _existing("handle_lookup_ms")
+        or _ms(handle_lookup_start_wall, handle_lookup_end_wall)
+    )
+    payload_serialize_ms = (
+        _existing("payload_serialize_ms")
+        or _ms(payload_serialize_start_wall, payload_serialize_end_wall)
+    )
+    generator_create_ms = (
+        _existing("generator_create_ms")
+        or _ms(generator_create_start_wall, generator_created_wall)
+    )
+    generator_created_to_submission_ms = (
+        _existing("generator_created_to_first_iteration_ms")
+        or _ms(generator_created_wall, submission_attempt_wall)
+    )
+    local_receive_to_submission_ms = (
+        _existing("local_receive_to_actual_submission_ms")
+        or _ms(local_receive_wall_ns, submission_attempt_wall)
+    )
+    first_remote_signal_ms = (
+        _existing("first_iteration_to_first_remote_event_ms")
+        or _ms(submission_attempt_wall, first_remote_event_wall)
+    )
+    # D1 zero-gap: the user-equivalent command-trigger → modal_submission_attempt
+    # interval (the TRUE user-visible submit boundary) for the externally
+    # invoked benchmark command.
+    user_equivalent_trigger_to_modal_submission_ms = _ms(command_start_ns, submission_attempt_wall)
+
+    return (
+        "[v2.host_submission_breakdown] "
+        f"request_id={request_id} "
+        f"command_start_to_python_first_line_ms={_fmt_v2_metric(command_start_to_python_first_line_ms)} "
+        f"python_first_line_to_local_receive_ms={_fmt_v2_metric(python_first_line_to_local_receive_ms)} "
+        f"local_receive_to_registry_start_ms={_fmt_v2_metric(local_receive_to_registry_start_ms)} "
+        f"node_registry_init_ms={_fmt_v2_metric(node_registry_init_ms)} "
+        f"registry_end_to_worker_start_ms={_fmt_v2_metric(registry_end_to_worker_start_ms)} "
+        f"node_registry_preload_ms={_fmt_v2_metric(node_registry_preload_ms)} "
+        f"worker_start_to_plan_build_start_ms={_fmt_v2_metric(worker_start_to_plan_build_start_ms)} "
+        f"plan_build_ms={_fmt_v2_metric(plan_build_ms)} "
+        f"plan_build_to_transport_entry_ms={_fmt_v2_metric(plan_build_to_transport_entry_ms)} "
+        f"transport_entry_to_handle_lookup_ms={_fmt_v2_metric(transport_entry_to_handle_lookup_ms)} "
+        f"handle_lookup_ms={_fmt_v2_metric(handle_lookup_ms)} "
+        f"payload_serialize_ms={_fmt_v2_metric(payload_serialize_ms)} "
+        f"generator_create_ms={_fmt_v2_metric(generator_create_ms)} "
+        f"generator_created_to_submission_ms={_fmt_v2_metric(generator_created_to_submission_ms)} "
+        f"local_receive_to_submission_ms={_fmt_v2_metric(local_receive_to_submission_ms)} "
+        f"submission_boundary_source={_HOST_SUBMISSION_BOUNDARY_SOURCE} "
+        f"first_remote_signal_ms={_fmt_v2_metric(first_remote_signal_ms)} "
+        f"scheduling_ms={_fmt_v2_metric(scheduling_ms)} "
+        f"scheduling_source={scheduling_source or 'unavailable'} "
+        f"user_equivalent_trigger_to_modal_submission_ms={_fmt_v2_metric(user_equivalent_trigger_to_modal_submission_ms)}"
+    )
+
+
+def build_trigger_to_submission_line(
+    runtime_trace: Any,
+    *,
+    origin: Mapping[str, Any] | None = None,
+    transport_meta: Mapping[str, Any] | None = None,
+    cold_wait_before_ms: float | None = None,
+) -> str:
+    """Render the per-run [v2.trigger_to_submission] reconciliation line.
+
+    Goal-7 accounting for the trigger→submission window: every schema stage
+    is an offset (ms) from the benchmark_iteration_selected monotonic stamp;
+    trigger_to_submission_ms = modal_submission_attempt −
+    benchmark_iteration_selected; measured_children_ms / residual_ms /
+    reconciliation_status reuse the canonical _build_local_submission_breakdown
+    partition (same semantics, identical children).  Pure and defensive:
+    every missing event renders 'absent' and never raises.
+    """
+    _bd = _build_local_submission_breakdown(
+        runtime_trace,
+        origin=origin,
+        transport_meta=transport_meta,
+        plan_to_dict_count=1,
+    )
+    def _event_mono(name: str) -> int | None:
+        for evt in getattr(runtime_trace, "events", ()):
+            if getattr(evt, "name", "") != name:
+                continue
+            value = getattr(evt, "monotonic_ns", None)
+            if isinstance(value, int):
+                return value
+        return None
+    def _delta_ms(start_name: str, end_name: str) -> Any:
+        start = _event_mono(start_name)
+        end = _event_mono(end_name)
+        if start is None or end is None:
+            return None
+        delta = end - start
+        if delta < 0:
+            return "invalid_negative"
+        return round(delta / 1_000_000.0, 3)
+    _fmt = _fmt_v2_metric
+    _trigger = _event_mono("benchmark_iteration_selected")
+    _submit = _event_mono("modal_submission_attempt")
+    _trigger_to_submission_ms: Any = None
+    if _trigger is not None and _submit is not None and _submit >= _trigger:
+        _trigger_to_submission_ms = round((_submit - _trigger) / 1_000_000.0, 3)
+    _measured = _bd.get("measured_children_ms")
+    _residual: Any = None
+    if isinstance(_trigger_to_submission_ms, (int, float)) and isinstance(_measured, (int, float)):
+        _residual = round(_trigger_to_submission_ms - float(_measured), 3)
+    _status = "complete"
+    if not isinstance(_trigger_to_submission_ms, (int, float)):
+        _status = "incomplete"
+    elif not isinstance(_measured, (int, float)):
+        _status = "incomplete"
+    elif isinstance(_residual, (int, float)) and _residual < -0.001:
+        _status = "overlap"
+    return (
+        "[v2.trigger_to_submission] "
+        f"request_id={str(_bd.get('request_id') or '')} "
+        f"benchmark_iteration_selected_to_local_worker_submit_ms={_fmt(_delta_ms('benchmark_iteration_selected', 'local_worker_submit'))} "
+        f"local_worker_submit_to_worker_start_ms={_fmt(_delta_ms('local_worker_submit', 'worker_start'))} "
+        f"worker_start_to_plan_build_start_ms={_fmt(_bd.get('worker_start_to_plan_build_ms'))} "
+        f"plan_build_ms={_fmt(_bd.get('plan_build_ms'))} "
+        f"plan_build_end_to_modal_handle_ready_ms={_fmt(_delta_ms('plan_build_end', 'modal_handle_ready'))} "
+        f"modal_handle_ready_to_modal_submission_attempt_ms={_fmt(_delta_ms('modal_handle_ready', 'modal_submission_attempt'))} "
+        f"intentional_cold_wait_before_run_ms={_fmt(cold_wait_before_ms)} "
+        f"trigger_to_submission_ms={_fmt(_trigger_to_submission_ms)} "
+        f"measured_children_ms={_fmt(_measured)} "
+        f"residual_ms={_fmt(_residual)} "
+        f"reconciliation_status={_status}"
+    )
+
+
+def build_user_trigger_line(
+    *,
+    request_id: str = "",
+    command_start_unix_ms: int | None = None,
+    python_first_line_ns: int | None = None,
+    submission_attempt_wall_ns: int | None = None,
+    response_received_wall_ns: int | None = None,
+    registry_store_hit: bool | None = None,
+    registry_load_ms: float | None = None,
+) -> str:
+    """Report the three never-conflated external-command clocks (D1 zero-gap).
+
+    - process_start_to_response_ms: python_first_line → response receipt
+    - user_equivalent_trigger_to_response_ms: command trigger → response receipt
+    - user_equivalent_trigger_to_modal_submission_ms: command trigger →
+      modal_submission_attempt (the TRUE user-visible submit boundary)
+
+    Registry-store state is reported beside them so setup work is always
+    attributable and never conflated with trigger latency.  Pure and
+    defensive: every missing stamp renders 'absent' and never raises."""
+    def _ms(begin: Any, end: Any) -> Any:
+        if begin is None or end is None or isinstance(begin, bool) or isinstance(end, bool):
+            return None
+        try:
+            delta = int(end) - int(begin)
+        except (TypeError, ValueError):
+            return None
+        if delta < 0:
+            return None
+        return round(delta / 1_000_000.0, 3)
+
+    _cmd_ns = None
+    if command_start_unix_ms is not None and not isinstance(command_start_unix_ms, bool):
+        try:
+            _cmd_ns = int(command_start_unix_ms) * 1_000_000
+        except (TypeError, ValueError):
+            _cmd_ns = None
+    return (
+        "[v2.user_trigger] "
+        f"request_id={request_id} "
+        f"process_start_to_response_ms={_fmt_v2_metric(_ms(python_first_line_ns, response_received_wall_ns))} "
+        f"user_equivalent_trigger_to_response_ms={_fmt_v2_metric(_ms(_cmd_ns, response_received_wall_ns))} "
+        f"user_equivalent_trigger_to_modal_submission_ms={_fmt_v2_metric(_ms(_cmd_ns, submission_attempt_wall_ns))} "
+        f"registry_store_hit={_fmt_v2_metric(registry_store_hit)} "
+        f"registry_load_ms={_fmt_v2_metric(registry_load_ms)}"
+    )
+
+
 async def _run_one(
     *,
     index: int,
@@ -1430,7 +3677,8 @@ async def _run_one(
 ) -> dict[str, Any]:
     # T0: benchmark iteration origin (literal first line)
     _req_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
-    _t0_wall_ms = int(time.time() * 1000)
+    _t0_ts = _capture_ts()
+    _t0_wall_ms = int(_t0_ts[0] // 1_000_000)
     try:
         _command_start_for_origin = int(os.environ.get("COMFYMODAL_COMMAND_START_UNIX_MS", ""))
     except (TypeError, ValueError):
@@ -1446,9 +3694,28 @@ async def _run_one(
         "benchmark_run_index": index,
         "local_receive_wall_ns": _t1_wall_ns,
         "local_receive_mono_ns": _t1_mono_ns,
+        "benchmark_iteration_selected_wall_ns": _t0_ts[0],
+        "benchmark_iteration_selected_mono_ns": _t0_ts[1],
     }
     if _extra_origin:
         request_origin_info.update(_extra_origin)
+    # Semantic-neutral conditioning-cache nonce (benchmark-only): carried in
+    # the request origin so the remote exact-cache key can be isolated per
+    # run WITHOUT touching the workflow/prompt/seed/sampler.  Empty when the
+    # option is unused -> request_origin_info is unchanged (zero behavior
+    # change).  Covers every _run_one-based mode (default loop, variance-
+    # cold/matrix, transfer/backing/provider/host/region AB, acceptance).
+    _cc_nonce_origin = _conditioning_cache_nonce_arg()
+    if _cc_nonce_origin:
+        request_origin_info["conditioning_cache_nonce"] = _cc_nonce_origin
+        # D10 nonce-isolation guard: a nonce-carrying measurement MUST target
+        # the D1-primed deployment.  Fail closed when the env pins a different
+        # app or no primed identity exists; otherwise resolve the transport's
+        # COMFYMODAL_V2_APP_NAME from the primed identity so the request can
+        # never silently land on the legacy default app (the D10 failure: the
+        # old app's baked runtime ignores the nonce -> canonical key -> warm
+        # exact_hit with encode_calls=0).
+        _resolve_nonce_target_app()
     # Request-level experiment arms (unet_transfer / vae_overlap /
     # png_encode / conditioning_hit) travel as allowlisted request-origin
     # env keys so the container applies the arm per-request.  Baseline arms
@@ -1462,11 +3729,25 @@ async def _run_one(
     # Mirror the ComfyUI server's full node registry before any plan build:
     # a base-only registry would reject comfy_extras nodes at validation and
     # fingerprint the wrong surface.
-    if not await _ensure_full_node_registry():
-        raise RuntimeError(
-            "[v2.harness] node registry initialization failed; "
-            "cannot build an authoritative plan validation proof"
-        )
+    #
+    # D1 zero-gap: when the persisted registry-proof/validation store covers
+    # this workflow, plan construction needs no live registry (fast path).
+    # Otherwise load the full registry once (the plan build then persists the
+    # store entry so later commands are fast).
+    _registry_store_hit = _registry_proof_store_covers(
+        workflow, modal_options=modal_options,
+    )
+    if _registry_store_hit:
+        print("[v2.harness] registry_load=skipped store_hit=yes", flush=True)
+        _registry_load_ms = 0.0
+    else:
+        _registry_load_t0 = time.perf_counter()
+        if not await _ensure_full_node_registry():
+            raise RuntimeError(
+                "[v2.harness] node registry initialization failed; "
+                "cannot build an authoritative plan validation proof"
+            )
+        _registry_load_ms = round((time.perf_counter() - _registry_load_t0) * 1000.0, 3)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Prefix timestamp capture: worker_start → plan_build_start
@@ -1497,6 +3778,13 @@ async def _run_one(
     _rtc_end_ts = _capture_ts()
 
     # ── Emit all captured timestamps in temporal order ──
+    runtime_trace.emit_at("benchmark_iteration_selected",
+        wall_unix_ns=_t0_ts[0], monotonic_ns=_t0_ts[1], phase="local",
+        metadata={"benchmark_run_index": index})
+    runtime_trace.emit_at("local_worker_submit",
+        wall_unix_ns=_t1_wall_ns, monotonic_ns=_t1_mono_ns, phase="local",
+        metadata={"queue_depth": 0, "submit_mechanism": "direct_asyncio",
+                  "benchmark_run_index": index})
     runtime_trace.emit_at("worker_start",
         wall_unix_ns=_ws_ts[0], monotonic_ns=_ws_ts[1],
         phase="local", metadata={
@@ -1581,6 +3869,23 @@ async def _run_one(
     _validate_remote_profile(result)
     _response_wall_ns, _response_mono_ns = _capture_ts()
     wall_ms = (time.perf_counter() - started) * 1000.0
+    # ── Production-adjusted total wall (benchmark-only instrumentation) ──
+    # TOTAL WALL (wall_ms) already excludes Modal scheduling (it is measured
+    # from execute_plan entry) and never subtracts pre-Python/Python restore.
+    # It DOES include the host-side node-registry init this runner performs
+    # before plan build.  The production-adjusted figure subtracts only that
+    # registry init — never scheduling, never restore — and is emitted only
+    # when both inputs are present.
+    _node_registry_init_ms = None
+    if (
+        isinstance(_NODE_REGISTRY_START_NS, int)
+        and isinstance(_NODE_REGISTRY_END_NS, int)
+        and not isinstance(_NODE_REGISTRY_START_NS, bool)
+        and not isinstance(_NODE_REGISTRY_END_NS, bool)
+    ):
+        _nri_delta_ns = _NODE_REGISTRY_END_NS - _NODE_REGISTRY_START_NS
+        if _nri_delta_ns >= 0:
+            _node_registry_init_ms = round(_nri_delta_ns / 1_000_000.0, 3)
     identity = _identity(result)
     _expected_app = os.environ.get("COMFYMODAL_V2_APP_NAME", APP_NAME) or APP_NAME
     if identity.get("app_name") and identity.get("app_name") != _expected_app:
@@ -1652,8 +3957,37 @@ async def _run_one(
     artifact["waterfall_local"] = (
         result.get("waterfall_local") if isinstance(result, dict) else None
     )
+    # ── Production-adjusted total wall (benchmark-only instrumentation) ──
+    # TOTAL WALL is the host-reconciled waterfall's total_wall_ms (command→
+    # response MINUS Modal scheduling, already excluded by the waterfall).
+    # The host-side node-registry init is benchmark-only and subtracted here;
+    # pre-Python restore, Python restore, and application work are NOT
+    # subtracted.  wall_ms (execute_plan perf duration) is NOT used as the
+    # base because it includes scheduling.  Emitted only when both inputs
+    # are present.
+    _wf_total_wall_ms = None
+    _wf_local = artifact.get("waterfall_local")
+    if isinstance(_wf_local, dict):
+        _wf_total_wall_ms = _wf_local.get("total_wall_ms")
+    if _wf_total_wall_ms is None:
+        _wf_total_wall_ms = artifact["waterfall"].get("total_wall_ms")
+    production_adjusted_total_wall_ms = None
+    if _wf_total_wall_ms is not None and _node_registry_init_ms is not None:
+        production_adjusted_total_wall_ms = round(
+            float(_wf_total_wall_ms) - _node_registry_init_ms, 3
+        )
+    artifact["production_adjusted_total_wall_ms"] = production_adjusted_total_wall_ms
     (output_dir / f"run_{index}.json").write_text(
         json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+    )
+    # Production-adjusted total wall (see the computation near wall_ms): TOTAL
+    # WALL minus the host-side node-registry init only.  Printed per run and
+    # persisted into run_<i>.json under "production_adjusted_total_wall_ms";
+    # absent when either input is missing.
+    print(
+        f"production_adjusted_total_wall_ms="
+        f"{_fmt_v2_metric(production_adjusted_total_wall_ms)}",
+        flush=True,
     )
 
     # ── Full trace bundle download handoff ─────────────────────────────
@@ -1720,13 +4054,167 @@ async def _run_one(
         "runtime_shape": runtime_shape_artifact,
         "timing": artifact["timing"],
     }, default=str))
-    if not _defer_waterfall:
-        # Prefer the host-reconciled rebuild (TOTAL WALL denominator) when it
-        # exists; the remote-built report stays available in the artifact.
-        _print_waterfall = artifact.get("waterfall_local") or _waterfall
-        if artifact.get("waterfall_local"):
-            print("WATERFALL (host-reconciled)", flush=True)
-        print(render_waterfall(_print_waterfall), flush=True)
+    # ── Persistence-drain join (deterministic trailing-event collection) ──
+    # The transport drains the post-result stream in the background to capture
+    # the remote trailing persistence event.  Join it here with a bounded
+    # timeout so the process never exits with a pending drain task, then merge
+    # the received persistence outcome into the structured artifact/trace
+    # (never into caller-visible stages or the result/output descriptor).
+    try:
+        from comfymodal_runtime.modal_transport import (
+            join_persistence_drain,
+            get_persistence_status,
+        )
+        await join_persistence_drain(prompt_id, timeout=_PERSISTENCE_DRAIN_JOIN_TIMEOUT)
+        _persist_record = get_persistence_status(prompt_id)
+        if _persist_record:
+            artifact["persistence"] = _persist_record
+        _merge_deferred_commit_trace_events(result, runtime_trace)
+    except Exception as _persist_exc:  # noqa: BLE001
+        print(
+            f"[v2.benchmark] persistence drain join failed: "
+            f"{type(_persist_exc).__name__}: {_persist_exc}",
+            flush=True,
+        )
+    # Per-run waterfall is always printed (never deferred), so the single-run
+    # path is not silenced by the post-loop renderer.  Prefer the host-reconciled
+    # rebuild (TOTAL WALL denominator) when it exists; the remote-built report
+    # stays available in the artifact.
+    _print_waterfall = artifact.get("waterfall_local") or _waterfall
+    if artifact.get("waterfall_local"):
+        print("WATERFALL (host-reconciled)", flush=True)
+    else:
+        print(
+            "WATERFALL (host reconcile unavailable - remote/partial report below)",
+            flush=True,
+        )
+    print(render_waterfall(_print_waterfall), flush=True)
+    # ── Host-side provenance re-emission (RUN-1 gate) ─────────────────────
+    # Remote (Modal container) stdout never reaches the captured benchmark
+    # log, so after every completed run the host re-emits the executor /
+    # conditioning breakdowns and the PNG provenance from the run artifact.
+    # Each line is best-effort: a missing event yields None (skipped) and any
+    # malformed payload degrades to a skip message, never an abort.
+    for _host_fmt in (
+        format_host_prompt_executor_breakdown,
+        format_host_conditioning_breakdown,
+        format_host_folder_warm,
+        format_host_input_types_warm,
+        format_host_png_output,
+    ):
+        try:
+            _host_line = _host_fmt(artifact)
+        except Exception as _host_exc:  # noqa: BLE001
+            print(
+                f"[v2.host_breakdown] {_host_fmt.__name__} skipped: "
+                f"{type(_host_exc).__name__}: {_host_exc}",
+                flush=True,
+            )
+            continue
+        if _host_line:
+            print(_host_line, flush=True)
+    # ── Host submission timeline breakdown (V2 pass 2 instrumentation) ────
+    # Single-line per-run record decomposing the proven ~17s
+    # local_receive → submission registry-init cost (benchmark-only) and the
+    # scheduling interval from the reconciled report.  Bounded: a missing
+    # event/stamp never breaks the run.
+    try:
+        from comfymodal_runtime.modal_restore_boundary import (
+            extract_restore_begin_from_result as _extract_restore_begin,
+        )
+        try:
+            _command_start_for_breakdown = int(
+                os.environ.get("COMFYMODAL_COMMAND_START_UNIX_MS", "")
+            )
+        except (TypeError, ValueError):
+            _command_start_for_breakdown = None
+        _sched_report = artifact.get("waterfall_local")
+        if not isinstance(_sched_report, dict):
+            _sched_report = artifact.get("waterfall")
+        if not isinstance(_sched_report, dict):
+            _sched_report = None
+        _scheduling_ms = None
+        if _sched_report is not None:
+            _sched_val = _sched_report.get("scheduling_ms")
+            if isinstance(_sched_val, (int, float)) and not isinstance(_sched_val, bool):
+                _scheduling_ms = float(_sched_val)
+        _scheduling_source = "unavailable"
+        try:
+            _restore_begin_carried = _extract_restore_begin(
+                result, artifact.get("timing")
+            )
+        except Exception:  # noqa: BLE001
+            _restore_begin_carried = None
+        if _restore_begin_carried is not None:
+            _scheduling_source = "result_carried"
+        elif (
+            _sched_report is not None
+            and "modal_restore_begin_unavailable"
+            not in (_sched_report.get("boundary_flags") or ())
+        ):
+            _scheduling_source = "modal_app_log"
+        _host_submission_line = build_host_submission_breakdown_line(
+            artifact,
+            command_start_unix_ms=_command_start_for_breakdown,
+            python_first_line_ns=_PYTHON_FIRST_LINE_NS,
+            local_receive_wall_ns=_t1_wall_ns,
+            node_registry_start_ns=_NODE_REGISTRY_START_NS,
+            node_registry_end_ns=_NODE_REGISTRY_END_NS,
+            scheduling_ms=_scheduling_ms,
+            scheduling_source=_scheduling_source,
+        )
+        print(_host_submission_line, flush=True)
+        _cold_before_ms = None
+        if _COLD_WAITS:
+            _last = _COLD_WAITS[-1]
+            if isinstance(_last, dict) and isinstance(_last.get("waited_mono_ms"), (int, float)):
+                _cold_before_ms = float(_last["waited_mono_ms"])
+        try:
+            _trigger_line = build_trigger_to_submission_line(
+                runtime_trace,
+                origin=request_origin_info,
+                transport_meta=runtime_trace._metadata,
+                cold_wait_before_ms=_cold_before_ms,
+            )
+            print(_trigger_line, flush=True)
+            # ── User-equivalent external-command clocks (D1 zero-gap) ──────
+            # The three never-conflated clocks for the externally-invoked
+            # benchmark command: process start (python_first_line) and the
+            # user-equivalent command trigger (COMFYMODAL_COMMAND_START_UNIX_MS)
+            # against both response receipt and the TRUE submit boundary
+            # (modal_submission_attempt).  Registry-store state is reported
+            # beside them so setup work stays attributable.
+            _submission_attempt_wall_ns = None
+            for _h_evt in (_host_trace_events(artifact) or []):
+                if (
+                    isinstance(_h_evt, dict)
+                    and _h_evt.get("name") == "modal_submission_attempt"
+                    and isinstance(_h_evt.get("wall_unix_ns"), (int, float))
+                ):
+                    _submission_attempt_wall_ns = int(_h_evt["wall_unix_ns"])
+                    break
+            _user_trigger_line = build_user_trigger_line(
+                request_id=prompt_id,
+                command_start_unix_ms=_command_start_for_breakdown,
+                python_first_line_ns=_PYTHON_FIRST_LINE_NS,
+                submission_attempt_wall_ns=_submission_attempt_wall_ns,
+                response_received_wall_ns=_response_wall_ns,
+                registry_store_hit=_registry_store_hit,
+                registry_load_ms=_registry_load_ms,
+            )
+            print(_user_trigger_line, flush=True)
+        except Exception as _trig_exc:  # noqa: BLE001
+            print(
+                f"[v2.trigger_to_submission] skipped: "
+                f"{type(_trig_exc).__name__}: {_trig_exc}",
+                flush=True,
+            )
+    except Exception as _sub_exc:  # noqa: BLE001
+        print(
+            f"[v2.host_submission_breakdown] skipped: "
+            f"{type(_sub_exc).__name__}: {_sub_exc}",
+            flush=True,
+        )
     return artifact
 
 
@@ -2899,11 +5387,27 @@ async def _run_acceptance_sequence(
         # Mirror the ComfyUI server's full node registry before any plan build:
         # a base-only registry would reject comfy_extras nodes at validation
         # and fingerprint the wrong surface.
-        if not await _ensure_full_node_registry():
-            raise RuntimeError(
-                "[v2.harness] node registry initialization failed; "
-                "cannot build an authoritative plan validation proof"
-            )
+        #
+        # D1 zero-gap: when the persisted registry-proof/validation store covers
+        # this workflow, plan construction needs no live registry (fast path).
+        _registry_store_hit = _registry_proof_store_covers(
+            workflow,
+            modal_options=_bench_modal_options,
+            production_options=(
+                production_options if production_options.get("enabled") else None
+            ),
+        )
+        if _registry_store_hit:
+            print("[v2.harness] registry_load=skipped store_hit=yes", flush=True)
+            _registry_load_ms = 0.0
+        else:
+            _registry_load_t0 = time.perf_counter()
+            if not await _ensure_full_node_registry():
+                raise RuntimeError(
+                    "[v2.harness] node registry initialization failed; "
+                    "cannot build an authoritative plan validation proof"
+                )
+            _registry_load_ms = round((time.perf_counter() - _registry_load_t0) * 1000.0, 3)
         _bep_call_ts = (int(time.time() * 1_000_000_000), time.monotonic_ns())
         runtime_trace.emit_at("build_execution_plan_call_start",
             wall_unix_ns=_bep_call_ts[0], monotonic_ns=_bep_call_ts[1], phase="local")
@@ -6220,6 +8724,7 @@ async def _run_snapshot_restore_only(
     app_name: str,
     class_name: str,
     gpu: str,
+    conditioning_cache_nonce: str = "",
 ) -> dict[str, Any]:
     """UNET-absent snapshot restore-only benchmark.
 
@@ -6275,6 +8780,10 @@ async def _run_snapshot_restore_only(
                 "gap_seconds": gap_seconds,
                 "snapshot_exclude_unet": 1,
                 "evict_retain_role": "clip_vae",
+                # Semantic-neutral conditioning-cache nonce (when active):
+                # recorded as run evidence only — the no-op probe never
+                # executes the workflow or touches the conditioning cache.
+                "conditioning_cache_nonce": conditioning_cache_nonce,
             },
             "identity": {},
             "cold_check": {},
@@ -6832,7 +9341,7 @@ async def _run_variance_cold(
 
         if index + 1 < run_count:
             print(f"[v2.variance_cold] phase=gap seconds={gap_seconds}", flush=True)
-            await asyncio.sleep(gap_seconds)
+            await _intentional_cold_wait(gap_seconds)
 
     meta = {
         "mode": "variance_cold",
@@ -6988,6 +9497,84 @@ def _report_only_matrix_from_dir(output_dir: Path, attempt_files: list[Path]) ->
     return summary
 
 
+def _batch_a_raise_authorized(batch_b_acceptance: bool,
+                              batch_c_acceptance: bool) -> bool:
+    """Batch-A is the authoritative raise layer only when NO stricter batch
+    layer is enabled.
+
+    Batch-B preserves every Batch-A gate and Batch-C wraps Batch-B, so when
+    either is enabled a Batch-A failure must be reported (the block is still
+    rendered) but deferred to the stricter layer instead of aborting the run.
+    """
+    return not (batch_b_acceptance or batch_c_acceptance)
+
+
+def _batch_b_raise_authorized(batch_c_acceptance: bool) -> bool:
+    """Batch-B is the authoritative raise layer only when Batch-C is disabled.
+
+    Batch-C wraps Batch-B (never duplicates it) and fails unconditionally when
+    Batch-B fails, so a Batch-B failure must be deferred to Batch-C when it is
+    enabled.  The Batch-B block is still rendered in that case.
+    """
+    return not batch_c_acceptance
+
+
+async def _prime_registry_proof() -> None:
+    """Load the full node registry once and persist the store entry for the
+    canonical benchmark workflow (no Modal transport, no remote calls).
+
+    Registry work happens HERE — at deploy time, before any user benchmark
+    trigger — so externally-invoked benchmark commands reach Modal without
+    paying the 17-90 s import (D1 zero-gap)."""
+    _load_t0 = time.perf_counter()
+    if not await _ensure_full_node_registry():
+        raise RuntimeError(
+            "[v2.harness] node registry initialization failed; cannot prime "
+            "the registry-proof store"
+        )
+    _load_ms = round((time.perf_counter() - _load_t0) * 1000.0, 3)
+    workflow, modal_options = _load_workflow()
+    _opts = normalize_production_options(modal_options)
+    _plan = build_execution_plan(
+        workflow,
+        prompt_id=f"v2-prime-{uuid.uuid4().hex[:8]}",
+        client_id="v2-prime-registry-proof",
+        modal_options=modal_options,
+        production_options=_opts if _opts.get("enabled") else None,
+        gpu=GPU,
+        workspace=None,
+        request_metadata={"benchmark_app": APP_NAME, "prime_registry_proof": True},
+        trace=None,
+        validate=False,
+        collect_validation_proof=_PLAN_VALIDATION_PROOF,
+        comfyui_root=_COMFYUI_ROOT_DIR,
+    )
+    _covered = _registry_proof_store_covers(
+        workflow,
+        modal_options=modal_options,
+        production_options=_opts if _opts.get("enabled") else None,
+    )
+    _store_path = ""
+    try:
+        from comfymodal_runtime.registry_proof_store import store_path as _sp
+        _store_path = str(_sp())
+    except Exception:
+        pass
+    print(json.dumps({
+        "prime_registry_proof": True,
+        "registry_load_ms": round(_load_ms, 1),
+        "workflow_hash": str(_plan.workflow_hash)[:16],
+        "store_entry_persisted": bool(_covered),
+        "store_path": _store_path,
+        "prime_ok": bool(_covered),
+    }, default=str), flush=True)
+    if not _covered:
+        raise RuntimeError(
+            "registry-proof priming failed: no store entry persisted "
+            "(deploy-frozen .deployed_state.json identity required)"
+        )
+
+
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False, transfer_ab: bool = False,
@@ -6999,11 +9586,36 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                variance_pretouch: int = 0, report_only: str | None = None,
                gap_seconds: float | None = None, run_count: int | None = None,
                teardown: str = "full", pin_transfer: int = 0,
-               quiesced_transfer: int = 0) -> None:
+               quiesced_transfer: int = 0,
+               batch_a_acceptance: bool = False,
+               batch_b_acceptance: bool = False,
+               batch_c_acceptance: bool = False,
+               prime_registry_proof: bool = False,
+               unique_prompt_suffix: str = "",
+               conditioning_cache_nonce: str = "") -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
     os.environ["COMFYMODAL_V2_GPU"] = GPU
+
+    # Host boot origin: module-global stamp captured on the FIRST line of the
+    # benchmark process (before the heavy import block).  Emitted once per
+    # process so the command→python-first-line boot interval is measurable.
+    print(
+        f"[v2.host] python_first_line_wall_unix_ns={_PYTHON_FIRST_LINE_NS}",
+        flush=True,
+    )
+
+    # --conditioning-cache-nonce: semantic-neutral exact-conditioning cache
+    # nonce.  Forces a cache MISS under a fresh value WITHOUT changing the
+    # workflow/prompt/seed/sampler sent to ComfyUI.  Carried ONLY in the
+    # request origin (never in the workflow), so the workflow stays
+    # byte-identical.  Zero behavior change when unused.
+    if conditioning_cache_nonce:
+        print(
+            f"[v2.conditioning_cache_nonce] nonce={conditioning_cache_nonce}",
+            flush=True,
+        )
 
     # ── Offline report regeneration (no Modal / network needed) ──────────
     if report_only:
@@ -7047,6 +9659,46 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                 f"{_bf_summary.get('valid_count')}/{_bf_limit} valid"
             )
         return
+
+    if prime_registry_proof:
+        await _prime_registry_proof()
+        return
+
+    # ── One-time full node-registry preload (D1 local-dispatch fix) ───────
+    # Previously the full registry load (~17-21s; 87.9s measured on this host)
+    # ran inside _run_one between the local_receive stamp and the worker_start
+    # stamp on run 1, inflating local_receive_to_worker_start_ms by the entire
+    # preload duration.  Preload once here, before the first benchmark
+    # iteration, so every per-run local_receive→worker_start window reflects
+    # production (a long-lived server with the registry already loaded);
+    # _run_one's await then short-circuits via the ready fast path.  The
+    # preload is harness setup, reported as node_registry_preload_ms — never
+    # scheduling (C3 semantics preserved).
+    #
+    # D1 zero-gap: when a store entry for the current deploy-frozen generation
+    # already exists (primed at deploy time via --prime-registry-proof), the
+    # registry import is skipped entirely.
+    _store_primed = False
+    try:
+        from comfymodal_runtime.registry_proof_store import has_generation_entry as _has_gen
+        _store_primed = bool(_has_gen())
+    except Exception:
+        _store_primed = False
+    if not _store_primed:
+        _nri_preload_start_ns = time.perf_counter_ns()
+        if not await _ensure_full_node_registry():
+            raise RuntimeError(
+                "[v2.harness] node registry initialization failed; "
+                "cannot build an authoritative plan validation proof"
+            )
+        _nri_preload_ms = round((time.perf_counter_ns() - _nri_preload_start_ns) / 1_000_000, 3)
+        print(
+            f"[v2.harness] node_registry_preload_ms={_fmt_v2_metric(_nri_preload_ms)}",
+            flush=True,
+        )
+    else:
+        _nri_preload_ms = 0.0
+        print("[v2.harness] node_registry_preload_skipped store_generation_entry=yes", flush=True)
 
     requested_shape = runtime_shape_config().identity_payload()
     shape_guard = _runtime_shape_guard(requested_shape)
@@ -7104,10 +9756,22 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             app_name=_ro_app,
             class_name=CLASS_NAME,
             gpu=GPU,
+            conditioning_cache_nonce=conditioning_cache_nonce,
         )
         return
 
     workflow, modal_options = _load_workflow()
+    # --unique-prompt-suffix: append a fresh token to every literal prompt
+    # text source so the exact-conditioning cache key (entry text + canonical
+    # workflow hash) is unique per run — a deterministic MISS vehicle with
+    # no manual cache-state deletion.  Zero behavior change when unused.
+    if unique_prompt_suffix:
+        _ups_n = _apply_unique_prompt_suffix(workflow, unique_prompt_suffix)
+        print(
+            f"[v2.unique_prompt_suffix] suffix={unique_prompt_suffix} "
+            f"applied to {_ups_n} text sources",
+            flush=True,
+        )
     output_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"v2_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     transport = ModalTransport()
@@ -7263,9 +9927,82 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             output_dir=output_dir,
             bypass_cpu_snapshot_unet=bypass_cpu_snapshot_unet,
             _defer_waterfall=(RUN_COUNT == 1),
+            # Carried into the remote trace metadata via request_origin_info
+            # (pre-existing _extra_origin mechanism; unknown keys are ignored
+            # by the allowlist so production behavior is unchanged).
+            _extra_origin=_benchmark_origin_extra(
+                unique_prompt_suffix, conditioning_cache_nonce
+            ),
         ))
+        # Batch-A acceptance validation: RUN 1 artifact only, strict, no
+        # retry and no extra samples.  Never runs unless batch_a_acceptance
+        # is enabled (opt-in flag/env); printing happens only in this mode.
+        # The raise is authoritative ONLY when no stricter layer is enabled
+        # (Batch-B preserves Batch-A's gates; Batch-C wraps Batch-B), so an
+        # A-only failure must not abort before the stricter layer runs.
+        if index == 0 and batch_a_acceptance:
+            from tools.batch_a_acceptance import render_acceptance_block, validate_batch_a
+            _bga_res = validate_batch_a(artifacts[-1])
+            print(render_acceptance_block(_bga_res), flush=True)
+            if not _bga_res.passed and _batch_a_raise_authorized(
+                batch_b_acceptance, batch_c_acceptance
+            ):
+                raise RuntimeError("batch-a acceptance: RUN 1 FAILED Batch-A gates")
+        # Batch-B acceptance validation: RUN 1 artifact only, strict, no
+        # retry and no extra samples.  Never runs unless batch_b_acceptance
+        # is enabled (opt-in flag/env); printing happens only in this mode.
+        # The raise is authoritative ONLY when Batch-C is disabled (Batch-C
+        # wraps Batch-B, never duplicates it), so a B-only failure must not
+        # abort before the stricter Batch-C layer is evaluated.
+        if index == 0 and batch_b_acceptance:
+            from tools.batch_b_acceptance import (
+                batch_b_config_from_env,
+                render_batch_b_block,
+                validate_batch_b,
+            )
+            _bgb_cfg = batch_b_config_from_env()
+            _bgb_res = validate_batch_b(
+                artifacts[-1],
+                expect_runtime_state_skip=_bgb_cfg["expect_runtime_state_skip"],
+                snapshot_hygiene_enabled=_bgb_cfg["snapshot_hygiene_enabled"],
+                snapshot_manifest_enabled=_bgb_cfg["snapshot_manifest_enabled"],
+                stage13_tolerance_ms=_bgb_cfg["stage13_tolerance_ms"],
+                expect_stage13=_bgb_cfg["expect_stage13"],
+                expect_slow_h2d_forensic=_bgb_cfg["expect_slow_h2d_forensic"],
+            )
+            print(render_batch_b_block(_bgb_res), flush=True)
+            if not _bgb_res.passed and _batch_b_raise_authorized(
+                batch_c_acceptance
+            ):
+                raise RuntimeError("batch-b acceptance: RUN 1 FAILED Batch-B gates")
+        # Batch-C acceptance validation: RUN 1 artifact only, strict, no
+        # retry and no extra samples.  Never runs unless batch_c_acceptance
+        # is enabled (opt-in flag/env); printing happens only in this mode.
+        # Batch-C wraps Batch-B (never duplicates it) and adds the strict
+        # plan-validation fast-path lane when
+        # COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH=1.
+        if index == 0 and batch_c_acceptance:
+            from tools.batch_c_acceptance import (
+                batch_c_config_from_env,
+                render_batch_c_block,
+                validate_batch_c,
+            )
+            _bgc_cfg = batch_c_config_from_env()
+            _bgc_res = validate_batch_c(
+                artifacts[-1],
+                expect_plan_fast_path=_bgc_cfg["expect_plan_fast_path"],
+                expect_runtime_state_skip=_bgc_cfg["expect_runtime_state_skip"],
+                snapshot_hygiene_enabled=_bgc_cfg["snapshot_hygiene_enabled"],
+                snapshot_manifest_enabled=_bgc_cfg["snapshot_manifest_enabled"],
+                stage13_tolerance_ms=_bgc_cfg["stage13_tolerance_ms"],
+                expect_stage13=_bgc_cfg["expect_stage13"],
+                expect_slow_h2d_forensic=_bgc_cfg["expect_slow_h2d_forensic"],
+            )
+            print(render_batch_c_block(_bgc_res), flush=True)
+            if not _bgc_res.passed:
+                raise RuntimeError("batch-c acceptance: RUN 1 FAILED Batch-C gates")
         if index + 1 < RUN_COUNT:
-            await asyncio.sleep(GAP_SECONDS)
+            await _intentional_cold_wait(GAP_SECONDS)
     trace_errors = [
         a for a in artifacts if a.get("_trace_handoff_error")
     ]
@@ -7277,6 +10014,8 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         },
         "run_count": len(artifacts),
         "gap_seconds": GAP_SECONDS,
+        "node_registry_preload_ms": _nri_preload_ms,
+        "intentional_cold_waits": list(_COLD_WAITS),
         "trace_handoff_errors": len(trace_errors),
         "waterfall_runs": sum(1 for item in artifacts if item.get("waterfall")),
         "runs": [{
@@ -7404,7 +10143,7 @@ if __name__ == "__main__":
         "--run-count",
         type=int,
         default=None,
-        help="Override the number of variance-cold runs (defaults to V2_VARIANCE_RUN_COUNT).",
+        help="Explicitly override the benchmark run count. Required as --run-count 1 for E22 arms.",
     )
     _parser.add_argument(
         "--teardown",
@@ -7568,10 +10307,375 @@ if __name__ == "__main__":
              "sample (retained), validation_discard (discarded), or probe "
              "(default: sample).",
     )
+    _parser.add_argument(
+        "--batch-a-acceptance",
+        action="store_true",
+        default=False,
+        help="Batch-A validation mode: after RUN 1, validate the strict "
+             "Batch-A gates (fresh, status, reconciliation<=50ms, G1 single "
+             "UNET read/bind/H2D, models reload skip, node timestamps, "
+             "terminal cleanup stamps, host telemetry overhead<=20ms, no slow "
+             "forensic trigger) and print the BATCH A ACCEPTANCE block. "
+             "Fails (non-zero exit) when gates fail. Opt-in; never the "
+             "default. Also enabled by COMFYMODAL_V2_BATCH_A_ACCEPTANCE=1.",
+    )
+    _parser.add_argument(
+        "--batch-b-acceptance",
+        action="store_true",
+        default=False,
+        help="Batch-B validation mode: after RUN 1, validate the strict "
+             "Batch-B gates (Batch-A preserved, runtime-state skip guard, "
+             "snapshot hygiene, snapshot manifest, stage-13 decomposition "
+             "reconciliation, host telemetry) and print the BATCH B "
+             "ACCEPTANCE block.  Fails (non-zero exit) when gates fail. "
+             "Opt-in; never the default.  Also enabled by "
+             "COMFYMODAL_V2_BATCH_B_ACCEPTANCE=1.",
+    )
+    _parser.add_argument(
+        "--batch-c-acceptance",
+        action="store_true",
+        default=False,
+        help="Batch-C validation mode: after RUN 1, validate the strict "
+             "Batch-C gates (Batch-B preserved plus the plan-validation "
+             "fast-path lane: future_fast_path_eligible, plan_proof_decision "
+             "plan_validation_fast_path, consumed=True, no legacy_validation_"
+             "fallback, no certificate volume_read fallback, deployment hash / "
+             "custom-nodes generation / dependency proof matches) and print "
+             "the BATCH C ACCEPTANCE block.  Fails (non-zero exit) when gates "
+              "fail.  Opt-in; never the default.  Also enabled by "
+              "COMFYMODAL_V2_BATCH_C_ACCEPTANCE=1 (and automatically by "
+              "COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH=1).",
+    )
+    _parser.add_argument(
+        "--prime-registry-proof",
+        action="store_true",
+        default=False,
+        help="Load the full node registry ONCE and persist the registry-proof/validation "
+             "store entry for the canonical benchmark workflow. No Modal calls, no "
+             "submission. Intended to run at deploy time (deploy_and_run_v2_single.bat) "
+             "so every later user-equivalent benchmark command skips the registry import.",
+    )
+    _parser.add_argument(
+        "--unique-prompt-suffix",
+        default="",
+        help="Append a unique token to every prompt text source in the workflow so "
+             "the exact-conditioning cache key is unique per run (deterministic miss). "
+             "Pass a fresh token per run (e.g. uuid/timestamp).",
+    )
+    _parser.add_argument(
+        "--conditioning-cache-nonce",
+        default="",
+        help="Semantic-neutral exact-conditioning cache nonce: forces a cache "
+             "MISS under a fresh value WITHOUT changing the workflow/prompt/"
+             "seed/sampler sent to ComfyUI. Pass a fresh uuid per run. "
+             "Never used for --unique-prompt-suffix semantics.",
+    )
+    _parser.add_argument(
+        "--verify-d6-profile",
+        action="store_true",
+        default=False,
+        help="Fail-fast local check of the D6 fast-path deploy profile against "
+             "the actual _runtime_env() construction. Exits 0 on exact match, "
+             "1 on mismatch. Aborts BEFORE any deploy.",
+    )
+    _parser.add_argument(
+        "--verify-e10-profile",
+        action="store_true",
+        default=False,
+        help="Fail-fast local check of the complete E10 bucket-first B profile "
+             "against the actual _runtime_env() deployment mapping. Exits "
+             "before deploy or any Modal call.",
+    )
+    _parser.add_argument(
+        "--verify-e10-remote-profile",
+        action="store_true",
+        default=False,
+        help="Read the deployed container's exact E10 bucket-first environment "
+             "through run_env_probe and fail before any graph request.",
+    )
+    _parser.add_argument(
+        "--verify-run-preflight",
+        action="store_true",
+        default=False,
+        help="Fail-fast local request preflight for run_v2_single.bat, run "
+             "BEFORE Modal submission: validates the request environment "
+             "(app, class, CPU/MEM/baselines, runtime-shape fingerprint, D1 "
+             "proof coverage, run count) against the deployed identity "
+             "recorded in .deployed_state.json, and the nonce (if any) "
+             "through _resolve_nonce_target_app(). Exits 0=PASS / 1=FAIL; "
+             "the run batch aborts on FAIL before any Modal call or spend.",
+    )
+    _parser.add_argument(
+        "--verify-e22-arm-profile",
+        action="store_true",
+        default=False,
+        help="Fail-fast local check of the E22 causal A/B arm profile: "
+             "E19 atomic profile + arm-specific CHECKPOINT_PREWARM (0 or 1). "
+             "Exits 0 on exact match, 1 on mismatch. Aborts BEFORE any deploy.",
+    )
+    _parser.add_argument(
+        "--verify-e25-profile",
+        action="store_true",
+        default=False,
+        help="Fail-fast local check of the E25 whole-critical-path validation "
+             "profile: E19 atomic base + speculative CLIP hydration + GPU fast "
+             "return + optimization diagnostics + canonical late VAE. "
+             "Exits 0 on exact match, 1 on mismatch. Aborts BEFORE any deploy.",
+    )
+    _parser.add_argument(
+        "--verify-e26-profile",
+        action="store_true",
+        default=False,
+        help="Fail-fast local check of the E26 concrete cold-wins validation "
+             "profile: E19 atomic base + E26 speculative CLIP (frozen-manifest "
+             "absolute paths) + production GPU fast return + checkpoint "
+             "prewarm + late VAE + optimization diagnostics.  Exits 0 on exact "
+             "match, 1 on mismatch. Aborts BEFORE any deploy.",
+    )
+    _parser.add_argument(
+        "--verify-e28-profile",
+        action="store_true",
+        default=False,
+        help="Fail-fast local check of the E28 critical-path implementation "
+             "validation profile: E19 atomic base + earliest restore-time "
+             "speculative CLIP + tuned direct-GPU loader defaults (CLIP "
+             "T8/B64MiB, UNET T8/B256MiB) + multi-window Gantt + E27 "
+             "forensics; FP32 cast-once OFF.  Exits 0 on exact match, 1 on "
+             "mismatch. Aborts BEFORE any deploy.",
+    )
     _args = _parser.parse_args()
 
-    # Campaign persistence args must be reachable from _run_one/main.
+    # Apply the explicit count to the normal benchmark loop as well as the
+    # specialized variance modes.  E22 is intentionally fail-closed here so
+    # a wrapper regression cannot spend a second request.
+    if _args.run_count is not None:
+        if _args.run_count < 1:
+            print("E22 run count must be a positive integer", flush=True)
+            sys.exit(1)
+        RUN_COUNT = int(_args.run_count)
+    if _e22_arm_active() and not _args.prime_registry_proof:
+        _e22_env_run_count = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+        if _args.run_count != 1 or _e22_env_run_count != "1":
+            print(
+                "=== ERROR: E22 requires explicit --run-count 1 and "
+                "V2_BENCHMARK_RUNS=1; refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+
+    # E26 hard single-run guard: the validation selector requires
+    # --run-count 1 + V2_BENCHMARK_RUNS=1 + a fresh conditioning nonce.
+    # Local-only verify subcommands (no Modal spend) are exempt — they run
+    # during the wrapper's pre-deploy/pre-request gates and do not execute
+    # the paid request.
+    _e26_verify_only = bool(
+        _args.verify_d6_profile
+        or _args.verify_e10_profile
+        or _args.verify_e10_remote_profile
+        or _args.verify_run_preflight
+        or _args.verify_e22_arm_profile
+        or _args.verify_e25_profile
+        or _args.verify_e26_profile
+        or _args.verify_e28_profile
+    )
+    if _e26_profile_active() and not _args.prime_registry_proof and not _e26_verify_only:
+        _e26_env_run_count = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+        if _args.run_count != 1 or _e26_env_run_count != "1":
+            print(
+                "=== ERROR: E26 validation requires explicit --run-count 1 "
+                f"and V2_BENCHMARK_RUNS=1 (got {_args.run_count!r} / "
+                f"{_e26_env_run_count!r}); refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+        _e26_nonce = os.environ.get("V2_E26_CONDITIONING_NONCE", "").strip()
+        if not _e26_nonce:
+            print(
+                "=== ERROR: E26 validation requires V2_E26_CONDITIONING_NONCE; "
+                "refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+
+    # E25 hard single-run guard: the validation selector requires
+    # --run-count 1 + V2_BENCHMARK_RUNS=1 + a fresh conditioning nonce.
+    # Local-only verify subcommands (no Modal spend) are exempt — they run
+    # during the wrapper's pre-deploy/pre-request gates and do not execute
+    # the paid request.
+    _e25_verify_only = bool(
+        _args.verify_d6_profile
+        or _args.verify_e10_profile
+        or _args.verify_e10_remote_profile
+        or _args.verify_run_preflight
+        or _args.verify_e22_arm_profile
+        or _args.verify_e25_profile
+        or _args.verify_e26_profile
+        or _args.verify_e28_profile
+    )
+    if _e25_profile_active() and not _args.prime_registry_proof and not _e25_verify_only:
+        _e25_env_run_count = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+        if _args.run_count != 1 or _e25_env_run_count != "1":
+            print(
+                "=== ERROR: E25 validation requires explicit --run-count 1 "
+                f"and V2_BENCHMARK_RUNS=1 (got {_args.run_count!r} / "
+                f"{_e25_env_run_count!r}); refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+        _e25_nonce = os.environ.get("V2_E25_CONDITIONING_NONCE", "").strip()
+        if not _e25_nonce:
+            print(
+                "=== ERROR: E25 validation requires V2_E25_CONDITIONING_NONCE; "
+                "refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+
+    # E28 hard single-run guard: the validation selector requires
+    # --run-count 1 + V2_BENCHMARK_RUNS=1 + a fresh conditioning nonce.
+    # Local-only verify subcommands (no Modal spend) are exempt — they run
+    # during the wrapper's pre-deploy/pre-request gates and do not execute
+    # the paid request.
+    _e28_verify_only = bool(
+        _args.verify_d6_profile
+        or _args.verify_e10_profile
+        or _args.verify_e10_remote_profile
+        or _args.verify_run_preflight
+        or _args.verify_e22_arm_profile
+        or _args.verify_e25_profile
+        or _args.verify_e26_profile
+        or _args.verify_e28_profile
+    )
+    if _e28_profile_active() and not _args.prime_registry_proof and not _e28_verify_only:
+        _e28_env_run_count = os.environ.get("V2_BENCHMARK_RUNS", "").strip()
+        if _args.run_count != 1 or _e28_env_run_count != "1":
+            print(
+                "=== ERROR: E28 validation requires explicit --run-count 1 "
+                f"and V2_BENCHMARK_RUNS=1 (got {_args.run_count!r} / "
+                f"{_e28_env_run_count!r}); refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+        _e28_nonce = os.environ.get("V2_E28_CONDITIONING_NONCE", "").strip()
+        if not _e28_nonce:
+            print(
+                "=== ERROR: E28 validation requires V2_E28_CONDITIONING_NONCE; "
+                "refusing paid execution ===",
+                flush=True,
+            )
+            sys.exit(1)
+
+    # Campaign persistence args must be reachable from _run_one/main (and
+    # from the preflight's nonce-target resolution).
     _EXPERIMENT_ARGS = _args
+
+    # D6 atomic deploy gate: --verify-d6-profile runs the fail-fast local
+    # check and exits (0=PASS / 1=FAIL) BEFORE any Modal work or deploy.
+    if _args.verify_d6_profile:
+        sys.exit(_run_d6_verify_cli())
+
+    if _args.verify_e10_profile:
+        sys.exit(_run_e10_profile_cli())
+
+    if _args.verify_e10_remote_profile:
+        sys.exit(asyncio.run(_run_e10_remote_profile_cli()))
+
+    # Run preflight gate: --verify-run-preflight validates the request
+    # environment against the recorded deployment and exits BEFORE any
+    # Modal submission (fail-closed; the run batch aborts on FAIL).
+    if _args.verify_run_preflight:
+        sys.exit(_run_run_preflight_cli(nonce=_args.conditioning_cache_nonce))
+
+    if _args.verify_e22_arm_profile:
+        ok, details = verify_e22_arm_profile()
+        print("[v2.e22_arm_profile]", flush=True)
+        print(f"profile={details.get('profile', 'default')}", flush=True)
+        _profile_keys = tuple(E19_FINAL_COLD_LOADER_PROFILE)
+        print(f"ATOMIC_PROFILE={E19_FINAL_COLD_LOADER_PROFILE_NAME}", flush=True)
+        for _key in _profile_keys:
+            _short = _key.removeprefix("COMFYMODAL_V2_").lower()
+            print(f"{_short}={details.get(_key, 'unavailable')}", flush=True)
+        print(f"e22_arm={details.get('e22_arm', '')}", flush=True)
+        print(f"validation={details.get('validation', 'FAIL')}", flush=True)
+        if details.get("error"):
+            print(f"error={details['error']}", flush=True)
+        if ok:
+            print("PROFILE ACCEPTED", flush=True)
+            print(
+                "DEPLOY_COMMAND=modal deploy -m "
+                "comfymodal_runtime.modal_app",
+                flush=True,
+            )
+        else:
+            print("PROFILE REJECTED", flush=True)
+        sys.exit(0 if ok else 1)
+
+    if _args.verify_e25_profile:
+        ok, details = verify_e25_validation_profile()
+        print("[v2.e25_profile]", flush=True)
+        print(f"profile={details.get('profile', 'default')}", flush=True)
+        print(f"ATOMIC_PROFILE={details.get('profile', 'default')}", flush=True)
+        for _key in tuple(E19_FINAL_COLD_LOADER_PROFILE) + tuple(E25_VALIDATION_PROFILE):
+            _short = _key.removeprefix("COMFYMODAL_V2_").lower()
+            print(f"{_short}={details.get(_key, 'unavailable')}", flush=True)
+        print(f"validation={details.get('validation', 'FAIL')}", flush=True)
+        if details.get("error"):
+            print(f"error={details['error']}", flush=True)
+        if ok:
+            print("PROFILE ACCEPTED", flush=True)
+            print(
+                "DEPLOY_COMMAND=modal deploy -m "
+                "comfymodal_runtime.modal_app",
+                flush=True,
+            )
+        else:
+            print("PROFILE REJECTED", flush=True)
+        sys.exit(0 if ok else 1)
+
+    if _args.verify_e26_profile:
+        ok, details = verify_e26_validation_profile()
+        print("[v2.e26_profile]", flush=True)
+        print(f"profile={details.get('profile', 'default')}", flush=True)
+        print(f"ATOMIC_PROFILE={details.get('profile', 'default')}", flush=True)
+        for _key in tuple(E19_FINAL_COLD_LOADER_PROFILE) + tuple(E26_VALIDATION_PROFILE):
+            _short = _key.removeprefix("COMFYMODAL_V2_").lower()
+            print(f"{_short}={details.get(_key, 'unavailable')}", flush=True)
+        print(f"validation={details.get('validation', 'FAIL')}", flush=True)
+        if details.get("error"):
+            print(f"error={details['error']}", flush=True)
+        if ok:
+            print("PROFILE ACCEPTED", flush=True)
+            print(
+                "DEPLOY_COMMAND=modal deploy -m "
+                "comfymodal_runtime.modal_app",
+                flush=True,
+            )
+        else:
+            print("PROFILE REJECTED", flush=True)
+        sys.exit(0 if ok else 1)
+
+    if _args.verify_e28_profile:
+        ok, details = verify_e28_validation_profile()
+        print("[v2.e28_profile]", flush=True)
+        print(f"profile={details.get('profile', 'default')}", flush=True)
+        print(f"ATOMIC_PROFILE={details.get('profile', 'default')}", flush=True)
+        for _key in (tuple(E19_FINAL_COLD_LOADER_PROFILE)
+                     + tuple(E28_VALIDATION_PROFILE) + tuple(E28_LOADER_PROFILE)):
+            _short = _key.removeprefix("COMFYMODAL_V2_").lower()
+            print(f"{_short}={details.get(_key, 'unavailable')}", flush=True)
+        print(f"validation={details.get('validation', 'FAIL')}", flush=True)
+        if details.get("error"):
+            print(f"error={details['error']}", flush=True)
+        if ok:
+            print("PROFILE ACCEPTED", flush=True)
+            print(
+                "DEPLOY_COMMAND=modal deploy -m "
+                "comfymodal_runtime.modal_app",
+                flush=True,
+            )
+        else:
+            print("PROFILE REJECTED", flush=True)
+        sys.exit(0 if ok else 1)
 
     _variance_pretouch = _resolve_pretouch(_args.variance_pretouch)
 
@@ -7599,25 +10703,78 @@ if __name__ == "__main__":
         os.environ.get("V2_BENCHMARK_MODE", "").strip().lower() == "provider_ab"
     )
 
-    asyncio.run(main(
-        bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
-        cpu_snapshot_unet_ab=_args.cpu_snapshot_unet_ab,
-        acceptance=_args.acceptance,
-        variance_cold=_variance_cold,
-        variance_matrix=_variance_matrix,
-        transfer_ab=_args.transfer_ab,
-        region_ab=_args.region_ab,
-        host_ab=_host_ab,
-        backing_ab=_backing_ab,
-        provider_ab=_provider_ab,
-        volume_read=_volume_read,
-        snapshot_restore_only=_snapshot_restore_only,
-        snapshot_restore_only_backfill=_args.snapshot_restore_only_backfill,
-        variance_pretouch=_variance_pretouch,
-        report_only=_args.report_only,
-        gap_seconds=_args.gap_seconds,
-        run_count=_args.run_count,
-        teardown=_args.teardown,
-        pin_transfer=int(_args.pin_transfer),
-        quiesced_transfer=int(_args.quiesced_transfer),
-    ))
+    # Batch-A acceptance validation mode: opt-in via --batch-a-acceptance or
+    # COMFYMODAL_V2_BATCH_A_ACCEPTANCE=1.  Validates the RUN 1 artifact against
+    # the strict Batch-A gates and prints the BATCH A ACCEPTANCE block.
+    _batch_a_acceptance = bool(_args.batch_a_acceptance) or (
+        os.environ.get("COMFYMODAL_V2_BATCH_A_ACCEPTANCE", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+
+    # Batch-B acceptance validation mode: opt-in via --batch-b-acceptance or
+    # COMFYMODAL_V2_BATCH_B_ACCEPTANCE=1.  Validates the RUN 1 artifact against
+    # the strict Batch-B gates and prints the BATCH B ACCEPTANCE block.
+    _batch_b_acceptance = bool(_args.batch_b_acceptance) or (
+        os.environ.get("COMFYMODAL_V2_BATCH_B_ACCEPTANCE", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+
+    # Batch-C acceptance validation mode: opt-in via --batch-c-acceptance or
+    # COMFYMODAL_V2_BATCH_C_ACCEPTANCE=1, or automatically when the strict
+    # fast-path expectation COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH=1 is
+    # set (a fast-path expectation without the layer would silently not gate).
+    _batch_c_acceptance = bool(_args.batch_c_acceptance) or (
+        os.environ.get("COMFYMODAL_V2_BATCH_C_ACCEPTANCE", "").strip().lower()
+        in ("1", "true", "yes")
+    ) or (
+        os.environ.get("COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+
+    async def _run_main_with_drain_teardown() -> None:
+        try:
+            await main(
+                bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
+                cpu_snapshot_unet_ab=_args.cpu_snapshot_unet_ab,
+                acceptance=_args.acceptance,
+                variance_cold=_variance_cold,
+                variance_matrix=_variance_matrix,
+                transfer_ab=_args.transfer_ab,
+                region_ab=_args.region_ab,
+                host_ab=_host_ab,
+                backing_ab=_backing_ab,
+                provider_ab=_provider_ab,
+                volume_read=_volume_read,
+                snapshot_restore_only=_snapshot_restore_only,
+                snapshot_restore_only_backfill=_args.snapshot_restore_only_backfill,
+                variance_pretouch=_variance_pretouch,
+                report_only=_args.report_only,
+                gap_seconds=_args.gap_seconds,
+                run_count=_args.run_count,
+                teardown=_args.teardown,
+                pin_transfer=int(_args.pin_transfer),
+                quiesced_transfer=int(_args.quiesced_transfer),
+                batch_a_acceptance=_batch_a_acceptance,
+                batch_b_acceptance=_batch_b_acceptance,
+                batch_c_acceptance=_batch_c_acceptance,
+                prime_registry_proof=_args.prime_registry_proof,
+                unique_prompt_suffix=_args.unique_prompt_suffix,
+                conditioning_cache_nonce=_args.conditioning_cache_nonce,
+            )
+        finally:
+            # Process/loop teardown: join any remaining persistence drains with
+            # a bounded budget so no drain task is left pending at loop
+            # shutdown (no "Task was destroyed but it is pending" warnings).
+            try:
+                from comfymodal_runtime.modal_transport import join_all_persistence_drains
+                _joined = await join_all_persistence_drains(timeout=_PERSISTENCE_DRAIN_JOIN_TIMEOUT)
+                if _joined:
+                    print(f"[v2.benchmark] persistence drains joined={len(_joined)}", flush=True)
+            except Exception as _teardown_exc:  # noqa: BLE001
+                print(
+                    f"[v2.benchmark] persistence drain teardown failed: "
+                    f"{type(_teardown_exc).__name__}: {_teardown_exc}",
+                    flush=True,
+                )
+
+    asyncio.run(_run_main_with_drain_teardown())

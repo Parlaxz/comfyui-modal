@@ -69,6 +69,12 @@ ENV_MAX_QUEUE = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_QUEUE"
 # Bound on the background LRU-touch queue (touched digests awaiting a
 # coalesced manifest rewrite) — Experiment 5 async_lru arm.
 ENV_MAX_LRU_QUEUE = "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_LRU_QUEUE"
+# RUN-6 (serve-by-components): bounded number of the manifest's existing
+# entries whose header+data are ALSO prefetched (keyed by their OWN stored
+# digests) so a demand lookup whose plan-time digest drifted can still be
+# served via the component-match scan.  Clamped to [0, 8].
+ENV_PREFETCH_MAX_ENTRIES = "COMFYMODAL_V2_CONDITIONING_PREFETCH_MAX_ENTRIES"
+_PREFETCH_MAX_ENTRIES_DEFAULT = 3
 
 SCHEMA_VERSION = 1
 FORMAT_VERSION = 1
@@ -258,9 +264,16 @@ def build_exact_key_components(ctx: Mapping[str, Any]) -> dict[str, Any]:
     fields because the native ``CLIPTextEncode`` node has no layer/skip
     inputs at this boundary — the fields exist in the schema so a future
     node with such inputs cannot produce a colliding key.
+
+    ``cache_nonce`` is a benchmark-only, semantic-neutral key isolation
+    field: a fresh value forces a MISS even when the ordinary key exists.  It
+    is CONDITIONAL — included only when ``ctx["cache_nonce"]`` is a non-empty
+    string, so the canonical key JSON is byte-identical when the nonce is
+    absent (never an empty-string placeholder).  It never reaches
+    tokenization/encode/model inputs or the sampler.
     """
     filenames = [str(f) for f in (ctx.get("filenames") or []) if str(f or "").strip()]
-    return {
+    components = {
         "schema_version": int(ctx.get("schema_version", SCHEMA_VERSION)),
         "format_version": int(ctx.get("format_version", FORMAT_VERSION)),
         "clip_identity": _s(ctx.get("clip_identity")),
@@ -290,6 +303,12 @@ def build_exact_key_components(ctx: Mapping[str, Any]) -> dict[str, Any]:
             "skip": _canonical_value(ctx.get("entry_skip", "")),
         },
     }
+    # Semantic-neutral conditioning-cache nonce (benchmark-only): conditional
+    # top-level field — absent when empty so the byte layout is unchanged.
+    _cache_nonce = str(ctx.get("cache_nonce") or "").strip()
+    if _cache_nonce:
+        components["cache_nonce"] = _cache_nonce
+    return components
 
 
 def exact_key_digest(components: Mapping[str, Any]) -> str:
@@ -320,13 +339,20 @@ def conditioning_cache_key_summary(
         key_hash = hashlib.sha256(
             _canonical_json(sorted(digests)).encode("utf-8")
         ).hexdigest()
-    return {
+    summary = {
         "key_hash": key_hash,
         "identity_status": "valid" if digests and not missing else "invalid",
         "schema_version": SCHEMA_VERSION,
         "validation_scope": _KEY_VALIDATION_SCOPE,
         "missing": ",".join(sorted(set(missing))),
     }
+    # Semantic-neutral conditioning-cache nonce (benchmark-only): surfaced so
+    # telemetry shows WHICH nonce isolated this key; absent when unused (the
+    # summary then carries no nonce key at all).
+    _nonce = str(base_ctx.get("cache_nonce") or "").strip()
+    if _nonce:
+        summary["cache_nonce"] = _nonce
+    return summary
 
 
 def _merge_entry_context(base_ctx: Mapping[str, Any], entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -795,6 +821,14 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _safe_getsize(path: str) -> int | None:
+    """Best-effort ``os.path.getsize``; ``None`` on any failure."""
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return None
+
+
 class ExactConditioningCache:
     """File-backed bounded LRU for exact CLIP conditioning entries."""
 
@@ -882,6 +916,51 @@ class ExactConditioningCache:
             "flush_count": 0,
             "fallback_sync_stores": 0,
         }
+        # ── Plan-time prefetch + in-memory cache (Task 2) ────────────────
+        # Plan-time background prefetch reads the manifest + entry bytes into
+        # memory so demand-time lookup can serve an exact hit without the
+        # cold Modal-Volume file reads.  ALL memory state is guarded by
+        # ``_prefetch_lock`` (SEPARATE from ``self._lock``; the two are never
+        # nested — the lookup path snapshots before acquiring ``self._lock``
+        # and defers memory-entry discards until after releasing it).  Any
+        # validation failure or self-store/commit invalidates the memory
+        # entries (fail closed to the normal file path).
+        self._prefetch_lock = threading.Lock()
+        self._mem_manifest: dict[str, Any] | None = None
+        self._mem_manifest_mono_ns: int = 0
+        self._mem_manifest_mtime_ns: int = 0
+        self._mem_manifest_size: int = 0
+        self._mem_payloads: dict[str, dict[str, Any]] = {}
+        self._mem_invalidated = False
+        self._prefetch_diag: dict[str, Any] = {
+            "prefetch_requested": 0,
+            "prefetch_loaded": 0,
+            "prefetch_failures": 0,
+            "prefetch_manifest_bytes": 0,
+            "prefetch_payload_bytes": 0,
+            "prefetch_wall_ms": 0.0,
+            "prefetch_reload_ms": 0.0,
+            "prefetch_source": "none",
+        }
+        # Throttle for the prefetch-time volume reload — a separate throttle
+        # from ``_maybe_reload``; its duration lives ONLY in the prefetch
+        # diagnostics (never in the lookup-path ``volume_reload_ms``).
+        # RUN-2: the FIRST prefetch of the container SKIPS the reload
+        # entirely (single-use request containers see the latest volume
+        # commit at mount); ``_prefetch_reload_count`` distinguishes the
+        # first prefetch from later ones (which keep the throttled reload).
+        self._prefetch_last_reload_mono: float | None = None
+        self._prefetch_reload_count: int = 0
+        self._prefetch_reload_interval_s = _env_float(
+            "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_PREFETCH_RELOAD_INTERVAL_S",
+            _DEFAULT_RELOAD_INTERVAL_S,
+        )
+        # RUN-2: in-flight prefetch join events keyed by request_id (guarded
+        # by ``_prefetch_lock``).  ``prefetch_entries`` registers an Event
+        # BEFORE any slow work and sets it in a ``finally``; the demand-time
+        # prefill hook calls ``join_prefetch`` (bounded) so the memory
+        # manifest/payloads are installed before the demand lookup.
+        self._prefetch_events: dict[str, threading.Event] = {}
         os.makedirs(self._entries_dir, exist_ok=True)
 
     # ── Commit hook (registered by the Modal prompt-cache volume owner) ──
@@ -904,6 +983,11 @@ class ExactConditioningCache:
         hook = self._commit_hook
         if hook is None:
             return True
+        # A commit may surface other containers' state and always follows a
+        # local self-store — prefetched in-memory bytes are superseded (fail
+        # closed).  No ``self._lock`` is held here (test-pinned), so the
+        # ``_prefetch_lock`` acquisition is safe.
+        self._invalidate_mem()
         try:
             hook()
             return True
@@ -1013,6 +1097,357 @@ class ExactConditioningCache:
                 pass
         return _removed
 
+    # ── Plan-time prefetch + in-memory cache (Task 2) ────────────────────
+
+    def _prefetch_maybe_reload(self) -> tuple[float, str]:
+        """Throttled Modal volume reload for the prefetch path only.
+
+        RUN-2: SKIPS the reload entirely on the FIRST prefetch of the
+        container (status ``skipped_first``) — single-use request containers
+        see the latest volume commit at mount, so the reload adds latency
+        without freshness (the explorer research documented this).  Later
+        prefetches keep the throttled reload (long-lived containers).  Any
+        reload duration is recorded ONLY in the prefetch diagnostics —
+        never in the lookup-path ``volume_reload_ms`` (test-pinned to ~0.0
+        on lookup).  Any failure is a miss.  Returns ``(reload_ms, status)``
+        where status is one of ``ran`` / ``skipped_first`` /
+        ``skipped_throttled`` / ``skipped_unmounted`` / ``skipped_no_hooks``.
+        """
+        if not self._mounted:
+            return 0.0, "skipped_unmounted"
+        if self._reload_hook is None and self._commit_hook is None:
+            return 0.0, "skipped_no_hooks"
+        if self._prefetch_reload_count == 0:
+            self._prefetch_reload_count = 1
+            return 0.0, "skipped_first"
+        now = time.monotonic()
+        if self._prefetch_last_reload_mono is not None:
+            if now - self._prefetch_last_reload_mono < self._prefetch_reload_interval_s:
+                return 0.0, "skipped_throttled"
+        _rl_start = time.monotonic_ns()
+        try:
+            if self._reload_hook is not None:
+                self._reload_hook()
+            else:
+                self._reload_volume()
+        except Exception:
+            pass
+        finally:
+            self._prefetch_last_reload_mono = time.monotonic()
+            self._prefetch_reload_count += 1
+        return round((time.monotonic_ns() - _rl_start) / 1_000_000, 3), "ran"
+
+    def _mem_state_snapshot(self) -> dict[str, Any]:
+        """Snapshot the prefetch memory state under ``_prefetch_lock``.
+
+        Called BEFORE acquiring ``self._lock`` so ``_prefetch_lock`` is never
+        nested inside it.  The snapshot holds the current manifest dict and
+        payload map references plus the prefetch diagnostics.
+        """
+        with self._prefetch_lock:
+            return {
+                "manifest": self._mem_manifest,
+                "manifest_mono_ns": self._mem_manifest_mono_ns,
+                "manifest_mtime_ns": self._mem_manifest_mtime_ns,
+                "manifest_size": self._mem_manifest_size,
+                "payloads": self._mem_payloads,
+                "invalidated": self._mem_invalidated,
+                "prefetch_diag": dict(self._prefetch_diag),
+            }
+
+    def _mem_manifest_stale(self, mem_state: Mapping[str, Any]) -> bool:
+        """True when the on-disk manifest no longer matches the prefetched
+        copy (mtime/size changed since the prefetch read)."""
+        if not mem_state.get("manifest"):
+            return True
+        try:
+            _st = os.stat(self._manifest_path)
+        except OSError:
+            return True
+        if not _st.st_size:
+            return False
+        if int(_st.st_mtime_ns) != int(mem_state.get("manifest_mtime_ns") or 0):
+            return True
+        if int(_st.st_size) != int(mem_state.get("manifest_size") or 0):
+            return True
+        return False
+
+    def _invalidate_mem_locked(self) -> None:
+        """Mark prefetched memory state stale.  Caller holds ``self._lock``;
+        the plain attribute write is GIL-atomic and never acquires
+        ``_prefetch_lock`` (the no-nesting rule holds)."""
+        self._mem_invalidated = True
+
+    def _invalidate_mem(self) -> None:
+        """Mark prefetched memory state stale (no ``self._lock`` held)."""
+        with self._prefetch_lock:
+            self._mem_invalidated = True
+
+    def _discard_mem_payloads(self, digests: set[str]) -> None:
+        """Drop failed memory entries.  Called OUTSIDE ``self._lock`` so
+        ``_prefetch_lock`` is never nested inside it."""
+        if not digests:
+            return
+        with self._prefetch_lock:
+            for _d in digests:
+                self._mem_payloads.pop(_d, None)
+
+    def prefetch_entries(
+        self,
+        base_ctx: Mapping[str, Any],
+        entries: list[Mapping[str, Any]],
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """Best-effort plan-time prefetch of exact conditioning entries.
+
+        Reads the manifest and each requested entry's header + data blob
+        into memory so a later demand-time ``lookup_many`` can serve an
+        exact hit without cold file reads.  Runs ONE throttled volume
+        reload (recorded only in the prefetch diagnostics).  Prefetch-time
+        validation mirrors the demand-time header rules (parse + format /
+        schema / format-version / key_hash + manifest byte_length); the
+        FULL canonical-key / model-identity / checksum validation still runs
+        at demand time on the in-memory bytes (fail closed).  Entries whose
+        files do not exist are skipped.  A missing manifest is recorded and
+        returns (fail-open to a plain demand-time miss).  Never raises,
+        never touches the coordinator pool, and never blocks lookups on the
+        prefetch lock.  Returns a small diagnostics dict
+        ``{requested, loaded, failures, manifest_bytes, payload_bytes,
+        wall_ms, source, prefetch_reload_ms}``.
+        """
+        _t0 = time.monotonic_ns()
+        _rid = str(request_id or "")
+        # RUN-2: register the in-flight join event BEFORE any slow work so a
+        # demand-time ``join_prefetch`` can wait for this prefetch.  The
+        # Event is set (and the registration dropped) in the ``finally``.
+        _done_event = threading.Event()
+        with self._prefetch_lock:
+            self._prefetch_events[_rid] = _done_event
+        diag: dict[str, Any] = {
+            "requested": 0,
+            "loaded": 0,
+            "failures": 0,
+            "manifest_bytes": 0,
+            "payload_bytes": 0,
+            "wall_ms": 0.0,
+            "source": "none",
+            "prefetch_reload": "",
+        }
+        try:
+            requested = list(entries) if isinstance(entries, (list, tuple)) else []
+            if requested:
+                diag["requested"] = len(requested)
+            _reload_ms, _reload_status = self._prefetch_maybe_reload()
+            diag["prefetch_reload"] = _reload_status
+            if _reload_ms:
+                diag["prefetch_reload_ms"] = _reload_ms
+            _mr_diag: dict[str, Any] = {}
+            try:
+                manifest = self._read_manifest(_diag=_mr_diag)
+            except Exception:
+                manifest = None
+            if manifest is not None:
+                diag["manifest_bytes"] = int(_mr_diag.get("manifest_read_bytes", 0))
+            if not manifest or not manifest.get("entries"):
+                # Missing/empty manifest: record and return.  The memory
+                # manifest is NOT installed so the demand path stays on the
+                # file read (fail-open to a normal miss).
+                diag["source"] = "manifest_missing"
+            else:
+                manifest_entries = {
+                    str(e.get("key_hash", "")): e
+                    for e in manifest.get("entries", [])
+                    if isinstance(e, Mapping) and e.get("key_hash")
+                }
+                mem_payloads: dict[str, dict[str, Any]] = {}
+                loaded = 0
+                failures = 0
+                payload_bytes = 0
+                for entry in requested:
+                    try:
+                        ctx = _merge_entry_context(base_ctx, entry)
+                        components = build_exact_key_components(ctx)
+                        missing = _key_usable(components)
+                        if missing:
+                            failures += 1
+                            continue
+                        digest = exact_key_digest(components)
+                        if digest not in manifest_entries:
+                            continue  # not in the manifest -> nothing to load
+                        header_path, data_path = self._entry_paths(digest)
+                        if not os.path.isfile(header_path) or not os.path.isfile(data_path):
+                            continue  # skip entries whose files don't exist
+                        with open(header_path, "rb") as _hf:
+                            header_bytes = _hf.read()
+                        header = json.loads(header_bytes.decode("utf-8"))
+                        if not isinstance(header, Mapping):
+                            failures += 1
+                            continue
+                        # Same header-level rules as _lookup_entry (full
+                        # canonical-key equality is deferred to demand time
+                        # on the in-memory bytes).
+                        if header.get("format") != FORMAT_NAME:
+                            failures += 1
+                            continue
+                        if header.get("schema_version") != SCHEMA_VERSION:
+                            failures += 1
+                            continue
+                        if header.get("format_version") != FORMAT_VERSION:
+                            failures += 1
+                            continue
+                        if header.get("key_hash") != digest:
+                            failures += 1
+                            continue
+                        with open(data_path, "rb") as _df:
+                            data_bytes = _df.read()
+                        if int(manifest_entries[digest].get("byte_length", -1)) != len(data_bytes):
+                            failures += 1
+                            continue
+                        mem_payloads[digest] = {
+                            "header_bytes": header_bytes,
+                            "data_bytes": data_bytes,
+                            "read_mono_ns": time.monotonic_ns(),
+                        }
+                        payload_bytes += len(data_bytes)
+                        loaded += 1
+                    except (OSError, json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+                        failures += 1
+                        continue
+                # ── RUN-6 (serve-by-components) fallback: also prefetch a
+                #    BOUNDED number of the manifest's existing entries, keyed
+                #    by their OWN stored digests (read from each header), so
+                #    a demand lookup whose plan-time digest drifted can still
+                #    be served via the component-match scan.  The plan-time
+                #    digest rarely equals a stored digest (compute_dtype /
+                #    tokenizer_identity approximations drift), so this is the
+                #    path that actually populates the payload memory store. ──
+                try:
+                    _prefetch_max_entries = max(
+                        0, min(8, int(os.environ.get(ENV_PREFETCH_MAX_ENTRIES, str(_PREFETCH_MAX_ENTRIES_DEFAULT)) or "0"))
+                    )
+                except (TypeError, ValueError):
+                    _prefetch_max_entries = _PREFETCH_MAX_ENTRIES_DEFAULT
+                _manifest_loaded = 0
+                for _manifest_entry in reversed(manifest.get("entries", [])):
+                    if _manifest_loaded >= _prefetch_max_entries:
+                        break
+                    if not isinstance(_manifest_entry, Mapping):
+                        continue
+                    _stored_digest = str(_manifest_entry.get("key_hash", "") or "")
+                    if not _stored_digest or _stored_digest in mem_payloads:
+                        continue
+                    _m_hdr_path, _m_data_path = self._entry_paths(_stored_digest)
+                    try:
+                        if not os.path.isfile(_m_hdr_path) or not os.path.isfile(_m_data_path):
+                            continue
+                        with open(_m_hdr_path, "rb") as _mhf:
+                            _m_header_bytes = _mhf.read()
+                        _m_header = json.loads(_m_header_bytes.decode("utf-8"))
+                        if not isinstance(_m_header, Mapping):
+                            continue
+                        _own_digest = str(_m_header.get("key_hash", "") or "")
+                        if not _own_digest or _own_digest in mem_payloads:
+                            continue
+                        # Same header-level rules as the plan-digest path.
+                        if (
+                            _m_header.get("format") != FORMAT_NAME
+                            or _m_header.get("schema_version") != SCHEMA_VERSION
+                            or _m_header.get("format_version") != FORMAT_VERSION
+                        ):
+                            continue
+                        with open(_m_data_path, "rb") as _mdf:
+                            _m_data_bytes = _mdf.read()
+                        if int(_manifest_entry.get("byte_length", -1)) != len(_m_data_bytes):
+                            continue
+                        mem_payloads[_own_digest] = {
+                            "header_bytes": _m_header_bytes,
+                            "data_bytes": _m_data_bytes,
+                            "read_mono_ns": time.monotonic_ns(),
+                        }
+                        payload_bytes += len(_m_data_bytes)
+                        loaded += 1
+                        _manifest_loaded += 1
+                    except (OSError, json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+                        continue
+                # Install the memory manifest even when zero payloads loaded
+                # (manifest-only prefetch still skips the cold manifest read).
+                with self._prefetch_lock:
+                    self._mem_manifest = dict(manifest)
+                    self._mem_manifest_mono_ns = _t0
+                    try:
+                        _st = os.stat(self._manifest_path)
+                        self._mem_manifest_mtime_ns = int(_st.st_mtime_ns)
+                        self._mem_manifest_size = int(_st.st_size)
+                    except OSError:
+                        self._mem_manifest_mtime_ns = 0
+                        self._mem_manifest_size = 0
+                    if mem_payloads:
+                        self._mem_payloads.update(mem_payloads)
+                    self._mem_invalidated = False
+                diag["loaded"] = loaded
+                diag["failures"] = failures
+                diag["payload_bytes"] = payload_bytes
+                diag["prefetch_payload_entries"] = loaded
+                diag["source"] = "full" if loaded else "manifest_only"
+        except Exception as exc:
+            diag["failures"] = diag.get("failures", 0) + 1
+            try:
+                print(
+                    f"[cache.prefetch] failed reason={type(exc).__name__}:{exc}"[:200],
+                    flush=True,
+                )
+            except Exception:
+                pass
+        finally:
+            # RUN-2: signal demand-time joiners that this prefetch finished
+            # (success OR failure) and drop the in-flight registration.
+            with self._prefetch_lock:
+                self._prefetch_events.pop(_rid, None)
+            _done_event.set()
+        diag["wall_ms"] = round((time.monotonic_ns() - _t0) / 1_000_000, 3)
+        with self._prefetch_lock:
+            self._prefetch_diag = {
+                "prefetch_requested": diag["requested"],
+                "prefetch_loaded": diag["loaded"],
+                "prefetch_failures": diag["failures"],
+                "prefetch_manifest_bytes": diag["manifest_bytes"],
+                "prefetch_payload_bytes": diag["payload_bytes"],
+                "prefetch_payload_entries": diag.get("prefetch_payload_entries", 0),
+                "prefetch_wall_ms": diag["wall_ms"],
+                "prefetch_reload_ms": diag.get("prefetch_reload_ms", 0.0),
+                "prefetch_reload": diag.get("prefetch_reload", ""),
+                "prefetch_source": diag["source"],
+            }
+        return diag
+
+    def join_prefetch(self, request_id: str = "", timeout_s: float = 1.5) -> bool:
+        """Bounded wait for an in-flight prefetch to complete.
+
+        RUN-2 demand-time join: the demand-time prefill hook calls this
+        right before ``lookup_many`` so the memory manifest/payloads are
+        installed before the demand lookup (converting a cold ~700ms file
+        path into a memory hit).  Returns True when no prefetch is in flight
+        for *request_id* or the in-flight prefetch completed within the
+        bound; False on timeout.  Never raises; never blocks longer than the
+        bound.  A bounded ``""``-key fallback is consulted when the exact
+        request-id has no in-flight prefetch (launches that carried no id
+        register under ``""``).  The Event is set in ``prefetch_entries``'s
+        ``finally`` on success OR failure.
+        """
+        _rid = str(request_id or "")
+        _event: threading.Event | None = None
+        with self._prefetch_lock:
+            _event = self._prefetch_events.get(_rid)
+            if _event is None and _rid:
+                _event = self._prefetch_events.get("")
+        if _event is None:
+            return True
+        try:
+            _bound = max(0.0, float(timeout_s or 0.0))
+        except (TypeError, ValueError):
+            _bound = 1.5
+        return _event.wait(timeout=_bound)
+
     # ── Lookup ──────────────────────────────────────────────────────────
     def _reload_volume(self) -> None:
         """Best-effort Modal volume reload so other containers' commits are
@@ -1056,6 +1491,18 @@ class ExactConditioningCache:
             "miss_count": 0,
             "total_ms": 0.0,
             "residual_ms": 0.0,
+            # Task 2: plan-time prefetch / in-memory cache fields (additive;
+            # never part of the measured-children sum).
+            "prefetch_requested": 0,
+            "prefetch_wall_ms": 0.0,
+            "prefetch_overlap_ms": 0.0,
+            "prefetch_source": "none",
+            "prefetch_reload": "",
+            "prefetch_payload_entries": 0,
+            "manifest_memory_hit": 0,
+            "payload_memory_hit": 0,
+            "payload_memory_source": "",
+            "normal_lookup_fallback": 0,
         }
         _t0 = time.monotonic_ns()
         if not entries:
@@ -1067,18 +1514,43 @@ class ExactConditioningCache:
             base_components = build_exact_key_components(base_ctx)
             diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
             if not _base_key_missing(base_components):
+                # ── Task 2: snapshot the prefetch memory state BEFORE taking
+                #    self._lock so _prefetch_lock is never nested inside it. ──
+                _mem_state = self._mem_state_snapshot()
+                _pf_diag = _mem_state.get("prefetch_diag") or {}
+                diag["prefetch_requested"] = int(_pf_diag.get("prefetch_requested", 0))
+                diag["prefetch_wall_ms"] = round(float(_pf_diag.get("prefetch_wall_ms", 0.0)), 3)
+                diag["prefetch_source"] = str(_pf_diag.get("prefetch_source", "none"))
+                diag["prefetch_reload"] = str(_pf_diag.get("prefetch_reload", "") or "")
+                diag["prefetch_payload_entries"] = int(_pf_diag.get("prefetch_payload_entries", 0))
+                _mem_discard_digests: set[str] = set()
                 _lw_start = time.monotonic_ns()
                 self._lock.acquire()
                 diag["lock_wait_ms"] = round((time.monotonic_ns() - _lw_start) / 1_000_000, 3)
                 try:
+                    # Re-check invalidation under self._lock: a store may have
+                    # enqueued between the snapshot and the lock acquisition.
+                    if self._mem_invalidated:
+                        _mem_state["invalidated"] = True
                     # NOTE: the lookup path performs ZERO Volume RPCs.  The
                     # only reload is the worker's throttled reload-before-
                     # batch inside _persist_batch(), which runs off the
                     # foreground path.  ``volume_reload_ms`` stays ~0.0 so
                     # downstream consumers keep reading the key.
-                    _mr_start = time.monotonic_ns()
-                    manifest = self._read_manifest(_diag=diag)
-                    diag["manifest_read_ms"] = round((time.monotonic_ns() - _mr_start) / 1_000_000, 3)
+                    manifest = None
+                    if (
+                        _mem_state.get("manifest") is not None
+                        and not _mem_state.get("invalidated")
+                        and not self._mem_manifest_stale(_mem_state)
+                    ):
+                        # Fresh prefetched manifest: serve from memory (the
+                        # manifest is NOT re-read from disk).
+                        manifest = _mem_state["manifest"]
+                        diag["manifest_memory_hit"] = 1
+                    if manifest is None:
+                        _mr_start = time.monotonic_ns()
+                        manifest = self._read_manifest(_diag=diag)
+                        diag["manifest_read_ms"] = round((time.monotonic_ns() - _mr_start) / 1_000_000, 3)
                     diag["manifest_entries"] = len(manifest.get("entries", []))
                     manifest_entries = {
                         str(e.get("key_hash", "")): e
@@ -1098,7 +1570,12 @@ class ExactConditioningCache:
                         digest = exact_key_digest(components)
                         diag["key_build_digest_ms"] += round((time.monotonic_ns() - _kb_start) / 1_000_000, 3)
                         _el_start = time.monotonic_ns()
-                        value = self._lookup_entry(components, digest, manifest_entries, _diag=diag)
+                        value, _discard_mem = self._lookup_entry_maybe_mem(
+                            components, digest, manifest_entries, _mem_state,
+                            _diag=diag, _lookup_start_mono=_t0,
+                        )
+                        if _discard_mem:
+                            _mem_discard_digests.add(digest)
                         diag["entry_lookup_ms"] += round((time.monotonic_ns() - _el_start) / 1_000_000, 3)
                         if value is None:
                             misses.append(dict(entry))
@@ -1122,6 +1599,11 @@ class ExactConditioningCache:
                         )
                 finally:
                     self._lock.release()
+                # ── Post-lock: discard memory entries whose in-memory bytes
+                #    failed validation (never nest _prefetch_lock inside
+                #    self._lock) ──
+                if _mem_discard_digests:
+                    self._discard_mem_payloads(_mem_discard_digests)
             else:
                 missing = _base_key_missing(base_components)
                 _log_decision(
@@ -1158,37 +1640,32 @@ class ExactConditioningCache:
         self._set_lookup_diag(diag)
         return hits, misses, len(hits), len(misses)
 
-    def _lookup_entry(
+    def _validate_entry_bytes(
         self,
+        header_bytes: bytes,
+        data_bytes: bytes,
         components: Mapping[str, Any],
         digest: str,
-        manifest_entries: Mapping[str, Any],
+        manifest_byte_length: int,
         _diag: dict[str, Any] | None = None,
     ) -> Any:
-        """Validate and deserialize one entry.  Every mismatch is a miss."""
-        if digest not in manifest_entries:
-            return None
-        header_path, data_path = self._entry_paths(digest)
+        """Validate + deserialize one entry from bytes (on-disk or memory).
+
+        The SAME validation sequence runs for the file path
+        (``_lookup_entry``) and the in-memory prefetch path
+        (``_lookup_entry_maybe_mem``) so the two are provably identical:
+        header parse, format/schema/format-version, ``key_hash == digest``,
+        full canonical key equality vs the live components, model identity
+        equality, manifest ``byte_length``, then
+        ``deserialize_conditioning`` with the payload + per-tensor
+        checksums.  Returns the conditioning value or ``None`` (fail
+        closed).  Never raises.
+        """
         try:
-            if not os.path.isfile(header_path) or not os.path.isfile(data_path):
-                return None
-            _hdr_start = 0
-            if _diag is not None and _OPT_DIAG:
-                _hdr_start = time.monotonic_ns()
-            with open(header_path, "r", encoding="utf-8") as f:
-                header_text = f.read()
-            if _diag is not None:
-                _diag["header_bytes_read"] = _diag.get("header_bytes_read", 0) + len(
-                    header_text.encode("utf-8")
-                )
-            if _diag is not None and _OPT_DIAG:
-                _diag["entry_header_open_read_ms"] = _diag.get(
-                    "entry_header_open_read_ms", 0.0
-                ) + round((time.monotonic_ns() - _hdr_start) / 1_000_000, 3)
             _hp_start = 0
             if _diag is not None and _OPT_DIAG:
                 _hp_start = time.monotonic_ns()
-            header = json.loads(header_text)
+            header = json.loads(header_bytes.decode("utf-8"))
             if _diag is not None and _OPT_DIAG:
                 _diag["entry_header_parse_ms"] = _diag.get(
                     "entry_header_parse_ms", 0.0
@@ -1216,33 +1693,204 @@ class ExactConditioningCache:
                 _diag["entry_header_validate_ms"] = _diag.get(
                     "entry_header_validate_ms", 0.0
                 ) + round((time.monotonic_ns() - _hv_start) / 1_000_000, 3)
-            _d_start = 0
-            if _diag is not None and _OPT_DIAG:
-                _d_start = time.monotonic_ns()
-            with open(data_path, "rb") as f:
-                data = f.read()
-            if _diag is not None:
-                _diag["data_bytes_read"] = _diag.get("data_bytes_read", 0) + len(data)
-            if _diag is not None and _OPT_DIAG:
-                _diag["entry_data_open_read_ms"] = _diag.get(
-                    "entry_data_open_read_ms", 0.0
-                ) + round((time.monotonic_ns() - _d_start) / 1_000_000, 3)
-                _diag["entry_data_bytes"] = len(data)
-            if int(manifest_entries[digest].get("byte_length", -1)) != len(data):
+            if int(manifest_byte_length) != len(data_bytes):
                 return None
             _de_start = 0
             if _diag is not None and _OPT_DIAG:
                 _de_start = time.monotonic_ns()
             value = deserialize_conditioning(
-                header, data, _diag=_diag if _OPT_DIAG else None
+                header, data_bytes, _diag=_diag if _OPT_DIAG else None
             )
             if _diag is not None and _OPT_DIAG:
                 _diag["entry_deserialize_ms"] = _diag.get(
                     "entry_deserialize_ms", 0.0
                 ) + round((time.monotonic_ns() - _de_start) / 1_000_000, 3)
-            if value is None:
-                return None
             return value
+        except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+            return None
+
+    def _lookup_entry_maybe_mem(
+        self,
+        components: Mapping[str, Any],
+        digest: str,
+        manifest_entries: Mapping[str, Any],
+        mem_state: Mapping[str, Any] | None,
+        *,
+        _diag: dict[str, Any] | None = None,
+        _lookup_start_mono: int = 0,
+    ) -> tuple[Any, bool]:
+        """Serve one entry from the prefetched memory cache when valid.
+
+        Runs the IDENTICAL validation sequence on the in-memory bytes as
+        the file path.  On success the memory copy is served (bytes-served
+        accounting still reports the on-disk file sizes).  On ANY validation
+        failure the memory copy is discarded (deferred by the caller until
+        ``self._lock`` is released) and the normal file path runs (fail
+        closed).
+
+        RUN-6 (serve-by-components): when the digest-keyed memory entry
+        misses, the prefetched payloads (keyed by their OWN stored digests)
+        are scanned and each is validated against the LIVE components with
+        the SAME rigorous rules — because the stored key_hash equals the
+        demand digest IFF the stored canonical components equal the live
+        ones, a pass here is a provably-exact match.  Any pass serves
+        (``payload_memory_source=component_match``); none -> cold file path.
+
+        Returns ``(value_or_None, discard_mem_digest)``.
+        """
+        header_path, data_path = self._entry_paths(digest)
+        mem_payload = None
+        mem_payloads_snapshot = None
+        if (
+            mem_state is not None
+            and not mem_state.get("invalidated")
+            and mem_state.get("manifest") is not None
+        ):
+            mem_payloads_snapshot = mem_state.get("payloads") or {}
+            mem_payload = mem_payloads_snapshot.get(digest)
+        if mem_payload is not None:
+            if _diag is not None:
+                _diag["manifest_memory_hit"] = 1
+            _manifest_byte_length = -1
+            _manifest_entry = manifest_entries.get(digest)
+            if _manifest_entry is not None:
+                _manifest_byte_length = int(_manifest_entry.get("byte_length", -1))
+            value = self._validate_entry_bytes(
+                mem_payload["header_bytes"],
+                mem_payload["data_bytes"],
+                components,
+                digest,
+                _manifest_byte_length,
+                _diag=_diag,
+            )
+            if value is None:
+                if _diag is not None:
+                    _diag["normal_lookup_fallback"] = _diag.get("normal_lookup_fallback", 0) + 1
+                return self._lookup_entry(components, digest, manifest_entries, _diag=_diag), True
+            if _diag is not None:
+                _diag["payload_memory_hit"] = _diag.get("payload_memory_hit", 0) + 1
+                _diag["payload_memory_source"] = "key_hit"
+                # Bytes SERVED still report the on-disk file sizes (telemetry
+                # pin); the lengths of the in-memory copies are the fallback
+                # when the files have since been removed.
+                _h_size = _safe_getsize(header_path)
+                _d_size = _safe_getsize(data_path)
+                _diag["header_bytes_read"] = _diag.get("header_bytes_read", 0) + (
+                    _h_size if _h_size is not None else len(mem_payload["header_bytes"])
+                )
+                _diag["data_bytes_read"] = _diag.get("data_bytes_read", 0) + (
+                    _d_size if _d_size is not None else len(mem_payload["data_bytes"])
+                )
+                if _lookup_start_mono and mem_payload.get("read_mono_ns"):
+                    _diag["prefetch_overlap_ms"] = max(
+                        0, (_lookup_start_mono - int(mem_payload["read_mono_ns"])) / 1_000_000
+                    )
+            return value, False
+        # ── RUN-6 component-match scan (digest-keyed miss) ────────────────
+        if mem_payloads_snapshot:
+            for _cand_digest, _cand in mem_payloads_snapshot.items():
+                # Use the candidate's OWN header key_hash for the manifest
+                # byte_length lookup (the dict key may differ from the header
+                # key_hash when a payload was keyed by a drifted plan digest).
+                _cand_key_hash = _cand_digest
+                try:
+                    _cand_hdr = json.loads(_cand["header_bytes"].decode("utf-8"))
+                    _hdr_hash = str((_cand_hdr or {}).get("key_hash", "") or "")
+                    if _hdr_hash:
+                        _cand_key_hash = _hdr_hash
+                except Exception:
+                    pass
+                _cand_byte_length = -1
+                _cand_manifest = manifest_entries.get(_cand_key_hash)
+                if _cand_manifest is not None:
+                    _cand_byte_length = int(_cand_manifest.get("byte_length", -1))
+                try:
+                    _scan_value = self._validate_entry_bytes(
+                        _cand["header_bytes"],
+                        _cand["data_bytes"],
+                        components,
+                        digest,
+                        _cand_byte_length,
+                        _diag=None,
+                    )
+                except Exception:
+                    _scan_value = None
+                if _scan_value is None:
+                    continue
+                if _diag is not None:
+                    _diag["manifest_memory_hit"] = 1
+                    _diag["payload_memory_hit"] = _diag.get("payload_memory_hit", 0) + 1
+                    _diag["payload_memory_source"] = "component_match"
+                    _h_size = _safe_getsize(header_path)
+                    _d_size = _safe_getsize(data_path)
+                    _diag["header_bytes_read"] = _diag.get("header_bytes_read", 0) + (
+                        _h_size if _h_size is not None else len(_cand["header_bytes"])
+                    )
+                    _diag["data_bytes_read"] = _diag.get("data_bytes_read", 0) + (
+                        _d_size if _d_size is not None else len(_cand["data_bytes"])
+                    )
+                    if _lookup_start_mono and _cand.get("read_mono_ns"):
+                        _diag["prefetch_overlap_ms"] = max(
+                            0, (_lookup_start_mono - int(_cand["read_mono_ns"])) / 1_000_000
+                        )
+                # Best-effort re-key under the demand digest so later
+                # lookups hit the digest-keyed path directly.
+                try:
+                    with self._prefetch_lock:
+                        self._mem_payloads.setdefault(digest, _cand)
+                except Exception:
+                    pass
+                return _scan_value, False
+        return self._lookup_entry(components, digest, manifest_entries, _diag=_diag), False
+
+    def _lookup_entry(
+        self,
+        components: Mapping[str, Any],
+        digest: str,
+        manifest_entries: Mapping[str, Any],
+        _diag: dict[str, Any] | None = None,
+    ) -> Any:
+        """Validate and deserialize one entry from disk.  Every mismatch is a miss."""
+        if digest not in manifest_entries:
+            return None
+        header_path, data_path = self._entry_paths(digest)
+        try:
+            if not os.path.isfile(header_path) or not os.path.isfile(data_path):
+                return None
+            _hdr_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _hdr_start = time.monotonic_ns()
+            with open(header_path, "r", encoding="utf-8") as f:
+                header_text = f.read()
+            header_bytes = header_text.encode("utf-8")
+            if _diag is not None:
+                _diag["header_bytes_read"] = _diag.get("header_bytes_read", 0) + len(
+                    header_bytes
+                )
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_header_open_read_ms"] = _diag.get(
+                    "entry_header_open_read_ms", 0.0
+                ) + round((time.monotonic_ns() - _hdr_start) / 1_000_000, 3)
+            _d_start = 0
+            if _diag is not None and _OPT_DIAG:
+                _d_start = time.monotonic_ns()
+            with open(data_path, "rb") as f:
+                data_bytes = f.read()
+            if _diag is not None:
+                _diag["data_bytes_read"] = _diag.get("data_bytes_read", 0) + len(data_bytes)
+            if _diag is not None and _OPT_DIAG:
+                _diag["entry_data_open_read_ms"] = _diag.get(
+                    "entry_data_open_read_ms", 0.0
+                ) + round((time.monotonic_ns() - _d_start) / 1_000_000, 3)
+                _diag["entry_data_bytes"] = len(data_bytes)
+            return self._validate_entry_bytes(
+                header_bytes,
+                data_bytes,
+                components,
+                digest,
+                int(manifest_entries[digest].get("byte_length", -1)),
+                _diag=_diag,
+            )
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return None
 
@@ -1536,6 +2184,11 @@ class ExactConditioningCache:
             self._pending.append(payload)
             if digest:
                 self._pending_keys.add(digest)
+            # A self-store supersedes any prefetched bytes for this key (and
+            # the manifest rewrite that follows invalidates the whole memory
+            # manifest): fail closed so stale prefetched bytes are never
+            # served.  Caller holds self._lock via self._queue_cond.
+            self._invalidate_mem_locked()
             self._accumulate_worker("enqueued", 1)
             self._set_last_store_reason("")
             self._set_worker("queue_depth", len(self._pending))
@@ -1708,6 +2361,10 @@ class ExactConditioningCache:
                 _removed = self._remove_unindexed_files(manifest)
                 self._accumulate_worker("unindexed_files_removed", _removed)
                 self._dirty_since_commit = True
+                # A batch was written + the manifest rewritten: any
+                # prefetched in-memory bytes are superseded (fail closed).
+                # Caller holds self._lock here.
+                self._invalidate_mem_locked()
             # ── LEAVE the RLock before the commit RPC ─────────────────────
             _cm_start = time.monotonic_ns()
             commit_ok = self._commit()

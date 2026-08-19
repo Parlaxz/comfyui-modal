@@ -138,7 +138,7 @@ class TestLegacyOptionPassthrough(unittest.TestCase):
         self.assertEqual(restored.profiling_level, "full")
         self.assertEqual(
             restored.output_conversion_options.get("format"),
-            "webp",
+            "webp_lossy",
         )
 
     def test_empty_legacy_produces_defaults(self):

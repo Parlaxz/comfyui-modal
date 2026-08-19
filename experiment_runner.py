@@ -904,6 +904,23 @@ class ExperimentRunner:
             ]
             terminal_payload["error"] = (ck_errors[-1] if ck_errors else "checkpoint failed")[:200]
         await self._emit(terminal_event, terminal_payload)
+        # History V2: persist the experiment terminal state (idempotent).
+        try:
+            if not self._compilation.get("run_history_id"):
+                from history_v2_writer import get_writer as _get_v2_writer
+                _v2_w = _get_v2_writer()
+                if _v2_w is not None:
+                    if self._stop_mode:
+                        _v2_status = "stopped"
+                    elif has_fatal_checkpoint:
+                        _v2_status = "failed"
+                    elif failed > 0:
+                        _v2_status = "completed_with_failures"
+                    else:
+                        _v2_status = "completed"
+                    _v2_w.finalize_experiment(self._compilation.get("experiment_id", ""), _v2_status)
+        except Exception:
+            pass
         return {"completed": completed, "failed": failed, "interrupted": interrupted, "total_cells": total_cells}
 
     async def _run_checkpoint(self, ck: dict, cells: list, sem: asyncio.Semaphore) -> None:
@@ -1059,6 +1076,43 @@ class ExperimentRunner:
                         if tp:
                             cell_completed_payload["timing_payload"] = tp
                         await self._emit("cell.completed", cell_completed_payload)
+                    # History V2 mirror (Studio experiments; idempotent).
+                    if not self._compilation.get("run_history_id"):
+                        try:
+                            from history_v2_writer import get_writer as _get_v2_writer
+                            _v2_w = _get_v2_writer()
+                            if _v2_w is not None:
+                                _v2_tp = result.get("timing_payload")
+                                _v2_w.mirror_cell_terminal(
+                                    self._compilation.get("experiment_id", ""),
+                                    cell_key=str(cell.get("cell_key", "")),
+                                    attempt_id=str(attempt_id),
+                                    status="completed",
+                                    checkpoint_id=str(ck["id"]),
+                                    sequence=cell.get("sequence"),
+                                    axis_values=dict(cell.get("axis_values") or {}),
+                                    params={
+                                        "prompt": cell.get("prompt", ""),
+                                        "negative_prompt": cell.get("negative_prompt", ""),
+                                        "seed": cell.get("seed"),
+                                        "steps": cell.get("steps"),
+                                        "guidance": cell.get("guidance"),
+                                        "sampler": cell.get("sampler", ""),
+                                        "scheduler": cell.get("scheduler", ""),
+                                        "denoise": cell.get("denoise"),
+                                        "width": cell.get("width"),
+                                        "height": cell.get("height"),
+                                        "unet": cell.get("unet", ""),
+                                        "clip": cell.get("clip", ""),
+                                        "vae": cell.get("vae", ""),
+                                        "lora_chain": cell.get("lora_chain", []),
+                                    },
+                                    output_paths=[str(p) for p in (result.get("output_paths") or [])],
+                                    workflow_hash=str(cell.get("workflow_hash", "") or ck.get("workflow_hash", "") or ""),
+                                    timings=dict(_v2_tp) if isinstance(_v2_tp, dict) else None,
+                                )
+                        except Exception:
+                            pass
                     if result.get("status") == "completed":
                         ck_completed += 1
                     elif result.get("status") == "interrupted":
@@ -1083,6 +1137,42 @@ class ExperimentRunner:
                             if tp:
                                 cell_failed_payload["timing_payload"] = tp
                             await self._emit("cell.failed", cell_failed_payload)
+                            # History V2 mirror (Studio experiments; idempotent).
+                            if not self._compilation.get("run_history_id"):
+                                try:
+                                    from history_v2_writer import get_writer as _get_v2_writer
+                                    _v2_w = _get_v2_writer()
+                                    if _v2_w is not None:
+                                        _v2_w.mirror_cell_terminal(
+                                            self._compilation.get("experiment_id", ""),
+                                            cell_key=str(cell.get("cell_key", "")),
+                                            attempt_id=str(attempt_id),
+                                            status="failed",
+                                            checkpoint_id=str(ck["id"]),
+                                            error=str(result.get("error", "Cell execution failed")),
+                                            sequence=cell.get("sequence"),
+                                            axis_values=dict(cell.get("axis_values") or {}),
+                                            params={
+                                                "prompt": cell.get("prompt", ""),
+                                                "negative_prompt": cell.get("negative_prompt", ""),
+                                                "seed": cell.get("seed"),
+                                                "steps": cell.get("steps"),
+                                                "guidance": cell.get("guidance"),
+                                                "sampler": cell.get("sampler", ""),
+                                                "scheduler": cell.get("scheduler", ""),
+                                                "denoise": cell.get("denoise"),
+                                                "width": cell.get("width"),
+                                                "height": cell.get("height"),
+                                                "unet": cell.get("unet", ""),
+                                                "clip": cell.get("clip", ""),
+                                                "vae": cell.get("vae", ""),
+                                                "lora_chain": cell.get("lora_chain", []),
+                                            },
+                                            output_paths=[],
+                                            workflow_hash=str(cell.get("workflow_hash", "") or ck.get("workflow_hash", "") or ""),
+                                        )
+                                except Exception:
+                                    pass
                 # Determine checkpoint completion type
                 if self._pause_requested:
                     final_type = "checkpoint.paused"

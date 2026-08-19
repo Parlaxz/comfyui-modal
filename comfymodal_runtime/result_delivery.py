@@ -170,6 +170,9 @@ def build_materialized_output_entry(
         "asset_id": remote_entry.get("asset_id", ""),
         "identity": remote_entry.get("identity", ""),
         "backend_path": remote_entry.get("backend_path", remote_entry.get("path", "")),
+        "output_mode": remote_entry.get("output_mode", "original"),
+        "variant": remote_entry.get("variant", remote_entry.get("output_mode", "original")),
+        "logical_output_key": remote_entry.get("logical_output_key", ""),
     }
 
 
@@ -384,13 +387,27 @@ def convert_output_items(
         mime_type = meta_dict.get("mime_type", item.mime_type)
         file_ext = meta_dict.get("file_ext", item.file_ext)
         conv_time = float(meta_dict.get("conversion_time_ms", 0) or 0)
+        converted_format = str(meta_dict.get("output_format") or output_format)
 
         conv_meta = _make_conversion_meta(
             raw_bytes=converted_bytes,
-            format=output_format,
+            format=converted_format,
             mime_type=mime_type,
             file_ext=file_ext,
             conversion_time_ms=conv_time,
+            codec=str(meta_dict.get("codec", "") or ""),
+            quality=(
+                int(meta_dict["quality"])
+                if meta_dict.get("quality") is not None else None
+            ),
+            webp_lossless_compression=(
+                str(meta_dict["webp_lossless_compression"])
+                if meta_dict.get("webp_lossless_compression") is not None else None
+            ),
+            output_codec_ms=float(meta_dict.get("output_codec_ms", 0) or 0),
+            encoded_bytes=int(meta_dict.get("encoded_bytes", len(converted_bytes)) or len(converted_bytes)),
+            source_bytes=int(meta_dict.get("source_bytes", 0) or 0),
+            conversion_fallback=bool(meta_dict.get("conversion_fallback", meta_dict.get("fallback", False))),
         )
 
         new_item = OutputItem(
@@ -407,7 +424,7 @@ def convert_output_items(
             height=item.height,
             output_index=item.output_index,
             comparison_side=item.comparison_side,
-            format=output_format,
+            format=converted_format,
             animated=item.animated,
             conversion_meta=conv_meta,
         )
@@ -704,6 +721,11 @@ def materialize_modal_result(
             "byte_count": primary_entry.get("byte_count", 0),
             "asset_id": primary_entry.get("asset_id", ""),
             "backend_path": primary_entry.get("backend_path", ""),
+            "output_mode": primary_entry.get("output_mode", adapted.get("output_mode", "original")),
+            "variant": primary_entry.get(
+                "variant", adapted.get("variant", adapted.get("output_mode", "original"))
+            ),
+            "logical_output_key": primary_entry.get("logical_output_key", ""),
         }
 
     # Auto-save primary output

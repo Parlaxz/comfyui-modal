@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
 from tests.v2_baseline_fixtures import BASELINE_EXPECTED, BASELINE_ROWS
+from comfymodal_runtime.v2_waterfall import _detail_is_useful
 from tools.v2_waterfall import (
     build_waterfall,
     render_comparison,
@@ -92,9 +95,8 @@ def test_complete_trace_has_required_non_overlapping_rows_and_reconciles():
     assert [stage.key for stage in report.stages] == [
         "local_preparation", "modal_handle_submission", "modal_scheduling",
         "pre_python_snapshot_restore", "application_restore", "restore_to_method_entry",
-        "method_entry_to_unet_claim",
-        "unet_claim_to_ready", "remote_method_setup",
-        "prompt_executor_cache_setup", "first_node_to_clip", "clip_to_sampler_node",
+        "remote_method_setup",
+        "prompt_executor_cache_setup", "pre_sampler_execution",
         "sampler_graph_join_wait", "sampler_node_to_sampling", "sampling", "post_sampling_transition", "vae", "output_persistence",
         "remote_return_handoff", "remote_local_return",
     ]
@@ -109,10 +111,100 @@ def test_missing_values_are_unavailable_not_zero():
     report = build_waterfall(result={"trace": {"events": []}}, timing={}, wall_ms=100)
     assert all(stage.duration_ms is None for stage in report.stages)
     assert "residual" not in {stage.key for stage in report.stages}
-    assert report.residual_ms == 100.0
+    # Without a scheduling boundary the non-scheduling wall is unresolved: the
+    # gap is reported honestly (UNRESOLVED), never fabricated into a residual.
+    assert report.total_wall_ms is None
+    assert report.non_scheduling_ms is None
+    assert report.scheduling_time_ms is None
+    assert report.residual_ms is None
+    assert report.reconciliation_ms is None
+    assert report.reconciliation_status == "UNRESOLVED"
     output = render_waterfall(report, terminal_columns=132)
-    assert "-" in output
+    assert "REMOTE/PARTIAL" in output
+    assert "PENDING_HOST_RECONCILIATION" in output
     assert "Residual (unattributed)" not in output
+    # REMOTE/PARTIAL renders a REAL boxed table (empty here — no remote stage
+    # is measurable) with the same border geometry as the reconciled table, and
+    # still no '#' bars, no percentages, no fake TOTAL WALL number.
+    assert "+-----+" in output
+    assert "|   # | Stage" in output
+    # The conclusive footer's scheduling values are pending remotely.
+    pending_footer = [
+        line for line in output.splitlines()
+        if line.startswith("Command (without scheduling) -> Response:")
+        or line.startswith("Scheduling time:")
+    ]
+    assert len(pending_footer) == 2
+    assert all("awaiting host reconciliation" in line for line in pending_footer)
+    assert output.count("#") == 1  # only the '#' column-header label
+    assert output.count("%") == 1  # only the '%' column header
+    assert "|     | STATUS" in output
+
+
+def test_remote_partial_renders_real_table_with_stage_rows():
+    """A RUN-3-shaped partial (remote stages measured, scheduling / restore-
+    begin / local-receipt boundaries missing) renders a REAL boxed table:
+    numbered stage rows carry durations and cumulative, the '%' column renders
+    '-', the bar column is blank (no '#' anywhere but the header label), and
+    no fake TOTAL WALL number is printed."""
+    from tests.v2_waterfall_reconciliation_fixtures import (
+        build_real_run_result,
+        command_start_ms,
+        response_ns_for,
+    )
+    result = build_real_run_result(boundaries=False, restore_begin=False)
+    report = build_waterfall(
+        result=result,
+        timing={},
+        wall_ms=None,
+        command_start_unix_ms=command_start_ms(),
+        response_received_unix_ns=response_ns_for(result["wall_ms"]),
+    )
+    assert report.partial_waterfall is True
+    rendered = render_waterfall(report, terminal_columns=132)
+    assert "V2 COLD WATERFALL - REMOTE/PARTIAL (awaiting host reconciliation)" in rendered
+    assert "PENDING_HOST_RECONCILIATION" in rendered
+    assert "|   # | Stage" in rendered
+    numbered = [
+        line for line in rendered.splitlines()
+        if line.startswith("| ") and line.split("|")[1].strip().isdigit()
+    ]
+    assert numbered
+    for line in numbered:
+        parts = line.split("|")
+        assert parts[3].strip() != "-", line          # duration present
+        assert parts[4].strip() != "-", line          # cumulative present
+        assert parts[5].strip() == "-", line          # '%' renders '-' (never a number)
+        assert parts[6].strip() == "", line           # bar column blank
+        assert "#" not in line and "%" not in line, line
+    assert rendered.count("#") == 1                   # only the '#' header label
+    # The scheduling values are pending remotely: the conclusive footer lines
+    # carry the intermediate diagnostic token; the command->response window IS
+    # measurable so it renders a real value.
+    footer_pending = [
+        line for line in rendered.splitlines()
+        if line.startswith("Command (without scheduling) -> Response:")
+        or line.startswith("Scheduling time:")
+    ]
+    assert len(footer_pending) == 2
+    assert all("awaiting host reconciliation" in line for line in footer_pending)
+    assert "COMMAND -> RESPONSE:" in rendered
+    assert "|     | RECONCILIATION" in rendered
+    # The STATUS footer cell holds the short 'PENDING' token; the full token
+    # is a post-table plain line — nothing overflows the boxed border.
+    status_footer = next(line for line in rendered.splitlines() if "| STATUS" in line)
+    assert status_footer.split("|")[3].strip() == "PENDING"
+    assert "status=PENDING_HOST_RECONCILIATION" in rendered
+    # Every boxed row ends exactly at the border rule width (no overflow).
+    rules = [line for line in rendered.splitlines() if line.startswith("+-----+")]
+    assert rules
+    rule_len = len(rules[0])
+    assert all(
+        len(line) == rule_len
+        for line in rendered.splitlines()
+        if line.startswith("|") or line.startswith("+")
+    )
+    assert all(ord(character) < 128 for character in rendered)
 
 
 def test_cross_process_uses_wall_and_same_process_uses_monotonic():
@@ -168,12 +260,14 @@ def test_reconciliation_warning_and_tolerance():
 
 
 def test_widths_long_labels_details_and_comparison():
-    report = build_waterfall(result=_complete_result(), timing={}, wall_ms=12100, command_start_unix_ms=1000, response_received_unix_ns=13100 * 1_000_000, run_label="a very long run label")
-    for width in (90, 110, 132, 180, 220):
-        rendered = render_waterfall(report, terminal_columns=width)
-        assert "V2 COLD WATERFALL" in rendered
-        assert "PromptExecutor/cache setup" in rendered
-        assert "detail:" in rendered
+    report = build_waterfall(result=_complete_result(), timing={}, wall_ms=12100, command_start_unix_ms=1000, response_received_unix_ns=13100 * 1_000_000, modal_restore_begin_wall_unix_ns=3500 * 1_000_000, run_label="a very long run label")
+    # The console layout is a single fixed-width ASCII table; terminal width
+    # does not change it, and there is no secondary "detail:" section.
+    outputs = [render_waterfall(report, terminal_columns=width) for width in (90, 110, 132, 180, 220)]
+    assert all("V2 COLD WATERFALL" in out for out in outputs)
+    assert all("PromptExecutor/cache setup" in out for out in outputs)
+    assert all("detail:" not in out for out in outputs)
+    assert len({len(out) for out in outputs}) == 1  # width-independent layout
     comparison = render_comparison([report, report, report])
     assert "THREE-RUN COLD COMPARISON" in comparison
     assert "Median:" in comparison
@@ -197,9 +291,21 @@ def test_structured_report_contains_details_excluded_from_totals():
 
 
 def test_serialized_report_render_keeps_detail_rows():
-    report = build_waterfall(result=_complete_result(), timing={}, wall_ms=12100, command_start_unix_ms=1000, response_received_unix_ns=13100 * 1_000_000)
+    report = build_waterfall(result=_complete_result(), timing={}, wall_ms=12100, command_start_unix_ms=1000, response_received_unix_ns=13100 * 1_000_000, modal_restore_begin_wall_unix_ns=3500 * 1_000_000)
     rendered = render_waterfall(waterfall_to_dict(report), terminal_columns=132)
-    assert rendered.count("detail:") == len(report.details)
+    # Inline curated detail rows are indented under their parent (2-space label
+    # indent, blank number column).  Unavailable/zero/duplicative optional rows
+    # are omitted from the console but preserved in the serialized details list.
+    inline_rows = sum(
+        1 for line in rendered.splitlines()
+        if line.startswith("| ") and line.split("|")[1].strip() == ""
+        and line.split("|")[2].startswith("  ")
+    )
+    shown_details = [d for d in report.details if _detail_is_useful(d)]
+    assert inline_rows == len(shown_details), (
+        f"{inline_rows} inline rows != {len(shown_details)} rendered details"
+    )
+    assert len(waterfall_to_dict(report)["details"]) == len(report.details)
 
 
 def test_request_origin_and_residual_close_accounting_gap():
@@ -235,13 +341,15 @@ def test_request_origin_and_residual_close_accounting_gap():
     )
     residual_stages = {stage.key: stage for stage in residual_report.stages}
     assert "residual" not in residual_stages
-    assert residual_report.residual_ms == 29000.0
-    # The generic residual is the UNATTRIBUTED gap, not a measured stage:
-    # it must NOT be folded into the accounted total or fabricated into a
+    # The generic gap is the UNATTRIBUTED platform interval, never a measured
+    # stage and never fabricated: with TOTAL WALL unresolved, reconciliation
+    # stays honestly UNRESOLVED rather than a fake zero.
+    assert residual_report.residual_ms is None
+    assert residual_report.reconciliation_ms is None
+    assert residual_report.reconciliation_status == "UNRESOLVED"
+    # It must NOT be folded into the accounted total or fabricated into a
     # perfect reconciliation (accounted == total, reconciliation == 0).
     assert residual_report.accounted_ms != residual_report.total_ms
-    assert residual_report.reconciliation_ms != 0.0
-    assert any("reconciliation" in warning or "unaccounted" in warning for warning in residual_report.warnings)
 
 
 def test_modal_restore_begin_boundary_splits_scheduling_and_pre_python_restore():
@@ -296,31 +404,41 @@ def test_missing_restore_begin_flags_combined_scheduling_interval():
 
 def test_waterfall_report_reconciliation_fields_and_wide_render():
     """The report carries residual/reconciliation/controllable/platform walls,
-    the wide render shows provenance in the Source column, and the boundary
-    flags render with their combined-interval explanation."""
+    and the reconciled console shows ONLY the minimal footer — no residual /
+    controllable / platform / top-level-accounted rows."""
     report = build_waterfall(
         result=_complete_result(),
         timing={},
         wall_ms=12100,
         command_start_unix_ms=1000,
         response_received_unix_ns=13100 * 1_000_000,
+        modal_restore_begin_wall_unix_ns=3500 * 1_000_000,
     )
-    assert report.residual_ms == 0.0 or report.residual_ms is not None
+    assert report.residual_ms is not None
     assert report.reconciliation_status in ("OK", "EXCEEDS_TOLERANCE")
     assert report.platform_wall_ms is not None
     assert report.controllable_wall_ms is not None
     rendered = render_waterfall(report, terminal_columns=180)
-    assert "TOP-LEVEL ACCOUNTED" in rendered
-    assert "GLOBAL RESIDUAL" in rendered
-    assert "RESIDUAL %" in rendered
-    assert "RECONCILIATION STATUS" in rendered
-    assert "CONTROLLABLE APPLICATION WALL" in rendered
-    assert "PLATFORM/MODAL WALL" in rendered
-    assert "Boundary flags:" in rendered
-    assert "modal_restore_begin_unavailable" in rendered
-    assert "modal_scheduling covers submission->python_resume combined" in rendered
-    # Wide render includes provenance in the source column.
-    assert "remote_trace/" in rendered or "host_trace/" in rendered or "modal_app_log/" in rendered
+    assert "V2 COLD WATERFALL" in rendered
+    assert "Scheduling time:" in rendered  # conclusive footer, once at the bottom
+    assert "RECONCILIATION" in rendered
+    assert "STATUS" in rendered
+    # Successful console output never shows these accounting aggregates.
+    assert "TOP-LEVEL ACCOUNTED" not in rendered
+    assert "GLOBAL RESIDUAL" not in rendered
+    assert "RESIDUAL %" not in rendered
+    assert "CONTROLLABLE APPLICATION WALL" not in rendered
+    assert "PLATFORM/MODAL WALL" not in rendered
+    # Missing restore-begin stays an explicit unresolved-boundary flag in the
+    # report metadata of a partial report (never a fake stage value).
+    partial = build_waterfall(
+        result=_complete_result(),
+        timing={},
+        wall_ms=12100,
+        command_start_unix_ms=1000,
+        response_received_unix_ns=13100 * 1_000_000,
+    )
+    assert "modal_restore_begin_unavailable" in partial.boundary_flags
     # ASCII-only output even with flags/labels.
     assert all(ord(character) < 128 for character in rendered)
 
@@ -332,10 +450,21 @@ def test_structured_diagnostics_are_rendered_as_nested_detail_rows():
         "per_node_timings": [{"node_id": "42", "class_type": "CLIPTextEncode", "duration_ms": 234.5}],
         "active_read_records": [{"owner": "graph_loader", "path_hash": "abcdef1234567890", "wall_ms": 345.6}],
     }
-    rendered = render_waterfall(build_waterfall(result=result, timing={}, wall_ms=1000), terminal_columns=180)
-    assert "CPU owner: CLIP.encode [CLIP]" in rendered
-    assert "Node: CLIPTextEncode" in rendered
+    # Reconciled (command + response + restore-begin) so the full table renders.
+    rendered = render_waterfall(
+        build_waterfall(
+            result=result, timing={}, wall_ms=1000,
+            command_start_unix_ms=1000, response_received_unix_ns=14000 * 1_000_000,
+            modal_restore_begin_wall_unix_ns=3500 * 1_000_000,
+        ),
+        terminal_columns=180,
+    )
+    # Non-duplicative structured rows render as inline details...
     assert "Model read: graph_loader" in rendered
+    # ...but CPU-owner CLIP and the duplicative CLIPTextEncode node are
+    # deduped in favor of the clearest single CLIP row (the CLIP encode detail).
+    assert "CPU owner: CLIP.encode" not in rendered
+    assert "Node: CLIPTextEncode" not in rendered
 
 
 def test_rendered_waterfall_is_plain_ascii():
@@ -392,8 +521,12 @@ def test_negative_derived_stage_is_rejected():
     assert stage.status == "invalid"
     assert stage.duration_ms is None
     assert any("negative" in warning for warning in report.warnings)
-    # The rejected derived stage must not fabricate accounted time.
-    assert report.reconciliation_ms is not None
+    # The rejected derived stage must not fabricate accounted time: TOTAL WALL
+    # stays unresolved and reconciliation is never fabricated.
+    assert report.scheduling_ms is None
+    assert report.total_wall_ms is None
+    assert report.reconciliation_ms is None
+    assert report.reconciliation_status == "UNRESOLVED"
 
 
 def test_generic_residual_reflects_real_gap_not_perfect_reconciliation():
@@ -413,19 +546,17 @@ def test_generic_residual_reflects_real_gap_not_perfect_reconciliation():
     assert report.total_ms == 10000.0
     stages = {stage.key: stage for stage in report.stages}
     assert "residual" not in stages
-    assert report.residual_ms is not None
-    assert report.accounted_ms is not None
+    # The generic gap is the UNATTRIBUTED interval, never a measured stage:
+    # with no scheduling boundary, the non-scheduling wall is unresolved and
+    # reconciliation stays honestly UNRESOLVED (never fabricated into a perfect
+    # zero).  The whole scheduling window is informational, so accounted is
+    # restore + sampling only.
+    assert report.accounted_ms == 3000.0
+    assert report.total_wall_ms is None
+    assert report.residual_ms is None
+    assert report.reconciliation_ms is None
+    assert report.reconciliation_status == "UNRESOLVED"
     assert report.accounted_ms != report.total_ms
-    assert report.reconciliation_ms is not None
-    accounted_ms = report.accounted_ms
-    total_ms = report.total_ms
-    reconciliation_ms = report.reconciliation_ms
-    assert isinstance(accounted_ms, float)
-    assert isinstance(total_ms, float)
-    assert isinstance(reconciliation_ms, float)
-    assert abs(reconciliation_ms - report.residual_ms) < 1e-6
-    assert abs(reconciliation_ms - (total_ms - accounted_ms)) < 1e-6
-    assert any("reconciliation exceeds tolerance" in warning for warning in report.warnings)
 
 
 def _build_baseline_report(row: dict):
@@ -478,18 +609,24 @@ def test_three_baseline_rows_reconcile_within_tolerance():
             f"exceeds tolerance for total {report.total_ms}ms"
         )
 
-        # Platform row: request-matched, derived exactly, group=platform.
+        # Platform row: request-matched, derived exactly, group=platform, and
+        # informational (never a numbered stage nor part of the accounted sum).
         platform = stages["modal_scheduling"]
         assert platform.duration_ms is not None
         assert abs(platform.duration_ms - expected_platform) < 1e-9
         assert platform.status == "derived"
         assert platform.group == "platform"
+        assert platform.accounting_role == "informational"
+        assert platform.included_in_total is False
         assert platform.source_fields == (
             "dispatch_to_modal_entry_ms",
             "restore_total_ms",
             "restore_end_to_modal_method_ms",
         )
-        assert platform.included_in_total is True
+        # TOTAL WALL == command->response minus Modal scheduling, and the
+        # exclusive top-level sum reconciles to it within the hard 50 ms.
+        assert report.total_wall_ms == pytest.approx(report.total_ms - expected_platform)
+        assert abs(report.accounted_ms - report.total_wall_ms) <= max(25.0, report.total_ms * 0.0025)
 
         # Application restore is accounted exactly once: the restore stage is a
         # single row whose duration equals restore_total_ms.  The platform row
@@ -514,10 +651,8 @@ def test_three_baseline_rows_reconcile_within_tolerance():
         assert stages["modal_handle_submission"].duration_ms > 0
         assert "dispatch_to_modal_entry_ms" not in stages["modal_handle_submission"].source_fields
 
-        # Known platform time is never assigned to the generic residual.
-        residual = stages.get("residual")
-        if residual is not None and residual.duration_ms is not None:
-            assert abs(residual.duration_ms - expected_platform) > 1e-9
+        # Known platform time is never assigned to a generic residual stage.
+        assert "residual" not in stages
 
 
 def test_baseline_rows_assert_exact_supplied_source_values():
@@ -700,7 +835,7 @@ def test_cross_process_clock_skew_return_stages_unavailable_not_negative():
 def test_return_stages_measure_with_valid_response_boundaries():
     """With a trace that has valid (same-clock) response boundaries, the return
     stages are measured non-negative instead of being dropped as unavailable,
-    and reconciliation is still reported."""
+    and the accounting gap is never fabricated (UNRESOLVED without scheduling)."""
     events = [
         _event("output_persist_start", 11600, 7600, "remote"),
         _event("output_persist_end", 12300, 8300, "remote"),
@@ -722,12 +857,15 @@ def test_return_stages_measure_with_valid_response_boundaries():
     ret = stages["remote_local_return"]
     assert ret.duration_ms is not None and ret.duration_ms >= 0
     assert ret.status != "invalid"
-    assert report.reconciliation_ms is not None
+    # No scheduling boundary -> TOTAL WALL unresolved: reconciliation is not
+    # fabricated (the measured return stages never create a fake gap either).
+    assert report.reconciliation_status == "UNRESOLVED"
     assert not any("negative duration" in warning for warning in report.warnings)
 
 
 def test_serialized_waterfall_dict_contract():
-    """waterfall_to_dict emits the exact frontend-usable top-level shape."""
+    """waterfall_to_dict emits the exact frontend-usable top-level shape
+    (33 keys including the NEW scheduling-contract fields)."""
     report = build_waterfall(
         result=_complete_result(),
         timing={},
@@ -744,8 +882,12 @@ def test_serialized_waterfall_dict_contract():
         "residual_ms", "residual_pct", "reconciliation_status",
         "controllable_wall_ms", "platform_wall_ms", "boundary_flags",
         "scheduling_ms", "total_wall_ms", "command_response_ms",
+        "command_to_enqueue_ms", "scheduling_time_ms", "non_scheduling_ms",
+        "host_telemetry",
         "partial_waterfall", "partial_flags",
         "pre_python_interval_ms", "pre_python_interval_classification",
+        "data_flags", "reconciliation_target_ms", "reconciliation_hard_ms",
+        "validation_status",
     }
     assert data["run_label"] == "remote normal run"
     assert data["request_id"] == "request-1"

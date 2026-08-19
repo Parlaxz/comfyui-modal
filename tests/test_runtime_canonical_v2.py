@@ -68,7 +68,7 @@ class TestBuildExecutionPlan(unittest.TestCase):
         )
         self.assertIsInstance(plan.execution_options, ExecutionOptions)
         self.assertFalse(plan.execution_options.production_enabled)
-        self.assertEqual(plan.execution_options.output_conversion_options["format"], "webp")
+        self.assertEqual(plan.execution_options.output_conversion_options["format"], "webp_lossy")
         self.assertEqual(plan.source_workflow_hash, plan.workflow_hash)
         with self.assertRaises(AttributeError):
             plan.workflow = {}  # type: ignore[misc]
@@ -1600,3 +1600,20 @@ class TestLocalV2TracePreservation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

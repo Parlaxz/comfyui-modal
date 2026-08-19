@@ -82,7 +82,11 @@ def base64_counting_scope(attempt: Attempt) -> Iterator[None]:
     finally:
         _base64_counter_cb.reset(_token)
 
-from .contracts import OutputStrategy
+from .contracts import (
+    OutputStrategy,
+    build_logical_output_key,
+    normalize_output_mode,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +108,13 @@ class ConversionMeta:
     json_result_bytes: int = 0
     hash_of_raw: str = ""  # sha256 of raw converted bytes, computed *before* base64
     conversion_time_ms: float = 0.0
+    codec: str = ""
+    quality: int | None = None
+    webp_lossless_compression: str | None = None
+    output_codec_ms: float = 0.0
+    encoded_bytes: int = 0
+    source_bytes: int = 0
+    conversion_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,6 +249,15 @@ class AssetDescriptor:
     comparison_side: str = ""
     generation: str = ""
     thumbnail_identity: str = ""
+    codec: str = ""
+    quality: int | None = None
+    webp_lossless_compression: str | None = None
+    output_codec_ms: float = 0.0
+    conversion_fallback: bool = False
+    source_bytes: int = 0
+    output_mode: str = "original"
+    variant: str = "original"
+    logical_output_key: str = ""
 
 
 def build_asset_descriptor_list(
@@ -245,6 +265,8 @@ def build_asset_descriptor_list(
     *,
     generation: str = "",
     thumbnail_identities: Mapping[str, str] | None = None,
+    output_mode: str = "original",
+    variant: str | None = None,
 ) -> list[AssetDescriptor]:
     """Build a list of lightweight ``AssetDescriptor`` from an *Attempt*.
 
@@ -253,6 +275,8 @@ def build_asset_descriptor_list(
 
     No base64 data is computed or included — this is the pure metadata path.
     """
+    output_mode = normalize_output_mode(output_mode)
+    variant = str(variant or output_mode)
     _opt_t0 = time.monotonic_ns() if opt_diag_enabled() else None
     descriptors: list[AssetDescriptor] = []
     for item in attempt.items:
@@ -283,6 +307,26 @@ def build_asset_descriptor_list(
             comparison_side=item.comparison_side,
             generation=generation,
             thumbnail_identity=thumb_id,
+            codec=(item.conversion_meta.codec if item.conversion_meta else ""),
+            quality=(item.conversion_meta.quality if item.conversion_meta else None),
+            webp_lossless_compression=(
+                item.conversion_meta.webp_lossless_compression
+                if item.conversion_meta else None
+            ),
+            output_codec_ms=(
+                item.conversion_meta.output_codec_ms
+                if item.conversion_meta else 0.0
+            ),
+            conversion_fallback=(
+                item.conversion_meta.conversion_fallback
+                if item.conversion_meta else False
+            ),
+            source_bytes=(item.conversion_meta.source_bytes if item.conversion_meta else 0),
+            output_mode=output_mode,
+            variant=variant,
+            logical_output_key=build_logical_output_key(
+                item.node_id, item.output_key, item.output_index
+            ) or "",
         ))
     if _opt_t0 is not None:
         _opt_output_delivery_append(
@@ -298,6 +342,8 @@ def attempt_to_descriptor_result(
     generation: str = "",
     legacy_data: bool = False,
     thumbnail_identities: Mapping[str, str] | None = None,
+    output_mode: str = "original",
+    variant: str | None = None,
 ) -> dict[str, Any]:
     """Convert an *Attempt* to a result dict with lightweight descriptors.
 
@@ -314,10 +360,14 @@ def attempt_to_descriptor_result(
       - ``outputs`` dict with native ComfyUI ``{filename, subfolder, type}``
       - ``asset_descriptors`` list with full ``AssetDescriptor`` dicts
     """
+    output_mode = normalize_output_mode(output_mode)
+    variant = str(variant or output_mode)
     descriptors = build_asset_descriptor_list(
         attempt,
         generation=generation,
         thumbnail_identities=thumbnail_identities,
+        output_mode=output_mode,
+        variant=variant,
     )
     outputs: dict[str, dict[str, list[dict[str, Any]]]] = {}
     images: list[dict[str, Any]] = []
@@ -350,7 +400,23 @@ def attempt_to_descriptor_result(
             "backend_path": item.path,
             "path": item.path,
             "generation": generation,
+            "output_mode": output_mode,
+            "variant": variant,
+            "logical_output_key": build_logical_output_key(
+                item.node_id, output_key, item.output_index
+            ) or "",
         }
+        if item.conversion_meta is not None:
+            entry.update({
+                "codec": item.conversion_meta.codec,
+                "quality": item.conversion_meta.quality,
+                "webp_lossless_compression": item.conversion_meta.webp_lossless_compression,
+                "output_codec_ms": item.conversion_meta.output_codec_ms,
+                "conversion_time_ms": item.conversion_meta.conversion_time_ms,
+                "encoded_bytes": item.conversion_meta.encoded_bytes or len(raw),
+                "source_bytes": item.conversion_meta.source_bytes,
+                "conversion_fallback": item.conversion_meta.conversion_fallback,
+            })
         if legacy_data:
             if not item.base64_data and raw:
                 _enc = base64.b64encode(raw)
@@ -376,6 +442,8 @@ def attempt_to_descriptor_result(
     descriptors_as_dicts = [dataclasses.asdict(d) for d in descriptors]
 
     return {
+        "output_mode": output_mode,
+        "variant": variant,
         "images": images,
         "videos": videos,
         "outputs": outputs,
@@ -391,6 +459,8 @@ def attempt_to_descriptor_result_v2(
     generation: str = "",
     include_base64: bool = False,
     thumbnail_identities: Mapping[str, str] | None = None,
+    output_mode: str = "original",
+    variant: str | None = None,
 ) -> dict[str, Any]:
     """V2 descriptor result — defaults include_base64 to False.
 
@@ -404,6 +474,8 @@ def attempt_to_descriptor_result_v2(
         generation=generation,
         legacy_data=include_base64,
         thumbnail_identities=thumbnail_identities,
+        output_mode=output_mode,
+        variant=variant,
     )
 
 
@@ -451,6 +523,14 @@ def _make_conversion_meta(
     mime_type: str,
     file_ext: str,
     conversion_time_ms: float,
+    *,
+    codec: str = "",
+    quality: int | None = None,
+    webp_lossless_compression: str | None = None,
+    output_codec_ms: float | None = None,
+    encoded_bytes: int = 0,
+    source_bytes: int = 0,
+    conversion_fallback: bool = False,
 ) -> ConversionMeta:
     """Build ConversionMeta from raw bytes.
 
@@ -468,6 +548,15 @@ def _make_conversion_meta(
         json_result_bytes=0,
         hash_of_raw=_hash_raw_bytes(raw_bytes),
         conversion_time_ms=conversion_time_ms,
+        codec=codec,
+        quality=quality,
+        webp_lossless_compression=webp_lossless_compression,
+        output_codec_ms=(
+            conversion_time_ms if output_codec_ms is None else output_codec_ms
+        ),
+        encoded_bytes=encoded_bytes or len(raw_bytes),
+        source_bytes=source_bytes,
+        conversion_fallback=conversion_fallback,
     )
 
 
@@ -524,6 +613,19 @@ def _item_from_entry(
             mime_type=str(entry.get("mime_type", "image/png")),
             file_ext=str(entry.get("file_ext", ".png")),
             conversion_time_ms=float(entry.get("conversion_time_ms", 0) or 0),
+            codec=str(entry.get("codec", "") or ""),
+            quality=(
+                int(entry["quality"])
+                if entry.get("quality") is not None else None
+            ),
+            webp_lossless_compression=(
+                str(entry["webp_lossless_compression"])
+                if entry.get("webp_lossless_compression") is not None else None
+            ),
+            output_codec_ms=float(entry.get("output_codec_ms", 0) or 0),
+            encoded_bytes=int(entry.get("encoded_bytes", len(raw)) or len(raw)),
+            source_bytes=int(entry.get("source_bytes", 0) or 0),
+            conversion_fallback=bool(entry.get("conversion_fallback", False)),
         )
     else:
         conv_meta = None

@@ -1,0 +1,54 @@
+[v2.e28_validation] run_selector=ACTIVE speculative_clip=1 gpu_fast_return=1 opt_diag=1 vae_mode=late checkpoint_prewarm=1 gantt=1 e27_forensics=1 runs=1
+[v2.profile_guard] E19 selector verified: all critical flags present
+[v2.env_profile]
+ATOMIC_PROFILE=E19_FINAL_COLD_LOADER
+env_profile=inherit
+thread_policy=TBASE
+snapshot_model_order=O0
+baseline_cpu_request=16 
+baseline_memory_request=49152 
+memory_request_mb=49152 
+vae_policy=v1
+release_gpu_after_request=0
+cpu_model_snapshot=1
+native_fast_disk_unet=1
+publish_restore_plan=0
+vae_snapshot=1
+clip_conditioning_cache=1
+unet_activation_mode=late
+vae_activation_mode=late
+persistent_local_handle=1
+full_trace=0
+residency_diagnostics=0
+deep_model_diag=0
+pagefault_tracking=0
+eviction_enabled=1
+eviction_role=clip_vae
+eviction_idle_seconds=0
+prefill_lanes=critical
+prefill_wait_for_unet=0
+restore_torch_threads=none
+variance_pretouch=0
+fast_cold_orchestration=1
+checkpoint_prewarm=1
+prewarm_threads=4
+prewarm_chunk_mb=8
+unet_fastsafetensors=1
+clip_fast_hydration=1
+clip_snapshot_exclude_weights=1
+critical_gpu_coordination=1
+scoped_cuda_readiness=1
+staged_safetensors=0
+c9qd_extras=0
+staged_source_order=0
+clip_staged_hydration=0
+volume_read_run_count=3
+restore_only_app=stable-modal-comfy-v2-restore-only-shadow
+restore_only_run_count=6
+snapshot_exclude_unet=1
+e10_bucket_first_validation=0
+=== Running one V2 benchmark trial against the existing deployment ===
+=== Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
+=== Fail-closed request preflight (local, no spend
+=== Single V2 benchmark completed ===
+=== Total command-to-response time: 40.527s ===

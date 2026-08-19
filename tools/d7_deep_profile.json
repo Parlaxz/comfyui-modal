@@ -1,0 +1,755 @@
+{
+  "meta": {
+    "device_kind": "cuda",
+    "capability": [
+      8,
+      6
+    ],
+    "torch_version": "2.8.0+cu128",
+    "python_version": "3.11.9",
+    "comfy_version": "unknown",
+    "seed": 1234,
+    "max_length": 77,
+    "batch": 1,
+    "mode": "deep",
+    "repeats": 3,
+    "warmup": 3
+  },
+  "arms": [
+    {
+      "arm": "P0",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32"
+    },
+    {
+      "arm": "P1",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32_tf32"
+    },
+    {
+      "arm": "P2",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "bf16"
+    },
+    {
+      "arm": "P3",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp16"
+    },
+    {
+      "arm": "P4",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "bf16"
+    }
+  ],
+  "fixtures": {
+    "classic_clip": {
+      "identity": {
+        "fixture": "classic_clip",
+        "class": [
+          "SD1ClipModel",
+          "SD1CheckpointClipModel"
+        ],
+        "param_count": 63428097,
+        "resident_dtype": "torch.float16",
+        "token_count": 77,
+        "batch": 1,
+        "device": "cuda:0",
+        "params_off_device": [],
+        "wrapper_status": null,
+        "tokenize_mode": "real"
+      },
+      "arms": {
+        "P0": {
+          "identity": {
+            "class": [
+              "SD1ClipModel",
+              "SD1CheckpointClipModel"
+            ],
+            "param_count": 63428097,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "fp32",
+            "actual_activation_dtype": {
+              "Linear": "torch.float32"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": 0.62369997613132,
+            "load_reentry_wall_ms": 7.524699962232262,
+            "forward_wall_median_ms": 10.81860001431778,
+            "forward_wall_mean_ms": 10.596266656648368,
+            "forward_wall_std_ms": 1.4148629053640347,
+            "forward_cuda_event_median_ms": 10.807583808898926,
+            "forward_cuda_event_mean_ms": 10.584501266479492,
+            "forward_cuda_event_std_ms": 1.4115555449293198,
+            "forward_wall_ms_list": [
+              9.0834,
+              11.8868,
+              10.8186
+            ],
+            "forward_cuda_event_ms_list": [
+              9.0747,
+              11.8712,
+              10.8076
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 10.81860001431778
+          },
+          "casting": {
+            "cast_op_count": 99,
+            "cast_bytes": 126641152,
+            "cast_wall_ms": 13.393400004133582,
+            "per_forward_weight_rematerialization": true,
+            "manual_cast_dtype": "torch.float32",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 135376384,
+            "allocated_after": 135376384,
+            "peak_allocated": 141907968,
+            "reserved_before": 167772160,
+            "reserved_after": 167772160
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 1.1920928955078125e-07,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 7,
+              "cpu_us": 2693.3000000000047,
+              "cuda_us": 3498.1260000000257
+            },
+            "ATTENTION": {
+              "count": 2,
+              "cpu_us": 601.3000000000102,
+              "cuda_us": 0.0
+            },
+            "NORM": {
+              "count": 3,
+              "cpu_us": 538.7999999999938,
+              "cuda_us": 169.21199999999953
+            },
+            "ACTIVATION": {
+              "count": 2,
+              "cpu_us": 88.50000000001091,
+              "cuda_us": 54.97400000000198
+            },
+            "COPY": {
+              "count": 11,
+              "cpu_us": 2409.6999999999703,
+              "cuda_us": 2026.5620000000004
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 4067.0999999999976,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 40,
+              "cpu_us": 9922.199999999973,
+              "cuda_us": 873.9999999999802
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.float32"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.float32"
+              ]
+            },
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": "torch.float32"
+            },
+            "cast_op_count": 99,
+            "cast_bytes": 126641152,
+            "cast_wall_ms": 13.393400004133582
+          }
+        },
+        "P2": {
+          "identity": {
+            "class": [
+              "SD1ClipModel",
+              "SD1CheckpointClipModel"
+            ],
+            "param_count": 63428097,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "bf16",
+            "actual_activation_dtype": {
+              "Linear": "torch.float32"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": 0.62369997613132,
+            "load_reentry_wall_ms": 7.136999978683889,
+            "forward_wall_median_ms": 13.481699978001416,
+            "forward_wall_mean_ms": 13.965833330682168,
+            "forward_wall_std_ms": 0.9582879211744113,
+            "forward_cuda_event_median_ms": 13.462431907653809,
+            "forward_cuda_event_mean_ms": 13.951199849446615,
+            "forward_cuda_event_std_ms": 0.959817567247052,
+            "forward_wall_ms_list": [
+              13.3462,
+              13.4817,
+              15.0696
+            ],
+            "forward_cuda_event_ms_list": [
+              13.3341,
+              13.4624,
+              15.057
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 13.481699978001416
+          },
+          "casting": {
+            "cast_op_count": 99,
+            "cast_bytes": 126641152,
+            "cast_wall_ms": 14.822500001173466,
+            "per_forward_weight_rematerialization": true,
+            "manual_cast_dtype": "torch.float32",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 135376384,
+            "allocated_after": 135376384,
+            "peak_allocated": 143621120,
+            "reserved_before": 167772160,
+            "reserved_after": 167772160
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 0.0,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 6,
+              "cpu_us": 2819.3999999999633,
+              "cuda_us": 1497.5549999999898
+            },
+            "ATTENTION": {
+              "count": 2,
+              "cpu_us": 269.3000000000043,
+              "cuda_us": 0.0
+            },
+            "NORM": {
+              "count": 3,
+              "cpu_us": 404.0999999999942,
+              "cuda_us": 175.7380000000021
+            },
+            "ACTIVATION": {
+              "count": 2,
+              "cpu_us": 95.00000000000091,
+              "cuda_us": 51.90400000000318
+            },
+            "COPY": {
+              "count": 13,
+              "cpu_us": 3460.200000000021,
+              "cuda_us": 2749.53200000005
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 39.49999999999852,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 45,
+              "cpu_us": 10084.900000000036,
+              "cuda_us": 589.0549999999993
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.float32"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.bfloat16",
+                "torch.float32"
+              ]
+            },
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": "torch.float32"
+            },
+            "cast_op_count": 99,
+            "cast_bytes": 126641152,
+            "cast_wall_ms": 14.822500001173466
+          }
+        }
+      },
+      "correctness": {
+        "P2": {
+          "class": "MATERIAL_DIFFERENCE",
+          "cond": {
+            "shape_ref": [
+              1,
+              77,
+              512
+            ],
+            "shape_cand": [
+              1,
+              77,
+              512
+            ],
+            "shape_equal": true,
+            "nan_ref": 0,
+            "nan_cand": 0,
+            "inf_ref": 0,
+            "inf_cand": 0,
+            "finite_percentage": 100.0,
+            "max_abs_error": 0.03504294157028198,
+            "mean_abs_error": 0.006256982684135437,
+            "rms_error": 0.007874018512666225,
+            "relative_error": 0.00785087101311665,
+            "cosine_similarity": 0.9999690055847168,
+            "class": "MATERIAL_DIFFERENCE"
+          },
+          "pooled": {
+            "shape_ref": [
+              1,
+              512
+            ],
+            "shape_cand": [
+              1,
+              512
+            ],
+            "shape_equal": true,
+            "nan_ref": 0,
+            "nan_cand": 0,
+            "inf_ref": 0,
+            "inf_cand": 0,
+            "finite_percentage": 100.0,
+            "max_abs_error": 0.024716854095458984,
+            "mean_abs_error": 0.006184385623782873,
+            "rms_error": 0.007794337347149849,
+            "relative_error": 0.008035850599280423,
+            "cosine_similarity": 0.9999697804450989,
+            "class": "MATERIAL_DIFFERENCE"
+          }
+        }
+      },
+      "stability": {
+        "P0": {
+          "cond_max_cosine_deviation": 1.1920928955078125e-07,
+          "repeats": 3
+        },
+        "P2": {
+          "cond_max_cosine_deviation": 0.0,
+          "repeats": 3
+        }
+      },
+      "status": "ok"
+    },
+    "t5": {
+      "identity": {
+        "fixture": "t5",
+        "class": [
+          "SDClipModel"
+        ],
+        "param_count": 41624321,
+        "resident_dtype": "torch.float16",
+        "token_count": 77,
+        "batch": 1,
+        "device": "cuda:0",
+        "params_off_device": [],
+        "wrapper_status": null,
+        "tokenize_mode": "synthetic"
+      },
+      "arms": {
+        "P0": {
+          "identity": {
+            "class": [
+              "SDClipModel"
+            ],
+            "param_count": 41624321,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "fp32",
+            "actual_activation_dtype": {
+              "Linear": "torch.float32"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": null,
+            "load_reentry_wall_ms": 12.55059998948127,
+            "forward_wall_median_ms": 14.852899999823421,
+            "forward_wall_mean_ms": 15.564900008030236,
+            "forward_wall_std_ms": 1.60349620262365,
+            "forward_cuda_event_median_ms": 14.830400466918945,
+            "forward_cuda_event_mean_ms": 15.542187054951986,
+            "forward_cuda_event_std_ms": 1.6049838088666073,
+            "forward_wall_ms_list": [
+              14.4407,
+              17.4011,
+              14.8529
+            ],
+            "forward_cuda_event_ms_list": [
+              14.4162,
+              17.38,
+              14.8304
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 14.852899999823421
+          },
+          "casting": {
+            "cast_op_count": 50,
+            "cast_bytes": 83231232,
+            "cast_wall_ms": 14.332399994600564,
+            "per_forward_weight_rematerialization": true,
+            "manual_cast_dtype": "torch.float32",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 92424192,
+            "allocated_after": 92424192,
+            "peak_allocated": 97913344,
+            "reserved_before": 234881024,
+            "reserved_after": 234881024
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 2.384185791015625e-07,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 6,
+              "cpu_us": 1092.9000000000133,
+              "cuda_us": 3512.0789999999934
+            },
+            "ATTENTION": {
+              "count": 2,
+              "cpu_us": 193.5999999999981,
+              "cuda_us": 0.0
+            },
+            "NORM": {
+              "count": 0,
+              "cpu_us": 0.0,
+              "cuda_us": 0.0
+            },
+            "ACTIVATION": {
+              "count": 1,
+              "cpu_us": 29.29999999999609,
+              "cuda_us": 0.0
+            },
+            "COPY": {
+              "count": 14,
+              "cpu_us": 3216.1000000000113,
+              "cuda_us": 7645.263999999993
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 39.90000000000305,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 73,
+              "cpu_us": 10291.99999999996,
+              "cuda_us": 6167.918999999977
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.float32"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.float32"
+              ]
+            },
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": null
+            },
+            "cast_op_count": 50,
+            "cast_bytes": 83231232,
+            "cast_wall_ms": 14.332399994600564
+          }
+        },
+        "P2": {
+          "identity": {
+            "class": [
+              "SDClipModel"
+            ],
+            "param_count": 41624321,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "bf16",
+            "actual_activation_dtype": {
+              "Linear": "torch.float32"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": null,
+            "load_reentry_wall_ms": 7.859300007112324,
+            "forward_wall_median_ms": 10.065199981909245,
+            "forward_wall_mean_ms": 10.171066639789691,
+            "forward_wall_std_ms": 0.8220288370644747,
+            "forward_cuda_event_median_ms": 10.01260757446289,
+            "forward_cuda_event_mean_ms": 10.14414914449056,
+            "forward_cuda_event_std_ms": 0.8232163982504885,
+            "forward_wall_ms_list": [
+              9.4071,
+              11.0409,
+              10.0652
+            ],
+            "forward_cuda_event_ms_list": [
+              9.3946,
+              11.0252,
+              10.0126
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 10.065199981909245
+          },
+          "casting": {
+            "cast_op_count": 50,
+            "cast_bytes": 83231232,
+            "cast_wall_ms": 11.937599978409708,
+            "per_forward_weight_rematerialization": true,
+            "manual_cast_dtype": "torch.float32",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 92424192,
+            "allocated_after": 92424192,
+            "peak_allocated": 99616256,
+            "reserved_before": 117440512,
+            "reserved_after": 117440512
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 0.0,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 5,
+              "cpu_us": 691.3999999999849,
+              "cuda_us": 810.4209999999985
+            },
+            "ATTENTION": {
+              "count": 2,
+              "cpu_us": 209.0000000000009,
+              "cuda_us": 0.0
+            },
+            "NORM": {
+              "count": 0,
+              "cpu_us": 0.0,
+              "cuda_us": 0.0
+            },
+            "ACTIVATION": {
+              "count": 1,
+              "cpu_us": 24.599999999997635,
+              "cuda_us": 0.0
+            },
+            "COPY": {
+              "count": 17,
+              "cpu_us": 2104.100000000002,
+              "cuda_us": 8977.493999999993
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 28.899999999996226,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 75,
+              "cpu_us": 9869.000000000002,
+              "cuda_us": 2632.132999999978
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.float32"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.bfloat16",
+                "torch.float32"
+              ]
+            },
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": null
+            },
+            "cast_op_count": 50,
+            "cast_bytes": 83231232,
+            "cast_wall_ms": 11.937599978409708
+          }
+        }
+      },
+      "correctness": {
+        "P2": {
+          "class": "MATERIAL_DIFFERENCE",
+          "cond": {
+            "shape_ref": [
+              1,
+              77,
+              512
+            ],
+            "shape_cand": [
+              1,
+              77,
+              512
+            ],
+            "shape_equal": true,
+            "nan_ref": 0,
+            "nan_cand": 0,
+            "inf_ref": 0,
+            "inf_cand": 0,
+            "finite_percentage": 100.0,
+            "max_abs_error": 0.032292723655700684,
+            "mean_abs_error": 0.006332681514322758,
+            "rms_error": 0.007952720858156681,
+            "relative_error": 0.007903905028321553,
+            "cosine_similarity": 0.9999682307243347,
+            "class": "MATERIAL_DIFFERENCE"
+          },
+          "pooled": {
+            "class": "UNSUPPORTED",
+            "reason": "encoder produces no pooled output"
+          }
+        }
+      },
+      "stability": {
+        "P0": {
+          "cond_max_cosine_deviation": 2.384185791015625e-07,
+          "repeats": 3
+        },
+        "P2": {
+          "cond_max_cosine_deviation": 0.0,
+          "repeats": 3
+        }
+      },
+      "status": "ok"
+    }
+  }
+}

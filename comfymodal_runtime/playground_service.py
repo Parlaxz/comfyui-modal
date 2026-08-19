@@ -25,6 +25,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -32,9 +33,13 @@ from typing import Any, Callable
 # Both direct and package-relative import paths are needed depending on
 # how the module is loaded (spec_from_file_location in tests vs. runtime).
 try:
-    from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan  # noqa: F401
+    from comfymodal_runtime.contracts import (  # noqa: F401
+        ExecutionOptions,
+        ExecutionPlan,
+        normalize_output_intent_options,
+    )
 except ImportError:
-    from contracts import ExecutionOptions, ExecutionPlan  # noqa: F401
+    from contracts import ExecutionOptions, ExecutionPlan, normalize_output_intent_options  # noqa: F401
 
 _log = logging.getLogger(__name__)
 
@@ -115,6 +120,20 @@ async def _offload_or_await(fn: Callable, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+def _jsonable_workflow(workflow: Any) -> Any:
+    """Recursively convert a frozen workflow into plain JSON containers.
+
+    Mapping/mappingproxy → dict, tuple/list sequences → list.  Scalars and
+    dict insertion order are preserved, the frozen source is never mutated,
+    and unknown objects pass through untouched (never stringified).
+    """
+    if isinstance(workflow, Mapping):
+        return {k: _jsonable_workflow(v) for k, v in workflow.items()}
+    if isinstance(workflow, (list, tuple)):
+        return [_jsonable_workflow(v) for v in workflow]
+    return workflow
+
+
 # ── Injectable contract protocols ──────────────────────────────────────
 
 
@@ -187,6 +206,9 @@ def _default_build_execution_plan(
     from production_workflow import normalize_production_options
     from workflow_metadata import extract_model_stack, prompt_sha256
 
+    effective_modal_options = normalize_output_intent_options(modal_options)
+    output_mode = str(effective_modal_options.get("output_mode", "original"))
+
     # ── 0. Validate controls against snapshot schemas ──
     schemas = derive_control_schemas_from_snapshot(snapshot)
     control_errors = validate_controls_against_schema(controls, schemas, feature_id)
@@ -241,12 +263,15 @@ def _default_build_execution_plan(
         "studio_snapshot_id": snapshot.get("id", ""),
         "studio_feature_id": feature_id,
         "studio_preset_label": preset.get("label", ""),
+        "studio_controls": copy.deepcopy(controls or {}),
+        "output_mode": output_mode,
+        "variant": output_mode,
     }
 
     # ── 8. Resolve production options and compile when normalized production
     #    is enabled (defaults to enabled for None/{} per normalize_production_options
     #    contract).  Explicit production.enabled=False stays raw.
-    _production_options = normalize_production_options(modal_options)
+    _production_options = normalize_production_options(effective_modal_options)
     _production_enabled = _production_options.get("enabled", False)
 
     output_node_ids = _derive_output_node_ids(
@@ -276,7 +301,7 @@ def _default_build_execution_plan(
         plan = canonical_build_plan(
             workflow,
             prompt_id=str(uuid.uuid4().hex[:12]),
-            modal_options=modal_options,
+            modal_options=effective_modal_options,
             production_options=production_options,
             gpu="",
             request_metadata=studio_meta,
@@ -301,6 +326,10 @@ def _default_build_execution_plan(
         # Use the normalized production state for execution_options.
         exec_options = ExecutionOptions(
             production_enabled=_production_options.get("enabled", False),
+            output_mode=output_mode,
+            output_conversion_options=effective_modal_options.get(
+                "output_conversion_options", {}
+            ),
         )
         model_stack = extract_model_stack(workflow) if hasattr(extract_model_stack, "__call__") else {}
         plan = ExecutionPlan(
@@ -449,6 +478,27 @@ async def _default_save_history(
         meta["experiment_id"] = run_history_id
         meta["workflow_hash"] = plan.workflow_hash
 
+        try:
+            serialized_plan = plan.to_dict()
+            if isinstance(serialized_plan, dict):
+                request_metadata = serialized_plan.get("request_metadata") or {}
+                controls = request_metadata.get("studio_controls")
+                meta["workflow_json"] = serialized_plan.get("workflow") or {}
+                meta["request_json"] = {
+                    "controls": controls if isinstance(controls, dict) else {},
+                    "prompt_bundle": serialized_plan.get("prompt_bundle") or {},
+                    "model_stack": serialized_plan.get("model_stack") or {},
+                    "execution_options": serialized_plan.get("execution_options") or {},
+                    "request_metadata": request_metadata,
+                }
+                meta["execution_plan_json"] = serialized_plan
+                meta["deployment_identity_json"] = (
+                    serialized_plan.get("deployment_identity") or {}
+                )
+                meta["model_stack"] = serialized_plan.get("model_stack") or {}
+        except Exception:
+            _log.warning("Failed to serialize plan for history run %s", run_history_id)
+
         primary_asset_id = ""
         if isinstance(result, dict):
             primary_asset_id = str(result.get("primary_asset_id", "") or "")
@@ -542,6 +592,8 @@ def _sync_materialize(
         result["_local_primary_output"] = primary
     descriptors = result.get("asset_descriptors", []) if isinstance(result, dict) else []
     workspace_id = str((workspace or {}).get("id", ""))
+    result_mode = str((result or {}).get("output_mode", "original") or "original")
+    result_variant = str((result or {}).get("variant", result_mode) or result_mode)
     if isinstance(descriptors, list) and workspace_id:
         try:
             from experiment_service import REGISTRY
@@ -557,7 +609,11 @@ def _sync_materialize(
                     asset_id=asset_id,
                     experiment_id="",
                     cell_key=experiment_id,
-                    variant="original",
+                    variant=str(
+                        descriptor.get("variant")
+                        or descriptor.get("output_mode")
+                        or result_variant
+                    ),
                     path=f"modal://{workspace_id}|{str(gpu or '')}|{backend_path}",
                     mime_type=str(descriptor.get("mime_type") or "application/octet-stream"),
                     byte_size=int(descriptor.get("byte_count", 0) or 0),
@@ -650,6 +706,7 @@ class PlaygroundService:
         execute_plan_fn: Callable[..., Any] | None = None,
         materialize_fn: Callable[..., Any] | None = None,
         save_history_fn: Callable[..., Any] | None = None,
+        plan_observer_fn: Callable[[ExecutionPlan], Any] | None = None,
     ) -> None:
         self._load_preset = load_preset_fn or _default_load_preset
         self._validate = validate_fn or _default_validate
@@ -657,6 +714,7 @@ class PlaygroundService:
         self._execute_plan = execute_plan_fn or _default_execute_plan
         self._materialize = materialize_fn or _default_materialize
         self._save_history = save_history_fn or _default_save_history
+        self._plan_observer = plan_observer_fn
 
     # ── Public entrypoint ──────────────────────────────────────────────
 
@@ -721,6 +779,12 @@ class PlaygroundService:
         # ── Safe check: plan must have a workflow ─────────────────────
         if not plan.workflow:
             return {"status": "error", "message": "ExecutionPlan has no workflow"}
+
+        if self._plan_observer is not None:
+            try:
+                self._plan_observer(plan)
+            except Exception as exc:
+                _log.warning("Playground plan observer failed: %s", exc)
 
         # ── Stage 4: Execute ─────────────────────────────────────────
         exp_id = preset.get("id", preset_id) + "_" + uuid.uuid4().hex[:8]
@@ -857,6 +921,15 @@ class PlaygroundService:
         meta["requested_controls"] = dict(plan.prompt_bundle)
         meta["experiment_id"] = exp_id
         meta["workflow_hash"] = plan.workflow_hash
+        # History V2: persist the exact executable workflow at completion so a
+        # future Generate-Original can replay it without mutable UI state.
+        try:
+            if isinstance(plan.workflow, dict):
+                meta["workflow_json"] = _jsonable_workflow(plan.workflow)
+            elif hasattr(plan.workflow, "items"):
+                meta["workflow_json"] = _jsonable_workflow(plan.workflow)
+        except Exception:
+            pass
         meta["output_count"] = len(output_paths)
         meta["production_plan_used"] = "yes" if plan.execution_options.production_enabled else "no"
         if isinstance(result, dict) and result.get("primary_asset_id"):

@@ -3231,6 +3231,16 @@ def _prepare_studio_run_context(
         if workflow_hash_at_submit:
             meta_payload["workflow_hash"] = workflow_hash_at_submit
 
+        # History V2: persist the exact executable workflow at submission
+        # time so a future Generate-Original can replay it without relying
+        # on current mutable UI state.
+        try:
+            _ck_list = compilation.get("checkpoints", [])
+            if _ck_list and isinstance(_ck_list[0], dict) and isinstance(_ck_list[0].get("workflow"), dict):
+                meta_payload["workflow_json"] = copy.deepcopy(_ck_list[0]["workflow"])
+        except Exception:
+            pass
+
         submission_record = REGISTRY.history().record_run(
             kind="studio_run",
             prompt_id=exp_id,
@@ -4065,6 +4075,36 @@ def handle_studio_experiment(
         }
         _create_experiment(exp_id, compilation, definition, REGISTRY)
         _log.info("Studio experiment created: %s", exp_id)
+
+        # History V2: create the durable experiment with fixed-position cells.
+        try:
+            from history_v2_writer import get_writer as _get_v2_writer
+            _v2_writer = _get_v2_writer()
+            if _v2_writer is not None:
+                _v2_cells = []
+                for _i, _cell in enumerate(compilation.get("cells", []) or []):
+                    if not isinstance(_cell, dict):
+                        continue
+                    _v2_cells.append({
+                        "cell_key": str(_cell.get("cell_key", "")),
+                        "sequence": _cell.get("sequence", _i),
+                        "axis_values": dict(_cell.get("axis_values") or {}),
+                    })
+                _studio_meta = compilation.get("studio_meta", {}) or {}
+                _v2_writer.ensure_experiment(
+                    exp_id,
+                    name=str(experiment_def.get("name", "") or ""),
+                    definition={
+                        "production": True,
+                        "studio": True,
+                        "workflow": str(_studio_meta.get("studio_preset_id", "") or ""),
+                        "preset": str(_studio_meta.get("studio_preset_label", "") or ""),
+                        "feature": str(_studio_meta.get("studio_feature_id", "") or ""),
+                    },
+                    cells=_v2_cells,
+                )
+        except Exception:
+            _log.warning("History V2 experiment ensure failed for %s", exp_id)
 
         # Start scheduler
         import asyncio

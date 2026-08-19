@@ -439,12 +439,17 @@ class ModalAriaTests(unittest.TestCase):
 
     # ── Oracle fix: Tab focus containment for parent modal ────────────
 
-    def test_parent_modal_tab_trap_keydown_handler(self):
-        """open_testing_modal must register a Tab-key focus trap on the modal overlay."""
+    def test_parent_modal_registers_layer_escape_handler(self):
+        """open_testing_modal must register a layer-2 Escape handler and inert the background."""
         self.assertIn(
-            "keydown",
+            "registerLayerHandler(2, {",
             self.text,
-            "Expected keydown handler for Tab trap in open_testing_modal",
+            "Expected layer-2 Escape handler registration in open_testing_modal",
+        )
+        self.assertIn(
+            "_inertBackground(true)",
+            self.text,
+            "Expected inert/aria-hidden applied to background in open_testing_modal",
         )
 
     def test_parent_modal_tab_trap_calls_focus_trap_helper(self):
@@ -460,15 +465,20 @@ class ModalAriaTests(unittest.TestCase):
             "Expected focusTrap/_trapTab helper in modal-testing.js for Tab containment",
         )
 
-    def test_parent_modal_close_removes_tab_trap(self):
-        """close_testing_modal must remove the Tab trap keydown listener."""
+    def test_parent_modal_close_removes_layer_escape_handler(self):
+        """close_testing_modal must unregister the layer-2 Escape handler and restore inert background."""
         close_start = self.text.find("function close_testing_modal")
         self.assertGreater(close_start, -1)
         close_region = self.text[close_start:close_start + 800]
         self.assertIn(
-            "keydown",
+            "_escHandler",
             close_region,
-            "Expected keydown listener removal in close_testing_modal for Tab trap cleanup",
+            "Expected layer-2 Escape handler cleanup in close_testing_modal",
+        )
+        self.assertIn(
+            "_inertBackground(false)",
+            close_region,
+            "Expected inert/aria-hidden restoration in close_testing_modal",
         )
 
     # ── Oracle fix: background inert handling ─────────────────────────
@@ -1178,12 +1188,12 @@ class StudioLegacyContractTests(unittest.TestCase):
     def test_settings_sections_have_data_section_attributes(self):
         """studio-settings.js must have data-section attributes on each section."""
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        # Build DOM sections use "data-section": sec.section pattern for 5 sections
+        # Build DOM sections use "data-section": sec.section pattern for 7 sections
         # The literal 'data-section' must appear in source for dynamic setting
         self.assertIn('"data-section"', text,
                        "Expected data-section attribute setting in studio-settings.js")
-        # All 5 sections must be represented in the sections config array
-        for section in ["studio", "backends", "runtime", "features", "legacy"]:
+        # All 7 sections must be represented in the sections config array
+        for section in ["general", "generation", "outputs", "history", "experiments", "interface", "advanced"]:
             self.assertIn(
                 section, text,
                 f"Expected section '{section}' referenced in studio-settings.js",
@@ -1425,13 +1435,28 @@ class ExperimentModeTests(unittest.TestCase):
             "Test Axes must not appear in experiment mode module",
         )
 
-    def test_experiment_disabled_run_mentions_legacy_setup(self):
-        """studio-experiment-mode.js must reference Legacy Setup when Run Experiment is disabled."""
+    def test_experiment_disabled_run_reason_from_helper(self):
+        """studio-experiment-mode.js must derive the disabled-run reason from getExperimentDisabledReason
+        and render it under the Run Experiment button in renderExperimentRunButton."""
         text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
         self.assertIn(
-            "Legacy Setup",
+            "export function getExperimentDisabledReason",
             text,
-            "Expected Legacy Setup reference when Run Experiment is disabled",
+            "Expected getExperimentDisabledReason export in studio-experiment-mode.js",
+        )
+        # renderExperimentRunButton must call it and render the returned reason
+        run_btn_start = text.find("function renderExperimentRunButton")
+        self.assertGreater(run_btn_start, -1)
+        run_btn_region = text[run_btn_start:]
+        self.assertIn(
+            "getExperimentDisabledReason(state)",
+            run_btn_region,
+            "Expected renderExperimentRunButton to call getExperimentDisabledReason",
+        )
+        self.assertIn(
+            "reasonEl.textContent = reason",
+            run_btn_region,
+            "Expected the disabled reason rendered under the Run Experiment button",
         )
 
     def test_experiment_disabled_gives_reason(self):
@@ -2125,19 +2150,31 @@ class RootCauseSettingsInfoHintsTests(unittest.TestCase):
     """Settings must replace bulky paragraph descriptions with info hints."""
 
     def test_settings_no_bulky_paragraph_descriptions(self):
-        """studio-settings.js must not have bulky <p> description paragraphs under each section heading."""
+        """studio-settings.js must render short, concise info rows — not bulky paragraphs.
+
+        Settings describes each section via a single-line info row
+        (<p class="comfymodal-studio-settings-info"> from the infoRow helper)
+        instead of long multi-sentence description blocks.
+        """
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        # Check for the pattern of bulky HTML blocks with multiple <p> tags
-        # Sections should use compact formatting, not inline bulky descriptions
-        # Specifically, check that sections are rendered using info-hint pattern
-        uses_info_hint = (
-            "createInfoHint" in text or "info-hint" in text or "comfymodal-studio-info-hint" in text
+        # Compact info-row helper must exist and be used for section descriptions
+        self.assertIn(
+            "comfymodal-studio-settings-info",
+            text,
+            "Expected comfymodal-studio-settings-info info-row class in studio-settings.js",
         )
-        self.assertTrue(
-            uses_info_hint,
-            "Expected info-hint pattern in studio-settings.js — "
-            "replace bulky paragraph descriptions with compact info icons/tooltips",
+        # All infoRow texts must be short single-sentence snippets (no bulky paragraphs)
+        info_texts = re.findall(r'infoRow\("([^"]+)"\)', text)
+        self.assertGreater(
+            len(info_texts), 0,
+            "Expected infoRow( ... ) calls in studio-settings.js",
         )
+        for info_text in info_texts:
+            with self.subTest(info=info_text):
+                self.assertLessEqual(
+                    len(info_text), 160,
+                    f"Settings info row must be a short concise description, got {len(info_text)} chars: {info_text!r}",
+                )
 
     def test_settings_no_bulky_inner_html_with_descriptions(self):
         """studio-settings.js must avoid large innerHTML blocks with multiple <p> tags."""

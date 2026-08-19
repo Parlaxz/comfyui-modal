@@ -171,6 +171,76 @@ export async function stopExperiment(apiBase, experimentId) {
   });
 }
 
+// ── Modern Experiment V2 API (D5) ────────────────────────────────────────
+
+/**
+ * Submit a modern experiment-v2 run definition.
+ * @param {string} apiBase
+ * @param {object} payload - Modern definition contract (workflows, axes,
+ *   prompts, and resolved defaults). The server expands the fixed cell plan;
+ *   no top-level cells or concurrency field is sent here.
+ * @returns {Promise<object|null>}
+ */
+export async function runExperimentV2(apiBase, payload) {
+  return apiFetch(apiBase, "/studio/experiment-v2", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/**
+ * Fetch the frozen modern experiment status (History V2 surface).
+ * @param {string} apiBase
+ * @param {string} experimentId
+ * @returns {Promise<object|null>}
+ */
+export async function getExperimentV2Status(apiBase, experimentId) {
+  if (!experimentId) return null;
+  return apiFetch(apiBase, `/history-v2/experiments/${encodeURIComponent(experimentId)}/status`);
+}
+
+/**
+ * Cancel a modern experiment (queued cells cancel without submission;
+ * running attempts cancel best-effort; completed outputs preserved).
+ * @param {string} apiBase
+ * @param {string} experimentId
+ * @returns {Promise<object|null>}
+ */
+export async function cancelExperimentV2(apiBase, experimentId) {
+  if (!experimentId) return null;
+  return apiFetch(apiBase, `/history-v2/experiments/${encodeURIComponent(experimentId)}/cancel`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Resume a modern experiment: submits only interrupted + never-started cells.
+ * @param {string} apiBase
+ * @param {string} experimentId
+ * @returns {Promise<object|null>}
+ */
+export async function resumeExperiment(apiBase, experimentId) {
+  if (!experimentId) return null;
+  return apiFetch(apiBase, `/history-v2/experiments/${encodeURIComponent(experimentId)}/resume`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Retry ONE failed cell as a new attempt under the same cell/generation.
+ * @param {string} apiBase
+ * @param {string} experimentId
+ * @param {string} cellId
+ * @returns {Promise<object|null>}
+ */
+export async function retryCell(apiBase, experimentId, cellId) {
+  if (!experimentId || !cellId) return null;
+  return apiFetch(apiBase, `/history-v2/experiments/${encodeURIComponent(experimentId)}/cells/${encodeURIComponent(cellId)}/retry`, {
+    method: "POST",
+  });
+}
+
 // ── Run History API (with pagination, filter, sort) ──────────────────────
 
 /**
@@ -336,5 +406,256 @@ export async function saveRunOutput(apiBase, runId, payload) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  });
+}
+
+// ── Studio Workflow API ──────────────────────────────────────────────────
+
+export async function listWorkflows(apiBase, opts = {}) {
+  const query = new URLSearchParams();
+  if (opts) {
+    if (opts.search) query.set("search", opts.search);
+    if (opts.tag) query.set("tag", opts.tag);
+    if (opts.folder) query.set("folder", opts.folder);
+    if (opts.favorite) query.set("favorite", "1");
+  }
+  const qs = query.toString();
+  return apiFetch(apiBase, "/studio/workflows" + (qs ? "?" + qs : ""));
+}
+
+export async function createWorkflow(apiBase, payload) {
+  return apiFetch(apiBase, "/studio/workflows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function importWorkflow(apiBase, payload) {
+  return apiFetch(apiBase, "/studio/workflows/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getWorkflow(apiBase, workflowId) {
+  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}`);
+}
+
+export async function updateWorkflow(apiBase, workflowId, payload) {
+  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listWorkflowFolders(apiBase) {
+  return apiFetch(apiBase, "/studio/workflows/folders");
+}
+
+export async function listWorkflowTags(apiBase) {
+  return apiFetch(apiBase, "/studio/workflows/tags");
+}
+
+export async function setWorkflowDefaultPreset(apiBase, workflowId, presetId) {
+  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}/default-preset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ preset_id: presetId }),
+  });
+}
+
+export async function clearWorkflowDefaultPreset(apiBase, workflowId) {
+  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}/default-preset`, {
+    method: "DELETE",
+  });
+}
+
+export async function getWorkflowRunContext(apiBase, workflowId, versionId = "") {
+  let path = `/studio/workflows/${encodeURIComponent(workflowId)}/run-context`;
+  if (versionId) path += `?version_id=${encodeURIComponent(versionId)}`;
+  return apiFetch(apiBase, path);
+}
+
+// ── Studio Workflow Versions API ─────────────────────────────────────────
+
+export async function listWorkflowVersions(apiBase, workflowId) {
+  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}/versions`);
+}
+
+export async function captureWorkflowVersion(apiBase, workflowId, capture) {
+  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}/versions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(capture),
+  });
+}
+
+export async function getWorkflowVersion(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}`);
+}
+
+export async function getVersionState(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/state`);
+}
+
+// ── Studio Workflow Mapping API ──────────────────────────────────────────
+
+export async function getMapping(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/mapping`);
+}
+
+export async function createMapping(apiBase, versionId, payload) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/mapping`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getMappingCandidates(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/mapping/candidates`);
+}
+
+export async function createMappingRevision(apiBase, versionId, payload) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/mapping/revision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// ── Studio Workflow Presets API ──────────────────────────────────────────
+
+export async function listVersionPresets(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets`);
+}
+
+export async function createVersionPreset(apiBase, versionId, payload) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getWorkflowPreset(apiBase, presetId) {
+  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}`);
+}
+
+export async function updateWorkflowPreset(apiBase, presetId, payload) {
+  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteWorkflowPreset(apiBase, presetId) {
+  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function duplicateWorkflowPreset(apiBase, presetId) {
+  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}/duplicate`, {
+    method: "POST",
+  });
+}
+
+export async function copyPresetToVersion(apiBase, presetId, targetVersionId) {
+  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}/copy-to-version`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_version_id: targetVersionId }),
+  });
+}
+
+export async function bulkCopyPresetsToVersion(apiBase, versionId, presetIds) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets/copy-bulk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ preset_ids: presetIds }),
+  });
+}
+
+// ── Studio Model Library API ────────────────────────────────────────────
+
+export async function listModels(apiBase, opts = {}) {
+  const query = new URLSearchParams();
+  if (opts) {
+    if (opts.search) query.set("search", opts.search);
+    if (opts.type) query.set("type", opts.type);
+    if (opts.state) query.set("state", opts.state);
+  }
+  const qs = query.toString();
+  return apiFetch(apiBase, "/studio/models" + (qs ? "?" + qs : ""));
+}
+
+export async function getModel(apiBase, modelId) {
+  return apiFetch(apiBase, `/studio/models/${encodeURIComponent(modelId)}`);
+}
+
+export async function updateModel(apiBase, modelId, body) {
+  return apiFetch(apiBase, `/studio/models/${encodeURIComponent(modelId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function rescanModels(apiBase, forceRehash) {
+  return apiFetch(apiBase, "/studio/models/rescan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force_rehash: !!forceRehash }),
+  });
+}
+
+export async function listModelTypes(apiBase) {
+  return apiFetch(apiBase, "/studio/models/types");
+}
+
+export async function requestModelInstall(apiBase, body) {
+  return apiFetch(apiBase, "/studio/models/install-request", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listCustomNodes(apiBase) {
+  return apiFetch(apiBase, "/studio/custom-nodes");
+}
+
+export async function refreshCustomNodes(apiBase) {
+  return apiFetch(apiBase, "/studio/custom-nodes/refresh", { method: "POST" });
+}
+
+export async function requestCustomNodeInstall(apiBase, body) {
+  return apiFetch(apiBase, "/studio/custom-nodes/install-request", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// ── Studio Workflow Version Dependencies / Compatibility API ────────────
+
+export async function getVersionDependencies(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/dependencies`);
+}
+
+export async function getVersionCompatibility(apiBase, versionId) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/compatibility`);
+}
+
+export async function updateVersionCompatibility(apiBase, versionId, body) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/compatibility`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }

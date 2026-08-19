@@ -7,9 +7,14 @@ the measured request path.
 
 from __future__ import annotations
 
-import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
+
+try:
+    from comfymodal_runtime.wait_attribution import classify_node_wait, extract_wait_windows
+except ImportError:  # pragma: no cover - degraded rendering when module missing
+    classify_node_wait = None
+    extract_wait_windows = None
 
 
 UNAVAILABLE = "unavailable"
@@ -17,6 +22,22 @@ MEASURED = "measured"
 DERIVED = "derived"
 INVALID = "invalid"
 NON_APPLICABLE = "non_applicable"
+
+# Reconciliation acceptance model: the exclusive top-level sum is compared
+# against the non-scheduling wall (command->response minus scheduling time).
+# Hard acceptance is <= 50 ms; the <= 10 ms target is
+# exposed as a warning (never hidden) but does not fail the run.
+RECONCILIATION_TARGET_MS = 10.0
+RECONCILIATION_HARD_MS = 50.0
+
+# Accounting roles:
+#   "top_level"        — exclusive chronological interval; the ONLY role that
+#                        affects cumulative / % / bar / accounted.
+#   "child"            — sequential detail under a top-level row; excluded.
+#   "overlap_detail"   — overlapping diagnostic span (UNET/VAE early-activation
+#                        lanes); excluded from accounted and rendered inline.
+#   "informational"    — e.g. Modal scheduling: never a numbered row, never
+#                        accounted/cumulative/%/bar; shown once in the footer.
 
 # Node rows always shown in expanded diagnostics even when tiny (< 25 ms):
 # strategic graph nodes whose presence/absence materially changes the read.
@@ -62,10 +83,11 @@ class WaterfallStage:
     source_fields: tuple[str, ...] = ()
     concurrent: bool = False
     provenance: str = ""
-    # Accounting role: "top_level" (exclusive wall, included_in_total=True),
-    # "child" (detail, included_in_total=False), "overlap_diagnostic"
-    # (overlapping/diagnostic span, excluded from accounted sums), or
-    # "reconciliation" (footer metadata, never a numbered stage).
+    # Accounting role: "top_level" (exclusive chronological interval, the ONLY
+    # role that affects cumulative/%/bar/accounted), "child" (sequential
+    # detail, included_in_total=False), "overlap_detail" (overlapping
+    # diagnostic span, excluded from accounted), or "informational" (never a
+    # numbered row nor accounted; e.g. Modal scheduling shown once in footer).
     accounting_role: str = "top_level"
 
 
@@ -90,10 +112,25 @@ class WaterfallReport:
     scheduling_ms: float | None = None
     total_wall_ms: float | None = None
     command_response_ms: float | None = None
+    command_to_enqueue_ms: float | None = None
+    scheduling_time_ms: float | None = None
+    non_scheduling_ms: float | None = None
+    host_telemetry: dict = field(default_factory=dict)
     partial_waterfall: bool = False
     partial_flags: tuple[str, ...] = ()
     pre_python_interval_ms: float | None = None
     pre_python_interval_classification: str = ""
+    # Required-data availability flags (e.g. "checkpoint_read_unavailable").
+    data_flags: tuple[str, ...] = ()
+    # Reconciliation acceptance thresholds (ms).  Hard acceptance <= 50 ms;
+    # the 10 ms target is surfaced as a warning, never hidden.
+    reconciliation_target_ms: float = RECONCILIATION_TARGET_MS
+    reconciliation_hard_ms: float = RECONCILIATION_HARD_MS
+    # Validation status: "COMPLETE" only when no required-data flags exist AND
+    # reconciliation is resolved within the hard ceiling.  "INCOMPLETE" when a
+    # required-data flag exists, "UNRESOLVED" when the wall is unknown,
+    # "FAILED" when reconciliation exceeds the hard ceiling.
+    validation_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -339,9 +376,9 @@ def _modal_restore_begin_boundary(
 def _python_resume_boundary(result: Mapping[str, Any]) -> Boundary | None:
     """The first executable line of the restored remote Python process.
 
-    Priority: ``_restore_timing.remote_python_resume`` timing boundary →
-    ``v2_startup_post_snapshot_restore_start`` event → ``snapshot_restore_start``
-    event (both remote) → ``restore_method_start`` timing boundary.
+    Priority: ``_restore_timing.remote_python_resume`` timing boundary ->
+    ``v2_startup_post_snapshot_restore_start`` event -> ``snapshot_restore_start``
+    event (both remote) -> ``restore_method_start`` timing boundary.
     """
     timing = _timing_boundary(result, "remote_python_resume", "remote_python_resume")
     if timing is not None:
@@ -383,7 +420,7 @@ def _stage_provenance(candidate: _Candidate) -> str:
         return "host_trace" if local else "remote_trace"
     if candidate.source == "metadata":
         # A mixed-source candidate collapses to "metadata"; a local boundary
-        # still identifies a host-side trace (e.g. command → local receive).
+        # still identifies a host-side trace (e.g. command -> local receive).
         return "host_trace" if local else "remote_trace"
     if candidate.source in ("detail", "cpu_owner", "node_timing", "active_read"):
         return "remote_trace"
@@ -456,6 +493,170 @@ def _candidate_from_duration(
     return _Candidate(source="", status=UNAVAILABLE)
 
 
+# Active-read record timestamp keys (wall vs monotonic are kept on the correct
+# Boundary field — never folded into the wrong clock domain).
+_ACTIVE_READ_START_KEYS = (
+    ("start_wall_unix_ns", "wall"),
+    ("start_monotonic_ns", "mono"),
+    ("start_ns", "wall"),
+)
+_ACTIVE_READ_END_KEYS = (
+    ("end_wall_unix_ns", "wall"),
+    ("end_monotonic_ns", "mono"),
+    ("end_ns", "wall"),
+)
+
+
+# Node-row timeline placement (G3 / Batch A): per_node_timings
+# start_perf_ns / end_perf_ns are captured with time.perf_counter_ns() in
+# runtime_executor._patched_exec_node (same timer boundaries as duration_ms).
+# Artifacts are produced on Linux (Modal), where CPython implements both
+# perf_counter_ns() and monotonic_ns() on CLOCK_MONOTONIC (same clock, same
+# epoch), so perf values are placed in the same "monotonic:remote" scope used
+# for other remote same-process mono intervals (pre_sampler_stages,
+# active_read_records) — the existing clock normalization.  Node rows are
+# NON-ACCOUNTING overlap detail (included_in_total=False, accounting_role
+# "child"), so any platform-level clock divergence could only misposition a
+# diagnostic row and can never affect reconciliation totals.  Old records
+# without timestamps fall back to duration-only rows (start/end None).
+
+
+def _active_read_record_boundary(
+    record: Mapping[str, Any],
+) -> tuple[Boundary, Boundary] | None:
+    """Build the active-read start/end Boundaries with correct wall-vs-mono
+    placement, or ``None`` when either timestamp is absent."""
+    start_wall = start_mono = None
+    for key, kind in _ACTIVE_READ_START_KEYS:
+        value = _number(record.get(key))
+        if value is None:
+            continue
+        if kind == "wall":
+            start_wall = value
+        else:
+            start_mono = value
+        break
+    end_wall = end_mono = None
+    for key, kind in _ACTIVE_READ_END_KEYS:
+        value = _number(record.get(key))
+        if value is None:
+            continue
+        if kind == "wall":
+            end_wall = value
+        else:
+            end_mono = value
+        break
+    if (start_wall is None and start_mono is None) or (end_wall is None and end_mono is None):
+        return None
+    process = str(record.get("process") or "remote")
+    return (
+        Boundary("active_read_start", start_wall, start_mono, process, "active_read"),
+        Boundary("active_read_end", end_wall, end_mono, process, "active_read"),
+    )
+
+
+# Model-read owner/path semantics.  A record is a candidate checkpoint read
+# only when its owner/path describes a model read; CLIP/text-encoder/VAE reads
+# are never acceptable substitutes.
+_ACTIVE_READ_MODEL_TOKENS = ("unet", "model", "read", "loader", "checkpoint", "graph")
+_ACTIVE_READ_NON_MODEL_TOKENS = ("clip", "text", "vae", "tokenizer", "cond", "lora")
+
+
+def _active_read_is_model_read(record: Mapping[str, Any]) -> bool:
+    owner = str(record.get("owner") or "").strip().lower()
+    path = str(record.get("path_hash") or record.get("path") or record.get("filename") or "").strip().lower()
+    if not owner and not path:
+        return False
+    combined = owner
+    if path:
+        combined += " " + path
+    if any(tag in combined for tag in _ACTIVE_READ_NON_MODEL_TOKENS):
+        return False
+    if any(tag in owner for tag in _ACTIVE_READ_MODEL_TOKENS):
+        return True
+    if path and any(ext in path for ext in (".safetensors", ".ckpt", ".pt", ".sft")):
+        return True
+    return False
+
+
+def _active_read_matches_result(record: Mapping[str, Any], result: Mapping[str, Any]) -> bool:
+    """The record must not explicitly belong to another request/instance/
+    restore session.  A record carrying NO identity fields is treated as ours
+    (matches); a record carrying a DIFFERENT request/instance/session is
+    rejected — never choose a foreign read."""
+    request_id = _request_id(result)
+    identity = _identity(result)
+    instance_id = str(identity.get("restored_instance_id") or "").strip()
+    session_id = str(identity.get("restore_session_id") or "").strip()
+    if request_id:
+        record_request = str(record.get("request_id") or "").strip()
+        if record_request and record_request != request_id:
+            return False
+    if instance_id:
+        record_instance = str(
+            record.get("restored_instance_id") or record.get("instance_id") or ""
+        ).strip()
+        if record_instance and record_instance != instance_id:
+            return False
+    if session_id:
+        record_session = str(record.get("restore_session_id") or "").strip()
+        if record_session and record_session != session_id:
+            return False
+    return True
+
+
+def _active_read_match_score(record: Mapping[str, Any], result: Mapping[str, Any]) -> int:
+    """Score how strongly the record matches this run (identity agreement) plus
+    timestamp strength (monotonic pairs are the most reliable clock)."""
+    score = 0
+    request_id = _request_id(result)
+    identity = _identity(result)
+    if request_id and str(record.get("request_id") or "").strip() == request_id:
+        score += 2
+    if str(record.get("restored_instance_id") or "").strip() and identity.get("restored_instance_id"):
+        score += 2
+    if str(record.get("restore_session_id") or "").strip() and identity.get("restore_session_id"):
+        score += 2
+    if str(record.get("container_session_id") or "").strip() and identity.get("container_session_id"):
+        score += 1
+    if str(record.get("path_hash") or "").strip():
+        score += 1
+    pair = _active_read_record_boundary(record)
+    if pair is not None and pair[0].monotonic_ns is not None and pair[1].monotonic_ns is not None:
+        score += 1  # strong same-clock monotonic timestamps
+    return score
+
+
+def _best_active_read(
+    result: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Boundary, Boundary] | None:
+    """Pick the safest active-read record: a MODEL read that matches this
+    request/instance/restore-session identity and has complete timestamps.
+
+    Returns ``(record, start_boundary, end_boundary)`` or ``None`` when no
+    safe match exists (the report then flags ``checkpoint_read_unavailable``
+    instead of substituting the H2D span or a foreign read).
+    """
+    best = None
+    best_score = -1
+    structured = _as_mapping(result).get("pre_sampler_structured_report")
+    for record in _as_mapping(structured).get("active_read_records", ()):
+        if not isinstance(record, Mapping):
+            continue
+        if not _active_read_is_model_read(record):
+            continue
+        if not _active_read_matches_result(record, result):
+            continue
+        pair = _active_read_record_boundary(record)
+        if pair is None:
+            continue
+        score = _active_read_match_score(record, result)
+        if score > best_score:
+            best = (record, pair[0], pair[1])
+            best_score = score
+    return best
+
+
 def _identity(result: Mapping[str, Any]) -> dict[str, Any]:
     value = _as_mapping(result).get("identity")
     if isinstance(value, Mapping):
@@ -480,6 +681,168 @@ def _identity(result: Mapping[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _map_cpu_vendor(vendor: Any) -> str:
+    """Normalize a CPU vendor id to a short display token: the classic
+    ``AuthenticAMD`` / ``GenuineIntel`` ids become ``AMD`` / ``Intel``;
+    anything else keeps its first whitespace token."""
+    text = str(vendor or "").strip()
+    if not text:
+        return ""
+    if text == "AuthenticAMD":
+        return "AMD"
+    if text == "GenuineIntel":
+        return "Intel"
+    return text.split()[0]
+
+
+def _extract_host_telemetry(
+    result: Mapping[str, Any],
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compact host-hardware header data from the same result build_waterfall
+    consumes (``result_view``).  Every value is optional and never fabricated:
+    absent data simply omits the key, so the compact header can never show a
+    fake zero.  Reads:
+
+    - GPU from ``gpu_allocation`` (gpu_actual_name / gpu_vram_total_mib /
+      cuda_version / gpu_compute_capability).
+    - Platform from the resolved identity (cloud / region /
+      restored_instance_id / fresh).
+    - CPU identity from ``host_hardware_fingerprint`` event metadata
+      (cpu_vendor / cpu_family / cpu_model / cpu_count_proc|cpu_count_os|
+      cpu_siblings).
+    - CPU runtime from ``runtime_shape.observed`` (cpu_request /
+      torch_intraop_threads / torch_interop_threads / native_thread_count).
+    - CPU pressure from ``trace.activation_diagnosis`` (cpu_peak_cores /
+      cpu_above_16_ms).
+    - Memory from ``host_memory`` event metadata (process_rss_mib /
+      process_maxrss_mib by stage), with a maxRSS fallback from
+      ``host_resource_snapshot`` ``ru_maxrss`` (KB -> MiB).
+    """
+    telemetry: dict[str, Any] = {}
+    result_view = _as_mapping(result)
+
+    # ── GPU ────────────────────────────────────────────────────────────────
+    gpu_allocation = _as_mapping(result_view.get("gpu_allocation"))
+    if gpu_allocation:
+        gpu_name = gpu_allocation.get("gpu_actual_name")
+        if gpu_name not in (None, ""):
+            telemetry["gpu_name"] = str(gpu_name)
+        vram = _number(gpu_allocation.get("gpu_vram_total_mib"))
+        if vram is not None and vram > 0:
+            telemetry["gpu_vram_mib"] = vram
+        cuda = gpu_allocation.get("cuda_version")
+        if cuda not in (None, ""):
+            telemetry["cuda_version"] = str(cuda)
+        capability = gpu_allocation.get("gpu_compute_capability")
+        if capability not in (None, ""):
+            telemetry["compute_capability"] = str(capability)
+
+    # ── Platform / identity ────────────────────────────────────────────────
+    resolved = _identity(result_view) if identity is None else identity
+    cloud = resolved.get("cloud")
+    if cloud not in (None, ""):
+        telemetry["cloud"] = str(cloud)
+    region = resolved.get("region")
+    if region not in (None, ""):
+        telemetry["region"] = str(region)
+    instance = resolved.get("restored_instance_id")
+    if instance not in (None, ""):
+        telemetry["restored_instance_id"] = str(instance)
+    if "fresh" in resolved:
+        telemetry["fresh"] = resolved["fresh"]
+
+    # ── CPU identity (host_hardware_fingerprint event metadata) ────────────
+    for meta in _metadata_events(result_view, "host_hardware_fingerprint"):
+        vendor = _map_cpu_vendor(meta.get("cpu_vendor"))
+        if vendor and "cpu_vendor" not in telemetry:
+            telemetry["cpu_vendor"] = vendor
+        for out_key, source_key in (
+            ("cpu_family", "cpu_family"),
+            ("cpu_model", "cpu_model"),
+        ):
+            value = meta.get(source_key)
+            if value not in (None, "") and out_key not in telemetry:
+                telemetry[out_key] = str(value)
+        visible = (
+            meta.get("cpu_count_proc")
+            if meta.get("cpu_count_proc") is not None
+            else meta.get("cpu_count_os")
+            if meta.get("cpu_count_os") is not None
+            else meta.get("cpu_siblings")
+        )
+        visible_num = _number(visible)
+        if visible_num is not None and visible_num > 0 and "cpu_visible" not in telemetry:
+            telemetry["cpu_visible"] = visible_num
+
+    # ── CPU runtime (runtime_shape.observed) ───────────────────────────────
+    runtime_observed = _as_mapping(_as_mapping(result_view.get("runtime_shape")).get("observed"))
+    if runtime_observed:
+        requested = runtime_observed.get("cpu_request")
+        if requested not in (None, ""):
+            telemetry["cpu_requested"] = str(requested)
+        intra = _number(runtime_observed.get("torch_intraop_threads"))
+        if intra is not None and intra > 0:
+            telemetry["torch_intraop"] = intra
+        inter = _number(runtime_observed.get("torch_interop_threads"))
+        if inter is not None and inter > 0:
+            telemetry["torch_interop"] = inter
+        native = _number(runtime_observed.get("native_thread_count"))
+        if native is not None and native > 0:
+            telemetry["native_threads"] = native
+    if "cpu_requested" not in telemetry:
+        identity_runtime = _as_mapping(resolved.get("runtime_shape"))
+        identity_request = identity_runtime.get("cpu_request")
+        if identity_request not in (None, ""):
+            telemetry["cpu_requested"] = str(identity_request)
+
+    # ── CPU pressure (trace.activation_diagnosis) ─────────────────────────
+    activation = _as_mapping(_as_mapping(_trace(result_view)).get("activation_diagnosis"))
+    if activation:
+        peak = activation.get("cpu_peak_cores")
+        if isinstance(peak, (int, float)) and not isinstance(peak, bool):
+            telemetry["cpu_peak_cores"] = float(peak)
+        above = _number(activation.get("cpu_above_16_ms"))
+        if above is not None:
+            telemetry["cpu_above_16_ms"] = above
+
+    # ── Memory (host_memory events by stage) ───────────────────────────────
+    rss_by_stage: dict[str, float] = {}
+    max_rss_candidates: list[float] = []
+    for meta in _metadata_events(result_view, "host_memory"):
+        stage = str(meta.get("stage") or "")
+        rss = meta.get("process_rss_mib")
+        if isinstance(rss, (int, float)) and not isinstance(rss, bool):
+            if stage and stage not in rss_by_stage:
+                rss_by_stage[stage] = float(rss)
+        maxrss = meta.get("process_maxrss_mib")
+        if isinstance(maxrss, (int, float)) and not isinstance(maxrss, bool):
+            max_rss_candidates.append(float(maxrss))
+    if "restore_start" in rss_by_stage:
+        telemetry["rss_restore_mib"] = rss_by_stage["restore_start"]
+    elif "restore_complete" in rss_by_stage:
+        telemetry["rss_restore_mib"] = rss_by_stage["restore_complete"]
+    if "peak_execution" in rss_by_stage:
+        telemetry["rss_peak_mib"] = rss_by_stage["peak_execution"]
+    if "result_complete" in rss_by_stage:
+        telemetry["rss_result_mib"] = rss_by_stage["result_complete"]
+    if max_rss_candidates:
+        telemetry["max_rss_mib"] = max(max_rss_candidates)
+    if "max_rss_mib" not in telemetry:
+        # maxRSS fallback: the highest ru_maxrss (KB) across resource
+        # snapshots, converted to MiB (KB / 1024 — same convention the
+        # host-memory producer uses for process_maxrss_mib).
+        ru_values = [
+            _number(meta.get("ru_maxrss"))
+            for meta in _metadata_events(result_view, "host_resource_snapshot")
+        ]
+        ru_values = [value for value in ru_values if value is not None and value > 0]
+        if ru_values:
+            telemetry["max_rss_mib"] = max(ru_values) / 1024.0
+
+    return telemetry
+
+
 def _request_id(result: Mapping[str, Any]) -> str:
     direct = _as_mapping(result).get("request_id") or _as_mapping(result).get("prompt_id")
     if direct:
@@ -493,6 +856,63 @@ def _request_id(result: Mapping[str, Any]) -> str:
     return ""
 
 
+# ── Direct output-return boundaries ────────────────────────────────────────
+# Consumed from the merged host trace (``remote_result_emit`` /
+# ``local_result_received`` / ``execute_plan_return`` events) or from
+# ``local_timing`` wall fields.  These are the exact direct-completion /
+# host-receipt / caller-return boundaries — never a remote pre-yield span.
+
+
+def _remote_emit_boundary(result: Mapping[str, Any]) -> Boundary | None:
+    """Direct-output completion boundary: the remote result emit (wall or
+    monotonic), falling back to the producer's ``remote_result_emit_wall_unix_ns``
+    / ``remote_result_emit_mono_ns`` local-timing fields."""
+    event = _event_boundary(result, "remote_result_emit", last=True)
+    if event is not None:
+        return event
+    wall = _number(_first_value(result, ("remote_result_emit_wall_unix_ns",)))
+    if wall is not None:
+        return Boundary("remote_result_emit", wall, None, "remote", "metadata")
+    mono = _number(_first_value(result, ("remote_result_emit_mono_ns",)))
+    if mono is not None:
+        return Boundary("remote_result_emit", None, mono, "remote", "metadata")
+    return None
+
+
+def _local_receipt_boundary(result: Mapping[str, Any]) -> Boundary | None:
+    """Exact host local-result receipt boundary: the local receipt event
+    (``local_result_received`` / ``final_result_received``) or the producer's
+    ``local_result_received_wall_ns`` / ``_mono_ns`` local-timing fields."""
+    event = _event_boundary(
+        result,
+        ("local_result_received", "final_result_received", "response_received"),
+        process="local",
+        last=True,
+    )
+    if event is not None:
+        return event
+    wall = _number(_first_value(result, ("local_result_received_wall_ns",)))
+    if wall is not None:
+        return Boundary("local_result_received", wall, None, "local", "metadata")
+    mono = _number(_first_value(result, ("local_result_received_mono_ns",)))
+    if mono is not None:
+        return Boundary("local_result_received", None, mono, "local", "metadata")
+    return None
+
+
+def _caller_return_boundary(
+    result: Mapping[str, Any],
+    response: Boundary | None,
+) -> Boundary | None:
+    """The caller-return boundary: the exact ``execute_plan_return`` host event
+    when present, else the *response* argument (the host's capture after the
+    call returns).  Never a remote pre-yield timestamp."""
+    event = _event_boundary(result, "execute_plan_return", last=True)
+    if event is not None:
+        return event
+    return response
+
+
 def _stage_candidate(
     result: Mapping[str, Any],
     key: str,
@@ -500,6 +920,7 @@ def _stage_candidate(
     restore_begin: Boundary | None = None,
     python_resume: Boundary | None = None,
     python_restore_end: Boundary | None = None,
+    response: Boundary | None = None,
 ) -> _Candidate:
     event = lambda names, **kwargs: _event_boundary(result, names, **kwargs)
     origin = lambda name: _origin_boundary(result, name, name)
@@ -534,9 +955,9 @@ def _stage_candidate(
         )
     if key == "modal_scheduling":
         # Modal scheduling before the snapshot restore begins.  Three tiers:
-        #   1. measured submission → restore_begin (authoritative platform
+        #   1. measured submission -> restore_begin (authoritative platform
         #      boundary from the Modal app log)
-        #   2. measured submission → python_resume (combined interval; the
+        #   2. measured submission -> python_resume (combined interval; the
         #      report flags modal_restore_begin_unavailable so the reader
         #      knows scheduling + pre-Python restore are fused here)
         #   3. legacy derived math (dispatch − restore − restore-to-method)
@@ -573,7 +994,7 @@ def _stage_candidate(
         return _Candidate()
     if key == "pre_python_snapshot_restore":
         # Modal pre-Python snapshot restoration: restore_begin (platform
-        # boundary) → first restored Python line.  When the platform boundary
+        # boundary) -> first restored Python line.  When the platform boundary
         # is absent this is a legitimate localized unknown — the combined
         # interval is already attributed to modal_scheduling — so the stage is
         # explicitly UNAVAILABLE (never fabricated into the residual).
@@ -586,30 +1007,8 @@ def _stage_candidate(
         start = restore_end
         end = remote_entry
         return _candidate(result, start, end, duration_keys=("restore_end_to_modal_method_ms",))
-    if key == "method_entry_to_unet_claim":
-        # Method entry → the request-scoped UNET ownership claim (worker
-        # publishes before touching storage/CUDA).  Both boundaries are remote
-        # so the interval is same-process monotonic.  The claim event is only
-        # emitted under the exclusive-owner gate; without it the stage is
-        # unavailable (never a phantom zero).
-        claim_event = _event_boundary(result, "unet_ownership_claim", process="remote")
-        return _candidate(result, remote_entry, claim_event, duration_keys=("method_entry_to_unet_claim_ms",))
-    if key == "unet_claim_to_ready":
-        # Worker claim → terminal ready (the load itself).  Concurrent with
-        # graph-side stages by design; reported explicitly, excluded from the
-        # accounted total (see build_waterfall concurrency handling).
-        claim_event = _event_boundary(result, "unet_ownership_claim", process="remote")
-        terminal = (
-            _event_boundary(result, "unet_early_activation_terminal", process="remote")
-            or _event_boundary(result, "unet_early_activation_terminal")
-        )
-        candidate = _candidate(
-            result, claim_event, terminal,
-            duration_keys=("unet_claim_to_ready_ms", "early_activation_total_ms", "synchronized_transfer_ms"),
-        )
-        return candidate
     if key == "sampler_graph_join_wait":
-        # The sampler-boundary graph join: first sampler node → join
+        # The sampler-boundary graph join: first sampler node -> join
         # completion.  The join is the worker-future wait that was previously
         # hidden inside the residual; the authoritative join span lives on the
         # ``unet_graph_join`` event metadata (join_start_mono_ns /
@@ -637,12 +1036,42 @@ def _stage_candidate(
         start = event("prompt_executor_invoke_start", process="remote")
         end = event(("graph_first_node", "first_executing_node"), process="remote")
         return _candidate(result, start, end, duration_keys=("executor_call_to_first_node_ms", "exec_start_to_cached_ms", "prompt_executor_cache_setup_ms"))
-    if key == "first_node_to_clip":
-        value = _first_value(result, ("first_node_to_clip_ms",))
-        return _candidate_from_duration(value)
-    if key == "clip_to_sampler_node":
-        value = _first_value(result, ("clip_to_sampler_node_ms",))
-        return _candidate_from_duration(value)
+    if key == "pre_sampler_execution":
+        # ONE mutually-exclusive pre-sampler parent: first node -> sampler
+        # node.  The first-sampler-node boundary is the strongest exact
+        # boundary (pre_sampler_stages.first_sampler_node_monotonic_ns, else
+        # the graph-join start); otherwise the consolidated duration is the
+        # exact sum of first_node_to_clip_ms + clip_to_sampler_node_ms so the
+        # accounted total is byte-identical to the split rows it replaces.
+        start = (
+            event("graph_first_node", process="remote")
+            or event("first_executing_node", process="remote")
+            or event(("graph_first_node", "first_executing_node"))
+        )
+        first_sampler = None
+        for metadata in _metadata_events(result, "pre_sampler_stages"):
+            value = _number(metadata.get("first_sampler_node_monotonic_ns"))
+            if value is not None:
+                first_sampler = Boundary("first_sampler_node", None, value, "remote", "metadata")
+                break
+        if first_sampler is None:
+            join_start_meta = _event_metadata_value(result, "unet_graph_join", "join_start_mono_ns", last=True)
+            if isinstance(join_start_meta, (int, float)) and not isinstance(join_start_meta, bool):
+                first_sampler = Boundary("sampler_graph_join_wait", None, int(join_start_meta), "remote", "metadata")
+        candidate = _candidate(result, start, first_sampler)
+        if candidate.duration_ms is not None:
+            return candidate
+        clip_start = _first_value(result, ("first_node_to_clip_ms",))
+        clip_lane = _first_value(result, ("clip_to_sampler_node_ms",))
+        if (
+            isinstance(clip_start, (int, float)) and isinstance(clip_lane, (int, float))
+            and not isinstance(clip_start, bool) and not isinstance(clip_lane, bool)
+        ):
+            return _candidate_from_duration(
+                float(clip_start) + float(clip_lane),
+                source_fields=("first_node_to_clip_ms", "clip_to_sampler_node_ms"),
+            )
+        return _Candidate()
     if key == "sampler_node_to_sampling":
         candidate = _candidate(
             result,
@@ -678,29 +1107,35 @@ def _stage_candidate(
     if key == "vae":
         return _candidate(result, event("vae_decode_start", process="remote"), event("vae_decode_end", process="remote"), duration_keys=("vae_decode_ms",))
     if key == "output_persistence":
+        # Output encode/descriptor ENDS at direct completion: the remote result
+        # emit boundary when present, else the persist/collect completion.
         start = event("output_encode_start", process="remote") or event("output_persist_start", process="remote")
-        end = event("output_persist_end", process="remote") or event("output_encode_end", process="remote")
+        end = (
+            _remote_emit_boundary(result)
+            or event("output_persist_end", process="remote")
+            or event("output_collect_end", process="remote")
+            or event("output_encode_end", process="remote")
+        )
         return _candidate(result, start, end, duration_keys=("output_collection_ms", "output_persist_ms", "output_commit_ms"))
     if key == "remote_local_return":
-        # The local hop: remote_return_start (emitted by execute_plan once the
-        # result leaves the transport) → final local receive.  Both boundaries
-        # are local so the interval is same-clock and never overlaps the
-        # cross-process handoff row.  Traces without a local return marker
-        # fall back to the remote output persist/collect boundary.
-        start = (
-            event("remote_return_start", process="local", last=True)
-            or event(("output_persist_end", "output_collect_end"), process="remote", last=True)
-            or event(("output_persist_end", "output_collect_end", "remote_return_start"), last=True)
-        )
-        end = event(("response_received", "final_result_received", "local_result_received"), process="local", last=True)
-        return _candidate(result, start, end, duration_keys=("remote_return_ms", "trigger_to_result_ms"))
+        # Local result handling / caller return = local receipt -> caller return
+        # (execute_plan_return event, else the response argument).  Never the
+        # remote pre-yield build time.
+        start = _local_receipt_boundary(result)
+        end = _caller_return_boundary(result, response)
+        return _candidate(result, start, end, duration_keys=("local_result_received_to_caller_return_ms", "result_received_to_return_ms", "remote_return_ms", "trigger_to_result_ms"))
     if key == "remote_return_handoff":
+        # Remote result handoff = remote emit -> local receipt.  When the
+        # direct emit marker is absent, the last remote completion boundary
+        # (persist/collect end) is the fallback start.
         return _candidate(
             result,
-            event("output_collect_end", process="remote", last=True)
+            _remote_emit_boundary(result)
+            or event("output_persist_end", process="remote", last=True)
+            or event("output_collect_end", process="remote", last=True)
+            or event("output_persist_end", last=True)
             or event("output_collect_end", last=True),
-            event("remote_return_start", process="local", last=True)
-            or event(("final_result_received", "response_received"), process="local", last=True),
+            _local_receipt_boundary(result),
         )
     return _Candidate()
 
@@ -712,20 +1147,19 @@ _STAGE_SPECS: tuple[tuple[str, str, str, bool], ...] = (
     ("pre_python_snapshot_restore", "Modal pre-Python snapshot restoration", "platform", False),
     ("application_restore", "Python/application restore", "application", False),
     ("restore_to_method_entry", "Restore-to-method entry", "application", False),
-    ("method_entry_to_unet_claim", "Method entry to UNET ownership claim", "application", True),
-    ("unet_claim_to_ready", "UNET claim to ready (worker load)", "application", True),
     ("remote_method_setup", "Remote method setup", "application", False),
     ("prompt_executor_cache_setup", "PromptExecutor/cache setup", "application", False),
-    ("first_node_to_clip", "First node to CLIP", "application", False),
-    ("clip_to_sampler_node", "CLIP to sampler node", "application", False),
+    # One mutually-exclusive pre-sampler parent: first node -> sampler node.
+    # CLIP / UNET / conditioning-cache timings are indented details under it.
+    ("pre_sampler_execution", "Pre-sampler execution", "application", False),
     ("sampler_graph_join_wait", "Sampler graph-join wait", "application", False),
     ("sampler_node_to_sampling", "Sampler node to sampling", "application", False),
     ("sampling", "Sampling", "application", False),
-    ("post_sampling_transition", "Post-sampling transition", "application", False),
-    ("vae", "VAE", "application", False),
+    ("post_sampling_transition", "Post-sampling / VAE transition", "application", False),
+    ("vae", "VAE decode", "application", False),
     ("output_persistence", "Output encode / descriptor", "application", False),
     ("remote_return_handoff", "Remote result handoff", "local", False),
-    ("remote_local_return", "Remote/local return", "local", False),
+    ("remote_local_return", "Local result handling / caller return", "local", False),
 )
 
 
@@ -777,7 +1211,7 @@ def _seed_phase_duration(
 
     Priority:
       1. measured — same-process monotonic pair between the phase's own
-         start/end trace events (``snapshot_graph_seed_validate_start`` →
+         start/end trace events (``snapshot_graph_seed_validate_start`` ->
          ``snapshot_graph_seed_validate_end``, and the apply equivalents)
       2. derived — authoritative metadata for the phase.  ``validate_ms`` is
          NOT carried on ``snapshot_graph_seed_validate_end``; it lives on the
@@ -820,6 +1254,72 @@ def _seed_phase_duration(
     return _Candidate()
 
 
+def _authoritative_cache_decision(
+    decisions: Sequence[Mapping[str, Any]],
+    result: Mapping[str, Any] | None = None,
+) -> tuple[str, Mapping[str, Any]] | None:
+    """Pick the authoritative conditioning-cache decision from the trace.
+
+    The producer emits one decision event per prefill.  A real exact hit is
+    authoritative even when a later no-op ``miss_not_stored`` event (zero
+    encode / zero store / zero miss entries) follows it.  A real miss (stored,
+    or a miss with actual encode/store work) supersedes an older hit.  When
+    *result* carries a request id, decisions explicitly belonging to another
+    request are ignored.
+    """
+    if not decisions:
+        return None
+    request_id = _request_id(result) if result is not None else ""
+    scoped = []
+    for decision in decisions:
+        if request_id:
+            record_request = str(decision.get("request_id") or "").strip()
+            if record_request and record_request != request_id:
+                continue
+        scoped.append(decision)
+    if not scoped:
+        scoped = list(decisions)
+
+    def _has_work(decision: Mapping[str, Any], decision_name: str) -> bool:
+        if decision_name in ("miss_stored", "miss", "cache_missing"):
+            return True
+        if decision_name == "miss_not_stored":
+            encode = decision.get("encode_calls")
+            store = decision.get("cache_store_calls")
+            return (
+                isinstance(encode, (int, float)) and not isinstance(encode, bool) and encode > 0
+            ) or (
+                isinstance(store, (int, float)) and not isinstance(store, bool) and store > 0
+            )
+        return False
+
+    real_misses = [
+        d for d in scoped
+        if str(d.get("decision") or "").strip() in ("miss_stored", "miss", "cache_missing")
+    ]
+    exact_hits = [
+        d for d in scoped if str(d.get("decision") or "").strip() == "exact_hit"
+    ]
+    no_ops = [
+        d for d in scoped if str(d.get("decision") or "").strip() == "miss_not_stored"
+    ]
+    # A real miss that performed work supersedes an older hit.
+    for decision in real_misses:
+        name = str(decision.get("decision") or "").strip()
+        if _has_work(decision, name):
+            return name, decision
+    # An authoritative exact hit wins over any following no-op miss_not_stored.
+    if exact_hits:
+        return "exact_hit", exact_hits[-1]
+    # A miss_not_stored with actual encode/store work is a real miss.
+    for decision in no_ops:
+        if _has_work(decision, "miss_not_stored"):
+            return "miss_not_stored", decision
+    # Fall back to the last decision event.
+    last = scoped[-1]
+    return str(last.get("decision") or "").strip(), last
+
+
 def _detail_stages(
     result: Mapping[str, Any],
     total_ms: float | None,
@@ -851,8 +1351,9 @@ def _detail_stages(
         ("cached_to_first_node", "cached to first node", "prompt_executor_cache_setup", "cached_to_first_node_ms"),
         ("sampler_node_to_lane_acquired", "sampler node to lane acquired", "sampler_node_to_sampling", "sampler_node_to_lane_acquired_ms"),
         ("lane_acquired_to_actual_stage", "lane acquired to actual stage", "sampler_node_to_sampling", "lane_acquired_to_actual_stage_ms"),
-        ("output_encode", "output encode", "output_persistence", "output_encode_ms"),
-        ("output_commit", "output commit", "output_persistence", "output_commit_ms"),
+        # NOTE: "output_encode" / "output_commit" metadata rows are omitted on
+        # purpose — the request-scoped PNG encode / descriptor details are the
+        # measured canonical rows (no duplicate clutter).
         ("unet_quiesce_wait", "UNET quiesce wait (diagnostic)", "remote_method_setup", "quiesce_wait_ms"),
         ("unet_transfer_queue_delay", "UNET transfer queue delay", "remote_method_setup", "transfer_queue_delay_ms"),
         ("unet_synchronized_transfer", "UNET synchronized transfer", "remote_method_setup", "synchronized_transfer_ms"),
@@ -950,6 +1451,140 @@ def _detail_stages(
                 accounting_role="child",
             ))
 
+    # ── Pre-sampler curation: conditioning-cache + CLIP encode ────────────
+    # Children of the pre-sampler region (included_in_total=False) so they can
+    # never double-count the accounted chain.
+    cache_events = _metadata_events(result, "clip_conditioning_cache_lookup")
+    decision_events = _metadata_events(result, "clip_conditioning_cache_decision")
+    if cache_events or decision_events:
+        cache_meta = cache_events[-1] if cache_events else {}
+        hit_count = cache_meta.get("hit_count")
+        miss_count = cache_meta.get("miss_count")
+        entry_count = cache_meta.get("entry_count")
+        lookup_ms = cache_meta.get("lookup_wall_ms")
+        # Authoritative outcome: a real exact hit wins over a following no-op
+        # miss_not_stored; a real miss with encode/store work wins over a hit.
+        decision_name, _decision_meta = _authoritative_cache_decision(decision_events, result)
+        is_hit = decision_name == "exact_hit"
+        if is_hit:
+            # Truthful hit row: no contradictory hit/miss counts, no fake
+            # duration.  Encode was skipped, shown as status text (no span).
+            parts = ["Conditioning cache exact_hit"]
+            if isinstance(lookup_ms, (int, float)):
+                parts.append(f"lookup={lookup_ms:.3f}ms")
+            label = " ".join(parts)
+            cache_candidate = _candidate_from_duration(
+                lookup_ms,
+                source_fields=("clip_conditioning_cache_lookup.lookup_wall_ms",),
+            )
+            details.append(WaterfallStage(
+                key="conditioning_cache_lookup",
+                label=label,
+                group="detail",
+                start_ns=None,
+                end_ns=None,
+                duration_ms=cache_candidate.duration_ms,
+                cumulative_ms=None,
+                percentage=_percentage(cache_candidate.duration_ms, total_ms, total_wall_ms),
+                source=cache_candidate.source or "detail",
+                status=cache_candidate.status,
+                is_detail=True,
+                parent_key="pre_sampler_execution",
+                included_in_total=False,
+                clock_scope="metadata",
+                source_fields=cache_candidate.source_fields,
+                provenance="remote_trace",
+                accounting_role="child",
+            ))
+            # Encode skipped on the hit: status text/detail, no fake duration.
+            details.append(WaterfallStage(
+                key="clip_encode_skipped",
+                label="CLIP encode skipped (cache hit)",
+                group="detail",
+                start_ns=None,
+                end_ns=None,
+                duration_ms=None,
+                cumulative_ms=None,
+                percentage=None,
+                source="status",
+                status=DERIVED,
+                is_detail=True,
+                parent_key="pre_sampler_execution",
+                included_in_total=False,
+                clock_scope="metadata",
+                provenance="remote_trace",
+                accounting_role="child",
+            ))
+        else:
+            parts = ["Conditioning cache"]
+            if decision_name:
+                parts.append(f"decision={decision_name}")
+            if isinstance(hit_count, (int, float)):
+                parts.append(f"hit={int(hit_count)}")
+            if isinstance(miss_count, (int, float)):
+                parts.append(f"miss={int(miss_count)}")
+            if isinstance(entry_count, (int, float)):
+                parts.append(f"entries={int(entry_count)}")
+            if isinstance(lookup_ms, (int, float)):
+                parts.append(f"lookup={lookup_ms:.3f}ms")
+            cache_candidate = _candidate_from_duration(
+                lookup_ms,
+                source_fields=("clip_conditioning_cache_lookup.lookup_wall_ms",),
+            )
+            details.append(WaterfallStage(
+                key="conditioning_cache_lookup",
+                label=" ".join(parts),
+                group="detail",
+                start_ns=None,
+                end_ns=None,
+                duration_ms=cache_candidate.duration_ms,
+                cumulative_ms=None,
+                percentage=_percentage(cache_candidate.duration_ms, total_ms, total_wall_ms),
+                source=cache_candidate.source or "detail",
+                status=cache_candidate.status,
+                is_detail=True,
+                parent_key="pre_sampler_execution",
+                included_in_total=False,
+                clock_scope="metadata",
+                source_fields=cache_candidate.source_fields,
+                provenance="remote_trace",
+                accounting_role="child",
+            ))
+
+    clip_encode_start = (
+        _event_boundary(result, "execution_prefill_encode_start", process="remote")
+        or _event_boundary(result, "execution_prefill_encode_start")
+    )
+    clip_encode_end = (
+        _event_boundary(result, "execution_prefill_encode_end", process="remote")
+        or _event_boundary(result, "execution_prefill_encode_end")
+    )
+    encoded_count = _event_metadata_value(result, "execution_prefill_encode_end", "encoded_count", last=True)
+    if clip_encode_start is not None or clip_encode_end is not None or encoded_count is not None:
+        clip_label = "CLIP encode"
+        if isinstance(encoded_count, (int, float)) and not isinstance(encoded_count, bool):
+            clip_label += f" ({int(encoded_count)} calls)"
+        clip_candidate = _candidate(result, clip_encode_start, clip_encode_end)
+        details.append(WaterfallStage(
+            key="clip_encode",
+            label=clip_label,
+            group="detail",
+            start_ns=None,
+            end_ns=None,
+            duration_ms=clip_candidate.duration_ms,
+            cumulative_ms=None,
+            percentage=_percentage(clip_candidate.duration_ms, total_ms, total_wall_ms),
+            source=clip_candidate.source or "detail",
+            status=clip_candidate.status,
+            is_detail=True,
+            parent_key="pre_sampler_execution",
+            included_in_total=False,
+            clock_scope=clip_candidate.clock_scope or "metadata",
+            source_fields=clip_candidate.source_fields,
+            provenance=_stage_provenance(clip_candidate) or "remote_trace",
+            accounting_role="child",
+        ))
+
     structured = _as_mapping(result).get("pre_sampler_structured_report")
     for index, record in enumerate(_as_mapping(structured).get("cpu_owner_records", ())):
         if not isinstance(record, Mapping):
@@ -970,18 +1605,54 @@ def _detail_stages(
             source="cpu_owner",
             status=DERIVED if isinstance(duration, (int, float)) and not isinstance(duration, bool) else UNAVAILABLE,
             is_detail=True,
-            parent_key="prompt_executor_cache_setup",
+            parent_key="pre_sampler_execution",
             included_in_total=False,
             clock_scope="metadata",
             provenance="remote_trace",
             accounting_role="child",
         ))
-    for index, record in enumerate(_as_mapping(structured).get("per_node_timings", ())):
+    _per_node_timings = _as_mapping(structured).get("per_node_timings", ())
+    # Wait windows are only needed when node rows will actually render; compute
+    # once, lazily, and never let a wait_attribution failure break rendering.
+    _wait_windows: Sequence = ()
+    if _per_node_timings and extract_wait_windows is not None:
+        try:
+            _wait_windows = extract_wait_windows(result)
+        except Exception:
+            _wait_windows = ()
+    for index, record in enumerate(_per_node_timings):
         if not isinstance(record, Mapping):
             continue
         duration = record.get("duration_ms")
         duration_ms = float(duration) if isinstance(duration, (int, float)) and not isinstance(duration, bool) else None
+        start_perf = _number(record.get("start_perf_ns"))
+        end_perf = _number(record.get("end_perf_ns"))
+        positioned = (
+            start_perf is not None
+            and end_perf is not None
+            and end_perf >= start_perf
+        )
         node_label = str(record.get("class_type") or record.get("node_id") or "node")
+        # Attribute any wait inside the node's window; the remaining "non-wait"
+        # time is the wall minus known waits and may still contain unclassified
+        # wait, so it is never labeled "compute".
+        _wait_breakdown: dict | None = None
+        if _wait_windows:
+            try:
+                _wait_breakdown = classify_node_wait(record, _wait_windows)
+            except Exception:
+                _wait_breakdown = None
+        _augmented = bool(
+            _wait_breakdown
+            and _wait_breakdown.get("available")
+            and _wait_breakdown.get("wait_total", 0.0) > 0.5
+        )
+        _display_label = node_label
+        if _augmented:
+            _non_wait_ms = float(_wait_breakdown.get("node_non_wait_wall", _wait_breakdown.get("node_compute_wall", 0.0)) or 0.0)
+            _wait_ms = float(_wait_breakdown.get("wait_total", 0.0) or 0.0)
+            _wait_kinds = "|".join(_wait_breakdown.get("wait_kinds") or ())
+            _display_label = f"{node_label} — non-wait {_non_wait_ms:.1f}ms + wait {_wait_ms:.1f}ms [{_wait_kinds}]"
         # Node rows are filtered to keep the diagnostics tight: show a node
         # only when it took meaningful time (>= 25 ms) or it is strategic.
         if not (
@@ -989,26 +1660,34 @@ def _detail_stages(
             or node_label in STRATEGIC_NODE_CLASS_TYPES
         ):
             continue
+        _pass_outcome_field = ("pass_outcome:" + str(record.get("pass_outcome")),) if record.get("pass_outcome") else ()
+        _wait_provenance_field = (f"wait:{_display_label}",) if _augmented else ()
         details.append(WaterfallStage(
             key=f"node_timing_{index}",
-            label=f"Node: {node_label}",
+            label=f"Node: {_display_label}",
             group="detail",
-            start_ns=None,
-            end_ns=None,
+            start_ns=start_perf if positioned else None,
+            end_ns=end_perf if positioned else None,
             duration_ms=duration_ms,
             cumulative_ms=None,
             percentage=_percentage(duration_ms, total_ms, total_wall_ms),
             source="node_timing",
-            status=DERIVED if isinstance(duration, (int, float)) and not isinstance(duration, bool) else UNAVAILABLE,
+            status=MEASURED if positioned else (DERIVED if duration_ms is not None else UNAVAILABLE),
             is_detail=True,
-            parent_key="prompt_executor_cache_setup",
+            parent_key="pre_sampler_execution",
             included_in_total=False,
-            clock_scope="metadata",
+            clock_scope="monotonic:remote" if positioned else "metadata",
+            source_fields=_pass_outcome_field + _wait_provenance_field,
             provenance="remote_trace",
             accounting_role="child",
         ))
     for index, record in enumerate(_as_mapping(structured).get("active_read_records", ())):
         if not isinstance(record, Mapping):
+            continue
+        # Records carrying start/end timestamps feed the request-scoped
+        # ``unet_checkpoint_read`` span; skipping them here avoids duplicate
+        # clutter.  Records with only a duration stay as "Model read:" rows.
+        if _active_read_record_boundary(record) is not None:
             continue
         duration = record.get("wall_ms")
         duration_ms = float(duration) if isinstance(duration, (int, float)) and not isinstance(duration, bool) else None
@@ -1029,7 +1708,7 @@ def _detail_stages(
             source="active_read",
             status=DERIVED if isinstance(duration, (int, float)) and not isinstance(duration, bool) else UNAVAILABLE,
             is_detail=True,
-            parent_key="remote_method_setup",
+            parent_key="pre_sampler_execution",
             included_in_total=False,
             clock_scope="metadata",
             provenance="remote_trace",
@@ -1078,8 +1757,18 @@ def _request_detail_stages(
 
     def add(
         key: str, label: str, parent: str, candidate: _Candidate,
-        *, overlaps: tuple[str, ...] = (), accounting_role: str = "child",
+        *, overlaps: tuple[str, ...] = (), accounting_role: str | None = None,
     ) -> None:
+        # UNET / VAE early-activation lane rows overlap the accounted chain by
+        # design: they are overlap_detail (never accounted).  Output/return and
+        # PromptExecutor rows are sequential children of an accounted parent.
+        if accounting_role is None:
+            accounting_role = (
+                "overlap_detail"
+                if parent in ("pre_sampler_execution", "remote_method_setup",
+                              "post_sampling_transition", "vae")
+                else "child"
+            )
         status = candidate.status
         duration = candidate.duration_ms
         source_fields = candidate.source_fields
@@ -1114,9 +1803,8 @@ def _request_detail_stages(
         ))
 
     # ── A. UNET lane ──────────────────────────────────────────────────────
-    # Pre-claim gaps hang off ``remote_method_setup``; the load chain hangs off
-    # ``unet_claim_to_ready``.  Both top-level parents are concurrent /
-    # excluded from the accounted total, so these children never affect it.
+    # CLIP/UNET/cache timings are indented overlap details under the single
+    # ``pre_sampler_execution`` parent (never numbered top-level rows).
     fast_to_start = event("unet_fast_disk_to_start", process="remote") or event("unet_fast_disk_to_start")
     fast_to_end = event("unet_fast_disk_to_end", process="remote") or event("unet_fast_disk_to_end")
     fast_bind_start = event("unet_fast_disk_bind_start", process="remote") or event("unet_fast_disk_bind_start")
@@ -1126,109 +1814,93 @@ def _request_detail_stages(
     ea_load_start = event("unet_activation_load_start", process="remote") or event("unet_activation_load_start")
     complete_event = event("unet_fast_disk_complete", process="remote") or event("unet_fast_disk_complete")
 
-    # 1. "UNET scheduled → worker start"
-    add("unet_scheduled_to_worker_start", "UNET scheduled → worker start", "remote_method_setup",
+    # 1. "UNET scheduled -> worker start"
+    add("unet_scheduled_to_worker_start", "UNET scheduled -> worker start", "pre_sampler_execution",
         _candidate(result, ea_scheduled, fast_to_start or ea_load_start))
 
-    # 2. "Worker start → checkpoint read start": active_read records carry
+    # 2. "Worker start -> checkpoint read start": active_read records carry
     #    only wall_ms in practice (no start/end ns), so this is usually
     #    unavailable and the read row below covers the span.
-    read_start_ns = None
-    read_end_ns = None
-    structured = _as_mapping(result).get("pre_sampler_structured_report")
-    for record in _as_mapping(structured).get("active_read_records", ()):
-        if not isinstance(record, Mapping):
-            continue
-        for key in ("start_ns", "start_wall_unix_ns", "start_monotonic_ns"):
-            value = _number(record.get(key))
-            if value:
-                read_start_ns = value
-                break
-        for key in ("end_ns", "end_wall_unix_ns", "end_monotonic_ns"):
-            value = _number(record.get(key))
-            if value:
-                read_end_ns = value
-                break
-        if read_start_ns is not None and read_end_ns is not None:
-            break
-    if read_start_ns is not None:
-        add("unet_worker_to_read_start", "Worker start → checkpoint read start", "remote_method_setup",
-            _candidate(result, fast_to_start, Boundary("active_read_start", None, read_start_ns, "remote", "event")))
+    best_read = _best_active_read(result)
+    if best_read is not None:
+        _read_record, read_start, _read_end = best_read
+        add("unet_worker_to_read_start", "Worker start -> checkpoint read start", "pre_sampler_execution",
+            _candidate(result, fast_to_start, read_start))
     else:
-        add("unet_worker_to_read_start", "Worker start → checkpoint read start", "remote_method_setup", _Candidate())
+        add("unet_worker_to_read_start", "Worker start -> checkpoint read start", "pre_sampler_execution", _Candidate())
 
-    # 3. "Checkpoint read": active_read start→end when carried, else the
-    #    fast-disk to_start→to_end pair.  When the H2D-pair fallback is used
-    #    the row is a diagnostic overlap of the Synchronized H2D span (which
-    #    the same pair would otherwise feed), so it is flagged overlap_diagnostic
-    #    and excluded from accounted sums; the H2D row is never touched.
-    if read_start_ns is not None and read_end_ns is not None:
-        read_candidate = _candidate(
-            result,
-            Boundary("active_read_start", None, read_start_ns, "remote", "event"),
-            Boundary("active_read_end", None, read_end_ns, "remote", "event"),
-        )
-        read_used_pair = False
-    else:
-        read_candidate = _candidate(result, fast_to_start, fast_to_end)
-        read_used_pair = read_candidate.duration_ms is not None
-    if read_used_pair:
-        read_label = "Checkpoint read (overlap: H2D span fallback)"
-        read_role = "overlap_diagnostic"
-        read_overlaps = ("unet_synchronized_h2d",)
-    else:
-        read_label = "Checkpoint read"
-        read_role = "child"
-        read_overlaps = ()
-    add("unet_checkpoint_read", read_label, "unet_claim_to_ready", read_candidate,
-        accounting_role=read_role, overlaps=read_overlaps)
+    # 3. "Checkpoint read": ONLY the active-read record's own span.  There is
+    #    NO H2D-pair fallback — when the active read is absent the row is
+    #    omitted entirely and the report flags checkpoint_read_unavailable
+    #    (required-data failure) instead of substituting another span.
+    if best_read is not None:
+        _read_record, read_start, read_end = best_read
+        add("unet_checkpoint_read", "Checkpoint read", "pre_sampler_execution",
+            _candidate(result, read_start, read_end),
+            accounting_role="overlap_detail", overlaps=())
 
-    # 4. "Read end → construction done": construction metadata (ctor/get_model)
-    #    on the complete event, else the to_end → bind_start measured span.
+    # 4. "Read end -> construction done" + independent "UNET get_model": both
+    #    are derived from the complete-event metadata WITHOUT claiming
+    #    exclusivity — construction is ctor_ms alone (measured to_end->bind_start
+    #    as fallback), get_model is get_model_ms alone.
     ctor_ms = _event_metadata_value(result, "unet_fast_disk_complete", "ctor_ms")
     get_model_ms = _event_metadata_value(result, "unet_fast_disk_complete", "get_model_ms")
     construction_candidate = _Candidate()
-    ctor_ok = isinstance(ctor_ms, (int, float)) and not isinstance(ctor_ms, bool)
-    model_ok = isinstance(get_model_ms, (int, float)) and not isinstance(get_model_ms, bool)
-    if ctor_ok and model_ok:
+    if isinstance(ctor_ms, (int, float)) and not isinstance(ctor_ms, bool):
         construction_candidate = _candidate_from_duration(
-            float(ctor_ms) + float(get_model_ms), source="metadata",
-            source_fields=("unet_fast_disk_complete.ctor_ms", "unet_fast_disk_complete.get_model_ms"),
+            float(ctor_ms), source="metadata", source_fields=("unet_fast_disk_complete.ctor_ms",),
         )
-    elif ctor_ok:
-        construction_candidate = _candidate_from_duration(float(ctor_ms), source="metadata", source_fields=("unet_fast_disk_complete.ctor_ms",))
-    elif model_ok:
-        construction_candidate = _candidate_from_duration(float(get_model_ms), source="metadata", source_fields=("unet_fast_disk_complete.get_model_ms",))
     if construction_candidate.duration_ms is None and fast_bind_start is not None:
         construction_candidate = _candidate(result, fast_to_end, fast_bind_start)
-    add("unet_read_to_construction", "Read end → construction done", "unet_claim_to_ready", construction_candidate)
+    add("unet_read_to_construction", "Read end -> construction done", "pre_sampler_execution", construction_candidate)
+    get_model_candidate = _Candidate()
+    if isinstance(get_model_ms, (int, float)) and not isinstance(get_model_ms, bool):
+        get_model_candidate = _candidate_from_duration(
+            float(get_model_ms), source="metadata", source_fields=("unet_fast_disk_complete.get_model_ms",),
+        )
+    add("unet_get_model", "UNET get_model", "pre_sampler_execution", get_model_candidate)
 
-    # 5. "Bind": bind_start → bind_end, else bind_ms metadata on complete.
+    # 5. "Bind": bind_start -> bind_end, else bind_ms metadata on complete.
     bind_ms = _event_metadata_value(result, "unet_fast_disk_complete", "bind_ms")
     bind_candidate = _candidate(result, fast_bind_start, fast_bind_end)
     if bind_candidate.duration_ms is None and isinstance(bind_ms, (int, float)) and not isinstance(bind_ms, bool):
         bind_candidate = _candidate_from_duration(float(bind_ms), source="metadata", source_fields=("unet_fast_disk_complete.bind_ms",))
-    add("unet_bind", "Bind", "unet_claim_to_ready", bind_candidate)
+    add("unet_bind", "Bind", "pre_sampler_execution", bind_candidate)
 
     # 6. "Synchronized H2D": to_device_ms/to_wall_ms metadata, else the
-    #    to_start→to_end pair — only when the pair was NOT already used for
-    #    the checkpoint-read row (never double-counted).
+    #    to_start->to_end pair.  The checkpoint-read row never consumes the
+    #    pair (no substitution), so the H2D detail always keeps its own span.
+    #    When exact UNET byte metadata exists, effective throughput is shown
+    #    as compact non-accounting text on the label (bytes / H2D wall sec).
     h2d_candidate = _Candidate()
     for h2d_key in ("to_device_ms", "to_wall_ms"):
         h2d_value = _event_metadata_value(result, "unet_fast_disk_complete", h2d_key)
         if isinstance(h2d_value, (int, float)) and not isinstance(h2d_value, bool):
             h2d_candidate = _candidate_from_duration(float(h2d_value), source="metadata", source_fields=(f"unet_fast_disk_complete.{h2d_key}",))
             break
-    if h2d_candidate.duration_ms is None and not read_used_pair:
+    if h2d_candidate.duration_ms is None:
         h2d_candidate = _candidate(result, fast_to_start, fast_to_end)
-    add("unet_synchronized_h2d", "Synchronized H2D", "unet_claim_to_ready", h2d_candidate)
+    h2d_label = "Synchronized H2D"
+    h2d_bytes = _event_metadata_value(result, "unet_fast_disk_complete", "parameter_bytes")
+    if not isinstance(h2d_bytes, (int, float)) or isinstance(h2d_bytes, bool) or h2d_bytes <= 0:
+        h2d_bytes = _first_value(result, ("parameter_bytes", "active_read_size_bytes", "unet_parameter_bytes"))
+    h2d_seconds = (h2d_candidate.duration_ms or 0.0) / 1000.0
+    if (
+        isinstance(h2d_bytes, (int, float))
+        and not isinstance(h2d_bytes, bool)
+        and h2d_bytes > 0
+        and h2d_seconds > 0
+    ):
+        gbps = h2d_bytes / 1_000_000_000.0 / h2d_seconds
+        h2d_label += f" ({gbps:.1f} GB/s)"
+    add("unet_synchronized_h2d", h2d_label, "pre_sampler_execution", h2d_candidate)
 
-    # 7. "H2D end → UNET ready": to_end → early-activation terminal (or the
+    # 7. "H2D end -> UNET ready": to_end -> early-activation terminal (or the
     #    fast-disk complete event).
-    add("unet_h2d_to_ready", "H2D end → UNET ready", "unet_claim_to_ready",
+    add("unet_h2d_to_ready", "H2D end -> UNET ready", "pre_sampler_execution",
         _candidate(result, fast_to_end, ea_terminal or complete_event))
 
-    # 8. "UNET ready → sampler demand": terminal → graph-join demand
+    # 8. "UNET ready -> sampler demand": terminal -> graph-join demand
     #    (join_start_mono_ns) or the sampler lane-wait start event.
     join_start_meta = _event_metadata_value(result, "unet_graph_join", "join_start_mono_ns", last=True)
     demand_candidate = _Candidate()
@@ -1241,9 +1913,9 @@ def _request_detail_stages(
         demand_candidate = _candidate(result, ea_terminal, Boundary("unet_graph_join", None, int(join_start_meta), "remote", "metadata"))
     if demand_candidate.duration_ms is None:
         demand_candidate = _candidate(result, ea_terminal, event("sampler_lane_wait_start", process="remote"))
-    add("unet_ready_to_demand", "UNET ready → sampler demand", "unet_claim_to_ready", demand_candidate)
+    add("unet_ready_to_demand", "UNET ready -> sampler demand", "pre_sampler_execution", demand_candidate)
 
-    # 9. "Sampler demand → join complete": join_start → join_completed
+    # 9. "Sampler demand -> join complete": join_start -> join_completed
     #    metadata, else join_wait_ms.
     join_end_meta = _event_metadata_value(result, "unet_graph_join", "join_completed_mono_ns", last=True)
     join_wait_ms = _event_metadata_value(result, "unet_graph_join", "join_wait_ms", last=True)
@@ -1256,9 +1928,9 @@ def _request_detail_stages(
         )
     if join_candidate.duration_ms is None and isinstance(join_wait_ms, (int, float)) and not isinstance(join_wait_ms, bool):
         join_candidate = _candidate_from_duration(float(join_wait_ms), source_fields=("unet_graph_join.join_wait_ms",))
-    add("unet_demand_to_join", "Sampler demand → join complete", "unet_claim_to_ready", join_candidate)
+    add("unet_demand_to_join", "Sampler demand -> join complete", "pre_sampler_execution", join_candidate)
 
-    # 10. "Join complete → sampling": join_completed → sampling_start event.
+    # 10. "Join complete -> sampling": join_completed -> sampling_start event.
     sampling_start = event("sampling_start", process="remote") or event("sampling_start")
     join_to_sampling = _Candidate()
     if (
@@ -1268,7 +1940,7 @@ def _request_detail_stages(
         and sampling_start.monotonic_ns is not None
     ):
         join_to_sampling = _candidate(result, Boundary("unet_graph_join", None, int(join_end_meta), "remote", "metadata"), sampling_start)
-    add("unet_join_to_sampling", "Join complete → sampling", "unet_claim_to_ready", join_to_sampling)
+    add("unet_join_to_sampling", "Join complete -> sampling", "pre_sampler_execution", join_to_sampling)
 
     # ── B. VAE lane ───────────────────────────────────────────────────────
     sampling_end = event("sampling_end", process="remote") or event("sampling_end")
@@ -1278,26 +1950,26 @@ def _request_detail_stages(
     vae_consumed = event("vae_early_activation_consumed", process="remote") or event("vae_early_activation_consumed")
     vae_decode_start = event("vae_decode_start", process="remote") or event("vae_decode_start")
 
-    # 1. "Sampling end → VAE scheduled"
-    add("vae_sampling_end_to_scheduled", "Sampling end → VAE scheduled", "post_sampling_transition",
+    # 1. "Sampling end -> VAE scheduled"
+    add("vae_sampling_end_to_scheduled", "Sampling end -> VAE scheduled", "post_sampling_transition",
         _candidate(result, sampling_end, vae_scheduled))
-    # 2. "VAE scheduled → worker/load start"
-    add("vae_scheduled_to_load", "VAE scheduled → worker/load start", "post_sampling_transition",
+    # 2. "VAE scheduled -> worker/load start"
+    add("vae_scheduled_to_load", "VAE scheduled -> worker/load start", "post_sampling_transition",
         _candidate(result, vae_scheduled, vae_load_start))
-    # 3. "VAE load/H2D": load_start → terminal, else reconciliation load_wall_ms.
+    # 3. "VAE load/H2D": load_start -> terminal, else reconciliation load_wall_ms.
     vae_load_ms = _event_metadata_value(result, "vae_early_activation_reconciliation", "load_wall_ms")
     vae_load_candidate = _candidate(result, vae_load_start, vae_terminal)
     if vae_load_candidate.duration_ms is None and isinstance(vae_load_ms, (int, float)) and not isinstance(vae_load_ms, bool):
         vae_load_candidate = _candidate_from_duration(float(vae_load_ms), source="metadata", source_fields=("vae_early_activation_reconciliation.load_wall_ms",))
     add("vae_load", "VAE load/H2D", "vae", vae_load_candidate)
-    # 4. "VAE ready → consumed": terminal → consumed, else reconciliation join_wait_ms.
+    # 4. "VAE ready -> consumed": terminal -> consumed, else reconciliation join_wait_ms.
     vae_join_ms = _event_metadata_value(result, "vae_early_activation_reconciliation", "join_wait_ms")
     vae_join_candidate = _candidate(result, vae_terminal, vae_consumed)
     if vae_join_candidate.duration_ms is None and isinstance(vae_join_ms, (int, float)) and not isinstance(vae_join_ms, bool):
         vae_join_candidate = _candidate_from_duration(float(vae_join_ms), source="metadata", source_fields=("vae_early_activation_reconciliation.join_wait_ms",))
-    add("vae_ready_to_consumed", "VAE ready → consumed", "vae", vae_join_candidate)
-    # 5. "Consumed → decode start" (the decode itself is the top-level vae stage).
-    add("vae_consumed_to_decode", "Consumed → decode start", "vae",
+    add("vae_ready_to_consumed", "VAE ready -> consumed", "vae", vae_join_candidate)
+    # 5. "Consumed -> decode start" (the decode itself is the top-level vae stage).
+    add("vae_consumed_to_decode", "Consumed -> decode start", "vae",
         _candidate(result, vae_consumed, vae_decode_start))
 
     # ── C. PromptExecutor localized residual ──────────────────────────────
@@ -1334,27 +2006,29 @@ def _request_detail_stages(
     output_persist_end = event("output_persist_end", process="remote") or event("output_persist_end")
     output_collect_end = event("output_collect_end", process="remote") or event("output_collect_end")
 
-    # 1. "VAE end → output encode start"
+    # 1. "VAE end -> output encode start"
     vae_decode_end = event("vae_decode_end", process="remote") or event("vae_decode_end")
-    add("output_vae_end_to_encode", "VAE end → output encode start", "output_persistence",
+    add("output_vae_end_to_encode", "VAE end -> output encode start", "output_persistence",
         _candidate(result, vae_decode_end, output_encode_start))
-    # 2. "PNG encode": encode_start → encode_end, else output_encode_ms.
+    # 2. "PNG encode": encode_start -> encode_end, else output_encode_ms.
     encode_ms = _first_value(result, ("output_encode_ms",))
     encode_candidate = _candidate(result, output_encode_start, output_encode_end)
     if encode_candidate.duration_ms is None and isinstance(encode_ms, (int, float)) and not isinstance(encode_ms, bool):
         encode_candidate = _candidate_from_duration(float(encode_ms), source="metadata", source_fields=("output_encode_ms",))
     add("output_png_encode", "PNG encode", "output_persistence", encode_candidate)
-    # 3. "Descriptor/materialization": encode_end → persist_end, else output_commit_ms.
+    # 3. "Descriptor/materialization": encode_end -> persist_end, else output_commit_ms.
     commit_ms = _first_value(result, ("output_commit_ms",))
     descriptor_candidate = _candidate(result, output_encode_end, output_persist_end)
     if descriptor_candidate.duration_ms is None and isinstance(commit_ms, (int, float)) and not isinstance(commit_ms, bool):
         descriptor_candidate = _candidate_from_duration(float(commit_ms), source="metadata", source_fields=("output_commit_ms",))
     add("output_descriptor", "Descriptor/materialization", "output_persistence", descriptor_candidate)
 
-    # 4. "Remote result emitted": the last remote emission boundary (persist
-    #    end / collect end) that the handoff stage already consumes — rendered
-    #    as a marker child with the same boundary info (no fabricated span).
-    emitted_source = output_collect_end or output_persist_end
+    # 4. "Remote result emitted": the direct-completion emission boundary that
+    #    the handoff stage already consumes — rendered as a marker child with
+    #    the same boundary info (no fabricated span).
+    emitted_source = (
+        _remote_emit_boundary(result) or output_collect_end or output_persist_end
+    )
     if emitted_source is not None:
         emitted_candidate = _Candidate(
             start=None, end=emitted_source,
@@ -1365,20 +2039,10 @@ def _request_detail_stages(
         emitted_candidate = _Candidate()
     add("output_remote_emitted", "Remote result emitted", "remote_return_handoff", emitted_candidate)
 
-    # 5. "Deferred persistence after yield": deferred_commit_start → end
-    #    (emitted on the teardown trace; when absent → localized unavailable).
+    # 5. "Deferred persistence after yield": deferred_commit_start -> end
+    #    (emitted on the teardown trace; when absent -> localized unavailable).
     add("output_deferred_commit", "Deferred persistence after yield", "remote_return_handoff",
         _candidate(result, event("deferred_commit_start"), event("deferred_commit_end", last=True)))
-
-    # 6. "Local receipt → caller return": final_result_received /
-    #    local_result_received (local) → response boundary.  When the response
-    #    boundary is absent the row is a localized unavailable.
-    local_receipt = event(("final_result_received", "local_result_received"), process="local", last=True)
-    if local_receipt is not None and response is not None:
-        add("local_receipt_to_return", "Local receipt → caller return", "remote_local_return",
-            _candidate(result, local_receipt, response))
-    else:
-        add("local_receipt_to_return", "Local receipt → caller return", "remote_local_return", _Candidate())
 
     return tuple(details)
 
@@ -1402,7 +2066,7 @@ def build_waterfall(
     boundary (scheduler hands the restored container to Python); when absent it
     is looked up in the result/timing dicts, and when still absent the report
     flags ``modal_restore_begin_unavailable`` and ``modal_scheduling`` covers
-    the combined submission → python_resume interval instead.
+    the combined submission -> python_resume interval instead.
     """
     result_view: Mapping[str, Any] = dict(result)
     if timing:
@@ -1410,6 +2074,10 @@ def build_waterfall(
     warnings: list[str] = []
     command_start = _command_boundary(command_start_unix_ms)
     response = _response_boundary(response_received_unix_ns)
+    # The caller-return boundary is the exact execute_plan_return host event
+    # when present, else the *response* argument (host capture).  Never a
+    # remote pre-yield timestamp.
+    caller_return = _caller_return_boundary(result_view, response)
     restore_begin = _modal_restore_begin_boundary(result_view, modal_restore_begin_wall_unix_ns)
     python_resume = _python_resume_boundary(result_view)
     python_restore_end = _timing_boundary(result_view, "restore_method_end", "restore_method_end")
@@ -1428,23 +2096,13 @@ def build_waterfall(
                 _origin_boundary(result_view, "local_receive_wall_ns", "local_receive_wall_ns")
                 or _event_boundary(result_view, ("transport_entry", "modal_handle_lookup_start"), process="local"),
             )
-        elif key == "remote_local_return" and response is not None:
-            start = _event_boundary(
-                result_view, "remote_return_start", process="local", last=True,
-            ) or _event_boundary(
-                result_view, ("output_persist_end", "output_collect_end"),
-                process="remote", last=True,
-            ) or _event_boundary(
-                result_view, ("output_persist_end", "output_collect_end", "remote_return_start"),
-                last=True,
-            )
-            candidate = _candidate(result_view, start, response, duration_keys=("remote_return_ms", "trigger_to_result_ms"))
         else:
             candidate = _stage_candidate(
                 result_view, key,
                 restore_begin=restore_begin,
                 python_resume=python_resume,
                 python_restore_end=python_restore_end,
+                response=response,
             )
         start_ns, end_ns = _stage_interval(candidate)
         status = candidate.status
@@ -1453,6 +2111,14 @@ def build_waterfall(
             status = INVALID
             warnings.append(f"{label}: negative duration")
             duration = None
+        # The whole scheduling window (enqueue + placement) is informational:
+        # local_preparation / modal_handle_submission / modal_scheduling are
+        # never numbered rows, never accounted/cumulative/%/bar.  The window is
+        # summarized once at the bottom (Scheduling time), and the stage
+        # percentages/bars use the non-scheduling wall as their denominator.
+        is_scheduling_window = key in (
+            "local_preparation", "modal_handle_submission", "modal_scheduling",
+        )
         stages.append(WaterfallStage(
             key=key,
             label=label,
@@ -1468,11 +2134,13 @@ def build_waterfall(
             source_fields=candidate.source_fields,
             concurrent=concurrent,
             provenance=_stage_provenance(candidate),
+            accounting_role="informational" if is_scheduling_window else "top_level",
+            included_in_total=not is_scheduling_window,
         ))
 
     total: float | None
-    if command_start is not None and response is not None:
-        total = _duration_between(command_start, response)
+    if command_start is not None and caller_return is not None:
+        total = _duration_between(command_start, caller_return)
         if total is not None and total < 0:
             warnings.append("command-to-response duration is negative")
             total = None
@@ -1520,17 +2188,60 @@ def build_waterfall(
         and total >= scheduling_ms >= 0
         else None
     )
+    # ── New timing contract ────────────────────────────────────────────────
+    # Scheduling time = (command -> Modal enqueue) + (Modal scheduling /
+    # placement).  Everything else (startup, restore, execution, output,
+    # response) is NON-scheduling, derived as total - scheduling_time so the
+    # invariant COMMAND->RESPONSE == scheduling + non-scheduling holds by
+    # construction (drift is display rounding only).
+    command_to_enqueue_ms: float | None = None
+    if command_start is not None and submission is not None:
+        enq = _duration_between(command_start, submission)
+        if enq is not None and enq >= 0:
+            command_to_enqueue_ms = enq
+    if command_to_enqueue_ms is None:
+        # Fallback: the two local scheduling-window stages tile the enqueue
+        # span when both are measured and valid.
+        enqueue_stages = {
+            stage.key: stage for stage in stages
+            if stage.key in ("local_preparation", "modal_handle_submission")
+        }
+        local_prep = enqueue_stages.get("local_preparation")
+        handle = enqueue_stages.get("modal_handle_submission")
+        if (
+            local_prep is not None and handle is not None
+            and local_prep.duration_ms is not None
+            and handle.duration_ms is not None
+            and local_prep.duration_ms >= 0
+            and handle.duration_ms >= 0
+            and local_prep.status != INVALID
+            and handle.status != INVALID
+        ):
+            command_to_enqueue_ms = local_prep.duration_ms + handle.duration_ms
+    scheduling_time_ms: float | None = None
+    if (
+        command_to_enqueue_ms is not None
+        and scheduling_ms is not None
+        and command_to_enqueue_ms >= 0
+        and scheduling_ms >= 0
+    ):
+        scheduling_time_ms = command_to_enqueue_ms + scheduling_ms
+        if total is not None and scheduling_time_ms > total:
+            warnings.append("scheduling exceeds command-to-response total")
+            scheduling_time_ms = None
+    non_scheduling_ms: float | None = None
+    if (
+        total is not None
+        and scheduling_time_ms is not None
+        and total >= scheduling_time_ms >= 0
+    ):
+        non_scheduling_ms = total - scheduling_time_ms
     partial_flags: list[str] = []
     if submission is None:
         partial_flags.append("missing_submission")
     if restore_begin is None:
         partial_flags.append("missing_modal_restore_begin")
-    if _event_boundary(
-        result_view,
-        ("final_result_received", "local_result_received"),
-        process="local",
-        last=True,
-    ) is None:
+    if _local_receipt_boundary(result_view) is None:
         partial_flags.append("missing_local_result_receipt")
     partial_waterfall = bool(partial_flags)
 
@@ -1546,74 +2257,107 @@ def build_waterfall(
             pre_python_interval_ms = float(interval_value)
             pre_python_interval_classification = "scheduling + pre-Python restore (unresolved platform interval)"
 
+    # Required-data flags: the checkpoint read is only measurable from the
+    # active-read record; when the UNET lane ran but no record is available it
+    # is an explicit required-data failure, never a substituted H2D span.
+    data_flags: list[str] = []
+    if _best_active_read(result_view) is None and _event_boundary(
+        result_view,
+        ("unet_ownership_claim", "unet_fast_disk_to_start", "unet_fast_disk_complete"),
+    ) is not None:
+        data_flags.append("checkpoint_read_unavailable")
+
+    # ── Accounting: exclusive top-level sum vs the non-scheduling wall ──────
+    # Only accounting_role == "top_level", non-concurrent, valid stages count.
+    # Detail / overlap_detail / informational rows never alter the accounted
+    # total.  Non-scheduling wall = command->response minus scheduling time
+    # (enqueue + placement); total_wall_ms is kept as the internal fallback.
+    accounted_denom = non_scheduling_ms if non_scheduling_ms is not None else total_wall_ms
     accounted_values = [
         stage.duration_ms
         for stage in stages
-        if stage.included_in_total
+        if stage.accounting_role == "top_level"
+        and stage.included_in_total
         and not stage.concurrent
-        and stage.accounting_role != "overlap_diagnostic"
         and stage.duration_ms is not None
         and stage.status != INVALID
     ]
     accounted_before_residual = sum(accounted_values)
-    residual = total - accounted_before_residual if total is not None and accounted_before_residual is not None else None
-    if residual is not None and residual > 0.0005:
-        # The catch-all residual is the UNATTRIBUTED gap, not a measured
-        # stage.  It is reconciliation metadata: reported in the footer
-        # (residual_ms / residual_pct) but never staged as a numbered row
-        # with a percentage or bar of its own.
-        residual_pct = _percentage(residual, total, total_wall_ms)
-        warnings.append(
-            f"global residual {residual:.3f}ms ({residual_pct:.2f}%) of command-to-response unaccounted"
-        )
 
     cumulative = 0.0
     completed: list[WaterfallStage] = []
     for stage in stages:
-        if stage.duration_ms is not None and stage.status != INVALID and not stage.concurrent:
+        if (
+            stage.accounting_role == "top_level"
+            and stage.duration_ms is not None
+            and stage.status != INVALID
+            and not stage.concurrent
+        ):
             cumulative += stage.duration_ms
             cum_value: float | None = cumulative
         else:
             cum_value = None
-        percentage = _percentage(stage.duration_ms, total, total_wall_ms)
+        percentage = (
+            _percentage(stage.duration_ms, total, accounted_denom)
+            if stage.accounting_role == "top_level" and not stage.concurrent
+            else None
+        )
         completed.append(WaterfallStage(**{**stage.__dict__, "cumulative_ms": cum_value, "percentage": percentage}))
     stages = completed
 
-    accounted_values = [
-        stage.duration_ms
-        for stage in stages
-        if stage.included_in_total
-        and not stage.concurrent
-        and stage.accounting_role != "overlap_diagnostic"
-        and stage.duration_ms is not None
-        and stage.status != INVALID
-    ]
-    accounted = sum(accounted_values) if accounted_values else None
-    reconciliation = total - accounted if total is not None and accounted is not None else None
-    tolerance = max(25.0, total * 0.0025) if total is not None and total >= 0 else None
-    if reconciliation is not None and tolerance is not None and abs(reconciliation) > tolerance:
-        warnings.append(
-            f"reconciliation exceeds tolerance: {reconciliation:.3f}ms > {tolerance:.3f}ms"
-        )
-
-    residual_pct = _percentage(residual, total, total_wall_ms)
-    reconciliation_status = (
-        "OK" if reconciliation is not None and tolerance is not None and abs(reconciliation) <= tolerance
-        else "EXCEEDS_TOLERANCE"
+    accounted = accounted_before_residual if accounted_values else None
+    # Reconciliation compares the exclusive top-level sum to the non-scheduling
+    # wall.  residual_ms is reconciliation metadata (never a numbered stage).
+    reconciliation = (
+        accounted_denom - accounted
+        if accounted_denom is not None and accounted is not None
+        else None
     )
+    residual = reconciliation
+    tolerance = RECONCILIATION_HARD_MS if reconciliation is not None else None
+    if reconciliation is not None:
+        if abs(reconciliation) > RECONCILIATION_TARGET_MS:
+            warnings.append(
+                f"reconciliation exceeds 10ms target: {reconciliation:.3f}ms"
+            )
+        if abs(reconciliation) > RECONCILIATION_HARD_MS:
+            warnings.append(
+                f"reconciliation exceeds tolerance: {reconciliation:.3f}ms > {RECONCILIATION_HARD_MS:.3f}ms"
+            )
+
+    residual_pct = _percentage(residual, total, accounted_denom)
+    if reconciliation is None:
+        reconciliation_status = "UNRESOLVED" if partial_waterfall else ""
+    elif abs(reconciliation) <= RECONCILIATION_HARD_MS:
+        reconciliation_status = "OK"
+    else:
+        reconciliation_status = "EXCEEDS_TOLERANCE"
+    # Validation can only be declared COMPLETE when no required-data flag
+    # exists AND reconciliation is resolved within the hard ceiling.
+    if data_flags:
+        validation_status = "INCOMPLETE"
+    elif reconciliation is None:
+        validation_status = "UNRESOLVED" if partial_waterfall else "UNKNOWN"
+    elif abs(reconciliation) <= RECONCILIATION_HARD_MS:
+        validation_status = "COMPLETE"
+    else:
+        validation_status = "FAILED"
     included_stages = [
         stage for stage in stages
-        if stage.included_in_total and not stage.concurrent
+        if stage.accounting_role == "top_level" and not stage.concurrent
         and stage.duration_ms is not None and stage.status != INVALID
     ]
     controllable_wall_ms = sum(
         (stage.duration_ms or 0.0) for stage in included_stages
         if stage.group in ("local", "application")
     ) if included_stages else None
+    # Platform wall includes the informational Modal scheduling span.
     platform_wall_ms = sum(
-        (stage.duration_ms or 0.0) for stage in included_stages
+        (stage.duration_ms or 0.0) for stage in stages
         if stage.group == "platform"
-    ) if included_stages else None
+        and stage.duration_ms is not None
+        and stage.status != INVALID
+    ) if stages else None
 
     identity = _identity(result)
     details = _detail_stages(result_view, total, total_wall_ms=total_wall_ms)
@@ -1631,6 +2375,7 @@ def build_waterfall(
             identity["fresh"] = str(restore_count) == "1" and str(request_count or "1") == "1"
         else:
             identity["fresh"] = "unknown"
+    host_telemetry = _extract_host_telemetry(result_view, identity)
     return WaterfallReport(
         run_label=run_label,
         request_id=_request_id(result_view),
@@ -1651,19 +2396,32 @@ def build_waterfall(
         scheduling_ms=scheduling_ms,
         total_wall_ms=total_wall_ms,
         command_response_ms=total,
+        command_to_enqueue_ms=command_to_enqueue_ms,
+        scheduling_time_ms=scheduling_time_ms,
+        non_scheduling_ms=non_scheduling_ms,
+        host_telemetry=host_telemetry,
         partial_waterfall=partial_waterfall,
         partial_flags=tuple(partial_flags),
         pre_python_interval_ms=pre_python_interval_ms,
         pre_python_interval_classification=pre_python_interval_classification,
+        data_flags=tuple(data_flags),
+        reconciliation_target_ms=RECONCILIATION_TARGET_MS,
+        reconciliation_hard_ms=RECONCILIATION_HARD_MS,
+        validation_status=validation_status,
     )
 
 
 def _fmt_duration(value: float | None, status: str = "") -> str:
+    """Honest duration formatting: >= 1 s prints seconds, < 1 s prints
+    milliseconds (3 decimals) so a real sub-millisecond interval never reads
+    ``0.000s``.  Both forms are 10 chars wide to keep the table aligned."""
     if status == INVALID:
         return "INVALID"
     if value is None:
         return "-"
-    return f"{value / 1000.0:7.3f}s"
+    if value >= 1000.0:
+        return f"{value / 1000.0:9.3f}s"
+    return f"{value:7.3f} ms"
 
 
 def _fmt_num(value: float | None, suffix: str = "") -> str:
@@ -1690,203 +2448,445 @@ def _percentage(duration_ms, total_ms, total_wall_ms):
     return (duration_ms / denom * 100.0 if duration_ms is not None and denom and denom > 0 else None)
 
 
-def _bar(stage: WaterfallStage, total_ms: float | None, width: int) -> str:
-    if stage.duration_ms is None or total_ms is None or total_ms <= 0:
+def _bar(stage: WaterfallStage, total_wall_ms: float | None, width: int = 40) -> str:
+    """Fixed-width '#'-only bar, top-level rows only, non-scheduling
+    denominator (command->response minus scheduling time; internal
+    ``total_wall_ms`` is the fallback)."""
+    if stage.concurrent:
         return " " * width
-    units = max(1, round(stage.duration_ms / total_ms * width))
-    char = "=" if stage.group == "platform" else "+" if stage.group == "local" else "#"
-    if stage.status == INVALID:
-        char = "!"
-    return (char * min(width, units)).ljust(width)
+    if stage.duration_ms is None or total_wall_ms is None or total_wall_ms <= 0:
+        return " " * width
+    units = max(1, round(stage.duration_ms / total_wall_ms * width))
+    return ("#" * min(width, units)).ljust(width)
 
 
-def _diagnostic_group(stage: WaterfallStage) -> str:
-    """Small sub-header label for an expanded-diagnostics row.
+# ── Detail curation ────────────────────────────────────────────────────────
+# Optional child rows under 25 ms are omitted unless strategically important
+# AND useful (the curated set).  Diagnostic aggregates and duplicative CLIP/
+# UNET/owner rows are hidden even when large.  Everything stays in the
+# serialized artifact; only the console is curated.
+_DETAIL_USEFUL_MIN_MS = 25.0
+_CURATED_DETAIL_KEYS = frozenset({
+    "conditioning_cache_lookup",   # conditioning cache decision/lookup
+    "clip_encode",                 # CLIP encode (clearest single CLIP row)
+    "clip_encode_skipped",         # status text when encode was skipped (cache hit)
+    "unet_checkpoint_read",        # real active-read span
+    "unet_read_to_construction",   # construction
+    "unet_get_model",              # required get_model
+    "unet_bind",                   # bind
+    "unet_synchronized_h2d",       # H2D
+    "unet_h2d_to_ready",           # H2D -> ready
+    "vae_load",                    # VAE H2D
+    "output_png_encode",           # PNG encode
+})
+_DETAIL_ALWAYS_HIDE_KEYS = frozenset({
+    "pre_sampler_total", "measured_children", "pre_sampler_residual",
+    "graph_prefill_activity", "output_remote_emitted",
+    "vae_sampling_end_to_scheduled", "vae_scheduled_to_load",
+    "vae_ready_to_consumed", "vae_consumed_to_decode",
+})
+# Node classes whose timing is already covered by a clearer curated detail
+# (CLIP encode / conditioning cache / UNET lane) — never duplicated.
+_DUPLICATIVE_NODE_CLASSES = frozenset({
+    "CLIPTextEncode", "CLIPTextEncodeWithModel", "UNETLoader", "CLIPLoader",
+})
 
-    Detail rows carry ``group="detail"`` uniformly, so the sub-header is
-    derived from the row's source / key prefix / parent stage instead.
+
+def _detail_is_useful(detail: WaterfallStage) -> bool:
+    """Console curation for inline child rows (artifact is never filtered)."""
+    if detail.status in (UNAVAILABLE, INVALID):
+        return False
+    if detail.key in _CURATED_DETAIL_KEYS:
+        # Curated rows render whenever present — including status-only rows
+        # with no measured duration (e.g. "CLIP encode skipped (cache hit)")
+        # and explicitly-required rows of any size.
+        return True
+    if detail.duration_ms is None or detail.duration_ms <= 0.0:
+        return False
+    if detail.key in _DETAIL_ALWAYS_HIDE_KEYS:
+        return False
+    if detail.source == "node_timing":
+        label = detail.label
+        class_type = label[len("Node: "):] if label.startswith("Node: ") else label
+        if class_type in _DUPLICATIVE_NODE_CLASSES:
+            # Covered by a clearer curated detail (CLIP encode / conditioning
+            # cache / UNET lane): never duplicated.
+            return False
+        if detail.duration_ms >= _DETAIL_USEFUL_MIN_MS:
+            return True
+        return class_type in STRATEGIC_NODE_CLASS_TYPES
+    if detail.source == "cpu_owner":
+        # Dedupe: the CLIP encode detail is the clearest single CLIP row.
+        return False
+    return detail.duration_ms >= _DETAIL_USEFUL_MIN_MS
+
+
+def _fmt_peak_cores(value: float) -> str:
+    """Format a peak-core count with up to 2 decimals, trailing zeros stripped
+    (``7.1333`` -> ``7.13``, ``7.0`` -> ``7``)."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _trim_gpu_name(name: str) -> str:
+    """Trim marketing prefixes/suffixes so the compact header stays short:
+    leading ``NVIDIA `` / ``AMD `` / ``Intel `` and trailing `` Server Edition``."""
+    for prefix in ("NVIDIA ", "AMD ", "Intel "):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    if name.endswith(" Server Edition"):
+        name = name[: -len(" Server Edition")]
+    return name.strip()
+
+
+def _render_compact_header(report: WaterfallReport) -> list[str]:
+    """Compact host header shared by BOTH renderers.
+
+    Four lines (labels padded to width 10, values joined by `` | ``):
+      1. Request / Instance / Fresh (always emitted).
+      2. Platform (cloud/region) + optional GPU / VRAM / CUDA / CC segments.
+      3. CPU identity + runtime segments (omitted entirely when no data).
+      4. Telemetry (CPU pressure / RSS / maxRSS) (omitted when no data).
+
+    Every segment is optional and omitted (never faked as ``0``) when its data
+    is missing, then one blank line separates the header from the table.
     """
-    if stage.source == "node_timing":
-        return "Node timings"
-    if stage.source == "cpu_owner":
-        return "CPU ownership"
-    if stage.source == "active_read":
-        return "Model reads"
-    key = stage.key
-    parent = stage.parent_key
-    if key.startswith("vae_") or parent == "vae":
-        return "VAE"
-    if key.startswith("unet_") or parent == "unet_claim_to_ready":
-        return "UNET"
-    if key.startswith("output_") or parent in ("output_persistence", "remote_return_handoff"):
-        return "Output"
-    if key.startswith("local_receipt_") or parent == "remote_local_return":
-        return "Return"
-    if key.startswith("snapshot_graph_seed_"):
-        return "Snapshot seed"
-    if parent in ("prompt_executor_cache_setup", "remote_method_setup"):
-        return "PromptExecutor"
-    if parent == "sampler_node_to_sampling":
-        return "Sampler"
-    if parent == "post_sampling_transition":
-        return "Post-sampling"
-    return stage.group or "Detail"
-
-
-def render_waterfall(report: WaterfallReport | Mapping[str, Any], *, terminal_columns: int | None = None) -> str:
-    """Render a plain-ASCII report with deterministic width calculations."""
-    if not isinstance(report, WaterfallReport):
-        report = _report_from_value(report)
-    detected = terminal_columns or shutil.get_terminal_size(fallback=(132, 40)).columns
-    width = max(110, min(180, int(detected)))
-    source_enabled = width >= 150
-    source_width = 20 if source_enabled else 0
-    label_target = max((len(stage.label) + (2 if stage.is_detail else 0) for stage in report.stages + report.details), default=28)
-    fixed_without_label = 49 + (23 if source_enabled else 0)
-    label_width = max(28, min(46, label_target, width - fixed_without_label - 24))
-    fixed = fixed_without_label + label_width
-    bar_width = max(24, width - fixed)
-    if report.partial_waterfall:
-        title = _ascii_text("V2 COLD WATERFALL - REMOTE/PARTIAL (awaiting host reconciliation)")
-    else:
-        title = _ascii_text(f"V2 COLD WATERFALL - {report.run_label or 'run'}")
+    telemetry = report.host_telemetry or {}
     identity = report.identity
-    lines = [title]
-    lines.append(
-        "Request: {request}  Instance: {instance}  GPU: {gpu}  Fresh: {fresh}".format(
-            request=_ascii_text(report.request_id or "-"),
-            instance=_ascii_text(identity.get("restored_instance_id") or "-"),
-            gpu=_ascii_text(identity.get("gpu") or "-"),
-            fresh=("YES" if identity.get("fresh") is True else "NO" if identity.get("fresh") is False else "-"),
+    lines: list[str] = []
+
+    # Line 1 — always emitted.
+    request = _ascii_text(report.request_id or "-")
+    instance = _ascii_text(identity.get("restored_instance_id") or "-")
+    fresh_value = identity.get("fresh")
+    fresh = "YES" if fresh_value is True else "NO" if fresh_value is False else "-"
+    lines.append(f"{'Request:':<10} {request} | Instance: {instance} | Fresh: {fresh}")
+
+    # Line 2 — Platform + optional GPU segments.
+    platform = _provider_region(report) or "-"
+    platform_segments = [_ascii_text(platform)]
+    gpu_name = telemetry.get("gpu_name")
+    if gpu_name:
+        platform_segments.append(f"GPU: {_ascii_text(_trim_gpu_name(str(gpu_name)))}")
+    vram = telemetry.get("gpu_vram_mib")
+    if vram is not None:
+        platform_segments.append(f"VRAM {int(vram):,} MiB")
+    cuda = telemetry.get("cuda_version")
+    if cuda:
+        platform_segments.append(f"CUDA {_ascii_text(cuda)}")
+    capability = telemetry.get("compute_capability")
+    if capability:
+        platform_segments.append(f"CC {_ascii_text(capability)}")
+    lines.append(f"{'Platform:':<10} " + " | ".join(platform_segments))
+
+    # Line 3 — CPU identity + runtime (omitted entirely when no data).
+    cpu_segments: list[str] = []
+    vendor = telemetry.get("cpu_vendor")
+    family = telemetry.get("cpu_family")
+    model = telemetry.get("cpu_model")
+    if vendor and family and model:
+        cpu_segments.append(
+            f"{_ascii_text(vendor)} Family {_ascii_text(family)} Model {_ascii_text(model)}"
         )
-    )
-    lines.append(f"TOTAL WALL:        {_fmt_duration(report.total_wall_ms)}   (command->response minus Modal scheduling)")
-    lines.append(f"SCHEDULING:        {_fmt_duration(report.scheduling_ms)}   (informational - excluded from % and bars)")
-    lines.append(f"COMMAND->RESPONSE: {_fmt_duration(report.total_ms)}")
+    visible = telemetry.get("cpu_visible")
+    if visible is not None:
+        cpu_segments.append(f"visible={int(visible)}")
+    requested = telemetry.get("cpu_requested")
+    if requested:
+        cpu_segments.append(f"requested={_ascii_text(requested)}")
+    intra = telemetry.get("torch_intraop")
+    inter = telemetry.get("torch_interop")
+    if intra is not None and inter is not None:
+        cpu_segments.append(f"Torch={int(intra)}/{int(inter)}")
+    native = telemetry.get("native_threads")
+    if native is not None:
+        cpu_segments.append(f"native={int(native)}")
+    if cpu_segments:
+        lines.append(f"{'CPU:':<10} " + " | ".join(cpu_segments))
+
+    # Line 4 — Telemetry (omitted entirely when no data).
+    telemetry_segments: list[str] = []
+    peak = telemetry.get("cpu_peak_cores")
+    if peak is not None:
+        telemetry_segments.append(f"CPU peak={_fmt_peak_cores(float(peak))} cores")
+    above = telemetry.get("cpu_above_16_ms")
+    if above is not None:
+        telemetry_segments.append(f">16 cores={int(above)}ms")
+    rss_restore = telemetry.get("rss_restore_mib")
+    rss_peak = telemetry.get("rss_peak_mib")
+    rss_result = telemetry.get("rss_result_mib")
+    if rss_restore is not None and rss_peak is not None and rss_result is not None:
+        telemetry_segments.append(
+            f"RSS {rss_restore / 1024.0:.2f} -> {rss_peak / 1024.0:.2f} -> {rss_result / 1024.0:.2f} GiB"
+        )
+    max_rss = telemetry.get("max_rss_mib")
+    if max_rss is not None:
+        telemetry_segments.append(f"maxRSS={max_rss / 1024.0:.2f} GiB")
+    if telemetry_segments:
+        lines.append(f"{'Telemetry:':<10} " + " | ".join(telemetry_segments))
+
     lines.append("")
-    columns = f" # | {'Stage':<{label_width}} | {'Duration':>8} | {'Cum.':>8} | {'%':>6} | "
-    if source_enabled:
-        columns += f"{'Source':<{source_width}} | "
-    columns += "Relative wall time"
-    rule = "+-" + "-+-".join(["-" * 3, "-" * label_width, "-" * 10, "-" * 10, "-" * 7] + (["-" * source_width] if source_enabled else []) + ["-" * bar_width]) + "-+"
-    lines.extend([rule, columns, rule])
+    return lines
 
-    def source_text(stage: WaterfallStage) -> str:
-        provenance = stage.provenance
-        source = stage.source or "-"
-        if provenance and source not in ("-", ""):
-            if source == provenance:
-                return provenance
-            return f"{provenance}/{source}"
-        return provenance or source
 
-    # REMOTE/PARTIAL (awaiting host reconciliation): total_wall_ms is unknown,
-    # so no percentage denominator and no bars exist for ANY stage row.
-    reconciled = report.total_wall_ms is not None and report.total_wall_ms > 0
+def _render_partial(report: WaterfallReport) -> str:
+    """REMOTE/PARTIAL waterfalls render a REAL boxed ASCII table of the
+    remotely-measured stages — the same table style/geometry as the reconciled
+    render, subject to partial semantics: no percentages (the '%' column is
+    always '-'), no '#' bars, and no scheduling/restore-begin/local-receipt
+    values (unknown remotely).  The host produces the final reconciled table;
+    the conclusive footer may still read "awaiting host reconciliation" for
+    values the remote has not reconciled yet."""
+    width_num = 3
+    width_label = 46
+    width_dur = 10
+    width_pct = 8
+    width_bar = 40
+    lines: list[str] = []
+    lines.append("V2 COLD WATERFALL - REMOTE/PARTIAL (awaiting host reconciliation)")
+    lines.extend(_render_compact_header(report))
+    rule = (
+        "+" + "-" * (width_num + 2) + "+" + "-" * (width_label + 2) + "+"
+        + "-" * (width_dur + 2) + "+" + "-" * (width_dur + 2) + "+"
+        + "-" * (width_pct + 2) + "+" + "-" * (width_bar + 2) + "+"
+    )
+    header = (
+        f"| {'#':>{width_num}} | {'Stage':<{width_label}} | {'Duration':>{width_dur}} | "
+        f"{'Cum.':>{width_dur}} | {'%':>{width_pct}} | {'Relative wall (non-scheduling)':<{width_bar}} |"
+    )
+    lines.extend([rule, header, rule])
 
     row = 1
     for stage in report.stages:
         if stage.accounting_role != "top_level":
             continue
-        prefix = f"{row:2d}"
-        source = source_text(stage)
-        label_text = stage.label
+        # Never render unavailable top-level rows (identical to reconciled).
+        if stage.duration_ms is None or stage.status in (UNAVAILABLE, INVALID):
+            continue
+        label = stage.label
         if stage.concurrent:
-            label_text = "~ " + label_text
-        if stage.key == "modal_scheduling":
-            if "modal_restore_begin_unavailable" in report.boundary_flags:
-                label_text = "Modal scheduling + pre-Python restore (awaiting host reconciliation)"
-            percentage_text = "-"
-            bar_text = " " * bar_width
-        elif not reconciled:
-            percentage_text = "-"
-            bar_text = " " * bar_width
-        else:
-            percentage_text = _fmt_num(stage.percentage, "%")
-            bar_text = _bar(stage, report.total_wall_ms or report.total_ms, bar_width)
-        line = f" {prefix} | {_shorten(label_text, label_width)} | {_fmt_duration(stage.duration_ms, stage.status):>10} | {_fmt_duration(stage.cumulative_ms):>10} | {percentage_text:>7} | "
-        if source_enabled:
-            line += f"{_shorten(source, source_width)} | "
-        line += bar_text
-        lines.append(line)
+            label = "~ " + label
+        # Partial semantics: '%' always renders '-', the bar column is blank —
+        # no percentage numbers and no '#' characters anywhere in stage rows.
+        lines.append(
+            f"| {row:>{width_num}} | {_shorten(label, width_label)} | "
+            f"{_fmt_duration(stage.duration_ms):>{width_dur}} | "
+            f"{_fmt_duration(stage.cumulative_ms):>{width_dur}} | "
+            f"{'-':>{width_pct}} | {'':>{width_bar}} |"
+        )
+        for detail in report.details:
+            if detail.parent_key != stage.key:
+                continue
+            if not _detail_is_useful(detail):
+                continue
+            lines.append(_detail_row(
+                detail, width_label, width_dur, width_num, width_pct, width_bar,
+            ))
         row += 1
     lines.append(rule)
-
-    # Expanded diagnostics: child / overlap-diagnostic rows grouped under
-    # small sub-headers.  These rows never carry a percentage or a bar
-    # (duration + status only); reconciliation metadata stays in the footer.
-    diagnostic_groups: dict[str, list[WaterfallStage]] = {}
-    for detail in report.details:
-        if detail.accounting_role in ("top_level", "reconciliation"):
-            continue
-        diagnostic_groups.setdefault(_diagnostic_group(detail), []).append(detail)
-    if diagnostic_groups:
-        lines.append("")
-        lines.append("Expanded diagnostics")
-        for group_label, group_rows in diagnostic_groups.items():
-            lines.append(f"[{group_label}]")
-            for detail in group_rows:
-                marker = "overlap" if detail.accounting_role == "overlap_diagnostic" else "detail"
-                lines.append(
-                    f"  {marker}: {_shorten(detail.label, label_width)}   {_fmt_duration(detail.duration_ms, detail.status)}"
-                )
-        lines.append("")
-    accounted_pct = (
-        _fmt_num(_percentage(report.accounted_ms, report.total_ms, report.total_wall_ms), "%")
-        if reconciled and report.accounted_ms is not None
-        else "-"
-    )
-    total_wall_pct = "  100.0%" if reconciled else "-"
-    command_response_pct = "  100.0%" if reconciled else "-"
-    total_wall_footer_bar = (
-        _bar(WaterfallStage("total_wall", "", "application", None, None, report.total_wall_ms, None, None, "", MEASURED), report.total_wall_ms or report.total_ms, bar_width)
-        if reconciled
-        else " " * bar_width
-    )
-    lines.append(f"    | ACCOUNTED     | {_fmt_duration(report.accounted_ms):>10} |            | {accounted_pct:>7} | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | RECONCILIATION | {_fmt_duration(report.reconciliation_ms):>10} |            |            | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | TOTAL WALL | {_fmt_duration(report.total_wall_ms):>10} |            | {total_wall_pct:>7} | " + (" " * (source_width + 3) if source_enabled else "") + total_wall_footer_bar)
-    lines.append(f"    | COMMAND -> RESPONSE | {_fmt_duration(report.total_ms):>10} |            | {command_response_pct:>7} | " + (" " * (source_width + 3) if source_enabled else "") + total_wall_footer_bar)
-    lines.append(f"    | TOP-LEVEL ACCOUNTED | {_fmt_duration(report.accounted_ms):>10} |            | {accounted_pct:>7} | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | GLOBAL RESIDUAL | {_fmt_duration(report.residual_ms):>10} |            |            | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | RESIDUAL %     | {_fmt_num(report.residual_pct, '%'):>10} |            |            | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | RECONCILIATION STATUS | {_ascii_text(report.reconciliation_status or '-'):>10} |            |            | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | CONTROLLABLE APPLICATION WALL | {_fmt_duration(report.controllable_wall_ms):>10} |            |            | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    lines.append(f"    | PLATFORM/MODAL WALL | {_fmt_duration(report.platform_wall_ms):>10} |            |            | " + (" " * (source_width + 3) if source_enabled else "") + "." * bar_width)
-    if report.pre_python_interval_ms is not None and report.total_wall_ms is None:
+    # Minimal footer — reconciliation/status, same full column structure as the
+    # main table, closed by a final boxed border.  Reconciliation is unknown
+    # remotely ('-'); status is the pending host-reconciliation marker.  The
+    # scheduling window is summarized once in the conclusive lines below.
+    lines.append(_footer_full_row(
+        "RECONCILIATION", _fmt_duration(report.reconciliation_ms),
+        width_label, width_dur, width_num, width_pct, width_bar,
+    ))
+    lines.append(_footer_full_row(
+        "STATUS", "PENDING",
+        width_label, width_dur, width_num, width_pct, width_bar,
+    ))
+    lines.append(rule)
+    # Post-table plain lines (never part of the box): the missing-boundary
+    # flags, the full pending status token, and the pre-Python pending
+    # classification the host will reconcile.
+    if report.partial_flags:
+        lines.append("missing=" + ",".join(report.partial_flags))
+    lines.append("status=PENDING_HOST_RECONCILIATION")
+    if report.pre_python_interval_ms is not None:
         lines.append(_ascii_text(
             f"Pending host reconciliation: command start -> Python resume = {report.pre_python_interval_ms:.3f} ms"
             f" - classification = {report.pre_python_interval_classification or 'scheduling + pre-Python restore (unresolved platform interval)'}"
         ))
-    if report.boundary_flags:
-        flag_explanations = {
-            "modal_restore_begin_unavailable": "modal_scheduling covers submission->python_resume combined",
-            "submission_boundary_unavailable": "submission boundary absent; scheduling spans cannot start at the local submit",
-        }
-        lines.append(
-            _ascii_text(
-                "Boundary flags: "
-                + ", ".join(
-                    f"{flag} ({flag_explanations.get(flag, '')})"
-                    for flag in report.boundary_flags
-                )
-            )
-        )
-    if report.partial_waterfall:
-        lines.append(
-            _ascii_text(
-                "REMOTE/PARTIAL WATERFALL - awaiting host reconciliation (missing: "
-                + ", ".join(report.partial_flags)
-                + ")"
-            )
-        )
-    lines.append(rule)
-    if report.warnings:
-        lines.append("Warnings:")
-        lines.extend(f"  - {warning}" for warning in report.warnings)
-    else:
-        lines.append("Warnings: none")
+    # Conclusive footer: scheduling = enqueue + placement, non-scheduling =
+    # total - scheduling_time.  Pending values render the intermediate
+    # diagnostic token (the host reconciles them into real numbers).
+    lines.append(
+        f"{'COMMAND -> RESPONSE:':<38}"
+        f"{_fmt_duration(report.total_ms) if report.total_ms is not None else 'awaiting host reconciliation'}"
+    )
+    lines.append(
+        f"{'Command (without scheduling) -> Response:':<38}"
+        f"{_fmt_duration(report.non_scheduling_ms) if report.non_scheduling_ms is not None else 'awaiting host reconciliation'}"
+    )
+    lines.append(
+        f"{'Scheduling time:':<38}"
+        f"{_fmt_duration(report.scheduling_time_ms) if report.scheduling_time_ms is not None else 'awaiting host reconciliation'}"
+    )
     return "\n".join(lines)
+
+
+def _detail_row(
+    detail: WaterfallStage,
+    width_label: int,
+    width_dur: int,
+    width_num: int,
+    width_pct: int,
+    width_bar: int,
+) -> str:
+    """Inline curated detail row: duration only, blank number/Cum/%/bar."""
+    label = "  " + detail.label
+    return (
+        f"| {'':>{width_num}} | {_shorten(label, width_label)} | "
+        f"{_fmt_duration(detail.duration_ms):>{width_dur}} | {'':>{width_dur}} | "
+        f"{'':>{width_pct}} | {'':>{width_bar}} |"
+    )
+
+
+def _provider_region(report: WaterfallReport) -> str:
+    """Normalized ``Provider/Region`` from the report identity (e.g. the live
+    ``CLOUD_PROVIDER_GCP/us-central1`` renders as ``GCP/us-central1``)."""
+    identity = report.identity
+    cloud = str(identity.get("cloud") or "").strip()
+    if cloud.upper().startswith("CLOUD_PROVIDER_"):
+        cloud = cloud[len("CLOUD_PROVIDER_"):]
+    region = str(identity.get("region") or "").strip()
+    if not cloud and not region:
+        return ""
+    return f"{cloud or '-'}/{region or '-'}"
+
+
+def _footer_full_row(
+    label: str,
+    value: str,
+    width_label: int,
+    width_dur: int,
+    width_num: int,
+    width_pct: int,
+    width_bar: int,
+) -> str:
+    """Footer row spanning the SAME full column structure as the main table."""
+    return (
+        f"| {'':>{width_num}} | {_shorten(label, width_label)} | "
+        f"{value:>{width_dur}} | {'':>{width_dur}} | {'':>{width_pct}} | {'':>{width_bar}} |"
+    )
+
+
+def _render_reconciled(report: WaterfallReport) -> str:
+    """ONE boxed ASCII table: exclusive top-level rows + inline curated
+    details, minimal footer directly below (Reconciliation / Status).
+    Unavailable top-level rows are never rendered.  Percentages and bars use
+    the non-scheduling wall (command->response minus scheduling time)."""
+    width_num = 3
+    width_label = 46
+    width_dur = 10
+    width_pct = 8
+    width_bar = 40
+    lines: list[str] = []
+    lines.append(_ascii_text(f"V2 COLD WATERFALL - {report.run_label or 'run'}"))
+    lines.extend(_render_compact_header(report))
+    rule = (
+        "+" + "-" * (width_num + 2) + "+" + "-" * (width_label + 2) + "+"
+        + "-" * (width_dur + 2) + "+" + "-" * (width_dur + 2) + "+"
+        + "-" * (width_pct + 2) + "+" + "-" * (width_bar + 2) + "+"
+    )
+    header = (
+        f"| {'#':>{width_num}} | {'Stage':<{width_label}} | {'Duration':>{width_dur}} | "
+        f"{'Cum.':>{width_dur}} | {'%':>{width_pct}} | {'Relative wall (non-scheduling)':<{width_bar}} |"
+    )
+    lines.extend([rule, header, rule])
+
+    row = 1
+    for stage in report.stages:
+        if stage.accounting_role != "top_level":
+            continue
+        # Never render unavailable top-level rows; a required unavailable
+        # boundary surfaces only as Required data / reconciliation status.
+        if stage.duration_ms is None or stage.status in (UNAVAILABLE, INVALID):
+            continue
+        label = stage.label
+        if stage.concurrent:
+            label = "~ " + label
+        if stage.percentage is not None:
+            percentage = _fmt_num(stage.percentage, "%")
+        else:
+            percentage = "-"
+        bar = _bar(
+            stage,
+            report.non_scheduling_ms if report.non_scheduling_ms is not None else report.total_wall_ms,
+            width_bar,
+        )
+        lines.append(
+            f"| {row:>{width_num}} | {_shorten(label, width_label)} | "
+            f"{_fmt_duration(stage.duration_ms):>{width_dur}} | "
+            f"{_fmt_duration(stage.cumulative_ms):>{width_dur}} | "
+            f"{percentage:>{width_pct}} | {bar} |"
+        )
+        for detail in report.details:
+            if detail.parent_key != stage.key:
+                continue
+            if not _detail_is_useful(detail):
+                continue
+            lines.append(_detail_row(
+                detail, width_label, width_dur, width_num, width_pct, width_bar,
+            ))
+        row += 1
+    lines.append(rule)
+    # Minimal footer — reconciliation/status, using the SAME full column
+    # structure as the main table, closed by a final boxed border.  The 10 ms
+    # target is surfaced only when missed (10 < |recon| <= 50 ms) while status
+    # stays OK under the hard ceiling.  The scheduling window (enqueue +
+    # placement) is summarized once in the conclusive lines below.
+    lines.append(_footer_full_row(
+        "RECONCILIATION", _fmt_duration(report.reconciliation_ms),
+        width_label, width_dur, width_num, width_pct, width_bar,
+    ))
+    lines.append(_footer_full_row(
+        "STATUS", _ascii_text(report.reconciliation_status or "-"),
+        width_label, width_dur, width_num, width_pct, width_bar,
+    ))
+    if (
+        report.reconciliation_ms is not None
+        and abs(report.reconciliation_ms) > report.reconciliation_target_ms
+        and abs(report.reconciliation_ms) <= report.reconciliation_hard_ms
+    ):
+        lines.append(_footer_full_row(
+            "TARGET 10MS", "MISSED",
+            width_label, width_dur, width_num, width_pct, width_bar,
+        ))
+    lines.append(rule)
+    if report.data_flags:
+        lines.append(f"Required data: {','.join(report.data_flags)}")
+        lines.append(f"VALIDATION: {_ascii_text(report.validation_status or 'INCOMPLETE')}")
+    # Conclusive footer — the new timing contract.  Scheduling time = enqueue +
+    # placement; non-scheduling = total - scheduling_time.  These are the
+    # final reconciled values and are NEVER the intermediate pending token.
+    lines.append(f"{'COMMAND -> RESPONSE:':<38}{_fmt_duration(report.total_ms)}")
+    lines.append(
+        f"{'Command (without scheduling) -> Response:':<38}"
+        f"{_fmt_duration(report.non_scheduling_ms)}"
+    )
+    lines.append(f"{'Scheduling time:':<38}{_fmt_duration(report.scheduling_time_ms)}")
+    return "\n".join(lines)
+
+
+def render_waterfall(report: WaterfallReport | Mapping[str, Any], *, terminal_columns: int | None = None) -> str:
+    """Render a plain-ASCII waterfall.
+
+    REMOTE/PARTIAL waterfalls render as a REAL boxed ASCII table of the
+    remotely-measured stages (no percentages, no bars — scheduling/
+    restore-begin/local-receipt are unknown remotely and the host produces
+    the final reconciled table); final host-reconciled waterfalls
+    render as ONE ASCII table with a minimal footer.
+    ``terminal_columns`` is accepted for call compatibility; the layout is a
+    fixed deterministic width so console output is byte-stable.
+    """
+    del terminal_columns
+    if not isinstance(report, WaterfallReport):
+        report = _report_from_value(report)
+    if report.partial_waterfall:
+        return _render_partial(report)
+    return _render_reconciled(report)
 
 
 def _report_from_value(value: WaterfallReport | Mapping[str, Any]) -> WaterfallReport:
@@ -1922,10 +2922,18 @@ def _report_from_value(value: WaterfallReport | Mapping[str, Any]) -> WaterfallR
         scheduling_ms=value.get("scheduling_ms"),
         total_wall_ms=value.get("total_wall_ms"),
         command_response_ms=value.get("command_response_ms"),
+        command_to_enqueue_ms=value.get("command_to_enqueue_ms"),
+        scheduling_time_ms=value.get("scheduling_time_ms"),
+        non_scheduling_ms=value.get("non_scheduling_ms"),
+        host_telemetry=dict(_as_mapping(value.get("host_telemetry"))),
         partial_waterfall=bool(value.get("partial_waterfall", False)),
         partial_flags=tuple(value.get("partial_flags", ())),
         pre_python_interval_ms=value.get("pre_python_interval_ms"),
         pre_python_interval_classification=str(value.get("pre_python_interval_classification", "")),
+        data_flags=tuple(value.get("data_flags", ())),
+        reconciliation_target_ms=float(value.get("reconciliation_target_ms", RECONCILIATION_TARGET_MS)),
+        reconciliation_hard_ms=float(value.get("reconciliation_hard_ms", RECONCILIATION_HARD_MS)),
+        validation_status=str(value.get("validation_status", "")),
     )
 
 
@@ -1948,7 +2956,7 @@ def render_comparison(reports: Sequence[WaterfallReport | Mapping[str, Any]]) ->
             totals.append(total)
         platform = stage_map.get("modal_scheduling")
         restore = stage_map.get("application_restore")
-        pre_keys = ("remote_method_setup", "prompt_executor_cache_setup", "first_node_to_clip", "clip_to_sampler_node", "sampler_node_to_sampling")
+        pre_keys = ("remote_method_setup", "prompt_executor_cache_setup", "pre_sampler_execution", "sampler_node_to_sampling")
         pre = sum(stage_map[key].duration_ms or 0 for key in pre_keys if key in stage_map)
         sampler = stage_map.get("sampling")
         output = 0.0
@@ -2016,10 +3024,18 @@ def waterfall_to_dict(report: WaterfallReport) -> dict[str, Any]:
         "scheduling_ms": report.scheduling_ms,
         "total_wall_ms": report.total_wall_ms,
         "command_response_ms": report.command_response_ms,
+        "command_to_enqueue_ms": report.command_to_enqueue_ms,
+        "scheduling_time_ms": report.scheduling_time_ms,
+        "non_scheduling_ms": report.non_scheduling_ms,
+        "host_telemetry": dict(report.host_telemetry),
         "partial_waterfall": report.partial_waterfall,
         "partial_flags": list(report.partial_flags),
         "pre_python_interval_ms": report.pre_python_interval_ms,
         "pre_python_interval_classification": report.pre_python_interval_classification,
+        "data_flags": list(report.data_flags),
+        "reconciliation_target_ms": report.reconciliation_target_ms,
+        "reconciliation_hard_ms": report.reconciliation_hard_ms,
+        "validation_status": report.validation_status,
     }
 
 
@@ -2087,12 +3103,18 @@ def attach_waterfall(
     run_label: str = "",
     modal_restore_begin_wall_unix_ns: int | None = None,
     print_render: bool = True,
+    replace_partial: bool = False,
 ) -> dict[str, Any] | None:
     """Idempotent, non-raising waterfall finalizer (mutates *result* in place).
 
     Preserves an existing valid waterfall; otherwise builds a report from
     *result_view* (or *result* itself) via ``build_waterfall`` — or serializes
     a prebuilt *report* — and attaches it as ``result["waterfall"]``.
+
+    ``replace_partial=True`` (host-reconciled callers) rebuilds even when an
+    existing valid report is marked ``partial_waterfall=True``: a REMOTE raw
+    artifact must never block the host from replacing it with the final
+    reconciled report.  A non-partial existing report is always preserved.
 
     A failure never raises into the workflow: an error marker is attached and
     a concise line is printed.  Returns the attached/preserved waterfall dict,
@@ -2103,7 +3125,10 @@ def attach_waterfall(
         return None
     existing = result.get("waterfall")
     if _is_valid_waterfall(existing):
-        return existing
+        if replace_partial and existing.get("partial_waterfall") is True:
+            existing = None  # remote raw artifact must not block the host rebuild
+        else:
+            return existing
     try:
         if report is None:
             view = result_view if result_view is not None else dict(result)

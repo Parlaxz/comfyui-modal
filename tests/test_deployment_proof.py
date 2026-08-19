@@ -370,8 +370,23 @@ class TestParityMatrix(unittest.TestCase):
 
 class TestHostValidationMemo(unittest.TestCase):
     def setUp(self):
+        import tempfile as _tf
+        import shutil as _sh
+        self._td = _tf.mkdtemp()
+        self.addCleanup(lambda: _sh.rmtree(self._td, ignore_errors=True))
+        self._saved_store = os.environ.get("COMFYMODAL_V2_REGISTRY_PROOF_STORE")
+        os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = os.path.join(
+            self._td, "v2_registry_proof_store.json"
+        )
+        self.addCleanup(self._restore_store_env)
         self.mod = _load_canonical()
         self.mod._PLAN_VALIDATION_MEMO.clear()
+
+    def _restore_store_env(self):
+        if self._saved_store is None:
+            os.environ.pop("COMFYMODAL_V2_REGISTRY_PROOF_STORE", None)
+        else:
+            os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = self._saved_store
 
     def test_host_validation_memoized(self):
         """Identical workflow + identity runs validate_prompt exactly once and

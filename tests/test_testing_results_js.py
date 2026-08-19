@@ -175,9 +175,13 @@ class ModalShellTests(unittest.TestCase):
         self.assertTrue(self.m.has_export("open_testing_modal"))
 
     def test_three_tabs(self):
-        for tab in ("Dashboard", "Setup", "Profiles", "Results", "History", "Settings"):
-            with self.subTest(tab=tab):
-                self.assertIn(tab, self.m.text)
+        """The Studio shell must expose the current five-page set in studio-shell.js."""
+        shell = _JsModule(REPO_ROOT / "web" / "studio-shell.js")
+        if not shell.text:
+            self.skipTest("web/studio-shell.js missing")
+        for page in ("playground", "history", "workflows", "backend", "settings"):
+            with self.subTest(page=page):
+                self.assertIn(page, shell.text)
 
     def test_imports_comfyui_app(self):
         # Should import from ../../scripts/app.js for sidebar registration

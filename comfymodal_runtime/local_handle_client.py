@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -47,6 +48,211 @@ class PersistentHandleError(RuntimeError):
 
 class PersistentHandleUnavailable(PersistentHandleError):
     """Raised when the owner process cannot be started or reached."""
+
+
+# ── Cooperative cancellation verdicts ───────────────────────────────────────
+# States are transport-owned and monotonic.  Confirmation is NEVER derived
+# locally: a handle becomes ``confirmed`` only when the stream consumer
+# observes the remote's explicit ``cancelled`` event (``confirmed: True``).
+
+CANCEL_STATE_IDLE = "idle"
+CANCEL_STATE_PENDING = "pending"
+CANCEL_STATE_CONFIRMED = "confirmed"
+CANCEL_STATE_COMPLETED = "completed"
+CANCEL_STATE_COMPLETED_BEFORE_CANCEL = "completed_before_cancel"
+CANCEL_STATE_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    """Narrow, truthful verdict for one cooperative cancellation request.
+
+    ``state`` is one of the ``CANCEL_STATE_*`` constants; ``confirmed`` is
+    ``True`` ONLY for ``confirmed`` (never derived from a put, an iterator
+    close, or a local task cancellation).
+    """
+
+    state: str
+    reason: str = ""
+    detail: str = ""
+
+    @property
+    def confirmed(self) -> bool:
+        return self.state == CANCEL_STATE_CONFIRMED
+
+
+def build_cancel_message(partition: str, reason: str = "") -> dict[str, str]:
+    """Build the primitive JSON-safe cancel message addressed to *partition*.
+
+    The remote generator receives ``control_queue`` + ``control_partition``
+    and consumes only messages whose ``partition`` matches its
+    ``control_partition`` (A/B isolation at the adapter boundary).  Only
+    plain primitives are used — never handles, clients, or picklable SDK
+    objects.
+    """
+    return {"type": "cancel", "partition": str(partition or ""), "reason": str(reason or "")}
+
+
+class RemoteCancellationHandle:
+    """Transport-owned cooperative cancellation handle for one attempt.
+
+    Keyed by request/attempt id.  ``cancel(reason)`` delivers one primitive
+    cancel message through the configured putter; the returned ``CancelResult``
+    is ``pending`` until the remote ``cancelled`` event is observed, at which
+    point ``_mark_confirmed`` transitions it to ``confirmed``.  A result event
+    transitions it to ``completed`` / ``completed_before_cancel`` (the attempt
+    finished before cancellation took effect).  Channel failures yield a
+    truthful ``unavailable`` verdict — the handle is never marked cancelled
+    locally (iterator close / task cancellation do not confirm).
+
+    Duplicate ``cancel()`` calls are idempotent: they reflect the current
+    verdict without re-delivering a second message.
+    """
+
+    __slots__ = (
+        "request_id",
+        "attempt_key",
+        "partition",
+        "_putter",
+        "_lock",
+        "_state",
+        "_cancel_requested",
+        "_completed",
+        "_confirmed",
+        "_reason",
+        "_detail",
+    )
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        attempt_key: str = "",
+        partition: str = "",
+        putter: Any | None = None,
+    ) -> None:
+        self.request_id = str(request_id)
+        self.attempt_key = str(attempt_key or self.request_id)
+        self.partition = str(partition or self.request_id)
+        # ``putter`` is an async callable(message: Mapping) -> bool; ``True``
+        # means the cancel message was delivered to the channel (put success —
+        # NOT remote-execution confirmation).
+        self._putter = putter
+        self._lock = threading.Lock()
+        self._state = CANCEL_STATE_IDLE
+        self._cancel_requested = False
+        self._completed = False
+        self._confirmed = False
+        self._reason = ""
+        self._detail = ""
+
+    # -- transport-internal state transitions ---------------------------
+
+    def _set_putter(self, putter: Any | None) -> None:
+        """Swap the delivery channel (used by transport retry/fallback)."""
+        with self._lock:
+            self._putter = putter
+
+    def _mark_confirmed(self, reason: str = "") -> None:
+        """Remote ``cancelled`` event observed — the ONLY confirmation path."""
+        with self._lock:
+            if self._completed:
+                return
+            self._confirmed = True
+            self._state = CANCEL_STATE_CONFIRMED
+            self._reason = str(reason or self._reason)
+            self._detail = "remote cancelled event observed with confirmed=True"
+
+    def _mark_completed(self) -> None:
+        """A normal result event was observed for this attempt."""
+        with self._lock:
+            if self._confirmed:
+                return
+            self._completed = True
+            self._state = (
+                CANCEL_STATE_COMPLETED_BEFORE_CANCEL
+                if self._cancel_requested
+                else CANCEL_STATE_COMPLETED
+            )
+            self._detail = (
+                "attempt completed before cancellation was confirmed"
+                if self._cancel_requested
+                else "attempt completed; no cancellation was requested"
+            )
+
+    # -- public surface -------------------------------------------------
+
+    def snapshot(self) -> CancelResult:
+        with self._lock:
+            return CancelResult(self._state, reason=self._reason, detail=self._detail)
+
+    async def cancel(self, reason: str = "") -> CancelResult:
+        """Deliver one primitive cancel message (idempotent).
+
+        Never confirms locally: put success maps to ``pending``; the attempt
+        completing first maps to ``completed_before_cancel``; a channel
+        failure maps to ``unavailable``.  Only an observed remote
+        ``cancelled`` event transitions the handle to ``confirmed``.
+        """
+        reason = str(reason or "")
+        with self._lock:
+            if self._confirmed:
+                return CancelResult(
+                    CANCEL_STATE_CONFIRMED, reason=self._reason or reason, detail=self._detail
+                )
+            if self._completed:
+                return CancelResult(
+                    CANCEL_STATE_COMPLETED_BEFORE_CANCEL,
+                    reason=reason,
+                    detail="attempt completed before cancellation was requested",
+                )
+            if self._cancel_requested:
+                # Idempotent duplicate: reflect the current verdict without a
+                # second delivery.
+                return CancelResult(self._state, reason=self._reason or reason, detail=self._detail)
+            putter = self._putter
+            if putter is None:
+                self._cancel_requested = True
+                self._state = CANCEL_STATE_UNAVAILABLE
+                self._reason = reason
+                self._detail = "no cancellation channel configured"
+                return CancelResult(self._state, reason=reason, detail=self._detail)
+        try:
+            delivered = bool(await putter(build_cancel_message(self.partition, reason)))
+        except Exception as exc:
+            with self._lock:
+                if self._confirmed:
+                    return CancelResult(CANCEL_STATE_CONFIRMED, reason=reason, detail=self._detail)
+                if self._completed:
+                    return CancelResult(
+                        CANCEL_STATE_COMPLETED_BEFORE_CANCEL,
+                        reason=reason,
+                        detail="attempt completed before cancellation was requested",
+                    )
+                self._cancel_requested = True
+                self._state = CANCEL_STATE_UNAVAILABLE
+                self._reason = reason
+                self._detail = f"cancel channel failure: {exc}"
+                return CancelResult(self._state, reason=reason, detail=self._detail)
+        with self._lock:
+            if self._confirmed:
+                return CancelResult(CANCEL_STATE_CONFIRMED, reason=reason, detail=self._detail)
+            if self._completed:
+                return CancelResult(
+                    CANCEL_STATE_COMPLETED_BEFORE_CANCEL,
+                    reason=reason,
+                    detail="attempt completed before cancellation was confirmed",
+                )
+            self._cancel_requested = True
+            if delivered:
+                self._state = CANCEL_STATE_PENDING
+                self._reason = reason
+                self._detail = "cancel delivered; awaiting remote confirmation"
+            else:
+                self._state = CANCEL_STATE_UNAVAILABLE
+                self._reason = reason
+                self._detail = "cancel put was not delivered"
+            return CancelResult(self._state, reason=reason, detail=self._detail)
 
 
 # ── Stale/deleted handle detection (conservative) ──────────────────────────
@@ -571,12 +777,20 @@ class PersistentHandleClient:
         *,
         request_id: str = "",
         gpu: Any = None,
+        control_queue_name: str = "",
+        control_partition: str = "",
     ) -> PersistentHandleProxy:
         """Open a streaming run against the owned handle.
 
         Returns a ``PersistentHandleProxy`` exposing ``input_id`` /
         ``input_created_at`` (when supplied by the owner) and supporting
         ``async for``.  Close deterministically with ``await proxy.aclose()``.
+
+        When ``control_queue_name`` is set, the owner resolves the same named
+        Modal ``Queue`` (through its own client cache) and passes the hydrated
+        handle plus ``control_partition`` into the remote generator so the
+        remote can observe cooperative cancel messages.  Cancellation itself
+        is sent through ``cancel_attempt`` — never through this stream socket.
         """
         await self._ensure_owner()
         key = self._ensure_token_id_in_key(key, workspace)
@@ -603,6 +817,8 @@ class PersistentHandleClient:
                 "payload": dict(payload),
                 "request_id": str(request_id or ""),
                 "gpu": gpu,
+                "control_queue_name": str(control_queue_name or ""),
+                "control_partition": str(control_partition or ""),
             })
             proxy.start()
         except Exception:
@@ -698,6 +914,96 @@ class PersistentHandleClient:
             except Exception:
                 pass
 
+    async def cancel_attempt(
+        self,
+        *,
+        key: Mapping[str, Any],
+        workspace: Mapping[str, Any],
+        control_queue_name: str,
+        control_partition: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Ask the owner to put a primitive cancel message on the control
+        Queue for *control_partition*.
+
+        Returns ``{"delivered": True, "partition": ...}`` on PUT success only.
+        Put success is NOT remote-execution confirmation: the transport handle
+        is confirmed solely when the run stream observes the remote's explicit
+        ``cancelled`` event.
+
+        Runs over its OWN loopback connection — never the busy run-stream
+        socket.  Failures raise ``PersistentHandleUnavailable`` /
+        ``PersistentHandleError``; the transport maps them to a truthful
+        ``unavailable`` verdict.
+        """
+        await self._ensure_owner()
+        key = self._ensure_token_id_in_key(key, workspace)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    "127.0.0.1", self._owner_port, limit=IPC_STREAM_LIMIT,
+                ),
+                timeout=self._connect_timeout,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise PersistentHandleUnavailable(
+                f"cannot connect to local handle owner for cancel_attempt: {exc}"
+            ) from exc
+        try:
+            await _write_json(writer, {
+                "op": "cancel_attempt",
+                "auth": self._auth_token,
+                "key": dict(key),
+                "workspace": dict(workspace),
+                "control_queue_name": str(control_queue_name or ""),
+                "control_partition": str(control_partition or ""),
+                "reason": str(reason or ""),
+            })
+            while True:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=self._publish_timeout,
+                )
+                if not line:
+                    # The op WAS delivered to the owner; the queue put may
+                    # have already happened.  Never retry blindly — report
+                    # the channel as unavailable.
+                    raise PersistentHandleError(
+                        "owner closed the connection before a cancel result",
+                        frame={"type": "result_unavailable"},
+                    )
+                frame = json.loads(line)
+                ftype = frame.get("frame")
+                if ftype == "decision":
+                    print(f"[v2.local_handle] decision={frame.get('decision', '')}", flush=True)
+                elif ftype == "result":
+                    result = frame.get("result")
+                    return result if isinstance(result, dict) else {"delivered": False}
+                elif ftype == "error":
+                    error = frame.get("error") or {}
+                    raise PersistentHandleError(
+                        _redact(
+                            f"cancel_attempt failed: "
+                            f"{error.get('type', 'unknown')}: {error.get('message', '')}",
+                            _request_secrets(workspace),
+                        ),
+                        frame=error,
+                    )
+        except asyncio.TimeoutError as exc:
+            raise PersistentHandleError(
+                f"cancel_attempt timed out: {exc}",
+                frame={"type": "result_unavailable"},
+            ) from exc
+        except (json.JSONDecodeError, ConnectionError, OSError) as exc:
+            raise PersistentHandleError(
+                f"cancel_attempt read failed: {exc}",
+                frame={"type": "result_unavailable"},
+            ) from exc
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
 
 # ── Default singleton ───────────────────────────────────────────────────────
 
@@ -721,10 +1027,19 @@ def get_default_handle_client() -> PersistentHandleClient:
 
 
 __all__ = [
+    "CANCEL_STATE_COMPLETED",
+    "CANCEL_STATE_COMPLETED_BEFORE_CANCEL",
+    "CANCEL_STATE_CONFIRMED",
+    "CANCEL_STATE_IDLE",
+    "CANCEL_STATE_PENDING",
+    "CANCEL_STATE_UNAVAILABLE",
+    "CancelResult",
     "PersistentHandleClient",
     "PersistentHandleError",
     "PersistentHandleProxy",
     "PersistentHandleUnavailable",
+    "RemoteCancellationHandle",
+    "build_cancel_message",
     "build_handle_key",
     "default_owner_state_path",
     "get_default_handle_client",

@@ -11,7 +11,8 @@ plan validation carries the exact deployed hash instead of a
 host-reconstructed value.
 
 Fails closed: exit code 0 and the state file are produced ONLY when the remote
-call succeeded AND the returned ``deployment_combined_hash`` is non-empty;
+call succeeded AND the returned ``deployment_combined_hash``,
+``custom_nodes_generation`` and ``overall_dependency_hash`` are all non-empty;
 otherwise prints ``[v2.deploy_identity] status=failed`` and exits 1.
 
 Workspace/credential handling mirrors ``tools/publish_custom_nodes_volume.py``
@@ -171,8 +172,25 @@ def main() -> int:
         print(f"[v2.deploy_identity] app={app_name} class={_CLASS_NAME} method={_METHOD_NAME}")
         result = asyncio.run(_call_deployment_identity(workspace, app_name, gpu))
 
+        requested_atomic_profile = str(
+            os.environ.get("COMFYMODAL_V2_ATOMIC_PROFILE", "") or ""
+        ).strip()
+        deployed_atomic_profile = str(
+            result.get("atomic_profile", "") or ""
+        ).strip()
+        if requested_atomic_profile and deployed_atomic_profile != requested_atomic_profile:
+            print(
+                "[v2.deploy_identity] status=failed "
+                "reason=atomic_profile_mismatch "
+                f"requested={requested_atomic_profile} "
+                f"deployed={deployed_atomic_profile or '<missing>'}",
+                file=sys.stderr,
+            )
+            return 1
+
         deployment_combined_hash = str(result.get("deployment_combined_hash") or "")
         custom_nodes_generation = str(result.get("custom_nodes_generation") or "")
+        overall_dependency_hash = str(result.get("overall_dependency_hash") or "")
         comfyui_version = str(result.get("comfyui_version") or "")
         manifest = result.get("registry_manifest") or {}
         if not isinstance(manifest, dict):
@@ -208,12 +226,52 @@ def main() -> int:
         if not deployment_combined_hash:
             print("[v2.deploy_identity] status=failed reason=empty_deployment_combined_hash", file=sys.stderr)
             return 1
+        if not custom_nodes_generation:
+            print("[v2.deploy_identity] status=failed reason=empty_custom_nodes_generation", file=sys.stderr)
+            return 1
+        if not overall_dependency_hash:
+            print("[v2.deploy_identity] status=failed reason=empty_overall_dependency_hash", file=sys.stderr)
+            return 1
+
+        # Deployed runtime-shape record (canonical deploy-batch env): computed
+        # from the SAME pinned env the deploy launcher sets
+        # (COMFYMODAL_V2_CPU_REQUEST=12, COMFYMODAL_V2_MEMORY_MB=32768,
+        # THREAD_POLICY=TBASE, SNAPSHOT_MODEL_ORDER=O0), which is also what
+        # the container bakes, so the run batch's preflight can compare the
+        # planned request shape against the deployment's recorded shape with
+        # zero remote calls.  Guarded: shape problems must never fail the
+        # identity record itself; the run preflight fails closed when the
+        # fields are missing.
+        _shape: dict = {}
+        try:
+            from comfymodal_runtime.runtime_shape import runtime_shape_config
+            _shape_cfg = runtime_shape_config()
+            _shape = {
+                "runtime_shape_fingerprint": _shape_cfg.runtime_shape_fingerprint,
+                "runtime_shape_label": _shape_cfg.runtime_shape_label or "",
+                "cpu_request": int(_shape_cfg.cpu_request),
+                "memory_request": int(_shape_cfg.memory_request),
+                "thread_policy": _shape_cfg.thread_policy,
+                "snapshot_model_order": _shape_cfg.snapshot_model_order,
+            }
+        except Exception:  # noqa: BLE001 — guarded; preflight fails closed
+            _shape = {}
+        _class_name = os.environ.get(
+            "COMFYMODAL_V2_CLASS_NAME", _CLASS_NAME
+        ).strip() or _CLASS_NAME
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, "").strip() or default)
+            except (TypeError, ValueError):
+                return default
 
         state = {
             "schema_version": 1,
             "source": "container_readback",
             "deployment_combined_hash": deployment_combined_hash,
             "custom_nodes_generation": custom_nodes_generation,
+            "overall_dependency_hash": overall_dependency_hash,
             "comfyui_version": comfyui_version,
             "registry_manifest_class_count": manifest_class_count,
             "comfyui_commit": deployed_comfyui_commit,
@@ -221,6 +279,21 @@ def main() -> int:
             "comfyui_core_match": comfyui_core_match,
             "deployed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "app_name": app_name,
+            "class_name": _class_name,
+            "atomic_profile": deployed_atomic_profile or requested_atomic_profile,
+            "runtime_shape_recorded": 1 if _shape else 0,
+            "runtime_shape_fingerprint": str(
+                _shape.get("runtime_shape_fingerprint") or ""
+            ),
+            "runtime_shape_label": str(_shape.get("runtime_shape_label") or ""),
+            "cpu_request": int(_shape.get("cpu_request") or 0),
+            "memory_request": int(_shape.get("memory_request") or 0),
+            "baseline_cpu_request": _env_int("COMFYMODAL_V2_BASELINE_CPU_REQUEST", 12),
+            "baseline_memory_request": _env_int(
+                "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", 32768
+            ),
+            "thread_policy": str(_shape.get("thread_policy") or ""),
+            "snapshot_model_order": str(_shape.get("snapshot_model_order") or ""),
         }
         _write_state(state)
         print(f"[v2.deploy_identity] state_file={_DEPLOYED_STATE_FILE}")
@@ -234,8 +307,17 @@ def main() -> int:
             f"[v2.deploy_identity] status=ok "
             f"deployment_combined_hash={deployment_combined_hash[:16]} "
             f"custom_nodes_generation={custom_nodes_generation[:16]} "
+            f"overall_dependency_hash={overall_dependency_hash[:16]} "
             f"comfyui_version={comfyui_version} "
-            f"manifest_classes={manifest_class_count}"
+            f"manifest_classes={manifest_class_count} "
+            f"class={_class_name} "
+            f"runtime_shape_fingerprint={state.get('runtime_shape_fingerprint')} "
+            f"cpu_request={state.get('cpu_request')} "
+            f"memory_request={state.get('memory_request')}"
+        )
+        print(
+            f"[v2.deploy_identity] atomic_profile="
+            f"{state.get('atomic_profile') or '<none>'}"
         )
         print(
             f"[v2.deploy_identity] "

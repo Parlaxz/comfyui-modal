@@ -16,6 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRESS_PATH = REPO_ROOT / "web" / "comfymodal-progress.js"
 PLAYGROUND_PATH = REPO_ROOT / "web" / "studio-playground.js"
+EXPERIMENT_MODE_PATH = REPO_ROOT / "web" / "studio-experiment-mode.js"
 
 
 class _ProgressSourceMixin:
@@ -179,20 +180,33 @@ class ExperimentEventHandlerTests(_ProgressSourceMixin, unittest.TestCase):
 
 
 class ExperimentRunPathTests(unittest.TestCase):
-    """Verify the experiment run submission path in studio-playground.js."""
+    """Verify the experiment run submission path in studio-playground.js and
+    the scoped-tracker wiring in studio-experiment-mode.js."""
 
     def setUp(self):
         self.source = PLAYGROUND_PATH.read_text(encoding="utf-8")
         # Scope to the experiment run onclick handler — the first
         # `btn.onclick = async () => {` in the file (experiment mode).
         self._exp_section = self.source[self.source.index("btn.onclick = async () => {"):]
+        # The experiment click handler in studio-experiment-mode.js wires the
+        # scoped tracker after executeExperimentRun returns. Narrow section
+        # covering the import → create → dispose-old → assign-new block.
+        exp_source = EXPERIMENT_MODE_PATH.read_text(encoding="utf-8")
+        self._tracker_section = exp_source[
+            exp_source.index('var { createScopedTracker } = await import("./comfymodal-progress.js")'):exp_source.index("_expTracker.start();")
+        ]
 
     def test_experiment_run_creates_scoped_tracker(self):
-        """Experiment run path must call _createAndStartScopedTracker."""
+        """Experiment run path must import and call createScopedTracker."""
         self.assertIn(
-            "_createAndStartScopedTracker",
-            self._exp_section,
-            "Experiment run onclick must create a scoped tracker",
+            'var { createScopedTracker } = await import("./comfymodal-progress.js")',
+            self._tracker_section,
+            "Experiment run path must import createScopedTracker to wire experiment events",
+        )
+        self.assertIn(
+            "createScopedTracker(_expApi",
+            self._tracker_section,
+            "Experiment run path must create the scoped tracker with the api",
         )
 
     def test_experiment_run_passes_experiment_id(self):
@@ -213,11 +227,21 @@ class ExperimentRunPathTests(unittest.TestCase):
         )
 
     def test_experiment_run_disposes_before_create(self):
-        """Experiment run path must dispose previous tracker before creating new one."""
+        """Experiment run path must dispose previous tracker before assigning new one."""
         self.assertIn(
-            "_disposeScopedTracker(state)",
-            self._exp_section,
-            "Experiment run path must dispose previous tracker before experiment run",
+            "var _old = state.playground._scopedTracker",
+            self._tracker_section,
+            "Experiment run path must capture the previous scoped tracker",
+        )
+        self.assertIn(
+            "_old.dispose()",
+            self._tracker_section,
+            "Experiment run path must dispose the previous scoped tracker",
+        )
+        self.assertIn(
+            "state.playground._scopedTracker = _expTracker",
+            self._tracker_section,
+            "Experiment run path must assign the new scoped tracker after disposing the old one",
         )
 
 

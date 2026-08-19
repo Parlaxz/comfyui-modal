@@ -48,7 +48,7 @@ export default defineConfig({
   projects: [
     {
       name: "mocked",
-      testIgnore: /studio-live\.spec\.mjs/,
+      testIgnore: /studio-live\.spec\.mjs|fake\//,
     },
     {
       name: "live",

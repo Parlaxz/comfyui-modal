@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 import modal
-from comfymodal_runtime.contracts import stable_hash
+from comfymodal_runtime.contracts import (
+    DEFAULT_OUTPUT_QUALITY,
+    DEFAULT_PREVIEW_QUALITY,
+    normalize_output_format,
+    normalize_quality,
+    normalize_webp_lossless_compression,
+    stable_hash,
+)
 from comfymodal_runtime.env import env_flag
 from comfymodal_runtime.runtime_shape import (
     apply_torch_thread_policy,
@@ -179,7 +186,7 @@ try:
         resolve_experiment as _v2_resolve_experiment,
     )
 except Exception:
-    _v2_png_compress_level = lambda: 6  # type: ignore
+    _v2_png_compress_level = lambda: 1  # type: ignore
     _v2_restore_total_vram_frozen_enabled = lambda: False  # type: ignore
     _v2_experiment_line = lambda _s: ""  # type: ignore
     _v2_resolve_experiment = lambda _n: None  # type: ignore
@@ -190,10 +197,36 @@ _RESTORE_MEMORY_EXPERIMENT_LOGGED = False
 _PNG_EXPERIMENT_LOCK = threading.Lock()
 _RESTORE_MEMORY_EXPERIMENT_LOCK = threading.Lock()
 
+# ── Ungated last-output-encode record (additive, trace-artifact path) ──
+# Set by encode_image_tensor_batch after its PIL save loop so
+# comfymodal_runtime.modal_app can enrich the output_encode_end trace event
+# with PNG compress level + save-loop wall time even when the opt-gated
+# decomposition is off.  Never raises; thread-safe via a dedicated lock.
+_LAST_PNG_ENCODE_INFO: dict[str, Any] | None = None
+_LAST_PNG_ENCODE_INFO_LOCK = threading.Lock()
+
+
+def get_last_png_encode_info() -> dict[str, Any] | None:
+    """Return a copy of the last output-encode record, or None when absent.
+
+    The encode runs on a worker thread; a lock guards the read so the copy is
+    never torn.  Never raises.
+    """
+    try:
+        with _LAST_PNG_ENCODE_INFO_LOCK:
+            info = _LAST_PNG_ENCODE_INFO
+            return dict(info) if isinstance(info, dict) else None
+    except Exception:
+        return None
+
+
+get_last_output_encode_info = get_last_png_encode_info
+
 
 def _png_experiment_log_once() -> None:
-    """Print the canonical ``[v2.experiment]`` line once per process when the
-    PNG level-1 arm is first exercised.  Never raises."""
+    """Print the canonical ``[v2.experiment]`` line once per process when a
+    non-default PNG level (6, via env override) is first exercised.  Never
+    raises."""
     global _PNG_EXPERIMENT_LOGGED
     with _PNG_EXPERIMENT_LOCK:
         if _PNG_EXPERIMENT_LOGGED:
@@ -291,118 +324,18 @@ def _change_extension(filename: str, new_ext: str) -> str:
 def _convert_image_bytes(
     input_bytes: bytes,
     output_format: str = "original",
-    quality: int = 75,
+    quality: int | float | str | None = None,
     webp_lossless_compression: str = "balanced",
 ) -> dict:
-    """Convert raw PNG bytes to target format.  Returns metadata dict."""
-    import io as _io
-    import time as _time
+    """Compatibility wrapper around the canonical output converter."""
+    from output_converter import convert_image_bytes
 
-    _t0 = _time.time()
-    meta = {
-        "bytes": input_bytes,
-        "mime_type": "image/png",
-        "file_ext": ".png",
-        "output_format": output_format,
-        "original_size_bytes": len(input_bytes),
-        "returned_size_bytes": len(input_bytes),
-        "conversion_time_ms": 0,
-        "quality": None,
-        "webp_lossless_compression": None,
-        "fallback": False,
-        "error": None,
-    }
-
-    if output_format not in _OUTPUT_FORMATS:
-        meta["error"] = f"unknown output_format: {output_format!r}"
-        meta["output_format"] = "original"
-        output_format = "original"
-    if not isinstance(quality, (int, float)):
-        quality = 75
-    quality = max(0, min(100, int(quality)))
-    if webp_lossless_compression not in _WEBP_LOSSLESS_COMPRESSION:
-        webp_lossless_compression = "balanced"
-
-    fmt_ext = _FORMAT_META.get(output_format, _FORMAT_META["original"])
-    meta["mime_type"] = fmt_ext["mime"]
-    meta["file_ext"] = fmt_ext["ext"]
-
-    if output_format == "original":
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    try:
-        from PIL import Image as _PillowImage
-    except ImportError:
-        meta["error"] = "Pillow not available; returning original PNG"
-        meta["fallback"] = True
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    try:
-        img = _PillowImage.open(_io.BytesIO(input_bytes))
-    except Exception as exc:
-        meta["error"] = f"failed to open image: {exc}"
-        meta["fallback"] = True
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    out_buf = _io.BytesIO()
-    try:
-        if output_format == "webp_lossless":
-            meta["quality"] = None
-            meta["webp_lossless_compression"] = webp_lossless_compression
-            method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
-            img.save(out_buf, format="WEBP", lossless=True, method=method)
-        elif output_format == "webp_lossy":
-            meta["quality"] = quality
-            meta["webp_lossless_compression"] = None
-            img.save(out_buf, format="WEBP", lossless=False, quality=quality, method=_WEBP_LOSSY_METHOD)
-        elif output_format == "jpeg":
-            meta["quality"] = quality
-            meta["webp_lossless_compression"] = None
-            # Composite alpha onto white background
-            if img.mode in ("RGBA", "LA", "PA"):
-                if img.mode == "RGBA":
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                elif img.mode == "LA":
-                    bg = _PillowImage.new("L", img.size, 255)
-                    bg.paste(img, mask=img.split()[1])
-                    img = bg.convert("RGB")
-                elif img.mode == "PA":
-                    img = img.convert("RGBA")
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-            elif img.mode == "P":
-                if "transparency" in img.info:
-                    img = img.convert("RGBA")
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                else:
-                    img = img.convert("RGB")
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
-            img.save(out_buf, format="JPEG", quality=quality)
-
-        out_buf.seek(0)
-        meta["bytes"] = out_buf.read()
-        meta["returned_size_bytes"] = len(meta["bytes"])
-    except Exception as exc:
-        meta["error"] = f"conversion failed: {exc}"
-        meta["fallback"] = True
-        meta["bytes"] = input_bytes
-        meta["returned_size_bytes"] = len(input_bytes)
-        meta["file_ext"] = ".png"
-        meta["mime_type"] = "image/png"
-
-    meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-    if meta.get("fallback"):
-        print(f"[comfyapp.convert] FALLBACK to PNG: fmt={output_format} err={meta['error']}")
-    return meta
+    return convert_image_bytes(
+        input_bytes,
+        output_format=output_format,
+        quality=quality,
+        webp_lossless_compression=webp_lossless_compression,
+    )
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 12: Silent exception logging helper GÃ¶Ã‡GÃ¶Ã‡
 _SILENT_EXCEPTION_DEBUG = env_flag("COMFYMODAL_SILENT_EXCEPTION_DEBUG")
@@ -579,7 +512,7 @@ def _opt_clamp_pending_store(tensor_id, clamp_entry):
 def encode_image_tensor_batch(
     images_t,
     output_format="original",
-    quality=75,
+    quality=DEFAULT_OUTPUT_QUALITY,
     webp_lossless_compression="balanced",
 ):
     """Encode a single image batch tensor to bytes.
@@ -590,7 +523,19 @@ def encode_image_tensor_batch(
     import io as _io
     from PIL import Image as _PILImage
 
-    # ── V2 png_encode experiment (default level 6 = PIL default; level 1 B) ──
+    _raw_output_format = output_format
+    output_format = normalize_output_format(output_format)
+    _quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(_raw_output_format or "").strip().lower() == "webp"
+        else DEFAULT_OUTPUT_QUALITY
+    )
+    quality = normalize_quality(quality, default=_quality_default)
+    webp_lossless_compression = normalize_webp_lossless_compression(
+        webp_lossless_compression
+    )
+
+    # ── V2 png_encode experiment (default level 1; level 6 via env override) ──
     # compress_level only changes the compression ratio — PNG is lossless at
     # every level, so decoded pixels are byte-identical.
     _png_level = _v2_png_compress_level()
@@ -617,6 +562,12 @@ def encode_image_tensor_batch(
     mime_type = fmt_meta["mime"]
 
     entries = []
+    _codec_timings_ms = []
+    _encoded_sizes = []
+    # Ungated timing of the PIL save loop (additive; independent of the
+    # opt-gated decomposition below).  Recorded after the loop so the runtime
+    # can enrich output_encode_end even when the opt path is disabled.
+    _png_save_loop_t0 = time.monotonic_ns()
     for batch_idx in range(B):
         _opt_batch_t0 = time.monotonic_ns() if _opt_on else None
         _opt_t0 = time.monotonic_ns() if _opt_on else None
@@ -646,6 +597,7 @@ def encode_image_tensor_batch(
 
         out_buf = _io.BytesIO()
         _opt_t0 = time.monotonic_ns() if _opt_on else None
+        _codec_t0 = time.monotonic_ns()
         if output_format == "original":
             pil_img.save(out_buf, format="PNG", compress_level=_png_level)
         elif output_format == "webp_lossless":
@@ -660,7 +612,10 @@ def encode_image_tensor_batch(
                 pil_img = bg
             pil_img.save(out_buf, format="JPEG", quality=quality)
         else:
-            pil_img.save(out_buf, format="PNG", compress_level=_png_level)
+            raise ValueError(f"unsupported normalized output format: {output_format!r}")
+        _codec_timings_ms.append(
+            round((time.monotonic_ns() - _codec_t0) / 1_000_000, 3)
+        )
         _opt_png_compress_ms = (
             round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
             if _opt_t0 is not None else None
@@ -683,6 +638,7 @@ def encode_image_tensor_batch(
                 "numpy_view_ms": _opt_numpy_view_ms,
                 "pil_create_ms": _opt_pil_create_ms,
                 "png_compress_ms": _opt_png_compress_ms,
+                "output_codec_ms": _codec_timings_ms[-1],
                 "raw_bytes_ms": _opt_raw_bytes_ms,
                 "total_ms": round((time.monotonic_ns() - _opt_batch_t0) / 1_000_000, 3),
                 "width": W,
@@ -704,14 +660,81 @@ def encode_image_tensor_batch(
                   f"png_compress_ms={_opt_entry['png_compress_ms']} "
                   f"gpu_to_cpu_ms={_opt_entry['gpu_to_cpu_ms']}")
         entries.append((raw_bytes, ext, mime_type))
-    # ── V2 png_encode experiment: log the arm once per process.  Baseline
-    # level 6 is PIL's default and logs nothing (it IS the default; no noise).
-    if _png_level != 6:
+        _encoded_sizes.append(len(raw_bytes))
+    # ── Ungated last-output-encode record (additive) ──
+    # Records the PNG compress level and the wall time of the entire PIL save
+    # loop so the runtime can enrich the output_encode_end trace event even
+    # when the opt-gated decomposition is off.  Never raises.
+    try:
+        global _LAST_PNG_ENCODE_INFO
+        _last_encode: dict[str, Any] = {
+            "compress_level": int(_png_level),
+            "png_compress_ms": round(
+                (time.monotonic_ns() - _png_save_loop_t0) / 1_000_000, 3
+            ),
+            "codec": "png" if output_format == "original" else (
+                "webp" if output_format.startswith("webp_") else "jpeg"
+            ),
+            "format": output_format,
+            "quality": quality if output_format in ("webp_lossy", "jpeg") else None,
+            "webp_lossless_compression": (
+                webp_lossless_compression if output_format == "webp_lossless" else None
+            ),
+            "output_codec_ms": round(sum(_codec_timings_ms), 3),
+            "encoded_bytes": sum(_encoded_sizes),
+            "source_bytes": B * H * W * C,
+            "conversion_fallback": False,
+            "items": [
+                {
+                    "codec": "png" if output_format == "original" else (
+                        "webp" if output_format.startswith("webp_") else "jpeg"
+                    ),
+                    "format": output_format,
+                    "quality": quality if output_format in ("webp_lossy", "jpeg") else None,
+                    "webp_lossless_compression": (
+                        webp_lossless_compression if output_format == "webp_lossless" else None
+                    ),
+                    "output_codec_ms": codec_ms,
+                    "encoded_bytes": encoded_bytes,
+                    "source_bytes": H * W * C,
+                    "conversion_fallback": False,
+                }
+                for codec_ms, encoded_bytes in zip(_codec_timings_ms, _encoded_sizes)
+            ],
+        }
+        with _LAST_PNG_ENCODE_INFO_LOCK:
+            _LAST_PNG_ENCODE_INFO = _last_encode
+    except Exception:
+        pass
+    # ── V2 png_encode experiment: log the arm once per process.  The default
+    # level 1 logs nothing (it IS the default; no noise); a level-6 override
+    # is the only thing that needs flagging.
+    if _png_level != 1:
         _png_experiment_log_once()
     return entries, ext, mime_type, W, H
 
 
 _encode_image_tensor_batch = encode_image_tensor_batch
+
+
+def _encode_entry_metadata(encode_info: dict[str, Any], batch_idx: int, raw_bytes: bytes) -> dict[str, Any]:
+    items = encode_info.get("items", [])
+    item_info = items[batch_idx] if batch_idx < len(items) else {}
+    codec_ms = item_info.get("output_codec_ms", encode_info.get("output_codec_ms", 0.0))
+    return {
+        "codec": item_info.get("codec", encode_info.get("codec", "")),
+        "quality": item_info.get("quality", encode_info.get("quality")),
+        "webp_lossless_compression": item_info.get(
+            "webp_lossless_compression", encode_info.get("webp_lossless_compression")
+        ),
+        "output_codec_ms": codec_ms,
+        "conversion_time_ms": codec_ms,
+        "encoded_bytes": item_info.get("encoded_bytes", len(raw_bytes)),
+        "source_bytes": item_info.get("source_bytes", 0),
+        "conversion_fallback": bool(
+            item_info.get("conversion_fallback", encode_info.get("conversion_fallback", False))
+        ),
+    }
 
 
 def _clamp_image_tensor(images):
@@ -764,9 +787,17 @@ def _clamp_image_tensor(images):
 
 def _collect_production_request_params(req):
     """Extract output format params from production request dict."""
-    output_format = req.get("output_format", "original")
-    quality = int(req.get("quality", 75))
-    webp_lossless_compression = req.get("webp_lossless_compression", "balanced")
+    raw_output_format = req.get("output_format", "original")
+    output_format = normalize_output_format(raw_output_format)
+    quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(raw_output_format or "").strip().lower() == "webp"
+        else DEFAULT_OUTPUT_QUALITY
+    )
+    quality = normalize_quality(req.get("quality"), default=quality_default)
+    webp_lossless_compression = normalize_webp_lossless_compression(
+        req.get("webp_lossless_compression", "balanced")
+    )
     return output_format, quality, webp_lossless_compression
 
 
@@ -854,6 +885,7 @@ class ComfyModalProductionOutput:
         entries, ext, mime_type, W, H = encode_image_tensor_batch(
             images_t, output_format, quality, webp_lossless_compression
         )
+        encode_info = get_last_output_encode_info() or {}
 
         prompt_id_short = str(prompt_id)[:8]
         nodestr = str(node_id)
@@ -871,6 +903,7 @@ class ComfyModalProductionOutput:
                 "output_index": batch_idx,
                 "node_id": node_id,
                 "format": output_format,
+                **_encode_entry_metadata(encode_info, batch_idx, raw_bytes),
             })
 
         # Store in registry
@@ -977,6 +1010,7 @@ class ComfyModalProductionImageComparerOutput:
             b_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_b_t, output_format, quality, webp_lossless_compression
             )
+            b_encode_info = get_last_output_encode_info() or {}
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
                 result_entries.append({
@@ -984,6 +1018,7 @@ class ComfyModalProductionImageComparerOutput:
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
+                    **_encode_entry_metadata(b_encode_info, batch_idx, raw_bytes),
                 })
                 b_count += 1
             encoded_unique = b_count
@@ -995,6 +1030,7 @@ class ComfyModalProductionImageComparerOutput:
             a_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_a_t, output_format, quality, webp_lossless_compression
             )
+            a_encode_info = get_last_output_encode_info() or {}
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
                 result_entries.append({
@@ -1002,6 +1038,7 @@ class ComfyModalProductionImageComparerOutput:
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "a_images",
                     "comparison_side": "a", "format": output_format,
+                    **_encode_entry_metadata(a_encode_info, batch_idx, raw_bytes),
                 })
                 a_count += 1
 
@@ -1011,6 +1048,7 @@ class ComfyModalProductionImageComparerOutput:
             b_encoded_tensors, _, _, _, _ = encode_image_tensor_batch(
                 images_b_t, output_format, quality, webp_lossless_compression
             )
+            b_encode_info = get_last_output_encode_info() or {}
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
                 result_entries.append({
@@ -1018,6 +1056,7 @@ class ComfyModalProductionImageComparerOutput:
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
+                    **_encode_entry_metadata(b_encode_info, batch_idx, raw_bytes),
                 })
                 b_count += 1
             encoded_unique = a_count + b_count
@@ -1029,6 +1068,7 @@ class ComfyModalProductionImageComparerOutput:
             a_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_a_t, output_format, quality, webp_lossless_compression
             )
+            a_encode_info = get_last_output_encode_info() or {}
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
                 result_entries.append({
@@ -1036,6 +1076,7 @@ class ComfyModalProductionImageComparerOutput:
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
+                    **_encode_entry_metadata(a_encode_info, batch_idx, raw_bytes),
                 })
                 b_count += 1
             a_count = b_count
@@ -5354,6 +5395,12 @@ def _complete_active_model_read(canonical_key: str) -> None:
             "loader_type": entry.get("loader_type", ""),
             "phase": entry.get("phase", ""),
             "request_id": entry.get("request_id", ""),
+            # Exact restore-session association: the entry carries these at
+            # read-start (request may be empty for lifecycle/preload reads),
+            # and the completed record preserves them so the drain can match
+            # on restore identity when no request_id was captured.
+            "restored_instance_id": _rid,
+            "restore_session_id": entry.get("restore_session_id", ""),
             "path_hash": entry.get("active_read_path_hash", ""),
             "file_size": entry.get("active_read_file_size"),
             "wall_ms": entry.get("active_read_wall_ms"),
@@ -7187,21 +7234,60 @@ def _build_v2_dependency_cache_identity(requirements_key: str = "") -> dict[str,
     }
 
 
-def _drain_completed_active_read_diagnostics(request_id: str = "") -> list[dict]:
-    if not request_id:
-        return []
+def _completed_active_read_matches(
+    record: dict,
+    *,
+    request_id: str = "",
+    restored_instance_id: str = "",
+    restore_session_id: str = "",
+) -> bool:
+    """Exact-match one completed active-read record against drain identities.
+
+    A record that carries its own ``request_id`` is consumed only by the
+    exact same request (prevents another request/model read from being
+    consumed).  A record without a request_id (lifecycle/preload reads) is
+    associated only when BOTH restore identities match exactly — never
+    partial, so cross-session leakage is impossible.
+    """
+    record_request_id = record.get("request_id", "")
+    if record_request_id:
+        return bool(request_id) and str(record_request_id) == str(request_id)
+    return (
+        bool(restored_instance_id)
+        and bool(restore_session_id)
+        and str(record.get("restored_instance_id", "")) == str(restored_instance_id)
+        and str(record.get("restore_session_id", "")) == str(restore_session_id)
+    )
+
+
+def _drain_completed_active_read_diagnostics(
+    request_id: str = "",
+    restored_instance_id: str = "",
+    restore_session_id: str = "",
+) -> list[dict]:
+    """Drain completed active-read records matching *request_id* and/or the
+    exact restore identities, preserving every record field verbatim.
+
+    Records carrying their own request_id require an exact request match;
+    records without one require exact ``restored_instance_id`` +
+    ``restore_session_id``.  Non-matching records are retained for later
+    requests — a read is never consumed by a different request/model load.
+    """
     with _ACTIVE_MODEL_READS_LOCK:
-        matched = [
-            dict(record)
-            for record in _COMPLETED_ACTIVE_READS
-            if record.get("request_id") == request_id
-        ]
+        matched: list[dict] = []
+        retained: list[dict] = []
+        for record in _COMPLETED_ACTIVE_READS:
+            if _completed_active_read_matches(
+                record,
+                request_id=request_id,
+                restored_instance_id=restored_instance_id,
+                restore_session_id=restore_session_id,
+            ):
+                matched.append(dict(record))
+            else:
+                retained.append(record)
         if matched:
-            _COMPLETED_ACTIVE_READS[:] = [
-                record
-                for record in _COMPLETED_ACTIVE_READS
-                if record.get("request_id") != request_id
-            ]
+            _COMPLETED_ACTIVE_READS[:] = retained
         return matched
 
 
@@ -8182,19 +8268,25 @@ download_image = _add_cpu_python_sources(
 ).add_local_python_source("comfymodal_runtime", copy=True)
 
 app = modal.App(APP_NAME, image=image, include_source=False)
-vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+_E16_READ_ONLY_VOLUME_LOOKUP = os.environ.get(
+    "COMFYMODAL_E16_SOURCE_BENCHMARK", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+_VOLUME_CREATE_IF_MISSING = not _E16_READ_ONLY_VOLUME_LOOKUP
+vol = modal.Volume.from_name(
+    VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
+)
 # P2: dedicated prompt-encoding cache volume. Independent of the
 # models and custom-nodes volumes so a bundle change cannot perturb
 # either.  ``create_if_missing=True`` is required so the very first
 # deploy creates the empty volume.
 prompt_cache_vol = modal.Volume.from_name(
-    PROMPT_CACHE_VOLUME_NAME, create_if_missing=True
+    PROMPT_CACHE_VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
 )
 # Runtime configuration and control state volume.  Never holds model
 # weights.  Always mounted alongside models/custom-nodes on GPU so
 # snapshot creation/restore see the same volume layout.
 runtime_config_vol = modal.Volume.from_name(
-    RUNTIME_CONFIG_VOLUME_NAME, create_if_missing=True
+    RUNTIME_CONFIG_VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
 )
 
 
@@ -8220,7 +8312,9 @@ def _build_gpu_volumes() -> dict:
     if env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
         base[PROMPT_CACHE_VOLUME_PATH] = prompt_cache_vol
     return base
-custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
+custom_nodes_vol = modal.Volume.from_name(
+    CUSTOM_NODES_VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
+)
 
 
 def _ensure_url_scheme(url: str) -> str:

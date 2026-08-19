@@ -3,12 +3,89 @@ setlocal enabledelayedexpansion
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_START_MS=%%a"
 
 chcp 65001 >nul
-if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
+REM -- E25 whole-critical-path validation selector (atomic opt-in) -----------
+REM Run-side mirror of the deploy selector: sets the five E25 validation flags
+REM for the request environment.  The deployed container must have been built
+REM with the same selector (deploy_and_run_v2_single.bat E25_VALIDATION).
+if not defined V2_E25_VALIDATION set "V2_E25_VALIDATION=0"
+set "V2_E25_VALIDATION_ACTIVE=0"
+if /i "!V2_E25_VALIDATION!"=="1" set "V2_E25_VALIDATION_ACTIVE=1"
+if /i "!V2_E25_VALIDATION!"=="true" set "V2_E25_VALIDATION_ACTIVE=1"
+if /i "!V2_E25_VALIDATION!"=="yes" set "V2_E25_VALIDATION_ACTIVE=1"
+if /i "!V2_E25_VALIDATION!"=="on" set "V2_E25_VALIDATION_ACTIVE=1"
+if "!V2_E25_VALIDATION_ACTIVE!"=="1" (
+    REM The E25 validation inherits the E19 base (deployed atomic profile is
+    REM E19_FINAL_COLD_LOADER); the request-side preflight requires the same
+    REM selector so the atomic-profile check passes.  E26: VAE is the
+    REM canonical late/safe production mode (early activation is OFF).
+    set "V2_E19_FINAL_COLD_LOADER=1"
+    set "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION=1"
+    set "COMFYMODAL_V2_GPU_FAST_RETURN=1"
+    set "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS=1"
+    set "COMFYMODAL_V2_VAE_ACTIVATION_MODE=late"
+    set "COMFYMODAL_V2_VAE_EARLY_START_MS=0"
+    if not defined V2_E25_CONDITIONING_NONCE set "V2_E25_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    set "V2_BENCHMARK_RUNS=1"
+    echo [v2.e25_validation] run_selector=ACTIVE speculative_clip=1 gpu_fast_return=1 opt_diag=1 vae_mode=late vae_early=0 runs=1
+)
+REM -- E26 concrete cold-wins validation selector (atomic opt-in) -----------
+REM Run-side mirror of the deploy selector: sets the E26 validation flags for
+REM the request environment.  The deployed container must have been built
+REM with the same selector (deploy_and_run_v2_single.bat E26_VALIDATION).
+REM Cycle = exactly two --run-count 1 requests on one deployment.
+if not defined V2_E26_VALIDATION set "V2_E26_VALIDATION=0"
+set "V2_E26_VALIDATION_ACTIVE=0"
+if /i "!V2_E26_VALIDATION!"=="1" set "V2_E26_VALIDATION_ACTIVE=1"
+if /i "!V2_E26_VALIDATION!"=="true" set "V2_E26_VALIDATION_ACTIVE=1"
+if /i "!V2_E26_VALIDATION!"=="yes" set "V2_E26_VALIDATION_ACTIVE=1"
+if /i "!V2_E26_VALIDATION!"=="on" set "V2_E26_VALIDATION_ACTIVE=1"
+if "!V2_E26_VALIDATION_ACTIVE!"=="1" (
+    REM Inherits the E19 base (deployed atomic profile is
+    REM E19_FINAL_COLD_LOADER); the request-side preflight requires the same
+    REM selector so the atomic-profile check passes.
+    set "V2_E19_FINAL_COLD_LOADER=1"
+    set "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION=1"
+    set "COMFYMODAL_V2_GPU_FAST_RETURN=1"
+    set "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS=1"
+    set "COMFYMODAL_V2_VAE_ACTIVATION_MODE=late"
+    set "COMFYMODAL_V2_VAE_EARLY_START_MS=0"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM=1"
+    if not defined V2_E26_CONDITIONING_NONCE set "V2_E26_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    set "V2_BENCHMARK_RUNS=1"
+    echo [v2.e26_validation] run_selector=ACTIVE speculative_clip=1 gpu_fast_return=1 opt_diag=1 vae_mode=late vae_early=0 checkpoint_prewarm=1 runs=1
+)
+REM -- E28 critical-path validation selector (atomic opt-in) -----------------
+REM Run-side mirror of the deploy selector: sets the E28 validation flags for
+REM the request environment.  The deployed container must have been built
+REM with the same selector (deploy_and_run_v2_single.bat E28_VALIDATION).
+if not defined V2_E28_VALIDATION set "V2_E28_VALIDATION=0"
+if /i "%~1"=="E28_VALIDATION" set "V2_E28_VALIDATION=1"
+set "V2_E28_VALIDATION_ACTIVE=0"
+if /i "!V2_E28_VALIDATION!"=="1" set "V2_E28_VALIDATION_ACTIVE=1"
+if /i "!V2_E28_VALIDATION!"=="true" set "V2_E28_VALIDATION_ACTIVE=1"
+if /i "!V2_E28_VALIDATION!"=="yes" set "V2_E28_VALIDATION_ACTIVE=1"
+if /i "!V2_E28_VALIDATION!"=="on" set "V2_E28_VALIDATION_ACTIVE=1"
+if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
+    set "V2_E19_FINAL_COLD_LOADER=1"
+    set "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION=1"
+    set "COMFYMODAL_V2_GPU_FAST_RETURN=1"
+    set "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS=1"
+    set "COMFYMODAL_V2_VAE_ACTIVATION_MODE=late"
+    set "COMFYMODAL_V2_VAE_EARLY_START_MS=0"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM=1"
+    set "COMFYMODAL_V2_GANTT_TELEMETRY=1"
+    set "COMFYMODAL_V2_E27_FORENSICS=1"
+    if not defined V2_E28_CONDITIONING_NONCE set "V2_E28_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    set "V2_BENCHMARK_RUNS=1"
+    echo [v2.e28_validation] run_selector=ACTIVE speculative_clip=1 gpu_fast_return=1 opt_diag=1 vae_mode=late checkpoint_prewarm=1 gantt=1 e27_forensics=1 runs=1
+)
+if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
+set "COMFYMODAL_V2_ATOMIC_PROFILE="
 if not defined COMFYMODAL_V2_GPU set "COMFYMODAL_V2_GPU=rtx-pro-6000"
 if not defined COMFYMODAL_V2_RESTORE_ONLY_APP_NAME set "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLOUD="
-if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=production"
+if not defined COMFYMODAL_V2_ENV_PROFILE set "COMFYMODAL_V2_ENV_PROFILE=inherit"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" (
     set "COMFYMODAL_V2_FULL_TRACE=0"
     set "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS=0"
@@ -25,15 +102,15 @@ if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="diagnostic" if not defined COMFYMODAL_V2_D
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 if not defined COMFYMODAL_V2_CPU_MODEL_SNAPSHOT set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
-if not defined COMFYMODAL_V2_NATIVE_FAST_DISK_UNET set "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=0"
+if not defined COMFYMODAL_V2_NATIVE_FAST_DISK_UNET set "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=1"
 if not defined COMFYMODAL_V2_PUBLISH_RESTORE_PLAN set "COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=0"
 if not defined COMFYMODAL_V2_VAE_SNAPSHOT set "COMFYMODAL_V2_VAE_SNAPSHOT=1"
 if not defined COMFYMODAL_V2_CLIP_CONDITIONING_CACHE set "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE=1"
 if not defined COMFYMODAL_V2_UNET_ACTIVATION_MODE set "COMFYMODAL_V2_UNET_ACTIVATION_MODE=late"
-if not defined COMFYMODAL_V2_VAE_ACTIVATION_MODE set "COMFYMODAL_V2_VAE_ACTIVATION_MODE=sampling_end"
+if not defined COMFYMODAL_V2_VAE_ACTIVATION_MODE set "COMFYMODAL_V2_VAE_ACTIVATION_MODE=late"
 if not defined COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE set "COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE=1"
-if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=1"
-if not defined V2_BENCHMARK_GAP_SECONDS set "V2_BENCHMARK_GAP_SECONDS=0"
+if not defined V2_BENCHMARK_RUNS set "V2_BENCHMARK_RUNS=10"
+if not defined V2_BENCHMARK_GAP_SECONDS set "V2_BENCHMARK_GAP_SECONDS=35"
 if not defined V2_VOLUME_READ_RUN_COUNT set "V2_VOLUME_READ_RUN_COUNT=3"
 if not defined V2_VOLUME_READ_GAP_SECONDS set "V2_VOLUME_READ_GAP_SECONDS=25"
 if not defined V2_RESTORE_ONLY_RUN_COUNT set "V2_RESTORE_ONLY_RUN_COUNT=6"
@@ -48,9 +125,138 @@ if not defined COMFYMODAL_V2_BASELINE_CPU_REQUEST set "COMFYMODAL_V2_BASELINE_CP
 if not defined COMFYMODAL_V2_BASELINE_MEMORY_REQUEST set "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST=32768"
 if /i "!COMFYMODAL_V2_ENV_PROFILE!"=="production" if not defined COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST set "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST=1"
 if not defined COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST set "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST=0"
+REM -- D-phase runtime flags (Phase-D integration gate; defaults preserve production behavior) --
+if not defined COMFYMODAL_V2_UNET_FASTSAFETENSORS set "COMFYMODAL_V2_UNET_FASTSAFETENSORS=0"
+if not defined COMFYMODAL_V2_CLIP_FAST_HYDRATION set "COMFYMODAL_V2_CLIP_FAST_HYDRATION=0"
+if not defined COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS set "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS=0"
+if not defined COMFYMODAL_V2_CLIP_COLD_FORENSICS set "COMFYMODAL_V2_CLIP_COLD_FORENSICS=0"
+if not defined COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST set "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST=0"
+if not defined COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA set "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA=0"
+if not defined COMFYMODAL_V2_INPUT_TYPES_WARM set "COMFYMODAL_V2_INPUT_TYPES_WARM=1"
+if not defined COMFYMODAL_V2_UNET_FORENSICS set "COMFYMODAL_V2_UNET_FORENSICS=0"
+if not defined COMFYMODAL_V2_C9QD_EXTRAS set "COMFYMODAL_V2_C9QD_EXTRAS=0"
+REM -- E10 complete bucket-first B profile (atomic opt-in) -----------------
+if not defined V2_E10_BUCKET_FIRST_VALIDATION set "V2_E10_BUCKET_FIRST_VALIDATION=0"
+set "V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE=0"
+if /i "!V2_E10_BUCKET_FIRST_VALIDATION!"=="1" set "V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE=1"
+if /i "!V2_E10_BUCKET_FIRST_VALIDATION!"=="true" set "V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE=1"
+if /i "!V2_E10_BUCKET_FIRST_VALIDATION!"=="yes" set "V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE=1"
+if /i "!V2_E10_BUCKET_FIRST_VALIDATION!"=="on" set "V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE=1"
+if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
+    set "V2_D10_INTEGRATION_VALIDATION=1"
+    set "V2_D10_INTEGRATION_VALIDATION_ACTIVE=1"
+    set "COMFYMODAL_V2_STAGED_SAFETENSORS=1"
+    set "COMFYMODAL_V2_STAGED_PRODUCERS=4"
+    set "COMFYMODAL_V2_STAGED_POOL_MB=1024"
+    set "COMFYMODAL_V2_STAGED_BUCKET_MB=256"
+    set "COMFYMODAL_V2_STAGED_CPU_CAST=1"
+    set "COMFYMODAL_V2_STAGED_ASYNC_H2D=1"
+    set "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS=1"
+    set "COMFYMODAL_V2_UNET_FASTSAFETENSORS=1"
+    set "COMFYMODAL_V2_CLIP_FAST_HYDRATION=1"
+    set "COMFYMODAL_V2_CLIP_STAGED_HYDRATION=1"
+    set "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS=1"
+    set "COMFYMODAL_V2_CLIP_COLD_FORENSICS=1"
+    set "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST=1"
+    set "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA=0"
+    set "COMFYMODAL_V2_INPUT_TYPES_WARM=1"
+    set "COMFYMODAL_V2_UNET_FORENSICS=0"
+    set "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION=1"
+    set "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET=0"
+)
+set "V2_D6_FASTPATH_VALIDATION_ACTIVE=0"
+if /i "!V2_D6_FASTPATH_VALIDATION!"=="1" set "V2_D6_FASTPATH_VALIDATION_ACTIVE=1"
+if /i "!V2_D6_FASTPATH_VALIDATION!"=="true" set "V2_D6_FASTPATH_VALIDATION_ACTIVE=1"
+if /i "!V2_D6_FASTPATH_VALIDATION!"=="yes" set "V2_D6_FASTPATH_VALIDATION_ACTIVE=1"
+if /i "!V2_D6_FASTPATH_VALIDATION!"=="on" set "V2_D6_FASTPATH_VALIDATION_ACTIVE=1"
+set "V2_D10_INTEGRATION_VALIDATION_ACTIVE=0"
+if /i "!V2_D10_INTEGRATION_VALIDATION!"=="1" set "V2_D10_INTEGRATION_VALIDATION_ACTIVE=1"
+if /i "!V2_D10_INTEGRATION_VALIDATION!"=="true" set "V2_D10_INTEGRATION_VALIDATION_ACTIVE=1"
+if /i "!V2_D10_INTEGRATION_VALIDATION!"=="yes" set "V2_D10_INTEGRATION_VALIDATION_ACTIVE=1"
+if /i "!V2_D10_INTEGRATION_VALIDATION!"=="on" set "V2_D10_INTEGRATION_VALIDATION_ACTIVE=1"
+REM -- E19 final cold-loader profile (atomic opt-in) ----------------------
+if not defined V2_E19_FINAL_COLD_LOADER set "V2_E19_FINAL_COLD_LOADER=0"
+set "V2_E19_FINAL_COLD_LOADER_ACTIVE=0"
+if /i "!V2_E19_FINAL_COLD_LOADER!"=="1" set "V2_E19_FINAL_COLD_LOADER_ACTIVE=1"
+if /i "!V2_E19_FINAL_COLD_LOADER!"=="true" set "V2_E19_FINAL_COLD_LOADER_ACTIVE=1"
+if /i "!V2_E19_FINAL_COLD_LOADER!"=="yes" set "V2_E19_FINAL_COLD_LOADER_ACTIVE=1"
+if /i "!V2_E19_FINAL_COLD_LOADER!"=="on" set "V2_E19_FINAL_COLD_LOADER_ACTIVE=1"
+if "!V2_E19_FINAL_COLD_LOADER_ACTIVE!"=="1" (
+    if "!V2_D6_FASTPATH_VALIDATION_ACTIVE!"=="1" (
+        echo === ERROR: E19 cannot combine with D6 atomic profile ===
+        exit /b 1
+    )
+    if "!V2_D10_INTEGRATION_VALIDATION_ACTIVE!"=="1" (
+        echo === ERROR: E19 cannot combine with D10 atomic profile ===
+        exit /b 1
+    )
+    if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
+        echo === ERROR: E19 cannot combine with E10 atomic profile ===
+        exit /b 1
+    )
+    set "COMFYMODAL_V2_ATOMIC_PROFILE=E19_FINAL_COLD_LOADER"
+    set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+    set "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1"
+    set "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=1"
+    set "COMFYMODAL_V2_EVICT_RETAIN_ROLE=clip_vae"
+    set "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS=0"
+    set "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION=1"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM=1"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS=4"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB=8"
+    set "COMFYMODAL_V2_UNET_FASTSAFETENSORS=1"
+    set "COMFYMODAL_V2_CLIP_FAST_HYDRATION=1"
+    set "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS=1"
+    set "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION=1"
+    set "COMFYMODAL_V2_SCOPED_CUDA_READINESS=1"
+    set "COMFYMODAL_V2_STAGED_SAFETENSORS=0"
+    set "COMFYMODAL_V2_C9QD_EXTRAS=0"
+    set "COMFYMODAL_V2_STAGED_SOURCE_ORDER=0"
+    set "COMFYMODAL_V2_CLIP_STAGED_HYDRATION=0"
+    set "COMFYMODAL_V2_CLIP_COLD_FORENSICS=0"
+    set "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST=0"
+    set "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA=0"
+    set "COMFYMODAL_V2_INPUT_TYPES_WARM=1"
+    set "COMFYMODAL_V2_UNET_FORENSICS=0"
+)
+REM -- Fail-closed: verify E19 selector actually set required flags --
+if "!COMFYMODAL_V2_ATOMIC_PROFILE!"=="E19_FINAL_COLD_LOADER" (
+    if "!COMFYMODAL_V2_FAST_COLD_ORCHESTRATION!"=="0" (
+        echo === ERROR: E19 profile selected but FAST_COLD_ORCHESTRATION=0 ===
+        echo === This means the E19 flags were not properly set. Aborting. ===
+        exit /b 1
+    )
+    if "!COMFYMODAL_V2_UNET_FASTSAFETENSORS!"=="0" (
+        echo === ERROR: E19 profile selected but UNET_FASTSAFETENSORS=0 ===
+        echo === This means the E19 flags were not properly set. Aborting. ===
+        exit /b 1
+    )
+    if "!COMFYMODAL_V2_CLIP_FAST_HYDRATION!"=="0" (
+        echo === ERROR: E19 profile selected but CLIP_FAST_HYDRATION=0 ===
+        echo === This means the E19 flags were not properly set. Aborting. ===
+        exit /b 1
+    )
+    echo [v2.profile_guard] E19 selector verified: all critical flags present
+)
 
 set "REPO_ROOT=%~dp0"
 cd /d "%REPO_ROOT%" || exit /b 1
+
+if "!V2_E19_FINAL_COLD_LOADER_ACTIVE!"=="1" (
+    python tools\benchmark_v2_direct.py --verify-d6-profile
+    if errorlevel 1 (
+        echo === ERROR: E19 atomic profile validation FAILED - aborting before any Modal call. ===
+        exit /b 1
+    )
+)
+
+if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
+    python tools\benchmark_v2_direct.py --verify-e10-profile
+    if errorlevel 1 (
+        echo === ERROR: E10 bucket-first profile validation FAILED - aborting before any Modal call. ===
+        exit /b 1
+    )
+)
 
 set "IDX=0"
 for /f "usebackq delims=" %%a in (`python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[]) if w.get('id')==aid),None);tid=ws and ws.get('token_id') or '';ts=ws and ws.get('token_secret') or '';sys.exit(1) if not(aid and ws and tid and ts) else None;print(tid);print(ts)"`) do (
@@ -61,6 +267,15 @@ for /f "usebackq delims=" %%a in (`python -c "import json,sys;d=json.load(open('
 if !IDX! lss 2 (
     echo === ERROR: Could not load active workspace credentials ===
     exit /b 1
+)
+
+if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
+    echo === Verifying deployed E10 bucket-first runtime profile ===
+    python tools\benchmark_v2_direct.py --verify-e10-remote-profile
+    if errorlevel 1 (
+        echo === E10 remote profile validation FAILED - aborting before graph request. ===
+        exit /b 1
+    )
 )
 
 REM -- Sanitized environment profile summary ------------------------
@@ -91,6 +306,7 @@ if defined COMFYMODAL_V2_RESTORE_TORCH_THREADS (
 set "V2_PROFILE_PRETOUCH=0"
 if defined V2_VARIANCE_PRETOUCH set "V2_PROFILE_PRETOUCH=!V2_VARIANCE_PRETOUCH!"
 echo [v2.env_profile]
+echo ATOMIC_PROFILE=!COMFYMODAL_V2_ATOMIC_PROFILE!
 echo env_profile=!COMFYMODAL_V2_ENV_PROFILE!
 echo thread_policy=!COMFYMODAL_V2_THREAD_POLICY!
 echo snapshot_model_order=!COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER!
@@ -118,14 +334,45 @@ echo prefill_lanes=!V2_PROFILE_PREFILL!
 echo prefill_wait_for_unet=!V2_PROFILE_PREFILL_WAIT!
 echo restore_torch_threads=!V2_PROFILE_THREADS!
 echo variance_pretouch=!V2_PROFILE_PRETOUCH!
+echo fast_cold_orchestration=!COMFYMODAL_V2_FAST_COLD_ORCHESTRATION!
+echo checkpoint_prewarm=!COMFYMODAL_V2_CHECKPOINT_PREWARM!
+echo prewarm_threads=!COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS!
+echo prewarm_chunk_mb=!COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB!
+echo unet_fastsafetensors=!COMFYMODAL_V2_UNET_FASTSAFETENSORS!
+echo clip_fast_hydration=!COMFYMODAL_V2_CLIP_FAST_HYDRATION!
+echo clip_snapshot_exclude_weights=!COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS!
+echo critical_gpu_coordination=!COMFYMODAL_V2_CRITICAL_GPU_COORDINATION!
+echo scoped_cuda_readiness=!COMFYMODAL_V2_SCOPED_CUDA_READINESS!
+echo staged_safetensors=!COMFYMODAL_V2_STAGED_SAFETENSORS!
+echo c9qd_extras=!COMFYMODAL_V2_C9QD_EXTRAS!
+echo staged_source_order=!COMFYMODAL_V2_STAGED_SOURCE_ORDER!
+echo clip_staged_hydration=!COMFYMODAL_V2_CLIP_STAGED_HYDRATION!
 echo volume_read_run_count=!V2_VOLUME_READ_RUN_COUNT!
 echo restore_only_app=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!
 echo restore_only_run_count=!V2_RESTORE_ONLY_RUN_COUNT!
 echo snapshot_exclude_unet=!COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET!
+echo e10_bucket_first_validation=!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!
+if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
+    echo staged_safetensors=!COMFYMODAL_V2_STAGED_SAFETENSORS!
+    echo staged_producers=!COMFYMODAL_V2_STAGED_PRODUCERS!
+    echo staged_pool_mb=!COMFYMODAL_V2_STAGED_POOL_MB!
+    echo staged_bucket_mb=!COMFYMODAL_V2_STAGED_BUCKET_MB!
+    echo staged_cpu_cast=!COMFYMODAL_V2_STAGED_CPU_CAST!
+    echo staged_async_h2d=!COMFYMODAL_V2_STAGED_ASYNC_H2D!
+    echo staged_contiguous_gpu_buckets=!COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS!
+    echo clip_fast_hydration=!COMFYMODAL_V2_CLIP_FAST_HYDRATION!
+    echo clip_staged_hydration=!COMFYMODAL_V2_CLIP_STAGED_HYDRATION!
+    echo critical_gpu_coordination=!COMFYMODAL_V2_CRITICAL_GPU_COORDINATION!
+    echo prefill_wait_for_unet=!COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET!
+)
 
 set "COMFYMODAL_COMMAND_START_UNIX_MS=!COMMAND_START_MS!"
 REM -- Benchmark invocation ------------------------------------------
-REM Default: V2_BENCHMARK_RUNS=1 -> exactly one run.  The acceptance
+REM Production default: V2_BENCHMARK_RUNS=10, V2_BENCHMARK_GAP_SECONDS=35
+REM -> 10 cold runs with a 35 s cooldown against the restore-only shadow
+REM app (the accepted production deployment; deploy first with
+REM deploy_and_run_v2_single.bat, which deploys and exits without probes).
+REM Override with V2_BENCHMARK_RUNS=1 for a single trial.  The acceptance
 REM sequence (A/B/C, ~3+ requests) runs ONLY via the explicit opt-in env
 REM V2_BENCHMARK_MODE=acceptance.  The variance-cold sequence (one request
 REM at a time, 25s gap, strict cold-identity proof) runs ONLY via the
@@ -184,11 +431,36 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     REM Forced instead of "if not defined" so a user's global production profile
     REM can never re-enable the production branch and wipe the eviction vars.
     set "COMFYMODAL_V2_ENV_PROFILE=inherit"
-    python tools\benchmark_v2_direct.py --snapshot-restore-only
+    python tools\benchmark_v2_direct.py --snapshot-restore-only %*
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
-    python tools\benchmark_v2_direct.py %*
+    echo === Fail-closed request preflight (local, no spend) ===
+    if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --verify-run-preflight --run-count 1 --conditioning-cache-nonce !V2_E28_CONDITIONING_NONCE!
+    ) else if "!V2_E26_VALIDATION_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --verify-run-preflight --run-count 1 --conditioning-cache-nonce !V2_E26_CONDITIONING_NONCE!
+    ) else if "!V2_E25_VALIDATION_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --verify-run-preflight --run-count 1 --conditioning-cache-nonce !V2_E25_CONDITIONING_NONCE!
+    ) else (
+        python tools\benchmark_v2_direct.py --verify-run-preflight %*
+    )
+    if errorlevel 1 (
+        echo === RUN PREFLIGHT FAILED - aborting before any Modal submission ===
+        exit /b 1
+    )
+    if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
+        set "V2_TOOL_ARGS="
+        set "V2_FIRST_SKIP="
+        for %%a in (%*) do if not defined V2_FIRST_SKIP (set "V2_FIRST_SKIP=1") else (set "V2_TOOL_ARGS=!V2_TOOL_ARGS! %%a")
+        python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E28_CONDITIONING_NONCE!!V2_TOOL_ARGS!
+    ) else if "!V2_E26_VALIDATION_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E26_CONDITIONING_NONCE!
+    ) else if "!V2_E25_VALIDATION_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E25_CONDITIONING_NONCE!
+    ) else (
+        python tools\benchmark_v2_direct.py %*
+    )
 )
 set "BENCHMARK_EXIT_CODE=!errorlevel!"
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_END_MS=%%a"

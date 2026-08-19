@@ -19,6 +19,11 @@ Gate: ``COMFYMODAL_V2_SNAPSHOT_MANIFEST`` (default off).  Never enable this
 during measured latency runs — the capture itself costs tens of
 milliseconds and allocates.  Everything here is bounded, JSON-safe and
 never raises.
+
+R2a additions: ``status`` also records ``RssAnon``/``RssFile`` (kB) and the
+manifest carries a ``cgroup`` entry reading ``memory.current`` (cgroup v2,
+v1 ``usage_in_bytes`` fallback), so the snapshot boundary can be measured
+from the cgroup accounting side as well.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ def _capture_status() -> dict[str, Any]:
     raw = _read_proc("/proc/self/status")
     if not raw:
         return out
+    _anon_keys = {"RssAnon": "rss_anon", "RssFile": "rss_file"}
     for line in raw.splitlines():
         if ":" not in line:
             continue
@@ -73,7 +79,32 @@ def _capture_status() -> dict[str, Any]:
                 out[key.lower()] = int(value.strip().split()[0])
             except Exception:
                 out[key.lower()] = value.strip()
+        elif key in _anon_keys:
+            try:
+                out[_anon_keys[key]] = int(value.strip().split()[0])
+            except Exception:
+                out[_anon_keys[key]] = value.strip()
     return out
+
+
+def _capture_cgroup() -> dict[str, Any]:
+    """cgroup memory.current (v2) with v1 usage_in_bytes fallback.
+
+    Returns ``{"available": bool, "memory_current_bytes": int | None}``;
+    ``None`` bytes when unreadable.  Never raises."""
+    for path in (
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                raw = fh.read(4096)
+            if not raw:
+                continue
+            return {"available": True, "memory_current_bytes": int(raw.strip().split()[0])}
+        except Exception:
+            continue
+    return {"available": False, "memory_current_bytes": None}
 
 
 def _capture_smaps_rollup() -> dict[str, int] | None:
@@ -352,18 +383,22 @@ def capture_snapshot_manifest(
     *,
     model_ctx: Any = None,
     extra: dict[str, Any] | None = None,
+    hygiene: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture the full manifest at *stage* (e.g. ``before_capture``,
     ``first_restored_line``).  JSON-safe, bounded, never raises.
 
     Returns the manifest dict; also stores it under ``_LATEST_BY_STAGE``
-    and prints a compact ``[v2.snapshot_manifest]`` line.
+    and prints a compact ``[v2.snapshot_manifest]`` line.  When *hygiene*
+    (the ``snapshot_capture_hygiene`` event dict) is provided it is stored
+    under ``manifest["capture_hygiene"]``.
     """
     manifest: dict[str, Any] = {
         "stage": str(stage),
         "capture_wall_unix_ns": time.time_ns(),
         "capture_mono_ns": time.monotonic_ns(),
         "status": _capture_status(),
+        "cgroup": _capture_cgroup(),
         "smaps_rollup": _capture_smaps_rollup(),
         "mappings": _capture_mappings(),
         "modules": _capture_modules(),
@@ -378,6 +413,8 @@ def capture_snapshot_manifest(
     }
     if extra:
         manifest["extra"] = extra
+    if hygiene is not None:
+        manifest["capture_hygiene"] = hygiene
     _LATEST_BY_STAGE[str(stage)] = manifest
     try:
         print(
@@ -385,6 +422,8 @@ def capture_snapshot_manifest(
             f"rss_kb={manifest['status'].get('vmrss')} "
             f"hwm_kb={manifest['status'].get('vmhwm')} "
             f"vmsize_kb={manifest['status'].get('vmsize')} "
+            f"rss_anon_kb={manifest['status'].get('rss_anon')} "
+            f"rss_file_kb={manifest['status'].get('rss_file')} "
             f"mappings={manifest['mappings'].get('total_mappings')} "
             f"anon={manifest['mappings'].get('anonymous_mappings')} "
             f"file={manifest['mappings'].get('file_backed_mappings')} "

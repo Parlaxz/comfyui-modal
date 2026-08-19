@@ -132,7 +132,25 @@ def _load_workflow_metadata():
 
 class TestPlanValidationProof(unittest.TestCase):
     def setUp(self):
+        import tempfile as _tf
         self.mod = _load_canonical()
+        # Isolate the D1 registry-proof store to a fresh temp path so the
+        # disk-backed validation fast path cannot serve synthetic payloads
+        # persisted by earlier tests in this process (the real repo store
+        # would otherwise be written/read when .deployed_state.json exists).
+        self._td = _tf.mkdtemp()
+        self._saved_store = os.environ.get("COMFYMODAL_V2_REGISTRY_PROOF_STORE")
+        os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = os.path.join(
+            self._td, "v2_registry_proof_store.json"
+        )
+
+    def tearDown(self):
+        import shutil
+        if self._saved_store is None:
+            os.environ.pop("COMFYMODAL_V2_REGISTRY_PROOF_STORE", None)
+        else:
+            os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = self._saved_store
+        shutil.rmtree(self._td, ignore_errors=True)
 
     # ── Payload collection ────────────────────────────────────────────────
 
@@ -229,7 +247,12 @@ class TestPlanValidationProof(unittest.TestCase):
                 collect_validation_proof=True,
             )
         self.mod._PLAN_VALIDATION_MEMO.clear()
-        with _stub_modules({
+        # D1 store-seam isolation: this test intentionally re-validates the
+        # SAME workflow with a DIFFERENT fake output set, so the disk-backed
+        # validation fast path must not serve the first build's payload here.
+        with mock.patch(
+            "comfymodal_runtime.registry_proof_store.lookup", return_value=None
+        ), _stub_modules({
             "execution": _make_fake_execution(["5", "9"]),
             "nodes": _make_fake_nodes(),
         }):

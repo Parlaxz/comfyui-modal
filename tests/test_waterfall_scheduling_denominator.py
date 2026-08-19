@@ -88,23 +88,24 @@ def test_extreme_scheduling_denominator():
     old_denominator_pct = sampling / report.total_ms * 100.0
     assert sampling_stage.percentage > old_denominator_pct * 2
 
-    # Reconciliation still runs against the full command->response total.
+    # Reconciliation compares the exclusive top-level sum to the non-scheduling
+    # wall (command->response minus scheduling time).
     assert report.reconciliation_status == "OK"
     assert report.accounted_ms is not None
-    assert abs(report.accounted_ms - report.total_ms) < 25.0
-
-    # The scheduling stage renders without a percentage in its column (it is
-    # informational, excluded from percentages and bars by design).
+    assert abs(report.accounted_ms - report.non_scheduling_ms) < 25.0
+    # Scheduling is informational: it never appears as a numbered table row.
     rendered = render_waterfall(report, terminal_columns=132)
-    row = next(
-        line for line in rendered.splitlines()
-        if "Modal scheduling" in line and "|" in line
+    assert not any(
+        "Modal scheduling" in line and "|" in line and line.strip()[:1].isdigit()
+        for line in rendered.splitlines()
     )
-    parts = [part.strip() for part in row.split("|")]
-    assert parts[4] == "-"
+    # The scheduling window is summarized exactly once, in the conclusive
+    # "Scheduling time:" footer line.
+    assert "| SCHEDULING" not in rendered
+    assert rendered.count("Scheduling time:") == 1
 
 
-# ── 2. Scheduling row has no % and a blank bar; header/footer walls ────────
+# ── 2. Scheduling is informational: no table row, no % / bar ───────────────
 def test_scheduling_row_no_percent_no_bar():
     scheduling = 200000.0
     sampling = _fixed_sum()
@@ -114,22 +115,26 @@ def test_scheduling_row_no_percent_no_bar():
 
     rendered = render_waterfall(report, terminal_columns=132)
     for expected in (
-        "TOTAL WALL:",
-        "SCHEDULING:",
-        "COMMAND->RESPONSE:",
+        "COMMAND -> RESPONSE:",
+        "Command (without scheduling) -> Response:",
+        "Scheduling time:",
     ):
-        assert expected in rendered, f"header missing {expected!r}"
-    assert "| TOTAL WALL |" in rendered
+        assert expected in rendered, f"conclusive footer missing {expected!r}"
+    assert "TOTAL WALL" not in rendered
 
-    row = next(
+    # No numbered table row mentions scheduling; the scheduling window is
+    # summarized exactly once in the conclusive "Scheduling time:" footer line.
+    table_rows = [
         line for line in rendered.splitlines()
-        if "Modal scheduling" in line and "|" in line
-    )
-    parts = [part.strip() for part in row.split("|")]
-    # At 132 columns the source column is hidden, so the % field is parts[4]
-    # and the trailing bar region is the last field.
-    assert parts[4] == "-", row
-    assert parts[5] == "", f"bar region not blank: {row!r}"
+        if line.strip()[:1].isdigit() and "|" in line
+    ]
+    assert not any("SCHEDULING" in line for line in table_rows)
+    footer_rows = [line for line in rendered.splitlines() if "| SCHEDULING" in line]
+    assert len(footer_rows) == 0
+    scheduling_lines = [line for line in rendered.splitlines() if line.startswith("Scheduling time:")]
+    assert len(scheduling_lines) == 1
+    assert "%" not in scheduling_lines[0]
+    assert "#" not in scheduling_lines[0]
 
 
 # ── 3. Core regression: sampling % uses total_wall, not total ──────────────
@@ -163,7 +168,40 @@ def test_final_reconciled_vs_remote_partial():
 
     partial_render = render_waterfall(partial_report, terminal_columns=132)
     assert "V2 COLD WATERFALL - REMOTE/PARTIAL (awaiting host reconciliation)" in partial_render
-    assert "TOTAL WALL:" in partial_render
+    assert "PENDING_HOST_RECONCILIATION" in partial_render
+    # Partial renders a REAL boxed table of the remotely-measured stages: same
+    # geometry as the reconciled table, but no percentages, no '#' bars and no
+    # scheduling values (unknown remotely; the conclusive footer lines carry
+    # the intermediate pending token and the host produces the final table).
+    assert "+-----+" in partial_render
+    assert "|   # | Stage" in partial_render
+    assert "COMMAND -> RESPONSE:" in partial_render
+    pending_footer = [
+        line for line in partial_render.splitlines()
+        if line.startswith("Command (without scheduling) -> Response:")
+        or line.startswith("Scheduling time:")
+    ]
+    assert len(pending_footer) == 2
+    assert all("awaiting host reconciliation" in line for line in pending_footer)
+    numbered = [
+        line for line in partial_render.splitlines()
+        if line.startswith("| ") and line.split("|")[1].strip().isdigit()
+    ]
+    assert numbered, "expected numbered stage rows in the partial table"
+    for line in numbered:
+        parts = line.split("|")
+        assert parts[3].strip() != "-", line   # duration present
+        assert parts[4].strip() != "-", line   # cumulative present
+        assert parts[5].strip() == "-", line   # '%' column renders '-' (never a number)
+        assert parts[6].strip() == "", line    # bar column blank
+        assert "#" not in line and "%" not in line, line
+    assert partial_render.count("#") == 1  # only the '#' column-header label
+    # Boxed footer rows inside the table, then the closing border.  No boxed
+    # SCHEDULING row: the scheduling window is summarized in the conclusive
+    # lines below.
+    assert "|     | SCHEDULING" not in partial_render
+    assert "|     | RECONCILIATION" in partial_render
+    assert "|     | STATUS" in partial_render
 
     final = build_real_run_result()
     final_report = _report(final, run_label="remote normal run")
@@ -171,6 +209,12 @@ def test_final_reconciled_vs_remote_partial():
     assert final_report.partial_flags == ()
     final_render = render_waterfall(final_report, terminal_columns=132)
     assert "REMOTE/PARTIAL" not in final_render
+    # Both tables share byte-identical border rules so container logs align.
+    partial_rules = [line for line in partial_render.splitlines() if line.startswith("+-----+")]
+    final_rules = [line for line in final_render.splitlines() if line.startswith("+-----+")]
+    assert partial_rules and final_rules
+    assert partial_rules[0] == final_rules[0]
+    assert len(partial_rules) == len(final_rules)
 
     # waterfall_to_dict round-trips the new fields.
     data = waterfall_to_dict(final_report)
@@ -186,8 +230,8 @@ def test_final_reconciled_vs_remote_partial():
 # ── 5. Extreme values still reconcile ──────────────────────────────────────
 def test_extreme_values_still_reconcile():
     """scheduling 300 s, pre-Python 20 s and restore 5 s still tile the wall:
-    accounted == total within 25 ms, status OK, total_wall == total -
-    scheduling."""
+    accounted == the non-scheduling wall within 25 ms, status OK,
+    total_wall (internal) == total - placement."""
     scheduling, pre_python, restore = 300000.0, 20000.0, 5000.0
     total = chain_total_ms(
         scheduling_ms=scheduling, pre_python_ms=pre_python, restore_ms=restore
@@ -201,7 +245,8 @@ def test_extreme_values_still_reconcile():
     assert report.scheduling_ms == pytest.approx(scheduling)
     assert report.total_wall_ms == pytest.approx(report.total_ms - scheduling)
     assert report.accounted_ms is not None
-    assert abs(report.accounted_ms - report.total_ms) <= 25.0
+    assert report.non_scheduling_ms is not None
+    assert abs(report.accounted_ms - report.non_scheduling_ms) <= 25.0
 
 
 # ── 6. Missing local receipt flags the partial waterfall ──────────────────

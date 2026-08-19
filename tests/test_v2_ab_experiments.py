@@ -69,7 +69,7 @@ def test_all_experiments_default_off(monkeypatch):
     expected = {
         "unet_transfer": ("baseline", {"pinned_staging": False, "chunk_mb": 512}),
         "vae_overlap": ("baseline", {"early_start_ms": 0, "expected_sampling_ms": 4900}),
-        "png_encode": ("level6", {"compress_level": 6}),
+        "png_encode": ("level1", {"compress_level": 1}),
         "conditioning_hit": ("sync_lru", {"async_lru": False}),
         "restore_memory": ("baseline", {"total_vram_frozen": False}),
     }
@@ -96,7 +96,7 @@ def test_all_experiments_default_off(monkeypatch):
     assert unet_staging_chunk_mb() == 512
     assert vae_early_start_ms() == 0
     assert vae_expected_sampling_ms() == 4900
-    assert png_compress_level() == 6
+    assert png_compress_level() == 1
     assert conditioning_async_lru_enabled() is False
     assert restore_total_vram_frozen_enabled() is False
 
@@ -152,8 +152,8 @@ def test_invalid_arm_fails_explicitly(monkeypatch, capsys):
     monkeypatch.setenv("COMFYMODAL_V2_PNG_COMPRESS_LEVEL", "3")
     sel = resolve_experiment("png_encode")
     out = capsys.readouterr().out
-    assert sel.arm == "level6"
-    assert sel.effective_settings["compress_level"] == 6
+    assert sel.arm == "level1"
+    assert sel.effective_settings["compress_level"] == 1
     assert "[v2.experiment] ERROR invalid_arm" in out
     assert "env_key=COMFYMODAL_V2_PNG_COMPRESS_LEVEL" in out
     assert "value='3'" in out
@@ -292,7 +292,7 @@ def test_png_level_equivalence(monkeypatch):
     monkeypatch.setattr(comfyapp, "_opt_diag_enabled", lambda: True)
     monkeypatch.delenv("COMFYMODAL_V2_PNG_COMPRESS_LEVEL", raising=False)
 
-    # Level 6 (baseline).
+    # Level 6 (non-default; explicit override).
     monkeypatch.setenv("COMFYMODAL_V2_PNG_COMPRESS_LEVEL", "6")
     comfyapp._PNG_EXPERIMENT_LOGGED = False
     comfyapp._OPT_ENCODE_DIAG.clear()
@@ -301,7 +301,7 @@ def test_png_level_equivalence(monkeypatch):
     raw6 = entries6[0][0]
     size6 = len(raw6)
 
-    # Level 1 (B arm).
+    # Level 1 (default).
     monkeypatch.setenv("COMFYMODAL_V2_PNG_COMPRESS_LEVEL", "1")
     comfyapp._PNG_EXPERIMENT_LOGGED = False
     comfyapp._OPT_ENCODE_DIAG.clear()

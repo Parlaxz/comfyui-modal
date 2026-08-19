@@ -400,6 +400,150 @@ def _ordered_ids(values: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
+WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
+OUTPUT_MODES = ("original", "preview")
+DEFAULT_OUTPUT_QUALITY = 75
+DEFAULT_PREVIEW_QUALITY = 70
+
+_OUTPUT_FORMAT_ALIASES = {
+    "original": "original",
+    "png": "original",
+    "webp": "webp_lossy",
+    "webp_lossy": "webp_lossy",
+    "webp-lossy": "webp_lossy",
+    "webp_lossless": "webp_lossless",
+    "webp-lossless": "webp_lossless",
+    "jpeg": "jpeg",
+    "jpg": "jpeg",
+}
+
+
+def normalize_output_mode(value: Any) -> str:
+    """Return the explicit semantic output mode.
+
+    Codec and filename values are deliberately not accepted as mode aliases:
+    WebP can be an explicitly requested Original, so mode must be carried by
+    the accepted request rather than inferred downstream.
+    """
+    raw = "original" if value is None else str(value).strip().lower()
+    if not raw:
+        raw = "original"
+    if raw not in OUTPUT_MODES:
+        raise ValueError(
+            f"unsupported output mode {value!r}; expected one of "
+            f"{', '.join(OUTPUT_MODES)}"
+        )
+    return raw
+
+
+def build_logical_output_key(
+    node_id: Any, output_key: Any, output_index: Any = 0
+) -> str | None:
+    """Build the stable attempt/variant/codec-independent output identity."""
+    if not isinstance(node_id, str) or not isinstance(output_key, str):
+        return None
+    node = node_id.strip()
+    slot = output_key.strip()
+    if not node or not slot or isinstance(output_index, bool):
+        return None
+    try:
+        item_index = int(output_index)
+    except (TypeError, ValueError):
+        return None
+    if item_index < 0:
+        return None
+    return f"node:{node}:slot:{slot}:item:{item_index}"
+
+
+def normalize_output_format(value: Any) -> str:
+    """Return the canonical runtime output format or reject it."""
+    raw = "original" if value is None else str(value).strip().lower()
+    if not raw:
+        raw = "original"
+    try:
+        return _OUTPUT_FORMAT_ALIASES[raw]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported output format {value!r}; expected one of "
+            f"{', '.join(OUTPUT_FORMATS)} or the webp/png/jpg aliases"
+        ) from exc
+
+
+def normalize_quality(value: Any, *, default: int = DEFAULT_OUTPUT_QUALITY) -> int:
+    """Coerce quality to an integer in the Pillow-supported 0-100 range."""
+    try:
+        if value is None:
+            raise ValueError
+        quality = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        quality = int(default)
+    return max(0, min(100, quality))
+
+
+def normalize_webp_lossless_compression(value: Any) -> str:
+    """Return a supported WebP lossless method name."""
+    raw = "balanced" if value is None else str(value).strip().lower()
+    if raw not in WEBP_LOSSLESS_COMPRESSION:
+        raise ValueError(
+            f"unsupported webp_lossless_compression {value!r}; expected "
+            f"one of {', '.join(WEBP_LOSSLESS_COMPRESSION)}"
+        )
+    return raw
+
+
+def normalize_output_conversion_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize the serializable output codec contract once at its boundary."""
+    source = dict(value) if isinstance(value, Mapping) else {}
+    if not source:
+        return {}
+    raw_format = source.get("format", source.get("output_format", "original"))
+    output_format = normalize_output_format(raw_format)
+    normalized = dict(source)
+    normalized["format"] = output_format
+
+    quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(raw_format or "").strip().lower() == "webp"
+        else DEFAULT_OUTPUT_QUALITY
+    )
+    if "quality" in source or str(raw_format or "").strip().lower() == "webp":
+        normalized["quality"] = normalize_quality(source.get("quality"), default=quality_default)
+    if "webp_lossless_compression" in source:
+        normalized["webp_lossless_compression"] = normalize_webp_lossless_compression(
+            source.get("webp_lossless_compression")
+        )
+    return normalized
+
+
+def normalize_output_intent_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Freeze output mode and Preview codec settings at plan acceptance."""
+    source = dict(value) if isinstance(value, Mapping) else {}
+    raw_mode = source.get("output_mode")
+    if raw_mode is None and "preview_enabled" in source:
+        raw_mode = "preview" if bool(source.get("preview_enabled")) else "original"
+    output_mode = normalize_output_mode(raw_mode)
+    normalized = dict(source)
+    normalized["output_mode"] = output_mode
+
+    conversion = source.get("output_conversion_options", source.get("output_conversion"))
+    conversion = dict(conversion) if isinstance(conversion, Mapping) else {}
+    if output_mode == "preview":
+        conversion.setdefault("format", source.get("preview_codec", "webp"))
+        if conversion.get("quality") is None:
+            conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
+    if conversion:
+        normalized["output_conversion_options"] = normalize_output_conversion_options(conversion)
+        normalized["output_format"] = normalized["output_conversion_options"]["format"]
+        if "quality" in normalized["output_conversion_options"]:
+            normalized["quality"] = normalized["output_conversion_options"]["quality"]
+        if "webp_lossless_compression" in normalized["output_conversion_options"]:
+            normalized["webp_lossless_compression"] = normalized["output_conversion_options"][
+                "webp_lossless_compression"
+            ]
+    return normalized
+
+
 def _normalized_entries(values: Any) -> tuple[dict[str, Any], ...]:
     """Normalize a sequence of mapping entries into frozen, str-keyed dicts.
 
@@ -430,11 +574,22 @@ class ExecutionOptions:
     progress_options: Mapping[str, Any] = field(default_factory=dict)
     compatibility_flags: Mapping[str, Any] = field(default_factory=dict)
     legacy_passthrough: Mapping[str, Any] = field(default_factory=dict)
+    output_mode: str = "original"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "production_output_node_ids", _normalized_ids(self.production_output_node_ids))
-        for name in (
+        output_mode = normalize_output_mode(self.output_mode)
+        conversion = dict(self.output_conversion_options or {})
+        if output_mode == "preview":
+            conversion.setdefault("format", "webp")
+            if conversion.get("quality") is None:
+                conversion["quality"] = DEFAULT_PREVIEW_QUALITY
+        object.__setattr__(
+            self,
             "output_conversion_options",
+            normalize_output_conversion_options(conversion),
+        )
+        for name in (
             "cancellation_options",
             "progress_options",
             "compatibility_flags",
@@ -442,6 +597,7 @@ class ExecutionOptions:
         ):
             object.__setattr__(self, name, _freeze(getattr(self, name) or {}))
         object.__setattr__(self, "production_enabled", bool(self.production_enabled))
+        object.__setattr__(self, "output_mode", output_mode)
         object.__setattr__(self, "result_route", str(self.result_route or ""))
         object.__setattr__(self, "profiling_level", str(self.profiling_level or "summary").lower())
         object.__setattr__(self, "requested_backend", str(self.requested_backend or "in_process").lower())
@@ -473,6 +629,22 @@ class ExecutionOptions:
             _record_compatibility_key("output_format")
         if conversion is None:
             conversion = {}
+        elif not isinstance(conversion, Mapping):
+            raise ValueError("output_conversion_options must be a mapping")
+        else:
+            conversion = dict(conversion)
+        for key in ("quality", "webp_lossless_compression"):
+            if key not in conversion and key in source:
+                conversion[key] = source[key]
+        raw_output_mode = source.get("output_mode")
+        if raw_output_mode is None and "preview_enabled" in source:
+            raw_output_mode = "preview" if bool(source.get("preview_enabled")) else "original"
+        output_mode = normalize_output_mode(raw_output_mode)
+        if output_mode == "preview":
+            if "format" not in conversion:
+                conversion["format"] = source.get("preview_codec", "webp")
+            if conversion.get("quality") is None:
+                conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
         if "output_conversion" in source:
             _record_compatibility_key("output_conversion")
 
@@ -493,6 +665,12 @@ class ExecutionOptions:
             "output_conversion_options",
             "output_conversion",
             "output_format",
+            "output_mode",
+            "preview_enabled",
+            "preview_codec",
+            "preview_quality",
+            "quality",
+            "webp_lossless_compression",
             "result_route",
             "profiling_level",
             "profile_level",
@@ -543,6 +721,7 @@ class ExecutionOptions:
         return cls(
             production_enabled=production_enabled,
             production_output_node_ids=output_ids,
+            output_mode=output_mode,
             output_conversion_options=conversion,
             result_route=source.get("result_route", ""),
             profiling_level=profile,
@@ -563,6 +742,7 @@ class ExecutionOptions:
                 "enabled": self.production_enabled,
                 "output_node_ids": list(self.production_output_node_ids),
             },
+            "output_mode": self.output_mode,
             "output_conversion_options": _thaw(self.output_conversion_options),
             "result_route": self.result_route,
             "profiling_level": self.profiling_level,
@@ -590,6 +770,7 @@ class ExecutionOptions:
             "output_node_ids": list(self.production_output_node_ids),
         }
         result["output_conversion_options"] = _thaw(self.output_conversion_options)
+        result["output_mode"] = self.output_mode
         result["result_route"] = self.result_route
         result["profiling_level"] = self.profiling_level
         result["requested_backend"] = self.requested_backend
@@ -606,6 +787,10 @@ class ExecutionOptions:
         conversion = _thaw(self.output_conversion_options)
         if isinstance(conversion, dict) and "format" in conversion:
             result["output_format"] = conversion["format"]
+        if isinstance(conversion, dict) and "quality" in conversion:
+            result["quality"] = conversion["quality"]
+        if isinstance(conversion, dict) and "webp_lossless_compression" in conversion:
+            result["webp_lossless_compression"] = conversion["webp_lossless_compression"]
         flags = _thaw(self.compatibility_flags)
         actual_load = flags.get("actual_load") if isinstance(flags, dict) else None
         if isinstance(actual_load, Mapping):

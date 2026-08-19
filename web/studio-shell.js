@@ -10,7 +10,8 @@
 // container uses a distinct class (comfymodal-studio-pagecontainer).
 
 import { renderPlayground } from "./studio-playground.js";
-import { renderHistory } from "./studio-history.js";
+import { renderHistoryV2 } from "./studio-history-v2.js";
+import { renderWorkflows } from "./studio-workflows.js";
 import { renderBackend } from "./studio-backend.js";
 import { renderSettings } from "./studio-settings.js";
 import { stopLegacyController } from "./studio-legacy.js";
@@ -18,7 +19,8 @@ import { el } from "./studio-ui.js";
 
 const PAGES = {
   playground: { label: "Playground", render: renderPlayground },
-  history:    { label: "History",    render: renderHistory },
+  history:    { label: "History",    render: renderHistoryV2 },
+  workflows:  { label: "Workflows",  render: renderWorkflows },
   backend:    { label: "Backend",    render: renderBackend },
   settings:   { label: "Settings",   render: renderSettings },
 };
