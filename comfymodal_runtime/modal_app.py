@@ -3181,6 +3181,25 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": os.environ.get(
             "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1"
         ),
+        # ── E30 CLIP cold-I/O genuine-QD reader (default OFF; explicit
+        # passthrough so a deployment baked with the flag reaches the
+        # container; without it the reader stays disabled and the E28
+        # fastsafetensors direct-GPU path runs unchanged). ──
+        "COMFYMODAL_V2_CLIP_QD_READER": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_READER", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_QD": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_QD", "4"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB", "32"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY", "restore_earliest"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_ARTIFACT": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_ARTIFACT", ""
+        ),
         "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
             "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
         ),
@@ -9909,6 +9928,38 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        # ── E29: canonical ledger restore boundary ──────────────────────────
+        # Record the modal_app restore() entry on the canonical axis (the
+        # true first executable line of the remote restore lifecycle), and
+        # carry the restore identities into the ledger for cross-request
+        # isolation of every later span.
+        try:
+            from .critical_path_ledger import (
+                begin_restore as _ledger_begin_restore,
+                record_event as _ledger_event,
+                set_request_identity as _ledger_identity,
+            )
+            _restore_ledger_rid = str(os.environ.get("COMFYMODAL_V2_BENCHMARK_REQUEST_ID", "") or "")
+            _ledger_begin_restore(_restore_ledger_rid)
+            _ledger_identity(
+                request_id=_restore_ledger_rid,
+                restored_instance_id=getattr(self, "_restored_instance_id", "") or "",
+                restore_session_id=getattr(self, "_restore_session_id", "") or "",
+                container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            )
+            _ledger_event("modal_restore_entry", mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
+        # ── E29: restore-decomposition span holders (always defined) ─────
+        # Initialized to None so every early close-site is safe even before
+        # the creation block below (which opens the actual spans) runs.
+        _span_restore_early: Any = None
+        _span_restore_eviction: Any = None
+        _span_restore_snapshot: Any = None
+        _span_restore_preamble: Any = None
+        _span_bootstrap: Any = None
+        _span_preload: Any = None
+        _span_finalize: Any = None
         # ── Remote resume / restore method boundary timestamps ──────────
         # Captured at the TRUE first executable line of restore() so the
         # Modal-scheduling-before-Python-resumes gap (submission → this
@@ -10050,6 +10101,27 @@ class ModalRuntimeEntrypoint:
             )
         except Exception:
             pass
+        # ── E29: close restore:early / open restore:eviction ─────────────
+        if _span_restore_early is not None:
+            try:
+                _span_restore_early.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
+        if _span_restore_eviction is not None:
+            try:
+                _span_restore_eviction.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
+        if _span_restore_snapshot is not None:
+            try:
+                _span_restore_snapshot.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
+        if _span_restore_preamble is not None:
+            try:
+                _span_restore_preamble.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         try:
             from .clip_fast_hydration_wiring import maybe_install_clip_fh_demand
             maybe_install_clip_fh_demand(
@@ -10144,7 +10216,31 @@ class ModalRuntimeEntrypoint:
         _restore_end_wall_ns: int | None = None
         _restore_end_mono_ns: int | None = None
         _restore_perf_start = time.perf_counter()
-        # ── [v2.restore_deep] leaf-segment stamp store (bounded, additive) ──
+        # ── E29: canonical ledger restore-decomposition spans ─────────────
+        # Each restore phase becomes a real ledger span (restore phase store)
+        # so the serial ledger decomposes restore() from first principles.
+        # Brackets are monotonic-stamped at the exact code site; a missing
+        # site leaves that span absent — never a guessed owner.
+        try:
+            from .critical_path_ledger import begin_span as _ledger_begin_span
+        except Exception:
+            _ledger_begin_span = None
+
+        def _restore_phase_span(_name: str) -> Any:
+            if _ledger_begin_span is None:
+                return None
+            try:
+                return _ledger_begin_span(_name, lane="RESTORE")
+            except Exception:
+                return None
+        _span_restore_early: Any = _restore_phase_span("restore:early")
+        _span_restore_eviction: Any = _restore_phase_span("restore:eviction")
+        _span_restore_snapshot: Any = _restore_phase_span("restore:snapshot")
+        _span_restore_preamble: Any = _restore_phase_span("restore:preamble")
+        _span_bootstrap: Any = _restore_phase_span("restore:bootstrap")
+        _span_preload: Any = _restore_phase_span("restore:preload")
+        _span_finalize: Any = _restore_phase_span("restore:finalize")
+        # [v2.restore_deep] leaf-segment stamp store (bounded, additive) ──
         # Captures monotonic_ns stamps around the currently-unattributed leaf
         # segments of the restore critical path; consumed once at the
         # [v2.restore_deep] emission near the tail of restore().  Every stamp
@@ -10378,6 +10474,12 @@ class ModalRuntimeEntrypoint:
                 except Exception:
                     pass
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
+                # ── E29: bootstrap span opened at the exact call site ─────
+                if _span_bootstrap is not None:
+                    try:
+                        _span_bootstrap.start_mono_ns = time.monotonic_ns()
+                    except Exception:
+                        pass
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
                 # ── D6 restore-side lifecycle checkpoint (default-OFF) ──
@@ -10396,6 +10498,21 @@ class ModalRuntimeEntrypoint:
                     _rd_deep["bootstrap_restore_end_ns"] = time.monotonic_ns()
                 except Exception:
                     pass
+                # ── E29: close bootstrap span at the exact return site ────
+                if _span_bootstrap is not None:
+                    try:
+                        _span_bootstrap.finish(mono_ns=time.monotonic_ns())
+                    except Exception:
+                        pass
+                try:
+                    _rd_deep["preload_bridge_prep_start_ns"] = time.monotonic_ns()
+                except Exception:
+                    pass
+                if _span_preload is not None:
+                    try:
+                        _span_preload.start_mono_ns = time.monotonic_ns()
+                    except Exception:
+                        pass
 
                 # [v2.generation_identity] bootstrap diagnostic
                 _boot_cn_gen = str(state.custom_node_generation or "")
@@ -11540,6 +11657,17 @@ class ModalRuntimeEntrypoint:
                 _rd_deep["preload_bridge_prep_end_ns"] = time.monotonic_ns()
             except Exception:
                 pass
+            # ── E29: close preload span / open finalize span ─────────────
+            if _span_preload is not None:
+                try:
+                    _span_preload.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
+            if _span_finalize is not None:
+                try:
+                    _span_finalize.start_mono_ns = time.monotonic_ns()
+                except Exception:
+                    pass
             # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # ── 12. restore_finalization ──
             def _do_restore_finalization():
@@ -11627,6 +11755,24 @@ class ModalRuntimeEntrypoint:
                 _rd_deep["restore_finalize_start_ns"] = time.monotonic_ns()
             except Exception:
                 pass
+            # ── E29: canonical ledger restore completion ─────────────────
+            # Record the modal_app restore() completion boundary so the
+            # serial ledger spans restore-entry .. restore-exit explicitly.
+            try:
+                from .critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "modal_restore_exit",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={"status": "restored"},
+                )
+            except Exception:
+                pass
+            # ── E29: close the finalize span at the restore exit ─────────
+            if _span_finalize is not None:
+                try:
+                    _span_finalize.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
             (
                 trace,
                 restore_total_ms,
@@ -11907,6 +12053,16 @@ class ModalRuntimeEntrypoint:
         if _RESIDENCY_DIAGNOSTICS_ENABLED:
             self._sample_snapshot_residency(stage="request_entry", trace=trace)
         trace.emit("graph_execution_start", phase="execution")
+        # ── E29: canonical ledger graph-execution span ────────────────────
+        # The graph/prefill/sampling/VAE decode window becomes one ledger
+        # span (children reconcile inside it via the trace-event bridge).
+        try:
+            from .critical_path_ledger import TraceSpanBridge
+            TraceSpanBridge(
+                "executor:graph-execution", lane="EXECUTOR",
+            ).start(mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
         # Stash the execution trace on the legacy API so the patched UNET
         # loader (_cached_unet_load) can emit V2 cache-hit events even
         # when current_v2_loader_bridge() returns None.
@@ -12541,6 +12697,14 @@ class ModalRuntimeEntrypoint:
                 }
                 trace.set_metadata(gpu_observation_classification=_gpu_obs_classification)
             trace.emit("graph_execution_end", phase="execution")
+            # ── E29: close the canonical ledger graph-execution span ─────
+            try:
+                from .critical_path_ledger import TraceSpanBridge
+                TraceSpanBridge("executor:graph-execution", lane="EXECUTOR").end(
+                    mono_ns=time.monotonic_ns()
+                )
+            except Exception:
+                pass
             # Drain late worker events (read/cpu/gpu/ready) from bridge
             # preparation into the execution trace so they are not lost.
             self._preload_bridge.drain_worker_events(trace)
@@ -12673,6 +12837,14 @@ class ModalRuntimeEntrypoint:
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
+            # ── E29: close the canonical ledger graph-execution span ─────
+            try:
+                from .critical_path_ledger import TraceSpanBridge
+                TraceSpanBridge("executor:graph-execution", lane="EXECUTOR").end(
+                    mono_ns=time.monotonic_ns()
+                )
+            except Exception:
+                pass
             # Capture GPU observation summary/classification on exception path too.
             # Safe after request_execution_trace_scope exit â€” reads from module-level state.
             try:
@@ -15959,6 +16131,14 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES",
             "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB",
             "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE",
+            # E29 canonical critical-path ledger gate (baked; deploy-only).
+            "COMFYMODAL_V2_CRITICAL_PATH_LEDGER",
+            # E30 CLIP cold-I/O genuine-QD reader gates (default OFF).
+            "COMFYMODAL_V2_CLIP_QD_READER",
+            "COMFYMODAL_V2_CLIP_QD_QD",
+            "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB",
+            "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY",
+            "COMFYMODAL_V2_CLIP_QD_ARTIFACT",
         )
         env = {key: os.environ.get(key, "") for key in keys}
         env["MODAL_CLOUD_PROVIDER"] = os.environ.get("MODAL_CLOUD_PROVIDER", "")
@@ -17424,6 +17604,86 @@ class ModalRuntimeEntrypoint:
                 "[v2.local_submission_breakdown.remote]", _local_submission_breakdown,
             )
 
+        # ── E29: canonical ledger request identity + method-entry markers ──
+        # Bind the ledger to the exact request (request_id + trace_id +
+        # restored/container identities) so every span is strictly
+        # request-scoped, then stamp the true method-entry boundary.
+        # ``begin_request`` preserves the restore-session spans (same process,
+        # same monotonic axis) and clears only previous-REQUEST spans.
+        try:
+            from .critical_path_ledger import (
+                begin_request as _ledger_begin,
+                record_event as _ledger_event,
+                set_request_identity as _ledger_identity,
+            )
+            _ledger_begin(_t4_request_id or request_id)
+            _ledger_identity(
+                request_id=_t4_request_id or request_id,
+                trace_id=str(
+                    getattr(getattr(context, "trace", None), "trace_id", "") or ""
+                ),
+                restored_instance_id=str(getattr(self, "_restored_instance_id", "") or ""),
+                restore_session_id=str(
+                    (self._restore_timing or {}).get("restore_session_id", "") or ""
+                ),
+                container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            )
+            _ledger_event("modal_method_entry", mono_ns=_method_first_line_ns)
+            _ledger_event(
+                "plan_deserialize_start",
+                mono_ns=_deserialize_start_ns if "_deserialize_start_ns" in dir() else None,
+            )
+            _ledger_event("plan_deserialize_end", mono_ns=_deserialize_end_ns)
+            _ledger_event("plan_accepted", mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
+        # ── E29: canonical ledger request-setup spans ─────────────────────
+        # These decompose the old coarse 263 ms / 872 ms buckets into real
+        # boundaries: identity capture, plan deserialize, setup/schedule
+        # (thread submits + worker-first-instruction stamps), and the
+        # plan-received yield.  Request-scoped spans (the restore store was
+        # already frozen by begin_request above).
+        try:
+            from .critical_path_ledger import begin_span as _ledger_begin_span
+        except Exception:
+            _ledger_begin_span = None
+        _span_identity_capture: Any = (
+            _ledger_begin_span("request:identity-capture", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_deserialize: Any = (
+            _ledger_begin_span("request:plan-deserialize", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_schedule_setup: Any = (
+            _ledger_begin_span("request:setup-schedule", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_cc_prefetch: Any = (
+            _ledger_begin_span("request:cc-prefetch-submit", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_itw: Any = (
+            _ledger_begin_span("request:input-types-warm", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        if _span_identity_capture is not None:
+            try:
+                _span_identity_capture.start_mono_ns = _method_first_line_ns
+                _span_identity_capture.finish(mono_ns=_identity_capture_end_ns)
+            except Exception:
+                pass
+        # ── E29: close request:plan-deserialize ───────────────────────────
+        # ``_deserialize_start_ns`` is captured immediately before the
+        # ExecutionPlan.from_dict call; the end stamp is right after it.
+        if _span_deserialize is not None:
+            try:
+                _span_deserialize.start_mono_ns = (
+                    _deserialize_start_ns if "_deserialize_start_ns" in dir() else _method_first_line_ns
+                )
+                _span_deserialize.finish(mono_ns=_deserialize_end_ns)
+            except Exception:
+                pass
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
 
@@ -18388,6 +18648,23 @@ class ModalRuntimeEntrypoint:
             )
 
         # â”€â”€ First status yield â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── E29: canonical ledger plan-receipt boundary ────────────────────
+        # The first status yield is the authoritative "plan received" point;
+        # stamp it on the canonical axis.
+        try:
+            from .critical_path_ledger import record_event as _ledger_event
+            _ledger_event("plan_received", mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
+        # ── E29: close the setup-schedule span at plan receipt ───────────
+        # The coarse 263 ms / 872 ms buckets now have real owners: identity
+        # capture, plan deserialize, setup/schedule submits, and the
+        # plan-received yield (each an explicit ledger span/event).
+        if _span_schedule_setup is not None:
+            try:
+                _span_schedule_setup.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         _plan_received_mono_ns = time.monotonic_ns()
         context.trace.emit("run_plan_first_status_yield", phase="method")
         yield {
@@ -18809,6 +19086,7 @@ class ModalRuntimeEntrypoint:
                         emit_gantt_records,
                         collect_gantt_report,
                     )
+                    from .gantt_canonical import emit_canonical_gantt
                     from .e27_forensics import (
                         cast_account_summary,
                         e27_forensics_enabled,
@@ -18824,6 +19102,18 @@ class ModalRuntimeEntrypoint:
                             _gantt_trace,
                             request_id=_t4_request_id or request_id,
                         )
+                        # ── E29: canonical-ledger Gantt (request-scoped) ──
+                        # Renders ONLY from the canonical ledger store, which
+                        # begin_request() reset at method entry — a reused
+                        # container can never append previous-request spans.
+                        try:
+                            from . import critical_path_ledger as _cpl
+                            emit_canonical_gantt(
+                                _cpl,
+                                request_id=_t4_request_id or request_id,
+                            )
+                        except Exception:
+                            pass
                         _gantt_report = collect_gantt_report(_gantt_trace)
                         if isinstance(data, dict) and _gantt_report.get("spans"):
                             data["gantt_telemetry"] = _gantt_report
@@ -18859,6 +19149,45 @@ class ModalRuntimeEntrypoint:
                     getattr(context, "trace", None),
                     request_id=_t4_request_id or request_id,
                 )
+                # ── E29: durable-result span + canonical ledger emission ──
+                # The result event is the first durable result boundary: close
+                # the durable-result span at the exact emit stamp, then emit
+                # the complete canonical ledger report (serial zero-gap
+                # reconciliation + Gantt) and persist the full report into the
+                # run artifact for offline validation.
+                try:
+                    from .critical_path_ledger import (
+                        capture_ledger_report_for_artifact,
+                        emit_ledger_report,
+                        record_event as _ledger_event,
+                    )
+                    _emit_mono = int(data.get("remote_result_emit_mono_ns") or 0)
+                    _ledger_event("first_durable_result", mono_ns=_emit_mono or time.monotonic_ns())
+                    if _span_durable_result is not None:
+                        try:
+                            _span_durable_result.finish(
+                                mono_ns=_emit_mono or time.monotonic_ns()
+                            )
+                        except Exception:
+                            pass
+                    emit_ledger_report(request_id=_t4_request_id or request_id)
+                    _ledger_artifact_report = capture_ledger_report_for_artifact()
+                    if _ledger_artifact_report is not None and isinstance(data, dict):
+                        data["canonical_ledger"] = _ledger_artifact_report
+                except Exception:
+                    pass
+                # ── E29: durable-result span opened at plan receipt ──────
+                # Spans the entire executor run (plan_received -> result emit)
+                # on the serial axis; its children (CLIP/UNET/sampling/VAE/
+                # output spans via the trace-event bridge) reconcile inside it.
+                try:
+                    from .critical_path_ledger import begin_span as _ledger_begin_span
+                    _span_durable_result = _ledger_begin_span(
+                        "request:executor-run", lane="EXECUTOR",
+                        start_mono_ns=_plan_received_mono_ns,
+                    )
+                except Exception:
+                    _span_durable_result = None
                 # ── Stage-13 decomposition (diagnostics; additive only) ──
                 # Fine-grained "Output encode / descriptor" children so the
                 # integrated run can prove whether any child exceeds the

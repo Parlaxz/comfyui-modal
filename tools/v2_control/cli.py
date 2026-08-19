@@ -1,0 +1,1159 @@
+"""v2ctl command-line interface (Batch E32).
+
+Thin CLI over the v2_control modules.  Local-only: every deploy/run/gate
+command builds a sanitized child environment and invokes the canonical
+backend (the known-good BATs) via subprocess.  No Modal SDK calls, no
+network, no ambient experiment env leakage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from . import environment as env_mod
+from . import registry as registry_mod
+from . import profiles as profiles_mod
+from . import config as config_mod
+from . import fingerprints as fp_mod
+from . import backend as backend_mod
+from . import locking as locking_mod
+from . import runtime_overrides as ro_mod
+from . import validation as val_mod
+from . import provenance as prov_mod
+from .errors import (
+    BackendError,
+    DeployCrashLoopError,
+    FlagError,
+    GateError,
+    LockHeldError,
+    LockStaleError,
+    ProtectedVarError,
+    ProfileError,
+    RuntimeOverrideViolation,
+    V2CtlError,
+)
+
+SCHEMA_VERSION = 1
+VERSION = "0.1.0"
+
+# Static audit: which flag names does the runtime actually consume?  Derived
+# from the Phase-0 audit of the deployed runtime source (modal_app request
+# allowlist, comfyapp runtime-flag resolvers, harness selectors) plus a live
+# source scan in `flags audit`.
+CONSUMED_SOURCE_GLOBS = (
+    "comfymodal_runtime/*.py",
+    "comfyapp.py",
+    "tools/benchmark_v2_direct.py",
+)
+_CONSUMED_TOKEN_RE = re.compile(r"\b(COMFYMODAL_V2_[A-Z0-9_]+|V2_[A-Z0-9_]+)\b")
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _scan_consumed_names(repo_root: Path) -> set[str]:
+    """Advisory lint: env-var tokens appearing in the runtime sources."""
+    found: set[str] = set()
+    for pattern in CONSUMED_SOURCE_GLOBS:
+        for path in sorted(repo_root.glob(pattern)):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in _CONSUMED_TOKEN_RE.finditer(text):
+                found.add(m.group(1))
+    return found
+
+
+# ── Bootstrap ──────────────────────────────────────────────────────────
+
+def _parse_sets(specs: list[str]) -> list[tuple[str, str]]:
+    return [config_mod.ConfigResolver.parse_set_spec(s) for s in specs]
+
+
+def _identity_env(config: config_mod.ResolvedConfig) -> dict[str, str]:
+    """Canonical target/resource identity env (protected; CLI/profile-driven).
+
+    These names are in the protected policy because the target identity is
+    controlled by dedicated CLI fields / profile ``[target]``/``[resources]``
+    sections, never by ``--set``/``--inherit``.  v2ctl itself sets them on
+    the child environment of deploy-capable commands.
+    """
+    return {
+        "COMFYMODAL_V2_APP_NAME": config.target.app,
+        "COMFYMODAL_V2_CLASS_NAME": config.target.class_name,
+        "COMFYMODAL_V2_GPU": config.resources.gpu,
+        "COMFYMODAL_V2_MEMORY_MB": str(config.resources.memory_mb),
+        "COMFYMODAL_V2_CPU_REQUEST": str(config.resources.cpu),
+        "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST": str(config.resources.memory_mb),
+        "COMFYMODAL_V2_BASELINE_CPU_REQUEST": str(config.resources.cpu),
+    }
+
+
+def _identity_env_for_command(command: str, config: config_mod.ResolvedConfig) -> dict[str, str]:
+    return _identity_env(config) if command in ("deploy", "deploy-run") else {}
+
+
+def build_components(repo_root: Path, profile_name: str, cli_options: dict[str, str] | None = None,
+                     sets: list[str] | None = None, inherits: list[str] | None = None,
+                     inherit_from: dict[str, str] | None = None):
+    registry = registry_mod.FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml")
+    registry.load()
+    profiles = profiles_mod.Profiles(repo_root / "config" / "v2" / "profiles")
+    resolver = config_mod.ConfigResolver(repo_root, profiles, registry)
+    config = resolver.resolve(
+        profile_name=profile_name,
+        cli_options=cli_options or {},
+        sets=_parse_sets(sets or []),
+        inherits=inherits or [],
+        inherit_from=inherit_from or os.environ,
+    )
+    fingerprints = fp_mod.FingerprintEngine(config)
+    env_builder = env_mod.EnvironmentBuilder()
+    backend_registry = backend_mod.BackendRegistry(repo_root)
+    return registry, profiles, resolver, config, fingerprints, env_builder, backend_registry
+
+
+def _redact_env(env: dict[str, str]) -> dict[str, str]:
+    return env_mod.EnvironmentBuilder().display(env)
+
+
+def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
+    """Derive the canonical backend selector argument from the resolved
+    config environment.
+
+    The deploy/run BATs enter their validation modes ONLY via the first
+    positional selector argument (e.g. ``E28_VALIDATION``) or the
+    corresponding env var.  Without it the run BAT falls back to the
+    restore-only PROBE path (``run_snapshot_restore_only_probe``) which never
+    invokes ``run_plan_stream`` and produces no generation artifact.  v2ctl
+    therefore forwards the selector when the profile requests a validation
+    mode.  Returns None when no selector applies (plain production run).
+    """
+    try:
+        env = {f.name: f.value for f in config.flags}
+        if str(env.get("V2_E28_VALIDATION", "0")) in ("1", "true", "yes", "on"):
+            return "E28_VALIDATION"
+        if str(env.get("V2_E26_VALIDATION", "0")) in ("1", "true", "yes", "on"):
+            return "E26_VALIDATION"
+        if str(env.get("V2_E25_VALIDATION", "0")) in ("1", "true", "yes", "on"):
+            return "E25_VALIDATION"
+    except Exception:
+        pass
+    return None
+
+
+def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
+    """The effective ``V2_BENCHMARK_MODE`` from the resolved config.
+
+    Returns the mode string (defaulting to ``e28_single`` — one full
+    ``run_plan_stream`` generation) or the profile's explicit mode.
+    """
+    try:
+        env = {f.name: f.value for f in config.flags}
+        mode = str(env.get("V2_BENCHMARK_MODE", "") or "e28_single").strip()
+        return mode or "e28_single"
+    except Exception:
+        return "e28_single"
+
+
+def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -> None:
+    """HARD GUARD: gate/run must produce a full generation (run_plan_stream),
+    never the snapshot-restore-only PROBE (which calls
+    ``run_snapshot_restore_only_probe`` and produces no generation artifact).
+
+    ``V2_BENCHMARK_MODE=snapshot_restore_only`` is a probe-only mode; using it
+    through the gate/run path is a configuration error and is refused before
+    any spend.
+    """
+    mode = _benchmark_mode(config)
+    if mode == "snapshot_restore_only":
+        raise GateError(
+            f"{command} refuses V2_BENCHMARK_MODE=snapshot_restore_only: that "
+            f"mode runs the restore-only PROBE (run_snapshot_restore_only_probe), "
+            f"which never invokes run_plan_stream and produces no generation "
+            f"artifact. Configure a full-run mode (e.g. e28_single) in the profile."
+        )
+
+
+def _deploy_version_advanced(
+    repo_root: Path, config: config_mod.ResolvedConfig, deploy_fp: str
+) -> bool:
+    """Verify the app's deployment version ADVANCED during this deploy.
+
+    The Modal client can exit 0 while the app was NOT actually updated (a
+    Windows charmap codec crash while printing build output, or a cached
+    no-op).  ``modal app history`` lists the app's deployment versions
+    (v1, v2, ...).  This helper returns True only when the newest version's
+    "Time deployed" is within the last few minutes (i.e. this deploy created
+    a new version).  Never raises: on any uncertainty it returns False so a
+    deploy is never wrongly treated as valid.
+    """
+    try:
+        import subprocess
+        import time
+
+        app_name = getattr(getattr(config, "target", None), "app", "") or ""
+        if not app_name:
+            return False
+        r = subprocess.run(
+            ["modal", "app", "history", app_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        if r.returncode != 0:
+            return False
+        # The history table has a "Time deployed" column; the newest version
+        # row lists the most recent deploy time.  Parse for "v<num>" rows and
+        # the newest timestamp.
+        newest_ts: float | None = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if "Central" in line or "deployed" in line.lower():
+                # e.g. "| v7      | 2026-08-19 16:41 Central Daylight | ..."
+                try:
+                    date_part = line.split("|")[2].strip()
+                    ts = time.mktime(
+                        time.strptime(date_part.split(" Central")[0].strip(), "%Y-%m-%d %H:%M")
+                    )
+                    if newest_ts is None or ts > newest_ts:
+                        newest_ts = ts
+                except Exception:
+                    continue
+        if newest_ts is None:
+            return False
+        return (time.time() - newest_ts) < 10 * 60  # within the last 10 minutes
+    except Exception:
+        return False
+
+
+# ── Manifests ──────────────────────────────────────────────────────────
+
+def _deployment_manifest_dir(repo_root: Path) -> Path:
+    return repo_root / ".v2ctl" / "deployments"
+
+
+def _run_manifest_dir(repo_root: Path) -> Path:
+    return repo_root / ".v2ctl" / "runs"
+
+
+def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
+                              fingerprints: fp_mod.FingerprintEngine,
+                              env: dict[str, str],
+                              result: backend_mod.BackendResult | None) -> Path:
+    d = _deployment_manifest_dir(repo_root)
+    d.mkdir(parents=True, exist_ok=True)
+    deploy_fp = fingerprints.deploy_fingerprint()
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": _utcnow_iso(),
+        "profile": config.profile_name,
+        "owner": config.owner,
+        "git": {"head": config.git.head, "branch": config.git.branch, "dirty": config.git.dirty},
+        "target": {"app": config.target.app, "class": config.target.class_name, "method": config.target.method},
+        "resources": {"gpu": config.resources.gpu, "cpu": config.resources.cpu,
+                      "memory_mb": config.resources.memory_mb,
+                      "min_containers": config.resources.min_containers,
+                      "scaledown_window": config.resources.scaledown_window},
+        "deploy_fingerprint": deploy_fp,
+        "deploy_inputs": fingerprints.deploy_inputs(),
+        "effective_environment": _redact_env(env),
+        "runtime_override_policy": config.runtime_override_policy,
+        # ── Truthful deploy-health state (E29 gate lesson) ─────────────────
+        # A Modal deploy exit 0 proves only that the app was uploaded and
+        # accepted ("transport deployed").  It does NOT prove the remote
+        # container lifecycle (restore) runs: crash-loop tracebacks appear
+        # only in Modal's remote lifecycle logs, never in the local deploy
+        # BAT stdout.  runtime_health_status is therefore ALWAYS "unverified"
+        # at deploy time; the first v2ctl gate/run is the health-validation
+        # boundary and updates it to "verified" only on a successful run.
+        "deployment_transport_status": "deployed",
+        "runtime_health_status": "unverified",
+        "health_check_note": (
+            "deploy exit 0 proves transport only; remote restore lifecycle "
+            "health is unverified until the first gate/run invocation observes "
+            "the container actually running (or a crash loop)"
+        ),
+    }
+    if result is not None:
+        manifest["backend"] = {
+            "command": result.command,
+            "exit_code": result.exit_code,
+            "started_at": result.started_at,
+            "ended_at": result.ended_at,
+            "elapsed_seconds": result.elapsed_seconds,
+        }
+        manifest["artifacts"] = {
+            "output_dir": str(result.artifacts.output_dir) if result.artifacts.output_dir else None,
+            "run_artifact": str(result.artifacts.run_artifact) if result.artifacts.run_artifact else None,
+            "summary_artifact": str(result.artifacts.summary_artifact) if result.artifacts.summary_artifact else None,
+            "campaign_manifest": str(result.artifacts.campaign_manifest) if result.artifacts.campaign_manifest else None,
+            "console_capture": str(result.artifacts.console_capture) if result.artifacts.console_capture else None,
+        }
+    path = d / f"deploy_{time.strftime('%Y%m%d-%H%M%S')}_{deploy_fp[:8]}.json"
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def latest_deployment_manifest(repo_root: Path) -> dict | None:
+    d = _deployment_manifest_dir(repo_root)
+    if not d.is_dir():
+        return None
+    files = sorted(d.glob("deploy_*.json"))
+    if not files:
+        return None
+    try:
+        return json.loads(files[-1].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
+                       fingerprints: fp_mod.FingerprintEngine,
+                       env: dict[str, str],
+                       result: backend_mod.BackendResult,
+                       provenance: prov_mod.Provenance | None) -> Path:
+    d = _run_manifest_dir(repo_root)
+    d.mkdir(parents=True, exist_ok=True)
+    run_fp = fingerprints.run_fingerprint()
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": _utcnow_iso(),
+        "profile": config.profile_name,
+        "owner": config.owner,
+        "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+        "run_fingerprint": run_fp,
+        "workload": {
+            "fresh_required": config.workload.fresh_required,
+            "conditioning_cache": config.workload.conditioning_cache,
+            "expected_output_sha": config.workload.expected_output_sha,
+            "run_count": config.workload.run_count,
+            "gap_seconds": config.workload.gap_seconds,
+            "nonce": config.workload.nonce,
+        },
+        "effective_environment": _redact_env(env),
+        "backend": {
+            "command": result.command,
+            "exit_code": result.exit_code,
+            "started_at": result.started_at,
+            "ended_at": result.ended_at,
+            "elapsed_seconds": result.elapsed_seconds,
+        },
+        "artifacts": {
+            "output_dir": str(result.artifacts.output_dir) if result.artifacts.output_dir else None,
+            "run_artifact": str(result.artifacts.run_artifact) if result.artifacts.run_artifact else None,
+            "summary_artifact": str(result.artifacts.summary_artifact) if result.artifacts.summary_artifact else None,
+            "campaign_manifest": str(result.artifacts.campaign_manifest) if result.artifacts.campaign_manifest else None,
+            "console_capture": str(result.artifacts.console_capture) if result.artifacts.console_capture else None,
+        },
+    }
+    if provenance is not None:
+        manifest["provenance"] = provenance.to_dict()
+    path = d / f"run_{time.strftime('%Y%m%d-%H%M%S')}_{run_fp[:8]}.json"
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def diff_deploy_inputs(expected: dict, actual: dict) -> list[str]:
+    """Leaf-path diff between two deploy_inputs dicts (sorted names)."""
+    changed: list[str] = []
+
+    def walk(a, b, prefix: str) -> None:
+        keys = sorted(set(a) | set(b))
+        for k in keys:
+            leaf = f"{prefix}.{k}" if prefix else k
+            av = a.get(k)
+            bv = b.get(k)
+            if isinstance(av, dict) and isinstance(bv, dict):
+                walk(av, bv, leaf)
+            elif av != bv:
+                changed.append(f"{leaf}: {av!r} -> {bv!r}")
+
+    walk(expected, actual, "")
+    return changed
+
+
+# ── Runtime-override gate ──────────────────────────────────────────────
+
+def enforce_runtime_overrides(config: config_mod.ResolvedConfig,
+                              inventory: ro_mod.RuntimeOverrideInventory,
+                              *,
+                              spend: bool) -> None:
+    """Fail before benchmark spend when runtime flag files are present."""
+    policy = config.runtime_override_policy or ro_mod.DEFAULT_RUNTIME_OVERRIDE_POLICY
+    present = inventory.list_local()
+    if policy == "forbid" and present:
+        names = ", ".join(f"{o.name}={o.value} ({o.source})" for o in present)
+        raise RuntimeOverrideViolation(
+            f"runtime flag files present and policy={policy}; refusing before spend. "
+            f"Files: {names}. Clear explicitly with "
+            f"`python tools/v2ctl.py runtime-flags clear <NAME>`; never auto-deleted.",
+            [{"name": o.name, "value": o.value, "source": o.source} for o in present],
+        )
+    if spend and policy == "forbid" and inventory.list_remote():
+        # Remote listing requires a helper; in this phase no helper is wired,
+        # so list_remote() returns [] and the local check above is the gate.
+        pass
+
+
+# ── Command implementations ────────────────────────────────────────────
+
+def cmd_version(args, repo_root: Path) -> int:
+    print(f"v2ctl {VERSION} (schema {SCHEMA_VERSION})")
+    return 0
+
+
+def cmd_doctor(args, repo_root: Path) -> int:
+    problems: list[str] = []
+    out: list[str] = ["[v2ctl.doctor]"]
+    # git state
+    git = config_mod.compute_git_state(repo_root)
+    out.append(f"git.head={git.head}")
+    out.append(f"git.branch={git.branch}")
+    out.append(f"git.dirty={int(git.dirty)}")
+    # python
+    out.append(f"python={sys.version.split()[0]}")
+    # backend scripts
+    backend_registry = backend_mod.BackendRegistry(repo_root)
+    for spec in backend_registry.available():
+        exists = spec.bat_path is not None and spec.bat_path.is_file()
+        out.append(f"backend.{spec.name}.exists={int(exists)} kind={spec.kind}")
+        if not exists:
+            problems.append(f"backend {spec.name} missing: {spec.bat_path}")
+    # registry/profile parse
+    try:
+        registry = registry_mod.FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml")
+        registry.load()
+        out.append(f"registry.flags={len(registry.registered_names())}")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"registry parse failed: {exc}")
+    try:
+        profiles = profiles_mod.Profiles(repo_root / "config" / "v2" / "profiles")
+        for name in profiles.available():
+            profiles.resolve(name)
+        out.append(f"profiles={','.join(profiles.available())}")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"profile parse failed: {exc}")
+    # runtime override policy
+    inventory = ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state")
+    present = inventory.list_local()
+    out.append(f"runtime_override_policy={ro_mod.DEFAULT_RUNTIME_OVERRIDE_POLICY}")
+    out.append(f"runtime_overrides.present={len(present)}")
+    for o in present:
+        out.append(f"runtime_override.{o.name}={o.value} source={o.source}")
+        problems.append(f"runtime flag file present: {o.name} (clear before gate/deploy-run)")
+    # deploy lock
+    lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+    status = lock.status()
+    if status is None:
+        out.append("deploy.lock=none")
+    else:
+        out.append(f"deploy.lock.owner={status.get('owner')} pid={status.get('pid')} "
+                   f"host={status.get('host')} target={status.get('target')} "
+                   f"profile={status.get('profile')} stale={int(lock.is_stale(status))}")
+        if lock.is_stale(status):
+            problems.append(f"deploy lock is stale (owner {status.get('owner')}); "
+                            "release with `lock force-release` after confirming ownership")
+    # deployment fingerprint match
+    manifest = latest_deployment_manifest(repo_root)
+    if manifest is None:
+        out.append("deployment.manifest=none")
+        problems.append("no deployment manifest found; run `v2ctl deploy-run` or `v2ctl deploy` first")
+    else:
+        try:
+            _, _, _, config, fingerprints, _, _ = build_components(repo_root, args.profile)
+            current = fingerprints.deploy_fingerprint()
+            stored = manifest.get("deploy_fingerprint")
+            match = stored == current
+            out.append(f"deployment.fingerprint.stored={stored}")
+            out.append(f"deployment.fingerprint.current={current}")
+            out.append(f"deployment.fingerprint.match={int(match)}")
+            if not match:
+                problems.append("deployment fingerprint mismatch: deploy-required state changed since last deploy")
+        except V2CtlError as exc:
+            problems.append(f"config resolution failed: {exc}")
+    for line in out:
+        print(line)
+    if problems:
+        print("[v2ctl.doctor] PROBLEMS:")
+        for p in problems:
+            print(f"  - {p}")
+        return 1
+    print("[v2ctl.doctor] OK")
+    return 0
+
+
+def _refuse_protected_explicit(config: config_mod.ResolvedConfig) -> None:
+    """Protected names must never arrive through explicit override channels."""
+    policy = env_mod.ProtectedPolicy.default()
+    for flag in [*config.flags, *config.unregistered]:
+        if flag.source in ("cli", "inherit", "set"):
+            policy.check(flag.name)
+
+
+def cmd_config(args, repo_root: Path) -> int:
+    try:
+        _, _, _, config, fingerprints, _, _ = build_components(
+            repo_root, args.profile,
+            sets=args.set, inherits=args.inherit,
+        )
+        _refuse_protected_explicit(config)
+    except V2CtlError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    out = {
+        "schema_version": SCHEMA_VERSION,
+        "profile": config.profile_name,
+        "owner": config.owner,
+        "git": {"head": config.git.head, "branch": config.git.branch, "dirty": config.git.dirty},
+        "target": {"app": config.target.app, "class": config.target.class_name, "method": config.target.method},
+        "resources": {"gpu": config.resources.gpu, "cpu": config.resources.cpu,
+                      "memory_mb": config.resources.memory_mb,
+                      "min_containers": config.resources.min_containers,
+                      "scaledown_window": config.resources.scaledown_window},
+        "workload": {"fresh_required": config.workload.fresh_required,
+                     "conditioning_cache": config.workload.conditioning_cache,
+                     "expected_output_sha": config.workload.expected_output_sha,
+                     "run_count": config.workload.run_count,
+                     "gap_seconds": config.workload.gap_seconds,
+                     "nonce": config.workload.nonce},
+        "runtime_override_policy": config.runtime_override_policy,
+        "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+        "run_fingerprint": fingerprints.run_fingerprint(),
+        "flags": [
+            {
+                "name": f.name, "value": f.value, "source": f.source,
+                "registered": f.registered, "consumed_at": f.consumed_at,
+                "change_requires": f.change_requires, "type": f.type,
+                "description": f.description,
+            }
+            for f in config.flags
+        ],
+        "unregistered": [
+            {"name": f.name, "value": f.value, "source": f.source,
+             "change_requires": f.change_requires}
+            for f in config.unregistered
+        ],
+    }
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_flags(args, repo_root: Path) -> int:
+    registry = registry_mod.FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml")
+    registry.load()
+    sub = args.flags_command
+    if sub == "list":
+        for f in registry.all_flags():
+            print(f"{f.name}\ttype={f.type}\tconsumed_at={f.consumed_at}\t"
+                  f"change_requires={f.change_requires}\towner={f.owner}")
+        return 0
+    if sub == "explain":
+        name = args.name
+        f = registry.get(name)
+        if f is None:
+            print(f"UNREGISTERED: {name}")
+            print("  Metadata is not admission: explicit --set is accepted for deploy/deploy-run.")
+            print("  Run-only use is refused until registered or proven request-time safe.")
+            return 0
+        print(f"name={f.name}")
+        print(f"type={f.type}")
+        print(f"default={f.default}")
+        print(f"consumed_at={f.consumed_at}")
+        print(f"change_requires={f.change_requires}")
+        print(f"owner={f.owner}")
+        print(f"description={f.description}")
+        if f.enum_values:
+            print(f"enum_values={','.join(f.enum_values)}")
+        if f.min is not None or f.max is not None:
+            print(f"range=[{f.min},{f.max}]")
+        if f.regex:
+            print(f"regex={f.regex}")
+        if f.aliases:
+            print(f"aliases={','.join(f.aliases)}")
+        if f.deprecated:
+            print("deprecated=true")
+        return 0
+    if sub == "validate":
+        try:
+            name, value = config_mod.ConfigResolver.parse_set_spec(args.name_value)
+        except FlagError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        registry_mod.FlagRegistry.validate_name(name)
+        f = registry.get(name)
+        if f is None:
+            print(f"UNREGISTERED: {name}={value} — syntax OK; accepted for deploy/deploy-run; "
+                  "run-only refused.")
+            return 0
+        try:
+            normalized = f.validate_value(value)
+        except FlagError as exc:
+            print(f"INVALID: {exc}", file=sys.stderr)
+            return 1
+        print(f"VALID: {name}={normalized} (type={f.type}, change_requires={f.change_requires})")
+        return 0
+    if sub == "audit":
+        consumed = _scan_consumed_names(repo_root)
+        profiles = profiles_mod.Profiles(repo_root / "config" / "v2" / "profiles")
+        profile_set: set[str] = set()
+        for name in profiles.available():
+            profile_set |= set(profiles.resolve(name).environment)
+        report = registry.audit(consumed, profile_set)
+        print("[v2ctl.flags.audit] advisory lint only - not a runtime whitelist")
+        print(f"consumed+registered ({len(report.consumed_registered)}):")
+        for n in report.consumed_registered:
+            print(f"  OK {n}")
+        print(f"consumed+unregistered ({len(report.consumed_unregistered)}):")
+        for n in report.consumed_unregistered:
+            print(f"  WARN {n} (runtime reads it; registry has no metadata)")
+        print(f"registered+no-consumer ({len(report.registered_no_consumer)}):")
+        for n in report.registered_no_consumer:
+            print(f"  WARN {n} (registered but no consumer found in sources)")
+        print(f"profile-set+no-consumer ({len(report.profile_set_no_consumer)}):")
+        for n in report.profile_set_no_consumer:
+            print(f"  WARN {n} (profile sets it; no consumer found)")
+        return 0
+    print("usage: v2ctl flags list|explain NAME|validate NAME=VALUE|audit", file=sys.stderr)
+    return 2
+
+
+def _require_no_deploy_in_flight(repo_root: Path) -> None:
+    lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+    status = lock.status()
+    if status is not None and not lock.is_stale(status):
+        raise LockHeldError(
+            f"deploy in flight by {status.get('owner')} (pid {status.get('pid')} "
+            f"on {status.get('host')}, target {status.get('target')}, "
+            f"profile {status.get('profile')}); run refused until released",
+            owner=status.get("owner"), pid=status.get("pid"), host=status.get("host"),
+            target=status.get("target"), profile=status.get("profile"),
+            timestamp=status.get("timestamp"),
+        )
+
+
+def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.FingerprintEngine,
+                    env: dict[str, str], command: str) -> None:
+    print("[v2ctl.dry-run] no invocation performed; effective configuration:")
+    print(f"profile={config.profile_name} owner={config.owner}")
+    print(f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
+    print(f"run_fingerprint={fingerprints.run_fingerprint()}")
+    print(f"command={command}")
+    print("[v2ctl.dry-run] child environment (redacted):")
+    redacted = env_mod.EnvironmentBuilder().display(env)
+    for k in sorted(redacted):
+        print(f"  {k}={redacted[k]}")
+
+
+def cmd_deploy(args, repo_root: Path) -> int:
+    try:
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
+            repo_root, args.profile, cli_options=_cli_target_options(args),
+            sets=args.set, inherits=args.inherit,
+        )
+        spec = backend_registry.deploy_only()
+        env = env_builder.build(config, host_env=os.environ,
+                                backend_extra={**spec.deploy_only_env,
+                                               **_identity_env_for_command("deploy", config)})
+        # Forward the canonical selector (e.g. E28_VALIDATION) as the BAT's
+        # first positional arg: the deploy BAT reads %~1 to activate its
+        # validation branch (env alone is not sufficient in all paths).
+        selector = _backend_selector(config)
+        command = backend_mod.BackendRunner.build_command_line(
+            spec, [selector] if selector else [])
+        if args.dry_run:
+            _dry_run_report(config, fingerprints, env, command)
+            return 0
+        # Deploy-only: warn (not fail) on runtime overrides; spend happens at run time.
+        inventory = ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state")
+        present = inventory.list_local()
+        if present and config.runtime_override_policy == "forbid":
+            print(f"[v2ctl.deploy] WARNING: {len(present)} runtime flag file(s) present; "
+                  "they will be enforced at gate/run time", file=sys.stderr)
+        lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+        lock.acquire(owner=config.owner or args.owner or "v2ctl",
+                     target=config.target.app, profile=config.profile_name)
+        try:
+            print(f"[v2ctl.deploy] profile={config.profile_name} "
+                  f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
+            print(f"[v2ctl.deploy] command={command}")
+            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+                spec, config=config, extra_env=env, capture=True)
+            # ── Crash-loop guard: a container that repeats the same traceback
+            # must NEVER produce a "successful" deployment manifest.  Diagnose
+            # the root cause locally and redeploy; never auto-retry. ──
+            crash = backend_mod.detect_crash_loop(result.stdout or "")
+            if crash is not None:
+                raise DeployCrashLoopError(
+                    f"deployed container is crash-looping: exception "
+                    f"{crash['exception_type']!r} repeated {crash['count']}x "
+                    f"in the deploy output. STOP: fix the root cause locally "
+                    f"and redeploy; the deployment is NOT valid.",
+                    exception_type=crash["exception_type"],
+                    count=int(crash["count"]),
+                )
+            manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
+            print(f"[v2ctl.deploy] exit={result.exit_code} manifest={manifest}")
+            if not result.ok():
+                # A failed deploy must NEVER leave a "deployed" manifest behind:
+                # remove it so gate/run cannot treat a broken deployment as valid.
+                try:
+                    manifest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return result.exit_code if result.exit_code else 1
+            # ── Deploy-version-advance verification (E29 root-cause fix) ────
+            # A Modal client can exit 0 while the app was NOT actually updated
+            # (Windows charmap crash, cached no-op).  Verify the app's
+            # deployment version ADVANCED during this deploy; if it did not,
+            # the deploy must be treated as a failure — never exit 0 on a
+            # deploy that left the app unchanged.
+            if not _deploy_version_advanced(repo_root, config, fingerprints.deploy_fingerprint()):
+                try:
+                    manifest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                print(
+                    "ERROR: deploy reported success but the app's deployment "
+                    "version did NOT advance — the deployed code was NOT "
+                    "updated. Refusing to treat this deploy as valid.",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
+        finally:
+            lock.release()
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_deploy_run(args, repo_root: Path) -> int:
+    try:
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
+            repo_root, args.profile, cli_options=_cli_target_options(args),
+            sets=args.set, inherits=args.inherit,
+        )
+        spec = backend_registry.canonical()
+        env = env_builder.build(config, host_env=os.environ,
+                                backend_extra=_identity_env_for_command("deploy-run", config))
+        # Forward the canonical selector as the BAT's first positional arg
+        # (see cmd_deploy).
+        selector = _backend_selector(config)
+        command = backend_mod.BackendRunner.build_command_line(
+            spec, [selector] if selector else [])
+        if args.dry_run:
+            _dry_run_report(config, fingerprints, env, command)
+            return 0
+        enforce_runtime_overrides(config,
+                                  ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
+                                  spend=True)
+        lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+        lock.acquire(owner=config.owner or args.owner or "v2ctl",
+                     target=config.target.app, profile=config.profile_name)
+        try:
+            print(f"[v2ctl.deploy-run] profile={config.profile_name} "
+                  f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
+            print(f"[v2ctl.deploy-run] command={command}")
+            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+                spec, config=config, extra_env=env, capture=True)
+            manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
+            print(f"[v2ctl.deploy-run] exit={result.exit_code} manifest={manifest}")
+            if not result.ok():
+                try:
+                    manifest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return result.exit_code if result.exit_code else 1
+            return 0
+        finally:
+            lock.release()
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_run(args, repo_root: Path) -> int:
+    try:
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
+            repo_root, args.profile, cli_options=_cli_target_options(args),
+            sets=args.set, inherits=args.inherit,
+        )
+        # Run-only: refuse unregistered and deploy-required explicit changes.
+        resolver.check_run_safety(config, run_only=True)
+        _require_no_deploy_in_flight(repo_root)
+        manifest = latest_deployment_manifest(repo_root)
+        if manifest is None:
+            raise GateError("no deployment manifest; run `v2ctl deploy-run` (or `deploy`) first")
+        stored = manifest.get("deploy_fingerprint")
+        current = fingerprints.deploy_fingerprint()
+        if stored != current:
+            changes = diff_deploy_inputs(manifest.get("deploy_inputs", {}),
+                                         fingerprints.deploy_inputs())
+            raise GateError(
+                "deployment fingerprint mismatch; deploy-required state changed since last "
+                f"deploy. stored={stored} current={current}. Changed: "
+                + ("; ".join(changes) if changes else "(unknown)"),
+            )
+        enforce_runtime_overrides(config,
+                                  ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
+                                  spend=True)
+        # ── Full-run guard: run must generate (run_plan_stream), never the
+        # snapshot-restore-only PROBE. ──
+        _require_full_run_mode(config, command="v2ctl run")
+        run_count = args.run_count or config.workload.run_count
+        spec = backend_registry.run_only()
+        env = env_builder.build(config, host_env=os.environ,
+                                backend_extra={"V2_BENCHMARK_RUNS": str(run_count)})
+        # Forward the canonical selector as the BAT's first positional arg so
+        # the run BAT enters its validation mode (e.g. E28_VALIDATION) instead
+        # of falling into the snapshot_restore_only probe branch.
+        selector = _backend_selector(config)
+        extra_args = ([selector] if selector else []) + ["--run-count", str(run_count)]
+        command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
+        if args.dry_run:
+            _dry_run_report(config, fingerprints, env, command)
+            return 0
+        print(f"[v2ctl.run] profile={config.profile_name} "
+              f"deploy_fingerprint={current} run_fingerprint={fingerprints.run_fingerprint()}")
+        print(f"[v2ctl.run] command={command}")
+        result = backend_mod.BackendRunner(repo_root, env_builder).run(
+            spec, config=config, extra_args=extra_args, extra_env=env, capture=True)
+        provenance = prov_mod.build_provenance(config, env, current, fingerprints.run_fingerprint(), [])
+        run_manifest = write_run_manifest(repo_root, config, fingerprints, env, result, provenance)
+        if result.artifacts.run_artifact is not None:
+            try:
+                prov_mod.write_provenance_sibling(result.artifacts.run_artifact, provenance)
+            except OSError:
+                pass
+        print(f"[v2ctl.run] exit={result.exit_code} manifest={run_manifest}")
+        if not result.ok():
+            return result.exit_code if result.exit_code else 1
+        return 0
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_gate(args, repo_root: Path) -> int:
+    try:
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
+            repo_root, args.profile, cli_options=_cli_target_options(args),
+            sets=args.set, inherits=args.inherit,
+        )
+        resolver.check_run_safety(config, run_only=True)
+        _require_no_deploy_in_flight(repo_root)
+        manifest = latest_deployment_manifest(repo_root)
+        if manifest is None or manifest.get("deploy_fingerprint") != fingerprints.deploy_fingerprint():
+            raise GateError("gate requires a deployment whose fingerprint matches the requested "
+                            "configuration; run `v2ctl deploy-run` first")
+        enforce_runtime_overrides(config,
+                                  ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
+                                  spend=True)
+        # ── Full-run guard: a gate must generate (run_plan_stream), never
+        # the snapshot-restore-only PROBE. ──
+        _require_full_run_mode(config, command="v2ctl gate")
+        spec = backend_registry.run_only()
+        if args.dry_run:
+            env = env_builder.build(config, host_env=os.environ, backend_extra={"V2_BENCHMARK_RUNS": "1"})
+            command = backend_mod.BackendRunner.build_command_line(spec, ["--run-count", "1"])
+            _dry_run_report(config, fingerprints, env, command)
+            return 0
+        validator = val_mod.Validator()
+        validator.register(val_mod.StructuralValidator())
+        validator.register(val_mod.ExpectedOutputShaValidator())
+        runner = backend_mod.BackendRunner(repo_root, env_builder)
+        gate = val_mod.GateRunner(repo_root=repo_root, fingerprints=fingerprints,
+                                  validators=validator, backend_runner=runner,
+                                  env_builder=env_builder)
+        result = gate.run_gate(config, spec)
+        print(f"[v2ctl.gate] valid={int(result.valid)} manifest={result.manifest_path}")
+        for reason in result.reasons:
+            print(f"  FAIL {reason}")
+        if result.run is not None and result.run.artifacts.run_artifact is not None:
+            provenance = prov_mod.build_provenance(
+                config, env_builder.build(config, host_env=os.environ,
+                                          backend_extra={"V2_BENCHMARK_RUNS": "1"}),
+                fingerprints.deploy_fingerprint(), fingerprints.run_fingerprint(), [])
+            try:
+                prov_mod.write_provenance_sibling(result.run.artifacts.run_artifact, provenance)
+            except OSError:
+                pass
+        return 0 if result.valid else 1
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_confirm(args, repo_root: Path) -> int:
+    try:
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
+            repo_root, args.profile, cli_options=_cli_target_options(args),
+            sets=args.set, inherits=args.inherit,
+        )
+        resolver.check_run_safety(config, run_only=True)
+        _require_no_deploy_in_flight(repo_root)
+        enforce_runtime_overrides(config,
+                                  ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
+                                  spend=True)
+        spec = backend_registry.run_only()
+        runs = args.runs or 1
+        if args.dry_run:
+            env = env_builder.build(config, host_env=os.environ,
+                                    backend_extra={"V2_BENCHMARK_RUNS": str(runs)})
+            command = backend_mod.BackendRunner.build_command_line(spec, ["--run-count", str(runs)])
+            _dry_run_report(config, fingerprints, env, command)
+            return 0
+        validator = val_mod.Validator()
+        validator.register(val_mod.StructuralValidator())
+        validator.register(val_mod.ExpectedOutputShaValidator())
+        runner = backend_mod.BackendRunner(repo_root, env_builder)
+        confirm = val_mod.ConfirmRunner(repo_root=repo_root, fingerprints=fingerprints,
+                                        backend_runner=runner, env_builder=env_builder)
+        result = confirm.confirm(Path(args.from_gate), config, spec, runs=runs)
+        print(f"[v2ctl.confirm] valid={int(result.valid)} manifest={result.manifest_path}")
+        for reason in result.reasons:
+            print(f"  FAIL {reason}")
+        return 0 if result.valid else 1
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_runtime_flags(args, repo_root: Path) -> int:
+    inventory = ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state")
+    sub = args.runtime_command
+    if sub == "list":
+        local = inventory.list_local()
+        print(f"runtime_override_policy={ro_mod.DEFAULT_RUNTIME_OVERRIDE_POLICY}")
+        print(f"local_override_count={len(local)}")
+        for o in local:
+            print(f"{o.name}={o.value} source={o.source}")
+        print("remote listing: not available in this phase (helper deferred; no remote calls made)")
+        return 0
+    if sub == "clear":
+        name = args.name
+        try:
+            removed = inventory.clear_local(name)
+        except ro_mod.RuntimeOverrideViolation as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if removed:
+            print(f"cleared {name}")
+            return 0
+        print(f"not present locally: {name}")
+        return 1
+    if sub == "clear-all":
+        try:
+            removed = inventory.clear_local_all(args.confirm)
+        except ro_mod.RuntimeOverrideViolation as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"cleared {len(removed)}: {', '.join(removed) if removed else '(none)'}")
+        return 0
+    return 2
+
+
+def cmd_lock(args, repo_root: Path) -> int:
+    lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+    sub = args.lock_command
+    if sub == "status":
+        status = lock.status()
+        if status is None:
+            print("deploy.lock=none")
+            return 0
+        stale = lock.is_stale(status)
+        print(f"owner={status.get('owner')}")
+        print(f"pid={status.get('pid')}")
+        print(f"host={status.get('host')}")
+        print(f"target={status.get('target')}")
+        print(f"profile={status.get('profile')}")
+        print(f"timestamp={status.get('timestamp')}")
+        print(f"stale={int(stale)}")
+        if stale:
+            print("stale lock: release with `v2ctl lock force-release` after confirming ownership")
+        return 0
+    if sub == "acquire":
+        try:
+            lock.acquire(owner=args.owner or "v2ctl", target=args.target or "unknown",
+                         profile=args.profile, force=args.force)
+        except (LockHeldError, LockStaleError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"acquired: {lock.status()}")
+        return 0
+    if sub == "release":
+        try:
+            lock.release()
+        except LockHeldError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print("released")
+        return 0
+    if sub == "force-release":
+        lock.force_release(args.owner or "v2ctl")
+        print("force-released")
+        return 0
+    return 2
+
+
+def _cli_target_options(args) -> dict[str, str]:
+    opts: dict[str, str] = {}
+    if getattr(args, "app", None):
+        opts["target.app"] = args.app
+    if getattr(args, "gpu", None):
+        opts["resources.gpu"] = args.gpu
+    if getattr(args, "memory_mb", None):
+        opts["resources.memory_mb"] = str(args.memory_mb)
+    if getattr(args, "cpu", None):
+        opts["resources.cpu"] = str(args.cpu)
+    if getattr(args, "owner", None):
+        opts["owner"] = args.owner
+    return opts
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="v2ctl",
+        description="ComfyUI Modal V2 canonical deploy/run control plane (local-only).",
+    )
+    parser.add_argument("--profile", default="production", help="profile name (config/v2/profiles)")
+    parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                        help="explicit flag override (highest precedence; repeatable)")
+    parser.add_argument("--inherit", action="append", default=[], metavar="NAME",
+                        help="explicitly inherit one ambient env var (repeatable)")
+    parser.add_argument("--owner", default=None, help="deploy owner label for the lock")
+    parser.add_argument("--dry-run", action="store_true", help="resolve and print, invoke nothing")
+    parser.add_argument("--json", action="store_true", help="machine-readable output where supported")
+    parser.add_argument("--app", default=None, help="override target app (protected from --set)")
+    parser.add_argument("--gpu", default=None, help="override resource GPU")
+    parser.add_argument("--memory-mb", type=int, default=None, help="override resource memory")
+    parser.add_argument("--cpu", type=int, default=None, help="override resource CPU")
+    parser.add_argument("--run-count", type=int, default=None, help="override run count")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("version")
+    p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser("doctor")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("config")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("flags")
+    fsub = p.add_subparsers(dest="flags_command", required=True)
+    fsub.add_parser("list").set_defaults(func=cmd_flags)
+    pe = fsub.add_parser("explain")
+    pe.add_argument("name")
+    pe.set_defaults(func=cmd_flags)
+    pv = fsub.add_parser("validate")
+    pv.add_argument("name_value", metavar="NAME=VALUE")
+    pv.set_defaults(func=cmd_flags)
+    fsub.add_parser("audit").set_defaults(func=cmd_flags)
+
+    p = sub.add_parser("deploy")
+    p.set_defaults(func=cmd_deploy)
+
+    p = sub.add_parser("deploy-run")
+    p.set_defaults(func=cmd_deploy_run)
+
+    p = sub.add_parser("run")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("gate")
+    p.set_defaults(func=cmd_gate)
+
+    p = sub.add_parser("confirm")
+    p.add_argument("--from", dest="from_gate", required=True, metavar="GATE_MANIFEST")
+    p.add_argument("--runs", type=int, default=1)
+    p.set_defaults(func=cmd_confirm)
+
+    p = sub.add_parser("runtime-flags")
+    rsub = p.add_subparsers(dest="runtime_command", required=True)
+    rsub.add_parser("list").set_defaults(func=cmd_runtime_flags)
+    rc = rsub.add_parser("clear")
+    rc.add_argument("name")
+    rc.set_defaults(func=cmd_runtime_flags)
+    ra = rsub.add_parser("clear-all")
+    ra.add_argument("--confirm", action="store_true", required=True)
+    ra.set_defaults(func=cmd_runtime_flags)
+
+    p = sub.add_parser("lock")
+    lsub = p.add_subparsers(dest="lock_command", required=True)
+    lsub.add_parser("status").set_defaults(func=cmd_lock)
+    la = lsub.add_parser("acquire")
+    la.add_argument("--force", action="store_true")
+    la.add_argument("--target", default=None)
+    la.set_defaults(func=cmd_lock)
+    lsub.add_parser("release").set_defaults(func=cmd_lock)
+    lf = lsub.add_parser("force-release")
+    lf.set_defaults(func=cmd_lock)
+
+    return parser
+
+
+_GLOBAL_HOIST_WITH_VALUE = ("--profile", "--owner")
+
+
+def _hoist_global_options(argv: list[str]) -> list[str]:
+    """Move repeatable/global options before the subcommand.
+
+    argparse rejects global options after a subcommand; agents naturally
+    write ``v2ctl run --set X=1 --dry-run``.  This pre-pass hoists the
+    repeatable and boolean global flags (and their values) to the front so
+    both orderings work.
+    """
+    front: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--set", "--inherit") or arg in _GLOBAL_HOIST_WITH_VALUE:
+            if i + 1 < len(argv):
+                front.extend([arg, argv[i + 1]])
+                i += 2
+                continue
+            rest.append(arg)
+            i += 1
+            continue
+        if arg in ("--dry-run", "--json"):
+            front.append(arg)
+            i += 1
+            continue
+        rest.append(arg)
+        i += 1
+    return front + rest
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(_hoist_global_options(argv))
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        return args.func(args, repo_root)
+    except V2CtlError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1941,6 +1941,19 @@ class RuntimeBootstrap:
 
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
+        # ── E29: canonical ledger restore boundary (measurement only) ────────
+        # The remote restore begins at this first executable line; record it on
+        # the canonical axis so the ledger can bridge bootstrap -> modal_app
+        # restore() -> request method entry without gaps.
+        try:
+            from .critical_path_ledger import record_event as _ledger_event
+            _ledger_event(
+                "bootstrap_restore_entry",
+                mono_ns=time.monotonic_ns(),
+                metadata={"source": "runtime_bootstrap.restore"},
+            )
+        except Exception:
+            pass
         # ── Measurement-only decomposition state (inert unless
         # COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS is set) ──────────────────
         _opt_fastdisk_wrapper_ms: float | None = None

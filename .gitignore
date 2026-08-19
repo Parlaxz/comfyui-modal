@@ -98,3 +98,6 @@ playwright-*.md
 
 # Runtime-state volume directory (restore-plan + snapshot-seed payloads)
 .runtime_state/
+
+# v2ctl local control-plane state (deploy/run manifests, locks, gates)
+.v2ctl/

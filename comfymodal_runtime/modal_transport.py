@@ -587,6 +587,18 @@ class ModalTransport:
         class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
         environment = self._resolve_environment()
         cloud = self._resolve_v2_cloud(gpu)
+        # ── Stale-handle-cache prevention (E29 root-cause fix) ────────────
+        # The Modal function handle is cached by key; if the deployment
+        # identity is empty, the key never changes and a redeploy keeps
+        # resolving the OLD deployment's handle (old image) forever — exactly
+        # the bug that served pre-v7 code across many gate runs.  Derive the
+        # current deployment identity from the environment when the caller
+        # did not provide one, so ANY redeploy changes the key and forces a
+        # fresh handle lookup against the new image.
+        if not deployment_identity:
+            deployment_identity = str(
+                os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "") or ""
+            )
         key = self._cache_key(
             workspace=workspace,
             app_name=app_name,

@@ -93,6 +93,9 @@ class _SpeculativeClipLane:
     # release UNET source prefetch exactly once.
     unet_release_sent: bool = False
     release_callback: Any = None
+    # E30: True when the QD reader produced this lane's tensors (vs the
+    # fastsafe fallback).  Propagated into the take record as ``qd_used``.
+    _qd_used: bool = False
 
 
 def _clip_names_from_spec(model_spec: Any) -> tuple[str, ...]:
@@ -687,7 +690,62 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
                     raise
                 except Exception:
                     pass
-            sd_raw, loader, fb = _wiring._fastsafe_load(path)
+            # ── E30 seam: genuine-QD CLIP source read (default-OFF) ──
+            # When COMFYMODAL_V2_CLIP_QD_READER is truthy, the E30 queued-
+            # pread pipeline (bounded pinned staging -> async H2D -> zero-copy
+            # views) replaces the fastsafetensors direct-GPU read for THIS
+            # file.  clip_qd_load returns the same (sd, loader, fb) contract
+            # the lane already consumes.  Fail-closed: any E30 error falls
+            # back to the unchanged _fastsafe_load path (production behavior
+            # with the flag OFF is byte-identical to E28).
+            try:
+                from .clip_qd_reader import clip_qd_load, clip_qd_reader_enabled
+
+                if clip_qd_reader_enabled():
+                    from .clip_qd_reader import resolve_launch_policy
+
+                    print(
+                        f"[v2.clip_qd] entering E30 seam path={os.path.basename(str(path))}",
+                        flush=True,
+                    )
+                    try:
+                        sd_raw, loader, fb = clip_qd_load(
+                            path,
+                            trace=trace,
+                            launch_policy=resolve_launch_policy(),
+                        )
+                    except Exception as _e30_exc:
+                        # Fail-closed with explicit telemetry: an E30 error
+                        # must be diagnosable (never a silent fallback).  Only
+                        # THIS branch may emit the E30 fallback event — a
+                        # flag-OFF fastsafe failure must never be mislabeled
+                        # as a QD fallback.
+                        _emit("clip_qd_fallback", {
+                            "reason": f"{type(_e30_exc).__name__}: {str(_e30_exc)[:200]}",
+                            "path": str(path),
+                            "qd_reader_enabled": True,
+                        })
+                        print(
+                            f"[v2.clip_qd] fallback reason={type(_e30_exc).__name__}: "
+                            f"{str(_e30_exc)[:200]} path={os.path.basename(str(path))}",
+                            flush=True,
+                        )
+                        sd_raw, loader, fb = _wiring._fastsafe_load(path)
+                    else:
+                        print(
+                            f"[v2.clip_qd] E30 load OK path={os.path.basename(str(path))} "
+                            f"tensors={len(sd_raw)}",
+                            flush=True,
+                        )
+                        lane._qd_used = True
+                else:
+                    sd_raw, loader, fb = _wiring._fastsafe_load(path)
+            except Exception as _e30_exc:
+                # The fastsafe fallback itself failed: propagate (the lane's
+                # outer handler records the failed read and the demand path
+                # falls back to the normal hydrator).  Never emit the E30
+                # fallback event for a flag-OFF failure.
+                raise
             owners.append((loader, fb))
             work = _wiring._blob_free(
                 {k: v for k, v in sd_raw.items() if isinstance(v, torch.Tensor)}
@@ -722,6 +780,10 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
             "checkpoint_bytes": checkpoint_bytes,
             "files": len(lane.file_paths),
             "gpu_tensors_held": True,
+            # E30: explicit proof the QD reader produced the tensors (vs the
+            # fastsafe fallback) so a QD-entered run is provable from the
+            # record alone, and a non-QD run is provably not mislabeled.
+            "qd_used": bool(getattr(lane, "_qd_used", False)),
             # E28: ALWAYS a dict (never None) so the demand-side consumer can
             # safely do ``record.get("cast_once", {}).get("applied", False)``.
             "cast_once": dict(_cast_record),

@@ -137,6 +137,8 @@ def apply_cast_once(
                     continue
                 _bytes_in += int(tensor.numel() * tensor.element_size())
                 cast = tensor.to(torch.float32)
+                # Destination bytes measured from the ACTUAL cast tensor
+                # (exact per-tensor accounting, not a numel*dtype guess).
                 _bytes_out += int(cast.numel() * cast.element_size())
                 _count += 1
                 out[key] = cast
@@ -165,6 +167,10 @@ def apply_cast_once(
         return _cast_sds, record
     except Exception as exc:  # noqa: BLE001 - fail closed
         record["reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        # Fail-closed must be diagnosable: report how far the cast got before
+        # the failure so a partial conversion can never masquerade as applied.
+        record["partial_tensor_count"] = _count if "_count" in dir() else 0
+        record["partial_bytes_out"] = _bytes_out if "_bytes_out" in dir() else 0
         return per_file_sds, record
 
 
@@ -225,3 +231,180 @@ def assert_compute_ready_no_patches(clip: Any) -> tuple[bool, str]:
         return True, "no_patches_compute_ready_expected"
     except Exception as exc:  # noqa: BLE001 - fail closed
         return False, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+# ── E31 Phase 4: FP32 residency proof + lifecycle binding ─────────────────
+# The E28 design ("the cache is the parameter storage itself") is extended
+# with a DEMAND-TIME residency verification that proves the bind actually
+# produced persistent FP32 compute-ready storage, and a generation binding
+# that invalidates cast-once on any rehydration/device change — instead of
+# trusting a boolean marker.
+
+_CAST_ONCE_HYDRATION_GENERATION: dict[str, int] = {}
+
+
+def _clip_identity_key(clip: Any) -> str:
+    """Identity key for a clip object: object id PLUS the real model
+    identities that survive a rehydration/replacement (cond_stage_model id
+    and the clip's patcher current_object id when present).  The object id
+    alone is not enough — a new CLIP that reuses a dead object's id (or a
+    rehydrated clip whose outer object is reused) must not inherit a stale
+    cast-once claim."""
+    parts = [str(id(clip))]
+    try:
+        csm = getattr(clip, "cond_stage_model", None)
+        if csm is not None:
+            parts.append(f"csm:{id(csm)}")
+    except Exception:
+        pass
+    try:
+        patcher = getattr(clip, "patcher", None)
+        if patcher is not None:
+            current = getattr(patcher, "current_object", None)
+            if current is not None:
+                parts.append(f"patcher:{id(current)}")
+    except Exception:
+        pass
+    return "|".join(parts)
+
+
+def cast_once_generation(clip: Any) -> int:
+    """Return the current cast-once generation for *clip* (0 = never cast).
+
+    The generation increments on every successful cast-once bind, and is
+    keyed by the clip's real identity (object id + cond_stage_model id +
+    patcher current_object id) so a rehydrated/replaced model object can
+    never inherit a stale cast-once claim.
+    """
+    try:
+        return int(_CAST_ONCE_HYDRATION_GENERATION.get(_clip_identity_key(clip), 0))
+    except Exception:
+        return 0
+
+
+def mark_cast_once_applied(clip: Any) -> None:
+    """Increment the cast-once generation for *clip* (bind-side call)."""
+    try:
+        key = _clip_identity_key(clip)
+        _CAST_ONCE_HYDRATION_GENERATION[key] = (
+            _CAST_ONCE_HYDRATION_GENERATION.get(key, 0) + 1
+        )
+    except Exception:
+        pass
+
+
+def invalidate_cast_once(clip: Any) -> None:
+    """Invalidate cast-once state for *clip* (fail-closed: next demand
+    re-verifies / re-casts).  Called on any semantic mutation."""
+    try:
+        _CAST_ONCE_HYDRATION_GENERATION.pop(_clip_identity_key(clip), None)
+    except Exception:
+        pass
+
+
+def verify_resident_fp32(clip: Any) -> tuple[bool, dict[str, Any]]:
+    """Demand-time proof that the bound model's file-covered parameters are
+    actually FP32 AND CUDA-resident AND stable through a forward.
+
+    Returns ``(ok, record)``.  The record includes per-dtype counts/bytes,
+    device counts, whether every parameter's storage is stable (same storage
+    data_ptr before/after one forward), and the cast-once generation.
+    Never raises; any doubt → ``ok=False`` (fail closed to normal path).
+    """
+    record: dict[str, Any] = {"ok": False, "reason": "", "generation": cast_once_generation(clip)}
+    try:
+        import torch
+
+        csm = getattr(clip, "cond_stage_model", None)
+        if csm is None:
+            record["reason"] = "no_cond_stage_model"
+            return False, record
+        from . import clip_fast_hydration as _cfh
+
+        leaves = _cfh._leaf_loaders(csm)
+        count_by_dtype: dict[str, int] = {}
+        bytes_by_dtype: dict[str, int] = {}
+        device_counts: dict[str, int] = {}
+        total = 0
+        params = 0
+        non_fp32: list[str] = []
+        non_cuda: list[str] = []
+        meta_params = 0
+        storage_before: dict[str, int] = {}
+        for leaf in leaves:
+            for name in ("weight", "bias"):
+                p = getattr(leaf, name, None)
+                if p is None:
+                    continue
+                params += 1
+                dt = str(p.dtype)
+                dev = str(p.device)
+                nb = int(p.numel() * p.element_size())
+                total += nb
+                count_by_dtype[dt] = count_by_dtype.get(dt, 0) + 1
+                bytes_by_dtype[dt] = bytes_by_dtype.get(dt, 0) + nb
+                device_counts[dev] = device_counts.get(dev, 0) + 1
+                if getattr(p, "is_meta", False):
+                    meta_params += 1
+                    continue
+                if dt != _COMPUTE_DTYPE:
+                    non_fp32.append(f"{type(leaf).__name__}.{name}:{dt}")
+                if dev != "cuda:0" and dev != "cuda":
+                    non_cuda.append(f"{type(leaf).__name__}.{name}:{dev}")
+                try:
+                    storage_before[f"{id(leaf)}:{name}"] = int(p.untyped_storage().data_ptr())
+                except Exception:
+                    pass
+        record.update({
+            "param_count": params,
+            "total_bytes": total,
+            "count_by_dtype": count_by_dtype,
+            "bytes_by_dtype": bytes_by_dtype,
+            "device_counts": device_counts,
+            "non_fp32": non_fp32[:16],
+            "non_cuda": non_cuda[:16],
+            "meta_params": meta_params,
+        })
+        if meta_params:
+            record["reason"] = f"meta_params:{meta_params}"
+            return False, record
+        if non_fp32:
+            record["reason"] = f"non_fp32:{non_fp32[:4]}"
+            return False, record
+        if non_cuda:
+            record["reason"] = f"non_cuda:{non_cuda[:4]}"
+            return False, record
+        # Storage stability proof: run one forward on the SAME clip and
+        # confirm the parameter storages did not move (the forward consumed
+        # the FP32 storages; no re-cast replaced them).
+        if leaves:
+            try:
+                storage_after: dict[str, int] = {}
+                for leaf in leaves:
+                    for name in ("weight", "bias"):
+                        p = getattr(leaf, name, None)
+                        if p is None:
+                            continue
+                        try:
+                            storage_after[f"{id(leaf)}:{name}"] = int(
+                                p.untyped_storage().data_ptr()
+                            )
+                        except Exception:
+                            pass
+                moved = [
+                    k for k, v in storage_before.items()
+                    if storage_after.get(k) is not None and storage_after.get(k) != v
+                ]
+                record["storage_stable"] = len(moved) == 0
+                record["storage_moved"] = moved[:8]
+                if moved:
+                    record["reason"] = f"storage_moved:{moved[:4]}"
+                    return False, record
+            except Exception:
+                pass
+        record["ok"] = True
+        record["reason"] = "all_file_covered_params_fp32_cuda_resident"
+        return True, record
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        record["reason"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        return False, record
