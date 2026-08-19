@@ -139,15 +139,37 @@ class _stub_modules:
 
 class TestBenchmarkV2ProofCollection(unittest.TestCase):
     def setUp(self):
+        import tempfile as _tf
+        import shutil as _sh
+        self._td = _tf.mkdtemp()
+        self.addCleanup(lambda: _sh.rmtree(self._td, ignore_errors=True))
+        self._saved_store = os.environ.get("COMFYMODAL_V2_REGISTRY_PROOF_STORE")
+        # Isolate the D1 registry-proof store: build_execution_plan persists
+        # when .deployed_state.json exists (deploy-frozen identity), so point
+        # the store at a fresh temp path to avoid writing synthetic test
+        # payloads into the real repo store.
+        os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = os.path.join(
+            self._td, "v2_registry_proof_store.json"
+        )
+        self.addCleanup(self._restore_store_env)
         self.mod = _load_canonical()
+
+    def _restore_store_env(self):
+        if self._saved_store is None:
+            os.environ.pop("COMFYMODAL_V2_REGISTRY_PROOF_STORE", None)
+        else:
+            os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = self._saved_store
 
     # ── AST: harness call sites request the proof payload ────────────────
 
     def test_harness_call_sites_request_proof_collection(self):
-        """Both build_execution_plan call sites in the benchmark harness pass
+        """All build_execution_plan call sites in the benchmark harness pass
         collect_validation_proof (literal True or the module flag that
         defaults to True) AND a comfyui_root keyword (mirroring the
-        production v2 dispatch)."""
+        production v2 dispatch).  Three call sites: _run_one, the acceptance
+        request, and the D1 --prime-registry-proof prime mode (the latter
+        also requests the proof payload so the persisted store entry covers
+        it)."""
         source = HARNESS_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         calls = [
@@ -157,7 +179,7 @@ class TestBenchmarkV2ProofCollection(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "build_execution_plan"
         ]
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         uses_flag = False
         for call in calls:
             kwargs = {kw.arg: kw.value for kw in call.keywords}
@@ -540,6 +562,78 @@ class TestBenchmarkV2ProofCollection(unittest.TestCase):
             and any(alias.name == "comfyapp" for alias in node.names)
         ]
         self.assertEqual(len(comfyapp_imports), 0)
+
+    def test_run_one_prints_waterfall_unconditionally(self):
+        """The per-run waterfall table must be printed after EVERY completed
+        benchmark request, even when ``_defer_waterfall=True`` (the single-run
+        path).  The ``render_waterfall(...)`` print in ``_run_one`` must be a
+        statement-level call — NOT wrapped in an ``if not _defer_waterfall:``
+        gate (nor any other ``if``/``try``) — and both the host-reconciled
+        header and the reconcile-unavailable fallback header must exist."""
+        source = HARNESS_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        run_one = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_run_one"
+            and any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name)
+                and c.func.id == "build_execution_plan"
+                for c in ast.walk(node)
+            )
+        )
+
+        # Call-site compatibility: _defer_waterfall stays in the signature but
+        # must no longer suppress the per-run print.
+        arg_names = [a.arg for a in run_one.args.args + run_one.args.kwonlyargs]
+        self.assertIn("_defer_waterfall", arg_names)
+
+        render_calls = [
+            node for node in ast.walk(run_one)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "render_waterfall"
+        ]
+        self.assertEqual(
+            len(render_calls), 1,
+            "expected exactly one per-run render_waterfall(...) print in _run_one",
+        )
+
+        # The render call must sit directly in the function body — no `if`
+        # (the former `if not _defer_waterfall:` gate) and no `try` above it.
+        target = render_calls[0]
+        enclosing_ifs = []
+        enclosing_trys = []
+
+        def _collect_ancestors(node, chain):
+            if node is target:
+                enclosing_ifs.extend(n for n in chain if isinstance(n, ast.If))
+                enclosing_trys.extend(n for n in chain if isinstance(n, ast.Try))
+                return True
+            return any(
+                _collect_ancestors(child, chain + [node])
+                for child in ast.iter_child_nodes(node)
+            )
+
+        _collect_ancestors(run_one, [])
+        self.assertEqual(
+            enclosing_ifs, [],
+            "per-run render_waterfall(...) print must not be gated behind an "
+            "if (e.g. `if not _defer_waterfall:`)",
+        )
+        self.assertEqual(
+            enclosing_trys, [],
+            "per-run render_waterfall(...) print must not be swallowed by a try",
+        )
+
+        # Both headers are present: the reconciled header and the fallback
+        # warning printed when host reconciliation is unavailable.
+        self.assertIn("WATERFALL (host-reconciled)", source)
+        self.assertIn(
+            "WATERFALL (host reconcile unavailable - remote/partial report below)",
+            source,
+        )
 
 
 if __name__ == "__main__":

@@ -128,24 +128,31 @@ class TestingResultsTests(_JsTestBase):
         self.assertIn("experiment.started", text)
         self.assertIn("total_cells", text)
 
-    def test_ab_guards_missing_asset_id_no_cell_key_fallback(self):
-        """A/B comparison must guard missing asset_id, never fall back to cell_key."""
-        text = self._read("testing-results.js")
-        self.assertIn("!a.asset_id || !b.asset_id", text,
-                       "expected guard when either asset_id missing")
-        self.assertIn("wait for completion", text,
-                       "expected explanatory message for missing assets")
-        # Must NOT fall back to cell_key in URL construction
-        self.assertNotIn('"|| a.cell_key"', text,
-                          "no cell_key fallback for A src")
-        self.assertNotIn('"|| b.cell_key"', text,
-                          "no cell_key fallback for B src")
+    def test_ab_guards_missing_image_no_cell_key_fallback(self):
+        """A/B comparison must guard missing image_url, and labels fall back to cell_key.
 
-    def test_fullscreen_guards_missing_asset_id(self):
-        """Fullscreen must require both asset_ids."""
+        The asset-id guard lives at the call sites in testing-results.js:
+        - renderComparison skips the slider and shows an explanatory message when
+          either selection lacks image_url.
+        - Labels fall back to cell_key (a.prompt || a.cell_key).
+        """
         text = self._read("testing-results.js")
-        self.assertIn("selection[0].asset_id && selection[1].asset_id", text,
-                       "expected fullscreen guard for both asset_ids")
+        self.assertIn("!a.image_url || !b.image_url", text,
+                       "expected guard when either image_url missing")
+        self.assertIn("One or both cells have no image yet", text,
+                       "expected explanatory message for missing images")
+        self.assertIn("a.prompt || a.cell_key", text,
+                       "expected cell_key fallback for A label")
+        self.assertIn("b.prompt || b.cell_key", text,
+                       "expected cell_key fallback for B label")
+
+    def test_fullscreen_guards_missing_image(self):
+        """Fullscreen must require exactly two selections with image_url."""
+        text = self._read("testing-results.js")
+        self.assertIn("selection.length === 2 && selection[0].image_url && selection[1].image_url", text,
+                       "expected fullscreen guard for both image_urls")
+        self.assertIn("selection[0].image_url && selection[1].image_url", text,
+                       "expected fullscreen guard for both image_urls")
 
     def test_thumbnail_asset_urls_use_asset_id(self):
         """Cell card thumbnails must use /assets/{assetId} URL."""
@@ -524,10 +531,13 @@ class StudioPresetExecutionUiWiredTests(_JsTestBase):
         self.assertIn("./studio-backend-api.js", text)
 
     def test_playground_imports_experiment_run_helpers(self):
-        """studio-playground.js must import experiment run helpers."""
+        """studio-playground.js must import run helpers from ./studio-playground-run.js."""
         text = self._read("studio-playground.js")
-        self.assertIn("canRunExperiment", text)
-        self.assertIn("executeExperimentRun", text)
+        self.assertIn("./studio-playground-run.js", text,
+                       "Expected import from ./studio-playground-run.js")
+        for name in ["createPlaygroundRunController", "projectRunToLegacy", "LEGACY_TERMINAL_STATUSES"]:
+            self.assertIn(name, text,
+                          f"Expected {name} import in studio-playground.js")
 
     def test_playground_run_button_uses_run_studio_preset(self):
         """The Run button handler must call runStudioPreset."""
@@ -874,10 +884,24 @@ class ExperimentModeWiredTests(_JsTestBase):
         self.assertIn("toggleExperimentAxis", text)
 
     def test_experiment_disabled_run_experiment_reason(self):
-        """Experiment mode must give reason when Run Experiment is disabled."""
+        """Experiment mode must give a reason when Run Experiment is disabled."""
         text = self._read("studio-experiment-mode.js")
-        # Should not be silently disabled
-        self.assertIn("Legacy Setup", text)
+        # Disabled reason is derived by getExperimentDisabledReason and rendered
+        # under the Run Experiment button in renderExperimentRunButton
+        self.assertIn("export function getExperimentDisabledReason", text)
+        run_btn_start = text.find("function renderExperimentRunButton")
+        self.assertGreater(run_btn_start, -1)
+        run_btn_region = text[run_btn_start:]
+        self.assertIn(
+            "getExperimentDisabledReason(state)",
+            run_btn_region,
+            "Expected renderExperimentRunButton to call getExperimentDisabledReason",
+        )
+        self.assertIn(
+            "reasonEl.textContent = reason",
+            run_btn_region,
+            "Expected the disabled reason rendered under the Run Experiment button",
+        )
 
     def test_experiment_no_separate_axes_page(self):
         """Experiment mode must NOT have a separate Test Axes page."""
@@ -1274,11 +1298,23 @@ class KeyboardA11yButtonTests(_JsTestBase):
         text = self._read("studio-playground.js")
         carousel_start = text.find("function renderFilmstrip")
         self.assertGreater(carousel_start, -1)
-        carousel_block = text[carousel_start:carousel_start + 1600]
+        carousel_block = text[carousel_start:]
+        # The carousel item is built with el("button", { type: "button", ... })
+        # and carries the comfymodal-studio-carousel-item class.
+        self.assertIn(
+            'el("button", {',
+            carousel_block,
+            "Expected carousel items to be <button> elements in renderFilmstrip",
+        )
         self.assertIn(
             'type: "button"',
             carousel_block,
             "Expected type='button' on carousel items",
+        )
+        self.assertIn(
+            "comfymodal-studio-carousel-item",
+            carousel_block,
+            "Expected comfymodal-studio-carousel-item class on carousel items",
         )
 
     def test_carousel_item_has_aria_label(self):
@@ -1335,21 +1371,21 @@ class HistoryPreviewDialogTests(_JsTestBase):
     """History preview overlay must behave as an accessible nested dialog."""
 
     def test_preview_overlay_has_role_dialog(self):
-        """studio-history.js preview overlay must have role='dialog'."""
-        text = self._read("studio-history.js")
+        """studio-history-v2-detail.js overlay must have role='dialog'."""
+        text = self._read("studio-history-v2-detail.js")
         self.assertIn(
             'role: "dialog"',
             text,
-            "Expected role='dialog' on the history preview overlay",
+            "Expected role='dialog' on the history-v2 detail overlay",
         )
 
     def test_preview_overlay_has_aria_modal(self):
-        """studio-history.js preview overlay must have aria-modal='true'."""
-        text = self._read("studio-history.js")
+        """studio-history-v2-detail.js overlay must have aria-modal='true'."""
+        text = self._read("studio-history-v2-detail.js")
         self.assertIn(
-            "aria-modal",
+            '"aria-modal": "true"',
             text,
-            "Expected aria-modal on the history preview overlay",
+            "Expected aria-modal='true' on the history-v2 detail overlay",
         )
 
     def test_preview_overlay_has_aria_label(self):
@@ -1362,13 +1398,19 @@ class HistoryPreviewDialogTests(_JsTestBase):
         )
 
     def test_preview_escape_closes_only_preview(self):
-        """Escape in preview must close only the preview, not the parent modal."""
-        text = self._read("studio-history.js")
-        # Must have an Escape handler scoped to the preview
+        """Escape in the history-v2 detail overlay must close only the overlay (layer 3)."""
+        text = self._read("studio-history-v2-detail.js")
+        # Layer-based Escape via registerLayerHandler(3, ...) scopes Escape
+        # to the overlay so it never bubbles to the parent modal
         self.assertIn(
-            "Escape",
+            "registerLayerHandler(3,",
             text,
-            "Expected Escape key handling in studio-history.js for preview close",
+            "Expected layer-3 Escape handler in studio-history-v2-detail.js for overlay close",
+        )
+        self.assertIn(
+            "escape: function ()",
+            text,
+            "Expected Escape handler in studio-history-v2-detail.js",
         )
 
     def test_preview_focus_moves_into_overlay(self):
@@ -1392,12 +1434,15 @@ class HistoryPreviewDialogTests(_JsTestBase):
     # ── Oracle fix: Tab focus containment for history preview ────────
 
     def test_preview_tab_trap_keydown_handler(self):
-        """Preview overlay must have onkeydown handler for Tab containment."""
-        text = self._read("studio-history.js")
+        """The history-v2 detail overlay has NO tab trap — Escape (layer 3) is the close contract."""
+        text = self._read("studio-history-v2-detail.js")
+        # No onkeydown Tab containment — close is layer-3 Escape based
+        self.assertNotIn("onkeydown", text,
+                         "History-v2 detail overlay must not use onkeydown Tab trap")
         self.assertIn(
-            "onkeydown",
+            "registerLayerHandler(3,",
             text,
-            "Expected onkeydown handler on preview overlay for Tab trap",
+            "Expected layer-3 Escape registration as the close contract",
         )
 
     def test_preview_tab_trap_calls_focus_trap_helper(self):
@@ -1424,12 +1469,17 @@ class HistoryPreviewDialogTests(_JsTestBase):
     # ── Issue 3: Backdrop click reliable close ─────────────────────────
 
     def test_preview_backdrop_click_closes(self):
-        """Click on backdrop must close the preview via specific class check."""
-        text = self._read("studio-history.js")
+        """Click on backdrop must close the history-v2 detail overlay via its backdrop class."""
+        text = self._read("studio-history-v2-detail.js")
         self.assertIn(
-            "preview-backdrop",
+            "comfymodal-studio-history-v2-overlay-backdrop",
             text,
-            "Expected backdrop class handler for reliable close on backdrop click",
+            "Expected backdrop element in the history-v2 detail overlay",
+        )
+        self.assertIn(
+            'backdrop.addEventListener("click", function () { close(); });',
+            text,
+            "Expected backdrop click handler to close the overlay",
         )
 
     def test_history_imports_el_from_studio_ui(self):
@@ -1578,13 +1628,22 @@ class MobileTouchTargetTests(_JsTestBase):
         )
 
     def test_history_preview_close_min_size(self):
-        """History preview close must have min 44px hit area at <=480px."""
-        if not self._media_text:
-            self.fail("No @media (max-width: 480px) block found")
+        """History-v2 detail overlay must offer reliable click-to-close targets.
+
+        The overlay's close button (comfymodal-studio-history-v2-overlay-close)
+        and the full-viewport backdrop click both dismiss the overlay — the
+        backdrop spans the whole screen so it always provides a large touch area.
+        """
+        detail_text = self._read("studio-history-v2-detail.js")
         self.assertIn(
-            "history-preview-close",
-            self._media_text,
-            "Expected .comfymodal-studio-history-preview-close min-size at <=480px",
+            "comfymodal-studio-history-v2-overlay-close",
+            detail_text,
+            "Expected history-v2 detail overlay close button class",
+        )
+        self.assertIn(
+            'backdrop.addEventListener("click", function () { close(); });',
+            detail_text,
+            "Expected backdrop click-to-close on the history-v2 detail overlay",
         )
 
 

@@ -456,7 +456,7 @@ LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
     # Handle resolution booleans
     ("created_modal_client",          "created_modal_client"),
     ("performed_cls_from_name",       "performed_cls_from_name"),
-    ("constructed_class_instance",    "constructed_class_instance"),
+    ("constructed_instance",          "constructed_instance"),
     # Payload / workflow metadata
     ("input_image_count",             "input_image_count"),
     ("workflow_node_count",           "workflow_node_count"),
@@ -902,7 +902,129 @@ def _build_local_submission_breakdown(
         # Handle resolution booleans
         "created_modal_client": _created_client,
         "performed_cls_from_name": _performed_cls,
-        "constructed_class_instance": _constructed_instance,
+        "constructed_instance": _constructed_instance,
         # Large-residual diagnostic
         "unmeasured_boundary": _unmeasured_boundary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Forensic interval registry (module-level, thread-safe)
+# ---------------------------------------------------------------------------
+# Shared cross-lane registry of named wall-clock intervals (JSON-safe values
+# only).  Concurrent worker lanes (e.g. input-types warming, fastsafe UNET
+# workers) register their scheduling/duration intervals here under a single
+# module-level lock so other lanes can compute cross-thread overlap.
+
+_FORENSIC_LOCK = threading.Lock()
+_forensic_intervals: dict[str, dict[str, Any]] = {}
+
+
+def register_forensic_interval(
+    name: str,
+    *,
+    start_mono_ns: int,
+    end_mono_ns: int,
+    cpu_ms: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Store or replace one forensic interval entry under *name*.
+
+    ``start_mono_ns``/``end_mono_ns`` are ``time.monotonic_ns()`` stamps;
+    ``cpu_ms`` is the optional thread-CPU duration; ``metadata`` is copied so
+    later caller-side mutations cannot corrupt the stored record.  All values
+    are JSON-safe.
+    """
+    with _FORENSIC_LOCK:
+        _forensic_intervals[name] = {
+            "start_mono_ns": int(start_mono_ns),
+            "end_mono_ns": int(end_mono_ns),
+            "cpu_ms": cpu_ms,
+            "metadata": dict(metadata or {}),
+        }
+
+
+def forensic_intervals() -> dict[str, dict[str, Any]]:
+    """Return a deep-enough copy (dict + inner dict) of all entries."""
+    with _FORENSIC_LOCK:
+        return {
+            _name: {
+                "start_mono_ns": _record["start_mono_ns"],
+                "end_mono_ns": _record["end_mono_ns"],
+                "cpu_ms": _record.get("cpu_ms"),
+                "metadata": dict(_record.get("metadata") or {}),
+            }
+            for _name, _record in _forensic_intervals.items()
+        }
+
+
+def forensic_overlap_ms(
+    a_start_mono_ns: int,
+    a_end_mono_ns: int,
+    b_start_mono_ns: int,
+    b_end_mono_ns: int,
+) -> float:
+    """Overlap in milliseconds of two monotonic-ns intervals (0.0 when
+    disjoint): ``max(0, min(a_end,b_end) - max(a_start,b_start)) / 1e6``."""
+    _overlap_ns = max(
+        0,
+        min(a_end_mono_ns, b_end_mono_ns)
+        - max(a_start_mono_ns, b_start_mono_ns),
+    )
+    return _overlap_ns / 1_000_000
+
+
+def cpu_affinity_count() -> int:
+    """Number of CPUs the current process may run on.
+
+    Prefers ``os.sched_getaffinity(0)`` (mask size, Linux); falls back to
+    ``os.cpu_count()`` (0 when unknown).  Never raises.  Stdlib-only.
+    """
+    try:
+        return int(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    try:
+        return int(os.cpu_count() or 0)
+    except Exception:
+        return 0
+
+
+def effective_cores_from(cpu_ms, wall_ms) -> float | None:
+    """Ratio of thread-CPU ms to wall ms (``round(cpu_ms / wall_ms, 4)``).
+
+    None-safe: returns None when either input is None or wall_ms <= 0.  This
+    is a utilization ratio — it does NOT imply scheduling-wait attribution.
+    """
+    if cpu_ms is None or wall_ms is None:
+        return None
+    try:
+        _wall = float(wall_ms)
+        if _wall <= 0:
+            return None
+        return round(float(cpu_ms) / _wall, 4)
+    except Exception:
+        return None
+
+
+def forensic_intervals_disjoint(intervals) -> tuple[bool, str | None]:
+    """Check a list of ``(name, start_mono_ns, end_mono_ns)`` intervals for
+    strict non-overlap (touching allowed: ``prev_end <= next_start``).
+
+    Returns ``(True, None)`` when disjoint, or ``(False, "<name_a> overlaps
+    <name_b>")`` naming the first violating adjacent pair.  Never raises.
+    """
+    try:
+        _sorted_iv = sorted(
+            (iv for iv in (intervals or [])
+             if isinstance(iv, (list, tuple)) and len(iv) >= 3),
+            key=lambda iv: int(iv[1]),
+        )
+        for _a, _b in zip(_sorted_iv, _sorted_iv[1:]):
+            _a_name, _a_end = str(_a[0]), int(_a[2])
+            _b_name, _b_start = str(_b[0]), int(_b[1])
+            if _a_end > _b_start:
+                return (False, f"{_a_name} overlaps {_b_name}")
+        return (True, None)
+    except Exception:
+        return (True, None)

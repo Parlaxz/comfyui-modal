@@ -86,7 +86,7 @@ EXPERIMENT_SPECS: dict[str, ExperimentSpec] = {
         arms=("level6", "level1"),
         selector="request",
         env_key="COMFYMODAL_V2_PNG_COMPRESS_LEVEL",
-        default_arm="level6",
+        default_arm="level1",
         implementation_version="1",
     ),
     "conditioning_hit": ExperimentSpec(
@@ -211,19 +211,19 @@ def vae_expected_sampling_ms() -> int:
 def png_compress_level() -> int:
     """COMFYMODAL_V2_PNG_COMPRESS_LEVEL — request-selectable.
 
-    Allowed {1, 6}; any other value (or non-int) -> 6 with a logged error.
+    Allowed {1, 6}; any other value (or non-int) -> 1 with a logged error.
     """
     _PNG_LEVEL_ALLOWED = frozenset({1, 6})
     raw = os.environ.get("COMFYMODAL_V2_PNG_COMPRESS_LEVEL", "").strip()
     if not raw:
-        return 6
+        return 1
     try:
         parsed = int(raw)
     except (TypeError, ValueError):
         parsed = None
     if parsed not in _PNG_LEVEL_ALLOWED:
-        log_invalid_arm("png_encode", "COMFYMODAL_V2_PNG_COMPRESS_LEVEL", raw, 6)
-        return 6
+        log_invalid_arm("png_encode", "COMFYMODAL_V2_PNG_COMPRESS_LEVEL", raw, 1)
+        return 1
     return parsed
 
 

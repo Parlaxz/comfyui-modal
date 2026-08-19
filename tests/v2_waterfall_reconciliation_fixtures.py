@@ -37,6 +37,8 @@ dict key), ``pre_sampler_structured_report.active_read_records`` with
 
 from __future__ import annotations
 
+import copy
+
 from typing import Any
 
 # Arbitrary but consistent unix-ns base (2023-11-14 16:53:20 UTC).
@@ -146,14 +148,19 @@ def _chain(
     scheduling_ms: float = SCHEDULING_MS,
     pre_python_ms: float = PRE_PYTHON_MS,
     sampling_ms: float = SAMPLING_MS,
+    enqueue_ms: float = LOCAL_PREP_MS + SUBMISSION_MS,
     missing_children: bool = False,
 ) -> dict[str, float]:
     """Offsets (ms from command_start) of every boundary in the chain.
 
     The chain is purely additive; the wall total is the last offset.
+    ``enqueue_ms`` is the command -> Modal-submission window (default
+    ``LOCAL_PREP_MS + SUBMISSION_MS`` = 20.0, preserving the historical
+    chain); shifting it moves the submission boundary and everything after it
+    while keeping placement/restore/execution durations identical.
     """
     local_receive = LOCAL_PREP_MS
-    submission = local_receive + SUBMISSION_MS
+    submission = enqueue_ms
     restore_begin = submission + scheduling_ms
     python_resume = restore_begin + pre_python_ms
     restore_end = python_resume + restore_ms
@@ -288,29 +295,21 @@ def _restore_timing(offsets: dict[str, float], restore_ms: float) -> dict[str, A
     }
 
 
-def build_real_run_result(
+def _result_from_offsets(
+    offsets: dict[str, float],
     *,
+    restore_ms: float,
     boundaries: bool = True,
     restore_begin: bool = True,
-    restore_ms: float = RESTORE_MS,
-    scheduling_ms: float = SCHEDULING_MS,
-    pre_python_ms: float = PRE_PYTHON_MS,
-    sampling_ms: float = SAMPLING_MS,
     missing_children: bool = False,
+    request_id: str = "req-20260812-142808",
+    restored_instance_id: str = "ri-realrun-01",
+    container_session_id: str = "cs-realrun-01",
+    gpu: str = "RTX6000",
+    cloud: str = "aws",
+    region: str = "us-east-1",
 ) -> dict[str, Any]:
-    """Full result dict for ``build_waterfall``.
-
-    ``boundaries=False`` reproduces the DEFICIENT artifact from the real run
-    (no modal submission boundary): the pre-Python window cannot be split and
-    the report must flag it.  ``restore_begin=False`` drops the Modal
-    app-log boundary (as the OLD tooling never ingested it).
-    """
-    offsets = _chain(
-        restore_ms=restore_ms,
-        scheduling_ms=scheduling_ms,
-        pre_python_ms=pre_python_ms,
-        sampling_ms=sampling_ms,
-    )
+    """Build the full result dict from a precomputed chain offset table."""
     origin: dict[str, Any] = {
         "ui_run_triggered_wall_unix_ms": BASE_MS,
         "local_receive_wall_ns": _wall(offsets["local_receive"]),
@@ -329,20 +328,20 @@ def build_real_run_result(
                 event["metadata"]["cached_to_first_node_ms"] = 226.0
 
     result: dict[str, Any] = {
-        "request_id": "req-20260812-142808",
+        "request_id": request_id,
         "identity": {
-            "restored_instance_id": "ri-realrun-01",
-            "gpu": "RTX6000",
-            "cloud": "aws",
-            "region": "us-east-1",
+            "restored_instance_id": restored_instance_id,
+            "gpu": gpu,
+            "cloud": cloud,
+            "region": region,
             "restore_count": 1,
             "request_count": 1,
         },
         "wall_ms": offsets["response"],
         "_restore_timing": _restore_timing(offsets, restore_ms),
         "trace": {
-            "request_id": "req-20260812-142808",
-            "container_session_id": "cs-realrun-01",
+            "request_id": request_id,
+            "container_session_id": container_session_id,
             "metadata": {
                 "request_origin_info": origin,
             },
@@ -353,6 +352,8 @@ def build_real_run_result(
                 {
                     "owner": "unet",
                     "path_hash": "0f0a2b3c4d5e",
+                    "request_id": request_id,
+                    "container_session_id": container_session_id,
                     "wall_ms": UNET_READ_MS,
                     "start_wall_unix_ns": _wall(offsets["method_entry"] + 13.0),
                     "end_wall_unix_ns": _wall(offsets["method_entry"] + 13.0 + UNET_READ_MS),
@@ -367,12 +368,183 @@ def build_real_run_result(
     return result
 
 
+def build_real_run_result(
+    *,
+    boundaries: bool = True,
+    restore_begin: bool = True,
+    restore_ms: float = RESTORE_MS,
+    scheduling_ms: float = SCHEDULING_MS,
+    pre_python_ms: float = PRE_PYTHON_MS,
+    sampling_ms: float = SAMPLING_MS,
+    enqueue_ms: float = LOCAL_PREP_MS + SUBMISSION_MS,
+    missing_children: bool = False,
+) -> dict[str, Any]:
+    """Full result dict for ``build_waterfall``.
+
+    ``boundaries=False`` reproduces the DEFICIENT artifact from the real run
+    (no modal submission boundary): the pre-Python window cannot be split and
+    the report must flag it.  ``restore_begin=False`` drops the Modal
+    app-log boundary (as the OLD tooling never ingested it).
+    ``enqueue_ms`` shifts the command -> Modal-submission window (default
+    ``LOCAL_PREP_MS + SUBMISSION_MS``, preserving the historical chain).
+    """
+    offsets = _chain(
+        restore_ms=restore_ms,
+        scheduling_ms=scheduling_ms,
+        pre_python_ms=pre_python_ms,
+        sampling_ms=sampling_ms,
+        enqueue_ms=enqueue_ms,
+    )
+    return _result_from_offsets(
+        offsets,
+        restore_ms=restore_ms,
+        boundaries=boundaries,
+        restore_begin=restore_begin,
+        missing_children=missing_children,
+    )
+
+
+def build_reference_run_result(
+    *,
+    enqueue_ms: float = 19158.0,
+    placement_ms: float = 854.266,
+    total_ms: float = 35168.0,
+    post_restore_shift_ms: float = 0.0,
+) -> dict[str, Any]:
+    """Reference-run fixture for the NEW scheduling contract (test A).
+
+    Builds a full result whose stamps yield command -> enqueue == *enqueue_ms*,
+    placement == *placement_ms* and total == *total_ms*, by scaling the default
+    chain's post-restore-begin durations so the final response offset lands
+    EXACTLY on *total_ms*.  non_scheduling == total - enqueue - placement by
+    construction.  ``post_restore_shift_ms`` moves the whole post-restore-begin
+    block later by a constant (startup grows, scheduling unchanged).
+    """
+    base = _chain()
+    default_enqueue = LOCAL_PREP_MS + SUBMISSION_MS
+    default_restore_begin = default_enqueue + SCHEDULING_MS
+    default_post = base["response"] - default_restore_begin
+    scale = (total_ms - enqueue_ms - placement_ms) / default_post
+    post_begin = enqueue_ms + placement_ms
+    offsets: dict[str, float] = {}
+    for key, value in base.items():
+        if key == "local_receive":
+            offsets[key] = value
+        elif key == "submission":
+            offsets[key] = enqueue_ms
+        elif key == "restore_begin":
+            offsets[key] = post_begin
+        else:
+            offsets[key] = post_begin + (value - default_restore_begin) * scale + post_restore_shift_ms
+    restore_ms = offsets["restore_end"] - offsets["python_resume"]
+    return _result_from_offsets(
+        offsets,
+        restore_ms=restore_ms,
+        request_id="req-reference-run",
+        restored_instance_id="ri-reference-01",
+        container_session_id="cs-reference-01",
+    )
+
+
+def attach_host_telemetry(
+    result: dict[str, Any],
+    *,
+    gpu_name: str = "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    vram_mib: int = 97250,
+    cuda: str = "13.0",
+    cc: str = "12.0",
+    vendor: str = "AuthenticAMD",
+    family: int = 191,
+    model: int = 2,
+    visible: int = 28,
+    requested: int = 12,
+    torch_intraop: int = 12,
+    torch_interop: int = 14,
+    native: int = 53,
+    peak_cores: float = 7.13,
+    above_16_ms: int | None = 0,
+    rss_restore_mib: float = 9888,
+    rss_peak_mib: float = 23572,
+    rss_result_mib: float = 13466,
+    max_rss_mib: float = 36612,
+) -> dict[str, Any]:
+    """Return a deep copy of *result* with full host-hardware telemetry
+    attached (``gpu_allocation``, ``runtime_shape.observed``,
+    ``host_hardware_fingerprint`` / ``host_memory`` / ``host_resource_snapshot``
+    trace events and ``trace.activation_diagnosis``).  Defaults produce the
+    canonical 4-line compact header: GPU trimmed to ``RTX PRO 6000 Blackwell``,
+    ``VRAM 97,250 MiB``, ``CUDA 13.0``, ``CC 12.0``, CPU ``AMD Family 191
+    Model 2``, visible=28, requested=12, Torch=12/14, native=53,
+    ``CPU peak=7.13 cores``, RSS ~9.66 -> 23.02 -> 13.15 GiB, maxRSS ~35.75 GiB.
+    """
+    result = copy.deepcopy(result)
+    result["gpu_allocation"] = {
+        "gpu_requested_order": "a10g",
+        "torch_version": "2.9.0",
+        "gpu_actual_name": gpu_name,
+        "gpu_compute_capability": cc,
+        "gpu_vram_total_mib": vram_mib,
+        "cuda_version": cuda,
+    }
+    result["runtime_shape"] = {
+        "observed": {
+            "cpu_request": requested,
+            "torch_intraop_threads": torch_intraop,
+            "torch_interop_threads": torch_interop,
+            "native_thread_count": native,
+        }
+    }
+    trace = result.setdefault("trace", {})
+    trace["activation_diagnosis"] = {
+        "cpu_peak_cores": peak_cores,
+        "cpu_above_16_ms": above_16_ms,
+    }
+    events = trace.setdefault("events", [])
+    events.append({
+        "name": "host_hardware_fingerprint",
+        "process": "remote",
+        "wall_unix_ns": BASE_NS,
+        "monotonic_ns": 0,
+        "metadata": {
+            "cpu_vendor": vendor,
+            "cpu_family": family,
+            "cpu_model": model,
+            "cpu_count_proc": visible,
+        },
+    })
+    for stage, rss in (
+        ("restore_complete", rss_restore_mib),
+        ("peak_execution", rss_peak_mib),
+        ("result_complete", rss_result_mib),
+    ):
+        events.append({
+            "name": "host_memory",
+            "process": "remote",
+            "wall_unix_ns": BASE_NS,
+            "monotonic_ns": 0,
+            "metadata": {
+                "stage": stage,
+                "process_rss_mib": rss,
+                "process_maxrss_mib": max_rss_mib,
+            },
+        })
+    events.append({
+        "name": "host_resource_snapshot",
+        "process": "remote",
+        "wall_unix_ns": BASE_NS,
+        "monotonic_ns": 0,
+        "metadata": {"phase": "peak", "ru_maxrss": int(max_rss_mib * 1024)},
+    })
+    return result
+
+
 def chain_total_ms(
     *,
     restore_ms: float = RESTORE_MS,
     scheduling_ms: float = SCHEDULING_MS,
     pre_python_ms: float = PRE_PYTHON_MS,
     sampling_ms: float = SAMPLING_MS,
+    enqueue_ms: float = LOCAL_PREP_MS + SUBMISSION_MS,
 ) -> float:
     """The wall total (ms) the chain tiles to."""
     return _chain(
@@ -380,6 +552,7 @@ def chain_total_ms(
         scheduling_ms=scheduling_ms,
         pre_python_ms=pre_python_ms,
         sampling_ms=sampling_ms,
+        enqueue_ms=enqueue_ms,
     )["response"]
 
 

@@ -55,6 +55,45 @@ def _fake_nodes(calls: list[tuple]) -> SimpleNamespace:
     )
 
 
+def _comfy_hidden():
+    """Context manager hiding any real ComfyUI ``comfy`` package from
+    ``sys.modules`` and the ComfyUI root from ``sys.path``.
+
+    A prior suite in the same process (e.g. the v2 CPU-snapshot lifecycle
+    suite) may import the real ComfyUI ``comfy`` package and leave its root
+    on ``sys.path``.  Those tests must observe the same "no comfy" baseline
+    in BOTH environments, so this temporarily removes every ``comfy*`` /
+    ``comfy_*`` sys.modules entry and any ComfyUI-root sys.path entry, then
+    restores the prior state on exit.
+    """
+    import contextlib
+    import os
+    import sys as _sys
+
+    @contextlib.contextmanager
+    def _cm():
+        _path_before = list(_sys.path)
+        _comfy_mods_before = {
+            _k: _v for _k, _v in list(_sys.modules.items())
+            if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_")
+        }
+        try:
+            _sys.path[:] = [
+                _p for _p in _path_before
+                if not (_p and os.path.basename(_p.rstrip("\\/")).lower() == "comfyui")
+            ]
+            for _k in list(_sys.modules):
+                if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_"):
+                    _sys.modules.pop(_k, None)
+            yield
+        finally:
+            _sys.path[:] = _path_before
+            for _k, _v in _comfy_mods_before.items():
+                _sys.modules[_k] = _v
+
+    return _cm()
+
+
 class V2PreloadBridgeTests(unittest.TestCase):
     def test_worker_pool_is_created_after_snapshot_boundary(self):
         coordinator = ModelPreloadCoordinator(unet_loader=lambda _key: "unet")
@@ -234,6 +273,15 @@ class V2PreloadBridgeTests(unittest.TestCase):
             result = nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(
                 "different.safetensors", "default"
             )
+        # The planned UNET ("unet.safetensors") loads on the worker lane and
+        # the identity-mismatch fallback does not cancel it.  Wait for that
+        # lane so the assertions below are race-free — the worker performs
+        # the process's first torch import, which can take over a second.
+        _prep = bridge._preparation
+        if _prep is not None:
+            _unet_future = getattr(_prep, "unet_future", None)
+            if _unet_future is not None:
+                _unet_future.result()
         self.assertEqual(result, ("prepared-unet:different.safetensors:default",))
         self.assertIn(("unet", "unet.safetensors", "default"), calls)
         self.assertIn(("unet", "different.safetensors", "default"), calls)
@@ -1184,36 +1232,46 @@ class V2PreloadBridgeTests(unittest.TestCase):
 
     def test_install_partial_then_retry(self):
         """Simulate partial availability: no comfy → retry with it."""
-        from comfymodal_runtime.model_preload import (
-            _ensure_core_wrappers, _install_read_wrapper,
-            _read_wrapper_installed, _gpu_wrapper_installed,
-        )
+        from comfymodal_runtime.model_preload import _ensure_core_wrappers
+        import sys
         import types
 
         import comfymodal_runtime.model_preload as mp
-        mp._read_wrapper_installed = False
-        mp._gpu_wrapper_installed = False
 
-        # First call — no comfy available in sys.modules
-        result1 = _ensure_core_wrappers()
-        self.assertEqual(result1.get("load_torch_file"), "unavailable")
+        # Hermeticity: force the "no comfy" baseline even if a prior suite
+        # left the real ComfyUI package importable in this process.
+        _read_before = mp._read_wrapper_installed
+        _gpu_before = mp._gpu_wrapper_installed
+        with _comfy_hidden():
+            try:
+                mp._read_wrapper_installed = False
+                mp._gpu_wrapper_installed = False
 
-        # Now simulate that comfy.utils becomes available (e.g. nodes.py loaded it).
-        # Register a fake module in sys.modules.
-        import sys
-        utils_mod = types.ModuleType("comfy.utils")
-        utils_mod.load_torch_file = lambda ckpt, **kw: {"w": ckpt}
-        sys.modules["comfy.utils"] = utils_mod
+                # First call — no comfy available in sys.modules
+                result1 = _ensure_core_wrappers()
+                self.assertEqual(result1.get("load_torch_file"), "unavailable")
 
-        try:
-            # Retry — read wrapper should install now
-            result2 = _ensure_core_wrappers()
-            self.assertEqual(result2.get("load_torch_file"), "installed",
-                             "retry after comfy.utils appears must install read wrapper")
-            self.assertTrue(_read_wrapper_installed)
-        finally:
-            # Clean up sys.modules to avoid polluting other tests
-            sys.modules.pop("comfy.utils", None)
+                # Now simulate that comfy.utils becomes available (e.g. nodes.py loaded it).
+                # Register a fake module in sys.modules.
+                utils_mod = types.ModuleType("comfy.utils")
+                utils_mod.load_torch_file = lambda ckpt, **kw: {"w": ckpt}
+                sys.modules["comfy.utils"] = utils_mod
+
+                try:
+                    # Retry — read wrapper should install now
+                    result2 = _ensure_core_wrappers()
+                    self.assertEqual(result2.get("load_torch_file"), "installed",
+                                     "retry after comfy.utils appears must install read wrapper")
+                    # Assert the LIVE module global (a from-imported boolean
+                    # would be a stale copy captured at import time).
+                    self.assertTrue(mp._read_wrapper_installed)
+                finally:
+                    # Clean up sys.modules to avoid polluting other tests
+                    sys.modules.pop("comfy.utils", None)
+            finally:
+                # Restore wrapper-install flags to their pre-test state.
+                mp._read_wrapper_installed = _read_before
+                mp._gpu_wrapper_installed = _gpu_before
 
     def test_get_live_module_returns_existing(self):
         """``_get_live_module`` returns existing ``sys.modules`` entries."""
@@ -1228,6 +1286,14 @@ class V2PreloadBridgeTests(unittest.TestCase):
 
     def test_drain_worker_events_recovers_late_events(self):
         """Drain copies worker events; no prefix duplication; phases preserved."""
+        # Hermeticity: the worker lanes behave differently when a real ComfyUI
+        # ``comfy`` package is importable (core wrappers wrap live modules).
+        # Hide comfy so the lane emits the same canonical events in every
+        # process state, then restore afterwards.
+        with _comfy_hidden():
+            self._run_drain_worker_events_recovers_late_events()
+
+    def _run_drain_worker_events_recovers_late_events(self):
         calls: list[tuple] = []
         nodes = _fake_nodes(calls)
         bridge = V2LoaderBridge()
@@ -1260,15 +1326,30 @@ class V2PreloadBridgeTests(unittest.TestCase):
         self.assertNotIn("preload_schedule_start", exec_names,
                          "restore prefix must not be duplicated")
 
-        # No duplicates of non-diagnostic events.
+        # No duplicates of non-diagnostic events, keyed per lane: with a
+        # healthy multi-lane worker (UNET + CLIP) each lane emits its
+        # lane-scoped events (``ready``, ``loader_invoke_*``,
+        # ``preload_worker_finished``) exactly once, so the drained view
+        # legitimately contains one occurrence per lane.  Uniqueness is per
+        # ``(event.name, lane)``, not per bare name.
         # ``core_wrapper_install`` and ``unet_decompose_install`` are
         # diagnostic events that legitimately fire once per install
         # attempt (bridge.install + worker fallback).
         _DIAG_EVENTS = frozenset({"core_wrapper_install", "unet_decompose_install"})
         from collections import Counter
-        event_names_no_diag = [n for n in exec_names if n not in _DIAG_EVENTS]
-        name_counts = Counter(event_names_no_diag)
-        dupes = {n: c for n, c in name_counts.items() if c > 1}
+
+
+        def _drain_event_key(event):
+            lane = event.metadata.get("lane") if hasattr(event.metadata, "get") else None
+            return (event.name, lane)
+
+
+        non_diag_keys = [
+            key for key in (_drain_event_key(e) for e in exec_trace.events)
+            if key[0] not in _DIAG_EVENTS
+        ]
+        name_counts = Counter(non_diag_keys)
+        dupes = {key: count for key, count in name_counts.items() if count > 1}
         self.assertEqual(len(dupes), 0,
                          f"drained events must have no duplicates: {dupes}")
 
@@ -1321,13 +1402,25 @@ class V2PreloadBridgeTests(unittest.TestCase):
         all_names = [e.name for e in restore_trace.events] + [e.name for e in exec_trace.events]
         self.assertIn("failed", all_names, "failed must be in restore or exec trace")
         self.assertNotIn("ready", all_names, "ready must NOT appear on failure")
-        # No duplicates across merged names (core_wrapper_install and
-        # unet_decompose_install can appear once per install attempt).
+        # drain_worker_events COPIES the post-cursor preparation events into
+        # the execution trace (copy-not-move, see drain_worker_events), so a
+        # merged view legitimately contains each drained event twice.  Assert
+        # the real invariants instead: per-trace uniqueness plus copy-not-move
+        # presence (drained events remain on the preparation trace).
         _DIAG_EVENTS = frozenset({"core_wrapper_install", "unet_decompose_install"})
         from collections import Counter
-        non_diag = [n for n in all_names if n not in _DIAG_EVENTS]
-        dupes = {n: c for n, c in Counter(non_diag).items() if c > 1}
-        self.assertEqual(len(dupes), 0, f"no duplicates: {dupes}")
+        restore_names = [e.name for e in restore_trace.events if e.name not in _DIAG_EVENTS]
+        exec_names = [e.name for e in exec_trace.events if e.name not in _DIAG_EVENTS]
+        restore_dupes = {n: c for n, c in Counter(restore_names).items() if c > 1}
+        exec_dupes = {n: c for n, c in Counter(exec_names).items() if c > 1}
+        self.assertEqual(len(restore_dupes), 0,
+                         f"restore trace must have no duplicates: {restore_dupes}")
+        self.assertEqual(len(exec_dupes), 0,
+                         f"exec trace must have no duplicates: {exec_dupes}")
+        self.assertTrue(
+            set(exec_names) <= {e.name for e in restore_trace.events},
+            "drained events must remain on the preparation trace (copy-not-move)",
+        )
 
     def test_drain_idempotent_no_duplicate_prefix(self):
         """Drain never duplicates events already on the execution trace."""

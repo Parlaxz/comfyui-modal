@@ -53,12 +53,9 @@ EXPECTED_STAGE_KEYS = [
     "pre_python_snapshot_restore",
     "application_restore",
     "restore_to_method_entry",
-    "method_entry_to_unet_claim",
-    "unet_claim_to_ready",
     "remote_method_setup",
     "prompt_executor_cache_setup",
-    "first_node_to_clip",
-    "clip_to_sampler_node",
+    "pre_sampler_execution",
     "sampler_graph_join_wait",
     "sampler_node_to_sampling",
     "sampling",
@@ -95,14 +92,22 @@ def _dur(stage) -> float:
 
 
 def _assert_tiles(report, total_ms, atol=0.02):
+    """The exclusive top-level sum reconciles to the NON-SCHEDULING wall
+    (command->response minus scheduling time = enqueue + placement), and
+    residual/reconciliation are ~0."""
     assert report.total_ms is not None
     assert abs(report.total_ms - total_ms) < 1e-6
+    assert report.non_scheduling_ms is not None
     accounted = sum(
         _dur(stage)
         for stage in report.stages
-        if stage.included_in_total and not stage.concurrent and stage.duration_ms is not None and stage.status != INVALID
+        if stage.accounting_role == "top_level" and not stage.concurrent
+        and stage.duration_ms is not None and stage.status != INVALID
     )
-    assert abs(accounted - report.total_ms) < atol, f"accounted {accounted} != total {report.total_ms}"
+    assert abs(accounted - report.non_scheduling_ms) < atol, (
+        f"accounted {accounted} != non-scheduling wall {report.non_scheduling_ms}"
+    )
+    assert abs(accounted - report.accounted_ms) < 1e-6
     assert report.residual_ms is not None
     assert abs(report.residual_ms) <= atol, f"residual {report.residual_ms} exceeds {atol}ms"
 
@@ -155,7 +160,9 @@ def test_missing_modal_restore_start_flag_and_combined_interval():
     assert abs(_dur(stages["modal_scheduling"]) - (SCHEDULING_MS + PRE_PYTHON_MS)) < 1e-6
     assert stages["modal_scheduling"].source_fields == ("submission_to_python_resume_ms",)
     assert stages["pre_python_snapshot_restore"].status == UNAVAILABLE
-    # Residual is NOT inflated: the combined interval is accounted.
+    # The combined scheduling interval is informational (excluded from
+    # accounted), so accounted still equals the non-scheduling wall: nothing is
+    # inflated.
     _assert_tiles(report, EXPECTED["total_ms"])
 
 
@@ -242,13 +249,14 @@ def test_nested_spans_never_double_count():
     top_sum = sum(
         _dur(stage)
         for stage in report.stages
-        if stage.included_in_total and not stage.concurrent and stage.duration_ms is not None and stage.status != INVALID
+        if stage.accounting_role == "top_level" and not stage.concurrent
+        and stage.duration_ms is not None and stage.status != INVALID
     )
     assert report.accounted_ms is not None
     assert abs(top_sum - report.accounted_ms) < 1e-6
+    assert abs(top_sum - report.non_scheduling_ms) < 1e-6
     detail_sum = sum((detail.duration_ms or 0.0) for detail in report.details)
-    assert report.total_ms is not None
-    assert abs(top_sum + detail_sum - report.total_ms) > 1.0  # details overlap the top level
+    assert abs(top_sum + detail_sum - report.non_scheduling_ms) > 1.0  # details overlap the top level
 
 
 # ── 12. Overlapping UNET/prefill spans do not double-count ─────────────────
@@ -312,7 +320,8 @@ def test_command_response_exactly_reconciles():
     result = build_real_run_result()
     report = _report(result)
     assert report.accounted_ms is not None
-    assert abs(report.accounted_ms - EXPECTED["total_ms"]) < 0.02
+    assert report.non_scheduling_ms is not None
+    assert abs(report.accounted_ms - report.non_scheduling_ms) < 0.02
     assert report.residual_ms is not None
     assert abs(report.residual_ms) < 0.02
     assert report.reconciliation_status == "OK"
@@ -320,16 +329,19 @@ def test_command_response_exactly_reconciles():
 
 # ── OLD vs NEW accounting regression ───────────────────────────────────────
 def test_old_vs_new_accounting():
-    # NEW: full fixture -> residual near zero.
+    # NEW: full fixture -> exclusive top-level sum == non-scheduling wall,
+    # residual ~0.
     result_new = build_real_run_result()
     report_new = _report(result_new)
     assert report_new.accounted_ms is not None
-    assert abs(report_new.accounted_ms - EXPECTED["total_ms"]) < 25.0
+    assert report_new.non_scheduling_ms is not None
+    assert abs(report_new.accounted_ms - report_new.non_scheduling_ms) < 25.0
     assert report_new.residual_ms is not None
     assert abs(report_new.residual_ms) <= 25.0
 
     # OLD: deficient artifact (no submission boundary, no restore-begin input)
-    # reproduces the quoted failure mode: the pre-Python window is unaccounted.
+    # reproduces the quoted failure mode: the pre-Python window is unaccounted
+    # and the accounting gap stays honestly unresolved (no fake residual).
     result_old = build_real_run_result(boundaries=False, restore_begin=False)
     report_old = _report(result_old)
     assert "modal_restore_begin_unavailable" in report_old.boundary_flags
@@ -337,14 +349,16 @@ def test_old_vs_new_accounting():
     stages_old = _stages(report_old)
     assert stages_old["modal_scheduling"].status == UNAVAILABLE
     assert stages_old["pre_python_snapshot_restore"].status == UNAVAILABLE
-    expected_old_residual = 19.0 + SCHEDULING_MS + PRE_PYTHON_MS
-    assert report_old.residual_ms is not None
-    assert abs(report_old.residual_ms - expected_old_residual) < 0.1
-    # Qualitative claim: the quoted old residual (10.731 s) IS the pre-Python
-    # window; our reconstruction lands at 11.209 s (stage-value drift from the
-    # missing original log), and the NEW model removes it entirely.
-    assert report_old.residual_ms > 10000.0
-    assert report_old.residual_ms < 12000.0
+    assert report_old.total_wall_ms is None
+    assert report_old.reconciliation_ms is None
+    assert report_old.reconciliation_status == "UNRESOLVED"
+    # Qualitative claim: the quoted old residual (10.731 s) IS the unaccounted
+    # pre-Python window (~11.2 s in this reconstruction); the NEW model removes
+    # it entirely once the host supplies the platform boundaries.
+    assert report_old.total_ms is not None
+    assert report_old.accounted_ms is not None
+    assert (report_old.total_ms - report_old.accounted_ms) > 10000.0
+    assert (report_old.total_ms - report_old.accounted_ms) < 12000.0
 
 
 # ── Extra invariants ───────────────────────────────────────────────────────
@@ -385,21 +399,38 @@ def test_render_footer_contains_walls_and_reconciliation():
     result = build_real_run_result()
     report = _report(result)
     rendered = render_waterfall(report)
+    # One table + minimal boxed footer (Reconciliation / Status), plus the
+    # three conclusive footer lines: COMMAND -> RESPONSE, Command (without
+    # scheduling) -> Response, Scheduling time.  No user-facing TOTAL WALL.
     for expected in (
+        "COMMAND -> RESPONSE:",
+        "Command (without scheduling) -> Response:",
+        "Scheduling time:",
+        "RECONCILIATION",
+        "STATUS",
+    ):
+        assert expected in rendered
+    assert "TOTAL WALL" not in rendered
+    # Successful console output never prints these accounting aggregates.
+    for absent in (
         "TOP-LEVEL ACCOUNTED",
         "GLOBAL RESIDUAL",
+        "RESIDUAL %",
         "RECONCILIATION STATUS",
         "CONTROLLABLE APPLICATION WALL",
         "PLATFORM/MODAL WALL",
-        "COMMAND -> RESPONSE",
     ):
-        assert expected in rendered
+        assert absent not in rendered
     assert report.controllable_wall_ms is not None
     assert report.platform_wall_ms is not None
     # Platform wall == scheduling + pre-Python restore only.
     assert abs(report.platform_wall_ms - (SCHEDULING_MS + PRE_PYTHON_MS)) < 1e-6
-    # Controllable wall == total - platform.
-    assert abs(report.controllable_wall_ms - (EXPECTED["total_ms"] - report.platform_wall_ms)) < 1e-6
+    # Controllable wall == total - platform - the scheduling-window local stages
+    # (the whole enqueue window is informational under the new contract).
+    assert abs(
+        report.controllable_wall_ms
+        - (EXPECTED["total_ms"] - report.platform_wall_ms - report.command_to_enqueue_ms)
+    ) < 1e-6
 
 
 def test_waterfall_to_dict_round_trip_preserves_reconciliation():

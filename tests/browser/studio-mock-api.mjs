@@ -92,6 +92,8 @@ export async function installStudioMockApi(page, options = {}) {
     unhandledCalls: [], // {method, pathname} from catch-all only
     pollCounts: new Map(), // expId → integer
     saveRequests: [], // { run_id, output_index } from POST /run-history/:id/save
+    configPost: null, // last POST /comfymodal/config body (Settings page)
+    profileLevel: "off", // in-memory /comfymodal/profile/level stored value
   };
 
   let lastRunRequest = null;
@@ -916,7 +918,7 @@ export async function installStudioMockApi(page, options = {}) {
    * The Playground does not read this directly; it is called during
    * ComfyUI extension setup for diagnostics.  Return a minimal stub.
    */
-  async function serveConfig(route, url) {
+  async function serveConfig(route, url, body) {
     return _json({
       status: "ok",
       modal_token_configured: true,
@@ -924,6 +926,75 @@ export async function installStudioMockApi(page, options = {}) {
       deploy_state: "deployed",
       frontend_version: "0.1.0",
     });
+  }
+
+  // ── Settings page routes (used by studio-settings.spec.mjs) ──────────────
+  //
+  // The redesigned Studio Settings page (web/studio-settings.js) reads a
+  // full /comfymodal/config response to populate the Execution Engine and
+  // GPU selects and the Outputs section, and it refreshes the deploy status
+  // and heavy-tracing profile level on every render.  These handlers stay
+  // purely additive — the pre-existing serveConfig handler above remains
+  // untouched (the new route entries are registered before it in the table).
+
+  /** GET /comfymodal/config — full settings config (engine, GPU, output prefs). */
+  async function serveSettingsConfig(route, url, body) {
+    return _json({
+      status: "ok",
+      // Prior stub fields preserved — ComfyUI extension setup reads these
+      modal_token_configured: true,
+      gpu: "rtx-pro-6000",
+      deploy_state: "deployed",
+      frontend_version: "0.1.0",
+      // Execution engine options
+      execution_mode: "v2",
+      available_execution_modes: [
+        { value: "v2", label: "V2 - Recommended" },
+        { value: "v1", label: "V1 - Legacy fallback" },
+      ],
+      execution_mode_locked: false,
+      // GPU options
+      default_gpu: "rtx-pro-6000",
+      available_gpus: [
+        { value: "rtx-pro-6000", label: "rtx-pro-6000" },
+        { value: "a100-40gb", label: "a100-40gb" },
+      ],
+      // Output preferences (server-side authority for the Outputs section)
+      output_format: "original",
+      quality: 75,
+      webp_lossless_compression: "balanced",
+      auto_save_local: false,
+      save_folder: "output/modal",
+      save_metadata_sidecar: true,
+    });
+  }
+
+  /** POST /comfymodal/config — record the last posted body and acknowledge. */
+  async function saveSettingsConfig(route, url, body) {
+    state.configPost = body || null;
+    return _json({ status: "ok" });
+  }
+
+  /** GET /comfymodal/profile/level — in-memory stored/effective level. */
+  async function serveProfileLevel(route, url, body) {
+    return _json({
+      status: "ok",
+      level: state.profileLevel,
+      effective: state.profileLevel,
+    });
+  }
+
+  /** POST /comfymodal/profile/level — persist the requested level. */
+  async function saveProfileLevel(route, url, body) {
+    if (body && typeof body.level === "string") {
+      state.profileLevel = body.level;
+    }
+    return _json({ status: "ok", level: state.profileLevel });
+  }
+
+  /** GET /comfymodal/deploy/status — idle deployment. */
+  async function serveDeployStatus(route, url, body) {
+    return _json({ status: "ok", state: "idle", message: "" });
   }
 
   /** Catch-all: 599 JSON for any unhandled /comfymodal/ request */
@@ -972,6 +1043,16 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
+
+    // Settings page (studio-settings.spec.mjs) — full config, profile level,
+    // and deploy status. Registered before the legacy stub config entries so
+    // the Settings page sees the full payload while /api/comfymodal/config
+    // still uses the pre-existing minimal stub.
+    ["GET", "/comfymodal/config", serveSettingsConfig],
+    ["POST", "/comfymodal/config", saveSettingsConfig],
+    ["GET", "/comfymodal/profile/level", serveProfileLevel],
+    ["POST", "/comfymodal/profile/level", saveProfileLevel],
+    ["GET", "/comfymodal/deploy/status", serveDeployStatus],
 
     // ComfyUI config endpoint — called during extension setup
     ["GET", "/api/comfymodal/config", serveConfig],
@@ -1092,6 +1173,8 @@ export async function installStudioMockApi(page, options = {}) {
       state.unhandledCalls.length = 0;
       state.pollCounts.clear();
       state.saveRequests.length = 0;
+      state.configPost = null;
+      state.profileLevel = "off";
       lastRunRequest = null;
       lastExperimentRequest = null;
       failQueue.length = 0;

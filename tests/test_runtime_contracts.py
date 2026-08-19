@@ -55,7 +55,7 @@ class TestExecutionContracts(unittest.TestCase):
         )
         self.assertEqual(options.production_output_node_ids, ("2", "12"))
         self.assertEqual(options.requested_backend, "safe")
-        self.assertEqual(options.output_conversion_options["format"], "webp")
+        self.assertEqual(options.output_conversion_options["format"], "webp_lossy")
         self.assertEqual(options.to_legacy_dict()["actual_load"]["mode"], "unet_vae_only")
 
     def test_legacy_options_restore_output_format(self):

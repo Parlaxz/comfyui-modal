@@ -784,11 +784,11 @@ class CpuSnapshotSpecProjectionTests(unittest.TestCase):
     produce structurally different model_spec dicts.  These tests verify
     that the projection helper normalises both shapes and compares only
     the requested identity fields (UNET name/class/weight_dtype, CLIP
-    filenames/class/type/layout), ignoring node_id, model_stack, VAE,
-    and device.
+    filenames/class/type/layout, and the exact VAE loader identity),
+    ignoring node_id, model_stack, and device.
     """
 
-    # ── Plan A-style spec (no node_id, no model_stack, VAE empty) ──────
+    # ── Plan A-style spec (no node_id, no model_stack, VAE populated) ──
     PLAN_A_SPEC = {
         "loaders": {
             "unet": [
@@ -797,7 +797,9 @@ class CpuSnapshotSpecProjectionTests(unittest.TestCase):
             "clip": [
                 {"loader_class": "CLIPLoader", "clip_name": "t5xxl_fp16.safetensors", "type": "sd3", "device": "default"},
             ],
-            "vae": [],
+            "vae": [
+                {"loader_class": "VAELoader", "vae_name": "ae.safetensors"},
+            ],
         },
     }
 
@@ -825,6 +827,7 @@ class CpuSnapshotSpecProjectionTests(unittest.TestCase):
 
     def test_specs_match_across_plan_ab(self):
         """_cpu_snapshot_specs_match returns True for compatible A/B specs."""
+        # aligned with VAE-inclusive activation contract (257b677)
         self.assertTrue(
             _cpu_snapshot_specs_match(self.PLAN_A_SPEC, self.PLAN_B_SPEC)
         )
@@ -1050,7 +1053,7 @@ class CpuSnapshotSpecProjectionTests(unittest.TestCase):
 
 
 class CpuSnapshotModelKeyMatchingTests(unittest.TestCase):
-    """_cpu_snapshot_model_keys_match ignores vae_identity."""
+    """_cpu_snapshot_model_keys_match requires exact vae_identity."""
 
     def test_matches_identical_keys(self):
         """Identical keys must match."""
@@ -1058,11 +1061,14 @@ class CpuSnapshotModelKeyMatchingTests(unittest.TestCase):
         b = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
         self.assertTrue(_cpu_snapshot_model_keys_match(a, b))
 
-    def test_matches_when_only_vae_differs(self):
-        """VAE-only difference must not prevent match."""
+    def test_mismatch_when_only_vae_differs(self):
+        """VAE-only difference must prevent match (VAE-inclusive matcher)."""
+        # aligned with VAE-inclusive activation contract (257b677)
         a = ModelRestoreKey(unet_identity="u", clip_identity="c", vae_identity="", clip_type="sd3")
         b = ModelRestoreKey(unet_identity="u", clip_identity="c", vae_identity="ae.safetensors", clip_type="sd3")
-        self.assertTrue(_cpu_snapshot_model_keys_match(a, b))
+        self.assertFalse(_cpu_snapshot_model_keys_match(a, b))
+        # Keys with the same VAE identity still match.
+        self.assertTrue(_cpu_snapshot_model_keys_match(b, b))
 
     def test_mismatches_on_unet_difference(self):
         """UNET identity difference must cause mismatch."""
@@ -1241,8 +1247,9 @@ class CpuSnapshotRequestBindingProjectionTests(unittest.TestCase):
             match = _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
             self.assertFalse(match, "single-to-dual layout change should not projection-match")
 
-    def test_binds_when_only_vae_differs(self):
-        """VAE-only key difference must still bind (non-VAE matcher)."""
+    def test_rejects_when_only_vae_differs(self):
+        """VAE-only key difference must prevent bind (VAE-inclusive matcher)."""
+        # aligned with VAE-inclusive activation contract (257b677)
         snapshot = self._make_snapshot_with_spec(self._make_plan_a_spec())
         # Snapshot has no VAE (vae_identity="")
         snapshot.model_key = ModelRestoreKey(
@@ -1259,22 +1266,36 @@ class CpuSnapshotRequestBindingProjectionTests(unittest.TestCase):
         )
         request_spec = self._make_plan_b_spec(has_vae=True)
 
-        # Non-VAE key matcher must return True
-        self.assertTrue(
+        # VAE-inclusive key matcher must reject the difference
+        self.assertFalse(
             _cpu_snapshot_model_keys_match(request_key, snapshot.model_key),
-            "keys must match when only VAE differs",
+            "keys must not match when only VAE differs",
         )
-        # Spec projection must also match (VAE ignored in projection)
-        self.assertTrue(
+        # Spec projection must also reject the VAE-differing spec
+        self.assertFalse(
             _cpu_snapshot_specs_match(request_spec, snapshot.model_spec),
-            "specs must match when only VAE differs",
+            "specs must not match when only VAE differs",
         )
 
         match = (
             _cpu_snapshot_model_keys_match(request_key, snapshot.model_key)
             and _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
         )
-        self.assertTrue(match, "VAE-only difference must not prevent bind")
+        self.assertFalse(match, "VAE-only difference must prevent bind")
+
+        # Same request still binds when the snapshot ALSO carries the VAE.
+        matching_snapshot = self._make_snapshot_with_spec(
+            self._make_plan_b_spec(has_vae=True)
+        )
+        matching_snapshot.model_key = request_key
+        self.assertTrue(
+            _cpu_snapshot_model_keys_match(request_key, matching_snapshot.model_key),
+            "keys with equal VAE identity must match",
+        )
+        self.assertTrue(
+            _cpu_snapshot_specs_match(request_spec, matching_snapshot.model_spec),
+            "specs with equal VAE loader must match",
+        )
 
     def test_request_event_name_is_cpu_snapshot_models_request_bound(self):
         """Request event name must be exactly 'cpu_snapshot_models_request_bound'."""
@@ -1671,7 +1692,8 @@ class CpuSnapshotVariantCCompatibilityTests(unittest.TestCase):
 
     def test_vae_empty_snapshot_vs_ae_request(self):
         """Snapshot with vae_identity='' and request with ae.safetensors
-        must be compatible (VAE is excluded from matching)."""
+        must NOT be compatible (VAE identity is part of activation)."""
+        # aligned with VAE-inclusive activation contract (257b677)
         snap_key = ModelRestoreKey(
             unet_identity="u.safetensors", clip_identity="c.safetensors",
             vae_identity="", clip_type="sd3",
@@ -1680,12 +1702,16 @@ class CpuSnapshotVariantCCompatibilityTests(unittest.TestCase):
             unet_identity="u.safetensors", clip_identity="c.safetensors",
             vae_identity="ae.safetensors", clip_type="sd3",
         )
-        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
-        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, req_key))
+        self.assertFalse(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertEqual(
+            _cpu_snapshot_key_mismatch_reason(snap_key, req_key),
+            "VAE identity mismatch",
+        )
 
-    def test_changed_vae_still_hits(self):
-        """Different VAE identity between snapshot and request still matches
-        (VAE is graph-time only)."""
+    def test_changed_vae_does_not_hit(self):
+        """Different VAE identity between snapshot and request must NOT match
+        (VAE identity is part of the activation contract)."""
+        # aligned with VAE-inclusive activation contract (257b677)
         snap_key = ModelRestoreKey(
             unet_identity="u.safetensors", clip_identity="c.safetensors",
             vae_identity="", clip_type="sd3",
@@ -1694,18 +1720,22 @@ class CpuSnapshotVariantCCompatibilityTests(unittest.TestCase):
             unet_identity="u.safetensors", clip_identity="c.safetensors",
             vae_identity="different_ae.safetensors", clip_type="sd3",
         )
-        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
-        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, req_key))
+        self.assertFalse(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertEqual(
+            _cpu_snapshot_key_mismatch_reason(snap_key, req_key),
+            "VAE identity mismatch",
+        )
 
     def test_dual_clip_with_vae_and_default_device(self):
-        """Dual CLIP (qwen/qwen) with z_image default weight_dtype and VAE
-        in request spec must still match snapshot projection (device/VAE
-        ignored)."""
+        """Dual CLIP (qwen/qwen) with z_image default weight_dtype and the
+        same VAE in both snapshot and request specs must still match the
+        snapshot projection (device ignored, VAE identity compared)."""
+        # aligned with VAE-inclusive activation contract (257b677)
         snap_spec = {
             "loaders": {
                 "unet": [{"loader_class": "UNETLoader", "unet_name": "lumina2.safetensors", "weight_dtype": "default"}],
                 "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "qwen.safetensors", "clip_name2": "qwen.safetensors", "type": "sd3", "device": "default"}],
-                "vae": [],
+                "vae": [{"loader_class": "VAELoader", "vae_name": "ae.safetensors"}],
             },
         }
         req_spec = {
@@ -2062,7 +2092,10 @@ class CpuSnapshotWorkflowE2ETests(unittest.TestCase):
 
     def setUp(self):
         self._d = tempfile.mkdtemp(prefix="wf_e2e_")
-        for n in ("flux_1_dev.safetensors", "clip_l.safetensors"):
+        # Mirror _SINGLE_WF / _DUAL_DUP_WF: UNET + CLIP + VAE loaders all
+        # need a resolvable fixture because stack_to_warmup_profile folds the
+        # VAE into the profile and identity_from_profile stats every file.
+        for n in ("flux_1_dev.safetensors", "clip_l.safetensors", "flux_vae.safetensors"):
             open(os.path.join(self._d, n), "a").close()
 
     def tearDown(self):
@@ -2699,24 +2732,49 @@ class CpuSnapshotUnetStatePropagationTests(unittest.TestCase):
         """Call _maybe_propagate_cpu_snapshot_unet_state, then
         _extract_unet_runtime_state_event on the result, proving extraction
         works without manually inserting a restore event into the fixture."""
-        from tools.benchmark_v2_direct import _extract_unet_runtime_state_event
+        # Hermeticity: importing ``tools.benchmark_v2_direct`` executes its
+        # module body, which inserts the parent ComfyUI root into ``sys.path``
+        # (making the real ``comfy`` package importable in this process from
+        # then on).  Snapshot and restore ``sys.path`` + ``sys.modules`` so
+        # this suite leaves the process exactly as it found it w.r.t. comfy
+        # importability.
+        import sys as _sys
+        _path_before = list(_sys.path)
+        _comfy_mods_before = {
+            _k: _v for _k, _v in list(_sys.modules.items())
+            if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_")
+        }
+        try:
+            from tools.benchmark_v2_direct import _extract_unet_runtime_state_event
 
-        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
-        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
-            self._make_model_key(), self._make_model_spec(), self.trace,
-        )
+            self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+            self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+                self._make_model_key(), self._make_model_spec(), self.trace,
+            )
 
-        # Build a result dict as _run_in_process does
-        result = {"trace": self.trace.to_dict()}
-        meta = _extract_unet_runtime_state_event(result, "snapshot_restored_post_retarget")
-        self.assertIsNotNone(meta)
-        self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
-        self.assertEqual(meta["unet_identity"], self._UNET_IDENTITY)
-        self.assertEqual(meta["requested_weight_dtype"], self._WEIGHT_DTYPE)
-        self.assertEqual(meta["restored_instance_id"], self._RESTORED_INSTANCE_ID)
-        self.assertEqual(meta["restore_session_id"], self._RESTORE_SESSION_ID)
-        self.assertEqual(meta["request_id"], "req-propagate-001")
-        self.assertTrue(meta.get("propagated_from_restore"))
+            # Build a result dict as _run_in_process does
+            result = {"trace": self.trace.to_dict()}
+            meta = _extract_unet_runtime_state_event(result, "snapshot_restored_post_retarget")
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+            self.assertEqual(meta["unet_identity"], self._UNET_IDENTITY)
+            self.assertEqual(meta["requested_weight_dtype"], self._WEIGHT_DTYPE)
+            self.assertEqual(meta["restored_instance_id"], self._RESTORED_INSTANCE_ID)
+            self.assertEqual(meta["restore_session_id"], self._RESTORE_SESSION_ID)
+            self.assertEqual(meta["request_id"], "req-propagate-001")
+            self.assertTrue(meta.get("propagated_from_restore"))
+        finally:
+            # Restore the pre-test sys.path (the ComfyUI root insertion from
+            # tools.benchmark_v2_direct is the pollution source).
+            _sys.path[:] = _path_before
+            # Remove any comfy*/comfy_* modules this test pulled into
+            # sys.modules; restore any that were already present.
+            for _k in list(_sys.modules):
+                if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_"):
+                    if _k in _comfy_mods_before:
+                        _sys.modules[_k] = _comfy_mods_before[_k]
+                    else:
+                        _sys.modules.pop(_k, None)
 
     # ── Activation failure clears saved state ────────────────────────
 

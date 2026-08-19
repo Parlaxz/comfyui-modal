@@ -562,7 +562,8 @@ class TestSafetensorsProxyIntegrity:
         assert count_agg[0] == 1, f"Expected count=1, got {count_agg[0]}"
 
     def test_safetensors_proxy_context_manager_delegates_enter(self):
-        """Proxy __enter__ delegates to wrapped __enter__ when available."""
+        """Proxy __enter__ runs wrapped __enter__ for its side effects but
+        returns the PROXY so keys()/get_tensor() route through it."""
         enter_result = object()
         entered = [False]
 
@@ -585,7 +586,7 @@ class TestSafetensorsProxyIntegrity:
         proxy = _SafeOpenProxy(orig, orig_gt, count_agg, bytes_agg)
 
         with proxy as p:
-            assert p is enter_result, "Proxy __enter__ must delegate to wrapped"
+            assert p is proxy, "Proxy __enter__ must return the proxy"
         assert entered[0], "Wrapped __enter__ must be called"
 
     def test_safetensors_proxy_context_manager_fallback_to_self(self):

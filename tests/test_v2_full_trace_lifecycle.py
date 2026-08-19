@@ -240,10 +240,10 @@ class FullTraceV2GapsTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_runtime_env_has_torch_key(self) -> None:
-        """COMFYMODAL_V2_FULL_TRACE_TORCH is included in _runtime_env() with default '1'."""
+        """Torch profiler is included but disabled by default."""
         env = modal_app._runtime_env()
         self.assertIn("COMFYMODAL_V2_FULL_TRACE_TORCH", env)
-        self.assertEqual(env["COMFYMODAL_V2_FULL_TRACE_TORCH"], "1")
+        self.assertEqual(env["COMFYMODAL_V2_FULL_TRACE_TORCH"], "0")
 
     def test_runtime_env_has_four_trace_propagation_keys(self) -> None:
         """Full-trace propagation keys are present with defaults."""
@@ -342,7 +342,7 @@ class FullTraceV2GapsTest(unittest.TestCase):
         self.assertIn("torch_disabled", printed_text)
 
     def test_torch_profiler_runs_when_flag_one(self) -> None:
-        """start_torch_profiler runs when COMFYMODAL_V2_FULL_TRACE_TORCH=1 (default)."""
+        """start_torch_profiler runs when explicitly enabled."""
         from comfymodal_runtime.full_execution_trace import FullExecutionTraceSession as _FT
         _FT.reset_instance()
         session = _FT.create_if_enabled(
@@ -351,7 +351,7 @@ class FullTraceV2GapsTest(unittest.TestCase):
         )
         if session is None:
             self.skipTest("full trace not enabled (env not set)")
-        # Default is "1" — should proceed into import
+        # Explicit opt-in should proceed into import.
         with patch.dict(os.environ, {"COMFYMODAL_V2_FULL_TRACE_TORCH": "1"}, clear=False):
             session.start_torch_profiler()
         # profiler may or may not have started depending on torch availability,
@@ -376,7 +376,7 @@ class FullTraceV2GapsTest(unittest.TestCase):
         """_runtime_env() returns expected default values for all trace/profile keys."""
         env = modal_app._runtime_env()
         self.assertEqual(env.get("COMFYMODAL_V2_FULL_TRACE"), "0")
-        self.assertEqual(env.get("COMFYMODAL_V2_FULL_TRACE_TORCH"), "1")
+        self.assertEqual(env.get("COMFYMODAL_V2_FULL_TRACE_TORCH"), "0")
         self.assertEqual(env.get("COMFYMODAL_V2_FULL_TRACE_ENTRIES"), "8000000")
         self.assertEqual(env.get("COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS"), "50")
         self.assertEqual(env.get("COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH"), "64")

@@ -902,6 +902,9 @@ def _default_modal_settings() -> dict:
         "auto_save_local": _SAVER_DEFAULTS["auto_save_local"],
         "save_folder": _SAVER_DEFAULTS["save_folder"],
         "save_metadata_sidecar": _SAVER_DEFAULTS["save_metadata_sidecar"],
+        "preview_default": "off",
+        "preview_codec": "webp",
+        "preview_quality": 70,
         # ── Phase 8: execution mode ──
         "execution_mode": MODE_V2,
     }
@@ -1057,6 +1060,17 @@ def _save_latest_benchmark_workflow(payload: dict) -> dict:
 _modal_settings_cache: dict | None = None
 
 
+def _normalize_preview_settings(settings: dict) -> dict:
+    if settings.get("preview_default") not in ("off", "on"):
+        settings["preview_default"] = "off"
+    if settings.get("preview_codec") != "webp":
+        settings["preview_codec"] = "webp"
+    quality = settings.get("preview_quality")
+    if isinstance(quality, bool) or not isinstance(quality, int) or not 1 <= quality <= 100:
+        settings["preview_quality"] = 70
+    return settings
+
+
 def _load_modal_settings() -> dict:
     """Load persisted output/auto-save settings from disk."""
     global _modal_settings_cache
@@ -1071,6 +1085,7 @@ def _load_modal_settings() -> dict:
             for key in defaults:
                 if key in saved and isinstance(saved[key], type(defaults[key])):
                     merged[key] = saved[key]
+            _normalize_preview_settings(merged)
             # Settings are user-facing and may only select V1/V2.  Treat old
             # or hand-edited values as the safe V2 default; shadow is an
             # internal comparison mode and never a persisted UI setting.
@@ -1093,6 +1108,7 @@ def _save_modal_settings(settings: dict) -> dict:
     for key in defaults:
         if key in settings and isinstance(settings[key], type(defaults[key])):
             merged[key] = settings[key]
+    _normalize_preview_settings(merged)
     _saved_mode = normalize_mode(merged.get("execution_mode"))
     if _saved_mode not in (MODE_V1, MODE_V2):
         merged["execution_mode"] = MODE_V2
@@ -4582,6 +4598,9 @@ if _server:
             "auto_save_local": settings.get("auto_save_local", False),
             "save_folder": settings.get("save_folder", ""),
             "save_metadata_sidecar": settings.get("save_metadata_sidecar", True),
+            "preview_default": settings.get("preview_default", "off"),
+            "preview_codec": settings.get("preview_codec", "webp"),
+            "preview_quality": settings.get("preview_quality", 70),
             # ── Phase 8: execution mode ──
             "execution_mode": resolved["mode"],
             "execution_mode_source": resolved["source"],
@@ -4612,6 +4631,9 @@ if _server:
             "auto_save_local",
             "save_folder",
             "save_metadata_sidecar",
+            "preview_default",
+            "preview_codec",
+            "preview_quality",
         }
         _settings_update = {}
         for key in _setting_keys:
@@ -4632,6 +4654,22 @@ if _server:
             if "webp_lossless_compression" in _settings_update and _settings_update["webp_lossless_compression"] not in WEBP_LOSSLESS_COMPRESSION:
                 valid = False
                 _err_key = "webp_lossless_compression"
+            if "preview_default" in _settings_update and _settings_update["preview_default"] not in ("off", "on"):
+                valid = False
+                _err_key = "preview_default"
+            if "preview_codec" in _settings_update and _settings_update["preview_codec"] != "webp":
+                valid = False
+                _err_key = "preview_codec"
+            if "preview_quality" in _settings_update:
+                _preview_quality = _settings_update["preview_quality"]
+                if (
+                    isinstance(_preview_quality, bool)
+                    or not isinstance(_preview_quality, int)
+                    or _preview_quality < 1
+                    or _preview_quality > 100
+                ):
+                    valid = False
+                    _err_key = "preview_quality"
             if not valid:
                 return web.json_response(
                     {"status": "error", "message": f"invalid value for {_err_key}"}, status=400
@@ -5034,6 +5072,56 @@ if _server:
                 return web.json_response({"status": "error", "message": "name required"}, status=400)
             result = await _call_set_runtime_flag(name, value)
             return web.json_response({"status": "ok", "result": result})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    # ── Profile level (persisted to .profile_config.json) ──
+    _PROFILE_VALID_LEVELS = ("off", "summary", "detailed", "trace", "trace_verbose")
+
+    @_server.routes.get("/comfymodal/profile/level")
+    async def modal_get_profile_level(request: web.Request) -> web.Response:
+        try:
+            cfg_path = os.path.join(_NODE_DIR, ".profile_config.json")
+            file_level = "off"
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as _f:
+                    cfg = json.load(_f)
+                if isinstance(cfg, dict) and isinstance(cfg.get("level"), str) and cfg["level"].strip():
+                    file_level = cfg["level"].strip().lower()
+            except Exception:
+                pass
+            try:
+                effective = get_profile_level()
+            except Exception:
+                effective = None
+            if not effective:
+                effective = file_level
+            return web.json_response({"status": "ok", "level": file_level, "effective": effective})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/profile/level")
+    async def modal_set_profile_level(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            level = body.get("level", "").strip().lower()
+            if level not in _PROFILE_VALID_LEVELS:
+                return web.json_response({"status": "error", "message": "invalid level"}, status=400)
+            cfg_path = os.path.join(_NODE_DIR, ".profile_config.json")
+            cfg = {}
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as _f:
+                    cfg = json.load(_f)
+                if not isinstance(cfg, dict):
+                    cfg = {}
+            except Exception:
+                cfg = {}
+            cfg["level"] = level
+            tmp_path = f"{cfg_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, cfg_path)
+            return web.json_response({"status": "ok", "level": level})
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -5783,6 +5871,33 @@ if _server:
             "type": "experiment.created",
             "payload": event_payload,
         })
+        # History V2: create the durable experiment with fixed-position cells.
+        try:
+            from history_v2_writer import get_writer as _get_v2_writer
+            _v2_writer = _get_v2_writer()
+            if _v2_writer is not None:
+                _v2_cells = []
+                for _i, _cell in enumerate(compilation.get("cells", []) or []):
+                    if not isinstance(_cell, dict):
+                        continue
+                    _v2_cells.append({
+                        "cell_key": str(_cell.get("cell_key", "")),
+                        "sequence": _cell.get("sequence", _i),
+                        "axis_values": dict(_cell.get("axis_values") or {}),
+                    })
+                _v2_writer.ensure_experiment(
+                    exp_id,
+                    name=str(definition.get("name", exp_id)),
+                    definition={
+                        "production": True,
+                        "schema_version": CURRENT_SCHEMA_VERSION,
+                        "revision": definition.get("revision", 1),
+                        "workflow_hash": str(compilation.get("workflow_hash", "") or ""),
+                    },
+                    cells=_v2_cells,
+                )
+        except Exception:
+            print(f"[comfyui-modal.history-v2] ensure_experiment failed for {exp_id}")
         return web.json_response({
             "status": "ok",
             "experiment_id": exp_id,
@@ -5991,6 +6106,9 @@ if _server:
                 "studio_meta": data.get("studio_meta", {}),
                 "total_cells": data.get("total_cells", 0),
                 "waterfall": payload.get("waterfall", {}),
+                "sequence": data.get("sequence"),
+                "axis_values": data.get("axis_values") or {},
+                "output_paths": payload.get("output_paths", []),
             }
             record = REGISTRY.history().record_run(
                 kind="experiment_cell",
@@ -6186,6 +6304,9 @@ if _server:
                             if os.path.isdir(output_dir):
                                 os.makedirs(os.path.dirname(final_dir), exist_ok=True)
                                 os.replace(output_dir, final_dir)
+                                payload["output_paths"] = [
+                                    str(p) for p in sorted(Path(final_dir).iterdir()) if p.is_file()
+                                ]
                         except Exception as mat_exc:
                             print(f"[comfyui-modal] materialization failed for {cell_key}: {mat_exc}")
                             # B2: on failure, persist cell.failed instead of cell.completed
@@ -7001,6 +7122,7 @@ if _server:
         normalize_preset_payload,
     )
     from studio_routes import register_studio_routes
+    from studio_workflow_routes import register_workflow_routes
 
     # Paths for persistence (referenced by imported modules).
     _STUDIO_SNAPSHOTS_PATH = os.path.join(_NODE_DIR, ".studio_snapshots.json")
@@ -7031,6 +7153,93 @@ if _server:
 
     # Register all snapshot and preset routes (external studio output dir)
     register_studio_routes(_server, _NODE_DIR, studio_output_dir=get_studio_outputs_dir())
+
+    # History V2 HTTP API (history_v2_routes.py) backed by the local
+    # History V2 SQLite database under the default local data root.
+    from history_v2_store import default_data_root as _history_v2_default_data_root
+    from history_v2_routes import register_history_v2_routes
+    register_history_v2_routes(_server, _history_v2_default_data_root())
+
+    # ── D4: Modern Experiment surface (additive) ─────────────────────
+    # Modern Experiment REST + lifecycle (experiment_modern_routes.py).
+    # Additive only: no legacy endpoint is replaced or hijacked and the
+    # legacy /comfymodal/experiments surface stays untouched.
+    from experiment_modern_routes import (
+        register_experiment_modern_routes,
+        startup_experiment_modern_lifecycle,
+        shutdown_experiment_modern_lifecycle,
+    )
+    import experiment_modern_scheduler as _modern_scheduler_module
+
+    # The scheduler module's process-local registry is the actual production
+    # registry (not an empty shadow dict): schedulers constructed on create
+    # register there, and the routes/lifecycle resolve those same instances.
+    # Strongly referenced so owned schedulers are never garbage-collected.
+    _MODERN_EXPERIMENT_REGISTRY = _modern_scheduler_module
+
+    # Register the additive modern Experiment routes against the same
+    # default History V2 data root used above.  A shared per-experiment
+    # ModalTransport is constructed via the production seam for every
+    # accepted experiment (one transport per scheduler).
+    _modern_experiment_data_root = _history_v2_default_data_root()
+
+    def _modern_transport_factory() -> ModalTransport:
+        return ModalTransport(workspace=_active_workspace() or {})
+
+    register_experiment_modern_routes(
+        _server,
+        _modern_experiment_data_root,
+        registry=_MODERN_EXPERIMENT_REGISTRY,
+        node_dir=_NODE_DIR,
+        transport_factory=_modern_transport_factory,
+    )
+
+    # aiohttp lifecycle callbacks (async, fully awaited — never
+    # fire-and-forget).  Defensive: skip silently when the app or its
+    # signal collections are absent (minimal servers / unit tests).
+    _modern_app = getattr(_server, "app", None)
+    if _modern_app is not None:
+        _modern_on_startup = getattr(_modern_app, "on_startup", None)
+        if _modern_on_startup is not None:
+            async def _modern_experiment_startup(app: Any) -> None:
+                await startup_experiment_modern_lifecycle(
+                    _modern_experiment_data_root,
+                    registry=_MODERN_EXPERIMENT_REGISTRY,
+                )
+
+            _modern_on_startup.append(_modern_experiment_startup)
+
+        _modern_on_shutdown = getattr(_modern_app, "on_shutdown", None)
+        if _modern_on_shutdown is not None:
+            async def _modern_experiment_shutdown(app: Any) -> None:
+                await shutdown_experiment_modern_lifecycle(
+                    registry=_MODERN_EXPERIMENT_REGISTRY,
+                )
+
+            _modern_on_shutdown.append(_modern_experiment_shutdown)
+
+    # Workflow platform routes (studio_domain) — registered separately so the
+    # snapshot/preset legacy surface stays untouched:
+    #   GET|POST    /comfymodal/studio/workflows
+    #   POST        /comfymodal/studio/workflows/import
+    #   GET         /comfymodal/studio/workflows/folders|tags
+    #   GET|PATCH   /comfymodal/studio/workflows/{workflow_id}
+    #   POST|DELETE /comfymodal/studio/workflows/{workflow_id}/default-preset
+    #   GET         /comfymodal/studio/workflows/{workflow_id}/run-context
+    #   GET|POST    /comfymodal/studio/workflows/{workflow_id}/versions
+    #   GET         /comfymodal/studio/workflows/versions/{version_id}(/state)
+    #   GET|POST    /comfymodal/studio/workflows/versions/{version_id}/mapping(/candidates|/revision)
+    #   GET|POST    /comfymodal/studio/workflows/versions/{version_id}/presets
+    #   POST        /comfymodal/studio/workflows/versions/{version_id}/presets/copy-bulk
+    #   GET|PATCH|DELETE  /comfymodal/studio/workflows/presets/{preset_id}
+    #   POST        /comfymodal/studio/workflows/presets/{preset_id}/duplicate|copy-to-version
+    from dependency_resolver import DependencyResolver as _DependencyResolver
+    _dependency_resolver = _DependencyResolver(_NODE_DIR, _COMFYUI_ROOT)
+    register_workflow_routes(_server, _NODE_DIR, resolver=_dependency_resolver)
+    from model_library_routes import register_model_library_routes
+    register_model_library_routes(
+        _server, _NODE_DIR, _COMFYUI_ROOT, resolver=_dependency_resolver
+    )
 
     # — Studio Backends (legacy compatibility / import-only) —
     # The .studio_backends.json persistence layer is maintained as a
@@ -7198,9 +7407,99 @@ if _server:
             body = await request.json()
         except Exception:
             return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+
         preset_id = (body or {}).get("presetId", "").strip()
         feature_id = (body or {}).get("featureId", "").strip()
         controls = (body or {}).get("controls", {}) or {}
+
+        # Extract browser-side trace context.  Primary source is the
+        # top-level "trace" dict sent by newer Studio frontends.
+        # Fallback: legacy callers embed t0 timestamps inside a
+        # "metadata" dict — only use it when it contains recognised
+        # t0 trace fields so existing callers do not lose timestamps
+        # while the frontend alignment lands.
+        _body = body or {}
+        _TRACE_T0_FIELDS = frozenset({"t0_perf_ms", "t0_perf_now_ms",
+                                       "t0_client_press", "t0_client_press_ms"})
+        raw_trace = _body.get("trace")
+        if isinstance(raw_trace, dict):
+            browser_trace: dict = raw_trace
+        else:
+            metadata = _body.get("metadata", {}) or {}
+            if isinstance(metadata, dict):
+                recognized = {k: v for k, v in metadata.items()
+                              if k in _TRACE_T0_FIELDS}
+                browser_trace = recognized if recognized else {}
+            else:
+                browser_trace = {}
+        # Set studio_route_received at route entry (before validation/compile)
+        # so the incoming trace dict preserves when this server started
+        # processing the request.  This flows through trace_ctx →
+        # build_single_run_spec → cell trace dict.
+        import time as _studio_trace_time
+        if "studio_route_received" not in browser_trace:
+            browser_trace["studio_route_received"] = _studio_trace_time.time()
+        # Capture workspace synchronously at dispatch time so the
+        # same workspace is used throughout the request (never re-resolved).
+        _studio_ws = _active_workspace() or {}
+        _studio_gpu = (body or {}).get("gpu")
+        _studio_mo = (body or {}).get("modal_options")
+
+        # ── Modern Studio Workflow run branch ──────────────────────────
+        # When the request carries a workflow_version_id, route through the
+        # Studio Workflow platform (studio_workflow_run) instead of the legacy
+        # snapshot/preset surface.  presetId becomes optional (the workflow's
+        # default preset is used when omitted).
+        _workflow_version_id = str(
+            (body or {}).get("workflow_version_id")
+            or (body or {}).get("workflowVersionId")
+            or ""
+        ).strip()
+        if _workflow_version_id:
+            import asyncio as _studio_asyncio
+            try:
+                from studio_workflow_run import handle_workflow_run_async
+                _workflow_id = (
+                    (body or {}).get("workflow_id")
+                    or (body or {}).get("workflowId")
+                    or ""
+                )
+                _workflow_preset_id = (
+                    (body or {}).get("preset_id")
+                    or (body or {}).get("presetId")
+                    or ""
+                )
+                _workflow_feature_id = (body or {}).get("featureId") or "txt2img"
+                result = await _studio_asyncio.wait_for(
+                    handle_workflow_run_async(
+                        _workflow_id, _workflow_version_id, _workflow_preset_id,
+                        _workflow_feature_id, controls, _NODE_DIR,
+                        trace_ctx=browser_trace,
+                        gpu=_studio_gpu,
+                        modal_options=_studio_mo,
+                        workspace=_studio_ws,
+                    ),
+                    timeout=600.0,
+                )
+                status_code = 200 if result.get("status") == "ok" else 400
+                return web.json_response(result, status=status_code)
+            except Exception as exc:
+                _log.exception("Studio workflow run error")
+                try:
+                    from studio_run_adapter import _execution_error_response
+                    error_payload = _execution_error_response(
+                        exc,
+                        operation="studio_workflow_run_route",
+                        run_id=_workflow_version_id,
+                    )
+                except Exception:
+                    error_payload = {
+                        "status": "error",
+                        "message": "Internal error processing Studio execution. Retry or inspect the run details.",
+                        "error_code": "STUDIO_EXECUTION_ERROR",
+                    }
+                return web.json_response(error_payload, status=500)
+
         if not preset_id or not feature_id:
             return web.json_response(
                 {"status": "error", "message": "presetId and featureId are required"}, status=400
@@ -7218,38 +7517,6 @@ if _server:
                     "message": "Control validation failed",
                     "errors": _run_validation_errors,
                 }, status=400)
-            # Extract browser-side trace context.  Primary source is the
-            # top-level "trace" dict sent by newer Studio frontends.
-            # Fallback: legacy callers embed t0 timestamps inside a
-            # "metadata" dict — only use it when it contains recognised
-            # t0 trace fields so existing callers do not lose timestamps
-            # while the frontend alignment lands.
-            _body = body or {}
-            _TRACE_T0_FIELDS = frozenset({"t0_perf_ms", "t0_perf_now_ms",
-                                           "t0_client_press", "t0_client_press_ms"})
-            raw_trace = _body.get("trace")
-            if isinstance(raw_trace, dict):
-                browser_trace: dict = raw_trace
-            else:
-                metadata = _body.get("metadata", {}) or {}
-                if isinstance(metadata, dict):
-                    recognized = {k: v for k, v in metadata.items()
-                                  if k in _TRACE_T0_FIELDS}
-                    browser_trace = recognized if recognized else {}
-                else:
-                    browser_trace = {}
-            # Set studio_route_received at route entry (before validation/compile)
-            # so the incoming trace dict preserves when this server started
-            # processing the request.  This flows through trace_ctx →
-            # build_single_run_spec → cell trace dict.
-            import time as _studio_trace_time
-            if "studio_route_received" not in browser_trace:
-                browser_trace["studio_route_received"] = _studio_trace_time.time()
-            # Capture workspace synchronously at dispatch time so the
-            # same workspace is used throughout the request (never re-resolved).
-            _studio_ws = _active_workspace() or {}
-            _studio_gpu = (body or {}).get("gpu")
-            _studio_mo = (body or {}).get("modal_options")
             import asyncio as _studio_asyncio
             result = await _studio_asyncio.wait_for(
                 handle_studio_run_async(
@@ -7648,4 +7915,4 @@ if _server:
         _pt.mark("total")
         return web.json_response(response_data)
 
-    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*")
+    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*, /comfymodal/history-v2/feed, /comfymodal/history-v2/generations/{id}/*, /comfymodal/history-v2/experiments/{id}/*, /comfymodal/history-v2/assets/{id}")

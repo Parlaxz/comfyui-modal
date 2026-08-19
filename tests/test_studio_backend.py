@@ -361,50 +361,56 @@ class SettingsContentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
 
-    def test_settings_studio_section_default_page(self):
-        """Studio section must display 'Default page: Playground'."""
-        self.assertIn("Default page", self.text)
+    def test_settings_general_info_playground_is_first_page(self):
+        """General section navigation info must list Playground as the first/default page."""
+        self.assertIn("Primary navigation", self.text)
+        self.assertIn("Playground / History", self.text)
 
-    def test_settings_studio_topnav_pages(self):
-        """Studio section must display top nav pages."""
-        self.assertIn("Top nav pages", self.text)
-        self.assertIn("Playground | History | Backend | Settings", self.text)
+    def test_settings_general_info_mentions_backend_navigation(self):
+        """General section navigation info must note that Backend remains available."""
+        self.assertIn("Backend remains available in navigation", self.text)
 
-    def test_settings_studio_theme(self):
-        """Studio section must display theme info."""
-        self.assertIn("Nexus-inspired", self.text)
+    def test_settings_general_run_mode_segmented_control(self):
+        """General section must have a Cloud/Local run-mode segmented control."""
+        self.assertIn('"data-testid": "settings-run-mode"', self.text)
+        self.assertIn('text: "Cloud"', self.text)
+        self.assertIn('text: "Local"', self.text)
 
-    def test_settings_studio_modal_size(self):
-        """Studio section must display modal size."""
-        self.assertIn("Modal size", self.text)
+    def test_settings_general_info_mentions_navigation(self):
+        """General section must mention the primary navigation with Playground default page."""
+        self.assertIn("Primary navigation: Playground / History / Workflows / Settings", self.text)
 
-    def test_settings_studio_reset_button(self):
-        """Studio section must have a reset UI preferences button."""
-        self.assertIn("Reset UI preferences", self.text)
+    def test_settings_interface_panel_layout_reset(self):
+        """Interface section must have a 'Reset panel layout' button."""
+        self.assertIn('"data-testid": "settings-reset-panel-layout"', self.text)
+        self.assertIn('text: "Reset panel layout"', self.text)
 
-    def test_settings_backends_section(self):
-        """Settings must have Backends/Presets section with stats."""
-        self.assertIn("Backends / Presets", self.text)
+    def test_settings_advanced_runtime_backend_group(self):
+        """Advanced section must have a 'Runtime & Backend' group with deploy state and inventory testids."""
+        self.assertIn("Runtime & Backend", self.text)
+        self.assertIn('"data-testid": "settings-deploy-state"', self.text)
+        self.assertIn('"data-testid": "settings-runtime-snapshots"', self.text)
+        self.assertIn('"data-testid": "settings-runtime-presets"', self.text)
+        self.assertIn('"data-testid": "settings-runtime-backends"', self.text)
         self.assertIn("Open Backend tab", self.text)
 
-    def test_settings_runtime_section(self):
-        """Settings must have Modal/Runtime section with deploy/token/gpu info."""
-        self.assertIn("Modal / Runtime", self.text)
+    def test_settings_runtime_group_inventory_rows(self):
+        """Runtime & Backend group must show deploy state plus snapshots/presets/backends count rows."""
+        self.assertIn("Runtime & Backend", self.text)
         self.assertIn("Deploy state", self.text)
-        self.assertIn("Modal token", self.text)
-        self.assertIn("GPU", self.text)
+        self.assertIn("Snapshots", self.text)
+        self.assertIn("Presets", self.text)
+        self.assertIn("Backends", self.text)
 
     def test_settings_runtime_legacy_link(self):
         """Runtime section must link to Legacy Settings."""
         self.assertIn("Open Legacy Settings", self.text)
 
-    def test_settings_features_section(self):
-        """Settings must have Features section with statuses."""
-        self.assertIn("Txt2Img", self.text)
-        self.assertIn("Enabled", self.text)
-        self.assertIn("Object Remove", self.text)
-        self.assertIn("Future: image-edit tooling", self.text)
-        self.assertIn("Object Replace", self.text)
+    def test_settings_generation_execution_engine_rows(self):
+        """Generation section must have execution-engine status and readiness rows."""
+        self.assertIn("Execution Engine", self.text)
+        self.assertIn('"data-testid": "settings-execution-engine-status"', self.text)
+        self.assertIn('"data-testid": "settings-execution-engine-readiness"', self.text)
 
     def test_settings_legacy_section(self):
         """Settings must have Legacy section with links."""
@@ -429,13 +435,13 @@ class SettingsContentTests(unittest.TestCase):
 class SettingsCountsTests(unittest.TestCase):
     """Settings must show backend/preset/snapshot counts."""
 
-    def test_settings_counts_referenced(self):
-        """Settings must reference snapshots, presets, and backends for counts."""
+    def test_settings_runtime_counts_referenced(self):
+        """refreshRuntimeCounts must fetch snapshots, presets, and backends for the count rows."""
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        self.assertIn("snapshots", text)
-        self.assertIn("runnable", text)
-        self.assertIn("presets", text)
-        self.assertIn("need binding", text)
+        self.assertIn("refreshRuntimeCounts", text)
+        self.assertIn('"/studio/snapshots"', text)
+        self.assertIn('"/studio/presets"', text)
+        self.assertIn('"/studio/backends"', text)
 
 
 # ---------------------------------------------------------------------------
@@ -551,15 +557,20 @@ class HistorySafeRenderingTests(unittest.TestCase):
         self.assertFalse(has_dangerous)
 
     def test_history_uses_safe_el_factory(self):
-        """History uses safe el() from studio-ui.js (wraps createElement) with no innerHTML."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        # Imports the canonical safe factory (which wraps document.createElement)
-        self.assertIn('import { el } from', text,
-                       "Expected el() import from studio-ui.js — el() wraps createElement safely")
-        # Must not use template-literal innerHTML for run data
-        has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
-        self.assertFalse(has_dangerous,
-                         "History must not use template-literal innerHTML for dynamic run data")
+        """History V2 feed and detail import el() from studio-ui.js and avoid innerHTML for dynamic data."""
+        v2_text = (WEB / "studio-history-v2.js").read_text(encoding="utf-8")
+        detail_text = (WEB / "studio-history-v2-detail.js").read_text(encoding="utf-8")
+        # Both modules import the canonical safe factory (which wraps document.createElement)
+        self.assertIn('import { el } from "./studio-ui.js"', v2_text,
+                       "Expected el() import from studio-ui.js in studio-history-v2.js")
+        self.assertIn('from "./studio-ui.js"', detail_text,
+                       "Expected el() import from studio-ui.js in studio-history-v2-detail.js")
+        # Neither module may use template-literal innerHTML for dynamic data
+        for name, text in (("studio-history-v2.js", v2_text),
+                           ("studio-history-v2-detail.js", detail_text)):
+            has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
+            self.assertFalse(has_dangerous,
+                             name + " must not use template-literal innerHTML for dynamic data")
 
     def test_history_failed_state(self):
         """History must show error state on failure."""
@@ -930,9 +941,12 @@ class HistoryGalleryTests(unittest.TestCase):
         """history must use a gallery grid container class."""
         self.assertIn("comfymodal-studio-history-gallery", self.text)
 
-    def test_history_has_preview_overlay(self):
-        """history must have a preview overlay class."""
-        self.assertIn("comfymodal-studio-history-preview", self.text)
+    def test_history_v2_detail_overlay_is_modal_dialog(self):
+        """history V2 detail must open a full-screen overlay with role=dialog and aria-modal."""
+        detail_text = (WEB / "studio-history-v2-detail.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-history-v2-overlay", detail_text)
+        self.assertIn('role: "dialog"', detail_text)
+        self.assertIn('"aria-modal": "true"', detail_text)
 
     def test_history_overlay_has_close_button(self):
         """history preview must have a close button."""
@@ -963,12 +977,11 @@ class HistoryGalleryTests(unittest.TestCase):
         """history gallery must preserve experiment_id grouping."""
         self.assertIn("experiment_id", self.text)
 
-    def test_history_ungrouped_runs_use_gallery_grid(self):
-        """ungrouped history must still render inside the gallery grid wrapper."""
-        self.assertIn(
-            'container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));',
-            self.text,
-        )
+    def test_history_v2_runs_render_in_results_grid(self):
+        """history V2 must render runs inside the results wrapper as a grid."""
+        v2_text = (WEB / "studio-history-v2.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-history-v2-results", v2_text)
+        self.assertIn("comfymodal-studio-history-v2-grid", v2_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1025,7 @@ class PlaygroundCarouselTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class GalleryCarouselStylesTests(unittest.TestCase):
-    """studio-styles.js must define gallery, carousel, and preview overlay styles."""
+    """studio-styles.js must define history-v2 grid/overlay, gallery, and carousel styles."""
 
     def setUp(self) -> None:
         self.text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
@@ -1021,9 +1034,10 @@ class GalleryCarouselStylesTests(unittest.TestCase):
         """styles must define .comfymodal-studio-history-gallery."""
         self.assertIn("comfymodal-studio-history-gallery", self.text)
 
-    def test_styles_have_history_preview_class(self):
-        """styles must define .comfymodal-studio-history-preview."""
-        self.assertIn("comfymodal-studio-history-preview", self.text)
+    def test_styles_have_history_v2_grid_and_overlay_classes(self):
+        """styles must define the history-v2 grid and full-screen overlay rules."""
+        self.assertIn("comfymodal-studio-history-v2-grid", self.text)
+        self.assertIn("comfymodal-studio-history-v2-overlay", self.text)
 
     def test_styles_have_carousel_class(self):
         """styles must define .comfymodal-studio-carousel."""
@@ -2389,21 +2403,24 @@ class HistoryTypeFilterStudioRunTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class HistoryPaginationBoundaryTests(unittest.TestCase):
-    """Next/Prev pagination must never produce invalid offsets."""
+    """Cursor-based pagination must reset nextCursor and gate 'Load more' on hasMore."""
 
     def setUp(self) -> None:
-        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+        self.text = (WEB / "studio-history-v2.js").read_text(encoding="utf-8")
 
-    def test_prev_disabled_at_offset_zero(self):
-        """Prev button must be disabled when offset <= 0."""
-        # Look for the prev button disabled attribute guard
-        self.assertIn("disabled: queryParams.offset <= 0", self.text,
-                      "Prev button must have disabled: offset <= 0 guard")
+    def test_load_more_disabled_while_loading(self):
+        """'Load more' button must be disabled while a page is loading."""
+        self.assertIn('"data-testid": "history-v2-load-more"', self.text,
+                      "Load more button must expose the history-v2-load-more testid")
+        self.assertIn("disabled: loading", self.text,
+                      "Load more button must be disabled: loading")
 
-    def test_next_disabled_at_last_page(self):
-        """Next button must be disabled when offset + limit >= totalCount."""
-        self.assertIn("disabled: queryParams.offset + queryParams.limit >= totalCount", self.text,
-                      "Next button must have disabled: offset+limit >= totalCount guard")
+    def test_has_more_false_at_end_of_pages(self):
+        """Pagination must reset nextCursor on refresh and stop when hasMore is false."""
+        self.assertIn("cursor: reset ? null : nextCursor", self.text,
+                      "Refresh must reset nextCursor to null")
+        self.assertIn("hasMore = page.hasMore", self.text,
+                      "hasMore must be derived from the page response")
 
 
 # ---------------------------------------------------------------------------

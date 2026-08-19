@@ -54,6 +54,7 @@ from .cpu_snapshot_models import (
     _PAGE_READINESS_MODE_WILLNEED,
 )
 from .trace import RuntimeTrace
+from . import gpu_lane_coordination as _gpu_coordination
 from .unet_forward_probe import (
     emit_post_load_models_gpu_event,
     install_nextdit_forward_pre_hook,
@@ -204,6 +205,1770 @@ _OPT_CLIP_FORWARD_MONO: tuple[int, int] | None = None
 _OPT_UNET_READY_MONO_NS: int | None = None
 _OPT_UNET_DEMAND_MONO_NS: int | None = None
 
+# ── Batch C6 probe gate: COMFYMODAL_V2_UNET_READ_H2D_PIPELINE ────────
+# Measurement-only phases I-1 (per-tensor materialization series) and I-2
+# (wave-split H2D replay probe).  Values: unset/"off" -> "off" (byte-for-byte
+# production); "probe" -> "probe"; anything else -> "unsupported" (explicitly
+# rejected, treated as off, logged once at import).  The future interleaved
+# pipeline value "1" is RESERVED and NOT implemented -> rejected as unsupported.
+def _read_c6_probe_mode() -> str:
+    raw = os.environ.get("COMFYMODAL_V2_UNET_READ_H2D_PIPELINE", "").strip().lower()
+    if raw == "probe":
+        return "probe"
+    if raw in ("", "off", "0", "false", "no", "none"):
+        return "off"
+    return "unsupported"
+
+
+_C6_PROBE_MODE: str = _read_c6_probe_mode()
+if _C6_PROBE_MODE == "unsupported":
+    print("[v2.c6_probe] COMFYMODAL_V2_UNET_READ_H2D_PIPELINE value unsupported; probe disabled (value '1' is reserved and not implemented)", flush=True)
+
+# Wave-split H2D replay probe: fixed wave count (phase I-2).
+_C6_PROBE_WAVE_COUNT: int = 8
+
+
+def _c6_probe_series_percentiles(series, total_bytes):
+    """Relative end-ms at which cumulative materialized bytes reach the
+    25/50/75/100% points of the series total (single walk)."""
+    _fracs = (0.25, 0.5, 0.75, 1.0)
+    _out = [None, None, None, None]
+    _total = float(total_bytes or 0.0)
+    _k = 0
+    for _e in series:
+        _cum = float(_e.get("cum_bytes", 0.0))
+        _t = float(_e.get("t_end_ms", 0.0))
+        while _k < 4 and _cum >= _total * _fracs[_k]:
+            _out[_k] = round(_t, 4)
+            _k += 1
+        if _k >= 4:
+            break
+    if _total <= 0.0 or not series:
+        return _out
+    _last = round(float(series[-1].get("t_end_ms", 0.0)), 4)
+    for _i in range(_k, 4):
+        _out[_i] = _last
+    return _out
+
+
+# ── Batch C6 I-3 gates (probe mode only; measurement/verification) ──────
+# Header-vs-state-dict config parity (A) plus the micro mmap/pageable H2D
+# overlap probe (B).  All dead when COMFYMODAL_V2_UNET_READ_H2D_PIPELINE is
+# not "probe"; nothing here ever raises into the load path.
+_C6_PROBE_FILE_PATH: str = ""
+_C6_I3_CAPTURE: dict | None = None
+_C6_MICRO_SAMPLE_ORDINALS: tuple[int, ...] = (2, 116, 222, 337)
+_C6_RING_SOURCES: list | None = None
+
+
+def _c6_comfy_fn(module_name: str, attr: str, fallback: Any = None) -> Any:
+    """Resolve a live comfy helper defensively (never raises)."""
+    try:
+        import importlib as _il_c6
+        _mod = _il_c6.import_module(module_name)
+        return getattr(_mod, attr)
+    except Exception:
+        return fallback
+
+
+def _c6_safetensors_dtype_map() -> dict[str, Any]:
+    """Safetensors dtype-name -> torch dtype (mirrors comfy.utils._TYPES)."""
+    try:
+        import comfy.utils as _cu_dt
+        _types = getattr(_cu_dt, "_TYPES", None)
+        if isinstance(_types, dict):
+            return dict(_types)
+    except Exception:
+        pass
+    try:
+        import torch as _torch_dt
+        return {
+            "F64": _torch_dt.float64, "F32": _torch_dt.float32,
+            "F16": _torch_dt.float16, "BF16": _torch_dt.bfloat16,
+            "I64": _torch_dt.int64, "I32": _torch_dt.int32,
+            "I16": _torch_dt.int16, "I8": _torch_dt.int8,
+            "U8": _torch_dt.uint8, "U64": _torch_dt.uint64,
+            "U32": _torch_dt.uint32, "U16": _torch_dt.uint16,
+        }
+    except Exception:
+        return {}
+
+
+def _c6_parse_safetensors_header(path) -> dict | None:
+    """Read ONLY the safetensors JSON header (never payload).  Returns
+    {key: {dtype, shape, data_offsets}} plus "__metadata__", else None."""
+    try:
+        import struct as _st_c6
+        import json as _json_c6
+        with open(path, "rb") as _f:
+            _head_len = _st_c6.unpack("<Q", _f.read(8))[0]
+            _raw = _f.read(_head_len)
+        _header = _json_c6.loads(_raw.decode("utf-8"))
+        if not isinstance(_header, dict):
+            return None
+        _out: dict[str, Any] = {}
+        for _k, _info in _header.items():
+            if _k == "__metadata__":
+                _out["__metadata__"] = _info
+                continue
+            try:
+                _offsets = _info.get("data_offsets")
+                _out[_k] = {
+                    "dtype": str(_info.get("dtype", "")),
+                    "shape": [int(_s) for _s in (_info.get("shape") or [])],
+                    "data_offsets": [int(_offsets[0]), int(_offsets[1])] if _offsets else [0, 0],
+                }
+            except Exception:
+                return None
+        return _out
+    except Exception:
+        return None
+
+
+def _c6_build_meta_sd(header) -> dict:
+    """Build a meta-device state dict from the header only (shape/dtype/
+    numel, no payload materialization)."""
+    try:
+        import torch as _torch_ms
+    except Exception:
+        return {}
+    _sd: dict[str, Any] = {}
+    _map = _c6_safetensors_dtype_map()
+    for _k, _info in (header or {}).items():
+        if _k == "__metadata__":
+            continue
+        try:
+            _shape = _info.get("shape")
+            _dt = _map.get(_info.get("dtype", ""))
+            if not _shape or _dt is None:
+                continue
+            _sd[_k] = _torch_ms.empty(_shape, dtype=_dt, device="meta")
+        except Exception:
+            continue
+    return _sd
+
+
+def _c6_auth_weight_dtype(model) -> str | None:
+    """Max-numel param dtype of the real loaded model (mirrors
+    comfy.utils.weight_dtype semantics)."""
+    try:
+        _counts: dict[str, int] = {}
+        for _p in model.parameters():
+            try:
+                _counts[str(_p.dtype)] = _counts.get(str(_p.dtype), 0) + int(_p.numel())
+            except Exception:
+                continue
+        if not _counts:
+            return None
+        return max(_counts, key=_counts.get)
+    except Exception:
+        return None
+
+
+def _c6_derive_config_from_header(path, *, get_config_fn=None, calculate_fn=None,
+                                  weight_dtype_fn=None, unet_dtype_fn=None,
+                                  unet_manual_cast_fn=None, unet_offload_device_fn=None,
+                                  extended_fp16_fn=None) -> dict | None:
+    """Meta-only derivation of the load-time UNET config from the safetensors
+    header (mirrors comfy.sd.load_diffusion_model_state_dict).  All comfy
+    functions are injectable for tests; absent functions -> None."""
+    try:
+        if get_config_fn is None:
+            get_config_fn = _c6_comfy_fn("comfy.model_detection", "model_config_from_unet")
+        if calculate_fn is None:
+            calculate_fn = _c6_comfy_fn("comfy.utils", "calculate_parameters")
+        if weight_dtype_fn is None:
+            weight_dtype_fn = _c6_comfy_fn("comfy.utils", "weight_dtype")
+        if unet_dtype_fn is None:
+            unet_dtype_fn = _c6_comfy_fn("comfy.model_management", "unet_dtype")
+        if unet_manual_cast_fn is None:
+            unet_manual_cast_fn = _c6_comfy_fn("comfy.model_management", "unet_manual_cast")
+        if unet_offload_device_fn is None:
+            unet_offload_device_fn = _c6_comfy_fn("comfy.model_management", "unet_offload_device")
+        if any(_fn is None for _fn in (get_config_fn, calculate_fn, weight_dtype_fn,
+                                       unet_dtype_fn, unet_manual_cast_fn)):
+            return None
+        _header = _c6_parse_safetensors_header(path)
+        if _header is None:
+            return None
+        _meta_sd = _c6_build_meta_sd(_header)
+        if not _meta_sd:
+            return None
+        _prefix_fn = _c6_comfy_fn("comfy.model_detection", "unet_prefix_from_state_dict")
+        _strip_fn = _c6_comfy_fn("comfy.utils", "state_dict_prefix_replace")
+        if _prefix_fn is None or _strip_fn is None:
+            return None
+        _prefix = _prefix_fn(_meta_sd)
+        _stripped = _meta_sd
+        if _prefix:
+            try:
+                _stripped = _strip_fn(dict(_meta_sd), {_prefix: ""}, filter_keys=True)
+                if not _stripped:
+                    _stripped = _meta_sd
+            except Exception:
+                _stripped = _meta_sd
+        _params = calculate_fn(_stripped)
+        _wd = weight_dtype_fn(_stripped)
+        _metadata = _header.get("__metadata__")
+        _config = get_config_fn(_stripped, "", metadata=_metadata)
+        _derivation_note = "unet"
+        if _config is None:
+            _mmdit_fn = _c6_comfy_fn("comfy.model_detection", "convert_diffusers_mmdit")
+            if _mmdit_fn is not None:
+                try:
+                    _new_sd = _mmdit_fn(_stripped, "")
+                    if _new_sd is not None:
+                        _config = get_config_fn(_new_sd, "")
+                        _derivation_note = "diffusers_mmdit"
+                except Exception:
+                    _config = None
+            if _config is None:
+                return None
+        _supported = list(getattr(_config, "supported_inference_dtypes", None) or [])
+        _unet_cfg = dict(getattr(_config, "unet_config", None) or {})
+        _load_device = None
+        if unet_offload_device_fn is not None:
+            try:
+                _load_device = unet_offload_device_fn()
+            except Exception:
+                _load_device = None
+        _unet_dtype = unet_dtype_fn(model_params=_params, supported_dtypes=_supported, weight_dtype=_wd)
+        _manual_cast = None
+        try:
+            _manual_cast = unet_manual_cast_fn(_unet_dtype, _load_device, _supported)
+        except Exception:
+            _manual_cast = None
+        return {
+            "config_class": type(_config).__name__,
+            "unet_config": _unet_cfg,
+            "supported_inference_dtypes": [str(_d) for _d in _supported],
+            "parameters": int(_params),
+            "param_count": int(_params),
+            "weight_dtype": str(_wd) if _wd is not None else None,
+            "unet_dtype": str(_unet_dtype),
+            "manual_cast_dtype": str(_manual_cast) if _manual_cast is not None else None,
+            "meta_derivation": True,
+            "derivation_note": _derivation_note,
+        }
+    except Exception:
+        return None
+
+
+def _c6_value_probe_allow_fp16(path, header, n_layers) -> bool | None:
+    """Bounded single-tensor payload read of the ONLY value-dependent input
+    (detect_unet_config's ffn_norm1 std < 0.42 gate).  Never materializes
+    other tensors; None on any failure."""
+    try:
+        import struct as _st_vp
+        import torch as _torch_vp
+        _key = f"layers.{int(n_layers) - 2}.ffn_norm1.weight"
+        _info = (header or {}).get(_key)
+        if _info is None:
+            return None
+        _dtype = _c6_safetensors_dtype_map().get(_info.get("dtype", ""))
+        _shape = _info.get("shape")
+        _offsets = _info.get("data_offsets")
+        if _dtype is None or not _shape or not _offsets:
+            return None
+        _start, _end = int(_offsets[0]), int(_offsets[1])
+        with open(path, "rb") as _f:
+            _head_len = _st_vp.unpack("<Q", _f.read(8))[0]
+            _f.seek(8 + _head_len + _start)
+            _raw = _f.read(max(_end - _start, 0))
+        _t = _torch_vp.frombuffer(bytearray(_raw), dtype=_dtype).view(list(_shape))
+        return bool(float(_torch_vp.std(_t.float(), unbiased=False).item()) < 0.42)
+    except Exception:
+        return None
+
+
+def _c6_config_parity_compare(auth: dict, cand: dict, value_probe: bool | None) -> dict:
+    """Fail-closed comparison of the authoritative captured config vs the
+    meta-derived candidate.  The allow_fp16 value-dependent gap is resolved
+    by the value probe when run; every other field fails closed."""
+    _fields: dict[str, dict[str, Any]] = {}
+    _mismatch: list[str] = []
+    _gaps: list[str] = []
+
+    def _cmp(field, a_val, c_val):
+        _match = (a_val == c_val)
+        _fields[field] = {
+            "auth": _c6_json_safe(a_val),
+            "cand": _c6_json_safe(c_val),
+            "match": bool(_match),
+        }
+        if not _match:
+            _mismatch.append(field)
+
+    _auth_uc = auth.get("unet_config")
+    _cand_uc = cand.get("unet_config")
+
+    def _strip_dtype(_d):
+        # the runtime "dtype" stamp (set_inference_dtype) is compared
+        # separately via the unet_dtype field, never in the dict equality
+        if isinstance(_d, dict):
+            return {_k: _v for _k, _v in _d.items() if _k != "dtype"}
+        return _d
+
+    _auth_cmp_uc = _strip_dtype(_auth_uc)
+    _cand_cmp_uc = _strip_dtype(_cand_uc)
+    _uc_gap = False
+    if not (_auth_cmp_uc == _cand_cmp_uc) and isinstance(_auth_cmp_uc, dict) and isinstance(_cand_cmp_uc, dict):
+        _auth_wo = {_k: _v for _k, _v in _auth_cmp_uc.items() if _k != "allow_fp16"}
+        _cand_wo = {_k: _v for _k, _v in _cand_cmp_uc.items() if _k != "allow_fp16"}
+        _uc_gap = (_auth_wo == _cand_wo)
+    if _uc_gap:
+        _fields["unet_config"] = {
+            "auth": _c6_json_safe(_auth_uc),
+            "cand": _c6_json_safe(_cand_uc),
+            "match": False,
+            "status": "value_dependent_gap",
+        }
+        _gaps.append("unet_config")
+    else:
+        _uc_match = (_auth_cmp_uc == _cand_cmp_uc)
+        _fields["unet_config"] = {
+            "auth": _c6_json_safe(_auth_uc),
+            "cand": _c6_json_safe(_cand_uc),
+            "match": bool(_uc_match),
+        }
+        if not _uc_match:
+            _mismatch.append("unet_config")
+
+    _cand_supported = list(cand.get("supported_inference_dtypes") or [])
+    if value_probe is not None:
+        _ext_fp16 = False
+        try:
+            _ext_fp16 = bool(_c6_comfy_fn("comfy.model_management", "extended_fp16_support", lambda: False)())
+        except Exception:
+            _ext_fp16 = False
+        if value_probe and _ext_fp16 and "torch.float16" not in _cand_supported:
+            _bf_idx = _cand_supported.index("torch.bfloat16") if "torch.bfloat16" in _cand_supported else -1
+            _cand_supported.insert(_bf_idx + 1 if _bf_idx >= 0 else len(_cand_supported), "torch.float16")
+    _cmp("supported_inference_dtypes", auth.get("supported_inference_dtypes"), _cand_supported)
+
+    _cmp("config_class", auth.get("config_class"), cand.get("config_class"))
+    _cmp("parameters", auth.get("parameters"), cand.get("parameters"))
+    _cmp("weight_dtype", auth.get("weight_dtype"), cand.get("weight_dtype"))
+    _cmp("unet_dtype", auth.get("unet_dtype"), cand.get("unet_dtype"))
+    _cmp("manual_cast_dtype", auth.get("manual_cast_dtype"), cand.get("manual_cast_dtype"))
+    _cmp("expected_param_count", auth.get("param_count"), cand.get("param_count"))
+    _cmp("expected_module_count", auth.get("module_count"), cand.get("module_count"))
+
+    _gap_ok = bool(
+        value_probe is not None
+        and _fields.get("supported_inference_dtypes", {}).get("match", False)
+    )
+    _fail_closed = list(_mismatch)
+    if not _gap_ok:
+        _fail_closed = list(_mismatch) + list(_gaps)
+    _verdict = "MATCH" if not _fail_closed else "MISMATCH"
+    return {
+        "verdict": _verdict,
+        "fields": _fields,
+        "value_probe_required": bool(
+            value_probe is not None and "allow_fp16" not in (cand.get("unet_config") or {})
+        ),
+        "value_probe": value_probe,
+        "fail_closed": {
+            "mismatch_fields": sorted(_fail_closed),
+            "gap_fields": sorted(_gaps),
+            "gap_resolved": bool(_gap_ok),
+        },
+    }
+
+
+def _c6_classify_transform(pairs, transform_fn=None) -> dict:
+    """Incremental transform-dependency classification over the captured
+    (input_sd, output_sd) pairs.  Uses the LAST pair (authoritative real
+    bind).  Bounded single-key / pair experiments on COPIES of the input
+    tensors; never mutates the authoritative sd."""
+    _out: dict[str, Any] = {
+        "transform_is_identity": False,
+        "classification": {"INDEPENDENT": [], "SMALL_GROUP": [], "FULL_DICT_REQUIRED": []},
+        "unclassified": 0,
+        "runs": 0,
+        "output_keys": 0,
+    }
+    try:
+        if not pairs:
+            _out["transform_is_identity"] = True
+            return _out
+        _in_sd, _out_sd = pairs[-1]
+        _out["output_keys"] = len(_out_sd) if isinstance(_out_sd, dict) else 0
+        if not isinstance(_in_sd, dict) or not isinstance(_out_sd, dict):
+            _out["unclassified"] = 1
+            return _out
+        _in_keys = list(_in_sd.keys())
+        _out["transform_is_identity"] = bool(
+            set(_in_keys) == set(_out_sd.keys())
+            and all(_in_sd[_k] is _out_sd[_k] for _k in _in_keys)
+        )
+        if _out["transform_is_identity"]:
+            _out["classification"]["INDEPENDENT"] = list(_in_keys)
+            return _out
+        if transform_fn is None:
+            _out["unclassified"] = len(_in_keys)
+            return _out
+        import copy as _copy_c6
+        _runs = 0
+        _RUNS_MAX = 128
+        _SAMPLE_MAX = 64
+        _KEY_LIMIT = 512
+        _in_keys = _in_keys[:_KEY_LIMIT]
+        _sample = _in_keys[:_SAMPLE_MAX]
+        _classified: set[str] = set()
+
+        def _run(_subset: dict) -> dict | None:
+            nonlocal _runs
+            if _runs >= _RUNS_MAX:
+                return None
+            _runs += 1
+            _cp: dict[str, Any] = {}
+            for _kk, _vv in _subset.items():
+                try:
+                    _cp[_kk] = _copy_c6.deepcopy(_vv)
+                except Exception:
+                    _cp[_kk] = _vv
+            try:
+                _res = transform_fn(_cp)
+                return _res if isinstance(_res, dict) else None
+            except Exception:
+                return None
+
+        def _matches_whole(_res: dict) -> bool:
+            if not _res:
+                return False
+            for _rk, _rt in _res.items():
+                _ref = _out_sd.get(_rk)
+                if _ref is None:
+                    return False
+                try:
+                    if tuple(_rt.shape) != tuple(_ref.shape):
+                        return False
+                    if str(_rt.dtype) != str(_ref.dtype):
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        _need_pair: list[str] = []
+        for _k in _sample:
+            if _runs >= _RUNS_MAX:
+                break
+            if _k in _classified:
+                continue
+            _res = _run({_k: _in_sd[_k]})
+            if _res is not None and _matches_whole(_res):
+                _out["classification"]["INDEPENDENT"].append(_k)
+                _classified.add(_k)
+            else:
+                _need_pair.append(_k)
+
+        for _k in _need_pair:
+            if _runs >= _RUNS_MAX:
+                break
+            if _k in _classified:
+                continue
+            _resolved = False
+            for _j in _in_keys:
+                if _j == _k or _j in _classified:
+                    continue
+                if _runs >= _RUNS_MAX:
+                    break
+                _res = _run({_k: _in_sd[_k], _j: _in_sd[_j]})
+                if _res is not None and _matches_whole(_res):
+                    _out["classification"]["SMALL_GROUP"].append([_k, _j])
+                    _classified.add(_k)
+                    _classified.add(_j)
+                    _resolved = True
+                    break
+            if not _resolved and _k not in _classified:
+                _out["classification"]["FULL_DICT_REQUIRED"].append(_k)
+                _classified.add(_k)
+
+        _out["runs"] = _runs
+        _out["unclassified"] = max(0, len(_in_keys) - len(_classified))
+        return _out
+    except Exception:
+        return _out
+
+
+def _c6_classify_overlap(records) -> dict:
+    """Pure classification of micro-overlap sample records (unit-testable)."""
+    _per: list[dict[str, Any]] = []
+    for _r in records:
+        if _r.get("no_next"):
+            continue
+        _h2d = float(_r.get("h2d_cuda_ms", 0.0) or 0.0)
+        _next = float(_r.get("next_mat_wall_ms", 0.0) or 0.0)
+        _comb = float(_r.get("combined_wall_ms", 0.0) or 0.0)
+        _denom = max(min(_h2d, _next), 1e-6)
+        _eff = max(0.0, min((_h2d + _next - _comb) / _denom, 1.0))
+        _per.append({
+            "ordinal": _r.get("ordinal"),
+            "h2d_ms": round(_h2d, 4),
+            "next_ms": round(_next, 4),
+            "combined_ms": round(_comb, 4),
+            "eff": round(_eff, 4),
+        })
+    _n = len(_per)
+    if _n == 0:
+        return {"class": "NO_SAMPLES", "mean_eff": None, "direct_fraction": None,
+                "complete_fraction": None, "n_samples": 0, "per_sample": _per}
+    _mean_eff = sum(_p["eff"] for _p in _per) / _n
+    _direct = sum(1 for _r in records if not _r.get("no_next") and _r.get("overlap_direct"))
+    _complete = sum(1 for _r in records if not _r.get("no_next") and _r.get("overlap_complete"))
+    _direct_f = _direct / _n
+    _complete_f = _complete / _n
+    if _complete >= 2 and _mean_eff >= 0.6:
+        _cls = "TRUE_DMA_OVERLAP"
+    elif _direct >= 2 and _mean_eff >= 0.2:
+        _cls = "PARTIAL_OVERLAP"
+    else:
+        _cls = "EFFECTIVELY_SERIAL"
+    return {
+        "class": _cls,
+        "mean_eff": round(_mean_eff, 4),
+        "direct_fraction": round(_direct_f, 4),
+        "complete_fraction": round(_complete_f, 4),
+        "n_samples": _n,
+        "per_sample": _per,
+    }
+
+
+def _c6_json_safe(value):
+    """Recursively convert non-JSON-serializable values (torch.dtype,
+    torch.device, tensors, numpy scalars, arbitrary objects) to str."""
+    import torch as _torch_c6js
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(_k): _c6_json_safe(_v) for _k, _v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_c6_json_safe(_v) for _v in value]
+    try:
+        if isinstance(value, _torch_c6js.dtype):
+            return str(value)
+        if isinstance(value, _torch_c6js.device):
+            return str(value)
+        if isinstance(value, _torch_c6js.Tensor):
+            return f"tensor(shape={list(value.shape)},dtype={value.dtype})"
+    except Exception:
+        pass
+    try:
+        import numpy as _np_c6js
+        if isinstance(value, _np_c6js.generic):
+            return value.item()
+    except Exception:
+        pass
+    return str(value)
+
+
+def _c6_run_config_parity() -> None:
+    """I-3 orchestrator: compare the authoritative captured config against
+    the meta-header derivation and classify the transform dependency.
+    Probe mode only; guarded; resets the single-flight capture."""
+    if _C6_PROBE_MODE != "probe":
+        return
+    _lane = _ACTIVE_LANE_TRACE.get()
+    _trace = getattr(_lane, "_trace", None) if _lane is not None else None
+    if _trace is None:
+        _trace = _ACTIVE_REQUEST_TRACE.get()
+    try:
+        _cap = globals().get("_C6_I3_CAPTURE")
+        _path = globals().get("_C6_PROBE_FILE_PATH", "")
+
+        def _c6_emit_safe(_event, _meta):
+            if _trace is None:
+                return
+            try:
+                _trace.emit(_event, phase="restore", metadata=_c6_json_safe(_meta))
+            except Exception as _exc:
+                print(
+                    f"[v2.c6_probe] i3 emit_error={_event} {type(_exc).__name__}",
+                    flush=True,
+                )
+
+        if _cap is None or not _path:
+            _meta = {"verdict": "SKIPPED", "reason": "capture_missing"}
+            _c6_emit_safe("unet_i3_config_parity", _meta)
+            print("[v2.c6_probe] i3 parity=SKIPPED reason=capture_missing", flush=True)
+            return
+        _config = _cap.get("model_config")
+        if _config is None:
+            _meta = {"verdict": "SKIPPED", "reason": "capture_missing"}
+            _c6_emit_safe("unet_i3_config_parity", _meta)
+            print("[v2.c6_probe] i3 parity=SKIPPED reason=capture_missing", flush=True)
+            return
+        _auth_unet_cfg = dict(getattr(_config, "unet_config", None) or {})
+        _auth = {
+            "config_class": type(_config).__name__,
+            "unet_config": _auth_unet_cfg,
+            "supported_inference_dtypes": [
+                str(_d) for _d in (getattr(_config, "supported_inference_dtypes", None) or [])
+            ],
+            "parameters": int(_cap.get("param_count", -1)),
+            "param_count": int(_cap.get("param_count", -1)),
+            "module_count": int(_cap.get("module_count", -1)),
+            "weight_dtype": _c6_auth_weight_dtype(_cap.get("model")),
+            "unet_dtype": str(_auth_unet_cfg.get("dtype")) if _auth_unet_cfg.get("dtype") is not None else None,
+            "manual_cast_dtype": (
+                str(getattr(_config, "manual_cast_dtype", None))
+                if getattr(_config, "manual_cast_dtype", None) is not None else None
+            ),
+        }
+        _cand = _c6_derive_config_from_header(_path)
+        if _cand is None:
+            _meta = {"verdict": "SKIPPED", "reason": "candidate_unavailable"}
+            _c6_emit_safe("unet_i3_config_parity", _meta)
+            print("[v2.c6_probe] i3 parity=SKIPPED reason=candidate_unavailable", flush=True)
+            return
+        _header = _c6_parse_safetensors_header(_path)
+        _n_layers = (_cand.get("unet_config") or {}).get("n_layers") or _auth_unet_cfg.get("n_layers") or 0
+        _value_probe = None
+        if _n_layers:
+            try:
+                _value_probe = _c6_value_probe_allow_fp16(_path, _header, _n_layers)
+            except Exception:
+                _value_probe = None
+        _result = _c6_config_parity_compare(_auth, _cand, _value_probe)
+        _transform = _c6_classify_transform(
+            list(_cap.get("transform_pairs") or []),
+            getattr(_config, "process_unet_state_dict", None),
+        )
+        _result["transform"] = _transform
+        _c6_emit_safe("unet_i3_transform_classification", _transform)
+        _c6_emit_safe("unet_i3_config_parity", _result)
+        _fields_matched = sum(1 for _f in _result["fields"].values() if _f.get("match"))
+        _total_fields = len(_result["fields"])
+        print(
+            f"[v2.c6_probe] i3 parity={_result['verdict']} "
+            f"fields_matched={_fields_matched}/{_total_fields} value_probe={_value_probe}",
+            flush=True,
+        )
+        _cls = _transform.get("classification", {})
+        print(
+            f"[v2.c6_probe] i3 transform identity={_transform.get('transform_is_identity')} "
+            f"INDEPENDENT={len(_cls.get('INDEPENDENT', []))} "
+            f"SMALL_GROUP={len(_cls.get('SMALL_GROUP', []))} "
+            f"FULL_DICT={len(_cls.get('FULL_DICT_REQUIRED', []))}",
+            flush=True,
+        )
+    except Exception as _exc:
+        print(
+            f"[v2.c6_probe] i3 parity=ERROR reason={type(_exc).__name__}:{_exc}",
+            flush=True,
+        )
+        return None
+    finally:
+        global _C6_I3_CAPTURE, _C6_PROBE_FILE_PATH
+        _C6_I3_CAPTURE = None
+        _C6_PROBE_FILE_PATH = ""
+
+
+# ── Batch C6 pinned-staging-ring feasibility microprobe (probe mode) ─────
+# Measurement-only: temp pinned CPU buffers + CUDA dests/events/streams;
+# never bound into any model or patcher.  Dead when the probe flag is off.
+
+
+def _c6_ring_plan(chunk_count, buffers) -> list[dict]:
+    """Ring schedule: chunk i -> buffer i%buffers.  A chunk must never write
+    a pinned buffer whose previous DMA (chunk i-buffers) is still pending,
+    so the reuse wait applies to chunk i when i >= buffers."""
+    _plan: list[dict[str, Any]] = []
+    _buf = max(0, int(buffers))
+    for _i in range(max(0, int(chunk_count))):
+        _plan.append({
+            "chunk": _i,
+            "buffer": (_i % _buf) if _buf > 0 else None,
+            "reuse_wait_chunk": (_i - _buf) if (_buf > 0 and _i >= _buf) else None,
+        })
+    return _plan
+
+
+def _c6_ring_run(srcs: list[dict], pin: bool, buffers: int, torch_mod=None) -> dict:
+    """Run one pinned-ring config over the collected source tensors.
+    Measurement only: per-slot pinned CPU buffers + CUDA dests/events.
+    Any failure returns {"error": <type-name>, "error_msg", "fail_step",
+    "records"}; never raises."""
+    _out: dict[str, Any] = {
+        "pin": bool(pin), "buffers": int(buffers), "records": [], "error": None,
+    }
+    _dests: dict[int, Any] = {}
+    _pinned_bufs: dict[int, Any] = {}
+    _pinned_shapes: dict[int, Any] = {}
+    _dest_shapes: dict[Any, Any] = {}
+    _torch_mod = None
+    _fail_step: str | None = "setup"
+    try:
+        _fail_step = "setup"
+        import torch as _torch_ring
+        _torch_mod = torch_mod if torch_mod is not None else _torch_ring
+        _buffers = max(0, int(buffers))
+        _plan = _c6_ring_plan(len(srcs), _buffers)
+        _ev_pending: list[Any] = [None] * _buffers
+        _t_run0 = time.monotonic_ns()
+        _thread0 = time.thread_time_ns()
+        _minflt0 = None
+        try:
+            import resource as _res_ring
+            _minflt0 = int(_res_ring.getrusage(_res_ring.RUSAGE_SELF).ru_minflt)
+        except Exception:
+            _minflt0 = None
+        for _i, _src in enumerate(srcs):
+            _tensor = _src.get("tensor")
+            if _tensor is None:
+                continue
+            _plan_entry = _plan[_i] if _i < len(_plan) else {}
+            _buf_idx = _plan_entry.get("buffer")
+            _rec: dict[str, Any] = {
+                "ordinal": _src.get("ordinal"),
+                "key": _src.get("key"),
+                "bytes": _src.get("nbytes"),
+                "data_ptr": _src.get("data_ptr"),
+                "storage_offset": _src.get("storage_offset"),
+                "is_view": _src.get("is_view"),
+                "buffer": _buf_idx,
+            }
+            if pin and _buffers > 0 and _buf_idx is not None:
+                if _i >= _buffers:
+                    _fail_step = "reuse_wait"
+                    try:
+                        _t_w0 = time.monotonic_ns()
+                        _ev_pending[_buf_idx].synchronize()
+                        _t_w1 = time.monotonic_ns()
+                        _rec["reuse_wait_ms"] = round((_t_w1 - _t_w0) / 1_000_000, 4)
+                    except Exception:
+                        _rec["reuse_wait_ms"] = None
+                else:
+                    _rec["reuse_wait_ms"] = None
+                # ring slots see tensors of different shapes: reallocate the
+                # slot buffer whenever shape/dtype differs from the stored one
+                _pin_key = (tuple(list(_tensor.shape)), _tensor.dtype)
+                if _pinned_shapes.get(_buf_idx) != _pin_key:
+                    try:
+                        del _pinned_bufs[_buf_idx]
+                    except Exception:
+                        pass
+                    _fail_step = "pinned_alloc"
+                    _pinned_bufs[_buf_idx] = _torch_mod.empty(
+                        list(_tensor.shape), dtype=_tensor.dtype, pin_memory=True)
+                    _pinned_shapes[_buf_idx] = _pin_key
+                _fail_step = "cpu_stage_copy"
+                _t_s0 = time.monotonic_ns()
+                _pinned_bufs[_buf_idx].copy_(_tensor, non_blocking=False)
+                _t_s1 = time.monotonic_ns()
+                _rec["cpu_stage_ms"] = round((_t_s1 - _t_s0) / 1_000_000, 4)
+                _rec["cpu_gbps"] = round(
+                    (int(_src.get("nbytes") or 0) / 1e9) / max((_t_s1 - _t_s0) / 1e6, 1e-9), 3)
+                _source = _pinned_bufs[_buf_idx]
+            else:
+                _rec["cpu_stage_ms"] = 0.0
+                _rec["cpu_gbps"] = 0.0
+                _source = _tensor
+            # CUDA dest slots are likewise shape-tracked (covers the single
+            # pageable slot keyed by None too)
+            _dest_key = (tuple(list(_tensor.shape)), _tensor.dtype)
+            if _dest_shapes.get(_buf_idx) != _dest_key:
+                try:
+                    del _dests[_buf_idx]
+                except Exception:
+                    pass
+                _fail_step = "dest_alloc"
+                _dests[_buf_idx] = _torch_mod.empty(
+                    list(_tensor.shape), dtype=_tensor.dtype, device="cuda")
+                _dest_shapes[_buf_idx] = _dest_key
+            _fail_step = "event_record"
+            _ev_start = _torch_mod.cuda.Event(enable_timing=True)
+            _ev_start.record()
+            _t_i0 = time.monotonic_ns()
+            _fail_step = "h2d_copy"
+            _dests[_buf_idx].copy_(_source, non_blocking=True)
+            _t_i1 = time.monotonic_ns()
+            _fail_step = "event_record"
+            _ev_end = _torch_mod.cuda.Event(enable_timing=True)
+            _ev_end.record()
+            _rec["h2d_issue_ms"] = round((_t_i1 - _t_i0) / 1_000_000, 4)
+            _rec["t_issue0_ns"] = _t_i0
+            if pin and _buffers > 0 and _buf_idx is not None:
+                _ev_pending[_buf_idx] = _ev_end
+            _rec["_ev_start"] = _ev_start
+            _rec["_ev_end"] = _ev_end
+            _out["records"].append(_rec)
+        _fail_step = "finalize_sync"
+        _torch_mod.cuda.synchronize()
+        _thread1 = time.thread_time_ns()
+        _minflt1 = None
+        try:
+            import resource as _res_ring2
+            _minflt1 = int(_res_ring2.getrusage(_res_ring2.RUSAGE_SELF).ru_minflt)
+        except Exception:
+            _minflt1 = None
+        _total_h2d = 0.0
+        _total_cpu = 0.0
+        _first_start_ns = None
+        _last_end_ns = None
+        for _rec in _out["records"]:
+            _t0 = _rec.pop("t_issue0_ns", None)
+            _ms = None
+            _fail_step = "elapsed"
+            try:
+                _ms = float(_rec["_ev_start"].elapsed_time(_rec["_ev_end"]))
+            except Exception:
+                _ms = None
+            _rec.pop("_ev_start", None)
+            _rec.pop("_ev_end", None)
+            _rec["h2d_cuda_ms"] = round(_ms, 4) if _ms is not None else None
+            if _ms is not None:
+                _total_h2d += _ms
+                _rec["h2d_gbps"] = round(
+                    (int(_rec.get("bytes") or 0) / 1e9) / max(_ms / 1e3, 1e-9), 3)
+            _total_cpu += float(_rec.get("cpu_stage_ms") or 0.0)
+            if _t0 is not None:
+                _start = _t0 - int(float(_rec.get("cpu_stage_ms") or 0.0) * 1e6) if pin else _t0
+                if _first_start_ns is None or _start < _first_start_ns:
+                    _first_start_ns = _start
+                _end = _t0 + (int(_ms * 1e6) if _ms is not None else 0)
+                if _last_end_ns is None or _end > _last_end_ns:
+                    _last_end_ns = _end
+        if _first_start_ns is not None and _last_end_ns is not None:
+            _out["ring_actual_wall_ms"] = round((_last_end_ns - _first_start_ns) / 1_000_000, 4)
+        else:
+            _out["ring_actual_wall_ms"] = None
+        _out["total_cpu_stage_ms"] = round(_total_cpu, 4)
+        _out["total_h2d_ms"] = round(_total_h2d, 4)
+        _out["serial_expected_ms"] = round(_total_cpu + _total_h2d, 4)
+        _serial = _total_cpu + _total_h2d
+        _actual = _out["ring_actual_wall_ms"]
+        if pin and _serial > 0 and _actual is not None:
+            # overlap hidden = serial - ring wall; normalized by the smaller side
+            _out["overlap_efficiency"] = round(
+                max(0.0, min((_serial - _actual) / max(min(_total_cpu, _total_h2d), 1e-6), 1.0)), 4)
+        else:
+            _out["overlap_efficiency"] = None
+        _out["thread_cpu_ms"] = round((_thread1 - _thread0) / 1_000_000, 4)
+        if _minflt0 is not None and _minflt1 is not None:
+            _out["minflt_delta"] = max(0, _minflt1 - _minflt0)
+        else:
+            _out["minflt_delta"] = None
+        _fail_step = None
+        return _out
+    except Exception as _exc:
+        return {
+            "error": type(_exc).__name__,
+            "error_msg": str(_exc)[:400],
+            "fail_step": _fail_step,
+            "pin": bool(pin),
+            "buffers": int(buffers),
+            "records": _out["records"],
+        }
+    finally:
+        try:
+            for _d in _dests.values():
+                del _d
+            for _p in _pinned_bufs.values():
+                del _p
+            if _torch_mod is not None:
+                _torch_mod.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _c6_ring_classify(results: dict) -> dict:
+    """Choose the best ring buffer count from the four config results.
+    Prefer 2 when pinned2 wall is within 5% of pinned3 AND eff2 >= 0.5;
+    else 3 when pinned3 materially improves (wall < 0.95 * pinned2 wall);
+    else the lower-wall config of 1/2/3, or None.  Pure; offline-testable."""
+    _out: dict[str, Any] = {
+        "best_buffers": None,
+        "pageable_wall_ms": None,
+        "pinned1_wall_ms": None,
+        "pinned2_wall_ms": None,
+        "pinned3_wall_ms": None,
+        "eff1": None, "eff2": None, "eff3": None,
+        "pinned_issue_ms_median": None,
+        "cpu_gbps_median": None,
+        "h2d_gbps_median": None,
+    }
+    try:
+        def _get(_cfg, _key):
+            _r = results.get(_cfg) or {}
+            if isinstance(_r, dict) and not _r.get("error"):
+                return _r.get(_key)
+            return None
+
+        _p1_w = _get("pinned1", "ring_actual_wall_ms")
+        _p2_w = _get("pinned2", "ring_actual_wall_ms")
+        _p3_w = _get("pinned3", "ring_actual_wall_ms")
+        _e1 = _get("pinned1", "overlap_efficiency")
+        _e2 = _get("pinned2", "overlap_efficiency")
+        _e3 = _get("pinned3", "overlap_efficiency")
+        _out["pageable_wall_ms"] = _get("pageable", "ring_actual_wall_ms")
+        _out["pinned1_wall_ms"] = _p1_w
+        _out["pinned2_wall_ms"] = _p2_w
+        _out["pinned3_wall_ms"] = _p3_w
+        _out["eff1"] = _e1
+        _out["eff2"] = _e2
+        _out["eff3"] = _e3
+        _best = None
+        if _p2_w is not None and _p3_w is not None:
+            if _e2 is not None and _p2_w <= _p3_w * 1.05 and _e2 >= 0.5:
+                _best = 2
+            elif _p3_w < 0.95 * _p2_w:
+                _best = 3
+            else:
+                _walls = [(w, b) for w, b in ((_p1_w, 1), (_p2_w, 2), (_p3_w, 3)) if w is not None]
+                _best = min(_walls)[1] if _walls else None
+        elif _p2_w is not None:
+            _best = 2
+        elif _p3_w is not None:
+            _best = 3
+        elif _p1_w is not None:
+            _best = 1
+        _out["best_buffers"] = _best
+        import statistics as _stat_c6
+        _issue_ms: list[float] = []
+        _cpu_gbps: list[float] = []
+        _h2d_gbps: list[float] = []
+        for _cfg in ("pinned1", "pinned2", "pinned3"):
+            _r = results.get(_cfg) or {}
+            if isinstance(_r, dict) and not _r.get("error"):
+                for _rec in (_r.get("records") or []):
+                    try:
+                        if _rec.get("h2d_issue_ms") is not None:
+                            _issue_ms.append(float(_rec["h2d_issue_ms"]))
+                    except Exception:
+                        pass
+                    try:
+                        if _rec.get("cpu_gbps"):
+                            _cpu_gbps.append(float(_rec["cpu_gbps"]))
+                    except Exception:
+                        pass
+                    try:
+                        if _rec.get("h2d_gbps"):
+                            _h2d_gbps.append(float(_rec["h2d_gbps"]))
+                    except Exception:
+                        pass
+        _out["pinned_issue_ms_median"] = round(_stat_c6.median(_issue_ms), 4) if _issue_ms else None
+        _out["cpu_gbps_median"] = round(_stat_c6.median(_cpu_gbps), 4) if _cpu_gbps else None
+        _out["h2d_gbps_median"] = round(_stat_c6.median(_h2d_gbps), 4) if _h2d_gbps else None
+        return _out
+    except Exception:
+        return _out
+
+
+def _c6_run_pinned_ring_probe() -> None:
+    """Pinned-staging-ring feasibility microprobe (probe mode only).  Runs
+    the pageable and 1/2/3-buffer pinned configs over the collected source
+    tensors; emits unet_i3_pinned_ring_probe.  Never raises; resets
+    _C6_RING_SOURCES."""
+    if _C6_PROBE_MODE != "probe":
+        return
+    _lane = _ACTIVE_LANE_TRACE.get()
+    _trace = getattr(_lane, "_trace", None) if _lane is not None else None
+    if _trace is None:
+        _trace = _ACTIVE_REQUEST_TRACE.get()
+
+    def _emit_safe(_event, _meta):
+        if _trace is None:
+            return
+        try:
+            _trace.emit(_event, phase="restore", metadata=_c6_json_safe(_meta))
+        except Exception as _exc:
+            print(f"[v2.c6_probe] ring emit_error={_event} {type(_exc).__name__}", flush=True)
+
+    try:
+        _srcs = globals().get("_C6_RING_SOURCES") or []
+        if len(_srcs) < 4:
+            _meta = {"verdict": "SKIPPED", "reason": "insufficient_sources", "count": len(_srcs)}
+            _emit_safe("unet_i3_pinned_ring_probe", _meta)
+            print("[v2.c6_probe] ring SKIPPED insufficient_sources", flush=True)
+            return
+        import torch as _torch_rp2
+        if not _torch_rp2.cuda.is_available():
+            _meta = {"verdict": "SKIPPED", "reason": "cuda_unavailable"}
+            _emit_safe("unet_i3_pinned_ring_probe", _meta)
+            print("[v2.c6_probe] ring SKIPPED cuda_unavailable", flush=True)
+            return
+        _configs: dict[str, dict[str, Any]] = {}
+        for _name, _pin, _buf in (("pageable", False, 0), ("pinned1", True, 1),
+                                  ("pinned2", True, 2), ("pinned3", True, 3)):
+            _configs[_name] = _c6_ring_run(_srcs, pin=_pin, buffers=_buf)
+            if isinstance(_configs[_name], dict) and _configs[_name].get("error"):
+                print(
+                    f"[v2.c6_probe] ring {_name} error={_configs[_name].get('error')} "
+                    f"step={_configs[_name].get('fail_step')} "
+                    f"msg={str(_configs[_name].get('error_msg', ''))[:300]}",
+                    flush=True,
+                )
+        _classifier = _c6_ring_classify(_configs)
+        _summary: dict[str, dict[str, Any]] = {}
+        for _name, _r in _configs.items():
+            if isinstance(_r, dict):
+                _summary[_name] = {
+                    _k: _v for _k, _v in _r.items()
+                    if _k in ("error", "error_msg", "fail_step", "ring_actual_wall_ms",
+                              "total_cpu_stage_ms", "total_h2d_ms", "serial_expected_ms",
+                              "overlap_efficiency", "thread_cpu_ms", "minflt_delta",
+                              "pin", "buffers")
+                }
+        _sources = [
+            {"ordinal": _s.get("ordinal"), "key": _s.get("key"), "nbytes": _s.get("nbytes")}
+            for _s in _srcs[:12]
+        ]
+        _meta = {
+            "verdict": "COMPLETE",
+            "chunks": len(_srcs),
+            "sources": _sources,
+            "configs": _summary,
+            "classifier": _classifier,
+            "records": {
+                _name: (_r.get("records") if isinstance(_r, dict) else [])
+                for _name, _r in _configs.items()
+            },
+        }
+        _emit_safe("unet_i3_pinned_ring_probe", _meta)
+        print(
+            f"[v2.c6_probe] ring best={_classifier.get('best_buffers')} "
+            f"pageable_wall={_classifier.get('pageable_wall_ms')} "
+            f"p1_wall={_classifier.get('pinned1_wall_ms')} "
+            f"p2_wall={_classifier.get('pinned2_wall_ms')} "
+            f"p3_wall={_classifier.get('pinned3_wall_ms')} "
+            f"eff2={_classifier.get('eff2')} eff3={_classifier.get('eff3')} "
+            f"pinned_issue_ms={_classifier.get('pinned_issue_ms_median')} "
+            f"cpu_gbps={_classifier.get('cpu_gbps_median')} "
+            f"h2d_gbps={_classifier.get('h2d_gbps_median')}",
+            flush=True,
+        )
+    except Exception as _exc:
+        print(f"[v2.c6_probe] ring ERROR reason={type(_exc).__name__}:{_exc}", flush=True)
+    finally:
+        global _C6_RING_SOURCES
+        _C6_RING_SOURCES = None
+
+
+# ── Production pinned-ring UNET fast path (ZImage only; default OFF) ─────
+# COMFYMODAL_V2_UNET_PINNED_RING=1 enables a construction-before-read UNET
+# load: the ZImage module tree is built from the header-only meta config,
+# weights are streamed through two flat pinned CPU slots into CUDA with
+# per-wave event reuse, and parameters are bound incrementally via
+# ``param.data``.  Default OFF; every stage fails closed to the baseline
+# ``_invoke_original`` path.  Reuses the existing _c6_* header/probe helpers
+# and the _fast_disk_* guard conditions.
+_RING_WAVE_TARGET_BYTES: int = 64 * 1024 * 1024
+_RING_MAX_WAVE_BYTES: int = 128 * 1024 * 1024
+_RING_DEPTH: int = 2
+_RING_FLAG_INVALID_PRINTED: bool = False
+
+
+def _ring_flag_value() -> str:
+    """Read COMFYMODAL_V2_UNET_PINNED_RING: on/off/invalid (fail closed)."""
+    _raw = os.environ.get("COMFYMODAL_V2_UNET_PINNED_RING", "").strip().lower()
+    if _raw in ("1", "true", "yes", "on"):
+        return "on"
+    if _raw in ("", "0", "false", "no", "off", "none"):
+        return "off"
+    return "invalid"
+
+
+def _ring_pipeline_enabled() -> bool:
+    """True only for the "on" value; "invalid" is printed once and disabled."""
+    global _RING_FLAG_INVALID_PRINTED
+    _val = _ring_flag_value()
+    if _val == "on":
+        return True
+    if _val == "invalid" and not _RING_FLAG_INVALID_PRINTED:
+        _RING_FLAG_INVALID_PRINTED = True
+        print("[v2.pinned_ring] flag value invalid; pipeline disabled", flush=True)
+    return False
+
+
+# ── V2 meta-direct UNET loader (Batch C6 salvage, gen 2; default OFF) ────
+# The pipeline lives in comfymodal_runtime/unet_meta_direct.py (lazy-imported
+# from the _load_unet branch so the off-path import surface is zero).  Flag
+# semantics mirror the V1 pinned-ring flag: on/off/invalid (fail closed).
+_MD_FLAG_INVALID_PRINTED: bool = False
+
+
+def _md_flag_value() -> str:
+    """Read COMFYMODAL_V2_UNET_META_DIRECT: on/off/invalid (fail closed)."""
+    _raw = os.environ.get("COMFYMODAL_V2_UNET_META_DIRECT", "").strip().lower()
+    if _raw in ("1", "true", "yes", "on"):
+        return "on"
+    if _raw in ("", "0", "false", "no", "off", "none"):
+        return "off"
+    return "invalid"
+
+
+def _md_pipeline_enabled() -> bool:
+    """True only for the "on" value; "invalid" is printed once and disabled."""
+    global _MD_FLAG_INVALID_PRINTED
+    _val = _md_flag_value()
+    if _val == "on":
+        return True
+    if _val == "invalid" and not _MD_FLAG_INVALID_PRINTED:
+        _MD_FLAG_INVALID_PRINTED = True
+        print("[v2.meta_direct] flag value invalid; pipeline disabled", flush=True)
+    return False
+
+
+# ── V2 fastsafetensors UNET loader (Batch C9 production integration; ──────
+# default OFF).  The pipeline lives in
+# comfymodal_runtime/unet_fastsafetensors.py (lazy-imported from the
+# _load_unet branch so the off-path import surface is zero).  Flag
+# semantics mirror the V1 pinned-ring / V2 meta-direct flags: on/off/invalid
+# (fail closed).  The historical flags (PINNED_RING / META_DIRECT /
+# READ_H2D_PIPELINE) are untouched.
+_FS_FLAG_INVALID_PRINTED: bool = False
+
+
+def _fs_flag_value() -> str:
+    """Read COMFYMODAL_V2_UNET_FASTSAFETENSORS: on/off/invalid (fail closed)."""
+    _raw = os.environ.get("COMFYMODAL_V2_UNET_FASTSAFETENSORS", "").strip().lower()
+    if _raw in ("1", "true", "yes", "on"):
+        return "on"
+    if _raw in ("", "0", "false", "no", "off", "none"):
+        return "off"
+    return "invalid"
+
+
+def _fs_pipeline_enabled() -> bool:
+    """True only for the "on" value; "invalid" is printed once and disabled."""
+    global _FS_FLAG_INVALID_PRINTED
+    _val = _fs_flag_value()
+    if _val == "on":
+        return True
+    if _val == "invalid" and not _FS_FLAG_INVALID_PRINTED:
+        _FS_FLAG_INVALID_PRINTED = True
+        print("[v2.fastsafetensors] flag value invalid; pipeline disabled", flush=True)
+    return False
+
+
+def _ring_derive_config(path, _probe_wall=None) -> tuple[Any, dict, dict, int, str] | None:
+    """Derive the ZImage model_config from the safetensors header only (no
+    payload), mirroring comfy.sd.load_diffusion_model_state_dict's config
+    path.  Returns (config, meta_sd, header, n_layers, eff_prefix) or None.
+    ``unet_prefix_from_state_dict`` returns the heuristic default "model."
+    when no candidate prefix matches (the unprefixed ZImage case); the
+    effective prefix is "" when the strip fell back to the meta sd."""
+    try:
+        import torch as _torch_rd
+        _header = _c6_parse_safetensors_header(path)
+        if _header is None:
+            return None
+        _meta_sd = _c6_build_meta_sd(_header)
+        if not _meta_sd:
+            return None
+        _prefix_fn = _c6_comfy_fn("comfy.model_detection", "unet_prefix_from_state_dict")
+        _strip_fn = _c6_comfy_fn("comfy.utils", "state_dict_prefix_replace")
+        _calc_fn = _c6_comfy_fn("comfy.utils", "calculate_parameters")
+        _wd_fn = _c6_comfy_fn("comfy.utils", "weight_dtype")
+        _cfg_fn = _c6_comfy_fn("comfy.model_detection", "model_config_from_unet")
+        if any(_fn is None for _fn in (_prefix_fn, _strip_fn, _calc_fn, _wd_fn, _cfg_fn)):
+            return None
+        _prefix = str(_prefix_fn(_meta_sd) or "")
+        _stripped = _meta_sd
+        if _prefix:
+            try:
+                _stripped = _strip_fn(dict(_meta_sd), {_prefix: ""}, filter_keys=True)
+                if not _stripped:
+                    _stripped = _meta_sd
+            except Exception:
+                _stripped = _meta_sd
+        _eff_prefix = _prefix if _stripped is not _meta_sd else ""
+        _metadata = _header.get("__metadata__")
+        _config = _cfg_fn(_stripped, "", metadata=_metadata)
+        if _config is None:
+            return None
+        _n_layers = int((getattr(_config, "unet_config", None) or {}).get("n_layers") or 0)
+        _vp_t0 = time.monotonic_ns()
+        _allow_fp16 = _c6_value_probe_allow_fp16(path, _header, _n_layers)
+        if _probe_wall is not None:
+            try:
+                _probe_wall["value_probe_wall_ms"] = round(
+                    (time.monotonic_ns() - _vp_t0) / 1_000_000, 4)
+            except Exception:
+                pass
+        if _allow_fp16 is None:
+            return None
+        if _allow_fp16:
+            _ext_fp16_fn = _c6_comfy_fn("comfy.model_management", "extended_fp16_support")
+            _ext = False
+            if _ext_fp16_fn is not None:
+                try:
+                    _ext = bool(_ext_fp16_fn())
+                except Exception:
+                    _ext = False
+            _supported = list(getattr(_config, "supported_inference_dtypes", None) or [])
+            if _ext and _torch_rd.float16 not in _supported:
+                _bf = _supported.index(_torch_rd.bfloat16) if _torch_rd.bfloat16 in _supported else -1
+                _supported.insert(_bf + 1 if _bf >= 0 else len(_supported), _torch_rd.float16)
+                try:
+                    _config.supported_inference_dtypes = _supported
+                except Exception:
+                    pass
+            _uc = getattr(_config, "unet_config", None)
+            if isinstance(_uc, dict):
+                _uc["allow_fp16"] = True
+        else:
+            _uc = getattr(_config, "unet_config", None)
+            if isinstance(_uc, dict):
+                _uc["allow_fp16"] = False
+        _unet_dtype_fn = _c6_comfy_fn("comfy.model_management", "unet_dtype")
+        _manual_cast_fn = _c6_comfy_fn("comfy.model_management", "unet_manual_cast")
+        _offload_fn = _c6_comfy_fn("comfy.model_management", "unet_offload_device")
+        if _unet_dtype_fn is not None and _manual_cast_fn is not None:
+            _params = _calc_fn(_stripped)
+            _wd = _wd_fn(_stripped)
+            _supported = list(getattr(_config, "supported_inference_dtypes", None) or [])
+            _unet_dtype = _unet_dtype_fn(
+                model_params=_params, supported_dtypes=_supported, weight_dtype=_wd)
+            _load_device = None
+            if _offload_fn is not None:
+                try:
+                    _load_device = _offload_fn()
+                except Exception:
+                    _load_device = None
+            try:
+                _manual_cast = _manual_cast_fn(_unet_dtype, _load_device, _supported)
+            except Exception:
+                _manual_cast = None
+            _set = getattr(_config, "set_inference_dtype", None)
+            if callable(_set):
+                try:
+                    _set(_unet_dtype, _manual_cast)
+                except Exception:
+                    pass
+        return (_config, _stripped, _header, _n_layers, _eff_prefix)
+    except Exception:
+        return None
+
+
+def _ring_resolve_unet_path(unet_name, lane) -> str | None:
+    """Resolve the UNET file path for the pinned-ring pipeline.  ComfyUI's
+    path module is the top-level ``folder_paths`` (``comfy.folder_paths``
+    does not exist); prefer ``get_full_path_or_raise`` with a
+    ``get_full_path`` fallback, then the lane trace's ``resolved_path``.
+    Never raises; None when unresolvable."""
+    _name = str(unet_name or "")
+    if not _name:
+        return None
+    _fp = None
+    try:
+        import folder_paths as _fp_mod
+        _fp = _fp_mod
+    except Exception:
+        _fp = None
+    if _fp is not None:
+        _or_raise = getattr(_fp, "get_full_path_or_raise", None)
+        if _or_raise is not None:
+            try:
+                _p = _or_raise("diffusion_models", _name)
+                if _p:
+                    return str(_p)
+            except Exception:
+                pass
+        _plain = getattr(_fp, "get_full_path", None)
+        if _plain is not None:
+            try:
+                _p = _plain("diffusion_models", _name)
+                if _p:
+                    return str(_p)
+            except Exception:
+                pass
+    try:
+        _md = getattr(getattr(lane, "_trace", None), "_metadata", None) or {}
+        _rp = _md.get("resolved_path") or ""
+        if _rp:
+            return str(_rp)
+    except Exception:
+        pass
+    return None
+
+
+def _ring_eligible(record, model_key, kwargs, lane) -> tuple[bool, str]:
+    """Production pinned-ring eligibility gate (conditions 1-10; the caller
+    has already checked the flag).  Derives the header config internally;
+    any failure returns (False, named_reason)."""
+    try:
+        import torch as _torch_re
+        _unet_name = str(kwargs.get("unet_name", "") or "")
+        _path = _ring_resolve_unet_path(_unet_name, lane)
+        if not _path:
+            return (False, "path_unresolved")
+        _derived = _ring_derive_config(_path)
+        if _derived is None:
+            return (False, "config_derivation_failed")
+        _config, _meta_sd, _header, _n_layers, _prefix = _derived
+        if type(_config).__name__ != "ZImage":
+            return (False, "family_not_zimage")
+        _allow = _c6_value_probe_allow_fp16(_path, _header, _n_layers)
+        if _allow is None:
+            return (False, "value_probe_unresolved")
+        if not _fast_disk_high_vram():
+            return (False, "not_high_vram")
+        if _fast_disk_torch_future_enabled():
+            return (False, "torch_future")
+        _evidence = _fast_disk_model_config_evidence(_config)
+        if _evidence.get("quant_config_present"):
+            return (False, "quant_config_present")
+        if _evidence.get("custom_operations_present"):
+            return (False, "custom_operations_present")
+        if _evidence.get("fp8_optimization"):
+            return (False, "fp8_optimization")
+        if _evidence.get("force_channels_last"):
+            return (False, "force_channels_last")
+        _req_wd = str(kwargs.get("weight_dtype", "default") or "default")
+        if _req_wd != "default":
+            return (False, "dtype_conversion_requested")
+        _dtypes = set()
+        for _k, _info in _header.items():
+            if _k == "__metadata__":
+                continue
+            _dt = _info.get("dtype", "")
+            if _dt:
+                _dtypes.add(_dt)
+        if len(_dtypes) != 1:
+            return (False, "non_uniform_dtype")
+        _sd_dt = _c6_safetensors_dtype_map().get(_dtypes.pop())
+        if _sd_dt is None:
+            return (False, "unsupported_dtype")
+        _supported = list(getattr(_config, "supported_inference_dtypes", None) or [])
+        if _sd_dt not in _supported:
+            return (False, "unsupported_dtype")
+        try:
+            if not _torch_re.cuda.is_available():
+                return (False, "cuda_unavailable")
+        except Exception:
+            return (False, "cuda_unavailable")
+        try:
+            _mgmt = _c6_comfy_fn("comfy.model_management", "get_torch_device")
+            _target = _mgmt() if _mgmt is not None else None
+        except Exception:
+            _target = None
+        if _target is None or str(getattr(_target, "type", "") or "").lower() != "cuda":
+            return (False, "cuda_unavailable")
+        try:
+            _p = _torch_re.empty(1 * 1024 * 1024 // 2, dtype=_torch_re.float16, pin_memory=True)
+            del _p
+        except Exception:
+            return (False, "pinned_unavailable")
+        return (True, "")
+    except Exception:
+        return (False, "eligibility_error")
+
+
+def _ring_wave_build(keys, bytes_map, target_bytes=_RING_WAVE_TARGET_BYTES,
+                     max_bytes=_RING_MAX_WAVE_BYTES) -> list[list[str]] | None:
+    """Pack header-order keys into waves: tensors larger than the target get
+    their own wave; small tensors pack until the target.  A single tensor
+    over max_bytes returns None (tensor_exceeds_wave_cap)."""
+    _waves: list[list[str]] = []
+    _cur: list[str] = []
+    _cur_bytes = 0
+    for _k in keys:
+        _b = int(bytes_map.get(_k, 0))
+        if _b > max_bytes:
+            return None
+        if _b > target_bytes:
+            if _cur:
+                _waves.append(_cur)
+                _cur = []
+                _cur_bytes = 0
+            _waves.append([_k])
+            continue
+        if _cur and _cur_bytes + _b > target_bytes:
+            _waves.append(_cur)
+            _cur = []
+            _cur_bytes = 0
+        _cur.append(_k)
+        _cur_bytes += _b
+    if _cur:
+        _waves.append(_cur)
+    return _waves
+
+
+def _ring_emit(status, reason, metrics, trace=None) -> None:
+    """Lean production telemetry: one unet_pinned_ring_pipeline event
+    (JSON-safe) plus one console line."""
+    try:
+        _m = _c6_json_safe(dict(metrics))
+        _m["status"] = status
+        _m["reason"] = reason or ""
+        if trace is not None:
+            trace.emit("unet_pinned_ring_pipeline", phase="restore", metadata=_m)
+    except Exception as _exc:
+        print(f"[v2.pinned_ring] emit_error={type(_exc).__name__}", flush=True)
+    try:
+        print(
+            f"[v2.pinned_ring] status={status} reason={reason or ''} "
+            f"waves={metrics.get('wave_count')} "
+            f"total_wall_ms={metrics.get('total_pipeline_wall_ms')} "
+            f"hidden_overlap_ms={metrics.get('hidden_overlap_ms')}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _ring_run_waves(model, params, path, header, waves, lane, prefix="", target=None, torch_mod=None, buffers=None) -> tuple[dict, Any, list] | None:
+    """Pinned-ring wave H2D runner: two flat typed pinned slots, one event
+    pair per wave, incremental ``param.data`` binding.  Returns
+    (metrics, file_ctx, wave_events) or None on failure.  Never synchronizes
+    beyond the per-slot reuse waits (the single final sync is the caller's)."""
+    import torch as _torch_rw
+    _torch = torch_mod if torch_mod is not None else _torch_rw
+    _pin_slots: list[Any] = [None, None]
+    _pin_numelems: list[int] = [0, 0]
+    _pin_dtypes: list[Any] = [None, None]
+    _ev_pending: list[Any] = [None, None]
+    _dests: dict[str, Any] = {}
+    _open = None
+    _metrics: dict[str, Any] = {
+        "read_pagein_wall_ms": 0.0, "cpu_staging_wall_ms": 0.0,
+        "h2d_host_issue_wall_ms": 0.0, "reuse_wait_total_ms": 0.0,
+        "max_reuse_wait_ms": 0.0, "pinned_alloc_bytes": 0,
+    }
+    _wave_events: list[tuple[Any, Any, dict[str, Any]]] = []
+    try:
+        try:
+            import safetensors as _st_ring
+            _open = _st_ring.safe_open(path, framework="pt", device="cpu")
+        except Exception as _exc:
+            return (None, "safe_open:" + type(_exc).__name__)
+        try:
+            _open.__enter__()
+        except AttributeError:
+            pass
+        for _w_idx, _wave_keys in enumerate(waves):
+            _s = _w_idx % 2
+            _wm: dict[str, Any] = {"keys": _wave_keys, "bytes": 0, "stage_ms": 0.0,
+                                   "issue_ms": 0.0, "device_ms": None, "reuse_wait_ms": None}
+            if _ev_pending[_s] is not None:
+                _t0 = time.monotonic_ns()
+                try:
+                    _ev_pending[_s].synchronize()
+                except Exception:
+                    pass
+                _t1 = time.monotonic_ns()
+                _wait_ms = round((_t1 - _t0) / 1_000_000, 4)
+                _wm["reuse_wait_ms"] = _wait_ms
+                _metrics["reuse_wait_total_ms"] += _wait_ms
+                _metrics["max_reuse_wait_ms"] = max(_metrics["max_reuse_wait_ms"], _wait_ms)
+                _ev_pending[_s] = None
+            # source read (pageable) into per-wave list; compute offsets
+            _srcs: list[Any] = []
+            _offsets: list[tuple[str, Any, int, int]] = []
+            _wave_numelem = 0
+            _wave_bytes = 0
+            _dt = None
+            _read_t0 = time.monotonic_ns()
+            try:
+                for _k in _wave_keys:
+                    _full = (prefix + _k) if prefix and not _k.startswith(prefix) else _k
+                    _t = _open.get_tensor(_full)
+                    _srcs.append(_t)
+                    _n = int(_t.numel())
+                    _offsets.append((_k, _t, _wave_numelem, _wave_numelem + _n))
+                    _wave_numelem += _n
+                    _wave_bytes += int(_n) * int(_t.element_size())
+                    _dt = _t.dtype
+            except Exception as _exc:
+                return (None, "read:" + type(_exc).__name__)
+            _read_t1 = time.monotonic_ns()
+            _wm["bytes"] = _wave_bytes
+            _metrics["read_pagein_wall_ms"] += round((_read_t1 - _read_t0) / 1_000_000, 4)
+            # ensure slot capacity (grow-to-largest, realloc replaces)
+            if _pin_slots[_s] is None or _pin_numelems[_s] < _wave_numelem:
+                _old = _pin_slots[_s]
+                try:
+                    _pin_slots[_s] = _torch.empty(_wave_numelem, dtype=_dt, pin_memory=True)
+                    _pin_numelems[_s] = _wave_numelem
+                    _pin_dtypes[_s] = _dt
+                    _metrics["pinned_alloc_bytes"] += int(_wave_numelem) * int(_dt.itemsize)
+                except Exception as _exc:
+                    return (None, "pinned_alloc:" + type(_exc).__name__)
+                finally:
+                    if _old is not None:
+                        try:
+                            del _old
+                        except Exception:
+                            pass
+            # STAGE (sync pageable -> pinned)
+            _stage_t0 = time.monotonic_ns()
+            try:
+                for _k, _t, _off0, _off1 in _offsets:
+                    _pin_slots[_s][_off0:_off1].view(list(_t.shape)).copy_(_t, non_blocking=False)
+            except Exception as _exc:
+                return (None, "stage_copy:" + type(_exc).__name__)
+            _stage_t1 = time.monotonic_ns()
+            _wm["stage_ms"] = round((_stage_t1 - _stage_t0) / 1_000_000, 4)
+            _metrics["cpu_staging_wall_ms"] += _wm["stage_ms"]
+            # DMA: per-key cuda dests, async enqueue then bind param.data
+            _ev_start = _torch.cuda.Event(enable_timing=True)
+            _ev_start.record()
+            _issue_t0 = time.monotonic_ns()
+            try:
+                for _k, _t, _off0, _off1 in _offsets:
+                    _dest = _torch.empty(list(_t.shape), dtype=_t.dtype, device=target)
+                    _dests[_k] = _dest
+                    _dest.copy_(_pin_slots[_s][_off0:_off1].view(list(_t.shape)), non_blocking=True)
+                    _dst = params.get(_k)
+                    if _dst is None and buffers is not None:
+                        _dst = buffers.get(_k)
+                    if _dst is not None:
+                        _dst.data = _dest
+            except Exception as _exc:
+                return (None, "dma_bind:" + type(_exc).__name__)
+            _issue_t1 = time.monotonic_ns()
+            _ev_end = _torch.cuda.Event(enable_timing=True)
+            _ev_end.record()
+            _ev_pending[_s] = _ev_end
+            _wm["issue_ms"] = round((_issue_t1 - _issue_t0) / 1_000_000, 4)
+            _metrics["h2d_host_issue_wall_ms"] += _wm["issue_ms"]
+            _wave_events.append((_ev_start, _ev_end, _wm))
+            _srcs.clear()
+        return (_metrics, _open, _wave_events)
+    except Exception as _exc:
+        return (None, "ring_run:" + type(_exc).__name__)
+    finally:
+        if _open is not None:
+            try:
+                _open.__exit__(None, None, None)
+            except Exception:
+                pass
+        try:
+            for _s in range(2):
+                if _pin_slots[_s] is not None:
+                    del _pin_slots[_s]
+                    _pin_slots[_s] = None
+        except Exception:
+            pass
+        try:
+            _dests.clear()
+        except Exception:
+            pass
+        try:
+            _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _ring_fail(metrics, trace, reason, t0_total) -> None:
+    """Fallback helper: emit status=fallback with the named stage reason."""
+    try:
+        metrics.update({
+            "status": "fallback", "reason": reason, "fallback_count": 1,
+            "total_pipeline_wall_ms": round((time.monotonic_ns() - t0_total) / 1_000_000, 4),
+        })
+    except Exception:
+        pass
+    try:
+        import torch as _torch_rf
+        _torch_rf.cuda.empty_cache()
+    except Exception:
+        pass
+    _ring_emit(metrics.get("status", "fallback"), metrics.get("reason", reason), metrics, trace)
+    return None
+
+
+def _ring_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
+    """Production pinned-ring UNET fast path.  Returns ``(patcher,)`` on
+    success (flows through the unchanged _load_unet tail); None on
+    ineligible/fallback (the caller then runs ``_invoke_original`` fresh)."""
+    _lane = lane if lane is not None else _ACTIVE_LANE_TRACE.get()
+    _trace = getattr(_lane, "_trace", None) if _lane is not None else None
+    if _trace is None:
+        _trace = _ACTIVE_REQUEST_TRACE.get()
+    _t0_total = time.monotonic_ns()
+    _metrics: dict[str, Any] = {
+        "flag": _ring_flag_value(), "eligibility": "ok", "family": "ZImage", "reason": "",
+        "header_config_wall_ms": None, "value_probe_wall_ms": None, "get_model_wall_ms": None,
+        "param_count": 0, "tensor_count": 0, "total_bytes": 0, "wave_count": 0,
+        "wave_target_bytes": _RING_WAVE_TARGET_BYTES, "max_wave_bytes": _RING_MAX_WAVE_BYTES,
+        "actual_max_wave_bytes": 0, "actual_mean_wave_bytes": 0, "pinned_alloc_bytes": 0,
+        "sd_unmapped_keys": [], "model_only_param_count": 0, "model_only_buffer_count": 0,
+        "read_pagein_wall_ms": 0.0, "cpu_staging_wall_ms": 0.0, "h2d_device_wall_ms": 0.0,
+        "h2d_host_issue_wall_ms": 0.0, "reuse_wait_total_ms": 0.0, "max_reuse_wait_ms": 0.0,
+        "final_model_to_wall_ms": 0.0, "final_sync_wall_ms": 0.0,
+        "total_pipeline_wall_ms": 0.0, "serial_equivalent_ms": 0.0, "hidden_overlap_ms": 0.0,
+        "fallback_count": 0, "status": "ok",
+    }
+    _file_ctx = None
+    _wave_events: list[tuple[Any, Any, dict[str, Any]]] = []
+    _run_metrics: dict[str, Any] = {}
+    try:
+        import torch as _torch_tp
+        _unet_name = str(kwargs.get("unet_name", "") or "")
+        _path = _ring_resolve_unet_path(_unet_name, _lane)
+        if not _path:
+            return _ring_fail(_metrics, _trace, "stage:path_unresolved", _t0_total)
+        # S2 eligibility (pre-construction, conditions 1-10)
+        _ok, _reason = _ring_eligible(None, model_key, kwargs, _lane)
+        if not _ok:
+            _metrics.update({"eligibility": "ineligible", "reason": _reason, "status": "ineligible"})
+            _ring_emit(_metrics.get("status"), _metrics.get("reason"), _metrics, _trace)
+            return None
+        # S1 config derivation (header only)
+        _t_cfg = time.monotonic_ns()
+        _probe_wall: dict[str, Any] = {}
+        _derived = _ring_derive_config(_path, _probe_wall=_probe_wall)
+        if _derived is None:
+            return _ring_fail(_metrics, _trace, "stage:config_derivation_failed", _t0_total)
+        _config, _meta_sd, _header, _n_layers, _prefix = _derived
+        _metrics["header_config_wall_ms"] = round((time.monotonic_ns() - _t_cfg) / 1_000_000, 4)
+        _metrics["value_probe_wall_ms"] = _probe_wall.get("value_probe_wall_ms")
+        if type(_config).__name__ != "ZImage":
+            _metrics.update({"family": type(_config).__name__, "eligibility": "ineligible",
+                             "reason": "family_not_zimage", "status": "ineligible"})
+            _ring_emit(_metrics.get("status"), _metrics.get("reason"), _metrics, _trace)
+            return None
+        # S3 construction (meta sd for signature parity; ZImage ignores payload)
+        _t_gm = time.monotonic_ns()
+        _model = _config.get_model(_meta_sd, "")
+        _metrics["get_model_wall_ms"] = round((time.monotonic_ns() - _t_gm) / 1_000_000, 4)
+        # S4 patcher (plain non-dynamic ModelPatcher, mirroring sd.py)
+        _mgmt_fn = _c6_comfy_fn("comfy.model_management", "get_torch_device")
+        _target = _mgmt_fn() if _mgmt_fn is not None else _torch_tp.device("cuda")
+        _offload_fn = _c6_comfy_fn("comfy.model_management", "unet_offload_device")
+        _offload = _offload_fn() if _offload_fn is not None else _torch_tp.device("cpu")
+        _mp_cls = _c6_comfy_fn("comfy.model_patcher", "ModelPatcher")
+        if _mp_cls is None:
+            return _ring_fail(_metrics, _trace, "stage:patcher_unavailable", _t0_total)
+        _patcher = _mp_cls(_model, load_device=_target, offload_device=_offload)
+        # S5 key map + transform identity + uniform dtype.  The authoritative
+        # bind (model_base.load_model_weights) strips the unet_prefix and
+        # loads into the diffusion_model submodule with strict=False, so the
+        # keys are UNPREFIXED and model-only params/buffers are allowed.
+        _unet = getattr(_model, "diffusion_model", None) or _model
+        _params = dict(_unet.named_parameters())
+        _buffers = dict(_unet.named_buffers())
+        _metrics["param_count"] = len(_params)
+        try:
+            _transformed = _config.process_unet_state_dict(dict(_meta_sd))
+        except Exception:
+            _transformed = None
+        if not isinstance(_transformed, dict):
+            return _ring_fail(_metrics, _trace, "stage:transform_not_independent", _t0_total)
+        _sd_keys = set(_transformed.keys())
+        if _sd_keys != set(_meta_sd.keys()):
+            return _ring_fail(_metrics, _trace, "stage:transform_not_independent", _t0_total)
+        _dest_key_set = set(_params.keys()) | set(_buffers.keys())
+        _unmapped = sorted(_k for _k in _sd_keys if _k not in _dest_key_set)
+        _metrics["sd_unmapped_keys"] = _unmapped[:20]
+        if _unmapped:
+            return _ring_fail(_metrics, _trace, "stage:key_param_mismatch", _t0_total)
+        _metrics["model_only_param_count"] = sum(
+            1 for _k in _params.keys() if _k not in _sd_keys)
+        _metrics["model_only_buffer_count"] = sum(
+            1 for _k in _buffers.keys() if _k not in _sd_keys)
+        _dtypes = set()
+        for _k, _info in _header.items():
+            if _k == "__metadata__":
+                continue
+            if _info.get("dtype"):
+                _dtypes.add(_info["dtype"])
+        if len(_dtypes) != 1:
+            return _ring_fail(_metrics, _trace, "stage:non_uniform_dtype", _t0_total)
+        _sd_dt = _c6_safetensors_dtype_map().get(_dtypes.pop())
+        if _sd_dt is None or _sd_dt not in list(getattr(_config, "supported_inference_dtypes", None) or []):
+            return _ring_fail(_metrics, _trace, "stage:unsupported_dtype", _t0_total)
+        _dest_dtypes = set()
+        for _k in _sd_keys:
+            _dst = _params.get(_k)
+            if _dst is None:
+                _dst = _buffers.get(_k)
+            if _dst is None:
+                continue
+            _dest_dtypes.add(_dst.dtype)
+        if not _dest_dtypes or len(_dest_dtypes) != 1 or _sd_dt not in _dest_dtypes:
+            return _ring_fail(_metrics, _trace, "stage:dtype_mismatch", _t0_total)
+        # S6 waves (header/read order preserved by the stripped meta-sd order)
+        _meta_bytes = {k: int(v.numel()) * int(v.element_size()) for k, v in _meta_sd.items()}
+        _waves = _ring_wave_build(list(_meta_sd.keys()), _meta_bytes)
+        if _waves is None:
+            return _ring_fail(_metrics, _trace, "stage:tensor_exceeds_wave_cap", _t0_total)
+        _metrics["tensor_count"] = len(_meta_sd)
+        _metrics["total_bytes"] = int(sum(_meta_bytes.values()))
+        _metrics["wave_count"] = len(_waves)
+        _wave_bytes_list = [int(sum(_meta_bytes[k] for k in _w)) for _w in _waves]
+        _metrics["actual_max_wave_bytes"] = max(_wave_bytes_list) if _wave_bytes_list else 0
+        _metrics["actual_mean_wave_bytes"] = (
+            int(sum(_wave_bytes_list) / len(_wave_bytes_list)) if _wave_bytes_list else 0)
+        # S7 ring run
+        _run_result = _ring_run_waves(_model, _params, _path, _header, _waves, _lane,
+                                      prefix=_prefix, target=_target, buffers=_buffers)
+        if _run_result is None or _run_result[0] is None:
+            _ring_detail = ""
+            if isinstance(_run_result, tuple) and len(_run_result) > 1:
+                _ring_detail = ":" + str(_run_result[1])
+            return _ring_fail(_metrics, _trace, "stage:ring_run" + _ring_detail, _t0_total)
+        _run_metrics, _file_ctx, _wave_events = _run_result
+        # S8 final model.to (must NOT duplicate the parameter transfer): every
+        # sd-mapped param must already be on cuda (ring bind complete); model-only
+        # leftovers may stay cpu and are moved by model.to (strict=False parity)
+        _unbound_cpu = [k for k in _sd_keys
+                        if k in _params and str(_params[k].device).startswith("cpu")]
+        if _unbound_cpu:
+            return _ring_fail(_metrics, _trace, "stage:ring_bind_incomplete", _t0_total)
+        _t_to = time.monotonic_ns()
+        try:
+            _model.to(_target)
+        except Exception:
+            return _ring_fail(_metrics, _trace, "stage:final_model_to", _t0_total)
+        _metrics["final_model_to_wall_ms"] = round((time.monotonic_ns() - _t_to) / 1_000_000, 4)
+        if _metrics["final_model_to_wall_ms"] > 500.0:
+            return _ring_fail(_metrics, _trace, "stage:final_to_duplicates_transfer", _t0_total)
+        # S9 exactly ONE final synchronize
+        _t_sync = time.monotonic_ns()
+        try:
+            _torch_tp.cuda.synchronize()
+        except Exception:
+            return _ring_fail(_metrics, _trace, "stage:final_sync", _t0_total)
+        _metrics["final_sync_wall_ms"] = round((time.monotonic_ns() - _t_sync) / 1_000_000, 4)
+        # wave device elapsed (realized by the final sync)
+        _h2d_dev = 0.0
+        for _ev_s, _ev_e, _wm in _wave_events:
+            try:
+                _ms = float(_ev_s.elapsed_time(_ev_e))
+            except Exception:
+                _ms = None
+            _wm["device_ms"] = round(_ms, 4) if _ms is not None else None
+            if _ms is not None:
+                _h2d_dev += _ms
+        _metrics["h2d_device_wall_ms"] = round(_h2d_dev, 4)
+        # close the file context after the final sync
+        if _file_ctx is not None:
+            try:
+                _file_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            _file_ctx = None
+        # S10 totals + emit
+        _metrics["pinned_alloc_bytes"] = int(_run_metrics.get("pinned_alloc_bytes", 0))
+        _metrics["read_pagein_wall_ms"] = round(float(_run_metrics.get("read_pagein_wall_ms", 0.0)), 4)
+        _metrics["cpu_staging_wall_ms"] = round(float(_run_metrics.get("cpu_staging_wall_ms", 0.0)), 4)
+        _metrics["h2d_host_issue_wall_ms"] = round(float(_run_metrics.get("h2d_host_issue_wall_ms", 0.0)), 4)
+        _metrics["reuse_wait_total_ms"] = round(float(_run_metrics.get("reuse_wait_total_ms", 0.0)), 4)
+        _metrics["max_reuse_wait_ms"] = round(float(_run_metrics.get("max_reuse_wait_ms", 0.0)), 4)
+        _metrics["total_pipeline_wall_ms"] = round((time.monotonic_ns() - _t0_total) / 1_000_000, 4)
+        _metrics["serial_equivalent_ms"] = round(
+            (float(_metrics["read_pagein_wall_ms"] or 0)
+             + float(_metrics["cpu_staging_wall_ms"] or 0)
+             + float(_metrics["h2d_device_wall_ms"] or 0)
+             + float(_metrics["get_model_wall_ms"] or 0)
+             + float(_metrics["final_model_to_wall_ms"] or 0)
+             + float(_metrics["final_sync_wall_ms"] or 0)), 4)
+        _metrics["hidden_overlap_ms"] = round(
+            max(0.0, float(_metrics["serial_equivalent_ms"]) - float(_metrics["total_pipeline_wall_ms"])), 4)
+        _metrics["status"] = "ok"
+        _metrics["reason"] = ""
+        _ring_emit("ok", "", _metrics, _trace)
+        return (_patcher,)
+    except Exception as _exc:
+        return _ring_fail(_metrics, _trace, f"stage:{type(_exc).__name__}", _t0_total)
+
+
 # ── V2 A/B experiments (Experiment 1 unet_transfer / Experiment 2
 # vae_overlap) ─────────────────────────────────────────────────────────
 # Accessors come from ``comfymodal_runtime.v2_experiments`` (the unified
@@ -332,10 +2097,16 @@ def _vae_decode_boundary_metadata(
 @dataclass
 class _PageFaultSnapshot:
     """Snapshot of process page-fault counters at a given moment.
-    Uses resource.getrusage (Linux-only; returns zeros on other platforms).
+
+    Reads ``resource.getrusage`` first (Linux).  When that is unavailable
+    (or zeroed under gVisor runsc), falls back to ``/proc/self/stat``
+    fields 10 (minflt) and 12 (majflt).  When BOTH sources are unavailable
+    the snapshot is marked ``unavailable=True`` — it never fakes zero
+    deltas (a zero here is indistinguishable from "never measured").
     """
     major: int = 0
     minor: int = 0
+    unavailable: bool = False
 
     @classmethod
     def now(cls) -> "_PageFaultSnapshot":
@@ -344,11 +2115,30 @@ class _PageFaultSnapshot:
             ru = _r.getrusage(_r.RUSAGE_SELF)
             return cls(major=ru.ru_majflt, minor=ru.ru_minflt)
         except Exception:
-            return cls()
+            pass
+        # Fallback: /proc/self/stat.  ``comm`` (field 2) may contain spaces
+        # or parentheses, so strip it via rfind(')'): the remainder starts
+        # at field 3 (state), making field 10 (minflt) index 7 and field 12
+        # (majflt) index 9 of that remainder.
+        try:
+            with open("/proc/self/stat", "r", encoding="utf-8", errors="replace") as _pf_stat_f:
+                _pf_stat_line = _pf_stat_f.read()
+            _pf_stat_fields = _pf_stat_line[_pf_stat_line.rfind(")") + 2:].split()
+            if len(_pf_stat_fields) >= 10:
+                return cls(major=int(_pf_stat_fields[9]), minor=int(_pf_stat_fields[7]))
+        except Exception:
+            pass
+        return cls(unavailable=True)
 
 
-def _pagefault_delta(before: _PageFaultSnapshot, after: _PageFaultSnapshot) -> dict[str, int]:
-    """Return major/minor fault deltas from two snapshots."""
+def _pagefault_delta(before: _PageFaultSnapshot, after: _PageFaultSnapshot) -> dict[str, int | None]:
+    """Return major/minor fault deltas from two snapshots.
+
+    Returns ``None`` (JSON null) for BOTH counters when either snapshot
+    could not be read — never fake zeros.
+    """
+    if before.unavailable or after.unavailable:
+        return {"major_faults": None, "minor_faults": None}
     return {
         "major_faults": max(0, after.major - before.major),
         "minor_faults": max(0, after.minor - before.minor),
@@ -1290,6 +3080,14 @@ _BG_UNET_DIAG_LOCK = RLock()
 
 _SENTINEL_READ = "_comfy_modal_read_wrapper"
 _SENTINEL_GPU = "_comfy_modal_gpu_wrapper"
+_SENTINEL_FORENSICS = "_comfymodal_clip_cold_forensics"
+"""Symmetric cross-sentinel guard for the five shared GPU/patcher/CLIP
+targets also wrapped by ``comfymodal_runtime.clip_cold_path_forensics``.
+
+When a shared target already carries this attribute the forensics module
+owns the function — skip installation so exactly one wrapper wins
+regardless of install order (forensics install() checks the matching
+``_SENTINEL_GPU`` on the same targets)."""
 _SENTINEL_SD = "_comfy_modal_sd_wrapper"
 _SENTINEL_SUBFN = "_comfy_modal_subfn_wrapper"
 _SENTINEL_DEEP_ST = "_comfy_modal_deep_st_wrapper"
@@ -2009,7 +3807,19 @@ def resolve_unet_effective_dtype(
     """
     # Import torch lazily — may not be available at parse time in all contexts.
     import torch as _torch
-    import comfy.cli_args as _ca
+    # comfy.cli_args is always present in the deployed container; the
+    # fail-soft path below exists so unit tests (no comfy on sys.path) can
+    # exercise the bridge.  Production behavior is unchanged: on ImportError
+    # every CLI flag below is treated as unset (False), exactly as argparse
+    # leaves it when none of --fp32-unet/--fp64-unet/--bf16-unet/--fp16-unet
+    # are passed, so resolution falls through to the normal weight-dtype /
+    # target-GPU branches.
+    try:
+        import comfy.cli_args as _ca
+    except ImportError:  # pragma: no cover - unit-test-only environment
+        import types as _types
+
+        _ca = _types.SimpleNamespace(args=_types.SimpleNamespace())
 
     # 1. CLI flags (work in both normal and CPU-snapshot contexts)
     if getattr(_ca.args, "fp32_unet", False):
@@ -2205,6 +4015,45 @@ def _opt_vae_h2d_capture(models: list[Any]) -> dict[str, Any]:
     }
 
 
+def _gpu_fast_return_enabled() -> bool:
+    """True when the proven-ready GPU-load fast return is enabled.
+
+    E26: promoted to the production default.  The behavior remains strictly
+    fail-closed (the wrapper only short-circuits when the exact UNET is in
+    the load list AND every parameter/buffer is provably CUDA-resident AND
+    no force flags AND no mutation lane), so production enablement is safe.
+    ``COMFYMODAL_V2_GPU_FAST_RETURN`` may still force-disable (value 0) or
+    force-enable (1/true/yes/on); the default when unset is now ON.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_GPU_FAST_RETURN", "1")
+    stripped = raw.strip().lower()
+    if stripped in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _all_models_proven_cuda_resident(models: list[Any]) -> bool:
+    """True when every model in *models* has ALL parameters and buffers on a
+    CUDA device.  Fail-closed: any exception or any non-CUDA tensor -> False.
+    """
+    try:
+        for model in models:
+            inner = getattr(model, "model", None)
+            if inner is None:
+                inner = model
+            for tensor in list(getattr(inner, "parameters", lambda: ())() or ()):
+                if str(getattr(tensor, "device", "cpu")).startswith("cuda"):
+                    continue
+                return False
+            for tensor in list(getattr(inner, "buffers", lambda: ())() or ()):
+                if str(getattr(tensor, "device", "cpu")).startswith("cuda"):
+                    continue
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap ``comfy.model_management.load_models_gpu`` to emit commit events.
 
@@ -2220,6 +4069,58 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 minimum_memory_required=None, force_full_load=False):
         before = _gpu_depth.get()
         _gpu_depth.set(before + 1)
+        # ── E25: proven-ready fast return for an already GPU-resident
+        # registered UNET (opt-in, fail-closed) ──
+        # The fastsafetensors/execution UNET lane already bound + validated
+        # every parameter on the target device.  The sampler's subsequent
+        # load_models_gpu re-runs ComfyUI's ModelPatcher.load bookkeeping
+        # (unpatch_hooks, load-list walk, patch accounting) over an already
+        # resident model — real serial work with no transfers.  When the
+        # exact UNET is provably all-on-target and the request is not
+        # forcing a full load, short-circuit to a telemetry-preserving
+        # fast return.  FAIL-CLOSED: the gate requires (a) opt-in env,
+        # (b) a request-scoped trace, (c) no mutation lane (graph thread),
+        # (d) a registered UNET in the load list, (e) every parameter of
+        # every model on a CUDA device, and (f) no force_full_load /
+        # force_patch_weights.  Any doubt falls through to the original
+        # path.  D15 coordination is preserved: the fast return is a pure
+        # bookkeeping skip (no GPU work), but it may never bypass the UNET
+        # GPU gate while the CLIP critical section is active — the gate below
+        # checks ``clip_critical_active`` so the D15 invariant (UNET GPU
+        # overlap with CLIP critical = 0) is never weakened.
+        _e25_fast_return = False
+        if (
+            before == 0
+            and _gpu_fast_return_enabled()
+            and not force_full_load
+            and not force_patch_weights
+            and _ACTIVE_REQUEST_TRACE.get() is not None
+            and _ACTIVE_LANE_TRACE.get() is None
+            and _has_registered_unet_in_models(models)
+            and _all_models_proven_cuda_resident(models)
+            # D15 strict: the fast return is a pure bookkeeping skip with no
+            # GPU work — it may never bypass the UNET GPU gate while CLIP
+            # owns the critical GPU section.  Fail-closed on any error.
+            and not _gpu_coordination.clip_critical_active(
+                str(getattr(_ACTIVE_REQUEST_TRACE.get(), "request_id", "") or "")
+            )
+        ):
+            _e25_fast_return = True
+            _gpu_request_call_count_var.set(_gpu_request_call_count_var.get() + 1)
+            _request_trace_fr = _ACTIVE_REQUEST_TRACE.get()
+            try:
+                _request_trace_fr.emit(
+                    "graph_gpu_load_fast_return",
+                    phase="execution",
+                    metadata={
+                        "model_count": len(models),
+                        "caller_classification": "sampler_setup_proven_ready",
+                        "reason": "proven_cuda_resident",
+                        "request_id": str(getattr(_request_trace_fr, "request_id", "") or ""),
+                    },
+                )
+            except Exception:
+                pass
         _graph_start_ns = 0
         _graph_thread_start_ns = None
         _graph_process_start_ns = None
@@ -2236,6 +4137,7 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _ownership_join: dict[str, Any] | None = None
         # Activation diagnostics record (captured on outermost entry)
         _gpu_record: dict[str, Any] | None = None
+        _unet_gpu_gate: Any = None
         # First request-scoped UNET activation variance (diagnostic-only).
         _variance_first_unet = False
         _variance_t0 = None
@@ -2260,8 +4162,12 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             _graph_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
             _graph_process_start_ns = time.process_time_ns() if hasattr(time, "process_time_ns") else None
             # Prepare activation diagnostic record.
-            _start_minflt = 0
-            _start_majflt = 0
+            # Page-fault baselines start as None (unmeasured) — they become
+            # ints ONLY when getrusage actually succeeds.  This keeps the
+            # emitted record honest (JSON null) instead of faking 0s when
+            # getrusage is unavailable (e.g. under gVisor runsc).
+            _start_minflt: int | None = None
+            _start_majflt: int | None = None
             if observability_allows("detailed_activation"):
                 try:
                     try:
@@ -2546,7 +4452,29 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         if _variance_first_unet:
             cuda_sync_if_enabled()
         _diag_ok = False
+        _coord_lane = _ACTIVE_LANE_TRACE.get() if before != 0 else lane
+        _coord_trace = (_ACTIVE_REQUEST_TRACE.get() if before != 0 else request_trace) or (
+            getattr(_coord_lane, "_trace", None) if _coord_lane is not None else None
+        )
         try:
+            # ── E25: proven-ready fast return (no GPU work, no D15 gate) ──
+            # Emitted only when the opt-in gate above set the flag; the
+            # telemetry + call accounting already ran.  Returns the models
+            # list unchanged (ComfyUI's load_models_gpu returns the models).
+            if _e25_fast_return:
+                return models
+            if (
+                before == 0
+                and _coord_trace is not None
+                and _has_registered_unet_in_models(models)
+                and _gpu_coordination.enabled()
+                and (_coord_lane is None or getattr(_coord_lane, "_lane", "") == "UNET")
+            ):
+                _unet_gpu_gate = _gpu_coordination.begin_unet_gpu_phase(
+                    str(getattr(_coord_trace, "request_id", "") or ""),
+                    _coord_trace,
+                    reason="clip_gpu_critical_active",
+                )
             _retval = original(models, memory_required=memory_required,
                                force_patch_weights=force_patch_weights,
                                minimum_memory_required=minimum_memory_required,
@@ -2556,6 +4484,25 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 cuda_sync_if_enabled()
             return _retval
         finally:
+            if _unet_gpu_gate is not None:
+                try:
+                    _unet_gpu_end_ns = time.monotonic_ns()
+                    _gpu_coordination.end_unet_gpu_phase(
+                        _unet_gpu_gate, success=_diag_ok
+                    )
+                    try:
+                        from .fast_cold_orchestration import record_unet_gpu_interval
+
+                        record_unet_gpu_interval(
+                            _unet_gpu_gate.started_ns / 1_000_000_000.0,
+                            _unet_gpu_end_ns / 1_000_000_000.0,
+                            "native_or_snapshot_activation",
+                            trace=_coord_trace,
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             after = _gpu_depth.get()
             _gpu_depth.set(after - 1)
             if before == 0:
@@ -2792,15 +4739,25 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                             _end_minflt = _end_ru.ru_minflt
                             _end_majflt = _end_ru.ru_majflt
                         else:
-                            _end_minflt = 0
-                            _end_majflt = 0
+                            _end_minflt = None
+                            _end_majflt = None
                         _gpu_record["wall_ms"] = round((_end_wall_ns - _gpu_record["start_monotonic_ns"]) / 1_000_000, 3)
                         _process_start = _gpu_record.get("_process_start_ns")
                         _thread_start = _gpu_record.get("_thread_start_ns")
                         _gpu_record["process_cpu_ms"] = round((_end_process_ns - _process_start) / 1_000_000, 3) if _process_start is not None else None
                         _gpu_record["thread_cpu_ms"] = round((_end_thread_ns - _thread_start) / 1_000_000, 3) if _thread_start is not None else None
-                        _gpu_record["minor_faults"] = max(0, _end_minflt - _gpu_record.get("_minor_faults_before", 0))
-                        _gpu_record["major_faults"] = max(0, _end_majflt - _gpu_record.get("_major_faults_before", 0))
+                        # Honest fault deltas: None (JSON null) whenever either
+                        # endpoint was unmeasured — never fake 0s.
+                        _gpu_record["minor_faults"] = (
+                            max(0, _end_minflt - _gpu_record.get("_minor_faults_before"))
+                            if _end_minflt is not None and _gpu_record.get("_minor_faults_before") is not None
+                            else None
+                        )
+                        _gpu_record["major_faults"] = (
+                            max(0, _end_majflt - _gpu_record.get("_major_faults_before"))
+                            if _end_majflt is not None and _gpu_record.get("_major_faults_before") is not None
+                            else None
+                        )
                         _gpu_record["gpu_allocated_delta_bytes"] = (
                             _gpu_alloc_after - _gpu_record["gpu_allocated_before"]
                             if _gpu_alloc_after is not None and _gpu_record.get("gpu_allocated_before") is not None
@@ -2902,11 +4859,21 @@ class _SafeOpenProxy:
     for aggregate diagnostics without mutating the native C-extension object.
     _orig_gt(k) is called exactly once per requested tensor key.
     """
-    def __init__(self, wrapped, orig_gt, count_agg, bytes_agg):
+    def __init__(self, wrapped, orig_gt, count_agg, bytes_agg, series=None, series_cap=2048):
         object.__setattr__(self, "_wrapped", wrapped)
         object.__setattr__(self, "_orig_gt", orig_gt)
         object.__setattr__(self, "_count_agg", count_agg)
         object.__setattr__(self, "_bytes_agg", bytes_agg)
+        object.__setattr__(self, "_series", series)
+        object.__setattr__(self, "_series_cap", int(series_cap))
+        object.__setattr__(self, "_series_truncated", False)
+        object.__setattr__(self, "_series_first_start_ns", None)
+        object.__setattr__(self, "_series_cum_bytes", 0)
+        object.__setattr__(self, "_c6_micro_pending", None)
+        object.__setattr__(self, "_c6_micro_records", [])
+        object.__setattr__(self, "_c6_micro_disabled", False)
+        object.__setattr__(self, "_c6_micro_sample_set", None)
+        object.__setattr__(self, "_c6_ring_fallback", [])
 
     def __getattr__(self, name):
         if name == "get_tensor":
@@ -2916,22 +4883,321 @@ class _SafeOpenProxy:
     def _proxy_get_tensor(self, k):
         lane2 = _ACTIVE_LANE_TRACE.get()
         _start_ns = 0
-        if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG:
+        if lane2 is not None and lane2._lane == "UNET" and (_DIAGNOSTIC_FLAG or _C6_PROBE_MODE == "probe"):
             _start_ns = time.monotonic_ns()
+        # ── Batch C6 I-3 micro-overlap probe (probe mode only; guarded) ──
+        # A sample point leaves a pending async H2D copy; the NEXT
+        # materialization finalizes it.  The extra sync at sample points
+        # perturbs I-1 wall timing at those ordinals — accepted.
+        if _C6_PROBE_MODE == "probe" and not self._c6_micro_disabled:
+            try:
+                if self._c6_micro_pending is not None:
+                    self._c6_micro_pending["t_next_start"] = time.monotonic_ns()
+            except Exception:
+                pass
         tensor = self._orig_gt(k)
-        if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG and _start_ns:
+        if lane2 is not None and lane2._lane == "UNET" and (_DIAGNOSTIC_FLAG or _C6_PROBE_MODE == "probe") and _start_ns:
             self._count_agg[0] += 1
             try:
                 self._bytes_agg[0] += tensor.numel() * tensor.element_size()
             except Exception:
                 pass
+        if (
+            _C6_PROBE_MODE == "probe"
+            and lane2 is not None
+            and lane2._lane == "UNET"
+            and (_DIAGNOSTIC_FLAG or _C6_PROBE_MODE == "probe")
+            and _start_ns
+            and self._series is not None
+        ):
+            try:
+                self._record_series_entry(k, tensor, _start_ns)
+            except Exception:
+                pass
+        if _C6_PROBE_MODE == "probe":
+            try:
+                self._c6_micro_after_materialize(lane2, k, tensor)
+            except Exception:
+                self._c6_micro_disable_cleanup()
+            try:
+                self._c6_ring_collect(k, tensor)
+            except Exception:
+                pass
         return tensor
+
+    def _c6_ring_collect(self, k, tensor):
+        """Collect bounded ring-probe source references (probe mode).  Only
+        the first read populates _C6_RING_SOURCES; large mmap-backed tensors
+        are held briefly (refs only, no allocation) and released by the
+        probe's finally."""
+        try:
+            _nbytes = int(tensor.numel()) * int(tensor.element_size())
+        except Exception:
+            return
+        _entry: dict[str, Any] = {
+            "ordinal": max(0, self._count_agg[0] - 1),
+            "key": k,
+            "nbytes": _nbytes,
+            "data_ptr": None,
+            "storage_offset": None,
+            "is_view": None,
+            "tensor": tensor,
+        }
+        try:
+            _entry["data_ptr"] = int(tensor.data_ptr())
+        except Exception:
+            pass
+        try:
+            _entry["storage_offset"] = int(tensor.storage_offset())
+        except Exception:
+            pass
+        try:
+            _entry["is_view"] = bool(tensor._base is not None)
+        except Exception:
+            pass
+        _holder = globals().get("_C6_RING_SOURCES")
+        if _holder is None:
+            global _C6_RING_SOURCES
+            _C6_RING_SOURCES = []
+            _holder = _C6_RING_SOURCES
+        if _nbytes >= 60_000_000:
+            if len(_holder) < 12:
+                _holder.append(_entry)
+        elif _nbytes >= 30_000_000:
+            _fb = self._c6_ring_fallback
+            _fb.append((_nbytes, _entry))
+            _fb.sort(key=lambda _t: _t[0], reverse=True)
+            del _fb[12:]
+
+    def _c6_ring_finalize_collection(self):
+        """Read-end fallback: when fewer than 8 large tensors were found,
+        top up from the 30 MB+ candidates kept on the proxy."""
+        _holder = globals().get("_C6_RING_SOURCES")
+        if _holder is None:
+            return
+        if len(_holder) >= 8:
+            return
+        for _nbytes, _entry in self._c6_ring_fallback:
+            if len(_holder) >= 12:
+                break
+            _holder.append(_entry)
+
+    def _c6_micro_after_materialize(self, lane2, k, tensor):
+        if self._c6_micro_disabled:
+            return
+        if not self._c6_micro_enabled(lane2):
+            return
+        if self._c6_micro_pending is not None:
+            try:
+                self._c6_micro_pending["t_next_end"] = time.monotonic_ns()
+            except Exception:
+                pass
+            self._c6_micro_finalize(no_next=False)
+            return
+        _ordinal = max(0, self._count_agg[0] - 1)
+        if _ordinal in self._c6_micro_sample_set:
+            self._c6_micro_sample(lane2, k, tensor, _ordinal)
+
+    def _c6_micro_enabled(self, lane2):
+        if self._c6_micro_disabled:
+            return False
+        if self._c6_micro_sample_set is None:
+            if _C6_PROBE_MODE != "probe" or lane2 is None or lane2._lane != "UNET":
+                object.__setattr__(self, "_c6_micro_disabled", True)
+                return False
+            try:
+                import torch as _torch_me
+                if not _torch_me.cuda.is_available():
+                    object.__setattr__(self, "_c6_micro_disabled", True)
+                    return False
+            except Exception:
+                object.__setattr__(self, "_c6_micro_disabled", True)
+                return False
+            object.__setattr__(self, "_c6_micro_sample_set", set(_C6_MICRO_SAMPLE_ORDINALS))
+        return True
+
+    def _c6_micro_sample(self, lane2, k, tensor, ordinal):
+        import torch as _torch_s
+        _p: dict[str, Any] = {
+            "ordinal": ordinal,
+            "key": k,
+            "bytes": 0,
+            "data_ptr": None,
+            "storage_offset": None,
+            "is_view": None,
+            "minflt_before": None,
+            "minflt_after": None,
+            "t_issue0": None,
+            "t_issue1": None,
+            "t_next_start": None,
+            "t_next_end": None,
+        }
+        try:
+            _p["bytes"] = int(tensor.numel()) * int(tensor.element_size())
+        except Exception:
+            pass
+        try:
+            _p["data_ptr"] = int(tensor.data_ptr())
+        except Exception:
+            pass
+        try:
+            _p["storage_offset"] = int(tensor.storage_offset())
+        except Exception:
+            pass
+        try:
+            _p["is_view"] = bool(tensor._base is not None)
+        except Exception:
+            pass
+        try:
+            import resource as _res_s
+            _p["minflt_before"] = int(_res_s.getrusage(_res_s.RUSAGE_SELF).ru_minflt)
+        except Exception:
+            _p["minflt_before"] = None
+        _dest = _torch_s.empty(list(tensor.shape), dtype=tensor.dtype, device="cuda")
+        _ev_start = _torch_s.cuda.Event(enable_timing=True)
+        _ev_start.record()
+        _t0 = time.monotonic_ns()
+        _dest.copy_(tensor, non_blocking=True)
+        _t1 = time.monotonic_ns()
+        _ev_end = _torch_s.cuda.Event(enable_timing=True)
+        _ev_end.record()
+        _p["dest"] = _dest
+        _p["ev_start"] = _ev_start
+        _p["ev_end"] = _ev_end
+        _p["t_issue0"] = _t0
+        _p["t_issue1"] = _t1
+        try:
+            import resource as _res_s2
+            _p["minflt_after"] = int(_res_s2.getrusage(_res_s2.RUSAGE_SELF).ru_minflt)
+        except Exception:
+            _p["minflt_after"] = None
+        object.__setattr__(self, "_c6_micro_pending", _p)
+
+    def _c6_micro_finalize(self, no_next=False):
+        _p = self._c6_micro_pending
+        if _p is None:
+            return
+        try:
+            import torch as _torch_f
+            _torch_f.cuda.synchronize()
+            _elapsed_ms = float(_p["ev_start"].elapsed_time(_p["ev_end"]))
+            _ev_ns = _elapsed_ms * 1_000_000.0
+            _t0 = _p["t_issue0"]
+            _rec: dict[str, Any] = {
+                "ordinal": _p["ordinal"],
+                "key": _p["key"],
+                "bytes": _p["bytes"],
+                "data_ptr": _p["data_ptr"],
+                "storage_offset": _p["storage_offset"],
+                "is_view": _p["is_view"],
+                "copy_issue_host_ms": round((_p["t_issue1"] - _t0) / 1_000_000, 4),
+                "h2d_cuda_ms": round(_elapsed_ms, 4),
+                "minflt_delta": max(0, int(_p.get("minflt_after") or 0) - int(_p.get("minflt_before") or 0)),
+            }
+            if no_next:
+                _rec.update({
+                    "next_mat_start_rel_ms": None,
+                    "next_mat_end_rel_ms": None,
+                    "next_mat_wall_ms": None,
+                    "combined_wall_ms": None,
+                    "overlap_direct": None,
+                    "overlap_complete": None,
+                    "no_next": True,
+                })
+            else:
+                _rec.update({
+                    "next_mat_start_rel_ms": round((_p["t_next_start"] - _t0) / 1_000_000, 4),
+                    "next_mat_end_rel_ms": round((_p["t_next_end"] - _t0) / 1_000_000, 4),
+                    "next_mat_wall_ms": round((_p["t_next_end"] - _p["t_next_start"]) / 1_000_000, 4),
+                    "combined_wall_ms": round((_p["t_next_end"] - _t0) / 1_000_000, 4),
+                    "overlap_direct": bool(_p["t_next_start"] < _t0 + _ev_ns),
+                    "overlap_complete": bool(_p["t_next_end"] <= _t0 + _ev_ns + 1_000_000),
+                    "no_next": False,
+                })
+            self._c6_micro_records.append(_rec)
+        except Exception:
+            pass
+        finally:
+            try:
+                del _p["dest"]
+            except Exception:
+                pass
+            try:
+                import torch as _torch_gc
+                _torch_gc.cuda.empty_cache()
+            except Exception:
+                pass
+            object.__setattr__(self, "_c6_micro_pending", None)
+
+    def _c6_micro_disable_cleanup(self):
+        try:
+            _p = self._c6_micro_pending
+            if _p is not None:
+                try:
+                    del _p["dest"]
+                except Exception:
+                    pass
+                object.__setattr__(self, "_c6_micro_pending", None)
+        except Exception:
+            pass
+        object.__setattr__(self, "_c6_micro_disabled", True)
+
+    def _record_series_entry(self, k, tensor, start_ns):
+        _end_ns = time.monotonic_ns()
+        if self._series_first_start_ns is None:
+            object.__setattr__(self, "_series_first_start_ns", start_ns)
+        _entry = {
+            "ordinal": len(self._series),
+            "key": k,
+            "t_start_ms": round((start_ns - self._series_first_start_ns) / 1_000_000, 4),
+            "t_end_ms": round((_end_ns - self._series_first_start_ns) / 1_000_000, 4),
+            "wall_ms": round((_end_ns - start_ns) / 1_000_000, 4),
+        }
+        try:
+            _entry["shape"] = list(tensor.shape)
+        except Exception:
+            pass
+        try:
+            _entry["dtype"] = str(tensor.dtype)
+        except Exception:
+            pass
+        try:
+            _entry["numel"] = int(tensor.numel())
+        except Exception:
+            pass
+        try:
+            _entry["nbytes"] = int(tensor.numel()) * int(tensor.element_size())
+        except Exception:
+            pass
+        try:
+            _entry["data_ptr"] = int(tensor.data_ptr())
+        except Exception:
+            pass
+        try:
+            _entry["storage_offset"] = int(tensor.storage_offset())
+        except Exception:
+            pass
+        try:
+            _entry["is_view"] = bool(tensor._base is not None)
+        except Exception:
+            pass
+        try:
+            _entry["storage_nbytes"] = int(tensor.untyped_storage().nbytes())
+        except Exception:
+            pass
+        self._series_cum_bytes += int(_entry.get("nbytes", 0))
+        _entry["cum_bytes"] = self._series_cum_bytes
+        if len(self._series) < self._series_cap:
+            self._series.append(_entry)
+        else:
+            object.__setattr__(self, "_series_truncated", True)
 
     def __enter__(self):
         try:
-            return self._wrapped.__enter__()
+            self._wrapped.__enter__()
         except AttributeError:
-            return self
+            pass
+        return self
 
     def __exit__(self, *exc):
         lane2 = _ACTIVE_LANE_TRACE.get()
@@ -2940,7 +5206,82 @@ class _SafeOpenProxy:
                 "tensor_count": self._count_agg[0],
                 "total_bytes": self._bytes_agg[0],
             })
+            if _C6_PROBE_MODE == "probe" and self._series is not None and len(self._series) > 0:
+                try:
+                    self._emit_c6_probe_series(lane2)
+                except Exception:
+                    pass
+            if _C6_PROBE_MODE == "probe":
+                try:
+                    self._c6_ring_finalize_collection()
+                except Exception:
+                    pass
+            if _C6_PROBE_MODE == "probe":
+                try:
+                    if self._c6_micro_pending is not None:
+                        self._c6_micro_finalize(no_next=True)
+                    if self._c6_micro_records:
+                        _classifier = _c6_classify_overlap(self._c6_micro_records)
+                        try:
+                            lane2._trace.emit("unet_i3_micro_overlap", phase="restore", metadata={
+                                "samples": _c6_json_safe(list(self._c6_micro_records)),
+                                "classifier": _c6_json_safe(_classifier),
+                            })
+                        except Exception as _exc:
+                            print(
+                                f"[v2.c6_probe] micro emit_error={type(_exc).__name__}",
+                                flush=True,
+                            )
+                        print(
+                            f"[v2.c6_probe] micro_overlap samples={len(self._c6_micro_records)} "
+                            f"class={_classifier.get('class')} "
+                            f"eff_mean={_classifier.get('mean_eff')} "
+                            f"direct={_classifier.get('direct_fraction')} "
+                            f"complete={_classifier.get('complete_fraction')}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
         return self._wrapped.__exit__(*exc) if hasattr(self._wrapped, "__exit__") else None
+
+    def _emit_c6_probe_series(self, lane2):
+        import sys as _sys_px
+        _series = self._series
+        _total_bytes = self._bytes_agg[0]
+        _read_wall_ms = float(_series[-1].get("t_end_ms", 0.0))
+        _comfy_utils_mmap = "unavailable"
+        try:
+            import comfy.utils as _cu_px
+            _comfy_utils_mmap = str(getattr(_cu_px, "DISABLE_MMAP", "unavailable"))
+        except Exception:
+            pass
+        lane2._trace.emit("unet_read_h2d_pipeline_probe", phase="restore", metadata={
+            "mode": "probe",
+            "kind": "tensor_materialize_series",
+            "tensor_count": self._count_agg[0],
+            "total_bytes": _total_bytes,
+            "series_count": len(_series),
+            "series_truncated": bool(self._series_truncated),
+            "read_wall_ms": round(_read_wall_ms, 4),
+            "comfy_utils_disable_mmap": _comfy_utils_mmap,
+            "platform": _sys_px.platform,
+            "series": list(_series),
+        })
+        _p25, _p50, _p75, _p100 = _c6_probe_series_percentiles(_series, _total_bytes)
+        _largest10 = sorted(
+            (
+                (str(_e.get("key", ""))[:40], round(float(_e.get("wall_ms", 0.0)), 3))
+                for _e in _series
+            ),
+            key=lambda _t: _t[1],
+            reverse=True,
+        )[:10]
+        print(
+            f"[v2.c6_probe] read tensors={self._count_agg[0]} bytes={_total_bytes} "
+            f"wall={round(_read_wall_ms, 4)}ms p25={_p25} p50={_p50} p75={_p75} "
+            f"p100={_p100} largest10={_largest10}",
+            flush=True,
+        )
 
     def keys(self):
         return self._wrapped.keys()
@@ -2959,14 +5300,24 @@ def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[...
 
     @functools.wraps(original)
     def wrapper(file, framework="pt", device="cpu", **kwargs):
+        global _C6_PROBE_FILE_PATH
         before = _deep_st_depth.get()
         _deep_st_depth.set(before + 1)
         lane = _ACTIVE_LANE_TRACE.get()
         target_path = _DEEP_TARGET_PATH.get()
         _outer = (before == 0)
-        _eligible = (_outer and _DIAGNOSTIC_FLAG and lane is not None
-                     and lane._lane == "UNET" and target_path
-                     and (isinstance(file, str) and target_path in file))
+        # Probe mode relaxes the path filter: the execution-phase UNET lane
+        # worker never populates _DEEP_TARGET_PATH, so probe eligibility no
+        # longer depends on it (deep-diag stays byte-identical).
+        _eligible = (_outer and (_DIAGNOSTIC_FLAG or _C6_PROBE_MODE == "probe")
+                     and lane is not None and lane._lane == "UNET"
+                     and ((target_path and isinstance(file, str) and target_path in file)
+                          or _C6_PROBE_MODE == "probe"))
+        if _eligible and _C6_PROBE_MODE == "probe":
+            try:
+                _C6_PROBE_FILE_PATH = file if isinstance(file, str) else ""
+            except Exception:
+                pass
         _result = None
         if _eligible:
             lane._trace.emit("unet_safetensors_open_start", phase="restore",
@@ -2994,9 +5345,11 @@ def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[...
                     _tensor_count_agg = [0]
                     _tensor_bytes_agg = [0]
                     _orig_get_tensor = _result.get_tensor
+                    _tensor_series = [] if _C6_PROBE_MODE == "probe" else None
 
                     _result = _SafeOpenProxy(_result, _orig_get_tensor,
-                                             _tensor_count_agg, _tensor_bytes_agg)
+                                             _tensor_count_agg, _tensor_bytes_agg,
+                                             series=_tensor_series)
                 else:
                     lane._trace.emit("unet_safetensors_load_combined_start", phase="restore",
                                      metadata={"stage_split_available": False})
@@ -3994,8 +6347,30 @@ def _fast_disk_emit_event(
             "to_wall_ms": _t.get("to_wall_ms"),
             "to_device_ms": _t.get("to_device_ms"),
             "to_device_ms_label": _t.get("to_device_ms_label", "unavailable"),
+            # ── H2D decomposition (additive; absent when instrumentation
+            # failed or the measurement was unavailable) ──
+            "h2d_cuda_elapsed_ms": _t.get("h2d_cuda_elapsed_ms"),
+            "h2d_enqueue_host_ms": _t.get("h2d_enqueue_host_ms"),
+            "h2d_sync_wait_host_ms": _t.get("h2d_sync_wait_host_ms"),
+            "h2d_copy_count": _t.get("h2d_copy_count"),
+            "h2d_total_bytes": _t.get("h2d_total_bytes"),
+            "h2d_largest_copy_bytes": _t.get("h2d_largest_copy_bytes"),
+            "h2d_stream_id": _t.get("h2d_stream_id"),
+            "h2d_stream_cuda_stream": _t.get("h2d_stream_cuda_stream"),
+            "h2d_sync_method": _t.get("h2d_sync_method"),
             **_accounting,
         })
+        # ── H2D classification (guarded; additive) ──
+        # Absent when the telemetry module / classify_h2d is unavailable.
+        # Never overwrites an existing key.
+        try:
+            from comfymodal_runtime import host_hardware_telemetry as _hht_cls
+            _timings = record.get("timings") or {}
+            _cls = _hht_cls.classify_h2d(_timings)
+        except Exception:
+            _cls = None
+        if _cls is not None and "h2d_classification" not in _meta:
+            _meta["h2d_classification"] = _cls
     if extra_meta:
         _meta.update(dict(extra_meta))
     if trace is not None and _event is not None:
@@ -4003,6 +6378,171 @@ def _fast_disk_emit_event(
     _fast_disk_print_proof(
         record, decision=decision, reason=reason, stage=stage, model=model,
     )
+
+
+def _fast_disk_waves_eligible(target, to_kwargs, staging_eligible) -> tuple[bool, str]:
+    """Wave-split probe eligibility.  Pinned staging takes precedence, then
+    dtype/memory-format conversion requests and non-CUDA targets reject.
+    Returns ``(ok, reason)``; never raises."""
+    if staging_eligible:
+        return (False, "pinned_staging_active")
+    if "dtype" in to_kwargs or "memory_format" in to_kwargs:
+        return (False, "dtype_conversion_requested")
+    if target is None or str(getattr(target, "type", "")) != "cuda":
+        return (False, "target_not_cuda")
+    try:
+        import torch as _torch_wv
+        if (
+            _torch_wv.cuda.is_available()
+            and getattr(_torch_wv.cuda, "Event", None) is not None
+        ):
+            return (True, "ok")
+    except Exception:
+        pass
+    return (False, "cuda_unavailable")
+
+
+def _fast_disk_build_wave_items(model) -> list[tuple[Any, str, str, Any, int]]:
+    """Collect CPU-resident parameters then buffers per module in
+    Module._apply order (modules() DFS).  Any failure returns ``[]``."""
+    try:
+        import torch as _torch_wv
+        _Tensor = _torch_wv.Tensor
+    except Exception:
+        return []
+    _items: list[tuple[Any, str, str, Any, int]] = []
+    try:
+        for _module in model.modules():
+            for _name, _param in _module._parameters.items():
+                try:
+                    if isinstance(_param, _Tensor) and _param.data is not None \
+                            and str(_param.device).startswith("cpu"):
+                        _items.append((_module, _name, "param", _param,
+                                       int(_param.numel()) * int(_param.element_size())))
+                except Exception:
+                    continue
+            for _name, _buffer in _module._buffers.items():
+                try:
+                    if isinstance(_buffer, _Tensor) and _buffer.data is not None \
+                            and str(_buffer.device).startswith("cpu"):
+                        _items.append((_module, _name, "buffer", _buffer,
+                                       int(_buffer.numel()) * int(_buffer.element_size())))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return _items
+
+
+def _fast_disk_partition_waves(items, wave_count) -> list[dict[str, Any]]:
+    """Greedy byte-boundary wave partition.  Boundaries sit at
+    ``total_bytes*k/wave_count``; a wave closes once cumulative bytes reach
+    the next boundary.  At most ``wave_count`` waves; the last absorbs the
+    remainder.  Each wave carries ordinal/first_ordinal/last_ordinal/
+    tensor_count/bytes/items."""
+    try:
+        _total = sum(int(_it[4]) for _it in items)
+    except Exception:
+        _total = 0
+    if not items or _total <= 0:
+        return []
+    _waves: list[dict[str, Any]] = []
+    _buf: list[Any] = []
+    _buf_bytes = 0
+    _cum = 0
+    _first = 0
+    _next_k = 1
+    _wc = max(1, int(wave_count))
+    for _idx, _it in enumerate(items):
+        _b = int(_it[4])
+        _buf.append(_it)
+        _buf_bytes += _b
+        _cum += _b
+        if _next_k < _wc and _cum >= (_total * _next_k) / _wc:
+            _waves.append({
+                "ordinal": len(_waves),
+                "first_ordinal": _first,
+                "last_ordinal": _idx,
+                "tensor_count": len(_buf),
+                "bytes": _buf_bytes,
+                "items": _buf,
+            })
+            _first = _idx + 1
+            _buf = []
+            _buf_bytes = 0
+            _next_k += 1
+    if _buf:
+        _waves.append({
+            "ordinal": len(_waves),
+            "first_ordinal": _first,
+            "last_ordinal": len(items) - 1,
+            "tensor_count": len(_buf),
+            "bytes": _buf_bytes,
+            "items": _buf,
+        })
+    return _waves
+
+
+def _fast_disk_replay_waves(model, waves, target, to_kwargs, non_blocking_default=False) -> None:
+    """Replay the per-item ``tensor.to(target, non_blocking=...)`` semantics
+    of Module._apply for the given waves.  Never synchronizes.  Exceptions
+    propagate so the probe caller can fall back to the original ``to()``."""
+    import torch as _torch_wv
+    _nb = bool(to_kwargs.get("non_blocking", non_blocking_default))
+    for _wave in waves:
+        for _item in _wave.get("items", []):
+            _module, _name, _kind, _tensor, _bytes = _item
+            with _torch_wv.no_grad():
+                _applied = _tensor.to(target, non_blocking=_nb)
+            if _applied is _tensor:
+                continue
+            if _kind == "param":
+                setattr(_module, _name, _torch_wv.nn.Parameter(
+                    _applied, requires_grad=_tensor.requires_grad))
+            else:
+                setattr(_module, _name, _applied)
+
+
+def _fast_disk_replay_to_waves_probe(model, record, to_args, to_kwargs, target, trace, lane_trace, staging_eligible=False):
+    """Measurement-only phase I-2 wave-split H2D replay probe.  Returns
+    ``(used, waves, ev_pairs)``.  Never raises: any failure prints a
+    fallback line and returns ``(False, None, None)`` so the caller runs the
+    exact original ``to()``.  Per-wave CUDA events are recorded but never
+    synchronized here — they are realized by the single existing
+    synchronize in the replay ``finally``.  If a failure happens after some
+    parameters were already moved, the fallback original ``to()`` re-runs
+    over the whole module; already-moved parameters are no-ops (``.to()``
+    returns self), so the final state is identical — the same pattern the
+    pinned-staging fallback already relies on."""
+    if model is None:
+        return (False, None, None)
+    try:
+        import torch as _torch_wv
+        _ok, _reason = _fast_disk_waves_eligible(target, to_kwargs, staging_eligible)
+        if not _ok:
+            print(f"[v2.c6_probe] waves fallback={_reason}", flush=True)
+            return (False, None, None)
+        _items = _fast_disk_build_wave_items(model)
+        if not _items:
+            return (False, None, None)
+        _waves = _fast_disk_partition_waves(_items, _C6_PROBE_WAVE_COUNT)
+        if not _waves:
+            return (False, None, None)
+        _ev_pairs: list[tuple[Any, Any]] = []
+        for _wave in _waves:
+            _ev_start = _torch_wv.cuda.Event(enable_timing=True)
+            _ev_start.record()
+            _t0 = time.perf_counter()
+            _fast_disk_replay_waves(model, [_wave], target, to_kwargs)
+            _t1 = time.perf_counter()
+            _ev_end = _torch_wv.cuda.Event(enable_timing=True)
+            _ev_end.record()
+            _wave["enqueue_host_ms"] = round((_t1 - _t0) * 1000, 3)
+            _ev_pairs.append((_ev_start, _ev_end))
+        return (True, _waves, _ev_pairs)
+    except Exception as _exc:
+        print(f"[v2.c6_probe] waves fallback=exception:{type(_exc).__name__}", flush=True)
+        return (False, None, None)
 
 
 def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
@@ -4131,6 +6671,37 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
     # plain A path keeps both at their defaults).
     _staging_used: bool = False
     _staging_metrics: dict[str, Any] | None = None
+    # ── Host telemetry: pre-H2D resource snapshot + decomposition refs ──
+    # The snapshot and reference capture are measurement-only and sit
+    # OUTSIDE the measured to_wall_ms window (before _start_ns) so waterfall
+    # reconciliation stays byte-identical.  Every piece is guarded; failure
+    # leaves the decomposition fields absent and never affects the copy.
+    try:
+        from comfymodal_runtime import host_hardware_telemetry as _hht
+        _hht.capture_resource_snapshot("pre_h2d", trace)
+    except Exception:
+        pass
+    _h2d_pre_cpu_refs: list[Any] | None = None
+    _enqueue_t0: float | None = None
+    try:
+        import torch as _torch_pre
+        if (
+            _torch_pre.cuda.is_available()
+            and target is not None
+            and str(getattr(target, "type", "") or "") == "cuda"
+        ):
+            _h2d_pre_cpu_refs = [
+                _t
+                for _t in (list(model.parameters()) + list(model.buffers()))
+                if str(getattr(_t, "device", "")).startswith("cpu")
+            ]
+            if not _h2d_pre_cpu_refs:
+                _h2d_pre_cpu_refs = None
+    except Exception:
+        _h2d_pre_cpu_refs = None
+    _probe_used: bool = False
+    _probe_waves: list[dict[str, Any]] | None = None
+    _probe_ev_pairs: list[tuple[Any, Any]] | None = None
     _start_ns = time.monotonic_ns()
     _torch_rp = None
     _ev_start = None
@@ -4163,6 +6734,10 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
                 else "wall_only"
             ),
         })
+    # H2D decomposition: host wall clock of the copy-loop body only (the
+    # ``original_to``/staging call).  sync_wait_host_ms is derived purely as
+    # to_wall_ms − enqueue_host_ms in the finally below.
+    _enqueue_t0 = time.perf_counter()
     try:
         if _staging_eligible:
             _staging_metrics = None
@@ -4194,6 +6769,12 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
                 f"effective=baseline fallback={_staging_reason}",
                 flush=True,
             )
+        if _C6_PROBE_MODE == "probe":
+            _probe_used, _probe_waves, _probe_ev_pairs = _fast_disk_replay_to_waves_probe(
+                model, record, to_args, to_kwargs, target, trace, lane_trace,
+                _staging_eligible)
+            if _probe_used:
+                return model
         return original_to(model, *to_args, **to_kwargs)
     finally:
         _wall_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
@@ -4226,6 +6807,58 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
                 _opt_h2d_probe = None
         record["timings"]["to_wall_ms"] = _wall_ms
         record["timings"]["to_device_ms"] = _device_ms
+        # ── H2D decomposition (measurement-only; additive, never raises) ──
+        # New h2d_* keys ride on the existing unet_fast_disk_complete event
+        # via record["timings"].  to_wall_ms/to_device_ms are never touched
+        # here — the CUDA elapsed below is the SAME _device_ms already
+        # computed above after the existing synchronize (reused, never a new
+        # sync).  Every field is guarded; failure leaves the field absent.
+        try:
+            if _enqueue_t0 is not None:
+                _h2d_enqueue_host_ms = round(
+                    (time.perf_counter() - _enqueue_t0) * 1000, 3
+                )
+                record["timings"]["h2d_enqueue_host_ms"] = _h2d_enqueue_host_ms
+            if _device_ms is not None:
+                record["timings"]["h2d_cuda_elapsed_ms"] = _device_ms
+            _w = record["timings"].get("to_wall_ms")
+            _e = record["timings"].get("h2d_enqueue_host_ms")
+            if _w is not None and _e is not None:
+                record["timings"]["h2d_sync_wait_host_ms"] = round(
+                    max(float(_w) - float(_e), 0.0), 3
+                )
+            if _h2d_pre_cpu_refs:
+                _cnt = 0
+                _total = 0
+                _largest = 0
+                for _t in _h2d_pre_cpu_refs:
+                    try:
+                        if str(getattr(_t, "device", "")).startswith("cuda"):
+                            _n = int(_t.numel()) * int(_t.element_size())
+                            _cnt += 1
+                            _total += _n
+                            if _n > _largest:
+                                _largest = _n
+                    except Exception:
+                        continue
+                record["timings"]["h2d_copy_count"] = _cnt
+                record["timings"]["h2d_total_bytes"] = _total
+                record["timings"]["h2d_largest_copy_bytes"] = _largest
+            try:
+                import torch as _torch_decomp
+                _cur_stream = _torch_decomp.cuda.current_stream()
+                record["timings"]["h2d_stream_id"] = str(_cur_stream)
+                _cs_id = getattr(_cur_stream, "cuda_stream", None)
+                if _cs_id is not None:
+                    try:
+                        record["timings"]["h2d_stream_cuda_stream"] = int(_cs_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            record["timings"]["h2d_sync_method"] = "torch.cuda.synchronize (full device)"
+        except Exception:
+            pass
         if _staging_used:
             try:
                 # Unified experiment metadata, once per request on the B arm.
@@ -4268,6 +6901,92 @@ def _fast_disk_replay_to(record: dict[str, Any], lane_trace: Any) -> Any:
                     "gbps": _staging_metrics.get("gbps"),
                 })
             trace.emit(_EVENT_FAST_DISK_TO_END, phase="restore", metadata=_end_meta)
+        # ── I-2 wave-split H2D probe realization (guarded; additive) ────
+        # Per-wave CUDA events were recorded by the probe without a sync of
+        # their own; the single existing synchronize above realizes them.
+        if _probe_used and _probe_ev_pairs and _probe_waves:
+            try:
+                for _i, (_ev_s, _ev_e) in enumerate(_probe_ev_pairs):
+                    try:
+                        _ms = round(float(_ev_s.elapsed_time(_ev_e)), 3)
+                        _probe_waves[_i]["device_ms"] = _ms
+                    except Exception:
+                        pass
+                _waves_meta = []
+                _cum_wave_bytes = 0
+                for _w in _probe_waves:
+                    _cum_wave_bytes += int(_w.get("bytes", 0))
+                    _waves_meta.append({
+                        "ordinal": _w["ordinal"],
+                        "first_ordinal": _w["first_ordinal"],
+                        "last_ordinal": _w["last_ordinal"],
+                        "tensor_count": _w["tensor_count"],
+                        "bytes": _w["bytes"],
+                        "enqueue_host_ms": _w.get("enqueue_host_ms"),
+                        "device_ms": _w.get("device_ms"),
+                        "cum_bytes": _cum_wave_bytes,
+                    })
+                _total_tensors = sum(int(_w["tensor_count"]) for _w in _probe_waves)
+                _total_bytes = sum(int(_w["bytes"]) for _w in _probe_waves)
+                _sum_wave_device_ms = sum(
+                    float(_w.get("device_ms", 0.0) or 0.0) for _w in _probe_waves)
+                _sum_enqueue_host_ms = sum(
+                    float(_w.get("enqueue_host_ms", 0.0) or 0.0) for _w in _probe_waves)
+                _host_gap_ms = (
+                    round(max(float(_wall_ms) - _sum_enqueue_host_ms, 0.0), 3)
+                    if _sum_enqueue_host_ms > 0.0
+                    else None
+                )
+                if trace is not None:
+                    trace.emit("unet_read_h2d_wave_probe", phase="restore", metadata={
+                        "mode": "probe",
+                        "kind": "h2d_wave_series",
+                        "wave_count": len(_probe_waves),
+                        "total_tensors": _total_tensors,
+                        "total_bytes": _total_bytes,
+                        "total_wall_ms": _wall_ms,
+                        "total_device_ms": _device_ms,
+                        "waves": _waves_meta,
+                        "device_ms_sum": round(_sum_wave_device_ms, 3),
+                        "host_gap_ms": _host_gap_ms,
+                    })
+                _dev_list = [
+                    round(float(_w.get("device_ms", 0.0) or 0.0), 3)
+                    for _w in _probe_waves
+                ]
+                _dev_str = ",".join(str(_v) for _v in _dev_list[:3])
+                if len(_dev_list) > 4:
+                    _dev_str += ",.."
+                print(
+                    f"[v2.c6_probe] h2d waves={len(_probe_waves)} "
+                    f"tensors={_total_tensors} bytes={_total_bytes} "
+                    f"wall_ms={_wall_ms} device_ms={_device_ms} "
+                    f"sum_waves_device_ms={round(_sum_wave_device_ms, 3)} "
+                    f"waves_device_ms=[{_dev_str}]",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        # ── Host telemetry: post-H2D resource snapshot (guarded; runs after
+        # the existing final synchronize; never raises) ──
+        try:
+            from comfymodal_runtime import host_hardware_telemetry as _hht
+            _hht.capture_resource_snapshot("post_h2d", trace)
+        except Exception:
+            pass
+        # ── Host telemetry: slow-H2D forensic trigger (guarded) ──
+        # OFF the healthy path: only fires when the H2D wall time is at/above
+        # the slow threshold (COMFYMODAL_V2_SLOW_H2D_THRESHOLD_MS, default
+        # 4000 ms) or COMFYMODAL_V2_HOST_DIAGNOSTICS=1 forces it.  Silent
+        # no-op when the module / function is absent; never raises.
+        try:
+            from comfymodal_runtime import host_hardware_telemetry as _hht_f
+            _timings = record.get("timings") or {}
+            _wall = float(_timings.get("to_wall_ms") or _timings.get("to_device_ms") or 0.0)
+            if _hht_f.should_trigger_slow_probe(_wall):
+                _hht_f.emit_slow_h2d_forensics(_timings, trace)
+        except Exception:
+            pass
 
 
 def _fast_disk_maybe_defer_to(
@@ -5426,8 +8145,8 @@ def _install_read_wrapper(*, utils_module: Any, trace: RuntimeTrace | None = Non
 def _install_gpu_wrapper(*, mm_module: Any, trace: RuntimeTrace | None = None) -> str:
     """Install the ``load_models_gpu`` wrapper on *mm_module*.
 
-    Returns status ``"installed"``, ``"already_installed"``, or
-    ``"unavailable"``.
+    Returns status ``"installed"``, ``"already_installed"``,
+    ``"skipped_forensics_wrapper_present"``, or ``"unavailable"``.
     """
     global _gpu_wrapper_installed
     if _gpu_wrapper_installed:
@@ -5438,12 +8157,20 @@ def _install_gpu_wrapper(*, mm_module: Any, trace: RuntimeTrace | None = None) -
     if getattr(func, _SENTINEL_GPU, False):
         _gpu_wrapper_installed = True
         return "already_installed"
+    if getattr(func, _SENTINEL_FORENSICS, False):
+        # Cross-sentinel guard: the CLIP cold-path forensics module owns
+        # this shared target already; wrapping again would double-instrument.
+        _gpu_wrapper_installed = True
+        return "skipped_forensics_wrapper_present"
     with _wrappers_lock:
         if _gpu_wrapper_installed:
             return "already_installed"
         if getattr(mm_module.load_models_gpu, _SENTINEL_GPU, False):
             _gpu_wrapper_installed = True
             return "already_installed"
+        if getattr(mm_module.load_models_gpu, _SENTINEL_FORENSICS, False):
+            _gpu_wrapper_installed = True
+            return "skipped_forensics_wrapper_present"
         mm_module.load_models_gpu = _make_gpu_loader_wrapper(mm_module.load_models_gpu)
         _gpu_wrapper_installed = True
     return "installed"
@@ -5569,11 +8296,23 @@ def _make_clip_span_wrapper(
         emit = before == 0 and trace is not None
         _before = _clip_span_snapshot(with_cuda=with_cuda) if emit else None
         _status = "ok"
+        _fast_cold_forward_started = False
         if emit and span_name == "clip_forward":
             # Real outermost CLIP forward begins: fire the milestone used
             # by the execution-unet H2D delay gate (a cache-hit request
             # never reaches this point, so the delay never applies there).
             _CLIP_FORWARD_STARTED.set()
+        if before == 0 and span_name == "clip_forward":
+            try:
+                from .fast_cold_orchestration import mark_clip_forward_start
+
+                mark_clip_forward_start(
+                    request_id=str(getattr(trace, "request_id", "") or ""),
+                    trace=trace,
+                )
+                _fast_cold_forward_started = True
+            except Exception:
+                pass
         if emit and trace is not None:
             trace.emit_at(
                 f"{span_name}_start",
@@ -5610,6 +8349,16 @@ def _make_clip_span_wrapper(
         finally:
             after = depth_var.get()
             depth_var.set(after - 1)
+            if _fast_cold_forward_started:
+                try:
+                    from .fast_cold_orchestration import mark_clip_forward_end
+
+                    mark_clip_forward_end(
+                        request_id=str(getattr(trace, "request_id", "") or ""),
+                        trace=trace,
+                    )
+                except Exception:
+                    pass
             # ── LANE 2 (measurement-only): publish the CLIP forward window ──
             if (
                 emit
@@ -5736,6 +8485,48 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     if mm_mod is not None:
         result["load_models_gpu"] = _install_gpu_wrapper(mm_module=mm_mod, trace=trace)
         result["cast_to_device"] = _install_cast_to_device_wrapper(mm_module=mm_mod, trace=trace)
+        # ── E27: soft-empty-cache decomposition + Qwen cast counter ──
+        # E27-native, gated on COMFYMODAL_V2_E27_FORENSICS (independent of the
+        # D2-era CLIP_COLD_FORENSICS gate the E19 profile forces off).
+        try:
+            import torch as _torch_e27
+            from comfymodal_runtime.e27_forensics import (
+                install_soft_cache_chain,
+                install_patch_weight_cast_counter,
+            )
+
+            _e27_soft = install_soft_cache_chain(mm_mod, _torch_e27)
+            result["e27_soft_cache_chain"] = _e27_soft
+            _mp_e27 = _get_live_module("comfy.model_patcher")
+            if _mp_e27 is not None and getattr(_mp_e27, "ModelPatcher", None) is not None:
+                result["e27_cast_counter"] = install_patch_weight_cast_counter(
+                    _mp_e27.ModelPatcher
+                )
+            else:
+                result["e27_cast_counter"] = "model_patcher_unavailable"
+            # ── E27 Follow-Up A: forward-cast counter on the REAL cast path ──
+            # comfy.ops.cast_bias_weight / cast_to / cast_to_device are the
+            # actual per-forward manual-cast entry points for the Qwen encoder.
+            # Distinct from the patch_weight_to_device counter above.
+            try:
+                from comfymodal_runtime.e27_forensics import (
+                    install_forward_cast_counters,
+                )
+
+                _ops_e27 = _get_live_module("comfy.ops")
+                if _ops_e27 is not None:
+                    result["e27_forward_cast_counter"] = (
+                        install_forward_cast_counters(_ops_e27)
+                    )
+                else:
+                    result["e27_forward_cast_counter"] = "comfy_ops_unavailable"
+            except Exception as _e27_fwd_exc:
+                result["e27_forward_cast_counter"] = (
+                    f"error:{type(_e27_fwd_exc).__name__}:{str(_e27_fwd_exc)[:120]}"
+                )
+        except Exception as _e27_exc:
+            result["e27_soft_cache_chain"] = (
+                f"error:{type(_e27_exc).__name__}:{str(_e27_exc)[:120]}")
     else:
         result["load_models_gpu"] = "unavailable"
         result["cast_to_device"] = "unavailable"
@@ -5743,7 +8534,10 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     result.update(_install_model_patcher_wrappers(trace=trace))
 
     # ── Install deep diag wrappers (idempotent, path-filtered) ────
-    if _DIAGNOSTIC_FLAG:
+    # Also installed in Batch C6 probe mode so the I-1 per-tensor
+    # materialization series is self-sufficient (independent of the
+    # deep-model-diag flag).
+    if _DIAGNOSTIC_FLAG or _C6_PROBE_MODE == "probe":
         import safetensors as _st
         import torch as _torch
         _st_mod = _get_live_module("safetensors")
@@ -5760,6 +8554,15 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     result["comfy.sd.load_clip"] = _clip_result
 
     result.update(_install_clip_span_wrappers(trace=trace))
+
+    # Batch D2: generic CLIP cold-path forensics (flag-gated, additive;
+    # inert unless COMFYMODAL_V2_CLIP_COLD_FORENSICS=1).
+    try:
+        from comfymodal_runtime.clip_cold_path_forensics import install_forensics_if_enabled
+        for comp, status in install_forensics_if_enabled(trace=trace).items():
+            result[f"clip_cold_forensics.{comp}"] = status
+    except Exception:
+        pass
 
     # Emit diagnostic events when a trace is available.
     if trace is not None:
@@ -5912,8 +8715,31 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
     if not callable(get_model) or getattr(get_model, _SENTINEL_SUBFN, False):
         return
 
+    # ── Batch C6 I-3: capture the authoritative transform (probe mode) ──
+    if _C6_PROBE_MODE == "probe":
+        _psd = getattr(model_config, "process_unet_state_dict", None)
+        if callable(_psd) and not getattr(_psd, "_c6_i3_transform_wrapper", False):
+            try:
+                @functools.wraps(_psd)
+                def _c6_psd_wrapper(state_dict):
+                    _result = _psd(state_dict)
+                    try:
+                        _cap = globals().get("_C6_I3_CAPTURE")
+                        if _cap is not None:
+                            _pairs = _cap.setdefault("transform_pairs", [])
+                            if len(_pairs) < 8:
+                                _pairs.append((state_dict, _result))
+                    except Exception:
+                        pass
+                    return _result
+                setattr(_c6_psd_wrapper, "_c6_i3_transform_wrapper", True)
+                model_config.process_unet_state_dict = _c6_psd_wrapper
+            except Exception:
+                pass
+
     @functools.wraps(get_model)
     def wrapped_get_model(*args: Any, **kwargs: Any) -> Any:
+        global _C6_I3_CAPTURE
         started_ns = time.monotonic_ns()
         lane._trace.emit("unet_model_config_get_model_start", phase="restore")
         _nest_before = _unet_subfn_nesting_depth.get()
@@ -5922,6 +8748,29 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
         try:
             model = get_model(*args, **kwargs)
             _instrument_unet_model_weights(model, lane)
+            if _C6_PROBE_MODE == "probe":
+                try:
+                    _param_count = -1
+                    _module_count = -1
+                    try:
+                        _param_count = sum(int(_p.numel()) for _p in model.parameters())
+                    except Exception:
+                        pass
+                    try:
+                        _module_count = len(list(model.modules()))
+                    except Exception:
+                        pass
+                    _C6_I3_CAPTURE = {
+                        "model_config": model_config,
+                        "model": model,
+                        "new_sd": args[0] if args else None,
+                        "prefix": args[1] if len(args) > 1 else "",
+                        "param_count": _param_count,
+                        "module_count": _module_count,
+                        "transform_pairs": [],
+                    }
+                except Exception:
+                    globals()["_C6_I3_CAPTURE"] = None
             return model
         finally:
             _unet_subfn_nesting_depth.set(_nest_before)
@@ -6654,7 +9503,7 @@ def external_model_lane_scope(
     })
     # Set path filtering for deep diag wrappers
     _deep_path_token = None
-    if _DIAGNOSTIC_FLAG:
+    if _DIAGNOSTIC_FLAG or _C6_PROBE_MODE == "probe":
         if _resolved_path_val:
             _deep_path_token = _DEEP_TARGET_PATH.set(_resolved_path_val)
     # NOTE: active-read before/after deltas are NOT sampled here.
@@ -6768,6 +9617,13 @@ def set_model_load_identity(restored_instance_id: str, restore_session_id: str) 
 @contextmanager
 def request_execution_trace_scope(trace: RuntimeTrace) -> Iterator[None]:
     _gpu_request_call_count_var.set(0)
+    _gpu_coordination.start_request(trace.request_id, trace)
+    try:
+        from .fast_cold_orchestration import attach_trace
+
+        attach_trace(trace.request_id, trace)
+    except Exception:
+        pass
     token = _ACTIVE_REQUEST_TRACE.set(trace)
     try:
         yield
@@ -9052,11 +11908,11 @@ class V2LoaderBridge:
         _erc["unet"] = 1
         _erc["clip"] = self._compute_clip_expected_read_count()
         _erc["vae"] = 1 if self._model_key.vae_identity else 0
-        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
-            # sampling_end mode: restore/preparation must NOT submit a VAE
-            # future.  The VAE GPU activation is scheduled exactly once at
-            # the real SAMPLER_SAMPLE sampling_end boundary via
-            # schedule_vae_early_activation_at_sampling_end(); the original
+        if vae_activation_mode() in _VAE_ACTIVATION_MODE_ACTIVE:
+            # Active VAE activation modes (sampling_end / sampling_first_step):
+            # restore/preparation must NOT submit a VAE future in either
+            # mode.  The VAE GPU activation is scheduled exactly once at the
+            # real sampling boundary via the matching scheduler; the original
             # (patched) graph VAELoader remains the unchanged late fallback.
             prepare_vae = False
         else:
@@ -9705,10 +12561,41 @@ class V2LoaderBridge:
                 "validation_scope": "",
                 "missing": "",
             }
+            # Bounded breakdown instrumentation: default locals at this scope
+            # so the emission sites below are always safe to reference.
+            _cc_lookup_wall_ms: float | None = None
+            _cc_lookup_diag: dict[str, Any] = {}
+            # Semantic-neutral conditioning-cache nonce (benchmark-only): read
+            # from the built context; '' when absent -> telemetry stays clean.
+            _cc_nonce: str = ""
+            _cc_nonce_kw: dict[str, Any] = {}
             if _cc_cache_svc is not None:
                 _cc_ctx = _build_clip_conditioning_cache_context(
                     self, clip=clip, trace=trace, request_id=_request_id,
                 )
+                _cc_nonce = str(_cc_ctx.get("cache_nonce", "") or "").strip()
+                if _cc_nonce:
+                    _cc_nonce_kw = {"nonce": _cc_nonce}
+                # ── RUN-2: bounded demand-time join of an in-flight
+                #    prefetch.  The prefetch thread runs at plan receipt but
+                #    can still be mid-flight (volume reload / manifest reads)
+                #    when the prefill callback fires; joining for up to the
+                #    bound installs the memory manifest/payloads BEFORE the
+                #    demand lookup so an exact hit skips the cold file path.
+                #    On timeout the lookup falls through to the cold path
+                #    (prefetch_join_timeout=1).  Never raises; never blocks
+                #    longer than the bound. ────────────────────────────────
+                _cc_join_ms: float = 0.0
+                _cc_join_timeout: int = 0
+                try:
+                    _cc_join_fn = getattr(_cc_cache_svc, "join_prefetch", None)
+                    if _cc_join_fn is not None:
+                        _cc_join_start = time.monotonic_ns()
+                        _cc_join_ok = _cc_join_fn(_request_id, timeout_s=_prefetch_join_timeout_s())
+                        _cc_join_ms = round((time.monotonic_ns() - _cc_join_start) / 1_000_000, 3)
+                        _cc_join_timeout = 0 if _cc_join_ok else 1
+                except Exception:
+                    _cc_join_timeout = 0
                 _cc_lookup_start = time.monotonic_ns()
                 _cc_key_info = conditioning_cache_key_summary(_cc_ctx, filtered)
                 _cc_hits, _cc_miss_entries, _cc_hit_count, _cc_miss_count = (
@@ -9717,26 +12604,81 @@ class V2LoaderBridge:
                 _cc_lookup_wall_ms = round(
                     (time.monotonic_ns() - _cc_lookup_start) / 1_000_000, 3
                 )
-                _cc_lookup_diag = dict(
-                    getattr(_cc_cache_svc, "latest_lookup_diagnostics", lambda: {})() or {}
+                # RUN-1 gate remediation: merge the plan-time prefetch
+                # engagement evidence INTO the lookup diag dict itself
+                # (prefetch_requested / prefetch_source / prefetch_reason,
+                # override semantics) so the host-visible
+                # ``clip_conditioning_cache_lookup.metadata.lookup_diagnostics``
+                # carries the truth even when prefetch_entries never ran.
+                _cc_lookup_diag = _merge_prefetch_evidence_into_diag(
+                    dict(
+                        getattr(_cc_cache_svc, "latest_lookup_diagnostics", lambda: {})() or {}
+                    ),
+                    _request_id,
                 )
+                # RUN-2: bounded demand-time join outcome (additive; excluded
+                # from the measured-children sum).
+                _cc_lookup_diag["prefetch_join_ms"] = round(_cc_join_ms, 3)
+                _cc_lookup_diag["prefetch_join_timeout"] = _cc_join_timeout
+                _cc_prefetch_evidence = _prefetch_evidence_for(_request_id)
                 if trace:
+                    _cc_lookup_metadata: dict[str, Any] = {
+                        "hit_count": _cc_hit_count,
+                        "miss_count": _cc_miss_count,
+                        "entry_count": len(filtered),
+                        "lookup_wall_ms": _cc_lookup_wall_ms,
+                        "lookup_diagnostics": _cc_lookup_diag,
+                        # Task 2: plan-time prefetch / in-memory cache
+                        # fields (additive, appended after existing).
+                        "prefetch_requested": _cc_prefetch_evidence.get(
+                            "prefetch_requested", _cc_lookup_diag.get("prefetch_requested", 0)
+                        ),
+                        "prefetch_wall_ms": _cc_lookup_diag.get("prefetch_wall_ms", 0.0),
+                        "prefetch_overlap_ms": _cc_lookup_diag.get("prefetch_overlap_ms", 0.0),
+                        "prefetch_source": _cc_prefetch_evidence.get(
+                            "prefetch_source", _cc_lookup_diag.get("prefetch_source", "none")
+                        ),
+                        "manifest_memory_hit": _cc_lookup_diag.get("manifest_memory_hit", 0),
+                        "payload_memory_hit": _cc_lookup_diag.get("payload_memory_hit", 0),
+                        "normal_lookup_fallback": _cc_lookup_diag.get("normal_lookup_fallback", 0),
+                        # RUN-1 gate remediation: prefetch engagement
+                        # reason (additive, appended last).
+                        "prefetch_reason": _cc_prefetch_evidence.get(
+                            "prefetch_reason", _cc_lookup_diag.get("prefetch_reason", "none")
+                        ),
+                        # RUN-2: bounded demand-time join (additive).
+                        "prefetch_join_ms": _cc_lookup_diag.get("prefetch_join_ms", 0.0),
+                        "prefetch_join_timeout": _cc_lookup_diag.get("prefetch_join_timeout", 0),
+                        "prefetch_reload": _cc_lookup_diag.get("prefetch_reload", ""),
+                        # RUN-6 (serve-by-components) fields (additive).
+                        "payload_memory_source": _cc_lookup_diag.get("payload_memory_source", ""),
+                        "prefetch_payload_entries": _cc_lookup_diag.get("prefetch_payload_entries", 0),
+                    }
+                    # Semantic-neutral nonce telemetry (additive; only when
+                    # the request carries a nonce).
+                    if _cc_nonce:
+                        _cc_lookup_metadata["cache_nonce"] = _cc_nonce
                     trace.emit(
                         "clip_conditioning_cache_lookup",
                         phase="execution",
-                        metadata={
-                            "hit_count": _cc_hit_count,
-                            "miss_count": _cc_miss_count,
-                            "entry_count": len(filtered),
-                            "lookup_wall_ms": _cc_lookup_wall_ms,
-                            "lookup_diagnostics": _cc_lookup_diag,
-                        },
+                        metadata=_cc_lookup_metadata,
                     )
                 for _cc_index, _cc_value in _cc_hits.items():
                     _cc_text = str(filtered[_cc_index].get("text", ""))
                     _cc_hit_results[(id(clip), _cc_text)] = _cc_value
                 _cc_exact_hit = bool(filtered) and _cc_miss_count == 0
                 if _cc_exact_hit:
+                    _gpu_coordination.record_clip_ready(
+                        _request_id,
+                        trace,
+                        cache_state="cache_hit",
+                    )
+                    try:
+                        from .fast_cold_orchestration import mark_no_forward
+
+                        mark_no_forward(_request_id, trace)
+                    except Exception:
+                        pass
                     _schedule_unet_activation_conditioning_cache_hit(
                         self,
                         trace=trace,
@@ -9752,21 +12694,29 @@ class V2LoaderBridge:
                         validation_scope=_cc_key_info["validation_scope"],
                         entries=len(filtered),
                         request_id=_request_id or "absent",
+                        **_cc_nonce_kw,
                     )
                     if trace:
+                        _cc_decision_metadata: dict[str, Any] = {
+                            "decision": "exact_hit",
+                            "key_hash": _cc_key_info["key_hash"],
+                            "identity_status": _cc_key_info["identity_status"],
+                            "schema_version": _cc_key_info["schema_version"],
+                            "validation_scope": _cc_key_info["validation_scope"],
+                            "encode_calls": 0,
+                            "entry_count": len(filtered),
+                        }
+                        # Semantic-neutral nonce telemetry (only when set).
+                        if _cc_nonce:
+                            _cc_decision_metadata["cache_nonce"] = _cc_nonce
                         trace.emit(
                             "clip_conditioning_cache_decision",
                             phase="execution",
-                            metadata={
-                                "decision": "exact_hit",
-                                "key_hash": _cc_key_info["key_hash"],
-                                "identity_status": _cc_key_info["identity_status"],
-                                "schema_version": _cc_key_info["schema_version"],
-                                "validation_scope": _cc_key_info["validation_scope"],
-                                "encode_calls": 0,
-                                "entry_count": len(filtered),
-                            },
+                            metadata=_cc_decision_metadata,
                         )
+                    _emit_conditioning_exact_hit_breakdown(
+                        _cc_lookup_diag, _request_id, "exact_hit", _cc_lookup_wall_ms
+                    )
                 if _cc_miss_count > 0:
                     log_conditioning_cache_decision(
                         "miss", key_hash=_cc_key_info["key_hash"],
@@ -9778,6 +12728,7 @@ class V2LoaderBridge:
                         entries=len(filtered),
                         lookup_wall_ms=_cc_lookup_wall_ms,
                         request_id=_request_id or "absent",
+                        **_cc_nonce_kw,
                     )
             # The existing activation hooks run only when the encode loop
             # will actually run (miss or partial).  On an exact hit the
@@ -9887,42 +12838,62 @@ class V2LoaderBridge:
                     persist_failed=_cc_store_diag.get("persist_failed", 0),
                     entries=len(filtered),
                     request_id=_request_id or "absent",
+                    **_cc_nonce_kw,
                 )
                 if trace:
-                    trace.emit(
-                        "clip_conditioning_cache_decision",
-                        phase="execution",
-                        metadata={
-                            "decision": "miss_stored",
-                            "key_hash": _cc_stored_key_info["key_hash"],
-                            "identity_status": _cc_stored_key_info["identity_status"],
-                            "schema_version": _cc_stored_key_info["schema_version"],
-                            "validation_scope": _cc_stored_key_info["validation_scope"],
-                            "stored_count": _cc_enqueued,
-                            "enqueued_count": _cc_enqueued,
-                            "persisted_count": _cc_store_diag.get("persisted", 0),
-                            "persist_failed_count": _cc_store_diag.get("persist_failed", 0),
-                            "encode_calls": _cc_encode_calls,
-                            "encode_loop_wall_ms": _cc_encode_loop_wall_ms,
-                            "cache_store_wall_ms": round(_cc_cache_store_wall_ms, 3),
-                            "cache_store_calls": _cc_cache_store_calls,
-                            "store_diagnostics": _cc_store_diag,
-                        },
-                    )
-            elif _cc_cache_svc is not None and trace:
-                trace.emit(
-                    "clip_conditioning_cache_decision",
-                    phase="execution",
-                    metadata={
-                        "decision": "miss_not_stored",
+                    _cc_stored_metadata: dict[str, Any] = {
+                        "decision": "miss_stored",
+                        "key_hash": _cc_stored_key_info["key_hash"],
+                        "identity_status": _cc_stored_key_info["identity_status"],
+                        "schema_version": _cc_stored_key_info["schema_version"],
+                        "validation_scope": _cc_stored_key_info["validation_scope"],
+                        "stored_count": _cc_enqueued,
+                        "enqueued_count": _cc_enqueued,
+                        "persisted_count": _cc_store_diag.get("persisted", 0),
+                        "persist_failed_count": _cc_store_diag.get("persist_failed", 0),
                         "encode_calls": _cc_encode_calls,
                         "encode_loop_wall_ms": _cc_encode_loop_wall_ms,
                         "cache_store_wall_ms": round(_cc_cache_store_wall_ms, 3),
                         "cache_store_calls": _cc_cache_store_calls,
                         "store_diagnostics": _cc_store_diag,
-                        "entry_count": len(_cc_miss_entries),
-                        "reason": getattr(_cc_cache_svc, "last_store_reason", ""),
-                    },
+                    }
+                    # Semantic-neutral nonce telemetry (only when set).
+                    if _cc_nonce:
+                        _cc_stored_metadata["cache_nonce"] = _cc_nonce
+                    trace.emit(
+                        "clip_conditioning_cache_decision",
+                        phase="execution",
+                        metadata=_cc_stored_metadata,
+                    )
+                _emit_conditioning_exact_hit_breakdown(
+                    _cc_lookup_diag, _request_id, "miss_stored", _cc_lookup_wall_ms
+                )
+            elif _cc_cache_svc is not None and trace:
+                _cc_miss_not_stored_metadata: dict[str, Any] = {
+                    "decision": "miss_not_stored",
+                    "encode_calls": _cc_encode_calls,
+                    "encode_loop_wall_ms": _cc_encode_loop_wall_ms,
+                    "cache_store_wall_ms": round(_cc_cache_store_wall_ms, 3),
+                    "cache_store_calls": _cc_cache_store_calls,
+                    "store_diagnostics": _cc_store_diag,
+                    "entry_count": len(_cc_miss_entries),
+                    "reason": getattr(_cc_cache_svc, "last_store_reason", ""),
+                }
+                # Semantic-neutral nonce telemetry (only when set).
+                if _cc_nonce:
+                    _cc_miss_not_stored_metadata["cache_nonce"] = _cc_nonce
+                trace.emit(
+                    "clip_conditioning_cache_decision",
+                    phase="execution",
+                    metadata=_cc_miss_not_stored_metadata,
+                )
+            if (
+                _cc_cache_svc is not None
+                and not _cc_exact_hit
+                and _cc_enqueued == 0
+            ):
+                _emit_conditioning_exact_hit_breakdown(
+                    _cc_lookup_diag, _request_id, "miss_not_stored", _cc_lookup_wall_ms
                 )
             # ── Terminal events FIRST, then publish results ──────────────
             # ``_prefill_results`` is published under ``_prefill_lock`` AFTER
@@ -10133,6 +13104,11 @@ class V2LoaderBridge:
             timeout=timeout,
             cancel_futures=cancel_futures,
         )
+        try:
+            if self._trace is not None:
+                _gpu_coordination.request_end(self._trace.request_id, self._trace)
+        except Exception:
+            pass
         return {
             "present": _present,
             "done_before_wait": _done,
@@ -10157,9 +13133,10 @@ class V2LoaderBridge:
         """
         if self._preparation is None or self._model_key is None:
             return None
-        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
-            # sampling_end mode: never submit a VAE future from extension
-            # either — the VAE is activated once at sampling_end.
+        if vae_activation_mode() in _VAE_ACTIVATION_MODE_ACTIVE:
+            # Active VAE activation modes (sampling_end / sampling_first_step):
+            # never submit a VAE future from extension either — the VAE is
+            # activated exactly once at the sampling boundary.
             prepare_vae = False
         return self.coordinator.extend(
             self._preparation,
@@ -10219,6 +13196,27 @@ class V2LoaderBridge:
             prep.clip_future = clip_future
             prep.diagnostics.clip_started_at = _now
             prep.diagnostics.clip_completed_at = _now
+
+        # ── Batch-A G1: carry the in-flight execution-UNET lane ──
+        # A clip-only publication (UNET == _LOADER_MISS) that follows a
+        # plan-receipt early schedule must keep that exact in-flight future
+        # (single flight — the later schedule_execution_unet call becomes a
+        # no-op and the graph joins this future via wait_unet).  Only an
+        # in-flight future with the same model key is carried: a done future
+        # belongs to a previous request and is deliberately dropped so every
+        # request gets its own lane.  The shared diagnostics object is kept
+        # so the worker's completion timestamps remain readable through the
+        # new preparation.
+        _prev_prep = self._preparation
+        if (
+            unet is _LOADER_MISS
+            and _prev_prep is not None
+            and _prev_prep.unet_future is not None
+            and not _prev_prep.unet_future.done()
+            and _prev_prep.model_key == model_key
+        ):
+            prep.unet_future = _prev_prep.unet_future
+            prep.diagnostics = _prev_prep.diagnostics
 
         # Publish only after all ready futures are assigned.
         self._preparation = prep
@@ -10463,6 +13461,72 @@ class V2LoaderBridge:
                     if result is not _LOADER_MISS:
                         return result
                 _trace = active._trace if active is not None else _ACTIVE_REQUEST_TRACE.get()
+                # ── E28: VAE transition decomposition (Target E §8.6) ──
+                # The sampling_end → vae_decode_start window (~878 ms
+                # measured) is NOT empty_cache (sub-ms).  Emit spans that
+                # decompose what actually consumes it: the activation
+                # model-management/load window (vae_model_activation /
+                # vae_model_management), any H2D transfer (vae_h2d), and the
+                # decode-preparation gap (vae_decode_prep).  Gated (gantt /
+                # e27) and never raises.
+                try:
+                    from .gantt_telemetry import gantt_enabled, register_gantt_span
+                    from .e27_forensics import emit_e27_span, e27_forensics_enabled
+
+                    if (gantt_enabled() or e27_forensics_enabled()) and _VAE_SAMPLING_END_MONO_NS:
+                        _vae_gap_start = int(_VAE_SAMPLING_END_MONO_NS or 0)
+                        _vae_gap_end = time.monotonic_ns()
+                        if _vae_gap_end > _vae_gap_start:
+                            _vae_rid = str(getattr(_trace, "request_id", "") or "")
+                            if gantt_enabled():
+                                register_gantt_span(
+                                    "vae_transition",
+                                    start_mono_ns=_vae_gap_start,
+                                    end_mono_ns=_vae_gap_end,
+                                    lane="MODEL-MGMT",
+                                    metadata={
+                                        "kind": "sampling_end_to_decode_start",
+                                        "request_id": _vae_rid,
+                                    },
+                                )
+                            emit_e27_span(
+                                "vae_transition",
+                                start_ns=_vae_gap_start,
+                                end_ns=_vae_gap_end,
+                                request_id=_vae_rid,
+                                kind="sampling_end_to_decode_start",
+                            )
+                            # Activation model-management window (the E27
+                            # load span already exists when the activation
+                            # worker ran; re-emit as the model-mgmt span so
+                            # the Gantt shows it even without e27 forensics).
+                            try:
+                                _vae_act_state = _vae_activation_get(_vae_rid) or {}
+                                _vae_act_start = _vae_act_state.get("trigger_mono_ns")
+                                _vae_act_end = _vae_act_state.get("terminal_mono_ns")
+                                if _vae_act_start and _vae_act_end:
+                                    if gantt_enabled():
+                                        register_gantt_span(
+                                            "vae_model_activation",
+                                            start_mono_ns=int(_vae_act_start),
+                                            end_mono_ns=int(_vae_act_end),
+                                            lane="MODEL-MGMT",
+                                            metadata={
+                                                "status": _vae_act_state.get("status", ""),
+                                                "request_id": _vae_rid,
+                                            },
+                                        )
+                                    emit_e27_span(
+                                        "vae_model_activation",
+                                        start_ns=int(_vae_act_start),
+                                        end_ns=int(_vae_act_end),
+                                        request_id=_vae_rid,
+                                        status=_vae_act_state.get("status", ""),
+                                    )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 _decode_args, _decode_kwargs = V2LoaderBridge._vae_decode_layout_inputs(
                     _demanded_vae, args, kwargs, trace=_trace,
                 )
@@ -10570,6 +13634,7 @@ class V2LoaderBridge:
         _loader_trace = _ACTIVE_REQUEST_TRACE.get() or self._trace
         _loader_start_wall_ns = time.time_ns()
         _loader_start_mono_ns = time.monotonic_ns()
+        _execution_identity = "unknown"
 
         def _emit_unet_loader_end(status: str) -> None:
             _end_wall_ns = time.time_ns()
@@ -10582,8 +13647,13 @@ class V2LoaderBridge:
                     phase="restore",
                     metadata={
                         "status": status,
+                        "execution_identity": _execution_identity,
+                        "fallback_count": int(
+                            _execution_identity in {"native", "fallback"}
+                        ),
                         "unet_identity": model_key.unet_identity,
                         "requested_weight_dtype": _req_wd,
+                        "requested_fastsafetensors": bool(_fs_pipeline_enabled()),
                         "wall_ms": round(
                             max(0, _end_mono_ns - _loader_start_mono_ns) / 1_000_000, 3
                         ),
@@ -10604,11 +13674,114 @@ class V2LoaderBridge:
                 },
             )
         try:
-            result = self._invoke_original("UNETLoader", kwargs)
+            _ring_patcher = None
+            try:
+                if _ring_pipeline_enabled():
+                    _ring_patcher = _ring_try_pipeline(self, model_key, kwargs, lane=None)
+            except Exception as _exc:
+                print(f"[v2.pinned_ring] ERROR reason={type(_exc).__name__}:{_exc}", flush=True)
+                _ring_patcher = None
+            # V2 meta-direct branch (Batch C6 salvage, gen 2; default off).
+            # Lazy-imported so the off path has zero import cost; the flag
+            # gate mirrors the V1 ring branch.  Any failure returns None and
+            # the caller runs _invoke_original FRESH exactly once.
+            _md_patcher = None
+            if _ring_patcher is None and _md_pipeline_enabled():
+                try:
+                    _md_mod = None
+                    try:
+                        import comfymodal_runtime.unet_meta_direct as _md_mod  # noqa: PLC0415
+                    except Exception as _exc_md:
+                        print(
+                            f"[v2.meta_direct] import_error={type(_exc_md).__name__}",
+                            flush=True,
+                        )
+                    if _md_mod is not None:
+                        _md_patcher = _md_mod._md_try_pipeline(
+                            self, model_key, kwargs, lane=None,
+                        )
+                except Exception as _exc:
+                    print(f"[v2.meta_direct] ERROR reason={type(_exc).__name__}:{_exc}", flush=True)
+                    _md_patcher = None
+            # V2 fastsafetensors branch (Batch C9 production integration;
+            # default off).  Lazy-imported; any failure returns None and the
+            # caller runs _invoke_original FRESH exactly once.  On success the
+            # native fast-disk machinery is not invoked at all (no second
+            # read / bind / model.to / H2D replay).
+            _fs_patcher = None
+            if (_ring_patcher is None and _md_patcher is None
+                    and _fs_pipeline_enabled()):
+                try:
+                    _fs_mod = None
+                    try:
+                        import comfymodal_runtime.unet_fastsafetensors as _fs_mod  # noqa: PLC0415
+                    except Exception as _exc_fs:
+                        print(
+                            f"[v2.fastsafetensors] import_error={type(_exc_fs).__name__}",
+                            flush=True,
+                        )
+                    if _fs_mod is not None:
+                        _fs_patcher = _fs_mod._fs_try_pipeline(
+                            self, model_key, kwargs, lane=None,
+                        )
+                except Exception as _exc:
+                    if (
+                        _exc.__class__.__name__ == "SourceFenceFailure"
+                        or "structural_source_fence_failure" in str(_exc)
+                    ):
+                        raise
+                    print(
+                        f"[v2.fastsafetensors] ERROR reason={type(_exc).__name__}:{_exc}",
+                        flush=True,
+                    )
+                    _fs_patcher = None
+            if _ring_patcher is not None:
+                result = _ring_patcher
+                _execution_identity = "pinned_ring"
+            elif _md_patcher is not None:
+                result = _md_patcher
+                _execution_identity = "meta_direct"
+            elif _fs_patcher is not None:
+                result = _fs_patcher
+                _execution_identity = (
+                    "staged"
+                    if env_flag("COMFYMODAL_V2_STAGED_SAFETENSORS")
+                    else "fastsafetensors"
+                )
+            else:
+                result = self._invoke_original("UNETLoader", kwargs)
+                _execution_identity = "native"
         except Exception:
             _emit_unet_loader_end("error")
             raise
         _emit_unet_loader_end("ok")
+        try:
+            from .fast_cold_orchestration import record_loader_execution_identity
+
+            record_loader_execution_identity(
+                "unet",
+                _execution_identity,
+                trace=_loader_trace,
+                fallback=_execution_identity in {"native", "fallback"},
+            )
+        except Exception:
+            pass
+        # ── Batch C6 probes (probe mode only; guarded) ──────────────────
+        if _C6_PROBE_MODE == "probe":
+            try:
+                _c6_run_pinned_ring_probe()
+            except Exception as _exc:
+                print(
+                    f"[v2.c6_probe] ring ERROR reason={type(_exc).__name__}:{_exc}",
+                    flush=True,
+                )
+            try:
+                _c6_run_config_parity()
+            except Exception as _exc:
+                print(
+                    f"[v2.c6_probe] i3 parity=ERROR reason={type(_exc).__name__}:{_exc}",
+                    flush=True,
+                )
         unet = result[0] if isinstance(result, (tuple, list)) and result else result
 
         # ── Emit normal_loader_ready state (print + trace) ──────────────
@@ -10650,6 +13823,7 @@ class V2LoaderBridge:
             if _target_trace is not None:
                 _target_trace.emit(
                     "unet_runtime_state",
+                    phase="restore",
                     metadata={
                         "stage": "normal_loader_ready",
                         "unet_identity": model_key.unet_identity,
@@ -10794,12 +13968,13 @@ class V2LoaderBridge:
 
     def _consume_vae(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
         identity = str(kwargs.get("vae_name", args[0] if args else ""))
-        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
-            # sampling_end mode: no VAE future was prepared at restore.
-            # Join the sampling_end activation future (when present and
-            # terminal-ready) outside the mutation lane; on any absent /
-            # failed / invalid / not-ready outcome return _LOADER_MISS so
-            # the unchanged original VAELoader path proceeds.
+        if vae_activation_mode() in _VAE_ACTIVATION_MODE_ACTIVE:
+            # Active VAE activation modes (sampling_end / sampling_first_step):
+            # no VAE future was prepared at restore.  Join the activation
+            # future (when present and terminal-ready) outside the mutation
+            # lane; on any absent / failed / invalid / not-ready outcome
+            # return _LOADER_MISS so the unchanged original VAELoader path
+            # proceeds.
             _outcome = self._join_vae_early_activation(trace=self._trace)
             if _outcome.get("valid") and _outcome.get("vae") is not None:
                 return (_outcome["vae"],)
@@ -10849,7 +14024,7 @@ class V2LoaderBridge:
         _demanded_vae = demanded_vae if demanded_vae is not None else (
             kwargs.get("vae", args[0] if args else None)
         )
-        if vae_activation_mode() == _VAE_ACTIVATION_MODE_SAMPLING_END:
+        if vae_activation_mode() in _VAE_ACTIVATION_MODE_ACTIVE:
             self._join_vae_early_activation(
                 trace=self._trace,
                 demanded_vae=_demanded_vae,
@@ -10956,7 +14131,7 @@ class V2LoaderBridge:
         validated.  Any other outcome lets the caller fall back to the
         unchanged original VAEDecode/loader path.
         """
-        if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+        if vae_activation_mode() not in _VAE_ACTIVATION_MODE_ACTIVE:
             return {"scheduled": False, "status": "mode_late", "terminal": False,
                     "valid": False, "reason": "", "join_wait_ms": 0.0, "vae": None}
         _rt = trace or self._trace
@@ -14791,6 +17966,51 @@ def _read_effective_workflow_hash(trace: RuntimeTrace | None) -> str:
         return ""
 
 
+def _read_conditioning_cache_nonce(trace: RuntimeTrace | None) -> str:
+    """Read the semantic-neutral conditioning-cache nonce from the trace.
+
+    Mirrors ``_read_effective_workflow_hash``: checks ``remote_method_entry``
+    / ``method_entry`` event metadata first (keys ``conditioning_cache_nonce``
+    / ``cache_nonce``), then ``trace._metadata`` — including the
+    ``request_origin_info`` dict the benchmark carries the nonce in.  Returns
+    '' when absent so the cache key then has NO nonce field (byte-identical).
+    """
+    if trace is None:
+        return ""
+    try:
+        for event in reversed(trace.events):
+            metadata = event.metadata or {}
+            if event.name in {"remote_method_entry", "method_entry"}:
+                value = (
+                    metadata.get("conditioning_cache_nonce")
+                    or metadata.get("cache_nonce")
+                )
+                if value:
+                    return str(value)
+    except Exception:
+        pass
+    try:
+        metadata = trace._metadata or {}
+        value = (
+            metadata.get("conditioning_cache_nonce")
+            or metadata.get("cache_nonce")
+            or ""
+        )
+        if value:
+            return str(value)
+        origin = metadata.get("request_origin_info")
+        if isinstance(origin, Mapping):
+            value = (
+                origin.get("conditioning_cache_nonce")
+                or origin.get("cache_nonce")
+            )
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return ""
+
+
 def _clip_cache_tokenizer_identity(clip: Any) -> str:
     tokenizer = getattr(clip, "tokenizer", None)
     if tokenizer is None:
@@ -14846,6 +18066,127 @@ def _clip_cache_compute_dtype(clip: Any) -> str:
         except Exception:
             continue
     return ""
+
+
+# ── Bounded exact-conditioning-cache breakdown instrumentation ─────────
+# One ``[v2.conditioning_exact_hit_breakdown]`` stdout line per exact-cache
+# lookup/decision.  Reads ONLY the always-on lookup diagnostics (never new
+# timers) plus the opt-gated fields that populate under
+# COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS=1.  Purely observational — cache,
+# key, lock, and persistence behavior are untouched.
+_CC_BREAKDOWN_ALWAYS_ON_KEYS: tuple[tuple[str, str], ...] = (
+    ("total_ms", "total_ms"),
+    ("key_build_ms", "key_build_digest_ms"),
+    ("lock_wait_ms", "lock_wait_ms"),
+    ("manifest_read_ms", "manifest_read_ms"),
+    ("manifest_bytes", "manifest_read_bytes"),
+    ("manifest_entries", "manifest_entries"),
+    ("entry_lookup_ms", "entry_lookup_ms"),
+    ("header_bytes", "header_bytes_read"),
+    ("data_bytes", "data_bytes_read"),
+    ("lru_touch_ms", "lru_touch_ms"),
+    ("lru_touch_mode", "lru_touch_mode"),
+    ("children_ms", "measured_children_ms"),
+    ("residual_ms", "residual_ms"),
+)
+_CC_BREAKDOWN_OPT_KEYS: tuple[str, ...] = (
+    "entry_header_open_read_ms",
+    "entry_header_parse_ms",
+    "entry_header_validate_ms",
+    "entry_data_open_read_ms",
+    "entry_deserialize_ms",
+    "deser_payload_sha_ms",
+    "deser_tensor_sha_ms",
+    "deser_tensor_rebuild_ms",
+    "deser_materialize_ms",
+    "deser_tensor_count",
+    "deser_tensors_bytes",
+    "hit_read_bytes",
+    "hit_read_mbps",
+    # Task 2: plan-time prefetch / in-memory cache fields (additive;
+    # emitted only when present in the lookup diagnostics, appended after
+    # all pre-existing fields).
+    "prefetch_requested",
+    "prefetch_wall_ms",
+    "prefetch_overlap_ms",
+    "prefetch_source",
+    "manifest_memory_hit",
+    "payload_memory_hit",
+    "normal_lookup_fallback",
+    # RUN-1 gate remediation: prefetch engagement reason (env_off /
+    # cache_off / key_build_failed / key_build_partial / ok) merged from the
+    # plan-time evidence (additive; emitted only when present).
+    "prefetch_reason",
+    # RUN-2: bounded demand-time join of the in-flight prefetch + first-
+    # prefetch reload-skip status (additive; appended after all existing).
+    "prefetch_join_ms",
+    "prefetch_join_timeout",
+    "prefetch_reload",
+    # RUN-6 (serve-by-components): how a memory payload was served (key_hit /
+    # component_match) and how many payloads the prefetch loaded (additive).
+    "payload_memory_source",
+    "prefetch_payload_entries",
+)
+
+
+def format_conditioning_exact_hit_breakdown(
+    diag: Mapping[str, Any],
+    request_id: str,
+    decision: str,
+    lookup_wall_ms: float | None = None,
+) -> str:
+    """Format the one-line exact-conditioning-cache breakdown.
+
+    ``decision`` is one of ``exact_hit`` / ``miss_stored`` /
+    ``miss_not_stored``.  Always-on lookup diagnostics are emitted under
+    their fixed keys; opt-gated fields are appended only when present in
+    ``diag`` (they appear under COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS=1).
+    Missing fields are omitted — never invented.
+    """
+    parts: list[str] = [
+        "[v2.conditioning_exact_hit_breakdown]",
+        f"request_id={str(request_id or 'absent')}",
+        f"decision={decision}",
+    ]
+    if lookup_wall_ms is not None:
+        parts.append(f"lookup_wall_ms={lookup_wall_ms}")
+    for emit_key, diag_key in _CC_BREAKDOWN_ALWAYS_ON_KEYS:
+        if emit_key == "children_ms":
+            parts.append("opt=1")
+        if diag_key in diag:
+            parts.append(f"{emit_key}={diag[diag_key]}")
+    for key in _CC_BREAKDOWN_OPT_KEYS:
+        if key in diag:
+            parts.append(f"{key}={diag[key]}")
+    return " ".join(parts)
+
+
+def _emit_conditioning_exact_hit_breakdown(
+    diag: Mapping[str, Any],
+    request_id: str,
+    decision: str,
+    lookup_wall_ms: float | None = None,
+) -> None:
+    """Print the bounded one-line breakdown with an immediate flush.
+
+    RUN-1 gate remediation: the plan-time prefetch engagement evidence
+    (``_LAST_PREFETCH_EVIDENCE``) for *request_id* is merged into the
+    effective diagnostics with OVERRIDE semantics for ``prefetch_requested``
+    / ``prefetch_source`` / ``prefetch_reason`` — the truthful plan-time
+    record wins over the cache's post-hoc prefetch diag (which stays at its
+    0/none defaults when ``prefetch_entries`` never ran).  Absent evidence
+    leaves the line byte-for-byte unchanged.
+    """
+    _effective = _merge_prefetch_evidence_into_diag(diag, request_id)
+    print(
+        format_conditioning_exact_hit_breakdown(
+            _effective,
+            request_id=request_id,
+            decision=decision,
+            lookup_wall_ms=lookup_wall_ms,
+        ),
+        flush=True,
+    )
 
 
 def _build_clip_conditioning_cache_context(
@@ -14921,6 +18262,12 @@ def _build_clip_conditioning_cache_context(
         or getattr(bridge, "_production_options_hash", "")
         or ""
     )
+    # Semantic-neutral conditioning-cache nonce (benchmark-only): set only
+    # when the request carries one (via request_origin_info in the trace), so
+    # the cache key is isolated per run WITHOUT touching the workflow/prompt.
+    _cc_nonce = _read_conditioning_cache_nonce(trace)
+    if _cc_nonce:
+        ctx["cache_nonce"] = _cc_nonce
     try:
         import torch as _torch
         ctx["torch_version"] = str(_torch.__version__)
@@ -14929,6 +18276,698 @@ def _build_clip_conditioning_cache_context(
         ctx["torch_version"] = ""
         ctx["torch_num_threads"] = 0
     return ctx
+
+
+# ── Plan-time conditioning prefetch (Task 2) ────────────────────────────
+# ``maybe_prefetch_conditioning`` is the plan-receipt launch point for the
+# exact-conditioning-cache prefetch: it approximates the demand-time key
+# context from the ExecutionPlan alone (NO live CLIP object), derives the
+# same filtered entry list the prefill hook uses, and reads the matching
+# entries into the cache's in-memory store so demand-time lookup can serve
+# an exact hit without cold Modal-Volume file reads.  compute_dtype and
+# tokenizer_identity are APPROXIMATED plan-time and rely on demand-time
+# canonical-key revalidation (clip_conditioning_cache._validate_entry_bytes,
+# full canonical-key equality) to fail closed: any drift simply falls back
+# to the normal file path.
+ENV_PREFETCH = "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH"
+# RUN-2: bounded demand-time join of the in-flight prefetch (ms; clamped to
+# [0, 10000]).  The join converts a cold ~700ms file path into a memory hit
+# when the prefetch completes within the bound; on timeout the lookup falls
+# through to the cold path and prefetch_join_timeout=1 is recorded.
+ENV_PREFETCH_JOIN_TIMEOUT_MS = "COMFYMODAL_V2_CONDITIONING_PREFETCH_JOIN_TIMEOUT_MS"
+_PREFETCH_JOIN_TIMEOUT_S_DEFAULT = 1.5
+
+
+def _prefetch_join_timeout_s() -> float:
+    try:
+        _ms = float(
+            os.environ.get(ENV_PREFETCH_JOIN_TIMEOUT_MS, "1500") or "1500"
+        )
+    except (TypeError, ValueError):
+        return _PREFETCH_JOIN_TIMEOUT_S_DEFAULT
+    return max(0.0, min(10.0, _ms / 1000.0))
+
+
+def _plan_time_options_hash(plan: Any) -> str:
+    """Plan-time production-options hash.
+
+    Computes the SAME value the demand path reads from the trace
+    ``remote_method_entry`` ``effective_options_hash``
+    (``stable_hash(execution_options.to_dict())`` — modal_app
+    ``_run_plan_stream_impl``), so the plan-time approximation matches the
+    demand-time key exactly when the execution options are unchanged.
+    """
+    try:
+        _opts = getattr(plan, "execution_options", None)
+        if _opts is None:
+            return ""
+        _opts_dict = _opts.to_dict() if hasattr(_opts, "to_dict") else dict(_opts)
+        if not _opts_dict:
+            return ""
+        return stable_hash(_opts_dict)
+    except Exception:
+        return ""
+
+
+def _plan_time_prefill_entries(plan: Any) -> list[dict[str, Any]]:
+    """Derive the demand-time filtered CLIPTextEncode entries plan-time.
+
+    Mirrors the execution_prefill hook: the canonical ``encodes`` come from
+    the same source (plan ``prompt_bundle`` when present, else the static
+    workflow resolver used by ``derive_prefill_key``) and are filtered by
+    ``COMFYMODAL_V2_PREFILL_LANES`` exactly like ``_filter_prefill_entries``.
+    Returns [] when the workflow structure is not available — the caller
+    then falls back to a manifest-only prefetch.
+    """
+    entries: list[dict[str, Any]] = []
+    try:
+        _pb = getattr(plan, "prompt_bundle", None) or {}
+        _pb_encodes = _pb.get("encodes") if isinstance(_pb, Mapping) else None
+        if isinstance(_pb_encodes, list):
+            entries = [dict(_e) for _e in _pb_encodes if isinstance(_e, Mapping)]
+        if not entries:
+            from .restore_plan import derive_model_key, derive_prefill_key
+            _workflow = dict(getattr(plan, "workflow", None) or {})
+            if _workflow:
+                _model_key = derive_model_key(_workflow)
+                _pk = derive_prefill_key(_model_key, _workflow)
+                _encodes = ((_pk.encode_options or {}).get("encodes") or [])
+                entries = [dict(_e) for _e in _encodes if isinstance(_e, Mapping)]
+    except Exception:
+        return []
+    if not entries:
+        return []
+    lane_mode = _PREFILL_LANE_MODE
+    if lane_mode == "none":
+        return []
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        text = str(entry.get("text", "") or "")
+        if not text:
+            continue
+        if lane_mode == "all":
+            kept.append(entry)
+            continue
+        # Host-side prompt bundles may omit ``role`` (the container-side
+        # ``_infer_prompt_role`` defaults unlabeled CLIPTextEncode nodes to
+        # "positive" at demand time); mirror that default so a role-less
+        # bundle still gets its payloads prefetched.  A wrong guess only
+        # costs a payload prefetch — demand-time canonical-key revalidation
+        # fails closed.
+        role = str(entry.get("role", "") or "").lower() or "positive"
+        if role in _PREFILL_CRITICAL_ROLES:
+            kept.append(entry)
+    return kept
+
+
+def _plan_time_compute_dtype(clip_type: str) -> str:
+    """Best-guess plan-time compute dtype for the CLIP encoder.
+
+    APPROXIMATED: the demand-time value is read from the live CLIP patcher
+    (``_clip_cache_compute_dtype``).  For a fixed deployment the compute
+    dtype is deterministic per CLIP family, so the guess matches in the
+    common case; ANY drift fails closed via demand-time canonical-key
+    revalidation (the memory entry is simply not served and the normal
+    file path runs).
+    """
+    t = str(clip_type or "").lower()
+    if "flux" in t or "qwen" in t or "sd3" in t:
+        return "torch.bfloat16"
+    return "torch.float16"
+
+
+def _plan_time_tokenizer_identity(
+    clip_type: str, loader_class: str, filenames: list[Any]
+) -> str:
+    """Deterministic plan-time tokenizer identity approximation.
+
+    APPROXIMATED: the demand-time value hashes the live tokenizer
+    (class/options/vocab — ``_clip_cache_tokenizer_identity``).  For a
+    fixed (clip_type, loader_class) in a fixed container the tokenizer is
+    itself fixed, so a structural hash over the loader identity gives an
+    exact match in the common case and fails closed on any drift.
+    """
+    try:
+        return stable_hash({
+            "clip_type": str(clip_type or ""),
+            "loader_class": str(loader_class or ""),
+            "filenames": [str(f or "") for f in (filenames or [])],
+            "approximation": "plan_time_structural",
+        })
+    except Exception:
+        return ""
+
+
+def _build_plan_time_cache_context(plan: Any) -> dict[str, Any]:
+    """Approximate the demand-time exact-cache context from the ExecutionPlan.
+
+    Fields derived plan-time from the plan + container state (no live CLIP
+    object): clip_identity/clip_type via the same workflow -> model-key
+    derivation the runtime uses, loader identity from the plan model stack
+    (full ``loaders`` spec or the simple ``{"clip": [...]}`` form), the plan
+    ``prompt_bundle.encodes`` (per-entry loader identity), and a direct
+    workflow-node fallback (CLIPLoader/DualCLIPLoader) — each missing
+    identity field is filled independently from any source.  workflow /
+    source-workflow hashes, deployment / custom-node / model generations,
+    the production-options hash (identical to the demand trace computation),
+    and torch version / threads round out the key.  compute_dtype and
+    tokenizer_identity are APPROXIMATED and rely on demand-time canonical-key
+    revalidation to fail closed: any drift simply means the memory entry is
+    not served and the normal file path runs.
+
+    Returns {} ONLY when the plan is None or there is no workflow hash at all
+    (nothing to key on).  When the workflow hash is present but identity
+    fields are partially empty the context PROCEEDS (best-effort): the
+    manifest can still be prefetched (~150-260ms of the demand lookup) and a
+    wrong identity fails closed at demand time.  Callers record
+    ``key_build_partial:<missing fields>`` via the returned context.
+    """
+    if plan is None:
+        return {}
+    try:
+        ctx: dict[str, Any] = {
+            "request_id": "",
+            "clip_identity": "",
+            "clip_type": "",
+            "loader_class": "",
+            "filenames": [],
+            "weight_dtype": "",
+            # ── APPROXIMATED plan-time (no live CLIP object) ─────────────
+            # compute_dtype: derived from the live CLIP patcher at demand
+            # time; approximated as "" here so any drift fails closed via
+            # canonical-key equality (memory entry not served -> file path).
+            "compute_dtype": "",
+            # tokenizer_identity: deterministically tied to (clip_type,
+            # loader_class) in clip_conditioning_cache; approximated as ""
+            # here — again fail-closed via canonical-key revalidation.
+            "tokenizer_identity": "",
+            "entry_layer": "",
+            "entry_skip": "",
+            "model_generation": "",
+        }
+        _workflow = getattr(plan, "workflow", None)
+        _workflow_dict = dict(_workflow) if isinstance(_workflow, Mapping) else {}
+        # 1) clip identity / clip_type from the same workflow -> model-key
+        #    path the runtime uses (derive_model_key).  On the COMPILED
+        #    dispatch workflow this commonly yields empty identities — the
+        #    loader-node / prompt-bundle / model-stack fallbacks below fill
+        #    each missing field independently.
+        try:
+            from .restore_plan import derive_model_key
+            _model_key = derive_model_key(_workflow_dict)
+            if _model_key is not None:
+                ctx["clip_identity"] = str(getattr(_model_key, "clip_identity", "") or "")
+                ctx["clip_type"] = str(getattr(_model_key, "clip_type", "") or "")
+                ctx["model_generation"] = str(
+                    getattr(_model_key, "model_volume_generation", "") or ""
+                )
+        except Exception:
+            pass
+        # 2) Loader identity from the plan model stack — full spec form
+        #    (``{"loaders": {"clip": [...]}}``, mirrors the demand path which
+        #    reads ``bridge._request_list("clip")``) OR the simple form
+        #    (``{"clip": ["name.safetensors", ...]}``).
+        try:
+            _model_stack = getattr(plan, "model_stack", None) or {}
+            _loaders = ((_model_stack.get("loaders") or {}).get("clip") or [])
+            for _req in _loaders:
+                if not isinstance(_req, Mapping):
+                    continue
+                _lc = str(_req.get("loader_class", "") or "")
+                if _lc:
+                    ctx["loader_class"] = ctx["loader_class"] or _lc
+                _fn = _req.get("clip_name")
+                if _fn:
+                    ctx["filenames"] = ctx["filenames"] or [str(_fn)]
+                    ctx["clip_identity"] = ctx["clip_identity"] or str(_fn)
+                elif _req.get("clip_name1") and _req.get("clip_name2"):
+                    ctx["filenames"] = ctx["filenames"] or [
+                        str(_req["clip_name1"]),
+                        str(_req["clip_name2"]),
+                    ]
+                    ctx["clip_identity"] = ctx["clip_identity"] or str(_req["clip_name1"])
+                _wd = str(_req.get("weight_dtype", "") or "")
+                if _wd:
+                    ctx["weight_dtype"] = _wd
+                break
+            if not _loaders:
+                # Simple form: model_stack may be {"clip": ["name.safetensors"]}.
+                _simple = _model_stack.get("clip")
+                if isinstance(_simple, (list, tuple)) and _simple:
+                    _fn = str(_simple[0] or "")
+                    if _fn:
+                        ctx["filenames"] = ctx["filenames"] or [_fn]
+                        ctx["clip_identity"] = ctx["clip_identity"] or _fn
+        except Exception:
+            pass
+        # 3) Loader identity from the plan prompt bundle (per-entry
+        #    authoritative loader fields carried on compiled workflows).
+        try:
+            _pb = getattr(plan, "prompt_bundle", None) or {}
+            _encodes = _pb.get("encodes") if isinstance(_pb, Mapping) else None
+            if isinstance(_encodes, list):
+                for _e in _encodes:
+                    if not isinstance(_e, Mapping):
+                        continue
+                    _lc = str(_e.get("loader_class", "") or "")
+                    if _lc:
+                        ctx["loader_class"] = ctx["loader_class"] or _lc
+                    _ct = str(_e.get("clip_type", "") or "")
+                    if _ct:
+                        ctx["clip_type"] = ctx["clip_type"] or _ct
+                    _wd = str(_e.get("weight_dtype", "") or "")
+                    if _wd:
+                        ctx["weight_dtype"] = ctx["weight_dtype"] or _wd
+                    _fn = _e.get("filenames")
+                    _fn_list: list[str] = []
+                    if isinstance(_fn, (list, tuple)):
+                        _fn_list = [str(f) for f in _fn if str(f or "").strip()]
+                    elif isinstance(_fn, str) and _fn.strip():
+                        _fn_list = [_fn.strip()]
+                    if _fn_list:
+                        ctx["filenames"] = ctx["filenames"] or _fn_list
+                        # Demand-time clip_identity == the CLIP loader
+                        # filename (verified locally); DualCLIPLoader uses
+                        # the first name.
+                        ctx["clip_identity"] = ctx["clip_identity"] or _fn_list[0]
+                    break
+        except Exception:
+            pass
+        # 4) Workflow-node fallback (compiled workflows may retain the loader
+        #    node).  Fills each still-missing identity field independently.
+        try:
+            for _node in _workflow_dict.values():
+                if not isinstance(_node, Mapping):
+                    continue
+                _class_type = str(_node.get("class_type", "") or "")
+                _inputs = _node.get("inputs") or {}
+                if not isinstance(_inputs, Mapping):
+                    continue
+                if _class_type in ("CLIPLoader", "DualCLIPLoader"):
+                    ctx["loader_class"] = ctx["loader_class"] or _class_type
+                    _wd = str(_inputs.get("weight_dtype", "") or "")
+                    if _wd:
+                        ctx["weight_dtype"] = ctx["weight_dtype"] or _wd
+                    if _class_type == "CLIPLoader":
+                        if isinstance(_inputs.get("clip_name"), str):
+                            ctx["filenames"] = ctx["filenames"] or [str(_inputs["clip_name"])]
+                            ctx["clip_identity"] = ctx["clip_identity"] or str(
+                                _inputs["clip_name"]
+                            )
+                        ctx["clip_type"] = ctx["clip_type"] or str(
+                            _inputs.get("type", "") or ""
+                        )
+                    else:
+                        _n1 = str(_inputs.get("clip_name1", "") or "")
+                        _n2 = str(_inputs.get("clip_name2", "") or "")
+                        if _n1 or _n2:
+                            ctx["filenames"] = ctx["filenames"] or [
+                                x for x in (_n1, _n2) if x
+                            ]
+                            ctx["clip_identity"] = ctx["clip_identity"] or (_n1 or _n2)
+                        ctx["clip_type"] = ctx["clip_type"] or str(
+                            _inputs.get("type", "") or ""
+                        )
+                    break
+        except Exception:
+            pass
+        ctx["workflow_hash"] = str(getattr(plan, "workflow_hash", "") or "")
+        ctx["source_workflow_hash"] = str(getattr(plan, "source_workflow_hash", "") or "")
+        # Semantic-neutral conditioning-cache nonce (benchmark-only): carried
+        # in plan.request_metadata request_origin_info so the plan-time
+        # prefetch derives the SAME nonce key the demand path builds (a fresh
+        # nonce -> prefetch finds nothing -> cold path -> correct).  Set only
+        # when present; the prefetched manifest then keys under the nonce
+        # identity, never the ordinary canonical one.
+        try:
+            _rm = getattr(plan, "request_metadata", None) or {}
+            if isinstance(_rm, Mapping):
+                _ro = (
+                    _rm.get("request_origin_info")
+                    or _rm.get("__request_origin_info__")
+                    or {}
+                )
+                if isinstance(_ro, Mapping):
+                    _nonce = str(
+                        _ro.get("conditioning_cache_nonce", "") or ""
+                    ).strip()
+                    if _nonce:
+                        ctx["cache_nonce"] = _nonce
+        except Exception:
+            pass
+        _dep_id = getattr(plan, "deployment_identity", None) or {}
+        if not isinstance(_dep_id, Mapping):
+            _dep_id = {}
+        ctx["deployment_hash"] = str(
+            _dep_id.get("deployment_combined_hash", "")
+            or os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+            or ""
+        )
+        ctx["custom_node_generation"] = str(
+            _dep_id.get("custom_nodes_generation", "")
+            or _read_custom_nodes_generation()
+            or ""
+        )
+        ctx["model_generation"] = str(
+            ctx.get("model_generation", "") or _read_models_generation() or ""
+        )
+        ctx["production_options_hash"] = _plan_time_options_hash(plan)
+        # ── APPROXIMATED live-CLIP fields (fail closed at demand time via
+        #    canonical-key revalidation if the guesses drift) ─────────────
+        ctx["compute_dtype"] = _plan_time_compute_dtype(ctx["clip_type"])
+        ctx["tokenizer_identity"] = _plan_time_tokenizer_identity(
+            ctx["clip_type"], ctx["loader_class"], ctx["filenames"]
+        )
+        try:
+            import torch as _torch
+            ctx["torch_version"] = str(_torch.__version__)
+            ctx["torch_num_threads"] = int(_torch.get_num_threads())
+        except Exception:
+            ctx["torch_version"] = ""
+            ctx["torch_num_threads"] = 0
+        # RELAXED gate: proceed whenever there IS a workflow hash.  Partially
+        # empty identity fields are best-effort approximations — demand-time
+        # canonical-key revalidation fails closed (memory entry not served ->
+        # normal file path), so a wrong identity costs nothing while the
+        # manifest still gets prefetched (~150-260ms of the demand lookup).
+        # Callers record ``key_build_partial:<missing fields>``.
+        if not ctx["workflow_hash"]:
+            return {}
+        return ctx
+    except Exception as _ctx_exc:
+        try:
+            print(
+                f"[cache.prefetch] ctx_build_failed reason={type(_ctx_exc).__name__}:{_ctx_exc}"[:200],
+                flush=True,
+            )
+        except Exception:
+            pass
+        return {}
+
+
+# ── Prefetch engagement evidence (RUN-1 gate remediation) ────────────────
+# ``maybe_prefetch_conditioning`` records TRUTHFUL engagement on every exit
+# path (env_off / cache_off / key_build_failed / ok) into
+# ``_LAST_PREFETCH_EVIDENCE`` keyed by request_id.  The
+# ``[v2.conditioning_exact_hit_breakdown]`` emission merges the matching
+# entry (override semantics — the plan-time record wins over the cache's
+# post-hoc prefetch diag, which stays at its 0/none defaults when
+# ``prefetch_entries`` never ran) so a demand-time miss line surfaces WHY
+# the prefetch did not engage.  All access is lock-guarded: the prefetch
+# runs on a daemon thread while the prefill callback runs on the
+# coordinator pool thread.
+_LAST_PREFETCH_EVIDENCE: dict[str, dict[str, Any]] = {}
+_LAST_PREFETCH_EVIDENCE_LOCK = threading.Lock()
+
+
+def _record_prefetch_evidence(
+    request_id: str,
+    *,
+    requested: int,
+    source: str,
+    reason: str,
+    modal: Mapping[str, Any] | None = None,
+) -> None:
+    """Record the plan-time prefetch engagement for *request_id*.
+
+    ``modal`` is the (optional) cross-lane launch evidence read from the
+    modal_app ``_CONDITIONING_PREFETCH_EVIDENCE`` dict; it is stored under a
+    ``modal`` sub-key that the breakdown emission ignores (only
+    ``prefetch_requested`` / ``prefetch_source`` / ``prefetch_reason`` are
+    ever emitted).
+    """
+    with _LAST_PREFETCH_EVIDENCE_LOCK:
+        _entry: dict[str, Any] = {
+            "prefetch_requested": int(requested or 0),
+            "prefetch_source": str(source or "none"),
+            "prefetch_reason": str(reason or "none"),
+        }
+        if modal:
+            _entry["modal"] = {
+                "scheduled": modal.get("scheduled"),
+                "env": modal.get("env"),
+                "reason": modal.get("reason"),
+            }
+        _LAST_PREFETCH_EVIDENCE[str(request_id or "")] = _entry
+
+
+def _prefetch_evidence_for(request_id: str) -> dict[str, Any]:
+    """Return the recorded engagement evidence for *request_id* (or {}).
+
+    Bounded fallback semantics: when the exact request-id key is absent AND
+    the key is non-empty, the ``""`` slot is consulted — a launch that
+    carried no request id records its engagement under ``""``, and the
+    demand-time real request id must still find it (RUN-4 correlation fix).
+    Only ``""`` entries that represent an ACTUAL engagement
+    (``prefetch_requested >= 1``) are honored as a fallback, so stale
+    cleanup entries (requested=0) never leak.  Never raises.
+    """
+    with _LAST_PREFETCH_EVIDENCE_LOCK:
+        _key = str(request_id or "")
+        _entry = _LAST_PREFETCH_EVIDENCE.get(_key)
+        if not _entry and _key:
+            _fallback = _LAST_PREFETCH_EVIDENCE.get("")
+            if _fallback and int(_fallback.get("prefetch_requested", 0) or 0) >= 1:
+                _entry = _fallback
+        return dict(_entry) if _entry else {}
+
+
+# Required exact-cache key fields that the plan-time context approximates.
+# Mirrors the cache module's ``_REQUIRED_KEY_FIELDS`` + ``filenames``.  Used
+# only for the bounded ``key_build_partial:<missing fields>`` evidence reason.
+_PLAN_TIME_REQUIRED_FIELDS: tuple[str, ...] = (
+    "clip_identity",
+    "clip_type",
+    "loader_class",
+    "model_generation",
+    "workflow_hash",
+    "deployment_hash",
+    "custom_node_generation",
+    "production_options_hash",
+    "tokenizer_identity",
+    "compute_dtype",
+    "weight_dtype",
+    "torch_version",
+    "filenames",
+)
+
+
+def _missing_plan_time_fields(ctx: Mapping[str, Any]) -> list[str]:
+    """Required exact-cache key fields that are empty in a plan-time ctx."""
+    _missing: list[str] = []
+    for _name in _PLAN_TIME_REQUIRED_FIELDS:
+        _value = ctx.get(_name)
+        if _name == "filenames":
+            if not any(str(f or "").strip() for f in (_value or [])):
+                _missing.append(_name)
+        elif not str(_value or ""):
+            _missing.append(_name)
+    return _missing
+
+
+def _merge_prefetch_evidence_into_diag(
+    diag: Mapping[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    """Merge the plan-time prefetch engagement evidence into a lookup diag.
+
+    Override semantics: the truthful plan-time record (``prefetch_requested``
+    / ``prefetch_source`` / ``prefetch_reason``) wins over the cache's
+    post-hoc prefetch diag defaults (0/none) when ``prefetch_entries`` never
+    ran.  Used so BOTH the host-visible
+    ``clip_conditioning_cache_lookup.metadata.lookup_diagnostics`` AND the
+    container stdout ``[v2.conditioning_exact_hit_breakdown]`` carry the
+    engagement.  Idempotent.  Never raises.
+    """
+    _out: dict[str, Any] = dict(diag) if diag else {}
+    _evidence = _prefetch_evidence_for(request_id)
+    for _key in ("prefetch_requested", "prefetch_source", "prefetch_reason"):
+        if _key in _evidence:
+            _out[_key] = _evidence[_key]
+    return _out
+
+
+def _read_modal_prefetch_evidence(request_id: str) -> dict[str, Any]:
+    """Best-effort correlation with the modal_app launch-lane evidence.
+
+    The modal_app integration lane records ``_CONDITIONING_PREFETCH_EVIDENCE``
+    keyed by request_id -> {"requested": int, "env": "0|1", "scheduled": int,
+    "reason": "thread_started"|"unavailable"} at launch time (see that lane's
+    report for the authoritative layout).  This read is guarded: an absent
+    module, absent/misnamed dict, or missing request entry all yield {} —
+    never a raise.  Used ONLY for cross-lane diagnostics; it never alters
+    cache behavior.
+    """
+    try:
+        import sys as _sys_mod
+        _ma = _sys_mod.modules.get("comfymodal_runtime.modal_app")
+        if _ma is None:
+            return {}
+        _ev = getattr(_ma, "_CONDITIONING_PREFETCH_EVIDENCE", None)
+        if not isinstance(_ev, dict):
+            return {}
+        _entry = _ev.get(str(request_id or ""))
+        return dict(_entry) if isinstance(_entry, dict) else {}
+    except Exception:
+        return {}
+
+
+def maybe_prefetch_conditioning(
+    plan: Any,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Plan-time, best-effort prefetch of the exact conditioning cache.
+
+    Called ONCE at plan receipt (see the call-site notes below).  Approximates
+    the demand-time key context from plan/container state (NO live CLIP
+    object), derives the same filtered CLIPTextEncode entry list the prefill
+    hook uses, and preloads the manifest + matching entry bytes into the
+    cache's in-memory store so a later demand-time exact hit skips the cold
+    Modal-Volume reads.  compute_dtype / tokenizer_identity are
+    APPROXIMATED and rely on demand-time canonical-key revalidation to fail
+    closed (any drift -> the memory entry is not served -> the normal file
+    path runs).  Returns the cache's prefetch diagnostics dict, or ``{}``
+    when the feature is disabled, the cache is disabled, or anything failed.
+    NEVER raises.  NEVER touches the coordinator pool.
+
+    On EVERY exit path this records the truthful engagement into
+    ``_LAST_PREFETCH_EVIDENCE`` (keyed by request_id) — ``prefetch_reason``
+    is one of ``running`` (in-flight, recorded at thread ENTRY so a
+    demand-time lookup that races ahead of the daemon thread still sees the
+    engagement), ``env_off`` / ``cache_off`` / ``key_build_failed`` /
+    ``key_build_partial:<fields>`` / ``ok`` — which the
+    ``[v2.conditioning_exact_hit_breakdown]`` emission AND the
+    ``clip_conditioning_cache_lookup`` trace-event ``lookup_diagnostics``
+    merge into, so a demand-time miss surfaces WHY the prefetch did not
+    engage (RUN-1 gate remediation; the RUN-4 trace/stdout discrepancy was
+    the daemon thread recording evidence AFTER the trace emit — entry-time
+    recording closes that race).  The modal_app launch-lane evidence
+    (``_CONDITIONING_PREFETCH_EVIDENCE``) is read guardedly for cross-lane
+    correlation only and never changes behavior.
+
+    ── modal_app integration lane (call-site requirement) ───────────────
+    * Where:  in ``_run_plan_stream_impl`` immediately AFTER
+      ``plan = ExecutionPlan.from_dict(...)`` (modal_app.py ~15491) and
+      BEFORE ``executor.stream`` — the prefetch must be launched before
+      (or race harmlessly with) demand-time lookup inside the executor.
+    * How:    schedule it off the async method — never inline, and never
+      through the coordinator pool:
+          threading.Thread(
+              target=maybe_prefetch_conditioning,
+              args=(plan,),
+              kwargs={"request_id": str(request_id or "")},
+              daemon=True,
+              name="comfymodal-conditioning-prefetch",
+          ).start()
+      or, inside an async context:
+          await asyncio.to_thread(maybe_prefetch_conditioning, plan, request_id)
+      The daemon thread is preferred (fire-and-forget; the function is
+      best-effort and self-contained).
+    * Env:    the gate ``COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH`` defaults
+      to ON (unset → enabled); set it to ``0`` to disable.  It must reach the
+      container.  Add it to the request-diagnostic env allowlist
+      ``_REQUEST_DIAGNOSTIC_ENV_ALLOWLIST`` (modal_app.py ~512-525, e.g.
+      ``("conditioning_prefetch", "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH")``
+      and/or the direct key) AND to the deployment ``_runtime_env`` dict
+      passthrough (modal_app.py ~3031 region):
+          "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": os.environ.get(
+              "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1"
+          )
+      exactly like the existing ``COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU``
+      / ``COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS`` entries.
+    """
+    # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+    # Conditioning prefetch worker entry: this daemon thread has NO live CLIP
+    # object by design (plan-time, cache-only), so the checkpoint carries
+    # clip=None.  Trace is unavailable here; clip_state_checkpoint falls back
+    # to the last demand-install trace (_ACTIVE_TRACE).
+    try:
+        from comfymodal_runtime.clip_fast_hydration_wiring import clip_state_checkpoint
+        clip_state_checkpoint(None, "conditioning_prefetch_worker_start", None)
+    except Exception:
+        pass
+    _rid = str(request_id or "")
+    # Cross-lane correlation read (guarded; absent -> unknown, never raises).
+    _modal_evidence = _read_modal_prefetch_evidence(_rid) or None
+    # ── Record engagement AT THREAD ENTRY (RUN-4 fix) ────────────────────
+    # The prefetch runs on a daemon thread; the demand-time prefill hook's
+    # clip_conditioning_cache_lookup trace emit can race ahead of this
+    # thread's completion (e.g. during the throttled volume reload).  By
+    # recording prefetch_requested=1 immediately here, the trace metadata
+    # always carries the engagement even mid-flight (reason "running"),
+    # refined below to the final gate/build outcome.  Bounded; never raises.
+    _record_prefetch_evidence(
+        _rid, requested=1, source="none", reason="running",
+        modal=_modal_evidence,
+    )
+    try:
+        # Default-enabled (production default): unset -> prefetch runs; "0" ->
+        # disabled (env_off evidence); "1" (or any env_flag truth token) ->
+        # enabled.  The default flip is the container-side counterpart of the
+        # _runtime_env passthrough default "1" in modal_app.py.
+        if not env_flag(ENV_PREFETCH, default=True):
+            _record_prefetch_evidence(
+                _rid, requested=1, source="none", reason="env_off",
+                modal=_modal_evidence,
+            )
+            return {}
+        cache = get_exact_conditioning_cache()
+        if cache is None:
+            _record_prefetch_evidence(
+                _rid, requested=1, source="none", reason="cache_off",
+                modal=_modal_evidence,
+            )
+            return {}
+        try:
+            ctx = _build_plan_time_cache_context(plan)
+        except Exception as _ctx_exc:
+            try:
+                print(
+                    f"[cache.prefetch] ctx_build_failed reason={type(_ctx_exc).__name__}:{_ctx_exc}"[:200],
+                    flush=True,
+                )
+            except Exception:
+                pass
+            ctx = {}
+        if not ctx:
+            _record_prefetch_evidence(
+                _rid, requested=1, source="none", reason="key_build_failed",
+                modal=_modal_evidence,
+            )
+            return {}
+        # Partial identity fields are best-effort approximations: PROCEED
+        # (the manifest alone is worth prefetching) but record the missing
+        # required fields so the gate can see WHY payloads may not load.
+        _missing_fields = _missing_plan_time_fields(ctx)
+        entries = _plan_time_prefill_entries(plan)
+        pdiag = cache.prefetch_entries(ctx, entries, request_id=_rid)
+        _reason = (
+            "key_build_partial:" + ",".join(_missing_fields)
+            if _missing_fields
+            else "ok"
+        )
+        _record_prefetch_evidence(
+            _rid,
+            requested=1,
+            source=str(pdiag.get("source", "none") or "none"),
+            reason=_reason,
+            modal=_modal_evidence,
+        )
+        return pdiag
+    except Exception as exc:
+        # The plan-time key/context build failure path (bounded reason).
+        _record_prefetch_evidence(
+            _rid, requested=1, source="none", reason="key_build_failed",
+            modal=_modal_evidence,
+        )
+        try:
+            print(
+                f"[cache.prefetch] skipped reason={type(exc).__name__}:{exc}"[:200],
+                flush=True,
+            )
+        except Exception:
+            pass
+        return {}
 
 
 def _schedule_unet_activation_conditioning_cache_hit(
@@ -15358,12 +19397,25 @@ def finalize_unet_early_activation(
 # original graph loader path.
 _VAE_ACTIVATION_MODE_LATE = "late"
 _VAE_ACTIVATION_MODE_SAMPLING_END = "sampling_end"
+# Experimental bounded opt-in: trigger the transfer-only VAE early-start at
+# the first completed sampler step (the earliest sampling-underway boundary)
+# instead of the sampling_end boundary.  The worker pre-copies VAE CPU
+# params/buffers to CUDA on a side stream DURING sampling (no lane), then
+# performs the narrow lane-bound .data rebind strictly after the sampler
+# released the mutation lane at sampling_end.
+_VAE_ACTIVATION_MODE_SAMPLING_FIRST_STEP = "sampling_first_step"
 _VAE_ACTIVATION_MODE_VALID = frozenset(
-    {_VAE_ACTIVATION_MODE_LATE, _VAE_ACTIVATION_MODE_SAMPLING_END}
+    {
+        _VAE_ACTIVATION_MODE_LATE,
+        _VAE_ACTIVATION_MODE_SAMPLING_END,
+        _VAE_ACTIVATION_MODE_SAMPLING_FIRST_STEP,
+    }
 )
 # Modes that schedule/join the VAE activation future.  Late mode is NOT
 # included — it must never create state, join, or add graph waits.
-_VAE_ACTIVATION_MODE_ACTIVE = frozenset({_VAE_ACTIVATION_MODE_SAMPLING_END})
+_VAE_ACTIVATION_MODE_ACTIVE = frozenset(
+    {_VAE_ACTIVATION_MODE_SAMPLING_END, _VAE_ACTIVATION_MODE_SAMPLING_FIRST_STEP}
+)
 
 _EVENT_VAE_EA_MODE = "vae_early_activation_mode"
 _EVENT_VAE_EA_SCHEDULED = "vae_early_activation_scheduled"
@@ -15386,12 +19438,19 @@ _VAE_EA_FAILURE_STATUSES = frozenset({"failed", "precopy_failed", "cancelled"})
 # Experiment 2 early-start VAE worker can proceed to its narrow lane bind
 # without polling.  The mutation lane itself is the real safety barrier.
 _VAE_SAMPLING_END_EVENT = threading.Event()
+# Monotonic-ns timestamp captured at the authoritative sampling_end boundary
+# (release_sampler_mutation_lane_at_sampling_end, immediately BEFORE the
+# event is set / the lane released).  Consumed by the early-start worker to
+# measure how much of the pre-copy transfer fell inside active sampling.
+_VAE_SAMPLING_END_MONO_NS: int = 0
 
 
 def _resolve_vae_activation_mode(raw: str) -> str:
     """Normalize a ``COMFYMODAL_V2_VAE_ACTIVATION_MODE`` value.
 
-    The ONLY allowed opt-in value is exactly ``"sampling_end"`` (V2-only).
+    The ONLY allowed opt-in values are exactly ``"sampling_end"`` (V2-only
+    production timing) and the experimental ``"sampling_first_step"`` (same
+    transfer-only worker, triggered at the first completed sampler step).
     ``"late"`` is the default.  Any other value — including any historical
     ``"early"`` spelling — falls back to ``"late"`` so existing behavior is
     never altered by a typo or an unknown value.
@@ -15399,6 +19458,8 @@ def _resolve_vae_activation_mode(raw: str) -> str:
     value = str(raw or "").strip().lower()
     if value == _VAE_ACTIVATION_MODE_SAMPLING_END:
         return _VAE_ACTIVATION_MODE_SAMPLING_END
+    if value == _VAE_ACTIVATION_MODE_SAMPLING_FIRST_STEP:
+        return _VAE_ACTIVATION_MODE_SAMPLING_FIRST_STEP
     return _VAE_ACTIVATION_MODE_LATE
 
 
@@ -15411,9 +19472,11 @@ _VAE_ACTIVATION_MODE_LOG_EMITTED: bool = False
 def vae_activation_mode() -> str:
     """Return the effective VAE activation mode.
 
-    ``"late"`` (default) preserves existing behavior exactly; the only
-    allowed opt-in value is ``"sampling_end"``.  Logs the parsed effective
-    mode once per process on first access.
+    ``"late"`` (default) preserves existing behavior exactly; the allowed
+    opt-in values are ``"sampling_end"`` and the experimental
+    ``"sampling_first_step"`` (same transfer-only early-start worker, but
+    triggered at the first completed sampler step).  Logs the parsed
+    effective mode once per process on first access.
     """
     global _VAE_ACTIVATION_MODE_LOG_EMITTED
     if not _VAE_ACTIVATION_MODE_LOG_EMITTED:
@@ -15468,9 +19531,15 @@ def _vae_activation_new_state(request_id: str) -> dict[str, Any]:
         "vae_resolution_source": "",
         "vae_identity": "",
         "prefetch_join": {},
+        "trigger_mono_ns": 0,
+        "sampling_start_mono_ns": 0,
         "sampling_end_mono_ns": 0,
         "sampling_end_duration_ms": 0.0,
         "submitted_mono_ns": 0,
+        "precopy_start_mono_ns": 0,
+        "sampling_end_wait_ms": 0.0,
+        "overlap_ms": 0.0,
+        "precopy_wall_ms": 0.0,
         "worker_started_mono_ns": 0,
         "terminal_mono_ns": 0,
         "join_demand_mono_ns": 0,
@@ -15990,7 +20059,48 @@ def _run_early_vae_activation(
     try:
         import torch as _torch_vae
         with _torch_vae.inference_mode():
-            _mm_load_models_gpu([_patcher])
+            # ── E27: VAE transition span + memory boundaries (gated) ──
+            _e27_vae_t0 = time.monotonic_ns()
+            try:
+                from .e27_forensics import (
+                    e27_forensics_enabled,
+                    snapshot_e27_memory,
+                    emit_e27_span,
+                )
+
+                if e27_forensics_enabled():
+                    snapshot_e27_memory(
+                        trace, "vae_transition_before",
+                        mode=mode, trigger=state.get("trigger", ""),
+                        request_id=request_id or "",
+                    )
+            except Exception:
+                pass
+            try:
+                _mm_load_models_gpu([_patcher])
+            finally:
+                _e27_vae_t1 = time.monotonic_ns()
+                try:
+                    from .e27_forensics import (
+                        e27_forensics_enabled,
+                        snapshot_e27_memory,
+                        emit_e27_span,
+                    )
+
+                    if e27_forensics_enabled():
+                        snapshot_e27_memory(
+                            trace, "vae_transition_after",
+                            mode=mode, request_id=request_id or "",
+                        )
+                        emit_e27_span(
+                            "vae_transition",
+                            start_ns=_e27_vae_t0,
+                            end_ns=_e27_vae_t1,
+                            mode=mode,
+                            request_id=request_id or "",
+                        )
+                except Exception:
+                    pass
     except Exception as exc:
         return _vae_activation_terminal(
             state, trace, request_id, status="failed",
@@ -16038,17 +20148,19 @@ def release_sampler_mutation_lane_at_sampling_end(
     request_id: str = "",
 ) -> bool:
     """Release the existing sampler owner after the authoritative boundary."""
-    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+    if vae_activation_mode() not in _VAE_ACTIVATION_MODE_ACTIVE:
         return False
     lane = _get_mutation_lane()
     if lane.owner != "sampler":
         return False
-    # Experiment 2 (vae_overlap, B arm): signal the early-start VAE worker
-    # that the authoritative sampling_end boundary was reached.  Set BEFORE
-    # the lane release: the worker can only mutate the model after it
-    # acquires the lane as owner "VAE", which blocks until this release, so
-    # the event can never allow a mutation before the sampler actually
-    # released the lane.
+    # Experiment 2 (vae_overlap, B arm) / sampling_first_step mode: signal
+    # the early-start VAE worker that the authoritative sampling_end boundary
+    # was reached.  Set BEFORE the lane release: the worker can only mutate
+    # the model after it acquires the lane as owner "VAE", which blocks until
+    # this release, so the event can never allow a mutation before the sampler
+    # actually released the lane.
+    global _VAE_SAMPLING_END_MONO_NS
+    _VAE_SAMPLING_END_MONO_NS = time.monotonic_ns()
     _VAE_SAMPLING_END_EVENT.set()
     lane.release("sampler")
     if trace is not None:
@@ -16060,7 +20172,7 @@ def release_sampler_mutation_lane_at_sampling_end(
 
 def acquire_sampler_mutation_lane_at_sampling_start() -> None:
     """Reacquire the shared sampler owner for later sampler invocations."""
-    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
+    if vae_activation_mode() not in _VAE_ACTIVATION_MODE_ACTIVE:
         return
     lane = _get_mutation_lane()
     if lane.owner != "sampler":
@@ -16263,6 +20375,10 @@ def _run_vae_early_start_worker(
     _delay_s = (max(0.0, float(expected_ms or 0.0) - float(offset_ms or 0.0))) / 1000.0
     if _delay_s > 0:
         _VAE_SAMPLING_END_EVENT.wait(_delay_s)
+    # ── Phase 1 telemetry: pre-copy start boundary + GPU baseline ──
+    state["precopy_start_mono_ns"] = time.monotonic_ns()
+    _gpu_alloc_before = _gpu_allocated_bytes()
+    state["gpu_allocated_before"] = _gpu_alloc_before
     _precopy_start_ns = time.monotonic_ns()
     _stream = _vae_side_stream()
     _copied: list[tuple[Any, Any]] = []
@@ -16278,7 +20394,7 @@ def _run_vae_early_start_worker(
         if trace is not None:
             trace.emit(_EVENT_VAE_EA_LOAD_START, phase="execution", metadata={
                 "mode": _VAE_ACTIVATION_MODE,
-                "trigger": "early_start",
+                "trigger": state.get("trigger", "early_start"),
                 "request_id": request_id,
                 "key_hash": key_hash,
                 "source": source,
@@ -16286,7 +20402,7 @@ def _run_vae_early_start_worker(
         print(
             f"[v2.vae_early_activation] event=load_start "
             f"request_id={request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
-            f"trigger=early_start key_hash={key_hash} source={source or 'absent'} "
+            f"trigger={state.get('trigger', 'early_start')} key_hash={key_hash} source={source or 'absent'} "
             f"vae_object_id={state.get('vae_object_id', '')}",
             flush=True,
         )
@@ -16310,6 +20426,7 @@ def _run_vae_early_start_worker(
             int(_t.element_size()) * _t.numel() for _t, _g in _copied
         )
         _precopy_wall_ms = round((time.monotonic_ns() - _precopy_start_ns) / 1_000_000, 3)
+        state["precopy_wall_ms"] = _precopy_wall_ms
         if trace is not None and _OPT_DIAG:
             emit_opt(trace, "vae_precopy", phase="execution", metadata={
                 "request_id": request_id,
@@ -16318,6 +20435,10 @@ def _run_vae_early_start_worker(
                 "tensors": len(_copied),
                 "wall_ms": _precopy_wall_ms,
                 "stream": str(_stream),
+                "trigger_mono_ns": state.get("trigger_mono_ns", 0),
+                "precopy_start_mono_ns": state.get("precopy_start_mono_ns", 0),
+                "sampling_end_mono_ns": state.get("sampling_end_mono_ns", 0),
+                "overlap_ms": state.get("overlap_ms", 0.0),
             })
     except Exception as exc:
         with _VAE_ACTIVATION_LOCK:
@@ -16331,7 +20452,7 @@ def _run_vae_early_start_worker(
         if trace is not None:
             trace.emit(_EVENT_VAE_EA_FAILED, phase="execution", metadata={
                 "mode": _VAE_ACTIVATION_MODE,
-                "trigger": "early_start",
+                "trigger": state.get("trigger", "early_start"),
                 "request_id": request_id,
                 "key_hash": key_hash,
                 "status": "failed",
@@ -16348,6 +20469,8 @@ def _run_vae_early_start_worker(
     _phase2_start_ns = time.monotonic_ns()
     _VAE_SAMPLING_END_EVENT.wait(timeout=60.0)
     _join_wait_ms = round((time.monotonic_ns() - _phase2_start_ns) / 1_000_000, 3)
+    state["sampling_end_wait_ms"] = _join_wait_ms
+    state["sampling_end_mono_ns"] = int(_VAE_SAMPLING_END_MONO_NS or 0)
     # ── Phase 3: narrow lane bind (the ONLY model mutation) ──
     if state.get("cancelled") or state.get("terminal"):
         if not future.done():
@@ -16369,6 +20492,16 @@ def _run_vae_early_start_worker(
         for _t, _g in _copied:
             _t.data = _g
         state["transfer_count"] = 1 if _copied else 0
+        # ── Phase 3 telemetry: GPU after-baseline + overlap measurement ──
+        _gpu_alloc_after = _gpu_allocated_bytes()
+        state["gpu_allocated_after"] = _gpu_alloc_after
+        if _gpu_alloc_before is not None and _gpu_alloc_after is not None:
+            state["gpu_allocated_delta_bytes"] = _gpu_alloc_after - _gpu_alloc_before
+        state["overlap_ms"] = round(max(
+            0.0,
+            (float(state.get("sampling_end_mono_ns", 0) or 0)
+             - float(state.get("precopy_start_mono_ns", 0) or 0)) / 1_000_000,
+        ), 3)
         # Evidence — mirror ``_run_early_vae_activation``'s terminal fields.
         _first_dev = ""
         _first_dtype = ""
@@ -16400,7 +20533,7 @@ def _run_vae_early_start_worker(
         if trace is not None:
             trace.emit("vae_early_activation_load_end", phase="execution", metadata={
                 "mode": _VAE_ACTIVATION_MODE,
-                "trigger": "early_start",
+                "trigger": state.get("trigger", "early_start"),
                 "request_id": request_id,
                 "key_hash": key_hash,
                 "source": source,
@@ -16409,7 +20542,7 @@ def _run_vae_early_start_worker(
             trace.emit(_EVENT_VAE_EA_RECONCILIATION, phase="execution", metadata={
                 "request_id": request_id,
                 "mode": _VAE_ACTIVATION_MODE,
-                "trigger": "early_start",
+                "trigger": state.get("trigger", "early_start"),
                 "key_hash": key_hash,
                 "status": "ready",
                 "terminal": True,
@@ -16432,6 +20565,15 @@ def _run_vae_early_start_worker(
                 "arch_identifier": state.get("arch_identifier", ""),
                 "sampling_end_mono_ns": state.get("sampling_end_mono_ns", 0),
                 "sampling_end_duration_ms": state.get("sampling_end_duration_ms", 0.0),
+                "trigger_mono_ns": state.get("trigger_mono_ns", 0),
+                "sampling_start_mono_ns": state.get("sampling_start_mono_ns", 0),
+                "precopy_start_mono_ns": state.get("precopy_start_mono_ns", 0),
+                "precopy_wall_ms": state.get("precopy_wall_ms", 0.0),
+                "sampling_end_wait_ms": state.get("sampling_end_wait_ms", 0.0),
+                "overlap_ms": state.get("overlap_ms", 0.0),
+                "gpu_allocated_before": state.get("gpu_allocated_before"),
+                "gpu_allocated_after": state.get("gpu_allocated_after"),
+                "gpu_allocated_delta_bytes": state.get("gpu_allocated_delta_bytes"),
                 "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                 "restore_session_id": _LATEST_RESTORE_SESSION_ID,
             })
@@ -16636,6 +20778,184 @@ def schedule_vae_early_start_at_sampling_start(
             )
     except Exception:
         pass
+    return True
+
+
+def schedule_vae_early_activation_at_first_step(
+    bridge: "V2LoaderBridge",
+    *,
+    trace: RuntimeTrace | None = None,
+    request_id: str = "",
+    sampler_node_id: str = "",
+    sampler_node_class: str = "",
+    first_step_mono_ns: int = 0,
+) -> bool:
+    """Experimental sampling_first_step mode: schedule the transfer-only VAE
+    early activation at the first completed sampler step.
+
+    No-op (returns False) in every other mode, including the default
+    ``"late"``.  Reuses the exact Experiment 2 transfer-only worker
+    (``_run_vae_early_start_worker``): it pre-copies the VAE's CPU
+    parameters/buffers to CUDA on a dedicated side stream DURING sampling
+    (no lane, no model mutation), then waits for the authoritative
+    sampling-end event and performs a narrow lane-bound ``.data`` rebind
+    strictly after the sampler released the mutation lane.  Exactly one
+    activation per request (idempotent; the sampling_end scheduler stays a
+    no-op in this mode).  Any resolution/load failure falls back to the
+    unchanged original graph loader path.
+    """
+    if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_FIRST_STEP:
+        return False
+    _request_id = str(request_id or "")
+    if not _request_id and trace is not None:
+        _request_id = str(trace.request_id)
+    if not _request_id:
+        return False
+    if bridge is None:
+        return False
+    prep = getattr(bridge, "_preparation", None)
+    model_key = getattr(bridge, "_model_key", None)
+    if prep is None or model_key is None or not getattr(model_key, "vae_identity", ""):
+        return False
+    # Idempotent: a request with an already-scheduled activation future is
+    # never scheduled twice (exactly one activation per request).
+    with _VAE_ACTIVATION_LOCK:
+        _existing = _VAE_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and _existing.get("future") is not None:
+            return True
+    _future = Future()
+    _state = _vae_activation_new_state(_request_id)
+    # Resolve the exact VAE object via the bridge adapter (read-only).
+    try:
+        _vae, _source = bridge.resolve_vae_object(trace=trace)
+    except Exception as exc:
+        if not _future.done():
+            _future.set_result(None)
+        _vae_activation_terminal(
+            _state, trace, _request_id, status="failed",
+            reason="resolution_failed", error=str(exc)[:200],
+        )
+        return False
+    if _vae is None:
+        if not _future.done():
+            _future.set_result(None)
+        _vae_activation_terminal(
+            _state, trace, _request_id, status="failed",
+            reason="no_vae_resolution",
+        )
+        return False
+    _key_components, _key_hash = _build_vae_activation_key(
+        mode=_VAE_ACTIVATION_MODE,
+        model_key=model_key,
+        request_id=_request_id,
+        vae=_vae,
+        source=_source,
+        sampling_end_mono_ns=int(first_step_mono_ns or 0),
+    )
+    # Populate the state exactly like the standard scheduler does, with the
+    # first-step trigger identity: first_step_mono_ns is the earliest
+    # sampling-underway timestamp we have, so it doubles as the sampling
+    # start; sampling_end_mono_ns is filled by the worker at phase 2.
+    _state["owner"] = "sampling_first_step"
+    _state["trigger"] = "sampling_first_step"
+    _state["trigger_mono_ns"] = int(first_step_mono_ns or 0)
+    _state["sampling_start_mono_ns"] = int(first_step_mono_ns or 0)
+    _state["mode"] = _VAE_ACTIVATION_MODE
+    _state["key"] = _key_components
+    _state["key_hash"] = _key_hash
+    _state["vae"] = _vae
+    _state["vae_object_id"] = _key_components.get("vae_object_id", "")
+    _state["vae_patcher_object_id"] = _key_components.get("vae_patcher_object_id", "")
+    _state["vae_resolution_source"] = _source
+    _state["vae_identity"] = _key_components.get("vae_identity", "")
+    _state["vae_policy_version"] = _key_components.get("vae_policy_version", 0)
+    _state["vae_weight_dtype"] = _key_components.get("vae_weight_dtype", "")
+    _state["vae_compute_dtype"] = _key_components.get("vae_compute_dtype", "")
+    _state["vae_memory_format"] = _key_components.get("vae_memory_format", "")
+    _state["vae_prefetch_mode"] = _key_components.get("vae_prefetch_mode", "")
+    _state["c5_impl_version"] = _key_components.get("c5_impl_version", "")
+    _state["torch_version"] = _key_components.get("torch_version", "")
+    _state["cuda_version"] = _key_components.get("cuda_version", "")
+    _state["arch_identifier"] = _key_components.get("arch_identifier", "")
+    _state["sampling_end_mono_ns"] = 0  # first-step: filled at worker phase 2
+    _state["status"] = "scheduled"
+    _state["future"] = _future
+    _state["submitted_mono_ns"] = time.monotonic_ns()
+    # Emit the scheduled event + concise line (mirror _vae_activation_submit).
+    if trace is not None:
+        trace.emit(_EVENT_VAE_EA_SCHEDULED, phase="execution", metadata={
+            "mode": _VAE_ACTIVATION_MODE,
+            "trigger": "sampling_first_step",
+            "trigger_mono_ns": int(first_step_mono_ns or 0),
+            "request_id": _request_id,
+            "key_hash": _key_hash,
+            "source": _source,
+            "vae_object_id": _key_components.get("vae_object_id", ""),
+            "vae_patcher_object_id": _key_components.get("vae_patcher_object_id", ""),
+            "vae_policy_version": _key_components.get("vae_policy_version", 0),
+            "vae_weight_dtype": _key_components.get("vae_weight_dtype", ""),
+            "vae_compute_dtype": _key_components.get("vae_compute_dtype", ""),
+            "vae_memory_format": _key_components.get("vae_memory_format", ""),
+            "vae_prefetch_mode": _key_components.get("vae_prefetch_mode", ""),
+            "c5_impl_version": _key_components.get("c5_impl_version", ""),
+            "torch_version": _key_components.get("torch_version", ""),
+            "cuda_version": _key_components.get("cuda_version", ""),
+            "arch_identifier": _key_components.get("arch_identifier", ""),
+            "vae_identity_hash": stable_hash(str(model_key.vae_identity))[:16],
+            "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+            "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+        })
+    print(
+        f"[v2.vae_early_activation] event=scheduled "
+        f"request_id={_request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
+        f"trigger=sampling_first_step "
+        f"trigger_mono_ns={int(first_step_mono_ns or 0)} "
+        f"key_hash={_key_hash} source={_source or 'absent'} "
+        f"vae_identity_hash={stable_hash(str(model_key.vae_identity))[:16]} "
+        f"vae_policy_version={_key_components.get('vae_policy_version', 0)} "
+        f"vae_weight_dtype={_key_components.get('vae_weight_dtype', '') or 'absent'} "
+        f"vae_compute_dtype={_key_components.get('vae_compute_dtype', '') or 'absent'} "
+        f"vae_memory_format={_key_components.get('vae_memory_format', '') or 'absent'} "
+        f"vae_prefetch_mode={_key_components.get('vae_prefetch_mode', '') or 'absent'} "
+        f"c5_impl_version={_key_components.get('c5_impl_version', '') or 'absent'} "
+        f"torch={_key_components.get('torch_version', '') or 'absent'} "
+        f"cuda={_key_components.get('cuda_version', '') or 'absent'} "
+        f"arch={_key_components.get('arch_identifier', '') or 'absent'} "
+        f"restored_instance_id={_LATEST_RESTORED_INSTANCE_ID or 'absent'} "
+        f"restore_session_id={_LATEST_RESTORE_SESSION_ID or 'absent'}",
+        flush=True,
+    )
+    # Spawn ONE daemon worker thread (pre-copy starts immediately — no
+    # artificial delay: offset_ms/expected_ms are 0).
+    _thread = Thread(
+        target=_run_vae_early_start_worker,
+        kwargs={
+            "bridge": bridge,
+            "prep": prep,
+            "trace": trace,
+            "request_id": _request_id,
+            "state": _state,
+            "vae": _vae,
+            "source": _source,
+            "key_hash": _key_hash,
+            "sampling_start_mono_ns": int(first_step_mono_ns or 0),
+            "offset_ms": 0.0,
+            "expected_ms": 0.0,
+            "future": _future,
+        },
+        name="comfymodal-vae-first-step",
+        daemon=True,
+    )
+    _thread.start()
+    # Store the per-request state (idempotent re-check under the lock).
+    with _VAE_ACTIVATION_LOCK:
+        _existing = _VAE_ACTIVATION_STATE.get(_request_id)
+        if _existing is not None and _existing.get("future") is not None:
+            if not _future.done():
+                _future.set_result(None)
+            return True
+        _VAE_ACTIVATION_STATE[_request_id] = _state
+    _vae_activation_trim()
     return True
 
 

@@ -348,3 +348,108 @@ function _deepCloneObject(obj) {
     return {};
   }
 }
+
+// ── Workflow Selection Persistence ─────────────────────────────────────────
+//
+// Persists the currently selected workflow/version/preset so the Playground
+// can restore the exact selection across page reloads, and stores a one-shot
+// "handoff" written by the Workflows page ("run this workflow/version/preset
+// in the Playground") that the Playground consumes once on load.
+//
+// Both keys are versioned (v1) to allow future migration.
+
+const WORKFLOW_SELECTION_STORAGE_KEY = "comfymodal.studio.playground.workflow.v1";
+const WORKFLOW_HANDOFF_STORAGE_KEY = "comfymodal.studio.playground.workflow-handoff.v1";
+
+/**
+ * Normalize a raw selection/handoff object into the canonical string-field
+ * shape. Returns null for non-object input.
+ * @param {*} raw
+ * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ */
+function _sanitizeSelectionFields(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    workflowId: typeof raw.workflowId === "string" ? raw.workflowId : "",
+    workflowVersionId: typeof raw.workflowVersionId === "string" ? raw.workflowVersionId : "",
+    presetId: typeof raw.presetId === "string" ? raw.presetId : "",
+    workflowName: typeof raw.workflowName === "string" ? raw.workflowName : "",
+    presetName: typeof raw.presetName === "string" ? raw.presetName : "",
+  };
+}
+
+/**
+ * Save the current workflow selection to localStorage.
+ * @param {{workflowId?: string, workflowVersionId?: string, presetId?: string, workflowName?: string, presetName?: string}} sel
+ */
+export function saveWorkflowSelection(sel) {
+  const clean = _sanitizeSelectionFields(sel);
+  if (!clean) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(WORKFLOW_SELECTION_STORAGE_KEY, JSON.stringify(clean));
+  } catch (e) {
+    // localStorage quota exceeded or unavailable — silently ignore
+  }
+}
+
+/**
+ * Load the persisted workflow selection from localStorage.
+ * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ */
+export function loadWorkflowSelection() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(WORKFLOW_SELECTION_STORAGE_KEY);
+    if (!raw) return null;
+    return _sanitizeSelectionFields(JSON.parse(raw));
+  } catch (e) {
+    // Ignore parse errors or quota issues
+  }
+  return null;
+}
+
+/**
+ * Clear the persisted workflow selection from localStorage.
+ */
+export function clearWorkflowSelection() {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(WORKFLOW_SELECTION_STORAGE_KEY);
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Persist a one-shot workflow handoff (from the Workflows page) that the
+ * Playground consumes on load via takeWorkflowHandoff().
+ * @param {{workflowId?: string, workflowVersionId?: string, presetId?: string, workflowName?: string, presetName?: string}} sel
+ */
+export function saveWorkflowHandoff(sel) {
+  const clean = _sanitizeSelectionFields(sel);
+  if (!clean) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(WORKFLOW_HANDOFF_STORAGE_KEY, JSON.stringify(clean));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Read and remove the one-shot workflow handoff. The write is consumed
+ * exactly once: the value is returned AND deleted from localStorage.
+ * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ */
+export function takeWorkflowHandoff() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(WORKFLOW_HANDOFF_STORAGE_KEY);
+    if (!raw) return null;
+    localStorage.removeItem(WORKFLOW_HANDOFF_STORAGE_KEY);
+    return _sanitizeSelectionFields(JSON.parse(raw));
+  } catch (e) {
+    return null;
+  }
+}

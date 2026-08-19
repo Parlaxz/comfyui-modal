@@ -67,18 +67,17 @@ class _FakeLazyAsyncGen:
     Modal's ``remote_gen.aio()`` returns an object with ``__aiter__`` and
     ``__anext__`` *directly* (no await on the call).  The creation call
     (``.aio()``) is separate from first iteration (``__anext__``).
+
+    Modal SDK 1.4.3 exposes NO ``input_id``/``input_created_at`` generator
+    attributes — input IDs are only learned from yielded event metadata.
     """
 
     def __init__(
         self,
         events: list[dict] | None = None,
-        *,
-        input_id: str = "fake-input-abc123",
     ) -> None:
         self._events = list(events or [])
         self._index = 0
-        self.input_id = input_id
-        self.input_created_at = time.time_ns()
 
     def __aiter__(self):
         return self
@@ -244,7 +243,12 @@ class TestTransportGeneratorIterationSeparation(unittest.TestCase):
         asyncio.run(run())
 
     def test_input_id_observed(self):
-        """modal_input_id_observed event fires when input_id is available."""
+        """modal_input_id_observed event fires when input_id is learned from
+        the yielded event metadata (SDK 1.4.3 exposes no generator attribute)."""
+        events = [
+            {"type": "status", "data": {"phase": "restore", "modal_input_id": "fake-input-abc123"}},
+            {"type": "result", "data": {"images": [], "outputs": {}}},
+        ]
         trace = RuntimeTrace(request_id="input-id-test", process="local")
         origin = _make_origin("input-id-test")
         trace.set_metadata(request_origin_info=origin)
@@ -255,7 +259,7 @@ class TestTransportGeneratorIterationSeparation(unittest.TestCase):
                 execution_options=ExecutionOptions(production_enabled=False),
             )
             transport = ModalTransport(
-                v2_handle_factory=self.handle_factory,
+                v2_handle_factory=_make_v2_handle_factory(events=events),
             )
             async for _ in transport.run_plan_stream(
                 plan,
@@ -847,7 +851,7 @@ class TestV2BreakdownReconciliationBehavioral(unittest.TestCase):
         self.assertIn("handle_cache_hit=False", output)
         self.assertIn("created_modal_client=False", output)
         self.assertIn("performed_cls_from_name=False", output)
-        self.assertIn("constructed_class_instance=False", output)
+        self.assertIn("constructed_instance=False", output)
 
     def test_created_modal_client_true_on_resolution(self):
         """When client_resolution_start fires, created_modal_client=True."""
@@ -963,14 +967,19 @@ class TestInputIdDelayed(unittest.TestCase):
     """Input ID that is only exposed after the first iteration."""
 
     class _FakeLazyGenDelayedId:
-        """Generator where input_id is empty at creation, set after iteration."""
+        """Generator where input_id is empty at creation and only learned
+        from the yielded result event metadata (SDK 1.4.3 has no generator
+        input_id attribute)."""
 
         def __init__(self):
-            self._events = [{"type": "status", "data": {"phase": "restore"}},
-                            {"type": "result", "data": {"images": [], "outputs": {}}}]
+            self._events = [
+                {"type": "status", "data": {"phase": "restore"}},
+                {"type": "result", "data": {
+                    "images": [], "outputs": {},
+                    "modal_input_id": "delayed-id-456",
+                }},
+            ]
             self._index = 0
-            self.input_id = ""
-            self.input_created_at = None
 
         def __aiter__(self):
             return self
@@ -980,9 +989,6 @@ class TestInputIdDelayed(unittest.TestCase):
                 raise StopAsyncIteration
             event = self._events[self._index]
             self._index += 1
-            if self._index == 1:
-                self.input_id = "delayed-id-456"
-                self.input_created_at = time.time_ns()
             return event
 
     def test_input_id_observed_after_first_iteration_when_delayed(self):
@@ -1019,7 +1025,7 @@ class TestInputIdDelayed(unittest.TestCase):
         asyncio.run(run())
 
     def test_input_id_observed_only_once_when_available_at_creation(self):
-        """When input_id is available at generator creation, only one
+        """When input_id is available in the first yielded event, only one
         modal_input_id_observed event is emitted."""
         trace = RuntimeTrace(request_id="early-id-dedup", process="local")
         origin = _make_origin("early-id-dedup")
@@ -1032,7 +1038,10 @@ class TestInputIdDelayed(unittest.TestCase):
             )
             transport = ModalTransport(
                 v2_handle_factory=_make_v2_handle_factory(
-                    events=[{"type": "result", "data": {"images": [], "outputs": {}}}],
+                    events=[{"type": "result", "data": {
+                        "images": [], "outputs": {},
+                        "modal_input_id": "fake-input-abc123",
+                    }}],
                 ),
             )
             async for _ in transport.run_plan_stream(
@@ -3164,3 +3173,20 @@ class TestTransportIteratorCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

@@ -755,11 +755,31 @@ def measure_tensors_synced_h2d(
     _gpu_tensors: list[Any] = []
     _gpu_names: list[str] = []
     _held: list[Any] = [t for _, t in tensors]
+    # ── H2D decomposition (measurement-only; never alters loop mechanics) ──
+    # CUDA-event interval realizes the async copies (start event after the
+    # pre-sync, end event before the existing final synchronize).  Every new
+    # field is guarded; on any failure the field stays absent and the
+    # function's "Never raises" contract holds.
+    _ev_start = None
+    _ev_end = None
+    _loop_wall_start = None
+    _loop_wall_end = None
+    try:
+        _ev_start = torch.cuda.Event(enable_timing=True)
+        _ev_end = torch.cuda.Event(enable_timing=True)
+    except Exception:
+        _ev_start = _ev_end = None
     try:
         torch.cuda.synchronize()
+        if _ev_start is not None:
+            try:
+                _ev_start.record()
+            except Exception:
+                _ev_start = None
         _start_wall = time.perf_counter()
         _start_cpu = _proc_self_stat_cpu_ms()
         _before = _rusage_faults()
+        _loop_wall_start = time.perf_counter()
         for _name, _tensor in tensors:
             try:
                 _gpu = _tensor.to(device="cuda", non_blocking=True)
@@ -770,7 +790,16 @@ def measure_tensors_synced_h2d(
             _st = _tensor.untyped_storage() if hasattr(_tensor, "untyped_storage") else _tensor.storage()
             _held.append(_st)
             record["storages"] += 1
-            record["bytes"] += int(_st.nbytes())
+            _nbytes = int(_st.nbytes())
+            record["bytes"] += _nbytes
+            if _nbytes > record.get("largest_copy_bytes", 0):
+                record["largest_copy_bytes"] = _nbytes
+        _loop_wall_end = time.perf_counter()
+        if _ev_end is not None:
+            try:
+                _ev_end.record()
+            except Exception:
+                _ev_end = None
         torch.cuda.synchronize()
         _wall_s = max(time.perf_counter() - _start_wall, 1e-9)
         _cpu_ms = _proc_self_stat_cpu_ms()
@@ -778,6 +807,50 @@ def measure_tensors_synced_h2d(
         record["gb_per_s"] = round(
             (record["bytes"] / 1_000_000_000.0) / _wall_s, 3
         )
+        # ── H2D decomposition fields (additive; guarded individually) ──
+        if _loop_wall_start is not None and _loop_wall_end is not None:
+            try:
+                record["enqueue_host_ms"] = round(
+                    (_loop_wall_end - _loop_wall_start) * 1000.0, 3
+                )
+            except Exception:
+                pass
+        if _ev_start is not None and _ev_end is not None:
+            try:
+                record["cuda_elapsed_ms"] = round(
+                    float(_ev_start.elapsed_time(_ev_end)), 3
+                )
+            except Exception:
+                pass
+        # sync_wait_host_ms = total wall − loop body wall (pure subtraction;
+        # host-side estimate covering the final synchronize + event-elapsed
+        # read, consistent with the existing wall_ms window).
+        _e_host = record.get("enqueue_host_ms")
+        _w_total = record.get("wall_ms")
+        if _e_host is not None and _w_total is not None:
+            try:
+                record["sync_wait_host_ms"] = round(max(_w_total - _e_host, 0.0), 3)
+            except Exception:
+                pass
+        try:
+            record["stream_id"] = str(torch.cuda.current_stream())
+        except Exception:
+            pass
+        record["sync_method"] = "torch.cuda.synchronize (full device)"
+        # ── H2D classification (guarded; additive key only) ──
+        # classify_h2d reads the h2d_* key family; this measurement clone
+        # stores the same values unprefixed, so provide BOTH spellings.
+        # Absent when the telemetry module / function is unavailable; never
+        # raises (the "Never raises" contract holds with the module absent).
+        try:
+            from comfymodal_runtime import host_hardware_telemetry as _hht_c
+            _cls_view = dict(record)
+            _cls_view["h2d_cuda_elapsed_ms"] = record.get("cuda_elapsed_ms")
+            _cls_view["h2d_enqueue_host_ms"] = record.get("enqueue_host_ms")
+            _cls_view["h2d_sync_wait_host_ms"] = record.get("sync_wait_host_ms")
+            record["h2d_classification"] = _hht_c.classify_h2d(_cls_view)
+        except Exception:
+            pass
         record["process_cpu_ms"] = (
             round(_cpu_ms - _start_cpu, 3)
             if _cpu_ms is not None and _start_cpu is not None else None

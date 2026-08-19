@@ -59,7 +59,24 @@ from comfymodal_runtime.modal_app import (
 )
 from comfymodal_runtime.cpu_snapshot_models import CpuSnapshotModels
 
-import tools.benchmark_v2_direct as benchmark
+# Import the benchmark harness HERMETICALLY: ``tools.benchmark_v2_direct``
+# inserts the parent ComfyUI root into ``sys.path`` at import time (making the
+# real ``comfy`` package importable in this process from then on).  The module
+# object stays available to the tests below, but sys.path and sys.modules are
+# restored so this test module never changes ambient comfy importability.
+_path_before = list(sys.path)
+_comfy_mods_before = {
+    _k: _v for _k, _v in list(sys.modules.items())
+    if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_")
+}
+import tools.benchmark_v2_direct as benchmark  # noqa: E402
+sys.path[:] = _path_before
+for _k in list(sys.modules):
+    if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_"):
+        if _k in _comfy_mods_before:
+            sys.modules[_k] = _comfy_mods_before[_k]
+        else:
+            sys.modules.pop(_k, None)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

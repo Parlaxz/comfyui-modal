@@ -33,6 +33,7 @@ class StudioJsonStore:
     * All public methods are thread-safe (reentrant lock).
     * ``write_atomic`` writes to a ``.tmp`` sibling, then ``os.replace``.
     * On read, corrupt JSON raises ``StudioStoreError`` (never returns []).
+    * Reads tolerate a UTF-8 BOM (``utf-8-sig``); the BOM is stripped on read.
     * Missing files on read return [] (first-use convention).
     * Every I/O error is surfaced explicitly — no silent ``except: pass``.
     """
@@ -101,7 +102,7 @@ class StudioJsonStore:
         if not self._path.exists():
             return []
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
+            with open(self._path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
         except json.JSONDecodeError as exc:
             raise StudioStoreError(

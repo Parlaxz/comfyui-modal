@@ -1712,6 +1712,9 @@ class TestTorchProfiler(unittest.TestCase):
         FullExecutionTraceSession.reset_instance()
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
+        self._torch_env = patch.dict(os.environ, {ft._ENV_TORCH: "1"}, clear=False)
+        self._torch_env.start()
+        self.addCleanup(self._torch_env.stop)
         self._sessions = []
 
     def tearDown(self):
@@ -1733,6 +1736,13 @@ class TestTorchProfiler(unittest.TestCase):
         session = self._make_session()
         session.start_torch_profiler()
         session.stop_tracing()
+
+    def test_torch_profiler_is_opt_in_by_default(self):
+        session = self._make_session()
+        with patch.dict(os.environ, {}, clear=True):
+            session.start_torch_profiler()
+        self.assertIsNone(session._torch_profiler)
+        self.assertFalse(session._torch_profiler_active)
 
     def test_start_torch_profiler_twice_no_op(self):
         session = self._make_session()
@@ -1792,6 +1802,9 @@ class TestTorchProfilerThreadSafety(unittest.TestCase):
         FullExecutionTraceSession.reset_instance()
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
+        self._torch_env = patch.dict(os.environ, {ft._ENV_TORCH: "1"}, clear=False)
+        self._torch_env.start()
+        self.addCleanup(self._torch_env.stop)
         self._sessions: list[FullExecutionTraceSession] = []
 
     def tearDown(self):

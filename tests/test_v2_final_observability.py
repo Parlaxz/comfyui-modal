@@ -8,10 +8,10 @@ the shared real-run reconstruction fixture
 ``tests/test_waterfall_reconciliation.py``:
 
   - Waterfall accounting (11): REMOTE/PARTIAL rendering, scheduling-row
-    invariants, residual-is-footer-metadata-not-a-stage, the TOTAL WALL
+    invariants, residual-is-footer-metadata-not-a-stage, the non-scheduling
     percentage denominator, child/overlap accounting isolation, exclusive
-    top-level reconciliation to TOTAL WALL, and pre-Python interval
-    classification.
+    top-level reconciliation to the non-scheduling wall, and pre-Python
+    interval classification.
   - UNET diagnostics (4): active-read vs H2D span distinction, the
     ``overlap_diagnostic`` fallback path, bind/construction validity.
   - Output (5): remote yield, local receipt, caller return, deferred
@@ -48,7 +48,7 @@ from tests.v2_waterfall_reconciliation_fixtures import (
 
 CMD_START = command_start_ms()
 
-_STAGE_ROW_RE = re.compile(r"^\s+\d+\s+\| ")
+_STAGE_ROW_RE = re.compile(r"^\|\s*\d+\s+\| ")
 
 
 def _report(result, total_ms=None, **kwargs):
@@ -90,13 +90,6 @@ def _stage_rows(rendered):
     return [line for line in rendered.splitlines() if _STAGE_ROW_RE.match(line)]
 
 
-def _scheduling_row(rendered):
-    for line in rendered.splitlines():
-        if "Modal scheduling" in line and "|" in line:
-            return line
-    raise AssertionError("Modal scheduling row not found in render")
-
-
 def _reset_restore_arm_logs(rma):
     rma._FREEZE_LOGGED = False
     rma._APPLY_FALLBACK_LOGGED = False
@@ -109,81 +102,131 @@ def _reset_restore_arm_logs(rma):
 
 
 def test_01_remote_partial_stage_rows_have_no_percentage():
-    """REMOTE/PARTIAL (total_wall unknown): every stage row renders '%' as '-'."""
-    report = _partial_report()
+    """REMOTE/PARTIAL renders a REAL boxed table of the remotely-measured
+    stages: the '%' column renders '-' (no percentage numbers ever), and no
+    scheduling value is printed (the conclusive footer lines carry the pending
+    token)."""
+    report = _report(build_real_run_result(boundaries=False, restore_begin=False))
     assert report.partial_waterfall is True
     assert report.total_wall_ms is None
+    assert report.non_scheduling_ms is None
     rendered = render_waterfall(report, terminal_columns=132)
-    rows = _stage_rows(rendered)
-    assert len(rows) == len([s for s in report.stages if s.accounting_role == "top_level"])
-    for row in rows:
-        parts = [part.strip() for part in row.split("|")]
-        assert "%" not in row, row
-        assert parts[4] == "-", row  # percentage column is '-', never a number
+    assert "REMOTE/PARTIAL" in rendered
+    assert "PENDING_HOST_RECONCILIATION" in rendered
+    assert "|   # | Stage" in rendered
+    stage_rows = _stage_rows(rendered)
+    assert stage_rows, "expected numbered stage rows in the partial table"
+    for line in stage_rows:
+        parts = line.split("|")
+        assert parts[5].strip() == "-", line  # '%' renders '-' (never a number)
+        assert "%" not in line, line
+        assert "#" not in line, line
+    assert rendered.count("%") == 1  # only the '%' column header
+    pending_footer = [
+        line for line in rendered.splitlines()
+        if line.startswith("Command (without scheduling) -> Response:")
+        or line.startswith("Scheduling time:")
+    ]
+    assert len(pending_footer) == 2
+    assert all("awaiting host reconciliation" in line for line in pending_footer)
 
 
 def test_02_remote_partial_unresolved_platform_interval_has_no_bar():
-    """REMOTE/PARTIAL: the scheduling / pre-Python rows carry no '#/'=' bar."""
-    report = _partial_report()
+    """REMOTE/PARTIAL: a REAL table whose bar column is always blank — '#'
+    appears nowhere except the single column-header label; the missing-boundary
+    flags render as a plain 'missing=' line after the table."""
+    report = _report(build_real_run_result(boundaries=False, restore_begin=False))
     rendered = render_waterfall(report, terminal_columns=132)
-    for row in _stage_rows(rendered):
-        parts = [part.strip() for part in row.split("|")]
-        assert parts[5] == "", row  # bar region blank
-        assert "#" not in row and "=" not in row, row
-    # The fused unresolved platform row is explicitly flagged and the
-    # awaiting-host-reconciliation state is visible in the title.
-    sched = _scheduling_row(rendered)
-    assert "Modal scheduling + pre-Python restore" in sched
+    assert "|   # | Stage" in rendered
     assert "awaiting host reconciliation" in rendered
-    parts = [part.strip() for part in sched.split("|")]
-    assert parts[5] == ""
+    assert rendered.count("#") == 1  # only the '#' column-header label
+    assert "missing=" in rendered
+    for line in _stage_rows(rendered):
+        parts = line.split("|")
+        assert parts[6].strip() == "", line  # bar column blank
+        assert "#" not in line, line
+    pending_footer = [
+        line for line in rendered.splitlines()
+        if line.startswith("Command (without scheduling) -> Response:")
+        or line.startswith("Scheduling time:")
+    ]
+    assert len(pending_footer) == 2
+    assert all("awaiting host reconciliation" in line for line in pending_footer)
 
 
 def test_03_scheduling_row_never_has_percentage():
-    """The scheduling row renders '-' in the % column in BOTH modes."""
-    row_p = _scheduling_row(render_waterfall(_partial_report(), terminal_columns=132))
-    parts_p = [part.strip() for part in row_p.split("|")]
-    assert parts_p[4] == "-"
+    """The scheduling window is informational: never a numbered row in EITHER
+    mode and no boxed SCHEDULING footer row; it is summarized exactly once in
+    the conclusive 'Scheduling time:' line (no percentage)."""
     full = _report(build_real_run_result())
-    row_f = _scheduling_row(render_waterfall(full, terminal_columns=132))
-    parts_f = [part.strip() for part in row_f.split("|")]
-    assert parts_f[4] == "-"
-    assert parts_f[1].startswith("Modal scheduling")
+    rendered = render_waterfall(full, terminal_columns=132)
+    assert not any(
+        "Modal scheduling" in line and line.strip()[:1].isdigit()
+        for line in rendered.splitlines()
+    )
+    assert "| SCHEDULING" not in rendered
+    scheduling_line = next(line for line in rendered.splitlines() if line.startswith("Scheduling time:"))
+    assert "%" not in scheduling_line
+    # In the partial table scheduling is also informational: never a numbered
+    # row, and the conclusive line carries the pending token.
+    partial_rendered = render_waterfall(
+        _report(build_real_run_result(boundaries=False, restore_begin=False)),
+        terminal_columns=132,
+    )
+    partial_numbered = [
+        line for line in partial_rendered.splitlines()
+        if line.startswith("| ") and line.split("|")[1].strip().isdigit()
+    ]
+    assert not any("SCHEDULING" in line for line in partial_numbered)
+    assert "| SCHEDULING" not in partial_rendered
+    partial_scheduling_lines = [
+        line for line in partial_rendered.splitlines() if line.startswith("Scheduling time:")
+    ]
+    assert len(partial_scheduling_lines) == 1
+    assert "awaiting host reconciliation" in partial_scheduling_lines[0]
+    assert "%" not in partial_scheduling_lines[0]
+    assert "#" not in partial_scheduling_lines[0]
 
 
 def test_04_scheduling_row_never_has_bar():
-    """Even when reconciled, the scheduling row's bar region stays blank."""
+    """Even when reconciled, the scheduling window renders only in the
+    conclusive 'Scheduling time:' line — never a numbered row with a bar."""
     full = _report(build_real_run_result())
-    assert full.total_wall_ms is not None
+    assert full.non_scheduling_ms is not None
     rendered = render_waterfall(full, terminal_columns=132)
-    row = _scheduling_row(rendered)
-    parts = [part.strip() for part in row.split("|")]
-    assert parts[5] == "", row
-    assert "#" not in row and "=" not in row, row
+    assert not any(
+        "Modal scheduling" in line and line.strip()[:1].isdigit()
+        for line in rendered.splitlines()
+    )
+    scheduling_line = next(line for line in rendered.splitlines() if line.startswith("Scheduling time:"))
+    assert "#" not in scheduling_line and "=" not in scheduling_line
 
 
 def test_05_reconciliation_residual_not_a_numbered_stage():
-    """Residual lives only in report fields + footer, never a numbered stage."""
+    """Residual lives only in report fields (reconciliation metadata) — never a
+    numbered stage and never printed in the console."""
     report = _report(build_real_run_result())
     assert "residual" not in {stage.key for stage in report.stages}
     assert report.residual_ms is not None
     rendered = render_waterfall(report, terminal_columns=132)
     assert "Residual (unattributed)" not in rendered
-    assert "GLOBAL RESIDUAL" in rendered
+    assert "GLOBAL RESIDUAL" not in rendered
+    assert "RESIDUAL %" not in rendered
     assert not any("Residual" in row for row in _stage_rows(rendered))
 
 
 def test_06_reconciled_percentage_uses_total_wall_denominator():
-    """With total_wall known, stage % equals duration / total_wall."""
+    """With the non-scheduling wall known, stage % equals duration /
+    non-scheduling (command->response minus scheduling time)."""
     report = _report(build_real_run_result())
-    assert report.total_wall_ms is not None and report.total_wall_ms > 0
+    assert report.non_scheduling_ms is not None and report.non_scheduling_ms > 0
     assert report.total_wall_ms == pytest.approx(report.total_ms - report.scheduling_ms)
     stages = _stages(report)
     for key in ("sampling", "vae", "prompt_executor_cache_setup", "output_persistence"):
         stage = stages[key]
         assert stage.duration_ms is not None
         assert stage.percentage == pytest.approx(
-            stage.duration_ms / report.total_wall_ms * 100.0, abs=1e-9
+            stage.duration_ms / report.non_scheduling_ms * 100.0, abs=1e-9
         )
     # The serialized dict carries the same percentage, and the render shows it.
     data = waterfall_to_dict(report)
@@ -209,29 +252,31 @@ def test_07_child_durations_do_not_change_accounted():
     assert full.residual_ms == changed.residual_ms
 
 
-def test_08_overlap_diagnostic_rows_excluded_from_accounting():
-    """The H2D-pair fallback read row is overlap_diagnostic and never counted."""
+def test_08_overlap_detail_rows_never_alter_accounting():
+    """Overlapping UNET/VAE lane details (overlap_detail) are excluded from
+    the accounted sum; the checkpoint read is never substituted by the H2D
+    span when the active-read record is missing."""
+    full = _report(build_real_run_result())
+    assert full.total_wall_ms is not None
+    overlap_rows = [d for d in full.details if d.accounting_role == "overlap_detail"]
+    assert overlap_rows, "expected overlap_detail lane rows"
+    assert all(d.included_in_total is False for d in overlap_rows)
+    # Without any active-read record there is NO H2D substitution: the
+    # checkpoint detail is omitted and a required-data flag is raised, while
+    # accounted stays identical (details never affect it).
     result = build_real_run_result()
     result["pre_sampler_structured_report"]["active_read_records"] = []
     report = _report(result)
     details = _details(report)
-    read = details["unet_checkpoint_read"]
-    assert read.accounting_role == "overlap_diagnostic"
-    assert read.overlaps == ("unet_synchronized_h2d",)
-    assert read.label == "Checkpoint read (overlap: H2D span fallback)"
-    assert read.included_in_total is False
-    # Excluded from the accounted sum: the report still tiles to the wall.
-    assert report.accounted_ms == pytest.approx(report.total_ms, abs=1e-6)
+    assert "unet_checkpoint_read" not in details
+    assert "checkpoint_read_unavailable" in report.data_flags
+    assert report.accounted_ms == pytest.approx(full.accounted_ms, abs=1e-6)
     assert abs(report.residual_ms) <= max(25.0, report.total_ms * 0.0025)
-    # Rendered as an 'overlap' diagnostic marker, never a numbered stage row.
-    rendered = render_waterfall(report, terminal_columns=132)
-    assert "overlap: Checkpoint read" in rendered
-    assert not any("Checkpoint read" in row for row in _stage_rows(rendered))
 
 
 def test_09_exclusive_top_level_reconciles_to_total_wall():
-    """Exclusive (non-concurrent, non-scheduling) top-level sum + residual
-    reconciles to TOTAL WALL within tolerance."""
+    """Exclusive (non-concurrent) top-level sum == accounted; sum + residual
+    reconciles to the non-scheduling wall within tolerance."""
     report = _report(build_real_run_result())
     tolerance = max(25.0, report.total_ms * 0.0025)
     assert report.residual_ms is not None
@@ -246,11 +291,10 @@ def test_09_exclusive_top_level_reconciles_to_total_wall():
         and stage.status != INVALID
     ]
     assert abs(sum(exclusive) - report.accounted_ms) < 1e-6
-    # Drop the platform scheduling row: the remaining exclusive top-level wall
-    # plus the residual equals TOTAL WALL (accounted+residual==total, and
-    # total_wall==total-scheduling).
-    exclusive_wall = sum(exclusive) - (report.scheduling_ms or 0.0)
-    assert abs((exclusive_wall + report.residual_ms) - report.total_wall_ms) <= tolerance
+    # The scheduling window is informational (already excluded from the sum):
+    # the exclusive top-level wall plus the residual equals the non-scheduling
+    # wall.
+    assert abs((sum(exclusive) + report.residual_ms) - report.non_scheduling_ms) <= tolerance
 
 
 def test_10_huge_pre_python_interval_not_generic_residual():
@@ -270,6 +314,9 @@ def test_10_huge_pre_python_interval_not_generic_residual():
         "classification = scheduling + pre-Python restore (unresolved platform interval)"
         in rendered
     )
+    # The pending classification line renders AFTER the boxed table (a plain
+    # line, never inside the box).
+    assert "Pending host reconciliation" in rendered.split("+-----+")[-1]
     assert "Residual (unattributed)" not in rendered
     assert "residual" not in {stage.key for stage in report.stages}
 
@@ -301,7 +348,7 @@ def test_12_checkpoint_read_not_h2d_by_accidental_boundary_reuse():
     assert read.duration_ms == pytest.approx(1047.0)
     assert h2d.duration_ms == pytest.approx(2214.0)
     assert read.duration_ms != h2d.duration_ms
-    assert read.accounting_role == "child"
+    assert read.accounting_role == "overlap_detail"
     assert read.overlaps == ()
 
 
@@ -320,25 +367,28 @@ def test_13_active_read_span_distinct_from_h2d():
 
 
 def test_14_overlapping_read_h2d_not_double_counted():
-    """Without active-read timestamps the read row is a flagged overlap
-    diagnostic of the H2D span; accounted is untouched by both rows."""
+    """No H2D substitution: without an active-read record the checkpoint
+    detail is OMITTED (required-data flag) and the H2D detail stays
+    independent; accounted is untouched by either."""
     result = build_real_run_result()
     result["pre_sampler_structured_report"]["active_read_records"] = []
     report = _report(result)
     details = _details(report)
-    read = details["unet_checkpoint_read"]
-    assert read.accounting_role == "overlap_diagnostic"
-    assert read.overlaps == ("unet_synchronized_h2d",)
+    assert "unet_checkpoint_read" not in details
+    assert "checkpoint_read_unavailable" in report.data_flags
     h2d = details["unet_synchronized_h2d"]
-    assert h2d.accounting_role == "child"
+    assert h2d.accounting_role == "overlap_detail"
     assert h2d.duration_ms == pytest.approx(2214.0)
-    assert read.duration_ms == pytest.approx(1047.0)
+    # Independent get_model/construction/bind/ready details still render.
+    assert details["unet_read_to_construction"].duration_ms == pytest.approx(271.0)
+    assert details["unet_bind"].duration_ms == pytest.approx(158.0)
+    assert details["unet_h2d_to_ready"].duration_ms is not None
     overlap_sum = sum(
         (d.duration_ms or 0.0) for d in report.details
-        if d.accounting_role == "overlap_diagnostic"
+        if d.accounting_role == "overlap_detail"
     )
-    assert overlap_sum == pytest.approx(1047.0)
-    assert report.accounted_ms == pytest.approx(report.total_ms, abs=1e-6)
+    assert overlap_sum > 0
+    assert report.accounted_ms == pytest.approx(report.non_scheduling_ms, abs=1e-6)
     assert abs(report.residual_ms) <= max(25.0, report.total_ms * 0.0025)
 
 
@@ -375,29 +425,29 @@ def test_16_remote_yield_handoff_boundary_present():
 
 
 def test_17_local_receipt_boundary_present():
-    """local_receipt_to_return appears when the local receipt event AND the
-    response boundary exist."""
+    """Local result handling / caller return appears when the local receipt
+    event AND the caller-return boundary exist (top-level exclusive row)."""
     report = _report(build_real_run_result())
-    details = _details(report)
-    receipt = details["local_receipt_to_return"]
-    assert receipt.status == MEASURED
-    assert receipt.duration_ms is not None
-    assert receipt.parent_key == "remote_local_return"
-    assert receipt.included_in_total is False
+    stages = _stages(report)
+    handling = stages["remote_local_return"]
+    assert handling.status == MEASURED
+    assert handling.duration_ms is not None
+    assert handling.accounting_role == "top_level"
+    assert handling.included_in_total is True
 
 
 def test_18_caller_return_boundary_expected_duration():
     """The row spanning local receipt -> caller return carries the fixture
     duration (LOCAL_RETURN_MS)."""
     report = _report(build_real_run_result())
-    receipt = _details(report)["local_receipt_to_return"]
-    assert receipt.duration_ms == pytest.approx(LOCAL_RETURN_MS)
-    assert receipt.duration_ms > 0
+    handling = _stages(report)["remote_local_return"]
+    assert handling.duration_ms == pytest.approx(LOCAL_RETURN_MS)
+    assert handling.duration_ms > 0
 
 
 def test_19_deferred_persistence_excluded_from_critical_path():
     """output_deferred_commit is a child (included_in_total=False) and never
-    affects accounted_ms / TOTAL WALL."""
+    affects accounted_ms / the non-scheduling wall."""
     report = _report(build_real_run_result())
     deferred = _details(report)["output_deferred_commit"]
     assert deferred.status == MEASURED
@@ -405,15 +455,16 @@ def test_19_deferred_persistence_excluded_from_critical_path():
     assert deferred.included_in_total is False
     assert deferred.accounting_role == "child"
     assert deferred.parent_key == "remote_return_handoff"
-    # Critical path untouched: accounted still equals the command->response wall.
-    assert report.accounted_ms == pytest.approx(report.total_ms, abs=1e-6)
+    # Critical path untouched: accounted still equals the non-scheduling wall.
+    assert report.accounted_ms == pytest.approx(report.non_scheduling_ms, abs=1e-6)
     assert abs(report.residual_ms) <= max(25.0, report.total_ms * 0.0025)
 
 
 def test_20_missing_optional_boundary_renders_dash_not_invalid():
-    """Missing/negative child boundary pairs render '-' (UNAVAILABLE), never
-    INVALID; a top-level negative interval still renders INVALID."""
-    # (a) Missing child pair -> localized UNAVAILABLE.
+    """Missing/negative child boundary pairs are omitted from the console
+    (UNAVAILABLE, never INVALID); a top-level negative interval keeps its
+    invalid status in the serialized artifact but never prints 'INVALID'."""
+    # (a) Missing child pair -> localized UNAVAILABLE, omitted from console.
     result = build_real_run_result()
     result["trace"]["events"] = [
         e for e in result["trace"]["events"] if not e["name"].startswith("deferred_commit")
@@ -425,7 +476,7 @@ def test_20_missing_optional_boundary_renders_dash_not_invalid():
     assert deferred.status != INVALID
     rendered = render_waterfall(report, terminal_columns=132)
     assert "INVALID" not in rendered
-    assert "Deferred persistence" in rendered  # row still listed with '-'
+    assert "Deferred persistence" not in rendered  # unavailable optional row omitted
 
     # (b) Negative child pair -> downgraded to UNAVAILABLE + negative_interval.
     result_neg = build_real_run_result()
@@ -440,7 +491,8 @@ def test_20_missing_optional_boundary_renders_dash_not_invalid():
     assert "negative_interval" in deferred_neg.source_fields
     assert "INVALID" not in render_waterfall(report_neg, terminal_columns=132)
 
-    # (c) Top-level negative interval -> INVALID (never silent).
+    # (c) Top-level negative interval -> invalid in the artifact, '-' in the
+    #     console (never the literal 'INVALID').
     result_top = build_real_run_result()
     sampling_start_ns = next(
         event["wall_unix_ns"]
@@ -453,7 +505,14 @@ def test_20_missing_optional_boundary_renders_dash_not_invalid():
             event["monotonic_ns"] = event["wall_unix_ns"] - 700_000_000_000
     report_top = _report(result_top)
     assert _stages(report_top)["sampling"].status == INVALID
-    assert "INVALID" in render_waterfall(report_top, terminal_columns=132)
+    top_rendered = render_waterfall(report_top, terminal_columns=132)
+    assert "INVALID" not in top_rendered
+    # The invalid stage row still shows (with '-'), and the gap is surfaced by
+    # the reconciliation status in the artifact.
+    sampling_dict = next(
+        s for s in waterfall_to_dict(report_top)["stages"] if s["key"] == "sampling"
+    )
+    assert sampling_dict["status"] == "invalid"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -486,17 +545,21 @@ def test_22_tiny_nodes_filtered_from_render():
 
 
 def test_23_strategic_tiny_nodes_retained():
-    """A tiny strategic node (VAEDecode / UNETLoader) IS retained even under
-    the 25 ms threshold."""
+    """A tiny strategic node (VAEDecode / KSampler, non-duplicative) IS
+    retained even under the 25 ms threshold; duplicative loader nodes are
+    deduped in favor of the clearer curated details."""
     result = build_real_run_result()
     result["pre_sampler_structured_report"]["per_node_timings"] = [
         {"node_id": "n2", "class_type": "VAEDecode", "duration_ms": 5.0},
-        {"node_id": "n3", "class_type": "UNETLoader", "duration_ms": 7.0},
+        {"node_id": "n3", "class_type": "KSampler", "duration_ms": 7.0},
+        {"node_id": "n4", "class_type": "UNETLoader", "duration_ms": 7.0},
     ]
     report = _report(result)
     rendered = render_waterfall(report, terminal_columns=132)
     assert "Node: VAEDecode" in rendered
-    assert "Node: UNETLoader" in rendered
+    assert "Node: KSampler" in rendered
+    # UNETLoader is already covered by the UNET lane details: never duplicated.
+    assert "Node: UNETLoader" not in rendered
 
 
 def test_24_full_per_node_timings_preserved_in_artifact():

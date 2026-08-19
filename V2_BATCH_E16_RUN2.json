@@ -1,0 +1,529 @@
+{
+  "cache": {
+    "capability": "PARTIAL",
+    "drop_caches_exists": false,
+    "drop_caches_writable": false,
+    "mmap_release": "available",
+    "posix_fadvise_available": true,
+    "posix_fadvise_dontneed": "permitted"
+  },
+  "combined": {
+    "CURRENT_RANGE": {
+      "bytes": 20354753664,
+      "effective_GBps": 1.349,
+      "process_cpu_ms": 10410.0,
+      "status": "ok",
+      "wall_ms": 15085.015
+    },
+    "MMAP": {
+      "bytes": 20354753664,
+      "effective_GBps": 1.394,
+      "process_cpu_ms": 14710.0,
+      "status": "ok",
+      "wall_ms": 14597.748
+    },
+    "SEQUENTIAL_SOURCE_ORDER": {
+      "bytes": 20354753664,
+      "effective_GBps": 1.526,
+      "process_cpu_ms": 10080.0,
+      "status": "ok",
+      "wall_ms": 13339.14
+    },
+    "TMP_STAGE": {
+      "bytes": 20354753664,
+      "effective_GBps": null,
+      "process_cpu_ms": 0.0,
+      "status": "ok",
+      "wall_ms": 0.0
+    }
+  },
+  "elapsed_wall_ms": 63824.252,
+  "eligibility": {
+    "CLIP": {
+      "direct": 398,
+      "eligible_bytes": 8044936192,
+      "eligible_percent_by_bytes": 100.0,
+      "eligible_percent_by_tensor": 100.0,
+      "fallback": 0,
+      "fallback_reasons": {
+        "alignment": {
+          "bytes": 0,
+          "count": 0
+        },
+        "bounds": {
+          "bytes": 0,
+          "count": 0
+        },
+        "dtype": {
+          "bytes": 0,
+          "count": 0
+        },
+        "other exact reason": {
+          "bytes": 0,
+          "count": 0
+        },
+        "shape/density": {
+          "bytes": 0,
+          "count": 0
+        },
+        "size mismatch": {
+          "bytes": 0,
+          "count": 0
+        },
+        "unsupported representation": {
+          "bytes": 0,
+          "count": 0
+        }
+      },
+      "source_order_eligible": true,
+      "staged_plan_fallback_reason": null,
+      "total": 398,
+      "total_tensor_bytes": 8044936192
+    },
+    "UNET": {
+      "direct": 453,
+      "eligible_bytes": 12309817472,
+      "eligible_percent_by_bytes": 100.0,
+      "eligible_percent_by_tensor": 100.0,
+      "fallback": 0,
+      "fallback_reasons": {
+        "alignment": {
+          "bytes": 0,
+          "count": 0
+        },
+        "bounds": {
+          "bytes": 0,
+          "count": 0
+        },
+        "dtype": {
+          "bytes": 0,
+          "count": 0
+        },
+        "other exact reason": {
+          "bytes": 0,
+          "count": 0
+        },
+        "shape/density": {
+          "bytes": 0,
+          "count": 0
+        },
+        "size mismatch": {
+          "bytes": 0,
+          "count": 0
+        },
+        "unsupported representation": {
+          "bytes": 0,
+          "count": 0
+        }
+      },
+      "source_order_eligible": true,
+      "staged_plan_fallback_reason": null,
+      "total": 453,
+      "total_tensor_bytes": 12309817472
+    }
+  },
+  "identity": {
+    "container_session_id": "ta-01M070XQC5B31Z8CFY8QZSCDDR",
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-2TxFbK5pFmdkbNEIBqoZX9",
+    "models_mount": "/root/models",
+    "models_mount_read_only": true,
+    "models_volume": "comfyui-models",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "models": [
+    {
+      "arms": {
+        "CURRENT_RANGE": {
+          "arm": "CURRENT_RANGE",
+          "bytes": 8044936192,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "data_region_bytes": 8044936192,
+          "digest": "e48ed5beffc1b93d4c244f36e9c336b707707ed262666b4c2102819dfab101a1",
+          "digest_match": true,
+          "effective_GBps": 1.498,
+          "error": null,
+          "io_backend": "os.pread",
+          "max_read_bytes": 33554432,
+          "median_read_bytes": 16252928,
+          "min_read_bytes": 256,
+          "process_cpu_ms": 4130.0,
+          "read_call_count": 529,
+          "source_bytes_read": 8044936192,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "tensor_data_bytes": 8044936192,
+          "wall_ms": 5369.775
+        },
+        "MMAP": {
+          "arm": "MMAP",
+          "bytes": 8044936192,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "data_region_bytes": 8044936192,
+          "digest": "e48ed5beffc1b93d4c244f36e9c336b707707ed262666b4c2102819dfab101a1",
+          "digest_match": true,
+          "effective_GBps": 1.397,
+          "error": null,
+          "io_backend": "mmap",
+          "max_read_bytes": 268435456,
+          "median_read_bytes": 268435456.0,
+          "min_read_bytes": 260307968,
+          "mmap_block_bytes": 268435456,
+          "process_cpu_ms": 5820.0,
+          "read_call_count": 30,
+          "source_bytes_read": 8044936192,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "tensor_data_bytes": 8044936192,
+          "wall_ms": 5758.703
+        },
+        "SEQUENTIAL_SOURCE_ORDER": {
+          "arm": "SEQUENTIAL_SOURCE_ORDER",
+          "bytes": 8044936192,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "data_region_bytes": 8044936192,
+          "density_gap_bytes": 0,
+          "digest": "e48ed5beffc1b93d4c244f36e9c336b707707ed262666b4c2102819dfab101a1",
+          "digest_match": true,
+          "effective_GBps": 1.37,
+          "error": null,
+          "io_backend": "e11.preadv",
+          "max_read_bytes": 268435456,
+          "median_read_bytes": 268435456.0,
+          "min_read_bytes": 260307968,
+          "process_cpu_ms": 3960.0,
+          "read_call_count": 30,
+          "source_bytes_read": 8044936192,
+          "source_order_block_bytes": 268435456,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "tensor_data_bytes": 8044936192,
+          "wall_ms": 5872.12
+        },
+        "TMP_STAGE": {
+          "arm": "TMP_STAGE",
+          "bytes": 8044936192,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "combined_ms": 6675.771,
+          "data_region_bytes": 8044936192,
+          "digest": "e48ed5beffc1b93d4c244f36e9c336b707707ed262666b4c2102819dfab101a1",
+          "digest_match": true,
+          "effective_GBps": 2.41,
+          "error": null,
+          "io_backend": "copy_then_local_read",
+          "local_reread_bytes": 8044936192,
+          "max_read_bytes": 268435456,
+          "median_read_bytes": 8388608.0,
+          "min_read_bytes": 306976,
+          "process_cpu_ms": null,
+          "read_call_count": 990,
+          "source_bytes_read": 8044982048,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "temp_copy_GBps": 4.706,
+          "temp_copy_cpu_ms": 870.0,
+          "temp_copy_ms": 1709.403,
+          "temp_reread_GBps": 1.62,
+          "temp_reread_cpu_ms": 4910.0,
+          "temp_reread_ms": 4966.368,
+          "tensor_data_bytes": 8044936192,
+          "wall_ms": null
+        }
+      },
+      "data_region_bytes": 8044936192,
+      "eligibility": {
+        "direct": 398,
+        "eligible_bytes": 8044936192,
+        "eligible_percent_by_bytes": 100.0,
+        "eligible_percent_by_tensor": 100.0,
+        "fallback": 0,
+        "fallback_reasons": {
+          "alignment": {
+            "bytes": 0,
+            "count": 0
+          },
+          "bounds": {
+            "bytes": 0,
+            "count": 0
+          },
+          "dtype": {
+            "bytes": 0,
+            "count": 0
+          },
+          "other exact reason": {
+            "bytes": 0,
+            "count": 0
+          },
+          "shape/density": {
+            "bytes": 0,
+            "count": 0
+          },
+          "size mismatch": {
+            "bytes": 0,
+            "count": 0
+          },
+          "unsupported representation": {
+            "bytes": 0,
+            "count": 0
+          }
+        },
+        "source_order_eligible": true,
+        "staged_plan_fallback_reason": null,
+        "total": 398,
+        "total_tensor_bytes": 8044936192
+      },
+      "file_bytes": 8044982048,
+      "filename": "qwen_3_4b.safetensors",
+      "gap_bytes": 0,
+      "path": "/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors",
+      "payload_digest": null,
+      "resolution": "mounted_models_fallback",
+      "role": "CLIP",
+      "tensor_bytes": 8044936192,
+      "tensor_count": 398
+    },
+    {
+      "arms": {
+        "CURRENT_RANGE": {
+          "arm": "CURRENT_RANGE",
+          "bytes": 12309817472,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "data_region_bytes": 12309817472,
+          "digest": "f0660776d3ec870bf0a5f74497e7e6e324fb207b9d257265de896af06fd93d30",
+          "digest_match": true,
+          "effective_GBps": 1.267,
+          "error": null,
+          "io_backend": "os.pread",
+          "max_read_bytes": 33554432,
+          "median_read_bytes": 11534336,
+          "min_read_bytes": 128,
+          "process_cpu_ms": 6280.0,
+          "read_call_count": 725,
+          "source_bytes_read": 12309817472,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "tensor_data_bytes": 12309817472,
+          "wall_ms": 9715.24
+        },
+        "MMAP": {
+          "arm": "MMAP",
+          "bytes": 12309817472,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "data_region_bytes": 12309817472,
+          "digest": "f0660776d3ec870bf0a5f74497e7e6e324fb207b9d257265de896af06fd93d30",
+          "digest_match": true,
+          "effective_GBps": 1.393,
+          "error": null,
+          "io_backend": "mmap",
+          "max_read_bytes": 268435456,
+          "median_read_bytes": 268435456.0,
+          "min_read_bytes": 230221952,
+          "mmap_block_bytes": 268435456,
+          "process_cpu_ms": 8890.0,
+          "read_call_count": 46,
+          "source_bytes_read": 12309817472,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "tensor_data_bytes": 12309817472,
+          "wall_ms": 8839.045
+        },
+        "SEQUENTIAL_SOURCE_ORDER": {
+          "arm": "SEQUENTIAL_SOURCE_ORDER",
+          "bytes": 12309817472,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "data_region_bytes": 12309817472,
+          "density_gap_bytes": 0,
+          "digest": "f0660776d3ec870bf0a5f74497e7e6e324fb207b9d257265de896af06fd93d30",
+          "digest_match": true,
+          "effective_GBps": 1.649,
+          "error": null,
+          "io_backend": "e11.preadv",
+          "max_read_bytes": 268435456,
+          "median_read_bytes": 268435456.0,
+          "min_read_bytes": 230221952,
+          "process_cpu_ms": 6120.0,
+          "read_call_count": 46,
+          "source_bytes_read": 12309817472,
+          "source_order_block_bytes": 268435456,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "tensor_data_bytes": 12309817472,
+          "wall_ms": 7467.02
+        },
+        "TMP_STAGE": {
+          "arm": "TMP_STAGE",
+          "bytes": 12309817472,
+          "cache_reset_before": {
+            "attempted": true,
+            "errors": [],
+            "supported": true
+          },
+          "combined_ms": 9858.361,
+          "data_region_bytes": 12309817472,
+          "digest": "f0660776d3ec870bf0a5f74497e7e6e324fb207b9d257265de896af06fd93d30",
+          "digest_match": true,
+          "effective_GBps": 2.497,
+          "error": null,
+          "io_backend": "copy_then_local_read",
+          "local_reread_bytes": 12309817472,
+          "max_read_bytes": 268435456,
+          "median_read_bytes": 8388608.0,
+          "min_read_bytes": 3778464,
+          "process_cpu_ms": null,
+          "read_call_count": 1514,
+          "source_bytes_read": 12309866400,
+          "source_to_pinned_copy_bytes": 0,
+          "status": "ok",
+          "temp_copy_GBps": 5.323,
+          "temp_copy_cpu_ms": 1390.0,
+          "temp_copy_ms": 2312.613,
+          "temp_reread_GBps": 1.631,
+          "temp_reread_cpu_ms": 7420.0,
+          "temp_reread_ms": 7545.748,
+          "tensor_data_bytes": 12309817472,
+          "wall_ms": null
+        }
+      },
+      "data_region_bytes": 12309817472,
+      "eligibility": {
+        "direct": 453,
+        "eligible_bytes": 12309817472,
+        "eligible_percent_by_bytes": 100.0,
+        "eligible_percent_by_tensor": 100.0,
+        "fallback": 0,
+        "fallback_reasons": {
+          "alignment": {
+            "bytes": 0,
+            "count": 0
+          },
+          "bounds": {
+            "bytes": 0,
+            "count": 0
+          },
+          "dtype": {
+            "bytes": 0,
+            "count": 0
+          },
+          "other exact reason": {
+            "bytes": 0,
+            "count": 0
+          },
+          "shape/density": {
+            "bytes": 0,
+            "count": 0
+          },
+          "size mismatch": {
+            "bytes": 0,
+            "count": 0
+          },
+          "unsupported representation": {
+            "bytes": 0,
+            "count": 0
+          }
+        },
+        "source_order_eligible": true,
+        "staged_plan_fallback_reason": null,
+        "total": 453,
+        "total_tensor_bytes": 12309817472
+      },
+      "file_bytes": 12309866400,
+      "filename": "z_image_turbo_bf16.safetensors",
+      "gap_bytes": 0,
+      "path": "/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.safetensors",
+      "payload_digest": null,
+      "resolution": "mounted_models_fallback",
+      "role": "UNET",
+      "tensor_bytes": 12309817472,
+      "tensor_count": 453
+    }
+  ],
+  "pinned_fill": {
+    "bytes": 536870912,
+    "digest": "709e88b9cc2d6ed51cce96979f2565014f17a050c3e05faf1f0f7cefcfd1bc22",
+    "digest_match": true,
+    "error": null,
+    "host_slab_is_pinned": true,
+    "pageable_fill_ms": 447.845,
+    "pinned_fill_ms": 436.736,
+    "pinned_fill_overhead_percent": -2.481,
+    "read_geometry_bytes": 268435456,
+    "status": "ok"
+  },
+  "preadv_probe": {
+    "BYTE_VALIDATION": true,
+    "DIRECT_SOURCE_TO_PINNED_COPY_BYTES": 0,
+    "HOST_SLAB_IS_PINNED_ALL": true,
+    "PREADV_BRANCH_USED": true,
+    "PREADV_BYTES": 536870912,
+    "PREADV_CALLS": 2,
+    "per_model": [
+      {
+        "byte_validation": true,
+        "bytes_checked": 268435456,
+        "preadv_calls": 1,
+        "role": "CLIP"
+      },
+      {
+        "byte_validation": true,
+        "bytes_checked": 268435456,
+        "preadv_calls": 1,
+        "role": "UNET"
+      }
+    ]
+  },
+  "prewarm_estimate": {
+    "basis": "ESTIMATE_FROM_MEASURED_THROUGHPUT",
+    "bytes_at_0_5s": 763000000,
+    "bytes_at_1s": 1526000000,
+    "bytes_at_2s": 3052000000
+  },
+  "run_id": "RUN2",
+  "status": "ok",
+  "strategy_order": "CLIP_SOURCE_FIRST",
+  "structural_validity": "VALID_PRIMARY_AND_DIGESTS",
+  "tmp": {
+    "available_bytes": 9223372036849594368,
+    "capacity": "PASS",
+    "filesystem": "overlay",
+    "free_bytes": 9223372036849594368,
+    "headroom_bytes": 4294967296,
+    "required_bytes": 20354848448,
+    "runtime_disk_usage_bytes": 5177344,
+    "total_bytes": 9223372036854771712
+  },
+  "tool": "benchmark_source_io_e16",
+  "volume_generation_probe": {
+    "classification": "V1",
+    "outcome": "existing Volume accepts v1 pin"
+  }
+}

@@ -1284,6 +1284,9 @@ def _is_valid_clip_patcher(obj: Any) -> tuple[bool, str]:
     if not modules:
         return False, "clip cannot locate inspectable torch module"
 
+    if getattr(obj, "_comfymodal_clip_fh_excluded_weights", False):
+        return True, ""
+
     for name, mod in modules:
         ok, reason = _check_tensor_devices(mod, f"clip.{name}.")
         if not ok:

@@ -19,6 +19,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -196,6 +197,121 @@ class FakeInvoker:
         pass
 
 
+def _make_fake_execute_modal_prompt(canonical_result: dict):
+    """Return an async stand-in for ``execute_modal_prompt``.
+
+    The adapter's direct path now awaits the real canonical executor
+    (``from canonical_execution import execute_modal_prompt``) instead of a
+    fake-able invoker.  This fake mirrors the current contract: it is awaited
+    and returns a raw Modal result dict (``outputs`` / ``trace`` /
+    ``_restore_timing``).  It also records ``production_compile_count`` on the
+    caller-supplied ``run_trace`` when production compilation is active —
+    exactly like the real executor — so the adapter's
+    ``production_plan_used`` derivation keeps working in tests.
+    """
+    async def _fake_execute_modal_prompt(
+        workflow,
+        *,
+        run_trace=None,
+        production_report=None,
+        production_options=None,
+        **kwargs,
+    ):
+        _opts = production_options if isinstance(production_options, dict) else None
+        if production_report is None and _opts and _opts.get("enabled"):
+            if run_trace is not None:
+                run_trace.count("production_compile_count", 1)
+        return canonical_result
+
+    return _fake_execute_modal_prompt
+
+
+def _make_failing_execute_modal_prompt(error: str):
+    """Return an async stand-in for ``execute_modal_prompt`` that raises.
+
+    Simulates a remote execution failure (e.g. the production hash guard)
+    at the live seam the direct path actually awaits
+    (``studio_run_adapter.execute_modal_prompt``), so the adapter's
+    fail-closed path (error status + error history) is exercised without
+    any real Modal dispatch.
+    """
+    async def _fail_execute_modal_prompt(workflow, **kwargs):
+        raise RuntimeError(error)
+
+    return _fail_execute_modal_prompt
+
+
+def _make_fake_materialize_modal_result():
+    """Return a sync stand-in for ``materialize_modal_result``.
+
+    The adapter calls the real materializer synchronously after the executor
+    (``from comfymodal_runtime.result_delivery import materialize_modal_result``)
+    and reads ``written_files`` / ``primary_output`` from its return dict.
+    This fake writes one file per output entry into ``output_dir`` so the
+    adapter's ``output_paths`` / ``output_count`` derivation — and any file
+    existence assertions — behave like the real materializer.
+    """
+    def _fake_materialize(result, *, output_dir, prompt_id, **kwargs):
+        _dir = Path(output_dir)
+        _dir.mkdir(parents=True, exist_ok=True)
+        written_files: list[str] = []
+        primary_output: dict | None = None
+        _outputs = result.get("outputs") if isinstance(result, dict) else {}
+        if isinstance(_outputs, dict):
+            for _nid, _nouts in _outputs.items():
+                if not isinstance(_nouts, dict):
+                    continue
+                for _entries in _nouts.values():
+                    if not isinstance(_entries, list):
+                        continue
+                    for _entry in _entries:
+                        if not isinstance(_entry, dict):
+                            continue
+                        _fname = _entry.get("filename") or f"output_{len(written_files)}.png"
+                        _fpath = _dir / _fname
+                        _fpath.write_bytes(b"\x89PNG\r\n\x1a\n")
+                        written_files.append(str(_fpath))
+                        if primary_output is None:
+                            primary_output = {
+                                "path": str(_fpath),
+                                "filename": _fname,
+                                "node_id": str(_nid),
+                            }
+        if primary_output is None:
+            primary_output = {"path": "", "filename": ""}
+        return {
+            "written_files": written_files,
+            "primary_output": primary_output,
+        }
+
+    return _fake_materialize
+
+
+def _patch_direct_execution(canonical_result: dict) -> ExitStack:
+    """Patch the two adapter-level entry points the direct path now calls.
+
+    ``execute_modal_prompt`` is a module-level import on
+    ``studio_run_adapter`` (patchable directly).  ``materialize_modal_result``
+    is imported inside ``direct_studio_run_completion`` from
+    ``comfymodal_runtime.result_delivery``, so the module attribute is what
+    must be patched.
+    """
+    stack = ExitStack()
+    stack.enter_context(
+        patch(
+            "studio_run_adapter.execute_modal_prompt",
+            new=_make_fake_execute_modal_prompt(canonical_result),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "comfymodal_runtime.result_delivery.materialize_modal_result",
+            new=_make_fake_materialize_modal_result(),
+        )
+    )
+    return stack
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -322,7 +438,7 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
         )
 
     def _build_mock_stream(self, ctx: dict) -> dict:
-        """Build a mock stream result dict with markers from cell trace."""
+        """Build a mock canonical result dict with markers from cell trace."""
         _compilation = ctx.get("compilation", {})
         _cells = _compilation.get("cells", [])
         _cell_trace = _cells[0].get("trace", {}) if _cells else {}
@@ -331,11 +447,13 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
             "studio_route_received": _cell_trace.get("studio_route_received", 1000.1),
             "output_materialized": _cell_trace.get("browser_run_click", 1000.0) + 1.25,
             "t3_modal_entry": 1000.0,
-        }
-        if _compilation.get("production_plan_used"):
-            _stages["production_compile_complete"] = _cell_trace.get(
+            # Always present: the adapter only exposes
+            # production_compile_complete in timings when it is in the result
+            # trace, and tests assert the marker regardless of production mode.
+            "production_compile_complete": _cell_trace.get(
                 "production_compile_complete", 1000.2
-            )
+            ),
+        }
         return {
             "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
             "_certificate_candidate": {
@@ -353,15 +471,11 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
         }
 
     async def _run_direct(self, ctx: dict, tmpdir: str, **kwargs) -> dict:
-        """Run direct_studio_run_completion with patched Modal stream."""
-        import modal_client as mc_mod
-
+        """Run direct_studio_run_completion with the canonical executor and
+        materializer patched at the adapter level."""
         _mock_data = self._build_mock_stream(ctx)
 
-        async def _fake_stream(*a, **kw):
-            yield {"type": "result", "data": _mock_data}
-
-        with patch.object(mc_mod, 'run_prompt_stream', _fake_stream):
+        with _patch_direct_execution(_mock_data):
             result = await self.mod.direct_studio_run_completion(
                 ctx, tmpdir, **kwargs
             )
@@ -515,26 +629,15 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 ctx = self._make_context(tmp)
 
-                # Patch invoker to return failure
-                import experiment_runner as er_mod
-
-                async def _fail_run(worker_id, cell):
-                    return {"status": "failed",
-                            "error": "Hash mismatch: compiled vs actual"}
-
-                fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-                fake_invoker.open_worker = AsyncMock()
-                fake_invoker.close_worker = AsyncMock()
-                fake_invoker.run_cell = AsyncMock(side_effect=_fail_run)
-                fake_invoker._run_cell_tasks = {}
-                fake_invoker._cancelled_workers = set()
-                fake_invoker._studio_output_dir = None
-                fake_invoker._modal_options = {}
-                fake_invoker._production_report = None
-                fake_invoker._profile_preparer = None
-
-                with patch.object(er_mod, 'LocalRemoteInvoker',
-                                  return_value=fake_invoker, autospec=False):
+                # The direct path awaits the live ``execute_modal_prompt``
+                # seam on studio_run_adapter — patch it to raise so the
+                # adapter fails closed without any real Modal dispatch.
+                with patch(
+                    "studio_run_adapter.execute_modal_prompt",
+                    new=_make_failing_execute_modal_prompt(
+                        "Hash mismatch: compiled vs actual"
+                    ),
+                ):
                     result = await self.mod.direct_studio_run_completion(
                         ctx, tmp
                     )
@@ -584,35 +687,15 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(ctx["status"], "ok")
 
-                # Patch the invoker to simulate production hash guard failure.
-                import experiment_runner as er_mod
-
-                async def _hash_guard_run(worker_id, cell):
-                    return {
-                        "status": "failed",
-                        "error": "Production compiled workflow hash mismatch",
-                    }
-
-                fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-                fake_invoker.open_worker = AsyncMock()
-                fake_invoker.close_worker = AsyncMock()
-                fake_invoker.run_cell = AsyncMock(side_effect=_hash_guard_run)
-                fake_invoker._run_cell_tasks = {}
-                fake_invoker._cancelled_workers = set()
-                fake_invoker._studio_output_dir = None
-                fake_invoker._modal_options = {}
-                fake_invoker._production_report = {
-                    "enabled": True,
-                    "compiler_version": 1,
-                    "hash_schema_version": 1,
-                    "production_plan_schema_version": 1,
-                    "compiled_workflow_hash": "deadbeef" * 8,
-                    "output_node_ids": ["107"],
-                }
-                fake_invoker._profile_preparer = None
-
-                with patch.object(er_mod, 'LocalRemoteInvoker',
-                                  return_value=fake_invoker, autospec=False):
+                # Patch the live ``execute_modal_prompt`` seam to raise and
+                # simulate the production hash guard failure — no Modal
+                # dispatch is performed.
+                with patch(
+                    "studio_run_adapter.execute_modal_prompt",
+                    new=_make_failing_execute_modal_prompt(
+                        "Production compiled workflow hash mismatch"
+                    ),
+                ):
                     result = await self.mod.direct_studio_run_completion(
                         ctx, tmp
                     )
@@ -924,34 +1007,31 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(ctx["status"], "ok")
 
-                import modal_client as mc_mod
-
-                async def _fake_stream(*a, **kw):
-                    yield {"type": "result", "data": {
-                        "outputs": {
-                            "107": {"images": [{"filename": "test.png", "data": ""}]}
+                _mock_result = {
+                    "outputs": {
+                        "107": {"images": [{"filename": "test.png", "data": ""}]}
+                    },
+                    "trace": {
+                        "stages": {
+                            "browser_run_click": click_epoch,
+                            "output_materialized": materialized_epoch,
+                            "studio_route_received": click_epoch + 0.1,
+                            "production_compile_complete": click_epoch + 0.2,
                         },
-                        "trace": {
-                            "stages": {
-                                "browser_run_click": click_epoch,
-                                "output_materialized": materialized_epoch,
-                                "studio_route_received": click_epoch + 0.1,
-                                "production_compile_complete": click_epoch + 0.2,
-                            },
-                            "deltas_ms": {
-                                "sampler": 3200.0,
-                                "clip_encode": 350.0,
-                                "vae_decode": 280.0,
-                            },
-                            "derived_ms": {
-                                "output_collection_total_ms": 250.0,
-                            },
-                            "trace_version": 3,
+                        "deltas_ms": {
+                            "sampler": 3200.0,
+                            "clip_encode": 350.0,
+                            "vae_decode": 280.0,
                         },
-                        "_restore_timing": {"restore_total_ms": 120.0},
-                    }}
+                        "derived_ms": {
+                            "output_collection_total_ms": 250.0,
+                        },
+                        "trace_version": 3,
+                    },
+                    "_restore_timing": {"restore_total_ms": 120.0},
+                }
 
-                with patch.object(mc_mod, 'run_prompt_stream', _fake_stream):
+                with _patch_direct_execution(_mock_result):
                     result = await self.mod.direct_studio_run_completion(ctx, tmp)
 
                 self.assertEqual(result["status"], "ok")
@@ -1090,26 +1170,24 @@ class StudioDirectRunHistoryFinalizationTests(unittest.TestCase):
         self._registry_patcher.stop()
 
     def _mock_stream(self, stages=None, deltas=None):
-        """Build a mock run_prompt_stream that yields a canned result."""
-        import modal_client as mc_mod
-
+        """Build a mock canonical result and patch the adapter-level
+        execute_modal_prompt + materialize_modal_result."""
         _stages = dict(stages or {})
         if "browser_run_click" not in _stages:
             _stages["browser_run_click"] = 1000.0
         if "output_materialized" not in _stages:
             _stages["output_materialized"] = 1001.25
 
-        async def _fake_stream(*a, **kw):
-            yield {"type": "result", "data": {
-                "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
-                "trace": {
-                    "stages": _stages,
-                    "deltas_ms": dict(deltas or {"sampler": 500.0}),
-                    "derived_ms": {},
-                    "trace_version": 3,
-                },
-            }}
-        return patch.object(mc_mod, 'run_prompt_stream', _fake_stream)
+        _mock_result = {
+            "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
+            "trace": {
+                "stages": _stages,
+                "deltas_ms": dict(deltas or {"sampler": 500.0}),
+                "derived_ms": {},
+                "trace_version": 3,
+            },
+        }
+        return _patch_direct_execution(_mock_result)
 
     def test_history_has_completed_status_and_timings(self):
         """History record has completed status, timings, and meta."""

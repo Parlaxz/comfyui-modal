@@ -25,6 +25,16 @@ from .contracts import SnapshotExecutionSeed
 from .trace import RuntimeTrace
 from .variance_diagnostics import variance_stage
 from .optimization_diagnostics import emit_opt, opt_diag_enabled
+from .runtime_generation import (
+    DEFAULT_RUNTIME_STATE_MANIFEST_FILES,
+    DEFAULT_RUNTIME_STATE_MANIFEST_REQUIRED,
+    RUNTIME_STATE_GENERATION_FILENAME,
+    RUNTIME_STATE_GENERATION_SCHEMA_VERSION,
+    build_runtime_state_manifest as _default_runtime_state_manifest_builder,
+    read_runtime_state_generation_marker as _default_runtime_state_generation_reader,
+    verify_runtime_state_manifest as _default_runtime_state_manifest_verifier,
+    write_runtime_state_generation_marker as _default_runtime_state_generation_writer,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -282,6 +292,15 @@ class BootstrapConfig:
     # Step 3 — deployment-scoped seed payload path (hydrated at restore when
     # present; empty disables hydration and falls back to the minimal seed)
     seed_payload_path: str = ""
+    # Batch B — construction-time runtime-state generation marker path
+    # ({RUNTIME_STATE_PATH}/runtime_config_generation.json).  Empty derives
+    # from the prescan record directory when available.
+    runtime_state_generation_path: str = ""
+    # Batch B rev 2 — correctness-relevant construction files (relative to
+    # the runtime-state Volume root) included in the content manifest, and
+    # the subset that must be present at construction (fail closed).
+    runtime_state_manifest_files: tuple[str, ...] = DEFAULT_RUNTIME_STATE_MANIFEST_FILES
+    runtime_state_manifest_required: tuple[str, ...] = DEFAULT_RUNTIME_STATE_MANIFEST_REQUIRED
 
 
 @dataclass
@@ -313,6 +332,21 @@ class BootstrapState:
     snapshot_custom_node_source: str = ""
     snapshot_custom_node_schema: str = "0"
     deployment_combined_hash: str = ""
+    # Batch A — snapshot models-volume generation baseline (frozen at
+    # startup from models_generation.json, compared at restore; an empty
+    # baseline forces the existing reload — fail closed)
+    snapshot_models_generation: str = ""
+    # Batch B — snapshot runtime-state generation baseline (frozen at
+    # construction by finalize_runtime_state_generation from the marker
+    # written last on the runtime-state Volume; compared at restore; an empty
+    # baseline forces the existing reload_runtime_state — fail closed)
+    snapshot_runtime_state_generation: str = ""
+    runtime_state_generation_marker_written: bool = False
+    # Batch B rev 2 — content manifest of the correctness-relevant
+    # construction files ({rel_path: {"present": bool, "sha256": str}}),
+    # frozen at construction alongside the generation.  An empty manifest
+    # forces the existing reload at restore (fail closed).
+    snapshot_runtime_state_manifest: dict[str, Any] = field(default_factory=dict)
     # Lane B — snapshot-memory validation certificate
     snapshot_certificate: dict[str, Any] = field(default_factory=dict)
     snapshot_cert_valid: bool = False
@@ -1179,6 +1213,30 @@ def cpu_snapshot_environment() -> Iterator[None]:
             os.environ["CUDA_VISIBLE_DEVICES"] = previous
 
 
+def _default_models_generation_reader() -> dict[str, Any] | None:
+    """Best-effort reader for the existing models_generation.json contract.
+
+    Reuses comfyapp's authoritative ``_read_models_generation_record`` via
+    ``sys.modules`` (the V2 runtime imports comfyapp before bootstrap use,
+    so this is a dict lookup, not an import).  Any failure returns None,
+    which the guard treats as unknown and therefore reloads (fail closed).
+    """
+    try:
+        _mod = sys.modules.get("comfyapp")
+        if _mod is None:
+            import importlib
+            _mod = importlib.import_module("comfyapp")
+        _reader = getattr(_mod, "_read_models_generation_record", None)
+        if callable(_reader):
+            _result = _reader()
+            if isinstance(_result, dict) or _result is None:
+                return _result
+            return None
+    except Exception:
+        return None
+    return None
+
+
 class RuntimeBootstrap:
     """Coordinates exactly one CPU-snapshot and one post-restore lifecycle."""
 
@@ -1196,6 +1254,11 @@ class RuntimeBootstrap:
         apply_sage_policy: Callable[[], Any] | None = None,
         observe_generations: Callable[[], dict[str, str]] | None = None,
         read_current_custom_node_identity: Callable[[], dict[str, str]] | None = None,
+        read_models_generation_record: Callable[[], dict[str, Any] | None] | None = None,
+        write_runtime_state_generation_marker: Callable[..., str] | None = None,
+        read_runtime_state_generation_marker: Callable[[str], dict | None] | None = None,
+        build_runtime_state_manifest: Callable[..., dict] | None = None,
+        verify_runtime_state_manifest: Callable[[str, dict], tuple[bool, str]] | None = None,
         deployment_combined_hash: str = "",
     ) -> None:
         self.config = config or BootstrapConfig()
@@ -1209,6 +1272,21 @@ class RuntimeBootstrap:
         self.apply_sage_policy = apply_sage_policy
         self.observe_generations = observe_generations
         self.read_current_custom_node_identity = read_current_custom_node_identity
+        self.read_models_generation_record = read_models_generation_record
+        self.write_runtime_state_generation_marker = (
+            write_runtime_state_generation_marker
+            or _default_runtime_state_generation_writer
+        )
+        self.read_runtime_state_generation_marker = (
+            read_runtime_state_generation_marker
+            or _default_runtime_state_generation_reader
+        )
+        self.build_runtime_state_manifest = (
+            build_runtime_state_manifest or _default_runtime_state_manifest_builder
+        )
+        self.verify_runtime_state_manifest = (
+            verify_runtime_state_manifest or _default_runtime_state_manifest_verifier
+        )
         self.state = BootstrapState()
         self._deployment_combined_hash = str(deployment_combined_hash or "")
         self._sage_baked_cuda_available = False
@@ -1271,6 +1349,13 @@ class RuntimeBootstrap:
                 _emit_startup_stage("custom_node_source_copy", "end", started=_custom_node_copy_started, trace=trace)
             if trace:
                 trace.emit("sync_custom_nodes_end", phase="startup")
+
+            # ── Batch A: freeze the models-volume generation baseline ──
+            # O(1) local read of models_generation.json (custom-nodes
+            # Volume, just synced) so the restore-time guard can prove the
+            # restored mount matches construction.  Fail closed: an empty
+            # baseline forces the existing reload at restore.
+            self._capture_models_generation_baseline(trace=trace)
 
             if trace:
                 trace.emit("install_requirements_start", phase="startup")
@@ -1407,6 +1492,274 @@ class RuntimeBootstrap:
             except OSError:
                 pass
         os.replace(tmp, record_path)
+
+    def _capture_models_generation_baseline(self, *, trace: RuntimeTrace | None = None) -> str:
+        """Capture the construction-time models generation baseline.
+
+        Reads the authoritative models_generation.json record (existing
+        contract, O(1) local file read) so the restore-time guard can
+        compare the restored mount against the snapshot's baseline.  Fail
+        closed: any missing/corrupt/unreadable record leaves the baseline
+        empty, which forces the existing reload at restore time.
+        """
+        _baseline = ""
+        _source = "unavailable"
+        _read_ms = 0.0
+        try:
+            _t0 = time.perf_counter()
+            _reader = self.read_models_generation_record or _default_models_generation_reader
+            _rec = _reader()
+            if isinstance(_rec, dict):
+                _g = _rec.get("generation")
+                if isinstance(_g, str) and _g:
+                    _baseline = _g
+                    _source = "models_generation_json"
+            _read_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        except Exception as _bg_exc:
+            _source = f"read_error:{type(_bg_exc).__name__}"
+        self.state.snapshot_models_generation = _baseline
+        print(
+            f"[v2.models_volume_baseline] source={_source} "
+            f"generation={(_baseline[:12] + '…') if len(_baseline) > 12 else (_baseline or '-')} "
+            f"read_ms={_read_ms}",
+            flush=True,
+        )
+        if trace:
+            trace.emit(
+                "models_generation_baseline",
+                phase="startup",
+                metadata={
+                    "source": _source,
+                    "generation": _baseline[:12],
+                    "read_ms": _read_ms,
+                    "fail_closed_reload": int(not bool(_baseline)),
+                },
+            )
+        return _baseline
+
+    def _decide_models_reload(self) -> dict[str, Any]:
+        """O(1) local decision: is the models Volume reload required?
+
+        Reuses the existing models_generation.json contract: the mounted
+        record (a local file read) is compared against the snapshot
+        construction baseline.  Performs NO network/RPC I/O.  Fail closed:
+        missing/corrupt/mismatched/unknown state means reload.
+        """
+        _t0 = time.perf_counter()
+        _expected = str(getattr(self.state, "snapshot_models_generation", "") or "")
+        _decision = "reloaded_generation_unknown"
+        _reason = "no_snapshot_baseline"
+        _current = ""
+        if _expected:
+            try:
+                _reader = self.read_models_generation_record or _default_models_generation_reader
+                _rec = _reader()
+            except Exception:
+                _rec = None
+                _reason = "record_read_error"
+                _decision = "reloaded_generation_unknown"
+                _read_failed = True
+            else:
+                _read_failed = False
+            if isinstance(_rec, dict):
+                _current = str(_rec.get("generation", "") or "")
+                if not _current:
+                    _reason = "record_invalid"
+                elif _current != _expected:
+                    _decision = "reloaded_generation_mismatch"
+                    _reason = "generation_mismatch"
+                elif not os.path.isdir(self.config.models_path):
+                    _reason = "mount_missing"
+                else:
+                    _decision = "skipped_generation_match"
+                    _reason = "exact_match"
+            elif not _read_failed:
+                _reason = "record_unavailable"
+        _check_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        return {
+            "decision": _decision,
+            "reason": _reason,
+            "expected_generation": _expected,
+            "current_generation": _current,
+            "check_ms": _check_ms,
+        }
+
+    def _runtime_state_generation_path(self) -> str:
+        """Resolve the runtime-state generation marker path.
+
+        Uses the explicit config path when set, otherwise derives it from the
+        prescan record directory (both live on the runtime-state Volume root,
+        e.g. ``{RUNTIME_STATE_PATH}/``).  Returns ``""`` when nothing is
+        resolvable — callers fail closed (no baseline, reload as before).
+        """
+        path = getattr(self.config, "runtime_state_generation_path", "") or ""
+        if not path:
+            prescan = getattr(self.config, "prescan_record_path", "") or ""
+            if prescan:
+                path = os.path.join(
+                    os.path.dirname(prescan), RUNTIME_STATE_GENERATION_FILENAME
+                )
+        return str(path or "")
+
+    def finalize_runtime_state_generation(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        reason: str = "construction",
+    ) -> str:
+        """Construction-time marker write + baseline capture (Batch B rev 2).
+
+        Called at the END of snapshot construction — after every
+        correctness-relevant runtime-state write (including the optional
+        GPU-capacity freeze) and before snapshot capture.
+
+        Builds the content manifest of the correctness-relevant construction
+        files via LOCAL reads/hashes, writes
+        ``{root}/runtime_config_generation.json`` (schema v2, generation +
+        files manifest) through the same plain local-filesystem atomic writer
+        used by the other construction files (no Volume API, no RPC), and
+        freezes the exact generation + manifest into BootstrapState.
+
+        Fail closed: any derivation/read/hash failure (including a missing
+        required file) leaves the baseline generation AND manifest empty,
+        which forces the existing reload at restore time.  Returns the
+        captured generation (``""`` on failure).  Never raises.
+        """
+        _t0 = time.perf_counter()
+        _baseline = ""
+        _manifest: dict[str, Any] = {}
+        _source = "unavailable"
+        try:
+            _path = self._runtime_state_generation_path()
+            if not _path:
+                _source = "path_unavailable"
+            else:
+                _root = os.path.dirname(_path)
+                _builder = self.build_runtime_state_manifest
+                _manifest = _builder(
+                    _root,
+                    tuple(getattr(self.config, "runtime_state_manifest_files", ()) or ()),
+                    required=tuple(
+                        getattr(self.config, "runtime_state_manifest_required", ()) or ()
+                    ),
+                ) or {}
+                if not _manifest:
+                    _source = "manifest_empty"
+                else:
+                    _writer = self.write_runtime_state_generation_marker
+                    _baseline = (
+                        _writer(_root, reason=reason, files_manifest=_manifest) or ""
+                    )
+                    self.state.runtime_state_generation_marker_written = bool(_baseline)
+                    if _baseline:
+                        _source = "runtime_config_generation_json"
+        except Exception as _gen_exc:
+            _source = f"write_error:{type(_gen_exc).__name__}"
+            _baseline = ""
+            _manifest = {}
+        self.state.snapshot_runtime_state_generation = _baseline
+        self.state.snapshot_runtime_state_manifest = dict(_manifest)
+        _write_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        print(
+            f"[v2.runtime_state_generation_baseline] source={_source} "
+            f"generation={(_baseline[:12] + '…') if len(_baseline) > 12 else (_baseline or '-')} "
+            f"files={len(_manifest)} "
+            f"write_ms={_write_ms}",
+            flush=True,
+        )
+        if trace:
+            trace.emit(
+                "runtime_state_generation_baseline",
+                phase="startup",
+                metadata={
+                    "source": _source,
+                    "generation": _baseline[:12],
+                    "files": len(_manifest),
+                    "write_ms": _write_ms,
+                    "fail_closed_reload": int(not bool(_baseline)),
+                },
+            )
+        return _baseline
+
+    def _decide_runtime_state_reload(self) -> dict[str, Any]:
+        """O(1) local decision: is the runtime-state Volume reload required?
+
+        Reads ``runtime_config_generation.json`` from the restored mount using
+        LOCAL filesystem access only (no ``Volume.reload()``, no RPC).
+
+        Exact skip requires BOTH:
+          A. marker generation == snapshot baseline generation, AND
+          B. every correctness-relevant file on the restored mount matches
+             the captured construction manifest (expected-present files exist
+             with matching sha256; expected-absent files remain absent).
+
+        Fail closed: missing/corrupt/mismatched/unknown state means reload.
+        """
+        _t0 = time.perf_counter()
+        _expected = str(getattr(self.state, "snapshot_runtime_state_generation", "") or "")
+        _expected_manifest = dict(
+            getattr(self.state, "snapshot_runtime_state_manifest", None) or {}
+        )
+        _decision = "reloaded_generation_unknown"
+        _reason = "no_snapshot_baseline"
+        _current = ""
+        if _expected and _expected_manifest:
+            _root = os.path.dirname(self._runtime_state_generation_path())
+            try:
+                _reader = self.read_runtime_state_generation_marker
+                _rec = _reader(_root)
+            except Exception:
+                _rec = None
+                _reason = "record_read_error"
+                _decision = "reloaded_generation_error"
+                _read_failed = True
+            else:
+                _read_failed = False
+            if isinstance(_rec, dict):
+                _schema = int(_rec.get("schema_version", 0) or 0)
+                _current = str(_rec.get("generation", "") or "")
+                _marker_files = _rec.get("files")
+                if _schema != RUNTIME_STATE_GENERATION_SCHEMA_VERSION:
+                    _reason = "record_invalid"
+                elif not _current:
+                    _reason = "record_invalid"
+                elif _current != _expected:
+                    _decision = "reloaded_generation_mismatch"
+                    _reason = "generation_mismatch"
+                elif not isinstance(_marker_files, dict) or not _marker_files:
+                    _reason = "manifest_invalid"
+                elif _marker_files != _expected_manifest:
+                    _reason = "manifest_mismatch"
+                elif not _root or not os.path.isdir(_root):
+                    _reason = "mount_missing"
+                else:
+                    try:
+                        _verifier = self.verify_runtime_state_manifest
+                        _ok, _v_reason = _verifier(_root, _expected_manifest)
+                    except Exception as _vexc:
+                        _ok = False
+                        _v_reason = f"manifest_read_error:{type(_vexc).__name__}"
+                    if not _ok:
+                        _reason = _v_reason
+                        if _v_reason.startswith("manifest_read_error"):
+                            _decision = "reloaded_generation_error"
+                    else:
+                        _decision = "skipped_generation_match"
+                        _reason = "exact_match"
+            elif not _read_failed:
+                _reason = "record_unavailable"
+        elif not _expected:
+            _reason = "no_snapshot_baseline"
+        else:
+            _reason = "manifest_no_baseline"
+        _check_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        return {
+            "decision": _decision,
+            "reason": _reason,
+            "expected_generation": _expected,
+            "current_generation": _current,
+            "check_ms": _check_ms,
+        }
 
     def _read_current_custom_node_identity(self) -> dict[str, str]:
         """Authoritative-only read of the current custom-node identity.
@@ -1773,7 +2126,37 @@ class RuntimeBootstrap:
                             },
                         )
 
-            # ── 3. reload_runtime_state ──
+            # ── 3. reload_runtime_state (Batch B guard) ──
+            # Skip the network Volume reload when the mounted
+            # runtime_config_generation.json marker exactly matches the
+            # snapshot construction baseline (single O(1) local file read —
+            # no RPC).  Fail closed: missing/corrupt/mismatched/unknown state
+            # performs the existing reload exactly as before.  A skip never
+            # invokes the reload callback, so the modal_app-side
+            # _RUNTIME_STATE_VOLUME_RELOADED_MONO stamp is never falsely
+            # populated (the 900 s cert-reload dedup keeps its meaning of
+            # "a remote Volume reload actually executed").
+            _runtime_state_reload_decision = "reloaded_generation_unknown"
+            _runtime_state_reload_reason = "unconditional"
+            _runtime_state_reload_check_ms = 0.0
+            _runtime_state_reload_skipped = False
+            if self.reload_runtime_state is not None:
+                _runtime_state_reload = self._decide_runtime_state_reload()
+                _runtime_state_reload_decision = _runtime_state_reload["decision"]
+                _runtime_state_reload_reason = _runtime_state_reload["reason"]
+                _runtime_state_reload_check_ms = _runtime_state_reload["check_ms"]
+                _runtime_state_reload_skipped = (
+                    _runtime_state_reload_decision == "skipped_generation_match"
+                )
+            else:
+                # No reload callback configured: legacy behavior preserved
+                # byte-identically (no-op stage), reported as legacy_path.
+                _runtime_state_reload_decision = "legacy_path"
+                _runtime_state_reload_reason = "unconditional"
+            _runtime_state_reload_invoked = (
+                (not _runtime_state_reload_skipped) and self.reload_runtime_state is not None
+            )
+
             def _do_reload_runtime_state():
                 if trace:
                     trace.emit("reload_runtime_state_start", phase="restore")
@@ -1781,10 +2164,56 @@ class RuntimeBootstrap:
                     self.reload_runtime_state()
                 if trace:
                     trace.emit("reload_runtime_state_end", phase="restore")
-            with variance_stage(trace, stage="runtime_state", phase="restore"):
-                _do_reload_runtime_state()
 
-            # ── 4. reload_models ──
+            with variance_stage(trace, stage="runtime_state", phase="restore"):
+                if _runtime_state_reload_skipped:
+                    # The construction-time generation marker already proves
+                    # the restored mount matches the snapshot write set.
+                    pass
+                else:
+                    _do_reload_runtime_state()
+            print(
+                f"[v2.runtime_state_volume_restore] "
+                f"decision={_runtime_state_reload_decision} "
+                f"reason={_runtime_state_reload_reason} "
+                f"callback_called={int(_runtime_state_reload_invoked)} "
+                f"runtime_state_reload_invoked={int(_runtime_state_reload_invoked)} "
+                f"check_ms={_runtime_state_reload_check_ms}",
+                flush=True,
+            )
+            if trace:
+                trace.emit(
+                    "runtime_state_reload_decision",
+                    phase="restore",
+                    metadata={
+                        "decision": _runtime_state_reload_decision,
+                        "reason": _runtime_state_reload_reason,
+                        "callback_called": int(_runtime_state_reload_invoked),
+                        "runtime_state_reload_invoked": int(_runtime_state_reload_invoked),
+                        "check_ms": _runtime_state_reload_check_ms,
+                    },
+                )
+
+            # ── 4. reload_models (Batch A guard) ──
+            # Skip the network Volume reload when the mounted models
+            # generation record exactly matches the snapshot construction
+            # baseline (single O(1) local file read — no RPC).  Fail
+            # closed: missing/corrupt/mismatched/unknown state performs the
+            # existing reload exactly as before.
+            _models_reload_decision = "reloaded_generation_unknown"
+            _models_reload_reason = "unconditional"
+            _models_reload_check_ms = 0.0
+            _models_reload_skipped = False
+            if self.reload_models is not None:
+                _models_reload = self._decide_models_reload()
+                _models_reload_decision = _models_reload["decision"]
+                _models_reload_reason = _models_reload["reason"]
+                _models_reload_check_ms = _models_reload["check_ms"]
+                _models_reload_skipped = _models_reload_decision == "skipped_generation_match"
+            _models_reload_callback_called = (
+                (not _models_reload_skipped) and self.reload_models is not None
+            )
+
             def _do_reload_models():
                 if trace:
                     trace.emit("reload_models_start", phase="restore")
@@ -1792,8 +2221,33 @@ class RuntimeBootstrap:
                     self.reload_models()
                 if trace:
                     trace.emit("reload_models_end", phase="restore")
+
             with variance_stage(trace, stage="models", phase="restore"):
-                _do_reload_models()
+                if _models_reload_skipped:
+                    # The existing generation contract already proves the
+                    # mounted model state matches the snapshot baseline.
+                    pass
+                else:
+                    _do_reload_models()
+            print(
+                f"[v2.models_volume_restore] "
+                f"decision={_models_reload_decision} "
+                f"reason={_models_reload_reason} "
+                f"callback_called={int(_models_reload_callback_called)} "
+                f"check_ms={_models_reload_check_ms}",
+                flush=True,
+            )
+            if trace:
+                trace.emit(
+                    "models_reload_decision",
+                    phase="restore",
+                    metadata={
+                        "decision": _models_reload_decision,
+                        "reason": _models_reload_reason,
+                        "callback_called": int(_models_reload_callback_called),
+                        "check_ms": _models_reload_check_ms,
+                    },
+                )
 
             # Lane B: restore prescan identity from persisted record
             # (measurement-only bracket; the function is a no-op fallback
@@ -1995,6 +2449,17 @@ class RuntimeBootstrap:
                 )
 
             self.state.restore_completed_at = time.time()
+            # ── Host hardware telemetry (once per container restore) ──
+            # Runs OUTSIDE every variance_stage block so it can never alter
+            # stage timing.  Silent no-op when the telemetry module is not
+            # deployed (guarded import).
+            try:
+                from comfymodal_runtime import host_hardware_telemetry as _hht
+                _hht.set_trace(trace)
+                _hht.emit_host_fingerprint(trace)
+                _hht.capture_resource_snapshot("post_restore", trace)
+            except Exception:
+                pass
             if trace:
                 trace.emit(
                     "snapshot_restore_end",
@@ -2037,6 +2502,8 @@ class RuntimeBootstrap:
                         "sage_verify_ms": _sage_verify_ms,
                         "prescan_identity_ms": _opt_prescan_identity_ms,
                         "custom_node_check_ms": _opt_custom_node_check_ms,
+                        "models_reload_check_ms": _models_reload_check_ms,
+                        "runtime_state_reload_check_ms": _runtime_state_reload_check_ms,
                         "seed_read_ms": _opt_seed_read_sum_ms(),
                         "gc_ms": _opt_gc_ms,
                     }
@@ -2046,6 +2513,9 @@ class RuntimeBootstrap:
                             _measured_sum_ms += _dec_meta[_out_key]
                         else:
                             _dec_meta[_out_key] = None
+                    _dec_meta["models_reload_decision"] = _models_reload_decision
+                    _dec_meta["runtime_state_reload_decision"] = _runtime_state_reload_decision
+                    _dec_meta["runtime_state_reload_invoked"] = int(_runtime_state_reload_invoked)
                     _bootstrap_total_ms = round((time.perf_counter() - started) * 1000, 3)
                     _dec_meta["bootstrap_total_ms"] = _bootstrap_total_ms
                     _dec_meta["measured_sum_ms"] = round(_measured_sum_ms, 3)
