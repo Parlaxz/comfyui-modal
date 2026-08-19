@@ -844,6 +844,59 @@ def _try_fast_hydrate(
             # loop applies — a mismatch drops the speculative tensors and
             # falls back to the normal per-file read.
             _spec_per_file_sds, _spec_owners, _spec_record = _speculative_taken
+            # ── E30: demand-time take/bind/owner-retained events ──
+            # The reader's own take/bind events inside clip_qd_load mark the
+            # SOURCE-side boundaries; the authoritative demand-time take +
+            # bind + owner-retain happen HERE.  Emit the E30 contract events
+            # (canonical ledger + trace) exactly when the QD reader produced
+            # the tensors (record.qd_used), so a QD-entered run is provable
+            # end-to-end and a fastsafe lane never fabricates QD events.
+            _qd_used = bool((_spec_record or {}).get("qd_used", False))
+            if _qd_used:
+                try:
+                    from .clip_qd_reader import (
+                        EVT_TAKE,
+                        EVT_BIND,
+                        EVT_OWNER_RETAINED,
+                        emit_qd_event,
+                        ledger_event,
+                    )
+
+                    _qd_take_meta = {
+                        "request_id": _rid,
+                        "path": str(files[0].get("path", "")) if files else "",
+                        "taken": True,
+                        "files": len(_spec_per_file_sds),
+                        "qd_used": True,
+                    }
+                    emit_qd_event(trace, EVT_TAKE, **_qd_take_meta)
+                    ledger_event(EVT_TAKE, **_qd_take_meta)
+                    emit_qd_event(
+                        trace, EVT_BIND,
+                        request_id=_rid,
+                        files=len(_spec_per_file_sds),
+                        qd_used=True,
+                    )
+                    ledger_event(
+                        EVT_BIND,
+                        request_id=_rid,
+                        files=len(_spec_per_file_sds),
+                        qd_used=True,
+                    )
+                    emit_qd_event(
+                        trace, EVT_OWNER_RETAINED,
+                        request_id=_rid,
+                        owners=len(_spec_owners),
+                        qd_used=True,
+                    )
+                    ledger_event(
+                        EVT_OWNER_RETAINED,
+                        request_id=_rid,
+                        owners=len(_spec_owners),
+                        qd_used=True,
+                    )
+                except Exception:
+                    pass
             # E28 Target C: when the speculative lane applied the compute-ready
             # FP32 cast-once, verification expects FP32 (the cast target) —
             # exact key set + shapes as frozen, dtype FP32.  Fail-closed: any
@@ -1042,6 +1095,54 @@ def _try_fast_hydrate(
                     "speculative": int(_speculative_taken is not None),
                 },
             )
+        except Exception:
+            pass
+        # ── E31: cast-once demand-time residency proof + generation ──
+        # When the cast-once flag was applied, prove the bind actually left
+        # persistent FP32 compute-ready storage on the CURRENT model object
+        # and mark the generation; any doubt fails closed (the verification
+        # itself is evidence, never a silent claim).  Default OFF with the
+        # flag; zero cost with the flag off.
+        try:
+            from .clip_fp32_cast_once import (
+                cast_once_enabled as _e31_cast_once_enabled,
+                mark_cast_once_applied as _e31_mark_applied,
+                verify_resident_fp32 as _e31_verify_resident,
+            )
+
+            if _e31_cast_once_enabled():
+                _e31_ok, _e31_record = _e31_verify_resident(clip)
+                if not _e31_ok:
+                    # Fail closed: the bind did not produce provable FP32
+                    # residency — surface it as a visible event instead of a
+                    # silent claim (a subsequent forward would fall back to
+                    # the regular cast path, which is safe, but the A/B must
+                    # never mistake it for cast-once).
+                    _emit(
+                        trace,
+                        "clip_fh_cast_once_residency_failed",
+                        {
+                            "reason": str(_e31_record.get("reason", "")),
+                            "generation": int(_e31_record.get("generation", 0)),
+                        },
+                    )
+                else:
+                    _e31_mark_applied(clip)
+                    _emit(
+                        trace,
+                        "clip_fh_cast_once_applied",
+                        {
+                            "generation": int(
+                                _e31_record.get("generation", 0)
+                            ),
+                            "fp32_params": int(
+                                (_e31_record.get("count_by_dtype") or {}).get(
+                                    "torch.float32", 0
+                                )
+                            ),
+                            "total_bytes": int(_e31_record.get("total_bytes", 0)),
+                        },
+                    )
         except Exception:
             pass
         if _orchestration_record is not None:

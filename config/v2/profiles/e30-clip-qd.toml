@@ -1,0 +1,22 @@
+# v2ctl profile: E30 CLIP QD-IO.
+schema_version = 1
+name = "e30-clip-qd"
+extends = "production"
+owner = "E30"
+
+[workload]
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# E30 genuine-QD CLIP source reader (default OFF; this profile opts in).
+COMFYMODAL_V2_CLIP_QD_READER = "1"
+COMFYMODAL_V2_CLIP_QD_QD = "4"
+COMFYMODAL_V2_CLIP_QD_BLOCK_MIB = "32"
+COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY = "restore_earliest"
+# No artifact by default; set COMFYMODAL_V2_CLIP_QD_ARTIFACT to a container
+# path to persist per-block stats JSON on the remote gate.
+COMFYMODAL_V2_CLIP_FAST_HYDRATION = "1"
+COMFYMODAL_V2_CLIP_COLD_FORENSICS = "1"

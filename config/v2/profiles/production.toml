@@ -1,0 +1,57 @@
+# v2ctl production profile — base profile with the real production defaults
+# from deploy_and_run_v2_single.bat (Batch E32, Agent A).
+schema_version = 1
+name = "production"
+owner = "v2-core"
+# No extends: production is the base profile.
+
+[target]
+app = "stable-modal-comfy-v2-restore-only-shadow"
+class = "ModalRuntimeEntrypointV2"
+method = "run_plan_stream"
+
+[resources]
+gpu = "rtx-pro-6000"
+cpu = 12
+memory_mb = 32768
+min_containers = 0
+scaledown_window = 4
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = ""
+run_count = 10
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# Real production defaults pinned by deploy_and_run_v2_single.bat.
+COMFYMODAL_V2_ENV_PROFILE = "production"
+COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "1"
+COMFYMODAL_V2_NATIVE_FAST_DISK_UNET = "1"
+COMFYMODAL_V2_VAE_SNAPSHOT = "1"
+COMFYMODAL_V2_CLIP_CONDITIONING_CACHE = "1"
+COMFYMODAL_V2_UNET_ACTIVATION_MODE = "late"
+COMFYMODAL_V2_VAE_ACTIVATION_MODE = "late"
+COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE = "1"
+COMFYMODAL_V2_THREAD_POLICY = "TBASE"
+COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER = "O0"
+COMFYMODAL_V2_MEMORY_MB = "32768"
+COMFYMODAL_V2_CPU_REQUEST = "12"
+COMFYMODAL_V2_VAE_POLICY = "v1"
+COMFYMODAL_V2_BASELINE_CPU_REQUEST = "12"
+COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "32768"
+COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST = "1"
+COMFYMODAL_V2_GPU_FAST_RETURN = "1"
+COMFYMODAL_V2_UNET_FASTSAFETENSORS = "0"
+COMFYMODAL_V2_CLIP_FAST_HYDRATION = "0"
+COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "0"
+COMFYMODAL_V2_CLIP_COLD_FORENSICS = "0"
+COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST = "0"
+COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA = "0"
+COMFYMODAL_V2_INPUT_TYPES_WARM = "1"
+COMFYMODAL_V2_UNET_FORENSICS = "0"
+COMFYMODAL_V2_C9QD_EXTRAS = "0"

@@ -4699,6 +4699,17 @@ def _build_sampling_wrapper() -> Callable:
             "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
             "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
+        # ── E29: sampling span opened on the canonical axis ──────────────
+        # The trace-event bridge pairs this start with the authoritative
+        # sampling_end (closed in the wrapper finally) into one ledger span.
+        try:
+            from comfymodal_runtime.critical_path_ledger import TraceSpanBridge
+            TraceSpanBridge(
+                "sampling", lane="SAMPLING",
+                metadata={"node_id": str(node_id), "node_class": str(node_class)},
+            ).start(mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
         # ── Host hardware telemetry: sampling-start resource snapshot ──
         # Silent no-op when the telemetry module is not deployed (guarded
         # import).  Never raises, never alters sampling timing.
@@ -4935,6 +4946,36 @@ def _build_sampling_wrapper() -> Callable:
             # restoration) below, and cannot mask the original sampler
             # exception propagating through this finally block.
             _sampling_end_event = None
+            # ── E29: canonical ledger sampling_end boundary ──────────────
+            # The exact instant the sampler returned is stamped on the
+            # canonical axis (before the trace emission) so the serial ledger
+            # can decompose sampling_end -> VAE transition from first
+            # principles.
+            try:
+                from comfymodal_runtime.critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "sampling_end",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={
+                        "node_id": str(node_id),
+                        "duration_ms": duration_ms,
+                        "request_id": str(getattr(trace, "request_id", "") or ""),
+                    },
+                )
+            except Exception:
+                pass
+            # ── E29: sampling span closed on the canonical axis ──────────
+            # The trace-event bridge turns the sampler start/end pair into a
+            # canonical ledger span so the serial ledger owns the sampling
+            # stage boundary; the span's residual classifies any unexplained
+            # wall inside the sampler as UNATTRIBUTED.
+            try:
+                from comfymodal_runtime.critical_path_ledger import TraceSpanBridge
+                TraceSpanBridge("sampling", lane="SAMPLING").end(
+                    mono_ns=time.monotonic_ns()
+                )
+            except Exception:
+                pass
             try:
                 _sampling_end_event = trace.emit("sampling_end", phase="execution", metadata={
                     "node_id": node_id,

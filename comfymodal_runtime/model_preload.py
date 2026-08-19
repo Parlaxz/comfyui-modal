@@ -15613,7 +15613,29 @@ def _build_unet_activation_key(
 def _mm_load_models_gpu(models: list[Any], **kwargs: Any) -> Any:
     """Call the live ComfyUI ``load_models_gpu`` (the original load path)."""
     import comfy.model_management as _mm
-    return _mm.load_models_gpu(models, **kwargs)
+    # ── E29: canonical ledger model-management boundary ──────────────────
+    # Every request-scoped load_models_gpu call is bridged into the canonical
+    # ledger as a real span so the serial ledger owns the VAE/UNET model
+    # management wall (entry, lane wait, load, exit) instead of hiding it in
+    # an anonymous "post-sampling" bucket.  The bridge is keyed by the
+    # function name so nested/reentrant calls keep their own span.
+    try:
+        from .critical_path_ledger import TraceSpanBridge
+        TraceSpanBridge(
+            "model-mgmt:load_models_gpu", lane="MODEL-MGMT",
+        ).start(mono_ns=time.monotonic_ns())
+    except Exception:
+        pass
+    try:
+        return _mm.load_models_gpu(models, **kwargs)
+    finally:
+        try:
+            from .critical_path_ledger import TraceSpanBridge
+            TraceSpanBridge("model-mgmt:load_models_gpu", lane="MODEL-MGMT").end(
+                mono_ns=time.monotonic_ns()
+            )
+        except Exception:
+            pass
 
 
 # Max pinned bytes for the early-activation transfer fix (protects the
@@ -20133,6 +20155,12 @@ def _run_early_vae_activation(
             state, trace, request_id, status="invalid",
             reason="residency_not_proven", diagnostics=_evidence,
         )
+    # ── E29: close the VAE activation span (ready path) ─────────────────
+    if _span_vae_activation is not None:
+        try:
+            _span_vae_activation.finish(mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
     return _vae_activation_terminal(
         state, trace, request_id, status="ready", reason="ok",
         transfer_count=state["transfer_count"], diagnostics=_evidence,
@@ -20357,6 +20385,35 @@ def _run_vae_early_start_worker(
     failed and lets the unchanged sampling_end A path resubmit.
     """
     _worker_started_mono_ns = time.monotonic_ns()
+    # ── E29: canonical ledger VAE worker first-instruction marker ────────
+    # Stamped on the canonical axis with the request identity so the queue
+    # delay between submission and the worker's first instruction is directly
+    # measurable (and never silently attributed to a guessed stage).
+    try:
+        from .critical_path_ledger import record_event as _ledger_event
+        _ledger_event(
+            "vae_worker_first_instruction",
+            mono_ns=_worker_started_mono_ns,
+            metadata={
+                "request_id": request_id,
+                "worker": "vae_early_start",
+            },
+        )
+    except Exception:
+        pass
+    # ── E29: canonical ledger VAE activation span ────────────────────────
+    # The whole early-activation worker (queue -> lane acquire -> load ->
+    # validation) becomes one ledger span so the serial ledger owns the
+    # sampling_end -> VAE-ready transition wall.
+    try:
+        from .critical_path_ledger import begin_span as _ledger_begin_span
+        _span_vae_activation: Any = _ledger_begin_span(
+            "vae:early-activation", lane="VAE",
+            start_mono_ns=_worker_started_mono_ns,
+            metadata={"request_id": request_id, "worker": "vae_early_start"},
+        )
+    except Exception:
+        _span_vae_activation = None
     with _VAE_ACTIVATION_LOCK:
         state["worker_started_mono_ns"] = _worker_started_mono_ns
     # ── Phase 0: worker-started milestone ──
@@ -20465,6 +20522,14 @@ def _run_vae_early_start_worker(
             flush=True,
         )
         return {"status": "failed", "reason": "precopy_failed"}
+    # ── E29: close the VAE activation span (cancelled path) ─────────
+    # The B-arm worker also owns a ledger span when it runs (see the
+    # first-instruction marker above); close it on the cancelled path too.
+    if _span_vae_activation is not None:
+        try:
+            _span_vae_activation.finish(mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
     # ── Phase 2: wait for the authoritative sampling_end boundary ──
     _phase2_start_ns = time.monotonic_ns()
     _VAE_SAMPLING_END_EVENT.wait(timeout=60.0)
@@ -20475,6 +20540,12 @@ def _run_vae_early_start_worker(
     if state.get("cancelled") or state.get("terminal"):
         if not future.done():
             future.set_result(None)
+        # ── E29: close the VAE activation span (cancelled path) ─────────
+        if _span_vae_activation is not None:
+            try:
+                _span_vae_activation.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         return {"status": "cancelled", "reason": "request_finalized"}
     try:
         import torch as _torch_p3
@@ -20528,6 +20599,12 @@ def _run_vae_early_start_worker(
             state, trace, request_id, status="ready", reason="ok",
             transfer_count=state["transfer_count"],
         )
+        # ── E29: close the VAE activation span (ready path) ─────────────
+        if _span_vae_activation is not None:
+            try:
+                _span_vae_activation.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         if not future.done():
             future.set_result(True)
         if trace is not None:
@@ -20586,6 +20663,12 @@ def _run_vae_early_start_worker(
                 state["reason"] = "lane_bind_failed"
                 state["error"] = str(exc)[:200]
                 state["terminal_mono_ns"] = time.monotonic_ns()
+        # ── E29: close the VAE activation span (failed path) ────────────
+        if _span_vae_activation is not None:
+            try:
+                _span_vae_activation.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         if not future.done():
             future.set_result(None)
         print(
@@ -21015,6 +21098,28 @@ def _vae_activation_submit(
         _state["sampling_end_duration_ms"] = round(float(sampling_end_duration_ms or 0.0), 3)
         _state["status"] = "scheduled"
         _state["submitted_mono_ns"] = time.monotonic_ns()
+        # ── E29: canonical ledger VAE handoff markers ────────────────────
+        # Every handoff in the sampling_end -> VAE worker path is stamped on
+        # the canonical axis with the exact request identity so the serial
+        # ledger can prove where the ~899 ms bucket lives (queue delay, lane
+        # wait, scheduler delay, CPU starvation, allocator, sync, or
+        # UNATTRIBUTED) — never a guessed owner.
+        try:
+            from .critical_path_ledger import record_event as _ledger_event
+            _ledger_event(
+                "vae_activation_submitted",
+                mono_ns=int(_state.get("submitted_mono_ns", 0) or 0),
+                metadata={
+                    "request_id": request_id,
+                    "trigger": trigger,
+                    "vae_identity_hash": (
+                        stable_hash(str(model_key.vae_identity))[:16]
+                        if model_key is not None else ""
+                    ),
+                },
+            )
+        except Exception:
+            pass
         # Emit the concise scheduled line BEFORE submitting so the worker's
         # load-start (guarded by the same lock) can never precede it.
         if trace is not None:

@@ -3977,6 +3977,21 @@ async def _run_one(
             float(_wf_total_wall_ms) - _node_registry_init_ms, 3
         )
     artifact["production_adjusted_total_wall_ms"] = production_adjusted_total_wall_ms
+    # ── E29: persist the canonical ledger into the run artifact ─────────
+    # The remote result carries the full canonical ledger report (spans,
+    # events, reconciliation, serial zero-gap ledger); surface it at the top
+    # level of the persisted run artifact so offline validation reads the
+    # SAME structure the remote emitted (never a host-side re-derivation).
+    try:
+        _remote_ledger = None
+        if isinstance(result, dict):
+            _remote_ledger = result.get("canonical_ledger")
+            if not isinstance(_remote_ledger, dict) and isinstance(result.get("data"), dict):
+                _remote_ledger = result["data"].get("canonical_ledger")
+        if isinstance(_remote_ledger, dict):
+            artifact["canonical_ledger"] = _remote_ledger
+    except Exception:
+        pass
     (output_dir / f"run_{index}.json").write_text(
         json.dumps(artifact, default=str, indent=2), encoding="utf-8"
     )
@@ -9692,6 +9707,8 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                 "cannot build an authoritative plan validation proof"
             )
         _nri_preload_ms = round((time.perf_counter_ns() - _nri_preload_start_ns) / 1_000_000, 3)
+        # E29: define _nri_preload_ms on every path (summary.json field exists
+        # unconditionally; the 0.0 default was set only on the primed branch).
         print(
             f"[v2.harness] node_registry_preload_ms={_fmt_v2_metric(_nri_preload_ms)}",
             flush=True,
@@ -9699,6 +9716,9 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
     else:
         _nri_preload_ms = 0.0
         print("[v2.harness] node_registry_preload_skipped store_generation_entry=yes", flush=True)
+    if "_nri_preload_ms" not in locals():
+        _nri_preload_ms = 0.0
+        print("[v2.harness] node_registry_preload_skipped reason=no_store_check", flush=True)
 
     requested_shape = runtime_shape_config().identity_payload()
     shape_guard = _runtime_shape_guard(requested_shape)
@@ -9774,6 +9794,18 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         )
     output_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"v2_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    # ── Deployment identity for the transport handle cache (E29 fix) ─────
+    # ModalTransport caches the Modal function handle keyed by deployment
+    # identity; without it the cache never invalidates and a redeploy keeps
+    # resolving the OLD deployment's handle (old image).  Export the
+    # recorded deployment hash so every run resolves the CURRENT image.
+    try:
+        _ds = json.loads((ROOT / ".deployed_state.json").read_text(encoding="utf-8"))
+        _dh = str(_ds.get("deployment_combined_hash") or "").strip()
+        if _dh:
+            os.environ["COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH"] = _dh
+    except Exception:
+        pass
     transport = ModalTransport()
 
     # ── Variance-cold mode (explicit opt-in; unique shadow app name) ──────

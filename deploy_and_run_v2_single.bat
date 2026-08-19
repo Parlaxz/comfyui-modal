@@ -714,6 +714,20 @@ if "!V1_EXISTS!"=="1" (
         exit /b !V2_EXIT!
     )
 
+    REM ── Deploy-failure detection (E29 root-cause fix) ────────────────────
+    REM The Modal client can exit 0 even when the deploy actually failed
+    REM (e.g. a Windows charmap codec crash while printing build output, or a
+    REM Modal-side error box).  NEVER treat such a deploy as successful: scan
+    REM the captured log for the Modal error-box marker, a Python traceback,
+    REM or the charmap codec crash signature, and fail hard when present.
+    findstr /C:"+- Error" /C:"Traceback (most recent call last)" /C:"charmap" /C:"codec can't encode" "!V2_LOG!" >nul 2>nul
+    if not errorlevel 1 (
+        echo === ERROR: V2 deploy output contains a Modal/Python error marker despite exit 0 ===
+        echo === The deployed app was NOT updated. Refusing to continue. ===
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+
     REM Validate V2 identifiers
     python -c "import sys; s=''.join(open(sys.argv[1],encoding='utf-8',errors='replace').read().split()); sys.exit(0 if ''.join(sys.argv[2].split()) in s else 1)" "!V2_LOG!" "!V2_DEPLOY_IDENT!"
     if errorlevel 1 (
@@ -833,6 +847,17 @@ if "!V1_EXISTS!"=="1" (
         if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
         exit /b !V2_DEPLOY_EXIT!
     )
+    REM ── Deploy-failure detection (E29 root-cause fix; mirrors the first
+    REM deploy check): a Modal client that exits 0 with an error marker in
+    REM the log must never be treated as a successful deploy. ──
+    findstr /C:"+- Error" /C:"Traceback (most recent call last)" /C:"charmap" /C:"codec can't encode" "!V2_LOG!" >nul 2>nul
+    if not errorlevel 1 (
+        echo === ERROR: V2 deploy output contains a Modal/Python error marker despite exit 0 ===
+        echo === The deployed app was NOT updated. Refusing to continue. ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
 
     REM Validate V2 identifiers
     python -c "import sys; s=''.join(open(sys.argv[1],encoding='utf-8',errors='replace').read().split()); sys.exit(0 if ''.join(sys.argv[2].split()) in s else 1)" "!V2_LOG!" "!V2_DEPLOY_IDENT!"
@@ -882,6 +907,16 @@ if "!V1_EXISTS!"=="1" (
         echo === ERROR: V2 re-deploy after Volume publish failed with exit code !V2_REEXIT! ===
         if defined V2_RELOG if exist "!V2_RELOG!" del /q "!V2_RELOG!"
         exit /b !V2_REEXIT!
+    )
+    REM ── Deploy-failure detection (E29 root-cause fix; mirrors the first
+    REM deploy check): a Modal client that exits 0 with an error marker in
+    REM the log must never be treated as a successful re-deploy. ──
+    findstr /C:"+- Error" /C:"Traceback (most recent call last)" /C:"charmap" /C:"codec can't encode" "!V2_RELOG!" >nul 2>nul
+    if not errorlevel 1 (
+        echo === ERROR: V2 re-deploy output contains a Modal/Python error marker despite exit 0 ===
+        echo === The deployed app was NOT updated. Refusing to continue. ===
+        if defined V2_RELOG if exist "!V2_RELOG!" del /q "!V2_RELOG!"
+        exit /b 1
     )
     if defined V2_RELOG if exist "!V2_RELOG!" del /q "!V2_RELOG!"
     echo === V2 re-deploy after Volume publish verified OK ===
