@@ -19,6 +19,7 @@ import pytest
 
 from tools.v2_control.errors import GateError
 from tools.v2_control.validation import (
+    CanonicalLedgerValidator,
     ConfirmRunner,
     ExpectedOutputShaValidator,
     GateRunner,
@@ -36,6 +37,7 @@ from tests.v2ctl_fakes import (
     FakeBackendRunner,
     FakeConfig,
     FakeFingerprints,
+    FakeFlag,
     FakeSpec,
 )
 
@@ -378,3 +380,100 @@ class TestBuildRunRecord:
         assert record.telemetry["request_id"] == "req-0001"
         assert record.run_fingerprint == "r" * 64
         assert record.deploy_fingerprint == "d" * 64
+
+
+class TestCanonicalLedgerValidator:
+    """E29: the canonical ledger is the authoritative payload; a run with a
+    missing/errored ledger must never pass the tracer gate, and the validator
+    must NOT require ledger events inside ordinary trace.events."""
+
+    def _config_with_ledger_on(self) -> FakeConfig:
+        config = FakeConfig()
+        config.flags.append(FakeFlag(name="COMFYMODAL_V2_CRITICAL_PATH_LEDGER", value="1"))
+        return config
+
+    def _record(self, artifact_data: dict, tmp_path: Path) -> RunRecord:
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text(json.dumps(artifact_data), encoding="utf-8")
+        result = FakeBackendRunner(
+            stdout="request_id=req-0001\ncorrelation_id=corr-0001\nfresh=1\nrestored=0\n",
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        ).run(FakeSpec(), config=FakeConfig())
+        return build_run_record_from_result(result, FakeConfig(), "d" * 64, "r" * 64)
+
+    def test_missing_ledger_fails(self, tmp_path):
+        record = self._record({"request_id": "req-0001"}, tmp_path)
+        failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
+        assert any("canonical ledger missing" in f for f in failures)
+
+    def test_error_status_fails(self, tmp_path):
+        record = self._record(
+            {"canonical_ledger_status": "error", "canonical_ledger_error": {"stage": "finalize"}},
+            tmp_path,
+        )
+        failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
+        assert any("errored" in f for f in failures)
+
+    def test_missing_endpoints_fails(self, tmp_path):
+        record = self._record(
+            {
+                "canonical_ledger_status": "ok",
+                "canonical_ledger": {"endpoint_status": "missing", "serial_ledger": None},
+            },
+            tmp_path,
+        )
+        failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
+        assert any("endpoint_status" in f for f in failures)
+
+    def test_zero_gap_false_fails(self, tmp_path):
+        record = self._record(
+            {
+                "canonical_ledger_status": "ok",
+                "canonical_ledger": {
+                    "endpoint_status": "ok",
+                    "serial_ledger": {"zero_gap": False},
+                },
+            },
+            tmp_path,
+        )
+        failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
+        assert any("zero-gap" in f for f in failures)
+
+    def test_ok_ledger_passes(self, tmp_path):
+        record = self._record(
+            {
+                "canonical_ledger_status": "ok",
+                "canonical_ledger": {
+                    "endpoint_status": "ok",
+                    "serial_ledger": {"zero_gap": True},
+                },
+            },
+            tmp_path,
+        )
+        failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
+        assert failures == []
+
+    def test_ledger_off_profile_passes_without_ledger(self, tmp_path):
+        # Ledger flag OFF → validator must NOT fail on a missing ledger.
+        record = self._record({"request_id": "req-0001"}, tmp_path)
+        config = FakeConfig()  # no flag → off
+        failures = CanonicalLedgerValidator().validate(record, config)
+        assert failures == []
+
+    def test_does_not_require_ledger_events_in_trace_events(self, tmp_path):
+        # The E29 ledger lives in data["canonical_ledger"], NOT in
+        # trace.events — a passing artifact must not need modal_restore_entry
+        # etc. inside ordinary RuntimeTrace events.
+        record = self._record(
+            {
+                "canonical_ledger_status": "ok",
+                "canonical_ledger": {
+                    "endpoint_status": "ok",
+                    "serial_ledger": {"zero_gap": True},
+                },
+                "trace": {"events": []},  # ordinary trace has NO ledger events
+            },
+            tmp_path,
+        )
+        failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
+        assert failures == []

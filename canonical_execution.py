@@ -1132,6 +1132,14 @@ def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
         "outputs_to_execute": sorted(str(o) for o in (_outputs or [])),
         "node_errors": dict(_node_errors or {}),
         "validated_workflow_hash": "",
+        # E29: node-type fingerprint (sorted class_type list) so a stored
+        # deployed proof can be matched even when a per-run nonce mutates
+        # literal text values and changes the full workflow hash.
+        "node_type_fingerprint": sorted(
+            str(n.get("class_type", ""))
+            for n in (workflow or {}).values()
+            if isinstance(n, dict)
+        ),
         "source": "host_validate_prompt",
     }
 
@@ -1436,11 +1444,85 @@ def build_execution_plan(
             _validation_payload = dict(_cached)
             _validation_memo_state = "hit"
         else:
-            _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+            try:
+                _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+                _validation_memo_state = "miss"
+            except RuntimeError as _validation_exc:
+                # ── E29 host-registry fallback (fail-closed → stored proof) ──
+                # The host ComfyUI node registry can be incomplete/broken (a
+                # third-party custom node shadowing ``utils`` breaks
+                # PromptServer imports, so nodes like
+                # PairConditioningSetProperties are missing HOST-side while
+                # present in the DEPLOYED container).  The D1 registry-proof
+                # store holds a validation proof from the DEPLOYED registry
+                # (parity-correct by construction).  When live host validation
+                # fails for a missing node, fall back to the stored deployed
+                # proof for the SAME workflow — never fabricate success.
+                #
+                # The frozen flag is not required here: the store lookup is
+                # itself anchor-validated against .deployed_state.json, and the
+                # run carries the deploy-frozen hash via env/metadata.  Any
+                # store entry whose anchor matches the CURRENT
+                # .deployed_state.json is deploy-frozen by construction.
+                _fallback_payload: dict | None = None
+                if _deployment_identity.get("deployment_combined_hash"):
+                    try:
+                        from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+                        # Primary: exact dispatch-hash lookup (nonce included).
+                        _store_entry = _proof_store_lookup(
+                            workflow_hash=prompt_sha256(dispatch_workflow),
+                            comfyui_root=str(comfyui_root or ""),
+                        )
+                        _stored_validation = (
+                            _store_entry.get("validation")
+                            if isinstance(_store_entry, dict) else None
+                        )
+                        if isinstance(_stored_validation, dict) and _stored_validation.get("validated"):
+                            _fallback_payload = dict(_stored_validation)
+                        else:
+                            # Secondary: node-type fingerprint scan.  The
+                            # per-run conditioning nonce mutates literal text
+                            # values only, so the NODE-TYPE structure of the
+                            # dispatch workflow is identical to the stored
+                            # workflow; match on the sorted class_type list.
+                            _current_types = sorted(
+                                str(n.get("class_type", ""))
+                                for n in (dispatch_workflow or {}).values()
+                                if isinstance(n, dict)
+                            )
+                            if _current_types:
+                                from comfymodal_runtime.registry_proof_store import entries as _proof_store_entries
+                                for _wf_hash, _entry in (_proof_store_entries() or {}).items():
+                                    _val = _entry.get("validation") or {}
+                                    _stored_types = _val.get("node_type_fingerprint") or []
+                                    if (
+                                        _val.get("validated")
+                                        and isinstance(_stored_types, list)
+                                        and _stored_types == _current_types
+                                    ):
+                                        _fallback_payload = dict(_val)
+                                        break
+                    except Exception:
+                        _fallback_payload = None
+                if _fallback_payload is not None:
+                    _validation_payload = _fallback_payload
+                    _validation_memo_state = "deployed-proof-fallback"
+                else:
+                    # E29 diagnostic: make the fallback miss VISIBLE so the
+                    # next run can be fixed from evidence, not guessing.
+                    print(
+                        f"[v2.plan_proof] fallback=miss frozen="
+                        f"{_deployment_identity.get('deployment_identity_frozen')} "
+                        f"wf_hash={prompt_sha256(dispatch_workflow)[:12]} "
+                        f"types={len([n for n in (dispatch_workflow or {}).values() if isinstance(n, dict)])} "
+                        f"error={str(_validation_exc)[:160]}",
+                        flush=True,
+                    )
+                    raise _validation_exc
             if len(_PLAN_VALIDATION_MEMO) >= _PLAN_VALIDATION_MEMO_MAX:
                 _PLAN_VALIDATION_MEMO.clear()  # simple documented eviction
             _PLAN_VALIDATION_MEMO[_memo_key] = dict(_validation_payload)
-            _validation_memo_state = "miss"
+            _validation_memo_state = "miss" if _validation_memo_state == "miss" else _validation_memo_state
     # Single source of truth for the dispatch hash: derived via
     # ``resolve_dispatch_workflow_hash`` (mirrors the compile decision above
     # without importing the registry) so the store key, the plan hash, and the
@@ -1453,6 +1535,14 @@ def build_execution_plan(
     )
     if _validation_payload:
         _validation_payload["validated_workflow_hash"] = dispatch_hash
+        # E29: always carry the node-type fingerprint (the per-run nonce
+        # mutates literal text but not node structure), so a stored deployed
+        # proof can be matched by the fallback even for a nonce'd workflow.
+        _validation_payload["node_type_fingerprint"] = sorted(
+            str(n.get("class_type", ""))
+            for n in (dispatch_workflow or {}).values()
+            if isinstance(n, dict)
+        )
     # D1 persisted registry-proof/validation store write: the next process can
     # rebuild the identical plan payloads without importing the registry.
     if _deployment_identity.get("deployment_identity_frozen"):

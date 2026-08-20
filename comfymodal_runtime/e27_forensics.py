@@ -607,6 +607,26 @@ def install_soft_empty_cache_wrapper(mm_module: Any, torch_mod: Any) -> str:
                             "duration_ms": round((end_ns - start_ns) / 1_000_000, 4),
                         },
                     )
+                    # ── E29: canonical ledger soft_empty_cache event ──────
+                    # The measured soft_empty_cache wall (sync + empty_cache +
+                    # ipc) becomes a ledger event so the serial ledger owns
+                    # the sampling_end->VAE memory-management window with
+                    # REAL measured values (never the D18-era assumption).
+                    try:
+                        from .critical_path_ledger import record_event as _ledger_event
+                        _ledger_event(
+                            "soft_empty_cache",
+                            mono_ns=start_ns,
+                            metadata={
+                                "status": status,
+                                "total_ms": round((end_ns - start_ns) / 1_000_000, 4),
+                                "sync_ms": sync.get("wall_ms"),
+                                "empty_cache_ms": empty.get("wall_ms"),
+                                "ipc_collect_ms": ipc.get("wall_ms"),
+                            },
+                        )
+                    except Exception:
+                        pass
                 _SOFT_CACHE_CONTEXT.record = None
 
         setattr(wrapper, _SENTINEL_SOFT_CACHE, True)

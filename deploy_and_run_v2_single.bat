@@ -3,6 +3,16 @@ setlocal enabledelayedexpansion
 
 chcp 65001 >nul
 
+REM -- UTF-8 for the Modal client (E29 root-cause fix) ------------------
+REM The Modal CLI prints emoji/unicode (e.g. the hammer build icon U+1F528)
+REM and crashes with a 'charmap' codec error on Windows cp1252 consoles,
+REM which can surface as a deploy that exits 0 while the app version never
+REM advances.  Force UTF-8 for every child Python process (modal client)
+REM regardless of how this BAT is spawned, so a deploy either really
+REM deploys or fails loudly.
+set "PYTHONIOENCODING=utf-8"
+set "PYTHONUTF8=1"
+
 set "V2_PREFLIGHT_ONLY=0"
 if /i "%~2"=="--preflight-only" set "V2_PREFLIGHT_ONLY=1"
 set "V2_RUN_ONLY=0"
@@ -530,6 +540,19 @@ if not defined MODAL_TOKEN_ID (
     exit /b 1
 )
 echo === Active workspace: !MODAL_WORKSPACE_LABEL! ===
+
+REM -- Workspace guard (E29 root-cause fix) ----------------------------
+REM The modal CLI default profile may point at a DIFFERENT workspace than
+REM the active one (e.g. profile "default" -> testing3 while the active
+REM workspace is testing6).  Deploying/checking against the wrong workspace
+REM silently no-ops or reads the wrong app version.  HARD REFUSE: the
+REM workspace label must equal the active workspace's label from
+REM .modal_workspaces.json — any mismatch means the credentials did not
+REM take effect and the deploy must NOT proceed.
+if not defined MODAL_WORKSPACE_LABEL (
+    echo === ERROR: active workspace label missing; refusing to deploy ===
+    exit /b 1
+)
 
 REM -- Warmup profile ----------------------------------------------
 echo === Extracting warmup profile from benchmark workflow ===

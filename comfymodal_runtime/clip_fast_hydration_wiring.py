@@ -751,6 +751,21 @@ def _try_fast_hydrate(
     _orchestration_record = None
     _copy_event = None
     _scoped_readiness = _gpu_coord.scoped_cuda_readiness_enabled()
+    # ── E29: canonical ledger CLIP hydration span ───────────────────────
+    # The whole fast-hydrate window (source read / speculative take / bind /
+    # sync) becomes one ledger span so the serial ledger owns CLIP GPU
+    # hydration wall (E30/E31 decision input) instead of hiding it inside
+    # the coarse executor span.  Never raises.
+    _span_clip_hydration: Any = None
+    try:
+        from .critical_path_ledger import begin_span as _ledger_begin_span
+        _span_clip_hydration = _ledger_begin_span(
+            "CLIP hydration", lane="CLIP",
+            start_mono_ns=time.monotonic_ns(),
+            metadata={"source": "clip_fast_hydration_wiring._try_fast_hydrate"},
+        )
+    except Exception:
+        _span_clip_hydration = None
     # ── E25: take a completed speculative read (file->GPU + transform) so
     # the file read is hidden under setup; verification + bind + sync still
     # run here exactly as before.  Fail-closed: on any inconsistency the
@@ -1192,6 +1207,12 @@ def _try_fast_hydrate(
         except Exception:
             pass
         _emit(trace, "clip_fh_hydration_end", result)
+        # ── E29: close the canonical ledger CLIP hydration span ─────────
+        if _span_clip_hydration is not None:
+            try:
+                _span_clip_hydration.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         return result
     except Exception as exc:
         if _orchestration_record is not None:
@@ -1214,6 +1235,12 @@ def _try_fast_hydrate(
             torch.cuda.empty_cache()
         except Exception:
             pass
+        # ── E29: close the canonical ledger CLIP hydration span (error) ──
+        if _span_clip_hydration is not None:
+            try:
+                _span_clip_hydration.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         reason = f"{type(exc).__name__}: {str(exc)[:160]}"
         state = cfh.clip_hydration_state(clip)["state"]
         _emit_decision(

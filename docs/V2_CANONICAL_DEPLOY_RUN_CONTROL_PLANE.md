@@ -147,6 +147,7 @@ python tools/v2ctl.py run
 python tools/v2ctl.py deploy-run
 python tools/v2ctl.py gate
 python tools/v2ctl.py confirm
+python tools/v2ctl.py source-probe
 python tools/v2ctl.py runtime-flags
 python tools/v2ctl.py lock
 ```
@@ -245,6 +246,22 @@ A structurally invalid gate exits nonzero.
 Only runs after a valid gate manifest and rechecks that source/config/deployment have not changed.
 
 This encodes the project rule: **one cold run first; inspect/validate it; only then spend a confirmation run.**
+
+## 4.9 `source-probe` (E29 source-identity stop-gate)
+
+Proves, WITHOUT any generation, that the bytes the deployed GPU class actually imports equal the expected local source. This is the authoritative answer to "is the remote running my code?" — image IDs, app versions, and trace contents are NOT proof.
+
+```text
+python tools/v2ctl.py source-probe --profile e29-tracer --owner E29
+```
+
+- Invokes the deployed class's no-generation `source_identity_probe` method (registered via `_modal.method()` in `_build_decorated_v2_class` — a method wrapped only in `_METHODS_TO_WRAP` but NOT `_modal.method()`-decorated is never exposed by Modal and returns `NotFoundError`).
+- Compares remote SHA-256 against expected local SHA-256 for: `modal_app.py`, `critical_path_ledger.py`, `runtime_bootstrap.py`, `runtime_executor.py`, `gantt_telemetry.py`.
+- Classifies each module `MATCH` / `MISMATCH` / `MISSING` / `UNEXPECTED_PATH`; exits nonzero unless ALL match.
+- Reports the ledger enable state (`COMFYMODAL_V2_CRITICAL_PATH_LEDGER`, `_ENABLED`, `record_event` presence) from inside the container.
+- On PASS, flips the matching deployment manifest's `source_identity_status` from `unverified` → `verified` (deploy-health semantics: `deployment_transport_status` / `runtime_health_status` / `source_identity_status` are distinct; a deployment is fully validated only after the source probe succeeds AND a gate observes the container running).
+
+The ONLY v2ctl command that makes a direct Modal SDK call. It uses the ACTIVE workspace credentials from `.modal_workspaces.json` (never the raw `modal` CLI profile) — see the workspace pitfall below.
 
 ---
 
@@ -749,35 +766,44 @@ that `V2_BENCHMARK_MODE` is a full-run mode (`e28_single`/`e26_single`/
 and that Modal shows `run_plan_stream` — NOT `run_snapshot_restore_only_probe`.
 Never "fix" a structurally invalid gate by rerunning the same config.
 
-## 22c. Known Pitfall — Stale Warm Containers Serve Old Code (MUST READ)
+## 22c. Known Pitfall — "Stale container" diagnostics (CORRECTED after E29)
 
-**Symptom (observed E29 gate iterations):** a gate run reports a correct
-profile/SHA but the artifact's `source_identity.class_name` is an OLD class
-(e.g. `ModalRuntimeEntrypoint` while the deployment targets
-`ModalRuntimeEntrypointV2`) and the container trace has NONE of the current
-instrumentation events despite the flags being effective.  The gate was
-served by a warm container from a PREVIOUS deployment.
+**Symptom (early E29 gate iterations):** a gate run reports a correct
+profile/SHA but the artifact's `source_identity.class_name` is
+`ModalRuntimeEntrypoint` while the deployment targets
+`ModalRuntimeEntrypointV2`, and the container trace has NONE of the current
+instrumentation events.  This was initially attributed to warm containers
+serving old code.
 
-**Why:** Modal keeps warm containers alive across redeploys of the same app
-(a redeploy does not terminate them).  A reused container runs the code it
-was started with — the OLD bake.  `fresh_required` and `restore_count==1`
-alone do NOT prove the container runs the CURRENT deployment's code.
+**CORRECTION (proven during E29):** `class_name=ModalRuntimeEntrypoint` is
+a LEGACY NAMING ARTIFACT — the deployed class is dynamically built as
+`ModalRuntimeEntrypointV2` from the base `ModalRuntimeEntrypoint`, and the
+container reports the base name.  A class-name mismatch is NOT a stale-
+container signal.  The actual root causes of the missing E29 events were the
+use-before-assignment bug and the missing `_modal.method()` registration
+(see §24.5/§24.4), NOT stale containers.  Warm-container reuse is real
+(Modal keeps containers alive across redeploys; `restore_count` increments),
+but it is not diagnosed by the class name.
 
-**Detection:** verify `source_identity.class_name` matches the configured
-target class.  A mismatch means a stale container: mark it `stale_container`,
-never fresh.  Also verify the current instrumentation events are present in
-the container trace.
+**Detection (authoritative):** `python tools/v2ctl.py source-probe
+--profile <p>` — byte-compare the deployed modules' SHA-256 against the
+expected local source (MATCH/MISMATCH/MISSING/UNEXPECTED_PATH).  That is
+the ONLY proof of which code the container runs.  Image IDs and class names
+are NOT proof (Modal's `add_local_python_source` without `copy=True` mounts
+local bytes at container start; the same image ID can serve different
+Python sources, and vice versa).
 
 **The reliable fix:** run cold-gate validation with
 `COMFYMODAL_V2_SINGLE_USE_CONTAINERS=1` so every request starts a fresh
-container with the current baked code.  This is the only dependable fresh-
-cold proof under Modal warm reuse.
+container with the current baked code.  This remains the dependable fresh-
+cold boundary under Modal warm reuse.
 
-**Agent rule:** before trusting a "fresh" gate, confirm (a) the container
-class matches the deployment target, (b) the current instrumentation is
-present in the trace, and (c) the container was started for this request
-(`request_count==1` with single-use containers).  A warm container must be
-treated as RESTORED and can never satisfy a fresh-required gate.
+**Agent rule:** before trusting a "fresh" gate, confirm (a) the source-
+probe MATCHes the current tree, (b) the current instrumentation events are
+present in the artifact's `canonical_ledger` (NOT `trace.events`), and
+(c) the container was started for this request (`restore_count==1` with
+single-use containers).  A warm container is RESTORED and can never satisfy
+a fresh-required gate.
 
 ---
 
@@ -791,7 +817,154 @@ If `v2ctl` itself is broken, the agent must diagnose/fix `v2ctl` or stop and rep
 
 ---
 
-# 24. Non-Goals
+# 24. Operational Playbook — Pitfalls That Cost Days (E29 batch, all proven)
+
+## 24.1 Deploy/run recipe that works (E29 verified)
+
+```text
+# 1. Check the deploy lock and resolve config
+python tools/v2ctl.py lock status
+python tools/v2ctl.py config --profile e29-tracer
+
+# 2. Deploy (acquires the lock; verifies the app version ADVANCED)
+python tools/v2ctl.py deploy --profile e29-tracer --owner E29
+
+# 3. Prove the deployed bytes equal the local source (no generation)
+python tools/v2ctl.py source-probe --profile e29-tracer --owner E29
+#   → verdict=MATCH + manifest source_identity_status=verified
+
+# 4. One cold gate (one paid generation)
+python tools/v2ctl.py gate --profile e29-tracer --owner E29
+#   → valid=1 requires: fresh container, exact output SHA,
+#     canonical_ledger_status=ok, endpoint_status=ok, zero_gap=True
+```
+
+The canonical ledger (E29) lives in the run artifact under
+`canonical_ledger` (with `canonical_ledger_status`), NOT in ordinary
+`trace.events`. Validate against `data["canonical_ledger"]`:
+`events`, `spans`, `serial_ledger`, `reconciliation`, `endpoint_status`.
+
+## 24.2 Workspace mismatch — the raw `modal` CLI is NOT the active workspace
+
+The `modal` CLI profile (`modal profile list`) can point at a DIFFERENT
+workspace than the one `.modal_workspaces.json` marks active (observed:
+profile `default` → testing3, active workspace → testing6). Consequences:
+
+- `modal app history <app>` reads the WRONG workspace's versions (v9 vs v33+).
+- A direct `modal deploy` deploys to the WRONG workspace.
+
+**Rule:** never use the raw `modal` CLI for version checks or deploys.
+v2ctl resolves credentials from `.modal_workspaces.json`
+(`active_workspace_id`) — `_app_version_number`, `_load_workspace`, and the
+BAT's workspace-loading all use those credentials. `MODAL_TOKEN_ID` /
+`MODAL_TOKEN_SECRET` from the active workspace must be in the child env.
+
+## 24.3 Deploy exit 0 ≠ app updated — verify the version ADVANCED
+
+A Modal deploy can exit 0 while the app version does NOT advance (Windows
+`charmap` codec crash printing the 🔨/🎉 emoji, or a cached no-op). v2ctl
+refuses such deploys: it captures the app's highest version number BEFORE
+the deploy (`_app_version_number`, workspace-aware) and requires a strictly
+greater number AFTER. Never trust "App deployed" + exit 0 alone.
+
+Windows environment requirement (taste/lessons): `chcp 65001` +
+`PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8` for every modal/child process, or
+the CLI's Unicode error panel crashes with `charmap` and produces an EMPTY
+or misleading deploy log. The deploy/run BATs set these at the top.
+
+## 24.4 A method must be `_modal.method()`-registered to exist remotely
+
+Adding a new remote method to `ModalRuntimeEntrypoint` requires BOTH:
+
+1. the method definition on the class, AND
+2. `setattr(cls, "<name>", _modal.method()(cls.<name>))` in
+   `_build_decorated_v2_class`, AND
+3. `"<name>"` in `_METHODS_TO_WRAP` AND `_NON_WORKFLOW_METHODS`.
+
+A method only in `_METHODS_TO_WRAP` is wrapped but NEVER exposed by Modal —
+the deployed class returns
+`NotFoundError: Class has no method <name>`. This cost a full deploy cycle.
+
+## 24.5 Instrumentation must never silently fail (E29 ledger lesson)
+
+The E29 canonical ledger was missing from every remote run for days because
+the finalization block referenced `_span_durable_result` before assignment
+(use-before-assignment → `UnboundLocalError`) inside a broad
+`except Exception: pass`. Rules for lifecycle instrumentation:
+
+- initialize every span holder to `None` at the TOP of the function;
+- open `request:executor-run` at PLAN RECEIPT, close it at
+  `first_durable_result`;
+- NEVER swallow finalization exceptions on a tracer run: attach
+  `canonical_ledger_status="ok"|"error"` + `canonical_ledger_error`
+  to the result so a broken tracer FAILS the gate, not silently vanishes;
+- the serial ledger MUST use explicit authoritative endpoints
+  (`remote_python_resume_mono_ns` → `first_durable_result_mono_ns`), never
+  min/max of existing events — a truncated ledger must not tile its own
+  truncated interval and claim zero-gap (`endpoint_status="missing"` fails).
+
+## 24.6 Host plan validation can fail on the LOCAL node registry
+
+`build_execution_plan` runs `execution.validate_prompt` HOST-side
+(fail-closed). The host node registry can be broken/incomplete while the
+deployed container is fine — observed causes:
+
+- a third-party custom node (`ComfyUI-CacheDiT/utils.py` or the rgthree
+  emoji print without UTF-8) breaks `server.py`'s `utils.install_util`
+  import → `PromptServer`-importing packs (Impact Pack, rgthree) fail to
+  load → `missing_node_type` for `PairConditioningSetProperties` /
+  `Any Switch (rgthree)`.
+
+Fix (implemented): when live host validation fails, `build_execution_plan`
+falls back to the D1 registry-proof store's DEPLOYED validation proof,
+matched by `node_type_fingerprint` (sorted `class_type` list — the per-run
+conditioning nonce changes literal text only, not node structure). The
+store must be primed (`python tools/benchmark_v2_direct.py
+--prime-registry-proof`, run by the deploy BAT) with UTF-8 so the full
+registry (incl. rgthree) loads and stores a validated proof WITH the
+fingerprint. The fallback is fail-closed: it only uses a stored proof whose
+anchor matches the current `.deployed_state.json` and whose fingerprint
+matches the workflow.
+
+## 24.7 The ledger must be copied into the SAMPLE artifact
+
+The remote attaches `canonical_ledger` to the result; `run_0.json` carries
+it. But the gate validates `run_001_sample.json`, written by
+`experiment_result_store.build_run_record`. If the record builder drops
+unknown keys, the ledger vanishes from the validated artifact. The record
+builder now carries `canonical_ledger` + `canonical_ledger_status` +
+`canonical_ledger_error`; the artifact writer in `benchmark_v2_direct.py`
+surfaces status/error too. When adding new remote payload keys, ALWAYS
+check both the artifact writer AND the sample-record builder.
+
+## 24.8 `class_name` is a legacy naming artifact, NOT a stale signal
+
+The deployed class is dynamically built as `ModalRuntimeEntrypointV2`
+(`type("ModalRuntimeEntrypointV2", (ModalRuntimeEntrypoint,), ...)`) but the
+container may report `class_name=ModalRuntimeEntrypoint` (the base).
+A class-name mismatch is NOT proof of a stale container. Use the
+source-probe (byte hashes) + image/container identity for staleness, never
+the class name.
+
+## 24.9 Canonical ledger events do not live in `trace.events`
+
+`critical_path_ledger.record_event()` writes into the ledger's OWN stores
+(`_EVENTS` / `_RESTORE_EVENTS`), NOT the ordinary `RuntimeTrace`. "The
+remote trace lacks `modal_restore_entry`, therefore the source is old" is an
+INVALID inference. The E29 validation target is `data["canonical_ledger"]`.
+Keep E30/E31 normal trace-event ingestion separate from E29 ledger storage
+unless an explicit bridge joins them.
+
+## 24.10 The `source-probe` manifest flip
+
+`source-probe` PASS flips the deployment manifest
+(`.v2ctl/deployments/deploy_*.json`) `source_identity_status` to
+`verified`. The manifest is a JSON file (read/write via the path, not the
+parsed dict — `latest_deployment_manifest()` returns a dict).
+
+---
+
+# 26. Non-Goals
 
 This design does not require:
 
@@ -806,7 +979,7 @@ The goal is one authoritative, reproducible control plane around the existing ru
 
 ---
 
-# 25. Final Design Rule
+# 27. Final Design Rule
 
 Move from:
 

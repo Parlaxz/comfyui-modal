@@ -52,11 +52,14 @@ COMFYMODAL_V2_CLIP_QD_READER = "0"
 COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
 COMFYMODAL_V2_E31_FORENSICS = "0"
 COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"
-# ── Cold-gate container guarantee (root-cause fix) ─────────────────────
-# A warm container from a previous deployment serves stale code (proven:
-# gate runs showed class_name=ModalRuntimeEntrypoint with no E29 ledger
-# events).  Single-use containers terminate after each request, so every
-# gate request runs on a freshly-restarted container with the CURRENT
-# baked code — the only reliable way to prove a genuinely fresh cold
-# generation under Modal's warm-container reuse.
+# ── Cold-gate container guarantee (cold-run semantics) ─────────────────
+# Single-use containers terminate after each request, so every gate request
+# runs on a freshly-restarted container — a genuine cold-generation boundary.
+# NOTE: a fresh container is NOT by itself source-identity proof: Modal
+# delivers the local Python source through its local-source packaging path,
+# so an unchanged base image ID or a fresh container does not prove the
+# Python source bytes are current.  Source identity is proven separately by
+# `v2ctl source-probe` (remote SHA-256 == expected local SHA-256).  The
+# class_name reported by the container is a legacy naming artifact, not a
+# stale-code signal.
 COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
