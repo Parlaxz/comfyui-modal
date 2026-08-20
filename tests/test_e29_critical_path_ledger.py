@@ -598,6 +598,30 @@ class E30E31LedgerIngestionTest(unittest.TestCase):
         for e in events:
             self.assertEqual(e["identity"]["request_id"], "e30e31-fixture")
 
+    def test_speculative_clip_lane_events_ingested(self):
+        # The restore-time speculative CLIP source lane (E28) emits its
+        # started/finished boundaries on the canonical axis so the ledger can
+        # prove overlap vs stretch of the concurrent source read.
+        t0 = time.monotonic_ns()
+        cpl.record_event("clip_speculative_lane_started", mono_ns=t0)
+        cpl.record_event("clip_speculative_lane_finished", mono_ns=t0 + 1_000_000)
+        events = cpl.get_events()
+        names = [e["name"] for e in events]
+        self.assertIn("clip_speculative_lane_started", names)
+        self.assertIn("clip_speculative_lane_finished", names)
+
+    def test_unet_and_empty_cache_events_ingested(self):
+        # The plan-receipt UNET lane submit and the measured soft_empty_cache
+        # wall are ledger events (Phase 8/9 evidence).
+        t0 = time.monotonic_ns()
+        cpl.record_event("unet_lane_submitted", mono_ns=t0)
+        cpl.record_event("soft_empty_cache", mono_ns=t0 + 500_000,
+                         metadata={"total_ms": 12.5, "empty_cache_ms": 10.0})
+        events = cpl.get_events()
+        names = [e["name"] for e in events]
+        self.assertIn("unet_lane_submitted", names)
+        self.assertIn("soft_empty_cache", names)
+
 
 class ErrorPathTest(unittest.TestCase):
     """record_event / begin_span must never raise on bad input."""
@@ -620,6 +644,242 @@ class ErrorPathTest(unittest.TestCase):
         self.assertIsNotNone(s)
         s.finish(end_mono_ns=time.monotonic_ns())
         self.assertGreaterEqual(len(cpl.get_spans()), 1)
+
+
+class AuthoritativeEndpointsTest(unittest.TestCase):
+    """E29 acceptance contract: the serial ledger MUST be bounded by the
+    explicit authoritative endpoints, never by min/max(existing events)."""
+
+    def setUp(self):
+        cpl.clear_ledger_for_test()
+        cpl.set_request_identity(
+            request_id="req-ep",
+            restored_instance_id="ri-1",
+            restore_session_id="rs-1",
+            container_session_id="cs-1",
+        )
+
+    def tearDown(self):
+        cpl.clear_ledger_for_test()
+
+    def test_report_requires_both_endpoints(self):
+        # No endpoints → endpoint_status missing, serial_ledger None.
+        with cpl.begin_span("request:executor-run", lane="EXECUTOR") as s:
+            s.record_work(1_000_000)
+        report = cpl.request_ledger_report()
+        self.assertEqual(report["endpoint_status"], "missing")
+        self.assertIsNone(report["serial_ledger"])
+        self.assertIn("remote_python_resume_mono_ns", report["missing_endpoints"])
+        self.assertIn("first_durable_result_mono_ns", report["missing_endpoints"])
+
+    def test_report_uses_explicit_endpoints_not_minmax(self):
+        # Spans exist ONLY in a narrow window; the report must still cover the
+        # FULL authoritative window with explicit UNATTRIBUTED gaps.
+        start = time.monotonic_ns()
+        with cpl.begin_span("request:executor-run", lane="EXECUTOR") as s:
+            s.record_work(2_000_000)
+        span_end = max(sp["end_mono_ns"] for sp in cpl.get_spans())
+        # Authoritative window is LARGER than the span window on both sides.
+        cpl.set_authoritative_endpoints(
+            remote_python_resume_mono_ns=start - 5_000_000,
+            first_durable_result_mono_ns=span_end + 5_000_000,
+        )
+        report = cpl.request_ledger_report()
+        self.assertEqual(report["endpoint_status"], "ok")
+        self.assertEqual(report["start_mono_ns"], start - 5_000_000)
+        self.assertEqual(report["end_mono_ns"], span_end + 5_000_000)
+        serial = report["serial_ledger"]
+        # The pre-span and post-span windows MUST be explicit UNATTRIBUTED.
+        names = [seg["name"] for seg in serial["segments"]]
+        self.assertGreaterEqual(names.count("UNATTRIBUTED"), 2)
+        self.assertGreater(serial["unattributed_ms"], 0.0)
+        self.assertTrue(serial["zero_gap"])
+
+    def test_truncated_ledger_cannot_shrink_bounds(self):
+        # A ledger with only a tiny tail must NOT report zero-gap over the
+        # truncated interval: the authoritative window is fixed.
+        start = time.monotonic_ns()
+        with cpl.begin_span("late-only", lane="SAMPLING") as s:
+            s.record_work(1_000_000)
+        end = max(sp["end_mono_ns"] for sp in cpl.get_spans())
+        cpl.set_authoritative_endpoints(
+            remote_python_resume_mono_ns=start,
+            first_durable_result_mono_ns=end + 3_000_000,
+        )
+        report = cpl.request_ledger_report()
+        serial = report["serial_ledger"]
+        # The gap between the span and the end must be explicit UNATTRIBUTED.
+        self.assertEqual(serial["end_mono_ns"], end + 3_000_000)
+        names = [seg["name"] for seg in serial["segments"]]
+        self.assertIn("UNATTRIBUTED", names)
+
+    def test_clear_resets_endpoints(self):
+        cpl.set_authoritative_endpoints(
+            remote_python_resume_mono_ns=123,
+            first_durable_result_mono_ns=456,
+        )
+        cpl.clear_ledger_for_test()
+        report = cpl.request_ledger_report()
+        self.assertEqual(report["endpoint_status"], "missing")
+
+
+class V38SpanSurvivalRegressionTest(unittest.TestCase):
+    """Reproduce the v38 2-spans/6-events failure so it can never return.
+
+    v38's canonical ledger had restore_span_count=0, request_span_count=2
+    (only the bridge spans ``sampling`` + ``executor:graph-execution``), and
+    every direct ``begin_span`` (restore decomposition, request-setup,
+    ``request:executor-run``) silently died.  Root causes:
+
+    * ``CriticalPathSpan.finish`` only accepted ``end_mono_ns`` but every
+      close site passed ``mono_ns=`` -> TypeError swallowed by the
+      surrounding ``except Exception: pass``.
+    * Restore spans were opened AFTER their close sites (None at close).
+    * ``_deserialize_end_ns`` was referenced before assignment.
+
+    These tests lock the FIXED behavior: the ledger API must accept both
+    keyword spellings and the close-after-open lifecycle must persist.
+    """
+
+    def setUp(self):
+        cpl.clear_ledger_for_test()
+
+    def tearDown(self):
+        cpl.clear_ledger_for_test()
+
+    def test_finish_accepts_mono_ns_keyword(self):
+        # The exact v38 bug: close sites used finish(mono_ns=...); this must
+        # now be an alias for end_mono_ns and MUST persist the span.
+        t0 = time.monotonic_ns()
+        s = cpl.begin_span("restore:early", lane="RESTORE", start_mono_ns=t0)
+        time.sleep(0.002)
+        s.finish(mono_ns=time.monotonic_ns())
+        spans = cpl.get_spans()
+        self.assertEqual(len(spans), 1, "finish(mono_ns=...) must persist the span")
+        self.assertEqual(spans[0]["name"], "restore:early")
+        self.assertIsNotNone(spans[0]["end_mono_ns"])
+        self.assertGreaterEqual(spans[0]["duration_ms"], 0.0)
+
+    def test_finish_end_mono_ns_still_works(self):
+        s = cpl.begin_span("restore:finalize", lane="RESTORE")
+        s.finish(end_mono_ns=time.monotonic_ns())
+        spans = cpl.get_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["name"], "restore:finalize")
+
+    def test_restore_phase_spans_survive_begin_request(self):
+        # The v38 lifecycle: restore spans must be created BEFORE their close
+        # sites and survive the request-scoped reset at method entry.
+        cpl.begin_restore("req-v38")
+        t0 = time.monotonic_ns()
+        early = cpl.begin_span("restore:early", lane="RESTORE", start_mono_ns=t0)
+        early.finish(mono_ns=time.monotonic_ns())
+        evict = cpl.begin_span("restore:eviction", lane="RESTORE",
+                               start_mono_ns=time.monotonic_ns())
+        evict.finish(mono_ns=time.monotonic_ns())
+        snap = cpl.begin_span("restore:snapshot", lane="RESTORE",
+                              start_mono_ns=time.monotonic_ns())
+        snap.finish(mono_ns=time.monotonic_ns())
+        cpl.begin_request("req-v38")
+        restore_spans = cpl.get_restore_spans()
+        self.assertEqual(len(restore_spans), 3)
+        names = [s["name"] for s in restore_spans]
+        self.assertEqual(names, ["restore:early", "restore:eviction", "restore:snapshot"])
+
+    def test_request_setup_spans_persist_with_close(self):
+        # The v38 request-setup spans were created but never closed -> never
+        # persisted.  Closing them must land them in the request store.
+        cpl.begin_request("req-setup")
+        t0 = time.monotonic_ns()
+        idc = cpl.begin_span("request:identity-capture", lane="REQUEST-SETUP",
+                             start_mono_ns=t0)
+        idc.finish(mono_ns=time.monotonic_ns())
+        ds = cpl.begin_span("request:plan-deserialize", lane="REQUEST-SETUP",
+                            start_mono_ns=time.monotonic_ns())
+        ds.finish(mono_ns=time.monotonic_ns())
+        ss = cpl.begin_span("request:setup-schedule", lane="REQUEST-SETUP",
+                            start_mono_ns=time.monotonic_ns())
+        ss.finish(mono_ns=time.monotonic_ns())
+        spans = cpl.get_spans()
+        self.assertEqual(len(spans), 3)
+        names = [s["name"] for s in spans]
+        for expected in ("request:identity-capture", "request:plan-deserialize",
+                         "request:setup-schedule"):
+            self.assertIn(expected, names)
+
+    def test_executor_run_span_plan_received_to_durable_result(self):
+        # request:executor-run opens at plan_received and closes at the
+        # durable result; it must persist with the exact end boundary.
+        cpl.begin_request("req-exec")
+        t0 = time.monotonic_ns()
+        cpl.record_event("plan_received", mono_ns=t0)
+        run = cpl.begin_span("request:executor-run", lane="EXECUTOR",
+                             start_mono_ns=t0)
+        time.sleep(0.002)
+        end = time.monotonic_ns()
+        cpl.record_event("first_durable_result", mono_ns=end)
+        run.finish(mono_ns=end)
+        spans = cpl.get_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["name"], "request:executor-run")
+        self.assertEqual(spans[0]["start_mono_ns"], t0)
+        self.assertEqual(spans[0]["end_mono_ns"], end)
+
+    def test_identity_set_then_refreshed_keeps_ids(self):
+        # The v38 identity block was empty because set_request_identity ran
+        # before the IDs existed.  A later refresh must update the block used
+        # by subsequent spans/events.
+        cpl.set_request_identity(request_id="req-1")
+        with cpl.begin_span("early", lane="RESTORE") as s:
+            s.record_work(1_000_000)
+        # IDs are created later in restore; refresh now.
+        cpl.set_request_identity(
+            request_id="req-1",
+            restored_instance_id="ri-abc",
+            restore_session_id="rs-xyz",
+            container_session_id="cs-1",
+        )
+        with cpl.begin_span("later", lane="RESTORE") as s:
+            s.record_work(1_000_000)
+        spans = cpl.get_spans()
+        self.assertEqual(spans[0]["identity"]["restored_instance_id"], "")
+        self.assertEqual(spans[1]["identity"]["restored_instance_id"], "ri-abc")
+        self.assertEqual(spans[1]["identity"]["restore_session_id"], "rs-xyz")
+
+    def test_mm_load_models_gpu_bridge_lifecycle(self):
+        # The real gpu-loader wrapper pattern: a fresh bridge opens at the
+        # outermost call entry, a FRESH bridge instance closes it in the
+        # finally (adopting the active span).  This must produce exactly one
+        # persisted span spanning the call wall.
+        t0 = time.monotonic_ns()
+        cpl.TraceSpanBridge("model-mgmt:load_models_gpu", lane="MODEL-MGMT").start(
+            mono_ns=t0
+        )
+        time.sleep(0.003)
+        cpl.TraceSpanBridge("model-mgmt:load_models_gpu", lane="MODEL-MGMT").end(
+            mono_ns=time.monotonic_ns()
+        )
+        spans = cpl.get_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["name"], "model-mgmt:load_models_gpu")
+        self.assertEqual(spans[0]["lane"], "MODEL-MGMT")
+        self.assertGreaterEqual(spans[0]["duration_ms"], 2.0)
+        self.assertIsNotNone(spans[0]["end_mono_ns"])
+
+    def test_restore_span_created_at_site_has_honest_duration(self):
+        # The v38/early-fix corruption: spans created at restore entry but
+        # re-stamped later reported duration from CREATION, not from the
+        # stamped start.  A span created at its true site must have
+        # duration_ms ≈ mono window.
+        t0 = time.monotonic_ns()
+        s = cpl.begin_span("restore:eviction", lane="RESTORE", start_mono_ns=t0)
+        time.sleep(0.004)
+        t1 = time.monotonic_ns()
+        s.finish(mono_ns=t1)
+        rec = cpl.get_spans()[0]
+        self.assertEqual(rec["start_mono_ns"], t0)
+        self.assertEqual(rec["end_mono_ns"], t1)
+        self.assertLessEqual(abs(rec["duration_ms"] - (t1 - t0) / 1_000_000), 20.0)
 
 
 if __name__ == "__main__":

@@ -184,26 +184,41 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
         )
 
 
-def _deploy_version_advanced(
-    repo_root: Path, config: config_mod.ResolvedConfig, deploy_fp: str
-) -> bool:
-    """Verify the app's deployment version ADVANCED during this deploy.
+def _app_version_number(app_name: str) -> int:
+    """Highest ``v<N>`` version number from ``modal app history`` (0 if none).
 
-    The Modal client can exit 0 while the app was NOT actually updated (a
-    Windows charmap codec crash while printing build output, or a cached
-    no-op).  ``modal app history`` lists the app's deployment versions
-    (v1, v2, ...).  This helper returns True only when the newest version's
-    "Time deployed" is within the last few minutes (i.e. this deploy created
-    a new version).  Never raises: on any uncertainty it returns False so a
-    deploy is never wrongly treated as valid.
+    Returns 0 on any uncertainty — never raises.  The history table rows look
+    like ``| v9 | 2026-08-19 17:42 Central Daylight | ...``; the header row
+    (``| Version | ...``) contains no ``v<num>`` and is ignored by the regex.
+
+    CRITICAL (workspace-safety): the invocation MUST use the ACTIVE
+    workspace's credentials from ``.modal_workspaces.json`` — never the raw
+    ``modal`` CLI, whose default profile may point at a DIFFERENT workspace
+    (e.g. testing3 while the active workspace is testing6).  Checking the
+    wrong workspace's version count silently makes a no-op deploy look valid
+    (or vice versa).
     """
-    try:
-        import subprocess
-        import time
+    import json
+    import os
+    import re
+    import subprocess
 
-        app_name = getattr(getattr(config, "target", None), "app", "") or ""
-        if not app_name:
-            return False
+    try:
+        # Resolve the ACTIVE workspace credentials from .modal_workspaces.json.
+        ws_file = Path(__file__).resolve().parents[2] / ".modal_workspaces.json"
+        data = json.loads(ws_file.read_text(encoding="utf-8"))
+        active_id = data.get("active_workspace_id")
+        ws = next(
+            (w for w in data.get("workspaces", []) if w.get("id") == active_id),
+            None,
+        )
+        if not ws or not ws.get("token_id") or not ws.get("token_secret"):
+            return 0
+        env = dict(os.environ)
+        env["MODAL_TOKEN_ID"] = str(ws["token_id"])
+        env["MODAL_TOKEN_SECRET"] = str(ws["token_secret"])
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         r = subprocess.run(
             ["modal", "app", "history", app_name],
             capture_output=True,
@@ -211,31 +226,21 @@ def _deploy_version_advanced(
             encoding="utf-8",
             errors="replace",
             timeout=60,
+            env=env,
         )
         if r.returncode != 0:
-            return False
-        # The history table has a "Time deployed" column; the newest version
-        # row lists the most recent deploy time.  Parse for "v<num>" rows and
-        # the newest timestamp.
-        newest_ts: float | None = None
+            return 0
+        highest = 0
         for line in r.stdout.splitlines():
-            line = line.strip()
-            if "Central" in line or "deployed" in line.lower():
-                # e.g. "| v7      | 2026-08-19 16:41 Central Daylight | ..."
+            m = re.search(r"\bv(\d+)\b", line, re.IGNORECASE)
+            if m:
                 try:
-                    date_part = line.split("|")[2].strip()
-                    ts = time.mktime(
-                        time.strptime(date_part.split(" Central")[0].strip(), "%Y-%m-%d %H:%M")
-                    )
-                    if newest_ts is None or ts > newest_ts:
-                        newest_ts = ts
-                except Exception:
+                    highest = max(highest, int(m.group(1)))
+                except ValueError:
                     continue
-        if newest_ts is None:
-            return False
-        return (time.time() - newest_ts) < 10 * 60  # within the last 10 minutes
+        return highest
     except Exception:
-        return False
+        return 0
 
 
 # ── Manifests ──────────────────────────────────────────────────────────
@@ -280,6 +285,13 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         # boundary and updates it to "verified" only on a successful run.
         "deployment_transport_status": "deployed",
         "runtime_health_status": "unverified",
+        # ── Source-identity health state (E29 source-identity stop-gate) ──
+        # A deploy proves the app was uploaded but NOT that the bytes the
+        # container imports equal the expected local source.  source_identity
+        # is "unverified" at deploy time and flips to "verified" only after a
+        # successful v2ctl source-probe (remote SHA-256 == expected local
+        # SHA-256 for every required module).
+        "source_identity_status": "unverified",
         "health_check_note": (
             "deploy exit 0 proves transport only; remote restore lifecycle "
             "health is unverified until the first gate/run invocation observes "
@@ -691,6 +703,12 @@ def cmd_deploy(args, repo_root: Path) -> int:
             print(f"[v2ctl.deploy] profile={config.profile_name} "
                   f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
             print(f"[v2ctl.deploy] command={command}")
+            # ── Deploy-version-advance verification (E29 root-cause fix) ──
+            # Capture the app's highest deployment version BEFORE the deploy
+            # so a post-deploy comparison can prove a NEW version appeared
+            # (a "version deployed recently" check falsely passes when a
+            # deploy right after a prior one no-ops).
+            _pre_version = _app_version_number(config.target.app) if config.target.app else 0
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec, config=config, extra_env=env, capture=True)
             # ── Crash-loop guard: a container that repeats the same traceback
@@ -722,7 +740,8 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # deployment version ADVANCED during this deploy; if it did not,
             # the deploy must be treated as a failure — never exit 0 on a
             # deploy that left the app unchanged.
-            if not _deploy_version_advanced(repo_root, config, fingerprints.deploy_fingerprint()):
+            _post_version = _app_version_number(config.target.app) if config.target.app else 0
+            if _post_version <= _pre_version:
                 try:
                     manifest.unlink(missing_ok=True)
                 except OSError:
@@ -876,6 +895,7 @@ def cmd_gate(args, repo_root: Path) -> int:
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
+        validator.register(val_mod.CanonicalLedgerValidator())
         runner = backend_mod.BackendRunner(repo_root, env_builder)
         gate = val_mod.GateRunner(repo_root=repo_root, fingerprints=fingerprints,
                                   validators=validator, backend_runner=runner,
@@ -930,6 +950,97 @@ def cmd_confirm(args, repo_root: Path) -> int:
             print(f"  FAIL {reason}")
         return 0 if result.valid else 1
     except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_source_probe(args, repo_root: Path) -> int:
+    """v2ctl source-probe: prove the deployed bytes equal the local source.
+
+    Invokes ONLY the no-generation ``source_identity_probe`` on the deployed
+    GPU class (the same class/transport ``run_plan_stream`` uses) and
+    classifies each required module MATCH / MISMATCH / MISSING /
+    UNEXPECTED_PATH.  Exits nonzero on anything but a full MATCH.  Never
+    runs a generation.
+    """
+    try:
+        from . import source_probe as sp
+
+        workspace = sp._load_workspace(repo_root)
+        # Reuse the profile's target identity (app/class/gpu) so the probe
+        # addresses the SAME deployment the gate would.
+        try:
+            registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = (
+                build_components(repo_root, args.profile,
+                                 cli_options=_cli_target_options(args),
+                                 sets=args.set, inherits=args.inherit)
+            )
+            app_name = config.target.app
+            class_name = config.target.class_name
+            gpu = config.resources.gpu
+            deploy_fp = fingerprints.deploy_fingerprint()
+        except Exception:
+            app_name = ""
+            class_name = ""
+            gpu = "rtx-pro-6000"
+            deploy_fp = ""
+        import os as _os
+        if app_name:
+            _os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
+        if class_name:
+            _os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
+        if gpu:
+            _os.environ["COMFYMODAL_V2_GPU"] = str(gpu)
+
+        exit_code, report = sp.run_source_probe(repo_root, workspace=workspace, gpu=str(gpu))
+        print(f"[v2ctl.source-probe] profile={args.profile}")
+        print(f"[v2ctl.source-probe] git_head={report['expected'].get('git_head', '')[:12]}")
+        print(f"[v2ctl.source-probe] target app={app_name or '(profile unresolved)'} "
+              f"class={class_name or '(profile unresolved)'} gpu={gpu or 'rtx-pro-6000'}")
+        summary = report["remote_summary"]
+        print(f"[v2ctl.source-probe] remote class={summary['class_name']} "
+              f"image={summary['image_id']} container={summary['container_session_id']}")
+        print(f"[v2ctl.source-probe] remote deployment_combined_hash="
+              f"{summary['deployment_combined_hash'][:16] or '(empty)'}")
+        print(f"[v2ctl.source-probe] remote cwd={summary['cwd']}")
+        print(f"[v2ctl.source-probe] remote comfymodal_runtime __file__="
+              f"{summary['comfymodal_runtime_file']}")
+        for p in summary["comfymodal_runtime_path"]:
+            print(f"[v2ctl.source-probe]   __path__: {p}")
+        for c in report["classification"]["modules"]:
+            print(f"[v2ctl.source-probe]   {c['module']}: {c['verdict']} "
+                  f"remote_sha={c.get('remote_sha', '')[:16] or '(none)'} "
+                  f"expected_sha={c.get('expected_sha', '')[:16] or '(none)'}"
+                  + (f" path={c.get('remote_path')}" if c.get("remote_path") else ""))
+        led = report["classification"]
+        print(f"[v2ctl.source-probe] ledger flag={led['ledger_flag']} "
+              f"enabled={led['ledger_enabled']} record_event={led['ledger_record_event']}")
+        print(f"[v2ctl.source-probe] verdict={led['verdict']}")
+        if led["verdict"] != "MATCH":
+            print(f"[v2ctl.source-probe] RESULT=FAIL source_identity != expected local source",
+                  file=sys.stderr)
+        else:
+            print(f"[v2ctl.source-probe] RESULT=PASS source_identity=MATCH")
+            # Flip the deployment manifest's source_identity_status to
+            # verified when it exists (truthful health semantics).
+            try:
+                import json as _json
+                mdir = _deployment_manifest_dir(repo_root)
+                files = sorted(mdir.glob("deploy_*.json")) if mdir.is_dir() else []
+                for manifest_path in reversed(files):
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if manifest.get("deploy_fingerprint") == deploy_fp:
+                        manifest["source_identity_status"] = "verified"
+                        manifest_path.write_text(
+                            json.dumps(manifest, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                        print(f"[v2ctl.source-probe] manifest source_identity_status=verified")
+                        break
+            except Exception as _exc_manifest:
+                print(f"[v2ctl.source-probe] (manifest status update skipped: {_exc_manifest})")
+        return exit_code
+    except (V2CtlError, OSError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -1082,6 +1193,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="from_gate", required=True, metavar="GATE_MANIFEST")
     p.add_argument("--runs", type=int, default=1)
     p.set_defaults(func=cmd_confirm)
+
+    p = sub.add_parser("source-probe")
+    p.set_defaults(func=cmd_source_probe)
 
     p = sub.add_parser("runtime-flags")
     rsub = p.add_subparsers(dest="runtime_command", required=True)

@@ -3072,6 +3072,13 @@ Reset to ``None`` after the callback completes."""
 _BG_UNET_DIAG_STORE: dict[str, list] = {}
 _BG_UNET_DIAG_LOCK = RLock()
 
+# ── E29: post-VAE graph-tail span holder ─────────────────────────────
+# Cross-module carrier for the post-vae:graph-tail ledger span: opened at
+# the post-VAE-decode boundary (loader bridge) and closed at result-assembly
+# start (modal_app).  Held here so the close site can find it without a
+# second import-time coupling.
+_POST_VAE_GRAPH_TAIL: dict[str, Any] = {"span": None}
+
 # ── ComfyUI core dispatch wrappers (installed once globally) ─────────
 # Wrappers target the *live* module objects already loaded by ComfyUI's
 # ``nodes.py`` at startup, resolving via ``sys.modules`` rather than a
@@ -4150,6 +4157,22 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             _gpu_request_call_count_var.set(count + 1)
             lane = _ACTIVE_LANE_TRACE.get()
             request_trace = _ACTIVE_REQUEST_TRACE.get()
+            # ── E29: canonical ledger load_models_gpu span (outermost) ───
+            # Every request-scoped load_models_gpu call becomes one ledger
+            # span so the serial ledger owns the VAE/UNET model-management
+            # wall (entry -> lane wait -> load -> exit) instead of hiding it
+            # inside the anonymous sampling_end->VAE window.  Reentrant
+            # calls keep their own span (only the outermost is bridged).
+            _ledger_mm_span: Any = None
+            try:
+                from .critical_path_ledger import TraceSpanBridge
+                _ledger_mm_bridge = TraceSpanBridge(
+                    "model-mgmt:load_models_gpu", lane="MODEL-MGMT",
+                    metadata={"caller": "gpu_loader_wrapper"},
+                )
+                _ledger_mm_bridge.start(mono_ns=time.monotonic_ns())
+            except Exception:
+                _ledger_mm_bridge = None
             _variance_first_unet = (
                 request_trace is not None
                 and lane is None
@@ -4840,6 +4863,14 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                             _res_cb_after("unet_gpu_load_after", request_trace)
                         except Exception:
                             pass
+            # ── E29: close the canonical ledger load_models_gpu span ─────
+            try:
+                from .critical_path_ledger import TraceSpanBridge
+                TraceSpanBridge("model-mgmt:load_models_gpu", lane="MODEL-MGMT").end(
+                    mono_ns=time.monotonic_ns()
+                )
+            except Exception:
+                pass
     wrapper._comfy_modal_gpu_wrapper = True
     return wrapper
 
@@ -8302,6 +8333,20 @@ def _make_clip_span_wrapper(
             # by the execution-unet H2D delay gate (a cache-hit request
             # never reaches this point, so the delay never applies there).
             _CLIP_FORWARD_STARTED.set()
+        _ledger_clip_forward: Any = None
+        if before == 0 and span_name == "clip_forward":
+            # ── E29: canonical ledger CLIP forward span ──────────────────
+            # The outermost CLIP forward (encode_token_weights) becomes one
+            # ledger span so the serial ledger owns CLIP forward wall.
+            try:
+                from .critical_path_ledger import begin_span as _ledger_begin_span
+                _ledger_clip_forward = _ledger_begin_span(
+                    "CLIP forward", lane="CLIP",
+                    start_mono_ns=time.monotonic_ns(),
+                    metadata={"source": "model_preload._make_clip_span_wrapper"},
+                )
+            except Exception:
+                _ledger_clip_forward = None
         if before == 0 and span_name == "clip_forward":
             try:
                 from .fast_cold_orchestration import mark_clip_forward_start
@@ -8349,6 +8394,12 @@ def _make_clip_span_wrapper(
         finally:
             after = depth_var.get()
             depth_var.set(after - 1)
+            # ── E29: close the canonical ledger CLIP forward span ────────
+            if _ledger_clip_forward is not None:
+                try:
+                    _ledger_clip_forward.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
             if _fast_cold_forward_started:
                 try:
                     from .fast_cold_orchestration import mark_clip_forward_end
@@ -13537,6 +13588,19 @@ class V2LoaderBridge:
                     _trace.emit("vae_decode_start", phase="execution", metadata={
                         **_decode_start_meta,
                     })
+                # ── E29: canonical ledger VAE decode span ────────────────
+                # The decode wall becomes one ledger span so the serial
+                # ledger owns VAE decode (Phase 9).  Never raises.
+                _span_vae_decode: Any = None
+                try:
+                    from .critical_path_ledger import begin_span as _ledger_begin_span
+                    _span_vae_decode = _ledger_begin_span(
+                        "VAE decode", lane="VAE",
+                        start_mono_ns=time.monotonic_ns(),
+                        metadata={"source": "loader_bridge_vae_decode"},
+                    )
+                except Exception:
+                    _span_vae_decode = None
                 _decode_wall_start = time.monotonic_ns()
                 try:
                     with V2LoaderBridge._vae_decode_compute_scope(_demanded_vae, trace=_trace):
@@ -13545,6 +13609,44 @@ class V2LoaderBridge:
                     _decode_wall_ms = round(
                         (time.monotonic_ns() - _decode_wall_start) / 1_000_000, 3
                     )
+                    if _span_vae_decode is not None:
+                        try:
+                            _span_vae_decode.finish(mono_ns=time.monotonic_ns())
+                        except Exception:
+                            pass
+                    # ── E29: canonical ledger post-VAE-decode marker ────
+                    # The exact instant the VAE decode span closes; marks the
+                    # boundary between VAE decode and remaining graph work.
+                    try:
+                        from .critical_path_ledger import record_event as _ledger_event
+                        _ledger_event(
+                            "post_vae_decode",
+                            mono_ns=time.monotonic_ns(),
+                            metadata={
+                                "decode_wall_ms": _decode_wall_ms,
+                                "request_id": str(
+                                    getattr(_trace, "request_id", "") or ""
+                                ),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    # ── E29: canonical ledger post-VAE graph-tail span ────
+                    # Opens at the post-VAE-decode boundary so the remaining
+                    # graph work (node transitions, output-node dispatch)
+                    # after VAE decode is bounded on the canonical axis.  It
+                    # closes in modal_app at result-assembly start via the
+                    # module-level holder.  Never raises.
+                    try:
+                        from .critical_path_ledger import begin_span as _ledger_begin_span
+                        _POST_VAE_GRAPH_TAIL["span"] = _ledger_begin_span(
+                            "post-vae:graph-tail", lane="EXECUTOR",
+                            start_mono_ns=time.monotonic_ns(),
+                        )
+                    except Exception:
+                        pass
+                    except Exception:
+                        pass
                     if _trace is not None:
                         _trace.emit("vae_decode_end", phase="execution", metadata={
                             **_vae_decode_boundary_metadata(active, _demanded_vae, trace=_trace),
@@ -16719,6 +16821,20 @@ def _run_early_unet_activation(
     with _UNET_ACTIVATION_LOCK:
         state["status"] = "running"
         state["worker_started_mono_ns"] = time.monotonic_ns()
+    # ── E29: canonical ledger early-activation worker first instruction ──
+    try:
+        from .critical_path_ledger import record_event as _ledger_event
+        _ledger_event(
+            "unet_worker_first_instruction",
+            mono_ns=state.get("worker_started_mono_ns"),
+            metadata={
+                "request_id": str(request_id or ""),
+                "worker": "unet_early_activation",
+                "key_hash": str(key_hash or ""),
+            },
+        )
+    except Exception:
+        pass
     # ── Exclusive ownership claim: publish BEFORE touching storage or CUDA ──
     # The worker owns the retained UNET from this point until its terminal
     # boundary; the graph load path joins this future before it mutates the
@@ -20098,6 +20214,22 @@ def _run_early_vae_activation(
                     )
             except Exception:
                 pass
+            # ── E29: canonical ledger VAE lane acquired ────────────────
+            # Marks the exact instant the VAE worker has acquired the
+            # mutation lane and is about to call _mm_load_models_gpu.
+            try:
+                from .critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "vae_lane_acquired",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={
+                        "request_id": request_id,
+                        "key_hash": state.get("key_hash", ""),
+                        "mode": mode,
+                    },
+                )
+            except Exception:
+                pass
             try:
                 _mm_load_models_gpu([_patcher])
             finally:
@@ -20161,6 +20293,24 @@ def _run_early_vae_activation(
             _span_vae_activation.finish(mono_ns=time.monotonic_ns())
         except Exception:
             pass
+    # ── E29: canonical ledger VAE ready terminal ───────────────────────
+    # Marks the exact instant the VAE activation worker validates residency
+    # and enters terminal "ready" state.
+    try:
+        from .critical_path_ledger import record_event as _ledger_event
+        _ledger_event(
+            "vae_ready_terminal",
+            mono_ns=time.monotonic_ns(),
+            metadata={
+                "request_id": request_id,
+                "key_hash": state.get("key_hash", ""),
+                "status": "ready",
+                "transfer_count": state.get("transfer_count", 0),
+                "residency_status": state.get("residency_status", ""),
+            },
+        )
+    except Exception:
+        pass
     return _vae_activation_terminal(
         state, trace, request_id, status="ready", reason="ok",
         transfer_count=state["transfer_count"], diagnostics=_evidence,
@@ -20237,6 +20387,24 @@ def schedule_vae_early_activation_at_sampling_end(
     """
     if vae_activation_mode() != _VAE_ACTIVATION_MODE_SAMPLING_END:
         return False
+    # ── E29: canonical ledger VAE activation requested ─────────────────
+    # The exact instant schedule_vae_early_activation_at_sampling_end is
+    # entered with a valid mode; marks the start of the VAE handoff on the
+    # canonical axis.
+    try:
+        from .critical_path_ledger import record_event as _ledger_event
+        _ledger_event(
+            "vae_activation_requested",
+            mono_ns=time.monotonic_ns(),
+            metadata={
+                "request_id": str(request_id or ""),
+                "sampler_node_id": str(sampler_node_id or ""),
+                "sampler_node_class": str(sampler_node_class or ""),
+                "trigger": "sampling_end",
+            },
+        )
+    except Exception:
+        pass
     _request_id = str(request_id or "")
     if not _request_id and trace is not None:
         _request_id = str(trace.request_id)
@@ -20284,16 +20452,41 @@ def schedule_vae_early_activation_at_sampling_end(
         sampling_end_mono_ns=int(_state.get("sampling_end_mono_ns", 0) or 0),
     )
     _sampling_end_mono_ns = time.monotonic_ns()
+    # ── E29: canonical ledger VAE activation-handoff span ──────────────
+    # Spans from "sampling_end → VAE object resolution" through submit.
+    # Closed in _vae_activation_submit after the future is scheduled.
+    _span_vae_activation_handoff: Any = None
+    try:
+        from .critical_path_ledger import begin_span as _ledger_begin_span
+        _span_vae_activation_handoff = _ledger_begin_span(
+            "vae:activation-handoff", lane="VAE",
+            start_mono_ns=time.monotonic_ns(),
+            metadata={"request_id": _request_id, "trigger": "sampling_end"},
+        )
+    except Exception:
+        _span_vae_activation_handoff = None
+    _state["_e29_activation_handoff_span"] = _span_vae_activation_handoff
     # Resolve the exact VAE object via the bridge adapter.
     try:
         _vae, _source = bridge.resolve_vae_object(trace=trace)
     except Exception as exc:
+        # Close handoff span on resolution failure
+        if _span_vae_activation_handoff is not None:
+            try:
+                _span_vae_activation_handoff.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         _vae_activation_terminal(
             _state, trace, _request_id, status="failed",
             reason="resolution_failed", error=str(exc)[:200],
         )
         return False
     if _vae is None:
+        if _span_vae_activation_handoff is not None:
+            try:
+                _span_vae_activation_handoff.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         if trace is not None:
             trace.emit(_EVENT_VAE_EA_SKIPPED, phase="execution", metadata={
                 "mode": _VAE_ACTIVATION_MODE,
@@ -21186,6 +21379,13 @@ def _vae_activation_submit(
             _state["reason"] = "submit_failed"
             _state["error"] = str(exc)[:200]
             _state["terminal_mono_ns"] = time.monotonic_ns()
+            # ── E29: close handoff span on submit failure ──────────────
+            try:
+                _handoff_span = _state.pop("_e29_activation_handoff_span", None)
+                if _handoff_span is not None:
+                    _handoff_span.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
             print(
                 f"[v2.vae_early_activation] event=terminal "
                 f"request_id={request_id or 'absent'} mode={_VAE_ACTIVATION_MODE} "
@@ -21198,8 +21398,22 @@ def _vae_activation_submit(
             _state["terminal"] = True
             _state["reason"] = "no_active_preparation"
             _state["terminal_mono_ns"] = time.monotonic_ns()
+            # ── E29: close handoff span on no-preparation failure ──────
+            try:
+                _handoff_span = _state.pop("_e29_activation_handoff_span", None)
+                if _handoff_span is not None:
+                    _handoff_span.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
             return False
         _state["future"] = _future
+    # ── E29: close the VAE activation-handoff span (success path) ──────
+    try:
+        _handoff_span = _state.pop("_e29_activation_handoff_span", None)
+        if _handoff_span is not None:
+            _handoff_span.finish(mono_ns=time.monotonic_ns())
+    except Exception:
+        pass
     _vae_activation_trim()
     return True
 

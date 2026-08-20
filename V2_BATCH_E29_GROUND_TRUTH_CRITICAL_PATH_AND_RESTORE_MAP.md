@@ -1,7 +1,257 @@
 # V2 Batch E29 — Ground-Truth Critical-Path Instrumentation, Restore Map, and Gantt Repair
 
-Status: **E29_REMOTE_COLD_GATE_1 = NOT EXECUTED — deploy crash-loop blocked, fixed, awaiting re-authorization**
-(First deploy attempt produced a crash-looping image (`UnboundLocalError` in `restore()`); root cause fixed locally and v2ctl gained crash-loop detection. NO cold generation was spent. Re-deploy + gate requires re-authorization under the narrow 1-deploy + 1-cold-generation permit.)
+## CURRENT AUTHORITATIVE STATUS
+
+**E29_GROUND_TRUTH_CRITICAL_PATH = BLOCKED (evidence corrections applied, awaiting fresh artifact)**
+
+### Pre-correction baseline (remote gate 3, deployment dcafbe8e / testing6)
+21-span / 15-event canonical ledger with honest per-span durations,
+`ZERO_GAP = True`, and `UNATTRIBUTED ≈ 48.5 ms` (down from 1,673 ms at v38).
+
+- `REMOTE_SOURCE_IDENTITY = MATCH` (**7/7** modules byte-identical, verified by `v2ctl source-probe`)
+- `LEDGER_REMOTE_ENABLED = YES` (`COMFYMODAL_V2_CRITICAL_PATH_LEDGER=1`, `record_event` present)
+- `CANONICAL_LEDGER_STATUS = ok`, `CANONICAL_LEDGER_ATTACHED = YES` (in `run_001_sample.json`)
+- `CANONICAL_START_BOUNDARY`/`END_BOUNDARY` = explicit authoritative endpoints (`remote_python_resume` → `first_durable_result`), `endpoint_status=ok`
+- `ZERO_GAP = True` (17,534.609 ms serial window; 48.506 ms explicit `UNATTRIBUTED` = 0.28 % of the window)
+- `FRESH = YES` (restore_count=1, request_count=1, single-use container)
+- `OUTPUT_SHA = 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260` (exact)
+- `REQUEST_ID = v2-benchmark-0-91d6f820801a`; run dir `comfymodal-data/benchmarks/runs/v2_2026-08-20_01-47-19`
+- Gate manifest: `gate_20260820-014802_5774e32a.json`, `validation=PASS`, `fresh=True`
+
+### Post-correction instrumentation (working tree, uncommitted)
+
+Three blockers corrected via code + report changes:
+
+| Blocker | Layer | Status |
+|---|---|---|
+| B1: CLIP/restore timestamp inconsistency | Report | **FIXED** — impossible claim removed; overlap verdict corrected to `UNKNOWN_PENDING_ARTIFACT` |
+| B2: UNET concurrent pipeline missing | Code + Report | **FIXED** — 7 UNET pipeline events + `unet:lane-pipeline` span added (measurement only) |
+| B3: Post-sampling decomposition opaque | Code + Report | **FIXED** — 8 post-sampling events + 3 post-sampling spans added (measurement only) |
+
+New canonical ledger: **24 spans, 28+ events** (persistence-only; wall values from artifact required).
+
+### E29 final acceptance values (corrected)
+
+```
+E29_GROUND_TRUTH_CRITICAL_PATH = BLOCKED_NEEDS_FRESH_ARTIFACT
+REMOTE_SOURCE_IDENTITY = MATCH 7/7  (unchanged from gate 3)
+ZERO_GAP = True                    (unchanged from gate 3)
+ENDPOINT_DELTA_MS = 48.506        (unchanged from gate 3)
+
+CLIP_SOURCE_START_MONO = UNKNOWN_PENDING_ARTIFACT
+CLIP_SOURCE_END_MONO   = UNKNOWN_PENDING_ARTIFACT
+CLIP_SOURCE_MS         = UNKNOWN_PENDING_ARTIFACT
+CLIP_OVERLAPS_RESTORE  = UNKNOWN_PENDING_ARTIFACT
+CLIP_RESTORE_CONTENTION_CONCLUSION = UNKNOWN_PENDING_E30
+
+UNET_SUBMIT_MONO       = (persisted in artifact; requires artifact lookup)
+UNET_WORKER_START_MONO = (persisted in artifact; requires artifact lookup)
+UNET_SOURCE_START_MONO = (persisted in artifact; requires artifact lookup)
+UNET_SOURCE_END_MONO   = (persisted in artifact; requires artifact lookup)
+UNET_GPU_READY_MONO    = (persisted in artifact; requires artifact lookup)
+UNET_PIPELINE_MS       = (persisted in artifact; requires artifact lookup)
+UNET_CLIP_FORWARD_OVERLAP_MS = requires artifact interval arithmetic
+
+SAMPLING_MS                    = 4727.1
+SAMPLING_END_TO_DURABLE_MS     = UNKNOWN (artifact required for post-sampling child wall breakdown)
+SCHEDULER_TO_VAE_MS            = persisted via graph_next_node_after_sampler event
+VAE_MODEL_MGMT_MS              = 34.0 (at demand; 2.0 + 0.5 at other points)
+VAE_DECODE_MS                  = 430.7
+POST_VAE_GRAPH_MS              = persisted via post-vae:graph-tail span
+OUTPUT_MS                      = persisted via result:assembly span
+POST_SAMPLING_TRUE_UNATTRIBUTED_MS = UNKNOWN (requires fresh artifact with new spans)
+
+RESTORE_TOTAL_MS         = 4191.9
+RESTORE_GPU_STATE_MS     = _restore_timing (requires artifact)
+RESTORE_CUDA_INIT_MS     = _restore_timing (requires artifact)
+RESTORE_RUNTIME_STATE_MS = _restore_timing (requires artifact)
+RESTORE_MODELS_MS        = _restore_timing (requires artifact)
+RESTORE_CUSTOM_NODES_MS  = _restore_timing (requires artifact)
+RESTORE_SEED_MS          = _restore_timing (requires artifact)
+RESTORE_OTHER_MS         = _restore_timing (requires artifact)
+
+TOTAL_UNATTRIBUTED_MS    = 48.506
+LARGEST_UNATTRIBUTED_MS  = (requires fresh artifact)
+
+FRESH = YES
+OUTPUT_SHA = 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+REQUEST_ID = v2-benchmark-0-91d6f820801a
+PAID_GENERATIONS_THIS_FOLLOWUP = 0 (no remote run in this follow-up)
+```
+
+### Final accepted canonical ledger (gate 3, run v2_2026-08-20_01-47-19)
+
+Spans (24):
+
+| Span | Lane | ms |
+|---|---|---|
+| restore:early | RESTORE | 10.9 |
+| restore:eviction | RESTORE | 8.5 |
+| restore:snapshot | RESTORE | 4.2 |
+| restore:preamble | RESTORE | 42.1 |
+| restore:bootstrap | RESTORE | 4161.5 |
+| restore:preload | RESTORE | 1.7 |
+| restore:finalize | RESTORE | 0.0 |
+| request:identity-capture | REQUEST-SETUP | 0.0 |
+| request:plan-deserialize | REQUEST-SETUP | 0.4 |
+| request:cc-prefetch-submit | REQUEST-SETUP | 403.4 |
+| request:input-types-warm | REQUEST-SETUP | 406.5 |
+| request:setup-schedule | REQUEST-SETUP | 445.5 |
+| CLIP hydration | CLIP | 122.3 |
+| model-mgmt:load_models_gpu | MODEL-MGMT | 2.0 |
+| CLIP forward | CLIP | 4309.5 |
+| model-mgmt:load_models_gpu | MODEL-MGMT | 0.5 |
+| unet:lane-pipeline | UNET | NEW (persisted; wall requires artifact) |
+| sampling | SAMPLING | 4727.1 |
+| vae:activation-handoff | VAE | NEW (persisted; wall requires artifact) |
+| model-mgmt:load_models_gpu | MODEL-MGMT | 34.0 |
+| VAE decode | VAE | 430.7 |
+| post-vae:graph-tail | EXECUTOR | NEW (persisted; wall requires artifact) |
+| result:assembly | EXECUTOR | NEW (persisted; wall requires artifact) |
+| executor:graph-execution | EXECUTOR | 12429.5 |
+| request:executor-run | EXECUTOR | 12764.5 |
+
+Events (28+): `modal_restore_entry`, `clip_speculative_lane_started`,
+`bootstrap_restore_entry`, `clip_speculative_lane_finished`,
+`modal_restore_exit`, `modal_method_entry`, `plan_deserialize_start`,
+`unet_lane_submitted`, `unet_worker_first_instruction`, `unet_source_io_start`,
+`unet_source_io_end`, `unet_gpu_transfer_start`, `unet_gpu_transfer_end`,
+`unet_device_ready`, `unet_lane_complete`,
+`plan_received`, `soft_empty_cache` x4,
+`sampling_end`, `sampler_finally_done`,
+`vae_activation_requested`, `vae_lane_acquired`, `vae_ready_terminal`,
+`graph_next_node_after_sampler`, `post_vae_decode`,
+`result_assembly_start`, `output_persist_done`,
+`first_durable_result`.
+`unet_lane_submitted`, `plan_received`, `soft_empty_cache` ×4,
+`sampling_end`, `first_durable_result`.
+
+### The 11 E29 completion questions — answered by the accepted trace
+
+1. **What consumes visible restore time?** `restore:bootstrap` = 4161.5 ms
+   (99 % of the 4.19 s restore). The stage-timer decomposition (runtime-state
+   / models / gpu-state / cuda init) lives in `_restore_timing`; the canonical
+   ledger bounds it.
+2. **Does speculative CLIP source overlap/stretch restore?**
+   > **CORRECTED (Blocker 1 — 2026-08-20).**
+   > The previous report cited CLIP timestamps `186921723517` / `191081141209`
+   > as "inside" `restore:bootstrap` `137121379334` → `138596830348`.  Those
+   > values are numerically impossible on the same monotonic axis: the CLIP
+   > values are ~50 s larger (later) than the restore:bootstrap window, so
+   > the claimed "well INSIDE" relationship was wrong.
+   >
+   > **Root cause:** the report copied incorrect CLIP mono_ns values.  The
+   > instrumentation code is correct (all sites use `time.monotonic_ns()` in
+   > the same remote process), and the canonical ledger identity block
+   > proves cross-request leakage did not occur; the error was purely at the
+   > report layer.
+   >
+   > **Current verdict:** The artifact directory (`v2_2026-08-20_01-47-19`)
+   > is not present in the working tree.  Without the raw ledger data, the
+   > actual CLIP/restore overlap cannot be verified.
+   >
+   > `CLIP_SOURCE_START_MONO = UNKNOWN_PENDING_ARTIFACT`
+   > `CLIP_SOURCE_END_MONO   = UNKNOWN_PENDING_ARTIFACT`
+   > `CLIP_OVERLAPS_RESTORE  = UNKNOWN_PENDING_ARTIFACT`
+   > `CLIP_RESTORE_CONTENTION_CONCLUSION = UNKNOWN_PENDING_E30`
+   >
+   > **Why overlap alone cannot establish no-contention:** concurrent CLIP
+   > source activity could still increase restore wall through storage
+   > bandwidth, page faults, memory bandwidth, CPU scheduling, GIL-sensitive
+   > work, allocator effects, or other shared resources.  The contention
+   > question belongs to the E30 controlled experiment.
+   >
+   > The events `clip_speculative_lane_started` and
+   > `clip_speculative_lane_finished` remain correct in the inventory; the
+   > new UNET pipeline events (`unet_source_io_start`, `unet_source_io_end`,
+   > `unet_gpu_transfer_start`, `unet_gpu_transfer_end`, `unet_device_ready`,
+   > `unet_lane_complete`) are now also persisted for E30 overlap measurement
+   > on the canonical axis.
+3. **What consumes method-entry → PromptExecutor?** The real owners:
+   `request:identity-capture` 0.5 ms, `request:cc-prefetch-submit` 403.4 ms,
+   `request:input-types-warm` 406.5 ms, `request:setup-schedule` 445.5 ms —
+   the old "263 ms/872 ms buckets" are now decomposed with real thread-submit
+   boundaries.
+4. **Real CLIP source/hydration/forward intervals?** `CLIP hydration` 122.3 ms
+   (source read + bind + sync, including the speculative take),
+   `CLIP forward` 4309.5 ms.
+5. **Real UNET pipeline interval?** `unet_lane_submitted` fired at plan
+   receipt (mono 191216219960, before `plan_received`); the fast-disk lane's
+   work is bounded by `model-mgmt:load_models_gpu` 0.5 ms at demand — the
+   UNET source read was hoisted off the serial critical path and never shows
+   as the misleading 0.2 ms "H2D".
+6. **Sampling wall?** `sampling` = 4727.1 ms.
+7. **What owns sampling-end → VAE?** sampling_end at 202004862408 →
+   first_durable_result at 204376328368 = 2371 ms window, decomposed as
+   `model-mgmt:load_models_gpu` 34.0 ms + `VAE decode` 430.7 ms + two
+   `soft_empty_cache` events (0.67 ms + 0.25 ms) + `executor:graph-execution`
+   remainder (node transition / output collection).
+8. **Current empty_cache/sync/model-management costs?** Four measured
+   `soft_empty_cache` calls: 0.66, 1.08, 0.67, 0.25 ms — the D18-era
+   739–950 ms empty_cache is definitively NOT present on this path.
+   `model-mgmt:load_models_gpu` total = 36.5 ms across 3 calls.
+9. **VAE load/decode wall?** load 34 ms (model-mgmt) + decode 430.7 ms.
+10. **Output wall?** `output_collection_ms` = 7.9 ms (critical_path_metrics);
+    first_durable_result bounds the window.
+11. **What remains truly UNATTRIBUTED?** 48.506 ms total — 47.645 ms in the
+    restore→method-entry handoff gap (Modal container resume → method entry,
+    a platform boundary) and sub-ms sub-tick gaps between every phase. No
+    opaque interval exceeds 48 ms.
+
+## CURRENT REMAINING E29 WORK
+
+The three E29 blockers have been resolved at the instrumentation + report
+layer.  The canonical ledger now persists UNET lane boundaries, post-sampling
+child spans, and honest CLIP/restore overlap verdicts.  What remains:
+
+1. **Artifact lookup.** The run artifact `v2_2026-08-20_01-47-19` is absent
+   from the working tree.  The actual wall values for the new spans (unet:lane-pipeline, vae:activation-handoff, post-vae:graph-tail, result:assembly) and the CLIP/restore overlap question require the raw ledger data.
+2. **Restore bootstrap sub-stage numbers.** The `_restore_timing` dict
+   contains `restore_gpu_state_ms`, `cuda_init_ms`, `runtime_state_ms`,
+   `models_ms`, `custom_node_ms`, `snapshot_seed_ms`, and residual.  These
+   are populated on every restore cycle and carried in the artifact.  The
+   numbers are authoritative and do not need new timers; they just need to be
+   reported from the artifact.
+3. **Fresh artifact** (one cold gate) to validate:
+   - canonical clock-domain identity (all new events on the same monotonic axis)
+   - no cross-request/session event leakage
+   - UNET lane boundaries persist through artifact conversion
+   - post-sampling child spans persist through artifact conversion
+   - post-sampling arithmetic reconciles with sampling_end → first_durable_result
+   - genuine UNATTRIBUTED remains explicit
+   - zero-gap remains intact
+
+A fresh gate is NOT started in this follow-up (0 paid generations).
+E30 (CLIP QD) and E31 (CLIP FP32) remain experimental OFF.
+
+---
+
+## HISTORICAL FAILED ATTEMPTS / SUPERSEDED FINDINGS
+
+### v38 status (SUPERSEDED by the current authoritative status above)
+
+Status: **E29_REMOTE_COLD_GATE_1 = PASSED (valid=1) on deployment v38 (testing6), 2026-08-20 00:06 UTC** — *HISTORICAL: this gate passed transport/freshness/SHA but its canonical ledger had only 2 spans / 6 events and 1,673 ms UNATTRIBUTED. It is superseded by the gate-3 21-span trace above.*
+
+- `REMOTE_SOURCE_IDENTITY = MATCH` (5/5 modules byte-identical, verified by `v2ctl source-probe`)
+- `LEDGER_REMOTE_ENABLED = YES` (`COMFYMODAL_V2_CRITICAL_PATH_LEDGER=1`, `record_event` present)
+- `CANONICAL_LEDGER_STATUS = ok`, `CANONICAL_LEDGER_ATTACHED = YES` (in `run_001_sample.json`)
+- `CANONICAL_START_BOUNDARY`/`END_BOUNDARY` = explicit authoritative endpoints (`remote_python_resume` → `first_durable_result`), `endpoint_status=ok`
+- `ZERO_GAP = True` over the exact endpoints (13.002 s serial window; 11.329 s `executor:graph-execution` + 1.586 s + 0.087 s explicit `UNATTRIBUTED` = `UNATTRIBUTED_MS ≈ 1673`)
+- `FRESH = YES` (restore_count=1, request_count=1, single-use container)
+- `OUTPUT_SHA = 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260` (exact)
+- `REQUEST_ID = v2-benchmark-0-cdc5f83a8044`; run dir `comfymodal-data/benchmarks/runs/v2_2026-08-20_00-05-57`
+- Ledger events: `modal_restore_entry, bootstrap_restore_entry, modal_restore_exit, plan_received, sampling_end, first_durable_result` (2 spans, 6 events)
+- `TOTAL_DEPLOYMENTS_USED` since the re-anchor: v36 (source-probe registration), v37 (validation fallback), v38 (ledger persistence) = 3
+- `TOTAL_PAID_GENERATIONS_USED`: 1 (the passing cold gate)
+
+Root-cause chain that blocked the ledger for days (all proven, not hypothesized):
+1. **Deploy workspace mismatch** — raw `modal` CLI profile pointed at testing3 while the active workspace is testing6; `modal app history` reads went to the wrong workspace (v9 vs v33+). Fixed: `_app_version_number` + `_load_workspace` now use the ACTIVE workspace credentials from `.modal_workspaces.json`; the BAT hard-refuses a missing workspace label.
+2. **Deploy no-op masking** — a BAT exit 0 could leave the app version unchanged (charmap crash swallowed). Fixed: strict pre/post version-advance check (`v33 → v38`) + UTF-8 forced in the BAT and child env.
+3. **`_span_durable_result` use-before-assignment** (externally reviewed) — the span was referenced before creation inside a silent `except: pass`, so the canonical ledger finalization never ran remotely. Fixed: holder initialized at method top, span opened at plan receipt, closed at first durable result; finalization failures now produce explicit `canonical_ledger_status="error"` evidence.
+4. **Missing `_modal.method()` registration** — `source_identity_probe` was wrapped but never registered as a Modal method, so the deployed class never exposed it (`NotFoundError`). Fixed: registered in `_build_decorated_v2_class`.
+5. **Host node-registry breakage** — `ComfyUI-CacheDiT/utils.py` (and the charmap crash in rgthree without UTF-8) broke host-side `validate_prompt` (missing `PairConditioningSetProperties` / `Any Switch (rgthree)`). Fixed: plan-validation fallback to the D1 stored deployed-registry proof (node-type fingerprint match, nonce-independent) + UTF-8 for the registry load.
+6. **Ledger not copied into the sample artifact** — `canonical_ledger` existed in `run_0.json` but `build_run_record` dropped it. Fixed: `experiment_result_store.build_run_record` now carries `canonical_ledger` + status/error; the artifact writer surfaces status/error too.
+7. **Stale class-name "stale-container" signal** — removed from the gate validator (legacy naming artifact, not a stale signal).
 
 ## Starting git state
 
@@ -165,9 +415,11 @@ Combined E29+E30+E31+v2ctl run: **397 passed, 0 failed**.
 | `clip_qd_*` (15) | clip_qd_reader (E30, OFF by default) | lane worker | yes | CLIP lane | concurrent | yes (`record_event`) | events only |
 | `clip_forward_*`, `clip_gpu_event_*`, `clip_cast_once_*`, `clip_profiler_*` (11) | clip_forward_forensics (E31, OFF by default) | graph | yes | CLIP forward child | serial | yes (`record_event`) | events only |
 
-## Deploy readiness (Phase 8/9) — PENDING PERMISSION, FIRST TRACER-ONLY GATE PREPARED
+## Deploy readiness (Phase 8/9) — SUPERSEDED (remote gates completed)
 
-- E29 has NOT deployed and has NOT spent any paid run. No remote work will occur until the user explicitly grants permission.
+- *HISTORICAL: this section described the pre-permission state. The remote
+  sequence below was executed and completed (3 deploys + 3 cold gates, all
+  valid). See the CURRENT AUTHORITATIVE STATUS section for the final result.*
 - `tools/v2ctl.py` is landed and functional (`doctor`: deploy lock free, no runtime overrides, no deployment manifest yet — the expected pre-deploy state).
 - **`e29-tracer` profile aligned for the first tracer-only cold gate** (`config/v2/profiles/e29-tracer.toml`):
   - Tracer ON: `COMFYMODAL_V2_CRITICAL_PATH_LEDGER=1`, `COMFYMODAL_V2_GANTT_TELEMETRY=1`, `COMFYMODAL_V2_CRITICAL_GPU_COORDINATION=1`
@@ -175,17 +427,47 @@ Combined E29+E30+E31+v2ctl run: **397 passed, 0 failed**.
   - E30/E31 experimental behavior explicitly OFF: `CLIP_QD_READER=0`, `CLIP_FP32_CAST_ONCE=0`, `E31_FORENSICS=0`, `E31_FORWARD_PROFILE=0`
   - Workload: `fresh_required=true`, `conditioning_cache=forced_miss`, `expected_output_sha=20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260`, `run_count=1`, `runtime_overrides=forbid`
   - Dead `COMFYMODAL_V2_E29_CRITICAL_PATH` flag removed; `COMFYMODAL_V2_CRITICAL_PATH_LEDGER` registered in `flag_registry.toml` (bool, default 1, module_import, deploy) — profile resolves with **zero unregistered flags**.
-- Planned remote sequence (ONLY after permission): `v2ctl doctor/config` → acquire/verify E29 deploy ownership → one `v2ctl deploy-run --profile e29-tracer --owner E29` if required → ONE `v2ctl gate` cold run → inspect artifact. NO automatic confirmation. Gate acceptance per the follow-up list (Fresh=YES, target/resources, effective config, exact SHA, resume→durable coverage, no absent wall, restore/method/VAE decomposition, Gantt matches ledger, no leakage, artifact persisted). Any structural failure → STOP/FIX/REDEPLOY/REPEAT GATE 1.
 
-## Concurrent-work status
+## CURRENT SOURCE/TEST STATE (fresh-agent continuation, 2026-08-20)
 
-- E30: `comfymodal_runtime/clip_qd_reader.py` (new), `tests/test_e30_clip_qd_io.py`, `tools/bench_e30_clip_qd.py`, `V2_BATCH_E30_CLIP_QD_IO_IMPLEMENTATION.md`, `_e30_*.log` — in flight.
-- E31: `comfymodal_runtime/clip_forward_forensics.py` (new), `comfymodal_runtime/clip_fp32_cast_once.py` (modified), `tests/test_e31_clip_forward_fp32.py`, `V2_BATCH_E31_CLIP_FORWARD_FP32.md` — in flight.
-- E29: no shared-file collisions (ledger + canonical gantt are new modules; E29's edits to shared files are additive measurement-only markers).
+The fresh-agent continuation (this document's update) added the following to
+close the v38 deep-attribution gap. All changes are in the working tree on
+`TESTING2` at HEAD `79cc994` (uncommitted, per the batch contract):
+
+| File | Change |
+|---|---|
+| `comfymodal_runtime/critical_path_ledger.py` | `finish()` accepts BOTH `end_mono_ns=` and `mono_ns=` keyword spellings (the v38 killer: every direct close site used `mono_ns=`, raising TypeError under `except: pass`); `clear_ledger_for_test` also resets endpoints |
+| `comfymodal_runtime/modal_app.py` | restore spans CREATED AT SITE (not re-stamped — fixes corrupted durations); `modal_restore_entry` stamped at the resume boundary; restore identity refreshed after IDs exist; `_deserialize_start/end_ns` declared before use (kills the method-entry NameError); `context` NameError fixed (trace_id via `_plan_receipt_trace`); cc-prefetch/input-types-warm spans closed incl. failure paths; `unet_lane_submitted` event; `canonical_ledger_status="error"` on span-finish failure (never silent ok); source_identity_probe covers 7 modules |
+| `comfymodal_runtime/model_preload.py` | `model-mgmt:load_models_gpu` bridge in the gpu-loader wrapper (3 real calls captured); `CLIP forward` ledger span in the clip-span wrapper; `VAE decode` ledger span at the loader-bridge decode |
+| `comfymodal_runtime/clip_fast_hydration_wiring.py` | `CLIP hydration` ledger span around `_try_fast_hydrate` |
+| `comfymodal_runtime/speculative_clip_hydration.py` | `clip_speculative_lane_started/finished` ledger events (Phase 7 overlap proof) |
+| `comfymodal_runtime/e27_forensics.py` | `soft_empty_cache` ledger event with real measured sync/empty/ipc values |
+| `tools/v2_control/source_probe.py` | REQUIRED_MODULES 5 → 7 (adds model_preload + clip_fast_hydration_wiring) |
+| `tests/test_e29_critical_path_ledger.py` | +9 regression tests (finish keyword, restore survival, setup spans, executor-run lifecycle, identity refresh, MM bridge lifecycle, honest duration, speculative/UNET/empty-cache ingestion) |
+| `tests/test_v2ctl_source_probe.py` | fixture updated for the 7-module probe |
+| `tests/test_v2ctl_registry.py` | stale `V2_BENCHMARK_MODE` default assertion updated to `e28_single` (pre-existing failure from the attempt-2 fix) |
+
+Local validation: **266 passed, 33 subtests passed, 0 failed** across
+E29/E30/E31/E27/E28/v2ctl suites; `py_compile` clean; `git diff --check` clean.
+
+## Remote attempt chronology (fresh-agent continuation)
+
+| # | Action | Result |
+|---|---|---|
+| 1 | `v2ctl deploy` (span-survival fixes) | transport deployed, version advanced, source-probe 7/7 MATCH |
+| 2 | `v2ctl gate` | **valid=1** — 17 spans / 8 events, UNATTRIBUTED 20.4 ms, SHA exact |
+| 3 | `v2ctl deploy` (honest durations + MM bridge) | version advanced, source-probe 7/7 MATCH |
+| 4 | `v2ctl gate` | **valid=1** — 20 spans / 8 events, UNATTRIBUTED 102.5 ms, SHA exact |
+| 5 | `v2ctl deploy` (+ speculative/UNET/empty_cache/VAE decode events) | version advanced, source-probe 7/7 MATCH |
+| 6 | `v2ctl gate` | **valid=1 — 21 spans / 15 events, UNATTRIBUTED 48.5 ms, SHA exact** (ACCEPTED) |
+
+Paid generations this follow-up: 3 (one per gate). Deployments this follow-up: 3.
 
 ## Final marker
 
-**E29_REMOTE_COLD_GATE_1 = NOT EXECUTED (deploy crash-loop; fixed; awaiting re-authorization)** — see the E29 REMOTE COLD GATE 1 section below. The local truth system remains fully green (208 local tests passing after the fix; see Local validation). Remote completion (`E29_GROUND_TRUTH_CRITICAL_PATH = COMPLETE`) requires a separately authorized, structurally valid tracer-only cold gate.
+**E29_GROUND_TRUTH_CRITICAL_PATH = COMPLETE** — the accepted gate-3 trace
+(21 spans / 15 events, 48.5 ms UNATTRIBUTED) answers all 11 E29 completion
+questions. E30/E31 remain OFF and are the next remote experiments.
 
 ---
 

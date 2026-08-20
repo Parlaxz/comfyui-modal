@@ -5094,6 +5094,23 @@ def _build_sampling_wrapper() -> Callable:
                     )
             except Exception:
                 pass
+            # ── E29: sampler finally-done marker ────────────────────────
+            # The exact instant the sampler wrapper actually returned control
+            # to the graph executor (after VAE activation scheduling).
+            # Stamped on the canonical axis so the serial ledger can
+            # decompose the sampling_end -> graph-resume window.
+            try:
+                from comfymodal_runtime.critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "sampler_finally_done",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={
+                        "node_id": str(node_id),
+                        "request_id": str(getattr(trace, "request_id", "") or ""),
+                    },
+                )
+            except Exception:
+                pass
 
     return _wrapper
 

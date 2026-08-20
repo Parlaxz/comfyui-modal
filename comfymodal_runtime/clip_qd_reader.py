@@ -464,6 +464,7 @@ class _ReaderState:
         self.last_completion_mono: Optional[int] = None
         self.t_start_mono = time.monotonic_ns()
         self.block_records: list[dict] = []
+        self.buffer_wait_ms_total = 0.0
 
     def pull(self) -> Optional[tuple[int, int]]:
         with self._lock:
@@ -485,6 +486,10 @@ class _ReaderState:
                 self.first_completion_mono = now
             self.last_completion_mono = now
             self.block_records.append(record)
+
+    def add_buffer_wait(self, ms: float) -> None:
+        with self._lock:
+            self.buffer_wait_ms_total += ms
 
 
 def _steady_state_gbps(records: list[dict]) -> Optional[float]:
@@ -540,6 +545,7 @@ def _new_stats(*, qd: int, block_bytes: int, file_bytes: int, n_ranges: int,
         "queue_backlog_max": 0,
         "block_bytes": int(block_bytes),
         "file_bytes": int(file_bytes),
+        "bytes_read": 0,
         "n_ranges": int(n_ranges),
         "submit_count": 0,
         "completion_count": 0,
@@ -583,6 +589,8 @@ def _finalize_stats(stats: dict, state: _ReaderState, wall_ms: float,
     stats["queue_backlog_max"] = state.queue_backlog_max
     stats["submit_count"] = state.submitted
     stats["completion_count"] = state.completed
+    stats["bytes_read"] = sum(int(r.get("len", 0)) for r in state.block_records)
+    stats["buffer_pool_wait_ms"] = round(state.buffer_wait_ms_total, 4)
     stats["total_source_wall_ms"] = round(wall_ms, 4)
     stats["aggregate_gbps"] = round(
         stats["file_bytes"] / (wall_ms * 1e6) if wall_ms > 0 else 0.0, 4
@@ -750,6 +758,22 @@ def read_file_qd(
                  wall_ms=stats["total_source_wall_ms"],
                  latency_ms=stats["tail_completion_latency_ms"])
     ledger_event(EVT_SUBMIT_END, wall_ms=stats["total_source_wall_ms"])
+    ledger_event(
+        "clip_qd_stats",
+        configured_qd=stats["configured_qd"],
+        observed_max_outstanding=stats["observed_max_outstanding"],
+        bytes_read=stats["bytes_read"],
+        file_bytes=stats["file_bytes"],
+        total_source_wall_ms=stats["total_source_wall_ms"],
+        aggregate_gbps=stats["aggregate_gbps"],
+        steady_state_gbps=stats["steady_state_gbps"],
+        buffer_pool_wait_ms=stats["buffer_pool_wait_ms"],
+        submit_count=stats["submit_count"],
+        completion_count=stats["completion_count"],
+        per_read_errors=stats["per_read_errors"],
+        launch_policy=stats["launch_policy"],
+        syscall_mode=stats["syscall_mode"],
+    )
     _write_artifact(artifact, {"stats": stats, "path": str(path)})
     _print_summary(stats, path)
     if collect_bytes and int(total) <= _VERIFY_COLLECT_LIMIT:
@@ -827,6 +851,8 @@ def _gpu_worker(path: str, state: _ReaderState, slot: Any, slot_ev: Any,
                     off=int(abs_start), len=int(ln),
                     wait_ms=round(wait_ms, 4),
                 )
+        if wait_ms > 0:
+            state.add_buffer_wait(wait_ms)
         b0 = time.perf_counter()
         mv = memoryview(slot.numpy())[:ln]
         got = _read_at(fd, mv, abs_start)
@@ -1027,6 +1053,22 @@ def read_file_qd_gpu(
                       h2d_host_issue_total_ms=stats["h2d"]["h2d_host_issue_total_ms"])
         ledger_event(EVT_COPY_END, h2d_device_ms=stats["h2d"]["h2d_device_ms"],
                      h2d_host_issue_total_ms=stats["h2d"]["h2d_host_issue_total_ms"])
+        ledger_event(
+            "clip_qd_stats",
+            configured_qd=stats["configured_qd"],
+            observed_max_outstanding=stats["observed_max_outstanding"],
+            bytes_read=stats["bytes_read"],
+            file_bytes=stats["file_bytes"],
+            total_source_wall_ms=stats["total_source_wall_ms"],
+            aggregate_gbps=stats["aggregate_gbps"],
+            steady_state_gbps=stats["steady_state_gbps"],
+            buffer_pool_wait_ms=stats["buffer_pool_wait_ms"],
+            submit_count=stats["submit_count"],
+            completion_count=stats["completion_count"],
+            per_read_errors=stats["per_read_errors"],
+            launch_policy=stats["launch_policy"],
+            syscall_mode=stats["syscall_mode"],
+        )
         # Zero-copy views (alignment-checked; rare misalignment falls back).
         sd: dict[str, Any] = {}
         for key, dtype_str, shape, rel_start, length in tensor_map:

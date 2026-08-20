@@ -68,7 +68,10 @@ def test_real_registry_flag_metadata(real_registry):
     mode = real_registry.get("V2_BENCHMARK_MODE")
     assert mode.enum_values is not None
     assert "snapshot_restore_only" in mode.enum_values
-    assert mode.default == "snapshot_restore_only"
+    # The E29 attempt-2 fix made e28_single the registry DEFAULT so v2ctl
+    # run/gate never silently falls back to the restore-only probe; the
+    # probe mode is an explicit opt-in ONLY.
+    assert mode.default == "e28_single"
 
 
 def test_nonce_regex_metadata(real_registry):

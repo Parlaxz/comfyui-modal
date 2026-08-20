@@ -80,6 +80,32 @@ _RESTORE_SPANS: list[dict[str, Any]] = []
 _RESTORE_EVENTS: list[dict[str, Any]] = []
 _RESTORE_RID: str = ""
 
+# ── Authoritative serial-ledger endpoints (E29 acceptance contract) ─────
+# ``request_ledger_report`` MUST bound the serial zero-gap ledger by these
+# explicit endpoints (remote_python_resume -> first_durable_result), never by
+# min/max of whatever spans/events happen to exist.  A truncated ledger must
+# not be able to tile its own truncated interval and still claim zero-gap.
+_AUTHORITATIVE_ENDPOINTS: dict[str, int] = {}
+
+
+def set_authoritative_endpoints(
+    *,
+    remote_python_resume_mono_ns: int | None = None,
+    first_durable_result_mono_ns: int | None = None,
+) -> None:
+    """Record the explicit canonical boundaries for the serial zero-gap
+    ledger.  Both endpoints are required for the acceptance report; a missing
+    endpoint surfaces as ``endpoint_status="missing"`` with the exact key."""
+    global _AUTHORITATIVE_ENDPOINTS
+    if remote_python_resume_mono_ns is not None:
+        _AUTHORITATIVE_ENDPOINTS["remote_python_resume_mono_ns"] = int(
+            remote_python_resume_mono_ns
+        )
+    if first_durable_result_mono_ns is not None:
+        _AUTHORITATIVE_ENDPOINTS["first_durable_result_mono_ns"] = int(
+            first_durable_result_mono_ns
+        )
+
 
 def _in_restore_phase() -> bool:
     """True while the ledger is capturing the restore lifecycle.
@@ -202,7 +228,7 @@ def begin_request(request_id: str = "") -> None:
 
 def clear_ledger_for_test() -> None:
     """Test helper: clear spans/events/identity without touching env gates."""
-    global _SPANS, _EVENTS, _RESTORE_SPANS, _RESTORE_EVENTS, _RESTORE_RID, _CURRENT_REQUEST_ID, _IDENTITY
+    global _SPANS, _EVENTS, _RESTORE_SPANS, _RESTORE_EVENTS, _RESTORE_RID, _CURRENT_REQUEST_ID, _IDENTITY, _AUTHORITATIVE_ENDPOINTS
     # Also reset the bridge registry: an orphaned active bridge from a
     # previous test must never keep a span open across tests.
     try:
@@ -218,6 +244,7 @@ def clear_ledger_for_test() -> None:
     with _IDENTITY_LOCK:
         _IDENTITY.clear()
         _CURRENT_REQUEST_ID = ""
+    _AUTHORITATIVE_ENDPOINTS.clear()
 
 
 def record_event(
@@ -363,7 +390,21 @@ class CriticalPathSpan:
         return self._persist()
 
     # ── split-boundary API (for spans opened/closed at different code sites) ──
-    def finish(self, end_mono_ns: int | None = None) -> dict[str, Any] | None:
+    def finish(
+        self,
+        end_mono_ns: int | None = None,
+        mono_ns: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Close the span at an explicit boundary stamp.
+
+        Accepts BOTH ``end_mono_ns`` and ``mono_ns`` keyword spellings:
+        several close sites historically used ``mono_ns=`` (the event API
+        spelling), which raised TypeError and silently dropped the whole
+        span under the surrounding ``except Exception: pass``.  The two
+        spellings are aliases; when both are given ``end_mono_ns`` wins.
+        """
+        if mono_ns is not None and end_mono_ns is None:
+            end_mono_ns = mono_ns
         if self._finalized:
             return None
         self._finalized = True
@@ -683,6 +724,14 @@ def request_ledger_report() -> dict[str, Any]:
     The serial axis spans restore entry .. first durable result: the
     restore-session spans/events (same process, same monotonic clock) are
     included whenever a restore session exists for this container process.
+
+    E29 acceptance contract: the serial ledger MUST use the explicit
+    authoritative endpoints set via ``set_authoritative_endpoints()``
+    (remote_python_resume_mono_ns -> first_durable_result_mono_ns), NOT
+    min/max(existing spans/events).  A truncated ledger must not be able to
+    tile its own truncated interval and still claim zero-gap: if the
+    authoritative endpoints are missing, the report's ``serial_ledger`` is
+    None and ``endpoint_status`` carries the exact missing boundary.
     """
     spans = get_spans()
     events = get_events()
@@ -690,16 +739,31 @@ def request_ledger_report() -> dict[str, Any]:
     restore_events = get_restore_events()
     all_spans = [*restore_spans, *spans]
     all_events = [*restore_events, *events]
-    start = min(
-        [int(s["start_mono_ns"]) for s in all_spans]
-        + [int(e["mono_ns"]) for e in all_events]
-        + [time.monotonic_ns()],
-    )
-    end = max(
-        [int(s["end_mono_ns"]) for s in all_spans]
-        + [int(e["mono_ns"]) for e in all_events]
-        + [start],
-    )
+    # ── E29: explicit authoritative endpoints (not min/max of events) ────
+    auth = dict(_AUTHORITATIVE_ENDPOINTS)
+    start = auth.get("remote_python_resume_mono_ns")
+    end = auth.get("first_durable_result_mono_ns")
+    missing = []
+    if start is None:
+        missing.append("remote_python_resume_mono_ns")
+    if end is None:
+        missing.append("first_durable_result_mono_ns")
+    if start is None or end is None:
+        return {
+            "identity": identity_block(),
+            "span_count": len(all_spans),
+            "event_count": len(all_events),
+            "restore_span_count": len(restore_spans),
+            "request_span_count": len(spans),
+            "spans": all_spans,
+            "events": all_events,
+            "reconciliation": [reconcile_scope_arithmetic(s) for s in all_spans],
+            "serial_ledger": None,
+            "endpoint_status": "missing",
+            "missing_endpoints": missing,
+        }
+    start = int(start)
+    end = int(end)
     return {
         "identity": identity_block(),
         "span_count": len(all_spans),
@@ -712,6 +776,9 @@ def request_ledger_report() -> dict[str, Any]:
         "serial_ledger": build_serial_ledger(
             start_mono_ns=start, end_mono_ns=end, spans=all_spans,
         ),
+        "endpoint_status": "ok",
+        "start_mono_ns": start,
+        "end_mono_ns": end,
     }
 
 

@@ -3984,12 +3984,22 @@ async def _run_one(
     # SAME structure the remote emitted (never a host-side re-derivation).
     try:
         _remote_ledger = None
+        _remote_status = None
+        _remote_error = None
         if isinstance(result, dict):
             _remote_ledger = result.get("canonical_ledger")
+            _remote_status = result.get("canonical_ledger_status")
+            _remote_error = result.get("canonical_ledger_error")
             if not isinstance(_remote_ledger, dict) and isinstance(result.get("data"), dict):
                 _remote_ledger = result["data"].get("canonical_ledger")
+                _remote_status = result["data"].get("canonical_ledger_status")
+                _remote_error = result["data"].get("canonical_ledger_error")
         if isinstance(_remote_ledger, dict):
             artifact["canonical_ledger"] = _remote_ledger
+        if _remote_status is not None:
+            artifact["canonical_ledger_status"] = str(_remote_status)
+        if _remote_error is not None:
+            artifact["canonical_ledger_error"] = _remote_error
     except Exception:
         pass
     (output_dir / f"run_{index}.json").write_text(

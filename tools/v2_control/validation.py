@@ -228,6 +228,60 @@ class ExpectedOutputShaValidator(ValidatorPlugin):
         return []
 
 
+class CanonicalLedgerValidator(ValidatorPlugin):
+    """E29 tracer-gate validator: the canonical ledger is the authoritative
+    ground-truth payload and lives in ``data["canonical_ledger"]`` (with
+    ``canonical_ledger_status``) — NOT in ordinary RuntimeTrace events.
+
+    Fails a run whose canonical ledger is missing, errored, or does not have
+    the explicit authoritative endpoints + a zero-gap serial ledger.  This
+    makes it impossible for a run with a missing/broken ledger to be
+    classified as a valid E29 tracer run."""
+
+    name = "canonical_ledger"
+
+    def validate(self, record: RunRecord, config: Any) -> list[str]:
+        # The profile must enable the E29 ledger for this validator to apply.
+        flag = "COMFYMODAL_V2_CRITICAL_PATH_LEDGER"
+        try:
+            fl = config.flag(flag)
+        except Exception:
+            fl = None
+        if fl is None or str(getattr(fl, "value", fl or "")).strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            # Ledger not enabled for this run → nothing to validate here
+            # (a non-tracer profile must not fail on a missing ledger).
+            return []
+
+        telemetry = record.telemetry or {}
+        status = str(telemetry.get("canonical_ledger_status") or "")
+        if status == "error":
+            return [
+                "canonical ledger finalization errored on the remote "
+                "(canonical_ledger_status=error)"
+            ]
+        if status == "ok":
+            endpoint_status = str(
+                telemetry.get("canonical_ledger_endpoint_status") or ""
+            )
+            if endpoint_status != "ok":
+                return [
+                    f"canonical ledger endpoint_status={endpoint_status or '(missing)'}: "
+                    "explicit authoritative endpoints (remote_python_resume -> "
+                    "first_durable_result) are required"
+                ]
+            if telemetry.get("canonical_ledger_zero_gap") != "True":
+                return ["canonical ledger serial zero-gap did not pass"]
+            return []
+        # status absent → canonical ledger missing from the artifact entirely.
+        return [
+            "canonical ledger missing from the run artifact "
+            "(canonical_ledger_status absent): an E29 tracer run must attach "
+            "canonical_ledger + canonical_ledger_status"
+        ]
+
+
 def _config_workload(config: Any) -> dict:
     workload = getattr(config, "workload", None)
     if workload is None:
@@ -325,12 +379,10 @@ def build_run_record_from_result(
             # fresh/restored identity: the AUTHORITATIVE cold proof is the
             # container's own request/restore counts (restore_count==1 and
             # request_count==1 == exactly one request on a freshly restored
-            # container) AND the container's reported class matches the
-            # configured target class (a stale container from an OLD
-            # deployment reports the OLD class name — proven by gate runs
-            # showing class_name=ModalRuntimeEntrypoint while the deployment
-            # targets ModalRuntimeEntrypointV2).  The `retained` flag is NOT
-            # a freshness proof.
+            # container).  NOTE: the container's reported class_name is a
+            # legacy naming artifact (ModalRuntimeEntrypoint vs the deployed
+            # ModalRuntimeEntrypointV2 target) and is NOT a stale-container
+            # signal — do NOT use class-name mismatch as staleness proof.
             if not (telemetry.get("fresh") or telemetry.get("restored")):
                 snap = data.get("snapshot_identity") or {}
                 src = data.get("source_identity") or {}
@@ -343,18 +395,28 @@ def build_run_record_from_result(
                             telemetry[k] = str(src[k])
                     rc = src.get("restore_count")
                     qc = src.get("request_count")
-                    expected_class = getattr(getattr(config, "target", None), "class_name", "") or ""
-                    actual_class = str(src.get("class_name") or "")
-                    class_ok = (not expected_class) or (actual_class == expected_class)
-                    if not class_ok:
-                        telemetry["restored"] = "True"
-                        telemetry["stale_container"] = "True"
-                        telemetry["stale_class"] = actual_class
-                    elif rc is not None and qc is not None:
+                    if rc is not None and qc is not None:
                         if int(rc) == 1 and int(qc) == 1:
                             telemetry["fresh"] = "True"
                         else:
                             telemetry["restored"] = "True"
+            # ── E29: canonical ledger presence (authoritative) ────────────
+            # The E29 canonical ledger lives in data["canonical_ledger"]
+            # (with canonical_ledger_status), NOT in ordinary trace events.
+            # Surface its status into telemetry so the CanonicalLedgerValidator
+            # can reject a run whose ledger is missing or errored.
+            if "canonical_ledger_status" in data:
+                telemetry["canonical_ledger_status"] = str(data["canonical_ledger_status"])
+            if isinstance(data.get("canonical_ledger"), dict):
+                telemetry["canonical_ledger"] = "present"
+                telemetry["canonical_ledger_endpoint_status"] = str(
+                    data["canonical_ledger"].get("endpoint_status") or ""
+                )
+                serial = data["canonical_ledger"].get("serial_ledger")
+                if isinstance(serial, dict):
+                    telemetry["canonical_ledger_zero_gap"] = str(
+                        serial.get("zero_gap", False)
+                    )
             if output_sha is None and isinstance(data.get("output_sha"), str):
                 output_sha = data["output_sha"]
             if output_sha is None:

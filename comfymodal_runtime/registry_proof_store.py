@@ -205,6 +205,22 @@ def lookup(workflow_hash: str, comfyui_root: str = "") -> dict | None:
         return None
 
 
+def entries() -> dict:
+    """Return ALL stored entries (best-effort, never raises).
+
+    E29: used by the plan-validation fallback to scan for a stored deployed
+    proof matching the current workflow by node-type fingerprint (the per-run
+    conditioning nonce changes the full workflow hash but not the node
+    structure).  Never raises; returns {} on any error.
+    """
+    try:
+        store = _load_store()
+        out = store.get("entries") or {}
+        return {k: dict(v) for k, v in out.items() if isinstance(v, dict)}
+    except Exception:
+        return {}
+
+
 def save(fields: dict) -> None:
     """Persist a store entry (best-effort, never raises).
 

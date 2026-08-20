@@ -845,6 +845,24 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
     finally:
         lane.record["result"] = result
         lane.finished_mono_ns = time.monotonic_ns()
+        # ── E29: canonical ledger speculative-CLIP lane-finished marker ──
+        # The source-read completion boundary on the canonical axis, so the
+        # serial ledger can prove whether the read finished before or after
+        # demand (Phase 7 overlap/stretch question).
+        try:
+            from .critical_path_ledger import record_event as _ledger_event
+            _ledger_event(
+                "clip_speculative_lane_finished",
+                mono_ns=lane.finished_mono_ns,
+                metadata={
+                    "request_id": lane.request_id,
+                    "identity": lane.identity[:32] if lane.identity else "",
+                    "ok": int(bool(result and result.get("ok"))),
+                    "path_source": lane.path_source,
+                },
+            )
+        except Exception:
+            pass
 
 
 def get_speculative_clip_lane(request_id: str) -> Optional["_SpeculativeClipLane"]:
@@ -1118,6 +1136,23 @@ def start_restore_time_clip_lane(
             })
         except Exception:
             pass
+    # ── E29: canonical ledger speculative-CLIP lane-started marker ───────
+    # The restore-time CLIP source lane launch becomes a ledger event so the
+    # serial ledger can prove when the concurrent CLIP source read began
+    # relative to restore (overlap vs stretch, Phase 7).
+    try:
+        from .critical_path_ledger import record_event as _ledger_event
+        _ledger_event(
+            "clip_speculative_lane_started",
+            mono_ns=lane.started_mono_ns,
+            metadata={
+                "request_id": key,
+                "identity": identity[:32],
+                "path_source": "frozen_manifest",
+            },
+        )
+    except Exception:
+        pass
     try:
         from .gantt_telemetry import register_gantt_span
 

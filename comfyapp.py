@@ -12905,6 +12905,19 @@ class _ComfyAPIMixin:
         def _production_unet_worker():
             import nodes as _prod_nodes
             _thread_start_ns = time.perf_counter_ns()
+            # ── E29: canonical ledger production-UNET worker first instruction ──
+            try:
+                from comfymodal_runtime.critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "unet_worker_first_instruction",
+                    metadata={
+                        "request_id": "",
+                        "worker": "production_unet_worker",
+                        "unet_identity_hash": _canonical_key_str[:16],
+                    },
+                )
+            except Exception:
+                pass
             try:
                 self._record_critical_path_restore(
                     "production_unet_thread_start",

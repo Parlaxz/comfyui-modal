@@ -84,6 +84,7 @@ from .unet_salvage_probe import (
 )
 from .env import env_flag as _env_flag
 from . import gpu_lane_coordination as _gpu_coord
+from .critical_path_ledger import begin_span as _ledger_begin_span, record_event as _ledger_event
 from .trace import (
     cpu_affinity_count as _trace_cpu_affinity_count,
     effective_cores_from as _trace_effective_cores_from,
@@ -1106,12 +1107,30 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
     if _trace is None:
         _trace = _ACTIVE_REQUEST_TRACE.get()
     _t0_total = _time.monotonic_ns()
+    # ── E29: canonical ledger UNET pipeline span + worker-first-instruction ──
+    _unet_span = None
+    try:
+        _unet_span = _ledger_begin_span("unet:lane-pipeline", lane="UNET")
+    except Exception:
+        _unet_span = None
     # Forensic registry request id (from the resolved trace, when available).
     _fs_req_id = getattr(_trace, "request_id", None) if _trace is not None else None
     if not isinstance(_fs_req_id, str) or not _fs_req_id:
         _fs_req_id = None
     if _fs_req_id:
         _gpu_coord.start_request(_fs_req_id, _trace)
+    # ── E29: unet_worker_first_instruction (post-req-id resolution) ──
+    try:
+        _ledger_event(
+            "unet_worker_first_instruction",
+            mono_ns=_t0_total,
+            metadata={
+                "request_id": _fs_req_id or "",
+                "unet_identity_hash": str(getattr(model_key, "stable_hash", ""))[:16],
+            },
+        )
+    except Exception:
+        pass
     # Process CPU affinity count (shared by both worker registry records).
     _cpu_affinity_count = _trace_cpu_affinity_count()
     # Serial accounting intervals (name, start_mono_ns, end_mono_ns), absolute
@@ -1388,6 +1407,11 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
                         raise RuntimeError("structural_source_fence_failure:unet")
                     _orchestration.record_fastsafe("unet", "start", event_recorded=False)
                 if _staged_active:
+                    # ── E29: unet_source_io_start (staged path) ──
+                    try:
+                        _ledger_event("unet_source_io_start", metadata={"transport": "staged"})
+                    except Exception:
+                        pass
                     _staged_plan_value = _fs_staged_plan(
                         _path, _header, _target)
                     _t_prepare = _time.monotonic_ns()
@@ -1479,6 +1503,11 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
                     finally:
                         _metrics["unet_staged_commit_ms"] = round(
                             (_time.monotonic_ns() - _t_commit) / 1_000_000, 4)
+                    # ── E29: unet_source_io_end (staged path) ──
+                    try:
+                        _ledger_event("unet_source_io_end", metadata={"transport": "staged"})
+                    except Exception:
+                        pass
                     if _metrics.get("unet_staged_h2d_ms") is None:
                         _metrics["unet_staged_h2d_ms"] = (
                             _metrics.get("unet_staged_commit_ms"))
@@ -1492,9 +1521,19 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
                     )
                     _worker_b_result["transport"] = "staged"
                 else:
+                    # ── E29: unet_source_io_start (fastsafe path) ──
+                    try:
+                        _ledger_event("unet_source_io_start", metadata={"transport": "fastsafe"})
+                    except Exception:
+                        pass
                     _e27_uread_start = _time.monotonic_ns()
                     _t, _ld, _f = _fs_fastsafe_load(_path, _target, _metrics)
                     _e27_uread_end = _time.monotonic_ns()
+                    # ── E29: unet_source_io_end (fastsafe path) ──
+                    try:
+                        _ledger_event("unet_source_io_end", metadata={"transport": "fastsafe"})
+                    except Exception:
+                        pass
                     # E27: UNET source-read span on the shared monotonic axis.
                     try:
                         from .e27_forensics import emit_e27_span
@@ -1528,6 +1567,11 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
                     reason=("staged_transport" if _staged_active
                             else "direct_gpu_fastsafetensors"),
                 )
+                # ── E29: unet_gpu_transfer_start ──
+                try:
+                    _ledger_event("unet_gpu_transfer_start")
+                except Exception:
+                    pass
                 _transfer_started = True
                 _copy_event = None
                 if _fs_scoped_cuda_readiness_enabled():
@@ -1554,6 +1598,11 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
                         reason=("staged_transport" if _staged_active
                                 else "direct_gpu_fastsafetensors"),
                     )
+                    # ── E29: unet_gpu_transfer_end ──
+                    try:
+                        _ledger_event("unet_gpu_transfer_end")
+                    except Exception:
+                        pass
                 if _wb_cpu0 is not None:
                     try:
                         _metrics["worker_b_thread_cpu_ms"] = round(
@@ -1971,6 +2020,11 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
         _gpu_coord.record_unet_ready(
             _fs_req_id or "", _trace, reason="unet_ready"
         )
+        # ── E29: unet_device_ready ──
+        try:
+            _ledger_event("unet_device_ready")
+        except Exception:
+            pass
         if _orchestration is not None:
             from .fast_cold_orchestration import record_unet_ready
 
@@ -2084,6 +2138,29 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
                 )
         except Exception:
             pass
+        # ── E29: unet_lane_complete + span metadata + span finish ──
+        try:
+            _ledger_event(
+                "unet_lane_complete",
+                metadata={
+                    "request_id": _fs_req_id or "",
+                    "unet_identity_hash": str(getattr(model_key, "stable_hash", ""))[:16],
+                    "transport": _worker_b_result.get("transport", "unknown"),
+                    "total_pipeline_wall_ms": _metrics.get("total_pipeline_wall_ms"),
+                },
+            )
+        except Exception:
+            pass
+        if _unet_span is not None:
+            try:
+                _unet_span.metadata.update({
+                    "request_id": _fs_req_id or "",
+                    "unet_identity_hash": str(getattr(model_key, "stable_hash", ""))[:16],
+                    "transport": _worker_b_result.get("transport", "unknown"),
+                })
+                _unet_span.finish(end_mono_ns=_time.monotonic_ns())
+            except Exception:
+                pass
         return (_patcher,)
     except Exception as _exc:
         if "structural_source_fence_failure" in str(_exc) or _exc.__class__.__name__ == "SourceFenceFailure":
@@ -2091,6 +2168,12 @@ def _fs_try_pipeline(bridge, model_key, kwargs, lane) -> tuple[Any, ...] | None:
         return _fs_fail(_metrics, _trace, f"stage:{type(_exc).__name__}",
                         _t0_total, loader=_loader, fb=_fb)
     finally:
+        # ── E29: safety-net span close (idempotent — success path already finished) ──
+        if _unet_span is not None:
+            try:
+                _unet_span.finish(end_mono_ns=_time.monotonic_ns())
+            except Exception:
+                pass
         _gate = _worker_b_result.get("gpu_gate")
         if _gate is not None:
             try:

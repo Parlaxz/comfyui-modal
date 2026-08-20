@@ -417,6 +417,19 @@ def build_run_record(
         "wall_ms": _first_value(result, ("wall_ms",)),
         "persisted_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_identity": dict(identity),
+        # ── E29: canonical critical-path ledger (ground truth) ───────────
+        # The remote result attaches the full canonical ledger report; carry
+        # it verbatim (plus its status) into the persisted sample record so
+        # the gate validator reads the SAME structure the remote emitted.
+        "canonical_ledger": _first_value(
+            result, ("canonical_ledger",),
+        ),
+        "canonical_ledger_status": _first_value(
+            result, ("canonical_ledger_status",),
+        ),
+        "canonical_ledger_error": _first_value(
+            result, ("canonical_ledger_error",),
+        ),
     }
     return _json_safe(record)  # type: ignore[return-value]
 
