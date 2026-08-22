@@ -95,6 +95,7 @@ def _anchor(generation: str, deployment_hash: str) -> dict:
     return {
         "generation": generation,
         "deployment_hash": deployment_hash,
+        "dependency_hash": "overall-a",
         "comfyui_version": "0.24.0",
         "comfyui_commit": "c0ffee",
     }

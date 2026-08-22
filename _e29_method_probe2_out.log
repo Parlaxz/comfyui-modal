@@ -1,0 +1,5 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+FAIL source_identity_probe: NotFoundError: Class has no method source_identity_probe, and attributes can't be accessed for `Cls.from_name` instances
+OK   run_env_probe: dict
+   keys: ['cpu', 'env', 'gpu', 'memory_mb', 'min_containers', 'request_id', 'scaledown_window', 'single_use_containers', 'single_use_containers_spec', 'status', 'waterfall']
+FAIL get_deployment_identity_static: TypeError: ModalRuntimeEntrypoint.get_deployment_identity_static() got an unexpected keyword argument 'request_id'

@@ -1,0 +1,64 @@
+exit: 0
+--- stdout (upload/mount/build lines) ---
+[timing_trace] module loaded __file__=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\timing_trace.py TRACE_VERSION=2.0.0
+[comfyapp] COMFYAPP_VERSION=2.16.30
+Building image im-gblwCX9oiRF7PFCc3iV6EF
+Building image im-fQILUvqWnOm02lBoD6WSeg
+Building image im-Oj7VBCVvPSOYA0Z2Vlean4
+├── 🔨 Created mount PythonPackage:run_prompt_options
+├── 🔨 Created mount PythonPackage:workflow_metadata
+├── 🔨 Created mount PythonPackage:profiler_trace_v4
+├── 🔨 Created mount PythonPackage:warmup_profile
+├── 🔨 Created mount PythonPackage:wall_clock_trace_v3
+├── 🔨 Created mount PythonPackage:optimizations
+├── 🔨 Created mount PythonPackage:failure_summary
+├── 🔨 Created mount PythonPackage:production_workflow
+├── 🔨 Created mount PythonPackage:timing_trace
+├── 🔨 Created mount PythonPackage:canonical_execution
+├── 🔨 Created mount PythonPackage:gpu_catalog
+├── 🔨 Created mount PythonPackage:api_prompt_validator
+├── 🔨 Created mount PythonPackage:modal_client
+├── 🔨 Created mount PythonPackage:comfyapp
+├── 🔨 Created mount PythonPackage:comfymodal_runtime
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+✓ App deployed in 113.781s! 🎉
+View Deployment: 
+https://modal.com/apps/testing3/main/deployed/stable-modal-comfy-v2-restore-onl
+--- stdout tail ---
+e:run_prompt_options
+├── 🔨 Created mount PythonPackage:workflow_metadata
+├── 🔨 Created mount PythonPackage:profiler_trace_v4
+├── 🔨 Created mount PythonPackage:warmup_profile
+├── 🔨 Created mount PythonPackage:wall_clock_trace_v3
+├── 🔨 Created mount PythonPackage:optimizations
+├── 🔨 Created mount PythonPackage:failure_summary
+├── 🔨 Created mount PythonPackage:production_workflow
+├── 🔨 Created mount PythonPackage:timing_trace
+├── 🔨 Created mount PythonPackage:canonical_execution
+├── 🔨 Created mount PythonPackage:gpu_catalog
+├── 🔨 Created mount PythonPackage:api_prompt_validator
+├── 🔨 Created mount PythonPackage:modal_client
+├── 🔨 Created mount PythonPackage:comfyapp
+├── 🔨 Created mount PythonPackage:comfymodal_runtime
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+│   Install\ComfyUI\custom_nodes\comfyui-modal\cachedit_dependency_lock.txt
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+│   Install\ComfyUI\custom_nodes\comfyui-modal\.custom_node_requirements
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+│   Install\ComfyUI\custom_nodes
+├── 🔨 Created mount C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June 
+│   Install\ComfyUI\custom_nodes\comfyui-modal\.baked_custom_node_deps\custom_n
+│   ode_deps_baked.json
+└── 🔨 Created function ModalRuntimeEntrypointV2.*.
+✓ App deployed in 113.781s! 🎉
+
+View Deployment: 
+https://modal.com/apps/testing3/main/deployed/stable-modal-comfy-v2-restore-onl
+y-shadow
+
+--- stderr tail ---
+[modal-client] 2026-08-19T18:07:13-0500 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*
+

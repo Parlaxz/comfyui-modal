@@ -16,6 +16,7 @@ Python 3.11 stdlib + pytest only; no network.
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -293,3 +294,65 @@ def test_float_formatting_repr():
     config.workload = _Workload(gap_seconds=0.30000000000000004)
     inputs = FingerprintEngine(config).run_inputs()
     assert inputs["workload"]["gap_seconds"] == repr(0.30000000000000004)
+
+
+# ---------------------------------------------------------------------------
+# Post-selector runtime provenance
+# ---------------------------------------------------------------------------
+
+
+def test_e30_selector_fingerprint_matches_post_bat_runtime_values():
+    """E30 arms inherit E19; the BAT then force-sets these four flags."""
+    from tools.v2_control.config import ConfigResolver
+    from tools.v2_control.profiles import Profiles
+    from tools.v2_control.registry import FlagRegistry
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = ConfigResolver(
+        repo_root,
+        Profiles(repo_root / "config" / "v2" / "profiles"),
+        FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml"),
+    ).resolve(profile_name="e30-clip-qd-arm-b")
+    engine = FingerprintEngine(config)
+    runtime_flags = {
+        "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+        "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+        "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "1",
+        "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    }
+
+    # Resolution remains the pre-BAT input; the fingerprint is post-selector.
+    for name in runtime_flags:
+        flag = config.flag(name)
+        assert flag is not None
+        assert flag.value == "0"
+    assert {
+        name: engine.deploy_inputs()["deploy_flags"][name]
+        for name in runtime_flags
+    } == runtime_flags
+
+    # A config representing the values actually handed to the runtime must
+    # produce the same identity as v2ctl's projected fingerprint.
+    runtime_config = deepcopy(config)
+    for flag in runtime_config.flags:
+        if flag.name in runtime_flags:
+            flag.value = runtime_flags[flag.name]
+    assert engine.deploy_fingerprint() == FingerprintEngine(runtime_config).deploy_fingerprint()
+
+
+def test_selector_projection_does_not_change_unrelated_production_profile():
+    from tools.v2_control.config import ConfigResolver
+    from tools.v2_control.profiles import Profiles
+    from tools.v2_control.registry import FlagRegistry
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = ConfigResolver(
+        repo_root,
+        Profiles(repo_root / "config" / "v2" / "profiles"),
+        FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml"),
+    ).resolve(profile_name="production")
+    inputs = FingerprintEngine(config).deploy_inputs()["deploy_flags"]
+    assert inputs["COMFYMODAL_V2_CLIP_FAST_HYDRATION"] == "0"
+    assert inputs["COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS"] == "0"
+    assert inputs["COMFYMODAL_V2_FAST_COLD_ORCHESTRATION"] == "0"
+    assert inputs["COMFYMODAL_V2_UNET_FASTSAFETENSORS"] == "0"

@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import inspect
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +63,11 @@ class RunRecord:
     backend_ok: bool
     telemetry: dict = field(default_factory=dict)
     output_sha: str | None = None
+    v2ctl_invocation_id: str = ""
+    request_id: str = ""
+    profile_config_fingerprint: str = ""
+    provenance_validation_status: str = ""
+    backend_exit_code: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -73,8 +80,13 @@ class RunRecord:
             "expected_output_sha": self.expected_output_sha,
             "artifacts": _artifacts_to_dict(self.artifacts),
             "backend_ok": self.backend_ok,
+            "backend_exit_code": self.backend_exit_code,
             "telemetry": dict(self.telemetry),
             "output_sha": self.output_sha,
+            "v2ctl_invocation_id": self.v2ctl_invocation_id,
+            "request_id": self.request_id,
+            "profile_config_fingerprint": self.profile_config_fingerprint,
+            "provenance_validation_status": self.provenance_validation_status,
         }
 
 
@@ -154,20 +166,24 @@ class StructuralValidator(ValidatorPlugin):
     """Generic structural checks from design section 18: backend success, a
     persisted run artifact exists, telemetry carries request/correlation ids,
     fresh/restored identity is present when fresh is required, output SHA
-    matches when one is configured, and effective-config proof presence is
-    checked only when the record carries it."""
+    matches when one is configured, and effective provenance is required for
+    every canonical record.  Missing proof or identity fails closed."""
 
     name = "structural"
 
     def validate(self, record: RunRecord, config: Any) -> list[str]:
         failures: list[str] = []
 
-        # backend completed successfully
-        if not record.backend_ok:
-            failures.append("backend invocation did not complete successfully")
-
         # persisted run artifact present
         run_artifact = _artifact_run_path(record)
+        if not record.backend_ok:
+            if run_artifact is None or not Path(run_artifact).is_file():
+                failures.append(
+                    "backend invocation failed without producing a persisted run artifact"
+                    f" (exit code {record.backend_exit_code if record.backend_exit_code is not None else 'unknown'})"
+                )
+            else:
+                failures.append("backend invocation did not complete successfully")
         if run_artifact is None or not Path(run_artifact).is_file():
             failures.append(f"persisted run artifact missing: {run_artifact}")
 
@@ -178,6 +194,43 @@ class StructuralValidator(ValidatorPlugin):
             failures.append("telemetry missing request_id")
         if "correlation_id" not in telemetry and "CORRELATION_ID" not in telemetry:
             failures.append("telemetry missing correlation_id")
+
+        # Canonical validation is fail-closed: a persisted artifact is not
+        # enough without the identity that bound it to this v2ctl operation.
+        artifacts = record.artifacts
+        invocation_id = str(
+            record.v2ctl_invocation_id
+            or getattr(artifacts, "v2ctl_invocation_id", "")
+            or ""
+        ).strip()
+        profile_config_fingerprint = str(
+            record.profile_config_fingerprint
+            or getattr(artifacts, "profile_config_fingerprint", "")
+            or ""
+        ).strip()
+        provenance_status = str(
+            record.provenance_validation_status
+            or getattr(artifacts, "provenance_validation_status", "")
+            or ""
+        ).strip()
+        request_id = str(
+            record.request_id
+            or getattr(artifacts, "request_id", "")
+            or telemetry.get("request_id")
+            or telemetry.get("REQUEST_ID")
+            or ""
+        ).strip()
+        if not invocation_id:
+            failures.append("effective provenance missing v2ctl_invocation_id")
+        if not request_id:
+            failures.append("effective provenance missing request_id")
+        if not profile_config_fingerprint:
+            failures.append("effective provenance missing profile_config_fingerprint")
+        if provenance_status != "validated":
+            failures.append(
+                "effective provenance was not canonically validated: "
+                f"{provenance_status or '(missing)'}"
+            )
 
         # fresh identity line when fresh required: a REUSED (restored)
         # container must FAIL a fresh-required gate, never satisfy it.
@@ -201,10 +254,15 @@ class StructuralValidator(ValidatorPlugin):
                     f"output SHA mismatch: expected {record.expected_output_sha}, observed {record.output_sha}"
                 )
 
-        # effective-config proof: checked only when the record carries it
+        # Every accepted canonical run must carry the compact effective-config
+        # proof emitted by the runtime.  Do not treat absence as legacy data.
         proof = telemetry.get("v2ctl_config") or telemetry.get("V2CTL_CONFIG")
-        if proof is not None and not proof:
-            failures.append("effective-config proof present but empty")
+        if not proof:
+            failures.append("effective-config proof missing")
+        elif not isinstance(proof, str) or not all(
+            token in proof for token in ("deploy=", "run=", "profile=")
+        ):
+            failures.append("effective-config proof is incomplete")
 
         return failures
 
@@ -282,6 +340,539 @@ class CanonicalLedgerValidator(ValidatorPlugin):
         ]
 
 
+def _flag_enabled(config: Any, name: str) -> bool:
+    """Read one resolved flag without making validation depend on Config types."""
+    try:
+        flag = config.flag(name)
+    except Exception:  # noqa: BLE001 - validation is deliberately duck-typed
+        flag = None
+    if flag is not None:
+        value = getattr(flag, "value", flag)
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    for flag in getattr(config, "flags", ()) or ():
+        if getattr(flag, "name", "") == name:
+            return str(getattr(flag, "value", "")).strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+    return False
+
+
+def _artifact_data(record: RunRecord) -> dict[str, Any]:
+    """Load the persisted run artifact, returning an empty mapping on error."""
+    path = _artifact_run_path(record)
+    if path is None:
+        return {}
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _e31_trace_events(data: dict[str, Any], telemetry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return ordinary trace events carrying E31 proof and cache observations.
+
+    E31's *timing* evidence is authoritative only on the canonical ledger.  Its
+    residency/bind and cache facts are emitted on the ordinary trace, so this
+    helper intentionally reads only the known trace containers rather than
+    recursively accepting arbitrary nested dictionaries.
+    """
+    events: list[dict[str, Any]] = []
+    sources: list[Any] = [data, telemetry]
+    for root in (data, telemetry):
+        for source in (root.get("result"), root.get("full_trace"), root.get("trace")):
+            if isinstance(source, dict):
+                sources.append(source)
+                nested_trace = source.get("trace")
+                if isinstance(nested_trace, dict):
+                    sources.append(nested_trace)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        candidate = source.get("events")
+        if isinstance(candidate, list):
+            events.extend(item for item in candidate if isinstance(item, dict))
+        # A few artifact writers persist these named proof records directly.
+        for name, value in (
+            ("clip_fh_cast_once_bind_proof", source.get("cast_once_bind_proof")),
+            ("clip_fh_cast_once_forward_check", source.get("e31_forward_evidence")),
+        ):
+            if isinstance(value, dict):
+                events.append({"name": name, "metadata": value})
+    return events
+
+
+def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one trace event's metadata while preserving its scalar fields."""
+    payload: dict[str, Any] = {}
+    metadata = event.get("metadata")
+    if isinstance(metadata, dict):
+        payload.update(metadata)
+    for key, value in event.items():
+        if key not in {"name", "metadata", "phase", "wall_unix_ns", "monotonic_ns"}:
+            payload.setdefault(key, value)
+    return payload
+
+
+def _named_e31_event(events: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if str(event.get("name", "")) == name:
+            return _event_payload(event)
+    return None
+
+
+def _nested_mapping(value: Any, *keys: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    for key in keys:
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _number(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _truth(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "ok", "pass")
+
+
+class E31ForensicsValidator(ValidatorPlugin):
+    """Fail-closed evidence gate for profiles with E31 forensics enabled.
+
+    The canonical ledger is the only accepted source for forward GPU timing
+    and real cast accounting.  In particular, the hydration result's
+    ``conversion_count`` is intentionally never used: it describes the bind
+    transform and cannot prove a real forward-time BF16->FP32 conversion.
+    """
+
+    name = "e31_forensics"
+
+    def applies(self, config: Any) -> bool:
+        return _flag_enabled(config, "COMFYMODAL_V2_E31_FORENSICS")
+
+    def validate(self, record: RunRecord, config: Any) -> list[str]:
+        if not self.applies(config):
+            return []
+
+        failures: list[str] = []
+        data = _artifact_data(record)
+        telemetry = record.telemetry or {}
+        ledger = data.get("canonical_ledger")
+        if not isinstance(ledger, dict):
+            candidate = telemetry.get("canonical_ledger")
+            ledger = candidate if isinstance(candidate, dict) else None
+        status = data.get("canonical_ledger_status", telemetry.get("canonical_ledger_status"))
+        if not isinstance(ledger, dict) or str(status or "").lower() != "ok":
+            return [
+                "authoritative E31 canonical ledger evidence missing "
+                "(canonical_ledger_status=ok and canonical_ledger required)"
+            ]
+
+        canonical_events = ledger.get("events")
+        if not isinstance(canonical_events, list):
+            canonical_events = []
+        canonical_names = {
+            str(item.get("name", ""))
+            for item in canonical_events
+            if isinstance(item, dict)
+        }
+        required_canonical = {
+            "clip_gpu_event_start",
+            "clip_gpu_event_end",
+            "clip_forward_cast_summary",
+        }
+        missing = sorted(required_canonical - canonical_names)
+        if missing:
+            failures.append(
+                "authoritative E31 canonical ledger missing event evidence: "
+                + ", ".join(missing)
+            )
+            return failures
+
+        gpu_stamps = {
+            str(item.get("name")): _number(item.get("mono_ns"))
+            for item in canonical_events
+            if isinstance(item, dict)
+            and item.get("name") in {"clip_gpu_event_start", "clip_gpu_event_end"}
+        }
+        gpu_start = gpu_stamps.get("clip_gpu_event_start")
+        gpu_end = gpu_stamps.get("clip_gpu_event_end")
+        if gpu_start is None or gpu_end is None or gpu_start >= gpu_end:
+            failures.append("authoritative E31 GPU event evidence has invalid boundaries")
+
+        summary_event = next(
+            (item for item in reversed(canonical_events)
+             if isinstance(item, dict) and item.get("name") == "clip_forward_cast_summary"),
+            None,
+        )
+        summary = _event_payload(summary_event or {})
+
+        expected = str(_config_workload(config).get("expected_output_sha", "") or "").strip()
+        if not expected:
+            failures.append("E31 requires an expected output SHA")
+        elif not record.output_sha:
+            failures.append("E31 expected output SHA configured but no output SHA observed")
+        elif record.output_sha != expected:
+            failures.append(
+                f"E31 output SHA mismatch: expected {expected}, observed {record.output_sha}"
+            )
+
+        workload = _config_workload(config)
+        if str(workload.get("conditioning_cache", "") or "").strip().lower() != "forced_miss":
+            failures.append("E31 requires conditioning_cache=forced_miss")
+
+        events = _e31_trace_events(data, telemetry)
+        lookup = _named_e31_event(events, "clip_conditioning_cache_lookup") or {}
+        miss_count = _number(lookup.get("miss_count"))
+        miss_decision = False
+        for event in events:
+            if event.get("name") != "clip_conditioning_cache_decision":
+                continue
+            payload = _event_payload(event)
+            decision = str(payload.get("decision", "")).strip().lower()
+            if decision in {"miss", "miss_stored", "miss_not_stored"}:
+                miss_decision = True
+                break
+        if not ((miss_count is not None and miss_count > 0) or miss_decision):
+            failures.append("E31 conditioning-cache miss evidence missing")
+
+        real_count = _number(summary.get("real_conversions"))
+        real_bytes = _number(summary.get("real_conversion_bytes"))
+        source_dtypes = summary.get("source_dtypes")
+        dest_dtypes = summary.get("dest_dtypes")
+        bf16_count = _number(source_dtypes.get("torch.bfloat16")) if isinstance(source_dtypes, dict) else None
+        fp32_count = _number(dest_dtypes.get("torch.float32")) if isinstance(dest_dtypes, dict) else None
+        cast_once_on = _flag_enabled(config, "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")
+
+        if not cast_once_on:
+            if real_count is None or real_count <= 0 or real_bytes is None or real_bytes <= 0:
+                failures.append(
+                    "E31 OFF requires canonical real BF16->FP32 conversion count and bytes "
+                    "(hydration conversion_count is not accepted)"
+                )
+            if bf16_count is None or bf16_count <= 0 or fp32_count is None or fp32_count <= 0:
+                failures.append("E31 OFF canonical cast summary lacks BF16 source/FP32 destination proof")
+            return failures
+
+        if real_count != 0 or real_bytes != 0:
+            failures.append(
+                "E31 ON requires zero canonical real conversions and zero real conversion bytes"
+            )
+
+        bind = _named_e31_event(events, "clip_fh_cast_once_bind_proof")
+        applied = _named_e31_event(events, "clip_fh_cast_once_applied")
+        forward = _named_e31_event(events, "clip_fh_cast_once_forward_check")
+        if not bind or not _truth(bind.get("ok")):
+            failures.append("E31 ON cast-once bind/residency proof missing or not valid")
+        applied_params = _number((applied or {}).get("fp32_params"))
+        if not applied or not (
+            (applied_params is not None and applied_params > 0)
+            or _truth((applied or {}).get("cast_once_applied"))
+        ):
+            failures.append("E31 ON cast-once applied proof missing")
+
+        proof = bind or {}
+        count_by_dtype = proof.get("count_by_dtype")
+        device_counts = proof.get("device_counts")
+        fp32_resident = (
+            isinstance(count_by_dtype, dict)
+            and (_number(count_by_dtype.get("torch.float32")) or 0) > 0
+        )
+        cuda_resident = (
+            isinstance(device_counts, dict)
+            and any((str(key).startswith("cuda") and (_number(value) or 0) > 0)
+                    for key, value in device_counts.items())
+        )
+        if not fp32_resident:
+            failures.append("E31 ON residency proof does not establish FP32 residency")
+        if not cuda_resident:
+            failures.append("E31 ON residency proof does not establish CUDA residency")
+
+        generation = _number(proof.get("generation"))
+        applied_generation = _number((applied or {}).get("generation"))
+        if generation is None or generation <= 0 or applied_generation != generation:
+            failures.append("E31 ON generation/bind proof is missing or inconsistent")
+
+        if not forward:
+            failures.append("E31 ON real-forward proof missing")
+        else:
+            if not _truth(forward.get("forward_observed")) or not _truth(
+                forward.get("forward_actually_observed")
+            ):
+                failures.append("E31 ON real-forward observation missing")
+            stability = _nested_mapping(forward, "post_forward_stability", "stability")
+            if not (_truth(forward.get("storage_stable")) and
+                    _truth(stability.get("storage_stable", forward.get("storage_stable")))):
+                failures.append("E31 ON storage-stable residency proof missing")
+            bind_generation = _number(forward.get("bind_generation"))
+            post_generation = _number(forward.get("post_forward_generation"))
+            if bind_generation != generation or post_generation != generation:
+                failures.append("E31 ON forward generation does not match bind generation")
+
+        return failures
+
+
+# Descriptive compatibility alias for callers that name the seam by contract.
+E31EvidenceValidator = E31ForensicsValidator
+
+
+class E37StrictProofValidator(ValidatorPlugin):
+    """Fail-closed control-plane proof gate for the E37 profiles.
+
+    E37 deliberately keeps E31 diagnostics and FP32 cast-once disabled.  Its
+    acceptance proof is instead the plan-validation fast path, a real
+    conditioning-cache miss, the canonical first-durable ledger, and the
+    source/v2ctl identity carried by the persisted artifact.
+    """
+
+    name = "e37_strict_proof"
+    expected_output_sha = (
+        "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+    )
+
+    def applies(self, config: Any) -> bool:
+        return _flag_enabled(config, "COMFYMODAL_V2_E37_STRICT_PROOF") or str(
+            getattr(config, "profile_name", "") or ""
+        ).startswith("e37-")
+
+    def validate(self, record: RunRecord, config: Any) -> list[str]:
+        if not self.applies(config):
+            return []
+
+        failures: list[str] = []
+        data = _artifact_data(record)
+        events = _e31_trace_events(data, record.telemetry or {})
+
+        workload = _config_workload(config)
+        configured_sha = str(workload.get("expected_output_sha", "") or "").strip()
+        if configured_sha != self.expected_output_sha:
+            failures.append(
+                "E37 requires the canonical expected output SHA "
+                f"{self.expected_output_sha}, configured {configured_sha or '(missing)'}"
+            )
+        if record.output_sha != self.expected_output_sha:
+            failures.append(
+                "E37 exact output SHA mismatch: expected "
+                f"{self.expected_output_sha}, observed {record.output_sha or '(missing)'}"
+            )
+        if str(workload.get("conditioning_cache", "") or "").strip().lower() != "forced_miss":
+            failures.append("E37 requires conditioning_cache=forced_miss")
+
+        # Batch-C proves consumed=True, but E37 additionally requires the
+        # decision reason to be explicitly present and empty.  Absence is not
+        # equivalent to an empty reason.
+        proof_events = [
+            _event_payload(event)
+            for event in events
+            if event.get("name") == "plan_proof_decision"
+        ]
+        proof = proof_events[-1] if proof_events else None
+        if not isinstance(proof, dict):
+            failures.append("E37 consumed plan proof missing")
+        else:
+            if not _truth(proof.get("consumed")):
+                failures.append("E37 consumed plan proof must have consumed=True")
+            if proof.get("decision") != "plan_validation_fast_path":
+                failures.append("E37 plan proof decision is not plan_validation_fast_path")
+            if "reason" not in proof or proof.get("reason") != "":
+                failures.append("E37 plan proof reason must be explicitly empty")
+
+        lookup = _named_e31_event(events, "clip_conditioning_cache_lookup") or {}
+        miss_count = _number(lookup.get("miss_count"))
+        miss_observed = miss_count is not None and miss_count > 0
+        if lookup.get("hit") is False or str(lookup.get("hit", "")).strip().lower() in {
+            "0", "false", "no", "off",
+        }:
+            miss_observed = True
+        for event in events:
+            if event.get("name") != "clip_conditioning_cache_decision":
+                continue
+            decision = str(_event_payload(event).get("decision", "")).strip().lower()
+            if decision in {"miss", "miss_stored", "miss_not_stored"}:
+                miss_observed = True
+                break
+        if not miss_observed:
+            failures.append("E37 actual conditioning-cache miss evidence missing")
+
+        # The canonical ledger is authoritative.  Require both its explicit
+        # endpoint/zero-gap contract and the durable boundary event itself.
+        ledger = data.get("canonical_ledger")
+        if not isinstance(ledger, dict):
+            candidate = (data.get("result") or {}).get("canonical_ledger")
+            ledger = candidate if isinstance(candidate, dict) else None
+        status = data.get("canonical_ledger_status")
+        if status is None and isinstance(data.get("result"), dict):
+            status = data["result"].get("canonical_ledger_status")
+        if not isinstance(ledger, dict) or str(status or "").lower() != "ok":
+            failures.append("E37 canonical first-durable ledger missing or not OK")
+        else:
+            if ledger.get("endpoint_status") != "ok":
+                failures.append("E37 canonical ledger endpoint_status must be ok")
+            serial = ledger.get("serial_ledger")
+            if not isinstance(serial, dict) or serial.get("zero_gap") is not True:
+                failures.append("E37 canonical first-durable ledger zero-gap proof missing")
+            canonical_events = ledger.get("events")
+            if not isinstance(canonical_events, list):
+                canonical_events = []
+            durable = [
+                event for event in canonical_events
+                if isinstance(event, dict) and event.get("name") == "first_durable_result"
+            ]
+            if not durable:
+                failures.append("E37 canonical first-durable result event missing")
+            end_ns = ledger.get("end_mono_ns")
+            if end_ns is not None:
+                durable_ns = durable[-1].get("mono_ns") if durable else None
+                if durable_ns is None:
+                    durable_ns = durable[-1].get("monotonic_ns") if durable else None
+                if durable_ns is None or int(durable_ns) != int(end_ns):
+                    failures.append("E37 first-durable event does not match ledger end boundary")
+
+        # Source identity is distinct from v2ctl provenance.  Require the
+        # runtime's DeploymentIdentity projection as well as StructuralValidator
+        # below's invocation/profile/request provenance checks.
+        result_value = data.get("result")
+        result: dict[str, Any] = result_value if isinstance(result_value, dict) else {}
+        ledger_identity = ledger.get("identity") if isinstance(ledger, dict) else None
+        source_candidates = (
+            data.get("source_identity"),
+            data.get("identity"),
+            result.get("source_identity"),
+            result.get("identity"),
+            ledger_identity,
+        )
+        source = next((item for item in source_candidates if isinstance(item, dict)), None)
+        source_markers = (
+            "combined_hash", "deployment_combined_hash", "runtime_hash",
+            "dependency_hash", "custom_node_hash", "file_hashes",
+        )
+        # The runtime persists the canonical deployment identity in the
+        # artifact's effective environment.  Accept that explicit deployment
+        # hash as source proof, but do not treat profile/request IDs or an
+        # arbitrary environment fingerprint as provenance.
+        effective_env = data.get("effective_env")
+        effective_env_hash = (
+            effective_env.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH")
+            if isinstance(effective_env, dict)
+            else None
+        )
+        has_effective_env_hash = (
+            isinstance(effective_env_hash, str) and bool(effective_env_hash.strip())
+        )
+        has_source_identity = source is not None and any(
+            source.get(key) for key in source_markers
+        )
+        if not has_source_identity and not has_effective_env_hash:
+            failures.append("E37 source identity proof missing")
+
+        return failures
+
+
+# Descriptive alias for callers/tests that use the E37 evidence name.
+E37EvidenceValidator = E37StrictProofValidator
+
+
+class E37CleanLaneProofValidator(ValidatorPlugin):
+    """Fail-closed proof gate for the diagnostic E37 CLEAN_LANE profile."""
+
+    name = "e37_clean_lane_proof"
+
+    def applies(self, config: Any) -> bool:
+        profile = str(getattr(config, "profile_name", "") or "")
+        return profile == "e37-clean-lane-qd4" or _flag_enabled(
+            config, "COMFYMODAL_V2_E37_CLEAN_LANE"
+        ) or _flag_enabled(config, "COMFYMODAL_V2_CLEAN_LANE")
+
+    def validate(self, record: RunRecord, config: Any) -> list[str]:
+        if not self.applies(config):
+            return []
+        failures: list[str] = []
+        events = _e31_trace_events(_artifact_data(record), record.telemetry or {})
+        event_value = _named_e31_event(events, "clean_lane_proof")
+        if not isinstance(event_value, dict):
+            failures.append("CLEAN_LANE_PROOF missing")
+            return failures
+        event: dict[str, Any] = event_value
+        qd: dict[str, Any] = dict(event["qd"]) if isinstance(event.get("qd"), dict) else {}
+        ordering: dict[str, Any] = dict(event["ordering"]) if isinstance(event.get("ordering"), dict) else {}
+        quiescence: dict[str, Any] = dict(event["quiescence"]) if isinstance(event.get("quiescence"), dict) else {}
+        intervals: dict[str, Any] = dict(event["phase_intervals"]) if isinstance(event.get("phase_intervals"), dict) else {}
+        volume: list[Any] = list(event["volume_reads"]) if isinstance(event.get("volume_reads"), list) else []
+        forbidden_attempts = event.get("forbidden_activity_attempts")
+        if event.get("mode") != "E37_CLEAN_LANE" or event.get("proof_version") != 1:
+            failures.append("CLEAN_LANE_PROOF mode/version missing")
+        if (
+            qd.get("configured_qd") != 4
+            or qd.get("actual_inflight") != 4
+            or qd.get("actual_worker_count") != 4
+        ):
+            failures.append("CLEAN_LANE actual QD must be 4")
+        if qd.get("fallback") is True or qd.get("mode") != "QD4":
+            failures.append("CLEAN_LANE QD proof shows FASTSAFE fallback")
+        if qd.get("source_errors"):
+            failures.append("CLEAN_LANE source errors present")
+        if qd.get("stats_status") != "ok":
+            failures.append("CLEAN_LANE QD stats are not OK")
+        if not qd.get("reconciliation_240_240"):
+            failures.append("CLEAN_LANE 240/240 source reconciliation missing")
+        if qd.get("h2d_host_issue_ms") is None or qd.get("h2d_cuda_event_ms") is None:
+            failures.append("CLEAN_LANE paired H2D host/CUDA timing missing")
+        if not volume or any(
+            not isinstance(item, dict)
+            or not item.get("path")
+            or not item.get("identity")
+            or item.get("owner") != "clip_qd_reader"
+            or item.get("size_bytes") is None
+            or item.get("start_ns") is None
+            or item.get("end_ns") is None
+            or item.get("concurrency") != 4
+            for item in volume
+        ):
+            failures.append("CLEAN_LANE Volume read identity/interval proof missing")
+        if event.get("gpu_operation_overlap") or event.get("forbidden_overlap"):
+            failures.append("CLEAN_LANE forbidden GPU overlap observed")
+        if not isinstance(forbidden_attempts, list):
+            failures.append("CLEAN_LANE forbidden-activity attempt evidence missing")
+        required_order = (
+            "restore_return_ns", "plan_identity_complete_ns", "qd_start_ns",
+            "qd_ready_ns", "bind_ns", "forward_start_ns", "forward_end_ns",
+        )
+        if any(not isinstance(ordering.get(key), int) for key in required_order):
+            failures.append("CLEAN_LANE lifecycle ordering proof incomplete")
+        else:
+            values = [ordering[key] for key in required_order]
+            if values != sorted(values) or ordering["restore_return_ns"] >= ordering["plan_identity_complete_ns"]:
+                failures.append("CLEAN_LANE lifecycle ordering is false")
+        if not intervals or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("start_ns"), int)
+            or not isinstance(item.get("end_ns"), int)
+            or item["end_ns"] < item["start_ns"]
+            for item in intervals.values()
+        ):
+            failures.append("CLEAN_LANE phase intervals missing")
+        required_quiescence = (
+            "source_reads_complete", "submitted_blocks_reconciled", "futures_joined",
+            "no_qd_worker_runnable", "pinned_ownership_safe",
+            "h2d_events_complete", "device_ready_published",
+        )
+        if any(quiescence.get(key) is not True for key in required_quiescence):
+            failures.append("CLEAN_LANE quiescence proof missing or false")
+        if not isinstance(event.get("thread_state"), dict):
+            failures.append("CLEAN_LANE CPU/native thread state proof missing")
+        return failures
+
+
 def _config_workload(config: Any) -> dict:
     workload = getattr(config, "workload", None)
     if workload is None:
@@ -312,6 +903,15 @@ def parse_telemetry(stdout: str) -> dict:
         stripped = line.strip()
         if not stripped or "=" not in stripped:
             continue
+        proof_match = re.search(
+            r"\[v2ctl\.config\]\s+deploy=([^\s]+)\s+run=([^\s]+)\s+profile=([^\s]+)",
+            stripped,
+        )
+        if proof_match:
+            telemetry["v2ctl_config"] = (
+                f"deploy={proof_match.group(1)} "
+                f"run={proof_match.group(2)} profile={proof_match.group(3)}"
+            )
         key_part, _, value = stripped.partition("=")
         key = key_part.strip().split()[-1] if key_part.strip() else ""
         value = value.strip()
@@ -442,8 +1042,17 @@ def build_run_record_from_result(
         expected_output_sha=str(workload.get("expected_output_sha", "") or ""),
         artifacts=artifacts,
         backend_ok=bool(getattr(result, "exit_code", 1) == 0),
+        backend_exit_code=getattr(result, "exit_code", None),
         telemetry=telemetry,
         output_sha=output_sha,
+        v2ctl_invocation_id=str(getattr(artifacts, "v2ctl_invocation_id", "") or ""),
+        request_id=str(getattr(artifacts, "request_id", "") or telemetry.get("request_id", "") or ""),
+        profile_config_fingerprint=str(
+            getattr(artifacts, "profile_config_fingerprint", "") or ""
+        ),
+        provenance_validation_status=str(
+            getattr(artifacts, "provenance_validation_status", "") or ""
+        ),
     )
 
 
@@ -460,11 +1069,86 @@ def _format_run_command(spec: Any, extra_args: list[str]) -> str:
     build = getattr(spec, "build_command_line", None)
     if callable(build):
         try:
-            return build(spec, extra_args)
+            return str(build(spec, extra_args))
         except Exception:  # noqa: BLE001 - best-effort, pure formatting
             pass
     name = getattr(spec, "name", "backend")
     return f"{name} {' '.join(extra_args)}".strip()
+
+
+def _profile_config_fingerprint(fingerprints: Any) -> str:
+    try:
+        method = getattr(fingerprints, "profile_config_fingerprint", None)
+        if callable(method):
+            return str(method())
+        method = getattr(fingerprints, "config_fingerprint", None)
+        if callable(method):
+            return str(method())
+    except Exception:  # noqa: BLE001 - compatibility fakes
+        pass
+    return ""
+
+
+def _profile_config_fingerprint_from_config(config: Any) -> str:
+    try:
+        from .fingerprints import FingerprintEngine
+        return FingerprintEngine(config).profile_config_fingerprint()
+    except Exception:  # noqa: BLE001 - duck-typed validation config
+        return ""
+
+
+def _canonical_extra_env(
+    config: Any,
+    deploy_fp: str,
+    run_fp: str,
+    profile_config_fp: str,
+    invocation_id: str,
+    extras: dict[str, str],
+) -> dict[str, str]:
+    result = dict(extras)
+    result.update({
+        "COMFYMODAL_V2CTL_INVOCATION_ID": invocation_id,
+        "COMFYMODAL_V2CTL_PROFILE": str(getattr(config, "profile_name", "") or ""),
+        "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT": profile_config_fp,
+        "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": deploy_fp,
+        "COMFYMODAL_V2CTL_RUN_FINGERPRINT": run_fp,
+    })
+    return result
+
+
+def _run_backend(
+    runner: Any,
+    spec: Any,
+    *,
+    config: Any,
+    extra_args: list[str],
+    extra_env: dict[str, str],
+    timeout_seconds: float,
+    invocation_id: str,
+    strict_canonical: bool,
+    allow_multiple_run_artifacts: bool = False,
+) -> Any:
+    """Call real BackendRunner plus older duck-typed test runners safely."""
+    kwargs: dict[str, Any] = {
+        "config": config,
+        "extra_args": extra_args,
+        "extra_env": extra_env,
+        "capture": True,
+        "timeout_seconds": timeout_seconds,
+    }
+    try:
+        parameters = inspect.signature(runner.run).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "invocation_id" in parameters:
+        kwargs["invocation_id"] = invocation_id
+    elif "invocation_context" in parameters:
+        kwargs["invocation_context"] = invocation_id
+    if "strict_canonical_discovery" in parameters:
+        kwargs["strict_canonical_discovery"] = strict_canonical
+    if "allow_multiple_run_artifacts" in parameters:
+        kwargs["allow_multiple_run_artifacts"] = allow_multiple_run_artifacts
+    return runner.run(spec, **kwargs)
 
 
 class GateRunner:
@@ -486,9 +1170,17 @@ class GateRunner:
         self._backend_runner = backend_runner
         self._env_builder = env_builder
 
-    def run_gate(self, config: Any, backend_spec: Any) -> GateResult:
+    def run_gate(
+        self,
+        config: Any,
+        backend_spec: Any,
+        invocation_id: str | None = None,
+        invocation_context: str | None = None,
+    ) -> GateResult:
+        invocation_id = str(invocation_id or invocation_context or uuid.uuid4().hex)
         deploy_fp = self._fingerprints.deploy_fingerprint()
         run_fp = self._fingerprints.run_fingerprint()
+        profile_config_fp = _profile_config_fingerprint(self._fingerprints)
         # ── Full-run guard: gate must generate (run_plan_stream), never the
         # snapshot-restore-only PROBE. ──
         from .cli import _benchmark_mode
@@ -500,24 +1192,27 @@ class GateRunner:
                 "which never invokes run_plan_stream and produces no generation "
                 "artifact. Configure a full-run mode (e.g. e28_single)."
             )
-        # Forward the canonical selector (e.g. E28_VALIDATION) as the first
-        # backend arg so the run BAT enters its validation mode instead of the
-        # snapshot_restore_only probe branch.
-        from .cli import _backend_selector
+        # Keep selector, run count, nonce, and selector env in one canonical
+        # construction shared with confirm and CLI dry-run reporting.
+        from .cli import _validation_backend_args
 
-        selector = _backend_selector(config)
-        extra_args = ([selector] if selector else []) + ["--run-count", "1"]
+        extra_args, selector_env = _validation_backend_args(config)
         try:
-            result = self._backend_runner.run(
-                backend_spec,
-                config=config,
+            result = _run_backend(
+                self._backend_runner, backend_spec, config=config,
                 extra_args=extra_args,
-                extra_env={"V2_BENCHMARK_RUNS": "1"},
-                capture=True,
-                timeout_seconds=600.0,
+                extra_env=_canonical_extra_env(
+                    config, deploy_fp, run_fp, profile_config_fp, invocation_id,
+                    {"V2_BENCHMARK_RUNS": "1", **selector_env},
+                ),
+                timeout_seconds=600.0, invocation_id=invocation_id,
+                strict_canonical=True,
             )
         except Exception as exc:  # noqa: BLE001 - backend spawn/timeout failure
-            raise GateError(f"gate backend invocation failed before completing: {exc}") from exc
+            detail = str(exc)
+            if "no canonical run artifact" in detail.lower():
+                detail = f"no persisted run artifact was discovered; {detail}"
+            raise GateError(f"gate backend invocation failed before completing: {detail}") from exc
 
         # ── Crash-loop guard: a container that repeats the same traceback in
         # the gate output is crash-looping; the run is NOT a valid measurement
@@ -573,8 +1268,8 @@ class GateRunner:
 
 class ConfirmRunner:
     """Confirmation protocol: refuses a missing/invalid/stale gate manifest,
-    then runs exactly ``runs`` backend invocations and persists a combined
-    confirmation manifest."""
+    then runs exactly ``runs`` separate single-run backend invocations and
+    persists a combined confirmation manifest."""
 
     def __init__(
         self,
@@ -597,7 +1292,21 @@ class ConfirmRunner:
         config: Any,
         backend_spec: Any,
         runs: int = 1,
+        invocation_id: str | None = None,
+        invocation_context: str | None = None,
     ) -> GateResult:
+        invocation_id = str(invocation_id or invocation_context or uuid.uuid4().hex)
+        # Confirm is a full-generation protocol just like gate.  Keep this
+        # guard here as well as in the CLI so direct callers cannot spend on
+        # the restore-only probe path.
+        from .cli import _benchmark_mode
+
+        if _benchmark_mode(config) == "snapshot_restore_only":
+            raise GateError(
+                "confirm refuses V2_BENCHMARK_MODE=snapshot_restore_only: that "
+                "mode runs the restore-only PROBE, which produces no generation "
+                "artifact. Configure a full-run mode (e.g. e28_single)."
+            )
         path = Path(gate_manifest)
         if not path.is_file():
             raise GateError(f"gate manifest not found: {path}")
@@ -644,23 +1353,41 @@ class ConfirmRunner:
         if runs < 1:
             raise GateError("confirm runs must be >= 1")
 
-        # exactly `runs` backend invocations
+        # Each confirmation is deliberately a separate single-run backend
+        # invocation.  In particular, never pass `runs` as --run-count or
+        # enable multi-artifact discovery for the confirmation loop.
         run_fp = self._fingerprints.run_fingerprint()
         deploy_fp = self._fingerprints.deploy_fingerprint()
+        profile_config_fp = _profile_config_fingerprint(self._fingerprints)
+        from .cli import _validation_backend_args
+
+        extra_args, selector_env = _validation_backend_args(config)
         all_reasons: list[str] = []
         records: list[RunRecord] = []
         for index in range(runs):
+            # A strict canonical discovery binds one persisted artifact to one
+            # backend invocation.  Separate IDs keep separate confirmations
+            # from becoming an ambiguous multi-run invocation.
+            run_invocation_id = invocation_id if runs == 1 else uuid.uuid4().hex
             try:
-                result = self._backend_runner.run(
-                    backend_spec,
-                    config=config,
-                    extra_args=["--run-count", str(runs)],
-                    extra_env={"V2_BENCHMARK_RUNS": str(runs)},
-                    capture=True,
-                    timeout_seconds=600.0,
+                result = _run_backend(
+                    self._backend_runner, backend_spec, config=config,
+                    extra_args=extra_args,
+                    extra_env=_canonical_extra_env(
+                        config, deploy_fp, run_fp, profile_config_fp, run_invocation_id,
+                        {"V2_BENCHMARK_RUNS": "1", **selector_env},
+                    ),
+                    timeout_seconds=600.0, invocation_id=run_invocation_id,
+                    strict_canonical=True,
+                    allow_multiple_run_artifacts=False,
                 )
             except Exception as exc:  # noqa: BLE001 - backend spawn/timeout
-                raise GateError(f"confirm backend invocation {index + 1} failed before completing: {exc}") from exc
+                detail = str(exc)
+                if "no canonical run artifact" in detail.lower():
+                    detail = f"no persisted run artifact was discovered; {detail}"
+                raise GateError(
+                    f"confirm backend invocation {index + 1} failed before completing: {detail}"
+                ) from exc
             record = build_run_record_from_result(result, config, deploy_fp, run_fp)
             records.append(record)
             all_reasons.extend(self._validators.run(record, config))
@@ -758,10 +1485,11 @@ def _build_manifest(
         "resources": _resources_dict(config),
         "deploy_fingerprint": deploy_fp,
         "run_fingerprint": run_fp,
+        "profile_config_fingerprint": _profile_config_fingerprint_from_config(config),
     }
     if deploy_inputs:
         snapshot["deploy_inputs"] = deploy_inputs
-    return {
+    manifest = {
         "schema_version": _GATE_SCHEMA_VERSION,
         "gate_valid": valid,
         "reasons": list(reasons),
@@ -769,6 +1497,18 @@ def _build_manifest(
         "config_snapshot": snapshot,
         "created_at": _now_utc().isoformat(),
     }
+    if record is not None:
+        manifest.update({
+            "v2ctl_invocation_id": record.v2ctl_invocation_id,
+            "request_id": record.request_id,
+            "profile": record.profile,
+            "profile_config_fingerprint": record.profile_config_fingerprint,
+            "provenance_validation_status": record.provenance_validation_status,
+            "selected_run_path": str(getattr(record.artifacts, "run_artifact", "") or ""),
+            "selected_summary_path": str(getattr(record.artifacts, "summary_artifact", "") or ""),
+            "run_artifacts": [str(p) for p in (getattr(record.artifacts, "run_artifacts", []) or [])],
+        })
+    return manifest
 
 
 def _safe_deploy_inputs(fingerprints: Any) -> dict:

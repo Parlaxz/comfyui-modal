@@ -879,6 +879,18 @@ def evaluate_plan_snapshot_parity(plan_identity: Mapping | None, snapshot_proof:
                       and _plan["custom_nodes_generation"] == _proof["custom_nodes_generation"])
     _reg_parity = evaluate_workflow_registry_parity(_plan.get("registry_proof"), _proof.get("registry_manifest"))
     _reg_match = bool(_plan.get("registry_proof_complete")) and bool(_reg_parity.get("workflow_registry_match"))
+    # When the planner supplies the optional exact binding, reject a proof
+    # copied from a different dispatch workflow.  Legacy frozen identities
+    # without this field retain the existing class-set parity behavior.
+    _plan_workflow_hash = str(_plan.get("workflow_hash", "") or "")
+    _plan_registry_proof = _plan.get("registry_proof")
+    _proof_workflow_hash = str(
+        _plan_registry_proof.get("workflow_hash", "")
+        if isinstance(_plan_registry_proof, Mapping) else ""
+    )
+    _workflow_binding_ok = not _plan_workflow_hash or not _proof_workflow_hash or _plan_workflow_hash == _proof_workflow_hash
+    if not _workflow_binding_ok:
+        _reg_match = False
     # Legacy full-registry fingerprint equality — DIAGNOSTIC ONLY (never an
     # eligibility blocker).
     _reg_full_match = bool(_plan.get("registry_fingerprint") and _proof.get("registry_fingerprint")

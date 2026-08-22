@@ -56,6 +56,10 @@ class BackendError(V2CtlError):
     """Canonical backend invocation failed."""
 
 
+class ProvenanceError(BackendError):
+    """A canonical artifact cannot be bound to the requested invocation."""
+
+
 class DeployCrashLoopError(V2CtlError):
     """The deployed container is crash-looping (repeated identical
     tracebacks observed in the deploy output).  The deployment must not be

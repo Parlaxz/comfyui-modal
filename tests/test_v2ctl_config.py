@@ -97,13 +97,22 @@ def test_flags_sorted(resolver):
 
 def test_precedence_profile_chain(resolver):
     base = _env_flags(resolver.resolve(profile_name="production"))
-    e31 = _env_flags(resolver.resolve(profile_name="e31-clip-fp32"))
-    # e31 overrides the production default for these three.
+    e31a = _env_flags(
+        resolver.resolve(profile_name="e31-clip-fp32-fastsafe-arm-a")
+    )
+    e31b = _env_flags(
+        resolver.resolve(profile_name="e31-clip-fp32-fastsafe-arm-b")
+    )
+    # The canonical E31 arms inherit the production/E29 loader settings and
+    # differ only in the FP32 cast-once experiment bit.
     assert base["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == "0"
-    assert e31["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == "1"
-    assert e31["COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"] == "8"
+    assert e31a["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == "0"
+    assert e31b["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == "1"
+    assert e31a["COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"] == "8"
+    assert e31b["COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"] == "8"
     # And inherits production's untouched values.
-    assert e31["COMFYMODAL_V2_CPU_REQUEST"] == base["COMFYMODAL_V2_CPU_REQUEST"] == "12"
+    assert e31a["COMFYMODAL_V2_CPU_REQUEST"] == base["COMFYMODAL_V2_CPU_REQUEST"] == "12"
+    assert e31b["COMFYMODAL_V2_CPU_REQUEST"] == base["COMFYMODAL_V2_CPU_REQUEST"] == "12"
 
 
 def test_cli_overrides_profile(resolver):
@@ -150,7 +159,7 @@ def test_set_beats_inherit_and_profile(resolver):
 
 def test_set_overrides_profile_env(resolver):
     config = resolver.resolve(
-        profile_name="e31-clip-fp32",
+        profile_name="e31-clip-fp32-fastsafe-arm-b",
         sets=[("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE", "0")],
     )
     assert _flag(config, "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE").value == "0"
@@ -394,12 +403,12 @@ def test_to_dict_json_safe(resolver):
     import json
 
     config = resolver.resolve(
-        profile_name="e31-clip-fp32",
+        profile_name="e31-clip-fp32-fastsafe-arm-b",
         sets=[("V2_UNKNOWN_JSON", "1")],
     )
     data = config.to_dict()
     json.dumps(data)  # must not raise
-    assert data["profile_name"] == "e31-clip-fp32"
+    assert data["profile_name"] == "e31-clip-fp32-fastsafe-arm-b"
     assert data["target"]["app"] == "stable-modal-comfy-v2-restore-only-shadow"
     assert isinstance(data["flags"], list)
     assert isinstance(data["unregistered"], list)

@@ -363,6 +363,7 @@ def _resolve_fast_path_observables(artifact: dict) -> dict[str, Any]:
         ),
         "dependency_proof_ready": _dep_proof_raw is not None,
         "fallback_reason": str(_reason_raw) if _reason_raw is not None else None,
+        "plan_proof_reason": str(_reason_raw) if _reason_raw is not None else None,
         "cert_plan_validation_consumed_conflict": _plan_val_consumed_conflict,
     }
 
@@ -468,6 +469,7 @@ def validate_batch_c(
 
     # ── Fast-path observables (real evidence only; absence = NOT READY) ───
     _obs = _resolve_fast_path_observables(artifact)
+    _e37_strict = _env_truthy("COMFYMODAL_V2_E37_STRICT_PROOF")
 
     def _report_only_detail(label: str, ready: bool, observed: Any) -> str:
         """Expectation-OFF detail: observed (or NOT READY), never fails."""
@@ -582,6 +584,25 @@ def validate_batch_c(
         "fast_path_consumed", _g3_ok, _obs["consumed"], _g3_detail,
     ))
 
+    # E37 narrows the otherwise-compatible Batch-C contract: consumed proof
+    # must carry an explicit empty reason, not merely an omitted reason.
+    _e37_reason_ok = (
+        not _e37_strict
+        or (_obs["plan_proof_decision_ready"] and _obs.get("plan_proof_reason") == "")
+    )
+    checks.append(GateCheck(
+        "e37_plan_proof_reason_empty",
+        _e37_reason_ok,
+        _obs.get("plan_proof_reason"),
+        (
+            "E37 plan proof reason is explicitly empty"
+            if _e37_reason_ok and _e37_strict
+            else "E37 strict proof disabled"
+            if not _e37_strict
+            else "E37 requires plan_proof_decision.reason=''"
+        ),
+    ))
+
     # ── Gate 4: no legacy validation fallback ────────────────────────────
     _g4_ok = False
     if expect_plan_fast_path:
@@ -677,6 +698,45 @@ def validate_batch_c(
             _key, _g_ok, _obs[_key], _g_detail,
         ))
 
+    # A forced-miss workload still needs runtime evidence.  Do not infer a
+    # miss from the profile setting alone: the lookup/decision event must say
+    # so.  This is only an E37 addition; historical Batch-C profiles retain
+    # their existing eight-gate contract.
+    _result_value = artifact.get("result")
+    _result: dict[str, Any] = _result_value if isinstance(_result_value, dict) else {}
+    _cache_miss = False
+    for _event in _events(_result):
+        if not isinstance(_event, dict):
+            continue
+        _name = _event.get("name")
+        _meta_value = _event.get("metadata")
+        _meta: dict[str, Any] = _meta_value if isinstance(_meta_value, dict) else {}
+        if _name == "clip_conditioning_cache_lookup":
+            try:
+                _cache_miss = _cache_miss or int(_meta.get("miss_count", 0) or 0) > 0
+            except (TypeError, ValueError):
+                pass
+            if _meta.get("hit") is False:
+                _cache_miss = True
+        elif _name == "clip_conditioning_cache_decision":
+            if str(_meta.get("decision", "")).strip().lower() in {
+                "miss", "miss_stored", "miss_not_stored",
+            }:
+                _cache_miss = True
+    _e37_cache_ok = not _e37_strict or _cache_miss
+    checks.append(GateCheck(
+        "e37_conditioning_cache_miss",
+        _e37_cache_ok,
+        _cache_miss,
+        (
+            "E37 actual conditioning-cache miss observed"
+            if _e37_cache_ok and _e37_strict
+            else "E37 strict proof disabled"
+            if not _e37_strict
+            else "E37 requires actual conditioning-cache miss evidence"
+        ),
+    ))
+
     # ── Fallback diagnosis ───────────────────────────────────────────────
     # Classify the ineligible reason when the run actually fell back to legacy
     # validation (decision=legacy_validation_fallback) or the plan proof was
@@ -701,7 +761,7 @@ def validate_batch_c(
     _fast_path_gates = [
         c for c in checks if c.key in FAST_PATH_GATE_KEYS
     ]
-    fast_path_ok = all(c.ok for c in _fast_path_gates)
+    fast_path_ok = all(c.ok for c in _fast_path_gates) and _e37_reason_ok and _e37_cache_ok
 
     passed = batch_b.passed and (not expect_plan_fast_path or fast_path_ok)
     if not passed:

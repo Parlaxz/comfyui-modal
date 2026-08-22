@@ -35,7 +35,8 @@ def test_available_sorted(real_profiles):
     assert "production" in names
     assert "e29-tracer" in names
     assert "e30-clip-qd" in names
-    assert "e31-clip-fp32" in names
+    assert "e31-clip-fp32-fastsafe-arm-a" in names
+    assert "e31-clip-fp32-fastsafe-arm-b" in names
 
 
 def test_load_production(real_profiles):
@@ -96,11 +97,18 @@ def test_e30_extends_production(real_profiles):
     assert rp.runtime_overrides["policy"] == "forbid"
 
 
-def test_e31_extends_production(real_profiles):
-    rp = real_profiles.resolve("e31-clip-fp32")
+@pytest.mark.parametrize(
+    ("profile_name", "cast_once"),
+    [
+        ("e31-clip-fp32-fastsafe-arm-a", "0"),
+        ("e31-clip-fp32-fastsafe-arm-b", "1"),
+    ],
+)
+def test_e31_extends_production(real_profiles, profile_name, cast_once):
+    rp = real_profiles.resolve(profile_name)
     assert rp.owner == "E31"
-    assert rp.chain == ["production", "e31-clip-fp32"]
-    assert rp.environment["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == "1"
+    assert rp.chain == ["production", "e29-tracer", profile_name]
+    assert rp.environment["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == cast_once
     assert rp.environment["COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"] == "8"
     assert rp.environment["COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES"] == "67108864"
     assert rp.environment["COMFYMODAL_V2_MEMORY_MB"] == "32768"  # inherited

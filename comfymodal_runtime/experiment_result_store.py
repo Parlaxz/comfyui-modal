@@ -182,6 +182,109 @@ def _trace_events(result: Mapping[str, Any]) -> list[Any]:
     return events if isinstance(events, list) else []
 
 
+_E31_FORWARD_EVENT_NAMES = frozenset({
+    "clip_forward_evidence",
+    "clip_forward_cast_summary",
+    "clip_forward_start",
+    "clip_forward_end",
+    "clip_gpu_event_start",
+    "clip_gpu_event_end",
+    "clip_forward_gpu_ms",
+})
+_E31_PROOF_EVENT_NAMES = frozenset({
+    "clip_fh_cast_once_bind_proof",
+    "clip_fh_cast_once_forward_check",
+    "clip_fh_cast_once_forward_failed",
+    "clip_fh_cast_once_residency_failed",
+    "clip_fh_cast_once_applied",
+})
+
+
+def _canonical_ledger(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    ledger = _first_mapping(result, ("canonical_ledger",))
+    return ledger if isinstance(ledger, Mapping) else {}
+
+
+def _e31_events(result: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return E31 events from both the trace and canonical ledger.
+
+    Hydration diagnostics are intentionally not treated as forward evidence.
+    In particular, a hydration ``conversion_count=0`` is not a forward
+    conversion result; only the E31 forward event names below qualify.
+    """
+    events: list[Mapping[str, Any]] = []
+    for event in _trace_events(result):
+        if isinstance(event, Mapping):
+            name = str(event.get("name", ""))
+            if name in _E31_FORWARD_EVENT_NAMES or name in _E31_PROOF_EVENT_NAMES:
+                events.append(event)
+    for event in _canonical_ledger(result).get("events", []) or []:
+        if isinstance(event, Mapping):
+            name = str(event.get("name", ""))
+            if name in _E31_FORWARD_EVENT_NAMES or name in _E31_PROOF_EVENT_NAMES:
+                events.append(event)
+    return events
+
+
+def _e31_metadata(result: Mapping[str, Any], names: frozenset[str]) -> Mapping[str, Any] | None:
+    """Return the latest metadata payload for the selected E31 events."""
+    latest: Mapping[str, Any] | None = None
+    for event in _e31_events(result):
+        if str(event.get("name", "")) not in names:
+            continue
+        metadata = event.get("metadata")
+        if isinstance(metadata, Mapping):
+            latest = metadata
+    return latest
+
+
+def _collect_e31_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Collect explicit forward/proof evidence without inferring from hydration."""
+    # Prefer the complete evidence envelope over start/end timing markers.
+    # The latter are useful ledger events but do not prove a forward ran.
+    forward = _e31_metadata(result, frozenset({"clip_forward_evidence"}))
+    if forward is None:
+        forward = _e31_metadata(result, frozenset({"clip_forward_cast_summary"}))
+    summary = _e31_metadata(result, frozenset({"clip_forward_cast_summary"}))
+    if summary is None and isinstance(forward, Mapping):
+        nested_summary = forward.get("forward_cast_summary")
+        if isinstance(nested_summary, Mapping):
+            summary = nested_summary
+    residency = _e31_metadata(result, frozenset({"clip_fh_cast_once_bind_proof"}))
+    forward_proof = _e31_metadata(result, frozenset({"clip_fh_cast_once_forward_check"}))
+    failed = _e31_metadata(
+        result,
+        frozenset({"clip_fh_cast_once_forward_failed", "clip_fh_cast_once_residency_failed"}),
+    )
+    generation_proof: Mapping[str, Any] | None = None
+    for source in (forward_proof, residency):
+        if not isinstance(source, Mapping):
+            continue
+        generation_fields = {
+            key: source[key]
+            for key in (
+                "generation", "bind_generation", "post_forward_generation",
+                "generation_stable", "storage_stable",
+            )
+            if key in source
+        }
+        if generation_fields:
+            generation_proof = generation_fields
+            break
+    observed = bool(forward) and any(
+        key in forward for key in ("forward_observed", "forward_actually_observed", "forward_conversion_count")
+    )
+    return {
+        "forward_evidence": forward,
+        "forward_cast_summary": summary,
+        "cast_once_residency_proof": residency,
+        "cast_once_forward_proof": forward_proof,
+        "cast_once_generation_proof": generation_proof,
+        "cast_once_failure": failed,
+        "forward_evidence_observed": observed,
+    }
+
+
 def _identity_of(result: Mapping[str, Any]) -> Mapping[str, Any]:
     """The run's identity dict (artifact-level or nested remote-level)."""
     identity = result.get("identity")
@@ -300,6 +403,12 @@ def build_run_record(
     run_role: str = "sample",
     retained: bool = True,
     discard_reason: str = "",
+    v2ctl_invocation_id: str = "",
+    profile: str = "",
+    profile_config_fingerprint: str = "",
+    deploy_fingerprint: str = "",
+    run_fingerprint: str = "",
+    generated_at_utc: str = "",
 ) -> dict[str, Any]:
     """Assemble one flat, deterministic experiment-run record.
 
@@ -376,8 +485,22 @@ def build_run_record(
 
     timing_source = final_reconciled if isinstance(final_reconciled, Mapping) else {}
 
+    # Reserved v2ctl metadata is read at write time as well as accepted by
+    # callers.  This makes the durable record self-contained and keeps
+    # non-v2ctl harnesses unchanged when the channel is absent.
+    _v2ctl_id = str(v2ctl_invocation_id or _first_value(result, ("v2ctl_invocation_id",)) or os.environ.get("COMFYMODAL_V2CTL_INVOCATION_ID", "") or "")
+    _profile = str(profile or _first_value(result, ("profile", "profile_name")) or os.environ.get("COMFYMODAL_V2CTL_PROFILE", "") or "")
+    _profile_cfg = str(profile_config_fingerprint or _first_value(result, ("profile_config_fingerprint", "config_fingerprint")) or os.environ.get("COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT", "") or "")
+    _deploy_fp = str(deploy_fingerprint or _first_value(result, ("deploy_fingerprint",)) or os.environ.get("COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT", "") or "")
+    _run_fp = str(run_fingerprint or _first_value(result, ("run_fingerprint",)) or os.environ.get("COMFYMODAL_V2CTL_RUN_FINGERPRINT", "") or "")
+    _request_id = str(request_id or _first_value(result, ("request_id", "prompt_id")) or "")
+    _generated = str(generated_at_utc or _first_value(result, ("generated_at_utc", "run_timestamp")) or datetime.now(timezone.utc).isoformat())
+    # E31 evidence is sourced only from explicit forward/proof events.  Do not
+    # substitute hydration counters here: hydration conversion_count=0 says
+    # nothing about whether the real CLIP forward converted weights.
+    e31_evidence = _collect_e31_evidence(result)
     record: dict[str, Any] = {
-        "request_id": str(request_id or ""),
+        "request_id": _request_id,
         "experiment": str(experiment or ""),
         "arm": str(arm or ""),
         "run_ordinal": int(run_ordinal) if run_ordinal is not None else 1,
@@ -415,8 +538,22 @@ def build_run_record(
         "scheduling_ms": timing_source.get("scheduling_ms"),
         "command_response_ms": timing_source.get("command_response_ms"),
         "wall_ms": _first_value(result, ("wall_ms",)),
+        "generated_at_utc": _generated,
         "persisted_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_identity": dict(identity),
+        "v2ctl_invocation_id": _v2ctl_id,
+        "profile": _profile,
+        "profile_name": _profile,
+        "profile_config_fingerprint": _profile_cfg,
+        "deploy_fingerprint": _deploy_fp,
+        "run_fingerprint": _run_fp,
+        "e31_forward_evidence": e31_evidence["forward_evidence"],
+        "e31_forward_cast_summary": e31_evidence["forward_cast_summary"],
+        "e31_cast_once_residency_proof": e31_evidence["cast_once_residency_proof"],
+        "e31_cast_once_forward_proof": e31_evidence["cast_once_forward_proof"],
+        "e31_cast_once_generation_proof": e31_evidence["cast_once_generation_proof"],
+        "e31_cast_once_failure": e31_evidence["cast_once_failure"],
+        "e31_forward_evidence_observed": e31_evidence["forward_evidence_observed"],
         # ── E29: canonical critical-path ledger (ground truth) ───────────
         # The remote result attaches the full canonical ledger report; carry
         # it verbatim (plus its status) into the persisted sample record so
@@ -454,7 +591,16 @@ def save_experiment_run(
     run_role = str(record.get("run_role") or "sample") or "sample"
     role_clean = _RUN_FILENAME_RE.sub("_", run_role) or "sample"
     path = out / f"run_{run_ordinal:03d}_{role_clean}.json"
-    path.write_text(_dumps(record), encoding="utf-8")
+
+    # The path is part of the canonical artifact identity.  Add it only after
+    # the final filename is known; an artifact hash, if needed, belongs in the
+    # provenance sidecar because embedding a hash of these bytes would be
+    # self-referential.  Discard a caller-supplied embedded hash rather than
+    # persisting misleading integrity metadata.
+    canonical_record = dict(record)
+    canonical_record.pop("artifact_sha256", None)
+    canonical_record["artifact_path"] = str(path.resolve())
+    path.write_text(_dumps(canonical_record), encoding="utf-8")
     return path
 
 
@@ -482,6 +628,12 @@ def _record_summary(record: Mapping[str, Any]) -> dict[str, Any]:
         "command_response_ms",
         "output_sha",
         "persisted_at_utc",
+        "generated_at_utc",
+        "v2ctl_invocation_id",
+        "profile",
+        "profile_config_fingerprint",
+        "deploy_fingerprint",
+        "run_fingerprint",
     )
     summary = {key: _json_safe(record.get(key)) for key in keys}
     run_ordinal = int(record.get("run_ordinal") or 1)
@@ -518,6 +670,16 @@ def write_campaign_manifest(
             for record in records
         ],
     }
+    # Additive campaign-level identity summary.  Do not invent provenance for
+    # legacy campaigns; an empty/mixed set is explicitly represented.
+    invocation_ids = sorted({str(r.get("v2ctl_invocation_id") or "") for r in records if r.get("v2ctl_invocation_id")})
+    profiles = sorted({str(r.get("profile") or r.get("profile_name") or "") for r in records if r.get("profile") or r.get("profile_name")})
+    profile_fps = sorted({str(r.get("profile_config_fingerprint") or "") for r in records if r.get("profile_config_fingerprint")})
+    if invocation_ids:
+        manifest["v2ctl_invocation_id"] = invocation_ids[0] if len(invocation_ids) == 1 else None
+        manifest["v2ctl_invocation_ids"] = invocation_ids
+        manifest["profile"] = profiles[0] if len(profiles) == 1 else None
+        manifest["profile_config_fingerprint"] = profile_fps[0] if len(profile_fps) == 1 else None
     path = out / "campaign_manifest.json"
     path.write_text(_dumps(manifest), encoding="utf-8")
     return path

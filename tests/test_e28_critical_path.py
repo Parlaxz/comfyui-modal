@@ -305,10 +305,17 @@ class Fp32CastOnceTest(unittest.TestCase):
             "key_set": ["b", "w"],
             "key_shapes": {"w": [2, 2], "b": [2]},
         }
+        cast_sds, cast_record = cast_once.apply_cast_once(
+            [{
+                "w": torch.ones(2, 2, dtype=torch.bfloat16),
+                "b": torch.ones(2, dtype=torch.bfloat16),
+            }],
+            [manifest],
+        )
+        self.assertTrue(cast_record["applied"])
         ok, _ = cast_once.verify_cast_once_sd(
             manifest,
-            {"w": torch.ones(2, 2, dtype=torch.float32),
-             "b": torch.ones(2, dtype=torch.float32)},
+            cast_sds[0],
         )
         self.assertTrue(ok)
         # BF16 (uncast) must fail the cast-once verification.

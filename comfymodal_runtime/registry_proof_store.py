@@ -85,8 +85,9 @@ def deployed_state_path() -> Path:
 def current_identity_anchor() -> dict:
     """Read the deploy-frozen identity anchor from ``.deployed_state.json``.
 
-    Returns ``{"generation", "deployment_hash", "comfyui_version",
-    "comfyui_commit"}`` ONLY when all four are non-empty; ANY missing/empty
+    Returns ``{"generation", "deployment_hash", "dependency_hash",
+    "comfyui_version", "comfyui_commit"}`` ONLY when all five are non-empty;
+    ANY missing/empty
     value → ``{}`` (fail closed; never a partial anchor).  Missing/unreadable
     file → ``{}``.
     """
@@ -99,13 +100,15 @@ def current_identity_anchor() -> dict:
         return {}
     generation = str(raw.get("custom_nodes_generation", "") or "").strip()
     deployment_hash = str(raw.get("deployment_combined_hash", "") or "").strip()
+    dependency_hash = str(raw.get("overall_dependency_hash", "") or "").strip()
     comfyui_version = str(raw.get("comfyui_version", "") or "").strip()
     comfyui_commit = str(raw.get("comfyui_commit", "") or "").strip()
-    if not (generation and deployment_hash and comfyui_version and comfyui_commit):
+    if not (generation and deployment_hash and dependency_hash and comfyui_version and comfyui_commit):
         return {}
     return {
         "generation": generation,
         "deployment_hash": deployment_hash,
+        "dependency_hash": dependency_hash,
         "comfyui_version": comfyui_version,
         "comfyui_commit": comfyui_commit,
     }
@@ -120,6 +123,7 @@ def _entry_key(anchor: dict, comfyui_root: str, workflow_hash: str) -> str:
     payload = {
         "generation": str(anchor.get("generation", "") or ""),
         "deployment_hash": str(anchor.get("deployment_hash", "") or ""),
+        "dependency_hash": str(anchor.get("dependency_hash", "") or ""),
         "comfyui_version": str(anchor.get("comfyui_version", "") or ""),
         "comfyui_commit": str(anchor.get("comfyui_commit", "") or ""),
         "comfyui_root_norm": os.path.normpath(str(comfyui_root or "")),
@@ -180,6 +184,34 @@ def _write_store(store: dict) -> None:
         pass
 
 
+def _proof_is_structurally_complete(proof: object, workflow_hash: str = "") -> bool:
+    """Return whether *proof* is a complete, hash-bound registry proof."""
+    if not isinstance(proof, dict) or not proof.get("complete"):
+        return False
+    if proof.get("schema_version") != 1:
+        return False
+    classes = proof.get("classes")
+    identities = proof.get("identities")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or any(not isinstance(name, str) or not name for name in classes)
+        or len(classes) != len(set(classes))
+    ):
+        return False
+    if not isinstance(identities, dict) or set(identities) != set(classes):
+        return False
+    if any(not isinstance(value, str) or not value for value in identities.values()):
+        return False
+    if proof.get("missing_host") or proof.get("unresolved_identity"):
+        return False
+    if proof.get("workflow_class_count") != len(classes):
+        return False
+    if workflow_hash and str(proof.get("workflow_hash", "") or "") != str(workflow_hash):
+        return False
+    return True
+
+
 def lookup(workflow_hash: str, comfyui_root: str = "") -> dict | None:
     """Return the stored entry dict ONLY when it matches the CURRENT anchor +
     normalized comfyui_root + workflow_hash.  ANY mismatch → ``None``.
@@ -196,9 +228,20 @@ def lookup(workflow_hash: str, comfyui_root: str = "") -> dict | None:
         entry = store.get("entries", {}).get(key)
         if not isinstance(entry, dict):
             return None
+        if entry.get("schema_version") != REGISTRY_PROOF_STORE_SCHEMA_VERSION:
+            return None
+        # The key is hash-derived, but retain an explicit payload check so a
+        # corrupt or hand-edited entry cannot be consumed for a neighboring
+        # workflow.
+        if str(entry.get("workflow_hash", "") or "") != str(workflow_hash or ""):
+            return None
         # Defensive: re-validate the stored anchor matches the current one.
         stored_anchor = entry.get("identity_anchor")
         if not isinstance(stored_anchor, dict) or stored_anchor != anchor:
+            return None
+        # Validation-only, partial, or unbound proofs are misses.  The caller
+        # must rebuild from the live registry instead of promoting them.
+        if not _proof_is_structurally_complete(entry.get("registry_proof"), workflow_hash):
             return None
         return dict(entry)
     except Exception:
@@ -206,7 +249,7 @@ def lookup(workflow_hash: str, comfyui_root: str = "") -> dict | None:
 
 
 def entries() -> dict:
-    """Return ALL stored entries (best-effort, never raises).
+    """Return current-anchor stored entries (best-effort, never raises).
 
     E29: used by the plan-validation fallback to scan for a stored deployed
     proof matching the current workflow by node-type fingerprint (the per-run
@@ -215,8 +258,16 @@ def entries() -> dict:
     """
     try:
         store = _load_store()
+        anchor = current_identity_anchor()
+        if not anchor:
+            return {}
         out = store.get("entries") or {}
-        return {k: dict(v) for k, v in out.items() if isinstance(v, dict)}
+        # Fallback scans must never consider a proof from another deployment,
+        # generation, or dependency anchor.
+        return {
+            k: dict(v) for k, v in out.items()
+            if isinstance(v, dict) and v.get("identity_anchor") == anchor
+        }
     except Exception:
         return {}
 
@@ -249,11 +300,22 @@ def save(fields: dict) -> None:
         }
         # Only carry payload fields that were actually provided so a partial
         # save (e.g. validation-only) merges without clobbering existing
-        # fingerprint/proof values.
+        # fingerprint/proof values.  A supplied proof must be complete and
+        # bound to this finalized dispatch hash.
+        supplied_proof = fields.get("registry_proof")
+        if isinstance(supplied_proof, dict) and supplied_proof:
+            supplied_proof = dict(supplied_proof)
+            proof_hash = str(supplied_proof.get("workflow_hash", "") or "")
+            if proof_hash and proof_hash != workflow_hash:
+                return
+            # Bind complete proofs produced by older builders that omitted the
+            # planner's finalized hash.  Incomplete proofs are never repaired.
+            supplied_proof.setdefault("workflow_hash", workflow_hash)
+            if not _proof_is_structurally_complete(supplied_proof, workflow_hash):
+                return
+            entry["registry_proof"] = supplied_proof
         if str(fields.get("registry_fingerprint", "") or ""):
             entry["registry_fingerprint"] = str(fields["registry_fingerprint"])
-        if isinstance(fields.get("registry_proof"), dict) and fields["registry_proof"]:
-            entry["registry_proof"] = dict(fields["registry_proof"])
         if isinstance(fields.get("validation"), dict):
             entry["validation"] = dict(fields["validation"])
         with _STORE_LOCK:
@@ -261,12 +323,21 @@ def save(fields: dict) -> None:
             entries = store.get("entries", {})
             existing = entries.get(key)
             if isinstance(existing, dict):
+                # Validation-only updates are permitted only as an extension
+                # of an already complete proof for this exact anchor/hash.
+                if "registry_proof" not in entry and not _proof_is_structurally_complete(
+                    existing.get("registry_proof"), workflow_hash
+                ):
+                    return
                 # Merge: keep the earlier creation time, refresh payload fields.
                 merged = dict(existing)
                 merged.update(entry)
                 merged["created_at_unix"] = existing.get("created_at_unix", entry["created_at_unix"])
                 entries[key] = merged
             else:
+                # Never create a validation-only entry.
+                if "registry_proof" not in entry:
+                    return
                 entries[key] = entry
             if len(entries) > _MAX_ENTRIES:
                 # Drop oldest created_at_unix; keep newest.
@@ -293,7 +364,15 @@ def has_generation_entry() -> bool:
         for entry in store.get("entries", {}).values():
             if not isinstance(entry, dict):
                 continue
-            if entry.get("identity_anchor") == anchor:
+            entry_hash = str(entry.get("workflow_hash", "") or "")
+            if (
+                entry.get("identity_anchor") == anchor
+                and entry.get("schema_version") == REGISTRY_PROOF_STORE_SCHEMA_VERSION
+                and entry_hash
+                and _proof_is_structurally_complete(
+                    entry.get("registry_proof"), entry_hash
+                )
+            ):
                 return True
     except Exception:
         return False

@@ -112,7 +112,9 @@ from the record alone, and a non-QD run is provably not mislabeled.
 | `tools/bench_e30_clip_qd.py`, `tools/e30_env_probe.py` | local benchmark + container env probe | LOCAL PROOF |
 | `_e30_deploy_wrapper.bat` | LEGACY — marked DEPRECATED at re-anchor; not part of the future workflow | HISTORICAL INTERMEDIATE STATE |
 | `config/v2/flag_registry.toml` | 5 E30 flags registered (metadata, not whitelist) | CURRENT SOURCE FACT (re-anchor) |
-| `config/v2/profiles/e30-clip-qd.toml` | Fixed: real flag names + expected SHA | CURRENT SOURCE FACT (re-anchor) |
+| `config/v2/profiles/e30-clip-qd-arm-a.toml` | QD control arm (reader OFF) | CURRENT SELECTABLE PROFILE |
+| `config/v2/profiles/e30-clip-qd-arm-b.toml` | QD experiment arm (QD4 / 32 MiB) | CURRENT SELECTABLE PROFILE |
+| `config/v2/profiles/e30-clip-qd.toml` | Legacy pre-arm profile name | HISTORICAL REPORT REFERENCE; not canonical |
 | `tests/test_v2ctl_config.py`, `tests/test_v2ctl_profiles.py` | Updated to the registered E30 flags | LOCAL PROOF |
 
 E29/E31 orchestration files (`critical_path_ledger.py`, `gantt_canonical.py`,
@@ -351,13 +353,15 @@ inconsistent, so none was added).
 
 ### 12.2 Profile
 
-`config/v2/profiles/e30-clip-qd.toml` (re-anchor fix): the previous profile
-set a stale `COMFYMODAL_V2_CLIP_QD_IO` key that nothing consumed.  It now
-sets the 5 real flags (`READER=1, QD=4, BLOCK_MIB=32,
+The deleted/legacy `config/v2/profiles/e30-clip-qd.toml` name is retained only
+as a historical report reference; it is not a canonical selectable profile.
+The current selectable pair is `e30-clip-qd-arm-a.toml` (control) and
+`e30-clip-qd-arm-b.toml` (QD4 / 32 MiB experiment). ARM B sets the five real
+QD flags (`READER=1, QD=4, BLOCK_MIB=32,
 LAUNCH_POLICY=restore_earliest`), keeps `CLIP_FAST_HYDRATION=1` +
 `CLIP_COLD_FORENSICS=1`, and pins the expected output SHA
-`20b10e1f…e5260`.  Future remote command: `python tools/v2ctl.py gate
---profile e30-clip-qd ...`.
+`20b10e1f…e5260`. A future full generation gate, if authorized, selects
+`python tools/v2ctl.py gate --profile e30-clip-qd-arm-b ...`.
 
 ### 12.3 Deploy wrapper
 
@@ -440,7 +444,7 @@ Once E29 tracing is trustworthy, E32/v2ctl works, and the user grants
 permission, run ONE proper cold gate:
 
 ```
-python tools/v2ctl.py gate --profile e30-clip-qd ...
+python tools/v2ctl.py gate --profile e30-clip-qd-arm-b ...
 ```
 
 Acceptance (all must hold on a FRESH container):

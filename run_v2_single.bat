@@ -58,6 +58,68 @@ REM -- E28 critical-path validation selector (atomic opt-in) -----------------
 REM Run-side mirror of the deploy selector: sets the E28 validation flags for
 REM the request environment.  The deployed container must have been built
 REM with the same selector (deploy_and_run_v2_single.bat E28_VALIDATION).
+REM -- E37 late CLIP validation selector (atomic opt-in) ----------------------
+REM E37 shares E19's full-generation base, but does not force E28 restore or
+REM diagnostic settings.  QD/FASTSAFE, late policy, minimal restore, and
+REM strict-proof values remain profile-provided and are verified locally.
+if not defined V2_E37_VALIDATION set "V2_E37_VALIDATION=0"
+if /i "%~1"=="E37_VALIDATION" set "V2_E37_VALIDATION=1"
+if /i "!COMFYMODAL_V2_E37_STRICT_PROOF!"=="1" set "V2_E37_VALIDATION=1"
+set "V2_E37_CLEAN_LANE_ACTIVE=0"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_E37_CLEAN_LANE_ACTIVE=1"
+if /i "!COMFYMODAL_V2_E37_CLEAN_LANE!"=="1" set "V2_E37_CLEAN_LANE_ACTIVE=1"
+if /i "!COMFYMODAL_V2_CLEAN_LANE!"=="1" set "V2_E37_CLEAN_LANE_ACTIVE=1"
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" set "V2_E19_FINAL_COLD_LOADER=0"
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" set "V2_E28_VALIDATION=0"
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" set "V2_E31_VALIDATION=0"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_E37_VALIDATION=1"
+set "V2_E37_VALIDATION_ACTIVE=0"
+if /i "!V2_E37_VALIDATION!"=="1" set "V2_E37_VALIDATION_ACTIVE=1"
+if /i "!V2_E37_VALIDATION!"=="true" set "V2_E37_VALIDATION_ACTIVE=1"
+if /i "!V2_E37_VALIDATION!"=="yes" set "V2_E37_VALIDATION_ACTIVE=1"
+if /i "!V2_E37_VALIDATION!"=="on" set "V2_E37_VALIDATION_ACTIVE=1"
+if "!V2_E37_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E37_CLEAN_LANE_ACTIVE!"=="0" set "V2_E19_FINAL_COLD_LOADER=1"
+    set "V2_E28_VALIDATION=0"
+    set "V2_E31_VALIDATION=0"
+    set "V2_BENCHMARK_MODE=e37_single"
+    set "V2_BENCHMARK_RUNS=1"
+    if not defined V2_E37_CONDITIONING_NONCE set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    echo [v2.e37_validation] run_selector=ACTIVE full_run=1 e19=1 nonce=present
+)
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" (
+    set "COMFYMODAL_V2_E37_CLEAN_LANE=1"
+    set "COMFYMODAL_V2_CLEAN_LANE=1"
+    set "COMFYMODAL_V2_ATOMIC_PROFILE=E37_CLEAN_LANE"
+    set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+    set "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=0"
+    set "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=0"
+    set "COMFYMODAL_V2_EVICT_RETAIN_ROLE=none"
+    set "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS=0"
+    set "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION=0"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM=0"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS=0"
+    set "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB=0"
+    set "COMFYMODAL_V2_UNET_FASTSAFETENSORS=0"
+    set "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS=0"
+    set "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH=0"
+    set "COMFYMODAL_V2_INPUT_TYPES_WARM=0"
+    set "COMFYMODAL_V2_PREFILL_LANES=none"
+    set "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET=0"
+    set "COMFYMODAL_V2_EXECUTION_PREFILL=0"
+    set "COMFYMODAL_V2_GRAPH_PRELOAD=0"
+    set "COMFYMODAL_V2_MODEL_PRELOAD=0"
+    set "COMFYMODAL_V2_EXACT_CACHE_PERSIST=0"
+    set "COMFYMODAL_V2_ALLOCATOR_PURGE=0"
+    set "COMFYMODAL_V2_BACKGROUND_PERSISTENCE=0"
+    set "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS=0"
+    set "V2_E28_VALIDATION=0"
+    set "V2_E31_VALIDATION=0"
+    set "V2_BENCHMARK_MODE=e37_single"
+    set "V2_BENCHMARK_RUNS=1"
+    if not defined V2_E37_CONDITIONING_NONCE set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    echo [v2.e37_clean_lane_validation] run_selector=ACTIVE full_run=1 e19=0 nonce=present
+)
 if not defined V2_E28_VALIDATION set "V2_E28_VALIDATION=0"
 if /i "%~1"=="E28_VALIDATION" set "V2_E28_VALIDATION=1"
 set "V2_E28_VALIDATION_ACTIVE=0"
@@ -81,7 +143,7 @@ if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
 )
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
-set "COMFYMODAL_V2_ATOMIC_PROFILE="
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="0" set "COMFYMODAL_V2_ATOMIC_PROFILE="
 if not defined COMFYMODAL_V2_GPU set "COMFYMODAL_V2_GPU=rtx-pro-6000"
 if not defined COMFYMODAL_V2_RESTORE_ONLY_APP_NAME set "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLOUD="
@@ -246,6 +308,18 @@ if "!V2_E19_FINAL_COLD_LOADER_ACTIVE!"=="1" (
     python tools\benchmark_v2_direct.py --verify-d6-profile
     if errorlevel 1 (
         echo === ERROR: E19 atomic profile validation FAILED - aborting before any Modal call. ===
+        exit /b 1
+    )
+)
+
+if "!V2_E37_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --verify-e37-clean-lane-profile --run-count 1
+    ) else (
+        python tools\benchmark_v2_direct.py --verify-e37-profile --run-count 1
+    )
+    if errorlevel 1 (
+        echo === ERROR: E37 profile validation FAILED - aborting before any Modal call. ===
         exit /b 1
     )
 )
@@ -436,7 +510,9 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
     echo === Fail-closed request preflight (local, no spend) ===
-    if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --verify-run-preflight --run-count 1 --conditioning-cache-nonce !V2_E37_CONDITIONING_NONCE!
+    ) else if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
         python tools\benchmark_v2_direct.py --verify-run-preflight --run-count 1 --conditioning-cache-nonce !V2_E28_CONDITIONING_NONCE!
     ) else if "!V2_E26_VALIDATION_ACTIVE!"=="1" (
         python tools\benchmark_v2_direct.py --verify-run-preflight --run-count 1 --conditioning-cache-nonce !V2_E26_CONDITIONING_NONCE!
@@ -449,7 +525,12 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
         echo === RUN PREFLIGHT FAILED - aborting before any Modal submission ===
         exit /b 1
     )
-    if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" (
+        set "V2_TOOL_ARGS="
+        set "V2_FIRST_SKIP="
+        for %%a in (%*) do if not defined V2_FIRST_SKIP (set "V2_FIRST_SKIP=1") else (set "V2_TOOL_ARGS=!V2_TOOL_ARGS! %%a")
+        python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E37_CONDITIONING_NONCE!!V2_TOOL_ARGS!
+    ) else if "!V2_E28_VALIDATION_ACTIVE!"=="1" (
         set "V2_TOOL_ARGS="
         set "V2_FIRST_SKIP="
         for %%a in (%*) do if not defined V2_FIRST_SKIP (set "V2_FIRST_SKIP=1") else (set "V2_TOOL_ARGS=!V2_TOOL_ARGS! %%a")

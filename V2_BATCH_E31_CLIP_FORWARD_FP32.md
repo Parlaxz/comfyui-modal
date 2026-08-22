@@ -47,7 +47,8 @@ E31-owned files (modified/created by this batch):
 - `comfymodal_runtime/clip_fast_hydration_wiring.py` (E31-marked additive block only)
 - `tests/test_e31_clip_forward_fp32.py` (E31 new, extended)
 - `config/v2/flag_registry.toml` (E31 flag metadata; E32 registry)
-- `config/v2/profiles/e31-clip-fp32.toml` (E31 profile, existing)
+- `config/v2/profiles/e31-clip-fp32-qd4-arm-a.toml` (current E31 QD4 control arm)
+- `config/v2/profiles/e31-clip-fp32-qd4-arm-b.toml` (current E31 QD4 experiment arm)
 - `V2_BATCH_E31_CLIP_FORWARD_FP32.md` (this report)
 
 Concurrent-ownership boundary: E29 owns `critical_path_ledger.py`,
@@ -66,7 +67,8 @@ CURRENT_E31_FILES:
   comfymodal_runtime/clip_forward_forensics.py   (E31 forensics module)
   comfymodal_runtime/clip_fp32_cast_once.py      (E28 cast-once + E31 extension)
   tests/test_e31_clip_forward_fp32.py            (29 tests)
-  config/v2/profiles/e31-clip-fp32.toml
+  config/v2/profiles/e31-clip-fp32-qd4-arm-a.toml
+  config/v2/profiles/e31-clip-fp32-qd4-arm-b.toml
   config/v2/flag_registry.toml                   (E31 flag metadata added)
   V2_BATCH_E31_CLIP_FORWARD_FP32.md              (this report)
 
@@ -337,11 +339,14 @@ Registered in `config/v2/flag_registry.toml` (E32's registry; verified via
 | `COMFYMODAL_V2_E31_FORWARD_PROFILE` | bool | 0 | module_import | deploy |
 | `COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT` | int | 1024 | module_import | deploy |
 
-`config/v2/profiles/e31-clip-fp32.toml` exists (extends production,
-`fresh_required = true`, cast-once + fastsafe tuning).  No forwarding
-whitelist edits were made.  The E31 forensics/profile flags are NOT in any
-request-env passthrough list (they are deploy-baked via v2ctl env), which
-matches their `consumed_at=module_import` lifecycle.
+The deleted/legacy `config/v2/profiles/e31-clip-fp32.toml` name is historical
+report nomenclature and is not selectable. Current selectable E31 arms are
+`e31-clip-fp32-qd4-arm-a.toml` / `e31-clip-fp32-qd4-arm-b.toml` and the
+corresponding `e31-clip-fp32-fastsafe-arm-a.toml` /
+`e31-clip-fp32-fastsafe-arm-b.toml`. No forwarding whitelist edits were made.
+The E31 forensics/profile flags are NOT in any request-env passthrough list
+(they are deploy-baked via v2ctl env), which matches their
+`consumed_at=module_import` lifecycle.
 
 ## 11. Phase 10 — local validation (LOCAL-MEASURED)
 

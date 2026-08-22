@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from .checkpoint_prewarm import CheckpointPrewarmer, resolve_prewarm_paths
+from . import clean_lane
 from .env import env_flag
 
 
@@ -413,6 +414,11 @@ class FastColdOrchestrator:
                 self.paths[role] = resolved
 
     def _start_prefetch(self, role: str, paths: Any) -> bool:
+        if clean_lane.enabled():
+            clean_lane.forbidden_activity(
+                "checkpoint_volume_prefetch", getattr(self, "trace", None), role=role
+            )
+            return False
         if not env_flag("COMFYMODAL_V2_CHECKPOINT_PREWARM", default=False):
             return False
         resolved = resolve_prewarm_paths(paths)

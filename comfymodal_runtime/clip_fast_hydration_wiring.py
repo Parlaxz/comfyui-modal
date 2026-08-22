@@ -50,6 +50,7 @@ import torch
 from comfymodal_runtime.env import env_flag
 from comfymodal_runtime import clip_fast_hydration as cfh
 from comfymodal_runtime import gpu_lane_coordination as _gpu_coord
+from comfymodal_runtime import clean_lane
 
 _FLAG_FAST = "COMFYMODAL_V2_CLIP_FAST_HYDRATION"
 _FLAG_STAGED = "COMFYMODAL_V2_CLIP_STAGED_HYDRATION"
@@ -79,6 +80,9 @@ _CLIP_THREADS_ENV = "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"
 _CLIP_BLOCK_BYTES_ENV = "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES"
 _CLIP_BBUF_KB_ENV = "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB"
 _CLIP_BBUF_KB = 512 * 1024  # 512 MiB bounce-buffer pool (see UNET note)
+
+CLIP_LOADER_START = "clip_loader_start"
+CLIP_DEVICE_READY = "clip_device_ready"
 
 
 def _clip_fastsafe_bbuf_kb() -> int:
@@ -149,6 +153,25 @@ _ACTIVE_TRACE: Any = None
 _LAST_CLIP: Any = None  # weakref.ref(clip) or None; never a strong reference
 
 
+def _close_source_owners(owners: Any) -> None:
+    """Best-effort failure cleanup for every loader/buffer component."""
+    for owner in list(owners or []):
+        components = tuple(owner) if isinstance(owner, (tuple, list)) else (owner,)
+        for component in components:
+            for name in ("close", "release_storage", "free_storage", "release_buffer"):
+                method = getattr(component, name, None)
+                if not callable(method):
+                    continue
+                try:
+                    try:
+                        method(purge_allocator=False)
+                    except TypeError:
+                        method()
+                except Exception:
+                    pass
+                break
+
+
 def _blob_free(sd: dict) -> dict:
     """View of a file state dict without structural tokenizer blob tensors.
 
@@ -209,6 +232,55 @@ def _emit(trace: Any, name: str, metadata: dict[str, Any]) -> None:
             trace.emit(name, phase="execution", metadata=payload)
     except Exception:
         pass
+
+
+def _emit_clip_loader_endpoint(
+    trace: Any,
+    name: str,
+    *,
+    endpoint_role: str,
+    loader_arm: str,
+) -> int:
+    """Stamp one common CLIP loader boundary on both telemetry axes.
+
+    The timestamp is captured once from ``time.monotonic_ns`` and passed
+    unchanged to the trace and canonical ledger.  This seam is deliberately
+    independent of the QD reader so FASTSAFE and speculative/QD loads share
+    endpoint semantics without one being derived from the other.
+    """
+    mono_ns = int(time.monotonic_ns())
+    payload: dict[str, Any] = {
+        "endpoint_role": str(endpoint_role),
+        "semantic_endpoint_role": str(endpoint_role),
+        "clock": "monotonic_ns",
+        "clock_source": "time.monotonic_ns",
+        "monotonic_ns": mono_ns,
+        "loader_arm": str(loader_arm),
+        "hydration_source": str(loader_arm),
+        "request_id": _request_id(),
+    }
+    wall_ns = int(time.time_ns())
+    if trace is not None:
+        try:
+            if hasattr(trace, "emit_at"):
+                trace.emit_at(
+                    name,
+                    wall_unix_ns=wall_ns,
+                    monotonic_ns=mono_ns,
+                    phase="execution",
+                    metadata=dict(payload),
+                )
+            elif hasattr(trace, "emit"):
+                trace.emit(name, phase="execution", metadata=dict(payload))
+        except Exception:
+            pass
+    try:
+        from .critical_path_ledger import record_event
+
+        record_event(name, mono_ns=mono_ns, wall_ns=wall_ns, metadata=payload)
+    except Exception:
+        pass
+    return mono_ns
 
 
 def _state_detail(state: dict[str, Any]) -> dict[str, Any]:
@@ -546,6 +618,31 @@ def _verify_file_against_manifest(
     return True, f"exact key/shape/dtype match vs frozen manifest ({len(key_set)} keys)"
 
 
+def _model_structural_destination_keys(
+    clip: Any, expected_keys: set[str]
+) -> list[str]:
+    """Freeze model-created destination keys not supplied by the checkpoint.
+
+    The proof still rejects any destination not in this frozen declaration at
+    demand time.  Aliased state-dict names for checkpoint parameters are
+    excluded by identity, matching the residency proof's destination map.
+    """
+    csm = getattr(clip, "cond_stage_model", None)
+    if csm is None:
+        return []
+    destination_all: list[tuple[str, Any]] = []
+    for leaf in cfh._leaf_loaders(csm):
+        for key, tensor in cfh._leaf_param_map(leaf).items():
+            destination_all.append((str(key), tensor))
+    expected_destination_ids = {
+        id(tensor) for key, tensor in destination_all if key in expected_keys
+    }
+    return sorted({
+        key for key, tensor in destination_all
+        if key not in expected_keys and id(tensor) not in expected_destination_ids
+    })
+
+
 def _build_manifest(
     clip: Any, paths: list[str], comfy_utils: Any = None
 ) -> Optional[dict]:
@@ -559,7 +656,7 @@ def _build_manifest(
         return None
     files: list[dict[str, Any]] = []
     reasons: list[str] = []
-    for path in paths:
+    for file_index, path in enumerate(paths):
         if not os.path.exists(path):
             reasons.append(f"missing:{os.path.basename(path)}")
             continue
@@ -590,12 +687,17 @@ def _build_manifest(
             dtypes = {str(v.dtype) for v in transformed.values()}
             files.append(
                 {
+                    # Index in the accepted manifest/files list (not the
+                    # original path list, which may contain skipped files).
+                    "file_index": int(len(files)),
                     "path": path,
                     "size_bytes": int(os.path.getsize(path)),
                     "mtime_ns": int(os.path.getmtime(path) * 1_000_000_000),
                     "dtype": str(next(iter(dtypes))),
                     "key_set": sorted(transformed.keys()),
                     "key_shapes": {k: list(v.shape) for k, v in transformed.items()},
+                    "expected_count": len(transformed),
+                    "expected_bytes": sum(int(v.numel()) * 4 for v in transformed.values()),
                     "pipeline": pipeline,
                     "non_tensor_entries": non_tensor,
                     "quant_metadata_present": bool(metadata.get("_quantization_metadata")),
@@ -605,6 +707,13 @@ def _build_manifest(
             reasons.append(f"{os.path.basename(path)}: {type(exc).__name__}: {str(exc)[:120]}")
     if not files:
         return {"eligible": False, "reason": "; ".join(reasons) or "no usable files"}
+    structural_destination_keys = _model_structural_destination_keys(
+        clip, {key for entry in files for key in entry["key_set"]}
+    )
+    # Store this on each frozen file entry because E31's proof contract
+    # receives the authoritative ``files`` list, not the enclosing manifest.
+    for entry in files:
+        entry["structural_destination_keys"] = list(structural_destination_keys)
     per_file_key_sets = [set(f["key_set"]) for f in files]
     routing_ok, routing_detail = cfh.verify_leaf_routing(clip, per_file_key_sets)
     assign_ok, assign_detail = cfh.can_assign_sd_supported(clip)
@@ -617,6 +726,7 @@ def _build_manifest(
         "eligible": True,
         "reason": "capability gates passed at capture",
         "files": files,
+        "structural_destination_keys": list(structural_destination_keys),
         "assign_bind_supported": True,
         "fastsafe_config": {
             "threads": _clip_fastsafe_threads(),
@@ -731,6 +841,368 @@ def _fastsafe_load(path: str) -> tuple[dict, Any, Any]:
         raise
 
 
+def _e31_forward_hook(
+    clip: Any,
+    per_file_sds: list[dict],
+    files: list[dict],
+    *,
+    expect_device: Optional[str],
+    bind_snapshot: dict[str, Any],
+    trace: Any = None,
+) -> dict[str, Any]:
+    """Arm E31 proof on the existing outer forward boundary.
+
+    The demand hydrator is called from inside the first encode request.  A new
+    method wrapper installed here would miss that in-flight call, so the
+    production path registers a generation-scoped callback consumed by
+    ``model_preload``'s existing outer ``encode_token_weights`` wrapper.  The
+    direct method-hook fallback is retained only for small offline fakes that
+    do not have the production outer wrapper.
+    """
+    from .clip_fp32_cast_once import (
+        cast_once_enabled,
+        compare_resident_fp32,
+        install_real_forward_check,
+        snapshot_resident_fp32,
+    )
+
+    import importlib
+
+    ff = importlib.import_module("comfymodal_runtime.clip_forward_forensics")
+    strict_e31 = bool(cast_once_enabled())
+    installation_evidence = []
+    try:
+        installation_evidence = list(ff.cast_installation_evidence())
+    except Exception:
+        installation_evidence = []
+    required_cast_surfaces = (
+        ("comfy.ops", "cast_bias_weight"),
+        ("comfy.model_management", "cast_to"),
+        ("comfy.model_management", "cast_to_device"),
+    )
+
+    def _surface_matches(entry: dict[str, Any], module_name: str, attr: str) -> bool:
+        observed_module = str(entry.get("module", ""))
+        return (
+            str(entry.get("attribute", "")) == attr
+            and (observed_module == module_name or observed_module.endswith("." + module_name.rsplit(".", 1)[-1]))
+            and bool(entry.get("wrapped"))
+            # ``wrapped`` is only accepted as installation evidence when the
+            # audit also identified the live callable and a successful
+            # install/idempotent status.  This keeps a stale or partial
+            # evidence record from becoming a strict success claim.
+            and entry.get("callable_identity") is not None
+            and str(entry.get("status", "")) in {"installed", "already", "alias"}
+        )
+
+    canonical_cast_surfaces = {
+        f"{module_name}.{attr}": any(
+            isinstance(entry, dict) and _surface_matches(entry, module_name, attr)
+            for entry in installation_evidence
+        )
+        for module_name, attr in required_cast_surfaces
+    }
+    instrumentation_available = bool(
+        callable(getattr(ff, "cast_forensics_summary", None))
+        and bool(getattr(ff, "e31_enabled", lambda: False)())
+        and all(canonical_cast_surfaces.values())
+    )
+    conversion_before = (
+        dict(ff.cast_forensics_summary()) if instrumentation_available else None
+    )
+    legacy_conversion_before = None
+    legacy_forensics = None
+    if not strict_e31:
+        try:
+            from . import e27_forensics
+
+            legacy_forensics = e27_forensics
+            legacy_conversion_before = dict(e27_forensics.forward_cast_account_summary())
+        except Exception:
+            legacy_conversion_before = None
+    state: dict[str, Any] = {
+        "installed": False,
+        "forward_observed": False,
+        "forward_actually_observed": False,
+        "generation": int(bind_snapshot.get("generation", 0) or 0),
+        "identity": str(id(getattr(clip, "cond_stage_model", None))),
+        "instrumentation_available": instrumentation_available,
+        "canonical_cast_surfaces": canonical_cast_surfaces,
+        "cast_once_requested": bool(strict_e31),
+        "cast_once_applied": True,
+        "cast_once_generation": int(bind_snapshot.get("generation", 0) or 0),
+        "forward_timing": None,
+        "post_forward_stability": None,
+        "e31_evidence_schema": 1,
+        "canonical": {
+            "phase": "execution",
+            "forward_boundary": "outer_clip_encode",
+        },
+    }
+    try:
+        bind_fingerprint = cfh.clip_hydration_fingerprint(clip)
+    except Exception:
+        bind_fingerprint = None
+
+    def _after_forward(observation: dict[str, Any]) -> None:
+        started = time.perf_counter()
+        state.update({
+            "forward_observed": bool(observation.get("forward_observed", False)),
+            "forward_actually_observed": bool(observation.get("forward_actually_observed", False)),
+            "forward_method": observation.get("forward_method"),
+            "forward_wall_ms": observation.get("forward_wall_ms"),
+            "forward_timing": observation.get("forward_timing"),
+            "forward_count": observation.get("forward_count"),
+            "bound_request_id": observation.get("bound_request_id"),
+            "forward_request_id": observation.get("forward_request_id"),
+        })
+        forward_count = observation.get("forward_count")
+        forward_count_ok = forward_count is not None and int(forward_count or 0) == 1
+        bound_request_id = str(
+            observation.get("bound_request_id") or getattr(trace, "request_id", "") or _request_id()
+        )
+        forward_request_id = str(observation.get("forward_request_id") or "")
+        request_scope_ok = bool(
+            not bound_request_id
+            or (forward_request_id and forward_request_id == bound_request_id)
+        )
+        # The E31 strict cast-once claim requires the production outer-boundary
+        # count and request identity.  Legacy/off-mode fallback hooks retain
+        # their existing diagnostic behavior, but their evidence is not
+        # eligible for a strict success claim.
+        strict_scope_ok = bool(
+            not strict_e31 or (forward_count_ok and request_scope_ok)
+        )
+        scope_ok = bool(
+            (
+                observation.get("forward_identity") is None
+                or str(observation.get("forward_identity")) == str(state.get("identity"))
+            )
+            and (
+                observation.get("forward_generation") is None
+                or int(observation.get("forward_generation", 0) or 0)
+                == int(bind_snapshot.get("generation", 0) or 0)
+            )
+            and strict_scope_ok
+        )
+        after = snapshot_resident_fp32(
+            clip,
+            per_file_sds,
+            files,
+            expect_device=expect_device,
+            phase="post_real_forward",
+        )
+        stable, stability = compare_resident_fp32(bind_snapshot, after)
+        try:
+            fingerprint_ok = bind_fingerprint is not None and (
+                cfh.clip_hydration_fingerprint(clip) == bind_fingerprint
+            )
+        except Exception:
+            fingerprint_ok = False
+        if not fingerprint_ok:
+            stable = False
+            stability = dict(stability)
+            stability["reason"] = "identity_or_patch_fingerprint_changed"
+        conversion_after = (
+            dict(ff.cast_forensics_summary()) if instrumentation_available else None
+        )
+        before_real = int((conversion_before or {}).get("real_conversions", 0) or 0)
+        after_real = int((conversion_after or {}).get("real_conversions", 0) or 0)
+        before_bytes = int((conversion_before or {}).get("real_conversion_bytes", 0) or 0)
+        after_bytes = int((conversion_after or {}).get("real_conversion_bytes", 0) or 0)
+        real_delta = after_real - before_real
+        bytes_delta = after_bytes - before_bytes
+        forward_timing = observation.get("forward_timing") or {}
+        canonical_cast_calls = forward_timing.get("canonical_cast_calls") or {}
+        try:
+            canonical_cast_call_count = int(
+                forward_timing.get("canonical_cast_call_count", 0) or 0
+            )
+        except Exception:
+            canonical_cast_call_count = 0
+        try:
+            cast_call_total = sum(
+                int(value or 0) for value in canonical_cast_calls.values()
+            ) if isinstance(canonical_cast_calls, dict) else -1
+        except Exception:
+            cast_call_total = -1
+        cast_call_evidence_ok = bool(
+            isinstance(canonical_cast_calls, dict)
+            and canonical_cast_call_count > 0
+            and cast_call_total == canonical_cast_call_count
+        )
+        if strict_e31:
+            conversion_ok = bool(
+                instrumentation_available
+                and conversion_before is not None
+                and conversion_after is not None
+                and real_delta == 0
+                and bytes_delta == 0
+                and cast_call_evidence_ok
+            )
+        else:
+            legacy_after = None
+            if legacy_conversion_before is not None and legacy_forensics is not None:
+                try:
+                    legacy_after = dict(legacy_forensics.forward_cast_account_summary())
+                except Exception:
+                    legacy_after = None
+            conversion_ok = bool(
+                legacy_conversion_before is None
+                or (
+                    legacy_after is not None
+                    and int(legacy_after.get("dest_bytes", 0) or 0)
+                    == int(legacy_conversion_before.get("dest_bytes", 0) or 0)
+                )
+            )
+        result = {
+            **observation,
+            "e31_evidence_schema": 1,
+            "forward_check_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "bind_generation": int(bind_snapshot.get("generation", 0) or 0),
+            "post_forward_generation": int(after.get("generation", 0) or 0),
+            "residency": after,
+            "stability": stability,
+            "storage_stable": bool(stable),
+            "conversion_before": conversion_before,
+            "conversion_after": conversion_after,
+            "cast_forensics_before": conversion_before,
+            "cast_forensics_after": conversion_after,
+            "real_conversions_before": before_real,
+            "real_conversions_after": after_real,
+            "real_conversions_delta": real_delta,
+            "real_conversion_bytes_before": before_bytes,
+            "real_conversion_bytes_after": after_bytes,
+            "real_conversion_bytes_delta": bytes_delta,
+            "instrumentation_available": instrumentation_available,
+            "canonical_cast_surfaces": canonical_cast_surfaces,
+            "canonical_cast_calls": canonical_cast_calls,
+            "canonical_cast_call_count": canonical_cast_call_count,
+            "cast_call_evidence_ok": cast_call_evidence_ok,
+            "forward_count": forward_count,
+            "forward_count_ok": forward_count_ok,
+            "bound_request_id": bound_request_id,
+            "forward_request_id": forward_request_id,
+            "request_scope_ok": request_scope_ok,
+            "scope_ok": scope_ok,
+            "mutation_guard_ok": bool(fingerprint_ok),
+            "legacy_conversion_before": legacy_conversion_before,
+            "conversion_ok": bool(conversion_ok),
+            "cast_once_requested": bool(strict_e31),
+            "cast_once_applied": True,
+            "cast_once_generation": int(bind_snapshot.get("generation", 0) or 0),
+            "conversion": {"count": int(real_delta), "bytes": int(bytes_delta)},
+            "conversion_count": int(real_delta),
+            "conversion_bytes": int(bytes_delta),
+            "post_forward_stability": {
+                "stable": bool(stable),
+                "storage_stable": bool(stability.get("storage_stable", stable)),
+                "metadata_stable": bool(stability.get("metadata_stable", False)),
+                "generation_stable": bool(stability.get("generation_stable", False)),
+            },
+            "canonical": {
+                "phase": "execution",
+                "forward_boundary": "outer_clip_encode",
+            },
+            "forward_observed": bool(observation.get("forward_observed", False)),
+            "forward_actually_observed": bool(observation.get("forward_actually_observed", False)),
+            "ok": bool(
+                observation.get("forward_observed", False)
+                and observation.get("forward_actually_observed", False)
+                and stable
+                and conversion_ok
+                and scope_ok
+                and fingerprint_ok
+            ),
+        }
+        _e31_request_id = str(getattr(trace, "request_id", "") or _request_id())
+        if _e31_request_id:
+            result["request_id"] = _e31_request_id
+            result["canonical"]["request_id"] = _e31_request_id
+        state.update(result)
+        state["e31_success"] = bool(result["ok"])
+        if result["ok"]:
+            # Publication is deliberately after the real-forward proof; a
+            # bind alone is not an E31 success claim.
+            cfh.mark_clip_hydrated(clip)
+            try:
+                pending_record = _RECORD.get(_request_id())
+                if pending_record is not None:
+                    pending_record["hydrated"] = True
+                    pending_record["e31_forward_evidence"] = dict(result)
+            except Exception:
+                pass
+        _emit(trace, "clip_fh_cast_once_forward_check", result)
+        if not result["ok"]:
+            try:
+                from .clip_fp32_cast_once import invalidate_cast_once
+
+                invalidate_cast_once(clip)
+            except Exception:
+                pass
+            try:
+                from . import model_preload
+
+                model_preload.clear_e31_forward_callback(
+                    getattr(clip, "cond_stage_model", None)
+                )
+            except Exception:
+                pass
+            setattr(clip, cfh.HYDRATED_MARKER, False)
+            _emit(
+                trace,
+                "clip_fh_cast_once_forward_failed",
+                {
+                    "reason": (
+                        "multiple_outer_forwards"
+                        if strict_e31 and not forward_count_ok
+                        else "request_or_generation_scope_mismatch"
+                        if strict_e31 and not (scope_ok and request_scope_ok)
+                        else "storage_or_conversion_instability"
+                    ),
+                    "evidence": result,
+                },
+            )
+            raise RuntimeError("E31 cast-once real-forward proof failed")
+
+    hook: dict[str, Any]
+    csm = getattr(clip, "cond_stage_model", None)
+    try:
+        from . import model_preload
+
+        hook = model_preload.register_e31_forward_callback(
+            csm,
+            _after_forward,
+            generation=int(bind_snapshot.get("generation", 0) or 0),
+            request_id=str(getattr(trace, "request_id", "") or _request_id()),
+        )
+    except Exception:
+        hook = {"installed": False, "reason": "outer_forward_registration_error"}
+    # Offline fakes generally have no production encode_token_weights wrapper.
+    # They may use the old outer CLIP encode boundary, but production objects
+    # must never silently fall back to a hook installed after demand entry.
+    if not hook.get("installed") and not callable(
+        getattr(type(csm), "encode_token_weights", None)
+    ):
+        hook = install_real_forward_check(clip, _after_forward)
+    state.update({k: v for k, v in hook.items() if k != "callback"})
+    try:
+        setattr(clip, "_comfymodal_e31_bound_cond_stage_model", csm)
+    except Exception:
+        pass
+    if not hook.get("installed"):
+        _emit(
+            trace,
+            "clip_fh_cast_once_forward_unavailable",
+            {"reason": "no_existing_clip_encode_boundary", "generation": int(bind_snapshot.get("generation", 0) or 0)},
+        )
+    return {
+        "hook": state,
+        "conversion_before": conversion_before,
+        "instrumentation_available": instrumentation_available,
+    }
+
+
 def _try_fast_hydrate(
     clip: Any, manifest: dict, *, trace: Any = None, comfy_utils: Any = None
 ) -> dict[str, Any]:
@@ -740,6 +1212,11 @@ def _try_fast_hydrate(
     model untouched."""
     import torch
 
+    # Re-hydration starts before source I/O.  Clearing here closes the failure
+    # window where a source read/transform error could otherwise leave the old
+    # marker or callback visible while native fallback is selected.
+    cfh.reset_clip_hydration_for_bind(clip)
+
     files = manifest.get("files", [])
     owners: list[tuple[Any, Any]] = []
     per_file_sds: list[dict] = []
@@ -748,9 +1225,19 @@ def _try_fast_hydrate(
     rss_before = _rss_mb()
     baseline = _cuda_baseline()
     t0 = time.perf_counter()
+    _clip_loader_start_ns = _emit_clip_loader_endpoint(
+        trace,
+        CLIP_LOADER_START,
+        endpoint_role="loader_start",
+        loader_arm="common_loader_boundary",
+    )
+    _clip_device_ready_ns: Optional[int] = None
+    _spec_record: dict[str, Any] = {}
     _orchestration_record = None
     _copy_event = None
     _scoped_readiness = _gpu_coord.scoped_cuda_readiness_enabled()
+    _e31_cast_once_applied = False
+    _e31_cast_record: dict[str, Any] = {}
     # ── E29: canonical ledger CLIP hydration span ───────────────────────
     # The whole fast-hydrate window (source read / speculative take / bind /
     # sync) becomes one ledger span so the serial ledger owns CLIP GPU
@@ -772,6 +1259,7 @@ def _try_fast_hydrate(
     # normal per-file read loop below runs.
     _speculative_taken = None
     _speculative_take_reason = ""
+    _qd_demand_used = False
     try:
         from .speculative_clip_hydration import (
             take_speculative_read,
@@ -828,6 +1316,130 @@ def _try_fast_hydrate(
         )
     except Exception:
         _speculative_taken = None
+    if clean_lane.enabled() and _speculative_taken is None:
+        # CLEAN_LANE deliberately has no restore-time speculative read.  Do
+        # the QD read synchronously at demand instead of treating the
+        # expected empty speculative lane as a quiescence failure.  The QD
+        # reader joins all of its workers and H2D events before returning and
+        # publishes the clean-lane quiescence proof at that boundary.
+        try:
+            from .clip_qd_reader import clip_qd_load, qd_config
+
+            _qd_cfg = qd_config()
+            _qd_value = int(_qd_cfg.get("qd", 0) or 0)
+            if not bool(_qd_cfg.get("enabled")):
+                raise RuntimeError("CLEAN_LANE_QD_READER_DISABLED")
+            if _qd_value != 4:
+                raise RuntimeError(f"CLEAN_LANE_QD4_REQUIRED: configured={_qd_value}")
+            _qd_block_mib = int(
+                _qd_cfg.get("block_mib", 0) or 0
+            )
+            _qd_launch_policy = str(_qd_cfg.get("launch_policy", "") or "")
+            if _qd_block_mib < 1 or not _qd_launch_policy:
+                raise RuntimeError("CLEAN_LANE_QD_CONFIGURATION_INCOMPLETE")
+            if not files:
+                raise RuntimeError("CLEAN_LANE_CLIP_MANIFEST_EMPTY")
+
+            for _file_manifest in files:
+                _path = _file_manifest.get("path", "")
+                if not os.path.exists(_path):
+                    raise RuntimeError(f"missing source file: {_path}")
+                _t_load = time.perf_counter()
+                _sd_raw, _loader, _fb = clip_qd_load(
+                    _path,
+                    qd=_qd_value,
+                    block_mib=_qd_block_mib,
+                    trace=trace,
+                    launch_policy=_qd_launch_policy,
+                    artifact_path=_qd_cfg.get("artifact_path") or None,
+                )
+                _t_loaded = time.perf_counter()
+                file_to_gpu_ms += (_t_loaded - _t_load) * 1000.0
+                _transformed = _apply_pipeline(
+                    _sd_raw, _file_manifest.get("pipeline", []), comfy_utils=comfy_utils
+                )
+                _ok, _detail = _verify_file_against_manifest(
+                    _file_manifest, _transformed
+                )
+                if not _ok:
+                    raise RuntimeError(_detail)
+                per_file_sds.append(_transformed)
+                owners.append((_loader, _fb))
+                checkpoint_bytes += int(_file_manifest.get("size_bytes", 0) or 0)
+
+            _qd_proof = clean_lane.proof()
+            _qd_quiescence = _qd_proof.get("quiescence") or {}
+            _required_quiescence = (
+                "source_reads_complete",
+                "submitted_blocks_reconciled",
+                "futures_joined",
+                "no_qd_worker_runnable",
+                "pinned_ownership_safe",
+                "h2d_events_complete",
+                "device_ready_published",
+            )
+            if any(_qd_quiescence.get(_key) is not True for _key in _required_quiescence):
+                raise RuntimeError("CLEAN_LANE_QD_NOT_QUIESCENT_BEFORE_BIND")
+
+            _qd_demand_used = True
+            _spec_record = {
+                "qd_used": True,
+                "qd_demand": True,
+                "configured_qd": _qd_value,
+                "block_mib": _qd_block_mib,
+                "launch_policy": _qd_launch_policy,
+            }
+            try:
+                from .clip_qd_reader import (
+                    EVT_BIND,
+                    EVT_OWNER_RETAINED,
+                    EVT_TAKE,
+                    emit_qd_event,
+                    ledger_event,
+                )
+
+                _qd_request_id = str(getattr(trace, "request_id", "") or _request_id())
+                _qd_meta = {
+                    "request_id": _qd_request_id,
+                    "path": str(files[0].get("path", "")) if files else "",
+                    "taken": True,
+                    "files": len(per_file_sds),
+                    "qd_used": True,
+                    "demand_side": True,
+                }
+                emit_qd_event(trace, EVT_TAKE, **_qd_meta)
+                ledger_event(EVT_TAKE, **_qd_meta)
+                emit_qd_event(
+                    trace, EVT_BIND, request_id=_qd_request_id,
+                    files=len(per_file_sds), qd_used=True, demand_side=True,
+                )
+                ledger_event(
+                    EVT_BIND, request_id=_qd_request_id,
+                    files=len(per_file_sds), qd_used=True, demand_side=True,
+                )
+                emit_qd_event(
+                    trace, EVT_OWNER_RETAINED, request_id=_qd_request_id,
+                    owners=len(owners), qd_used=True, demand_side=True,
+                )
+                ledger_event(
+                    EVT_OWNER_RETAINED, request_id=_qd_request_id,
+                    owners=len(owners), qd_used=True, demand_side=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            clean_lane.forbidden_activity(
+                "clip_qd_demand_read_failed", trace,
+                reason="synchronous QD demand read did not complete",
+            )
+            raise
+
+    if clean_lane.enabled() and _speculative_taken is None and not _qd_demand_used:
+        clean_lane.forbidden_activity(
+            "clip_forward_hidden_qd_join_or_fastsafe_fallback", trace,
+            reason="QD must be complete before bind/forward",
+        )
+        raise RuntimeError("CLEAN_LANE_QD_NOT_QUIESCENT_BEFORE_BIND")
     try:
         try:
             from comfymodal_runtime.fast_cold_orchestration import (
@@ -867,6 +1479,9 @@ def _try_fast_hydrate(
             # the tensors (record.qd_used), so a QD-entered run is provable
             # end-to-end and a fastsafe lane never fabricates QD events.
             _qd_used = bool((_spec_record or {}).get("qd_used", False))
+            if clean_lane.enabled() and not _qd_used:
+                clean_lane.forbidden_activity("non_qd_speculative_publication", trace)
+                raise RuntimeError("CLEAN_LANE_QD_PUBLICATION_REQUIRED")
             if _qd_used:
                 try:
                     from .clip_qd_reader import (
@@ -920,6 +1535,9 @@ def _try_fast_hydrate(
             _spec_cast_applied = bool(
                 ((_spec_record or {}).get("cast_once") or {}).get("applied", False)
             )
+            if _spec_cast_applied:
+                _e31_cast_once_applied = True
+                _e31_cast_record = dict((_spec_record or {}).get("cast_once") or {})
             _all_ok = True
             _detail = ""
             if len(_spec_per_file_sds) != len(files):
@@ -1003,11 +1621,9 @@ def _try_fast_hydrate(
             else:
                 # Mismatch: release the speculative owners and run the normal
                 # read loop below (the manifest is authoritative).
-                for _loader, _fb in _spec_owners:
-                    try:
-                        _loader.close()
-                    except Exception:
-                        pass
+                _e31_cast_once_applied = False
+                _e31_cast_record = {}
+                _close_source_owners(_spec_owners)
                 _emit(
                     trace,
                     "clip_fh_speculative_rejected",
@@ -1041,6 +1657,32 @@ def _try_fast_hydrate(
                 ok, detail = _verify_file_against_manifest(file_manifest, transformed)
                 if not ok:
                     raise RuntimeError(detail)
+                try:
+                    from .clip_fp32_cast_once import apply_cast_once, cast_once_enabled
+
+                    if cast_once_enabled():
+                        casted, cast_record = apply_cast_once(
+                            [transformed], [file_manifest], trace=trace
+                        )
+                        if not cast_record.get("applied"):
+                            raise RuntimeError(
+                                f"cast_once_transform_failed:{cast_record.get('reason', '')}"
+                            )
+                        transformed = casted[0]
+                        _e31_cast_once_applied = True
+                        if not _e31_cast_record:
+                            _e31_cast_record = dict(cast_record)
+                        else:
+                            for _field in ("tensor_count", "bytes_in", "bytes_out", "allocated_delta_bytes"):
+                                _e31_cast_record[_field] = int(_e31_cast_record.get(_field, 0) or 0) + int(cast_record.get(_field, 0) or 0)
+                            for _field in ("source_provenance", "per_file"):
+                                _e31_cast_record.setdefault(_field, [])
+                                _e31_cast_record[_field].extend(list(cast_record.get(_field) or []))
+                            _e31_cast_record["source_provenance_files"] = len(
+                                _e31_cast_record.get("source_provenance") or []
+                            )
+                except ImportError:
+                    pass
                 per_file_sds.append(transformed)
                 owners.append((loader, fb))
                 checkpoint_bytes += int(file_manifest.get("size_bytes", 0))
@@ -1051,6 +1693,9 @@ def _try_fast_hydrate(
             if _copy_event is None:
                 raise RuntimeError("scoped_copy_event_unavailable")
         t_bind = time.perf_counter()
+        # A new bind is a semantic mutation boundary.  Invalidate the old
+        # marker/generation and any pending callback before replacing storage.
+        cfh.reset_clip_hydration_for_bind(clip)
         ok, evidence = cfh.hydrate_clip_bind(
             clip,
             per_file_sds,
@@ -1059,8 +1704,6 @@ def _try_fast_hydrate(
         )
         if not ok:
             raise RuntimeError(f"bind: {evidence}")
-        for loader, fb in owners:
-            cfh.owner_attach(clip, loader, fb)
         _bind_wait_started_ns = 0
         _bind_wait_ok = False
         try:
@@ -1093,7 +1736,152 @@ def _try_fast_hydrate(
                 pass
         bind_ms = (time.perf_counter() - t_bind) * 1000.0
         wall_ms = (time.perf_counter() - t0) * 1000.0
-        cfh.mark_clip_hydrated(clip)
+        _loader_arm = (
+            "qd_demand"
+            if _qd_demand_used
+            else "qd_speculative"
+            if bool(_spec_record.get("qd_used", False))
+            else "fastsafe"
+        )
+        _clip_device_ready_ns = _emit_clip_loader_endpoint(
+            trace,
+            CLIP_DEVICE_READY,
+            endpoint_role="device_ready",
+            loader_arm=_loader_arm,
+        )
+        clean_lane.mark_bind(trace)
+        _loader_interval = {
+            "clock": "monotonic_ns",
+            "clock_source": "time.monotonic_ns",
+            "start": {
+                "name": CLIP_LOADER_START,
+                "endpoint_role": "loader_start",
+                "semantic_endpoint_role": "loader_start",
+                "monotonic_ns": int(_clip_loader_start_ns),
+            },
+            "ready": {
+                "name": CLIP_DEVICE_READY,
+                "endpoint_role": "device_ready",
+                "semantic_endpoint_role": "device_ready",
+                "monotonic_ns": int(_clip_device_ready_ns),
+            },
+            "loader_arm": _loader_arm,
+            "hydration_source": _loader_arm,
+            "wall_ms": round(
+                (int(_clip_device_ready_ns) - int(_clip_loader_start_ns)) / 1_000_000,
+                3,
+            ),
+        }
+        # E31's exact proof belongs after bind completion synchronization and
+        # before either hydration marker or owner publication.  A failed proof
+        # therefore takes the existing outer fast-path failure cleanup rather
+        # than escaping as a successful hydration.
+        _e31_bind_record: dict[str, Any] = {}
+        _e31_forward_install: dict[str, Any] = {}
+        _e31_owner_record: dict[str, Any] = {}
+        try:
+            from .clip_fp32_cast_once import (
+                cast_once_enabled as _e31_enabled,
+                cast_once_generation as _e31_generation,
+                mark_cast_once_applied as _e31_mark_applied,
+                verify_resident_fp32 as _e31_verify_resident,
+            )
+
+            if _e31_enabled():
+                if not _e31_cast_once_applied:
+                    raise RuntimeError("E31 cast-once expected but no cast-once tensors were produced")
+                _e31_ok, _e31_bind_record = _e31_verify_resident(
+                    clip,
+                    per_file_sds,
+                    files,
+                    expect_device=f"cuda:{torch.cuda.current_device()}",
+                    phase="post_bind",
+                )
+                if not _e31_ok:
+                    _emit(
+                        trace,
+                        "clip_fh_cast_once_residency_failed",
+                        {"reason": str(_e31_bind_record.get("reason", "")), "evidence": _e31_bind_record},
+                    )
+                    raise RuntimeError(
+                        f"E31 cast-once residency proof failed: {_e31_bind_record.get('reason', '')}"
+                    )
+                fp32_bytes = int(_e31_bind_record.get("fp32_bytes", 0) or 0)
+                # Install and validate the exact real-forward boundary BEFORE
+                # retiring source owners or publishing a cast generation.  If
+                # the trace-less outer wrapper/forensics path is unavailable,
+                # fail closed while all source components are still owned.
+                _e31_forward_install = _e31_forward_hook(
+                    clip,
+                    per_file_sds,
+                    files,
+                    expect_device=f"cuda:{torch.cuda.current_device()}",
+                    bind_snapshot=_e31_bind_record,
+                    trace=trace,
+                )
+                if not (_e31_forward_install.get("hook") or {}).get("installed"):
+                    raise RuntimeError("E31 real-forward hook installation failed")
+                if not _e31_forward_install.get("instrumentation_available", False):
+                    raise RuntimeError("E31 forward forensics instrumentation unavailable")
+                _e31_generation_before_mark = int(_e31_generation(clip))
+                _e31_mark_applied(clip)
+                _e31_bind_record["generation"] = int(_e31_generation(clip))
+                if _e31_bind_record["generation"] <= _e31_generation_before_mark:
+                    setattr(clip, cfh.HYDRATED_MARKER, False)
+                    raise RuntimeError("E31 cast-once generation mark did not advance")
+                # Publish the bind proof only after the successful generation
+                # mark.  The residency snapshot is taken before the mark, so
+                # emitting it earlier leaves the canonical top-level proof at
+                # generation 0 even though the bound/observed generation is 1.
+                _emit(trace, "clip_fh_cast_once_bind_proof", _e31_bind_record)
+                try:
+                    from . import model_preload as _e31_preload
+
+                    if not _e31_preload.update_e31_forward_callback_generation(
+                        getattr(clip, "cond_stage_model", None),
+                        generation=_e31_bind_record["generation"],
+                    ):
+                        # Offline instance wrappers do not use the production
+                        # pending callback.  Their closure observes the
+                        # mutable bind record directly.
+                        if not (_e31_forward_install.get("hook") or {}).get("methods"):
+                            raise RuntimeError("E31 forward callback generation rebind failed")
+                except ImportError:
+                    pass
+                _e31_owner_record = cfh.retire_source_owners(
+                    owners,
+                    bf16_bytes=int(_e31_cast_record.get("bytes_in", 0) or 0),
+                    fp32_bytes=fp32_bytes,
+                    clip=clip,
+                )
+                _emit(trace, "clip_fh_cast_once_owner_retired", _e31_owner_record)
+                if not _e31_owner_record.get("ok"):
+                    raise RuntimeError(
+                        "E31 source owner retirement failed: "
+                        f"{_e31_owner_record.get('owners_failed', 0)} owner(s)"
+                    )
+                (_e31_forward_install.get("hook") or {})["owner_transition"] = dict(_e31_owner_record)
+            else:
+                for loader, fb in owners:
+                    cfh.owner_attach(clip, loader, fb)
+                cfh.mark_clip_hydrated(clip)
+        except ImportError:
+            for loader, fb in owners:
+                cfh.owner_attach(clip, loader, fb)
+            cfh.mark_clip_hydrated(clip)
+        except Exception:
+            try:
+                cfh.reset_clip_hydration_for_bind(clip)
+            except Exception:
+                pass
+            setattr(clip, cfh.HYDRATED_MARKER, False)
+            try:
+                from .clip_fp32_cast_once import invalidate_cast_once
+
+                invalidate_cast_once(clip)
+            except Exception:
+                pass
+            raise
         # ── E28: post-bind ownership/residency proof ──
         # GPU parameter counts after the bind — proves the speculative
         # GPU tensors were retained (cuda=N, meta=0) or exposes a fallback.
@@ -1112,54 +1900,18 @@ def _try_fast_hydrate(
             )
         except Exception:
             pass
-        # ── E31: cast-once demand-time residency proof + generation ──
-        # When the cast-once flag was applied, prove the bind actually left
-        # persistent FP32 compute-ready storage on the CURRENT model object
-        # and mark the generation; any doubt fails closed (the verification
-        # itself is evidence, never a silent claim).  Default OFF with the
-        # flag; zero cost with the flag off.
-        try:
-            from .clip_fp32_cast_once import (
-                cast_once_enabled as _e31_cast_once_enabled,
-                mark_cast_once_applied as _e31_mark_applied,
-                verify_resident_fp32 as _e31_verify_resident,
+        if _e31_bind_record:
+            _emit(
+                trace,
+                "clip_fh_cast_once_applied",
+                {
+                    "generation": int(_e31_bind_record.get("generation", 0)),
+                    "fp32_params": int((_e31_bind_record.get("count_by_dtype") or {}).get("torch.float32", 0)),
+                    "fp32_bytes": int(_e31_bind_record.get("fp32_bytes", 0)),
+                    "post_mark_generation": int(_e31_bind_record.get("generation", 0)),
+                    "forward_hook": _e31_forward_install.get("hook", {}),
+                },
             )
-
-            if _e31_cast_once_enabled():
-                _e31_ok, _e31_record = _e31_verify_resident(clip)
-                if not _e31_ok:
-                    # Fail closed: the bind did not produce provable FP32
-                    # residency — surface it as a visible event instead of a
-                    # silent claim (a subsequent forward would fall back to
-                    # the regular cast path, which is safe, but the A/B must
-                    # never mistake it for cast-once).
-                    _emit(
-                        trace,
-                        "clip_fh_cast_once_residency_failed",
-                        {
-                            "reason": str(_e31_record.get("reason", "")),
-                            "generation": int(_e31_record.get("generation", 0)),
-                        },
-                    )
-                else:
-                    _e31_mark_applied(clip)
-                    _emit(
-                        trace,
-                        "clip_fh_cast_once_applied",
-                        {
-                            "generation": int(
-                                _e31_record.get("generation", 0)
-                            ),
-                            "fp32_params": int(
-                                (_e31_record.get("count_by_dtype") or {}).get(
-                                    "torch.float32", 0
-                                )
-                            ),
-                            "total_bytes": int(_e31_record.get("total_bytes", 0)),
-                        },
-                    )
-        except Exception:
-            pass
         if _orchestration_record is not None:
             _orchestration_record(
                 "clip",
@@ -1189,7 +1941,42 @@ def _try_fast_hydrate(
             "zero_copy": True,
             "zero_copy_evidence": evidence,
             "fallback_count": 0,
+            "e31_evidence_schema": 1,
+            "cast_once_requested": bool(_e31_bind_record),
+            "cast_once_applied": bool(_e31_bind_record),
+            "cast_once_generation": int(_e31_bind_record.get("generation", 0) or 0),
+            "owner_transition": _e31_owner_record if _e31_bind_record else None,
+            "forward_observed": False,
+            "forward_timing": None,
+            "conversion_count": int(_e31_cast_record.get("tensor_count", 0) or 0),
+            "conversion_bytes": int(_e31_cast_record.get("bytes_out", 0) or 0),
+            "post_forward_stability": None,
+            "canonical": {
+                "phase": "execution",
+                "hydration_source": cfh.MODE_FASTSAFE,
+                "loader_interval": _loader_interval,
+            },
         }
+        if _e31_bind_record:
+            result["cast_once_bind_proof"] = _e31_bind_record
+            result["cast_once_owner_transition"] = _e31_owner_record
+            result["owner_transition"] = _e31_owner_record
+            result["e31_forward_required"] = True
+            result["e31_forward_observed"] = False
+            result["e31_success"] = False
+            result["e31_forward_evidence"] = _e31_forward_install.get("hook", {})
+            result["cast_once_requested"] = True
+            result["cast_once_applied"] = True
+            result["cast_once_generation"] = int(_e31_bind_record.get("generation", 0) or 0)
+            result["conversion"] = {
+                "count": int(_e31_cast_record.get("tensor_count", 0) or 0),
+                "bytes": int(_e31_cast_record.get("bytes_out", 0) or 0),
+            }
+            result["post_forward_stability"] = None
+        _e31_request_id = str(getattr(trace, "request_id", "") or _request_id())
+        if _e31_request_id:
+            result["request_id"] = _e31_request_id
+            result["canonical"]["request_id"] = _e31_request_id
         _emit(
             trace,
             "clip_fh_hydration_start",
@@ -1215,6 +2002,10 @@ def _try_fast_hydrate(
                 pass
         return result
     except Exception as exc:
+        try:
+            cfh.reset_clip_hydration_for_bind(clip)
+        except Exception:
+            pass
         if _orchestration_record is not None:
             try:
                 _orchestration_record(
@@ -1226,11 +2017,7 @@ def _try_fast_hydrate(
                 )
             except Exception:
                 pass
-        for loader, fb in owners:
-            try:
-                loader.close()
-            except Exception:
-                pass
+        _close_source_owners(owners)
         try:
             torch.cuda.empty_cache()
         except Exception:
@@ -1394,6 +2181,7 @@ def _hydrate_native_copy(
     import torch
 
     state_before = cfh.clip_hydration_state(clip)["state"]
+    cfh.reset_clip_hydration_for_bind(clip)
     try:
         specs = manifest.get("loader_specs") or []
         native = _invoke_native_clip_loader(specs)
@@ -1426,6 +2214,7 @@ def _hydrate_native_copy(
         )
         return result
     except Exception as exc:
+        cfh.reset_clip_hydration_for_bind(clip)
         result = {
             "ok": False,
             "mode": cfh.MODE_NATIVE,
@@ -1457,7 +2246,7 @@ def _record_mode(
     )
     rec["mode"] = mode
     rec["fallback_count"] += int(info.get("fallback_count", 0) or 0)
-    if info.get("ok"):
+    if info.get("ok") and not info.get("e31_forward_required"):
         rec["hydrated"] = True
     entry = dict(info)
     if state_before is not None:
@@ -1696,6 +2485,7 @@ def _try_staged_hydrate(
     clip: Any, manifest: dict, *, trace: Any = None, comfy_utils: Any = None
 ) -> dict[str, Any]:
     t0 = time.perf_counter()
+    cfh.reset_clip_hydration_for_bind(clip)
     timings: dict[str, Any] = {
         "clip_staged_prepare_ms": None,
         "clip_staged_commit_ms": None,
@@ -2154,9 +2944,44 @@ def maybe_install_clip_fh_demand(
         except Exception:
             coordination_status = "unavailable"
         return {"status": "no_manifest", "coordination": coordination_status}
+    def _e31_forward_required() -> bool:
+        try:
+            from comfymodal_runtime.clip_forward_forensics import e31_enabled
+            from comfymodal_runtime.clip_fp32_cast_once import cast_once_enabled
+
+            return bool(e31_enabled() or cast_once_enabled())
+        except Exception:
+            return False
+
     if getattr(clip, cfh.DEMAND_WRAPPER_MARKER, False):
         coordination_status = cfh.install_gpu_critical_coordination(clip)
-        return {"status": "already_wrapped", "coordination": coordination_status}
+        forward_wrapper_status = "not_requested"
+        if _e31_forward_required():
+            try:
+                from comfymodal_runtime import model_preload as _model_preload
+
+                forward_wrapper_status = _model_preload._ensure_clip_forward_wrapper(clip)
+            except Exception as exc:
+                forward_wrapper_status = f"error:{type(exc).__name__}"
+        return {
+            "status": "already_wrapped",
+            "coordination": coordination_status,
+            "forward_wrapper": forward_wrapper_status,
+        }
+
+    # The production forward boundary belongs to the restored CLIP's
+    # ``cond_stage_model``, not the outer CLIP holder.  Arm it now, before the
+    # first demand can enter ``load_model``; this is intentionally independent
+    # of trace availability.  E31 registration later stores/consumes the
+    # callback on this same object.
+    forward_wrapper_status = "not_requested"
+    if _e31_forward_required():
+        try:
+            from comfymodal_runtime import model_preload as _model_preload
+
+            forward_wrapper_status = _model_preload._ensure_clip_forward_wrapper(clip)
+        except Exception as exc:
+            forward_wrapper_status = f"error:{type(exc).__name__}"
 
     def _hydrator(c: Any) -> None:
         _hydrate_clip_on_demand(c, trace=trace, comfy_utils=comfy_utils)
@@ -2183,7 +3008,11 @@ def maybe_install_clip_fh_demand(
             ],
         },
     )
-    return {"status": "installed", "coordination": coordination_status}
+    return {
+        "status": "installed",
+        "coordination": coordination_status,
+        "forward_wrapper": forward_wrapper_status,
+    }
 
 
 def clip_fh_request_summary(request_id: str = "") -> dict[str, Any]:

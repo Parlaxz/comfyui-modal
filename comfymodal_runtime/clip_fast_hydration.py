@@ -860,6 +860,7 @@ def hydrate_many(
 EXCLUDED_WEIGHTS_MARKER = "_comfymodal_clip_fh_excluded_weights"
 MANIFEST_ATTR = "_comfymodal_clip_fh_manifest"
 HYDRATED_MARKER = "_comfymodal_clip_fh_hydrated"
+HYDRATION_FINGERPRINT_ATTR = "_comfymodal_clip_fh_hydration_fingerprint"
 DEMAND_WRAPPER_MARKER = "_comfymodal_clip_fh_demand_wrapped"
 OWNER_ATTR = "_comfymodal_clip_fh_owner"
 STAGED_OWNER_ATTR = "_comfymodal_clip_fh_staged_owner"
@@ -897,6 +898,7 @@ def strip_clip_weights(clip: Any) -> dict[str, Any]:
     EXCLUDED_WEIGHTS_MARKER so validators can tolerate meta parameters.
     Returns JSON-safe stats.
     """
+    reset_clip_hydration_for_bind(clip)
     csm = getattr(clip, "cond_stage_model", None)
     if csm is None or not hasattr(csm, "named_parameters"):
         raise RuntimeError("clip has no inspectable cond_stage_model")
@@ -933,11 +935,145 @@ def clip_hydrated(clip: Any) -> bool:
     residency check — it distinguishes the actual materialization via
     ``clip_hydration_state`` (CPU_NATIVE_MATERIALIZED vs GPU_*).
     """
-    return bool(getattr(clip, HYDRATED_MARKER, False))
+    if not bool(getattr(clip, HYDRATED_MARKER, False)):
+        return False
+    # The marker is only a publish bit.  Re-check the narrow identity facts
+    # that make it meaningful before allowing a demand to return success.
+    return hydration_claim_valid(clip)
 
 
 def mark_clip_hydrated(clip: Any) -> None:
     setattr(clip, HYDRATED_MARKER, True)
+    try:
+        setattr(clip, HYDRATION_FINGERPRINT_ATTR, clip_hydration_fingerprint(clip))
+    except Exception:
+        # A marker without a proof fingerprint is not reusable.
+        setattr(clip, HYDRATED_MARKER, False)
+
+
+def _storage_identity(param: Any) -> tuple[Any, ...]:
+    try:
+        storage = param.untyped_storage()
+        storage_ptr = int(storage.data_ptr())
+    except Exception:
+        storage_ptr = None
+    try:
+        data_ptr = None if bool(getattr(param, "is_meta", False)) else int(param.data_ptr())
+    except Exception:
+        data_ptr = None
+    return (
+        id(param),
+        storage_ptr,
+        data_ptr,
+        tuple(int(x) for x in getattr(param, "shape", ())),
+        str(getattr(param, "dtype", "")),
+        str(getattr(param, "device", "")),
+    )
+
+
+def clip_hydration_fingerprint(clip: Any) -> tuple[Any, ...]:
+    """Return the small identity/fingerprint guard for a published claim.
+
+    This intentionally excludes parameter values.  It catches replacement or
+    movement of parameter storage and the patch/manual-cast registrations that
+    change the meaning of a compute-ready bind, without adding a tensor scan
+    to every demand.
+    """
+    csm = getattr(clip, "cond_stage_model", None)
+    params: list[tuple[Any, ...]] = []
+    if csm is not None and callable(getattr(csm, "named_parameters", None)):
+        for name, param in csm.named_parameters():
+            params.append((str(name), *_storage_identity(param)))
+    registrations: list[tuple[Any, ...]] = []
+    if csm is not None and callable(getattr(csm, "modules", None)):
+        for module in csm.modules():
+            for attr in ("weight_function", "bias_function"):
+                value = getattr(module, attr, None)
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    facts = tuple((type(item).__name__, id(item)) for item in value)
+                else:
+                    facts = ((type(value).__name__, id(value)),)
+                registrations.append((id(module), attr, facts))
+            if hasattr(module, "manual_cast_dtype"):
+                registrations.append((id(module), "manual_cast_dtype", str(getattr(module, "manual_cast_dtype", None))))
+    patcher = getattr(clip, "patcher", None)
+    if patcher is not None:
+        current_object = getattr(patcher, "current_object", None)
+        registrations.append((
+            id(patcher),
+            "current_object_identity",
+            id(current_object) if current_object is not None else None,
+        ))
+        for attr in ("manual_cast_dtype", "load_device", "offload_device", "current_device"):
+            if hasattr(patcher, attr):
+                registrations.append((id(patcher), attr, str(getattr(patcher, attr, None))))
+    return (tuple(params), tuple(registrations))
+
+
+def invalidate_stale_hydration_claim(clip: Any) -> bool:
+    """Clear a stale marker/generation/callback, returning whether it was stale."""
+    if not bool(getattr(clip, HYDRATED_MARKER, False)):
+        return False
+    expected = getattr(clip, HYDRATION_FINGERPRINT_ATTR, None)
+    try:
+        current = clip_hydration_fingerprint(clip)
+    except Exception:
+        current = None
+    if expected is not None and current == expected:
+        return False
+    try:
+        reset_clip_hydration_for_bind(clip)
+    except Exception:
+        setattr(clip, HYDRATED_MARKER, False)
+    return True
+
+
+def hydration_claim_valid(clip: Any) -> bool:
+    return not invalidate_stale_hydration_claim(clip)
+
+
+def reset_clip_hydration_for_bind(clip: Any) -> None:
+    """Invalidate all bind-scoped E31 state before replacing parameters.
+
+    A reused outer CLIP object is not evidence of a reused model.  Clear the
+    marker, cast generation, and any pending outer-forward callback before a
+    new bind so a stale callback can never certify the new storage.
+    """
+    try:
+        setattr(clip, HYDRATED_MARKER, False)
+        if hasattr(clip, HYDRATION_FINGERPRINT_ATTR):
+            delattr(clip, HYDRATION_FINGERPRINT_ATTR)
+    except Exception:
+        pass
+    try:
+        from .clip_fp32_cast_once import invalidate_cast_once
+        from .clip_fp32_cast_once import clear_real_forward_check
+
+        invalidate_cast_once(clip)
+        clear_real_forward_check(clip)
+    except Exception:
+        pass
+    csm = getattr(clip, "cond_stage_model", None)
+    previous_csm = getattr(clip, "_comfymodal_e31_bound_cond_stage_model", None)
+    for owner in (clip, csm, previous_csm):
+        if owner is None:
+            continue
+        for attr in (
+            "_comfymodal_e31_real_forward_hook",
+            "_comfymodal_e31_pending_forward_callback",
+        ):
+            try:
+                if hasattr(owner, attr):
+                    delattr(owner, attr)
+            except Exception:
+                pass
+    try:
+        if hasattr(clip, "_comfymodal_e31_bound_cond_stage_model"):
+            delattr(clip, "_comfymodal_e31_bound_cond_stage_model")
+    except Exception:
+        pass
 
 
 def clip_hydration_state(clip: Any) -> dict[str, Any]:
@@ -1354,6 +1490,13 @@ def hydrate_clip_bind(
     csm = getattr(clip, "cond_stage_model", None)
     if csm is None:
         raise RuntimeError("clip has no cond_stage_model")
+    # Every assign/copy bind is a semantic storage replacement boundary, not
+    # only the FP32 experiment.  Reset before the first load so a reused outer
+    # CLIP cannot inherit a marker, generation, or pending callback.
+    try:
+        reset_clip_hydration_for_bind(clip)
+    except Exception:
+        pass
     csm.can_assign_sd = True
     for module in csm.modules():
         module.can_assign_sd = True
@@ -1550,6 +1693,124 @@ def owner_attach(clip: Any, loader: Any, fb: Any) -> None:
     owners.append(_FastsafeOwner(loader, fb))
 
 
+def retire_source_owners(
+    owners: list[tuple[Any, Any]], *, bf16_bytes: int = 0, fp32_bytes: int = 0,
+    clip: Any = None,
+) -> dict[str, Any]:
+    """Retire source buffers after an independent FP32 bind.
+
+    Cast-once tensors do not borrow the BF16 fastsafe allocation.  Prefer the
+    loader/buffer's non-destructive storage release API, if present; never call
+    ``close`` or ``empty_cache`` on this successful hot path.  Discard/error
+    cleanup continues to use the existing close path.
+    """
+    before = len(owners)
+    release_calls = 0
+    retired = 0
+    statuses: list[dict[str, Any]] = []
+    total_bf16 = int(max(0, bf16_bytes))
+    total_fp32 = int(max(0, fp32_bytes))
+    seen: set[int] = set()
+    source_component_ids = {
+        id(item)
+        for owner in owners
+        for item in (tuple(owner) if isinstance(owner, (tuple, list)) else (owner,))
+        if item is not None
+    }
+    for index, owner in enumerate(list(owners)):
+        components = tuple(owner) if isinstance(owner, (tuple, list)) else (owner,)
+        component_status: list[dict[str, Any]] = []
+        released_for_owner = False
+        owner_bytes = total_bf16 // max(before, 1) + (total_bf16 % max(before, 1) if index == 0 else 0)
+        owner_fp32 = total_fp32 // max(before, 1) + (total_fp32 % max(before, 1) if index == 0 else 0)
+        for item in components:
+            if item is None or id(item) in seen:
+                continue
+            seen.add(id(item))
+            method = getattr(item, "release_storage", None)
+            method_name = "release_storage"
+            if not callable(method):
+                for name in ("free_storage", "release_buffer", "release"):
+                    candidate = getattr(item, name, None)
+                    if callable(candidate):
+                        method, method_name = candidate, name
+                        break
+            status: dict[str, Any] = {
+                "component_id": str(id(item)),
+                "method": method_name if callable(method) else None,
+                "released": False,
+                "error": "" if callable(method) else "no_release_api",
+            }
+            if callable(method):
+                try:
+                    # Successful E31 retirement must prove the explicit
+                    # no-purge contract.  Retrying without the keyword could
+                    # invoke an implementation that purges or calls
+                    # empty_cache, so an incompatible API fails closed.
+                    method(purge_allocator=False)
+                    status["released"] = True
+                    release_calls += 1
+                    released_for_owner = True
+                except TypeError:
+                    status["error"] = "release_api_requires_explicit_no_purge"
+                except Exception as exc:
+                    status["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+            component_status.append(status)
+        # A source owner is retired only when every distinct backing
+        # component has a successful release.  Releasing just the loader while
+        # leaving its buffer live would make the E31 FP32 claim unsafe.
+        owner_retired = bool(component_status) and all(
+            bool(item.get("released")) for item in component_status
+        )
+        if owner_retired:
+            retired += 1
+        statuses.append({
+            "owner_index": index,
+            "status": "retired" if owner_retired else "not_retired",
+            "released": owner_retired,
+            "component_count": len(component_status),
+            "release_call_count": sum(1 for item in component_status if item.get("released")),
+            "bytes_before": owner_bytes,
+            "bytes_after": 0 if owner_retired else owner_bytes,
+            "fp32_bytes": owner_fp32,
+            "components": component_status,
+        })
+    all_retired = before > 0 and retired == before
+    if all_retired:
+        # The cast-once parameters no longer borrow these owners.  Remove the
+        # references from both the caller's source list and any patcher list;
+        # do not close or purge on this successful hot path.
+        owners.clear()
+        if clip is not None:
+            patcher = getattr(clip, "patcher", None)
+            attached = getattr(patcher, OWNER_ATTR, None) if patcher is not None else None
+            if isinstance(attached, list):
+                attached[:] = [
+                    item for item in attached
+                    if id(item) not in source_component_ids
+                    and id(getattr(item, "loader", None)) not in source_component_ids
+                    and id(getattr(item, "fb", None)) not in source_component_ids
+                ]
+                try:
+                    if not attached:
+                        delattr(patcher, OWNER_ATTR)
+                except Exception:
+                    pass
+    return {
+        "ok": all_retired,
+        "owner_count_before": int(before),
+        "owner_count_after": int(before - retired),
+        "owner_bytes_before": total_bf16,
+        "owner_bytes_after": sum(int(item["bytes_after"]) for item in statuses),
+        "owners_retired": int(retired),
+        "owners_failed": int(before - retired),
+        "release_calls": int(release_calls),
+        "bf16_bytes": total_bf16,
+        "fp32_bytes": total_fp32,
+        "per_owner": statuses,
+    }
+
+
 def staged_owner_attach(clip: Any, owner: Any) -> None:
     patcher = getattr(clip, "patcher", None)
     if patcher is None:
@@ -1585,6 +1846,9 @@ def release_owner(clip: Any) -> bool:
     patcher = getattr(clip, "patcher", None)
     if patcher is None:
         return False
+    # Owner retirement/discard is a re-hydration boundary.  Do not leave an
+    # E31 marker or callback claiming storage whose backing owner is gone.
+    reset_clip_hydration_for_bind(clip)
     owners = getattr(patcher, OWNER_ATTR, None)
     staged_owners = getattr(patcher, STAGED_OWNER_ATTR, None)
     if not owners and not staged_owners:

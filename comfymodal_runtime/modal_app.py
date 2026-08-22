@@ -197,6 +197,17 @@ def _critical_path_delta_ms(start_ns: Any, end_ns: Any) -> float | None:
     return round((end_ns - start_ns) / 1_000_000, 3)
 
 
+def _get_plan_proof_decision_reason(
+    consumed: bool,
+    reason: str,
+    ineligible_reason: str,
+) -> str:
+    """Report no ineligibility reason after a plan proof is consumed."""
+    if consumed:
+        return ""
+    return reason or ineligible_reason or "not_eligible"
+
+
 def _format_v2_critical_path(values: Mapping[str, Any]) -> str:
     return " ".join(
         ["[v2.critical_path]"]
@@ -444,6 +455,7 @@ V2_SOURCE_MODULES = (
     "canonical_execution",
     "comfyapp",
     "comfymodal_runtime",
+    "comfymodal_runtime.registry_proof_store",
     "failure_summary",
     "gpu_catalog",
     "modal_client",
@@ -530,9 +542,9 @@ _FULL_TRACE_FINALIZED_LOCK = threading.Lock()
 def sync_observability_gates() -> None:
     """Re-resolve import-time observability gates from the current env.
 
-    ``_RESIDENCY_DIAGNOSTICS_ENABLED`` and ``_V2_FULL_TRACE_ENABLED`` (here)
-    plus ``_PAGEFAULT_TRACKING`` and ``_DIAGNOSTIC_FLAG`` (model_preload) are
-    frozen at import time.  When ``run_plan_stream`` applies a request
+    ``_RESIDENCY_DIAGNOSTICS_ENABLED`` and ``_V2_FULL_TRACE_ENABLED`` (here),
+    ``_PAGEFAULT_TRACKING``/``_DIAGNOSTIC_FLAG`` (model_preload), and E31's
+    forensics/profile gates are frozen at import time.  When ``run_plan_stream`` applies a request
     env-profile override the effective observability mode changes; recompute
     the module-level gates so they agree with call-time
     ``observability_allows`` checks for that request.  Recomputing an
@@ -547,6 +559,15 @@ def sync_observability_gates() -> None:
     )
     from .model_preload import sync_observability_gates as _sync_model_preload_gates
     _sync_model_preload_gates()
+    # E31's forensics/profile gates are also import-time values.  Request
+    # profiles are applied immediately before this lifecycle point, so refresh
+    # them here, before model_preload installs the CLIP/cast wrappers.  Keep
+    # this optional and fail-closed for lightweight/probe imports.
+    try:
+        from .clip_forward_forensics import sync_e31_gates
+        sync_e31_gates()
+    except Exception:
+        pass
 
 # ── Request-carried diagnostic env allowlist ─────────────────────────────
 # The variance benchmark runner may carry bounded diagnostic toggles in
@@ -574,6 +595,11 @@ _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("conditioning_async_lru", "COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU"),
     ("prompt_signature_cache", "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE"),
     ("conditioning_cache_prefetch", "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH"),
+    # E37's restore mode is deployment/profile controlled, but the request
+    # origin channel is also allowlisted so a resolved profile cannot be
+    # silently dropped by the runtime environment boundary.
+    ("minimal_restore", "COMFYMODAL_MINIMAL_RESTORE"),
+    ("COMFYMODAL_MINIMAL_RESTORE", "COMFYMODAL_MINIMAL_RESTORE"),
     # E28 per-run loader/cast tuning (Targets B/C): allowlisted so the
     # integrated campaign can tune threads/blocks/cast-once per request
     # without a redeploy.  The runtime parsers bound the values again.
@@ -2142,6 +2168,13 @@ def _capture_host_diagnostics() -> dict[str, Any] | None:
     Never raises; every capture is best-effort and wrapped.
     """
     global _HOST_DIAGNOSTICS_CACHE
+    try:
+        from . import clean_lane as _clean_lane
+        if _clean_lane.enabled():
+            _clean_lane.forbidden_activity("background_host_diagnostics")
+            return None
+    except Exception:
+        pass
     if not _host_diagnostics_enabled():
         return None
     if _HOST_DIAGNOSTICS_CACHE is not None:
@@ -3002,6 +3035,25 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ),
+        # E37 CLEAN_LANE deployment identity and explicit no-worker tuple.
+        # These values must cross Modal's class-env boundary; otherwise the
+        # local profile can be correct while the container silently falls
+        # back to production/E19 defaults.
+        "COMFYMODAL_V2_E37_CLEAN_LANE": os.environ.get(
+            "COMFYMODAL_V2_E37_CLEAN_LANE", "0"
+        ),
+        "COMFYMODAL_V2_CLEAN_LANE": os.environ.get(
+            "COMFYMODAL_V2_CLEAN_LANE", "0"
+        ),
+        "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA": os.environ.get(
+            "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA", ""
+        ),
+        # E37 controlled restore mode: explicit deploy-time passthrough keeps
+        # the profile's value from being lost at Modal's class env boundary;
+        # comfyapp.py still defaults to minimal restore when this is absent.
+        "COMFYMODAL_MINIMAL_RESTORE": os.environ.get(
+            "COMFYMODAL_MINIMAL_RESTORE", "1"
+        ),
         "COMFYMODAL_V2_ATOMIC_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ATOMIC_PROFILE", ""
         ),
@@ -3060,6 +3112,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # proven execution-UNET path and never monkey-patches unrelated loads.
         "COMFYMODAL_V2_GPU_FAST_RETURN": os.environ.get(
             "COMFYMODAL_V2_GPU_FAST_RETURN", "1"
+        ),
+        "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": os.environ.get(
+            "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -3161,6 +3216,27 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": os.environ.get(
             "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET", ""
+        ),
+        "COMFYMODAL_V2_EXECUTION_PREFILL": os.environ.get(
+            "COMFYMODAL_V2_EXECUTION_PREFILL", "1"
+        ),
+        "COMFYMODAL_V2_GRAPH_PRELOAD": os.environ.get(
+            "COMFYMODAL_V2_GRAPH_PRELOAD", "1"
+        ),
+        "COMFYMODAL_V2_MODEL_PRELOAD": os.environ.get(
+            "COMFYMODAL_V2_MODEL_PRELOAD", "1"
+        ),
+        "COMFYMODAL_V2_EXACT_CACHE_PERSIST": os.environ.get(
+            "COMFYMODAL_V2_EXACT_CACHE_PERSIST", "1"
+        ),
+        "COMFYMODAL_V2_ALLOCATOR_PURGE": os.environ.get(
+            "COMFYMODAL_V2_ALLOCATOR_PURGE", "1"
+        ),
+        "COMFYMODAL_V2_BACKGROUND_PERSISTENCE": os.environ.get(
+            "COMFYMODAL_V2_BACKGROUND_PERSISTENCE", "1"
+        ),
+        "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS", "1"
         ),
         # Execution-phase UNET H2D delay (experiment gate; default 0 =
         # immediate H2D).  Explicit passthrough so a deployment baked with
@@ -3371,6 +3447,17 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": os.environ.get(
             "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE", "0"
+        ),
+        # E31 forward forensics is deploy-baked and must be mirrored into the
+        # request container; otherwise its import-time default silently wins.
+        "COMFYMODAL_V2_E31_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_E31_FORENSICS", "0"
+        ),
+        "COMFYMODAL_V2_E31_FORWARD_PROFILE": os.environ.get(
+            "COMFYMODAL_V2_E31_FORWARD_PROFILE", "0"
+        ),
+        "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT": os.environ.get(
+            "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT", "1024"
         ),
         # Native page-readiness candidate — off (empty) by default so
         # current production behavior is unchanged until explicitly set to
@@ -3809,6 +3896,13 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
     reported as ``"absent"``.  Unlimited memory.max is reported as
     ``"unlimited"``.  Never raises.
     """
+    try:
+        from . import clean_lane as _clean_lane
+        if _clean_lane.enabled():
+            _clean_lane.forbidden_activity("background_memory_diagnostics", stage=stage)
+            return {"stage": stage, "suppressed": True}
+    except Exception:
+        pass
     info: dict[str, Any] = {
         "stage": stage,
         "memory.current": "absent",
@@ -5220,8 +5314,14 @@ def _resolve_comfyui_root() -> str:
 
 
 def _registry_manifest_roots() -> list[str]:
-    """Roots for path-independent registry identity, symmetric with the host
-    (canonical_execution): [comfyui_root, repo_root, comfyapp-file dir]."""
+    """Roots for path-independent registry identity.
+
+    Keep the custom-nodes root in this list as well as the ComfyUI and runtime
+    roots.  The host proof builder uses the same root set; omitting it on the
+    snapshot side makes the shortest logical module path differ (for example
+    ``node.py`` versus ``custom_nodes/pkg/node.py``) and turns valid proofs
+    into false identity mismatches.
+    """
     _roots: list[str] = []
     try:
         from comfymodal_runtime import contracts as _c
@@ -5233,6 +5333,9 @@ def _registry_manifest_roots() -> list[str]:
     _cfr = _resolve_comfyui_root()
     if _cfr and os.path.isdir(_cfr):
         _roots.append(_cfr)
+        _custom_nodes = os.path.join(_cfr, "custom_nodes")
+        if os.path.isdir(_custom_nodes):
+            _roots.append(_custom_nodes)
     try:
         import comfyapp as _ca
         _f = getattr(_ca, "__file__", "")
@@ -5241,6 +5344,32 @@ def _registry_manifest_roots() -> list[str]:
     except Exception:
         pass
     return [r for r in dict.fromkeys(_roots) if r]
+
+
+def _registry_manifest_publication_fields(
+    registry_manifest: Any,
+    *,
+    error: str = "",
+    root_count: int = 0,
+) -> dict[str, Any]:
+    """Return fail-closed manifest fields for proof publication points."""
+    if not isinstance(registry_manifest, dict):
+        registry_manifest = {}
+    manifest_error = str(registry_manifest.get("error") or error or "")
+    try:
+        class_count = len(registry_manifest.get("classes", {}) or {})
+    except Exception:
+        class_count = 0
+    try:
+        normalized_root_count = int(root_count)
+    except (TypeError, ValueError):
+        normalized_root_count = 0
+    return {
+        "registry_manifest": registry_manifest,
+        "registry_manifest_error": manifest_error,
+        "registry_manifest_root_count": normalized_root_count,
+        "registry_manifest_class_count": class_count,
+    }
 
 
 def _lf_sha256_bytes(data: bytes) -> str:
@@ -9034,13 +9163,29 @@ class ModalRuntimeEntrypoint:
                     # classes at request time, so manifest completeness is NOT
                     # required for the snapshot proof itself.
                     _dp_reg_manifest = {}
+                    _dp_reg_manifest_error = ""
+                    _dp_reg_manifest_root_count = 0
                     try:
                         from comfymodal_runtime.registry_proof import build_registry_manifest
+                        _dp_manifest_roots = _registry_manifest_roots()
+                        _dp_reg_manifest_root_count = len(_dp_manifest_roots or [])
                         _dp_reg_manifest = build_registry_manifest(
-                            roots=_registry_manifest_roots(),
+                            roots=_dp_manifest_roots,
                         )
-                    except Exception:
+                    except Exception as _dp_manifest_exc:
                         _dp_reg_manifest = {}
+                        _dp_reg_manifest_error = (
+                            f"{type(_dp_manifest_exc).__name__}: "
+                            f"{str(_dp_manifest_exc)[:300]}"
+                        )
+                    _dp_manifest_fields = _registry_manifest_publication_fields(
+                        _dp_reg_manifest,
+                        error=_dp_reg_manifest_error,
+                        root_count=_dp_reg_manifest_root_count,
+                    )
+                    _dp_reg_manifest = _dp_manifest_fields["registry_manifest"]
+                    _dp_reg_manifest_error = _dp_manifest_fields["registry_manifest_error"]
+                    _dp_reg_manifest_root_count = _dp_manifest_fields["registry_manifest_root_count"]
                     try:
                         _dp_repair_mode = str(_dp_module._resolve_requirements_repair_mode() or "")
                     except Exception:
@@ -9055,10 +9200,23 @@ class ModalRuntimeEntrypoint:
                         _dp_missing.append("generation_mismatch")
                     if not _dp_reg_fp:
                         _dp_missing.append("registry_fingerprint_unavailable")
+                    _dp_manifest_classes = (
+                        (_dp_reg_manifest or {}).get("classes", {})
+                        if isinstance(_dp_reg_manifest, dict) else {}
+                    )
+                    _dp_manifest_complete = bool(
+                        isinstance(_dp_reg_manifest, dict)
+                        and _dp_manifest_classes
+                        and not (_dp_reg_manifest.get("incomplete_classes") or [])
+                        and not _dp_reg_manifest.get("error")
+                    )
+                    if not _dp_manifest_complete:
+                        _dp_missing.append("registry_manifest_incomplete")
                     if not _dp_dep_identity:
                         _dp_missing.append("dependency_identity_unavailable")
                     _dp_complete = bool(
-                        _dp_dep_hash and _dp_baked_gen and _dp_gen_ok and _dp_reg_fp and _dp_dep_identity
+                        _dp_dep_hash and _dp_baked_gen and _dp_gen_ok and _dp_reg_fp
+                        and _dp_manifest_complete and _dp_dep_identity
                     )
                     _dp_proof = {
                         "schema_version": DEPLOYMENT_PROOF_SCHEMA_VERSION,
@@ -9067,7 +9225,9 @@ class ModalRuntimeEntrypoint:
                         "generation_matches_observed": _dp_gen_ok,
                         "registry_fingerprint": _dp_reg_fp,
                         "registry_manifest": _dp_reg_manifest,
-                        "registry_manifest_class_count": int(len((_dp_reg_manifest or {}).get("classes", {}) or {})),
+                        "registry_manifest_error": _dp_reg_manifest_error,
+                        "registry_manifest_root_count": _dp_reg_manifest_root_count,
+                        "registry_manifest_class_count": _dp_manifest_fields["registry_manifest_class_count"],
                         "dependency_manifest_identity": _dp_dep_identity,
                         "repair_mode": _dp_repair_mode,
                         "complete": _dp_complete,
@@ -9076,13 +9236,17 @@ class ModalRuntimeEntrypoint:
                         "source": "snapshot_startup",
                     }
                     state.freeze_validation_proof(_dp_proof)
+                    _dp_manifest_error_diag = _dp_reg_manifest_error.replace(
+                        "\r", "\\r"
+                    ).replace("\n", "\\n")[:300]
                     print(
                         f"[v2.deployment_proof] schema={DEPLOYMENT_PROOF_SCHEMA_VERSION} "
                         f"complete={_dp_complete} reason={_dp_proof['invalid_reason'] or 'ok'} "
                         f"dep_hash={_dp_dep_hash[:16] if _dp_dep_hash else '<empty>'} "
                         f"baked_gen={_dp_baked_gen[:16] if _dp_baked_gen else '<empty>'} "
                         f"gen_ok={int(_dp_gen_ok)} reg_fp={bool(_dp_reg_fp)} "
-                        f"dep_identity={bool(_dp_dep_identity)} repair_mode={_dp_repair_mode or 'n/a'}",
+                        f"dep_identity={bool(_dp_dep_identity)} repair_mode={_dp_repair_mode or 'n/a'} "
+                        f"manifest_error={_dp_manifest_error_diag or 'none'}",
                         flush=True,
                     )
             except Exception as _dp_exc:
@@ -10222,38 +10386,6 @@ class ModalRuntimeEntrypoint:
             )
         except Exception as _clip_fh_exc:
             print(f"[v2.clip_fh] restore install skipped: {type(_clip_fh_exc).__name__}", flush=True)
-        # ── E28: launch the speculative CLIP lane at the EARLIEST legal
-        # restore-time point ──
-        # The frozen manifest is available right after lazy snapshot init
-        # (~+18-37 ms after remote Python resume — measured in E27 Follow-Up
-        # A).  Start the direct-GPU CLIP read NOW (restore-time lifecycle,
-        # not plan receipt) so it waits only on the minimum CUDA readiness
-        # condition.  The plan-receipt path later reconciles the identity.
-        # Best-effort and fail-closed: never blocks restore, never raises.
-        try:
-            from .speculative_clip_hydration import (
-                start_restore_time_clip_lane,
-                speculative_clip_hydration_enabled,
-            )
-
-            if speculative_clip_hydration_enabled():
-                _restore_clip_holder = getattr(self, "_cpu_snapshot_models", None)
-                _restore_clip_obj = (
-                    getattr(_restore_clip_holder, "clip", None)
-                    if _restore_clip_holder is not None
-                    else None
-                )
-                start_restore_time_clip_lane(
-                    clip=_restore_clip_obj,
-                    cpu_models=_restore_clip_holder,
-                    trace=getattr(self, "_lifecycle_trace", None),
-                    release_callback=None,
-                )
-        except Exception as _e28_lane_exc:
-            print(
-                f"[v2.clip_fh] restore-time lane skipped: {type(_e28_lane_exc).__name__}",
-                flush=True,
-            )
         if _is_production_profile():
             production_snapshot_invariant(
                 getattr(self, "_cpu_snapshot_models", None),
@@ -10546,6 +10678,11 @@ class ModalRuntimeEntrypoint:
                 metadata=_resource_identity(),
             )
             trace.emit("remote_lifecycle_start", phase="restore", metadata={"snapshot": "False"})
+            try:
+                from . import clean_lane as _clean_lane
+                _clean_lane.begin_request(trace)
+            except Exception:
+                pass
             # Request-specific model, workflow, prefill, and output decisions
             # arrive with run_plan_stream.  Restore is snapshot/lifecycle-only;
             # it never reads a globally shared current plan.
@@ -10571,6 +10708,11 @@ class ModalRuntimeEntrypoint:
                 _span_bootstrap = _restore_phase_span("restore:bootstrap")
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
+                try:
+                    from . import clean_lane as _clean_lane
+                    _clean_lane.restore_child_classifications(trace)
+                except Exception:
+                    pass
                 # ── D6 restore-side lifecycle checkpoint (default-OFF) ──
                 # gpu-state/bootstrap restore completed: record the retained
                 # snapshot clip state at this restore point.
@@ -11848,6 +11990,35 @@ class ModalRuntimeEntrypoint:
                 )
             except Exception:
                 pass
+            # E37: the speculative CLIP lane is a post-restore operation.
+            # Keep manifest/identity reconciliation and the original lane
+            # arguments intact, but make modal_restore_exit the hard ordering
+            # boundary so no speculative source read can begin during restore.
+            try:
+                from .speculative_clip_hydration import (
+                    start_restore_time_clip_lane,
+                    speculative_clip_hydration_enabled,
+                )
+                from . import clean_lane as _clean_lane
+
+                if speculative_clip_hydration_enabled() and not _clean_lane.enabled():
+                    _restore_clip_holder = getattr(self, "_cpu_snapshot_models", None)
+                    _restore_clip_obj = (
+                        getattr(_restore_clip_holder, "clip", None)
+                        if _restore_clip_holder is not None
+                        else None
+                    )
+                    start_restore_time_clip_lane(
+                        clip=_restore_clip_obj,
+                        cpu_models=_restore_clip_holder,
+                        trace=getattr(self, "_lifecycle_trace", None),
+                        release_callback=None,
+                    )
+            except Exception as _e37_lane_exc:
+                print(
+                    f"[v2.clip_fh] post-restore lane skipped: {type(_e37_lane_exc).__name__}",
+                    flush=True,
+                )
             # ── E29: close the finalize span at the restore exit ─────────
             if _span_finalize is not None:
                 try:
@@ -12033,6 +12204,11 @@ class ModalRuntimeEntrypoint:
             )
 
             trace.emit("v2_restore_return", phase="restore")
+            try:
+                from . import clean_lane as _clean_lane
+                _clean_lane.mark_restore_return(trace)
+            except Exception:
+                pass
             _restore_result["trace"] = trace.to_dict()
             set_restore_return_marker(
                 restored_instance_id=restored_instance_id,
@@ -12096,6 +12272,10 @@ class ModalRuntimeEntrypoint:
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
+        try:
+            from . import clean_lane as _clean_lane
+        except Exception:
+            _clean_lane = None
         # Start process CPU sampler at method entry
         self._process_cpu_sampler = None
         if observability_allows("cpu_sampler"):
@@ -12680,13 +12860,17 @@ class ModalRuntimeEntrypoint:
         # is idempotent (a second call is a no-op), so no duplicate
         # construction happens when a restore already scheduled prefill.
         trace.emit("execution_prefill_schedule_start", phase="execution")
-        _execution_prefill_scheduled = bool(
-            self._preload_bridge.schedule_execution_prefill(
-                trace=trace,
-                request_id=str(context.request_id),
-                activation_diagnostic_state=_activation_diagnostic_state,
+        if _clean_lane is not None and _clean_lane.enabled():
+            _clean_lane.forbidden_activity("execution_prefill", trace)
+            _execution_prefill_scheduled = False
+        else:
+            _execution_prefill_scheduled = bool(
+                self._preload_bridge.schedule_execution_prefill(
+                    trace=trace,
+                    request_id=str(context.request_id),
+                    activation_diagnostic_state=_activation_diagnostic_state,
+                )
             )
-        )
         trace.emit("execution_prefill_schedule_end", phase="execution")
 
         # ── Execution-phase native fast-disk UNET preparation ──────────
@@ -12713,7 +12897,7 @@ class ModalRuntimeEntrypoint:
             and getattr(_snapshot_models, "unet", None) is None
         )
         _execution_unet_scheduled = False
-        if _snapshot_unet_absent:
+        if _snapshot_unet_absent and not (_clean_lane is not None and _clean_lane.enabled()):
             _execution_unet_scheduled = bool(
                 self._preload_bridge.schedule_execution_unet(
                     trace=trace,
@@ -12721,6 +12905,8 @@ class ModalRuntimeEntrypoint:
                 )
             )
 
+        if _clean_lane is not None and _clean_lane.enabled() and _snapshot_unet_absent:
+            _clean_lane.forbidden_activity("execution_unet_source_h2d", trace)
         print(
             "[v2.execution_prefill] "
             f"snapshot_active={int(_cpu_snapshot_active)} "
@@ -13962,6 +14148,11 @@ class ModalRuntimeEntrypoint:
             detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
             raise RuntimeError(f"Workflow validation failed: {detail}")
         # ── Step-3 plan-proof decision instrumentation ──
+        _plan_proof_decision_reason = _get_plan_proof_decision_reason(
+            _plan_proof_consumed,
+            _plan_proof_reason,
+            _pp_gate["ineligible_reason"],
+        )
         if _plan_proof_consumed:
             print(
                 f"[v2.plan_proof] decision=plan_validation_fast_path consumed=1 "
@@ -13979,13 +14170,13 @@ class ModalRuntimeEntrypoint:
         else:
             print(
                 f"[v2.plan_proof] decision=legacy_validation_fallback consumed=0 "
-                f"reason={_plan_proof_reason or (_pp_gate['ineligible_reason'] or 'not_eligible')}",
+                f"reason={_plan_proof_decision_reason}",
                 flush=True,
             )
         trace.emit("plan_proof_decision", phase="setup", metadata={
             "consumed": _plan_proof_consumed,
             "decision": "plan_validation_fast_path" if _plan_proof_consumed else "legacy_validation_fallback",
-            "reason": _plan_proof_reason or (_pp_gate['ineligible_reason'] or "not_eligible"),
+            "reason": _plan_proof_decision_reason,
         })
         trace.emit("pregraph_setup_start", phase="execution", metadata={
             "prompt_id": prompt_id,
@@ -16269,6 +16460,9 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES",
             "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB",
             "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE",
+            "COMFYMODAL_V2_E31_FORENSICS",
+            "COMFYMODAL_V2_E31_FORWARD_PROFILE",
+            "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT",
             # E29 canonical critical-path ledger gate (baked; deploy-only).
             "COMFYMODAL_V2_CRITICAL_PATH_LEDGER",
             # E30 CLIP cold-I/O genuine-QD reader gates (default OFF).
@@ -16347,6 +16541,7 @@ class ModalRuntimeEntrypoint:
             "comfymodal_runtime.gantt_telemetry",
             "comfymodal_runtime.model_preload",
             "comfymodal_runtime.clip_fast_hydration_wiring",
+            "comfymodal_runtime.registry_proof_store",
         )
 
         def _sha256_bytes(path: str) -> str:
@@ -16363,7 +16558,7 @@ class ModalRuntimeEntrypoint:
         for mod_name in modules:
             info: dict[str, Any] = {"name": mod_name}
             try:
-                mod = sys.modules.get(mod_name) or __import__(mod_name)
+                mod = sys.modules.get(mod_name) or __import__(mod_name, fromlist=["*"])
                 file_attr = str(getattr(mod, "__file__", "") or "")
                 info["file"] = file_attr
                 info["realpath"] = str(
@@ -16649,17 +16844,28 @@ class ModalRuntimeEntrypoint:
                 except Exception:  # noqa: BLE001
                     comfyui_version = ""
             registry_manifest: dict[str, Any] = {}
+            registry_manifest_error = ""
+            registry_manifest_root_count = 0
             try:
                 from comfymodal_runtime.registry_proof import (  # noqa: PLC0415
                     build_registry_manifest,
                 )
+                _manifest_roots = _registry_manifest_roots()
+                registry_manifest_root_count = len(_manifest_roots or [])
                 registry_manifest = build_registry_manifest(
-                    roots=_registry_manifest_roots(),
+                    roots=_manifest_roots,
                 ) or {}
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 registry_manifest = {}
-            if not isinstance(registry_manifest, dict):
-                registry_manifest = {}
+                registry_manifest_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            _manifest_fields = _registry_manifest_publication_fields(
+                registry_manifest,
+                error=registry_manifest_error,
+                root_count=registry_manifest_root_count,
+            )
+            registry_manifest = _manifest_fields["registry_manifest"]
+            registry_manifest_error = _manifest_fields["registry_manifest_error"]
+            registry_manifest_root_count = _manifest_fields["registry_manifest_root_count"]
             # Diagnostics: container ComfyUI git commit and LF-normalized
             # core-module content hashes (host tool compares these).
             _diag_cfr = _resolve_comfyui_root()
@@ -16675,9 +16881,11 @@ class ModalRuntimeEntrypoint:
                 "overall_dependency_hash": overall_dependency_hash,
                 "comfyui_version": comfyui_version,
                 "registry_manifest": registry_manifest,
-                "registry_manifest_class_count": len(
-                    (registry_manifest or {}).get("classes", {}) or {}
-                ),
+                "registry_manifest_error": registry_manifest_error,
+                "registry_manifest_root_count": registry_manifest_root_count,
+                "registry_manifest_class_count": _manifest_fields[
+                    "registry_manifest_class_count"
+                ],
                 "comfyui_commit": _diag_commit,
                 "core_module_sha256s": _diag_core_sha,
                 "atomic_profile": os.environ.get(
@@ -16692,6 +16900,8 @@ class ModalRuntimeEntrypoint:
                 "overall_dependency_hash": "",
                 "comfyui_version": "",
                 "registry_manifest": {},
+                "registry_manifest_error": "",
+                "registry_manifest_root_count": 0,
                 "registry_manifest_class_count": 0,
                 "comfyui_commit": "",
                 "core_module_sha256s": {"nodes.py": "", "execution.py": ""},
@@ -17965,6 +18175,11 @@ class ModalRuntimeEntrypoint:
         # after ``ExecutionPlan.from_dict``), so the whole method-entry
         # block died with a swallowed NameError and NO method-entry events
         # ever reached the ledger.
+        try:
+            from . import clean_lane as _clean_lane
+            _clean_lane.phase_start("plan_identity", getattr(self, "_plan_receipt_trace", None))
+        except Exception:
+            _clean_lane = None
         _deserialize_start_ns = time.monotonic_ns()
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
@@ -17984,6 +18199,11 @@ class ModalRuntimeEntrypoint:
             )
         except Exception:
             pass
+        try:
+            from . import clean_lane as _clean_lane
+            _clean_lane.mark_plan_identity_complete(getattr(self, "_plan_receipt_trace", None))
+        except Exception:
+            _clean_lane = None
 
         # ── Batch-A G1: start the execution-phase fast-disk UNET lane at
         # plan receipt ──
@@ -18004,10 +18224,15 @@ class ModalRuntimeEntrypoint:
                 _span_schedule_setup.start_mono_ns = _setup_schedule_start_ns
             except Exception:
                 pass
-        self._maybe_schedule_execution_unet_at_plan_receipt(
-            plan,
-            request_id=str(_t4_request_id or request_id),
-        )
+        if _clean_lane is not None and _clean_lane.enabled():
+            _clean_lane.forbidden_activity(
+                "plan_time_unet_source_h2d", getattr(self, "_plan_receipt_trace", None)
+            )
+        else:
+            self._maybe_schedule_execution_unet_at_plan_receipt(
+                plan,
+                request_id=str(_t4_request_id or request_id),
+            )
 
         # ── E25/E26/E28: speculative CLIP hydration lane at plan receipt ──
         # The exact model identity (model key + loader spec + workflow/
@@ -18032,6 +18257,7 @@ class ModalRuntimeEntrypoint:
         try:
             from comfymodal_runtime.speculative_clip_hydration import (
                 reconcile_restore_time_lane,
+                join_speculative_clip_lane,
             )
 
             _spec_model_key = getattr(self, "_plan_receipt_request_model_key", None)
@@ -18092,6 +18318,12 @@ class ModalRuntimeEntrypoint:
                     cpu_models=_spec_cpu_models,
                     release_callback=_release_unet_prefetch,
                 )
+                if _clean_lane is not None and _clean_lane.enabled():
+                    _clean_lane.phase_start("post_restore_clip_qd", getattr(self, "_plan_receipt_trace", None))
+                    _joined = join_speculative_clip_lane(_speculative_clip_request_id, timeout_s=60.0)
+                    if not isinstance(_joined, dict) or not (_joined.get("result") or {}).get("ok"):
+                        raise RuntimeError("CLEAN_LANE_QD_SOURCE_NOT_COMPLETE")
+                    _clean_lane.phase_end("post_restore_clip_qd", getattr(self, "_plan_receipt_trace", None))
                 if _started_lane is None:
                     # Fail-open: the lane could not start (e.g. no frozen
                     # manifest).  Ownership was claimed by the controller;
@@ -18122,7 +18354,7 @@ class ModalRuntimeEntrypoint:
         _cc_prefetch_reason = "unavailable"
         try:
             from comfymodal_runtime.model_preload import maybe_prefetch_conditioning as _maybe_prefetch
-            if callable(_maybe_prefetch):
+            if callable(_maybe_prefetch) and not (_clean_lane is not None and _clean_lane.enabled()):
                 _cc_prefetch_scheduled = 1
                 _cc_prefetch_reason = "thread_started"
                 # ── E29: close request:cc-prefetch-submit at the submit ──
@@ -18211,7 +18443,7 @@ class ModalRuntimeEntrypoint:
                 # and records truthful disabled evidence instead.
                 _itw_enabled = env_flag(
                     "COMFYMODAL_V2_INPUT_TYPES_WARM", default=True
-                )
+                ) and not (_clean_lane is not None and _clean_lane.enabled())
                 if not _itw_enabled:
                     _itw_disabled_by_env = True
                     _itw_reason = "COMFYMODAL_V2_INPUT_TYPES_WARM=0"
