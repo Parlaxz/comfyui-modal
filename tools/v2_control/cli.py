@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +43,25 @@ from .errors import (
 
 SCHEMA_VERSION = 1
 VERSION = "0.1.0"
+
+# E31 QD4 cast-once is a distinct validation path.  The profile inherits the
+# E29/E28 workload flags, so selector construction must key off the explicit
+# profile name before looking at the inherited E28 selector.
+E31_QD4_CAST_ONCE_PROFILE = "e31-clip-fp32-qd4-arm-b"
+E31_VALIDATION_SELECTOR = "E31_VALIDATION"
+
+# E37 deliberately inherits the E29/E28 workload shape, but its late CLIP
+# policy is not compatible with the historical E28 selector.  Keep this path
+# ahead of inherited selector flags so an E37 request can never be routed to
+# the E28 BAT branch.
+E37_LEGACY_PROFILES = frozenset({
+    "e37-clip-qd4",
+    "e37-clip-fastsafe",
+})
+E37_CLEAN_LANE_PROFILE = "e37-clean-lane-qd4"
+E37_STRICT_PROOF_FLAG = "COMFYMODAL_V2_E37_STRICT_PROOF"
+E37_VALIDATION_SELECTOR = "E37_VALIDATION"
+E37_CLEAN_LANE_SELECTOR = "E37_CLEAN_LANE_VALIDATION"
 
 # Static audit: which flag names does the runtime actually consume?  Derived
 # from the Phase-0 audit of the deployed runtime source (modal_app request
@@ -102,6 +122,25 @@ def _identity_env_for_command(command: str, config: config_mod.ResolvedConfig) -
     return _identity_env(config) if command in ("deploy", "deploy-run") else {}
 
 
+def _new_invocation_id() -> str:
+    """Create exactly one collision-resistant ID for a canonical operation."""
+    return uuid.uuid4().hex
+
+
+def _canonical_metadata_env(
+    config: config_mod.ResolvedConfig,
+    fingerprints: fp_mod.FingerprintEngine,
+    invocation_id: str,
+) -> dict[str, str]:
+    return {
+        "COMFYMODAL_V2CTL_INVOCATION_ID": invocation_id,
+        "COMFYMODAL_V2CTL_PROFILE": str(config.profile_name),
+        "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT": fingerprints.profile_config_fingerprint(),
+        "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": fingerprints.deploy_fingerprint(),
+        "COMFYMODAL_V2CTL_RUN_FINGERPRINT": fingerprints.run_fingerprint(),
+    }
+
+
 def build_components(repo_root: Path, profile_name: str, cli_options: dict[str, str] | None = None,
                      sets: list[str] | None = None, inherits: list[str] | None = None,
                      inherit_from: dict[str, str] | None = None):
@@ -126,6 +165,79 @@ def _redact_env(env: dict[str, str]) -> dict[str, str]:
     return env_mod.EnvironmentBuilder().display(env)
 
 
+_BACKEND_DIAGNOSTIC_MAX_CHARS = 8 * 1024
+_BACKEND_DIAGNOSTIC_HEAD_CHARS = _BACKEND_DIAGNOSTIC_MAX_CHARS // 2
+_BACKEND_DIAGNOSTIC_TAIL_CHARS = (
+    _BACKEND_DIAGNOSTIC_MAX_CHARS - _BACKEND_DIAGNOSTIC_HEAD_CHARS
+)
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)((?:[a-z0-9_]*)(?:token|secret|password|api[_-]?key|credential)"
+    r"(?:[a-z0-9_]*\s*[=:]\s*))"
+    r"([^\s,;\"']+)"
+)
+_DIAGNOSTIC_QUOTED_SECRET_RE = re.compile(
+    r"(?i)((?:[\"']?)[a-z0-9_]*(?:token|secret|password|api[_-]?key|credential)"
+    r"[a-z0-9_]*[\"']?\s*[=:]\s*[\"'])"
+    r"([^\"']+)([\"'])"
+)
+
+
+def _redact_backend_diagnostic(text: str, env: dict[str, str]) -> str:
+    """Redact credential-shaped values from backend output."""
+    output = text or ""
+    # Replace values actually supplied to the backend first, including values
+    # that do not use a ``NAME=value`` format in the backend's output.
+    protected = env_mod.EnvironmentBuilder().display(env)
+    for name, value in env.items():
+        if not value or protected.get(name) != "<redacted>":
+            continue
+        output = output.replace(str(value), "<redacted>")
+    # Also cover backend messages that print a credential without using the
+    # exact value from the child environment (for example, a parsed config).
+    output = _DIAGNOSTIC_QUOTED_SECRET_RE.sub(r"\1<redacted>\3", output)
+    output = _DIAGNOSTIC_SECRET_RE.sub(r"\1<redacted>", output)
+    return output
+
+
+def _safe_backend_diagnostic(text: str, env: dict[str, str]) -> str:
+    """Return bounded backend output with credential-shaped values redacted."""
+    output = _redact_backend_diagnostic(text, env)
+    if len(output) > _BACKEND_DIAGNOSTIC_MAX_CHARS:
+        output = output[:_BACKEND_DIAGNOSTIC_MAX_CHARS]
+        output += "\n...[diagnostic output truncated]"
+    return output
+
+
+def _backend_diagnostic_sections(text: str, env: dict[str, str]) -> tuple[str, str, bool]:
+    """Return redacted, bounded head/tail sections for one backend stream."""
+    output = _redact_backend_diagnostic(text, env)
+    truncated = len(output) > _BACKEND_DIAGNOSTIC_MAX_CHARS
+    if not truncated:
+        return output, output, False
+    return (
+        output[:_BACKEND_DIAGNOSTIC_HEAD_CHARS],
+        output[-_BACKEND_DIAGNOSTIC_TAIL_CHARS:],
+        True,
+    )
+
+
+def _print_backend_diagnostic(result: backend_mod.BackendResult,
+                              env: dict[str, str]) -> None:
+    """Print failed backend streams with bounded, redacted head and tail sections."""
+    print("[v2ctl.deploy] BEGIN backend diagnostics (stderr first; head and tail)",
+          file=sys.stderr)
+    for label, stream in (("stderr", result.stderr), ("stdout", result.stdout)):
+        head, tail, truncated = _backend_diagnostic_sections(stream, env)
+        print(f"--- backend {label} (head) ---", file=sys.stderr)
+        print(head or "(no output)", file=sys.stderr)
+        print(f"--- backend {label} (tail) ---", file=sys.stderr)
+        print(tail or "(no output)", file=sys.stderr)
+        if truncated:
+            print("...[diagnostic output truncated; showing bounded head and tail]",
+                  file=sys.stderr)
+    print("[v2ctl.deploy] END backend diagnostics", file=sys.stderr)
+
+
 def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     """Derive the canonical backend selector argument from the resolved
     config environment.
@@ -140,6 +252,21 @@ def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     """
     try:
         env = {f.name: f.value for f in config.flags}
+        if config.profile_name == E37_CLEAN_LANE_PROFILE or any(
+            str(env.get(name, "0")).lower() in ("1", "true", "yes", "on")
+            for name in ("COMFYMODAL_V2_E37_CLEAN_LANE", "COMFYMODAL_V2_CLEAN_LANE")
+        ):
+            return E37_CLEAN_LANE_SELECTOR
+        if config.profile_name in E37_LEGACY_PROFILES:
+            return E37_VALIDATION_SELECTOR
+        if str(env.get(E37_STRICT_PROOF_FLAG, "0")).lower() in (
+            "1", "true", "yes", "on"
+        ):
+            return E37_VALIDATION_SELECTOR
+        if config.profile_name == E31_QD4_CAST_ONCE_PROFILE:
+            return E31_VALIDATION_SELECTOR
+        if str(env.get("V2_E31_VALIDATION", "0")) in ("1", "true", "yes", "on"):
+            return E31_VALIDATION_SELECTOR
         if str(env.get("V2_E28_VALIDATION", "0")) in ("1", "true", "yes", "on"):
             return "E28_VALIDATION"
         if str(env.get("V2_E26_VALIDATION", "0")) in ("1", "true", "yes", "on"):
@@ -149,6 +276,63 @@ def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[str], dict[str, str]]:
+    """Build the canonical single-run validation selector and its env.
+
+    E25/E26/E28/E31 are activated by both a positional selector and a matching
+    conditioning-cache nonce.  Keep this construction shared by gate,
+    confirm, and dry-run reporting so a confirmation cannot silently fall
+    back to the restore-only BAT path.
+    """
+    selector = _backend_selector(config)
+    args = ([selector] if selector else []) + ["--run-count", "1"]
+    selector_env: dict[str, str] = {}
+    if selector:
+        validation_name = selector.removesuffix("_VALIDATION")
+        nonce_flag = None
+        flag_lookup = getattr(config, "flag", None)
+        if callable(flag_lookup):
+            nonce_flag = flag_lookup(f"V2_{validation_name}_CONDITIONING_NONCE")
+        nonce = str(getattr(nonce_flag, "value", "") or "").strip()
+        if not nonce:
+            nonce = str(getattr(getattr(config, "workload", None), "nonce", "") or "").strip()
+        nonce = nonce or uuid.uuid4().hex
+        args += ["--conditioning-cache-nonce", nonce]
+        if selector in (E37_CLEAN_LANE_SELECTOR, E37_VALIDATION_SELECTOR):
+            selector_env["V2_E37_CONDITIONING_NONCE"] = nonce
+        else:
+            selector_env[f"V2_{validation_name}_CONDITIONING_NONCE"] = nonce
+        if selector == E37_CLEAN_LANE_SELECTOR:
+            # CLEAN_LANE is a distinct deploy path.  It deliberately does not
+            # project the historical E19 tuple; the BAT must preserve the
+            # profile's off/none values and the clean verifier checks them.
+            selector_env["COMFYMODAL_V2_E37_CLEAN_LANE"] = "1"
+            selector_env["COMFYMODAL_V2_CLEAN_LANE"] = "1"
+            selector_env["V2_E37_VALIDATION"] = "1"
+            selector_env["V2_E28_VALIDATION"] = "0"
+            selector_env["V2_E31_VALIDATION"] = "0"
+            selector_env["V2_BENCHMARK_MODE"] = "e37_single"
+            selector_env["V2_BENCHMARK_RUNS"] = "1"
+        elif selector == E37_VALIDATION_SELECTOR:
+            # E37 profiles inherit E29's E28 selector.  Explicitly project the
+            # E37 request mode and disable historical selectors in the child
+            # environment; the positional selector alone is not sufficient
+            # for every BAT/parser path.
+            selector_env["V2_E37_VALIDATION"] = "1"
+            selector_env["V2_E28_VALIDATION"] = "0"
+            selector_env["V2_E31_VALIDATION"] = "0"
+            selector_env["V2_BENCHMARK_MODE"] = "e37_single"
+            selector_env["V2_BENCHMARK_RUNS"] = "1"
+        if selector == E31_VALIDATION_SELECTOR:
+            # The E31 profile inherits E29's E28 selector.  Explicitly turn
+            # that selector off in run-only children so E31 cannot silently
+            # fall through the ordinary E28 path.
+            selector_env["V2_E31_VALIDATION"] = "1"
+            selector_env["V2_E28_VALIDATION"] = "0"
+            selector_env["V2_BENCHMARK_MODE"] = "e31_single"
+    return args, selector_env
 
 
 def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
@@ -253,6 +437,18 @@ def _run_manifest_dir(repo_root: Path) -> Path:
     return repo_root / ".v2ctl" / "runs"
 
 
+def _profile_config_fingerprint(fingerprints: object) -> str:
+    """Read the E32 config fingerprint without breaking older test doubles."""
+    for name in ("profile_config_fingerprint", "config_fingerprint"):
+        method = getattr(fingerprints, name, None)
+        if callable(method):
+            try:
+                return str(method())
+            except Exception:  # noqa: BLE001 - compatibility fallback
+                continue
+    return ""
+
+
 def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
                               fingerprints: fp_mod.FingerprintEngine,
                               env: dict[str, str],
@@ -272,6 +468,7 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
                       "min_containers": config.resources.min_containers,
                       "scaledown_window": config.resources.scaledown_window},
         "deploy_fingerprint": deploy_fp,
+        "profile_config_fingerprint": _profile_config_fingerprint(fingerprints),
         "deploy_inputs": fingerprints.deploy_inputs(),
         "effective_environment": _redact_env(env),
         "runtime_override_policy": config.runtime_override_policy,
@@ -299,6 +496,9 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         ),
     }
     if result is not None:
+        manifest["v2ctl_invocation_id"] = result.v2ctl_invocation_id
+        manifest["request_id"] = result.request_id
+        manifest["provenance_validation_status"] = result.provenance_validation_status
         manifest["backend"] = {
             "command": result.command,
             "exit_code": result.exit_code,
@@ -312,6 +512,12 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
             "summary_artifact": str(result.artifacts.summary_artifact) if result.artifacts.summary_artifact else None,
             "campaign_manifest": str(result.artifacts.campaign_manifest) if result.artifacts.campaign_manifest else None,
             "console_capture": str(result.artifacts.console_capture) if result.artifacts.console_capture else None,
+            "run_artifacts": [str(p) for p in result.artifacts.run_artifacts],
+            "v2ctl_invocation_id": result.artifacts.v2ctl_invocation_id,
+            "request_id": result.artifacts.request_id,
+            "profile": result.artifacts.profile,
+            "profile_config_fingerprint": result.artifacts.profile_config_fingerprint,
+            "provenance_validation_status": result.artifacts.provenance_validation_status,
         }
     path = d / f"deploy_{time.strftime('%Y%m%d-%H%M%S')}_{deploy_fp[:8]}.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -346,6 +552,10 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         "owner": config.owner,
         "deploy_fingerprint": fingerprints.deploy_fingerprint(),
         "run_fingerprint": run_fp,
+        "v2ctl_invocation_id": result.v2ctl_invocation_id,
+        "profile_config_fingerprint": fingerprints.profile_config_fingerprint(),
+        "request_id": result.request_id,
+        "provenance_validation_status": result.provenance_validation_status,
         "workload": {
             "fresh_required": config.workload.fresh_required,
             "conditioning_cache": config.workload.conditioning_cache,
@@ -368,6 +578,12 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
             "summary_artifact": str(result.artifacts.summary_artifact) if result.artifacts.summary_artifact else None,
             "campaign_manifest": str(result.artifacts.campaign_manifest) if result.artifacts.campaign_manifest else None,
             "console_capture": str(result.artifacts.console_capture) if result.artifacts.console_capture else None,
+            "run_artifacts": [str(p) for p in result.artifacts.run_artifacts],
+            "v2ctl_invocation_id": result.artifacts.v2ctl_invocation_id,
+            "request_id": result.artifacts.request_id,
+            "profile": result.artifacts.profile,
+            "profile_config_fingerprint": result.artifacts.profile_config_fingerprint,
+            "provenance_validation_status": result.artifacts.provenance_validation_status,
         },
     }
     if provenance is not None:
@@ -543,6 +759,7 @@ def cmd_config(args, repo_root: Path) -> int:
         "runtime_override_policy": config.runtime_override_policy,
         "deploy_fingerprint": fingerprints.deploy_fingerprint(),
         "run_fingerprint": fingerprints.run_fingerprint(),
+        "profile_config_fingerprint": fingerprints.profile_config_fingerprint(),
         "flags": [
             {
                 "name": f.name, "value": f.value, "source": f.source,
@@ -664,6 +881,7 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
     print(f"profile={config.profile_name} owner={config.owner}")
     print(f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
     print(f"run_fingerprint={fingerprints.run_fingerprint()}")
+    print(f"selector={_backend_selector(config) or '(none)'}")
     print(f"command={command}")
     print("[v2ctl.dry-run] child environment (redacted):")
     redacted = env_mod.EnvironmentBuilder().display(env)
@@ -677,16 +895,19 @@ def cmd_deploy(args, repo_root: Path) -> int:
             repo_root, args.profile, cli_options=_cli_target_options(args),
             sets=args.set, inherits=args.inherit,
         )
+        invocation_id = _new_invocation_id()
         spec = backend_registry.deploy_only()
         env = env_builder.build(config, host_env=os.environ,
                                 backend_extra={**spec.deploy_only_env,
-                                               **_identity_env_for_command("deploy", config)})
+                                               **_identity_env_for_command("deploy", config),
+                                               **_canonical_metadata_env(config, fingerprints, invocation_id)})
         # Forward the canonical selector (e.g. E28_VALIDATION) as the BAT's
         # first positional arg: the deploy BAT reads %~1 to activate its
         # validation branch (env alone is not sufficient in all paths).
         selector = _backend_selector(config)
+        extra_args = [selector] if selector else []
         command = backend_mod.BackendRunner.build_command_line(
-            spec, [selector] if selector else [])
+            spec, extra_args)
         if args.dry_run:
             _dry_run_report(config, fingerprints, env, command)
             return 0
@@ -710,7 +931,8 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # deploy right after a prior one no-ops).
             _pre_version = _app_version_number(config.target.app) if config.target.app else 0
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
-                spec, config=config, extra_env=env, capture=True)
+                spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
+                invocation_id=invocation_id)
             # ── Crash-loop guard: a container that repeats the same traceback
             # must NEVER produce a "successful" deployment manifest.  Diagnose
             # the root cause locally and redeploy; never auto-retry. ──
@@ -727,6 +949,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
             manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
             print(f"[v2ctl.deploy] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
+                _print_backend_diagnostic(result, env)
                 # A failed deploy must NEVER leave a "deployed" manifest behind:
                 # remove it so gate/run cannot treat a broken deployment as valid.
                 try:
@@ -767,14 +990,17 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
             repo_root, args.profile, cli_options=_cli_target_options(args),
             sets=args.set, inherits=args.inherit,
         )
+        invocation_id = _new_invocation_id()
         spec = backend_registry.canonical()
         env = env_builder.build(config, host_env=os.environ,
-                                backend_extra=_identity_env_for_command("deploy-run", config))
+                                backend_extra={**_identity_env_for_command("deploy-run", config),
+                                               **_canonical_metadata_env(config, fingerprints, invocation_id)})
         # Forward the canonical selector as the BAT's first positional arg
         # (see cmd_deploy).
         selector = _backend_selector(config)
+        extra_args = [selector] if selector else []
         command = backend_mod.BackendRunner.build_command_line(
-            spec, [selector] if selector else [])
+            spec, extra_args)
         if args.dry_run:
             _dry_run_report(config, fingerprints, env, command)
             return 0
@@ -789,7 +1015,8 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
                   f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
             print(f"[v2ctl.deploy-run] command={command}")
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
-                spec, config=config, extra_env=env, capture=True)
+                spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
+                invocation_id=invocation_id, strict_canonical_discovery=True)
             manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
             print(f"[v2ctl.deploy-run] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
@@ -835,14 +1062,25 @@ def cmd_run(args, repo_root: Path) -> int:
         # snapshot-restore-only PROBE. ──
         _require_full_run_mode(config, command="v2ctl run")
         run_count = args.run_count or config.workload.run_count
+        selector = _backend_selector(config)
+        if selector:
+            if run_count != 1:
+                raise GateError(
+                    f"{selector} requires exactly one cold run; got run_count={run_count}"
+                )
+            extra_args, selector_env = _validation_backend_args(config)
+        else:
+            extra_args = ["--run-count", str(run_count)]
+            selector_env = {}
+        invocation_id = _new_invocation_id()
         spec = backend_registry.run_only()
         env = env_builder.build(config, host_env=os.environ,
-                                backend_extra={"V2_BENCHMARK_RUNS": str(run_count)})
+                                backend_extra={"V2_BENCHMARK_RUNS": str(run_count),
+                                               **selector_env,
+                                               **_canonical_metadata_env(config, fingerprints, invocation_id)})
         # Forward the canonical selector as the BAT's first positional arg so
         # the run BAT enters its validation mode (e.g. E28_VALIDATION) instead
         # of falling into the snapshot_restore_only probe branch.
-        selector = _backend_selector(config)
-        extra_args = ([selector] if selector else []) + ["--run-count", str(run_count)]
         command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
         if args.dry_run:
             _dry_run_report(config, fingerprints, env, command)
@@ -851,8 +1089,15 @@ def cmd_run(args, repo_root: Path) -> int:
               f"deploy_fingerprint={current} run_fingerprint={fingerprints.run_fingerprint()}")
         print(f"[v2ctl.run] command={command}")
         result = backend_mod.BackendRunner(repo_root, env_builder).run(
-            spec, config=config, extra_args=extra_args, extra_env=env, capture=True)
-        provenance = prov_mod.build_provenance(config, env, current, fingerprints.run_fingerprint(), [])
+            spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
+            invocation_id=invocation_id, strict_canonical_discovery=True,
+            allow_multiple_run_artifacts=run_count > 1)
+        provenance = prov_mod.build_provenance(
+            config, env, current, fingerprints.run_fingerprint(), [],
+            invocation_id=invocation_id,
+            profile_config_fingerprint=fingerprints.profile_config_fingerprint(),
+            request_id=result.request_id or "",
+        )
         run_manifest = write_run_manifest(repo_root, config, fingerprints, env, result, provenance)
         if result.artifacts.run_artifact is not None:
             try:
@@ -886,29 +1131,49 @@ def cmd_gate(args, repo_root: Path) -> int:
         # ── Full-run guard: a gate must generate (run_plan_stream), never
         # the snapshot-restore-only PROBE. ──
         _require_full_run_mode(config, command="v2ctl gate")
+        invocation_id = _new_invocation_id()
         spec = backend_registry.run_only()
         if args.dry_run:
-            env = env_builder.build(config, host_env=os.environ, backend_extra={"V2_BENCHMARK_RUNS": "1"})
-            command = backend_mod.BackendRunner.build_command_line(spec, ["--run-count", "1"])
+            extra_args, selector_env = _validation_backend_args(config)
+            env = env_builder.build(
+                config, host_env=os.environ,
+                backend_extra={"V2_BENCHMARK_RUNS": "1", **selector_env,
+                               **_canonical_metadata_env(config, fingerprints, invocation_id)},
+            )
+            command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
             return 0
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
         validator.register(val_mod.CanonicalLedgerValidator())
+        e31_validator = val_mod.E31ForensicsValidator()
+        if e31_validator.applies(config):
+            validator.register(e31_validator)
+        e37_validator = val_mod.E37StrictProofValidator()
+        if e37_validator.applies(config):
+            validator.register(e37_validator)
+        clean_lane_validator = val_mod.E37CleanLaneProofValidator()
+        if clean_lane_validator.applies(config):
+            validator.register(clean_lane_validator)
         runner = backend_mod.BackendRunner(repo_root, env_builder)
         gate = val_mod.GateRunner(repo_root=repo_root, fingerprints=fingerprints,
                                   validators=validator, backend_runner=runner,
                                   env_builder=env_builder)
-        result = gate.run_gate(config, spec)
+        result = gate.run_gate(config, spec, invocation_id=invocation_id)
         print(f"[v2ctl.gate] valid={int(result.valid)} manifest={result.manifest_path}")
         for reason in result.reasons:
             print(f"  FAIL {reason}")
         if result.run is not None and result.run.artifacts.run_artifact is not None:
             provenance = prov_mod.build_provenance(
                 config, env_builder.build(config, host_env=os.environ,
-                                          backend_extra={"V2_BENCHMARK_RUNS": "1"}),
-                fingerprints.deploy_fingerprint(), fingerprints.run_fingerprint(), [])
+                                          backend_extra={"V2_BENCHMARK_RUNS": "1",
+                                                         **_canonical_metadata_env(config, fingerprints, invocation_id)}),
+                fingerprints.deploy_fingerprint(), fingerprints.run_fingerprint(), [],
+                invocation_id=invocation_id,
+                profile_config_fingerprint=fingerprints.profile_config_fingerprint(),
+                request_id=result.run.request_id if result.run is not None else "",
+            )
             try:
                 prov_mod.write_provenance_sibling(result.run.artifacts.run_artifact, provenance)
             except OSError:
@@ -927,24 +1192,43 @@ def cmd_confirm(args, repo_root: Path) -> int:
         )
         resolver.check_run_safety(config, run_only=True)
         _require_no_deploy_in_flight(repo_root)
+        _require_full_run_mode(config, command="v2ctl confirm")
         enforce_runtime_overrides(config,
                                   ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
                                   spend=True)
+        invocation_id = _new_invocation_id()
         spec = backend_registry.run_only()
         runs = args.runs or 1
         if args.dry_run:
+            extra_args, selector_env = _validation_backend_args(config)
             env = env_builder.build(config, host_env=os.environ,
-                                    backend_extra={"V2_BENCHMARK_RUNS": str(runs)})
-            command = backend_mod.BackendRunner.build_command_line(spec, ["--run-count", str(runs)])
+                                    backend_extra={"V2_BENCHMARK_RUNS": "1", **selector_env,
+                                                   **_canonical_metadata_env(config, fingerprints, invocation_id)})
+            command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
             return 0
+        runner = backend_mod.BackendRunner(repo_root, env_builder)
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
-        runner = backend_mod.BackendRunner(repo_root, env_builder)
+        # Confirm must enforce the same canonical ledger contract as gate;
+        # otherwise an E37 gate could pass while confirmation silently drops
+        # the first-durable ledger validator.
+        validator.register(val_mod.CanonicalLedgerValidator())
+        e31_validator = val_mod.E31ForensicsValidator()
+        if e31_validator.applies(config):
+            validator.register(e31_validator)
+        e37_validator = val_mod.E37StrictProofValidator()
+        if e37_validator.applies(config):
+            validator.register(e37_validator)
+        clean_lane_validator = val_mod.E37CleanLaneProofValidator()
+        if clean_lane_validator.applies(config):
+            validator.register(clean_lane_validator)
         confirm = val_mod.ConfirmRunner(repo_root=repo_root, fingerprints=fingerprints,
-                                        backend_runner=runner, env_builder=env_builder)
-        result = confirm.confirm(Path(args.from_gate), config, spec, runs=runs)
+                                        backend_runner=runner, env_builder=env_builder,
+                                        validators=validator)
+        result = confirm.confirm(Path(args.from_gate), config, spec, runs=runs,
+                                 invocation_id=invocation_id)
         print(f"[v2ctl.confirm] valid={int(result.valid)} manifest={result.manifest_path}")
         for reason in result.reasons:
             print(f"  FAIL {reason}")

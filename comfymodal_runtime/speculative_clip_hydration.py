@@ -55,6 +55,7 @@ from typing import Any, Optional
 
 from . import clip_fast_hydration as cfh
 from . import clip_fast_hydration_wiring as _wiring
+from . import clean_lane
 
 # ── Module-level single-flight store (one lane per request) ──────────────
 
@@ -207,6 +208,8 @@ def _manifest_identity_digest(manifest: dict) -> str:
                     "dtype": entry.get("dtype", ""),
                     "key_set": entry.get("key_set", []),
                     "key_shapes": entry.get("key_shapes", {}),
+                    "structural_destination_keys": entry.get("structural_destination_keys", []),
+                    "manifest_structural_destination_keys": manifest.get("structural_destination_keys", []),
                     "pipeline": entry.get("pipeline", []),
                 }
             )
@@ -608,7 +611,7 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
 
     result: dict[str, Any] = {
         "ok": False,
-        "mode": cfh.MODE_FASTSAFE,
+        "mode": "QD4" if clean_lane.enabled() else cfh.MODE_FASTSAFE,
         "reason": "not_run",
     }
     owners: list[tuple[Any, Any]] = []
@@ -730,6 +733,12 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
                             f"{str(_e30_exc)[:200]} path={os.path.basename(str(path))}",
                             flush=True,
                         )
+                        if clean_lane.enabled():
+                            clean_lane.forbidden_activity(
+                                "qd_fastsafe_fallback", trace,
+                                reason=f"{type(_e30_exc).__name__}: {str(_e30_exc)[:200]}",
+                            )
+                            raise RuntimeError("CLEAN_LANE_QD_REQUIRED_NO_FALLBACK") from _e30_exc
                         sd_raw, loader, fb = _wiring._fastsafe_load(path)
                     else:
                         print(
@@ -767,7 +776,7 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
         try:
             from .clip_fp32_cast_once import apply_cast_once, cast_once_enabled
 
-            if cast_once_enabled():
+            if not clean_lane.enabled() and cast_once_enabled():
                 per_file_sds, _cast_record = apply_cast_once(
                     per_file_sds, list(lane.manifest_files), trace=trace
                 )
@@ -790,7 +799,7 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
         }
         result = {
             "ok": True,
-            "mode": cfh.MODE_FASTSAFE,
+            "mode": "QD4" if clean_lane.enabled() else cfh.MODE_FASTSAFE,
             "reason": "speculative_read_complete",
             "wall_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
@@ -833,10 +842,11 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
                 loader.close()
             except Exception:
                 pass
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        if not clean_lane.enabled():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         _emit("clip_fh_speculative_read_failed", {
             "reason": result["reason"],
             "read_wall_ms": result["wall_ms"],
@@ -1024,8 +1034,9 @@ def _drop_lane_locked(request_id: str) -> None:
 def speculative_clip_hydration_enabled() -> bool:
     """True when the speculative CLIP hydration lane is eligible."""
     try:
-        return _wiring.clip_fast_hydration_enabled() and bool(
-            os.environ.get("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1")
+        return _wiring.clip_fast_hydration_enabled() and (
+            clean_lane.enabled()
+            or bool(os.environ.get("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1"))
         )
     except Exception:
         return False
@@ -1080,6 +1091,17 @@ def start_restore_time_clip_lane(
     Returns the lane when started (or already present), else None.  Best-
     effort and never raises.
     """
+    if clean_lane.enabled():
+        # CLEAN_LANE has a separate post-return coordinator.  Returning here
+        # is intentional: a launch-policy label is not lifecycle proof.
+        if trace is not None:
+            try:
+                trace.emit("clean_lane_restore_launch_suppressed", phase="restore", metadata={
+                    "reason": "post_restore_coordinator_required",
+                })
+            except Exception:
+                pass
+        return None
     key = request_id or _RESTORE_TIME_KEY
     try:
         if not speculative_clip_hydration_enabled():

@@ -54,6 +54,7 @@ from .cpu_snapshot_models import (
     _PAGE_READINESS_MODE_WILLNEED,
 )
 from .trace import RuntimeTrace
+from . import clean_lane
 from . import gpu_lane_coordination as _gpu_coordination
 from .unet_forward_probe import (
     emit_post_load_models_gpu_event,
@@ -2375,6 +2376,82 @@ def _record_clip_encode(
         request_trace = _ACTIVE_REQUEST_TRACE.get()
         if request_trace is not None and _detailed_activation:
             request_trace.emit("clip_encode_diagnostic", phase="execution", metadata=dict(record))
+
+
+def _emit_clean_lane_forced_miss_evidence(
+    trace: RuntimeTrace | None,
+    *,
+    clip: Any,
+    text: str,
+    request_id: str = "",
+    reason: str,
+) -> None:
+    """Certify the real clean-lane CLIP request as a non-persistent miss.
+
+    CLEAN_LANE's forced-miss path may bypass the normal cache lookup seam
+    (including when the singleton is disabled or unavailable).  This helper
+    is called immediately before the graph/worker performs the actual encode.
+    It records no invented timing or key identity and never touches the cache
+    service.
+    """
+    if not clean_lane.enabled():
+        return
+    _request_id = str(request_id or (trace.request_id if trace is not None else ""))
+    metadata: dict[str, Any] = {
+        "hit": False,
+        "hit_count": 0,
+        "miss_count": 1,
+        "entry_count": 1,
+        "request_id": _request_id or "absent",
+        "clip_object_id": str(id(clip)),
+        "text_hash": stable_hash(str(text))[:16],
+        "text_length": len(str(text)),
+        "real_encode_request": True,
+        "lookup_status": "bypassed",
+        "reason": str(reason),
+        "persistence": "disabled",
+    }
+    try:
+        if trace is not None:
+            trace.emit(
+                "clip_conditioning_cache_lookup",
+                phase="execution",
+                metadata=dict(metadata),
+            )
+        log_conditioning_cache_decision(
+            "miss_not_stored",
+            request_id=_request_id or "absent",
+            hit=False,
+            hit_count=0,
+            miss_count=1,
+            entries=1,
+            encode_calls=1,
+            persisted=0,
+            persistence="disabled",
+            real_encode_request=True,
+            reason=str(reason),
+        )
+        if trace is not None:
+            trace.emit(
+                "clip_conditioning_cache_decision",
+                phase="execution",
+                metadata={
+                    "decision": "miss_not_stored",
+                    "request_id": _request_id or "absent",
+                    "hit": False,
+                    "hit_count": 0,
+                    "miss_count": 1,
+                    "entry_count": 1,
+                    "encode_calls": 1,
+                    "persisted_count": 0,
+                    "persistence": "disabled",
+                    "real_encode_request": True,
+                    "reason": str(reason),
+                },
+            )
+    except Exception:
+        # Proof telemetry must never change the encode/fallback behavior.
+        pass
 
 
 # ── CLIP execution-prefill phase attribution (Phase B diagnostics) ───
@@ -8309,6 +8386,125 @@ def _active_clip_span_trace() -> RuntimeTrace | None:
     return None
 
 
+_E31_PENDING_FORWARD_ATTR = "_comfymodal_e31_pending_forward_callback"
+_E31_FORWARD_EVIDENCE_SCHEMA = "e31.clip_forward"
+_E31_FORWARD_EVIDENCE_SCHEMA_VERSION = 1
+
+
+def _version_e31_forward_timing(record: Any) -> dict[str, Any]:
+    """Attach the stable JSON evidence envelope at publication time."""
+    result = dict(record) if isinstance(record, dict) else {}
+    result.setdefault("schema", _E31_FORWARD_EVIDENCE_SCHEMA)
+    result.setdefault("schema_version", _E31_FORWARD_EVIDENCE_SCHEMA_VERSION)
+    result.setdefault("evidence_version", _E31_FORWARD_EVIDENCE_SCHEMA_VERSION)
+    return result
+
+
+def register_e31_forward_callback(
+    cond_stage_model: Any,
+    callback: Callable[[dict[str, Any]], Any],
+    *,
+    generation: int,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Arm one bind-scoped callback on the existing outer CLIP forward.
+
+    Hydration runs from inside the first demand call, after the outer
+    ``encode_token_weights`` wrapper has entered.  Installing another method
+    hook at that point is too late for that in-flight forward.  This callback
+    is consumed by the already-installed outer wrapper after its real body
+    returns, without issuing a synthetic forward.
+    """
+    # Clear first, including when the replacement object no longer exposes
+    # the production boundary.  A failed registration must not preserve the
+    # previous generation's callback.
+    clear_e31_forward_callback(cond_stage_model)
+    if cond_stage_model is None or not callable(
+        getattr(type(cond_stage_model), "encode_token_weights", None)
+    ):
+        return {"installed": False, "reason": "no_encode_token_weights"}
+    method = getattr(type(cond_stage_model), "encode_token_weights", None)
+    if not getattr(method, _SENTINEL_CLIP_FORWARD, False):
+        return {"installed": False, "reason": "outer_forward_wrapper_unavailable"}
+    state = {
+        "installed": True,
+        "forward_observed": False,
+        "forward_actually_observed": False,
+        "generation": int(generation),
+        "bound_request_id": str(request_id or get_active_request_id()),
+        "identity": str(id(cond_stage_model)),
+        "method": "encode_token_weights",
+        "callback": callback,
+        "forward_count": 0,
+    }
+    setattr(cond_stage_model, _E31_PENDING_FORWARD_ATTR, state)
+    return state
+
+
+def clear_e31_forward_callback(cond_stage_model: Any) -> None:
+    try:
+        if cond_stage_model is not None and hasattr(cond_stage_model, _E31_PENDING_FORWARD_ATTR):
+            delattr(cond_stage_model, _E31_PENDING_FORWARD_ATTR)
+    except Exception:
+        pass
+
+
+def update_e31_forward_callback_generation(cond_stage_model: Any, *, generation: int) -> bool:
+    """Rebind a pending callback after instrumentation has been validated.
+
+    E31 validates the real-forward boundary before it publishes the cast
+    generation.  Updating the already-installed callback avoids reinstalling a
+    wrapper (and keeps the callback on the exact in-flight boundary) while
+    making the subsequent proof generation-scoped.
+    """
+    pending = getattr(cond_stage_model, _E31_PENDING_FORWARD_ATTR, None)
+    if not isinstance(pending, dict) or not callable(pending.get("callback")):
+        return False
+    pending["generation"] = int(generation)
+    return True
+
+
+def _consume_e31_forward_callback(
+    cond_stage_model: Any, *, forward_wall_ms: float, forward_timing: dict[str, Any] | None = None
+) -> None:
+    pending = getattr(cond_stage_model, _E31_PENDING_FORWARD_ATTR, None)
+    if not isinstance(pending, dict):
+        return
+    callback = pending.get("callback")
+    if not callable(callback):
+        return
+    if str(pending.get("identity", "")) != str(id(cond_stage_model)):
+        return
+    # Keep the state attached after the first proof.  A second real outer
+    # forward for the same bound generation/request must be visible as a
+    # count of two, not silently look like an independent successful proof.
+    forward_count = int(pending.get("forward_count", 0) or 0) + 1
+    pending["forward_count"] = forward_count
+    bound_request_id = str(pending.get("bound_request_id", "") or "")
+    # Prefill forwards may run on a lane context rather than the request
+    # context; both are the same request, and the lane trace is the canonical
+    # fallback used by the surrounding CLIP span wrapper.
+    active_trace = _active_clip_span_trace()
+    forward_request_id = str(
+        getattr(active_trace, "request_id", "") or get_active_request_id() or ""
+    )
+    observation = {
+        "forward_observed": True,
+        "forward_actually_observed": True,
+        "forward_method": "encode_token_weights",
+        "forward_wall_ms": round(float(forward_wall_ms), 3),
+        "forward_identity": str(id(cond_stage_model)),
+        "forward_generation": int(pending.get("generation", 0) or 0),
+        "forward_count": forward_count,
+        "real_outer_forward_count": forward_count,
+        "bound_request_id": bound_request_id,
+        "forward_request_id": forward_request_id,
+    }
+    if forward_timing is not None:
+        observation["forward_timing"] = dict(forward_timing)
+    callback(observation)
+
+
 def _make_clip_span_wrapper(
     span_name: str,
     depth_var: ContextVar[int],
@@ -8328,6 +8524,23 @@ def _make_clip_span_wrapper(
         _before = _clip_span_snapshot(with_cuda=with_cuda) if emit else None
         _status = "ok"
         _fast_cold_forward_started = False
+        _e31_forward_timer: Any = None
+        _e31_forward_evidence: dict[str, Any] | None = None
+        _e31_callback_error: BaseException | None = None
+        _forward_started_wall = time.perf_counter() if before == 0 and span_name == "clip_forward" else None
+        # E31 brackets the actual outermost encode_token_weights call.  This
+        # is deliberately independent of the request trace: a trace-less
+        # production forward is still real-forward evidence, while nested
+        # helper calls must not create an artificial second measurement.
+        if before == 0 and span_name == "clip_forward":
+            try:
+                from .clip_forward_forensics import ForwardTimer, e31_enabled
+
+                if e31_enabled():
+                    _e31_forward_timer = ForwardTimer()
+                    _e31_forward_timer.start()
+            except Exception:
+                _e31_forward_timer = None
         if emit and span_name == "clip_forward":
             # Real outermost CLIP forward begins: fire the milestone used
             # by the execution-unet H2D delay gate (a cache-hit request
@@ -8348,6 +8561,11 @@ def _make_clip_span_wrapper(
             except Exception:
                 _ledger_clip_forward = None
         if before == 0 and span_name == "clip_forward":
+            try:
+                from . import clean_lane as _clean_lane
+                _clean_lane.mark_forward(trace, phase="start")
+            except Exception:
+                pass
             try:
                 from .fast_cold_orchestration import mark_clip_forward_start
 
@@ -8387,6 +8605,8 @@ def _make_clip_span_wrapper(
             except Exception:
                 _opt_clip_interval = None
         try:
+            if _e31_forward_timer is not None:
+                _e31_forward_timer.mark_forward_observed()
             return original(*args, **kwargs)
         except BaseException:
             _status = "error"
@@ -8400,6 +8620,25 @@ def _make_clip_span_wrapper(
                     _ledger_clip_forward.finish(mono_ns=time.monotonic_ns())
                 except Exception:
                     pass
+            if before == 0 and span_name == "clip_forward" and _status == "ok" and args:
+                try:
+                    # Resolve the synchronized timing before invoking the
+                    # proof callback.  This makes trace-less forwards carry
+                    # the same timing/evidence as traced forwards.
+                    if _e31_forward_timer is not None:
+                        _e31_forward_evidence = _version_e31_forward_timing(
+                            _e31_forward_timer.end()
+                        )
+                    _consume_e31_forward_callback(
+                        args[0],
+                        forward_wall_ms=(
+                            (time.perf_counter() - _forward_started_wall) * 1000.0
+                            if _forward_started_wall is not None else 0.0
+                        ),
+                        forward_timing=_e31_forward_evidence,
+                    )
+                except BaseException as exc:
+                    _e31_callback_error = exc
             if _fast_cold_forward_started:
                 try:
                     from .fast_cold_orchestration import mark_clip_forward_end
@@ -8408,6 +8647,28 @@ def _make_clip_span_wrapper(
                         request_id=str(getattr(trace, "request_id", "") or ""),
                         trace=trace,
                     )
+                except Exception:
+                    pass
+            try:
+                from . import clean_lane as _clean_lane
+                if before == 0 and span_name == "clip_forward" and _status == "ok":
+                    _clean_lane.mark_forward(trace, phase="end")
+            except Exception:
+                pass
+            if _e31_forward_timer is not None:
+                try:
+                    if _e31_forward_evidence is None:
+                        _e31_forward_evidence = _version_e31_forward_timing(
+                            _e31_forward_timer.end()
+                        )
+                    if trace is not None:
+                        trace.emit_at(
+                            "clip_forward_evidence",
+                            wall_unix_ns=time.time_ns(),
+                            monotonic_ns=_e31_forward_evidence.get("clip_forward_end"),
+                            phase="execution",
+                            metadata=dict(_e31_forward_evidence),
+                        )
                 except Exception:
                     pass
             # ── LANE 2 (measurement-only): publish the CLIP forward window ──
@@ -8444,6 +8705,8 @@ def _make_clip_span_wrapper(
                     phase="execution",
                     metadata=_meta,
                 )
+            if _e31_callback_error is not None:
+                raise _e31_callback_error
 
     setattr(wrapper, _SENTINEL_CLIP_SPAN, True)
     return wrapper
@@ -8489,27 +8752,45 @@ def _install_clip_span_wrappers(
         ("clip_gpu_prepare", "load_model", _clip_gpu_prepare_depth, True, None),
         ("clip_raw_encode", "encode_from_tokens", _clip_raw_encode_depth, False, _clip_raw_encode_pre_hook),
         ("clip_scheduled_conditioning", "encode_from_tokens_scheduled", _clip_scheduled_depth, False, None),
+        # Install the actual outer forward boundary without waiting for a
+        # trace or for the raw-encode pre-hook.  Demand hydration happens from
+        # inside this call, so a late wrapper would miss the first real
+        # forward and could only manufacture evidence afterward.
+        ("clip_forward", "encode_token_weights", _clip_forward_depth, True, None),
     )
     with _wrappers_lock:
         for span_name, method_name, depth_var, with_cuda, pre_hook in _specs:
+            if method_name == "encode_token_weights":
+                try:
+                    from comfymodal_runtime.clip_forward_forensics import e31_enabled
+
+                    if not e31_enabled():
+                        continue
+                except Exception:
+                    continue
             _orig = getattr(CLIP_cls, method_name, None)
             if not callable(_orig):
+                # ``encode_token_weights`` is an optional CLIP boundary on
+                # small/fake implementations.  Do not turn its absence into
+                # a failed installation result for the other spans.
+                if method_name == "encode_token_weights":
+                    continue
                 result[span_name] = "unavailable"
                 continue
             if getattr(_orig, _SENTINEL_CLIP_SPAN, False):
                 result[span_name] = "already_installed"
                 continue
-            setattr(
-                CLIP_cls, method_name,
-                _make_clip_span_wrapper(
-                    span_name, depth_var, _orig, with_cuda=with_cuda, pre_hook=pre_hook,
-                ),
+            _wrapped = _make_clip_span_wrapper(
+                span_name, depth_var, _orig, with_cuda=with_cuda, pre_hook=pre_hook,
             )
+            if method_name == "encode_token_weights":
+                setattr(_wrapped, _SENTINEL_CLIP_FORWARD, True)
+            setattr(CLIP_cls, method_name, _wrapped)
             result[span_name] = "installed"
     return result
 
 
-def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
+def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, Any]:
     """Idempotent per-component installation using live modules.
 
     Resolves ``comfy.utils`` and ``comfy.model_management`` via
@@ -8578,6 +8859,23 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
         except Exception as _e27_exc:
             result["e27_soft_cache_chain"] = (
                 f"error:{type(_e27_exc).__name__}:{str(_e27_exc)[:120]}")
+        # ── E31: audit the real CLIP cast surfaces ────────────────────────
+        # Limited to comfy.ops/model_management entry points; torch
+        # operations are intentionally never patched.
+        try:
+            from comfymodal_runtime.clip_forward_forensics import (
+                e31_enabled,
+                install_cast_forensics,
+            )
+
+            if e31_enabled():
+                result["e31_cast_forensics"] = install_cast_forensics(
+                    _get_live_module("comfy.ops"), mm_mod,
+                )
+        except Exception as _e31_exc:
+            result["e31_cast_forensics"] = (
+                f"error:{type(_e31_exc).__name__}:{str(_e31_exc)[:120]}"
+            )
     else:
         result["load_models_gpu"] = "unavailable"
         result["cast_to_device"] = "unavailable"
@@ -12836,6 +13134,14 @@ class V2LoaderBridge:
                 for entry in _cc_miss_entries:
                     text = str(entry.get("text", ""))
                     try:
+                        if _cc_cache_svc is None:
+                            _emit_clean_lane_forced_miss_evidence(
+                                trace,
+                                clip=clip,
+                                text=text,
+                                request_id=_request_id,
+                                reason="cache_service_disabled_or_unavailable",
+                            )
                         result = _record_clip_encode(
                             caller="execution_prefill", clip=clip, text=text,
                             _explicit_state=_worker_state,
@@ -14723,6 +15029,13 @@ class V2LoaderBridge:
             _emit_reconciliation("fallback_error")
             return _LOADER_MISS
         if result is _LOADER_MISS:
+            _emit_clean_lane_forced_miss_evidence(
+                self._trace,
+                clip=clip,
+                text=text,
+                request_id=str(self._trace.request_id) if self._trace is not None else "",
+                reason="clean_lane_forced_miss",
+            )
             if self._trace:
                 self._trace.emit("graph_prefill_wait_end", phase="execution", metadata={"status": "unavailable"})
                 self._trace.emit("graph_wait_finished", phase="execution", metadata={

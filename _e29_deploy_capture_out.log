@@ -1,0 +1,46 @@
+command: "deploy_and_run_v2_single.bat" E28_VALIDATION
+selector: E28_VALIDATION
+exit: 0
+stdout tail:
+/*, /comfymodal/history-v2/feed, /comfymodal/history-v2/generations/{id}/*, /comfymodal/history-v2/experiments/{id}/*, /comfymodal/history-v2/assets/{id}
+⚠️  SeedVR2 optimizations check: SageAttention ❌ | Flash Attention ❌ | Triton ❌
+💡 For best performance: pip install sageattention flash-attn triton
+📊 Initial CUDA memory: 6.91GB free / 8.00GB total
+### ComfyUI-Workflow-Encrypt: Copy .js from 'C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-workflow-encrypt\js\comfyui-workflow-encrypt.js' to 'C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\web\extensions\comfyui-workflow-encrypt'
+# 😺dzNodes: LayerStyle -> [1;33mCannot import name 'guidedFilter' from 'cv2.ximgproc'
+A few nodes cannot works properly, while most nodes are not affected. Please REINSTALL package 'opencv-contrib-python'.
+For detail refer to [4mhttps://github.com/chflame163/ComfyUI_LayerStyle/issues/5[0m[m
+(RES4LYF) Init
+(RES4LYF) Importing beta samplers.
+(RES4LYF) Importing legacy samplers.
+
+[92m[rgthree-comfy] Loaded 48 exciting nodes. 🎉[0m
+
+[33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+[0m
+[v2.harness] production_output_registered output=True comparer=True
+[v2.harness] node_registry_initialized classes=2192
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[v2.plan_proof] schema=1 payload=yes validated=True outputs=2 wf_hash=2e43d4c0ba3b82c0 dep_complete=True reg_proof=1 memo=hit
+{"prime_registry_proof": true, "registry_load_ms": 25146.6, "workflow_hash": "2e43d4c0ba3b82c0", "store_entry_persisted": true, "store_path": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\.cache\\v2_registry_proof_store.json", "prime_ok": true}
+Cannot connect to comfyregistry.
+FETCH DATA from: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/custom-node-list.json[ComfyUI-Manager] Due to a network error, switching to local mode.
+=> custom-node-list.json
+=> cannot schedule new futures after shutdown
+FETCH DATA from: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-manager\custom-node-list.json [DONE]
+=== Deploy-only requested; acceptance benchmark skipped ===
+
+stderr tail:
+ost recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3\__init__.py", line 11, in <module>
+    from .src.comfyui_sam3.nodes import NODE_CLASS_MAPPINGS
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3\src\comfyui_sam3\nodes.py", line 6, in <module>
+    from sam3.model_builder import build_sam3_image_model, build_sam3_video_model
+ModuleNotFoundError: No module named 'sam3'
+
+WARNING:root:Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3 module for custom nodes: No module named 'sam3'
+

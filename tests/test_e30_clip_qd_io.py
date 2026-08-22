@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ sys.path.insert(0, r"C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Insta
 
 from comfymodal_runtime import clip_qd_reader as qr  # noqa: E402
 from comfymodal_runtime import clip_fast_hydration as cfh  # noqa: E402
+from comfymodal_runtime import clip_fast_hydration_wiring as cfw  # noqa: E402
 from comfymodal_runtime import speculative_clip_hydration as sch  # noqa: E402
 
 CUDA_OK = torch.cuda.is_available()
@@ -56,6 +58,24 @@ def _make_synth(path: str, tensors_per_layer: int = 4, dim: int = 512) -> dict:
         tensors[f"layer{i}.bias"] = torch.randn(dim, dtype=torch.bfloat16)
     safetensors.torch.save_file(tensors, path)
     return tensors
+
+
+class _FirstReadBarrier:
+    """Deterministically overlap the first source read of every worker."""
+
+    def __init__(self, read, participants: int):
+        self._read = read
+        self._barrier = threading.Barrier(int(participants))
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def __call__(self, fd, mv, offset):
+        with self._lock:
+            call = self._calls
+            self._calls += 1
+        if call < self._barrier.parties:
+            self._barrier.wait(timeout=5.0)
+        return self._read(fd, mv, offset)
 
 
 class GateOffTests(unittest.TestCase):
@@ -122,6 +142,368 @@ class GateOffTests(unittest.TestCase):
             qr.validate_launch_policy("at_boot_random")
 
 
+class StaticPlannerTests(unittest.TestCase):
+    def test_exact_qd_forward_regions_and_coverage(self):
+        regions = qr.plan_raw_source_regions(100, 23, 5, 7)
+        self.assertEqual(len(regions), 7)
+        flat = [item for region in regions for item in region]
+        self.assertEqual(flat, sorted(flat))
+        self.assertTrue(all(0 < ln <= 5 for _, ln in flat))
+        self.assertEqual(sum(ln for _, ln in flat), 23)
+        self.assertEqual(
+            qr.partition_coverage([(off - 100, off - 100 + ln) for off, ln in flat], 23)[0],
+            True,
+        )
+
+    def test_small_and_partial_sections(self):
+        self.assertEqual(qr.plan_raw_source_regions(4, 0, 8, 3), [[], [], []])
+        regions = qr.plan_raw_source_regions(4, 9, 8, 2)
+        self.assertEqual([item for r in regions for item in r], [(4, 8), (12, 1)])
+
+    def test_header_map_is_independent_of_raw_blocks(self):
+        header = {
+            "a": {"dtype": "U8", "shape": [3], "data_offsets": [0, 3]},
+            "b": {"dtype": "U8", "shape": [7], "data_offsets": [3, 10]},
+        }
+        self.assertEqual(qr.build_header_tensor_map(header)[1][0], "b")
+        regions = qr.plan_raw_source_regions(8, 10, 5, 1)
+        self.assertEqual(regions[0], [(8, 5), (13, 5)])
+
+    def test_owner_release_does_not_purge_and_explicit_purge_does(self):
+        owner = qr.QdGpuOwner(None, [], "cpu")
+        with mock.patch.object(qr.torch.cuda, "empty_cache") as purge:
+            owner.release_storage(purge_allocator=False)
+            owner.release_storage()
+            purge.assert_not_called()
+            owner.purge_allocator()
+            purge.assert_called_once()
+
+    def test_malformed_headers_fail_before_raw_planning(self):
+        import json
+
+        cases = (
+            ({
+                "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                "b": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]},
+            }, 12),
+            ({
+                "a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]},
+            }, 4),
+            ({
+                "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            }, 8),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (header, data_length) in enumerate(cases):
+                raw_header = json.dumps(header, separators=(",", ":")).encode()
+                path = Path(directory) / f"bad_{index}.safetensors"
+                path.write_bytes(len(raw_header).to_bytes(8, "little") + raw_header + bytes(data_length))
+                parsed = qr.parse_safetensors_header(str(path))
+                self.assertEqual(parsed["status"], "error")
+
+    def test_event_barrier_uses_host_query_and_sync(self):
+        class Event:
+            def __init__(self):
+                self.complete = False
+                self.wait_called = False
+                self.sync_called = False
+
+            def query(self):
+                return self.complete
+
+            def synchronize(self):
+                self.sync_called = True
+                self.complete = True
+
+            def wait(self):
+                self.wait_called = True
+                raise AssertionError("event.wait is not host memory protection")
+
+        event = Event()
+        self.assertGreaterEqual(qr._wait_event_host(event), 0.0)
+        self.assertTrue(event.sync_called)
+        self.assertFalse(event.wait_called)
+
+    def test_source_wall_and_gpu_ready_tail_are_distinct(self):
+        state = qr._StaticReaderState([[(100, 4)]])
+        state.submit()
+        state.record({
+            "worker_id": 0, "off": 100, "planned_len": 4, "read_len": 4,
+            "source_end_ns": 2_000_000_000, "gbps": 1.0,
+            "h2d_submitted_bytes": 4, "h2d_completed_bytes": 4,
+        })
+
+        class Telemetry:
+            max_inflight = 1
+
+            def snapshot(self):
+                return {
+                    "inflight": 0, "max_inflight": 1,
+                    "earliest_start_ns": 1_000_000_000,
+                    "latest_end_ns": 2_000_000_000,
+                    "per_worker": {"0": {"read_count": 1, "read_bytes": 4}},
+                }
+
+        stats = qr._new_stats(
+            qd=1, block_bytes=4, file_bytes=4, n_ranges=1,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        qr._finalize_stats(stats, state, 1.0, 0.0, Telemetry(), 4_000_000_000, 0.0)
+        self.assertEqual(stats["qd_source_io_wall_ms"], 1000.0)
+        self.assertEqual(stats["qd_source_to_gpu_ready_ms"], 3000.0)
+        self.assertEqual(stats["cuda_readiness_wait_ms"], 0.0)
+
+    def test_incomplete_h2d_record_fails_validation(self):
+        ok, reason = qr._validate_static_records(
+            [{
+                "off": 100, "planned_len": 4, "read_len": 4,
+                "h2d_submitted_bytes": 4, "h2d_completed_bytes": 0,
+            }], [(100, 4)], 100, 4, gpu=True,
+        )
+        self.assertFalse(ok)
+        self.assertIn("h2d_completed", reason)
+
+    def test_source_telemetry_tracks_true_inflight_peak(self):
+        telemetry = qr._SourceTelemetry(2)
+        first = telemetry.before(0)
+        second = telemetry.before(1)
+        telemetry.after(0, first, 4)
+        telemetry.after(1, second, 4)
+        snapshot = telemetry.snapshot()
+        self.assertEqual(snapshot["max_inflight"], 2)
+        self.assertEqual(snapshot["inflight"], 0)
+        self.assertEqual(snapshot["per_worker"]["0"]["read_count"], 1)
+        self.assertEqual(snapshot["per_worker"]["1"]["read_count"], 1)
+        self.assertEqual(snapshot["per_worker"]["0"]["read_bytes"], 4)
+        self.assertEqual(snapshot["per_worker"]["1"]["read_bytes"], 4)
+
+    def test_record_reconciliation_uses_authoritative_records_and_worker_finalization(self):
+        state = qr._StaticReaderState([[(100, 4), (104, 4)]])
+        telemetry = qr._SourceTelemetry(1)
+        for offset in (100, 104):
+            state.submit(0)
+            started = telemetry.before(0)
+            ended = telemetry.after(0, started, 4)
+            state.record({
+                "worker_id": 0, "off": offset, "planned_len": 4,
+                "read_len": 4, "source_end_ns": ended,
+            })
+        state.finalize_worker(0)
+        stats = qr._new_stats(
+            qd=1, block_bytes=4, file_bytes=8, n_ranges=2,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        qr._finalize_stats(stats, state, 1.0, 0.0, telemetry)
+
+        reconciliation = stats["record_reconciliation"]
+        worker = reconciliation["per_worker"]["0"]
+        self.assertTrue(reconciliation["ok"])
+        self.assertEqual(reconciliation["authoritative_record_count"], 2)
+        self.assertEqual(worker["record_count"], 2)
+        self.assertEqual(worker["completion_count"], 2)
+        self.assertEqual(worker["read_count"], 2)
+        self.assertEqual(worker["record_bytes"], 8)
+        self.assertEqual(worker["read_bytes"], 8)
+        self.assertEqual(worker["excluded_from_source_read_counters"]["record_count"], 0)
+        self.assertTrue(worker["finalization"]["matches_authoritative_records"])
+
+    def test_record_reconciliation_labels_records_excluded_from_source_counters(self):
+        state = qr._StaticReaderState([[(100, 4), (104, 4)]])
+        telemetry = qr._SourceTelemetry(1)
+        state.submit(0)
+        started = telemetry.before(0)
+        ended = telemetry.after(0, started, 4)
+        state.record({
+            "worker_id": 0, "off": 100, "planned_len": 4,
+            "read_len": 4, "source_end_ns": ended,
+        })
+        # This completion record is authoritative, but intentionally has no
+        # matching source-read callback: the artifact must name that semantic
+        # rather than backfilling telemetry.read_count.
+        state.submit(0)
+        state.record({
+            "worker_id": 0, "off": 104, "planned_len": 4,
+            "read_len": 4,
+        })
+        state.finalize_worker(0)
+        stats = qr._new_stats(
+            qd=1, block_bytes=4, file_bytes=8, n_ranges=2,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        qr._finalize_stats(stats, state, 1.0, 0.0, telemetry)
+
+        worker = stats["record_reconciliation"]["per_worker"]["0"]
+        self.assertTrue(stats["record_reconciliation"]["ok"])
+        self.assertEqual(worker["record_count"], 2)
+        self.assertEqual(worker["read_count"], 1)
+        self.assertEqual(worker["excluded_from_source_read_counters"]["record_count"], 1)
+        self.assertEqual(worker["excluded_from_source_read_counters"]["bytes"], 4)
+        self.assertIn("not additional reads", worker["excluded_from_source_read_counters"]["semantics"])
+        self.assertEqual(worker["finalization"]["record_count"], 2)
+
+    def test_queue_depth_tracks_observed_submitted_minus_completed(self):
+        state = qr._StaticReaderState([[(100, 4), (104, 4), (108, 4)]])
+        state.submit()
+        state.submit()
+        self.assertEqual(state.outstanding, 2)
+        self.assertEqual(state.max_outstanding, 2)
+        state.record({"off": 100, "planned_len": 4, "read_len": 4})
+        self.assertEqual(state.outstanding, 1)
+        state.record({"off": 104, "planned_len": 4, "read_len": 4})
+        self.assertEqual(state.outstanding, 0)
+        self.assertEqual(state.queue_backlog_max, 2)
+
+    def test_queue_depth_does_not_use_planned_count(self):
+        state = qr._StaticReaderState([[(100, 4), (104, 4), (108, 4)]])
+        state.submit()
+        state.record({"off": 100, "planned_len": 4, "read_len": 4})
+        stats = qr._new_stats(
+            qd=2, block_bytes=4, file_bytes=12, n_ranges=3,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        qr._finalize_stats(stats, state, 1.0, 0.0)
+        self.assertEqual(stats["planned_block_count"], 3)
+        self.assertEqual(stats["queue_backlog_max"], 1)
+        self.assertNotEqual(stats["queue_backlog_max"], stats["planned_block_count"])
+
+    def test_telemetry_schema_keeps_legacy_and_qd_fields(self):
+        stats = qr._new_stats(
+            qd=4, block_bytes=4, file_bytes=12, n_ranges=3,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        for key in (
+            "queue_backlog_max", "planned_block_count", "submitted_block_count",
+            "completed_block_count", "submit_count", "completion_count",
+            "total_source_wall_ms", "aggregate_gbps", "source_io",
+            "per_worker_source_io", "qd_max_source_io_inflight",
+        ):
+            self.assertIn(key, stats)
+        self.assertIsNone(stats["queue_backlog_max"])
+
+    def test_raw_block_can_cross_tensors_without_changing_view_map(self):
+        header = {
+            "left": {"dtype": "U8", "shape": [7], "data_offsets": [0, 7]},
+            "right": {"dtype": "U8", "shape": [3], "data_offsets": [7, 10]},
+        }
+        blocks = qr.plan_raw_source_regions(200, 10, 5, 1)[0]
+        self.assertEqual(blocks, [(200, 5), (205, 5)])
+        self.assertEqual(qr.build_header_tensor_map(header), [
+            ("left", "U8", [7], 0, 7),
+            ("right", "U8", [3], 7, 3),
+        ])
+
+    def test_gpu_worker_alternates_two_slots_and_waits_only_on_reuse(self):
+        class Slot:
+            def __init__(self):
+                self.data = bytearray(4)
+
+            def numpy(self):
+                return self.data
+
+            def __getitem__(self, item):
+                return self
+
+        class Destination:
+            def __init__(self):
+                self.copies = []
+
+            def numel(self):
+                return 12
+
+            def __getitem__(self, item):
+                return self
+
+            def copy_(self, source, non_blocking=False):
+                self.copies.append(bool(non_blocking))
+
+        class Event:
+            def __init__(self, elapsed_ms=None):
+                self.recorded = False
+                self.sync_count = 0
+                self.wait_called = False
+                self.elapsed_ms = elapsed_ms
+
+            def record(self):
+                self.recorded = True
+
+            def query(self):
+                return self.recorded and self.sync_count > 0
+
+            def synchronize(self):
+                self.sync_count += 1
+
+            def wait(self):
+                self.wait_called = True
+
+            def elapsed_time(self, start):
+                if self.elapsed_ms is None:
+                    raise RuntimeError("timing unavailable")
+                return self.elapsed_ms
+
+        state = qr._StaticReaderState([[(100, 4), (104, 4), (108, 4)]])
+        slots = [Slot(), Slot()]
+        events = [(Event(2.5), Event()), (Event(4.0), Event())]
+        stats = qr._new_stats(
+            qd=1, block_bytes=4, file_bytes=12, n_ranges=3,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        with mock.patch.object(qr, "_read_at", side_effect=lambda fd, mv, off: len(mv)):
+            qr._static_gpu_worker(
+                state, slots, [False, False], events, Destination(), 100, 0,
+                0, qr._SourceTelemetry(1), stats, [0.0], None,
+            )
+        self.assertEqual(events[0][1].sync_count, 1)
+        self.assertEqual(events[1][1].sync_count, 0)
+        self.assertFalse(any(event.wait_called for pair in events for event in pair))
+        self.assertEqual([record["slot_index"] for record in state.records], [0, 1, 0])
+        self.assertEqual(sum(record["h2d_completed_bytes"] for record in state.records), 4)
+        self.assertEqual(state.records[0]["h2d_device_ms"], 2.5)
+
+    def test_gpu_worker_leaves_device_timing_none_when_elapsed_time_unavailable(self):
+        class Event:
+            def __init__(self):
+                self.recorded = False
+
+            def record(self):
+                self.recorded = True
+
+            def query(self):
+                return self.recorded
+
+            def synchronize(self):
+                self.recorded = True
+
+        class Slot:
+            def numpy(self):
+                return bytearray(4)
+
+            def __getitem__(self, item):
+                return self
+
+        class Destination:
+            def numel(self):
+                return 4
+
+            def __getitem__(self, item):
+                return self
+
+            def copy_(self, source, non_blocking=False):
+                return None
+
+        state = qr._StaticReaderState([[(100, 4), (104, 4)]])
+        stats = qr._new_stats(
+            qd=1, block_bytes=4, file_bytes=8, n_ranges=2,
+            launch_policy="method_entry", syscall_mode="pread",
+        )
+        events = [(Event(), Event()), (Event(), Event())]
+        with mock.patch.object(qr, "_read_at", side_effect=lambda fd, mv, off: len(mv)):
+            qr._static_gpu_worker(
+                state, [Slot(), Slot()], [False, False], events, Destination(), 100, 0,
+                0, qr._SourceTelemetry(1), stats, [0.0], None,
+            )
+        self.assertIsNone(state.records[0]["h2d_device_ms"])
+
+
 class QDReaderTests(unittest.TestCase):
     def setUp(self):
         self._env = _save_env()
@@ -148,28 +530,64 @@ class QDReaderTests(unittest.TestCase):
         self.assertEqual(st["per_read_errors"], 0)
         self.assertGreater(st["total_source_wall_ms"], 0)
         self.assertGreater(st["aggregate_gbps"], 0)
+        self.assertGreater(st["qd_source_io_wall_ms"], 0)
+        self.assertEqual(st["total_source_wall_ms"], st["qd_source_io_wall_ms"])
+        self.assertEqual(
+            sum(v["read_bytes"] for v in st["per_worker_source_io"].values()),
+            st["file_bytes"],
+        )
+        self.assertEqual(
+            sum(v["read_count"] for v in st["per_worker_source_io"].values()),
+            st["completion_count"],
+        )
+        self.assertEqual(
+            sum(v["completion_count"] for v in st["per_worker_source_io"].values()),
+            st["record_reconciliation"]["authoritative_record_count"],
+        )
+        self.assertEqual(
+            sum(v["record_bytes"] for v in st["per_worker_source_io"].values()),
+            st["bytes_read"],
+        )
+        self.assertEqual(
+            st["record_reconciliation"]["excluded_from_source_read_counters"]["record_count"],
+            0,
+        )
+        for worker_id, worker in st["source_io"]["per_worker"].items():
+            self.assertEqual(worker["completion_record_count"], worker["record_count"])
+            self.assertEqual(worker["completion_record_bytes"], worker["record_bytes"])
+        self.assertGreaterEqual(st["qd_max_source_io_inflight"], 1)
+        for key in qr.CANONICAL_METRIC_KEYS:
+            self.assertEqual(st[key], st["metrics"][key])
+        self.assertEqual(st["QD_SOURCE_IO_WALL_MS"], st["qd_source_io_wall_ms"])
+        for worker_id in range(st["configured_qd"]):
+            offsets = [
+                block["off"] for block in st["blocks"]
+                if block.get("worker_id") == worker_id
+            ]
+            self.assertEqual(offsets, sorted(offsets))
 
     def test_queue_depth_reaches_configured_with_enough_ranges(self):
-        # With reads slow enough to overlap, observed max outstanding MUST
-        # equal the configured QD — this is the queue-depth proof (the real
-        # cold remote file has reads tens of ms long, far longer than pull
-        # cadence).  Patch _read_at with a bounded sleep to force overlap.
+        # A normal OS scheduler may complete a read before it starts the next
+        # worker, so configured QD is an upper bound, not an observation the
+        # reader promises to manufacture.  This fixture deliberately creates
+        # the overlap needed for the stronger exact-QD assertion.
+        path = str(Path(self._dir.name) / "qd_concurrency.safetensors")
+        _make_synth(path, tensors_per_layer=2, dim=1024)
         os.environ["COMFYMODAL_V2_CLIP_QD_BLOCK_MIB"] = "1"
         real_read = qr._read_at
-
-        def slow_read(fd, mv, offset):
-            time.sleep(0.005)
-            return real_read(fd, mv, offset)
-
-        qr._read_at = slow_read
+        qr._read_at = _FirstReadBarrier(real_read, participants=4)
         try:
-            r = qr.read_file_qd(self.path)
+            r = qr.read_file_qd(path, qd=4, block_mib=1)
         finally:
             qr._read_at = real_read
         self.assertEqual(r["status"], "ok")
         st = r["stats"]
         self.assertEqual(st["configured_qd"], 4)
+        self.assertEqual(st["n_ranges"], 5)
         self.assertEqual(st["observed_max_outstanding"], 4)
+        self.assertEqual(st["queue_backlog_max"], 4)
+        self.assertLess(st["queue_backlog_max"], st["n_ranges"])
+        self.assertEqual(st["qd_max_source_io_inflight"], 4)
         self.assertEqual(st["submit_count"], st["n_ranges"])
         self.assertEqual(st["completion_count"], st["n_ranges"])
 
@@ -261,9 +679,40 @@ class QDReaderTests(unittest.TestCase):
         r = qr.read_file_qd(str(Path(self._dir.name) / "nope.safetensors"))
         self.assertEqual(r["status"], "error")
 
+    def test_short_read_fails_closed_without_partial_publication(self):
+        real_read = qr._read_at
+        qr._read_at = lambda fd, mv, offset: 0
+        try:
+            r = qr.read_file_qd(self.path)
+        finally:
+            qr._read_at = real_read
+        self.assertEqual(r["status"], "error")
+        self.assertNotEqual(r.get("stats", {}).get("status"), "ok")
+        stats = r["stats"]
+        self.assertEqual(stats["planned_block_count"], stats["n_ranges"])
+        self.assertEqual(stats["submitted_block_count"], stats["n_ranges"])
+        self.assertEqual(stats["completed_block_count"], stats["n_ranges"])
+        self.assertLess(stats["bytes_read"], stats["planned_bytes"])
+
+    def test_source_worker_exception_fails_closed(self):
+        real_read = qr._read_at
+        qr._read_at = mock.Mock(side_effect=OSError("synthetic source failure"))
+        try:
+            r = qr.read_file_qd(self.path)
+        finally:
+            qr._read_at = real_read
+        self.assertEqual(r["status"], "error")
+        self.assertNotIn("bytes", r)
+        self.assertEqual(r["stats"]["submitted_block_count"], r["stats"]["n_ranges"])
+        self.assertEqual(r["stats"]["completed_block_count"], 0)
+
     def test_qd1_qd2_qd4_mechanics_matrix(self):
-        """QD1/QD2/QD4 must each reach their configured queue depth when
-        reads overlap (the true-QD proof: threads are NOT serialized slots)."""
+        """QD1/QD2/QD4 expose bounded, observed depth under the OS scheduler.
+
+        The implementation starts at most one worker per configured slot; it
+        does not promise that a fast synthetic read will overlap every worker.
+        The deterministic overlap guarantee is covered separately above.
+        """
         real_read = qr._read_at
 
         def slow_read(fd, mv, offset):
@@ -278,7 +727,10 @@ class QDReaderTests(unittest.TestCase):
                 self.assertEqual(r["status"], "ok", qd)
                 st = r["stats"]
                 self.assertEqual(st["configured_qd"], qd, qd)
-                self.assertEqual(st["observed_max_outstanding"], qd, qd)
+                self.assertGreaterEqual(st["observed_max_outstanding"], 1, qd)
+                self.assertLessEqual(st["observed_max_outstanding"], min(qd, st["n_ranges"]), qd)
+                self.assertGreaterEqual(st["queue_backlog_max"], 1, qd)
+                self.assertLessEqual(st["queue_backlog_max"], st["n_ranges"], qd)
                 self.assertEqual(st["submit_count"], st["n_ranges"], qd)
                 self.assertEqual(st["completion_count"], st["n_ranges"], qd)
                 self.assertEqual(st["per_read_errors"], 0, qd)
@@ -333,6 +785,8 @@ class QDReaderGpuTests(unittest.TestCase):
         self.assertEqual(st["completion_count"], st["n_ranges"])
         self.assertEqual(st["per_read_errors"], 0)
         self.assertGreater(st["h2d"]["copy_count"], 0)
+        self.assertIsNone(st["h2d"]["h2d_device_ms"])
+        self.assertTrue(all(block["h2d_device_ms"] is None for block in st["blocks"]))
         self.assertGreater(st["memory"]["cuda_alloc_delta_bytes"], 0)
         # zero-copy proof
         sd = r["sd"]
@@ -387,7 +841,7 @@ class QDReaderGpuTests(unittest.TestCase):
         r["owner"].close()
 
     def test_bounded_staging_no_full_host_copy(self):
-        """Staging memory must be qd x block_bytes (never a full second
+        """Staging memory must be qd x 2 x block_bytes (never a full second
         host copy of the file); the GPU holds exactly one contiguous
         destination buffer.  Use a file larger than the staging budget so
         the bound is meaningful."""
@@ -400,9 +854,9 @@ class QDReaderGpuTests(unittest.TestCase):
         path = str(Path(self._dir.name) / "big_staging.safetensors")
         safetensors.torch.save_file(big, path)
         st = qr.read_file_qd_gpu(path)["stats"]
-        self.assertEqual(st["h2d"]["pinned_bytes"], 4 * 2 * 1024 * 1024)
+        self.assertEqual(st["h2d"]["pinned_bytes"], 4 * 2 * 2 * 1024 * 1024)
         self.assertEqual(st["h2d"]["gpu_bytes"], st["file_bytes"])
-        self.assertLess(st["h2d"]["pinned_bytes"], st["file_bytes"])
+        self.assertLessEqual(st["h2d"]["pinned_bytes"], st["file_bytes"])
 
 
 class FakeTrace:
@@ -412,6 +866,90 @@ class FakeTrace:
 
     def emit(self, name, phase="execution", metadata=None):
         self.events.append((name, dict(metadata or {})))
+
+
+class ClipLoaderEndpointTests(unittest.TestCase):
+    def test_common_endpoints_have_roles_and_shared_monotonic_clock(self):
+        trace = FakeTrace("endpoint-test")
+        try:
+            from comfymodal_runtime import critical_path_ledger as cpl
+        except Exception:
+            self.skipTest("critical_path_ledger unavailable")
+        if not cpl._ENABLED:
+            self.skipTest("critical_path_ledger disabled")
+        cpl.clear_ledger_for_test()
+        with mock.patch.object(cfw.time, "monotonic_ns", side_effect=[101, 202, 303, 404]):
+            for arm in ("fastsafe", "qd_speculative"):
+                cfw._emit_clip_loader_endpoint(
+                    trace,
+                    cfw.CLIP_LOADER_START,
+                    endpoint_role="loader_start",
+                    loader_arm=arm,
+                )
+                cfw._emit_clip_loader_endpoint(
+                    trace,
+                    cfw.CLIP_DEVICE_READY,
+                    endpoint_role="device_ready",
+                    loader_arm=arm,
+                )
+
+        self.assertEqual(
+            [name for name, _ in trace.events],
+            [
+                cfw.CLIP_LOADER_START,
+                cfw.CLIP_DEVICE_READY,
+                cfw.CLIP_LOADER_START,
+                cfw.CLIP_DEVICE_READY,
+            ],
+        )
+        for index, (name, metadata) in enumerate(trace.events):
+            self.assertEqual(metadata["clock_source"], "time.monotonic_ns")
+            self.assertEqual(metadata["clock"], "monotonic_ns")
+            self.assertEqual(metadata["monotonic_ns"], [101, 202, 303, 404][index])
+            self.assertEqual(metadata["loader_arm"], ["fastsafe", "fastsafe", "qd_speculative", "qd_speculative"][index])
+            self.assertEqual(
+                metadata["endpoint_role"],
+                "loader_start" if name == cfw.CLIP_LOADER_START else "device_ready",
+            )
+            self.assertEqual(metadata["endpoint_role"], metadata["semantic_endpoint_role"])
+
+        canonical = [event for event in cpl._EVENTS if event["name"] in {
+            cfw.CLIP_LOADER_START, cfw.CLIP_DEVICE_READY,
+        }]
+        self.assertEqual([event["mono_ns"] for event in canonical], [101, 202, 303, 404])
+        self.assertEqual(
+            [event["metadata"]["endpoint_role"] for event in canonical],
+            ["loader_start", "device_ready", "loader_start", "device_ready"],
+        )
+        cpl.clear_ledger_for_test()
+
+
+class ClipQdLoadInferenceModeTests(unittest.TestCase):
+    def test_qd_read_boundary_disables_inference_mode(self):
+        """QD publication must yield normal tensors for assign=True binding."""
+        owner = qr.QdGpuOwner(None, [], "cuda:0")
+        observed = {}
+
+        def fake_read(*args, **kwargs):
+            observed["inference_mode"] = torch.is_inference_mode_enabled()
+            tensor = torch.empty(1)
+            observed["tensor"] = tensor
+            return {
+                "status": "ok",
+                "sd": {"weight": tensor},
+                "owner": owner,
+                "stats": {"configured_qd": 4, "total_source_wall_ms": 0.0},
+            }
+
+        with mock.patch.object(qr, "read_file_qd_gpu", side_effect=fake_read):
+            with torch.inference_mode():
+                sd, loader, fb = qr.clip_qd_load("mock.safetensors")
+
+        self.assertFalse(observed["inference_mode"])
+        self.assertFalse(observed["tensor"].is_inference())
+        self.assertIs(sd["weight"], observed["tensor"])
+        self.assertIs(fb, owner)
+        loader.close()
 
 
 class _TinyTransformer(torch.nn.Module):

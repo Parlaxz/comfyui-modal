@@ -123,8 +123,12 @@ config/
       production.toml
       diagnostics.toml
       e29-tracer.toml
-      e30-clip-qd.toml
-      e31-clip-fp32.toml
+      e30-clip-qd-arm-a.toml
+      e30-clip-qd-arm-b.toml
+      e31-clip-fp32-qd4-arm-a.toml
+      e31-clip-fp32-qd4-arm-b.toml
+      e31-clip-fp32-fastsafe-arm-a.toml
+      e31-clip-fp32-fastsafe-arm-b.toml
 
 docs/
   V2_CANONICAL_DEPLOY_RUN_CONTROL_PLANE.md
@@ -634,6 +638,41 @@ console capture
 
 If console capture is empty, persisted artifacts remain authoritative.
 
+## 19.1 Invocation-bound provenance (E32)
+
+Every canonical `v2ctl deploy-run`, `run`, `gate`, and `confirm` operation is
+bound to one collision-resistant invocation ID, generated once before its
+backend child process (and shared by every confirmation sample).  The ID is
+propagated through the reserved internal environment channel
+`COMFYMODAL_V2CTL_INVOCATION_ID`.  The same channel carries
+`COMFYMODAL_V2CTL_PROFILE`,
+`COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT`,
+`COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT`, and
+`COMFYMODAL_V2CTL_RUN_FINGERPRINT`.  v2ctl injects these values after caller
+extras; protected-environment rules still reject user attempts to set them.
+
+The primary run artifact must persist the top-level fields
+`v2ctl_invocation_id`, `profile` (or `profile_name`),
+`profile_config_fingerprint`, `deploy_fingerprint`, `run_fingerprint`,
+`request_id`, `output_sha` when available, and `generated_at_utc`.  A `v2ctl`
+block is accepted for compatibility with older writers, but new canonical
+writers use the top-level invocation field.  Result metadata also records the
+selected run/summary paths, any `run_artifacts` list, request ID, profile, and
+`provenance_validation_status`.
+
+Canonical discovery scans known roots and their immediate child directories,
+parses only plausible JSON, and requires an exact persisted invocation ID.
+It validates profile and profile/config fingerprint, reconciles request IDs
+from stdout and artifacts, and fails closed on zero matches, missing identity
+in an otherwise plausible run, wrong profile/fingerprint, ambiguous duplicate
+matches, or conflicting request IDs.  Malformed JSON is ignored safely and
+reported by the resulting zero-match failure when no valid artifact remains.
+Newest-mtime selection cannot prove invocation ownership and is never used by
+canonical calls.  Legacy mtime discovery is available only through an
+explicit legacy/noncanonical option and its result is labeled
+`provenance_validation_status=legacy_mtime`; it must not contaminate canonical
+gate/run/confirm validation.
+
 ---
 
 # 20. Migration Plan
@@ -961,6 +1000,52 @@ unless an explicit bridge joins them.
 (`.v2ctl/deployments/deploy_*.json`) `source_identity_status` to
 `verified`. The manifest is a JSON file (read/write via the path, not the
 parsed dict — `latest_deployment_manifest()` returns a dict).
+
+## 24.11 E27 source-only QD parity gate (prepared, blocked)
+
+```
+E27_PARITY_GATE_READY = BLOCKED
+```
+
+The exact intended parity target is the repaired production QD reader's
+source-only entry point, `comfymodal_runtime.clip_qd_reader.read_file_qd`,
+with these fixed inputs:
+
+```text
+profile:     config/v2/profiles/e30-clip-qd-arm-b.toml
+owner:       E27
+model_name:  qwen_3_4b.safetensors
+folder:      text_encoders
+path:        /root/models/text_encoders/qwen_3_4b.safetensors
+qd:          4
+block_mib:   32
+generation:  none
+H2D:         excluded (use read_file_qd, not read_file_qd_gpu)
+```
+
+`e30-clip-qd-arm-b` is the current selectable canonical arm and pins
+`COMFYMODAL_V2_CLIP_QD_READER=1`, `COMFYMODAL_V2_CLIP_QD_QD=4`,
+`COMFYMODAL_V2_CLIP_QD_BLOCK_MIB=32`, and the production
+`restore_earliest` launch policy. The logical model name must be resolved by
+the remote `folder_paths` resolver and the resolved path must be reported as
+the real safetensors path above; a basename-only or synthetic-file result is
+not E27 parity evidence.
+
+There is currently **no safe canonical source-only remote command** to execute
+for this target. `v2ctl source-probe` only hashes imported source and
+`v2ctl gate` is a full generation gate; neither invokes `read_file_qd`.
+The existing remote `run_clip_qd_probe` invokes the older
+`unet_qd_probe.run_unet_qd_probe_battery`, not the repaired production QD
+engine, and the direct probe launcher is not a canonical v2ctl backend.
+Therefore no executable command is claimed here and no Modal/direct probe is
+to be run. The missing mechanism is a v2ctl-owned, invocation-bound
+source-only remote method/backend that accepts this profile/path/QD contract,
+calls `read_file_qd`, persists its JSON metrics, and has a source-only parity
+validator. Until that mechanism exists, E27 parity remains BLOCKED.
+
+Prepared command: **NONE — blocked before invocation**. The profile and
+source/path contract above are the exact handoff for the missing backend; do
+not substitute `v2ctl gate`, `run_clip_qd_probe`, or a direct Modal launcher.
 
 ---
 

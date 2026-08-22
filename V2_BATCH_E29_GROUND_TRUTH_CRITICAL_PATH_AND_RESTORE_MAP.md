@@ -487,6 +487,7 @@ diff --stat: 11 files changed, 906 insertions(+), 8 deletions(-)  (same set as t
 ```
 doctor:  git.head=0ba7000 branch=TESTING2 dirty=1
          registry.flags=107  profiles=e29-tracer,e30-clip-qd,e31-clip-fp32,production
+         (HISTORICAL pre-arm profile set; these names are not current selectable profiles)
          runtime_overrides.present=0  runtime_override_policy=forbid
          deploy.lock=none  deployment.manifest=none
          (only expected problem: no deployment manifest yet)

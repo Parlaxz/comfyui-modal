@@ -25,6 +25,25 @@ import json
 from typing import Any
 
 
+# ``V2_E19_FINAL_COLD_LOADER`` is a harness selector, not a runtime flag.
+# The deploy/run BAT applies these values after v2ctl has resolved the
+# profile.  Keep this projection here so control-plane identities describe
+# the configuration the container actually receives, while ``ResolvedConfig``
+# remains the pre-selector input used by preflight and safety checks.
+#
+# These are deliberately limited to the flags whose post-selector values are
+# part of the runtime snapshot identity.  Do not infer values from a profile
+# name: the selector is the canonical activation signal.
+_POST_SELECTOR_EFFECTIVE_FLAGS: dict[str, dict[str, str]] = {
+    "V2_E19_FINAL_COLD_LOADER": {
+        "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+        "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+        "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "1",
+        "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    },
+}
+
+
 def _fmt(value: Any) -> str:
     """Deterministic string form: floats via repr(), everything else str()."""
     if isinstance(value, float):
@@ -35,7 +54,7 @@ def _fmt(value: Any) -> str:
 class FingerprintEngine:
     """Computes deploy/run fingerprints for a resolved configuration."""
 
-    def __init__(self, config: "ResolvedConfig") -> None:
+    def __init__(self, config: Any) -> None:
         self._config = config
 
     # -- input assembly ----------------------------------------------------
@@ -46,15 +65,16 @@ class FingerprintEngine:
         git = config.git
         target = config.target
         resources = config.resources
+        effective_values = self.effective_flag_values()
         dirty_hashes = {}
         for path, sha in sorted((git.dirty_hashes or {}).items()):
             dirty_hashes[path] = str(sha)
         deploy_flags = {}
         for flag in list(config.flags or ()):
             if flag.change_requires in ("build", "deploy"):
-                deploy_flags[flag.name] = _fmt(flag.value)
+                deploy_flags[flag.name] = effective_values[flag.name]
         for flag in list(config.unregistered or ()):
-            deploy_flags[flag.name] = _fmt(flag.value)
+            deploy_flags[flag.name] = effective_values[flag.name]
         return {
             "git_head": str(git.head),
             "git_dirty": bool(git.dirty),
@@ -80,12 +100,13 @@ class FingerprintEngine:
         """The exact ordered run input dict (for manifests / doctor)."""
         config = self._config
         workload = config.workload
+        effective_values = self.effective_flag_values()
         run_flags = {}
         for flag in list(config.flags or ()):
             if flag.change_requires in ("run", "none"):
-                run_flags[flag.name] = _fmt(flag.value)
+                run_flags[flag.name] = effective_values[flag.name]
         for flag in list(config.unregistered or ()):
-            run_flags[flag.name] = _fmt(flag.value)
+            run_flags[flag.name] = effective_values[flag.name]
         return {
             "deploy_fingerprint": self.deploy_fingerprint(),
             "workload": {
@@ -98,6 +119,68 @@ class FingerprintEngine:
             },
             "run_flags": run_flags,
         }
+
+    def config_inputs(self) -> dict:
+        """All resolved experiment-affecting configuration.
+
+        Unlike deployment/run fingerprints this deliberately has no git or
+        timestamp input: it identifies the selected profile and resolved
+        configuration itself and is safe to persist in invocation metadata.
+        """
+        config = self._config
+        effective_values = self.effective_flag_values()
+        flags = {}
+        for flag in list(getattr(config, "flags", ()) or ()):
+            flags[str(flag.name)] = effective_values[str(flag.name)]
+        for flag in list(getattr(config, "unregistered", ()) or ()):
+            flags[str(flag.name)] = effective_values[str(flag.name)]
+        return {
+            "profile": str(getattr(config, "profile_name", "") or ""),
+            "owner": str(getattr(config, "owner", "") or ""),
+            "target": self.deploy_inputs()["target"],
+            "resources": self.deploy_inputs()["resources"],
+            "flags": flags,
+            "workload": self.run_inputs()["workload"],
+            "runtime_override_policy": str(
+                getattr(config, "runtime_override_policy", "") or ""
+            ),
+        }
+
+    def config_fingerprint(self) -> str:
+        """Stable fingerprint of the resolved profile/configuration."""
+        return self._sha256_hex(self.config_inputs())
+
+    # Explicit name used by the reserved env/schema field.
+    def profile_config_fingerprint(self) -> str:
+        return self.config_fingerprint()
+
+    def profile_fingerprint(self) -> str:
+        return self.config_fingerprint()
+
+    def effective_flag_values(self) -> dict[str, str]:
+        """Return flag values after the canonical deploy-selector projection.
+
+        The resolver intentionally exposes the values requested by the
+        profile.  The launcher then applies selector-owned values before
+        deployment.  Project only flags already present in the resolved
+        configuration so this helper never invents a flag or a default for
+        duck-typed/older configurations.
+        """
+        config = self._config
+        values: dict[str, str] = {}
+        flags = list(getattr(config, "flags", ()) or ())
+        flags += list(getattr(config, "unregistered", ()) or ())
+        for flag in flags:
+            values[str(flag.name)] = _fmt(flag.value)
+
+        for selector, effects in _POST_SELECTOR_EFFECTIVE_FLAGS.items():
+            selector_value = values.get(selector, "").strip().lower()
+            if selector_value not in {"1", "true", "yes", "on"}:
+                continue
+            for name, value in effects.items():
+                if name in values:
+                    values[name] = value
+        return values
 
     # -- fingerprints ------------------------------------------------------
 

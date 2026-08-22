@@ -24,6 +24,15 @@ class FakeArtifactSet:
     summary_artifact: Path | None = None
     campaign_manifest: Path | None = None
     console_capture: Path | None = None
+    # Canonical provenance defaults keep the generic gate fixtures explicit;
+    # tests that exercise fail-closed behavior override these with empty
+    # values.
+    v2ctl_invocation_id: str = "fake-invocation"
+    request_id: str = "req-0001"
+    request_ids: list[str] = field(default_factory=lambda: ["req-0001"])
+    profile: str = "production"
+    profile_config_fingerprint: str = "fake-profile-config"
+    provenance_validation_status: str = "validated"
 
 
 @dataclass

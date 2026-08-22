@@ -22,8 +22,9 @@ Python 3.11 stdlib only; no network calls.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,14 @@ class Provenance:
     unregistered_flags: list = field(default_factory=list)
     runtime_overrides: list = field(default_factory=list)
     workload: dict = field(default_factory=dict)
+    v2ctl_invocation_id: str = ""
+    profile_config_fingerprint: str = ""
+    request_id: str = ""
+    artifact_path: str = ""
+    # Optional integrity metadata.  It is populated by
+    # write_provenance_sibling after the artifact's final bytes exist; it is
+    # intentionally not embedded in the artifact itself.
+    artifact_sha256: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +94,11 @@ class Provenance:
             "unregistered_flags": list(self.unregistered_flags),
             "runtime_overrides": [dict(o) for o in self.runtime_overrides],
             "workload": dict(self.workload),
+            "v2ctl_invocation_id": self.v2ctl_invocation_id,
+            "profile_config_fingerprint": self.profile_config_fingerprint,
+            "request_id": self.request_id,
+            "artifact_path": self.artifact_path,
+            "artifact_sha256": self.artifact_sha256,
         }
 
     def to_json(self) -> str:
@@ -107,6 +121,11 @@ class Provenance:
             unregistered_flags=list(data.get("unregistered_flags") or []),
             runtime_overrides=list(data.get("runtime_overrides") or []),
             workload=dict(data.get("workload") or {}),
+            v2ctl_invocation_id=str(data.get("v2ctl_invocation_id", "") or ""),
+            profile_config_fingerprint=str(data.get("profile_config_fingerprint", "") or ""),
+            request_id=str(data.get("request_id", "") or ""),
+            artifact_path=str(data.get("artifact_path", "") or ""),
+            artifact_sha256=(str(data["artifact_sha256"]) if data.get("artifact_sha256") else None),
         )
 
     def fingerprint_line(self) -> str:
@@ -130,6 +149,10 @@ def build_provenance(
     deploy_fp: str,
     run_fp: str,
     overrides: list[Any],  # list[RuntimeOverride]
+    *,
+    invocation_id: str = "",
+    profile_config_fingerprint: str = "",
+    request_id: str = "",
 ) -> Provenance:
     """Build a Provenance from a resolved config, a built environment (which
     the caller has already redacted via EnvironmentBuilder), fingerprints,
@@ -171,16 +194,36 @@ def build_provenance(
         unregistered_flags=sorted(unregistered),
         runtime_overrides=[_override_dict(o) for o in (overrides or [])],
         workload=_as_dict(workload),
+        v2ctl_invocation_id=str(invocation_id or ""),
+        profile_config_fingerprint=str(profile_config_fingerprint or ""),
+        request_id=str(request_id or ""),
     )
 
 
 def write_provenance_sibling(artifact: Path, provenance: Provenance) -> Path:
     """Write ``<artifact>.v2ctl-provenance.json`` next to the artifact.
-    NEVER modifies the artifact itself.  Returns the sibling path."""
+
+    The canonical path and optional integrity digest are finalized here, after
+    the artifact bytes have been written.  This keeps ``artifact_sha256`` out
+    of the artifact's own JSON and avoids an impossible embedded self-hash.
+    NEVER modifies the artifact itself.  Returns the sibling path.
+    """
     artifact = Path(artifact)
     sibling = artifact.with_name(artifact.name + ".v2ctl-provenance.json")
     sibling.parent.mkdir(parents=True, exist_ok=True)
-    sibling.write_text(provenance.to_json() + "\n", encoding="utf-8")
+    digest: str | None = None
+    if artifact.is_file():
+        hasher = hashlib.sha256()
+        with artifact.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    finalized = replace(
+        provenance,
+        artifact_path=str(artifact.resolve()),
+        artifact_sha256=digest,
+    )
+    sibling.write_text(finalized.to_json() + "\n", encoding="utf-8")
     LOG.info("provenance sibling written: %s", sibling)
     return sibling
 
@@ -223,15 +266,16 @@ def inject_provenance_hook_doc() -> str:
         "resolution and\n"
         "#        before/around the first result materialization, guarded by "
         "the presence of\n"
-        "#        V2CTL_DEPLOY_FINGERPRINT / V2CTL_RUN_FINGERPRINT in the "
+        "#        COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT / "
+        "COMFYMODAL_V2CTL_RUN_FINGERPRINT in the "
         "effective environment.\n"
         "#\n"
         "import os\n"
         "\n"
         "def _emit_v2ctl_provenance_line():\n"
-        "    deploy_fp = os.environ.get('V2CTL_DEPLOY_FINGERPRINT', '')\n"
-        "    run_fp = os.environ.get('V2CTL_RUN_FINGERPRINT', '')\n"
-        "    profile = os.environ.get('V2CTL_PROFILE', '')\n"
+        "    deploy_fp = os.environ.get('COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT', '')\n"
+        "    run_fp = os.environ.get('COMFYMODAL_V2CTL_RUN_FINGERPRINT', '')\n"
+        "    profile = os.environ.get('COMFYMODAL_V2CTL_PROFILE', '')\n"
         "    if not (deploy_fp and run_fp):\n"
         "        return  # not a v2ctl-controlled run; no proof line\n"
         "    line = '[v2ctl.config] deploy={} run={} profile={}'.format(\n"

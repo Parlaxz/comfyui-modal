@@ -244,6 +244,51 @@ enum_values = ["production", "diagnostic", "inherit"]
 description = "Runtime environment profile baked at deploy time."
 
 [[flag]]
+name = "COMFYMODAL_MINIMAL_RESTORE"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e37"
+description = "Use the E37 minimal restore path; absent means minimal restore remains ON."
+
+[[flag]]
+name = "COMFYMODAL_V2_E37_STRICT_PROOF"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e37"
+description = "Enable the E37 fail-closed plan/cache/ledger/source proof validator."
+
+[[flag]]
+name = "COMFYMODAL_V2_E37_CLEAN_LANE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e37"
+description = "Enable the diagnostic E37 CLEAN_LANE coordinator and fail-closed proof."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLEAN_LANE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e37"
+description = "Compatibility alias for the explicit E37 CLEAN_LANE runtime mode."
+
+[[flag]]
+name = "COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e37"
+description = "Require Batch-C plan-validation fast-path proof instead of report-only mode."
+
+[[flag]]
 name = "COMFYMODAL_V2_ATOMIC_PROFILE"
 type = "bool"
 default = "0"
@@ -574,7 +619,7 @@ default = "restore_earliest"
 consumed_at = "restore"
 change_requires = "deploy"
 owner = "e30"
-enum_values = ["restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry"]
+enum_values = ["restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry", "clean_lane_post_restore"]
 description = "E30 CLIP reader launch policy (the reader never chooses; the caller passes it)."
 
 [[flag]]
@@ -702,7 +747,7 @@ default = "critical"
 consumed_at = "restore"
 change_requires = "deploy"
 owner = "e29"
-enum_values = ["critical", "full"]
+enum_values = ["none", "critical", "full"]
 description = "Prefill lane policy (critical is production)."
 
 [[flag]]

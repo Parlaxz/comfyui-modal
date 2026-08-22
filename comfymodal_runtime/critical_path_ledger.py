@@ -120,13 +120,14 @@ def begin_restore(request_id: str = "") -> None:
     """Start the restore phase: clear any previous restore session (a fresh
     restore in the same process never reuses an older one) and any leftover
     request spans, then bind the ledger to the restore identity."""
-    global _SPANS, _EVENTS, _RESTORE_SPANS, _RESTORE_EVENTS, _RESTORE_RID, _CURRENT_REQUEST_ID
+    global _SPANS, _EVENTS, _RESTORE_SPANS, _RESTORE_EVENTS, _RESTORE_RID, _CURRENT_REQUEST_ID, _AUTHORITATIVE_ENDPOINTS
     with _STORE_LOCK:
         _SPANS = []
         _EVENTS = []
         _RESTORE_SPANS = []
         _RESTORE_EVENTS = []
         _RESTORE_RID = str(request_id or "") or "restore"
+        _AUTHORITATIVE_ENDPOINTS.clear()
     with _IDENTITY_LOCK:
         _CURRENT_REQUEST_ID = str(request_id or "")
 

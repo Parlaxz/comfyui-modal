@@ -68,6 +68,21 @@ AUTH_INTERNAL_VARS = (
 # The EXPERIMENTAL namespace: config flags / unregistered values live here.
 EXPERIMENTAL_PREFIXES = ("COMFYMODAL_", "V2_")
 
+# Reserved canonical identity channel.  BackendRunner is the final injector;
+# these names are exposed here so policy/tests/writers share one spelling.
+V2CTL_INVOCATION_ID_ENV = "COMFYMODAL_V2CTL_INVOCATION_ID"
+V2CTL_PROFILE_ENV = "COMFYMODAL_V2CTL_PROFILE"
+V2CTL_PROFILE_CONFIG_FINGERPRINT_ENV = "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"
+V2CTL_DEPLOY_FINGERPRINT_ENV = "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"
+V2CTL_RUN_FINGERPRINT_ENV = "COMFYMODAL_V2CTL_RUN_FINGERPRINT"
+V2CTL_RESERVED_ENV = (
+    V2CTL_INVOCATION_ID_ENV,
+    V2CTL_PROFILE_ENV,
+    V2CTL_PROFILE_CONFIG_FINGERPRINT_ENV,
+    V2CTL_DEPLOY_FINGERPRINT_ENV,
+    V2CTL_RUN_FINGERPRINT_ENV,
+)
+
 # Secret-shaped names: redacted in display output and refused as overrides.
 _SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "CREDENTIAL")
 
@@ -163,6 +178,14 @@ class ProtectedPolicy:
                     "V2CTL_RUN_FINGERPRINT",
                     "V2CTL_OWNER",
                     "V2CTL_PROFILE",
+                    # Canonical invocation/profile channel.  These are set
+                    # by v2ctl after all caller-provided extras and can never
+                    # be supplied through --set/--inherit.
+                    "COMFYMODAL_V2CTL_INVOCATION_ID",
+                    "COMFYMODAL_V2CTL_PROFILE",
+                    "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT",
+                    "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT",
+                    "COMFYMODAL_V2CTL_RUN_FINGERPRINT",
                 }
             ),
             prefixes=_DEFAULT_PREFIXES,

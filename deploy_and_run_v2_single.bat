@@ -31,10 +31,29 @@ if /i "%~1"=="E25_VALIDATION" set "V2_BENCHMARK_RUNS=1"
 if /i "%~1"=="E26_VALIDATION" set "V2_BENCHMARK_MODE=e26_single"
 if /i "%~1"=="E26_VALIDATION" set "V2_E26_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
 if /i "%~1"=="E26_VALIDATION" set "V2_BENCHMARK_RUNS=1"
+if /i "%~1"=="E37_VALIDATION" set "V2_BENCHMARK_MODE=e37_single"
+if /i "%~1"=="E37_VALIDATION" set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+if /i "%~1"=="E37_VALIDATION" set "V2_BENCHMARK_RUNS=1"
+set "V2_E37_CLEAN_LANE_ACTIVE=0"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_E37_CLEAN_LANE_ACTIVE=1"
+if /i "!COMFYMODAL_V2_E37_CLEAN_LANE!"=="1" set "V2_E37_CLEAN_LANE_ACTIVE=1"
+if /i "!COMFYMODAL_V2_CLEAN_LANE!"=="1" set "V2_E37_CLEAN_LANE_ACTIVE=1"
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" set "V2_E19_FINAL_COLD_LOADER=0"
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" set "V2_E28_VALIDATION=0"
+if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" set "V2_E31_VALIDATION=0"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_E37_VALIDATION=1"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_BENCHMARK_MODE=e37_single"
+if /i "%~1"=="E37_CLEAN_LANE_VALIDATION" set "V2_BENCHMARK_RUNS=1"
+if /i "%~1"=="E37_VALIDATION" if "!V2_E37_CLEAN_LANE_ACTIVE!"=="0" set "V2_E19_FINAL_COLD_LOADER=1"
 if /i "%~1"=="E28_VALIDATION" set "V2_BENCHMARK_MODE=e28_single"
 if /i "%~1"=="E28_VALIDATION" set "V2_E28_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
 if /i "%~1"=="E28_VALIDATION" set "V2_BENCHMARK_RUNS=1"
 if /i "%~1"=="E28_VALIDATION" set "V2_E19_FINAL_COLD_LOADER=1"
+if /i "%~1"=="E31_VALIDATION" set "V2_BENCHMARK_MODE=e31_single"
+if /i "%~1"=="E31_VALIDATION" set "V2_E31_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+if /i "%~1"=="E31_VALIDATION" set "V2_BENCHMARK_RUNS=1"
+if /i "%~1"=="E31_VALIDATION" set "V2_E19_FINAL_COLD_LOADER=1"
 
 REM -- E22 arm arguments: establish selectors inside cmd.exe ---------------
 if /i "%~1"=="E22_PREFETCH_OFF" (
@@ -372,6 +391,104 @@ exit /b 1
 echo === ERROR: E26 validation cannot combine with an E22 arm ===
 exit /b 1
 :e26_validation_continue
+REM -- E37 late CLIP validation selector (atomic opt-in) ----------------------
+REM E37 shares the E19 full-generation base, but must never inherit E28's
+REM restore-earliest or diagnostic forcing.  Required QD/FASTSAFE, late-policy,
+REM minimal-restore, and strict-proof values remain profile-owned; this block
+REM only projects the selector and hard-gates one full run.
+if not defined V2_E37_VALIDATION set "V2_E37_VALIDATION=0"
+if /i "%~1"=="E37_VALIDATION" set "V2_E37_VALIDATION=1"
+if /i "!COMFYMODAL_V2_E37_STRICT_PROOF!"=="1" set "V2_E37_VALIDATION=1"
+set "V2_E37_VALIDATION_ACTIVE=0"
+if /i "!V2_E37_VALIDATION!"=="1" set "V2_E37_VALIDATION_ACTIVE=1"
+if /i "!V2_E37_VALIDATION!"=="true" set "V2_E37_VALIDATION_ACTIVE=1"
+if /i "!V2_E37_VALIDATION!"=="yes" set "V2_E37_VALIDATION_ACTIVE=1"
+if /i "!V2_E37_VALIDATION!"=="on" set "V2_E37_VALIDATION_ACTIVE=1"
+if "!V2_E37_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" goto :e37_clean_validation
+    if "!V2_E19_FINAL_COLD_LOADER_ACTIVE!"=="0" goto :e37_fail_no_e19
+    if defined V2_E22_ARM_LABEL goto :e37_fail_e22
+    set "V2_E28_VALIDATION=0"
+    set "V2_E31_VALIDATION=0"
+    set "V2_BENCHMARK_MODE=e37_single"
+    set "V2_BENCHMARK_RUNS=1"
+    if not defined V2_E37_CONDITIONING_NONCE set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    echo [v2.e37_validation] selector=ACTIVE full_run=1 e19=1 nonce=present
+)
+goto :e37_validation_continue
+:e37_clean_validation
+set "COMFYMODAL_V2_E37_CLEAN_LANE=1"
+set "COMFYMODAL_V2_CLEAN_LANE=1"
+set "COMFYMODAL_V2_ATOMIC_PROFILE=E37_CLEAN_LANE"
+set "COMFYMODAL_V2_ENV_PROFILE=inherit"
+set "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=0"
+set "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT=0"
+set "COMFYMODAL_V2_EVICT_RETAIN_ROLE=none"
+set "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS=0"
+set "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION=0"
+set "COMFYMODAL_V2_CHECKPOINT_PREWARM=0"
+set "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS=0"
+set "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB=0"
+set "COMFYMODAL_V2_UNET_FASTSAFETENSORS=0"
+set "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS=0"
+set "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH=0"
+set "COMFYMODAL_V2_INPUT_TYPES_WARM=0"
+set "COMFYMODAL_V2_PREFILL_LANES=none"
+set "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET=0"
+set "COMFYMODAL_V2_EXECUTION_PREFILL=0"
+set "COMFYMODAL_V2_GRAPH_PRELOAD=0"
+set "COMFYMODAL_V2_MODEL_PRELOAD=0"
+set "COMFYMODAL_V2_EXACT_CACHE_PERSIST=0"
+set "COMFYMODAL_V2_ALLOCATOR_PURGE=0"
+set "COMFYMODAL_V2_BACKGROUND_PERSISTENCE=0"
+set "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS=0"
+set "V2_E37_VALIDATION=1"
+set "V2_E28_VALIDATION=0"
+set "V2_E31_VALIDATION=0"
+set "V2_BENCHMARK_MODE=e37_single"
+set "V2_BENCHMARK_RUNS=1"
+if not defined V2_E37_CONDITIONING_NONCE set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+echo [v2.e37_clean_lane_validation] selector=ACTIVE full_run=1 e19=0 qd=4 block_mib=32 nonce=present
+goto :e37_validation_continue
+:e37_fail_no_e19
+echo === ERROR: E37 validation requires E19 profile (V2_E19_FINAL_COLD_LOADER=1) ===
+exit /b 1
+:e37_fail_e22
+echo === ERROR: E37 validation cannot combine with an E22 arm ===
+exit /b 1
+:e37_validation_continue
+REM -- E31 QD4 cast-once validation selector (atomic opt-in) ------------------
+REM This is NOT ordinary E28: the E31 profile inherits E29/E28 settings, so
+REM the explicit selector disables E28 validation and forces the complete
+REM E31-owned QD4/cast-once tuple before the local verifier runs.
+if not defined V2_E31_VALIDATION set "V2_E31_VALIDATION=0"
+if /i "%~1"=="E31_VALIDATION" set "V2_E31_VALIDATION=1"
+set "V2_E31_VALIDATION_ACTIVE=0"
+if /i "!V2_E31_VALIDATION!"=="1" set "V2_E31_VALIDATION_ACTIVE=1"
+if /i "!V2_E31_VALIDATION!"=="true" set "V2_E31_VALIDATION_ACTIVE=1"
+if /i "!V2_E31_VALIDATION!"=="yes" set "V2_E31_VALIDATION_ACTIVE=1"
+if /i "!V2_E31_VALIDATION!"=="on" set "V2_E31_VALIDATION_ACTIVE=1"
+if "!V2_E31_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E19_FINAL_COLD_LOADER_ACTIVE!"=="0" goto :e31_fail_no_e19
+    if defined V2_E22_ARM_LABEL goto :e31_fail_e22
+    set "V2_E28_VALIDATION=0"
+    set "COMFYMODAL_V2_CLIP_QD_READER=1"
+    set "COMFYMODAL_V2_CLIP_QD_QD=4"
+    set "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB=32"
+    set "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY=restore_earliest"
+    set "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE=1"
+    set "COMFYMODAL_V2_E31_FORENSICS=1"
+    set "COMFYMODAL_V2_E31_FORWARD_PROFILE=0"
+    echo [v2.e31_validation] selector=ACTIVE qd_reader=1 qd=4 block_mib=32 launch_policy=restore_earliest cast_once=1 forensics=1 forward_profile=0
+)
+goto :e31_validation_continue
+:e31_fail_no_e19
+echo === ERROR: E31 validation requires E19 profile (V2_E19_FINAL_COLD_LOADER=1) ===
+exit /b 1
+:e31_fail_e22
+echo === ERROR: E31 validation cannot combine with an E22 arm ===
+exit /b 1
+:e31_validation_continue
 REM -- E28 critical-path implementation validation selector (atomic opt-in) --
 REM Inherits the E19 base EXACTLY and adds the E28 production optimizations:
 REM earliest restore-time CLIP lane (speculative CLIP was already on), the
@@ -438,7 +555,15 @@ REM -- Atomic deploy profile verify gate (abort BEFORE any deploy) ----------
 REM The E22 arm verifier is local-only and validates the complete E19 base
 REM profile plus the arm-specific deployment-scoped prewarm value.  The E25
 REM verifier validates the E19 base + the five E25 validation flags.
-if /i "!V2_E28_VALIDATION_ACTIVE!"=="1" (
+if /i "!V2_E37_VALIDATION_ACTIVE!"=="1" (
+    if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" (
+        python tools\benchmark_v2_direct.py --verify-e37-clean-lane-profile --run-count 1
+    ) else (
+        python tools\benchmark_v2_direct.py --verify-e37-profile --run-count 1
+    )
+) else if /i "!V2_E31_VALIDATION_ACTIVE!"=="1" (
+    python tools\benchmark_v2_direct.py --verify-e31-profile --run-count 1
+) else if /i "!V2_E28_VALIDATION_ACTIVE!"=="1" (
     python tools\benchmark_v2_direct.py --verify-e28-profile --run-count 1
 ) else if /i "!V2_E26_VALIDATION_ACTIVE!"=="1" (
     python tools\benchmark_v2_direct.py --verify-e26-profile --run-count 1
@@ -472,6 +597,10 @@ if "!V2_E26_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" echo === 
 if "!V2_E26_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" exit /b 1
 if "!V2_E28_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" echo === ERROR: E28 validation requires BENCHMARK_RUN_COUNT=1; refusing deployment/request ===
 if "!V2_E28_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" exit /b 1
+if "!V2_E31_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" echo === ERROR: E31 validation requires BENCHMARK_RUN_COUNT=1; refusing deployment/request ===
+if "!V2_E31_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" exit /b 1
+if "!V2_E37_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" echo === ERROR: E37 validation requires BENCHMARK_RUN_COUNT=1; refusing deployment/request ===
+if "!V2_E37_VALIDATION_ACTIVE!"=="1" if not "!V2_BENCHMARK_RUNS!"=="1" exit /b 1
 if "!V2_PREFLIGHT_ONLY!"=="1" (
     if defined V2_E22_ARM_LABEL echo [v2.preflight] BENCHMARK_RUN_COUNT=!V2_E22_REQUESTED_RUN_COUNT!
     if defined V2_E22_ARM_LABEL echo [v2.preflight] EXPECTED_PAID_REQUEST_COUNT=1
@@ -485,10 +614,18 @@ if "!V2_PREFLIGHT_ONLY!"=="1" (
     if "!V2_E28_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] BENCHMARK_RUN_COUNT=1
     if "!V2_E28_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] EXPECTED_PAID_REQUEST_COUNT=1
     if "!V2_E28_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] BENCHMARK_COMMAND=python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E28_CONDITIONING_NONCE!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] BENCHMARK_RUN_COUNT=1
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] EXPECTED_PAID_REQUEST_COUNT=1
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] BENCHMARK_COMMAND=python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E31_CONDITIONING_NONCE!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] BENCHMARK_RUN_COUNT=1
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] EXPECTED_PAID_REQUEST_COUNT=1
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] BENCHMARK_COMMAND=python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E37_CONDITIONING_NONCE!
     echo [v2.preflight] selector=!V2_E22_ARM_LABEL!
     if "!V2_E25_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] selector=E25_VALIDATION
     if "!V2_E26_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] selector=E26_VALIDATION
     if "!V2_E28_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] selector=E28_VALIDATION
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] selector=E31_VALIDATION
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] selector=E37_VALIDATION
     echo [v2.preflight] ATOMIC_PROFILE=!COMFYMODAL_V2_ATOMIC_PROFILE!
     echo [v2.preflight] CHECKPOINT_PREWARM=!COMFYMODAL_V2_CHECKPOINT_PREWARM!
     echo [v2.preflight] FAST_COLD_ORCHESTRATION=!COMFYMODAL_V2_FAST_COLD_ORCHESTRATION!
@@ -512,6 +649,19 @@ if "!V2_PREFLIGHT_ONLY!"=="1" (
     if "!V2_E26_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] VAE_ACTIVATION_MODE=!COMFYMODAL_V2_VAE_ACTIVATION_MODE!
     if "!V2_E26_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] VAE_EARLY_START_MS=!COMFYMODAL_V2_VAE_EARLY_START_MS!
     if "!V2_E26_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CHECKPOINT_PREWARM=!COMFYMODAL_V2_CHECKPOINT_PREWARM!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_READER=!COMFYMODAL_V2_CLIP_QD_READER!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_QD=!COMFYMODAL_V2_CLIP_QD_QD!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_BLOCK_MIB=!COMFYMODAL_V2_CLIP_QD_BLOCK_MIB!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_LAUNCH_POLICY=!COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_FP32_CAST_ONCE=!COMFYMODAL_V2_CLIP_FP32_CAST_ONCE!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] E31_FORENSICS=!COMFYMODAL_V2_E31_FORENSICS!
+    if "!V2_E31_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] E31_FORWARD_PROFILE=!COMFYMODAL_V2_E31_FORWARD_PROFILE!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_READER=!COMFYMODAL_V2_CLIP_QD_READER!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_QD=!COMFYMODAL_V2_CLIP_QD_QD!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_BLOCK_MIB=!COMFYMODAL_V2_CLIP_QD_BLOCK_MIB!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] CLIP_QD_LAUNCH_POLICY=!COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] MINIMAL_RESTORE=!COMFYMODAL_MINIMAL_RESTORE!
+    if "!V2_E37_VALIDATION_ACTIVE!"=="1" echo [v2.preflight] E37_STRICT_PROOF=!COMFYMODAL_V2_E37_STRICT_PROOF!
     echo PROFILE ACCEPTED
     echo MODAL_DEPLOY_SKIPPED=1
     exit /b 0
@@ -1054,6 +1204,32 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
         exit /b 1
     )
     echo === V2 E26 validation benchmark completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="e37_single" (
+    echo === Running V2 E37 late CLIP validation - single cold generation ===
+    if defined V2_E37_CONDITIONING_NONCE (
+        python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E37_CONDITIONING_NONCE!
+    ) else (
+        echo === ERROR: E37 validation requires a conditioning nonce ===
+        exit /b 1
+    )
+    if errorlevel 1 (
+        echo === ERROR: E37 validation benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 E37 validation benchmark completed ===
+) else if /i "!V2_BENCHMARK_MODE!"=="e31_single" (
+    echo === Running V2 E31 QD4 cast-once validation - single cold run ===
+    if defined V2_E31_CONDITIONING_NONCE (
+        python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_E31_CONDITIONING_NONCE!
+    ) else (
+        echo === ERROR: E31 validation requires a conditioning nonce ===
+        exit /b 1
+    )
+    if errorlevel 1 (
+        echo === ERROR: E31 validation benchmark failed ===
+        exit /b 1
+    )
+    echo === V2 E31 validation benchmark completed ===
 ) else if /i "!V2_BENCHMARK_MODE!"=="e28_single" (
     echo === Running V2 E28 critical-path validation - single cold run ===
     if defined V2_E28_CONDITIONING_NONCE (

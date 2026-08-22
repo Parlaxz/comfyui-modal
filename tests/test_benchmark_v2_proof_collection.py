@@ -42,17 +42,29 @@ imported (same pattern as tests/test_plan_validation_proof.py).
 """
 
 import ast
+import contextlib
+import io
 import importlib.util
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from comfymodal_runtime.contracts import (
     VALIDATION_PROOF_SCHEMA_VERSION,
     compute_registry_fingerprint,
+)
+
+from tools.benchmark_v2_direct import (
+    _COMFYUI_ROOT_DIR,
+    _emit_v2ctl_config_proof,
+    _export_deployment_identity_for_transport,
+    _registry_proof_store_covers,
+    _v2ctl_artifact_metadata,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -348,6 +360,136 @@ class TestBenchmarkV2ProofCollection(unittest.TestCase):
                 "before build_execution_plan(",
             )
 
+    def test_cached_31_class_proof_skips_live_registry_and_freezes_plan(self):
+        """A store hit supplies the complete deployed proof without loading nodes."""
+        import comfymodal_runtime.registry_proof_store as store
+
+        classes = [f"CachedClass{i:02d}" for i in range(31)]
+        workflow = {
+            str(i): {"class_type": name, "inputs": {}}
+            for i, name in enumerate(classes)
+        }
+        state_path = Path(self._td) / "deployed_state.json"
+        state_path.write_text(json.dumps({
+            "custom_nodes_generation": "g31",
+            "deployment_combined_hash": "d31",
+            "overall_dependency_hash": "dep31",
+            "comfyui_version": "v31",
+            "comfyui_commit": "c31",
+        }), encoding="utf-8")
+        old_state = os.environ.get("COMFYMODAL_V2_DEPLOYED_STATE_JSON")
+        old_dep = os.environ.pop("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", None)
+        os.environ["COMFYMODAL_V2_DEPLOYED_STATE_JSON"] = str(state_path)
+        try:
+            from comfymodal_runtime import contracts, registry_proof
+
+            workflow_hash = self.mod.prompt_sha256(workflow)
+            proof = {
+                "schema_version": 1,
+                "workflow_class_count": 31,
+                "classes": classes,
+                "identities": {name: f"id-{i}" for i, name in enumerate(classes)},
+                "missing_host": [],
+                "unresolved_identity": [],
+                "complete": True,
+                "workflow_hash": workflow_hash,
+            }
+            store.save({
+                "workflow_hash": workflow_hash,
+                "comfyui_root": str(_COMFYUI_ROOT_DIR),
+                "registry_fingerprint": "cached-registry-31",
+                "registry_proof": proof,
+                "validation": {"schema_version": 1, "validated": True},
+            })
+            # The harness lookup must hit before canonical plan construction.
+            with patch.object(contracts, "compute_registry_fingerprint", side_effect=AssertionError("live registry")), \
+                 patch.object(registry_proof, "build_workflow_registry_proof", side_effect=AssertionError("live proof")), \
+                 patch.object(self.mod, "_collect_plan_validation_proof", side_effect=AssertionError("live validation")):
+                self.assertTrue(_registry_proof_store_covers(workflow))
+                plan = self.mod.build_execution_plan(
+                    workflow,
+                    prompt_id="cached-31",
+                    validate=False,
+                    collect_validation_proof=True,
+                    comfyui_root=str(_COMFYUI_ROOT_DIR),
+                )
+            identity = dict(plan.deployment_identity)
+            self.assertTrue(identity["deployment_identity_frozen"])
+            self.assertEqual(identity["registry_fingerprint"], "cached-registry-31")
+            self.assertEqual(len(identity["registry_proof"]["classes"]), 31)
+            self.assertTrue(plan.validation["validated"])
+        finally:
+            if old_state is None:
+                os.environ.pop("COMFYMODAL_V2_DEPLOYED_STATE_JSON", None)
+            else:
+                os.environ["COMFYMODAL_V2_DEPLOYED_STATE_JSON"] = old_state
+            if old_dep is not None:
+                os.environ["COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH"] = old_dep
+
+    def test_transport_receives_identity_only_after_plan_export(self):
+        """The delayed export still keys transport handles by deployment hash."""
+        from comfymodal_runtime.modal_transport import HandleCache, ModalTransport
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".deployed_state.json").write_text(
+                json.dumps({"deployment_combined_hash": "transport-d31"}),
+                encoding="utf-8",
+            )
+            old_dep = os.environ.pop("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", None)
+            try:
+                with patch("tools.benchmark_v2_direct.ROOT", root):
+                    _export_deployment_identity_for_transport()
+                self.assertEqual(
+                    os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH"),
+                    "transport-d31",
+                )
+                cache = HandleCache()
+                transport = ModalTransport(
+                    v2_handle_factory=lambda **kwargs: object(),
+                    handle_cache=cache,
+                )
+                transport._v2_handle(workspace={"id": "test"}, gpu="test-gpu")
+                self.assertEqual(
+                    next(iter(cache._values)).deployment_identity,
+                    "transport-d31",
+                )
+            finally:
+                if old_dep is None:
+                    os.environ.pop("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", None)
+                else:
+                    os.environ["COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH"] = old_dep
+
+    def test_plan_export_is_between_build_and_execute(self):
+        """The benchmark ordering keeps env identity out of plan construction."""
+        tree = ast.parse(HARNESS_PATH.read_text(encoding="utf-8"))
+        for fn_name in ("_run_one", "_run_acceptance_request"):
+            fn = next(
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == fn_name
+            )
+            build_line = min(
+                node.lineno for node in ast.walk(fn)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "build_execution_plan"
+            )
+            export_line = min(
+                node.lineno for node in ast.walk(fn)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_export_deployment_identity_for_transport"
+            )
+            execute_line = min(
+                node.lineno for node in ast.walk(fn)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "execute_plan"
+            )
+            self.assertLess(build_line, export_line)
+            self.assertLess(export_line, execute_line)
+
     def test_harness_prelocks_utils_before_init_extra_nodes(self):
         """The registry helper pins the real ComfyUI ``utils`` package into
         sys.modules by explicit file path (``spec_from_file_location("utils",
@@ -634,6 +776,53 @@ class TestBenchmarkV2ProofCollection(unittest.TestCase):
             "WATERFALL (host reconcile unavailable - remote/partial report below)",
             source,
         )
+
+    def test_v2ctl_config_proof_requires_reserved_identity(self):
+        """Non-v2ctl runs must not receive fabricated runtime proof."""
+        names = (
+            "COMFYMODAL_V2CTL_INVOCATION_ID",
+            "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT",
+            "COMFYMODAL_V2CTL_RUN_FINGERPRINT",
+            "COMFYMODAL_V2CTL_PROFILE",
+        )
+        with patch.dict(os.environ, {name: "" for name in names}):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertFalse(_emit_v2ctl_config_proof())
+        self.assertEqual(output.getvalue(), "")
+
+    def test_v2ctl_config_proof_emits_compact_line_once(self):
+        values = {
+            "COMFYMODAL_V2CTL_INVOCATION_ID": "invocation-1",
+            "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": "d" * 64,
+            "COMFYMODAL_V2CTL_RUN_FINGERPRINT": "r" * 64,
+            "COMFYMODAL_V2CTL_PROFILE": "production",
+        }
+        with patch.dict(os.environ, values):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertTrue(_emit_v2ctl_config_proof())
+        self.assertEqual(
+            output.getvalue(),
+            "[v2ctl.config] deploy=dddddddd run=rrrrrrrr profile=production\n",
+        )
+
+    def test_v2ctl_artifact_metadata_propagates_authoritative_asset_id(self):
+        expected_sha = "a" * 64
+        values = {
+            "COMFYMODAL_V2CTL_INVOCATION_ID": "invocation-1",
+            "COMFYMODAL_V2CTL_PROFILE": "production",
+        }
+        artifact = {
+            "request_id": "request-1",
+            "output_sha": None,
+            "result": {
+                "images": [{"asset_id": expected_sha, "filename": "output.png"}],
+            },
+        }
+        with patch.dict(os.environ, values):
+            metadata = _v2ctl_artifact_metadata(artifact)
+        self.assertEqual(metadata["output_sha"], expected_sha)
 
 
 if __name__ == "__main__":

@@ -356,6 +356,13 @@ def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> Non
 PROFILING_ENABLED = env_flag("COMFYMODAL_PROFILING")
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
 ENABLE_WARMUP = env_flag("COMFYMODAL_ENABLE_WARMUP", default=True)
+# E37 restore contract: the restored method must return after lifecycle
+# identity/timing setup and the minimum backend/CUDA reattachment.  Keep the
+# complete restore implementation below for opt-out/debug runs rather than
+# deleting its lifecycle code.  The effective value is read at restore time so
+# the controlled profile can select the path without changing this module's
+# import-time environment.
+MINIMAL_RESTORE_DEFAULT = True
 ENABLE_TORCH_COMPILE = env_flag("COMFYMODAL_ENABLE_TORCH_COMPILE")
 ENABLE_GPU_SNAPSHOT = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
 CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
@@ -20449,7 +20456,10 @@ class _ComfyAPIMixin:
 
     @modal.enter(snap=False)
     def restore(self):
-        log_effective_runtime_shape(stage="after_restore")
+        # Avoid the optional runtime-shape diagnostic on the E37 path; the
+        # effective restore mode is logged below with the lifecycle identity.
+        if not env_flag("COMFYMODAL_MINIMAL_RESTORE", default=MINIMAL_RESTORE_DEFAULT):
+            log_effective_runtime_shape(stage="after_restore")
         # ── Post-snapshot restored-instance identity ──
         self._restored_instance_id = uuid.uuid4().hex[:16]
         self._restored_instance_start_unix = time.time()
@@ -20537,6 +20547,128 @@ class _ComfyAPIMixin:
         )
 
         is_in_proc = (self._select_backend() == "in_process")
+
+        # E37 controlled restore path.  Keep this branch before *any* volume,
+        # generation, custom-node, profile, prompt-cache, preload, or model
+        # reads.  The only work retained here is backend creation when a
+        # deferred snapshot needs it and the CUDA context/state handoff that
+        # an in-process backend needs before the first method call.  The
+        # complete historical restore remains below and is selected with
+        # COMFYMODAL_MINIMAL_RESTORE=0 for rollback/debug runs.
+        _minimal_restore_effective = env_flag(
+            "COMFYMODAL_MINIMAL_RESTORE", default=MINIMAL_RESTORE_DEFAULT
+        )
+        print(
+            f"[comfyapp.restore] minimal_restore_effective={int(_minimal_restore_effective)} "
+            f"source=COMFYMODAL_MINIMAL_RESTORE default={int(MINIMAL_RESTORE_DEFAULT)}"
+        )
+        __stages["minimal_restore_effective"] = int(_minimal_restore_effective)
+        __stages["minimal_restore_path"] = (
+            "lifecycle_backend_cuda_only" if _minimal_restore_effective else "legacy_full_restore"
+        )
+        if _minimal_restore_effective:
+            __stages.update({
+                "minimal_restore_effective": 1,
+                "minimal_restore_path": "lifecycle_backend_cuda_only",
+                "custom_nodes_sync_skipped": 1,
+                "custom_nodes_sync_skip_reason": "minimal_restore",
+                "custom_node_requirements_skipped": 1,
+                "models_generation_read_skipped": 1,
+                "models_volume_reload_skipped": 1,
+                "prompt_cache_hydration_skipped": 1,
+                "restore_preload_submitted_early": 0,
+                "restore_preload_joined": 0,
+                "restore_background_unet_submitted": 0,
+                "production_unet_submitted": 0,
+                "direct_warmup_skipped": 1,
+                "vae_decode_warmup_submitted": 0,
+                "optional_cuda_warmup_skipped": 1,
+            })
+            _backend_deferred = False
+            if is_in_proc:
+                _backend_inited = getattr(self, "_event_loop", None) is not None
+                if not _backend_inited:
+                    _backend_started_at = time.time()
+                    self._start_backend()
+                    _backend_deferred = True
+                    __stages["deferred_backend_init_ms"] = self._profile_ms(
+                        _backend_started_at
+                    )
+                __stages["minimal_restore_backend"] = self._select_backend()
+                if self._select_backend() == "in_process":
+                    if not ENABLE_GPU_SNAPSHOT and not _backend_deferred:
+                        _gpu_started_at = time.time()
+                        self._restore_in_process_gpu_state()
+                        __stages["gpu_state_ms"] = self._profile_ms(_gpu_started_at)
+                    else:
+                        __stages["gpu_state_ms"] = 0.0
+                        __stages["gpu_state_skip_reason"] = (
+                            "backend_initialized_with_gpu" if _backend_deferred
+                            else "gpu_snapshot"
+                        )
+                    _cuda_started_at = time.time()
+                    _cu_device, _cu_diag = self._initialize_cuda_context()
+                    __stages["cuda_warmup_ms"] = self._profile_ms(_cuda_started_at)
+                    __stages["cuda_context_ready"] = 1 if _cu_device is not None else 0
+                    if _cu_diag:
+                        __stages["cuda_context_sync_ms"] = _cu_diag.get(
+                            "cuda_context_sync_ms", 0
+                        )
+                        __stages["cuda_context_total_ms"] = _cu_diag.get(
+                            "cuda_context_total_ms", 0
+                        )
+                else:
+                    __stages["cuda_context_ready"] = 0
+                    __stages["cuda_skip_reason"] = "subprocess_backend"
+            else:
+                __stages["minimal_restore_backend"] = self._select_backend()
+                __stages["cuda_context_ready"] = 0
+                __stages["cuda_skip_reason"] = "subprocess_backend"
+
+            _minimal_restore_end = time.time()
+            __stages["restore_end_mono_ns"] = time.perf_counter_ns()
+            self._last_restore_timing = {
+                "restore_total_ms": self._profile_ms(restore_start),
+                "restore_start_unix_s": restore_start,
+                "restore_end_unix_s": _minimal_restore_end,
+                "restore_method_start_wall_unix_ns": int(restore_start_wall_s * 1_000_000_000),
+                "restore_method_start_mono_ns": restore_start_ns,
+                "restore_method_end_wall_unix_ns": int(_minimal_restore_end * 1_000_000_000),
+                "restore_method_end_mono_ns": __stages["restore_end_mono_ns"],
+                "restore_method_status": "success",
+                "restore_session_id": __stages["restore_session_id"],
+                "restored_instance_id": self._restored_instance_id,
+                "container_session_id": CONTAINER_SESSION_ID,
+                "snapshot_import_session_id": CONTAINER_SESSION_ID,
+                "restore_count": _container_restore_count,
+                "lifecycle_status": "ok",
+                "lifecycle_method": "restore",
+                "warmup_status": "skipped_minimal_restore",
+                "warmup_profile": {},
+                "warmup_profile_source": "none",
+                "warmup_profile_token": "",
+                **__stages,
+            }
+            self._record_critical_path_restore(
+                "restore_minimal_exit",
+                extra={"minimal_restore_effective": 1},
+            )
+            print(
+                f"[comfyapp] minimal restore complete "
+                f"restore_session_id={self._last_restore_timing['restore_session_id']} "
+                f"restored_instance_id={self._restored_instance_id} "
+                f"restore_total_ms={self._last_restore_timing['restore_total_ms']}"
+            )
+            _log_remote_identity(
+                "restore",
+                cls_name=self.__class__.__name__,
+                method_name="restore",
+                restore_session_id=self._last_restore_timing["restore_session_id"],
+                snapshot_created=0,
+                restored_from_snapshot=1,
+                restored_instance_id=self._restored_instance_id,
+            )
+            return
 
         _s = time.time()
         self._ensure_models_symlink()

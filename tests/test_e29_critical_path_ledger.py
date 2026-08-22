@@ -722,6 +722,19 @@ class AuthoritativeEndpointsTest(unittest.TestCase):
         report = cpl.request_ledger_report()
         self.assertEqual(report["endpoint_status"], "missing")
 
+    def test_fresh_restore_isolates_previous_request_endpoints(self):
+        """A reused container cannot carry an old endpoint into a new restore."""
+        cpl.set_authoritative_endpoints(
+            remote_python_resume_mono_ns=100,
+            first_durable_result_mono_ns=200,
+        )
+        cpl.begin_restore("req-new")
+        cpl.set_authoritative_endpoints(remote_python_resume_mono_ns=300)
+        cpl.begin_request("req-new")
+        report = cpl.request_ledger_report()
+        self.assertEqual(report["endpoint_status"], "missing")
+        self.assertEqual(report["missing_endpoints"], ["first_durable_result_mono_ns"])
+
 
 class V38SpanSurvivalRegressionTest(unittest.TestCase):
     """Reproduce the v38 2-spans/6-events failure so it can never return.

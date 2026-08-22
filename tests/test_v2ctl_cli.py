@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -264,6 +265,171 @@ class TestDryRun:
         # Keys may appear but only with redacted values.
         assert "MODAL_TOKEN_ID=<redacted>" in r.stdout
 
+    def test_deploy_failure_surfaces_bounded_diagnostics_and_success_stays_quiet(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """Failed backend streams are diagnostic-only; deploy bookkeeping is unchanged."""
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+        from tools.v2_control.backend import BackendResult
+
+        manifest = tmp_path / "deploy.json"
+        lock_instances = []
+        result = BackendResult(
+            exit_code=7,
+            stdout=("backend stdout\n" + ("diagnostic-line\n" * 1000)
+                    + "terminal-bat-error\n"),
+            stderr="backend stderr\nMODAL_TOKEN_SECRET=sekrit-backend-token\n",
+            command="fake-backend",
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:00:01+00:00",
+            elapsed_seconds=1.0,
+        )
+
+        class FakeLock:
+            def __init__(self, path):
+                self.released = False
+                lock_instances.append(self)
+
+            def acquire(self, **kwargs):
+                pass
+
+            def release(self):
+                self.released = True
+
+        class FakeRunner:
+            def __init__(self, repo_root, env_builder):
+                pass
+
+            @staticmethod
+            def build_command_line(spec, extra_args):
+                return "fake-backend"
+
+            def run(self, *args, **kwargs):
+                return result
+
+        def fake_manifest(*args, **kwargs):
+            manifest.write_text("{}", encoding="utf-8")
+            return manifest
+
+        monkeypatch.setenv("MODAL_TOKEN_SECRET", "sekrit-backend-token")
+        monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
+        monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
+        monkeypatch.setattr(cli, "write_deployment_manifest", fake_manifest)
+        args = SimpleNamespace(
+            profile="production", set=[], inherit=[], owner=None, dry_run=False,
+            app=None, gpu=None, memory_mb=None, cpu=None,
+        )
+
+        assert cli.cmd_deploy(args, REPO_ROOT) == 7
+        failed_output = capsys.readouterr().err
+        assert "BEGIN backend diagnostics" in failed_output
+        assert failed_output.index("backend stderr") < failed_output.index("backend stdout")
+        assert "--- backend stderr (head) ---" in failed_output
+        assert "--- backend stderr (tail) ---" in failed_output
+        assert "--- backend stdout (head) ---" in failed_output
+        assert "--- backend stdout (tail) ---" in failed_output
+        stdout_head = failed_output.index("--- backend stdout (head) ---")
+        stdout_tail = failed_output.index("--- backend stdout (tail) ---")
+        assert "terminal-bat-error" not in failed_output[stdout_head:stdout_tail]
+        assert "terminal-bat-error" in failed_output[stdout_tail:]
+        assert "sekrit-backend-token" not in failed_output
+        assert "diagnostic output truncated" in failed_output
+        assert "END backend diagnostics" in failed_output
+        assert not manifest.exists()
+        assert lock_instances[-1].released
+
+        result.exit_code = 0
+        versions = iter((0, 1))
+        monkeypatch.setattr(cli, "_app_version_number", lambda app: next(versions))
+        assert cli.cmd_deploy(args, REPO_ROOT) == 0
+        success_output = capsys.readouterr().err
+        assert "backend diagnostics" not in success_output
+        assert manifest.exists()
+        assert lock_instances[-1].released
+
+
+class TestBackendSelectorForwarding:
+    @pytest.mark.parametrize(
+        ("command", "profile", "selector"),
+        [
+            ("deploy", "e31-clip-fp32-qd4-arm-b", "E31_VALIDATION"),
+            ("deploy-run", "e31-clip-fp32-qd4-arm-b", "E31_VALIDATION"),
+            ("deploy-run", "e29-tracer", "E28_VALIDATION"),
+        ],
+    )
+    def test_selector_reaches_backend_and_matches_printed_command(
+        self, command, profile, selector, monkeypatch, tmp_path, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+        from tools.v2_control.backend import BackendResult
+
+        command_args = []
+        run_args = []
+
+        class FakeRunner:
+            def __init__(self, repo_root, env_builder):
+                pass
+
+            @staticmethod
+            def build_command_line(spec, extra_args):
+                command_args.append(list(extra_args))
+                return "fake-backend " + " ".join(extra_args)
+
+            def run(self, *args, **kwargs):
+                run_args.append(list(kwargs["extra_args"]))
+                return BackendResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                    command="fake-backend",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    ended_at="2026-01-01T00:00:01+00:00",
+                    elapsed_seconds=1.0,
+                )
+
+        class FakeLock:
+            def __init__(self, path):
+                pass
+
+            def acquire(self, **kwargs):
+                pass
+
+            def release(self):
+                pass
+
+        manifest = tmp_path / "deploy.json"
+
+        def fake_manifest(*args, **kwargs):
+            manifest.write_text("{}", encoding="utf-8")
+            return manifest
+
+        monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
+        monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
+        monkeypatch.setattr(cli, "write_deployment_manifest", fake_manifest)
+        if command == "deploy":
+            versions = iter((0, 1))
+            monkeypatch.setattr(cli, "_app_version_number", lambda app: next(versions))
+
+        args = SimpleNamespace(
+            profile=profile,
+            set=[],
+            inherit=[],
+            owner=None,
+            dry_run=False,
+            app=None,
+            gpu=None,
+            memory_mb=None,
+            cpu=None,
+        )
+        handler = cli.cmd_deploy if command == "deploy" else cli.cmd_deploy_run
+
+        assert handler(args, REPO_ROOT) == 0
+        assert command_args == [[selector]]
+        assert run_args == [[selector]]
+        assert f"fake-backend {selector}" in capsys.readouterr().out
+
 
 class TestRuntimeFlags:
     def test_runtime_flags_list(self) -> None:
@@ -311,6 +477,32 @@ class TestLock:
 
 
 class TestGateConfirm:
+    def test_confirm_dry_run_reports_e28_selector(self) -> None:
+        r = run_v2ctl(
+            "--profile", "e29-tracer", "confirm", "--dry-run",
+            "--from", "does-not-need-to-exist.json", "--runs", "3",
+        )
+        assert r.returncode == 0, r.stderr
+        assert "selector=E28_VALIDATION" in r.stdout
+        assert "E28_VALIDATION" in r.stdout
+        assert "--run-count 1" in r.stdout
+        assert "--conditioning-cache-nonce" in r.stdout
+        assert "V2_E28_CONDITIONING_NONCE=" in r.stdout
+        assert "V2_BENCHMARK_RUNS=1" in r.stdout
+
+    def test_e31_qd4_profile_uses_distinct_selector_and_nonce(self) -> None:
+        r = run_v2ctl(
+            "--profile", "e31-clip-fp32-qd4-arm-b", "confirm", "--dry-run",
+            "--from", "does-not-need-to-exist.json",
+        )
+        assert r.returncode == 0, r.stderr
+        assert "selector=E31_VALIDATION" in r.stdout
+        assert "E31_VALIDATION" in r.stdout
+        assert "--run-count 1" in r.stdout
+        assert "--conditioning-cache-nonce" in r.stdout
+        assert "V2_E31_CONDITIONING_NONCE=" in r.stdout
+        assert "V2_E28_VALIDATION=0" in r.stdout
+
     def test_gate_requires_deployment(self) -> None:
         manifest_dir = REPO_ROOT / ".v2ctl" / "deployments"
         if not manifest_dir.is_dir():

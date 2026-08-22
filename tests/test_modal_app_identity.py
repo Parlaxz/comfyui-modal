@@ -253,6 +253,35 @@ class TestResourceIdentity(unittest.TestCase):
             )
 
 
+class TestE31RuntimePropagation(unittest.TestCase):
+    def test_runtime_env_and_probe_carry_all_e31_flags(self):
+        names = {
+            "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "1",
+            "COMFYMODAL_V2_E31_FORENSICS": "1",
+            "COMFYMODAL_V2_E31_FORWARD_PROFILE": "0",
+            "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT": "17",
+        }
+        saved = {key: os.environ.get(key) for key in names}
+        try:
+            os.environ.update(names)
+            runtime_env = modal_app._runtime_env()
+            self.assertEqual(
+                {key: runtime_env[key] for key in names}, names,
+            )
+            probe = modal_app.ModalRuntimeEntrypoint().run_env_probe(
+                request_id="e31-env",
+            )
+            self.assertEqual(
+                {key: probe["env"][key] for key in names}, names,
+            )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 class TestStartupIdentityCapture(unittest.TestCase):
     """Phase 0 — startup() emits lifecycle and identity events."""
 
@@ -1526,12 +1555,14 @@ class TestV2SourceModulesClosure(unittest.TestCase):
             "(Modules in _IMPORTED_BUT_NON_V2 are known V1/studio-only imports.)",
         )
 
-    def test_v2_source_modules_contains_warmup_profile_and_workflow_metadata(self):
-        """Explicit gate: ``warmup_profile`` and ``workflow_metadata`` must be
-        present in ``V2_SOURCE_MODULES`` (the specific fix for the audited
-        omission)."""
+    def test_v2_source_modules_contains_required_lazy_runtime_modules(self):
+        """Explicitly package modules needed by lazy V2 runtime imports."""
         v2_modules = set(self._get_v2_source_modules())
-        for expected in ("warmup_profile", "workflow_metadata"):
+        for expected in (
+            "warmup_profile",
+            "workflow_metadata",
+            "comfymodal_runtime.registry_proof_store",
+        ):
             self.assertIn(
                 expected, v2_modules,
                 f"{expected} must be in V2_SOURCE_MODULES",

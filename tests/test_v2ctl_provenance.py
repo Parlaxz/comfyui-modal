@@ -9,6 +9,7 @@ the deferred hook doc.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 from tools.v2_control.provenance import (
@@ -91,13 +92,22 @@ class TestFingerprintLine:
 class TestSiblingPersistence:
     def test_write_and_read_round_trip(self, tmp_path):
         artifact = tmp_path / "run_0001_production.json"
-        artifact.write_text('{"hello":"world"}', encoding="utf-8")
+        artifact_bytes = b'{"hello":"world"}'
+        artifact.write_bytes(artifact_bytes)
         provenance = make_provenance()
         sibling = write_provenance_sibling(artifact, provenance)
         assert sibling.name == "run_0001_production.json.v2ctl-provenance.json"
         assert sibling.is_file()
         restored = read_provenance_sibling(artifact)
-        assert restored == provenance
+        assert restored is not None
+        assert restored.profile == provenance.profile
+        assert restored.v2ctl_invocation_id == provenance.v2ctl_invocation_id
+        assert restored.profile_config_fingerprint == provenance.profile_config_fingerprint
+        assert restored.deploy_fingerprint == provenance.deploy_fingerprint
+        assert restored.run_fingerprint == provenance.run_fingerprint
+        assert restored.request_id == provenance.request_id
+        assert restored.artifact_path == str(artifact.resolve())
+        assert restored.artifact_sha256 == hashlib.sha256(artifact_bytes).hexdigest()
 
     def test_artifact_never_modified(self, tmp_path):
         artifact = tmp_path / "run_1.json"

@@ -196,6 +196,35 @@ class TestBootstrapProofLifecycle(unittest.TestCase):
         self.assertEqual(state.snapshot_validation_proof, {})
 
 
+class TestRegistryManifestPublication(unittest.TestCase):
+    def test_manifest_error_and_root_count_are_published_fail_closed(self):
+        """Manifest failure detail remains observable without inventing data."""
+        from comfymodal_runtime.modal_app import _registry_manifest_publication_fields
+
+        fields = _registry_manifest_publication_fields(
+            {"classes": {}, "error": "nodes import failed"},
+            root_count=3,
+        )
+        self.assertEqual(
+            fields["registry_manifest"],
+            {"classes": {}, "error": "nodes import failed"},
+        )
+        self.assertEqual(fields["registry_manifest_error"], "nodes import failed")
+        self.assertEqual(fields["registry_manifest_root_count"], 3)
+        self.assertEqual(fields["registry_manifest_class_count"], 0)
+
+        fallback = _registry_manifest_publication_fields(
+            None,
+            error="RuntimeError: builder failed",
+            root_count=2,
+        )
+        self.assertEqual(fallback["registry_manifest"], {})
+        self.assertEqual(
+            fallback["registry_manifest_error"], "RuntimeError: builder failed"
+        )
+        self.assertEqual(fallback["registry_manifest_root_count"], 2)
+
+
 class TestBakedGenerationProvenance(unittest.TestCase):
     def test_generation_provenance_same_both_sides(self):
         """Host reader and container freeze extraction consume the same value
@@ -366,6 +395,25 @@ class TestParityMatrix(unittest.TestCase):
         self.assertIs(result["future_fast_path_eligible"], False)
         self.assertIn("plan_identity_incomplete", result["future_fast_path_ineligible_reason"])
         self.assertIn("snapshot_proof_incomplete", result["future_fast_path_ineligible_reason"])
+
+
+class TestPlanProofDecisionReporting(unittest.TestCase):
+    def test_consumed_proof_does_not_report_not_eligible(self):
+        from comfymodal_runtime.modal_app import _get_plan_proof_decision_reason
+
+        self.assertEqual(
+            _get_plan_proof_decision_reason(True, "", "parity_ineligible"),
+            "",
+        )
+        # The fallback remains fail-closed and keeps its existing reasons.
+        self.assertEqual(
+            _get_plan_proof_decision_reason(False, "repair_changed", ""),
+            "repair_changed",
+        )
+        self.assertEqual(
+            _get_plan_proof_decision_reason(False, "", ""),
+            "not_eligible",
+        )
 
 
 class TestHostValidationMemo(unittest.TestCase):

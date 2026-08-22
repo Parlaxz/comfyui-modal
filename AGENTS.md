@@ -1,0 +1,1 @@
+For structural code questions—symbols, callers/callees, architecture, cross-file impact, and dead-code analysis—prefer Codebase Memory graph discovery first, then verify exact source and coverage gaps with native tools. Native Read/Grep/Glob remain allowed for verification.

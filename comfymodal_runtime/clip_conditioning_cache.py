@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .env import env_flag
+from . import clean_lane
 
 # ── Experiment 5 (conditioning_hit) accessors — fail-open when the
 #    v2_experiments registry is absent so the cache never breaks imports. ──
@@ -1933,6 +1934,9 @@ class ExactConditioningCache:
         (``_lookup_entry`` never reads ``last_access_seq``), so queueing the
         touch is always correct.
         """
+        if clean_lane.enabled():
+            clean_lane.forbidden_activity("exact_cache_lru_persistence")
+            return
         if _conditioning_async_lru_enabled():
             self._enqueue_lru_touch(touched_digests)
             return
@@ -2109,6 +2113,9 @@ class ExactConditioningCache:
         closed to a future miss.  Never performs file/manifest/fsync/commit
         work on this thread.  Never raises.
         """
+        if clean_lane.enabled():
+            clean_lane.forbidden_activity("exact_cache_persistence")
+            return False
         diag = self._store_entry_diag()
         _t0 = time.monotonic_ns()
         try:

@@ -21,6 +21,7 @@ from tools.v2_control.errors import GateError
 from tools.v2_control.validation import (
     CanonicalLedgerValidator,
     ConfirmRunner,
+    E31ForensicsValidator,
     ExpectedOutputShaValidator,
     GateRunner,
     RunRecord,
@@ -120,9 +121,41 @@ class TestValidators:
             expected_output_sha="",
             artifacts=FakeArtifactSet(run_artifact=artifact),
             backend_ok=True,
-            telemetry={"request_id": "r1", "correlation_id": "c1", "fresh": "1"},
+            telemetry={
+                "request_id": "r1",
+                "correlation_id": "c1",
+                "fresh": "1",
+                "v2ctl_config": "deploy=abc12345 run=def67890 profile=production",
+            },
         )
         assert StructuralValidator().validate(record, FakeConfig()) == []
+
+    def test_structural_fails_closed_when_provenance_is_missing(self, tmp_path):
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        record = RunRecord(
+            run_fingerprint="a" * 64,
+            deploy_fingerprint="b" * 64,
+            profile="production",
+            target_app="app",
+            target_class="cls",
+            fresh_required=False,
+            expected_output_sha="",
+            artifacts=FakeArtifactSet(
+                run_artifact=artifact,
+                v2ctl_invocation_id="",
+                profile_config_fingerprint="",
+                provenance_validation_status="",
+            ),
+            backend_ok=True,
+            telemetry={"request_id": "r1", "correlation_id": "c1"},
+        )
+        failures = StructuralValidator().validate(record, FakeConfig())
+        text = "\n".join(failures)
+        assert "effective provenance missing v2ctl_invocation_id" in text
+        assert "effective provenance missing profile_config_fingerprint" in text
+        assert "effective-config proof missing" in text
+        assert "not canonically validated" in text
 
     def test_structural_valid_failures(self, tmp_path):
         record = RunRecord(
@@ -230,6 +263,20 @@ class TestGateRunner:
         assert data["config_snapshot"]["deploy_fingerprint"] == runner._fingerprints.deploy_fingerprint()
         assert data["run"]["backend_ok"] is False
 
+    def test_backend_failure_without_artifact_reports_exit_code(self, tmp_path):
+        backend = FakeBackendRunner(
+            stderr="argparse: missing --conditioning-cache-nonce",
+            artifacts=FakeArtifactSet(),
+            mode="fail",
+            exit_code=2,
+        )
+        runner = make_gate_runner(tmp_path, backend=backend)
+        result = runner.run_gate(FakeConfig(), FakeSpec())
+        reasons = "\n".join(result.reasons)
+        assert "without producing a persisted run artifact" in reasons
+        assert "exit code 2" in reasons
+        assert "persisted run artifact missing" in reasons
+
     def test_manifest_shape(self, tmp_path):
         artifact = tmp_path / "run_1.json"
         artifact.write_text("{}", encoding="utf-8")
@@ -283,13 +330,65 @@ class TestConfirmRunner:
         result = confirm.confirm(manifest, config, FakeSpec(), runs=3)
         assert backend.invocation_count == 3
         for invocation in backend.invocations:
-            assert invocation["extra_env"].get("V2_BENCHMARK_RUNS") == "3"
-            assert invocation["extra_args"] == ["--run-count", "3"]
+            assert invocation["extra_env"].get("V2_BENCHMARK_RUNS") == "1"
+            assert invocation["extra_args"] == ["--run-count", "1"]
         assert result.valid is True
         assert result.manifest_path is not None and result.manifest_path.is_file()
         data = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         assert data["confirm_runs"] == 3
         assert data["gate_manifest"] == str(Path(manifest))
+
+    def test_e28_selector_and_nonce_are_forwarded_to_gate_and_confirm(self, tmp_path):
+        config = FakeConfig()
+        config.flags.append(FakeFlag(name="V2_E28_VALIDATION", value="1"))
+        config.workload.nonce = "e28-test-nonce"
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        )
+        fingerprints = FakeFingerprints()
+        gate = make_gate_runner(tmp_path, fingerprints=fingerprints, backend=backend)
+        gate_result = gate.run_gate(config, FakeSpec())
+        assert gate_result.valid is True
+        gate_call = backend.invocations[0]
+        expected_args = [
+            "E28_VALIDATION", "--run-count", "1",
+            "--conditioning-cache-nonce", "e28-test-nonce",
+        ]
+        assert gate_call["extra_args"] == expected_args
+        assert gate_call["extra_env"]["V2_E28_CONDITIONING_NONCE"] == "e28-test-nonce"
+
+        backend.invocations.clear()
+        confirm = make_confirm_runner(tmp_path, fingerprints=fingerprints, backend=backend)
+        confirm.confirm(gate_result.manifest_path, config, FakeSpec())
+        assert backend.invocations[0]["extra_args"] == expected_args
+        assert backend.invocations[0]["extra_env"]["V2_E28_CONDITIONING_NONCE"] == "e28-test-nonce"
+
+    def test_confirm_runs_are_single_run_even_with_e28_selector(self, tmp_path):
+        fingerprints, config, manifest = self._run_valid_gate(tmp_path)
+        config.flags.append(FakeFlag(name="V2_E28_VALIDATION", value="1"))
+        config.workload.nonce = "e28-test-nonce"
+        backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=tmp_path / "run_1.json"),
+        )
+        confirm = make_confirm_runner(tmp_path, fingerprints=fingerprints, backend=backend)
+        # The gate manifest is valid, but the selector is resolved from the
+        # current config and every confirmation remains a one-run invocation.
+        result = confirm.confirm(manifest, config, FakeSpec(), runs=3)
+        assert result.valid is True
+        assert len(backend.invocations) == 3
+        assert all(call["extra_env"]["V2_BENCHMARK_RUNS"] == "1" for call in backend.invocations)
+        assert all(call["extra_args"][1:3] == ["--run-count", "1"] for call in backend.invocations)
+
+    def test_confirm_refuses_snapshot_restore_only_mode(self, tmp_path):
+        config = FakeConfig()
+        config.flags.append(FakeFlag(name="V2_BENCHMARK_MODE", value="snapshot_restore_only"))
+        confirm = make_confirm_runner(tmp_path)
+        with pytest.raises(GateError, match="snapshot_restore_only"):
+            confirm.confirm(tmp_path / "missing-gate.json", config, FakeSpec())
 
     def test_confirm_default_runs_once(self, tmp_path):
         fingerprints, config, manifest = self._run_valid_gate(tmp_path)
@@ -477,3 +576,184 @@ class TestCanonicalLedgerValidator:
         )
         failures = CanonicalLedgerValidator().validate(record, self._config_with_ledger_on())
         assert failures == []
+
+
+class TestE31ForensicsValidator:
+    """The E31 control-plane gate consumes canonical, not hydration, proof."""
+
+    def _config(self, cast_once: str = "0") -> FakeConfig:
+        config = FakeConfig(profile_name="e31-clip-fp32-fastsafe-arm-a")
+        config.workload.expected_output_sha = SHA_20B1
+        config.workload.conditioning_cache = "forced_miss"
+        config.flags.extend(
+            [
+                FakeFlag(name="COMFYMODAL_V2_E31_FORENSICS", value="1"),
+                FakeFlag(name="COMFYMODAL_V2_CLIP_FP32_CAST_ONCE", value=cast_once),
+            ]
+        )
+        return config
+
+    def _record(self, tmp_path: Path, config: FakeConfig, *, on: bool = False,
+                canonical_events: list[dict] | None = None,
+                trace_events: list[dict] | None = None) -> RunRecord:
+        artifact_data = {
+            "canonical_ledger_status": "ok",
+            "canonical_ledger": {
+                "endpoint_status": "ok",
+                "serial_ledger": {"zero_gap": True},
+                "events": canonical_events or [],
+            },
+            "trace": {"events": trace_events or []},
+            "output_sha": SHA_20B1,
+            "request_id": "req-0001",
+        }
+        artifact = tmp_path / ("e31_on.json" if on else "e31_off.json")
+        artifact.write_text(json.dumps(artifact_data), encoding="utf-8")
+        result = FakeBackendRunner(
+            stdout=(
+                "request_id=req-0001\ncorrelation_id=corr-0001\nfresh=1\n"
+                f"output_sha={SHA_20B1}\n"
+            ),
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        ).run(FakeSpec(), config=config)
+        return build_run_record_from_result(result, config, "d" * 64, "r" * 64)
+
+    @staticmethod
+    def _canonical(summary: dict) -> list[dict]:
+        return [
+            {"name": "clip_gpu_event_start", "mono_ns": 1},
+            {"name": "clip_gpu_event_end", "mono_ns": 2},
+            {"name": "clip_forward_cast_summary", "metadata": summary},
+        ]
+
+    @staticmethod
+    def _cache_events() -> list[dict]:
+        return [
+            {
+                "name": "clip_conditioning_cache_lookup",
+                "metadata": {"miss_count": 1, "hit_count": 0},
+            },
+            {
+                "name": "clip_conditioning_cache_decision",
+                "metadata": {"decision": "miss"},
+            },
+        ]
+
+    def test_missing_authoritative_e31_evidence_fails_closed(self, tmp_path):
+        config = self._config()
+        record = self._record(tmp_path, config, trace_events=self._cache_events())
+        failures = E31ForensicsValidator().validate(record, config)
+        assert any("canonical ledger" in failure for failure in failures)
+
+    def test_valid_off_requires_real_bf16_fp32_count_and_bytes(self, tmp_path):
+        config = self._config("0")
+        record = self._record(
+            tmp_path,
+            config,
+            canonical_events=self._canonical({
+                "real_conversions": 2,
+                "real_conversion_bytes": 128,
+                "source_dtypes": {"torch.bfloat16": 2},
+                "dest_dtypes": {"torch.float32": 2},
+            }),
+            trace_events=self._cache_events(),
+        )
+        assert E31ForensicsValidator().validate(record, config) == []
+
+    def test_valid_on_requires_bind_residency_and_stable_forward(self, tmp_path):
+        config = self._config("1")
+        generation = 7
+        trace = self._cache_events() + [
+            {
+                "name": "clip_fh_cast_once_bind_proof",
+                "metadata": {
+                    "ok": True,
+                    "phase": "post_bind",
+                    "generation": generation,
+                    "count_by_dtype": {"torch.float32": 2},
+                    "device_counts": {"cuda:0": 2},
+                },
+            },
+            {
+                "name": "clip_fh_cast_once_applied",
+                "metadata": {"generation": generation, "fp32_params": 2},
+            },
+            {
+                "name": "clip_fh_cast_once_forward_check",
+                "metadata": {
+                    "forward_observed": True,
+                    "forward_actually_observed": True,
+                    "bind_generation": generation,
+                    "post_forward_generation": generation,
+                    "storage_stable": True,
+                    "post_forward_stability": {"storage_stable": True},
+                },
+            },
+        ]
+        record = self._record(
+            tmp_path,
+            config,
+            on=True,
+            canonical_events=self._canonical({
+                "real_conversions": 0,
+                "real_conversion_bytes": 0,
+            }),
+            trace_events=trace,
+        )
+        assert E31ForensicsValidator().validate(record, config) == []
+
+    @pytest.mark.parametrize("bind_generation", [None, 0, 2])
+    def test_on_rejects_missing_or_stale_bind_generation(self, tmp_path, bind_generation):
+        config = self._config("1")
+        bind = {
+            "ok": True,
+            "count_by_dtype": {"torch.float32": 398},
+            "device_counts": {"cuda:0": 398},
+        }
+        if bind_generation is not None:
+            bind["generation"] = bind_generation
+        trace = self._cache_events() + [
+            {"name": "clip_fh_cast_once_bind_proof", "metadata": bind},
+            {
+                "name": "clip_fh_cast_once_applied",
+                "metadata": {"generation": 1, "fp32_params": 398},
+            },
+            {
+                "name": "clip_fh_cast_once_forward_check",
+                "metadata": {
+                    "forward_observed": True,
+                    "forward_actually_observed": True,
+                    "bind_generation": 1,
+                    "post_forward_generation": 1,
+                    "storage_stable": True,
+                    "post_forward_stability": {"storage_stable": True},
+                },
+            },
+        ]
+        record = self._record(
+            tmp_path,
+            config,
+            on=True,
+            canonical_events=self._canonical({
+                "real_conversions": 0,
+                "real_conversion_bytes": 0,
+            }),
+            trace_events=trace,
+        )
+
+        failures = E31ForensicsValidator().validate(record, config)
+        assert any("generation/bind proof" in failure for failure in failures)
+
+    def test_hydration_zero_conversion_is_not_forward_proof(self, tmp_path):
+        config = self._config("0")
+        record = self._record(
+            tmp_path,
+            config,
+            canonical_events=self._canonical({"conversion_count": 0}),
+            trace_events=self._cache_events() + [
+                {"name": "clip_fh_cast_once_forward_check",
+                 "metadata": {"conversion_count": 0, "conversion_bytes": 0}},
+            ],
+        )
+        failures = E31ForensicsValidator().validate(record, config)
+        assert any("real BF16->FP32" in failure for failure in failures)

@@ -1109,7 +1109,12 @@ def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
             _loop = asyncio.get_running_loop()
         except RuntimeError:
             _loop = None
-        _coro = execution.validate_prompt(prompt_id, workflow, None)
+        # ComfyUI validation may coerce scalar inputs in place.  Validation is
+        # a proof-producing read of the dispatch workflow, not an authoring
+        # step; never let that implementation detail change the hash used for
+        # registry-store lookup or the immutable plan payload.
+        _validation_workflow = copy.deepcopy(workflow)
+        _coro = execution.validate_prompt(prompt_id, _validation_workflow, None)
         if _loop is not None and _loop.is_running():
             # Running loop in the current thread (v2 dispatch runs on the
             # ComfyUI event loop).  Blocking that loop via
@@ -1142,6 +1147,62 @@ def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
         ),
         "source": "host_validate_prompt",
     }
+
+
+def _registry_proof_cache_entry_is_usable(
+    entry: object, workflow: object, workflow_hash: str,
+) -> bool:
+    """Defensively validate a registry-store hit before consuming it."""
+    if not isinstance(entry, Mapping):
+        return False
+    entry_hash = str(entry.get("workflow_hash", "") or "")
+    if entry_hash and entry_hash != str(workflow_hash or ""):
+        return False
+    proof = entry.get("registry_proof")
+    if not isinstance(proof, Mapping) or not proof.get("complete"):
+        return False
+    if proof.get("schema_version") != 1:
+        return False
+    classes = proof.get("classes")
+    identities = proof.get("identities")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or any(not isinstance(name, str) or not name for name in classes)
+        or len(classes) != len(set(classes))
+    ):
+        return False
+    if not isinstance(identities, Mapping) or set(identities) != set(classes):
+        return False
+    if proof.get("workflow_class_count") != len(classes):
+        return False
+    if proof.get("missing_host") or proof.get("unresolved_identity"):
+        return False
+    if any(not isinstance(value, str) or not value for value in identities.values()):
+        return False
+    expected_classes = sorted({
+        str(node.get("class_type", ""))
+        for node in (workflow or {}).values()
+        if isinstance(node, dict) and node.get("class_type")
+    }) if isinstance(workflow, dict) else []
+    if classes != expected_classes:
+        return False
+    # Real store entries carry both the current anchor and proof hash.  The
+    # relaxed branch is only for legacy test doubles; public store.lookup never
+    # returns an entry without these fields.
+    if "identity_anchor" in entry:
+        try:
+            from comfymodal_runtime.registry_proof_store import current_identity_anchor
+            from comfymodal_runtime.registry_proof_store import REGISTRY_PROOF_STORE_SCHEMA_VERSION
+            if entry.get("schema_version") != REGISTRY_PROOF_STORE_SCHEMA_VERSION:
+                return False
+            if entry.get("identity_anchor") != current_identity_anchor():
+                return False
+        except Exception:
+            return False
+        if str(proof.get("workflow_hash", "") or "") != str(workflow_hash or ""):
+            return False
+    return True
 
 
 def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str = "", workflow=None) -> dict:
@@ -1257,12 +1318,10 @@ def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str =
             )
         except Exception:
             _entry = None
-        if isinstance(_entry, dict) and (
-            _entry.get("registry_fingerprint") or _entry.get("registry_proof")
-        ):
+        if _registry_proof_cache_entry_is_usable(_entry, workflow, _wf_hash):
             _reg = str(_entry.get("registry_fingerprint", "") or "")
             _reg_proof = _entry.get("registry_proof") or {}
-            _reg_proof_complete = bool(_reg_proof.get("complete", False))
+            _reg_proof_complete = True
     if not _reg and not _reg_proof:
         _repo_root = os.path.dirname(os.path.abspath(__file__))
         _custom_nodes_dir = os.path.dirname(_repo_root)
@@ -1277,10 +1336,26 @@ def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str =
                 from comfymodal_runtime.registry_proof import build_workflow_registry_proof
                 _reg_proof = build_workflow_registry_proof(
                     workflow,
-                    roots=[r for r in (str(comfyui_root or ""), _repo_root) if r],
+                    roots=[
+                        r for r in (
+                            str(comfyui_root or ""),
+                            _custom_nodes_dir,
+                            _repo_root,
+                        ) if r
+                    ],
+                    workflow_hash=_wf_hash,
                 )
             except Exception:
                 _reg_proof = {}
+        if isinstance(_reg_proof, dict) and _reg_proof.get("complete"):
+            _proof_hash = str(_reg_proof.get("workflow_hash", "") or "")
+            if _proof_hash and _proof_hash != _wf_hash:
+                _reg_proof = {}
+            else:
+                # Bind a complete live proof to the finalized dispatch hash
+                # before it can be persisted or carried by the plan.
+                _reg_proof = dict(_reg_proof)
+                _reg_proof["workflow_hash"] = _wf_hash
         _reg_proof_complete = bool(_reg_proof.get("complete", False))
     return {
         "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
@@ -1294,7 +1369,18 @@ def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str =
         "dependency_manifest_identity": _dep_identity,
         "deployment_identity_frozen": _identity_frozen,
         "deployment_identity_fail_closed_reason": _identity_fail_closed_reason,
-        "complete": bool(_dep and _gen and _reg_proof_complete and not _identity_fail_closed_reason),
+        "workflow_hash": _wf_hash,
+        "complete": bool(
+            _dep and _gen and _reg_proof_complete
+            and not _identity_fail_closed_reason
+            # A deploy-frozen identity must include its frozen dependency
+            # pair.  Legacy metadata/env construction remains descriptive;
+            # the parity evaluator still gates it on dependency identity.
+            and (
+                not _identity_frozen
+                or bool(_overall and _dep_identity)
+            )
+        ),
     }
 
 
@@ -1399,6 +1485,20 @@ def build_execution_plan(
         )
         dispatch_workflow = compiled.compiled_workflow
         report = dict(compiled.report)
+    elif modal_options:
+        # Keep plan construction identical to resolve_dispatch_workflow_hash:
+        # callers that provide only modal_options still dispatch the compiled
+        # workflow and therefore receive proof keyed to that exact hash.
+        _derived_production = normalize_production_options(modal_options)
+        if _derived_production.get("enabled"):
+            normalized_production = normalize_production_options(_derived_production)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+            report = dict(compiled.report)
     # Deployment identity is computed ONCE up-front: it feeds the host-side
     # validation memo key AND the plan arg / instrumentation line below
     # (never recomputed twice).  ``dispatch_workflow`` is finalized above.
@@ -1406,14 +1506,10 @@ def build_execution_plan(
         request_metadata, comfyui_root, workflow=dispatch_workflow
     )
     # Step-1/Step-2 plan-carried validation proof.  Runs AFTER the dispatch
-    # workflow is finalized but BEFORE the hash so the host hash is computed
-    # over the exact dict object frozen into the plan (validate_prompt coerces
-    # scalar inputs in place).  Fail-closed: any validation failure aborts the
-    # build and exceptions are never cached.  The memo key uses the RAW
-    # dispatch hash (documented coercion nuance: on a miss validation coerces
-    # inputs and the hash then covers the coerced dict; on a hit the payload's
-    # validated_workflow_hash is reset below so plan.workflow_hash ==
-    # validated_workflow_hash holds by construction in both cases).
+    # workflow is finalized and uses the exact dispatch hash.  Validation is
+    # given a defensive copy, so the object used by the proof-store lookup is
+    # also the object frozen into the plan.  Fail-closed: any validation
+    # failure aborts the build and exceptions are never cached.
     _validation_payload: dict = {}
     _validation_memo_state = "off"
     if collect_validation_proof:
@@ -1493,6 +1589,16 @@ def build_execution_plan(
                             if _current_types:
                                 from comfymodal_runtime.registry_proof_store import entries as _proof_store_entries
                                 for _wf_hash, _entry in (_proof_store_entries() or {}).items():
+                                    # ``entries()`` is already anchor-filtered,
+                                    # but retain a defensive check here so a
+                                    # substituted/scanned store cannot promote
+                                    # stale or validation-only data.
+                                    if not _registry_proof_cache_entry_is_usable(
+                                        _entry,
+                                        dispatch_workflow,
+                                        str(_entry.get("workflow_hash", "") or ""),
+                                    ):
+                                        continue
                                     _val = _entry.get("validation") or {}
                                     _stored_types = _val.get("node_type_fingerprint") or []
                                     if (
@@ -1523,16 +1629,10 @@ def build_execution_plan(
                 _PLAN_VALIDATION_MEMO.clear()  # simple documented eviction
             _PLAN_VALIDATION_MEMO[_memo_key] = dict(_validation_payload)
             _validation_memo_state = "miss" if _validation_memo_state == "miss" else _validation_memo_state
-    # Single source of truth for the dispatch hash: derived via
-    # ``resolve_dispatch_workflow_hash`` (mirrors the compile decision above
-    # without importing the registry) so the store key, the plan hash, and the
-    # harness ``_registry_proof_store_covers`` lookup all agree.
-    dispatch_hash = resolve_dispatch_workflow_hash(
-        source_workflow,
-        modal_options=modal_options,
-        production_options=production_options,
-        production_report=production_report,
-    )
+    # Hash the finalized object that is actually frozen into the plan.  Do
+    # not independently recompile here: a second normalization/compile can
+    # diverge from the workflow passed to the proof-store lookup.
+    dispatch_hash = prompt_sha256(dispatch_workflow)
     if _validation_payload:
         _validation_payload["validated_workflow_hash"] = dispatch_hash
         # E29: always carry the node-type fingerprint (the per-run nonce

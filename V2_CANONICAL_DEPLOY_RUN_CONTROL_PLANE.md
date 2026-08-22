@@ -123,8 +123,12 @@ config/
       production.toml
       diagnostics.toml
       e29-tracer.toml
-      e30-clip-qd.toml
-      e31-clip-fp32.toml
+      e30-clip-qd-arm-a.toml
+      e30-clip-qd-arm-b.toml
+      e31-clip-fp32-qd4-arm-a.toml
+      e31-clip-fp32-qd4-arm-b.toml
+      e31-clip-fp32-fastsafe-arm-a.toml
+      e31-clip-fp32-fastsafe-arm-b.toml
 
 docs/
   V2_CANONICAL_DEPLOY_RUN_CONTROL_PLANE.md

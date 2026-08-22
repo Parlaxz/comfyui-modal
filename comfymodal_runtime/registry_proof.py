@@ -234,6 +234,8 @@ def build_workflow_registry_proof(
     workflow: object,
     class_mappings: Mapping[str, object] | None = None,
     roots=None,
+    *,
+    workflow_hash: str = "",
 ) -> dict:
     """Prove which registered classes a workflow depends on.
 
@@ -244,6 +246,10 @@ def build_workflow_registry_proof(
     ``roots`` is passed through to :func:`class_canonical_identity` so the
     per-class identities use path-independent logical module paths; when it
     is empty/None the identities fail closed (``unresolved_identity``).
+
+    ``workflow_hash`` is an optional binding supplied by the dispatch planner.
+    The proof remains class-set scoped, but carrying the exact dispatch hash
+    makes the store/plan association auditable without changing legacy calls.
     """
     if class_mappings is None:
         try:
@@ -257,6 +263,7 @@ def build_workflow_registry_proof(
                 "missing_host": [],
                 "unresolved_identity": [],
                 "complete": False,
+                "workflow_hash": str(workflow_hash or ""),
                 "error": str(exc),
             }
         mappings: Mapping[str, object] = getattr(nodes, "NODE_CLASS_MAPPINGS", {})
@@ -290,6 +297,7 @@ def build_workflow_registry_proof(
         "missing_host": missing_host,
         "unresolved_identity": unresolved_identity,
         "complete": complete,
+        "workflow_hash": str(workflow_hash or ""),
     }
 
 
