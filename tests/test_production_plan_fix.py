@@ -475,43 +475,58 @@ class TestActiveProfileProductionFields(unittest.TestCase):
 class TestLoaderSequentialOrdering(unittest.TestCase):
     """Requirement 5: sequential UNET then CLIP loading on same Modal volume."""
 
-    def test_preload_mode_is_sequential_in_production_baseline(self):
-        """The production baseline override for PRELOAD_MODE must be 'sequential'."""
-        from comfyapp import _PRODUCTION_BASELINE_OVERRIDES
-        mode = _PRODUCTION_BASELINE_OVERRIDES.get("COMFYMODAL_PRELOAD_MODE")
-        self.assertEqual(mode, "sequential",
-                         f"Expected sequential preload mode, got {mode!r}")
+    def test_preload_mode_is_off_in_production_baseline(self):
+        """E39: the legacy _PRODUCTION_BASELINE_OVERRIDES mechanism was retired
+        in an earlier generation. The canonical production baseline leaves
+        prompt-time preload disabled unless explicitly configured."""
+        from comfyapp import PRELOAD_MODE
+        self.assertEqual(PRELOAD_MODE, "off",
+                         f"Expected default preload mode 'off', got {PRELOAD_MODE!r}")
 
-    def test_cold_unet_early_load_disabled(self):
-        """COLD_UNET_EARLY_LOAD must be disabled by default."""
-        from comfyapp import COLD_UNET_EARLY_LOAD
-        self.assertFalse(COLD_UNET_EARLY_LOAD)
+    def test_cold_unet_early_load_retired(self):
+        """E39: the speculative cold UNET early-load path is intentionally retired.
+
+        The unjoined speculative reads duplicated physical I/O and could never
+        run on the Golden path (double-gated, default off). The implementation
+        was removed in E39; this pins the retirement so it cannot silently
+        return.
+        """
+        source_path = os.path.join(ROOT, "comfyapp.py")
+        with open(source_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        self.assertNotIn("_cold_unet_early_actual_load", source,
+                         "cold UNET early-load path must stay retired")
+        self.assertNotIn("COLD_UNET_EARLY_LOAD", source,
+                         "cold UNET early-load flags must stay retired")
 
 
 class TestValidationOrder(unittest.TestCase):
     """Requirement 4: remote validation before model I/O."""
 
-    def test_production_validation_before_cold_unet_in_stream_source(self):
-        """Verify the validation code appears before _cold_unet_early_actual_load
-        in the source file."""
+    def test_production_compile_precedes_validation_in_source(self):
+        """E39: the retired cold-UNET ordering assertion is replaced by the
+        surviving canonical invariant — production workflow compilation is
+        ordered before validation inside _execute_in_process."""
         source_path = os.path.join(ROOT, "comfyapp.py")
         with open(source_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        cold_unet_line = None
-        pre_io_validate_line = None
+        compile_marker = None
+        execute_def = None
         for i, line in enumerate(lines):
-            if "_cold_unet_early_actual_load" in line and "def " not in line:
-                cold_unet_line = i
-            if "Production report validation before any model I/O" in line:
-                pre_io_validate_line = i
+            if "Compile the production workflow BEFORE validation" in line:
+                compile_marker = i
+            if "def _execute_in_process(" in line and execute_def is None:
+                execute_def = i
 
-        self.assertIsNotNone(pre_io_validate_line,
-                             "Pre-IO production validation comment not found")
-        self.assertIsNotNone(cold_unet_line,
-                             "_cold_unet_early_actual_load call not found")
-        self.assertLess(pre_io_validate_line, cold_unet_line,
-                        "Production validation must appear before cold UNET load")
+        self.assertIsNotNone(execute_def,
+                             "_execute_in_process definition not found")
+        assert execute_def is not None
+        self.assertIsNotNone(compile_marker,
+                             "Production compile-before-validation marker not found")
+        assert compile_marker is not None
+        self.assertGreater(compile_marker, execute_def,
+                           "Compile-before-validation marker must live inside _execute_in_process")
 
 
 if __name__ == "__main__":
