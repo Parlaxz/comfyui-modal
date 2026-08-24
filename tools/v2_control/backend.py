@@ -231,6 +231,7 @@ class BackendResult:
     profile: str | None = None
     profile_config_fingerprint: str | None = None
     provenance_validation_status: str = "not_checked"
+    crash_loop: dict | None = None
 
     def ok(self) -> bool:
         return self.exit_code == 0
@@ -553,6 +554,20 @@ class BackendRunner:
         elapsed_seconds = time.monotonic() - started_mono
         stdout = completed.stdout.decode("utf-8", errors="replace") if capture else ""
         stderr = completed.stderr.decode("utf-8", errors="replace") if capture else ""
+        # ── E40: crash-loop accounting ────────────────────────────────────
+        # A remote container that dies at startup is restarted by Modal;
+        # the same fatal traceback then repeats in captured output. Detect
+        # it here so the operator sees CRASH_LOOP + signature instead of a
+        # generic timeout/failure, and so retry logic can refuse to burn
+        # another full invocation on a deterministic startup crash.
+        _crash_loop = (
+            detect_crash_loop(f"{stdout or ''}\n{stderr or ''}") if capture else None
+        )
+        if _crash_loop is not None:
+            print(
+                f"[v2ctl.crash-loop] detected exception={_crash_loop.get('exception_type')!r} "
+                f"count={_crash_loop.get('count')} backend={spec.name}"
+            )
         if capture:
             try:
                 artifacts = self.discover_artifacts(
@@ -590,6 +605,7 @@ class BackendRunner:
             request_ids=list(artifacts.request_ids),
             profile=artifacts.profile,
             profile_config_fingerprint=artifacts.profile_config_fingerprint,
+            crash_loop=_crash_loop,
             provenance_validation_status=artifacts.provenance_validation_status,
         )
 

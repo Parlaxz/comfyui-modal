@@ -890,11 +890,13 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
 
 
 def cmd_deploy(args, repo_root: Path) -> int:
+    _t0 = time.perf_counter()
     try:
         registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
             repo_root, args.profile, cli_options=_cli_target_options(args),
             sets=args.set, inherits=args.inherit,
         )
+        _t_components = time.perf_counter()
         invocation_id = _new_invocation_id()
         spec = backend_registry.deploy_only()
         env = env_builder.build(config, host_env=os.environ,
@@ -930,9 +932,15 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # (a "version deployed recently" check falsely passes when a
             # deploy right after a prior one no-ops).
             _pre_version = _app_version_number(config.target.app) if config.target.app else 0
+            _t_pre_query = time.perf_counter()
+            print(f"[v2ctl.deploy] phase components_ms={round((_t_components - _t0) * 1000)} "
+                  f"lock_env_ms={round((_t_pre_query - _t_components) * 1000)} "
+                  f"pre_modal_query_ms={round((time.perf_counter() - _t_pre_query) * 1000)}")
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id)
+            _t_backend = time.perf_counter()
+            print(f"[v2ctl.deploy] phase backend_bat_ms={round((_t_backend - _t_pre_query) * 1000)}")
             # ── Crash-loop guard: a container that repeats the same traceback
             # must NEVER produce a "successful" deployment manifest.  Diagnose
             # the root cause locally and redeploy; never auto-retry. ──
@@ -1020,6 +1028,16 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
             manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
             print(f"[v2ctl.deploy-run] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
+                # ── E40: crash-loop accounting ────────────────────────────
+                _cl = getattr(result, "crash_loop", None)
+                if _cl:
+                    print(
+                        f"ERROR: CRASH_LOOP detected: exception={_cl.get('exception_type')!r} "
+                        f"count={_cl.get('count')}. The remote container is "
+                        f"failing deterministically at startup; fix the reported "
+                        f"error before redeploying (v2ctl will not auto-retry).",
+                        file=sys.stderr,
+                    )
                 try:
                     manifest.unlink(missing_ok=True)
                 except OSError:
@@ -1421,6 +1439,75 @@ def _cli_target_options(args) -> dict[str, str]:
     return opts
 
 
+def _active_workspace_env() -> dict[str, str]:
+    """MODAL_TOKEN_ID/SECRET for the ACTIVE workspace in .modal_workspaces.json.
+
+    Same workspace-safety contract as :func:`_app_version_number`: the raw
+    ``modal`` CLI default profile may point at a DIFFERENT workspace (e.g.
+    testing3 while the active workspace is testing6), so every Modal
+    invocation driven by v2ctl must inject these credentials explicitly.
+    """
+    import json
+
+    ws_file = Path(__file__).resolve().parents[2] / ".modal_workspaces.json"
+    data = json.loads(ws_file.read_text(encoding="utf-8"))
+    active_id = data.get("active_workspace_id")
+    ws = next(
+        (w for w in data.get("workspaces", []) if w.get("id") == active_id),
+        None,
+    )
+    if not ws or not ws.get("token_id") or not ws.get("token_secret"):
+        raise V2CtlError(
+            "no usable ACTIVE workspace credentials in .modal_workspaces.json"
+        )
+    return {
+        "MODAL_TOKEN_ID": str(ws["token_id"]),
+        "MODAL_TOKEN_SECRET": str(ws["token_secret"]),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    }
+
+
+def cmd_preconvert_clip_fp16(args, repo_root: Path) -> int:
+    """v2ctl preconvert-clip-fp16: ONE-TIME BF16->FP16 twin creation on the
+    models volume (R44I3 ARM B), executed through the canonical v2ctl channel
+    with ACTIVE-workspace credentials — never a bare ``modal run``."""
+    import subprocess
+
+    script = repo_root / "tools" / "preconvert_clip_fp16_volume.py"
+    if not script.is_file():
+        print(f"ERROR: missing {script}", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env.update(_active_workspace_env())
+    cmd = [
+        "modal", "run", str(script),
+        "--name", args.name,
+    ]
+    if args.force:
+        cmd.append("--force")
+    print(f"[v2ctl.preconvert] name={args.name} force={args.force}")
+    # Modal CLI output contains non-cp1252 glyphs (✓); reconfigure BEFORE
+    # writing it (same E29 root cause the BATs solve with PYTHONUTF8).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(repo_root), timeout=args.timeout, env=env,
+    )
+    sys.stdout.write(result.stdout or "")
+    sys.stderr.write(result.stderr or "")
+    if result.returncode != 0:
+        print(f"ERROR: preconvert failed exit={result.returncode}",
+              file=sys.stderr)
+        return result.returncode or 1
+    print("[v2ctl.preconvert] RESULT=OK")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="v2ctl",
@@ -1480,6 +1567,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("source-probe")
     p.set_defaults(func=cmd_source_probe)
+
+    p = sub.add_parser("preconvert-clip-fp16")
+    p.add_argument("--name", default="qwen_3_4b.safetensors")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--timeout", type=int, default=3600)
+    p.set_defaults(func=cmd_preconvert_clip_fp16)
 
     p = sub.add_parser("runtime-flags")
     rsub = p.add_subparsers(dest="runtime_command", required=True)

@@ -996,8 +996,7 @@ E37_CLEAN_LANE_RUNTIME_PROFILE: dict[str, str] = {
     "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "0",
     "COMFYMODAL_V2_CLIP_QD_READER": "1",
     "COMFYMODAL_V2_CLIP_QD_QD": "4",
-    "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": "32",
-    "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": "clean_lane_post_restore",
+    "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": "32",    "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": "clean_lane_post_restore",
     "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "0",
     "COMFYMODAL_V2_E31_FORENSICS": "0",
     "COMFYMODAL_V2_E31_FORWARD_PROFILE": "0",
@@ -1032,10 +1031,126 @@ E37_CLEAN_LANE_HARNESS_PROFILE: dict[str, str] = {
 }
 
 
+def _r42_golden_validation_active() -> bool:
+    """True when the resolved env selects the R42 Golden pipeline."""
+    return _d6_normalize(os.environ.get("COMFYMODAL_GOLDEN_PIPELINE")) == "1"
+
+
+def _r43_known_fast_validation_active() -> bool:
+    """True when the resolved env selects the R43 known-fast recovery arm.
+
+    R43 restores the historically proven E37 clean-lane fast shape via
+    weight-resident recovery: Golden OFF, CLIP and UNET weights ride the
+    memory snapshot (CLIP_SNAPSHOT_EXCLUDE_WEIGHTS=0, SNAPSHOT_EXCLUDE_UNET=0)
+    so requests do zero model file IO; VAE stays native at request time.
+    """
+    if _r42_golden_validation_active():
+        return False
+    return (
+        _d6_normalize(os.environ.get("COMFYMODAL_V2_CLIP_QD_READER")) == "0"
+        and _d6_normalize(os.environ.get("COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS")) == "0"
+        and _d6_normalize(os.environ.get("COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET")) == "0"
+    )
+
+
+# R42 Golden QD4 reconciliation tuple (config/v2/profiles/r42-golden-qd4.toml).
+# The Golden pipeline supersedes several E37-era arms (documented mappings in
+# config_authority.build_config_truth); the snapshot composition is
+# static-metadata-only (zero role value bytes) and placement is unpinned.
+R42_GOLDEN_RUNTIME_PROFILE: dict[str, str] = {
+    "COMFYMODAL_GOLDEN_PIPELINE": "1",
+    "COMFYMODAL_V2_E37_CLEAN_LANE": "1",
+    "COMFYMODAL_V2_CLEAN_LANE": "1",
+    "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA": E37_CLEAN_LANE_EXPECTED_OUTPUT_SHA,
+    "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+    "COMFYMODAL_MINIMAL_RESTORE": "1",
+    "COMFYMODAL_V2_CRITICAL_PATH_LEDGER": "1",
+    "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
+    "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "0",
+    # Loader selection: ONE transport (golden_qd4, QD=4, 32 MiB) for all roles.
+    "COMFYMODAL_V2_CLIP_QD_READER": "1",
+    "COMFYMODAL_V2_CLIP_QD_QD": "4",
+    "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": "32",
+    "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": "clean_lane_post_restore",
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0",
+    "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": "0",
+    "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "0",
+    "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "0",
+    # Superseded by the Golden pipeline orchestration (resolved default 0).
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "0",
+    # Snapshot composition: static metadata only, zero role value bytes.
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+    "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": "1",
+    "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
+    "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "0",
+    "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT": "0",
+    "COMFYMODAL_V2_EVICT_RETAIN_ROLE": "none",
+    "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS": "0",
+    # Cache policy: maximum deterministic hits, conditioning forced miss.
+    "COMFYMODAL_V2_EXACT_CACHE_PERSIST": "0",
+    "COMFYMODAL_V2_BACKGROUND_PERSISTENCE": "0",
+    "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": "0",
+    # Everything algorithm-changing explicitly OFF.
+    "COMFYMODAL_V2_EXECUTION_PREFILL": "0",
+    "COMFYMODAL_V2_PREFILL_LANES": "none",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": "0",
+    "COMFYMODAL_V2_MODEL_PRELOAD": "0",
+    "COMFYMODAL_V2_GRAPH_PRELOAD": "0",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "0",
+    "COMFYMODAL_V2_GPU_FAST_RETURN": "0",
+    # E37 clean-lane hygiene retained verbatim.
+    "COMFYMODAL_V2_E37_STRICT_PROOF": "1",
+    "COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH": "1",
+    "COMFYMODAL_V2_E31_FORENSICS": "0",
+    "COMFYMODAL_V2_E31_FORWARD_PROFILE": "0",
+    "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": "0",
+    "COMFYMODAL_V2_ALLOCATOR_PURGE": "0",
+    "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS": "0",
+}
+
+# R43 known-fast recovery tuple (config/v2/profiles/r43-known-fast.toml).
+# E37-style weight-resident recovery: CLIP and UNET weights ride the memory
+# snapshot (zero request-time model file IO), VAE stays native at request
+# time. Golden OFF and all legacy file-transport/prewarm arms OFF; restore/
+# snapshot machinery untouched.
+R43_KNOWN_FAST_RUNTIME_PROFILE: dict[str, str] = dict(R42_GOLDEN_RUNTIME_PROFILE)
+R43_KNOWN_FAST_RUNTIME_PROFILE.update({
+    "COMFYMODAL_GOLDEN_PIPELINE": "0",
+    "COMFYMODAL_V2_CLIP_QD_READER": "0",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "0",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "0",
+    "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": "0",
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0",
+    "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": "0",
+    "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": "0",
+})
+
+
 def verify_e37_clean_lane_profile() -> tuple[bool, dict[str, Any]]:
-    """Fail-closed local verifier for the E37 CLEAN_LANE deploy tuple."""
+    """Fail-closed local verifier for the E37 CLEAN_LANE deploy tuple.
+
+    R42: when the resolved env selects the Golden pipeline
+    (``COMFYMODAL_GOLDEN_PIPELINE=1``), the expected tuple is the R42 Golden
+    contract instead of the E37-era values (snapshot composition, retired
+    arms, loader selection all differ by design).
+    """
+    golden_active = _r42_golden_validation_active()
+    r43_active = _r43_known_fast_validation_active()
+    runtime_profile = (
+        R42_GOLDEN_RUNTIME_PROFILE if golden_active
+        else R43_KNOWN_FAST_RUNTIME_PROFILE if r43_active
+        else E37_CLEAN_LANE_RUNTIME_PROFILE
+    )
     details: dict[str, Any] = {
-        "profile": E37_CLEAN_LANE_PROFILE_NAME,
+        "profile": (
+            "r42-golden-qd4" if golden_active
+            else "r43-known-fast" if r43_active
+            else E37_CLEAN_LANE_PROFILE_NAME
+        ),
         "active": _e37_clean_lane_active(),
     }
     if not details["active"]:
@@ -1060,8 +1175,24 @@ def verify_e37_clean_lane_profile() -> tuple[bool, dict[str, Any]]:
         details["validation"] = "FAIL"
         details["error"] = f"{type(exc).__name__}: {exc}"
         return False, details
-    for key, expected in E37_CLEAN_LANE_RUNTIME_PROFILE.items():
+    for key, expected in runtime_profile.items():
         got = _d6_normalize(effective.get(key))
+        if (
+            key in (
+                "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS",
+                "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB",
+            )
+            and _d6_normalize(effective.get("COMFYMODAL_V2_REQUEST_FASTSAFE")) == "1"
+        ):
+            # R44D: with the request-time FastSafe lane active, these knobs
+            # configure ONLY the request-scoped CheckpointPrewarmer (global
+            # prewarm flag stays 0).  The corrected historical baseline is
+            # 4 threads / 8 MiB chunks; the legacy zero expectations applied
+            # only to the retired restore-side orchestration.
+            expected = {
+                "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": "4",
+                "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": "8",
+            }[key]
         details[key] = got
         if got != expected:
             ok = False
@@ -4466,6 +4597,25 @@ async def _run_one(
             artifact["canonical_ledger_error"] = _remote_error
     except Exception:
         pass
+    # ── E40: single acceptance-authority telemetry blocks ────────────────
+    # loader_selection / runtime_status / resolved_config are emitted once
+    # per run by the runtime (modal_app result assembly) and surfaced here
+    # verbatim so offline validation reads the SAME structures.
+    try:
+        _e40_source = None
+        if isinstance(result, dict):
+            _e40_source = result
+            if not any(k in result for k in ("loader_selection", "runtime_status", "resolved_config")) \
+                    and isinstance(result.get("data"), dict):
+                _e40_source = result["data"]
+        if isinstance(_e40_source, dict):
+            for _e40_key in ("loader_selection", "runtime_status", "resolved_config",
+                             "e40_telemetry_error"):
+                _e40_val = _e40_source.get(_e40_key)
+                if _e40_val is not None:
+                    artifact[_e40_key] = _e40_val
+    except Exception:
+        pass
     (output_dir / f"run_{index}.json").write_text(
         json.dumps(artifact, default=str, indent=2), encoding="utf-8"
     )
@@ -4498,6 +4648,31 @@ async def _run_one(
         artifact["_trace_handoff_error"] = str(exc)[:300]
         (output_dir / f"run_{index}.json").write_text(
             json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+
+    # ── R44H2: V2 DYNAMIC CRITICAL PATH GANTT auto-render ──────────────
+    # Host-side, POST-artifact derived view (never on the remote critical
+    # path; raw telemetry remains the source of truth).  Renders THIS run's
+    # artifact into dynamic_gantt_run_<index>.txt next to it and prints a
+    # one-line pointer + local render overhead.  Best-effort: never fails
+    # the run.
+    try:
+        _t_dg0 = time.perf_counter()
+        from comfymodal_runtime.dynamic_gantt import render_artifact_file
+        _dg_report = render_artifact_file(str(output_dir), f"run_{index}.json")
+        _dg_ms = (time.perf_counter() - _t_dg0) * 1000.0
+        _dg_path = output_dir / f"dynamic_gantt_run_{index}.txt"
+        _dg_path.write_text(_dg_report + "\n", encoding="utf-8")
+        print(
+            f"[v2.dynamic_gantt] rendered run_{index} gantt "
+            f"({_dg_ms:.1f} ms host-side) -> {_dg_path.name}",
+            flush=True,
+        )
+    except Exception as _dg_exc:
+        print(
+            f"[v2.dynamic_gantt] render skipped: "
+            f"{type(_dg_exc).__name__}: {str(_dg_exc)[:160]}",
+            flush=True,
         )
 
     # ── Experiment-result persistence (V2 A/B campaign) ────────────────
@@ -11355,7 +11530,12 @@ if __name__ == "__main__":
         ok, details = verify_e37_clean_lane_profile()
         print("[v2.e37_clean_lane_profile]", flush=True)
         print(f"profile={details.get('profile', 'default')}", flush=True)
-        for key in tuple(E37_CLEAN_LANE_RUNTIME_PROFILE) + tuple(E37_CLEAN_LANE_HARNESS_PROFILE):
+        for key in (
+            tuple(E37_CLEAN_LANE_RUNTIME_PROFILE)
+            + tuple(R42_GOLDEN_RUNTIME_PROFILE)
+            + tuple(R43_KNOWN_FAST_RUNTIME_PROFILE)
+            + tuple(E37_CLEAN_LANE_HARNESS_PROFILE)
+        ):
             short = key.removeprefix("COMFYMODAL_V2_").lower()
             print(f"{short}={details.get(key, 'unavailable')}", flush=True)
         print(f"conditioning_cache={details.get('conditioning_cache', 'unavailable')}", flush=True)

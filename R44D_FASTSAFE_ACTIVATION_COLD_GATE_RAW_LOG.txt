@@ -1,0 +1,533 @@
+R44D_FASTSAFE_ACTIVATION_COLD_GATE_RAW_LOG
+Unabridged evidence for independent verification. All JSON verbatim from persisted artifacts.
+
+====================================================================================================
+A. GIT STATE AT BATCH START
+====================================================================================================
+
+$ git rev-parse HEAD
+0c59f46e3238f421378e8852ebc548da815b70af
+$ git branch --show-current
+r42-golden-reconciliation
+$ git status --short  (entry count: 75)
+
+====================================================================================================
+B. LOCAL VERIFICATION
+====================================================================================================
+
+$ python -m pytest tests/test_r44a_generation_determinism.py tests/test_runtime_state_reload_guard.py
+  tests/test_r44b_request_fastsafe.py tests/test_v2_waterfall.py tests/test_v2_waterfall_contract.py
+  tests/test_r44d_runtime_env_passthrough.py tests/test_r44d_proof_installation.py -q --no-header
+158 passed in 62.65s
+
+R44D SOURCE CHANGES (exact hunks):
+ 1. modal_app.py::_runtime_env  +4 REQUEST_* passthroughs (default '0')
+ 2. config/v2/profiles/r44-request-fastsafe.toml  PREWARM_THREADS 0->4, CHUNK_MB 0->8 (global flag stays 0)
+ 3. modal_app.py::run_plan_stream entry  composition-independent _install_clip_span_wrappers(trace=diagnostics)
+ 4. model_preload.py::_make_clip_span_wrapper  clip_raw_encode bypass forced-miss evidence (non-Golden, once/trace)
+ 5. tools/v2_control/validation.py::E37CleanLaneProofValidator  QD-transport block scoped to QD-requested runs
+ 6. request_fastpath.py::result  lazily register wait event so bounded waits observe late publishers
+ 7. request_unet_fastsafe.py::_continuation  record_observed('unet','fastsafetensors') on case-b success
+
+====================================================================================================
+C. LEVEL-1 ENV PROOF (v2ctl deploy --dry-run child env, REQUEST/PREWARM/FASTSAFE subset)
+====================================================================================================
+
+deploy_fingerprint=7fc24208612d533214d13f51053e38261ba1ceba146ff8b327741a6e00e2c24f
+  COMFYMODAL_GOLDEN_PIPELINE=0
+  COMFYMODAL_V2_CHECKPOINT_PREWARM=0
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB=8
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS=4
+  COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB=524288
+  COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES=268435456
+  COMFYMODAL_V2_CLIP_FASTSAFE_THREADS=8
+  COMFYMODAL_V2_CLIP_QD_READER=0
+  COMFYMODAL_V2_FAST_COLD_ORCHESTRATION=0
+  COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE=1
+  COMFYMODAL_V2_REQUEST_FASTSAFE=1
+  COMFYMODAL_V2_REQUEST_UNET_FASTSAFE=1
+  COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP=1
+  COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB=524288
+  COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES=268435456
+  COMFYMODAL_V2_UNET_FASTSAFE_THREADS=8
+
+====================================================================================================
+D. LEVEL-2 ENV PROOF (_runtime_env exercised by tests/test_r44d_runtime_env_passthrough.py — 17 passed)
+====================================================================================================
+
+test_request_keys_default_off_when_absent x4   PASSED (absent host env -> container default '0')
+test_request_keys_passthrough_when_set x4      PASSED (host '1' -> class env '1' verbatim)
+test_all_four_request_flags_active_together    PASSED
+test_fastsafe_tuning_keys_present x6           PASSED
+test_fastsafe_tuning_values_cross_boundary     PASSED (T8/B256MiB/bbuf512 both roles)
+test_global_prewarm_flag_and_request_scoped_knobs_coexist PASSED (flag 0 with threads=4/chunk=8)
+
+====================================================================================================
+E. DEPLOYMENT
+====================================================================================================
+
+Attempt 1: deploy_fingerprint afd97ecffec8153d87e3452ad10f4b4e8dd31972d455b0787890696993b09f06
+  RESULT: FAILED PRE-SPEND (zero cost). BAT verifier 'clean profile mismatch': legacy expectation
+  PREWARM_THREADS=0/CHUNK_MB=0 vs corrected R44 baseline 4/8. Fixed by scoping verifier expectation
+  to 4/8 only when COMFYMODAL_V2_REQUEST_FASTSAFE resolves 1 (r43 contract untouched).
+Attempt 2 (VALID DEPLOY):
+  deploy_fingerprint = "7fc24208612d533214d13f51053e38261ba1ceba146ff8b327741a6e00e2c24f"
+  profile = "r44-request-fastsafe"
+  profile_config_fingerprint = "07578273f5676c7e14c514a45397b3045c344e16c6c5fcd306d4c008d236288d"
+  owner = "R44D"
+  created_at = "2026-08-24T01:03:44+00:00"
+  deployment_transport_status = "deployed"
+  backend = {"command": "\"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal-r42\\deploy_and_run_v2_single.bat\" E37_CLEAN_LANE_VALIDATION", "elapsed_seconds": 610.6410000000033, "ended_at": "2026-08-24T01:02:58+00:00", "exit_code": 0, "started_at": "2026-08-24T00:52:47+00:00"}
+  run_fingerprint(child env) = "194ee7dc44d83f045be536ae958d8ff1125b941f5be68e9381ebc8b093d9615a"
+
+====================================================================================================
+F. GATE RESULT
+====================================================================================================
+
+[v2ctl.gate] valid=1 manifest=.v2ctl\gates\gate_20260824-010534_194ee7dc.json
+reasons: []
+run.output_dir = "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-24_01-04-43"
+run.request_id = "v2-benchmark-0-e9c81bcfd803"
+run.request_ids = ["v2-benchmark-0-e9c81bcfd803"]
+run.backend_exit_code = 0
+
+====================================================================================================
+G. RUN ARTIFACT — identity / status / sha / loader_selection / ledger
+====================================================================================================
+
+identity = {
+ "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+ "class_name": "ModalRuntimeEntrypoint",
+ "method_name": "run_plan_stream",
+ "gpu": [
+  "RTX-PRO-6000"
+ ],
+ "cpu": 12,
+ "memory_mb": 32768,
+ "fingerprint": "f4114f621f39c376cb1d608b6bebd8d86fe6f09d7e75e5885d7a6d36651aef79",
+ "runtime_shape": {
+  "thread_policy": "TBASE",
+  "torch_intraop_threads": null,
+  "torch_interop_threads": null,
+  "omp_num_threads": null,
+  "mkl_num_threads": null,
+  "openblas_num_threads": null,
+  "numexpr_num_threads": null,
+  "malloc_arena_max": null,
+  "snapshot_model_order": "O0",
+  "cpu_request": 12,
+  "memory_request": 32768,
+  "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+  "runtime_shape_label": null
+ },
+ "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+ "runtime_shape_label": null,
+ "stored_snapshot_model_order": null,
+ "restore_count": 1,
+ "request_count": 1,
+ "restored_instance_id": "15e287ca301f4f1e8a406fcd5e97378f",
+ "restore_session_id": "f0acbf992a17443f9f2eb7ffbdd25840",
+ "container_task_id": "ta-01M0RMRT2XTJY2KAR28KDWE8ZR",
+ "modal_container_id": "",
+ "image_id": "im-zuQ2EQi6kBAhOpK1JEvRw1",
+ "cloud": "CLOUD_PROVIDER_AWS",
+ "region": "us-east-2",
+ "modal_input_id": "in-01M0RMRSP738X2RDQ6TV3G3346:1787533485767-0",
+ "container_session_id": "5c395f74f9bf40b9"
+}
+runtime_status = {"status": "NOMINAL", "reasons": []}
+output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+loader_selection = {
+ "clip": {
+  "requested": "fastsafetensors_direct_gpu",
+  "effective": "fastsafetensors_direct_gpu",
+  "observed": "fastsafetensors_direct_gpu",
+  "fallback_attempted": false,
+  "fallback_loader": "",
+  "fallback_reason": ""
+ },
+ "unet": {
+  "requested": "fastsafetensors",
+  "effective": "fastsafetensors",
+  "observed": "fastsafetensors",
+  "fallback_attempted": false,
+  "fallback_loader": "",
+  "fallback_reason": ""
+ },
+ "vae": {
+  "requested": "native_comfy",
+  "effective": "native_comfy",
+  "observed": "native_comfy",
+  "fallback_attempted": false,
+  "fallback_loader": "",
+  "fallback_reason": ""
+ }
+}
+canonical_ledger_status = ok ; endpoint=ok ; zero_gap=True
+ledger.events = [
+ [
+  "modal_restore_entry",
+  {}
+ ],
+ [
+  "bootstrap_restore_entry",
+  {
+   "source": "runtime_bootstrap.restore"
+  }
+ ],
+ [
+  "modal_restore_exit",
+  {
+   "status": "restored"
+  }
+ ],
+ [
+  "modal_method_entry",
+  {}
+ ],
+ [
+  "plan_deserialize_start",
+  {}
+ ],
+ [
+  "plan_received",
+  {}
+ ],
+ [
+  "graph_next_node_after_sampler",
+  {
+   "request_id": "v2-benchmark-0-e9c81bcfd803"
+  }
+ ],
+ [
+  "result_assembly_start",
+  {
+   "prompt_id": "v2-benchmark-0-e9c81bcfd803",
+   "strategy": "direct_output_sink",
+   "items": 1
+  }
+ ],
+ [
+  "clip_conditioning_cache_decision",
+  {
+   "decision": "forced_miss",
+   "encode_calls": 1,
+   "source": "pre_sampler_structured_report"
+  }
+ ],
+ [
+  "output_persist_done",
+  {
+   "request_id": "v2-benchmark-0-e9c81bcfd803"
+  }
+ ],
+ [
+  "first_durable_result",
+  {}
+ ]
+]
+
+====================================================================================================
+H. REMOTE CONTROLS (container truth)
+====================================================================================================
+
+  COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE = False
+  COMFYMODAL_GOLDEN_PIPELINE = False
+  COMFYMODAL_V2_CHECKPOINT_PREWARM = False
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB = 8
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB = 0
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS = 0
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS = 4
+  COMFYMODAL_V2_CLIP_CONDITIONING_CACHE = True
+  COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB = 524288
+  COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES = 268435456
+  COMFYMODAL_V2_CLIP_FASTSAFE_THREADS = 8
+  COMFYMODAL_V2_CLIP_QD_READER = False
+  COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = False
+  COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU = False
+  COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH = False
+  COMFYMODAL_V2_FAST_COLD_ORCHESTRATION = False
+  COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST = True
+  COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE = True
+  COMFYMODAL_V2_REQUEST_FASTSAFE = True
+  COMFYMODAL_V2_REQUEST_UNET_FASTSAFE = True
+  COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP = True
+  COMFYMODAL_V2_SINGLE_USE_CONTAINERS = True
+  COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET = False
+  COMFYMODAL_V2_UNET_FASTSAFETENSORS = False
+  COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB = 524288
+  COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES = 268435456
+  COMFYMODAL_V2_UNET_FASTSAFE_THREADS = 8
+
+====================================================================================================
+I. TIMING / WATERFALL STAGES
+====================================================================================================
+
+  wall_ms = 28222.5
+  command_to_response_ms = 53179.4
+  restore_total_ms = 1113.273
+  pre_sampler_ms = 15780.195
+  sampler_ms = 3713.402
+  vae_decode_ms = 502.387
+  output_collection_ms = 9.857
+  reload_runtime_state_ms = 0.0 ; reload_models_ms = 0.0
+  local_preparation                           24846.1 ms  group=local
+  modal_handle_submission                       164.5 ms  group=local
+  modal_scheduling                             6170.1 ms  group=platform
+  application_restore                          1530.9 ms  group=application
+  restore_to_method_entry                        47.5 ms  group=application
+  remote_method_setup                           711.6 ms  group=application
+  sampler_node_to_sampling                     1432.4 ms  group=application
+  sampling                                     3713.4 ms  group=application
+  post_sampling_transition                      382.2 ms  group=application
+  vae                                           502.4 ms  group=application
+  output_persistence                            334.0 ms  group=application
+  remote_local_return                            15.0 ms  group=local
+trace stages t4-t8:
+    sampler_stage_start_perf_ns            267166339829
+    t4_clip_load_end                       1787533499.651418
+    t4_clip_load_start                     1787533493.189352
+    t4b_unet_load_end                      1787533506.7131968
+    t4b_unet_load_start                    1787533502.802215
+    t4c_vae_load_end                       1787533493.1867633
+    t4c_vae_load_start                     1787533492.6676333
+    t4d_model_sampling_end                 1787533506.7153003
+    t4d_model_sampling_start               1787533506.7131968
+    t5_text_encode_end                     1787533502.7423534
+    t5_text_encode_start                   1787533499.651418
+    t6_sampler_end                         1787533511.9209518
+    t6_sampler_start                       1787533508.2075493
+    t7_vae_decode_end                      1787533512.8055844
+    t7_vae_decode_start                    1787533512.3031936
+    t7b_collect_start                      1787533513.0777824
+    t8_cachedit_end                        1787533506.7155719
+    t8_cachedit_start                      1787533506.7153003
+    t8_noise_inject_end                    1787533506.775195
+    t8_noise_inject_start                  1787533506.7738464
+    t8b_outputs_collected                  1787533513.0876396
+    t8bb_persist_end                       1787533513.0875044
+    t8bb_persist_start                     1787533513.079867
+    t8c_output_encode_end                  1787533513.079848
+    t8c_output_encode_start                1787533512.8059702
+
+====================================================================================================
+J. KEY TRACE EVENT PAYLOADS (verbatim, identity fields trimmed)
+====================================================================================================
+
+=== runtime_state_generation_baseline ===
+{
+ "source": "runtime_config_generation_json",
+ "generation": "1e02514e9e15",
+ "files": 2,
+ "write_ms": 7.545,
+ "fail_closed_reload": 0
+}
+=== clean_lane_mode_enabled ===
+{
+ "mode": "E37_CLEAN_LANE"
+}
+=== runtime_state_reload_decision ===
+{
+ "decision": "skipped_generation_match",
+ "reason": "exact_match",
+ "expected_generation": "1e02514e9e1580da5ab8a1002f9e669a",
+ "current_generation": "1e02514e9e1580da5ab8a1002f9e669a",
+ "file_diff": {},
+ "callback_called": 0,
+ "runtime_state_reload_invoked": 0,
+ "check_ms": 399.256
+}
+=== models_reload_decision ===
+{
+ "decision": "skipped_generation_match",
+ "reason": "exact_match",
+ "callback_called": 0,
+ "check_ms": 3.796
+}
+=== plan_proof_decision ===
+{
+ "consumed": true,
+ "decision": "plan_validation_fast_path",
+ "reason": ""
+}
+=== clip_conditioning_cache_lookup ===
+{
+ "hit": false,
+ "hit_count": 0,
+ "miss_count": 1,
+ "entry_count": 1,
+ "request_id": "v2-benchmark-0-e9c81bcfd803",
+ "clip_object_id": "47273963267280",
+ "text_hash": "12ae32cb1ec02d01",
+ "text_length": 0,
+ "real_encode_request": true,
+ "lookup_status": "bypassed",
+ "reason": "raw_encode_without_engaged_conditioning_cache",
+ "persistence": "disabled"
+}
+=== clip_conditioning_cache_decision ===
+{
+ "decision": "miss_not_stored",
+ "request_id": "v2-benchmark-0-e9c81bcfd803",
+ "hit": false,
+ "hit_count": 0,
+ "miss_count": 1,
+ "entry_count": 1,
+ "encode_calls": 1,
+ "persisted_count": 0,
+ "persistence": "disabled",
+ "real_encode_request": true,
+ "reason": "raw_encode_without_engaged_conditioning_cache"
+}
+=== clip_forward_start ===
+{
+ "clip_span": "clip_forward"
+}
+=== clean_lane_proof ===
+{
+ "mode": "E37_CLEAN_LANE",
+ "proof_version": 1,
+ "phase_intervals": {
+  "restore": {
+   "start_ns": 245444715304,
+   "end_ns": 246533525268
+  },
+  "plan_identity": {
+   "start_ns": 246588065012,
+   "end_ns": 246604724541
+  }
+ },
+ "forbidden_activity_attempts": [
+  {
+   "name": "background_memory_diagnostics",
+   "attempt_ns": 246533351546,
+   "stage": "restore_complete"
+  },
+  {
+   "name": "plan_time_unet_source_h2d",
+   "attempt_ns": 246604735223
+  },
+  {
+   "name": "background_memory_diagnostics",
+   "attempt_ns": 247284622064,
+   "stage": "prompt_executor_start"
+  },
+  {
+   "name": "execution_prefill",
+   "attempt_ns": 247285057782
+  },
+  {
+   "name": "background_memory_diagnostics",
+   "attempt_ns": 247290898368,
+   "stage": "peak_execution"
+  }
+ ],
+ "volume_reads": [],
+ "restore_child_classifications": {
+  "identity_capture": "MUST_BE_IN_RESTORE",
+  "runtime_configuration": "MUST_BE_IN_RESTORE",
+  "snapshot_retargeting": "SNAPSHOT_CARRY",
+  "scheduler_state": "SCHEDULER_CARRY",
+  "clip_qd_source_read": "MOVE_AFTER_RESTORE",
+  "unet_plan_prefetch": "REDUNDANT",
+  "conditioning_prefetch": "REDUNDANT",
+  "input_types_warm": "REDUNDANT",
+  "host_diagnostics": "DIAGNOSTIC_ONLY",
+  "modal_banner_to_first_python": "DIAGNOSTIC_ONLY"
+ },
+ "ordering": {
+  "restore_return_ns": 246533525268,
+  "plan_identity_complete_ns": 246604724541,
+  "forward_start_ns": 255629144461,
+  "forward_end_ns": 257601371750
+ },
+ "qd": {},
+ "quiescence": {},
+ "thread_state": {},
+ "source_errors": [],
+ "gpu_operation_overlap": [],
+ "forbidden_overlap": []
+}
+=== clip_forward_end ===
+{
+ "duration_ms": 1973.478,
+ "thread_cpu_ms": 1020.0,
+ "process_cpu_ms": 1300.0,
+ "thread_minor_faults": 0,
+ "thread_major_faults": 0,
+ "process_minor_faults": 0,
+ "process_major_faults": 0,
+ "cuda_no_sync": true,
+ "cuda_initialized_before": true,
+ "cuda_initialized_after": true,
+ "cuda_allocated_before_bytes": 16146645504,
+ "cuda_allocated_after_bytes": 16180199936,
+ "cuda_allocated_delta_bytes": 33554432,
+ "cuda_reserved_before_bytes": 16150167552,
+ "cuda_reserved_after_bytes": 16389242880,
+ "cuda_reserved_delta_bytes": 239075328,
+ "status": "ok"
+}
+
+====================================================================================================
+K. EVENT NAME HISTOGRAM (proof-relevant)
+====================================================================================================
+
+    1 clean_lane_forbidden_activity
+    1 clean_lane_mode_enabled
+    1 clean_lane_proof
+    1 clean_lane_restore_child_classifications
+    1 clean_lane_restore_return
+    1 clip_conditioning_cache_decision
+    1 clip_conditioning_cache_lookup
+    1 clip_forward_end
+    1 clip_forward_start
+    1 clip_raw_encode_end
+    1 clip_raw_encode_start
+    1 clip_scheduled_conditioning_end
+    1 clip_scheduled_conditioning_start
+    2 sampler_end
+    2 sampler_start
+NOTE: request_fastpath_begin / clip_fast_load_* / unet_fastsafe_pipeline / bind_mode / storage_identity
+      strings appear 0 times in persisted artifacts: the R44B ctx.telemetry channel targets the
+      per-request diagnostics sink which does not persist per-event records. Physical execution is
+      proven by loader_selection observed arms (success-only) + node windows. Preserved as anomaly #1.
+
+====================================================================================================
+L. PRE-SAMPLER STRUCTURED REPORT
+====================================================================================================
+
+  clip_raw_encode_ms = 3081.092
+  clip_raw_encode_calls = [{"duration_ms": 3081.092, "clip_id": "47273963267280"}]
+  clip_text_encode_nodes = [{"node_id": "67", "duration_ms": 3092.656}]
+  conditioning_cache_nonce = "1837de4bd95a4c9496b4c5f819f31ced"
+
+====================================================================================================
+M. HOST TELEMETRY
+====================================================================================================
+
+{
+ "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+ "gpu_vram_mib": 97250,
+ "cuda_version": "13.0",
+ "compute_capability": "12.0",
+ "cloud": "CLOUD_PROVIDER_AWS",
+ "region": "us-east-2",
+ "restored_instance_id": "15e287ca301f4f1e8a406fcd5e97378f",
+ "fresh": true,
+ "cpu_vendor": "Intel",
+ "cpu_family": "6",
+ "cpu_model": "207",
+ "cpu_visible": 28,
+ "max_rss_mib": 4615.890625
+}
+
+====================================================================================================
+N. ARTIFACT FILES
+====================================================================================================
+
+        1804  campaign_manifest.json
+      610374  run_0.json
+      409547  run_001_sample.json
+       26144  run_001_sample.json.v2ctl-provenance.json
+       11815  summary.json

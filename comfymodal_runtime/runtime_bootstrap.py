@@ -38,6 +38,44 @@ from .runtime_generation import (
 
 _log = logging.getLogger(__name__)
 
+# ── R42 Stage C: restore reload-decision recorder (status-merge input) ────
+# Bounded module-level store of the most recent restore reload decisions
+# (runtime-state volume + models volume).  A decision whose callback was
+# actually INVOKED is external-mutation evidence and must surface as a
+# DEGRADED reason in the run record — never silent nominal.  Recording is
+# unconditional and never raises; consumers read via
+# ``last_restore_reload_decisions()``.
+_RELOAD_DECISIONS_MAX = 8
+_RESTORE_RELOAD_DECISIONS: list[dict[str, Any]] = []
+_RESTORE_RELOAD_DECISIONS_LOCK = __import__("threading").Lock()
+
+
+def _record_restore_reload_decision(
+    stage: str,
+    *,
+    decision: str,
+    reason: str,
+    callback_called: bool,
+    check_ms: float,
+) -> None:
+    with _RESTORE_RELOAD_DECISIONS_LOCK:
+        _RESTORE_RELOAD_DECISIONS.append(
+            {
+                "stage": str(stage),
+                "decision": str(decision),
+                "reason": str(reason),
+                "callback_called": bool(callback_called),
+                "check_ms": float(check_ms),
+            }
+        )
+        del _RESTORE_RELOAD_DECISIONS[:-_RELOAD_DECISIONS_MAX]
+
+
+def last_restore_reload_decisions() -> list[dict[str, Any]]:
+    """Snapshot copy of the latest recorded restore reload decisions."""
+    with _RESTORE_RELOAD_DECISIONS_LOCK:
+        return [dict(entry) for entry in _RESTORE_RELOAD_DECISIONS]
+
 # ── Measurement-only restore decomposition state ────────────────────────
 # Everything below is gated by COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS (off by
 # default; see optimization_diagnostics).  Only ``opt_``-prefixed trace events
@@ -1700,6 +1738,7 @@ class RuntimeBootstrap:
         _expected_manifest = dict(
             getattr(self.state, "snapshot_runtime_state_manifest", None) or {}
         )
+        _marker_files: dict[str, Any] = {}
         _decision = "reloaded_generation_unknown"
         _reason = "no_snapshot_baseline"
         _current = ""
@@ -1753,11 +1792,48 @@ class RuntimeBootstrap:
         else:
             _reason = "manifest_no_baseline"
         _check_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        # R42A drift diagnostics: on any non-skip outcome, pinpoint WHICH
+        # correctness-relevant file diverged (expected manifest vs marker
+        # manifest vs on-mount bytes) so a remote reload can never again be
+        # attributed to an anonymous "generation_mismatch".
+        _file_diff: dict[str, Any] = {}
+        if _decision != "skipped_generation_match":
+            try:
+                _actual: dict[str, Any] = {}
+                if _root and os.path.isdir(_root):
+                    _actual = self.build_runtime_state_manifest(
+                        _root,
+                        tuple(getattr(self.config, "runtime_state_manifest_files", ()) or ()),
+                        required=(),
+                    ) or {}
+                _keys = sorted(
+                    set(_expected_manifest) | set(_marker_files or {}) | set(_actual)
+                )
+                for _k in _keys:
+                    _e = (_expected_manifest or {}).get(_k) or {}
+                    _m = (_marker_files or {}).get(_k) or {}
+                    _a = _actual.get(_k) or {}
+                    _entry: dict[str, Any] = {
+                        "expected_sha": str(_e.get("sha256", ""))[:12],
+                        "marker_sha": str(_m.get("sha256", ""))[:12],
+                        "mount_sha": str(_a.get("sha256", ""))[:12],
+                        "expected_present": bool(_e.get("present", False)),
+                        "marker_present": bool(_m.get("present", False)),
+                        "mount_present": bool(_a.get("present", False)),
+                    }
+                    if _entry["expected_sha"] != _entry["mount_sha"] or (
+                        _entry["expected_present"] != _entry["mount_present"]
+                    ):
+                        _entry["diverged"] = True
+                    _file_diff[_k] = _entry
+            except Exception as _fd_exc:
+                _file_diff = {"error": type(_fd_exc).__name__}
         return {
             "decision": _decision,
             "reason": _reason,
             "expected_generation": _expected,
             "current_generation": _current,
+            "file_diff": _file_diff,
             "check_ms": _check_ms,
         }
 
@@ -2153,6 +2229,7 @@ class RuntimeBootstrap:
             _runtime_state_reload_reason = "unconditional"
             _runtime_state_reload_check_ms = 0.0
             _runtime_state_reload_skipped = False
+            _runtime_state_reload: dict[str, Any] = {}
             if self.reload_runtime_state is not None:
                 _runtime_state_reload = self._decide_runtime_state_reload()
                 _runtime_state_reload_decision = _runtime_state_reload["decision"]
@@ -2185,10 +2262,16 @@ class RuntimeBootstrap:
                     pass
                 else:
                     _do_reload_runtime_state()
+            _rs_expected_gen = str(_runtime_state_reload.get("expected_generation", "") or "")
+            _rs_current_gen = str(_runtime_state_reload.get("current_generation", "") or "")
+            _rs_file_diff = _runtime_state_reload.get("file_diff") or {}
             print(
                 f"[v2.runtime_state_volume_restore] "
                 f"decision={_runtime_state_reload_decision} "
                 f"reason={_runtime_state_reload_reason} "
+                f"expected_gen={_rs_expected_gen[:12] or '-'} "
+                f"current_gen={_rs_current_gen[:12] or '-'} "
+                f"diverged_files={sum(1 for v in _rs_file_diff.values() if isinstance(v, dict) and v.get('diverged')) if isinstance(_rs_file_diff, dict) else '-'} "
                 f"callback_called={int(_runtime_state_reload_invoked)} "
                 f"runtime_state_reload_invoked={int(_runtime_state_reload_invoked)} "
                 f"check_ms={_runtime_state_reload_check_ms}",
@@ -2201,6 +2284,9 @@ class RuntimeBootstrap:
                     metadata={
                         "decision": _runtime_state_reload_decision,
                         "reason": _runtime_state_reload_reason,
+                        "expected_generation": _rs_expected_gen,
+                        "current_generation": _rs_current_gen,
+                        "file_diff": _rs_file_diff,
                         "callback_called": int(_runtime_state_reload_invoked),
                         "runtime_state_reload_invoked": int(_runtime_state_reload_invoked),
                         "check_ms": _runtime_state_reload_check_ms,
@@ -2261,6 +2347,28 @@ class RuntimeBootstrap:
                         "check_ms": _models_reload_check_ms,
                     },
                 )
+
+            # ── R42 Stage C: record both reload decisions for status merge ──
+            # A reload that actually INVOKED its callback is external-state
+            # mutation evidence; the run must surface DEGRADED (never silent
+            # nominal).  Recorded unconditionally so assembly can inspect.
+            try:
+                _record_restore_reload_decision(
+                    "runtime_state",
+                    decision=_runtime_state_reload_decision,
+                    reason=_runtime_state_reload_reason,
+                    callback_called=bool(_runtime_state_reload_invoked),
+                    check_ms=_runtime_state_reload_check_ms,
+                )
+                _record_restore_reload_decision(
+                    "models",
+                    decision=_models_reload_decision,
+                    reason=_models_reload_reason,
+                    callback_called=bool(_models_reload_callback_called),
+                    check_ms=_models_reload_check_ms,
+                )
+            except Exception:
+                pass
 
             # Lane B: restore prescan identity from persisted record
             # (measurement-only bracket; the function is a no-op fallback

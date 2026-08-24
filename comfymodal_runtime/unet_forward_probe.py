@@ -515,6 +515,14 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
                     "model_identity": source,
                 }
                 request_trace.emit("unet_first_cuda_op", metadata=metadata)
+                # ── R44H2: feed the sampler first-eval boundary (the first
+                # underlying denoiser evaluation; explicitly NOT the first
+                # progress callback).
+                try:
+                    from comfymodal_runtime import sampler_telemetry as _stel
+                    _stel.note_first_eval(time.monotonic_ns())
+                except Exception:
+                    pass
 
                 # ── Authoritative first-UNET-forward boundary ──
                 # Marks the one-shot stall watchdog (no-op when unarmed) and

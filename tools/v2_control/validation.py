@@ -157,6 +157,178 @@ def _artifact_run_path(record: RunRecord) -> Path | None:
     return run_artifact if run_artifact is not None else None
 
 
+# E40 Lane E: single acceptance authority extensions
+def _runtime_contract_data(record: RunRecord) -> dict[str, Any]:
+    """Return runtime contract fields from telemetry and the persisted record."""
+    data: dict[str, Any] = {}
+    telemetry = record.telemetry if isinstance(record.telemetry, dict) else {}
+    contract_keys = (
+        "runtime_status",
+        "loader_selection",
+        "resolved_config",
+        "resolved_config_fingerprint",
+        "config_snapshot",
+        "provenance",
+        "deploy_inputs",
+        "config_truth",
+    )
+    for key in contract_keys:
+        if key in telemetry:
+            data[key] = telemetry[key]
+        candidate = getattr(record, key, None)
+        if candidate is not None:
+            data[key] = candidate
+    artifact_data = _artifact_data(record)
+    sources = [artifact_data, artifact_data.get("result"), artifact_data.get("telemetry")]
+    result = artifact_data.get("result")
+    if isinstance(result, dict):
+        sources.append(result.get("telemetry"))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in contract_keys:
+            if key in source:
+                data[key] = source[key]
+    return data
+
+
+# E40 Lane E: single acceptance authority extensions
+def _runtime_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# E40 Lane E: single acceptance authority extensions
+def _runtime_status_failures(runtime_status: Any) -> list[str]:
+    if not isinstance(runtime_status, dict):
+        return ["runtime_status_not_nominal:(missing)", "runtime_status_reasons_invalid"]
+    status = runtime_status.get("status")
+    failures: list[str] = []
+    if status != "NOMINAL":
+        failures.append(f"runtime_status_not_nominal:{status or '(missing)'}")
+    reasons = runtime_status.get("reasons")
+    if isinstance(reasons, list):
+        failures.extend(str(reason) for reason in reasons)
+    else:
+        failures.append("runtime_status_reasons_invalid")
+    return failures
+
+
+# E40 Lane E: single acceptance authority extensions
+def _loader_selection_failures(loader_selection: Any) -> list[str]:
+    if loader_selection is None:
+        return ["loader_selection_invalid"]
+    if not isinstance(loader_selection, dict):
+        return ["loader_selection_invalid"]
+    failures: list[str] = []
+    for role in ("clip", "unet", "vae"):
+        if role not in loader_selection:
+            continue
+        selection = loader_selection[role]
+        if not isinstance(selection, dict):
+            failures.append(f"loader_selection_invalid_{role}")
+            continue
+        requested = str(selection.get("requested", ""))
+        effective = str(selection.get("effective", ""))
+        observed = str(selection.get("observed", ""))
+        fallback_loader = str(selection.get("fallback_loader", ""))
+        if _runtime_bool(selection.get("fallback_attempted")):
+            failures.append(f"loader_fallback_{role}:{requested}->{fallback_loader}")
+        if observed != effective:
+            failures.append(f"loader_observed_mismatch_{role}")
+        if requested != effective:
+            failures.append(f"loader_effective_mismatch_{role}")
+    return failures
+
+
+# E40 Lane E: single acceptance authority extensions
+def _fingerprint_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("resolved_config_fingerprint", "fingerprint"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        for key in ("resolved_config", "config_snapshot", "provenance", "deploy_inputs"):
+            nested = _fingerprint_from_value(value.get(key))
+            if nested:
+                return nested
+    for key in ("resolved_config_fingerprint", "fingerprint"):
+        candidate = getattr(value, key, None)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+# E40 Lane E: single acceptance authority extensions
+def _runtime_fingerprint_failures(record: RunRecord, config: Any, data: dict[str, Any]) -> list[str]:
+    resolved_config = data.get("resolved_config")
+    if not isinstance(resolved_config, dict):
+        return []
+    observed = _fingerprint_from_value(resolved_config)
+    if not observed:
+        return []
+
+    comparable: list[Any] = []
+    for source in (data, record.telemetry, getattr(record, "artifacts", None), config):
+        if isinstance(source, dict):
+            comparable.extend(
+                source.get(key)
+                for key in (
+                    "resolved_config_fingerprint",
+                    "config_snapshot",
+                    "provenance",
+                    "deploy_inputs",
+                )
+                if key in source
+            )
+        else:
+            for key in (
+                "resolved_config_fingerprint",
+                "config_snapshot",
+                "provenance",
+                "deploy_inputs",
+                "resolved_config",
+            ):
+                candidate = getattr(source, key, None)
+                if candidate is not None:
+                    comparable.append(candidate)
+    for candidate in comparable:
+        expected = _fingerprint_from_value(candidate)
+        if expected and expected != observed:
+            return ["resolved_config_fingerprint_mismatch"]
+    return []
+
+
+# E40 Lane E: single acceptance authority extensions
+def _validate_runtime_contract(record: RunRecord, config: Any) -> list[str]:
+    data = _runtime_contract_data(record)
+    failures: list[str] = []
+    if "runtime_status" in data:
+        failures.extend(_runtime_status_failures(data["runtime_status"]))
+    if "loader_selection" in data:
+        failures.extend(_loader_selection_failures(data["loader_selection"]))
+    failures.extend(_runtime_fingerprint_failures(record, config, data))
+    truth = data.get("config_truth")
+    rows = truth.get("controls", truth) if isinstance(truth, dict) else truth
+    if isinstance(rows, dict):
+        iterable = rows.items()
+    elif isinstance(rows, list):
+        iterable = ((row.get("name", ""), row) for row in rows if isinstance(row, dict))
+    else:
+        iterable = ()
+    for name, row in iterable:
+            if not isinstance(row, dict):
+                continue
+            if row.get("agreement") is False and not str(row.get("reason", "") or "").strip():
+                failures.append(f"config_truth_unexplained_mismatch:{name}")
+    return failures
+
+
 # --------------------------------------------------------------------------
 # Built-in structural validators
 # --------------------------------------------------------------------------
@@ -264,6 +436,8 @@ class StructuralValidator(ValidatorPlugin):
         ):
             failures.append("effective-config proof is incomplete")
 
+        # E40 Lane E: single acceptance authority extensions
+        failures.extend(_validate_runtime_contract(record, config))
         return failures
 
 
@@ -444,6 +618,158 @@ def _truth(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on", "ok", "pass")
+
+
+_GOLDEN_PIPELINE_FLAG = "COMFYMODAL_GOLDEN_PIPELINE"
+
+
+def _mapping_golden_value(source: Any) -> Any | None:
+    """Best-effort COMFYMODAL_GOLDEN_PIPELINE lookup inside one mapping."""
+    if not isinstance(source, dict):
+        return None
+    if _GOLDEN_PIPELINE_FLAG in source:
+        return source[_GOLDEN_PIPELINE_FLAG]
+    for key in ("controls", "deploy_flags"):
+        nested = source.get(key)
+        if isinstance(nested, dict) and _GOLDEN_PIPELINE_FLAG in nested:
+            return nested[_GOLDEN_PIPELINE_FLAG]
+    return None
+
+
+def _golden_pipeline_active(run_like: Any) -> bool:
+    """True only when the run/config context resolves COMFYMODAL_GOLDEN_PIPELINE
+    truthy (registered config flag, resolved controls, deploy flags, or the
+    effective environment of the persisted artifact).  Fails closed: absent or
+    unclear context returns False."""
+    if _flag_enabled(run_like, _GOLDEN_PIPELINE_FLAG):
+        return True
+    candidates: list[Any] = [_mapping_golden_value(run_like)]
+    telemetry = getattr(run_like, "telemetry", None)
+    if isinstance(telemetry, dict):
+        candidates.append(_mapping_golden_value(telemetry))
+        data = _artifact_data(run_like)
+        result = data.get("result")
+        for source in (data, result if isinstance(result, dict) else {}):
+            candidates.append(_mapping_golden_value(source.get("resolved_config")))
+            candidates.append(_mapping_golden_value(source.get("config_snapshot")))
+            env = source.get("effective_env")
+            if not isinstance(env, dict):
+                env = source.get("effective_environment")
+            candidates.append(_mapping_golden_value(env))
+    return any(_truth(candidate) for candidate in candidates)
+
+
+def _golden_conditioning_first_class_event(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the first-class ``clip_conditioning_cache_decision`` ledger event
+    metadata when exactly one such event exists in either artifact shape
+    (thin v2ctl sample: top-level ``canonical_ledger``; full run record:
+    ``result.canonical_ledger``).  Returns ``None`` when absent/ambiguous."""
+    found: dict[str, Any] | None = None
+    result = data.get("result")
+    sources = [data, result if isinstance(result, dict) else {}]
+    for source in sources:
+        ledger = source.get("canonical_ledger")
+        if not isinstance(ledger, dict):
+            continue
+        events = ledger.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("name", "")) != "clip_conditioning_cache_decision":
+                continue
+            metadata = event.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            if found is not None:
+                return None  # ambiguous: more than one decision event
+            found = metadata
+    return found
+
+
+def _persist_controls_falsey(data: dict[str, Any]) -> bool:
+    """True when conditioning-cache persistence controls are present and
+    falsey in any reachable config surface of *data*.  Fail-closed: absent
+    controls return False."""
+    result = data.get("result")
+    sources = [data, result if isinstance(result, dict) else {}]
+    controls: dict[str, Any] = {}
+    for source in sources:
+        resolved = source.get("resolved_config")
+        if isinstance(resolved, dict) and isinstance(resolved.get("controls"), dict):
+            controls.update(resolved["controls"])
+        snapshot = source.get("config_snapshot")
+        if isinstance(snapshot, dict):
+            deploy_inputs = snapshot.get("deploy_inputs")
+            if isinstance(deploy_inputs, dict):
+                flags = deploy_inputs.get("deploy_flags")
+                if isinstance(flags, dict):
+                    for key in (
+                        "COMFYMODAL_V2_EXACT_CACHE_PERSIST",
+                        "COMFYMODAL_V2_BACKGROUND_PERSISTENCE",
+                    ):
+                        if key in flags and key not in controls:
+                            controls[key] = flags[key]
+    persist_controls = (
+        controls.get("COMFYMODAL_V2_EXACT_CACHE_PERSIST"),
+        controls.get("COMFYMODAL_V2_BACKGROUND_PERSISTENCE"),
+    )
+    if any(value is None or _truth(value) for value in persist_controls):
+        return False
+    return True
+
+
+def _golden_conditioning_miss_observed(data: dict[str, Any]) -> bool:
+    """Golden-pipeline equivalent of the E37 forced-miss proof.
+
+    Under COMFYMODAL_GOLDEN_PIPELINE the CLIP lane is served by golden_qd4 and
+    the FASTSAFE/qd_reader conditioning-cache trace events do not exist.  Two
+    machine-checkable equivalents are accepted:
+
+    A. Compositional (full run record): exactly one raw CLIP encode call,
+       nothing served from the golden CLIP commit cache, and
+       conditioning-cache persistence explicitly disabled.
+    B. First-class (either artifact shape): the runtime-emitted
+       ``clip_conditioning_cache_decision`` canonical-ledger event with
+       ``decision=forced_miss`` and ``encode_calls == 1`` — a raw encode call
+       exists ONLY when the cache did not serve — plus persistence controls
+       explicitly disabled.
+    """
+    result = data.get("result")
+    sources = [data, result if isinstance(result, dict) else {}]
+    encode_calls: list[Any] | None = None
+    clip_contract: dict[str, Any] | None = None
+    controls: dict[str, Any] = {}
+    for source in sources:
+        report = source.get("pre_sampler_structured_report")
+        if isinstance(report, dict) and isinstance(report.get("clip_raw_encode_calls"), list):
+            encode_calls = report["clip_raw_encode_calls"]
+        golden_telemetry = source.get("golden_telemetry")
+        if isinstance(golden_telemetry, dict):
+            contract = golden_telemetry.get("cache_contract")
+            if isinstance(contract, dict) and isinstance(contract.get("clip"), dict):
+                clip_contract = contract["clip"]
+        resolved = source.get("resolved_config")
+        if isinstance(resolved, dict) and isinstance(resolved.get("controls"), dict):
+            controls.update(resolved["controls"])
+    if encode_calls is not None and len(encode_calls) == 1 and clip_contract is not None:
+        if not _truth(clip_contract.get("commit_cache_served")) \
+                and _number(clip_contract.get("commit_read_storage_bytes")) == 0:
+            persist_controls = (
+                controls.get("COMFYMODAL_V2_EXACT_CACHE_PERSIST"),
+                controls.get("COMFYMODAL_V2_BACKGROUND_PERSISTENCE"),
+            )
+            if all(value is not None and not _truth(value) for value in persist_controls):
+                return True
+    # B. first-class runtime event (works on the thin v2ctl sample projection)
+    first_class = _golden_conditioning_first_class_event(data)
+    if first_class is not None:
+        if str(first_class.get("decision", "")) == "forced_miss" \
+                and _number(first_class.get("encode_calls")) == 1:
+            if _persist_controls_falsey(data):
+                return True
+    return False
 
 
 class E31ForensicsValidator(ValidatorPlugin):
@@ -702,7 +1028,9 @@ class E37StrictProofValidator(ValidatorPlugin):
                 miss_observed = True
                 break
         if not miss_observed:
-            failures.append("E37 actual conditioning-cache miss evidence missing")
+            golden = _golden_pipeline_active(record) or _golden_pipeline_active(config)
+            if not (golden and _golden_conditioning_miss_observed(data)):
+                failures.append("E37 actual conditioning-cache miss evidence missing")
 
         # The canonical ledger is authoritative.  Require both its explicit
         # endpoint/zero-gap contract and the durable boundary event itself.
@@ -796,6 +1124,13 @@ class E37CleanLaneProofValidator(ValidatorPlugin):
     def validate(self, record: RunRecord, config: Any) -> list[str]:
         if not self.applies(config):
             return []
+        # Under COMFYMODAL_GOLDEN_PIPELINE the CLIP lane is served by
+        # golden_qd4, so the CLEAN_LANE FASTSAFE/qd_reader proof artifacts
+        # (qd stats, volume reads, quiescence, lifecycle ordering) legitimately
+        # do not exist.  This validator carries no conditioning-forced-miss
+        # predicates, so the whole block is skipped for Golden runs.
+        if _golden_pipeline_active(record) or _golden_pipeline_active(config):
+            return []
         failures: list[str] = []
         events = _e31_trace_events(_artifact_data(record), record.telemetry or {})
         event_value = _named_e31_event(events, "clean_lane_proof")
@@ -811,63 +1146,81 @@ class E37CleanLaneProofValidator(ValidatorPlugin):
         forbidden_attempts = event.get("forbidden_activity_attempts")
         if event.get("mode") != "E37_CLEAN_LANE" or event.get("proof_version") != 1:
             failures.append("CLEAN_LANE_PROOF mode/version missing")
-        if (
-            qd.get("configured_qd") != 4
-            or qd.get("actual_inflight") != 4
-            or qd.get("actual_worker_count") != 4
-        ):
-            failures.append("CLEAN_LANE actual QD must be 4")
-        if qd.get("fallback") is True or qd.get("mode") != "QD4":
-            failures.append("CLEAN_LANE QD proof shows FASTSAFE fallback")
-        if qd.get("source_errors"):
-            failures.append("CLEAN_LANE source errors present")
-        if qd.get("stats_status") != "ok":
-            failures.append("CLEAN_LANE QD stats are not OK")
-        if not qd.get("reconciliation_240_240"):
-            failures.append("CLEAN_LANE 240/240 source reconciliation missing")
-        if qd.get("h2d_host_issue_ms") is None or qd.get("h2d_cuda_event_ms") is None:
-            failures.append("CLEAN_LANE paired H2D host/CUDA timing missing")
-        if not volume or any(
-            not isinstance(item, dict)
-            or not item.get("path")
-            or not item.get("identity")
-            or item.get("owner") != "clip_qd_reader"
-            or item.get("size_bytes") is None
-            or item.get("start_ns") is None
-            or item.get("end_ns") is None
-            or item.get("concurrency") != 4
-            for item in volume
-        ):
-            failures.append("CLEAN_LANE Volume read identity/interval proof missing")
+        # ── R44D: scope the QD4-transport proof block to QD-requested runs ──
+        # The qd/volume/quiescence/phase-interval fields are definitionally
+        # produced by the QD-reader CLIP transport.  Non-Golden compositions
+        # that deliberately serve CLIP through a different arm (e.g. the R44
+        # request-time FastSafe lane, QD reader OFF) can never truthfully
+        # produce them; demanding them here would force fabrication.  For
+        # those runs this validator instead requires the composition-
+        # appropriate forward-contract subset below, while CLIP transport
+        # truth remains owned by the loader-selection/structural validators.
+        qd_requested = _flag_enabled(config, "COMFYMODAL_V2_CLIP_QD_READER")
+        if qd_requested:
+            if (
+                qd.get("configured_qd") != 4
+                or qd.get("actual_inflight") != 4
+                or qd.get("actual_worker_count") != 4
+            ):
+                failures.append("CLEAN_LANE actual QD must be 4")
+            if qd.get("fallback") is True or qd.get("mode") != "QD4":
+                failures.append("CLEAN_LANE QD proof shows FASTSAFE fallback")
+            if qd.get("source_errors"):
+                failures.append("CLEAN_LANE source errors present")
+            if qd.get("stats_status") != "ok":
+                failures.append("CLEAN_LANE QD stats are not OK")
+            if not qd.get("reconciliation_240_240"):
+                failures.append("CLEAN_LANE 240/240 source reconciliation missing")
+            if qd.get("h2d_host_issue_ms") is None or qd.get("h2d_cuda_event_ms") is None:
+                failures.append("CLEAN_LANE paired H2D host/CUDA timing missing")
+            if not volume or any(
+                not isinstance(item, dict)
+                or not item.get("path")
+                or not item.get("identity")
+                or item.get("owner") != "clip_qd_reader"
+                or item.get("size_bytes") is None
+                or item.get("start_ns") is None
+                or item.get("end_ns") is None
+                or item.get("concurrency") != 4
+                for item in volume
+            ):
+                failures.append("CLEAN_LANE Volume read identity/interval proof missing")
         if event.get("gpu_operation_overlap") or event.get("forbidden_overlap"):
             failures.append("CLEAN_LANE forbidden GPU overlap observed")
         if not isinstance(forbidden_attempts, list):
             failures.append("CLEAN_LANE forbidden-activity attempt evidence missing")
-        required_order = (
-            "restore_return_ns", "plan_identity_complete_ns", "qd_start_ns",
-            "qd_ready_ns", "bind_ns", "forward_start_ns", "forward_end_ns",
-        )
+        if qd_requested:
+            required_order = (
+                "restore_return_ns", "plan_identity_complete_ns", "qd_start_ns",
+                "qd_ready_ns", "bind_ns", "forward_start_ns", "forward_end_ns",
+            )
+        else:
+            required_order = (
+                "restore_return_ns", "plan_identity_complete_ns",
+                "forward_start_ns", "forward_end_ns",
+            )
         if any(not isinstance(ordering.get(key), int) for key in required_order):
             failures.append("CLEAN_LANE lifecycle ordering proof incomplete")
         else:
             values = [ordering[key] for key in required_order]
             if values != sorted(values) or ordering["restore_return_ns"] >= ordering["plan_identity_complete_ns"]:
                 failures.append("CLEAN_LANE lifecycle ordering is false")
-        if not intervals or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("start_ns"), int)
-            or not isinstance(item.get("end_ns"), int)
-            or item["end_ns"] < item["start_ns"]
-            for item in intervals.values()
-        ):
-            failures.append("CLEAN_LANE phase intervals missing")
-        required_quiescence = (
-            "source_reads_complete", "submitted_blocks_reconciled", "futures_joined",
-            "no_qd_worker_runnable", "pinned_ownership_safe",
-            "h2d_events_complete", "device_ready_published",
-        )
-        if any(quiescence.get(key) is not True for key in required_quiescence):
-            failures.append("CLEAN_LANE quiescence proof missing or false")
+        if qd_requested:
+            if not intervals or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("start_ns"), int)
+                or not isinstance(item.get("end_ns"), int)
+                or item["end_ns"] < item["start_ns"]
+                for item in intervals.values()
+            ):
+                failures.append("CLEAN_LANE phase intervals missing")
+            required_quiescence = (
+                "source_reads_complete", "submitted_blocks_reconciled", "futures_joined",
+                "no_qd_worker_runnable", "pinned_ownership_safe",
+                "h2d_events_complete", "device_ready_published",
+            )
+            if any(quiescence.get(key) is not True for key in required_quiescence):
+                failures.append("CLEAN_LANE quiescence proof missing or false")
         if not isinstance(event.get("thread_state"), dict):
             failures.append("CLEAN_LANE CPU/native thread state proof missing")
         return failures

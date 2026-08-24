@@ -16,10 +16,11 @@ Python 3.11 stdlib only.  The only subprocess allowed anywhere in v2ctl is
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Any, Mapping
 
 from .errors import FlagError
 from .profiles import Profiles
@@ -464,10 +465,12 @@ def compute_git_state(repo_root: Path) -> GitState:
     if status_res is not None:
         lines = [line for line in status_res.stdout.splitlines() if line.strip()]
         dirty = bool(lines)
+        set_hash_cache_repo_root(repo_root)
         for rel in _porcelain_paths(lines):
             rel_norm = rel.rstrip("/")
             if _is_deploy_relevant(rel_norm):
                 _hash_path(repo_root, rel_norm, dirty_hashes)
+        flush_hash_cache()
 
     return GitState(
         head=head,
@@ -528,16 +531,90 @@ def _is_deploy_relevant(rel: str) -> bool:
 
 
 def _hash_path(repo_root: Path, rel: str, out: dict[str, str]) -> None:
-    """sha1 each file under ``rel`` (file or directory), keyed by relpath."""
+    """sha1 each file under ``rel`` (file or directory), keyed by relpath.
+
+    R44I3 latency fix: generated/cache directories are excluded (they can
+    never affect the deployed image payload) and content hashes are memoized
+    per ``(size, mtime_ns)`` in a small cache file so repeat deploys stop
+    re-reading every dirty byte serially.  Hash VALUES for unchanged files
+    are identical to the previous behavior, so fingerprints are stable."""
     full = repo_root.joinpath(*PurePosixPath(rel).parts)
     if full.is_file():
-        out[rel] = _sha1_hex(full)
+        out[rel] = _sha1_hex_cached(full)
         return
     if full.is_dir():
         for child in sorted(full.rglob("*")):
-            if child.is_file():
-                child_rel = child.relative_to(repo_root).as_posix()
-                out[child_rel] = _sha1_hex(child)
+            if not child.is_file():
+                continue
+            if any(part in _HASH_EXCLUDED_DIRS for part in child.parts):
+                continue
+            child_rel = child.relative_to(repo_root).as_posix()
+            out[child_rel] = _sha1_hex_cached(child)
+
+
+#: Directory names that never affect deployment identity.
+_HASH_EXCLUDED_DIRS = frozenset(
+    {"__pycache__", ".git", ".venv", "venv", ".mypy_cache", ".pytest_cache",
+     ".ruff_cache", "node_modules", ".codebase-memory"}
+)
+
+#: Cache location for memoized content hashes (per repo root).
+_HASH_CACHE_NAME = ".v2ctl/hash_cache.json"
+
+
+def _hash_cache_path(repo_root: Path) -> Path:
+    return repo_root.joinpath(*_HASH_CACHE_NAME.split("/"))
+
+
+def _sha1_hex_cached(path: Path) -> str:
+    """Content sha1 memoized per (size, mtime_ns) under the active repo root."""
+    stat = path.stat()
+    key = f"{path.as_posix()}|{stat.st_size}|{stat.st_mtime_ns}"
+    root = _HASH_CACHE_STATE.get("root")
+    if root is None:
+        return _sha1_hex(path)
+    cache = _HASH_CACHE_STATE.setdefault("entries", {})
+    entry = cache.get(key)
+    if isinstance(entry, str):
+        return entry
+    digest = _sha1_hex(path)
+    cache[key] = digest
+    return digest
+
+
+_HASH_CACHE_STATE: dict[str, Any] = {"root": None}
+
+
+def set_hash_cache_repo_root(repo_root: Path) -> None:
+    """Enable memoized hashing under ``repo_root`` (called by collect_git_state).
+
+    The cache file is rewritten only when at least one NEW hash was computed,
+    so unchanged repeat deploys perform zero file reads for already-hashed
+    content."""
+    global _HASH_CACHE_STATE
+    _HASH_CACHE_STATE = {"root": repo_root, "dirty": False}
+    try:
+        with _hash_cache_path(repo_root).open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            _HASH_CACHE_STATE["entries"] = data
+    except Exception:
+        pass
+
+
+def flush_hash_cache() -> None:
+    """Persist new hash entries (best-effort; called after dirty hashing)."""
+    root = _HASH_CACHE_STATE.get("root")
+    entries = _HASH_CACHE_STATE.get("entries")
+    if root is None or not isinstance(entries, dict) or not entries:
+        return
+    try:
+        cache_path = _hash_cache_path(root)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("w", encoding="utf-8") as handle:
+            json.dump(entries, handle, sort_keys=True)
+    except Exception:
+        pass
 
 
 def _sha1_hex(path: Path) -> str:

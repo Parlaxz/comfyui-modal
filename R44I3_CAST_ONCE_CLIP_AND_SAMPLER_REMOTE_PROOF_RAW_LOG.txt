@@ -1,0 +1,71 @@
+R44I3 RAW LOG — chronological digest (local times, Testing 6 workspace unless noted)
+=====================================================================================
+
+[11:51] deploy 82c5eca0d3a8c48c85408c82c4a8509660d66f029dc49e263fb4e385242af272 (cast-once I1-fixed)
+        local battery 498 passed / 2 skipped; static audit CLEAN; py_compile/TOML/dry-run OK
+[12:11] H3-era artifact re-inspection v2-benchmark-0-476f84af0e92 (0 sampling_start, tail present) — context only
+[16:52] PAID run1 v2-benchmark-0-f3938a3f67bd (deploy 82c5eca0)
+        clip_fast_load_start: adoption=cast_once_fp16 ckpt=BF16 expected=torch.float16 device=cuda:0 tensors=398
+        clip_fastsafe_fallback reason="RuntimeError: bind_dtype_mismatch:model.embed_tokens.weight"
+        gate valid=0 (runtime_status DEGRADED; loader_fallback_clip; loader_observed_mismatch_clip)
+        -> stop rule; diagnosis cycle began (no further spend)
+
+DIAGNOSIS (local, no spend):
+  - real-dispatch probes: CoreModelPatcher==ModelPatcher alias; is_dynamic()=False;
+    spray can_assign_sd=False; skeleton FP16 pre-load; assign=False copy-cast FP16 post-load
+  - true wrapper chain documented: Flux2TEModel_ -> SD1ClipModel child ".qwen3_4b" ->
+    Qwen3_4BModel(SDClipModel) -> .transformer -> llama.Qwen3_4B
+  - remote contradiction (dtype mismatch w/o aliasing) preserved unresolved; cast-once FROZEN per pivot
+
+PIVOT IMPLEMENTATION:
+  + request_clip_fastsafe: _SAME_DTYPE_RESIDENCY_ENV gate override; native-bind carve-out
+    (unique-recipient extras tolerated+reported); assign-pin repair kept isolated to cast-once lane
+  + modal_app._runtime_env: GENERIC COMFYMODAL_V2_*/WARMUP_* passthrough (bug-class fix R44D/R44F/I3)
+  + config_authority.py + config/v2/flag_registry.toml: both new flags registered (change_requires=deploy)
+  + AGENTS.md: runtime-env passthrough contract documented
+  + tools/preconvert_clip_fp16_volume.py + v2ctl subcommand preconvert-clip-fp16
+    (workspace creds from .modal_workspaces.json; UTF-8 reconfigure; never bare modal runs)
+  + tools/v2_control/config.py: dirty-hash memoization + cache-dir exclusions (172ms->89ms warm)
+  + tools/v2_control/cli.py: deploy phase timings (components/lock_env/pre_modal_query/backend_bat)
+  + tests/test_r44i3_same_dtype_residency.py: 8 tests
+  BATTERY: 442 passed / 0 failed; py_compile OK; TOML OK
+
+[19:29] PAID regate v2-benchmark-0-c7c9e57ca1ed (deploy 1048190312ae6a60…)
+        start event: same_dtype_residency_override=0  <-- flag silently dropped at class-env boundary
+        fallback bind_dtype_mismatch:model.embed_tokens.weight -> root cause = passthrough bug (fixed after)
+
+USER CORRECTIONS APPLIED:
+  - "testing 3 vs testing 6": bare modal CLI defaulted to testing3 (spend-limited);
+    all Modal invocations now via v2ctl with ACTIVE workspace (Testing 6) credentials
+  - "old app" runs: fresh-image verification added to cohort discipline (image_id recorded per run)
+
+ARM A CAMPAIGN (profile r44-request-fastsafe, RESIDENCY=1):
+[21:02Z] deploy ea2f977f… ; gates 21:03/21:06/21:07 valid x3 (superseded cohort, not pooled)
+[restart] stale lock cleared (v2ctl lock force-acquire/release + file removal)
+[21:36Z] deploy 275671d9… (fresh image im-Sc4Lhx5XUfOKB2CdNlnEBG)
+[21:37] gate valid=1 rid=v2-benchmark-0-22f1972f43f3 img=im-Sc4Lh…
+[21:39] gate valid=1
+[21:40] gate valid=1
+   run dirs: v2_2026-08-24_21-{37-12,38-23,39-59}
+   evidence: adoption=same_storage_assign bind=same_storage live=BF16 override=1
+             398/398 same-storage copied_count=0 owner_retained=true
+             model_sized_movement_detected=false SHA_OK NOMINAL gantt OK
+
+ARM B CAMPAIGN (profile r44i3-armb-fp16-twin, TWIN=1 RESIDENCY=0):
+[pre]    v2ctl preconvert-clip-fp16 --name qwen_3_4b.safetensors
+         -> already_present dst=qwen_3_4b.fp16.safetensors dst_bytes=8044981672 tensors=398
+[21:21Z] deploy 3323a775… (--set variant; superseded by profile variant)
+         gate with --set refused twice (run-only safety on deploy-required flags) -> dedicated profile created
+[21:57Z] deploy be8b68e3… (profile r44i3-armb-fp16-twin; image im-TKp6Z1hL0GvuG4wdeoUI9l)
+[21:58] gate valid=1 rid=v2-benchmark-0-24b0fc6fc43f twin_evt=True live=FP16
+[21:59] gate valid=1
+[22:01] gate valid=1
+   run dirs: v2_2026-08-24_21-{57-31,58-42,59-33}
+   CORRECTNESS FAIL: output sha 349aa3d2a9a5d6172d2420d25f0580ba7ed7c688ad8a25ec953cc857b510798c
+   on ALL THREE runs (expected 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260)
+   -> ARM B REJECTED (semantic), no further spend on it
+
+SELECTION: ARM A (BF16 same-storage residency). Median app wall 28023.2 ms (min 25923.1 / max 73230.7).
+Next single target: CLIP inner transformer forward (~3964.9 ms median).
+
+STOP.

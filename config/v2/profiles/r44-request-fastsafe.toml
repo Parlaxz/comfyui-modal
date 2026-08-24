@@ -1,0 +1,55 @@
+# v2ctl profile: R44B first-class request-time FastSafe CLIP+UNET recovery.
+# Extends r43-known-fast with the request-scoped FastSafe loader lane enabled
+# (COMFYMODAL_V2_REQUEST_*): CLIP and UNET are produced at REQUEST time via
+# FastSafe direct-GPU transport — no Golden context, no RestorePreparation,
+# no snapshot manifest. Restore/snapshot machinery untouched.
+schema_version = 1
+name = "r44-request-fastsafe"
+extends = "r42-golden-qd4"
+owner = "R44B"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# R44: keep every R43 zero (Golden off, QD reader off, old restore-side fast
+# machinery off) and enable ONLY the new first-class request-time FastSafe lane.
+COMFYMODAL_GOLDEN_PIPELINE = "0"
+COMFYMODAL_V2_CLIP_QD_READER = "0"
+COMFYMODAL_V2_CLIP_FAST_HYDRATION = "0"
+COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "0"
+COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET = "0"
+COMFYMODAL_V2_UNET_FASTSAFETENSORS = "0"
+COMFYMODAL_V2_FAST_COLD_ORCHESTRATION = "0"
+COMFYMODAL_V2_CHECKPOINT_PREWARM = "0"
+# R44D: these two configure ONLY the request-scoped CheckpointPrewarmer used
+# by COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP (the global prewarm flag above
+# stays 0 — old restore-side orchestration remains off).  Historical active
+# FastCold/E24 baseline: 4 threads / 8 MiB chunks.  Zero values would be
+# clamped by request_fastpath.arm_unet_source_prep to 1 thread / 1 MiB.
+COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS = "4"
+COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB = "8"
+COMFYMODAL_V2_REQUEST_FASTSAFE = "1"
+COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE = "1"
+# R44I3 ARM A: same-dtype CLIP residency — the fast arm adopts the CHECKPOINT
+# dtype (BF16) as the live residency dtype via the proven R44F parity lane
+# (meta skeleton + assign bind, zero conversion, zero second representation).
+# FP16 stays the native-fallback policy; canonical SHA remains the gate.
+COMFYMODAL_V2_CLIP_SAME_DTYPE_RESIDENCY = "1"
+# R44F: native zero-copy CLIP adoption — meta-skeleton construction plus
+# assign-style bind of the served FastSafe CUDA tensors (single residency,
+# no second model-sized allocation).  Requires the CLIP lane above; every
+# other profile keeps the default OFF (R44E copy-mode producer).
+COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE_NATIVE_ADOPT = "1"
+COMFYMODAL_V2_REQUEST_UNET_FASTSAFE = "1"
+COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP = "1"
+COMFYMODAL_V2_CLIP_FASTSAFE_THREADS = "8"
+COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES = "268435456"   # B256 MiB baseline
+COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB = "524288"          # bbuf512

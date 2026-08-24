@@ -1,0 +1,206 @@
+R42 GOLDEN COHORT REMOTE RAW LOG
+================================
+STATUS: HALTED AFTER RUN 2 - CLASS B STRUCTURAL STOP (runtime_state_generation_reload).
+Valid nominal cohort size: 1 of 5 (Run 1 only). Runs 3-5 NOT launched.
+No fix applied. No redeploy. No commit. User adjudication required.
+
+REVISED DIAGNOSIS (audit-corrected): the failure is GENERATION / CONTROL-PLANE
+NONDETERMINISM - volatile-field poisoning of the content-derived runtime-state
+generation token. The Run 2 benchmark task itself was FRESH/COLD (fresh
+snapshot restore, cold Golden pipeline, exact SHA). The earlier "warm-container
+reuse" wording was wrong and is withdrawn; see section 3.
+
+======================================================================
+0. FROZEN COHORT IDENTITY (unchanged)
+======================================================================
+Authoritative final structural gate (DATA RUN 1):
+  gate            gate_20260823-181257_9127112e   valid=1 reasons=[] provenance=validated
+  request         v2-benchmark-0-693e0e9c5705
+  deploy fp       3f6a303ad30787721839553cae9ec6d07a4947bc9221004bbe9ba651f10f3ae1
+  profile         r42-golden-qd4 ; owner R42
+  app             stable-modal-comfy-v2-restore-only-shadow ; image im-aQoLRY3AyiyliNTStHOW2W
+  output SHA      20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+  full evidence   R42_GOLDEN_GATE_REMOTE_RAW_LOG.txt (incorporated by reference)
+  artifacts       comfymodal-data/benchmarks/runs/v2_2026-08-23_18-12-05/
+
+======================================================================
+1. PROTOCOL EXECUTED (exactly as mandated, until stop)
+======================================================================
+Pre-Run 2 verification (mandated):
+  doctor    deployment.fingerprint.match=1 (stored==current==3f6a303a...f3ae1); OK
+  source-probe verdict=MATCH RESULT=PASS (8/8 modules MATCH)
+            remote container id reported by probe: 95f1d1c0a5444ec1
+Run 2 execution (single sequential request; no concurrency):
+  python tools/v2ctl.py --profile r42-golden-qd4 --owner R42 confirm ^
+      --from .v2ctl/gates/gate_20260823-181257_9127112e.json --runs 1
+  Validator result: valid=0
+    FAIL [structural] runtime_status_not_nominal:DEGRADED
+    FAIL [structural] runtime_state_generation_reload
+  Confirmation manifest: .v2ctl/confirmations/confirm_20260823-183157_9127112e.json
+  Artifacts: comfymodal-data/benchmarks/runs/v2_2026-08-23_18-30-38/
+STOP: Class B condition -> cohort halted immediately. Runs 3-5 NOT launched.
+
+======================================================================
+2. RUN 2 - FULL EVIDENCE (INVALID COHORT DATA; RETAINED RAW)
+======================================================================
+request_id        v2-benchmark-0-6a7bb251b304
+deploy fp         3f6a303ad30787721839553cae9ec6d07a4947bc9221004bbe9ba651f10f3ae1 (match, enforced by confirm)
+image             im-aQoLRY3AyiyliNTStHOW2W
+snapshot_identity im-aQoLRY3AyiyliNTStHOW2W|68377fd4f7f24be99594a204d75f034b   (Run 1 restored |5dcbedfd...)
+placement         provider=CLOUD_PROVIDER_AWS region=us-east-2 gpu=['RTX-PRO-6000'] cpu=12 mem=32768
+runtime_status    {"status": "DEGRADED", "reasons": ["runtime_state_generation_reload"]}
+loader_selection  clip/unet/vae requested=effective=observed=golden_qd4 x3; fallback_attempted=false x3
+output_sha        20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260 (EXACT MATCH)
+ledger            canonical_ledger_status=ok
+models volume     models_reload_decision = skipped_generation_match (exact_match; gen a1e24903... stable)
+walls (ms)        total_wall=22458.0  command_to_response=50712.1  restore_total=374.8
+                  sampler=3752.2  vae_decode=442.8  output_collection=12.3  pre_sampler=12761.3
+
+-- Guard chronology (UTC, wall_unix_ns from run_001_sample.json full_trace) ----
+18:07:19.671  container session 95f1d1c0a5444ec1 BOOTS as the deploy-time
+              SNAPSHOT-BUILD container (v2_startup_snap_true_enter_end,
+              remote_method_entry, AWS us-east-2).
+18:07:21.560  models_generation_baseline gen=a1e24903d0a1 (read_ms 2.872)
+18:07:54.688  CONSTRUCTION A finalize: writes runtime_config_generation.json
+              generation=1c9042e1d4e4ece87f3fe9095eb587b3 files=2 write_ms=7.772
+              (content-derived token over that construction's tracked-file bytes)
+18:09:15.926  container session d28091b872fe4df7 boots (GCP europe-west1);
+              CONSTRUCTION B at 18:09:51.05 writes marker
+              generation=9faa3a03211fb71fa2405011fb6732b3 (OVERWRITES volume;
+              this session later served Run 1's request -> Run 1 expected ==
+              volume == 9faa3a03... -> skipped_generation_match -> NOMINAL).
+18:10:00-18:30:30  ZERO trace events in either run's trace across this window:
+              the pre-Run 2 source-probe performed NO state-changing action and
+              wrote NOTHING to the shared volume.
+18:30:38+     RUN 2 request executes INSIDE session 95f1d1c0a5444ec1 (132 live
+              events): remote_method_entry -> snapshot_restore_start ->
+              v2_bootstrap_restore_start -> ... fresh/cold Golden pipeline.
+              Restored snapshot instance carries Construction A's frozen
+              baseline 1c9042e1...
+18:30:43.024  reload_runtime_state_start
+18:30:43.130  reload_runtime_state_end (~106 ms fail-closed Volume reload)
+18:30:43.131  runtime_state_reload_decision
+                decision=reloaded_generation_mismatch reason=generation_mismatch
+                expected_generation=1c9042e1d4e4ece87f3fe9095eb587b3 (snapshot-frozen, Construction A)
+                current_generation =9faa3a03211fb71fa2405011fb6732b3 (volume marker, Construction B)
+                check_ms=1.338 runtime_state_reload_invoked=1
+                file_diff (R42A drift diagnostics):
+                  gpu_capacity_frozen.json  expected_sha=e9c1418ef132 marker_sha=c3db8a43a9d8 mount_sha=c3db8a43a9d8 diverged=true
+                  prescan_custom_nodes.json expected_sha=197341948867 marker_sha=67aa041b548c mount_sha=67aa041b548c diverged=true
+18:30:43.134  models_reload_decision skipped_generation_match (models volume unaffected)
+
+-- Structural table row (Run 2) -------------------------------------------------
+Run=2 Valid=0 RuntimeStatus=DEGRADED reason_count=1 (AWS us-east-2 RTX-PRO-6000)
+Fresh/Cold main task=YES (fresh snapshot restore; cold loaders; exact SHA)
+Deploy fp=same Source=MATCH Generation exact=SHA yes Manifest hot SHA=false
+CLIP/UNET/VAE requested/effective/observed=golden_qd4 x3; fallback count=0
+Exact SHA=yes Ledger=ok
+Verdict: CLASS B - structurally degraded by the generation guard; NOT cohort
+data; retained raw only.
+
+======================================================================
+3. ROOT CAUSE - AUDITED (replaces the earlier warm-reuse wording)
+======================================================================
+REFRAMING PER USER CORRECTION:
+  The Run 2 benchmark task was fresh/cold. The shared container/session id
+  (95f1d1c0a5444ec1 appearing in both the probe output and Run 2's trace)
+  proves PROVENANCE OF THE FROZEN BASELINE STATE, not warm-container reuse,
+  and is not the cause of anything by itself.
+
+A. WRITERS / READERS of runtime_config_generation.json (full inventory)
+   Writer (exactly ONE production path):
+     RuntimeBootstrap.finalize_runtime_state_generation (runtime_bootstrap.py:1642)
+       -> write_runtime_state_generation_marker (runtime_generation.py:144)
+       called ONCE at snapshot construction (modal_app.py:9857, snap=True path),
+       with NO explicit generation => content-derived token.
+     (runtime_bootstrap.py:1296-1327 are constructor DI bindings with these
+      module functions as defaults - not additional writers.)
+   Reader (exactly ONE production authority):
+     RuntimeBootstrap._decide_runtime_state_reload (runtime_bootstrap.py:1722,
+     reader at :1748) - the restore-time guard; decides skip vs fail-closed
+     Volume.reload(). verify_runtime_state_manifest (:1776) validates file
+     bytes only after token equality.
+
+B. WHY TWO CONSTRUCTIONS OF THE SAME DEPLOYMENT PRODUCED DIFFERENT TOKENS
+   The deployed derivation IS content-derived (_content_derived_generation,
+   runtime_generation.py:132-141,175: sha256 over the canonical manifest of
+   tracked-file sha256s). Prior R42 state (report line 46) claims "volatile
+   fields excluded by construction". AUDIT RESULT: that holds for the MANIFEST
+   STRUCTURE but NOT for the HASHED FILE BYTES:
+     - gpu_capacity_frozen.json payload embeds "captured_at": time.time()
+       (restore_memory_arm.py:130-135) and provider-dependent gpu_name.
+       Its sha256 therefore differs on EVERY construction (observed:
+       e9c1418ef132 in Construction A vs c3db8a43a9d8 in Construction B).
+     - prescan_custom_nodes.json bytes also differed between the two observed
+       same-deployment constructions (197341948867 vs 67aa041b548c); the exact
+       volatile field inside the prescan payload is not yet located (writer
+       not audited) but the divergence is measured fact.
+   A volatile byte anywhere in a tracked file poisons its sha256 -> poisons
+   the manifest -> rotates the "content-derived" token per construction.
+   Observed tokens are therefore explained WITHOUT any randomness regression:
+   token = f(file bytes), and file bytes are not immutable per deployment.
+
+C. FAILURE MECHANISM (deterministic given the state layout)
+   Each snapshot-build container freezes ITS OWN construction token into the
+   snapshot instances it prepares; the shared volume marker holds only the
+   LATEST construction's token. With >=2 same-deployment constructions alive
+   (here: A=95f1d1... AWS 18:07:54Z, B=d28091b... GCP 18:09:51Z during final
+   gate prep), a request executing in/restoring state from a NON-latest
+   construction compares stale-expected != volume-current and fail-closes to
+   reload_runtime_state (~106 ms) -> RuntimeStatus DEGRADED.
+   Run 1 skipped ONLY because its serving construction (B) was also the last
+   volume writer. Run 2 failed because its serving construction (A) was not.
+   This is placement-independent (would occur single-provider) and independent
+   of probe timing or Volume visibility.
+
+D. SOURCE-PROBE MUTATION: PROVEN NO
+   1. Zero trace events in the 18:10:00-18:30:30Z window across BOTH retained
+      traces - the probe performed no construction and no writes.
+   2. The volume marker still held Construction B's token (9faa3a03...) at
+      Run 2's check - unchanged since 18:09:51Z, i.e. untouched by the probe.
+   3. Code: source_identity_probe (modal_app.py:16676) is read-only (SHA over
+      imported module files; no model init, no flag mutation); construction +
+      marker finalize run only on the snap=True snapshot-build path, which a
+      method-only probe invocation does not trigger.
+   The probe's role in this incident is limited to REVEALING the session id
+   that made provenance traceable. It did not cause the failure.
+
+E. DETERMINISM GUARANTEE - CURRENT ANSWER: NOT GUARANTEED
+   An unchanged deployment/image/source does NOT yield the same expected
+   generation across cold boots/providers today, because tracked-file BYTES
+   vary per construction (captured_at; provider-dependent gpu_name; prescan
+   volatility). The guarantee becomes true only if every manifest-tracked
+   file is byte-immutable for one deployment content (volatile fields stripped
+   or moved out-of-band, provider-variable fields normalized or excluded).
+
+F. CLASSIFICATION
+   CONFIRMED (code + artifacts): A, B, C, D as above.
+   UNRESOLVED (bounded): exact volatile field(s) inside prescan_custom_nodes.json;
+   whether Modal lane/instance selection can be influenced from the profile
+   (assumed no; placement unpinned by design).
+
+======================================================================
+4. WHAT WAS DELIBERATELY NOT DONE
+======================================================================
+No Runs 3-5 (Class B stop). No redeploy, no source/profile edits, no tuning,
+no git operations. Worktree left dirty and coherent on r42-golden-reconciliation.
+
+======================================================================
+5. OPTIONS FOR USER ADJUDICATION (cohort restart design)
+======================================================================
+A. Restart cohort from a NEW gate without control-plane changes. Risk: every
+   additional same-deployment construction re-arms the lottery; intermittent
+   Class B stops will recur whenever a request lands on a non-latest
+   construction's state.
+B. RECOMMENDED - minimal determinism batch FIRST (control-plane only, Golden
+   architecture untouched):
+   B1. Make manifest-tracked files byte-immutable per deployment content:
+       remove/move "captured_at" out of gpu_capacity_frozen.json (or exclude
+       that file from the manifest and validate it out-of-band), normalize or
+       exclude volatile prescan fields (locate writer first).
+   B2. Add a construction-time assertion: two consecutive constructions of the
+       same deployment must derive the SAME generation token (would have
+       caught this pre-deploy).
+   Then re-gate (new authoritative Run 1) and run the five-run cohort via
+   confirm with local-only pre-checks.
+C. Freeze characterization at Run 1 only.

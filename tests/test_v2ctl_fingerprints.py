@@ -16,7 +16,6 @@ Python 3.11 stdlib + pytest only; no network.
 from __future__ import annotations
 
 import sys
-from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -301,8 +300,8 @@ def test_float_formatting_repr():
 # ---------------------------------------------------------------------------
 
 
-def test_e30_selector_fingerprint_matches_post_bat_runtime_values():
-    """E30 arms inherit E19; the BAT then force-sets these four flags."""
+def test_e30_selector_keeps_deployed_values_and_reports_projection():
+    """The historical BAT projection is reported separately from deployment."""
     from tools.v2_control.config import ConfigResolver
     from tools.v2_control.profiles import Profiles
     from tools.v2_control.registry import FlagRegistry
@@ -321,7 +320,7 @@ def test_e30_selector_fingerprint_matches_post_bat_runtime_values():
         "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
     }
 
-    # Resolution remains the pre-BAT input; the fingerprint is post-selector.
+    # Resolution is the exact container environment truth.
     for name in runtime_flags:
         flag = config.flag(name)
         assert flag is not None
@@ -329,15 +328,11 @@ def test_e30_selector_fingerprint_matches_post_bat_runtime_values():
     assert {
         name: engine.deploy_inputs()["deploy_flags"][name]
         for name in runtime_flags
-    } == runtime_flags
+    } == {name: "0" for name in runtime_flags}
+    projection = engine.deploy_inputs()["post_selector_projection"]
+    assert projection["selector"] == "V2_E19_FINAL_COLD_LOADER"
+    assert projection["projected_flags"] == runtime_flags
 
-    # A config representing the values actually handed to the runtime must
-    # produce the same identity as v2ctl's projected fingerprint.
-    runtime_config = deepcopy(config)
-    for flag in runtime_config.flags:
-        if flag.name in runtime_flags:
-            flag.value = runtime_flags[flag.name]
-    assert engine.deploy_fingerprint() == FingerprintEngine(runtime_config).deploy_fingerprint()
 
 
 def test_selector_projection_does_not_change_unrelated_production_profile():

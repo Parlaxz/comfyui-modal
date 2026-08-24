@@ -284,6 +284,64 @@ def _model_storage_bytes(model: Any) -> dict[str, Any]:
     return {"storage_ranges": ranges, "storage_bytes": total}
 
 
+def _model_parameter_count(model: Any) -> int | str:
+    """Best-effort parameter + buffer element count for one retained model."""
+    total = 0
+    observed = False
+    for method_name in ("named_parameters", "named_buffers"):
+        method = getattr(model, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            for _name, tensor in method():
+                if tensor is None:
+                    continue
+                numel = getattr(tensor, "numel", None)
+                if not callable(numel):
+                    return "UNOBSERVABLE"
+                total += int(numel())
+                observed = True
+        except Exception:
+            return "UNOBSERVABLE"
+    return total if observed or callable(getattr(model, "named_parameters", None)) else "UNOBSERVABLE"
+
+
+def _model_storage_registry(model_ctx: Any, model: Any, role: str) -> Any:
+    """Find an already-built cpu_snapshot_models storage registry, if exposed."""
+    for owner, attr in (
+        (model_ctx, f"{role}_storage_registry"),
+        (model_ctx, f"{role}_registry"),
+        (model, "_comfy_modal_cpu_storage_registry"),
+    ):
+        try:
+            registry = getattr(owner, attr, None)
+        except Exception:
+            registry = None
+        if registry is not None:
+            return registry
+    try:
+        registries = getattr(model_ctx, "storage_registries", None)
+        if isinstance(registries, dict):
+            return registries.get(role)
+    except Exception:
+        pass
+    return None
+
+
+def _registry_storage_fields(registry: Any) -> dict[str, int | None]:
+    if registry is None:
+        return {"unique_storage_count": None, "unique_storage_bytes": None}
+    try:
+        count = getattr(registry, "unique_storage_count", None)
+        total = getattr(registry, "total_bytes", None)
+        return {
+            "unique_storage_count": int(count) if count is not None else None,
+            "unique_storage_bytes": int(total) if total is not None else None,
+        }
+    except Exception:
+        return {"unique_storage_count": None, "unique_storage_bytes": None}
+
+
 def _capture_retained_models(model_ctx: Any) -> dict[str, Any]:
     """Retained CLIP/UNET/VAE identity + storage bytes from the snapshot models."""
     out: dict[str, Any] = {"present": model_ctx is not None}
@@ -309,14 +367,16 @@ def _capture_retained_models(model_ctx: Any) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "object_id": str(id(model)),
             "type": type(model).__name__,
+            "meta_parameter_count": _model_parameter_count(model),
         }
         entry.update(_model_storage_bytes(model))
+        entry.update(_registry_storage_fields(_model_storage_registry(model_ctx, model, role)))
         out[role] = entry
     return out
 
 
-def _capture_executors() -> dict[str, Any]:
-    """Registered global executors/futures: scan loaded modules' globals."""
+def enumerate_registered_executors() -> list[dict[str, Any]]:
+    """Enumerate executor globals, retaining the live object for hygiene checks."""
     found: list[dict[str, Any]] = []
     for mod_name in list(sys.modules)[:_MAX_MODULES]:
         mod = sys.modules.get(mod_name)
@@ -328,18 +388,32 @@ def _capture_executors() -> dict[str, Any]:
             continue
         for attr_name in list(names)[:256]:
             obj = names.get(attr_name)
-            if obj is None or not isinstance(obj, object):
+            if obj is None:
                 continue
             cls_name = type(obj).__name__
-            if cls_name in ("ThreadPoolExecutor", "ProcessPoolExecutor"):
-                found.append({
-                    "module": mod_name[:96],
-                    "attr": str(attr_name)[:64],
-                    "type": cls_name,
-                })
-                if len(found) >= _MAX_EXECUTORS:
-                    return {"count": len(found), "executors": found}
-    return {"count": len(found), "executors": found}
+            if cls_name not in ("ThreadPoolExecutor", "ProcessPoolExecutor"):
+                continue
+            found.append({
+                "module": mod_name[:96],
+                "attr": str(attr_name)[:64],
+                "type": cls_name,
+                "object": obj,
+            })
+            if len(found) >= _MAX_EXECUTORS:
+                return found
+    return found
+
+
+def _capture_executors() -> dict[str, Any]:
+    """Registered global executors/futures: scan loaded modules' globals."""
+    found = enumerate_registered_executors()
+    return {
+        "count": len(found),
+        "executors": [
+            {key: value for key, value in item.items() if key != "object"}
+            for item in found
+        ],
+    }
 
 
 def _capture_gc() -> dict[str, Any]:
@@ -384,6 +458,7 @@ def capture_snapshot_manifest(
     model_ctx: Any = None,
     extra: dict[str, Any] | None = None,
     hygiene: dict[str, Any] | None = None,
+    quiescence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture the full manifest at *stage* (e.g. ``before_capture``,
     ``first_restored_line``).  JSON-safe, bounded, never raises.
@@ -393,6 +468,20 @@ def capture_snapshot_manifest(
     (the ``snapshot_capture_hygiene`` event dict) is provided it is stored
     under ``manifest["capture_hygiene"]``.
     """
+    # Reuse the capture-hygiene measurement functions so RSS/cgroup labels
+    # cannot be mistaken for the serialized Modal snapshot size.
+    try:
+        from .snapshot_capture_hygiene import (
+            read_cgroup_memory_current_bytes,
+            read_process_status_fields,
+        )
+        _hygiene_status = read_process_status_fields()
+        _cgroup_bytes = read_cgroup_memory_current_bytes()
+    except Exception:
+        _hygiene_status = {}
+        _cgroup_bytes = None
+    _rss_kb = _hygiene_status.get("rss_kb")
+    _process_rss_bytes = int(_rss_kb) * 1024 if isinstance(_rss_kb, int) else None
     manifest: dict[str, Any] = {
         "stage": str(stage),
         "capture_wall_unix_ns": time.time_ns(),
@@ -410,11 +499,19 @@ def capture_snapshot_manifest(
         "executors": _capture_executors(),
         "gc": _capture_gc(),
         "identity": _capture_modal_identity(),
+        "process_rss_bytes": _process_rss_bytes,
+        "process_rss_note": "Process RSS is NOT snapshot size.",
+        "cgroup_memory_current_bytes": _cgroup_bytes,
+        "cgroup_memory_available": _cgroup_bytes is not None,
+        "cgroup_memory_note": "cgroup current is NOT serialized snapshot size.",
+        "serialized_snapshot_bytes": "UNOBSERVABLE",
     }
     if extra:
         manifest["extra"] = extra
     if hygiene is not None:
         manifest["capture_hygiene"] = hygiene
+    if quiescence is not None:
+        manifest["quiescence"] = quiescence
     _LATEST_BY_STAGE[str(stage)] = manifest
     try:
         print(

@@ -1,0 +1,377 @@
+R42 GOLDEN GATE REMOTE RAW LOG
+==============================
+STATUS: NO REMOTE DEPLOYMENT OR GATE HAS BEEN PERFORMED AS OF THIS UPDATE.
+
+Exact v2ctl command lines executed remotely: NONE (this iteration so far).
+Deployment record: NONE (no .v2ctl/deployments entry created by R42).
+Crash-loop diagnostics: N/A (no deployment).
+Complete retained remote output: UNAVAILABLE — no remote execution occurred yet.
+
+PRE-GATE STATE (implementation complete, locally proven):
+- M-02 UNET adoption: COMPLETE on a live seam.
+  * Joinable owner lifecycle: owners registered BEFORE prepare/commit work
+    (golden/pipeline.py run_role_load / run_unet_commit(owner=...); bridge
+    _unet_worker) — demand JOINs in-flight producers; failures publish FAILED.
+  * Single physical H2D: UNET commit destination is CUDA when available.
+  * Adoption seam: golden wrapper on comfy.sd.load_diffusion_model
+    (model_preload._install_golden_diffusion_wrapper, always chained, call-time
+    gated): note_role_source("unet", path) at the live demand point;
+    deadlock-aware bounded join (immediate fail-closed fallback if no owner and
+    CLIP forward never started); skeleton construction mirroring
+    comfy.sd.load_diffusion_model_state_dict (header meta sd -> prefix strip ->
+    model_config_from_unet -> native dtype/manual-cast policy) with ZERO-COPY
+    bind via model.load_model_weights(views, "", assign=True) onto committed
+    CUDA tensors. NO native disk read, NO full-model copy, NO second H2D.
+    Fail-closed fallbacks: scaled_fp8 keys / non-uniform dtype / inference-dtype
+    mismatch / missing helpers / any exception -> native loader +
+    golden_qd_fallback:unet.
+  * Verifier: _r42_golden_unet_adoption at load_models_gpu NEVER skips the
+    native call — spot-verifies name/shape/dtype/CUDA-residency vs the Golden
+    payload, records observed=golden_qd4 + model-I/O uniqueness, adds
+    golden_unet_identity_mismatch on mismatch; native bookkeeping walk applies
+    patches/hooks (CacheDiT/Sage preserved; params resident => zero transfers).
+- M-03 VAE adoption: COMPLETE on a live seam.
+  * Golden branch inside the always-installed load_torch_file wrapper: vae-role
+    resolution (role_paths exact match OR folder_paths.get_full_path("vae",
+    basename)==path) -> GoldenRunContext.vae_demand_load(path) runs the Golden
+    QD4 producer EXACTLY ONCE inline or JOINs an in-flight/live owner (never a
+    second read), returning materialized CPU views (+metadata) to VAELoader's
+    normal comfy.sd.VAE(sd=...) construction.
+  * Scheduler: unarmed ACT_VAE_QD legal only post-CLIP-critical pre-sampling
+    (UNET_COMMIT..SAMPLING before sampling grant); heavy conflicts serialize via
+    bounded ForbiddenOverlapError retry; _vae_worker dedupes vs live owner.
+  * VAEDecode seam (modal_app ~14457) joins/verifies + records observed.
+- Runtime-state generation determinism: RESOLVED.
+  * Root cause CONFIRMED: random uuid4 generation in runtime-state marker was
+    not immutable per deployment; cross-replica/placement marker divergence
+    produced E40 Rerun C's reloaded_generation_mismatch.
+  * Fix: content-derived generation (SHA-256 over canonical correctness-file
+    manifest; volatile fields excluded). Same deployment content => same
+    generation everywhere.
+  * Status wiring: invoked reload callbacks force canonical reasons
+    runtime_state_generation_reload / models_volume_generation_reload =>
+    DEGRADED, never silent nominal (runtime_bootstrap recorder +
+    modal_app merge).
+
+EVIDENCE OF LOCAL READINESS (exact executed campaign, this iteration):
+- Worktree: ../comfyui-modal-r42 (branch r42-golden-reconciliation, base E39)
+- tests/golden ................................ 72 passed
+- tests/test_r42_golden_integration.py ........ 28 passed
+- test_r42_config_truth + test_e40_canonical .. 44 passed
+- waterfall x2 ................................ 68 passed
+- v2ctl fingerprints/validation/config/profiles 122 passed
+- e30_clip_qd_io + c9_qd_probe ................ 75 passed
+- snapshot capture hygiene/build manifest/
+  manifest hygiene extensions ................. 28 passed
+- conditioning nonce + exact-hit breakdown .... 31 passed
+- TOTAL: 468 passed, 0 failed
+- py_compile all changed files: OK; git diff --check: clean
+
+NEXT COMMANDS (Stage 1 — ONE cold structural gate):
+  python tools/v2ctl.py deploy-run --profile r42-golden-qd4 --owner R42
+  python tools/v2ctl.py gate --profile r42-golden-qd4 --owner R42
+Gate checklist: see batch mandate (config five-layer truth, RuntimeStatus=NOMINAL
+reasons=[], loaders observed=golden_qd4 all roles, zero fallback, conditioning
+forced miss encode=1 persist=0, snapshot zero role value bytes, cache contract
+MUST_HIT valid + no unexpected generation reload, UNET source overlap during
+CLIP forward + commit after CLIP_GPU_CRITICAL_DONE + M-02 adoption proof,
+VAE first-step schedule + M-03 join/adoption proof, exact SHA
+20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260, ledger ok).
+ANY failure => STOP, diagnose, fix, redeploy; cohort only after a fully valid gate.
+
+
+==============================================================================
+R42A BATCH - EXECUTION-RECOVERY CONTINUATION EVIDENCE (APPEND-ONLY)
+==============================================================================
+Worktree: ..\comfyui-modal-r42  branch=r42-golden-reconciliation  dirty=authoritative
+Git head: 0c59f46e3238f421378e8852ebc548da815b70af
+Workspace/app: stable-modal-comfy-v2-restore-only-shadow  owner=R42  profile=r42-golden-qd4
+Active source dir: comfyui-modal-r42 (source-probe verdict=MATCH after each deploy)
+
+-- EXACT COMMANDS EXECUTED (canonical control plane only) --
+  python tools/v2ctl.py source-probe --profile r42-golden-qd4 --owner R42
+  python tools/v2ctl.py doctor      --profile r42-golden-qd4 --owner R42
+  python tools/v2ctl.py deploy-run  --profile r42-golden-qd4 --owner R42   (x3)
+  python tools/v2ctl.py gate        --profile r42-golden-qd4 --owner R42   (x3)
+NO cohort. NO G1. NO commit. NO push.
+
+-- DEPLOYMENTS --
+  deploy#1 f3cd77c4957eb4a2b86eb3c42dfa943e969d44e365b8354355cb09e2c8a3b87d exit=0 manifest=deploy_20260823-100808_f3cd77c4.json
+  deploy#2 f1c10c79bab335da565643b13e18f191711f3f71f772719903e93958181a425d exit=0 manifest=deploy_20260823-110218_f1c10c79.json
+  deploy#3 39d2c04ac475a5f9f3c201f36d0fa23770a21b06b1369de866eb64d3e2b58871 exit=0 manifest=deploy_20260823-112539_39d2c04a.json
+  transport run (deploy#2): request=v2-benchmark-0-a90881451830 RuntimeStatus=NOMINAL reasons=[] sha=20b10e1f... exact; generation guard skipped_generation_match/exact_match expected==current==5c16d4dd... file_diff={}
+
+-- GATE ATTEMPTS --
+  gate#1 20260823-151318 valid=0 FAIL(11): runtime_status_not_nominal(DEGRADED runtime_state_generation_reload) + e37_strict_proof conditioning + 8x e37_clean_lane_proof
+  gate#2 20260823-160540 valid=0 FAIL(1): [e37_strict_proof] E37 actual conditioning-cache miss evidence missing  (all structural/clean-lane/generation failures resolved)
+  gate#3 20260823-162708 valid=1 PASS  manifest=.v2ctl/gates/gate_20260823-162708_8bf17955.json
+  gate#3 request_id=v2-benchmark-0-f587312dcb75
+  gate#3 full run artifact=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-23_16-26-14\run_0.json
+
+-- GATE#3 HEADLINE --
+  RuntimeStatus={"status": "NOMINAL", "reasons": []}
+  output_sha=20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+  canonical_sha_expected=20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260  MATCH=YES
+  canonical_ledger_status="ok"
+  loader clip = {"requested": "golden_qd4", "effective": "golden_qd4", "observed": "golden_qd4", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": ""}
+  loader unet = {"requested": "golden_qd4", "effective": "golden_qd4", "observed": "golden_qd4", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": ""}
+  loader vae = {"requested": "golden_qd4", "effective": "golden_qd4", "observed": "golden_qd4", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": ""}
+
+-- TIMELINE (gate#3, ms, t0=first manifest lookup) --
+  restore_total_ms=1020.084  restore_to_method_entry_ms=51.35 (prev bad ~9235)
+  pre_sampler_ms=11048.231  sampler_ms=3783.864 (prev ~4880)  vae_decode_ms=387.605 (prev ~450)
+  wall_ms=22376.4 (prev bad ~46500)  command_to_response_ms=33370.3  submit2entry_ms=6154.398
+
+-- MANIFEST TELEMETRY (full_sha=false EVERYWHERE) --
+  unet runtime_header_stat wall=23.008ms blocks=367 | cache validate_wall=0.284ms
+  vae  runtime_header_stat wall=3.271ms  blocks=10  | cache validate_wall=0.225ms
+  clip runtime_header_stat wall=16.218ms blocks=240 | cache validate_wall=0.369ms
+
+-- CLIP --
+  role_match@529.3 -> qd_submit_start@587.8 = 58.5ms presubmit (prev ~6000 full-SHA gap)
+  clip_qd_submit_start@587.8 -> clip_qd_device_ready@2618.5 wall=2004.135ms aggregate_gbps=4.014 fraction_time_at_target_qd=0.0122 bytes=8044936192
+  clip_manifest_ready presubmit_wall_ms=2096.778 ; clip_forward_started@3765.8 ; clip_gpu_critical_done@6408.1
+
+-- UNET --
+  prepare_start@3769.5 (during CLIP forward) -> source_prepared@5689.9 prep_wall=1897.875ms gbps=6.486 blocks=367 bytes=12309817472 lifecycle=CONSUMED
+  overlap_hidden_under_clip = 1920.4ms (prepare fully inside CLIP-forward window)
+  commit gated by clip_gpu_critical_done: commit_start@6408.2 -> device_ready@7347.3 commit_wall=799.954ms gbps=15.388 commit_cache_served=true storage_read=0
+  construct_start@6458.7 -> golden_unet_construct_fallback reason=model_config_none @7360.9 (RESIDUAL DEFECT, see below)
+  unet_demand_verify@9981.1 result=match checked=453 all_models_cuda_resident=true
+
+-- VAE --
+  vae_loader_entry->return mode=golden_descriptor wall=17.747ms @372.7 (NONBLOCKING; prev ~15415 circular wait)
+  first_sampler_step_proven@11121.1 -> vae_qd_submit_start@11145.8 -> device_ready@11318.4 wall=88.881ms gbps=3.772 bytes=335278732 (single producer)
+  vae_bind_start@15762.2 -> bind_end ok=false adoption_failure:KeyError('assigned_count') @15798.9 (FALSE FALLBACK: values WERE bound pre-error; fixed post-gate, see below)
+  vae_decode_start@15799.2 decode_wall=387.605
+  clip_conditioning_cache_decision decision=forced_miss encode_calls=1 (first-class ledger event)
+
+-- DUPLICATE-I/O PROOF (Golden engine accounting) --
+  model_io_uniqueness.unet = {"unet": {"demand_join_count": 1, "native_post_ready_source_reads": 0, "native_post_ready_h2d": 0, "verify": "match"}}
+  occupancy.bytes_read totals == exactly one full pass per role (clip 8.04GB, unet 12.31GB, vae 0.335GB)
+  NOTE: native-path re-read/H2D counters are assertion-style (hardcoded 0), NOT /proc-measured; residual UNET native construct window 7361..9981 (~2.6s) is UNMEASURED for physical I/O.
+
+-- GENERATION / SNAPSHOT --
+  runtime_state guard: skipped_generation_match reason=exact_match (deployment #2/#3 era); no reload invoked
+  snapshot weight values: construction hygiene unchanged (CLIP/UNET/VAE values=0 contract enforced by existing validators)
+
+-- REMAINING DEFECTS AFTER VALID GATE (block cohort) --
+  D1 FIXED-IN-WORKTREE (post-gate): bridge bind_vae_payload compared detail['assigned_count'] (outer dict) -> KeyError AFTER successful bind -> false 'real fallback' record. One-line fix applied; 105 focused tests re-passed. NOT yet deployed.
+  D2 OPEN: golden_unet_construct_fallback reason=model_config_none persists even with golden-payload retry -> native construction path (~2.6s serial 7361..9981) with UNMEASURED physical re-read/H2D (counters are assertions). Violates mission E/F stop conditions until measured+eliminated.
+  D3 OPEN: run-record status assembly ignores golden_telemetry.degradations -> NOMINAL despite recorded fallback strings (telemetry contradiction class, mission G).
+
+-- VERDICT --
+  R42_COHORT_READY = NO
+  (structural gate valid + NOMINAL + exact SHA + no hot-path SHA + no VAELoader wait;
+   BUT model_config_none construct fallback + false-fallback record class present in THIS gate)
+
+-- TERMINAL PROCESS STATUS --
+  All local commands exit 0. Remote gate exit code 0 with valid=1. No crash loop observed across 3 gates + 3 deploys.
+
+====================================================================================================
+R42A FINAL CONSTRUCTION/STATUS RECONCILIATION — REMOTE RAW EVIDENCE (2026-08-23)
+====================================================================================================
+
+## Iteration summary
+- D1: verified already-landed fix (golden_runtime_bridge.py bind_vae_payload reads detail["detail"]["assigned_count"]); deployed; vae_adoption_complete ok, no KeyError, no real fallback.
+- D2: ROOT CAUSE fixed (empty-strip bug); three deploys this iteration:
+    deploy#1 1d587380a81ff9a79e2011a658d8c361104a7c14866001375de801b18bef224f (D2 detection parity + D3 authority + measurement infra)
+    deploy#2 be31f177e82251eea95fcb3186dc2e7702b9cb1473a6344a127644ca9af9ac2e (identity recheck level fix)
+    deploy#3 3f6a303ad30787721839553cae9ec6d07a4947bc9221004bbe9ba651f10f3ae1 (load_model_weights pop-copy fix)  <-- AUTHORITATIVE
+- Gates this iteration: gate_20260823-173124_a94a1d09 (valid=1, functional proofs, identity instrumentation VACUOUS),
+  gate_20260823-175236_0b6754c9 (valid=1, identity still vacuous -> diagnosed pop-mutation),
+  gate_20260823-181257_9127112e (valid=1, ALL PROOFS MEASURED) <-- FINAL AUTHORITATIVE GATE
+
+## Commands (all three iterations identical)
+  python tools/v2ctl.py deploy-run   --profile r42-golden-qd4 --owner R42
+  python tools/v2ctl.py source-probe --profile r42-golden-qd4 --owner R42   -> verdict=MATCH / RESULT=PASS (each deploy)
+  python tools/v2ctl.py gate         --profile r42-golden-qd4 --owner R42
+
+## FINAL GATE 0701af23648942b6b2ae2876ee1f0558
+gate_valid=True reasons=[] provenance=validated
+request_id=v2-benchmark-0-693e0e9c5705
+run=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-23_18-12-05\run_001_sample.json
+
+## Deploy manifest (final)
+{"artifacts": {"campaign_manifest": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-23_18-09-08\\campaign_manifest.json", "console_capture": null, "output_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-23_18-09-08", "profile": "r42-golden-qd4", "profile_config_fingerprint": "eb57dbcab84267854cca86e2aac50ff27a4cb4ae171d5cf6384a7f8d1cb278f6", "provenance_validation_status": "validated", "request_id": "v2-benchmark-0-a4e86cb937d7", "run_artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-23_18-09-08\\run_001_sample.json", "run_artifacts": ["C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-23_18-09-08\\run_0.json", "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-23_18-09-08\\run_001_sample.json"], "summary_artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-23_18-09-08\\summary.json", "v2ctl_invocation_id": "d3441a6b16ce4a4c99fc2ccfb77a70b7"}, "backend": {"command": "\"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal-r42\\deploy_and_run_v2_single.bat\"
+
+## Source probe (final): verdict=MATCH RESULT=PASS source_identity_status=verified
+
+## Full ledger event timeline (mono ms from modal_restore_entry)
+       0.0ms  modal_restore_entry                          {}
+      98.9ms  bootstrap_restore_entry                      {"source": "runtime_bootstrap.restore"}
+     297.0ms  modal_restore_exit                           {"status": "restored"}
+     353.3ms  manifest_lookup_start                        {"role": "unet", "source": "runtime_header_stat"}
+     353.3ms  manifest_lookup_end                          {"blocks": 367, "full_sha": false, "header_fingerprint": "f16398b50908a733", "role": "unet", "source": "runtime_header_stat", "wall_ms": 23.051}
+     353.6ms  modal_method_entry                           {}
+     354.2ms  plan_deserialize_start                       {}
+    1189.4ms  plan_received                                {}
+    1194.7ms  phase_transition                             {"phase": "phase1_minimal_restore", "via": "begin_minimal_restore"}
+    1194.7ms  phase_transition                             {"phase": "phase2_clip_qd4", "via": "restore_ready"}
+    1194.7ms  restore_ready                                {}
+    1374.8ms  vae_role_match                               {"ckpt_tail": "/root/comfy/ComfyUI/models/vae/ae.safetensors"}
+    1383.4ms  manifest_lookup_start                        {"role": "vae", "source": "runtime_header_stat"}
+    1383.5ms  manifest_lookup_end                          {"blocks": 10, "full_sha": false, "header_fingerprint": "8463bf3748223e03", "role": "vae", "source": "runtime_header_stat", "wall_ms": 8.01}
+    1405.7ms  vae_descriptor_ready                         {"hydration": "deferred_until_first_sampler_step", "identity": "8c90d1362cea0173a7d093a3d4e516eb", "tensor_count": 244, "wall_ms": 30.711}
+    1405.7ms  vae_loader_return                            {"mode": "golden_descriptor", "wall_ms": 30.756}
+    1563.0ms  clip_role_match                              {"ckpt_tail": "oot/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors"}
+    1580.0ms  manifest_lookup_start                        {"role": "clip", "source": "runtime_header_stat"}
+    1580.0ms  manifest_lookup_end                          {"blocks": 240, "full_sha": false, "header_fingerprint": "75a838dfd5acb490", "role": "clip", "source": "runtime_header_stat", "wall_ms": 15.717}
+    1581.9ms  manifest_lookup_start                        {"role": "clip", "source": "cache"}
+    1582.0ms  manifest_lookup_end                          {"full_sha": false, "role": "clip", "source": "cache", "validate_wall_ms": 0.268}
+    1582.1ms  resource_acquire                             {"domains": ["storage_heavy"], "label": "clip_qd_source"}
+    1582.2ms  resource_acquire                             {"domains": ["h2d_heavy"], "label": "clip_qd_h2d"}
+    1621.0ms  clip_qd_submit_start                         {"block_bytes": 33554432, "configured_qd": 4, "device": "cpu", "file_bytes": 8044982048, "n_ranges": 240, "path": "/__modal/volumes/vo-YbBqlP9IbbNVZlCRENl5Je/text_encoders/qwen_3_4b.safetensors", "staging_slots": 8}
+    1633.8ms  clip_qd_source_first_completion              {"latency_ms": 11.5358}
+    1657.5ms  clip_qd_h2d_start                            {}
+    6112.6ms  clip_qd_source_last_completion               {"latency_ms": 3.6525}
+    6112.7ms  clip_qd_source_complete                      {"blocks": 240}
+    6140.5ms  clip_qd_h2d_end                              {"completed_bytes": 8044936192}
+    6141.8ms  clip_qd_stats                                {"aggregate_gbps": 1.7910908555639584, "bytes_read": 8044936192, "bytes_total": 8044936192, "commit_cache_served": null, "commit_read_storage_bytes": 0, "completed_waiting_h2d_max_depth": 8, "completion_count": 240, "configured_qd": 4, "first_completion_ms": 1
+    6141.9ms  clip_qd_device_ready                         {"aggregate_gbps": 1.7910908555639584, "wall_ms": 4491.640481}
+    6143.0ms  resource_release                             {"label": "clip_qd_h2d"}
+    6143.0ms  resource_release                             {"label": "clip_qd_source"}
+    6143.1ms  phase_transition                             {"phase": "phase3_clip_forward_unet_prepare", "via": "clip_device_ready"}
+    6143.1ms  clip_device_ready                            {"identity": "efd0f098d3c92dc9d8e618e299b1ac21", "role": "clip"}
+    6150.0ms  clip_manifest_ready                          {"presubmit_wall_ms": 4586.4}
+    7188.3ms  resource_acquire                             {"domains": ["gpu_compute"], "label": "clip_forward"}
+    7188.4ms  resource_acquire                             {"domains": ["gpu_mutation"], "label": "clip_gpu_critical"}
+    7188.4ms  phase_transition                             {"phase": "phase3_clip_forward_unet_prepare", "via": "clip_forward_started"}
+    7188.4ms  clip_forward_started                         {}
+    7188.4ms  phase_transition                             {"phase": "phase3_clip_forward_unet_prepare", "via": "clip_storage_released"}
+    7188.4ms  clip_storage_released                        {}
+    7190.9ms  manifest_lookup_start                        {"role": "unet", "source": "cache"}
+    7191.0ms  manifest_lookup_end                          {"full_sha": false, "role": "unet", "source": "cache", "validate_wall_ms": 0.214}
+    7191.1ms  resource_acquire                             {"domains": ["storage_heavy", "cpu_heavy"], "label": "unet_bulk_source"}
+    7191.3ms  unet_prepare_start                           {"block_bytes": 33554432, "configured_qd": 4, "heap_pool_buffers": 4, "n_ranges": 367, "path": "/__modal/volumes/vo-YbBqlP9IbbNVZlCRENl5Je/diffusion_models/z_image_turbo_bf16.safetensors"}
+    7301.4ms  unet_source_first_completion                 {"latency_ms": 106.8462}
+   12599.6ms  unet_source_last_completion                  {"latency_ms": 19.9891}
+   12627.8ms  unet_source_last_completion                  {"latency_ms": 19.9891}
+   12627.8ms  unet_source_prepared                         {"block_count": 367, "fingerprint": "aa7b8a74e0165aead9a1ba1152ae3e5f5d0eb853318322abd1160cb8e6aa88ab", "peak_heap_staging_bytes": 134217728, "prep_aggregate_gbps": 2.276, "prep_wall_ms": 5409.651, "read_errors": 0, "residency_method": "proc_io", "total_bytes"
+   12628.4ms  resource_release                             {"label": "unet_bulk_source"}
+   12628.5ms  phase_transition                             {"phase": "phase3_clip_forward_unet_prepare", "via": "unet_prepare_started"}
+   12628.5ms  unet_prepare_started                         {"block_count": 367, "identity": "4afc2699bf7eced10d1ccee23ebe07e7", "role": "unet"}
+   13327.7ms  resource_release                             {"label": "clip_forward"}
+   13327.7ms  resource_release                             {"label": "clip_gpu_critical"}
+   13327.8ms  phase_transition                             {"phase": "phase4_unet_commit", "via": "clip_gpu_critical_done"}
+   13327.8ms  clip_gpu_critical_done                       {}
+   13328.3ms  unet_commit_start                            {"identity": "4afc2699bf7eced10d1ccee23ebe07e7", "role": "unet"}
+   13328.3ms  resource_acquire                             {"domains": ["storage_heavy"], "label": "unet_bulk_source"}
+   13328.4ms  resource_acquire                             {"domains": ["h2d_heavy"], "label": "unet_h2d"}
+   13396.4ms  unet_construct_start                         {"path_tail": "mfyUI/models/diffusion_models/z_image_turbo_bf16.safetensors"}
+   13468.0ms  unet_commit_start                            {"block_count": 367, "identity_hash": "4afc2699bf7eced10d1ccee23ebe07e7", "total_bytes": 12309817472}
+   13470.3ms  unet_commit_load_start                       {"block_bytes": 33554432, "configured_qd": 4, "device": "cuda:0", "file_bytes": 12309866400, "n_ranges": 367, "path": "/__modal/volumes/vo-YbBqlP9IbbNVZlCRENl5Je/diffusion_models/z_image_turbo_bf16.safetensors", "staging_slots": 8}
+   13475.6ms  unet_source_first_completion                 {"latency_ms": 4.4552}
+   13475.8ms  unet_h2d_start                               {}
+   14348.8ms  unet_source_last_completion                  {"latency_ms": 3.7232}
+   14348.9ms  unet_source_complete                         {"blocks": 367}
+   14371.0ms  unet_h2d_end                                 {"completed_bytes": 12309817472}
+   14371.6ms  unet_stats                                   {"aggregate_gbps": 14.011750469151607, "bytes_read": 12309817472, "bytes_total": 12309817472, "commit_cache_served": null, "commit_read_storage_bytes": 0, "completed_waiting_h2d_max_depth": 8, "completion_count": 367, "configured_qd": 4, "first_completion_ms":
+   14371.6ms  unet_device_ready                            {"aggregate_gbps": 14.011750469151607, "wall_ms": 878.535305}
+   14373.6ms  unet_bind                                    {"identity": "4afc2699bf7eced10d1ccee23ebe07e7", "role": "unet"}
+   14373.6ms  resource_release                             {"label": "unet_h2d"}
+   14373.6ms  resource_release                             {"label": "unet_bulk_source"}
+   14373.7ms  phase_transition                             {"phase": "phase5_sampling", "via": "unet_device_ready"}
+   14373.7ms  unet_device_ready                            {"identity": "4afc2699bf7eced10d1ccee23ebe07e7", "role": "unet"}
+   14375.3ms  native_post_ready_window_open                {"proc_io_observable": true, "rchar": null, "read_bytes": 0}
+   14384.4ms  unet_model_config_detect                     {"arch": "ZImage", "detect_key_count": 453, "detected": true, "prefix": "model.", "raw_key_count": 453, "source": "header_meta"}
+   14384.4ms  unet_construct_stage                         {"arch": "ZImage", "stage": "model_config_resolved", "wall_ms": 2.311}
+   14421.1ms  unet_construct_stage                         {"stage": "skeleton_patcher_created", "wall_ms": 38.983}
+   14442.1ms  unet_storage_identity                        {"copied_storage_count": 0, "same_storage_count": 453, "tensor_count": 453, "unexpected_device_count": 0, "unexpected_dtype_count": 0}
+   14442.1ms  unet_construct_stage                         {"stage": "bind_complete", "wall_ms": 20.85}
+   14442.2ms  unet_demand_join                             {"decision": "joined"}
+   14442.2ms  unet_adopt_construct                         {"assign_mode": "assign_true", "assigned_count": 453, "leftover_count": 0, "wall_ms": 64.285}
+   14442.2ms  unet_construct_end                           {"outcome": "adopted", "wall_ms": 1045.891}
+   14442.2ms  unet_bind                                    {"assigned_count": 453, "leftover_count": 0, "mode": "assign_true"}
+   14513.7ms  unet_demand_verify                           {"all_models_cuda_resident": false, "checked": 453, "result": "match"}
+   14579.1ms  post_golden_unet_ready_native_io             {"cuda_allocated_bytes_delta": 4452864, "logical_read_bytes_proc": null, "native_load_torch_file_bytes": 0, "native_load_torch_file_calls": 0, "param_identity_changed": 0, "param_identity_checked": 453, "physical_storage_read_bytes": 0, "wall_ms": 203.785, "wi
+   15710.4ms  resource_acquire                             {"domains": ["gpu_compute"], "label": "sampling"}
+   15710.4ms  phase_transition                             {"phase": "phase5_sampling", "via": "sampling_started"}
+   15710.4ms  sampling_started                             {}
+   15710.4ms  phase_transition                             {"phase": "phase5_sampling", "via": "first_sampler_step_proven"}
+   15710.5ms  first_sampler_step_proven                    {}
+   15711.1ms  vae_schedule_state                           {"state": "first_sampler_step_proven"}
+   15713.4ms  manifest_lookup_start                        {"role": "vae", "source": "cache"}
+   15713.5ms  manifest_lookup_end                          {"full_sha": false, "role": "vae", "source": "cache", "validate_wall_ms": 0.279}
+   15713.6ms  resource_acquire                             {"domains": ["storage_heavy", "h2d_heavy"], "label": "vae_qd"}
+   15731.8ms  vae_qd_submit_start                          {"block_bytes": 33554432, "configured_qd": 4, "device": "cpu", "file_bytes": 335304388, "n_ranges": 10, "path": "/__modal/volumes/vo-YbBqlP9IbbNVZlCRENl5Je/vae/ae.safetensors", "staging_slots": 8}
+   15743.4ms  vae_qd_source_first_completion               {"latency_ms": 10.7002}
+   15743.7ms  vae_qd_h2d_start                             {}
+   15829.9ms  vae_qd_source_last_completion                {"latency_ms": 3.3373}
+   15830.1ms  vae_qd_source_complete                       {"blocks": 10}
+   15898.5ms  vae_qd_h2d_end                               {"completed_bytes": 335278732}
+   15899.1ms  vae_qd_stats                                 {"aggregate_gbps": 3.418187675708719, "bytes_read": 335278732, "bytes_total": 335278732, "commit_cache_served": null, "commit_read_storage_bytes": 0, "completed_waiting_h2d_max_depth": 2, "completion_count": 10, "configured_qd": 4, "first_completion_ms": 11.56
+   15899.1ms  vae_qd_device_ready                          {"aggregate_gbps": 3.418187675708719, "wall_ms": 98.086695}
+   15900.8ms  resource_release                             {"label": "vae_qd"}
+   15900.8ms  phase_transition                             {"phase": "phase5_sampling", "via": "vae_device_ready"}
+   15900.8ms  vae_device_ready                             {"identity": "8c90d1362cea0173a7d093a3d4e516eb", "role": "vae"}
+   15900.9ms  vae_schedule_state                           {"state": "device_ready"}
+   19465.6ms  sampling_end                                 {"duration_ms": 4888.612, "node_id": "1242", "request_id": "v2-benchmark-0-693e0e9c5705"}
+   19465.8ms  sampler_finally_done                         {"node_id": "1242", "request_id": "v2-benchmark-0-693e0e9c5705"}
+   20144.5ms  vae_bind_start                               {}
+   20177.1ms  vae_adoption_complete                        {"assigned_count": 244, "cast_count": 244, "decision": "already_ready", "identity": "8c90d1362cea0173a7d093a3d4e516eb", "wall_ms": 32.53}
+   20177.3ms  vae_bind_end                                 {"ok": true}
+   20177.3ms  vae_decode_join                              {"decision": "bound_before_decode"}
+   20177.3ms  vae_decode_start                             {}
+   20742.5ms  graph_next_node_after_sampler                {"request_id": "v2-benchmark-0-693e0e9c5705"}
+   20744.8ms  result_assembly_start                        {"items": 1, "prompt_id": "v2-benchmark-0-693e0e9c5705", "strategy": "direct_output_sink"}
+   20751.8ms  clip_conditioning_cache_decision             {"decision": "forced_miss", "encode_calls": 1, "source": "pre_sampler_structured_report"}
+   20790.4ms  output_persist_done                          {"request_id": "v2-benchmark-0-693e0e9c5705"}
+   20790.4ms  first_durable_result                         {}
+
+## Key proof events (full metadata)
+clip_qd_stats = {"aggregate_gbps": 1.7910908555639584, "bytes_read": 8044936192, "bytes_total": 8044936192, "commit_cache_served": null, "commit_read_storage_bytes": 0, "completed_waiting_h2d_max_depth": 8, "completion_count": 240, "configured_qd": 4, "first_completion_ms": 12.839802, "fraction_time_at_target_qd": 0.01682901521610006, "free_slots_min": 0, "h2d_backpressure_events": 192, "h2d_backpressure_ms_total": 10942.699, "h2d_completed_bytes": 8044936192, "h2d_device_wall_ms": 17348.955, "h2d_host_issue_ms_max": 159.698, "h2d_host_issue_ms_total": 1062.695, "h2d_submitted_bytes": 8044936192, "last_completion_ms": 4491.640481, "observed_max_outstanding": 4, "occupancy_samples": 481, "per_read_errors": 0, "pinned_bytes": 268435456, "planned_block_count": 240, "process_cpu_ms": 86270.0, "queue_backlog_max": 6, "samples_at_target_qd": 8, "source_latency_max_ms": 215.859194, "source_latency_p50_ms": 11.0608675, "source_latency_p90_ms": 67.50365289999999, "source_latency_p99_ms": 179.51609656999995, "source_wall_ms": 4491.640481, "staging_slots": 8, "status": "ok", "steady_state_gbps": 0.8878021591407084, "submit_count": 240, "target_qd": 4, "thread_cpu_ms": 7700.0, "time_below_qd_ms_by_reason": {"h2d_backpressure": 10942.699, "startup_ramp": 12.84, "tail_drain": 3.657}, "worker_exceptions": 0}
+unet_model_config_detect = {"arch": "ZImage", "detect_key_count": 453, "detected": true, "prefix": "model.", "raw_key_count": 453, "source": "header_meta"}
+unet_storage_identity = {"copied_storage_count": 0, "same_storage_count": 453, "tensor_count": 453, "unexpected_device_count": 0, "unexpected_dtype_count": 0}
+unet_demand_verify = {"all_models_cuda_resident": false, "checked": 453, "result": "match"}
+post_golden_unet_ready_native_io = {"cuda_allocated_bytes_delta": 4452864, "logical_read_bytes_proc": null, "native_load_torch_file_bytes": 0, "native_load_torch_file_calls": 0, "param_identity_changed": 0, "param_identity_checked": 453, "physical_storage_read_bytes": 0, "wall_ms": 203.785, "window_reason": "sampling_start"}
+vae_qd_stats = {"aggregate_gbps": 3.418187675708719, "bytes_read": 335278732, "bytes_total": 335278732, "commit_cache_served": null, "commit_read_storage_bytes": 0, "completed_waiting_h2d_max_depth": 2, "completion_count": 10, "configured_qd": 4, "first_completion_ms": 11.562503, "fraction_time_at_target_qd": 0.0, "free_slots_min": 0, "h2d_backpressure_events": 2, "h2d_backpressure_ms_total": 70.949, "h2d_completed_bytes": 335278732, "h2d_device_wall_ms": 2138.277, "h2d_host_issue_ms_max": 2.975, "h2d_host_issue_ms_total": 12.21, "h2d_submitted_bytes": 335278732, "last_completion_ms": 98.086695, "observed_max_outstanding": 3, "occupancy_samples": 21, "per_read_errors": 0, "pinned_bytes": 268435456, "planned_block_count": 10, "process_cpu_ms": 1070.0, "queue_backlog_max": 6, "samples_at_target_qd": 0, "source_latency_max_ms": 19.670887, "source_latency_p50_ms": 8.968159, "source_latency_p90_ms": 16.100219799999998, "source_latency_p99_ms": 19.31382028, "source_wall_ms": 98.086695, "staging_slots": 8, "status": "ok", "steady_state_gbps": 0.0, "submit_count": 10, "target_qd": 4, "thread_cpu_ms": 60.0, "time_below_qd_ms_by_reason": {"h2d_backpressure": 70.949, "startup_ramp": 11.563, "tail_drain": 3.345, "unexplained": 12.23}, "worker_exceptions": 0}
+vae_adoption_complete = {"assigned_count": 244, "cast_count": 244, "decision": "already_ready", "identity": "8c90d1362cea0173a7d093a3d4e516eb", "wall_ms": 32.53}
+clip_conditioning_cache_decision = {"decision": "forced_miss", "encode_calls": 1, "source": "pre_sampler_structured_report"}
+
+## Run-record contract blocks
+runtime_status = {"reasons": [], "status": "NOMINAL"}
+loader_selection = {"clip": {"effective": "golden_qd4", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": "", "observed": "golden_qd4", "requested": "golden_qd4"}, "unet": {"effective": "golden_qd4", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": "", "observed": "golden_qd4", "requested": "golden_qd4"}, "vae": {"effective": "golden_qd4", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": "", "observed": "golden_qd4", "requested": "golden_qd4"}}
+output_sha = 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+golden_telemetry.role_lifecycle = {"clip": {"producer_status": "NOT_STARTED", "bind_status": "NOT_STARTED", "adoption_status": "NOT_STARTED", "native_fallback_executed": false, "terminal_reason": ""}, "unet": {"producer_status": "NOT_STARTED", "bind_status": "NOT_STARTED", "adoption_status": "NOT_STARTED", "native_fallback_executed": false, "terminal_reason": ""}, "vae": {"producer_status": "committed", "bind_status": "bound", "adoption_status": "ADOPTED", "native_fallback_executed": false, "terminal_reason": ""}}
+golden_telemetry.degradations = []
+golden_telemetry.native_post_ready_io = {"window_reason": "sampling_start", "physical_storage_read_bytes": 0, "logical_read_bytes_proc": null, "native_load_torch_file_calls": 0, "native_load_torch_file_bytes": 0, "cuda_allocated_bytes_delta": 4452864, "param_identity_checked": 453, "param_identity_changed": 0, "wall_ms": 203.785}
+golden_telemetry.unet_storage_identity = {"tensor_count": 453, "same_storage_count": 453, "copied_storage_count": 0, "unexpected_device_count": 0, "unexpected_dtype_count": 0}
+golden_telemetry.model_io_uniqueness = {"unet": {"golden_source_producer_count": 1, "golden_commit_count": 1, "demand_join_count": 1, "native_fallback_count": 0, "duplicate_source_count": 0, "duplicate_h2d_count": 0, "adoption_mode": "skeleton_assign_bind", "same_storage_count": 453, "copied_storage_count": 0, "unexpected_device_count": 0, "unexpected_dtype_count": 0, "verify": "match"}}
+config_truth.agreements = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]
+canonical_ledger_status = ok
+
+## Critical-path metrics (ms)
+                             _registry_entries = 1
+             command_start_to_python_resume_ms = 20596.715
+               command_start_to_restore_end_ms = 20900.359
+             command_start_to_restore_start_ms = 20596.715
+                        command_to_response_ms = 40996.3
+         first_remote_event_to_final_result_ms = 19709.185
+                             graph_activity_ms = 13283.275
+                              handle_lookup_ms = 4.999
+         method_entry_to_first_remote_event_ms = 323.759
+                          output_collection_ms = 8.66
+                                pre_sampler_ms = 14514.629
+                  remote_handoff_payload_bytes = 2979
+      remote_python_resume_to_restore_start_ms = 0.0
+                    remote_result_emit_mono_ns = 201771879059
+               remote_result_emit_wall_unix_ns = 1787508753989081732
+                    restore_to_method_entry_ms = 49.95
+                              restore_total_ms = 224.89
+                          sampler_lane_wait_ms = 0.07
+                                    sampler_ms = 3749.764
+           snapshot_callback_age_at_restore_ms = 142224.449
+         snapshot_callback_to_command_start_ms = 121550.321
+           submission_to_first_remote_event_ms = 8236.104
+         submission_to_remote_python_resume_ms = 7558.75
+                               submit2entry_ms = 7917.344
+                                  t3b_to_t8_ms = 19554.99
+                  terminal_cleanup_end_mono_ns = 201775538096
+             terminal_cleanup_end_wall_unix_ns = 1787508753992740909
+                terminal_cleanup_start_mono_ns = 201774972707
+           terminal_cleanup_start_wall_unix_ns = 1787508753992175360
+                                 vae_decode_ms = 376.851
+                                       wall_ms = 27969.2
+
+## Terminal process status: exit=0 (deploy-run), gate valid=1, no crash loop, clean exit

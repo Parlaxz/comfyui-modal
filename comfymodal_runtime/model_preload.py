@@ -3163,6 +3163,7 @@ _POST_VAE_GRAPH_TAIL: dict[str, Any] = {"span": None}
 # ``comfy_aimdo``).  Each component is tracked independently.
 
 _SENTINEL_READ = "_comfy_modal_read_wrapper"
+_SENTINEL_GOLDEN_DIFFUSION = "_comfy_modal_golden_diffusion_wrapper"
 _SENTINEL_GPU = "_comfy_modal_gpu_wrapper"
 _SENTINEL_FORENSICS = "_comfymodal_clip_cold_forensics"
 """Symmetric cross-sentinel guard for the five shared GPU/patcher/CLIP
@@ -3190,8 +3191,10 @@ _SENTINEL_MODEL_PATCHER_PATCH_WEIGHT = "_comfy_modal_model_patcher_patch_weight_
 _SENTINEL_CAST_TO_DEVICE = "_comfy_modal_cast_to_device_wrapper"
 _SENTINEL_CLIP_SPAN = "_comfy_modal_clip_span_wrapper"
 _SENTINEL_CLIP_FORWARD = "_comfy_modal_clip_forward_wrapper"
+_SENTINEL_GOLDEN_VAE_DECODE = "_comfy_modal_golden_vae_decode_wrapper"
 
 _read_wrapper_installed: bool = False
+_golden_diffusion_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
 _sd_wrapper_installed: bool = False
 _subfn_wrappers_installed: bool = False
@@ -3199,6 +3202,7 @@ _deep_diag_wrappers_installed: bool = False
 _clip_wrapper_installed: bool = False
 _clip_constructor_wrapper_installed: bool = False
 _clip_load_sd_wrapper_installed: bool = False
+_golden_vae_decode_wrapper_installed: bool = False
 _wrappers_lock = RLock()
 
 # Reentrancy guards — per-thread via ContextVar default=0.
@@ -3503,6 +3507,15 @@ def mark_first_sampler_step(request_id: str) -> None:
         watchdog = _SAMPLER_STALL_WATCHDOGS.get(request_id)
     if watchdog is not None:
         watchdog.mark_first_sampler_step()
+    # R42: Golden envelope — sampler proven; VAE QD4 may arm now.
+    try:
+        from . import golden_runtime_bridge as _grb
+
+        _gctx = _grb.current()
+        if _gctx is not None:
+            _gctx.on_first_sampler_step()
+    except Exception:
+        pass
 
 
 def cancel_sampler_stall_watchdog(request_id: str) -> None:
@@ -3965,6 +3978,286 @@ def _get_live_module(mod_name: str) -> Any | None:
 # ── Wrapper factories ───────────────────────────────────────────────
 
 
+def _native_detection_input(base_sd, base_meta, prefix_fn, strip_fn, quant_fn=None):
+    """EXACT input parity with comfy.sd.load_diffusion_model_state_dict.
+
+    Native sequence: convert_old_quants -> unet_prefix_from_state_dict
+    -> state_dict_prefix_replace(filter_keys=True) applied ONLY when the
+    stripped result is non-empty (the empty-strip guard is the R42A D2 fix:
+    ``unet_prefix_from_state_dict`` falls back to "model." for bare-key
+    diffusion files, and an unconditional filter_keys strip yields an EMPTY
+    dict -> model_config_from_unet returns None -> native construct fallback).
+    Returns ``(detect_sd, detect_meta, prefix)``.
+    """
+    detect_sd = dict(base_sd)
+    detect_meta = base_meta
+    if callable(quant_fn):
+        try:
+            detect_sd, detect_meta = quant_fn(detect_sd, "", metadata=detect_meta)
+        except Exception:
+            detect_sd, detect_meta = dict(base_sd), base_meta
+    prefix = prefix_fn(detect_sd)
+    temp = strip_fn(dict(detect_sd), {prefix: ""}, filter_keys=True)
+    if len(temp) > 0:
+        detect_sd = temp
+        if callable(quant_fn):
+            try:
+                detect_sd, detect_meta = quant_fn(detect_sd, "", metadata=detect_meta)
+            except Exception:
+                pass
+    return detect_sd, detect_meta, prefix
+
+
+def _storage_identity_counts(named, views):
+    """Measured bind identity: compare bound parameter/buffer data_ptrs
+    against the Golden source tensors.  Returns ``(counts, ptr_map)`` where
+    counts has tensor_count / same_storage_count / copied_storage_count /
+    unexpected_device_count / unexpected_dtype_count."""
+    same_storage = copied_storage = unexpected_device = unexpected_dtype = 0
+    ptr_map: dict = {}
+    tensor_count = 0
+    for name, tensor in named.items():
+        tensor_count += 1
+        src = views.get(name)
+        try:
+            ptr_map[name] = (int(tensor.data_ptr()), str(tensor.device), str(tensor.dtype))
+        except Exception:
+            continue
+        if src is None:
+            continue
+        try:
+            if int(tensor.data_ptr()) == int(src.data_ptr()):
+                same_storage += 1
+            else:
+                copied_storage += 1
+        except Exception:
+            copied_storage += 1
+        if not str(tensor.device).startswith("cuda"):
+            unexpected_device += 1
+        if tensor.dtype != src.dtype:
+            unexpected_dtype += 1
+    counts = {
+        "tensor_count": tensor_count,
+        "same_storage_count": same_storage,
+        "copied_storage_count": copied_storage,
+        "unexpected_device_count": unexpected_device,
+        "unexpected_dtype_count": unexpected_dtype,
+    }
+    return counts, ptr_map
+
+
+def _make_golden_load_diffusion_model_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Build the R42 demand-side UNET skeleton/zero-copy binder."""
+    @functools.wraps(original)
+    def wrapper(unet_path, model_options={}, disable_dynamic=False):
+        try:
+            from . import golden_runtime_bridge as _grb
+            ctx = _grb.enabled_current()
+            if ctx is None or not str(unet_path).lower().endswith(".safetensors"):
+                return original(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
+            t0 = time.perf_counter_ns()
+            ctx.ledger_sink.emit("unet_construct_start", path_tail=str(unet_path)[-60:])
+            ctx.note_role_source("unet", str(unet_path))
+            from .golden.contracts import ModelRole
+            registry = ctx.pipeline.registry
+            if registry.get(ModelRole.UNET) is None:
+                # ── R42 fix: graph loaders commonly run BEFORE the CLIP
+                # forward boundary fires (which is what registers the Golden
+                # UNET owner via the prepare worker).  Instead of bailing
+                # immediately, poll for a bounded window until either the
+                # owner registers or the forward boundary starts; only then
+                # fall back.  Never blocks indefinitely.
+                _uw_start = time.monotonic()
+                _uw_deadline = _uw_start + 8.0
+                while time.monotonic() < _uw_deadline:
+                    if (
+                        registry.get(ModelRole.UNET) is not None
+                        or getattr(ctx, "_clip_forward_started", False)
+                    ):
+                        break
+                    time.sleep(0.02)
+                if registry.get(ModelRole.UNET) is None and not getattr(ctx, "_clip_forward_started", False):
+                    ctx.add_degradation("golden_qd_fallback:unet")
+                    ctx.ledger_sink.emit(
+                        "golden_unet_demand_early",
+                        reason="no_owner_and_forward_not_started_after_bounded_wait",
+                        waited_ms=round((time.monotonic() - _uw_start) * 1000.0, 1),
+                    )
+                    return original(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
+            decision, _owner = registry.join_or_adopt(
+                ModelRole.UNET, min(float(getattr(ctx, "join_timeout_s", 120.0)), 60.0))
+            if str(getattr(decision, "value", decision)) not in ("joined", "already_ready"):
+                ctx.add_degradation("golden_qd_fallback:unet")
+                return original(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
+            sd = ctx.unet_payload(timeout_s=30.0)
+            if not sd:
+                ctx.add_degradation("golden_qd_fallback:unet")
+                return original(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
+            started = time.monotonic_ns()
+            import torch
+            from .golden.qd_engine import parse_safetensors_header
+            layout = parse_safetensors_header(str(unet_path))
+            entries = list(layout.tensor_map)
+            if any(".scaled_fp8" in e.name for e in entries):
+                raise RuntimeError("scaled_fp8")
+            dtypes = {str(e.dtype) for e in entries}
+            if len(dtypes) != 1:
+                raise RuntimeError("non_uniform_dtype")
+            dtype_map = _c6_safetensors_dtype_map()
+            view_dtype = dtype_map.get(next(iter(dtypes)))
+            if view_dtype is None:
+                raise RuntimeError("unknown_dtype")
+            meta_sd = {e.name: torch.empty(tuple(e.shape), dtype=view_dtype, device="meta") for e in entries}
+            import comfy.model_detection as _md
+            import comfy.utils as _cu
+            import comfy.model_management as _mm
+            import comfy.model_patcher as _mp
+            prefix_fn = getattr(_md, "unet_prefix_from_state_dict", None)
+            strip_fn = getattr(_cu, "state_dict_prefix_replace", None)
+            config_fn = getattr(_md, "model_config_from_unet", None)
+            quant_fn = getattr(_cu, "convert_old_quants", None)
+            if not all(callable(x) for x in (prefix_fn, strip_fn, config_fn)):
+                raise RuntimeError("missing_comfy_helper")
+            header = _c6_parse_safetensors_header(str(unet_path))
+            metadata = header.get("__metadata__") if header else None
+
+            t_cfg = time.monotonic_ns()
+            detect_sd, detect_meta, prefix = _native_detection_input(
+                meta_sd, metadata, prefix_fn, strip_fn, quant_fn
+            )
+            model_config = config_fn(detect_sd, "", metadata=detect_meta)
+            ctx.ledger_sink.emit(
+                "unet_model_config_detect",
+                source="header_meta",
+                raw_key_count=len(meta_sd),
+                detect_key_count=len(detect_sd),
+                prefix=str(prefix),
+                detected=bool(model_config),
+                arch=type(model_config).__name__ if model_config is not None else "",
+            )
+            if model_config is None:
+                # ── R42 fix: header-only meta_sd can defeat detection; retry
+                # with the already-joined Golden payload (zero extra I/O).
+                _retry_sd = ctx.unet_payload(timeout_s=30.0)
+                if not _retry_sd:
+                    raise RuntimeError("model_config_none")
+                _detect2, _meta2, _prefix2 = _native_detection_input(_retry_sd, metadata)
+                model_config = config_fn(_detect2, "", metadata=_meta2)
+                if model_config is None:
+                    raise RuntimeError("model_config_none")
+                ctx.ledger_sink.emit(
+                    "unet_model_config_retry",
+                    source="golden_payload",
+                    key_count=len(_detect2),
+                    prefix=str(_prefix2),
+                )
+            ctx.ledger_sink.emit(
+                "unet_construct_stage",
+                stage="model_config_resolved",
+                wall_ms=round((time.monotonic_ns() - t_cfg) / 1e6, 3),
+                arch=type(model_config).__name__,
+            )
+            selected = model_options.get("dtype")
+            if selected is None:
+                selected = _mm.unet_dtype(supported_dtypes=list(model_config.supported_inference_dtypes))
+            if selected != view_dtype:
+                raise RuntimeError("inference_dtype_mismatch")
+            manual_cast = _mm.unet_manual_cast(selected, model_options.get("load_device", _mm.get_torch_device()), model_config.supported_inference_dtypes)
+            model_config.set_inference_dtype(selected, manual_cast)
+            model = model_config.get_model(detect_sd, "")
+            patcher = _mp.CoreModelPatcher(
+                model,
+                load_device=model_options.get("load_device", _mm.get_torch_device()),
+                offload_device=model_options.get("offload_device", _mm.unet_offload_device()),
+            )
+            ctx.ledger_sink.emit(
+                "unet_construct_stage",
+                stage="skeleton_patcher_created",
+                wall_ms=round((time.monotonic_ns() - t_cfg) / 1e6, 3),
+            )
+            views = {k[len(prefix):] if prefix and k.startswith(prefix) else k: v for k, v in sd.items()}
+            t_bind = time.monotonic_ns()
+            # R42A: pass a COPY — load_model_weights POPS every key out of the
+            # dict it receives (unet_prefix="" matches everything), which
+            # would otherwise empty `views` before the storage-identity
+            # measurement below reads it.
+            result = model.load_model_weights(dict(views), "", assign=True)
+            missing = getattr(result, "missing_keys", None) if result is not None else None
+            if missing:
+                raise RuntimeError("missing_keys")
+            # R42A: validate + measure at DIFFUSION level so names match the
+            # bare Golden payload keys (``model.named_parameters()`` prefixes
+            # every name with ``diffusion_model.`` and would make these checks
+            # vacuously pass).
+            _inner_model = getattr(model, "diffusion_model", model)
+            named = dict(_inner_model.named_parameters())
+            named.update(dict(_inner_model.named_buffers()))
+            for name, tensor in named.items():
+                if name in views and (tuple(tensor.shape) != tuple(views[name].shape) or tensor.dtype != views[name].dtype or not str(tensor.device).startswith("cuda")):
+                    raise RuntimeError("bind_validation")
+            # ── R42A: MEASURED storage identity (not asserted).  assign=True
+            # must make each bound parameter share the Golden CUDA storage;
+            # data_ptr equality is the physical proof.
+            identity_counts, ptr_map = _storage_identity_counts(named, views)
+            same_storage = identity_counts["same_storage_count"]
+            copied_storage = identity_counts["copied_storage_count"]
+            unexpected_device = identity_counts["unexpected_device_count"]
+            unexpected_dtype = identity_counts["unexpected_dtype_count"]
+            ctx._unet_bound_ptr_map = ptr_map
+            # Store the DIFFUSION module: ptr_map keys are diffusion-level
+            # names, and the window-close identity recheck must enumerate the
+            # same namespace.
+            ctx._unet_bound_model_ref = _inner_model
+            ctx.telemetry["unet_storage_identity"] = dict(identity_counts)
+            ctx.ledger_sink.emit("unet_storage_identity", **identity_counts)
+            ctx.ledger_sink.emit(
+                "unet_construct_stage",
+                stage="bind_complete",
+                wall_ms=round((time.monotonic_ns() - t_bind) / 1e6, 3),
+            )
+            leftovers = sum(1 for name in named if name not in views)
+            if leftovers:
+                try:
+                    model.to(patcher.load_device)
+                except Exception:
+                    pass
+            ctx.ledger_sink.emit("unet_demand_join", decision=str(getattr(decision, "value", decision)))
+            ctx.ledger_sink.emit("unet_adopt_construct", wall_ms=round((time.monotonic_ns() - started) / 1_000_000, 3), assigned_count=len(views), leftover_count=leftovers, assign_mode="assign_true")
+            from . import loader_selection
+            loader_selection.record_observed("unet", "golden_qd4")
+            ctx.clear_role_fallback_degradations("unet")
+            ctx.record_io_uniqueness(
+                "unet",
+                golden_source_producer_count=1,
+                golden_commit_count=1,
+                demand_join_count=1,
+                native_fallback_count=0,
+                duplicate_source_count=0,
+                duplicate_h2d_count=0,
+                adoption_mode="skeleton_assign_bind",
+                same_storage_count=same_storage,
+                copied_storage_count=copied_storage,
+                unexpected_device_count=unexpected_device,
+                unexpected_dtype_count=unexpected_dtype,
+            )
+            ctx.ledger_sink.emit("unet_construct_end", wall_ms=round((time.perf_counter_ns() - t0) / 1e6, 3), outcome="adopted")
+            ctx.ledger_sink.emit("unet_bind", assigned_count=len(views), leftover_count=leftovers, mode="assign_true")
+            return patcher
+        except Exception as exc:
+            try:
+                ctx.add_degradation("golden_qd_fallback:unet")
+                ctx.record_real_fallback("unet", f"construct_fallback:{str(exc)[:80]}")
+                from . import loader_selection as _ls_fb
+
+                _ls_fb.record_observed("unet", "native_comfy", fallback_attempted=True, fallback_loader="native_comfy", fallback_reason=f"construct:{str(exc)[:160]}")
+                ctx.ledger_sink.emit("golden_unet_construct_fallback", reason=str(exc)[:120])
+            except Exception:
+                pass
+            return original(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
+    setattr(wrapper, _SENTINEL_GOLDEN_DIFFUSION, True)
+    return wrapper
+
+
 def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap ``comfy.utils.load_torch_file`` to emit ``read_start/read_end``.
 
@@ -3974,6 +4267,103 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
 
     @functools.wraps(original)
     def wrapper(ckpt, safe_load=False, device=None, return_metadata=False):
+        try:
+            from . import golden_runtime_bridge as _grb
+            _ctx = _grb.enabled_current()
+            if _ctx is not None and str(ckpt).lower().endswith(".safetensors"):
+                import os as _os
+
+                def _role_matches(role: str) -> bool:
+                    if str(ckpt) == str(getattr(_ctx, "role_paths", {}).get(role)):
+                        return True
+                    try:
+                        import folder_paths as _fp
+
+                        if role == "vae":
+                            folders = ("vae",)
+                        elif role == "clip":
+                            folders = ("text_encoders", "clip")
+                        else:
+                            folders = ("diffusion_models", "checkpoints")
+                        for folder in folders:
+                            if _fp.get_full_path(folder, _os.path.basename(str(ckpt))) == str(ckpt):
+                                return True
+                    except Exception:
+                        pass
+                    return False
+
+                if _role_matches("vae"):
+                    _matched_role = "vae"
+                elif _role_matches("clip"):
+                    _matched_role = "clip"
+                elif _role_matches("unet"):
+                    _matched_role = "unet"
+                else:
+                    _matched_role = ""
+                if _matched_role:
+                    _role_event = {"clip": "clip_role_match", "vae": "vae_role_match", "unet": "unet_role_match"}.get(_matched_role, "role_match")
+                    _ctx.ledger_sink.emit(_role_event, ckpt_tail=str(ckpt)[-60:])
+                if os.environ.get("COMFYMODAL_GOLDEN_PIPELINE", "") == "1":
+                    import os as _os_diag
+
+                    print(
+                        "[v2.golden_torch_file] ckpt="
+                        f"{_os_diag.path.basename(str(ckpt))[:60]} matched_role={_matched_role or 'none'}",
+                        flush=True,
+                    )
+                if _matched_role == "vae":
+                    # VAELoader only needs names/shapes/dtypes to construct the
+                    # native graph.  The one value-producing QD4 read is
+                    # deferred until the first sampler step and joined by the
+                    # VAEDecode seam; never block here on the phase gate.
+                    try:
+                        from .golden.contracts import ModelRole as _GoldenModelRole
+
+                        _vae_owner = _ctx.pipeline.registry.get(_GoldenModelRole.VAE)
+                    except Exception:
+                        _vae_owner = None
+                    t_vae = time.perf_counter_ns()
+                    if _ctx._vae_committed.is_set() or (
+                        _vae_owner is not None and getattr(_vae_owner, "payload", None) is not None
+                    ):
+                        _res = _ctx.vae_demand_load(str(ckpt))
+                    else:
+                        _res = _ctx.vae_descriptor_load(str(ckpt))
+                    if _res is not None:
+                        _sd, _metadata = _res
+                        _mode = "golden_qd4" if _ctx._vae_committed.is_set() else "golden_descriptor"
+                        _ctx.ledger_sink.emit("vae_loader_return", mode=_mode, wall_ms=round((time.perf_counter_ns() - t_vae) / 1e6, 3))
+                        print(f"[v2.golden_vae] torch_file=served mode={_mode}", flush=True)
+                        return (_sd, _metadata) if return_metadata else _sd
+                elif _role_matches("clip"):
+                    # ── R42 M-01 (MINIMAL_RESTORE flow): CLIPLoader reads at
+                    # request time; the restore-preload seam is unreachable.
+                    # Serve the CLIP state dict from the Golden QD4 engine —
+                    # the single physical CLIP read of the request.
+                    try:
+                        t_clip = time.perf_counter_ns()
+                        _csd, _cmeta, _cdiag = _ctx.clip_golden_load(str(ckpt))
+                        _ctx.ledger_sink.emit("clip_manifest_ready", presubmit_wall_ms=round((time.perf_counter_ns() - t_clip) / 1e6, 3))
+                        print(
+                            "[v2.golden_clip] torch_file=served mode=golden_qd4",
+                            flush=True,
+                        )
+                        return (_csd, _cmeta) if return_metadata else _csd
+                    except Exception as _clip_exc:
+                        try:
+                            _ctx.record_real_fallback("clip", f"torch_file_qd_failure:{type(_clip_exc).__name__}")
+                            from . import loader_selection as _ls_fb4
+
+                            _ls_fb4.record_observed("clip", "native_comfy", fallback_attempted=True, fallback_loader="native_comfy", fallback_reason=str(_clip_exc)[:160])
+                        except Exception:
+                            pass
+                        print(
+                            f"[v2.golden_clip] torch_file=fallback "
+                            f"reason={type(_clip_exc).__name__}:{str(_clip_exc)[:120]}",
+                            flush=True,
+                        )
+        except Exception:
+            pass
         before = _torch_file_depth.get()
         _torch_file_depth.set(before + 1)
         _slow_read_state: _SlowReadBeforeState | None = None
@@ -3999,6 +4389,16 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         metadata={"lane": lane._lane, "path_hash": stable_hash(str(ckpt))[:16]},
                     )
         try:
+            # R42A: this is the ONLY native checkpoint source-read seam —
+            # count it (logical) for the post-ready native-I/O window.
+            try:
+                from . import golden_runtime_bridge as _grb_count
+
+                _count_ctx = _grb_count.enabled_current()
+                if _count_ctx is not None:
+                    _count_ctx.count_native_source_read(str(ckpt))
+            except Exception:
+                pass
             return original(ckpt, safe_load=safe_load, device=device, return_metadata=return_metadata)
         finally:
             after = _torch_file_depth.get()
@@ -4136,6 +4536,73 @@ def _all_models_proven_cuda_resident(models: list[Any]) -> bool:
         return True
     except Exception:
         return False
+
+
+def _r42_golden_unet_adoption(models: Any) -> bool:
+    """Verify the demand-side bind; native GPU loading always proceeds."""
+    try:
+        from . import golden_runtime_bridge as _grb
+        ctx = _grb.enabled_current()
+        if ctx is None or not (models or []):
+            return False
+        unet_patchers = [m for m in models if getattr(getattr(m, "model", None), "diffusion_model", None) is not None]
+        if not unet_patchers:
+            return False
+        sd = ctx.unet_payload(timeout_s=0.05)
+        if not sd:
+            ctx.record_io_uniqueness("unet", verify="payload_absent")
+            ctx.record_real_fallback("unet", "demand_verify_payload_absent")
+            from . import loader_selection as _ls_fb2
+
+            _ls_fb2.record_observed("unet", "native_comfy", fallback_attempted=True, fallback_loader="native_comfy", fallback_reason="payload_absent")
+            return False
+        checked = matches = mismatches = 0
+        for patcher in unet_patchers:
+            diffusion = patcher.model.diffusion_model
+            named = dict(diffusion.named_parameters())
+            named.update(dict(diffusion.named_buffers()))
+            for name, tensor in named.items():
+                checked += 1
+                candidate = sd.get(name)
+                if candidate is None:
+                    candidate = next((v for k, v in sd.items() if k.endswith(name)), None)
+                ok = candidate is not None and tuple(tensor.shape) == tuple(candidate.shape) and tensor.dtype == candidate.dtype and str(tensor.device).startswith("cuda")
+                matches += int(ok)
+                mismatches += int(not ok)
+        result = "match" if matches and mismatches == 0 else "mismatch"
+        all_resident = _all_models_proven_cuda_resident(models)
+        ctx.ledger_sink.emit(
+            "unet_demand_verify", result=result, checked=checked,
+            all_models_cuda_resident=all_resident,
+        )
+        if result == "match":
+            from . import loader_selection
+            loader_selection.record_observed("unet", "golden_qd4")
+            # R42A: post-ready native I/O is MEASURED by the bridge window
+            # (begin at DEVICE_READY, end at sampling start) — no assertion
+            # counters here.
+            ctx.record_io_uniqueness("unet", demand_join_count=len(unet_patchers), verify="match")
+            # Construct wrapper already validated every tensor and weights are
+            # cuda-resident; skip the redundant native load_models_gpu pass —
+            # but ONLY when every model in this batch is already resident, so
+            # a co-batched CLIP/VAE migration can never be silently dropped.
+            if all_resident:
+                return True
+            return False
+        else:
+            ctx.add_degradation("golden_unet_identity_mismatch")
+            ctx.record_io_uniqueness("unet", verify="mismatch")
+            ctx.record_real_fallback("unet", "identity_mismatch")
+            from . import loader_selection as _ls_fb3
+
+            _ls_fb3.record_observed("unet", "native_comfy", fallback_attempted=True, fallback_loader="native_comfy", fallback_reason="identity_mismatch")
+            return False
+    except Exception:
+        try:
+            ctx.record_io_uniqueness("unet", verify="mismatch")
+        except Exception:
+            pass
+    return False
 
 
 def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -4563,6 +5030,13 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             # list unchanged (ComfyUI's load_models_gpu returns the models).
             if _e25_fast_return:
                 return models
+            # ── R42 M-02: Golden UNET payload adoption (native skipped) ──
+            if before == 0 and not force_full_load and not force_patch_weights:
+                try:
+                    if _r42_golden_unet_adoption(models):
+                        return models
+                except Exception:
+                    pass
             if (
                 before == 0
                 and _coord_trace is not None
@@ -8250,6 +8724,24 @@ def _install_read_wrapper(*, utils_module: Any, trace: RuntimeTrace | None = Non
     return "installed"
 
 
+def _install_golden_diffusion_wrapper(*, trace: RuntimeTrace | None = None) -> str:
+    global _golden_diffusion_wrapper_installed
+    if _golden_diffusion_wrapper_installed:
+        return "already_installed"
+    mod = _get_live_module("comfy.sd")
+    original = getattr(mod, "load_diffusion_model", None) if mod is not None else None
+    if not callable(original):
+        return "unavailable"
+    if getattr(original, _SENTINEL_GOLDEN_DIFFUSION, False):
+        _golden_diffusion_wrapper_installed = True
+        return "already_installed"
+    with _wrappers_lock:
+        if not _golden_diffusion_wrapper_installed:
+            mod.load_diffusion_model = _make_golden_load_diffusion_model_wrapper(original)
+            _golden_diffusion_wrapper_installed = True
+    return "installed"
+
+
 def _install_gpu_wrapper(*, mm_module: Any, trace: RuntimeTrace | None = None) -> str:
     """Install the ``load_models_gpu`` wrapper on *mm_module*.
 
@@ -8535,8 +9027,14 @@ def _make_clip_span_wrapper(
         if before == 0 and span_name == "clip_forward":
             try:
                 from .clip_forward_forensics import ForwardTimer, e31_enabled
+                from . import golden_runtime_bridge as _grb_fwd
 
-                if e31_enabled():
+                # ── R42 fix: ForwardTimer.start/end carry the Golden
+                # lifecycle hooks (on_clip_forward_start/end) in addition to
+                # the E31 evidence.  The Golden prepare worker spawns from
+                # on_clip_forward_start, so the timer must also be created
+                # when only the Golden lane is active (E31 arms off).
+                if e31_enabled() or _grb_fwd.current() is not None:
                     _e31_forward_timer = ForwardTimer()
                     _e31_forward_timer.start()
             except Exception:
@@ -8587,6 +9085,39 @@ def _make_clip_span_wrapper(
         if emit and pre_hook is not None:
             try:
                 pre_hook(args, kwargs)
+            except Exception:
+                pass
+        if before == 0 and span_name == "clip_raw_encode":
+            # ── R44D: composition-independent forced-miss proof ─────────
+            # A raw encode_from_tokens call exists ONLY when the conditioning
+            # cache did not serve the request (R42A invariant documented at
+            # the pre_sampler_structured_report emitter).  Under non-Golden
+            # compositions (e.g. R44 request-time FastSafe) the cache
+            # lookup/decision emitters inside the Golden/bridge prefill
+            # machinery never run, so certify the REAL encode here through
+            # the canonical clean-lane bypass helper (gated on
+            # clean_lane.enabled() inside the helper; once per trace).
+            # Golden runs are excluded: their prefill path owns the
+            # lookup/decision evidence end-to-end.
+            try:
+                from . import golden_runtime_bridge as _r44d_grb
+
+                if (
+                    _r44d_grb.current() is None
+                    and trace is not None
+                    and not getattr(trace, "_comfymodal_cc_bypass_emitted", False)
+                ):
+                    try:
+                        setattr(trace, "_comfymodal_cc_bypass_emitted", True)
+                    except Exception:
+                        pass
+                    _emit_clean_lane_forced_miss_evidence(
+                        trace,
+                        clip=(args[0] if args else None),
+                        text="",
+                        request_id=str(getattr(trace, "request_id", "") or ""),
+                        reason="raw_encode_without_engaged_conditioning_cache",
+                    )
             except Exception:
                 pass
         # ── LANE 2 (measurement-only): CLIP forward CUDA chronology ──
@@ -8760,14 +9291,13 @@ def _install_clip_span_wrappers(
     )
     with _wrappers_lock:
         for span_name, method_name, depth_var, with_cuda, pre_hook in _specs:
-            if method_name == "encode_token_weights":
-                try:
-                    from comfymodal_runtime.clip_forward_forensics import e31_enabled
-
-                    if not e31_enabled():
-                        continue
-                except Exception:
-                    continue
+            # ── R42 fix: ``clip_forward`` is installed UNCONDITIONALLY.
+            # Previously installation was skipped when neither E31 nor a
+            # published Golden context was present AT INSTALL TIME, so a
+            # first call before request-entry seeding permanently missed the
+            # forward boundary.  The enablement decision now lives inside
+            # the wrapper (E31 arms OR live Golden context at call time),
+            # making installation idempotent and publish-order independent.
             _orig = getattr(CLIP_cls, method_name, None)
             if not callable(_orig):
                 # ``encode_token_weights`` is an optional CLIP boundary on
@@ -8788,6 +9318,62 @@ def _install_clip_span_wrappers(
             setattr(CLIP_cls, method_name, _wrapped)
             result[span_name] = "installed"
     return result
+
+
+def _install_golden_vae_decode_wrapper(trace: RuntimeTrace | None = None) -> str:
+    """Join and bind the deferred Golden VAE immediately before decode."""
+    global _golden_vae_decode_wrapper_installed
+    nodes_mod = _get_live_module("nodes")
+    vae_cls = getattr(nodes_mod, "VAEDecode", None) if nodes_mod is not None else None
+    original = getattr(vae_cls, "decode", None) if vae_cls is not None else None
+    if not callable(original):
+        return "unavailable"
+    if _golden_vae_decode_wrapper_installed or getattr(original, _SENTINEL_GOLDEN_VAE_DECODE, False):
+        _golden_vae_decode_wrapper_installed = True
+        return "already_installed"
+
+    @functools.wraps(original)
+    def _decode(self, vae, *args, **kwargs):
+        try:
+            from . import golden_runtime_bridge as _grb
+
+            ctx = _grb.enabled_current()
+            if ctx is not None:
+                ctx.ledger_sink.emit("vae_bind_start")
+                _bind_ok = bool(ctx.bind_vae_payload(vae))
+                ctx.ledger_sink.emit("vae_bind_end", ok=_bind_ok)
+                if not _bind_ok:
+                    # The bridge records the concrete join/adoption failure;
+                    # keep this seam free of duplicate degradation entries.
+                    pass
+                else:
+                    ctx.ledger_sink.emit("vae_decode_join", decision="bound_before_decode")
+        except Exception as exc:
+            try:
+                if ctx is not None:
+                    ctx.ledger_sink.emit(
+                        "golden_hook_error",
+                        hook="vae_decode_join",
+                        error=f"{type(exc).__name__}:{str(exc)[:160]}",
+                    )
+            except Exception:
+                pass
+        try:
+            ctx.ledger_sink.emit("vae_decode_start")
+        except Exception:
+            pass
+        return original(self, vae, *args, **kwargs)
+
+    setattr(_decode, _SENTINEL_GOLDEN_VAE_DECODE, True)
+    setattr(vae_cls, "decode", _decode)
+    _golden_vae_decode_wrapper_installed = True
+    if trace is not None:
+        trace.emit(
+            "golden_vae_decode_wrapper_install",
+            phase="restore",
+            metadata={"status": "installed"},
+        )
+    return "installed"
 
 
 def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, Any]:
@@ -8812,6 +9398,33 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, Any]:
         result["load_torch_file"] = _install_read_wrapper(utils_module=utils_mod, trace=trace)
     else:
         result["load_torch_file"] = "unavailable"
+
+    result["golden_load_diffusion_model"] = _install_golden_diffusion_wrapper(trace=trace)
+    # ── R42: the CLIP forward boundary carries the Golden prepare/commit
+    # triggers (on_clip_forward_start/end).  Without it the UNET prepare
+    # never starts and demand-side adoption bails golden_unet_demand_early.
+    try:
+        result["clip_span"] = _install_clip_span_wrappers(trace=trace)
+    except Exception as _cs_exc:
+        result["clip_span"] = f"error:{type(_cs_exc).__name__}"
+    try:
+        result["golden_vae_decode"] = _install_golden_vae_decode_wrapper(trace=trace)
+    except Exception as _vd_exc:
+        result["golden_vae_decode"] = f"error:{type(_vd_exc).__name__}"
+    try:
+        if os.environ.get("COMFYMODAL_GOLDEN_PIPELINE", "") == "1":
+            # ── R42: one line per key so container log truncation can never
+            # hide individual install results (nested dicts are expanded).
+            print("[v2.golden_wrappers] install_begin", flush=True)
+            for _k, _v in sorted(result.items()):
+                if isinstance(_v, dict):
+                    for _sk, _sv in sorted(_v.items()):
+                        print(f"[v2.golden_wrappers] install {_k}.{_sk}={_sv}", flush=True)
+                else:
+                    print(f"[v2.golden_wrappers] install {_k}={_v}", flush=True)
+            print("[v2.golden_wrappers] install_end", flush=True)
+    except Exception:
+        pass
 
     mm_mod = _get_live_module("comfy.model_management")
     if mm_mod is not None:
@@ -14156,6 +14769,15 @@ class V2LoaderBridge:
                     if env_flag("COMFYMODAL_V2_STAGED_SAFETENSORS")
                     else "fastsafetensors"
                 )
+                # R43: record the non-Golden fastsafetensors arm as observed
+                # so the E40 loader_selection contract does not report UNET
+                # loader_unobserved on the fast request-time path.
+                try:
+                    from . import loader_selection as _ls_unet_fs
+
+                    _ls_unet_fs.record_observed("unet", "fastsafetensors")
+                except Exception:
+                    pass
             else:
                 result = self._invoke_original("UNETLoader", kwargs)
                 _execution_identity = "native"
@@ -14269,6 +14891,78 @@ class V2LoaderBridge:
         kwargs = {
             "vae_name": request.get("vae_name", model_key.vae_identity),
         }
+        # ── R42 M-03: Golden VAE demand adoption (no second physical read) ──
+        _golden_attempted = False
+        _t_entry = 0
+        _return_emitted = False
+        try:
+            from . import golden_runtime_bridge as _grb_vae
+
+            _ctx = _grb_vae.enabled_current()
+            if _ctx is not None:
+                _golden_attempted = True
+                _t_entry = time.perf_counter_ns()
+                _ctx.ledger_sink.emit(
+                    "vae_loader_entry",
+                    vae_name_tail=str(kwargs.get("vae_name", ""))[-60:],
+                    committed=_ctx._vae_committed.is_set(),
+                )
+                import folder_paths as _fp
+
+                try:
+                    _vae_path = _fp.get_full_path("vae", str(kwargs.get("vae_name", "")))
+                    if _vae_path:
+                        _ctx.note_role_source("vae", _vae_path)
+                except Exception:
+                    pass
+                _vae_path = _fp.get_full_path("vae", str(kwargs.get("vae_name", "")))
+                if _vae_path:
+                    # ``ensure_vae_load_started`` remains the demand-side arm
+                    # for callers that discover VAE only after restore.  The
+                    # normal VAELoader path below intentionally uses the
+                    # nonblocking descriptor while that producer is unarmed.
+                    try:
+                        from .golden.contracts import ModelRole as _GoldenModelRole
+
+                        _vae_owner = _ctx.pipeline.registry.get(_GoldenModelRole.VAE)
+                    except Exception:
+                        _vae_owner = None
+                    if _ctx._vae_committed.is_set() or (
+                        _vae_owner is not None and getattr(_vae_owner, "payload", None) is not None
+                    ):
+                        _res = _ctx.vae_demand_load(str(_vae_path))
+                        _mode = "golden_qd4"
+                    else:
+                        _res = _ctx.vae_descriptor_load(_vae_path)
+                        _mode = "descriptor"
+                    if _res is not None:
+                        import comfy.sd as _csd
+
+                        _sd, _metadata = _res
+                        vae_obj = _csd.VAE(sd=dict(_sd))
+                        setattr(vae_obj, "_comfymodal_golden_vae_descriptor", True)
+                        setattr(vae_obj, "_comfymodal_golden_vae_path", str(_vae_path))
+                        _return_emitted = True
+                        _ctx.ledger_sink.emit(
+                            "vae_loader_return",
+                            mode=_mode,
+                            wall_ms=round((time.perf_counter_ns() - _t_entry) / 1e6, 3),
+                        )
+                        return vae_obj
+        except Exception:
+            pass
+        if _golden_attempted and not _return_emitted:
+            try:
+                _ctx.ledger_sink.emit(
+                    "vae_loader_return",
+                    mode="native",
+                    wall_ms=round((time.perf_counter_ns() - _t_entry) / 1e6, 3),
+                )
+            except Exception:
+                pass
+            from . import loader_selection as _ls_vae_fb
+
+            _ls_vae_fb.record_observed("vae", "native_comfy", fallback_attempted=True, fallback_loader="native_comfy", fallback_reason="golden_path_did_not_return")
         result = self._invoke_original("VAELoader", kwargs)
         return result[0] if isinstance(result, (tuple, list)) and result else result
 

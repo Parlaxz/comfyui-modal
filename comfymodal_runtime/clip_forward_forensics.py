@@ -274,6 +274,15 @@ class ForwardTimer:
         self._start_mono_ns = time.monotonic_ns()
         emit_ledger_event("clip_forward_start", mono_ns=self._start_mono_ns)
         emit_ledger_event("clip_gpu_event_start", mono_ns=self._start_mono_ns)
+        # R42: Golden envelope — UNET source prepare begins under CLIP compute.
+        try:
+            from . import golden_runtime_bridge as _grb
+
+            _gctx = _grb.current()
+            if _gctx is not None:
+                _gctx.on_clip_forward_start()
+        except Exception:
+            pass
         if stream is None:
             self._start_event = None
             self._end_event = None
@@ -294,6 +303,15 @@ class ForwardTimer:
         self._end_mono_ns = time.monotonic_ns()
         emit_ledger_event("clip_forward_end", mono_ns=self._end_mono_ns)
         emit_ledger_event("clip_gpu_event_end", mono_ns=self._end_mono_ns)
+        # R42: Golden envelope — CLIP GPU-critical done; UNET commit legal.
+        try:
+            from . import golden_runtime_bridge as _grb
+
+            _gctx = _grb.current()
+            if _gctx is not None:
+                _gctx.on_clip_forward_end()
+        except Exception:
+            pass
         host_wall_ms = (
             (self._end_wall - self._start_wall) * 1000.0
             if self._start_wall is not None

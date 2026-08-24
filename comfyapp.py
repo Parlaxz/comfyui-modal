@@ -20,9 +20,25 @@ from comfymodal_runtime.contracts import (
     normalize_output_format,
     normalize_quality,
     normalize_webp_lossless_compression,
+    resolve_webp_pillow_method,
     stable_hash,
 )
 from comfymodal_runtime.env import env_flag
+# ── E40 Lane A: single configuration authority ──────────────────────────
+# One resolved-config truth for the runtime. Golden-semantics controls are
+# resolved centrally; the fingerprint binds requested↔deployed↔runtime, and
+# any algorithm-changing env var OUTSIDE the authority is detected at import
+# instead of silently mutating behavior.
+try:
+    from comfymodal_runtime.config_authority import (
+        resolve as _config_authority_resolve,
+        detect_unregistered_mutations as _config_authority_detect_mutations,
+    )
+    RESOLVED_CONFIG = _config_authority_resolve()
+    UNREGISTERED_ENV_MUTATIONS = _config_authority_detect_mutations()
+except Exception:  # pragma: no cover - authority must never block import
+    RESOLVED_CONFIG = None
+    UNREGISTERED_ENV_MUTATIONS = []
 from comfymodal_runtime.runtime_shape import (
     apply_torch_thread_policy,
     log_effective_runtime_shape,
@@ -296,9 +312,13 @@ from production_workflow import (
 # ── Immutable dependency manifest (pure logic extracted for testability) ──
 import comfymodal_runtime.dependency_manifest as _dep_mft
 
-# GÃ¶Ã‡GÃ¶Ã‡ Inline output-converter constants & helpers (self-contained for Modal) GÃ¶Ã‡GÃ¶Ã‡
+# ── Inline output-converter constants & helpers (self-contained for Modal) ──
 _OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
 _WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
+# E2D: the effort vocabulary now drives BOTH WebP modes.  The lossy save
+# resolves its Pillow method from the mapped effort (fast→0, balanced→4,
+# max→6); the constant below is only the defensive fallback for an unknown
+# label and preserves the pre-E2D encoder for the default balanced path.
 _WEBP_LOSSLESS_METHOD = {"fast": 0, "balanced": 4, "max": 6}
 _WEBP_LOSSY_METHOD = 4
 _FORMAT_META = {
@@ -541,6 +561,15 @@ def encode_image_tensor_batch(
     webp_lossless_compression = normalize_webp_lossless_compression(
         webp_lossless_compression
     )
+    # E2D: effective WebP encoder-effort policy.  The mapped Pillow method
+    # drives BOTH WebP modes (lossy previously hardcoded method 4); the label
+    # and integer are exposed additively in codec diagnostics.
+    _is_webp = output_format in ("webp_lossless", "webp_lossy")
+    _webp_effort = webp_lossless_compression if _is_webp else None
+    _webp_method = (
+        _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, _WEBP_LOSSY_METHOD)
+        if _is_webp else None
+    )
 
     # ── V2 png_encode experiment (default level 1; level 6 via env override) ──
     # compress_level only changes the compression ratio — PNG is lossless at
@@ -611,7 +640,13 @@ def encode_image_tensor_batch(
             method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
             pil_img.save(out_buf, format="WEBP", lossless=True, method=method)
         elif output_format == "webp_lossy":
-            pil_img.save(out_buf, format="WEBP", lossless=False, quality=quality, method=_WEBP_LOSSY_METHOD)
+            pil_img.save(
+                out_buf,
+                format="WEBP",
+                lossless=False,
+                quality=quality,
+                method=_webp_method,
+            )
         elif output_format == "jpeg":
             if pil_img.mode == "RGBA":
                 bg = _PILImage.new("RGB", pil_img.size, (255, 255, 255))
@@ -687,6 +722,8 @@ def encode_image_tensor_batch(
             "webp_lossless_compression": (
                 webp_lossless_compression if output_format == "webp_lossless" else None
             ),
+            "webp_effort": _webp_effort,
+            "webp_method": _webp_method,
             "output_codec_ms": round(sum(_codec_timings_ms), 3),
             "encoded_bytes": sum(_encoded_sizes),
             "source_bytes": B * H * W * C,
@@ -701,6 +738,8 @@ def encode_image_tensor_batch(
                     "webp_lossless_compression": (
                         webp_lossless_compression if output_format == "webp_lossless" else None
                     ),
+                    "webp_effort": _webp_effort,
+                    "webp_method": _webp_method,
                     "output_codec_ms": codec_ms,
                     "encoded_bytes": encoded_bytes,
                     "source_bytes": H * W * C,
@@ -724,6 +763,74 @@ def encode_image_tensor_batch(
 _encode_image_tensor_batch = encode_image_tensor_batch
 
 
+# ── E2C: producer-side Thumbnail derivative encoding ─────────────────────
+# The direct sink already holds the clamped tensor locally, so the Thumbnail
+# derivative is encoded from the SAME in-memory pixels (resize → WebP) —
+# never by fetching a remote managed Original back.  Failure is graceful:
+# a missing Thumbnail must never invalidate the required primary output.
+_PRODUCTION_THUMBNAIL_MAX = 256
+_THUMBNAIL_QUALITY = 75
+
+
+def encode_thumbnail_batch(images_t, max_size=_PRODUCTION_THUMBNAIL_MAX):
+    """Encode a lightweight WebP Thumbnail derivative per batch item.
+
+    Source order: already-available clamped tensor → PIL resize (aspect
+    preserved) → WebP bytes.  Returns a list of dicts shaped::
+
+        {"bytes", "mime_type", "file_ext", "width", "height",
+         "byte_count", "output_codec_ms"}
+
+    with one entry per batch item; a failed item encodes as ``None``
+    (derivative failure is never fatal to the required output).
+    """
+    import io as _io
+    from PIL import Image as _PILImage
+
+    thumbnails: list[dict[str, Any] | None] = []
+    B = int(images_t.shape[0])
+    for batch_idx in range(B):
+        try:
+            arr = images_t[batch_idx].numpy()
+            mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
+            pil_img = _PILImage.fromarray(arr, mode=mode)
+            orig_width, orig_height = pil_img.size
+            pil_img.thumbnail((max_size, max_size))
+            thumb_width, thumb_height = pil_img.size
+            buffer = _io.BytesIO()
+            _codec_t0 = time.monotonic_ns()
+            pil_img.save(buffer, format="WEBP", quality=_THUMBNAIL_QUALITY)
+            codec_ms = round((time.monotonic_ns() - _codec_t0) / 1_000_000, 3)
+            thumb_bytes = buffer.getvalue()
+            thumbnails.append({
+                "bytes": thumb_bytes,
+                "mime_type": "image/webp",
+                "file_ext": ".webp",
+                "width": thumb_width,
+                "height": thumb_height,
+                "source_width": orig_width,
+                "source_height": orig_height,
+                "byte_count": len(thumb_bytes),
+                "output_codec_ms": codec_ms,
+                "quality": _THUMBNAIL_QUALITY,
+                "codec": "webp",
+            })
+        except Exception as exc:
+            print(
+                f"[ComfyModalProductionOutput] thumbnail derivative {batch_idx} "
+                f"failed (non-fatal): {type(exc).__name__}: {exc}"
+            )
+            thumbnails.append(None)
+    return thumbnails
+
+
+def _attach_thumbnail_to_entry(entry: dict[str, Any], thumbnail: dict[str, Any] | None) -> None:
+    """Attach one optional Thumbnail derivative dict onto a registry entry."""
+    if not thumbnail:
+        return
+    entry["thumbnail"] = thumbnail
+
+
 def _encode_entry_metadata(encode_info: dict[str, Any], batch_idx: int, raw_bytes: bytes) -> dict[str, Any]:
     items = encode_info.get("items", [])
     item_info = items[batch_idx] if batch_idx < len(items) else {}
@@ -734,6 +841,8 @@ def _encode_entry_metadata(encode_info: dict[str, Any], batch_idx: int, raw_byte
         "webp_lossless_compression": item_info.get(
             "webp_lossless_compression", encode_info.get("webp_lossless_compression")
         ),
+        "webp_effort": item_info.get("webp_effort", encode_info.get("webp_effort")),
+        "webp_method": item_info.get("webp_method", encode_info.get("webp_method")),
         "output_codec_ms": codec_ms,
         "conversion_time_ms": codec_ms,
         "encoded_bytes": item_info.get("encoded_bytes", len(raw_bytes)),
@@ -893,6 +1002,7 @@ class ComfyModalProductionOutput:
             images_t, output_format, quality, webp_lossless_compression
         )
         encode_info = get_last_output_encode_info() or {}
+        thumbnails = encode_thumbnail_batch(images_t)
 
         prompt_id_short = str(prompt_id)[:8]
         nodestr = str(node_id)
@@ -900,7 +1010,7 @@ class ComfyModalProductionOutput:
         result_entries = []
         for batch_idx, (raw_bytes, _, _) in enumerate(entries):
             filename = f"production_{prompt_id_short}_{nodestr}_{batch_idx}{ext}"
-            result_entries.append({
+            entry: dict[str, Any] = {
                 "filename": filename,
                 "bytes": raw_bytes,
                 "mime_type": mime_type,
@@ -911,7 +1021,11 @@ class ComfyModalProductionOutput:
                 "node_id": node_id,
                 "format": output_format,
                 **_encode_entry_metadata(encode_info, batch_idx, raw_bytes),
-            })
+            }
+            _attach_thumbnail_to_entry(
+                entry, thumbnails[batch_idx] if batch_idx < len(thumbnails) else None
+            )
+            result_entries.append(entry)
 
         # Store in registry
         for _entry in result_entries:
@@ -1018,15 +1132,20 @@ class ComfyModalProductionImageComparerOutput:
                 images_b_t, output_format, quality, webp_lossless_compression
             )
             b_encode_info = get_last_output_encode_info() or {}
+            b_thumbnails = encode_thumbnail_batch(images_b_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
                     **_encode_entry_metadata(b_encode_info, batch_idx, raw_bytes),
-                })
+                }
+                _attach_thumbnail_to_entry(
+                    entry, b_thumbnails[batch_idx] if batch_idx < len(b_thumbnails) else None
+                )
+                result_entries.append(entry)
                 b_count += 1
             encoded_unique = b_count
         elif has_image_b:
@@ -1038,15 +1157,20 @@ class ComfyModalProductionImageComparerOutput:
                 images_a_t, output_format, quality, webp_lossless_compression
             )
             a_encode_info = get_last_output_encode_info() or {}
+            a_thumbnails = encode_thumbnail_batch(images_a_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "a_images",
                     "comparison_side": "a", "format": output_format,
                     **_encode_entry_metadata(a_encode_info, batch_idx, raw_bytes),
-                })
+                }
+                _attach_thumbnail_to_entry(
+                    entry, a_thumbnails[batch_idx] if batch_idx < len(a_thumbnails) else None
+                )
+                result_entries.append(entry)
                 a_count += 1
 
             images_b_t = _clamp_image_tensor(image_b)
@@ -1056,15 +1180,20 @@ class ComfyModalProductionImageComparerOutput:
                 images_b_t, output_format, quality, webp_lossless_compression
             )
             b_encode_info = get_last_output_encode_info() or {}
+            b_thumbnails = encode_thumbnail_batch(images_b_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
                     **_encode_entry_metadata(b_encode_info, batch_idx, raw_bytes),
-                })
+                }
+                _attach_thumbnail_to_entry(
+                    entry, b_thumbnails[batch_idx] if batch_idx < len(b_thumbnails) else None
+                )
+                result_entries.append(entry)
                 b_count += 1
             encoded_unique = a_count + b_count
         else:
@@ -1076,15 +1205,20 @@ class ComfyModalProductionImageComparerOutput:
                 images_a_t, output_format, quality, webp_lossless_compression
             )
             a_encode_info = get_last_output_encode_info() or {}
+            a_thumbnails = encode_thumbnail_batch(images_a_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
                     **_encode_entry_metadata(a_encode_info, batch_idx, raw_bytes),
-                })
+                }
+                _attach_thumbnail_to_entry(
+                    entry, a_thumbnails[batch_idx] if batch_idx < len(a_thumbnails) else None
+                )
+                result_entries.append(entry)
                 b_count += 1
             a_count = b_count
             encoded_unique = b_count
@@ -1379,6 +1513,16 @@ if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
     SAFETENSORS_READ_MODE = "normal"
 SAFETENSORS_READ_BYTES_MIN_MB = int(os.getenv("COMFYMODAL_SAFETENSORS_READ_BYTES_MIN_MB", "512"))
 SAFETENSORS_STRICT = env_flag("COMFYMODAL_SAFETENSORS_STRICT")
+
+# E40 Lane D: canonical semantic owner identity for restore-time model reads.
+# One semantic operation -> one canonical owner identity. Producers register
+# active model reads under these names; consumers (physical-read coordinator,
+# request preflight, duplicate-reader wait) join on the SAME names.
+RESTORE_ROLE_OWNER_MAP = {
+    "clip": "restore_preload",
+    "unet": "restore_background_unet",
+    "vae": "restore_vae_loader",
+}
 
 # â”€â”€ v2.16.21 combined cold-start fast path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Master toggle: when 0, all v2.16.21 features are disabled and v2.16.20
@@ -5284,6 +5428,25 @@ def _complete_active_model_read(canonical_key: str) -> None:
         entry["status"] = "completed"
         entry["result_available"] = True
         entry["completed_at"] = time.time()
+        # ── E40 Lane B: single loader-observation authority ──────────────
+        # Every completed model read reports its loader arm per semantic
+        # role exactly once, here at the central read tracker.
+        try:
+            from comfymodal_runtime import loader_selection as _ls
+            _owner_l = str(entry.get("owner") or "").lower()
+            _loader_l = str(entry.get("loader_type") or "").lower()
+            if "unet" in _owner_l or "unet" in _loader_l or "diffusion" in _loader_l:
+                _obs_role = "unet"
+            elif "vae" in _owner_l or "vae" in _loader_l:
+                _obs_role = "vae"
+            elif "clip" in _owner_l or "clip" in _loader_l or "text_encoder" in _loader_l:
+                _obs_role = "clip"
+            else:
+                _obs_role = ""
+            if _obs_role:
+                _ls.record_observed(_obs_role, _loader_l or _owner_l or "unknown")
+        except Exception:
+            pass
         entry["complete_wall_unix_ns"] = _complete_wall_ns
         entry["complete_monotonic_ns"] = _complete_now_ns
         entry["complete_thread_time_ns"] = _complete_thread_time_ns
@@ -6650,7 +6813,19 @@ def _is_comfymodal_duplicate_dir(node_name: str, node_path: str) -> str | None:
     - git worktree registration pointing at the canonical checkout
     - the canonical git remote URL
     - canonical plugin content markers (comfyapp.py + comfymodal_runtime/)
+
+    R42 reconciliation: ``COMFYMODAL_ACTIVE_SOURCE_DIR`` designates which
+    ComfyModal directory IS the deployment source (isolated worktree deploys).
+    When set, that directory is allowed and every OTHER ComfyModal copy —
+    including the literal canonical ``comfyui-modal`` — is a duplicate.
+    Without it, behavior is unchanged (canonical name always kept).
     """
+    _active_source = os.environ.get("COMFYMODAL_ACTIVE_SOURCE_DIR", "").strip().strip("/\\").lower()
+    if _active_source:
+        if node_name.lower() == _active_source:
+            return None
+        if node_name == _COMFYMODAL_CANONICAL_NODE_NAME:
+            return "comfymodal_duplicate_worktree"
     if node_name == _COMFYMODAL_CANONICAL_NODE_NAME:
         return None
     if node_name in _COMFYMODAL_DUPLICATE_TYPO_NAMES:
@@ -6741,6 +6916,16 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/.comfymodal_experiments/*",
     "comfyui-modal/.playwright-mcp/",
     "comfyui-modal/.playwright-mcp/*",
+    # ── E40: transient local artifacts must never enter the image ────────
+    # These directories are written by local test/preview activity and are
+    # not application source. Baking them creates software-created image
+    # variance and fails deploys when files mutate mid-upload.
+    "comfyui-modal/output/",
+    "comfyui-modal/output/*",
+    "comfyui-modal/test-results/",
+    "comfyui-modal/test-results/*",
+    "comfyui-modal/playwright-report/",
+    "comfyui-modal/playwright-report/*",
     "comfyui-modal/.custom_node_requirements/",
     "comfyui-modal/.baked_custom_node_deps/",
     "comfyui-modal/*.md",
@@ -11837,11 +12022,20 @@ class _ComfyAPIMixin:
 
                 def _load_one(path: str, filename: str, cache_key: str, role: str = "unknown") -> tuple[str, str, object, object | None, float, int, dict]:
                     # Map role to restore-specific owner label.
-                    _role_owner = {
-                        "clip": "restore_clip_loader",
-                        "unet": "restore_background_unet",
-                        "vae": "restore_vae_loader",
-                    }.get(role, "restore_preload")
+                    # E40 Lane D: canonical semantic owner identity for
+                    # restore-time model reads. Consumers (physical-read
+                    # coordinator + request preflight) join on the SAME name,
+                    # so every producer role must resolve into this map.
+                    _role_owner = RESTORE_ROLE_OWNER_MAP.get(role, "restore_preload")
+                    # R42: expose model paths to the Golden envelope for UNET/VAE transports.
+                    try:
+                        from comfymodal_runtime import golden_runtime_bridge as _grb_paths
+
+                        _gctx_paths = _grb_paths.current()
+                        if _gctx_paths is not None and role in ("unet", "vae"):
+                            _gctx_paths.note_role_source(role, path)
+                    except Exception:
+                        pass
                     started = time.time()
                     # ── Signal worker started from actual loader context ──
                     _worker_started_ns = time.perf_counter_ns()
@@ -11911,7 +12105,32 @@ class _ComfyAPIMixin:
                         and PRODUCTION_MODEL_READ_COORDINATOR_ENABLED
                     )
                     try:
-                        if _use_read_bytes:
+                        # ── R42 M-01: Golden QD4 transport for CLIP ──────
+                        _golden_used = False
+                        if role == "clip" and path.lower().endswith(".safetensors"):
+                            try:
+                                from comfymodal_runtime import golden_runtime_bridge as _grb
+
+                                if _grb.current() is not None:
+                                    loaded = _grb.clip_golden_load(path)
+                                    _golden_used = True
+                                    try:
+                                        from .loader_selection import record_observed as _ro
+                                    except ImportError:
+                                        from comfymodal_runtime.loader_selection import record_observed as _ro
+                                    _ro("clip", "golden_qd4")
+                                    print(f"[restore.preload.strategy] role=clip strategy=golden_qd4 file={filename}")
+                            except Exception as _golden_exc:
+                                _golden_used = False
+                                print(f"[restore.preload.strategy] role=clip strategy=golden_qd4_fallback error={type(_golden_exc).__name__}:{str(_golden_exc)[:200]}")
+                                try:
+                                    from comfymodal_runtime import golden_runtime_bridge as _grb_fb
+
+                                    if _grb_fb.current() is not None:
+                                        _grb_fb.current().add_degradation("golden_qd_fallback:clip")
+                                except Exception:
+                                    pass
+                        if not _golden_used and _use_read_bytes:
                             if _can_coord:
                                 with _coordinator.acquire(
                                     owner="restore_preload",
@@ -11922,7 +12141,7 @@ class _ComfyAPIMixin:
                             else:
                                 loaded = _read_bytes_loader(path)
                             print(f"[restore.preload.strategy] role=clip strategy=read_bytes file={filename}")
-                        else:
+                        elif not _golden_used:
                             if _can_coord:
                                 with _coordinator.acquire(
                                     owner="restore_preload",
@@ -14663,12 +14882,22 @@ class _ComfyAPIMixin:
                 "node": node,
                 "class_type": class_type,
                 "started": now,
+                "started_mono_ns": time.monotonic_ns(),
+                "started_perf_ns": time.perf_counter_ns(),
                 "first_progress": None,
+                "first_progress_mono_ns": None,
                 "last_progress": None,
+                "last_progress_mono_ns": None,
                 "progress_events": 0,
                 "max_step": 0,
                 "max_steps": 0,
             }
+            # R44H2: feed the sampler boundary telemetry (node entry).
+            try:
+                from comfymodal_runtime import sampler_telemetry as _stel
+                _stel.note_sampler_node_entry(node, class_type)
+            except Exception:
+                pass
         # Trace t4..t7 stage windows: record the first time a node of the
         # given class starts so we have a clean t<N>_start timestamp even
         # when the class appears multiple times in the graph (e.g. dual
@@ -14793,13 +15022,29 @@ class _ComfyAPIMixin:
         if node != str(state.get("node")):
             return
         now = time.time()
+        _now_mono = time.monotonic_ns()
+        _now_perf = time.perf_counter_ns()
         if state["first_progress"] is None:
             state["first_progress"] = now
-            state["first_progress_ns"] = time.perf_counter_ns()
+            state["first_progress_ns"] = _now_perf
+            state["first_progress_mono_ns"] = _now_mono
         state["last_progress"] = now
+        state["last_progress_ns"] = _now_perf
+        state["last_progress_mono_ns"] = _now_mono
         state["progress_events"] += 1
         state["max_step"] = max(state["max_step"], int(data.get("step", 0)))
         state["max_steps"] = max(state["max_steps"], int(data.get("max", 0)))
+        # R44H2: per-step tick telemetry (timestamp-only; comfyapp progress
+        # events are the wrapper-independent tick source).
+        try:
+            from comfymodal_runtime import sampler_telemetry as _stel
+            _stel.note_progress_tick(
+                step=data.get("step"),
+                progress=data.get("max"),
+                source="comfyapp_progress",
+            )
+        except Exception:
+            pass
 
     def _finish_profiled_node(self, now: float) -> None:
         last_node = getattr(self, "_perf_last_node", None)
@@ -14863,6 +15108,25 @@ class _ComfyAPIMixin:
                 "max_steps": state.get("max_steps", 0),
                 "duration_ms": duration_ms,
             }
+            # R44H2: close the sampler post-loop tail (last progress -> node
+            # return) and stash true mono stamps for the durable emitter.
+            try:
+                from comfymodal_runtime import sampler_telemetry as _stel
+                _r44h2_tail = _stel.finish_sampler_tail(
+                    time.perf_counter_ns(),
+                    time.monotonic_ns(),
+                )
+                if windows and stage in windows:
+                    if _r44h2_tail:
+                        windows[stage]["r44h2_tail"] = _r44h2_tail
+                    if state.get("started_mono_ns"):
+                        windows[stage]["node_entry_mono_ns"] = state["started_mono_ns"]
+                    if state.get("first_progress_mono_ns"):
+                        windows[stage]["first_progress_mono_ns"] = state["first_progress_mono_ns"]
+                    if state.get("last_progress_mono_ns"):
+                        windows[stage]["last_progress_mono_ns"] = state["last_progress_mono_ns"]
+            except Exception:
+                pass
             self._ksampler_state = None
 
         if not PROFILING_ENABLED:

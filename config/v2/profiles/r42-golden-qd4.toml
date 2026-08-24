@@ -1,0 +1,89 @@
+# v2ctl profile: R42 Golden QD4 reconciliation production shape.
+# E39 base + targeted E40 canonical-authority layer + R41 golden pipeline.
+# One transport (golden_qd4, QD=4, 32 MiB) for CLIP/UNET/VAE; snapshot is
+# static-metadata-only; conditioning forced-miss; placement unpinned.
+schema_version = 1
+name = "r42-golden-qd4"
+extends = "e29-tracer"
+owner = "R42"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# ── R42 Golden pipeline master selector ────────────────────────────────────
+COMFYMODAL_GOLDEN_PIPELINE = "1"
+
+# ── R42 isolated-worktree deploy identity ─────────────────────────────────
+# The image bake stages custom nodes from the shared parent custom_nodes dir;
+# without this override it keeps the AUTHORITATIVE comfyui-modal checkout and
+# excludes this worktree, so request containers silently run E40 code no
+# matter how often r42 redeploys.  Designate THIS worktree as the single
+# deployment source (the canonical dir becomes the excluded duplicate).
+COMFYMODAL_ACTIVE_SOURCE_DIR = "comfyui-modal-r42"
+
+# ── Restore / orchestration policy ────────────────────────────────────────
+COMFYMODAL_MINIMAL_RESTORE = "1"
+COMFYMODAL_V2_CRITICAL_PATH_LEDGER = "1"
+COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
+# Legacy fast-cold orchestrator superseded by the Golden pipeline state
+# machine (documented mapping: superseded_by_golden_pipeline_orchestration).
+COMFYMODAL_V2_FAST_COLD_ORCHESTRATION = "0"
+
+# ── Loader selection: ONE transport for all three roles ───────────────────
+COMFYMODAL_V2_CLIP_QD_READER = "1"
+COMFYMODAL_V2_CLIP_QD_QD = "4"
+COMFYMODAL_V2_CLIP_QD_BLOCK_MIB = "32"
+COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY = "clean_lane_post_restore"
+# Legacy UNET arms are NOT nominal under Golden (documented mappings:
+# superseded_by_golden_qd4_loader); they survive only as DEGRADED fallbacks.
+COMFYMODAL_V2_UNET_FASTSAFETENSORS = "0"
+COMFYMODAL_V2_NATIVE_FAST_DISK_UNET = "0"
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+# E40 retirement retained: speculative CLIP hydration must never activate.
+COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION = "0"
+
+# ── Snapshot composition: static metadata only, zero role value bytes ────
+COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "1"
+COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET = "1"
+COMFYMODAL_V2_VAE_SNAPSHOT = "0"
+COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "0"
+COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT = "0"
+COMFYMODAL_V2_EVICT_RETAIN_ROLE = "none"
+COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS = "0"
+
+# ── Cache policy: maximum deterministic hits, conditioning forced miss ────
+COMFYMODAL_V2_EXACT_CACHE_PERSIST = "0"
+COMFYMODAL_V2_BACKGROUND_PERSISTENCE = "0"
+COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH = "0"
+
+# ── Everything algorithm-changing explicitly OFF (no inherit ambiguity) ──
+COMFYMODAL_V2_EXECUTION_PREFILL = "0"
+COMFYMODAL_V2_PREFILL_LANES = "none"
+COMFYMODAL_V2_CHECKPOINT_PREWARM = "0"
+COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS = "0"
+COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB = "0"
+COMFYMODAL_V2_MODEL_PRELOAD = "0"
+COMFYMODAL_V2_GRAPH_PRELOAD = "0"
+COMFYMODAL_V2_INPUT_TYPES_WARM = "0"
+COMFYMODAL_V2_GPU_FAST_RETURN = "0"
+
+# ── E37 clean-lane hygiene retained verbatim ──────────────────────────────
+COMFYMODAL_V2_E37_STRICT_PROOF = "1"
+COMFYMODAL_V2_E37_CLEAN_LANE = "1"
+COMFYMODAL_V2_CLEAN_LANE = "1"
+COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+COMFYMODAL_V2_ENV_PROFILE = "inherit"
+COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH = "1"
+COMFYMODAL_V2_E31_FORENSICS = "0"
+COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"
+COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS = "0"
+COMFYMODAL_V2_ALLOCATOR_PURGE = "0"
+COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS = "0"

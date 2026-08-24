@@ -92,6 +92,59 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+# R44A generation determinism: volatile diagnostic keys excluded from
+# generation identity, per tracked runtime-state file.  These keys are
+# construction-time OBSERVATIONS (wall-clock capture time, provider GPU
+# marketing string, record write timestamp) that legitimately differ across
+# independent constructions of the SAME semantic deployment.  Hashing raw
+# bytes made the content-derived generation nondeterministic: construction A
+# and B produced different manifests for identical deployments, so a fresh
+# instance restored from A compared against Volume state written by B failed
+# the exact-match proof and forced a spurious fail-closed reload
+# (`runtime_state_generation_reload` → RuntimeStatus DEGRADED).
+#
+# Identity is computed over the canonical JSON projection with these
+# TOP-LEVEL keys removed.  The keys remain in the physical files (diagnostics
+# value is unchanged); they simply cannot alter the semantic generation.
+# Semantic fields that DO affect runtime behavior stay in the identity — e.g.
+# ``total_vram_mib`` (drives restore VRAM sizing) and every prescan identity
+# field (custom-node source/identity provenance).
+RUNTIME_STATE_VOLATILE_IDENTITY_KEYS: dict[str, tuple[str, ...]] = {
+    "gpu_capacity_frozen.json": ("captured_at", "gpu_name"),
+    "prescan_custom_nodes.json": ("updated_at",),
+}
+
+
+def _semantic_identity_bytes(rel: str, raw: bytes) -> bytes:
+    """Canonical SEMANTIC projection of a tracked runtime-state file's bytes.
+
+    For a known JSON file (see ``RUNTIME_STATE_VOLATILE_IDENTITY_KEYS``),
+    parse the payload, drop the volatile diagnostic top-level keys, and
+    re-serialize canonically (sorted keys, compact separators).  For any
+    other file — or a payload that cannot be parsed as UTF-8 JSON — return
+    the raw bytes unchanged so hashing stays deterministic AND fail-closed:
+    unknown content must match byte-for-byte exactly, as before.
+    """
+    volatile = RUNTIME_STATE_VOLATILE_IDENTITY_KEYS.get(str(rel or ""))
+    if not volatile:
+        return raw
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return raw
+    if isinstance(data, dict):
+        data = {k: v for k, v in data.items() if k not in volatile}
+    return json.dumps(
+        data, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _identity_sha256_file(rel: str, path: str) -> str:
+    """SHA-256 of the semantic identity projection of a tracked file."""
+    with open(path, "rb") as fh:
+        return hashlib.sha256(_semantic_identity_bytes(rel, fh.read())).hexdigest()
+
+
 def build_runtime_state_manifest(
     root_dir: str,
     relative_files: tuple[str, ...] = DEFAULT_RUNTIME_STATE_MANIFEST_FILES,
@@ -108,7 +161,15 @@ def build_runtime_state_manifest(
       - absent and required  -> raises (fail closed: no usable baseline)
       - present but unreadable -> raises (fail closed)
 
-    Volatile timestamps are never included in the comparison data.
+    R44A: the recorded ``sha256`` is the SEMANTIC identity hash — the SHA-256
+    of the canonical projection with volatile diagnostic keys removed (see
+    ``RUNTIME_STATE_VOLATILE_IDENTITY_KEYS``) — so two independent
+    constructions of the same semantic deployment derive identical manifests
+    and identical generation tokens even when their diagnostic observations
+    (capture timestamps, provider GPU name strings, record write times)
+    differ.  Unknown/unparseable files fall back to raw-byte hashing
+    (deterministic and fail-closed).  ``verify_runtime_state_manifest``
+    applies the identical projection at restore time.
     """
     root = str(root_dir or "")
     if not root:
@@ -121,12 +182,30 @@ def build_runtime_state_manifest(
             continue
         path = os.path.join(root, rel)
         if os.path.isfile(path):
-            manifest[rel] = {"present": True, "sha256": _sha256_file(path)}
+            manifest[rel] = {
+                "present": True,
+                "sha256": _identity_sha256_file(rel, path),
+            }
         elif rel in required_set:
             raise OSError(f"required runtime-state file missing: {rel}")
         else:
             manifest[rel] = {"present": False}
     return manifest
+
+
+def _content_derived_generation(files_manifest: dict[str, dict] | None) -> str:
+    """Deterministic generation: SHA-256 over the canonical content manifest.
+
+    Same runtime-state SEMANTIC content ⇒ same generation on every container
+    of the deployment, regardless of placement, timestamps, construction
+    order, provider/region, or diagnostic-only observation drift (R44A: the
+    manifest hashes are semantic identity hashes — volatile diagnostic keys
+    are excluded by ``build_runtime_state_manifest``).
+    """
+    canonical = json.dumps(
+        dict(files_manifest or {}), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
 def write_runtime_state_generation_marker(
@@ -152,7 +231,15 @@ def write_runtime_state_generation_marker(
     callers (``RuntimeBootstrap.finalize_runtime_state_generation``) capture
     the exception and fail closed to an empty baseline.
     """
-    generation = str(generation or "") or uuid.uuid4().hex
+    # R42 generation determinism: an absent explicit generation is derived
+    # from the content manifest itself (volatile fields already excluded by
+    # build_runtime_state_manifest), NOT from a random UUID.  A random
+    # generation made cross-container equality nondeterministic: identical
+    # deployments could legitimately disagree, producing spurious
+    # reloaded_generation_mismatch reloads on some containers only.
+    # Content-derived generations are immutable for one deployment content,
+    # placement-independent, and cheap to validate exactly.
+    generation = str(generation or "") or _content_derived_generation(files_manifest)
     payload = {
         "schema_version": RUNTIME_STATE_GENERATION_SCHEMA_VERSION,
         "generation": generation,
@@ -215,7 +302,9 @@ def verify_runtime_state_manifest(
     construction manifest via LOCAL filesystem access only.
 
     For every manifest entry:
-      - expected-present: file must exist AND sha256 must match
+      - expected-present: file must exist AND semantic identity sha256 must
+        match (same canonical volatile-key-stripped projection used at
+        construction — R44A)
       - expected-absent:  file must remain absent
 
     Returns ``(True, "exact_match")`` or ``(False, reason)`` with reason in:
@@ -235,7 +324,7 @@ def verify_runtime_state_manifest(
             if not os.path.isfile(path):
                 return False, "manifest_file_missing"
             try:
-                actual = _sha256_file(path)
+                actual = _identity_sha256_file(rel, path)
             except OSError as exc:
                 return False, f"manifest_read_error:{type(exc).__name__}"
             expected_sha = (entry or {}).get("sha256", "")

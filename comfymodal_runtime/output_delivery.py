@@ -136,6 +136,16 @@ class OutputItem:
     format: str = ""
     animated: bool = False
     conversion_meta: ConversionMeta | None = None
+    # R42 reconciliation: E40-layer modal_app reads the producer-side
+    # thumbnail derivative on OutputItem.  The E2C producer machinery is not
+    # part of this worktree's frozen architecture, so these stay at their
+    # defaults (empty => consumers skip thumbnail handling gracefully).
+    thumbnail_bytes: bytes = b""
+    thumbnail_mime_type: str = ""
+    thumbnail_file_ext: str = ""
+    thumbnail_width: int = 0
+    thumbnail_height: int = 0
+    thumbnail_codec_ms: float = 0.0
 
     def __post_init__(self) -> None:
         if self.content_sha256:

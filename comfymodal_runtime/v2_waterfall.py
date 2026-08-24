@@ -126,11 +126,11 @@ class WaterfallReport:
     # the 10 ms target is surfaced as a warning, never hidden.
     reconciliation_target_ms: float = RECONCILIATION_TARGET_MS
     reconciliation_hard_ms: float = RECONCILIATION_HARD_MS
-    # Validation status: "COMPLETE" only when no required-data flags exist AND
+    # Diagnostic status: "COMPLETE" only when no required-data flags exist AND
     # reconciliation is resolved within the hard ceiling.  "INCOMPLETE" when a
     # required-data flag exists, "UNRESOLVED" when the wall is unknown,
     # "FAILED" when reconciliation exceeds the hard ceiling.
-    validation_status: str = ""
+    diagnostic_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -171,9 +171,15 @@ def _number(value: Any) -> int | None:
 
 
 def _event_clock(event: Mapping[str, Any], key: str) -> int | None:
+    metadata = _as_mapping(event.get("metadata"))
+    # R44I2: deferred-emitted boundary events carry their TRUE timestamp in
+    # metadata.mono_ns; the top-level monotonic_ns is the late emit stamp.
+    if key == "monotonic_ns" and str(metadata.get("emission") or "") == "deferred_boundary":
+        preferred = _number(metadata.get("mono_ns"))
+        if preferred is not None and preferred > 0:
+            return preferred
     value = event.get(key)
     if value is None:
-        metadata = _as_mapping(event.get("metadata"))
         value = metadata.get(key)
         if value is None:
             value = metadata.get("wall_ns" if key == "wall_unix_ns" else "mono_ns")
@@ -1073,10 +1079,16 @@ def _stage_candidate(
             )
         return _Candidate()
     if key == "sampler_node_to_sampling":
+        # R44H2 semantics: the TRUE sampling boundary is the authoritative
+        # wrapper ``sampling_start`` event ONLY.  The progress-derived
+        # ``sampler_start`` event is a PROXY whose end boundary is the first
+        # progress callback; it is still resolved as a fallback but is
+        # explicitly labeled as such via source_fields so no consumer can
+        # mistake it for the true sampling start.
         candidate = _candidate(
             result,
             event("sampler_lane_wait_start", process="remote"),
-            event(("sampling_start", "sampler_start")),
+            event("sampling_start"),
         )
         if candidate.duration_ms is not None:
             return candidate
@@ -1088,6 +1100,20 @@ def _stage_candidate(
         )
         if candidate.duration_ms is not None:
             return candidate
+        proxy = _candidate(
+            result,
+            event("sampler_lane_wait_start", process="remote"),
+            event("sampler_start"),
+        )
+        if proxy.duration_ms is not None:
+            import dataclasses as _dc
+
+            proxy = _dc.replace(
+                proxy,
+                source_fields=proxy.source_fields
+                + ("proxy:first_progress_callback_not_true_sampling_start",),
+            )
+            return proxy
         value = _first_value(result, ("sampler_node_to_sampler_start_ms", "sampler_node_to_sampling_ms"))
         return _candidate_from_duration(value)
     if key == "sampling":
@@ -2335,13 +2361,13 @@ def build_waterfall(
     # Validation can only be declared COMPLETE when no required-data flag
     # exists AND reconciliation is resolved within the hard ceiling.
     if data_flags:
-        validation_status = "INCOMPLETE"
+        diagnostic_status = "INCOMPLETE"
     elif reconciliation is None:
-        validation_status = "UNRESOLVED" if partial_waterfall else "UNKNOWN"
+        diagnostic_status = "UNRESOLVED" if partial_waterfall else "UNKNOWN"
     elif abs(reconciliation) <= RECONCILIATION_HARD_MS:
-        validation_status = "COMPLETE"
+        diagnostic_status = "COMPLETE"
     else:
-        validation_status = "FAILED"
+        diagnostic_status = "FAILED"
     included_stages = [
         stage for stage in stages
         if stage.accounting_role == "top_level" and not stage.concurrent
@@ -2407,7 +2433,7 @@ def build_waterfall(
         data_flags=tuple(data_flags),
         reconciliation_target_ms=RECONCILIATION_TARGET_MS,
         reconciliation_hard_ms=RECONCILIATION_HARD_MS,
-        validation_status=validation_status,
+        diagnostic_status=diagnostic_status,
     )
 
 
@@ -2857,7 +2883,7 @@ def _render_reconciled(report: WaterfallReport) -> str:
     lines.append(rule)
     if report.data_flags:
         lines.append(f"Required data: {','.join(report.data_flags)}")
-        lines.append(f"VALIDATION: {_ascii_text(report.validation_status or 'INCOMPLETE')}")
+        lines.append(f"VALIDATION: {_ascii_text(report.diagnostic_status or 'INCOMPLETE')}")
     # Conclusive footer — the new timing contract.  Scheduling time = enqueue +
     # placement; non-scheduling = total - scheduling_time.  These are the
     # final reconciled values and are NEVER the intermediate pending token.
@@ -2933,7 +2959,7 @@ def _report_from_value(value: WaterfallReport | Mapping[str, Any]) -> WaterfallR
         data_flags=tuple(value.get("data_flags", ())),
         reconciliation_target_ms=float(value.get("reconciliation_target_ms", RECONCILIATION_TARGET_MS)),
         reconciliation_hard_ms=float(value.get("reconciliation_hard_ms", RECONCILIATION_HARD_MS)),
-        validation_status=str(value.get("validation_status", "")),
+        diagnostic_status=str(value.get("diagnostic_status", value.get("validation_status", ""))),
     )
 
 
@@ -3035,7 +3061,7 @@ def waterfall_to_dict(report: WaterfallReport) -> dict[str, Any]:
         "data_flags": list(report.data_flags),
         "reconciliation_target_ms": report.reconciliation_target_ms,
         "reconciliation_hard_ms": report.reconciliation_hard_ms,
-        "validation_status": report.validation_status,
+        "diagnostic_status": report.diagnostic_status,
     }
 
 

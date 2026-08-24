@@ -56,6 +56,7 @@ from typing import Any, Optional
 from . import clip_fast_hydration as cfh
 from . import clip_fast_hydration_wiring as _wiring
 from . import clean_lane
+from .env import env_flag
 
 # ── Module-level single-flight store (one lane per request) ──────────────
 
@@ -432,7 +433,11 @@ def _start_speculative_clip_lane(
         _skip("clip_fast_hydration_gate_error")
         return None
     try:
-        if not os.environ.get("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1"):
+        # E40 Lane B: speculative CLIP hydration is DIAGNOSTIC_ONLY. It must
+        # never activate through an inherited/unset environment variable —
+        # explicit opt-in is required so the Golden loader arm cannot change
+        # silently between containers.
+        if not env_flag("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION"):
             _skip("speculative_clip_hydration_disabled")
             return None
     except Exception:
@@ -1032,11 +1037,15 @@ def _drop_lane_locked(request_id: str) -> None:
 
 
 def speculative_clip_hydration_enabled() -> bool:
-    """True when the speculative CLIP hydration lane is eligible."""
+    """True when the speculative CLIP hydration lane is eligible.
+
+    E40 Lane B: default OFF. The speculative arm is DIAGNOSTIC_ONLY and
+    requires explicit opt-in; an unset variable must never activate it.
+    """
     try:
         return _wiring.clip_fast_hydration_enabled() and (
             clean_lane.enabled()
-            or bool(os.environ.get("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1"))
+            or env_flag("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION")
         )
     except Exception:
         return False

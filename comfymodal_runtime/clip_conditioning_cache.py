@@ -865,6 +865,10 @@ class ExactConditioningCache:
         self._pending_keys: set[str] = set()
         self._max_queue = max(1, int(_env_int(ENV_MAX_QUEUE, _DEFAULT_MAX_QUEUE)))
         self._closing = False
+        # Set at the snapshot boundary before draining workers.  This is a
+        # separate gate from ``_closing`` so quiescence can reject new work
+        # before the teardown flush starts.
+        self._snapshot_quiescing = False
         self._worker: threading.Thread | None = None
         self._worker_broken = False
         self._worker_exited = False
@@ -1218,6 +1222,18 @@ class ExactConditioningCache:
         """
         _t0 = time.monotonic_ns()
         _rid = str(request_id or "")
+        with self._prefetch_lock:
+            if self._snapshot_quiescing:
+                return {
+                    "requested": 0,
+                    "loaded": 0,
+                    "failures": 0,
+                    "manifest_bytes": 0,
+                    "payload_bytes": 0,
+                    "wall_ms": 0.0,
+                    "source": "snapshot_quiescing",
+                    "prefetch_reload": "",
+                }
         # RUN-2: register the in-flight join event BEFORE any slow work so a
         # demand-time ``join_prefetch`` can wait for this prefetch.  The
         # Event is set (and the registration dropped) in the ``finally``.
@@ -1953,7 +1969,7 @@ class ExactConditioningCache:
         _lru_experiment_log_once()
         _fallback: set[str] = set()
         with self._lock:
-            if self._lru_closing:
+            if self._lru_closing or self._snapshot_quiescing:
                 return
             added = 0
             for d in touched_digests:
@@ -2116,6 +2132,9 @@ class ExactConditioningCache:
         if clean_lane.enabled():
             clean_lane.forbidden_activity("exact_cache_persistence")
             return False
+        if self._snapshot_quiescing:
+            self._set_last_store_reason("snapshot_quiescing")
+            return False
         diag = self._store_entry_diag()
         _t0 = time.monotonic_ns()
         try:
@@ -2164,7 +2183,7 @@ class ExactConditioningCache:
                 diag["lock_wait_ms"] = diag.get("lock_wait_ms", 0.0) + round(
                     (time.monotonic_ns() - _lw_start) / 1_000_000, 3
                 )
-            if self._closing:
+            if self._closing or self._snapshot_quiescing:
                 self._set_last_store_reason("shutting_down")
                 if diag is not None:
                     diag["enqueue_ms"] = diag.get("enqueue_ms", 0.0) + round(
@@ -2477,6 +2496,74 @@ class ExactConditioningCache:
         self._record_flush(_flush_ms, status, drained_count, final_commit_ms)
         return self._flush_diag(_flush_ms, status, drained_count, final_commit_ms)
 
+    def quiesce_for_snapshot(self, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Stop new cache work and prove that cache workers have drained.
+
+        The existing bounded ``flush`` implementation is the synchronous
+        persistence fallback as well as the normal worker teardown path.  A
+        timeout is fail-closed: remnants are reported and are never silently
+        treated as a quiescent snapshot.
+        """
+        try:
+            _timeout = max(0.0, float(timeout_s))
+        except (TypeError, ValueError):
+            _timeout = 10.0
+        _deadline = time.monotonic() + _timeout
+        details: list[Any] = []
+        with self._prefetch_lock:
+            self._snapshot_quiescing = True
+            prefetch_events = list(self._prefetch_events.values())
+        for event in prefetch_events:
+            remaining = max(0.0, _deadline - time.monotonic())
+            if not event.wait(timeout=remaining):
+                details.append("prefetch work did not finish before timeout")
+
+        flush_result: dict[str, Any] = {}
+        try:
+            remaining = max(0.0, _deadline - time.monotonic())
+            flush_result = self.flush(remaining)
+            details.append({"flush": flush_result})
+        except Exception as exc:
+            details.append(f"cache flush failed: {type(exc).__name__}: {exc}")
+
+        worker = self._worker
+        lru_worker = self._lru_worker
+        joined_workers = sum(
+            1 for thread in (worker, lru_worker)
+            if thread is not None and not thread.is_alive()
+        )
+        with self._queue_cond:
+            pending_persistence = len(self._pending)
+        with self._lru_cond:
+            pending_lru = len(self._pending_lru)
+        with self._prefetch_lock:
+            pending_prefetch = len(self._prefetch_events)
+        pending = pending_persistence + pending_lru + pending_prefetch
+        if pending:
+            details.append({
+                "pending_persistence": pending_persistence,
+                "pending_lru": pending_lru,
+                "pending_prefetch": pending_prefetch,
+            })
+        if flush_result.get("flush_status") == "timeout":
+            details.append("persistence worker join timed out")
+        if worker is not None and worker.is_alive():
+            details.append("persistence worker is still alive")
+        if lru_worker is not None and lru_worker.is_alive():
+            details.append("async-LRU worker is still alive")
+        quiesced = not pending and not any(
+            thread is not None and thread.is_alive()
+            for thread in (worker, lru_worker)
+        ) and flush_result.get("flush_status", "error") != "timeout"
+        if time.monotonic() > _deadline and not quiesced:
+            details.append("snapshot quiescence deadline exceeded")
+        return {
+            "quiesced": bool(quiesced),
+            "joined_workers": joined_workers,
+            "pending_dropped": 0,
+            "details": details,
+        }
+
     def _record_flush(
         self, flush_ms: float, status: str, drained_count: int, final_commit_ms: float
     ) -> None:
@@ -2658,6 +2745,21 @@ def _env_int(name: str, default: int) -> int:
 _SINGLETON: ExactConditioningCache | None = None
 _SINGLETON_LOCK = threading.Lock()
 _SINGLETON_RESOLVED = False
+
+
+def quiesce_for_snapshot(timeout_s: float = 10.0) -> dict[str, Any]:
+    """Quiesce the initialized exact-conditioning cache without initializing it."""
+    with _SINGLETON_LOCK:
+        cache = _SINGLETON
+        resolved = _SINGLETON_RESOLVED
+    if not resolved or cache is None:
+        return {
+            "quiesced": True,
+            "joined_workers": 0,
+            "pending_dropped": 0,
+            "details": ["conditioning cache was never initialized or is disabled"],
+        }
+    return cache.quiesce_for_snapshot(timeout_s=timeout_s)
 
 
 def _register_commit_hook_from_comfyapp(cache: ExactConditioningCache) -> None:

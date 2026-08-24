@@ -3632,7 +3632,7 @@ def _derive_active_read_owner(
 
     Restore preload roles map to canonical restore names:
 
-      clip → restore_clip_loader
+      clip → restore_preload
       unet → restore_background_unet
       vae  → restore_vae_loader
 
@@ -3643,8 +3643,9 @@ def _derive_active_read_owner(
     Returns the resolved owner string; falls back to ``explicit_owner``
     when role is empty and no lane context resolves.
     """
+    # E40 Lane D: must mirror comfyapp.RESTORE_ROLE_OWNER_MAP exactly.
     _ROLE_MAP: dict[str, str] = {
-        "clip": "restore_clip_loader",
+        "clip": "restore_preload",
         "unet": "restore_background_unet",
         "vae": "restore_vae_loader",
     }

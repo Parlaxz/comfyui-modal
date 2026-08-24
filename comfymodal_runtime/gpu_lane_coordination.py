@@ -16,6 +16,38 @@ SCOPED_CUDA_READINESS_FLAG = "COMFYMODAL_V2_SCOPED_CUDA_READINESS"
 CLIP_GPU_CRITICAL_ACTIVE = "CLIP_GPU_CRITICAL_ACTIVE"
 _MAX_STATES = 64
 
+# ── D15 additive hook: clip-critical-end callbacks ─────────────────────────
+# Registered zero-arg callables are invoked inside end_clip_critical() AFTER
+# the CLIP critical state has been released (outer boundary only).  Each
+# callback is individually guarded: a raising callback NEVER propagates into
+# the critical path.  With nothing registered, behavior is unchanged.
+_CLIP_CRITICAL_END_CALLBACKS: list[Any] = []
+_CLIP_CRITICAL_END_CALLBACKS_LOCK = threading.Lock()
+
+
+def register_clip_critical_end_callback(cb: Any) -> None:
+    """Register a callback fired when the CLIP GPU-critical section fully
+    ends (D15 structural boundary).  Callers must register once (no
+    deduplication).  Never raises."""
+    if not callable(cb):
+        return
+    with _CLIP_CRITICAL_END_CALLBACKS_LOCK:
+        _CLIP_CRITICAL_END_CALLBACKS.append(cb)
+
+
+def _fire_clip_critical_end_callbacks() -> None:
+    """Invoke registered clip-critical-end callbacks; never raises."""
+    try:
+        with _CLIP_CRITICAL_END_CALLBACKS_LOCK:
+            callbacks = tuple(_CLIP_CRITICAL_END_CALLBACKS)
+    except Exception:
+        return
+    for cb in callbacks:
+        try:
+            cb()
+        except Exception:
+            pass
+
 
 @dataclass
 class _RequestState:
@@ -410,6 +442,10 @@ def end_clip_critical(token: _ClipToken, *, success: bool = True, reason: str = 
             record_clip_ready(
                 token.request_id, token.trace, cache_state=token.cache_state
             )
+        # ── D15 additive hook: fire registered clip-critical-end callbacks
+        # after state release + readiness recording.  Guarded per callback;
+        # never raises into the critical path.
+        _fire_clip_critical_end_callbacks()
 
 
 def begin_clip_encode(

@@ -26,14 +26,20 @@ from typing import Any
 
 
 # ``V2_E19_FINAL_COLD_LOADER`` is a harness selector, not a runtime flag.
-# The deploy/run BAT applies these values after v2ctl has resolved the
-# profile.  Keep this projection here so control-plane identities describe
-# the configuration the container actually receives, while ``ResolvedConfig``
-# remains the pre-selector input used by preflight and safety checks.
+# R42 deployed-truth reconciliation (E40 root-cause fix): v2ctl's
+# EnvironmentBuilder projects the RESOLVED profile values verbatim into the
+# container environment; it does NOT apply any post-selector override.  The
+# historical BAT-side post-resolution override below is therefore NOT part of
+# the deployed configuration and must never masquerade as deployed values.
 #
-# These are deliberately limited to the flags whose post-selector values are
-# part of the runtime snapshot identity.  Do not infer values from a profile
-# name: the selector is the canonical activation signal.
+# It is retained purely as explicit, clearly-labeled knowledge: when the
+# selector is active, ``deploy_inputs()`` reports it separately under
+# ``post_selector_projection`` so control-plane identities stay auditable,
+# while ``deploy_flags`` carries the values the container actually receives.
+#
+# These are deliberately limited to the flags whose historical post-selector
+# values were part of the runtime snapshot identity.  Do not infer values from
+# a profile name: the selector is the canonical activation signal.
 _POST_SELECTOR_EFFECTIVE_FLAGS: dict[str, dict[str, str]] = {
     "V2_E19_FINAL_COLD_LOADER": {
         "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
@@ -42,6 +48,11 @@ _POST_SELECTOR_EFFECTIVE_FLAGS: dict[str, dict[str, str]] = {
         "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
     },
 }
+
+_POST_SELECTOR_NOTE = (
+    "historical BAT-side post-resolution override; "
+    "NOT applied to deployed env by v2ctl"
+)
 
 
 def _fmt(value: Any) -> str:
@@ -93,6 +104,7 @@ class FingerprintEngine:
             },
             "profile": str(config.profile_name),
             "deploy_flags": deploy_flags,
+            "post_selector_projection": self.post_selector_projection(),
             "runtime_override_policy": str(config.runtime_override_policy),
         }
 
@@ -158,13 +170,15 @@ class FingerprintEngine:
         return self.config_fingerprint()
 
     def effective_flag_values(self) -> dict[str, str]:
-        """Return flag values after the canonical deploy-selector projection.
+        """Return the ACTUAL projected container-env flag values.
 
-        The resolver intentionally exposes the values requested by the
-        profile.  The launcher then applies selector-owned values before
-        deployment.  Project only flags already present in the resolved
-        configuration so this helper never invents a flag or a default for
-        duck-typed/older configurations.
+        R42 deployed-truth reconciliation: v2ctl's EnvironmentBuilder projects
+        the RESOLVED profile values verbatim into the container environment,
+        so the deployed truth IS the resolved value.  The historical
+        post-selector override is NOT applied here (see
+        :func:`post_selector_projection`); it is reported separately by
+        ``deploy_inputs()`` under ``post_selector_projection`` so the
+        fingerprint stays an identity of what the container receives.
         """
         config = self._config
         values: dict[str, str] = {}
@@ -172,15 +186,32 @@ class FingerprintEngine:
         flags += list(getattr(config, "unregistered", ()) or ())
         for flag in flags:
             values[str(flag.name)] = _fmt(flag.value)
+        return values
 
+    def post_selector_projection(self) -> dict | None:
+        """The labeled historical post-selector knowledge, when active.
+
+        Returns ``None`` unless a selector flag from
+        ``_POST_SELECTOR_EFFECTIVE_FLAGS`` is active among the RESOLVED
+        values.  The returned shape is deterministic and JSON-serializable;
+        projected flags are limited to names already present in the resolved
+        configuration so this helper never invents a flag.
+        """
+        values = self.effective_flag_values()
         for selector, effects in _POST_SELECTOR_EFFECTIVE_FLAGS.items():
             selector_value = values.get(selector, "").strip().lower()
             if selector_value not in {"1", "true", "yes", "on"}:
                 continue
-            for name, value in effects.items():
-                if name in values:
-                    values[name] = value
-        return values
+            projected = {
+                name: value for name, value in sorted(effects.items())
+                if name in values
+            }
+            return {
+                "selector": str(selector),
+                "projected_flags": projected,
+                "note": _POST_SELECTOR_NOTE,
+            }
+        return None
 
     # -- fingerprints ------------------------------------------------------
 

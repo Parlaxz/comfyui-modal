@@ -220,6 +220,19 @@ _TRACE_EVENT_SPANS = {
 }
 
 
+# R44H2: printed adjacent to legacy Gantt output whenever the legacy
+# "CLIP forward" span is present.  The span name is a persisted schema
+# value (kept for backwards compatibility); its SEMANTICS are the OUTER
+# encode wrapper, not the inner transformer forward.
+_LEGACY_CLIP_FORWARD_WARNING = (
+    'WARNING: LEGACY "CLIP forward" = outer encode wrapper '
+    "(NOT the inner transformer forward);"
+)
+_LEGACY_CLIP_FORWARD_WARNING_2 = (
+    "use DYNAMIC GANTT for inner transformer forward."
+)
+
+
 def _restore_spans_from_metadata(trace: Any) -> list[dict[str, Any]]:
     """Restore/method boundary spans reconstructed from trace metadata.
 
@@ -564,13 +577,18 @@ def render_gantt_trace(
             origin_ns = 0
         lo = min([int(s["start_mono_ns"]) for s in spans] or [int(origin_ns)])
         hi = max([int(s["end_mono_ns"]) for s in spans] or [lo])
-        return _render_window(
+        lines = _render_window(
             spans,
             origin_ns=int(origin_ns),
             window_start_ns=lo,
             window_end_ns=max(hi, lo + 1),
             title=title,
         )
+        # R44H2: legacy label semantics warning (adjacent to legacy output).
+        if any(s.get("name") == "CLIP forward" for s in spans):
+            lines.append(_LEGACY_CLIP_FORWARD_WARNING)
+            lines.append(_LEGACY_CLIP_FORWARD_WARNING_2)
+        return lines
     except Exception:
         return [f"{title}: render failed (telemetry-only)"]
 
@@ -628,6 +646,11 @@ def render_gantt_windows(
                     title=f"V2 GANTT {spec['title']}",
                 )
             )
+            out.append("")
+        # R44H2: legacy label semantics warning (adjacent to legacy output).
+        if any(s.get("name") == "CLIP forward" for s in spans):
+            out.append(_LEGACY_CLIP_FORWARD_WARNING)
+            out.append(_LEGACY_CLIP_FORWARD_WARNING_2)
             out.append("")
         # AUTO-DENSE window.
         if spans:

@@ -196,6 +196,24 @@ description = "FastSafeTensor bounce-buffer size in KiB for UNET reads (request-
 # ── Deploy-baked (captured by the deployed runtime; a change needs a deploy) ──
 
 [[flag]]
+name = "COMFYMODAL_V2_CLIP_SAME_DTYPE_RESIDENCY"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "r44i3"
+description = "R44I3 ARM A: adopt the CHECKPOINT dtype as the live CLIP residency dtype (BF16 checkpoint -> BF16 live) via the parity same_storage_assign lane; overrides the text_encoder_dtype policy for the fast arm only. Requires REQUEST_CLIP_FASTSAFE + NATIVE_ADOPT. Default OFF."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_FP16_VOLUME_TWIN"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "r44i3"
+description = "R44I3 ARM B: prefer a preconverted <name>.fp16.safetensors sibling on the models volume (written once by tools/preconvert_clip_fp16_volume.py via v2ctl preconvert-clip-fp16) so the parity lane binds FP16->FP16 with zero conversion; falls back to the original checkpoint when absent. Default OFF."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
 type = "bool"
 default = "0"

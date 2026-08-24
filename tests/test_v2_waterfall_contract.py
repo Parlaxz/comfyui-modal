@@ -46,6 +46,7 @@ from comfymodal_runtime.v2_waterfall import (
     attach_waterfall,
     build_waterfall,
     render_waterfall,
+    _report_from_value,
     waterfall_to_dict,
 )
 from tests.v2_waterfall_reconciliation_fixtures import (
@@ -554,7 +555,16 @@ def test_serialized_artifact_exhaustive():
     assert all("accounting_role" in s for s in data["stages"])
     assert data["reconciliation_target_ms"] == 10.0
     assert data["reconciliation_hard_ms"] == 50.0
-    assert data["validation_status"] == report.validation_status
+    assert data["diagnostic_status"] == report.diagnostic_status
+
+
+def test_legacy_validation_status_is_tolerated_on_parse():
+    report = _reconciled_fixture()
+    legacy = waterfall_to_dict(report)
+    legacy["validation_status"] = legacy.pop("diagnostic_status")
+    parsed = _report_from_value(legacy)
+    assert parsed.diagnostic_status == report.diagnostic_status
+    assert "validation_status" not in waterfall_to_dict(parsed)
 
 
 # ── 20. Golden exact console format ────────────────────────────────────────
@@ -763,7 +773,7 @@ def test_active_read_never_chooses_foreign_or_clip_read():
     assert "unet_checkpoint_read" not in _details(report)
     assert "checkpoint_read_unavailable" in report.data_flags
     # Required data missing -> validation cannot be declared complete.
-    assert report.validation_status == "INCOMPLETE"
+    assert report.diagnostic_status == "INCOMPLETE"
 
 
 def test_active_read_safe_match_selected_over_foreign():
@@ -782,7 +792,7 @@ def test_active_read_safe_match_selected_over_foreign():
     detail = _details(report)["unet_checkpoint_read"]
     assert detail.duration_ms == pytest.approx(1047.0)
     assert "checkpoint_read_unavailable" not in report.data_flags
-    assert report.validation_status == "COMPLETE"
+    assert report.diagnostic_status == "COMPLETE"
 
 
 # ── Visibility: 10-50 ms target + required-data flags ──────────────────────
@@ -807,7 +817,7 @@ def test_required_data_flag_renders_compact_and_validation_incomplete():
     result["pre_sampler_structured_report"]["active_read_records"] = []
     report = _report(result)
     assert report.data_flags == ("checkpoint_read_unavailable",)
-    assert report.validation_status == "INCOMPLETE"
+    assert report.diagnostic_status == "INCOMPLETE"
     rendered = render_waterfall(report, terminal_columns=132)
     assert "Required data: checkpoint_read_unavailable" in rendered
     assert "VALIDATION: INCOMPLETE" in rendered

@@ -567,6 +567,15 @@ def build_run_record(
         "canonical_ledger_error": _first_value(
             result, ("canonical_ledger_error",),
         ),
+        # ── E40: single acceptance-authority telemetry blocks ────────────
+        # loader_selection / runtime_status / resolved_config are emitted
+        # once per run by modal_app result assembly; carry them verbatim
+        # into the persisted sample record so the gate validator reads the
+        # SAME structures the remote emitted (never a host re-derivation).
+        "loader_selection": _first_value(result, ("loader_selection",)),
+        "runtime_status": _first_value(result, ("runtime_status",)),
+        "resolved_config": _first_value(result, ("resolved_config",)),
+        "e40_telemetry_error": _first_value(result, ("e40_telemetry_error",)),
     }
     return _json_safe(record)  # type: ignore[return-value]
 

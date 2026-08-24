@@ -797,11 +797,14 @@ def maybe_prepare_clip_snapshot_exclusion(
 # ── Restore / demand side ──────────────────────────────────────────────────
 
 
-def _fastsafe_load(path: str) -> tuple[dict, Any, Any]:
+def _fastsafe_load(path: str, metrics: Optional[dict] = None) -> tuple[dict, Any, Any]:
     """fastsafetensors direct-to-GPU read (E28 tuned config: threads=8,
     max_copy_block=64 MiB — env-overridable).  Returns (tensors, loader,
     fb); caller OWNS loader+fb and must not close while tensors are live.
-    Raises on failure."""
+    Raises on failure.  When *metrics* (dict) is supplied it receives the
+    R44E sub-boundary walls: fastsafe_setup_wall_ms, fastsafe_copy_wall_ms
+    (exact copy_files_to_device), fastsafe_get_keys_wall_ms,
+    fastsafe_get_tensor_loop_wall_ms."""
     mod = cfh._fastsafe_module()
     if mod is None:
         raise RuntimeError("fastsafetensors unavailable")
@@ -813,6 +816,7 @@ def _fastsafe_load(path: str) -> tuple[dict, Any, Any]:
     from typing import cast as _cast
 
     device_str = f"cuda:{torch.cuda.current_device()}"
+    _t_setup = time.monotonic_ns()
     loader = _cast(Any, cls(
         None,
         device_str,
@@ -826,12 +830,31 @@ def _fastsafe_load(path: str) -> tuple[dict, Any, Any]:
     ))
     try:
         loader.add_filenames({0: [str(path)]})
+        if metrics is not None:
+            metrics["fastsafe_setup_wall_ms"] = round(
+                (time.monotonic_ns() - _t_setup) / 1e6, 3
+            )
+        _t_copy = time.monotonic_ns()
         fb = loader.copy_files_to_device(
             use_buf_register=_FASTSAFE_USE_BUF_REGISTER,
             max_copy_block_size=_clip_fastsafe_block_bytes(),
         )
+        if metrics is not None:
+            metrics["fastsafe_copy_wall_ms"] = round(
+                (time.monotonic_ns() - _t_copy) / 1e6, 3
+            )
+        _t_keys = time.monotonic_ns()
         keys = list(loader.get_keys())
+        if metrics is not None:
+            metrics["fastsafe_get_keys_wall_ms"] = round(
+                (time.monotonic_ns() - _t_keys) / 1e6, 3
+            )
+        _t_loop = time.monotonic_ns()
         sd = {k: fb.get_tensor(k) for k in keys}
+        if metrics is not None:
+            metrics["fastsafe_get_tensor_loop_wall_ms"] = round(
+                (time.monotonic_ns() - _t_loop) / 1e6, 3
+            )
         return sd, loader, fb
     except Exception:
         try:
@@ -1993,6 +2016,14 @@ def _try_fast_hydrate(
             )
         except Exception:
             pass
+        # R43: record the direct-GPU fastsafe arm as observed so the E40
+        # loader_selection contract does not report CLIP loader_unobserved.
+        try:
+            from . import loader_selection as _ls_fast
+
+            _ls_fast.record_observed("clip", cfh.MODE_FASTSAFE)
+        except Exception:
+            pass
         _emit(trace, "clip_fh_hydration_end", result)
         # ── E29: close the canonical ledger CLIP hydration span ─────────
         if _span_clip_hydration is not None:
@@ -2739,6 +2770,86 @@ def _merge_staged_telemetry(result: dict[str, Any], staged: Optional[dict[str, A
     return result
 
 
+def _try_golden_hydrate(
+    clip: Any, manifest: dict, *, trace: Any = None, comfy_utils: Any = None
+) -> Optional[dict[str, Any]]:
+    """R42 M-01 demand seam: the excluded-CLIP reconstruction fed by the
+    Golden QD4 engine instead of ``safetensors.load_file``.
+
+    Same bind contract as ``_hydrate_cpu_assign`` (per-file pipeline transform
+    -> manifest verification -> ``hydrate_clip_bind`` CPU assign), but every
+    per-file state dict comes from the Golden transport (single physical read,
+    bounded staging, exact occupancy telemetry).  Returns ``None`` when the
+    Golden lane is disabled or fails (caller falls back to the native
+    cpu_assign path; the bridge has already recorded the degradation).
+    """
+    import torch
+
+    try:
+        from comfymodal_runtime import golden_runtime_bridge as _grb
+
+        ctx = _grb.enabled_current()
+        if ctx is None:
+            return None
+        per_file_sds: list[dict] = []
+        for file_manifest in manifest.get("files", []):
+            path = str(file_manifest.get("path", "") or "")
+            if not path.lower().endswith(".safetensors"):
+                return None
+            sd, _meta, _diag = ctx.clip_golden_load(path)
+            work = {k: v for k, v in sd.items() if isinstance(v, torch.Tensor)}
+            transformed = _apply_pipeline(
+                work, file_manifest.get("pipeline", []), comfy_utils=comfy_utils
+            )
+            ok, detail = _verify_file_against_manifest(file_manifest, transformed)
+            if not ok:
+                raise RuntimeError(detail)
+            per_file_sds.append(transformed)
+        ok, evidence = cfh.hydrate_clip_bind(
+            clip, per_file_sds, require_no_meta=True, expect_device="cpu"
+        )
+        if not ok:
+            raise RuntimeError(f"bind: {evidence}")
+        cfh.mark_clip_hydrated(clip)
+        try:
+            from . import loader_selection as _ls
+
+            _ls.record_observed("clip", "golden_qd4")
+        except Exception:
+            pass
+        try:
+            ctx.record_io_uniqueness(
+                "clip",
+                golden_source_producer_count=1,
+                golden_commit_count=1,
+                demand_join_count=1,
+                native_fallback_count=0,
+                duplicate_source_count=0,
+                duplicate_h2d_count=0,
+                adoption_mode="demand_hydrate_cpu_assign",
+            )
+        except Exception:
+            pass
+        print("[v2.golden_clip] demand_hydrate=served mode=golden_qd4", flush=True)
+        return {
+            "ok": True,
+            "mode": "golden_qd4",
+            "reconstruction": "golden_qd4_cpu_assign",
+            "zero_copy_evidence": evidence,
+            "fallback_count": 0,
+        }
+    except Exception as exc:  # noqa: BLE001 - fail-closed boundary
+        try:
+            print(
+                f"[v2.golden_clip] demand_hydrate=fallback reason={type(exc).__name__}:"
+                f"{str(exc)[:120]}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return None
+
+
 def _hydrate_clip_on_demand(
     clip: Any, *, trace: Any = None, comfy_utils: Any = None
 ) -> dict[str, Any]:
@@ -2793,6 +2904,33 @@ def _hydrate_clip_on_demand(
             state_before=state_before,
             state_after=state_before,
         )
+    # ── R42 M-01 demand seam: Golden QD4 transport for excluded CLIP ──────
+    # Runs BEFORE the staged/fast/native branches: when the Golden lane is
+    # enabled this IS the single physical CLIP read of the request.  Any
+    # failure returns None and the pre-existing branches proceed unchanged
+    # (fail-closed native fallback; degradation already recorded).
+    if excluded:
+        golden_result = _try_golden_hydrate(
+            clip, manifest, trace=trace, comfy_utils=comfy_utils
+        )
+        if golden_result is not None:
+            state_after = cfh.clip_hydration_state(clip)["state"]
+            _emit_decision(
+                trace,
+                decision="golden_qd4",
+                reason="golden_pipeline_enabled",
+                state_before=state_before,
+                state_after=state_after,
+                fast_hydration_allowed=fast_allowed,
+                weights_excluded=excluded,
+            )
+            return _record_mode(
+                clip,
+                golden_result.get("mode", "golden_qd4"),
+                golden_result,
+                state_before=state_before,
+                state_after=state_after,
+            )
     staged_allowed = bool(
         (manifest or {}).get("staged_hydration_allowed", clip_staged_hydration_enabled())
     )

@@ -1,0 +1,300 @@
+R44E_FASTSAFE_FULL_EVIDENCE_AND_DECOMPOSITION_RAW_LOG
+Unabridged evidence for independent verification. All payloads verbatim from persisted artifacts.
+Worktree: ../comfyui-modal-r42 · Branch r42-golden-reconciliation · HEAD 0c59f46e3238f421378e8852ebc548da815b70af (no commits)
+
+====================================================================================================
+A. GIT STATE AT BATCH START
+====================================================================================================
+
+$ git rev-parse HEAD
+0c59f46e3238f421378e8852ebc548da815b70af
+$ git branch --show-current
+r42-golden-reconciliation
+$ git status --short   (75 dirty entries at start; R44A/B/C/D state preserved byte-for-byte outside R44E hunks)
+
+====================================================================================================
+B. LOCAL VERIFICATION (exact counts)
+====================================================================================================
+
+$ python -m pytest tests/test_r44a_generation_determinism.py tests/test_runtime_state_reload_guard.py
+  tests/test_r44b_request_fastsafe.py tests/test_r44e_evidence_durability.py tests/test_v2_waterfall.py
+  tests/test_v2_waterfall_contract.py tests/test_r44d_runtime_env_passthrough.py
+  tests/test_r44d_proof_installation.py -q --no-header
+168 passed in 10.21s   (final run; includes NEW tests/test_r44e_evidence_durability.py = 10 tests)
+
+Breakdown by file (from staged runs):
+  test_r44a_generation_determinism.py        9 passed
+  test_runtime_state_reload_guard.py        32 passed
+  test_r44b_request_fastsafe.py             24 passed
+  test_r44e_evidence_durability.py (NEW)    10 passed
+  test_v2_waterfall.py + _contract.py       68 passed
+  test_r44d_runtime_env_passthrough.py      17 passed
+  test_r44d_proof_installation.py            8 passed
+
+$ python -m py_compile comfymodal_runtime/request_fastpath.py comfymodal_runtime/request_clip_fastsafe.py
+  comfymodal_runtime/request_unet_fastsafe.py comfymodal_runtime/clip_fast_hydration_wiring.py
+  comfymodal_runtime/runtime_executor.py comfymodal_runtime/modal_app.py
+py_compile exit=0
+
+TOML parse: OK (r44-request-fastsafe.toml / r43-known-fast.toml / r42-golden-qd4.toml / e37-clean-lane-qd4.toml)
+
+====================================================================================================
+C. LEVEL-1 ENV PROOF (v2ctl deploy --dry-run child env, subset)
+====================================================================================================
+
+profile=r44-request-fastsafe owner=R44E
+deploy_fingerprint=8951dfd9b46dd7d9fd1b8627a17afa5447267395166da32db124c6d77e15dc95
+run_fingerprint=2da1a4364ab380dbc8267928595ada11d1e7066afc3ae80b589305055d44806c
+  COMFYMODAL_GOLDEN_PIPELINE=0
+  COMFYMODAL_V2_CHECKPOINT_PREWARM=0
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB=8
+  COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS=4
+  COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB=524288
+  COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES=268435456
+  COMFYMODAL_V2_CLIP_FASTSAFE_THREADS=8
+  COMFYMODAL_V2_CLIP_QD_READER=0
+  COMFYMODAL_V2_FAST_COLD_ORCHESTRATION=0
+  COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE=1
+  COMFYMODAL_V2_REQUEST_FASTSAFE=1
+  COMFYMODAL_V2_REQUEST_UNET_FASTSAFE=1
+  COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP=1
+  COMFYMODAL_V2_UNET_FASTSAFETENSORS=0
+  COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB=524288
+  COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES=268435456
+  COMFYMODAL_V2_UNET_FASTSAFE_THREADS=8
+
+====================================================================================================
+D. DEPLOYMENT (single owner R44E, ONE valid deploy, zero failed preflights)
+====================================================================================================
+
+[v2ctl.deploy] profile=r44-request-fastsafe deploy_fingerprint=8951dfd9b46dd7d9fd1b8627a17afa5447267395166da32db124c6d77e15dc95
+[v2ctl.deploy] command="...\deploy_and_run_v2_single.bat" E37_CLEAN_LANE_VALIDATION
+[v2ctl.deploy] exit=0 manifest=.v2ctl\deployments\deploy_20260823-214906_8951dfd9.json
+
+====================================================================================================
+E. GATE RESULT (the ONE paid cold request)
+====================================================================================================
+
+[v2ctl.gate] valid=1 manifest=.v2ctl\gates\gate_20260824-025048_2da1a436.json
+reasons: []
+backend_exit_code = 0
+request_id = "v2-benchmark-0-d5df02fd8dba"
+output_dir = "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-24_02-49-32"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+output_sha         = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"   (EXACT MATCH)
+provenance_validation_status = "validated"
+
+Run dir contents: campaign_manifest.json (1800 B) · run_0.json (621,926 B) · run_001_sample.json (420,506 B)
+                  · run_001_sample.json.v2ctl-provenance.json (26,144 B) · summary.json (11,834 B)
+
+====================================================================================================
+F. RUN ARTIFACT — identity / status / loader_selection / ledger (verbatim excerpts)
+====================================================================================================
+
+runtime_status = {"reasons": [], "status": "NOMINAL"}
+zero_gap = true ; canonical_ledger_status ok
+generation decisions (both runtime state and models):
+  {"decision": "skipped_generation_match", ... , "reload_models_ms": 0.0, "reload_runtime_state_ms": 0.0}
+loader_selection = {
+  "clip": {"requested": "fastsafetensors_direct_gpu", "effective": "fastsafetensors_direct_gpu",
+           "observed": "fastsafetensors_direct_gpu", "fallback_attempted": false},
+  "unet": {"requested": "fastsafetensors", "effective": "fastsafetensors",
+           "observed": "fastsafetensors", "fallback_attempted": false},
+  "vae":  {"requested": "native_comfy", "effective": "native_comfy",
+           "observed": "native_comfy", "fallback_attempted": false}
+}
+
+====================================================================================================
+G. R44E DURABLE FASTSAFE EVENTS (verbatim metadata from run_0.json trace events)
+====================================================================================================
+
+=== clip_fast_load_start  (mono_ns 215850074780) ===
+{
+ "paths": ["qwen_3_4b.safetensors"],
+ "device": "cuda:0",
+ "tensor_count_expected": 398,
+ "source_bytes_total": 8044982048,
+ "descriptor_wall_ms": 27.547
+}
+
+=== clip_fast_load_end  (mono_ns 220643321808) ===
+{
+ "ok": true,
+ "file_to_gpu_wall_ms": 2117.326,
+ "wall_ms": 4788.241,
+ "bind_ms": 2670.544,
+ "tensor_count": 398,
+ "source_bytes": 8044982048,
+ "device": "cuda:0",
+ "bind_mode": "copy_cuda",
+ "cuda_alloc_delta_bytes": 8044936192,
+ "owner_retained": true,
+ "owner_attach_count": 1,
+ "clip_device_ready": true,
+ "fastsafe_setup_wall_ms": 11.272,
+ "fastsafe_copy_wall_ms": 1934.712,
+ "fastsafe_get_keys_wall_ms": 0.018,
+ "fastsafe_get_tensor_loop_wall_ms": 0.317,
+ "descriptor_wall_ms": 27.547,
+ "descriptor_cache_hits": 0,
+ "cuda_allocated_before_bytes": 0,
+ "cuda_reserved_before_bytes": 0,
+ "cuda_allocated_after_fastsafe_bytes": 8044936192,
+ "cuda_reserved_after_fastsafe_bytes": 8046772224,
+ "cuda_allocated_after_construction_bytes": 8044936192,
+ "sampled_tensor_count": 8,
+ "sampled_same_storage_count": 0,
+ "sampled_non_same_storage_count": 8,
+ "seam_served_hits": 1,
+ "seam_passthrough_calls": 0
+}
+
+=== unet_source_prep_armed  (mono_ns 220658247886) ===
+{
+ "trigger": "clip_forward_start",
+ "armed_at_mono_ns": 220645216105,
+ "started": true,
+ "targeted_bytes": 12309866400,
+ "files": [{"path_basename": "z_image_turbo_bf16.safetensors", ...}]
+}
+
+=== unet_source_prep_joined  (mono_ns 225473454559) ===
+{
+ "join_start_mono_ns": 225472751458,
+ "join_end_mono_ns": 225472803237,
+ "join_wall_ms": 0.049,
+ "armed": true,
+ "joined": true,
+ "touched_bytes": 12309866400,
+ "read_count": 1468,
+ "stop_reason": "completed",
+ "finished_before_demand": true,
+ "source_fence_valid": true
+}
+
+=== unet_fastsafe_pipeline  (mono_ns 226216681202) ===
+{
+ "status": "ok",
+ "phase": "request",
+ "file_to_gpu_wall_ms": 624.6765,
+ "prepare_join_ms": 0.049,
+ "adopt_ms": 111.888,
+ "storage_identity_matched": 453,
+ "storage_identity_total": 453,
+ "owner_retained": true,
+ "ordering": "after_clip",
+ "fastsafe_setup_wall_ms": 3.8589,
+ "fastsafe_copy_wall_ms": 624.6765,
+ "fastsafe_instantiate_wall_ms": 0.3545,
+ "header_detect_wall_ms": 5.526,
+ "skeleton_wall_ms": 80.832,
+ "bind_wall_ms": 13.669,
+ "identity_validation_wall_ms": 11.839,
+ "gate_wait_ms": 1.089,
+ "copied_count": 0,
+ "bind_mode": "same_storage",
+ "final_validation_all_params_on_target": true,
+ "clip_forward_start_mono_ns": 220645206105,
+ "clip_forward_end_mono_ns": 225335086492,
+ "prep_armed_at_mono_ns": 220645216105,
+ "prep_start_mono_ns": 220645216105,
+ "prep_join_start_mono_ns": 225472751458,
+ "prep_join_end_mono_ns": 225472803237,
+ "unet_prep_overlap_ms": 4689.870387,
+ "unet_prep_overlap_pct_of_prep": 97.15,
+ "unet_prep_tail_at_forward_end_ms": 137.717,
+ "unet_prep_tail_at_demand_ms": 137.665
+}
+
+NOTE (honest disclosure): `unet_source_identity_resolved` is emitted at request-context creation,
+BEFORE the canonical RuntimeTrace is activated inside the method impl, so it remains diagnostics-only
+this cycle. Its effect IS durably proven by unet_source_prep_armed(trigger="clip_forward_start",
+targeted_bytes=12309866400) — the plan-derived identity reached the context and armed correctly.
+
+====================================================================================================
+H. CPU OWNER RECORDS (run_0.json, verbatim values incl. NEW R44E cuda delta fields)
+====================================================================================================
+
+{"operation": "load_models_gpu", "role": "CLIP", "wall_ms": 2283.612,
+ "cuda_allocated_delta_bytes": 8101709312, "cuda_reserved_delta_bytes": 8103395328, ...}
+{"operation": "CLIP.encode_from_tokens", "role": "CLIP", "wall_ms": 4628.329,
+ "cuda_allocated_delta_bytes": 8135263744, "cuda_reserved_delta_bytes": 8342470656, ...}
+{"operation": "CLIPTextEncode", "role": "CLIP", "wall_ms": 4691.791,
+ "cuda_allocated_delta_bytes": 8135263744, "cuda_reserved_delta_bytes": 8342470656, ...}
+{"operation": "load_models_gpu", "role": "other", "wall_ms": 48.366,
+ "cuda_allocated_delta_bytes": 4096, "cuda_reserved_delta_bytes": -205520896, ...}
+{"operation": "load_models_gpu", "role": "other", "wall_ms": 61.369,
+ "cuda_allocated_delta_bytes": 173819392, "cuda_reserved_delta_bytes": -1990197248, ...}
+
+====================================================================================================
+I. TRACE ROWS / SPANS (verbatim, run_0.json)
+====================================================================================================
+
+{"name": "UNET H2D", "lane": "GPU", "start_mono_ns": 225474623207, "end_mono_ns": 226216409280,
+ "duration_ms": 741.786}
+{"name": "CLIP forward", "lane": "GPU", "start_mono_ns": 223003152658, "end_mono_ns": 225333650417,
+ "duration_ms": 2330.498}   [inner span]
+
+clean_lane_proof.ordering = {"restore_return_ns": 215066628997, "plan_identity_complete_ns": 215140571556,
+ "forward_start_ns": 223003452970, "forward_end_ns": 225333195354}
+
+clip_forward_end (model_preload inner span):
+{"duration_ms": 2330.498, "thread_cpu_ms": 1310.0, "process_cpu_ms": 6110.0,
+ "cuda_no_sync": true, "cuda_allocated_before_bytes": 16146645504,
+ "cuda_allocated_after_bytes": 16180199936, "cuda_allocated_delta_bytes": 33554432,
+ "cuda_reserved_before_bytes": 16150167552, "cuda_reserved_after_bytes": 16389242880,
+ "cuda_reserved_delta_bytes": 239075328, "status": "ok"}
+
+clip_raw_encode_start/end (encode_from_tokens span):
+start mono 220709040679 → end mono 225334422182, duration_ms 4625.382,
+thread_cpu 3440.0, process_cpu 14520.0
+
+clip_forward_end (request_clip_fastsafe OUTER wrapper — NOW DURABLE):
+{"ok": true, "wall_ms": 4689.879, "allocated_delta_bytes": 8135263744,
+ "reserved_delta_bytes": 8342470656, "model_sized_migration_detected": false}
+
+====================================================================================================
+J. t4–t8 EPOCH STAGES (run_001_sample.json, verbatim)
+====================================================================================================
+
+t4_clip_load_start   1787539812.8237977
+t4_clip_load_end     1787539817.6493337          → CLIP node 4825.536 ms
+t5_text_encode_start 1787539817.6493337
+t5_text_encode_end   1787539822.3402803          → encode window 4690.947 ms
+t4b_unet_load_start  1787539822.4019117
+t4b_unet_load_end    1787539823.2214065          → UNET node 819.495 ms
+t4c_vae_load_start   1787539812.497131
+t4c_vae_load_end     1787539812.8215199          → VAE load 324.389 ms
+t6_sampler_start     1787539824.748089
+t6_sampler_end       1787539828.475485           → sampling 3727.396 ms
+t7_vae_decode_start  1787539829.1253858
+t7_vae_decode_end    1787539829.619716           → VAE decode 494.346 ms
+
+summary.json: wall_ms 59169.2 · command_to_response_ms 74363.8 · restore_total_ms 818.357
+              pre_sampler_ms 12519.213 · sampler_ms 3727.396 · vae_decode_ms 494.346
+
+final_reconciled_waterfall stages (duration_ms):
+local_preparation 15101.843 · modal_handle_submission 2595.729 · modal_scheduling 34232.862
+pre_python_snapshot_restore 1804.195 · application_restore 905.965 · restore_to_method_entry 49.866
+remote_method_setup 109.956 · prompt_executor_cache_setup 263.623 (derived)
+pre_sampler_execution 10793.307 (derived) · sampler_node_to_sampling 1461.501
+sampling 3727.396 · post_sampling_transition 649.850 · vae 494.346
+output_persistence 363.472 · remote_local_return 16.0
+
+====================================================================================================
+K. CLOCK ANCHOR (epoch↔mono, this run)
+====================================================================================================
+
+clip_fast_load_start: wall_unix_ns 1787539812854493346 ↔ monotonic_ns 215850074780
+A = wall_ns − mono_ns = 1787539597004418566
+Example: t4b_unet_load_start epoch 1787539822.4019117 s → mono 225397493134 ns
+
+====================================================================================================
+L. STOP-RULE COMPLIANCE
+====================================================================================================
+
+Exactly ONE valid deployment (first attempt, exit 0). Exactly ONE paid cold request (gate above).
+No tuning, no second request, no cohort, no post-gate code changes, no commits/pushes/resets.
+All paid work stopped immediately after gate valid=1.
+
+— R44E raw log end —

@@ -492,6 +492,27 @@ def normalize_webp_lossless_compression(value: Any) -> str:
     return raw
 
 
+# R42 reconciliation: E40-layer comfyapp imports this encoder-effort mapper.
+# The E2D targeted patch was excluded from the reconciliation copy, but this
+# single symbol (plus its two constants) is part of comfyapp's import contract.
+WEBP_EFFORT_METHODS = {"fast": 0, "balanced": 4, "max": 6}
+DEFAULT_WEBP_EFFORT = "balanced"
+
+
+def resolve_webp_pillow_method(effort: Any) -> int:
+    """Map an encoder-effort label to the Pillow/libwebp method integer.
+
+    Single source of truth for both WebP save seams (direct tensor sink and
+    byte converter).  Unknown values fall back to the historical balanced
+    method so behavior never silently drifts from the pre-E2D encoder.
+    """
+    try:
+        normalized = normalize_webp_lossless_compression(effort)
+    except ValueError:
+        normalized = DEFAULT_WEBP_EFFORT
+    return WEBP_EFFORT_METHODS[normalized]
+
+
 def normalize_output_conversion_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
     """Normalize the serializable output codec contract once at its boundary."""
     source = dict(value) if isinstance(value, Mapping) else {}

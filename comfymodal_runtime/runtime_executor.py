@@ -1975,8 +1975,10 @@ class _CpuTimer:
     __slots__ = (
         "operation", "role",
         "_wall_start", "_cpu_start", "_threads_start",
+        "_cuda_alloc_start", "_cuda_reserved_start",
         "_peak_sampler", "_lock",
         "_cutoff_ns", "_cutoff_wall", "_cutoff_cpu", "_cutoff_threads",
+        "_wall_start_mono", "caller",
     )
 
     def __init__(self, operation: str, role: str) -> None:
@@ -1985,17 +1987,42 @@ class _CpuTimer:
         self._wall_start: int = 0
         self._cpu_start: int = 0
         self._threads_start: int = 0
+        self._cuda_alloc_start: int | None = None
+        self._cuda_reserved_start: int | None = None
         self._peak_sampler = _PeakThreadSampler()
         self._lock = threading.Lock()
         self._cutoff_ns: int | None = None
         self._cutoff_wall: int = 0
         self._cutoff_cpu: int = 0
         self._cutoff_threads: int = 0
+        self._wall_start_mono: int = 0
+        self.caller: str = ""
+
+    @staticmethod
+    def _cuda_memory_readings() -> tuple[int | None, int | None]:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return None, None
+            return (
+                int(torch.cuda.memory_allocated()),
+                int(torch.cuda.memory_reserved()),
+            )
+        except Exception:
+            return None, None
 
     def __enter__(self) -> "_CpuTimer":
         self._wall_start = time.perf_counter_ns()
+        # R44H2: mono-domain start stamp (same clock as trace events) so the
+        # CPU-owner record lands on the canonical monotonic timeline.
+        try:
+            self._wall_start_mono = time.monotonic_ns()
+        except Exception:
+            self._wall_start_mono = 0
         self._cpu_start = time.process_time_ns()
         self._threads_start = _read_native_thread_count()
+        self._cuda_alloc_start, self._cuda_reserved_start = self._cuda_memory_readings()
         self._peak_sampler.start(self._threads_start)
         with _active_cpu_timers_lock:
             _active_cpu_timers.append(self)
@@ -2071,6 +2098,30 @@ class _CpuTimer:
             "native_threads_peak": peak,
             "native_threads_end": threads_end,
         }
+        # R44H2: mono start/end stamps + caller classification (additive;
+        # the parseable [v2.cpu_owner] line format is unchanged).
+        if self._wall_start_mono:
+            data["start_mono_ns"] = int(self._wall_start_mono)
+            data["end_mono_ns"] = int(
+                self._wall_start_mono + int(wall_end_ns - self._wall_start)
+            )
+        caller = getattr(self, "caller", "") or ""
+        if caller:
+            data["caller"] = str(caller)
+
+        # R44E: CUDA allocation/reserved deltas across the operation
+        # (answers "did load_models_gpu allocate/copy model-sized memory?").
+        alloc_end, reserved_end = self._cuda_memory_readings()
+        if (
+            self._cuda_alloc_start is not None
+            and alloc_end is not None
+        ):
+            data["cuda_allocated_delta_bytes"] = alloc_end - self._cuda_alloc_start
+        if (
+            self._cuda_reserved_start is not None
+            and reserved_end is not None
+        ):
+            data["cuda_reserved_delta_bytes"] = reserved_end - self._cuda_reserved_start
 
         # 5. Store in instrumentation state for structured report
         _state = _instrumentation_var.get()
@@ -2088,6 +2139,7 @@ def _emit_cpu_owner_line(data: dict[str, Any]) -> None:
         "operation", "role", "wall_ms", "process_cpu_ms",
         "effective_cores", "native_threads_start",
         "native_threads_peak", "native_threads_end",
+        "cuda_allocated_delta_bytes", "cuda_reserved_delta_bytes",
     )
     for f in fields:
         parts.append(f"{f}={_fmt_or_absent(data.get(f))}")
@@ -2172,6 +2224,27 @@ def _attach_structured_report(result: dict[str, Any], state: dict[str, Any]) -> 
     clip_calls = state.get("_clip_raw_encode_calls", [])
     if clip_calls:
         structured["clip_raw_encode_calls"] = list(clip_calls)
+    # ── R42A: first-class Golden conditioning-miss proof on the canonical
+    # axis.  A raw CLIP encode call exists ONLY when the conditioning cache
+    # did not serve the request, so the measured call count IS the miss
+    # evidence.  Emitted here (where the per-call breakdown is finalized) so
+    # both the full run record AND the thin v2ctl sample projection carry a
+    # machine-checkable decision event.
+    try:
+        from comfymodal_runtime.critical_path_ledger import record_event as _ledger_event
+
+        _cond_calls = len(clip_calls)
+        _ledger_event(
+            "clip_conditioning_cache_decision",
+            mono_ns=time.monotonic_ns(),
+            metadata={
+                "decision": "forced_miss" if _cond_calls > 0 else "no_raw_encode",
+                "encode_calls": _cond_calls,
+                "source": "pre_sampler_structured_report",
+            },
+        )
+    except Exception:
+        pass
 
     load_calls = state.get("_load_model_calls", [])
     if load_calls:
@@ -2742,6 +2815,28 @@ def install_pre_sampler_hooks() -> None:
                     state["sampler_node_id"] = node_id
                     state["sampler_class_type"] = node_class
 
+                # ── R44H2: sampler post-loop tail closure + durable boundary
+                # events.  Uses the TRUE node return (_t_end, never the
+                # cutoff-clipped _end_perf).  Timestamp-only; no sync.
+                if _is_sampler and state.get("sampler_node_id") == node_id:
+                    try:
+                        from comfymodal_runtime import sampler_telemetry as _stel
+                        _stel.finish_sampler_tail(
+                            _t_end,
+                            time.monotonic_ns(),
+                            output_tensor_count=(
+                                len(_result)
+                                if isinstance(_result, (tuple, list))
+                                else (1 if _result is not None else None)
+                            ),
+                        )
+                        from comfymodal_runtime.model_preload import (
+                            _ACTIVE_REQUEST_TRACE as _art_tail,
+                        )
+                        _stel.emit_durable_events(_art_tail.get())
+                    except Exception:
+                        pass
+
                 # Model loader tracking (first occurrence)
                 if _is_model_loader and "model_load_ns" not in state:
                     state["model_load_ns"] = _t0
@@ -2778,12 +2873,44 @@ def install_pre_sampler_hooks() -> None:
             # Extract models for role classification
             _models = args[0] if len(args) > 0 else kwargs.get("models", [])
 
+            # ── R44H2: sampler telemetry seam ─────────────────────────────
+            # (a) stamps every load_models_gpu call (mono start/end + caller,
+            #     including the post-cutoff VAE-decode call the cutoff path
+            #     previously dropped entirely), and (b) when the caller is
+            #     the sampler's own internal model-management call, installs
+            #     the authoritative SAMPLER_SAMPLE timing wrapper + first-
+            #     forward probe on the EXACT patcher about to be sampled
+            #     (idempotent; restores R44E-lost sampling_start durability).
+            _stel_entry_mono = 0
+            try:
+                from comfymodal_runtime import sampler_telemetry as _stel
+                _stel_entry_mono = _stel.note_load_models_gpu_enter(
+                    _models, _load_node_class
+                )
+            except Exception:
+                _stel_entry_mono = 0
+
             # ── Hard cutoff check ──────────────────────────────────────────
             _cutoff_ns = _sampling_cutoff_perf_ns.get()
             _t0 = time.perf_counter_ns()
             if _cutoff_ns is not None and _t0 >= _cutoff_ns:
-                # Entirely post-cutoff — skip instrumentation, no record
-                return _orig_load_models(*args, **kwargs)
+                # Entirely post-cutoff — skip pre-sampler instrumentation and
+                # the CPU-owner record (metric-clipping semantics unchanged),
+                # but still persist mono stamps so the VAE-decode
+                # load_models_gpu keeps its timestamps (R44G3 item 6).
+                _result_pc = _orig_load_models(*args, **kwargs)
+                try:
+                    if _stel_entry_mono:
+                        from comfymodal_runtime import sampler_telemetry as _stel
+                        _stel.note_load_models_gpu_exit(
+                            _stel_entry_mono,
+                            roles=",".join(
+                                sorted(_model_role_from_patcher(_m) for _m in _models)
+                            ) if _models else "other",
+                        )
+                except Exception:
+                    pass
+                return _result_pc
 
             # Classify roles before timing (deterministic sorted comma-separated)
             _load_roles: list[str] = []
@@ -2794,11 +2921,20 @@ def install_pre_sampler_hooks() -> None:
             _roles_str = ",".join(sorted(_load_roles))
 
             _cpu_timer_load = _CpuTimer("load_models_gpu", _roles_str)
+            _cpu_timer_load.caller = (
+                _load_node_class or ""
+            )  # R44H2: caller classification on the CPU-owner record
             _cpu_timer_load.__enter__()
             try:
                 return _orig_load_models(*args, **kwargs)
             finally:
                 _cpu_timer_load.__exit__()
+                try:
+                    if _stel_entry_mono:
+                        from comfymodal_runtime import sampler_telemetry as _stel
+                        _stel.note_load_models_gpu_exit(_stel_entry_mono, roles=_roles_str)
+                except Exception:
+                    pass
                 _elapsed = _ns_ms(_t0)
 
                 # Clip if cutoff fired mid-operation
@@ -4699,6 +4835,37 @@ def _build_sampling_wrapper() -> Callable:
             "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
             "diffusion_model_device": start_meta.get("diffusion_model_device", ""),
         })
+        # ── R44H2: durable request-scoped capture of the TRUE sampling
+        # start (R44G3 gap: the event must survive into the canonical
+        # artifact even when downstream sinks miss it).
+        try:
+            from comfymodal_runtime import sampler_telemetry as _stel
+            _latent_ref = args[5] if len(args) > 5 else kwargs.get("latent_image")
+            _stel.note_sampling_start(
+                int(getattr(_sampling_start_event, "monotonic_ns", 0) or time.monotonic_ns()),
+                int(getattr(_sampling_start_event, "wall_unix_ns", 0) or 0),
+                node_id=node_id,
+                steps=steps,
+                request_id=str(trace.request_id),
+                sigmas_len=(int(len(sigmas)) if sigmas is not None and hasattr(sigmas, "__len__") else None),
+                latent_dtype=str(getattr(_latent_ref, "dtype", "") or ""),
+                latent_device=str(getattr(_latent_ref, "device", "") or ""),
+                default_dtype=str(
+                    ((getattr(sampler_self, "model_options", None) or {}).get("default_dtype", "") or "")
+                ),
+            )
+        except Exception:
+            pass
+        # ── R42A: close the measured post-UNET-ready native-I/O window at the
+        # authoritative sampling-start boundary (idempotent; bridge-side
+        # first_sampler_step is the backup closer).
+        try:
+            from comfymodal_runtime import golden_runtime_bridge as _grb_win
+            _win_ctx = _grb_win.enabled_current()
+            if _win_ctx is not None:
+                _win_ctx.end_native_io_window("sampling_start")
+        except Exception:
+            pass
         # ── E29: sampling span opened on the canonical axis ──────────────
         # The trace-event bridge pairs this start with the authoritative
         # sampling_end (closed in the wrapper finally) into one ledger span.
@@ -4827,6 +4994,16 @@ def _build_sampling_wrapper() -> Callable:
 
         def _step_callback(*cb_args: Any, **cb_kwargs: Any) -> Any:
             nonlocal _first_step_fired
+            # ── R44H2: per-step tick telemetry (timestamp-only, negligible
+            # for the 8-step cohort; compact array persisted once).
+            try:
+                from comfymodal_runtime import sampler_telemetry as _stel
+                _stel.note_progress_tick(
+                    step=(cb_args[0] if cb_args else None),
+                    source="wrapper_callback",
+                )
+            except Exception:
+                pass
             if _deep_profile is not None:
                 try:
                     # Feed every callback index (including the final teardown
@@ -4987,6 +5164,16 @@ def _build_sampling_wrapper() -> Callable:
                     "diffusion_model_object_id": start_meta.get("diffusion_model_object_id", ""),
                 })
                 _sampler_boundary_line("sampling_end", _end_meta)
+                # ── R44H2: capture the wrapper sampling_end instant so the
+                # prep-phase boundary chain stays closed even when the tail
+                # seam is the only remaining reporter.
+                try:
+                    from comfymodal_runtime import sampler_telemetry as _stel
+                    _stel.note_sampling_end(
+                        int(getattr(_sampling_end_event, "monotonic_ns", 0) or time.monotonic_ns())
+                    )
+                except Exception:
+                    pass
             except Exception:
                 _sampling_end_event = None
                 try:

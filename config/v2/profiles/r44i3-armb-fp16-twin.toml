@@ -1,0 +1,23 @@
+# v2ctl profile: R44I3 ARM B — FP16 volume-twin same-storage CLIP residency.
+# Extends r44-request-fastsafe: identical workload/transport/UNET controls;
+# only the CLIP residency arm differs (preconverted FP16 twin on the models
+# volume, parity same_storage_assign bind, zero conversion).  ARM A lives in
+# the base profile via COMFYMODAL_V2_CLIP_SAME_DTYPE_RESIDENCY=1.
+schema_version = 1
+name = "r44i3-armb-fp16-twin"
+extends = "r44-request-fastsafe"
+owner = "R44I3"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+COMFYMODAL_V2_CLIP_SAME_DTYPE_RESIDENCY = "0"
+COMFYMODAL_V2_CLIP_FP16_VOLUME_TWIN = "1"

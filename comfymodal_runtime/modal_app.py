@@ -3167,6 +3167,22 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": os.environ.get(
             "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET", "0"
         ),
+        # ── R42 Golden pipeline passthroughs ──────────────────────────────
+        # Same silent-drop hazard: without these explicit entries the
+        # container runs with the Golden pipeline disabled / ledger off /
+        # strict proof off no matter what the profile resolved.
+        "COMFYMODAL_GOLDEN_PIPELINE": os.environ.get(
+            "COMFYMODAL_GOLDEN_PIPELINE", "0"
+        ),
+        "COMFYMODAL_V2_CRITICAL_PATH_LEDGER": os.environ.get(
+            "COMFYMODAL_V2_CRITICAL_PATH_LEDGER", "0"
+        ),
+        "COMFYMODAL_V2_E37_STRICT_PROOF": os.environ.get(
+            "COMFYMODAL_V2_E37_STRICT_PROOF", "0"
+        ),
+        "COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH": os.environ.get(
+            "COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH", "0"
+        ),
         # Snapshot-construction marker (deploy-time only).  Explicit
         # passthrough so the construction container activates the
         # content-verified custom-node generation reconciliation and emits the
@@ -3448,6 +3464,31 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": os.environ.get(
             "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE", "0"
         ),
+        # R44 request-time FastSafe activation keys (R44D boundary fix).
+        # These MUST cross the Modal class-env boundary: without this
+        # passthrough the container resolves them to the config-authority
+        # default "0" and the whole request_fastpath lane silently
+        # disengages (R44C gate evidence).  Defaults preserve "off".
+        "COMFYMODAL_V2_REQUEST_FASTSAFE": os.environ.get(
+            "COMFYMODAL_V2_REQUEST_FASTSAFE", "0"
+        ),
+        "COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE": os.environ.get(
+            "COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE", "0"
+        ),
+        "COMFYMODAL_V2_REQUEST_UNET_FASTSAFE": os.environ.get(
+            "COMFYMODAL_V2_REQUEST_UNET_FASTSAFE", "0"
+        ),
+        "COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP": os.environ.get(
+            "COMFYMODAL_V2_REQUEST_UNET_SOURCE_PREP", "0"
+        ),
+        # R44F native zero-copy CLIP adoption (meta skeleton + assign-style
+        # bind of the served FastSafe CUDA tensors).  Same boundary rule as
+        # the R44D activation keys: must cross the Modal class env or the
+        # container resolves it to "0" and the R44E copy-mode producer wins.
+        # Default "0" preserves proven behavior everywhere else.
+        "COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE_NATIVE_ADOPT": os.environ.get(
+            "COMFYMODAL_V2_REQUEST_CLIP_FASTSAFE_NATIVE_ADOPT", "0"
+        ),
         # E31 forward forensics is deploy-baked and must be mirrored into the
         # request container; otherwise its import-time default silently wins.
         "COMFYMODAL_V2_E31_FORENSICS": os.environ.get(
@@ -3531,6 +3572,24 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
+    # ── R44I3: GENERIC namespace passthrough (bug-class fix) ────────────
+    # Every COMFYMODAL_V2_* / COMFYMODAL_WARMUP_* variable present in the
+    # DEPLOY-TIME process environment now crosses the Modal class-env
+    # boundary automatically.  The deploy child environment is already
+    # sanitized by v2ctl's EnvironmentBuilder: ambient host vars are never
+    # copied, so anything present here arrived through the canonical
+    # channel (profile TOML / --set / --inherit) and is safe to forward.
+    # This eliminates the recurring "new flag works locally but silently
+    # defaults to off in the container" failure class (R44D, R44F, R44I3
+    # all hit it); the explicit entries above remain as documented
+    # defaults for keys absent from the environment.
+    for _ns_key, _ns_val in os.environ.items():
+        if _ns_key in env:
+            continue
+        if _ns_key.startswith("COMFYMODAL_V2_") or _ns_key.startswith(
+            "COMFYMODAL_WARMUP_"
+        ):
+            env[_ns_key] = _ns_val
     return env
 
 
@@ -9130,7 +9189,21 @@ class ModalRuntimeEntrypoint:
                         _dp_baked_mft = {}
                     _dp_baked_gen = str(_dp_baked_mft.get("production_custom_node_generation", "") or "")
                     _dp_observed_gen = str(getattr(state, "custom_node_generation", "") or "")
-                    _dp_gen_ok = bool(_dp_baked_gen and _dp_observed_gen and _dp_baked_gen == _dp_observed_gen)
+                    # ── R42 generation-determinism reconciliation ──────────
+                    # The volume-synced observed generation is the
+                    # deployment-authoritative custom-node content identity
+                    # (v2ctl republishes the volume on every deploy).  The
+                    # image-baked manifest generation is a stale build
+                    # artifact whenever code deploys outrun image builds, so
+                    # requiring baked==observed made the deployment proof
+                    # permanently incomplete (plan fast path could never
+                    # consume).  Keep baked equality as DIAGNOSTIC only —
+                    # mirroring the registry_fingerprint demotion above —
+                    # never an eligibility blocker.
+                    _dp_baked_generation_match = bool(
+                        _dp_baked_gen and _dp_observed_gen and _dp_baked_gen == _dp_observed_gen
+                    )
+                    _dp_gen_ok = bool(_dp_observed_gen)
                     _dp_dep_hash = str(_V2_DEPLOYMENT_COMBINED_HASH or "")
                     if not _dp_dep_hash:
                         _dp_dep_hash = str(getattr(state, "deployment_combined_hash", "") or "")
@@ -9194,8 +9267,8 @@ class ModalRuntimeEntrypoint:
                     _dp_missing = []
                     if not _dp_dep_hash:
                         _dp_missing.append("deployment_hash_unavailable")
-                    if not _dp_baked_gen:
-                        _dp_missing.append("baked_generation_unavailable")
+                    if not _dp_observed_gen:
+                        _dp_missing.append("observed_generation_unavailable")
                     if not _dp_gen_ok:
                         _dp_missing.append("generation_mismatch")
                     if not _dp_reg_fp:
@@ -9215,13 +9288,17 @@ class ModalRuntimeEntrypoint:
                     if not _dp_dep_identity:
                         _dp_missing.append("dependency_identity_unavailable")
                     _dp_complete = bool(
-                        _dp_dep_hash and _dp_baked_gen and _dp_gen_ok and _dp_reg_fp
+                        _dp_dep_hash and _dp_observed_gen and _dp_gen_ok and _dp_reg_fp
                         and _dp_manifest_complete and _dp_dep_identity
                     )
                     _dp_proof = {
                         "schema_version": DEPLOYMENT_PROOF_SCHEMA_VERSION,
                         "deployment_combined_hash": _dp_dep_hash,
-                        "custom_nodes_generation": _dp_baked_gen,
+                        # Authoritative custom-node content identity = the
+                        # volume-synced observed generation (see above).
+                        "custom_nodes_generation": _dp_observed_gen,
+                        "baked_custom_node_generation": _dp_baked_gen,
+                        "baked_generation_match": _dp_baked_generation_match,
                         "generation_matches_observed": _dp_gen_ok,
                         "registry_fingerprint": _dp_reg_fp,
                         "registry_manifest": _dp_reg_manifest,
@@ -9243,7 +9320,9 @@ class ModalRuntimeEntrypoint:
                         f"[v2.deployment_proof] schema={DEPLOYMENT_PROOF_SCHEMA_VERSION} "
                         f"complete={_dp_complete} reason={_dp_proof['invalid_reason'] or 'ok'} "
                         f"dep_hash={_dp_dep_hash[:16] if _dp_dep_hash else '<empty>'} "
+                        f"observed_gen={_dp_observed_gen[:16] if _dp_observed_gen else '<empty>'} "
                         f"baked_gen={_dp_baked_gen[:16] if _dp_baked_gen else '<empty>'} "
+                        f"baked_match={int(_dp_baked_generation_match)} "
                         f"gen_ok={int(_dp_gen_ok)} reg_fp={bool(_dp_reg_fp)} "
                         f"dep_identity={bool(_dp_dep_identity)} repair_mode={_dp_repair_mode or 'n/a'} "
                         f"manifest_error={_dp_manifest_error_diag or 'none'}",
@@ -9787,24 +9866,6 @@ class ModalRuntimeEntrypoint:
             metadata={"status": "skipped", "reason": "vae_not_part_of_cpu_snapshot", "duration_ms": 0.0},
         )
 
-        # ── Snapshot-build manifest (diagnostic only; default off) ────────
-        # Record the full process state Modal is about to serialize into the
-        # memory snapshot: RSS/mappings/modules/threads/fds/GC/retained
-        # models/executors + image identity.  Never enabled on measured
-        # latency runs; only shadow diagnostic deployments set the gate.
-        try:
-            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                from .snapshot_build_manifest import capture_snapshot_manifest
-                _manifest_record = capture_snapshot_manifest(
-                    "before_capture",
-                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
-                    extra={"lifecycle": "startup", "snap": "True"},
-                )
-                if isinstance(_manifest_record, dict):
-                    _restore_timing["snapshot_manifest"] = _manifest_record
-        except Exception:
-            pass
-
         # ── Restore-memory experiment: freeze snapshot GPU capacity ────────
         # The restore_memory_arm lane (parallel change) may freeze the
         # GPU-capacity snapshot at build time so restore-time VRAM accounting
@@ -9815,6 +9876,18 @@ class ModalRuntimeEntrypoint:
             maybe_freeze_snapshot_gpu_capacity()
         except Exception:
             pass
+
+        # ── Snapshot quiescence proof (fail closed) ───────────────────────
+        # This is unconditional: the callback must not return a snapshot-ready
+        # state while conditioning-cache or registered executor work is live.
+        from .snapshot_capture_hygiene import prove_snapshot_quiescence
+        _snapshot_quiescence = prove_snapshot_quiescence()
+        _restore_timing["snapshot_quiescence"] = _snapshot_quiescence
+        if not _snapshot_quiescence.get("proven", False):
+            raise RuntimeError(
+                "snapshot capture quiescence could not be proven: "
+                f"{_snapshot_quiescence}"
+            )
 
         # ── Runtime-state construction baseline (Batch B) ────────────────
         # Freeze generation + content manifest AFTER every correctness-
@@ -9829,6 +9902,26 @@ class ModalRuntimeEntrypoint:
             )
             if _rs_baseline:
                 _restore_timing["runtime_state_generation_baseline"] = _rs_baseline
+        except Exception:
+            pass
+
+        # ── Snapshot-build manifest (diagnostic only; default off) ────────
+        # Record the full process state Modal is about to serialize into the
+        # memory snapshot: RSS/mappings/modules/threads/fds/GC/retained
+        # models/executors + image identity + the quiescence proof.  Never
+        # enabled on measured latency runs; only shadow diagnostic deployments
+        # set the gate.
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_build_manifest import capture_snapshot_manifest
+                _manifest_record = capture_snapshot_manifest(
+                    "before_capture",
+                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
+                    extra={"lifecycle": "startup", "snap": "True"},
+                    quiescence=_snapshot_quiescence,
+                )
+                if isinstance(_manifest_record, dict):
+                    _restore_timing["snapshot_manifest"] = _manifest_record
         except Exception:
             pass
 
@@ -10144,12 +10237,53 @@ class ModalRuntimeEntrypoint:
             _ledger_identity(
                 request_id=_restore_ledger_rid,
                 restored_instance_id=getattr(self, "_restored_instance_id", "") or "",
-                restore_session_id=getattr(self, "_restore_session_id", "") or "",
-                container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+                restore_session_id=getattr(self, "_restore_session_id", "") or "",                container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
             )
             _ledger_event("modal_restore_entry", mono_ns=remote_python_resume_mono_ns)
         except Exception:
             pass
+        # ── R42: Golden context must exist at RESTORE entry ────────────────
+        # The Golden timeline starts at RESTORE_READY (CLIP QD4 is a
+        # restore-phase transport): the restore preload consults the per-run
+        # context, so seeding it only at request entry was too late — CLIP
+        # silently took the native path and every loader stayed unobserved.
+        # Idempotent: request-entry seeding reuses this same context.
+        try:
+            from . import golden_runtime_bridge as _grb_restore
+
+            _restore_gctx = _grb_restore.ensure_current()
+            print(
+                "[v2.golden_envelope] restore_ctx="
+                + ("published" if _restore_gctx is not None else "disabled"),
+                flush=True,
+            )
+            # ── R42: install the Golden wrapper chain here ─────────────────
+            # The model_preload wrapper sites are lane/instrumentation paths
+            # that never execute on the MINIMAL_RESTORE request flow; without
+            # this install the load_torch_file / load_diffusion_model /
+            # load_models_gpu golden branches are structurally unreachable.
+            if _restore_gctx is not None:
+                try:
+                    from comfymodal_runtime import model_preload as _mp_restore
+
+                    _wr = _mp_restore._ensure_core_wrappers()
+                    print(
+                        "[v2.golden_envelope] core_wrappers="
+                        + ",".join(f"{k}={v}" for k, v in sorted(_wr.items())),
+                        flush=True,
+                    )
+                except Exception as _wr_exc:
+                    print(
+                        "[v2.golden_envelope] core_wrappers=error:"
+                        f"{type(_wr_exc).__name__}:{str(_wr_exc)[:120]}",
+                        flush=True,
+                    )
+        except Exception as _golden_restore_exc:
+            print(
+                "[v2.golden_envelope] restore_ctx=seed_error "
+                f"error={type(_golden_restore_exc).__name__}:{str(_golden_restore_exc)[:120]}",
+                flush=True,
+            )
         # ── E29: restore-decomposition span holders (always defined) ─────
         # Initialized to None so every early close-site is safe even before
         # the creation block below (which opens the actual spans) runs.
@@ -13574,6 +13708,17 @@ class ModalRuntimeEntrypoint:
 
         wait_for_preload = getattr(api, "_wait_for_restore_preload_before_request", None)
         if callable(wait_for_preload):
+            # ── R42 Golden: restore_ready proof into the Golden timeline ──
+            # Emitted immediately BEFORE the restore-preload phase begins so
+            # the Golden scheduler transitions PHASE1 -> PHASE2 (CLIP QD load
+            # becomes legal).  Fail-closed: never blocks or raises here.
+            try:
+                from .golden_runtime_bridge import current as _golden_current
+                _golden_ctx_rr = _golden_current()
+                if _golden_ctx_rr is not None and _golden_ctx_rr.enabled:
+                    _golden_ctx_rr.on_restore_ready()
+            except Exception:
+                pass
             trace.emit("legacy_preload_check_start", phase="execution")
             wait_for_preload(workflow)
             trace.emit("legacy_preload_check_end", phase="execution")
@@ -14421,6 +14566,28 @@ class ModalRuntimeEntrypoint:
                                         "node_id": _node_str,
                                         "node_class": _class_node,
                                     })
+                                    # ── R42 Golden M-03: VAE decode demand join ──
+                                    # Consult the Golden VAE owner BEFORE the
+                                    # native decode: JOINED/ALREADY_READY means
+                                    # the Golden QD load produced the payload
+                                    # (observed golden_qd4); ADOPTED/FAILED/
+                                    # TIMEOUT degrades to the native decode —
+                                    # never nominal.  Fail-closed: any bridge
+                                    # error leaves the native decode untouched.
+                                    try:
+                                        from .golden_runtime_bridge import current as _golden_current
+                                        _golden_ctx_vae = _golden_current()
+                                        if _golden_ctx_vae is not None and _golden_ctx_vae.enabled:
+                                            _vae_decision, _vae_owner = _golden_ctx_vae.join_vae(30.0)
+                                            if str(getattr(_vae_decision, "value", _vae_decision)) in (
+                                                "already_ready", "joined",
+                                            ):
+                                                from . import loader_selection as _ls_golden
+                                                _ls_golden.record_observed("vae", "golden_qd4")
+                                            else:
+                                                _golden_ctx_vae.add_degradation("golden_qd_fallback:vae")
+                                    except Exception:
+                                        pass
                                 # VAE end: when a different node or None executes after VAEDecode
                                 # (before or independently of output encode check).
                                 if ("vae_decode_started" in _milestones and "vae_decode_ended" not in _milestones
@@ -14783,22 +14950,65 @@ class ModalRuntimeEntrypoint:
             _first_loader_node_ns = _milestones.get("first_loader_node_ns") if _milestones else None
             _first_clip_ns = _milestones.get("first_clip_encode_node_ns") if _milestones else None
             _first_sampler_ns = _milestones.get("first_sampler_node_ns") if _milestones else None
-            # Fix 3: authoritative sampling_start from SAMPLER_SAMPLE wrapper (not progress).
+            # Fix 3 + R44I2: authoritative sampling_start resolution order —
+            # direct sampler-call boundary (store) > SAMPLER_SAMPLE wrapper
+            # event > request-scoped store capture > first-progress milestone
+            # (explicitly labeled PROXY).  TRUE sources always beat the proxy;
+            # deferred-emitted events carry their TRUE stamp in metadata.
             _sampling_start_ns: int | None = None
+            _found_sampling_start_event = False
+            _sampling_start_event_mono: int | None = None
+            _sampling_start_event_src = ""
             _sampler_node_id = ""
             _sampler_class_type = ""
             _sampler_identification_source = "unavailable"
             for _ev in trace.events:
                 if _ev.name == "sampling_start":
-                    _sampling_start_ns = _ev.monotonic_ns
                     _sampling_meta = _ev.metadata if isinstance(_ev.metadata, Mapping) else {}
+                    if str(_sampling_meta.get("emission") or "") == "deferred_boundary":
+                        _deferred_mono = int(_sampling_meta.get("mono_ns") or 0)
+                        _sampling_start_event_mono = _deferred_mono or int(
+                            getattr(_ev, "monotonic_ns", 0) or 0
+                        )
+                    else:
+                        _sampling_start_event_mono = int(getattr(_ev, "monotonic_ns", 0) or 0)
+                    _sampling_start_event_src = (
+                        str(_sampling_meta.get("source") or "") or "authoritative_wrapper"
+                    )
+                    _found_sampling_start_event = True
                     _sampler_node_id = str(_sampling_meta.get("node_id") or "")
                     _sampler_class_type = str(_sampling_meta.get("node_class") or "")
                     if _sampler_node_id and _sampler_class_type:
                         _sampler_identification_source = "sampling_start_instrumentation"
                     break
-            if _sampling_start_ns is None:
-                _sampling_start_ns = _milestones.get("sampler_first_stage_ns") if _milestones else None
+            # ── R44H2/R44I2: true-vs-proxy classification of the sampling-start
+            # boundary + request-scoped store fallback.  The store only ever
+            # supplies TRUE emissions (never a progress proxy); the milestone
+            # fallback stays explicitly labeled.
+            _sampling_start_source: str = "unavailable"
+            try:
+                from comfymodal_runtime import sampler_telemetry as _stel_ss
+                _ss_store_mono, _ss_store_src = _stel_ss.resolve_sampling_start(None, None)
+            except Exception:
+                _ss_store_mono, _ss_store_src = None, "unavailable"
+            if _ss_store_mono and _ss_store_src == "authoritative_direct_sampler_boundary":
+                _sampling_start_ns = int(_ss_store_mono)
+                _sampling_start_source = "authoritative_direct_sampler_boundary"
+            elif _found_sampling_start_event and _sampling_start_event_mono:
+                _sampling_start_ns = int(_sampling_start_event_mono)
+                _sampling_start_source = (
+                    "authoritative_direct_sampler_boundary"
+                    if _sampling_start_event_src == "direct_sampler_call_boundary"
+                    else "authoritative_wrapper"
+                )
+            elif _ss_store_mono and _ss_store_src == "wrapper_runtime_store":
+                _sampling_start_ns = int(_ss_store_mono)
+                _sampling_start_source = "wrapper_runtime_store"
+            elif _sampling_start_ns is None:
+                _proxy_ns = _milestones.get("sampler_first_stage_ns") if _milestones else None
+                if _proxy_ns is not None:
+                    _sampling_start_ns = _proxy_ns
+                    _sampling_start_source = "proxy_first_progress"
             if not _sampler_node_id and _first_sampler_node_id:
                 _sampler_node_id = str(_first_sampler_node_id)
                 _sampler_class_type = str(
@@ -14971,6 +15181,10 @@ class ModalRuntimeEntrypoint:
                     "first_clip_encode_node_monotonic_ns": _first_clip_ns,
                     "first_sampler_node_monotonic_ns": _first_sampler_ns,
                     "sampling_start_monotonic_ns": _sampling_start_ns,
+                    # R44H2: provenance of the sampling-start boundary so
+                    # consumers never mistake a progress proxy for the true
+                    # wrapper emission.
+                    "sampling_start_source": _sampling_start_source,
                     # Additive breakdown: opt_exec_* sub-spans from the
                     # per-request instrumentation state (only real values).
                     "breakdown": _breakdown,
@@ -15189,6 +15403,7 @@ class ModalRuntimeEntrypoint:
                 "first_clip_encode_node_monotonic_ns": _first_clip_ns,
                 "first_sampler_node_monotonic_ns": _first_sampler_ns,
                 "sampling_start_monotonic_ns": _sampling_start_ns,
+                "sampling_start_source": _sampling_start_source,
                 "sampler_stage_status": _sampler_stage_status,
                 "has_clip_loader": _has_clip_loader,
                 "has_text_encode": _has_text_encode,
@@ -16073,6 +16288,7 @@ class ModalRuntimeEntrypoint:
         root.mkdir(parents=True, exist_ok=True)
         persisted = []
         wrote = False
+        thumb_wrote = False
         write_start = time.monotonic()
         for item in attempt.items:
             raw = item.raw_bytes
@@ -16104,6 +16320,44 @@ class ModalRuntimeEntrypoint:
                         temp.unlink(missing_ok=True)
                     except OSError:
                         pass
+            # ── E2C: persist the producer-side Thumbnail derivative from the
+            # already-local encoded bytes (content-addressed).  A Thumbnail
+            # write failure is graceful and never invalidates the required
+            # primary output.
+            if item.thumbnail_bytes:
+                try:
+                    thumb_digest = hashlib.sha256(item.thumbnail_bytes).hexdigest()
+                    thumb_ext = (
+                        item.thumbnail_file_ext
+                        if item.thumbnail_file_ext in {".webp", ".png", ".jpg", ".jpeg"}
+                        else ".webp"
+                    )
+                    thumb_relative = f"output_assets/{thumb_digest}{thumb_ext}"
+                    thumb_target = Path(RUNTIME_STATE_PATH, thumb_relative)
+                    if not thumb_target.exists():
+                        thumb_temp = thumb_target.with_name(
+                            f".{thumb_target.name}.{uuid.uuid4().hex}.tmp"
+                        )
+                        try:
+                            thumb_temp.write_bytes(item.thumbnail_bytes)
+                            os.replace(thumb_temp, thumb_target)
+                            thumb_wrote = True
+                            if hasattr(self, "_teardown_diagnostics"):
+                                self._teardown_diagnostics.record_file_write(
+                                    thumb_target, volume=RUNTIME_STATE_PATH,
+                                )
+                        finally:
+                            try:
+                                thumb_temp.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    item = dataclasses.replace(item, thumbnail_path=thumb_relative)
+                except Exception as exc:
+                    print(
+                        f"[output_delivery] thumbnail persistence failed "
+                        f"(non-fatal): {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
             persisted.append(dataclasses.replace(item, path=relative_path))
         write_end_ns = time.monotonic_ns()
         diag: dict[str, Any] = {
@@ -16114,9 +16368,10 @@ class ModalRuntimeEntrypoint:
             "commit_ms": 0.0,
             "overlap_ms": 0.0,
             "files_written": int(wrote),
+            "thumbnail_files_written": int(thumb_wrote),
             "commit_error": "",
         }
-        if not wrote:
+        if not wrote and not thumb_wrote:
             return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
         commit = getattr(volume, "commit", None)
@@ -16831,6 +17086,25 @@ class ModalRuntimeEntrypoint:
                 except Exception:  # noqa: BLE001
                     custom_nodes_generation = ""
                     overall_dependency_hash = ""
+            # ── R42 generation-determinism reconciliation ──────────────────
+            # The volume-synced generation record is the deployment-
+            # authoritative custom-node content identity (v2ctl republishes
+            # the volume per deploy; the image-baked manifest goes stale).
+            # The startup-frozen snapshot proof carries the observed value,
+            # so the frozen plan identity MUST carry the same value or
+            # plan↔proof parity (custom_nodes_generation +
+            # dependency_manifest_identity) can never match.
+            try:
+                _vol_gen_rec = (
+                    _legacy._read_custom_nodes_generation_record()
+                    if _legacy is not None
+                    else None
+                )
+                _vol_gen = str((_vol_gen_rec or {}).get("generation", "") or "")
+                if _vol_gen:
+                    custom_nodes_generation = _vol_gen
+            except Exception:  # noqa: BLE001 - keep baked fallback fail-closed
+                pass
             comfyui_version = ""
             try:
                 import comfyui_version as _cv  # noqa: PLC0415
@@ -17768,7 +18042,189 @@ class ModalRuntimeEntrypoint:
         control_queue: Any = None,
         control_partition: Any = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # ── R44H3: sampler telemetry request lifecycle ────────────────────
+        # Exactly ONE reset per production request, at the earliest point of
+        # the request handler — BEFORE any sampler event can emit (all
+        # note_*/tick/tail emissions happen later, inside the executor).
+        # ``run_prompt_stream`` delegates here, so this single call site
+        # covers every production entry point.  Fail-safe: any error merely
+        # leaves telemetry un-reset for this request; behavior is unchanged.
+        try:
+            from comfymodal_runtime import sampler_telemetry as _stel_h3
+
+            _stel_h3.reset_request(str(request_id or ""))
+        except Exception:
+            pass
         self._lazy_init_snapshot_state()
+        # ── E40 Lane B/A: per-run authority seeding ──────────────────────
+        # One resolved-config truth per run; loader-selection registry is
+        # reset and seeded with requested==effective from that authority.
+        try:
+            from .config_authority import resolve as _ca_resolve
+            from .config_authority import requested_loader as _ca_requested
+            from . import loader_selection as _loader_sel
+            _loader_sel.reset_for_run()
+            _e40_rc = _ca_resolve()
+            self._e40_resolved_config = _e40_rc
+            _loader_sel.seed_from_resolved({
+                _role: _ca_requested(_role, _e40_rc)
+                for _role in ("clip", "unet", "vae")
+            })
+            # ── R42 Golden Lane C: per-run Golden pipeline context ──────
+            # Enablement comes ONLY from the resolved config authority.
+            # The bridge owns all Golden logic; this file only publishes the
+            # per-run context so downstream seams (CLIP restore preload,
+            # clip-forward hooks, load_models_gpu adoption, VAE demand)
+            # can consult it fail-closed.  The canonical published attribute
+            # is ``_r42_golden_ctx`` (set by the envelope below); this block
+            # no longer creates a duplicate context under a second name.
+            try:
+                if not bool(_e40_rc.get("COMFYMODAL_GOLDEN_PIPELINE")):
+                    print(
+                        "[v2.golden_envelope] golden_pipeline=disabled reason=resolved_config",
+                        flush=True,
+                    )
+            except Exception:
+                pass
+        except Exception:
+            self._e40_resolved_config = None
+        # ── R42: Golden pipeline per-run envelope ─────────────────────────
+        self._r42_golden_ctx = None
+        try:
+            from . import golden_runtime_bridge as _grb
+
+            # Idempotent: reuse the restore-phase context when present so the
+            # whole run (restore preload → CLIP forward → UNET adoption → VAE
+            # demand) shares ONE owner registry / scheduler / ledger sink.
+            _gctx = _grb.ensure_current(getattr(self, "_e40_resolved_config", None))
+            if _gctx is not None:
+                # NOTE: the context is fully lazy — producers/workers spawn on
+                # lifecycle hooks (restore_ready / clip_forward / sampler
+                # step / demand seams).  There is deliberately NO
+                # ensure_started(): a phantom call here raised AttributeError
+                # inside this swallow-all guard and silently disabled the
+                # entire Golden lane (loader_unobserved_* on every role).
+                self._r42_golden_ctx = _gctx
+                print(
+                    "[v2.golden_envelope] golden_pipeline=enabled ctx_published=1 reused=%s"
+                    % str(_gctx is getattr(self, "_r42_golden_ctx", None)).lower(),
+                    flush=True,
+                )
+                # ── R42: install the Golden wrapper chain at request entry ──
+                # Request containers resume from snapshot straight into this
+                # handler; restore() does not run here.  Without this install
+                # the load_torch_file / load_diffusion_model /
+                # load_models_gpu golden branches are unreachable.
+                try:
+                    from comfymodal_runtime import model_preload as _mp_req
+
+                    _wr = _mp_req._ensure_core_wrappers()
+                    # ── R42: one line per key so container log truncation
+                    # can never hide individual install results.
+                    print("[v2.golden_envelope] core_wrappers_begin", flush=True)
+                    for _wk, _wv in sorted(_wr.items()):
+                        if isinstance(_wv, dict):
+                            for _wsk, _wsv in sorted(_wv.items()):
+                                print(f"[v2.golden_envelope] core_wrappers {_wk}.{_wsk}={_wsv}", flush=True)
+                        else:
+                            print(f"[v2.golden_envelope] core_wrappers {_wk}={_wv}", flush=True)
+                    print("[v2.golden_envelope] core_wrappers_end", flush=True)
+                    # ── R42 belt-and-braces: verify the CLIP forward boundary
+                    # actually landed.  ``encode_token_weights`` must carry
+                    # the _SENTINEL_CLIP_FORWARD sentinel; if a transient
+                    # install-time miss left it unwrapped, retry the span
+                    # installer once and report.
+                    try:
+                        import comfy.sd as _sd_verify
+
+                        _etw = getattr(getattr(_sd_verify, "CLIP", None), "encode_token_weights", None)
+                        if not callable(_etw) or not getattr(
+                            _etw, "_comfy_modal_clip_forward_wrapper", False
+                        ):
+                            _retry = _mp_req._install_clip_span_wrappers()
+                            print(
+                                "[v2.golden_envelope] clip_forward_retry="
+                                + str(_retry.get("clip_forward", "missing")),
+                                flush=True,
+                            )
+                    except Exception as _verify_exc:
+                        print(
+                            "[v2.golden_envelope] clip_forward_verify_error="
+                            f"{type(_verify_exc).__name__}:{str(_verify_exc)[:120]}",
+                            flush=True,
+                        )
+                except Exception as _wr_exc:
+                    print(
+                        "[v2.golden_envelope] core_wrappers=error:"
+                        f"{type(_wr_exc).__name__}:{str(_wr_exc)[:120]}",
+                        flush=True,
+                    )
+            else:
+                print(
+                    "[v2.golden_envelope] golden_pipeline=disabled reason=authority",
+                    flush=True,
+                )
+        except Exception as _golden_env_exc:
+            self._r42_golden_ctx = None
+            print(
+                "[v2.golden_envelope] golden_pipeline=seed_error "
+                f"error={type(_golden_env_exc).__name__}:{str(_golden_env_exc)[:160]}",
+                flush=True,
+            )
+        # ── R42: early Golden role-source publication at plan receipt ──────
+        # The UNET worker starts at CLIP forward start and needs the source
+        # path immediately; without early publication it waits 10s for a
+        # publication that only arrives when UNETLoader runs later, missing
+        # the prepare window entirely.  Walk the plan payload for loader
+        # node inputs and publish role sources + pre-warm manifests.
+        try:
+            from . import golden_runtime_bridge as _grb_early
+
+            _gctx_early = _grb_early.current()
+            if _gctx_early is not None and _gctx_early.enabled:
+                import folder_paths as _fp_early
+
+                def _walk_for_loader_names(obj: Any) -> None:
+                    if isinstance(obj, Mapping):
+                        for k, v in obj.items():
+                            ks = str(k)
+                            if ks == "unet_name" and isinstance(v, str) and v:
+                                _p = _fp_early.get_full_path("diffusion_models", v)
+                                if _p:
+                                    _gctx_early.note_role_source("unet", _p)
+                            elif ks == "vae_name" and isinstance(v, str) and v:
+                                _p = _fp_early.get_full_path("vae", v)
+                                if _p:
+                                    _gctx_early.note_role_source("vae", _p)
+                            else:
+                                _walk_for_loader_names(v)
+                    elif isinstance(obj, (list, tuple)):
+                        for item in obj:
+                            _walk_for_loader_names(item)
+
+                _walk_for_loader_names(plan_payload)
+                _published = sorted(getattr(_gctx_early, "role_paths", {}).keys())
+                print(
+                    "[v2.golden_envelope] early_sources=" + ",".join(_published),
+                    flush=True,
+                )
+                # Pre-warm the UNET manifest (full-file SHA identity) so the
+                # phase-3 worker finds a cached binding instead of hashing
+                # 12 GB inside the CLIP forward window.
+                _unet_path = getattr(_gctx_early, "role_paths", {}).get("unet", "")
+                if _unet_path:
+                    try:
+                        from .golden.contracts import ModelRole as _MR
+
+                        _gctx_early.build_manifest(_unet_path, _MR.UNET)
+                        print("[v2.golden_envelope] unet_manifest_prewarmed=1", flush=True)
+                    except Exception as _mw_exc:
+                        print(
+                            f"[v2.golden_envelope] unet_manifest_prewarm_error={type(_mw_exc).__name__}",
+                            flush=True,
+                        )
+        except Exception:
+            pass
         self._resource_tel = None
         if os.environ.get("COMFYMODAL_V2_RESOURCE_TELEMETRY", "0").strip().lower() in {"1", "true", "yes", "on"}:
             try:
@@ -17816,6 +18272,108 @@ class ModalRuntimeEntrypoint:
                 request_id=request_id,
             )
             _remote_watcher.start()
+        # ── R44D: composition-independent proof-wrapper installation ─────
+        # The model_preload CLIP span wrappers (clip_* spans, clean-lane
+        # forward proof, ledger CLIP-forward span, forced-miss conditioning
+        # evidence) were historically installed only from Golden-context
+        # callers, so non-Golden compositions produced no forward/proof
+        # telemetry at all (R44C gate evidence).  The installer itself is
+        # idempotent, sentinel-protected, resolves the active request trace
+        # PER CALL (_active_clip_span_trace), and carries no Golden gate —
+        # so install it for every v2 request here.  Purely additive
+        # instrumentation; any failure leaves composition unchanged.
+        try:
+            from comfymodal_runtime.model_preload import (
+                _install_clip_span_wrappers as _r44d_install_clip_spans,
+            )
+
+            _r44d_install_clip_spans(trace=diagnostics)
+        except Exception:
+            pass
+        # ── R44B: first-class request-time FastSafe context ──────────────
+        # Opened AFTER the E40 loader-selection reset above, once request_id
+        # and the per-request diagnostics trace are in scope.  Torn down in
+        # the matching finally below.  Fully fail-closed: any error here
+        # merely disables the lane for this request.
+        _r44b_ctx = None
+        try:
+            from comfymodal_runtime import request_fastpath as _r44b_fp
+
+            if _r44b_fp.enabled():
+                _r44b_ctx = _r44b_fp.begin(request_id=request_id, trace=diagnostics)
+                try:
+                    from comfymodal_runtime.request_clip_fastsafe import install_request_clip_fastsafe as _r44b_inst_c
+
+                    _r44b_inst_c(trace=diagnostics)
+                except Exception:
+                    pass
+                try:
+                    from comfymodal_runtime.request_unet_fastsafe import install_request_unet_fastsafe as _r44b_inst_u
+
+                    _r44b_inst_u(trace=diagnostics)
+                except Exception:
+                    pass
+                # ── R44E: immutable UNET source identity from the accepted
+                # plan, BEFORE graph execution, so source prep can arm at
+                # CLIP-forward start (overlap contract).  Identity only:
+                # canonical walker over ExecutionPlan workflow inputs +
+                # node-identical path resolution + stat.  No header parse,
+                # no value reads, no prewarm start here.  Fail closed on
+                # ambiguity (0 or >1 UNETLoader nodes ⇒ identity absent and
+                # the UNET-wrapper self-arm fallback remains the trigger).
+                try:
+                    import os as _r44b_os
+
+                    from comfymodal_runtime.restore_plan import (
+                        build_restore_model_spec as _r44b_spec,
+                    )
+                    from comfymodal_runtime.request_unet_fastsafe import (
+                        _resolve_unet_path as _r44b_resolve,
+                    )
+
+                    _r44b_wf = (
+                        plan_payload.get("workflow")
+                        if isinstance(plan_payload, Mapping)
+                        else None
+                    )
+                    if isinstance(_r44b_wf, Mapping) and _r44b_ctx is not None:
+                        _r44b_unets = (_r44b_spec(dict(_r44b_wf)) or {}).get(
+                            "loaders", {}
+                        ).get("unet", [])
+                        if len(_r44b_unets) == 1:
+                            _r44b_entry = _r44b_unets[0]
+                            _r44b_upath = _r44b_resolve(
+                                str(_r44b_entry.get("unet_name", ""))
+                            )
+                            _r44b_st = _r44b_os.stat(_r44b_upath)
+                            _r44b_ctx.set_unet_source_identity(
+                                node_id=str(_r44b_entry.get("node_id", "")),
+                                unet_name=str(_r44b_entry.get("unet_name", "")),
+                                weight_dtype=str(_r44b_entry.get("weight_dtype", "default")),
+                                path=_r44b_upath,
+                                size_bytes=int(_r44b_st.st_size),
+                                mtime_ns=int(_r44b_st.st_mtime_ns),
+                                resolution="plan",
+                            )
+                            _r44b_ctx.telemetry(
+                                "unet_source_identity_resolved",
+                                node_id=str(_r44b_entry.get("node_id", "")),
+                                unet_name=str(_r44b_entry.get("unet_name", "")),
+                                path_basename=_r44b_os.path.basename(_r44b_upath),
+                                size_bytes=int(_r44b_st.st_size),
+                                mtime_ns=int(_r44b_st.st_mtime_ns),
+                                weight_dtype=str(_r44b_entry.get("weight_dtype", "default")),
+                                resolution="plan",
+                            )
+                        elif len(_r44b_unets) > 1:
+                            _r44b_ctx.telemetry(
+                                "unet_source_identity_ambiguous",
+                                count=len(_r44b_unets),
+                            )
+                except Exception:
+                    pass
+        except Exception:
+            _r44b_ctx = None
         terminal_started = False
         try:
             async for event in self._run_plan_stream_impl(
@@ -17894,6 +18452,17 @@ class ModalRuntimeEntrypoint:
             # streams closed before the executor ran).
             if _remote_watcher is not None:
                 _remote_watcher.stop_and_join()
+            # ── R44B: close the request fast-path context (idempotent) ────
+            # Mirrors the per-request teardown of the remote-cancel watcher
+            # above: bounded join inside teardown, fully exception-safe.
+            if _r44b_ctx is not None:
+                try:
+                    from comfymodal_runtime import request_fastpath as _r44b_fp2
+
+                    _r44b_fp2.teardown(_r44b_ctx)
+                except Exception:
+                    pass
+                _r44b_ctx = None
             if not getattr(self, "_terminal_cleanup_done", False):
                 # Cleanup did not run synchronously at terminal identification
                 # (e.g. the stream was cancelled/closed before any terminal
@@ -19810,6 +20379,159 @@ class ModalRuntimeEntrypoint:
                     if isinstance(data, dict):
                         data["canonical_ledger_status"] = "error"
                         data["canonical_ledger_error"] = _ledger_finalize_error
+                # ── E40: single acceptance-authority telemetry blocks ────
+                # loader_selection / runtime_status / resolved_config are
+                # emitted exactly once per run, here at result assembly.
+                # The v2ctl StructuralValidator enforces them when present.
+                if isinstance(data, dict):
+                    try:
+                        from . import loader_selection as _ls_emit
+                        from .runtime_status import build_runtime_status as _brs
+                        _sel_snapshot = _ls_emit.snapshot()
+                        # Snapshot-resident arms are realized BY the restore
+                        # itself (no tracked disk read occurs), so an absent
+                        # observation for those arms means the snapshot
+                        # delivery was the observed arm — record it as such.
+                        for _role, _entry in _sel_snapshot.items():
+                            if not _entry.get("observed") and _entry.get("requested") in (
+                                "cpu_snapshot_native", "policy_v1", "native_comfy",
+                                "snapshot_resident",
+                            ):
+                                _ls_emit.record_observed(_role, _entry["requested"])
+                        _sel_snapshot = _ls_emit.snapshot()
+                        if _sel_snapshot:
+                            data["loader_selection"] = _sel_snapshot
+                        _e40_reasons = list(_ls_emit.mismatches())
+                        # R42A: terminal bridge fallback roles (empty unless
+                        # the Golden bridge recorded a real native fallback).
+                        _r42a_terminal_roles: list = []
+                        try:
+                            _ledger_ok = data.get("canonical_ledger_status") == "ok"
+                        except Exception:
+                            _ledger_ok = False
+                        if not _ledger_ok:
+                            _e40_reasons.append("canonical_ledger_not_ok")
+                        # ── R42: merge Golden degradation + config truth ──
+                        try:
+                            from . import golden_runtime_bridge as _grb_emit
+
+                            _gctx = getattr(self, "_r42_golden_ctx", None)
+                            if _gctx is not None:
+                                _e40_reasons.extend(
+                                    _grb_emit.map_degradation_to_reasons(_gctx.status_reasons())
+                                )
+                                # ── R42A: bridge terminal lifecycle truth is
+                                # THE authority.  Reconcile loader_selection
+                                # from it BEFORE snapshotting so the two
+                                # contract blocks can never contradict.
+                                _r42a_terminal_roles = list(_gctx.terminal_fallback_roles())
+                                if _r42a_terminal_roles:
+                                    _reconciled = _gctx.enforce_loader_selection_consistency()
+                                    if _reconciled:
+                                        _sel_snapshot = _ls_emit.snapshot()
+                                        data["loader_selection"] = _sel_snapshot
+                                # ── R42 Stage C: reload-invoked ⇒ DEGRADED ──
+                                try:
+                                    from .runtime_bootstrap import (
+                                        last_restore_reload_decisions as _lrrd,
+                                    )
+
+                                    for _rd in _lrrd():
+                                        if _rd.get("callback_called"):
+                                            _stage = str(_rd.get("stage", ""))
+                                            if _stage == "runtime_state":
+                                                _e40_reasons.append(
+                                                    "runtime_state_generation_reload"
+                                                )
+                                            elif _stage == "models":
+                                                _e40_reasons.append(
+                                                    "models_volume_generation_reload"
+                                                )
+                                except Exception:
+                                    pass
+                                _sink = getattr(_gctx, "ledger_sink", None)
+                                _summary = _gctx.telemetry_summary()
+                                data["golden_telemetry"] = {
+                                    "occupancy": _summary.get("occupancy", {}),
+                                    "prepared_sources": _summary.get("prepared_sources", {}),
+                                    "cache_contract": _summary.get("cache_contract", {}),
+                                    "model_io_uniqueness": dict(
+                                        getattr(_gctx.telemetry, "get", lambda *_a, **_k: {})(
+                                            "model_io_uniqueness", {}
+                                        )
+                                        or {}
+                                    ),
+                                    "degradations": _summary.get("degradations", []),
+                                    "role_lifecycle": _gctx.role_lifecycle_summary(),
+                                    "native_post_ready_io": dict(
+                                        getattr(_gctx.telemetry, "get", lambda *_a, **_k: {})(
+                                            "native_post_ready_io", {}
+                                        )
+                                        or {}
+                                    ),
+                                    "unet_storage_identity": dict(
+                                        getattr(_gctx.telemetry, "get", lambda *_a, **_k: {})(
+                                            "unet_storage_identity", {}
+                                        )
+                                        or {}
+                                    ),
+                                    "unet_committed": _summary.get("unet_committed"),
+                                    "vae_committed": _summary.get("vae_committed"),
+                                    "bridge_events": len(getattr(_sink, "events", []) or []),
+                                    "bridge_errors": int(
+                                        getattr(_sink, "error_count", 0) or 0
+                                    ),
+                                }
+                                data["config_truth"] = _grb_emit.build_config_truth_block(
+                                    getattr(self, "_e40_resolved_config", None), _gctx
+                                )
+                                if not _gctx.role_results:
+                                    _e40_reasons.append("golden_roles_not_observed")
+                        except Exception:
+                            pass
+                        # ── R42: filter stale PROVISIONAL fallback reasons
+                        # where the loader selection proves golden succeeded.
+                        # Transient degradation strings from retried paths must
+                        # not poison the final RuntimeStatus when the
+                        # authoritative loader_selection shows
+                        # observed==effective==golden.  R42A: roles with a
+                        # TERMINAL bridge fallback are never filtered — their
+                        # canonical reasons always survive.
+                        try:
+                            _sel_for_filter = data.get("loader_selection") or {}
+                            for _role in ("clip", "unet", "vae"):
+                                if _role in (locals().get("_r42a_terminal_roles") or ()):
+                                    continue
+                                _sel_r = _sel_for_filter.get(_role)
+                                if not isinstance(_sel_r, dict):
+                                    continue
+                                if (
+                                    _sel_r.get("observed") == "golden_qd4"
+                                    and _sel_r.get("effective") == "golden_qd4"
+                                    and not _sel_r.get("fallback_attempted")
+                                ):
+                                    _fb_tag = f"loader_fallback_{_role}"
+                                    _e40_reasons = [
+                                        r for r in _e40_reasons
+                                        if not str(r).startswith(_fb_tag)
+                                    ]
+                        except Exception:
+                            pass
+                        data["runtime_status"] = _brs(
+                            loader_selection=_sel_snapshot or None,
+                            reasons=_e40_reasons,
+                        )
+                        _e40_rc = getattr(self, "_e40_resolved_config", None)
+                        if _e40_rc is not None:
+                            data["resolved_config"] = {
+                                "fingerprint": _e40_rc.fingerprint(),
+                                "controls": _e40_rc.as_dict(),
+                            }
+                    except Exception as _e40_emit_exc:
+                        try:
+                            data.setdefault("e40_telemetry_error", str(_e40_emit_exc)[:300])
+                        except Exception:
+                            pass
                 # ── E29: durable-result span opened at plan receipt ──────
                 # NOTE: the span is opened at plan receipt (see the
                 # plan-receipt section above); the block below is REMOVED —

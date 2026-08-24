@@ -1,0 +1,81 @@
+{
+  "batch": "R42",
+  "title": "E40/R41 Golden Reconciliation — reconciliation provenance",
+  "generated": "2026-08-22",
+  "base_e39_sha": "0c59f46e3238f421378e8852ebc548da815b70af",
+  "e40_source_checkout": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal (branch TESTING2 @ E39, dirty; UNTOUCHED by R42)",
+  "e40_files_applied_tracked": [
+    "comfyapp.py",
+    "comfymodal_runtime/modal_app.py",
+    "comfymodal_runtime/snapshot_capture_hygiene.py",
+    "comfymodal_runtime/snapshot_build_manifest.py",
+    "comfymodal_runtime/clip_conditioning_cache.py",
+    "comfymodal_runtime/v2_waterfall.py",
+    "comfymodal_runtime/speculative_clip_hydration.py",
+    "comfymodal_runtime/clip_qd_reader.py",
+    "comfymodal_runtime/experiment_result_store.py",
+    "__init__.py",
+    "config/v2/profiles/e37-clean-lane-qd4.toml",
+    "tools/benchmark_v2_direct.py",
+    "tools/v2_control/backend.py",
+    "tools/v2_control/cli.py",
+    "tools/v2_control/validation.py",
+    "tests/test_v2_waterfall.py",
+    "tests/test_v2_waterfall_contract.py"
+  ],
+  "e40_files_applied_new": [
+    "comfymodal_runtime/loader_selection.py",
+    "comfymodal_runtime/config_authority.py",
+    "comfymodal_runtime/runtime_status.py",
+    "comfymodal_runtime/cache_taxonomy.py",
+    "tests/test_e40_canonical_authority.py"
+  ],
+  "e40_files_excluded_unrelated_E2_E4": [
+    "PHASE_E1..E5 audit .md files", "STUDIO_TEST_GATE.md",
+    "history_v2_replay.py", "history_v2_repository.py", "history_v2_routes.py", "history_v2_writer.py",
+    "output_converter.py", "studio_workflow_run.py",
+    "comfymodal_runtime/contracts.py (E2D webp effort)", "comfymodal_runtime/output_delivery.py",
+    "comfymodal_runtime/playground_service.py", "comfymodal_runtime/result_delivery.py",
+    "tools/batch_a_acceptance.py", "web/*.js", "tests/browser/**", "tests/studio_*.mjs",
+    "tests/run_studio_tests.py", "tests/test_batch_a/b/c_acceptance.py",
+    "tests/test_phase_e_contract.py", "tests/test_phase_e_wave2_contract.py"
+  ],
+  "r41_base_sha": "0c59f46e3238f421378e8852ebc548da815b70af",
+  "r41_head_sha": "442f18d",
+  "r41_commits": ["9f58629", "2187c5e", "4575c7e", "442f18d"],
+  "r41_diff_applied": "git diff 0c59f46..442f18d applied as patch (22 files, +4486, all-new golden/** modules); content-identity vs r41 worktree verified 0 mismatches / 19 files",
+  "r42_worktree": "../comfyui-modal-r42",
+  "r42_branch": "r42-golden-reconciliation",
+  "r42_changed_files": [
+    "comfymodal_runtime/golden/qd_engine.py (prepare_source/commit_to_device, timeline occupancy, claim_gate, h2d events)",
+    "comfymodal_runtime/golden/contracts.py (PreparedSource, PrepareCommitIdentityError, QDDropReason extensions, commit telemetry)",
+    "comfymodal_runtime/golden/pipeline.py (true unet_prepare, run_unet_commit identity gate, canonical event rewrites)",
+    "comfymodal_runtime/golden/resource_scheduler.py (UNET_PREPARE_STARTED / VAE_QD_ALLOWED transitions)",
+    "comfymodal_runtime/golden_runtime_bridge.py (NEW production seam)",
+    "comfyapp.py (M-01 CLIP golden routing + path registration)",
+    "comfymodal_runtime/modal_app.py (per-run Golden envelope, config_truth, degradation merge)",
+    "comfymodal_runtime/model_preload.py (first-sampler-step hook)",
+    "comfymodal_runtime/clip_forward_forensics.py (forward boundary hooks)",
+    "comfymodal_runtime/config_authority.py (build_config_truth, explain_legacy_control)",
+    "comfymodal_runtime/loader_selection.py (golden_qd4 arms)",
+    "tools/v2_control/fingerprints.py (deployed-truth fix)",
+    "tools/v2_control/validation.py (config_truth fail-closed check)",
+    "config/v2/profiles/r42-golden-qd4.toml (NEW)",
+    "tests/golden/test_golden_r42_prepare_commit.py (NEW, 14 tests)",
+    "tests/test_r42_config_truth.py (NEW, 22 tests)",
+    "tests/test_r42_golden_integration.py (NEW, 14 tests)"
+  ],
+  "verification": {
+    "layer_identity_checks": "E40 layer: 0 content mismatches / 22 files vs authoritative checkout; R41 layer: 0 content mismatches / 19 files vs r41 worktree (EOL-normalized)",
+    "local_tests": {
+      "golden_total": "72 passed (58 R41 preserved + 14 new R42)",
+      "config_truth_plus_e40_authority": "44 passed",
+      "r42_integration": "14 passed",
+      "waterfall_qdio_snapshot_conditioning": "156 passed",
+      "v2ctl_fingerprints_validation_config_profiles": "122 passed",
+      "py_compile": "OK all changed files",
+      "git_diff_check": "clean"
+    }
+  },
+  "remote_runs": "NONE PERFORMED — see report §43/§64: M-02/M-03 payload-consumption adoption incomplete; gate would be invalid per stop conditions; no paid runs burned"
+}
