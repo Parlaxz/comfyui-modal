@@ -13,8 +13,8 @@ gate CONDITIONAL GO for Writer A):
   point.  Its body visibly calls the stages in the exact required order:
   REAL RESTORE -> ``golden_request_setup`` -> ``golden_clip_load`` ->
   ``golden_clip_forward`` -> ``golden_unet_load`` ->
-  ``golden_sampler_prepare`` -> ``golden_sampling`` ->
-  ``golden_sampler_tail`` -> ``golden_vae_load`` -> ``golden_vae_decode`` ->
+  ``golden_sampler_prepare`` -> ``golden_vae_load`` -> ``golden_sampling`` ->
+  ``golden_sampler_tail`` -> ``golden_vae_decode`` ->
   ``golden_output`` -> ``golden_durable_commit`` -> committed-object
   reopen/stat/read/hash verification -> true-durable mark ->
   ``golden_teardown``.
@@ -85,9 +85,9 @@ STAGE_ORDER = (
     "golden_clip_forward",
     "golden_unet_load",
     "golden_sampler_prepare",
+    "golden_vae_load",
     "golden_sampling",
     "golden_sampler_tail",
-    "golden_vae_load",
     "golden_vae_decode",
     "golden_output",
     "golden_durable_commit",
@@ -3827,9 +3827,9 @@ async def golden_serial_execute(
         await golden_clip_forward(session)
         await golden_unet_load(session)
         await golden_sampler_prepare(session)
+        await golden_vae_load(session)
         await golden_sampling(session)
         await golden_sampler_tail(session)
-        await golden_vae_load(session)
         await golden_vae_decode(session)
         await golden_output(session)
         await golden_durable_commit(

@@ -108,7 +108,7 @@ def test_module_imports_cleanly_and_has_no_project_local_imports():
 REQUIRED_FUNCTIONS = [
     "golden_restore", "golden_request_setup", "golden_clip_load",
     "golden_clip_forward", "golden_unet_load", "golden_sampler_prepare",
-    "golden_sampling", "golden_sampler_tail", "golden_vae_load",
+    "golden_vae_load", "golden_sampling", "golden_sampler_tail",
     "golden_vae_decode", "golden_output", "golden_durable_commit",
     "golden_teardown", "golden_serial_execute", "golden_snapshot_content_proof",
 ]
@@ -1448,7 +1448,7 @@ def test_request_setup_fails_closed_on_workflow_hash_mismatch(monkeypatch):
         asyncio.run(gs.golden_request_setup(_setup_session(_canonical_prompt(), contract)))
 
 
-# ── 10. VAE stage begins only after tail ───────────────────────────────────
+# ── 10. VAE load/decode stage boundaries ───────────────────────────────────
 
 
 def test_vae_decode_guard_requires_completed_tail_interval():
@@ -1472,15 +1472,24 @@ def test_vae_decode_guard_requires_completed_tail_interval():
         asyncio.run(main())
 
 
-def test_stage_order_enforces_tail_before_vae_load_in_telemetry():
+def test_stage_order_enforces_vae_load_before_sampling_and_decode_after_tail():
     rec = gs.GoldenTelemetryRecorder()
-    for stage in ("golden_sampling", "golden_sampler_tail", "golden_vae_load"):
+    for stage in (
+        "golden_vae_load",
+        "golden_sampling",
+        "golden_sampler_tail",
+        "golden_vae_decode",
+    ):
         rec.begin_stage(stage)
         rec.end_stage(stage, ready=True)
     intervals = rec.intervals
     assert (
+        intervals["golden_vae_load"].end_monotonic_ns
+        <= intervals["golden_sampling"].entry_monotonic_ns
+    )
+    assert (
         intervals["golden_sampler_tail"].end_monotonic_ns
-        <= intervals["golden_vae_load"].entry_monotonic_ns
+        <= intervals["golden_vae_decode"].entry_monotonic_ns
     )
 
 

@@ -120,11 +120,11 @@ golden_unet_load()
         ↓
 golden_sampler_prepare()
         ↓
+golden_vae_load()
+        ↓
 golden_sampling()
         ↓
 golden_sampler_tail()
-        ↓
-golden_vae_load()
         ↓
 golden_vae_decode()
         ↓
@@ -754,9 +754,9 @@ golden_clip_load()
 golden_clip_forward()
 golden_unet_load()
 golden_sampler_prepare()
+golden_vae_load()
 golden_sampling()
 golden_sampler_tail()
-golden_vae_load()
 golden_vae_decode()
 golden_output()
 golden_durable_commit()

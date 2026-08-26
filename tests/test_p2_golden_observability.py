@@ -120,7 +120,7 @@ def test_primary_function_table_has_exact_order_and_golden_wall_durations():
     assert [row["function"] for row in rows] == [
         "actual_restore", "golden_request_setup()", "golden_clip_load()",
         "golden_clip_forward()", "golden_unet_load()", "golden_sampler_prepare()",
-        "golden_sampling()", "golden_sampler_tail()", "golden_vae_load()",
+        "golden_vae_load()", "golden_sampling()", "golden_sampler_tail()",
         "golden_vae_decode()", "golden_output()", "golden_durable_commit()",
         "golden_teardown()",
     ]

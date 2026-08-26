@@ -65,6 +65,7 @@ set "V2_GOLDEN_P1_ACTIVE=0"
 if /i "%~1"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="1" set "V2_GOLDEN_P1_ACTIVE=1"
 if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
+    set "V2_BENCHMARK_MODE=golden_p1_serial"
     if not defined COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM set "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1"
     echo [v2.golden_p1] selector=ACTIVE golden_enable_dynamic_vram=!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!
 )

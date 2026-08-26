@@ -120,6 +120,23 @@ def test_both_bats_activate_golden_p1_via_existing_selector_mechanisms():
         assert 'if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="1"' in text
 
 
+def test_deploy_golden_selector_uses_golden_mode_and_preserves_target_identity():
+    lines = _bat_lines("deploy_and_run_v2_single.bat")
+    golden_active = next(i for i, line in enumerate(lines) if 'if "!V2_GOLDEN_P1_ACTIVE!"=="1" (' in line)
+    golden_mode = next(i for i, line in enumerate(lines) if 'set "V2_BENCHMARK_MODE=golden_p1_serial"' in line)
+    default_mode = next(i for i, line in enumerate(lines) if 'set "V2_BENCHMARK_MODE=snapshot_restore_only"' in line)
+    restore_only = next(i for i, line in enumerate(lines) if 'if /i "!V2_BENCHMARK_MODE!"=="snapshot_restore_only" set "V2_IS_RESTORE_ONLY=1"' in line)
+    app_default = next(i for i, line in enumerate(lines) if 'COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow' in line)
+    restore_app = next(i for i, line in enumerate(lines) if 'set "COMFYMODAL_V2_APP_NAME=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!"' in line)
+
+    assert golden_mode > golden_active
+    assert golden_mode < default_mode < restore_only < restore_app
+    assert lines[app_default].strip().startswith(
+        "if not defined COMFYMODAL_V2_APP_NAME set "
+    )
+    assert _config("golden_p1").target.app == "stable-modal-comfy-v2-golden-p1"
+
+
 def test_run_bat_rejects_missing_or_wrong_golden_app_before_fallback():
     lines = _bat_lines("run_v2_single.bat")
     text = "\n".join(lines)
