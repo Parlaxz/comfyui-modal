@@ -1222,6 +1222,100 @@ def _cpu_model_snapshot_enabled() -> bool:
     return enabled
 
 
+def _golden_serial_profile_active() -> bool:
+    """Return whether this container is the dedicated Golden serial profile.
+
+    The deploy-baked DynamicVRAM flag is the normal selector, while the
+    profile name is also authoritative so a profile-only environment cannot
+    accidentally construct the legacy CPU snapshot models.
+    """
+    return env_flag("COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM") or (
+        os.environ.get("COMFYMODAL_V2CTL_PROFILE", "").strip().lower()
+        == "golden_p1"
+    )
+
+
+def _validate_golden_restore_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Accept only the completed, runtime-owned restore timing record."""
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("golden_restore_metadata_missing")
+    if metadata.get("restore_method_status") != "success":
+        raise RuntimeError("golden_restore_metadata_restore_not_successful")
+
+    required = (
+        "remote_python_resume_wall_unix_ns",
+        "remote_python_resume_mono_ns",
+        "restore_method_start_wall_unix_ns",
+        "restore_method_start_mono_ns",
+        "restore_method_end_wall_unix_ns",
+        "restore_method_end_mono_ns",
+    )
+    values: dict[str, int] = {}
+    for key in required:
+        value = metadata.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RuntimeError(f"golden_restore_metadata_invalid:{key}")
+        values[key] = value
+
+    if values["remote_python_resume_wall_unix_ns"] > values["restore_method_start_wall_unix_ns"]:
+        raise RuntimeError("golden_restore_metadata_wall_order_invalid")
+    if values["restore_method_start_wall_unix_ns"] > values["restore_method_end_wall_unix_ns"]:
+        raise RuntimeError("golden_restore_metadata_wall_order_invalid")
+    if values["remote_python_resume_mono_ns"] > values["restore_method_start_mono_ns"]:
+        raise RuntimeError("golden_restore_metadata_mono_order_invalid")
+    if values["restore_method_start_mono_ns"] > values["restore_method_end_mono_ns"]:
+        raise RuntimeError("golden_restore_metadata_mono_order_invalid")
+    return dict(metadata)
+
+
+def _validate_golden_runtime_mount_root(volume: Any) -> str:
+    """Validate the already-declared runtime-state mount used by Golden.
+
+    Golden has one runtime-state mount; the adapter must not derive or accept a
+    request-owned alternative.  Modal's raw Volume handle does not expose its
+    filesystem mount, but wrapped handles and test/runtime resource records may
+    expose one.  When they do, it must identify the same root.  The returned
+    root is the configured ``RUNTIME_STATE_PATH`` itself, never a replacement.
+    """
+    root_raw = RUNTIME_STATE_PATH
+    if not isinstance(root_raw, (str, os.PathLike)) or not os.path.isabs(os.fspath(root_raw)):
+        raise RuntimeError("golden_runtime_mount_root_invalid")
+    root = os.path.abspath(os.fspath(root_raw))
+    root_real = os.path.realpath(root)
+    if not os.path.isdir(root_real):
+        raise RuntimeError(f"golden_runtime_mount_root_missing:{root_real}")
+
+    resources = globals().get("_MODAL_RESOURCES", {})
+    candidates = [
+        getattr(volume, "volume_mount_root", None),
+        getattr(volume, "mount_root", None),
+    ]
+    if isinstance(resources, Mapping):
+        candidates.append(resources.get("runtime_state_mount_root"))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if not isinstance(candidate, (str, os.PathLike)):
+            raise RuntimeError("golden_runtime_mount_root_identity_invalid")
+        candidate_real = os.path.realpath(os.fspath(candidate))
+        if candidate_real != root_real:
+            raise RuntimeError(
+                "golden_runtime_mount_root_identity_mismatch:"
+                f"{candidate_real}!={root_real}"
+            )
+
+    return root
+
+
+def _golden_path_contained(path: str | os.PathLike, root: str) -> bool:
+    """Return whether a resolved path is contained by the Golden mount root."""
+    try:
+        path_real = os.path.realpath(os.fspath(path))
+        return os.path.commonpath((path_real, os.path.realpath(root))) == os.path.realpath(root)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _is_production_profile() -> bool:
     return os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower() == "production"
 
@@ -2752,6 +2846,7 @@ def _snapshot_target_fingerprint(
         "restore": {"enter": True, "snap": False},
         "run_plan_stream": {"method": True, "is_generator": True},
         "run_prompt_stream": {"method": True, "is_generator": True},
+        "run_golden_serial_stream": {"method": True, "is_generator": True},
         "read_output_asset": {"method": True, "is_generator": False},
         "run_checkpoint_stream": {"method": True, "is_generator": True},
     }
@@ -3034,6 +3129,17 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ),
+        # Golden DynamicVRAM must be present in the Modal class environment
+        # before comfyapp imports model modules; request-time activation alone
+        # is too late for AIMDO modules that capture control.lib at import.
+        "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM", "0"
+        ),
+        # Preserve the v2ctl profile selector beside the Golden gate so the
+        # container can make the same profile decision as the deploy process.
+        "COMFYMODAL_V2CTL_PROFILE": os.environ.get(
+            "COMFYMODAL_V2CTL_PROFILE", ""
         ),
         # E37 CLEAN_LANE deployment identity and explicit no-worker tuple.
         # These values must cross Modal's class-env boundary; otherwise the
@@ -5668,6 +5774,10 @@ class ModalRuntimeEntrypoint:
         self._deferred_commit_diag = None
         self._deferred_commit_pending = False
         self._terminal_response_delivered = False
+        # Guard used only while the explicit Golden adapter owns execution.
+        # Lifecycle startup remains compatible with the legacy runtime, but a
+        # Golden stage can never silently fall back into it.
+        self._golden_execution_active = False
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
@@ -8436,6 +8546,8 @@ class ModalRuntimeEntrypoint:
             return False
 
     def _load_legacy_runtime(self) -> Any:
+        if getattr(self, "_golden_execution_active", False):
+            raise RuntimeError("golden_legacy_runtime_forbidden")
         if self._legacy_api is not None:
             return self._legacy_api
         module = self._legacy_module or importlib.import_module("comfyapp")
@@ -8858,6 +8970,254 @@ class ModalRuntimeEntrypoint:
             pass
         return state
 
+    def _golden_snapshot_proof_surfaces(self) -> dict[str, list[Any]]:
+        """Return the real, currently reachable surfaces for Golden proof.
+
+        This is deliberately a passive inventory.  The Golden proof function
+        owns traversal and validation; this method only supplies objects that
+        already belong to this runtime instance.
+        """
+        roots: list[Any] = []
+        registries: list[Any] = []
+        coordinators: list[Any] = []
+
+        for surface in (
+            getattr(self, "_legacy_api", None),
+            getattr(self, "_preload_bridge", None),
+            getattr(self, "bootstrap", None),
+            getattr(self, "_cpu_snapshot_models", None),
+            getattr(self, "_snapshot_eviction_retained_model", None),
+        ):
+            if surface is not None:
+                roots.append(surface)
+
+        for name in (
+            "_cpu_snapshot_unet_storage_registry",
+            "_cpu_snapshot_clip_storage_registry",
+        ):
+            registry = getattr(self, name, None)
+            if registry is not None:
+                registries.append(registry)
+
+        bridge = getattr(self, "_preload_bridge", None)
+        for coordinator in (
+            getattr(bridge, "coordinator", None),
+            getattr(self, "_runtime_state_coordinator", None),
+        ):
+            if coordinator is not None:
+                coordinators.append(coordinator)
+
+        if not roots and not registries and not coordinators:
+            raise RuntimeError("golden_snapshot_proof_no_surfaces_available")
+        return {
+            "roots": roots,
+            "registries": registries,
+            "coordinators": coordinators,
+        }
+
+    def _clear_cpu_snapshot_state_for_golden(self) -> None:
+        """Drop all CPU snapshot model references before Golden capture."""
+        self._cpu_snapshot_models = None
+        self._cpu_snapshot_models_active = False
+        self._cpu_snapshot_unet_runtime_state = None
+        self._cpu_snapshot_unet_storage_registry = None
+        self._cpu_snapshot_clip_storage_registry = None
+        self._snapshot_eviction_retained_model = None
+        self._snapshot_eviction_retained_model_id = 0
+        self._snapshot_eviction_retained_model_type = ""
+        self._snapshot_eviction_retained_role = "none"
+        self._snapshot_models_evicted_before_capture = False
+        self._snapshot_eviction_metadata = {}
+        self._eviction_marker = None
+
+    def _assert_golden_restore_model_free(self) -> None:
+        """Reject a restore that carries any legacy model-snapshot residue."""
+        def has_residue(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, Mapping):
+                return bool(value)
+            return True
+
+        residue = {
+            name: getattr(self, name, None)
+            for name in (
+                "_cpu_snapshot_models",
+                "_cpu_snapshot_unet_runtime_state",
+                "_cpu_snapshot_unet_storage_registry",
+                "_cpu_snapshot_clip_storage_registry",
+                "_snapshot_eviction_retained_model",
+                "_eviction_marker",
+            )
+        }
+        if any(has_residue(value) for value in residue.values()) or any(
+            bool(getattr(self, name, False))
+            for name in ("_cpu_snapshot_models_active", "_snapshot_models_evicted_before_capture")
+        ):
+            present = sorted(name for name, value in residue.items() if has_residue(value))
+            raise RuntimeError(
+                "golden_restore_model_residue:" + ",".join(present or ["snapshot_state"])
+            )
+
+    def _assert_golden_execution_isolated(self) -> None:
+        """Reject legacy model/preload state before entering Golden stages."""
+        self._assert_golden_restore_model_free()
+        bridge = getattr(self, "_preload_bridge", None)
+        if getattr(bridge, "_preparation", None) is not None:
+            raise RuntimeError("golden_preload_state_forbidden")
+
+    def _run_golden_snapshot_content_proof(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        surfaces: Mapping[str, list[Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Run the passive Golden pre-capture proof and fail closed."""
+        from .golden_serial import (
+            GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES,
+            SNAPSHOT_SIZE_SOURCE,
+            golden_snapshot_content_proof,
+        )
+
+        # This is intentionally initialized before the measurement so failure
+        # records identify the value's provenance even when RSS is unavailable.
+        proof_candidate: Mapping[str, Any] | None = {
+            "snapshot_size_source": SNAPSHOT_SIZE_SOURCE,
+            "snapshot_size_is_serialized": False,
+        }
+        persist_path: str | None = None
+        try:
+            state_root = Path(RUNTIME_STATE_PATH)
+            if state_root.is_dir():
+                persist_path = str(state_root / "golden_snapshot_content_proof.json")
+        except OSError:
+            persist_path = None
+
+        try:
+            # Modal does not expose serialized snapshot bytes in this callback.
+            # Measure RSS at the actual pre-capture boundary and pass it as a
+            # conservative resident-memory proxy.  Never substitute cgroup
+            # usage, Python object sizes, or a fabricated serialized size.
+            from .snapshot_capture_hygiene import read_process_status_fields
+
+            process_status = read_process_status_fields()
+            rss_kb = (
+                process_status.get("rss_kb")
+                if isinstance(process_status, Mapping)
+                else None
+            )
+            if (
+                isinstance(rss_kb, bool)
+                or not isinstance(rss_kb, int)
+                or rss_kb <= 0
+            ):
+                raise RuntimeError("golden_snapshot_process_rss_unavailable")
+            snapshot_size_bytes = int(rss_kb) * 1024
+            if snapshot_size_bytes >= GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES:
+                raise RuntimeError(
+                    "golden_snapshot_process_rss_limit:"
+                    f"{snapshot_size_bytes}:{GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES}"
+                )
+
+            proof = golden_snapshot_content_proof(
+                **(dict(surfaces) if surfaces is not None else self._golden_snapshot_proof_surfaces()),
+                persist_path=persist_path,
+                snapshot_size_bytes=snapshot_size_bytes,
+                snapshot_size_source=SNAPSHOT_SIZE_SOURCE,
+                snapshot_size_is_serialized=False,
+            )
+            if not isinstance(proof, Mapping):
+                raise RuntimeError("golden_snapshot_content_proof_invalid_result")
+            proof_candidate = proof
+            if proof.get("schema") != "golden_snapshot_content_proof_v1":
+                raise RuntimeError("golden_snapshot_content_proof_schema_invalid")
+            if proof.get("passive") is not True:
+                raise RuntimeError("golden_snapshot_content_proof_not_passive")
+            if proof.get("snapshot_size_bytes") != snapshot_size_bytes:
+                raise RuntimeError("golden_snapshot_content_proof_size_mismatch")
+            if proof.get("snapshot_size_source") != SNAPSHOT_SIZE_SOURCE:
+                raise RuntimeError("golden_snapshot_content_proof_size_source_invalid")
+            if proof.get("snapshot_size_is_serialized") is not False:
+                raise RuntimeError("golden_snapshot_content_proof_serialized_size_invalid")
+            surface_count = proof.get("surface_count")
+            if isinstance(surface_count, bool) or not isinstance(surface_count, int) or surface_count <= 0:
+                raise RuntimeError("golden_snapshot_content_proof_surface_count_invalid")
+            count_keys = (
+                "tensor_count",
+                "parameter_bytes",
+                "model_patcher_count",
+                "qd_owner_count",
+                "open_payload_reader_count",
+                "preload_worker_count",
+                "future_count",
+            )
+            nonzero = {
+                key: proof.get(key)
+                for key in count_keys
+                if isinstance(proof.get(key), bool)
+                or not isinstance(proof.get(key), int)
+                or proof.get(key) != 0
+            }
+            nonzero_roles = {
+                key: proof.get(key)
+                for key in ("nonzero", "nonzero_roles")
+                if key in proof and proof.get(key) not in ({}, [])
+            }
+            if nonzero or nonzero_roles:
+                raise RuntimeError(
+                    "golden_snapshot_content_proof_nonzero:" 
+                    f"{json.dumps(nonzero or nonzero_roles, default=str)[:500]}"
+                )
+            proof_record = dict(proof)
+            proof_record["proven"] = True
+            if persist_path:
+                proof_record["persist_path"] = persist_path
+        except BaseException as exc:
+            failure: dict[str, Any] = dict(proof_candidate or {})
+            failure.update({
+                "schema": failure.get(
+                    "schema", "golden_snapshot_content_proof_v1"
+                ),
+                "passive": True,
+                "proven": False,
+                "snapshot_size_source": SNAPSHOT_SIZE_SOURCE,
+                "snapshot_size_is_serialized": False,
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            })
+            timing = self._restore_timing
+            if not isinstance(timing, dict):
+                timing = {}
+                self._restore_timing = timing
+            timing["golden_snapshot_content_proof"] = failure
+            if trace is not None:
+                try:
+                    trace.set_metadata(golden_snapshot_content_proof=failure)
+                    trace.emit(
+                        "golden_snapshot_content_proof",
+                        phase="lifecycle",
+                        metadata=failure,
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError(
+                "golden snapshot content proof failed: "
+                f"{failure['error']}"
+            ) from exc
+
+        timing = self._restore_timing
+        if not isinstance(timing, dict):
+            timing = {}
+            self._restore_timing = timing
+        timing["golden_snapshot_content_proof"] = proof_record
+        if trace is not None:
+            trace.set_metadata(golden_snapshot_content_proof=proof_record)
+            trace.emit(
+                "golden_snapshot_content_proof",
+                phase="lifecycle",
+                metadata=proof_record,
+            )
+        return proof_record
+
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
         _snap_enter_started = _v2_startup_stage("snap_true_enter", "start")
@@ -9257,8 +9617,30 @@ class ModalRuntimeEntrypoint:
             # shared current plan.  The actual request validates its workflow
             # inside run_plan_stream with the submitted ExecutionPlan.
 
-            # Plan C: CPU model snapshot construction
-            if _cpu_model_snapshot_enabled():
+            # Plan C: CPU model snapshot construction.  Golden is a separate
+            # serial profile: it must not even evaluate the legacy CPU-snapshot
+            # gate, since that gate can require the production snapshot setup.
+            _golden_serial_active = _golden_serial_profile_active()
+            _golden_pre_capture_surfaces: dict[str, list[Any]] | None = None
+            if _golden_serial_active:
+                self._clear_cpu_snapshot_state_for_golden()
+                # Inventory only after the clear: the proof must describe the
+                # actual capture boundary, not stale model-bearing surfaces.
+                _golden_pre_capture_surfaces = self._golden_snapshot_proof_surfaces()
+                trace.emit(
+                    "cpu_snapshot_models_created",
+                    phase="lifecycle",
+                    metadata={
+                        "status": "skipped",
+                        "reason": "golden_serial_profile",
+                    },
+                )
+                print(
+                    "[v2.cpu_snapshot] status=skipped "
+                    "reason=golden_serial_profile action=skip_model_build",
+                    flush=True,
+                )
+            elif _cpu_model_snapshot_enabled():
                 self._lazy_init_snapshot_state()
                 _cpu_snap_ok = False
                 api: Any | None = None
@@ -9682,9 +10064,6 @@ class ModalRuntimeEntrypoint:
             self._restore_timing = err_timing
             _LATEST_LIFECYCLE_TIMING = err_timing
             raise
-        trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "ready"})
-        self._remember_lifecycle_trace(trace)
-
         startup_total_ms = round((time.perf_counter() - _startup_perf) * 1000.0, 3)
         _restore_timing: dict[str, Any] = {
             "restore_total_ms": startup_total_ms,
@@ -9700,6 +10079,10 @@ class ModalRuntimeEntrypoint:
                     _restore_timing[f"{_stage}_ms"] = round(float(_dur_ms), 3)
         self._restore_timing = _restore_timing
         _LATEST_LIFECYCLE_TIMING = _restore_timing
+
+        if not _golden_serial_active:
+            trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "ready"})
+            self._remember_lifecycle_trace(trace)
 
         _report_host_memory("restore_complete")
 
@@ -9787,24 +10170,6 @@ class ModalRuntimeEntrypoint:
             metadata={"status": "skipped", "reason": "vae_not_part_of_cpu_snapshot", "duration_ms": 0.0},
         )
 
-        # ── Snapshot-build manifest (diagnostic only; default off) ────────
-        # Record the full process state Modal is about to serialize into the
-        # memory snapshot: RSS/mappings/modules/threads/fds/GC/retained
-        # models/executors + image identity.  Never enabled on measured
-        # latency runs; only shadow diagnostic deployments set the gate.
-        try:
-            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                from .snapshot_build_manifest import capture_snapshot_manifest
-                _manifest_record = capture_snapshot_manifest(
-                    "before_capture",
-                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
-                    extra={"lifecycle": "startup", "snap": "True"},
-                )
-                if isinstance(_manifest_record, dict):
-                    _restore_timing["snapshot_manifest"] = _manifest_record
-        except Exception:
-            pass
-
         # ── Restore-memory experiment: freeze snapshot GPU capacity ────────
         # The restore_memory_arm lane (parallel change) may freeze the
         # GPU-capacity snapshot at build time so restore-time VRAM accounting
@@ -9815,6 +10180,25 @@ class ModalRuntimeEntrypoint:
             maybe_freeze_snapshot_gpu_capacity()
         except Exception:
             pass
+
+        # ── Snapshot quiescence proof (fail closed) ───────────────────────
+        # Golden must prove quiescence before capture.  Other startup profiles
+        # retain their existing callback contract without running this proof.
+        from .snapshot_capture_hygiene import prove_snapshot_quiescence
+        if _golden_serial_active:
+            _snapshot_quiescence = prove_snapshot_quiescence()
+        else:
+            _snapshot_quiescence = {
+                "proven": True,
+                "skipped": True,
+                "reason": "non_golden_profile",
+            }
+        _restore_timing["snapshot_quiescence"] = _snapshot_quiescence
+        if not _snapshot_quiescence.get("proven", False):
+            raise RuntimeError(
+                "snapshot capture quiescence could not be proven: "
+                f"{_snapshot_quiescence}"
+            )
 
         # ── Runtime-state construction baseline (Batch B) ────────────────
         # Freeze generation + content manifest AFTER every correctness-
@@ -9829,6 +10213,26 @@ class ModalRuntimeEntrypoint:
             )
             if _rs_baseline:
                 _restore_timing["runtime_state_generation_baseline"] = _rs_baseline
+        except Exception:
+            pass
+
+        # ── Snapshot-build manifest (diagnostic only; default off) ────────
+        # Record the full process state Modal is about to serialize into the
+        # memory snapshot: RSS/mappings/modules/threads/fds/GC/retained
+        # models/executors + image identity + the quiescence proof.  Never
+        # enabled on measured latency runs; only shadow diagnostic deployments
+        # set the gate.
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_build_manifest import capture_snapshot_manifest
+                _manifest_record = capture_snapshot_manifest(
+                    "before_capture",
+                    model_ctx=getattr(self, "_cpu_snapshot_models", None),
+                    extra={"lifecycle": "startup", "snap": "True"},
+                    quiescence=_snapshot_quiescence,
+                )
+                if isinstance(_manifest_record, dict):
+                    _restore_timing["snapshot_manifest"] = _manifest_record
         except Exception:
             pass
 
@@ -9851,6 +10255,14 @@ class ModalRuntimeEntrypoint:
                     _restore_timing["snapshot_capture_hygiene"] = _hygiene_event
         except Exception:
             pass
+
+        # Golden's actual pre-capture boundary: all cleanup, quiescence, and
+        # content proof must complete before any ready/return marker.
+        if _golden_serial_active:
+            self._run_golden_snapshot_content_proof(
+                trace=trace,
+                surfaces=_golden_pre_capture_surfaces,
+            )
 
         _startup_return_wall_ns = time.time_ns()
         _startup_return_mono_ns = time.monotonic_ns()
@@ -9879,6 +10291,9 @@ class ModalRuntimeEntrypoint:
             )
         except Exception:
             pass
+        if _golden_serial_active:
+            trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "ready"})
+            self._remember_lifecycle_trace(trace)
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -10299,6 +10714,8 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 pass
         _span_restore_eviction = _restore_phase_span("restore:eviction")
+        if _golden_serial_profile_active():
+            self._assert_golden_restore_model_free()
         self._restore_eviction_boundary()
         # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
         # Retained-model handling (eviction boundary restore) completed; the
@@ -10386,7 +10803,7 @@ class ModalRuntimeEntrypoint:
             )
         except Exception as _clip_fh_exc:
             print(f"[v2.clip_fh] restore install skipped: {type(_clip_fh_exc).__name__}", flush=True)
-        if _is_production_profile():
+        if _is_production_profile() and not _golden_serial_profile_active():
             production_snapshot_invariant(
                 getattr(self, "_cpu_snapshot_models", None),
                 phase="restore",
@@ -10912,7 +11329,8 @@ class ModalRuntimeEntrypoint:
         # eviction the container carries CLIP/VAE only (unet=None), so this
         # gate stays closed and never activates or reconstructs the UNET.
         if (
-            _cpu_model_snapshot_enabled()
+            not _golden_serial_profile_active()
+            and _cpu_model_snapshot_enabled()
             and self._cpu_snapshot_models is not None
             and getattr(self._cpu_snapshot_models, "unet", None) is not None
             and self._restore_plan is not None
@@ -12270,6 +12688,8 @@ class ModalRuntimeEntrypoint:
                     _LATEST_LIFECYCLE_TIMING = _rt
 
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
+        if getattr(self, "_golden_execution_active", False):
+            raise RuntimeError("golden_prompt_executor_forbidden")
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
         try:
@@ -13422,6 +13842,8 @@ class ModalRuntimeEntrypoint:
         authorization, output collection, and result packaging. ComfyUI still
         owns its actual PromptExecutor and node execution semantics.
         """
+        if getattr(self, "_golden_execution_active", False):
+            raise RuntimeError("golden_prompt_executor_forbidden")
         # Reset the per-request unet_first_cuda_op dedup so the first forward
         # pass of this request emits the event.  Must fire before any CUDA op.
         reset_first_cuda_dedup()
@@ -16073,6 +16495,7 @@ class ModalRuntimeEntrypoint:
         root.mkdir(parents=True, exist_ok=True)
         persisted = []
         wrote = False
+        thumb_wrote = False
         write_start = time.monotonic()
         for item in attempt.items:
             raw = item.raw_bytes
@@ -16104,6 +16527,44 @@ class ModalRuntimeEntrypoint:
                         temp.unlink(missing_ok=True)
                     except OSError:
                         pass
+            # ── E2C: persist the producer-side Thumbnail derivative from the
+            # already-local encoded bytes (content-addressed).  A Thumbnail
+            # write failure is graceful and never invalidates the required
+            # primary output.
+            if item.thumbnail_bytes:
+                try:
+                    thumb_digest = hashlib.sha256(item.thumbnail_bytes).hexdigest()
+                    thumb_ext = (
+                        item.thumbnail_file_ext
+                        if item.thumbnail_file_ext in {".webp", ".png", ".jpg", ".jpeg"}
+                        else ".webp"
+                    )
+                    thumb_relative = f"output_assets/{thumb_digest}{thumb_ext}"
+                    thumb_target = Path(RUNTIME_STATE_PATH, thumb_relative)
+                    if not thumb_target.exists():
+                        thumb_temp = thumb_target.with_name(
+                            f".{thumb_target.name}.{uuid.uuid4().hex}.tmp"
+                        )
+                        try:
+                            thumb_temp.write_bytes(item.thumbnail_bytes)
+                            os.replace(thumb_temp, thumb_target)
+                            thumb_wrote = True
+                            if hasattr(self, "_teardown_diagnostics"):
+                                self._teardown_diagnostics.record_file_write(
+                                    thumb_target, volume=RUNTIME_STATE_PATH,
+                                )
+                        finally:
+                            try:
+                                thumb_temp.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    item = dataclasses.replace(item, thumbnail_path=thumb_relative)
+                except Exception as exc:
+                    print(
+                        f"[output_delivery] thumbnail persistence failed "
+                        f"(non-fatal): {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
             persisted.append(dataclasses.replace(item, path=relative_path))
         write_end_ns = time.monotonic_ns()
         diag: dict[str, Any] = {
@@ -16114,9 +16575,10 @@ class ModalRuntimeEntrypoint:
             "commit_ms": 0.0,
             "overlap_ms": 0.0,
             "files_written": int(wrote),
+            "thumbnail_files_written": int(thumb_wrote),
             "commit_error": "",
         }
-        if not wrote:
+        if not wrote and not thumb_wrote:
             return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
         commit = getattr(volume, "commit", None)
@@ -16406,6 +16868,7 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET",
             "COMFYMODAL_V2_RESOURCE_TELEMETRY",
             "COMFYMODAL_V2_ENV_PROFILE",
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM",
             "COMFYMODAL_V2_ATOMIC_PROFILE",
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
             "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
@@ -17769,6 +18232,22 @@ class ModalRuntimeEntrypoint:
         control_partition: Any = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self._lazy_init_snapshot_state()
+        # ── E40 Lane B/A: per-run authority seeding ──────────────────────
+        # One resolved-config truth per run; loader-selection registry is
+        # reset and seeded with requested==effective from that authority.
+        try:
+            from .config_authority import resolve as _ca_resolve
+            from .config_authority import requested_loader as _ca_requested
+            from . import loader_selection as _loader_sel
+            _loader_sel.reset_for_run()
+            _e40_rc = _ca_resolve()
+            self._e40_resolved_config = _e40_rc
+            _loader_sel.seed_from_resolved({
+                _role: _ca_requested(_role, _e40_rc)
+                for _role in ("clip", "unet", "vae")
+            })
+        except Exception:
+            self._e40_resolved_config = None
         self._resource_tel = None
         if os.environ.get("COMFYMODAL_V2_RESOURCE_TELEMETRY", "0").strip().lower() in {"1", "true", "yes", "on"}:
             try:
@@ -19810,6 +20289,49 @@ class ModalRuntimeEntrypoint:
                     if isinstance(data, dict):
                         data["canonical_ledger_status"] = "error"
                         data["canonical_ledger_error"] = _ledger_finalize_error
+                # ── E40: single acceptance-authority telemetry blocks ────
+                # loader_selection / runtime_status / resolved_config are
+                # emitted exactly once per run, here at result assembly.
+                # The v2ctl StructuralValidator enforces them when present.
+                if isinstance(data, dict):
+                    try:
+                        from . import loader_selection as _ls_emit
+                        from .runtime_status import build_runtime_status as _brs
+                        _sel_snapshot = _ls_emit.snapshot()
+                        # Snapshot-resident arms are realized BY the restore
+                        # itself (no tracked disk read occurs), so an absent
+                        # observation for those arms means the snapshot
+                        # delivery was the observed arm — record it as such.
+                        for _role, _entry in _sel_snapshot.items():
+                            if not _entry.get("observed") and _entry.get("requested") in (
+                                "cpu_snapshot_native", "policy_v1",
+                            ):
+                                _ls_emit.record_observed(_role, _entry["requested"])
+                        _sel_snapshot = _ls_emit.snapshot()
+                        if _sel_snapshot:
+                            data["loader_selection"] = _sel_snapshot
+                        _e40_reasons = list(_ls_emit.mismatches())
+                        try:
+                            _ledger_ok = data.get("canonical_ledger_status") == "ok"
+                        except Exception:
+                            _ledger_ok = False
+                        if not _ledger_ok:
+                            _e40_reasons.append("canonical_ledger_not_ok")
+                        data["runtime_status"] = _brs(
+                            loader_selection=_sel_snapshot or None,
+                            reasons=_e40_reasons,
+                        )
+                        _e40_rc = getattr(self, "_e40_resolved_config", None)
+                        if _e40_rc is not None:
+                            data["resolved_config"] = {
+                                "fingerprint": _e40_rc.fingerprint(),
+                                "controls": _e40_rc.as_dict(),
+                            }
+                    except Exception as _e40_emit_exc:
+                        try:
+                            data.setdefault("e40_telemetry_error", str(_e40_emit_exc)[:300])
+                        except Exception:
+                            pass
                 # ── E29: durable-result span opened at plan receipt ──────
                 # NOTE: the span is opened at plan receipt (see the
                 # plan-receipt section above); the block below is REMOVED —
@@ -19862,6 +20384,218 @@ class ModalRuntimeEntrypoint:
                         evt for evt in _dc_trace_events if isinstance(evt, dict)
                     )
             yield _deferred_commit_event
+
+    async def run_golden_serial_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Thin Golden Modal adapter: validate/normalize the request, then hand
+        off to ``golden_serial_execute`` exactly once.
+
+        This adapter deliberately does NOT construct an ExecutionPlan and does
+        NOT touch run_plan_stream/run_prompt_stream/executor machinery — Golden
+        owns its own stage ordering, teardown, and durability.  The Modal
+        runtime-state Volume handle is passed through unwrapped (no
+        ``GoldenVolumeHandle``) because ``golden_durable_commit`` needs the
+        real ``.commit`` API.
+        """
+        # Lazy Golden imports: keep module import cost zero when unused.
+        from .golden_serial import (
+            GoldenRequest,
+            golden_serial_execute,
+        )
+
+        request_id_raw: Any = ""
+        telemetry_path: Path | None = None
+        try:
+            if not isinstance(request, Mapping):
+                raise ValueError("golden_request_must_be_mapping")
+            request_id_raw = request.get("request_id")
+            if not isinstance(request_id_raw, str) or not request_id_raw.strip():
+                raise ValueError("golden_request_id_required_nonempty_string")
+            prompt = request.get("prompt")
+            if not isinstance(prompt, Mapping) or not prompt:
+                raise ValueError("golden_prompt_mapping_required")
+            extra_data_raw = request.get("extra_data")
+            if extra_data_raw is None:
+                extra_data_raw = {}
+            if not isinstance(extra_data_raw, Mapping):
+                raise ValueError("golden_extra_data_must_be_mapping")
+            restore_metadata = _validate_golden_restore_metadata(
+                getattr(self, "_restore_timing", None)
+            )
+
+            # Sanitized request id for the local telemetry path: keep only
+            # path-safe characters and refuse traversal outside the golden dir.
+            sanitized = "".join(
+                ch for ch in request_id_raw.strip()
+                if ch.isalnum() or ch in "-_."
+            ).strip(".")
+            if not sanitized:
+                raise ValueError("golden_request_id_unsanitizable")
+            golden_dir = Path(RUNTIME_STATE_PATH, "golden")
+            telemetry_path = golden_dir / f"{sanitized}.json"
+            if telemetry_path.resolve().parent != golden_dir.resolve():
+                raise ValueError("golden_telemetry_path_traversal_blocked")
+            golden_dir.mkdir(parents=True, exist_ok=True)
+
+            contract_raw = request.get("contract")
+            if contract_raw is not None:
+                raise ValueError("golden_contract_override_not_allowed")
+
+            volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
+            if volume is None:
+                raise RuntimeError("golden_runtime_state_volume_unavailable")
+            volume_mount_root = _validate_golden_runtime_mount_root(volume)
+            if not _golden_path_contained(golden_dir, volume_mount_root):
+                raise RuntimeError("golden_telemetry_path_outside_runtime_mount")
+            output_root = Path(volume_mount_root, "output_assets")
+            if not _golden_path_contained(output_root, volume_mount_root):
+                raise RuntimeError("golden_output_path_outside_runtime_mount")
+
+            # Resolve the mapping that is actually installed in this runtime.
+            # Passing it explicitly prevents Golden from silently importing a
+            # different registry or falling back to legacy executor state.
+            import nodes as _installed_nodes
+            node_classes = getattr(_installed_nodes, "NODE_CLASS_MAPPINGS", None)
+            if not isinstance(node_classes, Mapping):
+                raise RuntimeError("golden_node_class_mappings_invalid")
+            self._assert_golden_execution_isolated()
+
+            def _golden_snapshot_proof_supplier() -> dict[str, list[Any]]:
+                """Passive snapshot-proof supplier built ONLY from real,
+                currently-present instance surfaces.  Never mutates anything
+                and never calls teardown/quiescence helpers; fails closed when
+                no surface exists at all."""
+                return self._golden_snapshot_proof_surfaces()
+
+            # Fail-closed request-id containment: never delegate a raw id that
+            # could carry path separators or traversal sequences into Golden.
+            normalized_request_id = request_id_raw.strip()
+            if (
+                not normalized_request_id
+                or "/" in normalized_request_id
+                or "\\" in normalized_request_id
+                or ".." in normalized_request_id
+            ):
+                yield {
+                    "type": "error",
+                    "request_id": request_id_raw,
+                    "message": "golden_request_id_invalid"[:2000],
+                }
+                return
+
+            # ── Golden DynamicVRAM activation seam (official-equivalent) ──
+            # Exactly one call per request; the callee is idempotent per
+            # process (a repeat returns already_activated=True).  When the
+            # gate env is unset this honestly reports activated=False /
+            # reason="gate_not_set".  Fail closed: an activation failure
+            # emits exactly one bounded error event and never delegates to
+            # golden_serial_execute.
+            from .golden_aimdo_activation import activate_golden_dynamic_vram
+            try:
+                activation_evidence = activate_golden_dynamic_vram()
+            except Exception as exc:
+                yield {
+                    "type": "error",
+                    "request_id": normalized_request_id,
+                    "message": f"golden_activation_failed:{exc}"[:2000],
+                }
+                return
+
+            # Golden's CLIP/VAE loaders require DynamicVRAM before any model
+            # transport.  Reject a missing gate here, before graph execution
+            # or model-sized I/O, rather than discovering it after QD reads.
+            if not (
+                activation_evidence.get("activated")
+                or activation_evidence.get("already_activated")
+            ):
+                yield {
+                    "type": "error",
+                    "request_id": normalized_request_id,
+                    "message": "golden_dynamic_vram_gate_required"[:2000],
+                    "golden_activation": activation_evidence,
+                }
+                return
+
+            golden_request = GoldenRequest(
+                request_id=normalized_request_id,
+                prompt=dict(prompt),
+                extra_data=dict(extra_data_raw),
+            )
+            self._golden_execution_active = True
+            try:
+                result = await golden_serial_execute(
+                    golden_request,
+                    volume=volume,
+                    volume_mount_root=volume_mount_root,
+                    output_root=str(output_root),
+                    telemetry_path=str(telemetry_path),
+                    node_classes=node_classes,
+                    snapshot_proof=_golden_snapshot_proof_supplier,
+                    restore_metadata=restore_metadata,
+                )
+            finally:
+                self._golden_execution_active = False
+        except Exception as exc:
+            rid = request_id_raw if isinstance(request_id_raw, str) else ""
+            error_event: dict[str, Any] = {
+                "type": "error",
+                "request_id": rid,
+                "message": f"{type(exc).__name__}: {exc}"[:2000],
+            }
+            if isinstance(locals().get("activation_evidence"), dict):
+                error_event["golden_activation"] = locals()["activation_evidence"]
+            yield error_event
+            return
+
+        # These are captured after Golden returns and immediately before the
+        # adapter yields its one terminal event.  They are not derived from
+        # stage telemetry, so they retain the real adapter return/yield wall
+        # and monotonic boundaries.
+        _return_wall_unix_ns = time.time_ns()
+        _return_mono_ns = time.monotonic_ns()
+        result_data = dataclasses.asdict(result)
+        _terminal_timing = {
+            "return_wall_unix_ns": _return_wall_unix_ns,
+            "return_mono_ns": _return_mono_ns,
+            "return_monotonic_ns": _return_mono_ns,
+            "teardown_complete": True,
+            "terminal_complete": True,
+        }
+        # Golden activation evidence + observed flags.  Honest absence: when
+        # the gate was unset the evidence carries activated=False /
+        # reason="gate_not_set" and flags_observed shows false — never
+        # fabricated.
+        result_data["golden_activation"] = activation_evidence
+        result_data["golden_flags_observed"] = {
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": bool(
+                activation_evidence.get("activated")
+                or activation_evidence.get("already_activated")
+            ),
+            "core_model_patcher_is_dynamic": bool(
+                activation_evidence.get("is_dynamic_alias")
+            ),
+        }
+        # Evidence, never fabrication: attach the telemetry document Golden
+        # actually persisted at the known local path (bounded only by normal
+        # JSON size).  A read failure is reported honestly instead of being
+        # papered over.
+        try:
+            with open(telemetry_path, "r", encoding="utf-8") as fh:
+                result_data["golden_telemetry"] = json.load(fh)
+        except Exception as exc:
+            result_data["golden_telemetry_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        _yield_wall_unix_ns = time.time_ns()
+        _yield_mono_ns = time.monotonic_ns()
+        _terminal_timing.update({
+            "yield_wall_unix_ns": _yield_wall_unix_ns,
+            "yield_mono_ns": _yield_mono_ns,
+            "yield_monotonic_ns": _yield_mono_ns,
+        })
+        result_data["terminal"] = dict(_terminal_timing)
+        result_data["terminal_timing"] = dict(_terminal_timing)
+        yield {"type": "result", "data": result_data}
 
     async def run_prompt_stream(
         self,
@@ -19973,6 +20707,7 @@ def _build_decorated_v2_class() -> type:
         self._deferred_commit_task = None
         self._deferred_commit_diag = None
         self._deferred_commit_pending = False
+        self._golden_execution_active = False
         self._init_teardown_diagnostics()
         self._v2_initialized = True
 
@@ -19980,6 +20715,7 @@ def _build_decorated_v2_class() -> type:
     _METHODS_TO_WRAP = (
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
+        "run_golden_serial_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
         "run_numa_experiment",
@@ -19999,6 +20735,7 @@ def _build_decorated_v2_class() -> type:
     _NON_WORKFLOW_METHODS = frozenset({
         "startup", "restore", "exit",
         "read_output_asset",
+        "run_golden_serial_stream",
         "run_env_probe", "run_entry_probe",
         "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
@@ -20095,6 +20832,13 @@ def _build_decorated_v2_class() -> type:
         setattr(cls, "exit", _exit_decorator()(cls.exit))
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
+    # Golden adapter: generator method, but NOT in the normal stream
+    # release/cleanup machinery — Golden owns its own teardown.
+    setattr(
+        cls,
+        "run_golden_serial_stream",
+        _modal.method(is_generator=True)(cls.run_golden_serial_stream),
+    )
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))

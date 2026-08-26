@@ -1,98 +1,52 @@
-"""Profiles tab structural tests."""
-import re
+"""H18 Wave G — retirement contract for web/testing-profiles.js.
+
+The Comparison Profiles editor was retired in Wave E (H14, H5 §7/R1) and
+the module file was deleted in Wave G (H18). Stored comparison-profile
+data and the server-side READ_COMPAT routes survive independently. These
+tests pin the retirement: the file is gone and nothing in production
+references it.
+"""
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+WEB = REPO_ROOT / "web"
+RETIRED_NAME = "testing-profiles.js"
 
 
-class _JsModule:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.text = path.read_text(encoding="utf-8") if path.exists() else ""
-
-    def has_export(self, name: str) -> bool:
-        return bool(re.search(rf"export\s+(?:function|const|class)\s+{re.escape(name)}\b", self.text))
+def _code(text: str) -> str:
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("//")
+    )
 
 
-class ProfilesTabTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.m = _JsModule(REPO_ROOT / "web" / "testing-profiles.js")
-        if not self.m.path.exists():
-            raise AssertionError("web/testing-profiles.js missing")
+class RetiredProfilesModuleContractTests(unittest.TestCase):
+    def test_file_is_absent(self):
+        self.assertFalse(
+            (WEB / RETIRED_NAME).exists(),
+            f"web/{RETIRED_NAME} must stay deleted (Wave G)",
+        )
 
-    def test_exports_profiles_tab_render(self):
-        self.assertTrue(self.m.has_export("profiles_tab_render"))
+    def test_no_production_importer(self):
+        importers = []
+        for path in WEB.glob("*.js"):
+            code = _code(path.read_text(encoding="utf-8"))
+            if RETIRED_NAME in code or f"./{RETIRED_NAME}" in code:
+                importers.append(path.name)
+        self.assertEqual(importers, [], f"Unexpected importers of {RETIRED_NAME}: {importers}")
 
-    def test_contains_create_from_canvas_controls(self):
-        self.assertIn("Create from Canvas", self.m.text)
-        self.assertIn("Profile name", self.m.text)
-
-    def test_contains_saved_profiles_workspace_markers(self):
-        self.assertIn("testing-profiles-list", self.m.text)
-        self.assertIn("testing-profiles-editor", self.m.text)
-
-    def test_contains_profile_lifecycle_actions(self):
-        for label in ("Edit", "Validate", "Duplicate", "Delete"):
-            with self.subTest(label=label):
-                self.assertIn(label, self.m.text)
-
-    def test_contains_mapping_assistant_markers(self):
-        self.assertIn("Mapping Assistant", self.m.text)
-        self.assertIn("Save Mappings", self.m.text)
-
-    def test_contains_mapping_slot_keys(self):
-        for key in ("prompt", "negative_prompt", "seed", "steps", "guidance", "width", "height", "input_image"):
-            with self.subTest(key=key):
-                self.assertIn(key, self.m.text)
-
-    def test_uses_comparison_profile_create_api(self):
-        self.assertIn("/comparison/profiles", self.m.text)
-        self.assertIn("detect-slots", self.m.text)
-
-
-# ---------------------------------------------------------------------------
-# Deterministic legacy T2I normalization — labels/source, not Inferred T2I
-# ---------------------------------------------------------------------------
-
-class LegacyT2INormalizationTests(unittest.TestCase):
-    """Profile tests for deterministic legacy T2I normalization labels/source,
-    not Inferred T2I."""
-
-    def setUp(self) -> None:
-        self.m = _JsModule(REPO_ROOT / "web" / "testing-profiles.js")
-        if not self.m.path.exists():
-            raise AssertionError("web/testing-profiles.js missing")
-
-    def test_legacy_t2i_label_present(self):
-        """Profiles must reference a 'Legacy T2I' label for normalization."""
+    def test_no_comparison_editor_resurrection(self):
+        """The profiles alias must never mount a recreated Comparison editor."""
+        text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
+        self.assertIn('profiles: "playground"', text)
         self.assertIn(
-            "Legacy T2I",
-            self.m.text,
-            "Expected 'Legacy T2I' normalization label in testing-profiles.js",
+            "Comparison Profiles have retired",
+            text,
+            "Truthful deprecation copy must remain for the profiles alias",
         )
-
-    def test_t2i_normalization_source_marker(self):
-        """Profiles must include a t2i_normalization source key."""
-        text = self.m.text
-        has_source = (
-            "t2i_normalization" in text
-            or "t2i-normalization" in text
-            or "legacyT2i" in text
-        )
-        self.assertTrue(
-            has_source,
-            "Expected t2i_normalization source marker (t2i_normalization / legacyT2i) in testing-profiles.js",
-        )
-
-    def test_no_inferred_t2i(self):
-        """Profiles must NOT use 'Inferred T2I' as a label or reference."""
-        self.assertNotIn(
-            "Inferred T2I",
-            self.m.text,
-            "'Inferred T2I' should not appear in testing-profiles.js; use deterministic Legacy T2I labels instead",
-        )
+        code = _code(text)
+        self.assertNotIn("mountComparisonProfiles", code)
 
 
 if __name__ == "__main__":

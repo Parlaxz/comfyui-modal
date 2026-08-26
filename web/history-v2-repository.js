@@ -25,6 +25,7 @@
 // are visible instead of silently showing demo data.
 
 import { createFixtureRepository } from "./history-v2-fixtures.js";
+import { publishStudioSync } from "./studio-sync.js";
 
 // ── Public constants ─────────────────────────────────────────────────────
 
@@ -174,6 +175,10 @@ export function normalizeHistoryOutput(raw, index) {
   return {
     index: out.index != null ? out.index : (index != null ? index : 0),
     outputId: _firstString(out.output_id, out.outputId, out.id),
+    // F6: canonical logical-output identity ("node:<id>:slot:<key>:item:<n>")
+    // — per-output download actions key off this instead of array position
+    // whenever the backend projects it.
+    logicalKey: _firstString(out.logical_output_key, out.logicalKey),
     assetId: _firstString(out.asset_id, out.assetId),
     thumbUrl: _firstString(out.thumb_url, out.thumbUrl),
     previewUrl: _firstString(out.preview_url, out.previewUrl),
@@ -181,6 +186,64 @@ export function normalizeHistoryOutput(raw, index) {
     originalFailed: _toBool(out.original_failed, _toBool(out.originalFailed, false)),
     originalAvailable: _toBool(out.original_available, _toBool(out.originalAvailable, false)),
     status: _firstString(out.status, "success"),
+    // F10 configured-folder Export identity/state per variant.  The backend
+    // projection is authoritative: an Asset ID is NEVER inferred from URL
+    // text, and an absent variant stays null so the UI renders no Export
+    // action at all (older payloads without these fields stay safe).
+    previewAssetId: _firstString(out.preview_asset_id, out.previewAssetId),
+    previewExportState: normalizeExportState(
+      out.preview_export_state != null ? out.preview_export_state : out.previewExportState,
+    ),
+    originalAssetId: _firstString(out.original_asset_id, out.originalAssetId),
+    originalExportState: normalizeExportState(
+      out.original_export_state != null ? out.original_export_state : out.originalExportState,
+    ),
+  };
+}
+
+// Canonical per-variant export states (frozen F9 vocabulary).  Anything else
+// (absent, null, unknown) normalizes to null → "no Export action shown".
+const EXPORT_STATES = ["not_exported", "exported", "missing", "failed"];
+
+export function normalizeExportState(value) {
+  if (value == null || value === "") return null;
+  const key = String(value).toLowerCase().replace(/[\s-]+/g, "_");
+  return EXPORT_STATES.indexOf(key) !== -1 ? key : null;
+}
+
+/**
+ * F10 — normalized configured-folder Export response (frozen F9 contract).
+ * snake_case wire fields are authoritative; already_exported is a SUCCESSFUL
+ * idempotent outcome, never an error; partial:true marks a distinct failure
+ * class the UI must surface truthfully.
+ * @param {object|null|undefined} data parsed backend payload
+ * @param {object} [base] {httpStatus} from a non-200 response
+ * @returns {object} normalized export result
+ */
+export function normalizeExportResponse(data, base) {
+  const raw = data && typeof data === "object" ? data : {};
+  const b = base && typeof base === "object" ? base : {};
+  const ok = _firstString(raw.status, b.status) === "ok";
+  return {
+    ok: ok,
+    assetId: _firstString(raw.asset_id, raw.assetId, b.assetId),
+    saved: raw.saved == null ? null : _toBool(raw.saved, false),
+    alreadyExported: raw.already_exported == null
+      ? (raw.alreadyExported == null ? null : _toBool(raw.alreadyExported, false))
+      : _toBool(raw.already_exported, false),
+    exportState: normalizeExportState(raw.export_state != null ? raw.export_state : raw.exportState),
+    reason: _firstString(raw.reason, b.reason),
+    message: _firstString(raw.message, b.message, raw.detail),
+    partial: _toBool(raw.partial, _toBool(b.partial, false)),
+    destinationPath: _firstString(raw.destination_path, raw.destinationPath),
+    metadataPath: raw.metadata_path === undefined
+      ? (raw.metadataPath === undefined ? null : String(raw.metadataPath))
+      : (raw.metadata_path == null ? null : String(raw.metadata_path)),
+    byteCount: _toIntOrNull(raw.byte_count != null ? raw.byte_count : raw.byteCount),
+    fileExt: _firstString(raw.file_ext, raw.fileExt),
+    mimeType: _firstString(raw.mime_type, raw.mimeType),
+    exportedAt: _firstString(raw.exported_at, raw.exportedAt),
+    httpStatus: b.httpStatus != null ? b.httpStatus : null,
   };
 }
 
@@ -216,6 +279,223 @@ export function normalizeHistoryAttempt(raw) {
 
 export function normalizeHistoryAttempts(raw) {
   return (Array.isArray(raw) ? raw : []).map(normalizeHistoryAttempt);
+}
+
+// ── Generate Original (E4C) shared policy helpers ────────────────────────
+
+// Attempt statuses that mean "no more updates will arrive for this attempt".
+const TERMINAL_ATTEMPT_STATUSES = ["completed", "failed", "canceled", "interrupted"];
+
+export function isTerminalAttemptStatus(status) {
+  const key = status == null ? "" : String(status).toLowerCase().replace(/\s+/g, "_");
+  if (key === "success" || key === "succeeded") return true;
+  return TERMINAL_ATTEMPT_STATUSES.indexOf(key) !== -1;
+}
+
+/**
+ * Derive the Generate Original action state from durable backend data.
+ * The latest Original attempt is the LAST original-mode entry in attempts[]
+ * (the backend appends new attempts; order is chronological).
+ * @param {object|null|undefined} record generation/cell record
+ * @returns {{phase: string, latestAttempt: object|null, hasPreview: boolean,
+ *   originalAvailable: boolean, busyGeneration: boolean}}
+ */
+export function deriveOriginalActionState(record) {
+  const rec = record && typeof record === "object" ? record : {};
+  const attempts = Array.isArray(rec.attempts) ? rec.attempts : [];
+  let latestAttempt = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const a = attempts[i];
+    const mode = a && (a.mode || a.purpose) != null ? String(a.mode || a.purpose).toLowerCase() : "";
+    if (mode === "original") latestAttempt = a;
+  }
+  const feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : rec;
+  const hasPreview = !!(feat.previewUrl || feat.thumbUrl || feat.preview_url || feat.thumb_url
+    || (Array.isArray(rec.outputs) && rec.outputs.some(function (o) {
+      const out = o && typeof o === "object" ? o : {};
+      return !!(out.preview_url || out.previewUrl || out.thumb_url || out.thumbUrl);
+    })));
+  const originalAvailable = !!(feat.originalUrl || feat.originalAvailable || feat.original_url
+    || rec.originalAvailable || rec.original_available);
+  const attemptStatus = latestAttempt && latestAttempt.status != null
+    ? String(latestAttempt.status).toLowerCase().replace(/\s+/g, "_")
+    : "";
+  const attemptActive = attemptStatus === "queued" || attemptStatus === "running"
+    || attemptStatus === "pending" || attemptStatus === "in_progress";
+  const attemptFailed = attemptStatus === "failed" || attemptStatus === "error"
+    || attemptStatus === "errored" || attemptStatus === "failure";
+
+  let phase = "idle";
+  if (latestAttempt && attemptActive) phase = "active";
+  else if (originalAvailable) phase = "success";
+  else if (latestAttempt && attemptFailed) phase = "failed";
+
+  const genStatus = rec.status != null ? String(rec.status).toLowerCase() : "";
+  return {
+    phase: phase,
+    latestAttempt: latestAttempt,
+    hasPreview: hasPreview,
+    originalAvailable: originalAvailable,
+    busyGeneration: genStatus === "running" || genStatus === "queued",
+  };
+}
+
+/**
+ * Whether Generate Original may be offered for a record at all.
+ * Legacy/incomplete History (bridge/fixture repositories, or records the
+ * backend marks irreproducible) must never offer the action: the saved
+ * generation does not contain the exact immutable execution data required,
+ * and the browser must not rebuild it from the current Workflow/Preset.
+ */
+export function generateOriginalEligibility(record, repoInfo) {
+  const rec = record && typeof record === "object" ? record : {};
+  if (!rec.id) {
+    return { eligible: false, reason: "unavailable", message: "Generation identity unavailable." };
+  }
+  const mode = repoInfo && repoInfo.mode ? String(repoInfo.mode) : "";
+  if (mode === "bridge" || mode === "fixture") {
+    return {
+      eligible: false,
+      reason: "legacy",
+      message: "This saved generation does not contain the exact immutable execution data required to generate an Original.",
+    };
+  }
+  if (rec.irreproducible != null && _toBool(rec.irreproducible, false)) {
+    return {
+      eligible: false,
+      reason: "irreproducible",
+      message: "This saved generation does not contain the exact immutable execution data required to generate an Original.",
+    };
+  }
+  return { eligible: true, reason: "", message: "" };
+}
+
+/**
+ * F6 — Single Resume eligibility, derived ONLY from durable backend state.
+ *
+ * Resume is offered for an ordinary Single Generation that is durably
+ * `interrupted` (never failed/canceled/completed/active — those have their
+ * own verbs).  Tolerant to F5's concurrent `replay_capable` projection:
+ *   - explicit replay_capable=false (or irreproducible) → rendered disabled
+ *     with a truthful reason BEFORE any click;
+ *   - field absent (older/fake payload) → backend-safe fallback: the control
+ *     is offered and the bodyless POST remains authoritative.
+ * Experiment-cell generations resume through the Experiment surface, so they
+ * never offer the Single Resume verb.
+ * @param {object|null|undefined} record generation record
+ * @returns {{state: "hidden"|"unavailable"|"resume", reason: string}}
+ */
+export function deriveSingleResumeState(record) {
+  const rec = record && typeof record === "object" ? record : {};
+  if (!rec.id || rec.kind === "experiment") return { state: "hidden", reason: "" };
+  if (rec.experimentId || rec.experiment_id) {
+    return { state: "hidden", reason: "" };
+  }
+  const status = rec.status != null ? String(rec.status).toLowerCase().replace(/\s+/g, "_") : "";
+  if (status !== "interrupted") return { state: "hidden", reason: "" };
+  if (rec.irreproducible != null && _toBool(rec.irreproducible, false)) {
+    return {
+      state: "unavailable",
+      reason: "This saved generation does not contain the exact immutable execution data required to resume.",
+    };
+  }
+  // Tolerant consumption of the (concurrent F5) replay_capable projection:
+  // absent field → null → fall through and let the POST decide.
+  if (rec.replayCapable === false || rec.replay_capable === false) {
+    return {
+      state: "unavailable",
+      reason: "This saved generation does not contain the exact immutable execution data required to resume.",
+    };
+  }
+  return { state: "resume", reason: "" };
+}
+
+/**
+ * F6 — truthful Retry label for a FAILED latest Original-mode Attempt.
+ *
+ * The machinery is one route (/original/retry); only the presentation is
+ * conditional, from DURABLE attempt/asset history (never a transient flag):
+ *   - "Retry run"      — plain failed ordinary run: the failed workflow
+ *                        Attempt simply failed, with no successful Preview
+ *                        history, no prior successful Original, and no
+ *                        retained usable Original asset (no derivative
+ *                        Generate-Original story).
+ *   - "Retry Original" — the failure belongs to the explicit Original
+ *                        derivative lifecycle (Preview succeeded then
+ *                        Generate Original failed; an Original rerender/
+ *                        retry failed; retained Original-phase history).
+ */
+export function deriveRetryActionLabel(record) {
+  const rec = record && typeof record === "object" ? record : {};
+  const attempts = Array.isArray(rec.attempts) ? rec.attempts : [];
+  let hasDerivativeStory = false;
+  for (let i = 0; i < attempts.length; i++) {
+    const a = attempts[i] || {};
+    const mode = a.mode != null ? String(a.mode).toLowerCase() : "";
+    const status = a.status != null ? String(a.status).toLowerCase() : "";
+    if (mode === "preview" && status === "completed") hasDerivativeStory = true;
+    if (mode === "original" && status === "completed") hasDerivativeStory = true;
+  }
+  const feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : rec;
+  if (feat.originalUrl || feat.original_url
+    || feat.originalAvailable || feat.original_available
+    || rec.originalAvailable || rec.original_available) {
+    hasDerivativeStory = true;
+  }
+  return hasDerivativeStory ? "Retry Original" : "Retry run";
+}
+
+/**
+ * Normalize a Generate Original backend response (frozen E3B2 contract:
+ * status / generation_id / run_id / purpose=original / attempt_status /
+ * reused + machine-readable outcome/error where applicable).  Accepts both
+ * snake_case and camelCase so close naming variations still hydrate.
+ * @param {object|null|undefined} data parsed backend payload
+ * @param {object} [base] fields to merge (e.g. httpStatus from an error body)
+ * @returns {object} normalized action result
+ */
+export function normalizeOriginalGenerationResponse(data, base) {
+  const raw = data && typeof data === "object" ? data : {};
+  const b = base && typeof base === "object" ? base : {};
+  const outcome = _firstString(raw.outcome, b.outcome, raw.reason_code, b.reason_code);
+  const errorCode = _firstString(raw.error_code, b.error_code, raw.code, b.code);
+  const errorMessage = raw.error != null && typeof raw.error !== "object"
+    ? String(raw.error)
+    : _firstString(raw.error_message, b.error_message, raw.message, b.message, raw.detail);
+  const acceptedRaw = raw.accepted != null ? raw.accepted : b.accepted;
+  // E4D: refusal vocabulary from the landed E3B2 backend.  retry_required is
+  // a machine-readable state transition (failed-only Original): never a
+  // success, never auto-retried — the UI exposes explicit Retry instead.
+  const irreproducibleOutcome = outcome === "irreproducible" || outcome === "not_reproducible"
+    || outcome === "generation_not_reproducible" || errorCode === "irreproducible"
+    || errorCode === "generation_not_reproducible";
+  const failedOutcome = irreproducibleOutcome
+    || outcome === "unavailable" || outcome === "retry_required";
+  const busyOutcome = outcome === "busy" || outcome === "generation_busy"
+    || errorCode === "generation_busy";
+  let accepted;
+  if (failedOutcome) {
+    accepted = false;
+  } else if (acceptedRaw != null) {
+    accepted = _toBool(acceptedRaw, true);
+  } else {
+    // An HTTP-error body without an explicit accepted flag is a refusal.
+    accepted = b.httpStatus == null;
+  }
+  return {
+    accepted: accepted && !failedOutcome,
+    reused: _toBool(raw.reused, _toBool(b.reused, false)),
+    status: _firstString(raw.status, b.status),
+    generationId: _firstString(raw.generation_id, raw.generationId, b.generationId),
+    runId: _firstString(raw.run_id, raw.runId, b.runId),
+    purpose: _firstString(raw.purpose, b.purpose, "original"),
+    attemptStatus: _firstString(raw.attempt_status, raw.attemptStatus, b.attemptStatus),
+    outcome: busyOutcome ? "busy" : (irreproducibleOutcome ? "irreproducible" : outcome),
+    errorCode: errorCode,
+    errorMessage: errorMessage,
+    message: _firstString(raw.message, b.message),
+    httpStatus: b.httpStatus != null ? b.httpStatus : null,
+  };
 }
 
 function _isExperimentRaw(raw) {
@@ -256,6 +536,15 @@ function _normalizeGeneration(raw) {
     previewOnly: previewOnly,
     originalAvailable: _toBool(raw.original_available, _toBool(extra.original_available,
       outputs.some(function (out) { return !!normalizeHistoryOutput(out).originalUrl; }))),
+    // F5-tolerant replay-capability projection: null when the backend does
+    // not send it (older/fake payloads) so the UI falls back safely and the
+    // bodyless Resume POST stays authoritative.
+    replayCapable: raw.replay_capable === undefined || raw.replay_capable === null
+      ? null
+      : _toBool(raw.replay_capable, true),
+    // Durable replay-incapability marker (legacy snapshots): consumed by the
+    // Generate Original / Resume eligibility gates.
+    irreproducible: _toBool(raw.irreproducible, false),
     featuredOutput: _featuredOutput(raw, outputs),
     runId: _firstString(raw.run_id, raw.runId, raw.id),
   };
@@ -431,7 +720,11 @@ function _emptyGenerationRecord() {
     preset: "", prompt: "", negativePrompt: "", startedAt: "", completedAt: "",
     durationMs: null, favorite: false, note: "", tags: [], models: [],
     outputCount: 0, hasImage: false, previewOnly: false, originalAvailable: false,
-    featuredOutput: { index: 0, thumbUrl: "", previewUrl: "", originalUrl: "", originalFailed: false },
+    featuredOutput: {
+      index: 0, thumbUrl: "", previewUrl: "", originalUrl: "", originalFailed: false,
+      previewAssetId: null, previewExportState: null,
+      originalAssetId: null, originalExportState: null,
+    },
     runId: "",
   };
 }
@@ -493,6 +786,10 @@ function _createBridgeRepository(apiBase) {
     cancelExperiment: function () { return _notAvailable(); },
     generateOriginal: function () { return _notAvailable(); },
     generateOriginalForCell: function () { return _notAvailable(); },
+    retryOriginal: function () { return _notAvailable(); },
+    retryOriginalForCell: function () { return _notAvailable(); },
+    resumeGeneration: function () { return _notAvailable(); },
+    exportAsset: function () { return _notAvailable(); },
     listFacets: function () { return _bridgeListFacets(apiBase); },
   };
 }
@@ -628,6 +925,7 @@ function _bridgeSetFavorite(apiBase, id, favorite) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ favorite: value }),
   }).then(function (data) {
+    publishStudioSync("history");
     return data && typeof data === "object" ? data : { favorite: value };
   });
 }
@@ -640,6 +938,7 @@ function _bridgeSetNote(apiBase, id, note) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ note: value }),
   }).then(function (data) {
+    publishStudioSync("history");
     return data && typeof data === "object" ? data : { note: value };
   });
 }
@@ -664,7 +963,14 @@ function _bridgeListFacets(apiBase) {
 //                        path; automatic Retry-all is forbidden)
 //   retryExperiment    → unavailable placeholder (D5 forbids retry-all)
 //   resume/cancel      → POST the modern action routes
-//   generateOriginal*  → honest "not available" placeholder (deferred)
+//   generateOriginal / generateOriginalForCell
+//                      → POST /history-v2/generations/{generation_id}/original
+//                        (E4C: one Generation-scoped route; cells pass their
+//                        own generation_id; rerender flag only when explicit)
+//   retryOriginal / retryOriginalForCell
+//                      → POST /history-v2/generations/{generation_id}/original/retry
+//                        (E4D: dedicated failed-Original retry route, bodyless;
+//                        same Generation identity as Generate Original)
 
 function _createV2Repository(apiBase) {
   return {
@@ -672,8 +978,8 @@ function _createV2Repository(apiBase) {
     listFeed: function (query) { return _v2ListFeed(apiBase, query); },
     getGeneration: function (id) { return _v2GetGeneration(apiBase, id); },
     getExperiment: function (id) { return _v2GetExperiment(apiBase, id); },
-    setFavorite: function (id, favorite) { return _v2SetFavorite(apiBase, id, favorite); },
-    setNote: function (id, note) { return _v2SetNote(apiBase, id, note); },
+    setFavorite: function (id, favorite, opts) { return _v2SetFavorite(apiBase, id, favorite, opts); },
+    setNote: function (id, note, opts) { return _v2SetNote(apiBase, id, note, opts); },
     setFeaturedOutput: function (generationId, outputIndex) {
       return _v2SetFeaturedOutput(apiBase, generationId, outputIndex);
     },
@@ -681,8 +987,37 @@ function _createV2Repository(apiBase) {
     retryCell: function (experimentId, cellId) { return _v2RetryCell(apiBase, experimentId, cellId); },
     resumeExperiment: function (experimentId) { return _v2ResumeExperiment(apiBase, experimentId); },
     cancelExperiment: function (experimentId) { return _v2CancelExperiment(apiBase, experimentId); },
-    generateOriginal: function () { return _notAvailable(); },
-    generateOriginalForCell: function () { return _notAvailable(); },
+    // E4C: real Generation-scoped Original action.  Both entry points POST the
+    // SAME frozen route with a Generation ID — cells pass their own
+    // generation_id; no experiment-scoped or legacy generation endpoint.
+    generateOriginal: function (generationId, opts) {
+      return _v2GenerateOriginal(apiBase, generationId, opts);
+    },
+    generateOriginalForCell: function (generationId, opts) {
+      return _v2GenerateOriginal(apiBase, generationId, opts);
+    },
+    // E4D: dedicated failed-Original retry action over the SAME Generation
+    // identity — never a re-post of the ordinary /original route.
+    retryOriginal: function (generationId) {
+      return _v2RetryOriginal(apiBase, generationId);
+    },
+    retryOriginalForCell: function (generationId) {
+      return _v2RetryOriginal(apiBase, generationId);
+    },
+    // F1A/F6: canonical Single Resume — bodyless POST to the frozen route
+    // /history-v2/generations/{generation_id}/resume.  Never /original,
+    // never /original/retry, never the Experiment /resume route.
+    resumeGeneration: function (generationId) {
+      return _v2ResumeGeneration(apiBase, generationId);
+    },
+    // F10: configured-folder Export — exactly ONE bodyless POST to the
+    // frozen route /history-v2/assets/{asset_id}/export.  The backend
+    // derives generation/output/variant/Settings/filename itself; the
+    // browser never sends any of them.  Structured outcomes (including
+    // already_exported and failures) resolve normalized — never rejected.
+    exportAsset: function (assetId) {
+      return _v2ExportAsset(apiBase, assetId);
+    },
     listFacets: function () { return _v2ListFacets(apiBase); },
   };
 }
@@ -840,6 +1175,12 @@ function _v2GetExperiment(apiBase, id) {
         return Object.assign({}, featured, {
           key: _firstString(cell.key, cell.cell_id, cell.cellId),
           cellId: _firstString(cell.cell_id, cell.cellId, cell.key),
+          // E4C: the cell's own Generation identity — Generate Original for a
+          // cell always targets THIS generation, never the cell index.
+          generationId: _firstString(
+            cell.generation_id, cell.generationId,
+            generation.id, generation.generation_id, generation.run_id,
+          ),
           index: cell.index != null ? cell.index : index,
           axis: cell.axis && typeof cell.axis === "object"
             ? { x: _firstString(cell.axis.x), y: _firstString(cell.axis.y) }
@@ -861,40 +1202,51 @@ function _v2GetExperiment(apiBase, id) {
     });
 }
 
-function _v2SetFavorite(apiBase, id, favorite) {
+// Optional opts.kind hint ("experiment") tries the matching scope FIRST so
+// experiment annotations never produce a spurious generations 404; unknown
+// ids still fall back to the other scope exactly once.
+function _v2SetFavorite(apiBase, id, favorite, opts) {
   const value = !!favorite;
+  const preferExperiment = !!(opts && typeof opts === "object" && opts.kind === "experiment");
   const idEnc = encodeURIComponent(id || "");
   const generationsUrl = apiBase + "/history-v2/generations/" + idEnc + "/favorite";
   const experimentsUrl = apiBase + "/history-v2/experiments/" + idEnc + "/favorite";
-  return _v2PatchJson(generationsUrl, { favorite: value })
+  const firstUrl = preferExperiment ? experimentsUrl : generationsUrl;
+  const secondUrl = preferExperiment ? generationsUrl : experimentsUrl;
+  return _v2PatchJson(firstUrl, { favorite: value })
     .catch(function (err) {
       if (!(err && err.httpStatus === 404)) throw _v2ClientError(err, "History V2 favorite update failed");
-      // 404 on generations → the id may be an experiment; retry once.
-      return _v2PatchJson(experimentsUrl, { favorite: value })
+      // 404 on the first scope → the id may live in the other; retry once.
+      return _v2PatchJson(secondUrl, { favorite: value })
         .catch(function (err2) {
           throw _v2ClientError(err2, "History V2 favorite update failed");
         });
     })
     .then(function () {
+      publishStudioSync("history");
       return { favorite: value };
     });
 }
 
-function _v2SetNote(apiBase, id, note) {
+function _v2SetNote(apiBase, id, note, opts) {
   const value = note != null ? String(note) : "";
+  const preferExperiment = !!(opts && typeof opts === "object" && opts.kind === "experiment");
   const idEnc = encodeURIComponent(id || "");
   const generationsUrl = apiBase + "/history-v2/generations/" + idEnc + "/note";
   const experimentsUrl = apiBase + "/history-v2/experiments/" + idEnc + "/note";
-  return _v2PatchJson(generationsUrl, { note: value })
+  const firstUrl = preferExperiment ? experimentsUrl : generationsUrl;
+  const secondUrl = preferExperiment ? generationsUrl : experimentsUrl;
+  return _v2PatchJson(firstUrl, { note: value })
     .catch(function (err) {
       if (!(err && err.httpStatus === 404)) throw _v2ClientError(err, "History V2 note update failed");
-      // 404 on generations → the id may be an experiment; retry once.
-      return _v2PatchJson(experimentsUrl, { note: value })
+      // 404 on the first scope → the id may live in the other; retry once.
+      return _v2PatchJson(secondUrl, { note: value })
         .catch(function (err2) {
           throw _v2ClientError(err2, "History V2 note update failed");
         });
     })
     .then(function () {
+      publishStudioSync("history");
       return { note: value };
     });
 }
@@ -906,6 +1258,7 @@ function _v2SetFeaturedOutput(apiBase, generationId, outputIndex) {
       throw _v2ClientError(err, "History V2 featured output update failed");
     })
     .then(function () {
+      publishStudioSync("history");
       return { featuredOutputIndex: outputIndex };
     });
 }
@@ -928,7 +1281,10 @@ function _v2ListFacets(apiBase) {
 // reject truthfully like the rest of the v2 repository.
 
 function _v2ActionJson(url) {
-  return _v2FetchJson(url, { method: "POST" });
+  return _v2FetchJson(url, { method: "POST" }).then(function (data) {
+    publishStudioSync("history");
+    return data;
+  });
 }
 
 function _v2RetryCell(apiBase, experimentId, cellId) {
@@ -948,7 +1304,216 @@ function _v2ResumeExperiment(apiBase, experimentId) {
 
 function _v2CancelExperiment(apiBase, experimentId) {
   const url = apiBase + "/history-v2/experiments/" + encodeURIComponent(experimentId || "") + "/cancel";
-  return _v2ActionJson(url).then(function (data) {
-    return { accepted: true, message: "Cancel queued", ...(data && typeof data === "object" ? data : {}) };
+  return fetch(url, { method: "POST" })
+    .then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        const body = data && typeof data === "object" ? data : {};
+        if (!res.ok) {
+          // Structured refusal (e.g. 503 CANCELLATION_UNAVAILABLE, 409
+          // EXPERIMENT_TERMINAL): resolve a machine-readable result so the
+          // UI classifies it without parsing human text.  Unstructured
+          // failures still reject truthfully.
+          if (body.code || body.error_code || body.outcome) {
+            return {
+              accepted: false,
+              errorCode: _firstString(body.code, body.error_code),
+              message: _firstString(body.message, body.error_message, body.detail),
+              httpStatus: res.status,
+            };
+          }
+          const err = new Error("History V2 request failed (HTTP " + res.status + ")");
+          err.httpStatus = res.status;
+          throw err;
+        }
+        publishStudioSync("history");
+        return Object.assign({ accepted: true, message: "Cancel queued" }, body);
+      });
+    })
+    .catch(function (err) {
+      if (err && err.httpStatus) throw err;
+      throw new Error("History V2 unavailable: " + (err && err.message ? err.message : "network error"));
+    });
+}
+
+// ── Generate / Retry Original (E4C/E4D) ──────────────────────────────────
+//
+// Two distinct frozen E3B2 actions over the SAME immutable snapshot:
+//   Generate Original  POST {apiBase}/history-v2/generations/{id}/original
+//                      (body carries ONLY the explicit rerender flag when
+//                      provided — Generate Again)
+//   Retry Original     POST {apiBase}/history-v2/generations/{id}/original/retry
+//                      (bodyless by contract; creates the new Attempt for a
+//                      failed latest Original)
+// One POST per invocation.  Immutable workflow parameters are NEVER resent
+// and no Generation is ever created client-side: the backend replays its own
+// frozen execution plan under the SAME generation as a new Attempt.
+//
+// Machine-readable refusals (busy / retry_required / irreproducible /
+// unavailable) may arrive on 200 or non-200 responses; the JSON body is
+// parsed so the UI can classify them instead of showing a bare HTTP failure.
+// Anything else rejects truthfully like the rest of the v2 repository.
+
+function _v2OriginalActionResponse(res, id) {
+  return res.json().catch(function () { return null; }).then(function (data) {
+    if (res.ok) {
+      return normalizeOriginalGenerationResponse(data || {}, { generationId: id, purpose: "original" });
+    }
+    // Non-200: surface a machine-readable refusal when the body carries one.
+    if (data && typeof data === "object" && (data.outcome || data.error_code || data.code)) {
+      return normalizeOriginalGenerationResponse(data, {
+        httpStatus: res.status, generationId: id, purpose: "original",
+      });
+    }
+    const err = new Error("History V2 request failed (HTTP " + res.status + ")");
+    err.httpStatus = res.status;
+    throw err;
   });
+}
+
+function _v2GenerateOriginal(apiBase, generationId, opts) {
+  const id = generationId == null ? "" : String(generationId);
+  if (!id) {
+    // No fetch without a Generation identity (cells without one stay inert).
+    return Promise.resolve(normalizeOriginalGenerationResponse({
+      accepted: false, outcome: "unavailable", message: "Generation ID unavailable",
+    }));
+  }
+  const o = opts && typeof opts === "object" ? opts : null;
+  const body = {};
+  if (o && typeof o.rerender === "boolean") body.rerender = o.rerender;
+  const url = apiBase + "/history-v2/generations/" + encodeURIComponent(id) + "/original";
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(function (res) {
+    return _v2OriginalActionResponse(res, id);
+  }).then(function (result) {
+    if (result && result.accepted !== false) publishStudioSync("history");
+    return result;
+  }).catch(function (err) {
+    if (err && err.httpStatus) throw err;
+    throw new Error("History V2 unavailable: " + (err && err.message ? err.message : "network error"));
+  });
+}
+
+// ── Single Resume (F1A route / F6 frontend) ──────────────────────────────
+//
+// Canonical bodyless POST /history-v2/generations/{generation_id}/resume:
+// re-executes an INTERRUPTED ordinary Single under its SAME Generation and
+// frozen snapshot as a new append-only Attempt with the semantic output mode
+// preserved (Preview stays Preview, Original stays Original).  No option
+// delta is ever sent — the browser sends no body at all.  Machine-readable
+// refusals (busy / not resumable / not reproducible / dispatch unavailable /
+// not found) arrive on non-200 responses and are normalized so the UI can
+// classify them without parsing human text.
+
+function _v2ResumeGeneration(apiBase, generationId) {
+  const id = generationId == null ? "" : String(generationId);
+  if (!id) {
+    return Promise.resolve(normalizeOriginalGenerationResponse({
+      accepted: false, outcome: "unavailable", message: "Generation ID unavailable",
+    }, { purpose: "resume" }));
+  }
+  const url = apiBase + "/history-v2/generations/" + encodeURIComponent(id) + "/resume";
+  // Bodyless by contract: zero semantic body, zero option delta.
+  return fetch(url, { method: "POST" })
+    .then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        if (res.ok) {
+          const result = normalizeOriginalGenerationResponse(data || {}, { generationId: id, purpose: "resume" });
+          if (result && result.accepted !== false) publishStudioSync("history");
+          return result;
+        }
+        if (data && typeof data === "object" && (data.outcome || data.error_code || data.code)) {
+          return normalizeOriginalGenerationResponse(data, {
+            httpStatus: res.status, generationId: id, purpose: "resume",
+          });
+        }
+        const err = new Error("History V2 request failed (HTTP " + res.status + ")");
+        err.httpStatus = res.status;
+        throw err;
+      });
+    })
+    .catch(function (err) {
+      if (err && err.httpStatus) throw err;
+      throw new Error("History V2 unavailable: " + (err && err.message ? err.message : "network error"));
+    });
+}
+
+function _v2RetryOriginal(apiBase, generationId) {
+  const id = generationId == null ? "" : String(generationId);
+  if (!id) {
+    // No fetch without a Generation identity (cells without one stay inert).
+    return Promise.resolve(normalizeOriginalGenerationResponse({
+      accepted: false, outcome: "unavailable", message: "Generation ID unavailable",
+    }));
+  }
+  const url = apiBase + "/history-v2/generations/" + encodeURIComponent(id) + "/original/retry";
+  // Bodyless POST by contract: no flag payload, no request reconstruction —
+  // the backend owns the failed Attempt and the immutable snapshot.
+  return fetch(url, { method: "POST" })
+    .then(function (res) {
+      return _v2OriginalActionResponse(res, id);
+    }).then(function (result) {
+      if (result && result.accepted !== false) publishStudioSync("history");
+      return result;
+    })
+    .catch(function (err) {
+      if (err && err.httpStatus) throw err;
+      throw new Error("History V2 unavailable: " + (err && err.message ? err.message : "network error"));
+    });
+}
+
+// ── Configured-folder Export (F9 route / F10 frontend) ───────────────────
+//
+// Canonical BODYLESS POST /history-v2/assets/{asset_id}/export.  The backend
+// derives the generation, logical output, variant, Settings and filename —
+// the browser sends NO body at all (no generation, output index, logical
+// key, variant, Settings or filename).  There is deliberately NO legacy Save
+// route here.  Structured responses normalize without discarding saved /
+// already_exported / export_state / reason / message / partial /
+// destination_path; already_exported is an idempotent SUCCESS, never an
+// error.  Every outcome — including HTTP/network failures — RESOLVES a
+// normalized envelope so callers can paint one truthful note and refresh
+// durably without unhandled rejections.
+
+function _v2ExportAsset(apiBase, assetId) {
+  const id = assetId == null ? "" : String(assetId);
+  if (!id) {
+    // No fetch without an Asset identity (absent variants stay inert).
+    return Promise.resolve(normalizeExportResponse({
+      status: "error", reason: "asset_unavailable", message: "Asset ID unavailable",
+    }));
+  }
+  const url = apiBase + "/history-v2/assets/" + encodeURIComponent(id) + "/export";
+  return fetch(url, { method: "POST" })
+    .then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        const base = { httpStatus: res.status, assetId: id };
+        if (res.ok) {
+          const result = normalizeExportResponse(data || {}, base);
+          if (result && result.status !== "error") publishStudioSync("history");
+          return result;
+        }
+        // Non-200: the frozen error envelope carries reason/message/
+        // export_state/partial — normalize it instead of throwing so the UI
+        // can classify the failure truthfully.
+        if (data && typeof data === "object") {
+          return normalizeExportResponse(data, base);
+        }
+        return normalizeExportResponse({
+          status: "error",
+          reason: "http_" + res.status,
+          message: "Export request failed (HTTP " + res.status + ")",
+        }, base);
+      });
+    })
+    .catch(function (err) {
+      return normalizeExportResponse({
+        status: "error",
+        reason: "network_error",
+        message: "History V2 unavailable: " + (err && err.message ? err.message : "network error"),
+      }, { httpStatus: null, assetId: id });
+    });
 }

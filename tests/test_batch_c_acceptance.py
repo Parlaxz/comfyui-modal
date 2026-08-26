@@ -116,13 +116,13 @@ def _make_all_pass_artifact() -> dict[str, Any]:
         "waterfall": {
             "reconciliation_ms": 12.3,
             "reconciliation_status": "OK",
-            "validation_status": "COMPLETE",
+            "diagnostic_status": "COMPLETE",
             "total_wall_ms": 60000,
         },
         "waterfall_local": {
             "reconciliation_ms": 12.3,
             "reconciliation_status": "OK",
-            "validation_status": "COMPLETE",
+            "diagnostic_status": "COMPLETE",
             "total_wall_ms": 60000,
         },
         "result": {

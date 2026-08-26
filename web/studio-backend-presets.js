@@ -5,6 +5,7 @@
 // from the glue module (studio-backend.js).
 
 import { el } from "./studio-ui.js";
+import { renderLoadingState } from "./studio-loading.js";
 import { listPresets, createPreset, updatePreset, duplicatePreset, deletePreset } from "./studio-backend-api.js";
 import { _STATE, renderFeaturesChipGrid, launchPresetWizardForEdit, invalidateRuntimePresetsCache } from "./studio-backend.js";
 import { clearSelection } from "./studio-playground-state.js";
@@ -39,7 +40,11 @@ export function renderPresetsPage(listPanel, detailPanel, apiBase) {
   ]);
   listPanel.appendChild(legacyNote);
 
-  listContent.textContent = "Loading presets...";
+  listContent.appendChild(renderLoadingState({
+    label: "Loading presets\u2026",
+    size: "page",
+    testid: "backend-presets-loading",
+  }));
   listPresets(apiBase).then((presets) => {
     while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
     // null or undefined means network/API error (not just empty)

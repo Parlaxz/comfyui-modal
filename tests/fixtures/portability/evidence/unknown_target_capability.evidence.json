@@ -1,0 +1,22 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §5 native deps row: RunComfy UNKNOWN",
+    "PHASE_G3 §11 explicit unknowns",
+    "PHASE_G5 §5 unknown provider facts remain UNKNOWN"
+  ],
+  "capability": "native_system_dependency_build",
+  "capability_value": "unknown",
+  "decision_context": {
+    "question": "Can runcomfy satisfy a CUDA-toolchain native node build?",
+    "required_rule_behavior": "emit issue code target_capability_unknown; risk_level unknown",
+    "workflow_scenario": "native_build_dependency"
+  },
+  "description": "RunComfy native/system dependency support was audited UNKNOWN (not guessed). A decision that depends on this capability must emit target_capability_unknown instead of assuming support or failure.",
+  "evidence_id": "unknown_target_capability_runcomfy_native",
+  "expected": {
+    "issue_code": "target_capability_unknown",
+    "risk_level": "unknown"
+  },
+  "kind": "target_capability_evidence",
+  "target_id": "runcomfy"
+}

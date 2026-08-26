@@ -10,6 +10,8 @@
 //
 // Functions are idempotent and safe to call multiple times.
 
+import { publishStudioSync } from "./studio-sync.js";
+
 const MODAL_PREFIX = "/comfymodal";
 
 export const STORAGE_KEYS = {
@@ -184,6 +186,8 @@ export async function setOutputPreferences(prefs, syncToServer) {
   } catch (e) {
     // Event dispatch failure — non-critical
   }
+
+  if (syncToServer) publishStudioSync("settings");
 
   return merged;
 }

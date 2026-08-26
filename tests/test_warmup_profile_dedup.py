@@ -8,7 +8,7 @@ Covers:
   5. Repeated unchanged: cached token returned, no UUID, no setter.
   6. Workspace/app identity change clears cache; changed identity publishes.
   7. Failed setter does not advance cache (retry publishes).
-  8. LocalRemoteInvoker can await the preparer (fast unchanged path).
+   8. Callers can await the preparer (fast unchanged path).
 
 These tests never call the real Modal setter.
 """
@@ -529,12 +529,13 @@ class WarmupProfileDedupResultFieldsTests(unittest.TestCase):
         self.assertGreater(len(r2.get("active_profile_token", "")), 0,
                            "Token must be set on successful retry")
 
-    # ── 8. LocalRemoteInvoker compatibility ───────────────────────────
+    # ── 8. Caller compatibility (H19: former V1 invoker caller deleted;
+    #       the fast-await contract is pinned against the shared helper) ──
 
     def test_no_fire_and_forget_needed(self):
-        """LocalRemoteInvoker can continue awaiting the preparer — the
-        helper returns quickly on unchanged (no remote call) and the
-        caller does NOT need a separate fire-and-forget path."""
+        """Callers can simply await the preparer — the helper returns
+        quickly on unchanged (no remote call) and the caller does NOT need
+        a separate fire-and-forget path."""
         # The preparer always returns a result dict; on prompt-only unchanged
         # the await is fast because no network call occurs.
         setter = _make_async_setter()

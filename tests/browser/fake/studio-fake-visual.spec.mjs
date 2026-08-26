@@ -13,12 +13,8 @@
 import { test, expect } from "@playwright/test";
 import {
   setupFakeTest,
-  createComparePreset,
   selectPreset,
   submitSingleRun,
-  enableExperimentMode,
-  selectComparePreset,
-  submitExperiment,
 } from "./helpers.mjs";
 
 const SEEDED_PRESET_ID = "preset_default";
@@ -30,7 +26,8 @@ test.describe("Studio visual baselines (fake backend)", () => {
     try {
       await selectPreset(page, SEEDED_PRESET_ID);
       // Wait for the async preset load to settle (Run enabled) and for the
-      // seeded recent-runs carousel item to render before capturing.
+      // recent-runs filmstrip to hydrate from History V2 (the default fresh
+      // session seed already yields /history-v2/feed items) before capturing.
       await expect(page.locator('[data-testid="run-btn"]')).toBeEnabled({ timeout: 15000 });
       await expect(page.locator(".comfymodal-studio-carousel-item").first()).toBeVisible({
         timeout: 15000,
@@ -98,38 +95,34 @@ test.describe("Studio visual baselines (fake backend)", () => {
     }
   });
 
-  test("experiment grid", async ({ page }) => {
-    let compareId = "";
-    const fx = await setupFakeTest(page, {
-      beforeMount: async ({ sessionId }) => {
-        compareId = await createComparePreset(page, sessionId);
-      },
-    });
+  test("playground filmstrip with EXP-badged item", async ({ page }) => {
+    // H-WAVE D: the legacy experiment grid visual baseline is retired — the
+    // grid viewport can never render.  The Playground-side experiment
+    // presence is now the recent-runs filmstrip EXP item, hydrated from the
+    // default fresh-session History V2 seed.
+    const fx = await setupFakeTest(page);
     try {
-      await fx.setScenario("experiment_two_cell");
       await selectPreset(page, SEEDED_PRESET_ID);
-      await enableExperimentMode(page);
-      await selectComparePreset(page, compareId);
-      await submitExperiment(page);
+      await expect(page.locator('[data-testid="run-btn"]')).toBeEnabled({ timeout: 15000 });
 
-      const grid = page.locator('[data-testid="experiment-grid-viewport"]');
-      await expect(grid).toBeVisible({ timeout: 20000 });
-      const cells = grid.locator(".comfymodal-studio-experiment-grid-cell");
-      await expect(cells).toHaveCount(2, { timeout: 15000 });
-      // Stable condition: both cells completed (terminal + first 3s poll).
+      const expItem = page.locator(".comfymodal-studio-carousel-item-experiment").first();
+      await expect(expItem).toBeVisible({ timeout: 15000 });
+      await expect(expItem.locator(".comfymodal-studio-carousel-exp-badge")).toHaveText("EXP");
+      expect(await expItem.getAttribute("data-expid")).toBeTruthy();
+
+      // Stable condition: every filmstrip thumbnail has actually loaded so
+      // the capture is deterministic.
       await expect
         .poll(async () => {
-          const statuses = await cells.evaluateAll((els) =>
-            els.map((el) => el.getAttribute("data-cell-status"))
-          );
-          return statuses.filter((s) => s === "completed").length;
-        }, { timeout: 20000 })
-        .toBe(2);
+          const thumbs = page.locator("img.comfymodal-studio-carousel-thumb");
+          const n = await thumbs.count();
+          if (n === 0) return false;
+          const widths = await thumbs.evaluateAll((els) => els.map((el) => el.naturalWidth));
+          return widths.every((w) => w > 0);
+        }, { timeout: 15000, message: "all filmstrip thumbnails should load" })
+        .toBe(true);
 
-      await expect(page.locator(PAGE)).toHaveScreenshot("experiment-grid.png", {
-        // Cell images use per-run random asset ids → random PNG colors.
-        mask: [grid.locator("img.cm-exp-cell-image")],
-      });
+      await expect(page.locator(PAGE)).toHaveScreenshot("playground-filmstrip.png");
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();

@@ -9,15 +9,25 @@
 // ({ models, scanHint, filters, types, customNodes, loading, _loaded }), the
 // preset-editor model cache lives in `view.modelsCache` /
 // `view.modelsCacheState`.  `refresh` re-renders the whole workflows page.
+//
+// Authority: this view is read-only over the canonical stores —
+// `.studio_model_library.json` (models) and `.studio_custom_nodes.json`
+// (custom nodes) via the /studio/models* and /studio/custom-nodes* routes.
+// Scans/refreshes run ONLY on explicit user action (never on render), and
+// install requests only RECORD approval — nothing is ever downloaded or
+// installed automatically.
 
-import { el } from "./studio-ui.js";
+import { el, renderEmptyState } from "./studio-ui.js";
+import { renderLoadingState } from "./studio-loading.js";
 import {
   listModels,
   listModelTypes,
   listCustomNodes,
+  refreshCustomNodes,
   rescanModels,
   updateModel,
   requestModelInstall,
+  requestCustomNodeInstall,
 } from "./studio-backend-api.js";
 
 // ── Module helpers ────────────────────────────────────────────────────────
@@ -71,9 +81,20 @@ function _flattenStack(stack) {
   return [];
 }
 
-// Badge for library rows and dependency rows.
+// Badge for library rows and dependency rows. I3 chip taxonomy: shared
+// `.cm-chip` base + truthful tone while keeping the page-specific class.
+// Truthful mapping: installed→ok, missing/wrong-version→warn (capability
+// family), unknown/type/role→neutral (identity/unknown).
 function _badge(text, kind) {
-  return el("span", { class: "comfymodal-studio-model-badge " + kind, text: text });
+  const tone =
+    kind === "installed" ? "ok"
+      : (kind === "missing" || kind === "warning") ? "warn"
+        : "neutral";
+  return el("span", {
+    class: "comfymodal-studio-model-badge " + kind + " cm-chip",
+    "data-tone": tone,
+    text: text,
+  });
 }
 
 function _stateBadgeFor(state) {
@@ -103,10 +124,14 @@ export function renderModelLibraryView(opts) {
     _loaded: false,
   });
 
-  // First open: kick off the initial data load.
+  // First open: kick off the initial data load.  A query set externally
+  // (dependency-row handoff) after the first load re-fetches once.
   if (!md._loaded && !md.loading) {
     md.loading = true;
     loadModelsData(apiBase, view, refresh);
+  } else if (md._queryDirty && !md.loading) {
+    md._queryDirty = false;
+    reloadModelsList(apiBase, view, refresh);
   }
 
   const root = el("div", { class: "comfymodal-studio-model-library", "data-testid": "models-page" });
@@ -123,7 +148,10 @@ export function renderModelLibraryView(opts) {
   const rehashCb = el("input", { type: "checkbox", class: "comfymodal-studio-wf-checkbox", title: "Force full rehash of every file" });
   root.appendChild(el("div", { class: "comfymodal-studio-model-library-header" }, [
     el("div", { class: "comfymodal-studio-model-library-header-left" }, [
-      el("h3", { text: "Model Library" }),
+      // I6 heading hierarchy: this sub-view replaces the library view's
+      // content, so its title is the page-level h2 (under the single shell
+      // h1), styled with the same page-title class as "Workflows".
+      el("h2", { class: "comfymodal-studio-workflows-title", "data-testid": "models-page-title", text: "Model Library" }),
       el("span", { class: "comfymodal-studio-models-count", "data-testid": "models-count", text: md.models.length + " model" + (md.models.length === 1 ? "" : "s") }),
     ]),
     el("div", { class: "comfymodal-studio-workflows-header-actions" }, [
@@ -149,6 +177,9 @@ export function renderModelLibraryView(opts) {
   // Rescan summary line (shown transiently after a scan completes).
   const rescanStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
   root.appendChild(rescanStatus);
+  // Latest rendered status element — the list reload after a scan re-renders
+  // the page, so the handler writes its outcome to this fresh node.
+  md._rescanStatusEl = rescanStatus;
 
   // ── Filters row ─────────────────────────────────────────────────────────
   const searchIn = el("input", {
@@ -160,6 +191,7 @@ export function renderModelLibraryView(opts) {
     value: md.filters.query,
     oninput: (e) => {
       const value = e.currentTarget.value;
+      md._modelHighlight = ""; // manual edit invalidates handoff highlighting
       if (_searchTimer) clearTimeout(_searchTimer);
       _searchTimer = setTimeout(() => {
         md.filters.query = value;
@@ -200,40 +232,61 @@ export function renderModelLibraryView(opts) {
   // ── Model list ──────────────────────────────────────────────────────────
   const list = el("div", { class: "comfymodal-studio-model-list", "data-testid": "models-list" });
   if (md.loading && !md._loaded) {
-    list.appendChild(el("div", { class: "comfymodal-studio-models-empty", text: "Loading models\u2026" }));
+    list.appendChild(renderLoadingState({
+      label: "Loading models\u2026",
+      size: "page",
+      testid: "models-loading",
+    }));
   } else if (md.scanHint === "not_scanned" && md.models.length === 0) {
-    list.appendChild(el("div", { class: "comfymodal-studio-models-empty", text: "No models scanned yet. Click Scan models." }));
+    list.appendChild(renderEmptyState({
+      title: "No models scanned yet",
+      detail: "Click Scan models to index the local model folders.",
+      testid: "models-empty",
+    }));
   } else if (md.models.length === 0) {
-    list.appendChild(el("div", { class: "comfymodal-studio-models-empty", text: "No models match your filters." }));
+    list.appendChild(renderEmptyState({
+      title: "No models match your filters",
+      testid: "models-empty",
+    }));
   } else {
     md.models.forEach((m) => list.appendChild(renderModelRow(m, apiBase, view, refresh)));
   }
   root.appendChild(list);
+
+  // ── Custom nodes section ────────────────────────────────────────────────
+  root.appendChild(renderCustomNodesSection(md, apiBase, refresh));
 
   return root;
 
   // ── Internal async handlers (closure-scoped) ────────────────────────────
 
   async function handleRescan(apiBaseRef, viewRef, refreshRef, btn, rehashInput) {
+    if (btn.disabled) return; // request dedupe: ignore clicks while in flight
     btn.disabled = true;
     btn.textContent = "Scanning\u2026";
+    let ok = false;
+    let msg = "";
     const resp = await rescanModels(apiBaseRef, rehashInput.checked);
     const summary = resp && resp.summary ? resp.summary : null;
     const total = summary ? summary.total : null;
-    rescanStatus.style.display = "block";
     if (resp && resp.status === "ok") {
-      rescanStatus.textContent = summary
+      ok = true;
+      msg = summary
         ? "Scan complete \u2014 " + total + " model" + (total === 1 ? "" : "s") + " total."
         : "Scan complete.";
-      rescanStatus.classList.remove("error");
     } else {
-      rescanStatus.textContent = "Scan failed: " + ((resp && resp.message) || "request failed");
-      rescanStatus.classList.add("error");
+      msg = "Scan failed: " + ((resp && resp.message) || "request failed");
     }
+    if (viewRef.modelsData) viewRef.modelsData.scanHint = "ok";
     btn.disabled = false;
     btn.textContent = "Scan models";
-    if (viewRef.modelsData) viewRef.modelsData.scanHint = "ok";
     await reloadModelsList(apiBaseRef, viewRef, refreshRef);
+    const live = (viewRef.modelsData && viewRef.modelsData._rescanStatusEl) || null;
+    if (live) {
+      live.style.display = "block";
+      live.textContent = msg;
+      live.classList.toggle("error", !ok);
+    }
   }
 }
 
@@ -279,16 +332,219 @@ function _modelQuery(md) {
   return { search: f.query || "", type: f.type || "", state: f.state || "" };
 }
 
+// ── Custom nodes section (canonical registry browse + explicit refresh) ───
+
+/**
+ * Render the custom-node registry section of the Model Library view.
+ * Read-only over `.studio_custom_nodes.json` via /studio/custom-nodes;
+ * the refresh button is the ONLY trigger for POST /studio/custom-nodes/refresh.
+ *
+ * I6 "Find in registry" handoff: when `md._registryFocus` is set (dependency
+ * row handoff), the section filters client-side by node name/class substring,
+ * highlights an exact-name match, and offers an explicit Clear.  Navigation
+ * only — nothing installs, refreshes, or fetches automatically.
+ */
+function renderCustomNodesSection(md, apiBase, refresh) {
+  const nodes = Array.isArray(md.customNodes) ? md.customNodes : [];
+  const focus = typeof md._registryFocus === "string" ? md._registryFocus.trim() : "";
+  const focusQuery = focus.toLowerCase();
+  const visible = focusQuery
+    ? nodes.filter((n) => {
+        const name = String((n && n.name) || "").toLowerCase();
+        if (name.indexOf(focusQuery) !== -1) return true;
+        const classes = Array.isArray(n && n.classes) ? n.classes : [];
+        return classes.some((c) => String(c || "").toLowerCase().indexOf(focusQuery) !== -1);
+      })
+    : nodes;
+
+  const section = el("div", {
+    class: "comfymodal-studio-section",
+    "data-testid": "custom-nodes-section",
+  });
+
+  const refreshBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": "custom-nodes-refresh",
+    text: "Refresh registry",
+    style: "font-size:10px;padding:4px 10px;width:auto;",
+    onclick: () => handleNodesRefresh(apiBase, md, refresh, refreshBtn, statusEl),
+  });
+
+  section.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
+    el("h3", { class: "comfymodal-studio-section-title", text: "Custom nodes" }),
+    el("span", {
+      class: "comfymodal-studio-models-count",
+      "data-testid": "custom-nodes-count",
+      text: (focusQuery ? visible.length + " of " : "") +
+        nodes.length + " installed node" + (nodes.length === 1 ? "" : "s"),
+    }),
+    refreshBtn,
+  ]));
+
+  if (focusQuery) {
+    section.appendChild(el("div", {
+      class: "comfymodal-studio-dependency-banner attention",
+      "data-testid": "custom-nodes-focus",
+    }, [
+      el("span", {
+        class: "comfymodal-studio-dependency-banner-label",
+        text: "Registry filtered by \"" + focus + "\".",
+      }),
+      el("button", {
+        class: "comfymodal-secondary-btn",
+        type: "button",
+        "data-testid": "custom-nodes-focus-clear",
+        text: "Clear",
+        style: "font-size:10px;padding:2px 8px;width:auto;",
+        onclick: () => {
+          md._registryFocus = "";
+          refresh();
+        },
+      }),
+    ]));
+  }
+
+  const statusEl = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
+  section.appendChild(statusEl);
+  // Latest rendered status element — refresh() rebuilds the whole page, so
+  // the async handler writes its outcome here instead of a detached node.
+  md._nodesStatusEl = statusEl;
+
+  const table = el("div", { class: "comfymodal-studio-dependency-table", "data-testid": "custom-nodes-list" });
+  if (nodes.length === 0) {
+    table.appendChild(el("p", {
+      class: "comfymodal-studio-dependencies-note",
+      text: "No custom nodes recorded yet. Use Refresh registry to rediscover installed nodes.",
+    }));
+  } else if (visible.length === 0) {
+    table.appendChild(el("p", {
+      class: "comfymodal-studio-dependencies-note",
+      "data-testid": "custom-nodes-no-match",
+      text: "No installed registry node matches \"" + focus + "\".",
+    }));
+  } else {
+    visible.forEach((n) => table.appendChild(renderRegistryNodeRow(n, focusQuery)));
+  }
+  section.appendChild(table);
+  return section;
+
+  async function handleNodesRefresh(apiBaseRef, mdRef, refreshRef, btn, statusRef) {
+    if (btn.disabled) return; // request dedupe: ignore clicks while in flight
+    btn.disabled = true;
+    btn.textContent = "Refreshing\u2026";
+    let ok = false;
+    let msg = "";
+    try {
+      const resp = await refreshCustomNodes(apiBaseRef);
+      if (resp && resp.status === "ok" && Array.isArray(resp.custom_nodes)) {
+        mdRef.customNodes = resp.custom_nodes;
+        ok = true;
+        msg = "Registry refreshed \u2014 " + resp.custom_nodes.length
+          + " node" + (resp.custom_nodes.length === 1 ? "" : "s") + " found.";
+      } else {
+        msg = "Refresh failed: " + ((resp && resp.message) || "request failed");
+      }
+    } catch (err) {
+      msg = "Refresh failed: " + (err && err.message ? err.message : "request failed");
+    }
+    btn.disabled = false;
+    btn.textContent = "Refresh registry";
+    refreshRef(); // synchronous re-render: list/count reflect the refresh result
+    const live = mdRef._nodesStatusEl || statusRef;
+    live.style.display = "block";
+    live.textContent = msg;
+    live.classList.toggle("error", !ok);
+  }
+}
+
+// One row of the canonical custom-node registry (installed truth only).
+// `focusQuery` (lowercased) highlights an exact-name match from the
+// "Find in registry" handoff — inline style only, no shared-CSS change.
+function renderRegistryNodeRow(n, focusQuery) {
+  const name = String(n.name || "");
+  const exactMatch = !!focusQuery && name.toLowerCase() === focusQuery;
+  const row = el("div", {
+    class: "comfymodal-studio-dependency-row",
+    "data-testid": "custom-node-row",
+    "data-node-name": name,
+  });
+  if (exactMatch) {
+    row.setAttribute("data-registry-match", "true");
+    row.style.cssText =
+      "outline:1px solid var(--color-accent, #5a7fdb);outline-offset:-1px;" +
+      "background:var(--color-accent-muted, rgba(90, 127, 219, 0.12));";
+  }
+  row.appendChild(el("span", { class: "comfymodal-studio-dependency-name", text: name, title: name }));
+  row.appendChild(_badge("Installed", "installed"));
+  row.appendChild(el("span", {
+    class: "comfymodal-studio-dependency-detail",
+    text: n.installed_commit ? _shortCommit(n.installed_commit) : "",
+    title: n.installed_commit || "",
+  }));
+  const classes = Array.isArray(n.classes) ? n.classes : [];
+  if (classes.length) {
+    row.appendChild(el("span", {
+      class: "comfymodal-studio-dependency-detail",
+      text: classes.length + " class" + (classes.length === 1 ? "" : "es"),
+      title: classes.join(", "),
+    }));
+  }
+  if (n.install_path) {
+    row.appendChild(el("span", { class: "comfymodal-studio-dependency-path", text: n.install_path, title: n.install_path }));
+  }
+  if (n.repo_url) {
+    row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: n.repo_url, target: "_blank", rel: "noopener noreferrer", text: "repo" }));
+  }
+  return row;
+}
+
 function renderModelRow(m, apiBase, view, refresh) {
   const row = el("div", {
     class: "comfymodal-studio-model-row",
     "data-testid": "model-row",
     "data-model-id": m.model_id,
   });
-  row.appendChild(el("div", { class: "comfymodal-studio-model-main" }, [
+  const main = el("div", { class: "comfymodal-studio-model-main" }, [
     el("span", { class: "comfymodal-studio-model-name", text: m.display_name || m.filename || "" }),
     el("span", { class: "comfymodal-studio-model-file", text: m.filename || "" }),
-  ]));
+  ]);
+  // I6 reverse-usage line (session-derived): shown only when a dependency
+  // payload fetched in this session referenced this model filename.  The
+  // tooltip states that scope; View filters the Workflows list to those
+  // workflows through the EXISTING library filter state — no new store.
+  const usage = view && view.usageByModel instanceof Map
+    ? view.usageByModel.get(m.filename)
+    : null;
+  if (usage && usage.size > 0) {
+    main.appendChild(el("span", {
+      class: "comfymodal-studio-model-used-by",
+      "data-testid": "model-used-by",
+      title: "From workflow dependencies loaded in this session.",
+    }, [
+      el("span", { text: "Used by " + usage.size + " workflow" + (usage.size === 1 ? "" : "s") + " \u00b7 " }),
+      el("button", {
+        class: "comfymodal-secondary-btn",
+        type: "button",
+        "data-testid": "model-used-by-view",
+        text: "View",
+        style: "font-size:10px;padding:1px 6px;width:auto;",
+        onclick: () => {
+          view.mode = "library";
+          view.filters.usageModel = m.filename;
+          refresh();
+        },
+      }),
+    ]));
+  }
+  row.appendChild(main);
+  // Exact-match highlight for the dependency-row "Find in library" handoff.
+  if (view && typeof view.modelsData?._modelHighlight === "string" &&
+      view.modelsData._modelHighlight !== "" &&
+      String(m.filename) === view.modelsData._modelHighlight) {
+    row.setAttribute("data-model-match", "true");
+    row.style.cssText =
+      "outline:1px solid var(--color-accent, #5a7fdb);outline-offset:-1px;";
+  }
   row.appendChild(_badge(m.model_type || "other", "type"));
   row.appendChild(_badge(m.installed === true ? "Installed" : "Missing", m.installed === true ? "installed" : "missing"));
   row.appendChild(el("span", { class: "comfymodal-studio-model-size", text: _fmtSize(m.size) }));
@@ -505,9 +761,15 @@ function renderDownloadRequestSection(model, apiBase, showStatus) {
  *   failed / endpoint missing)
  * @param {function} [refreshHandler] - optional click handler for the Refresh
  *   button (data-testid="dependencies-refresh")
+ * @param {object} [opts] - optional parity context:
+ *   { apiBase } enables the explicit per-node install-request action on
+ *   missing custom-node rows; { onFindInLibrary(filename) } enables the
+ *   contextual "Find in library" handoff on missing model rows.  Both are
+ *   user-click-only; nothing here installs or downloads automatically.
  * @returns {HTMLElement}
  */
-export function renderDependencySection(version, deps, refreshHandler) {
+export function renderDependencySection(version, deps, refreshHandler, opts) {
+  const ctx = opts || {};
   const section = el("div", {
     class: "comfymodal-studio-section",
     "data-testid": "dependencies-summary",
@@ -550,13 +812,13 @@ export function renderDependencySection(version, deps, refreshHandler) {
     if (models.length) {
       section.appendChild(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-models" }, [
         el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Models" }),
-        el("div", { class: "comfymodal-studio-dependency-table" }, models.map(renderDependencyModelRow)),
+        el("div", { class: "comfymodal-studio-dependency-table" }, models.map((m) => renderDependencyModelRow(m, ctx))),
       ]));
     }
     if (nodes.length) {
       section.appendChild(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-nodes" }, [
         el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Custom nodes" }),
-        el("div", { class: "comfymodal-studio-dependency-table" }, nodes.map(renderDependencyNodeRow)),
+        el("div", { class: "comfymodal-studio-dependency-table" }, nodes.map((n) => renderDependencyNodeRow(n, ctx))),
       ]));
     }
 
@@ -587,20 +849,20 @@ function renderMetadataChips(version) {
     wrap.appendChild(el("div", { class: "comfymodal-studio-dependencies-group" }, [
       el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Model stack" }),
       el("div", { class: "comfymodal-studio-dependencies-chips" },
-        stack.map((m) => el("span", { class: "comfymodal-studio-wf-chip", text: m }))),
+        stack.map((m) => el("span", { class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral", text: m }))),
     ]));
   }
   if (classes.length) {
     wrap.appendChild(el("div", { class: "comfymodal-studio-dependencies-group" }, [
       el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Node classes" }),
       el("div", { class: "comfymodal-studio-dependencies-chips" },
-        classes.map((c) => el("span", { class: "comfymodal-studio-wf-chip", text: c }))),
+        classes.map((c) => el("span", { class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral", text: c }))),
     ]));
   }
   return wrap;
 }
 
-function renderDependencyModelRow(m) {
+function renderDependencyModelRow(m, ctx) {
   const row = el("div", {
     class: "comfymodal-studio-dependency-row",
     "data-testid": "dependency-model-row",
@@ -617,11 +879,22 @@ function renderDependencyModelRow(m) {
     if (src) {
       row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: src, target: "_blank", rel: "noopener noreferrer", text: "source" }));
     }
+    // Contextual handoff into the Model Library filter — no second
+    // model-management implementation, just a prefilled library query.
+    if (ctx && typeof ctx.onFindInLibrary === "function" && m.filename) {
+      row.appendChild(el("button", {
+        class: "comfymodal-secondary-btn",
+        "data-testid": "dependency-model-find",
+        text: "Find in library",
+        style: "font-size:10px;padding:2px 8px;width:auto;",
+        onclick: () => ctx.onFindInLibrary(m.filename),
+      }));
+    }
   }
   return row;
 }
 
-function renderDependencyNodeRow(n) {
+function renderDependencyNodeRow(n, ctx) {
   const row = el("div", {
     class: "comfymodal-studio-dependency-row",
     "data-testid": "dependency-node-row",
@@ -637,13 +910,80 @@ function renderDependencyNodeRow(n) {
   if (n.required_revision) {
     row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: "required " + n.required_revision }));
   }
+  // I6 contextual handoff (H7 model-row parity): a MISSING custom-node row
+  // offers "Find in registry", which opens the single Model Library view
+  // scoped to its registry section, filtered to this identifier.  Navigation
+  // only — no install request fires from this control.
+  if (n.state === "missing" && n.name && ctx && typeof ctx.onFindInRegistry === "function") {
+    row.appendChild(el("button", {
+      class: "comfymodal-secondary-btn",
+      type: "button",
+      "data-testid": "dependency-node-find-registry",
+      text: "Find in registry",
+      style: "font-size:10px;padding:2px 8px;width:auto;",
+      onclick: () => ctx.onFindInRegistry(n.name),
+    }));
+  }
   if (n.install_path) {
     row.appendChild(el("span", { class: "comfymodal-studio-dependency-path", text: n.install_path, title: n.install_path }));
   }
   if (n.repository_url) {
     row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: n.repository_url, target: "_blank", rel: "noopener noreferrer", text: "repo" }));
   }
+  // Explicit install REQUEST for missing nodes with a known repo.  This only
+  // records approval via /studio/custom-nodes/install-request — nothing is
+  // cloned, pulled, or installed by this UI.
+  if (n.state === "missing" && n.repository_url && ctx && ctx.apiBase) {
+    row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
+  }
   return row;
+}
+
+function renderNodeInstallRequestControl(node, apiBase) {
+  const wrap = el("span", { class: "comfymodal-studio-dependency-request" });
+  const btn = el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": "dependency-node-install-request",
+    text: "Request install",
+    style: "font-size:10px;padding:2px 8px;width:auto;",
+    onclick: async () => {
+      if (btn.disabled) return; // request dedupe while in flight
+      btn.disabled = true;
+      btn.textContent = "Requesting\u2026";
+      try {
+        const resp = await requestCustomNodeInstall(apiBase, {
+          name: node.name || "",
+          repo_url: node.repository_url || "",
+          revision: node.required_revision || "",
+        });
+        note.style.display = "block";
+        if (resp && resp.status === "ok") {
+          note.textContent = "Approval recorded \u2014 nothing was installed."
+            + (resp.note ? " " + resp.note : "");
+          note.classList.remove("error");
+        } else {
+          note.textContent = "Request failed: " + ((resp && resp.message) || "request failed");
+          note.classList.add("error");
+          btn.disabled = false;
+          btn.textContent = "Request install";
+        }
+      } catch (err) {
+        note.style.display = "block";
+        note.textContent = "Request failed: " + (err && err.message ? err.message : "request failed");
+        note.classList.add("error");
+        btn.disabled = false;
+        btn.textContent = "Request install";
+      }
+    },
+  });
+  const note = el("div", {
+    class: "comfymodal-studio-dialog-note",
+    "data-testid": "dependency-node-install-note",
+    style: "display:none;",
+  });
+  wrap.appendChild(btn);
+  wrap.appendChild(note);
+  return wrap;
 }
 
 // ── Model picker (preset editor "Model choices") ──────────────────────────

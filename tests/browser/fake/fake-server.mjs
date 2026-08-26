@@ -408,13 +408,16 @@ const ROUTES = [
       _json(res, r, 200);
     }
   }],
-  ["POST", "/comfymodal/studio/experiment", async (res, body) => {
-    const r = engine.handleStudioExperiment(res._sid, body || {});
-    if (r && r.status === "error") {
-      _json(res, r, r._httpStatus || 400);
-    } else {
-      _json(res, r, 200);
-    }
+  // RETIRED_EXECUTION parity (Phase H Wave F): production POST
+  // /studio/experiment returns bounded 410 EXPERIMENT_RETIRED with zero
+  // experiment creation; the fake mirrors that exactly. Harness-only legacy
+  // seeding goes through /__comfymodal_test/legacy-experiment-seed.
+  ["POST", "/comfymodal/studio/experiment", async (res) => {
+    _json(res, {
+      status: "error",
+      error_code: "EXPERIMENT_RETIRED",
+      message: "Legacy Studio experiment creation was retired in Phase H (Wave F). Modern experiments use POST /studio/experiment-v2.",
+    }, 410);
   }],
 
   // Experiments
@@ -463,6 +466,31 @@ const ROUTES = [
     const r = engine.getHistoryV2Experiment(res._sid, params.id);
     _json(res, r, r._httpStatus || 200);
   }],
+  // Generate Original — frozen E3B2 production route mirror. 200 carries the
+  // production payload (status/outcome/decision/reason/run_id/
+  // attempt_status/reused[/executor]); refusals are non-200 with
+  // machine-readable {status:"error", code, message} bodies.
+  ["POST", "/comfymodal/history-v2/generations/:id/original", async (res, body, params) => {
+    const r = engine.generateHistoryV2Original(res._sid, params.id, body || {});
+    _json(res, r, r._httpStatus || (r.status === "error" ? 409 : 200));
+  }],
+  ["POST", "/comfymodal/history-v2/generations/:id/original/retry", async (res, body, params) => {
+    const r = engine.retryHistoryV2Original(res._sid, params.id);
+    _json(res, r, r._httpStatus || (r.status === "error" ? 409 : 200));
+  }],
+  // Single Resume — frozen F1A production route mirror (bodyless POST).
+  ["POST", "/comfymodal/history-v2/generations/:id/resume", async (res, body, params) => {
+    const r = engine.resumeHistoryV2Generation(res._sid, params.id);
+    _json(res, r, r._httpStatus || (r.status === "error" ? 409 : 200));
+  }],
+  // Configured-folder Export — frozen F9 production route mirror (BODYLESS
+  // POST; the backend derives generation/output/variant/Settings/filename).
+  // 200 ok/already_exported · 404 unknown asset · 400 non-bodyless ·
+  // 500 armed export failures (partial:true marks the distinct class).
+  ["POST", "/comfymodal/history-v2/assets/:id/export", async (res, body, params) => {
+    const r = engine.exportHistoryV2Asset(res._sid, params.id, body);
+    _json(res, r, r._httpStatus || (r.status === "error" ? 500 : 200));
+  }],
   // Modern Experiment V2 (D5) — additive deterministic parity for the
   // production contract (experiment_modern_routes.py / freeze §11).  Placed
   // after the History V2 detail route and before any catch-all conflicts;
@@ -509,22 +537,33 @@ const ROUTES = [
   }],
   ["GET", "/comfymodal/history-v2/assets/:id", async (res, body, params) => {
     const a = engine.getAsset(res._sid, params.id);
-    if (!a.ok) return _error(res, "asset not found", 404);
+    if (!a.ok) return _error(res, a.status === 502 ? "asset upstream unavailable" : "asset not found", a.status || 404);
     _buffer(res, a.bytes, a.contentType);
   }],
 
   // Deploy status + profile level (deterministic defaults, session-scoped level)
   ["GET", "/comfymodal/deploy/status", async (res) => _json(res, engine.getDeployStatus(res._sid))],
+  ["GET", "/comfymodal/auth/status", async (res) => _json(res, { status: "ok", connected: true })],
+  ["GET", "/comfymodal/health", async (res) => _json(res, { status: "ok", message: "Fake runtime ready" })],
   ["GET", "/comfymodal/profile/level", async (res) => _json(res, engine.getProfileLevel(res._sid))],
   ["POST", "/comfymodal/profile/level", async (res, body) => {
     const r = engine.setProfileLevel(res._sid, body);
+    _json(res, r, r._httpStatus || 200);
+  }],
+  ["GET", "/comfymodal/workspaces", async (res) => _json(res, engine.listWorkspaces(res._sid))],
+  ["POST", "/comfymodal/workspaces", async (res, body) => {
+    const r = engine.upsertWorkspace(res._sid, body || {});
+    _json(res, r, r._httpStatus || 200);
+  }],
+  ["POST", "/comfymodal/workspaces/active", async (res, body) => {
+    const r = engine.activateWorkspace(res._sid, body || {});
     _json(res, r, r._httpStatus || 200);
   }],
 
   // Assets & outputs
   ["GET", "/comfymodal/assets/:asset_id", async (res, body, params) => {
     const a = engine.getAsset(res._sid, params.asset_id);
-    if (!a.ok) return _error(res, "asset not found", 404);
+    if (!a.ok) return _error(res, a.status === 502 ? "asset upstream unavailable" : "asset not found", a.status || 404);
     _buffer(res, a.bytes, a.contentType);
   }],
   ["GET", "/comfymodal/studio/outputs/:filename", async (res, body, params) => {
@@ -594,6 +633,10 @@ const ROUTES = [
     const r = engine.getFakeWorkflowRunContext(res._sid, params.id, versionId);
     _json(res, r, r._httpStatus || 200);
   }],
+  ["PATCH", "/comfymodal/studio/workflows/:id", async (res, body, params) => {
+    const r = engine.updateFakeWorkflow(res._sid, params.id, body || {});
+    _json(res, r, r._httpStatus || 200);
+  }],
   ["GET", "/comfymodal/studio/workflows/versions/:vid/dependencies", async (res) => {
     _json(res, _fakeDependenciesPayload());
   }],
@@ -626,6 +669,35 @@ const ROUTES = [
       return _error(res, "workflow not found", 404);
     }
     _json(res, { status: "ok", workflow: s.workflow });
+  }],
+
+  // Studio Workflow Portability (G12 deterministic contract payloads).
+  // Anchored regexes keep these distinct from /versions/:id catch-alls.
+  ["GET", "/comfymodal/studio/workflows/versions/:vid/portability", async (res, body, params) => {
+    const r = engine.getFakePortabilityReport(res._sid, params.vid);
+    _json(res, r, r._httpStatus || 200);
+  }],
+  ["GET", "/comfymodal/studio/workflows/versions/:vid/export", async (res, body, params) => {
+    const includePresets = res._url.searchParams.get("include_presets") === "1";
+    const r = engine.exportFakeWorkflowManifest(res._sid, params.vid, includePresets);
+    if (!r.ok) {
+      return _json(res, { status: "error", code: r.error_code, message: r.message }, r.status || 400);
+    }
+    const body2 = Buffer.from(r.body, "utf8");
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": body2.length,
+      "Content-Disposition": 'attachment; filename="' + r.filename + '"',
+      "Cache-Control": "no-store",
+    });
+    res.end(body2);
+  }],
+  ["POST", "/comfymodal/studio/workflows/import-manifest", async (res, body) => {
+    const dryRun = res._url.searchParams.get("dry_run") !== "0";
+    const r = dryRun
+      ? engine.previewFakeManifestImport(res._sid, body || {})
+      : engine.commitFakeManifestImport(res._sid, body || {});
+    _json(res, r, r._httpStatus || (r.status === "error" ? 400 : 200));
   }],
 
   // Studio Model Library (deterministic fake dataset).
@@ -756,6 +828,18 @@ async function handleTestControl(url, req, res, body, pathname) {
     const r = engine.setPendingScenario(sid, body && body.scenario, (body && body.overrides) || null);
     return _json(res, r, r.status === "error" ? 400 : 200);
   }
+  // Harness-only legacy experiment seed (Phase H Wave F): production
+  // /studio/experiment is retired (410), but specs that must exercise
+  // STALE legacy-shaped records still need a way to create one without
+  // touching the retired route. This control endpoint delegates directly
+  // to the engine creator and is never called by product code.
+  if (pathname === "/__comfymodal_test/legacy-experiment-seed" && req.method === "POST") {
+    const r = engine.handleStudioExperiment(sid, body || {});
+    if (r && r.status === "error") {
+      return _json(res, r, r._httpStatus || 400);
+    }
+    return _json(res, r, 200);
+  }
   if (pathname === "/__comfymodal_test/history-seed" && req.method === "POST") {
     const r = engine.seedHistory(sid, body && body.scenario);
     return _json(res, r, r.status === "error" ? 400 : 200);
@@ -764,12 +848,40 @@ async function handleTestControl(url, req, res, body, pathname) {
     const r = engine.setHistoryV2FailMode(sid, body && body.mode);
     return _json(res, r, r.status === "error" ? 400 : 200);
   }
+  if (pathname === "/__comfymodal_test/original-script" && req.method === "POST") {
+    const r = engine.setOriginalScript(sid, body || {});
+    return _json(res, r, r.status === "error" ? 400 : 200);
+  }
+  if (pathname === "/__comfymodal_test/asset-fail" && req.method === "POST") {
+    const r = engine.armAssetFailure(sid, body || {});
+    return _json(res, r, r.status === "error" ? 400 : 200);
+  }
+  if (pathname === "/__comfymodal_test/export-fail" && req.method === "POST") {
+    const r = engine.armExportFailure(sid, body || {});
+    return _json(res, r, r.status === "error" ? 400 : 200);
+  }
+  if (pathname === "/__comfymodal_test/export-delete" && req.method === "POST") {
+    const r = engine.deleteExportedFile(sid, body || {});
+    return _json(res, r, r.status === "error" ? 400 : 200);
+  }
   if (pathname === "/__comfymodal_test/emit" && req.method === "POST") {
     const r = engine.injectEvent(sid, { type: body && body.type, detail: body && body.detail });
     return _json(res, r, r.status === "error" ? 400 : 200);
   }
   if (pathname === "/__comfymodal_test/modern-experiment-state" && req.method === "POST") {
     const r = engine.setModernExperimentState(sid, body);
+    return _json(res, r, r.status === "error" ? (r._httpStatus || 400) : 200);
+  }
+  if (pathname === "/__comfymodal_test/portability" && req.method === "POST") {
+    const r = engine.armPortability(sid, body || {});
+    return _json(res, r, r.status === "error" ? (r._httpStatus || 400) : 200);
+  }
+  if (pathname === "/__comfymodal_test/portability-export-fail" && req.method === "POST") {
+    const r = engine.armPortabilityExportFail(sid, body || {});
+    return _json(res, r, r.status === "error" ? (r._httpStatus || 400) : 200);
+  }
+  if (pathname === "/__comfymodal_test/import-manifest-arm" && req.method === "POST") {
+    const r = engine.armManifestImport(sid, body || {});
     return _json(res, r, r.status === "error" ? (r._httpStatus || 400) : 200);
   }
   if (pathname === "/__comfymodal_test/state" && req.method === "GET") {

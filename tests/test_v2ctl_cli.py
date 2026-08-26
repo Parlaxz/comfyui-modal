@@ -49,6 +49,7 @@ class TestConfig:
         assert data["profile"] == "production"
         assert data["target"]["app"] == "stable-modal-comfy-v2-restore-only-shadow"
         assert data["target"]["class"] == "ModalRuntimeEntrypointV2"
+        assert data["target"]["method"] == "run_plan_stream"
         assert data["resources"]["gpu"] == "rtx-pro-6000"
         assert data["resources"]["memory_mb"] == 32768
         assert data["runtime_override_policy"] == "forbid"
@@ -62,6 +63,19 @@ class TestConfig:
         assert fp32["change_requires"] == "deploy"
         assert fp32["source"] == "default"  # production profile does not override it
         assert fp32["value"] == "0"
+
+    def test_config_golden_p1_uses_dedicated_target_method_and_flag(self) -> None:
+        r = run_v2ctl("config", "--profile", "golden_p1", "--json")
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout)
+        assert data["profile"] == "golden_p1"
+        assert data["target"] == {
+            "app": "stable-modal-comfy-v2-golden-p1",
+            "class": "ModalRuntimeEntrypointV2",
+            "method": "run_golden_serial_stream",
+        }
+        flags = {flag["name"]: flag["value"] for flag in data["flags"]}
+        assert flags["COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"] == "1"
     def test_config_e29_profile(self) -> None:
         r = run_v2ctl("config", "--profile", "e29-tracer", "--json")
         assert r.returncode == 0, r.stderr
@@ -246,6 +260,12 @@ class TestDryRun:
         config_e29 = resolver.resolve(profile_name="e29-tracer")
         _require_full_run_mode(config_e29, command="v2ctl gate")
 
+        # Only golden_p1 may select the dedicated Golden method.
+        config_non_golden = resolver.resolve(profile_name="production")
+        config_non_golden.target.method = "run_golden_serial_stream"
+        with pytest.raises(GateError, match="non-Golden profiles"):
+            _require_full_run_mode(config_non_golden, command="v2ctl gate")
+
     def test_e29_tracer_profile_forces_full_run_mode(self) -> None:
         # The e29-tracer profile must resolve to a FULL generation mode
         # (e28_single), never the snapshot-restore-only probe default.
@@ -356,6 +376,7 @@ class TestBackendSelectorForwarding:
             ("deploy", "e31-clip-fp32-qd4-arm-b", "E31_VALIDATION"),
             ("deploy-run", "e31-clip-fp32-qd4-arm-b", "E31_VALIDATION"),
             ("deploy-run", "e29-tracer", "E28_VALIDATION"),
+            ("deploy-run", "golden_p1", "golden_p1"),
         ],
     )
     def test_selector_reaches_backend_and_matches_printed_command(

@@ -26,6 +26,7 @@ def _asset(
     *,
     created_at: str = T0,
     run_id: str | None = None,
+    logical_output_key: str | None = None,
 ) -> Asset:
     return Asset(
         asset_id=asset_id,
@@ -36,6 +37,7 @@ def _asset(
         created_at=created_at,
         run_id=run_id,
         format="png",
+        logical_output_key=logical_output_key,
     )
 
 
@@ -189,12 +191,52 @@ class HistoryProjectionTests(unittest.TestCase):
         self.assertEqual(projected["original_url"], "/comfymodal/history-v2/assets/remote")
         self.assertFalse(projected["original_failed"])
 
-    @unittest.skip(
-        "E1B_REQUIRED_LOGICAL_OUTPUT_IDENTITY: persisted assets have no stable "
-        "output-slot identity; run_id is attempt provenance only."
-    )
-    def test_e1b_pending_original_thumbnail_logical_output_count(self):
-        self.fail("Logical output grouping is intentionally deferred to E1B.")
+    def test_keyed_variants_form_one_logical_output_group(self):
+        # Retired E1B-pending skip: logical-output identity HAS landed, so
+        # this is now an executable projection assertion. Preview/Thumbnail/
+        # Original variants sharing one stable logical_output_key project as
+        # ONE output group; a second slot stays distinct.
+        key0 = "node:9:slot:images:item:0"
+        key1 = "node:9:slot:images:item:1"
+        with tempfile.TemporaryDirectory() as tmp:
+            thumb_path = Path(tmp) / "thumb.webp"
+            thumb_path.write_bytes(b"thumb")
+            original_path = Path(tmp) / "original.png"
+            original_path.write_bytes(b"png")
+            second_path = Path(tmp) / "second.png"
+            second_path.write_bytes(b"second")
+
+            preview = _asset(
+                "preview", "preview", "/missing/preview.png",
+                run_id="run_preview", logical_output_key=key0,
+            )
+            thumb = _asset(
+                "thumb", "thumbnail", str(thumb_path),
+                run_id="run_preview", logical_output_key=key0,
+            )
+            original = _asset(
+                "original", "original", str(original_path),
+                run_id="run_original", logical_output_key=key0,
+            )
+            second = _asset(
+                "second", "original", str(second_path),
+                created_at=T1, run_id="run_second", logical_output_key=key1,
+            )
+            attempts = [
+                _attempt("run_preview", "preview", "completed"),
+                _attempt("run_original", "original", "completed"),
+                _attempt("run_second", "original", "completed", created_at=T1),
+            ]
+
+            outputs = _build_outputs([preview, thumb, original, second], attempts=attempts)
+
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(outputs[0]["asset_id"], "original")
+        self.assertEqual(outputs[0]["thumb_url"], "/comfymodal/history-v2/assets/thumb")
+        self.assertEqual(outputs[0]["preview_url"], "/comfymodal/history-v2/assets/preview")
+        self.assertEqual(outputs[0]["original_url"], "/comfymodal/history-v2/assets/original")
+        self.assertFalse(outputs[0]["original_failed"])
+        self.assertEqual(outputs[1]["asset_id"], "second")
 
 
 if __name__ == "__main__":

@@ -296,7 +296,9 @@ class ExperimentPerPresetReportTests(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════
 
 class RunnerCellReportSelectionTests(unittest.TestCase):
-    """LocalRemoteInvoker.run_cell uses cell report first, merges into modal_options."""
+    """Cell-level report precedence: cell report first, merged into
+    modal_options. (H19: docstring updated — the retired V1 invoker was
+    deleted; the precedence contract is pinned as pure dict logic.)"""
 
     def test_cell_report_takes_precedence(self):
         """Cell production_report is used before global (single-run fallback)."""

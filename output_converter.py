@@ -22,6 +22,7 @@ from comfymodal_runtime.contracts import (
     normalize_output_format,
     normalize_quality,
     normalize_webp_lossless_compression,
+    resolve_webp_pillow_method,
 )
 
 # ── Public enum values (must match frontend) ──────────────────────────
@@ -38,7 +39,10 @@ _WEBP_LOSSLESS_METHOD = {
     "max": 6,
 }
 
-# WebP lossy method
+# E2D: lossy WebP resolves its Pillow method from the same effort vocabulary
+# via contracts.resolve_webp_pillow_method (fast→0, balanced→4, max→6).  The
+# constant below remains the defensive fallback for an unknown label and
+# preserves the pre-E2D encoder for the default balanced path.
 _WEBP_LOSSY_METHOD = 4
 
 # ── Extension / MIME mapping ──────────────────────────────────────────
@@ -145,6 +149,8 @@ def convert_image_bytes(
         "conversion_fallback": False,
         "quality": None,
         "webp_lossless_compression": None,
+        "webp_effort": None,
+        "webp_method": None,
         "fallback": False,
         "error": None,
     }
@@ -212,25 +218,32 @@ def convert_image_bytes(
         if output_format == "webp_lossless":
             meta["quality"] = None
             meta["webp_lossless_compression"] = webp_lossless_compression
-            method = _WEBP_LOSSLESS_METHOD.get(
-                webp_lossless_compression, 4
+            meta["webp_effort"] = webp_lossless_compression
+            meta["webp_method"] = resolve_webp_pillow_method(
+                webp_lossless_compression
             )
             img.save(
                 out_buf,
                 format="WEBP",
                 lossless=True,
-                method=method,
+                method=meta["webp_method"],
             )
 
         elif output_format == "webp_lossy":
             meta["quality"] = quality
             meta["webp_lossless_compression"] = None
+            # E2D: the effort vocabulary drives the lossy encoder too; the
+            # default balanced label resolves to the historical method 4.
+            meta["webp_effort"] = webp_lossless_compression
+            meta["webp_method"] = resolve_webp_pillow_method(
+                webp_lossless_compression
+            )
             img.save(
                 out_buf,
                 format="WEBP",
                 lossless=False,
                 quality=quality,
-                method=_WEBP_LOSSY_METHOD,
+                method=meta["webp_method"],
             )
 
         elif output_format == "jpeg":

@@ -50,6 +50,14 @@ VERSION = "0.1.0"
 E31_QD4_CAST_ONCE_PROFILE = "e31-clip-fp32-qd4-arm-b"
 E31_VALIDATION_SELECTOR = "E31_VALIDATION"
 
+# Golden P1 is a separate backend harness and remote method.  Keep its
+# identity explicit so a profile cannot reach the Golden method accidentally
+# through a generic full-run path.
+GOLDEN_P1_PROFILE = "golden_p1"
+GOLDEN_P1_SELECTOR = "golden_p1"
+GOLDEN_P1_METHOD = "run_golden_serial_stream"
+FULL_RUN_METHOD = "run_plan_stream"
+
 # E37 deliberately inherits the E29/E28 workload shape, but its late CLIP
 # policy is not compatible with the historical E28 selector.  Keep this path
 # ahead of inherited selector flags so an E37 request can never be routed to
@@ -119,7 +127,9 @@ def _identity_env(config: config_mod.ResolvedConfig) -> dict[str, str]:
 
 
 def _identity_env_for_command(command: str, config: config_mod.ResolvedConfig) -> dict[str, str]:
-    return _identity_env(config) if command in ("deploy", "deploy-run") else {}
+    # Run must target the exact app/class resolved by the selected profile;
+    # otherwise run_v2_single.bat falls back to the production restore-only app.
+    return _identity_env(config) if command in ("deploy", "deploy-run", "run") else {}
 
 
 def _new_invocation_id() -> str:
@@ -251,6 +261,8 @@ def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     mode.  Returns None when no selector applies (plain production run).
     """
     try:
+        if config.profile_name == GOLDEN_P1_PROFILE:
+            return GOLDEN_P1_SELECTOR
         env = {f.name: f.value for f in config.flags}
         if config.profile_name == E37_CLEAN_LANE_PROFILE or any(
             str(env.get(name, "0")).lower() in ("1", "true", "yes", "on")
@@ -286,6 +298,21 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
     confirm, and dry-run reporting so a confirmation cannot silently fall
     back to the restore-only BAT path.
     """
+    # The resolved Golden environment activates the BAT's dedicated harness;
+    # do not forward the profile name as a benchmark positional selector.
+    if config.profile_name == GOLDEN_P1_PROFILE:
+        expected_sha = str(config.workload.expected_output_sha or "").strip()
+        args = [
+            "--run-count",
+            "1",
+        ]
+        # Keep duck-typed callers compatible when they construct a minimal
+        # Golden config.  The real golden_p1 profile supplies the SHA and
+        # therefore still forwards the strict expected-output contract.
+        if expected_sha:
+            args += ["--golden-p1-expected-output-sha", expected_sha]
+        return args, {}
+
     selector = _backend_selector(config)
     args = ([selector] if selector else []) + ["--run-count", "1"]
     selector_env: dict[str, str] = {}
@@ -365,6 +392,21 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
             f"mode runs the restore-only PROBE (run_snapshot_restore_only_probe), "
             f"which never invokes run_plan_stream and produces no generation "
             f"artifact. Configure a full-run mode (e.g. e28_single) in the profile."
+        )
+
+    profile = str(getattr(config, "profile_name", "") or "")
+    target = getattr(config, "target", None)
+    method = str(getattr(target, "method", "") or "").strip()
+    if profile == GOLDEN_P1_PROFILE:
+        if method != GOLDEN_P1_METHOD:
+            raise GateError(
+                f"{command} refuses golden_p1 target.method={method or '(missing)'}; "
+                f"golden_p1 requires {GOLDEN_P1_METHOD}"
+            )
+    elif method != FULL_RUN_METHOD:
+        raise GateError(
+            f"{command} refuses target.method={method or '(missing)'}; non-Golden "
+            f"profiles require {FULL_RUN_METHOD}"
         )
 
 
@@ -1020,6 +1062,16 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
             manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
             print(f"[v2ctl.deploy-run] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
+                # ── E40: crash-loop accounting ────────────────────────────
+                _cl = getattr(result, "crash_loop", None)
+                if _cl:
+                    print(
+                        f"ERROR: CRASH_LOOP detected: exception={_cl.get('exception_type')!r} "
+                        f"count={_cl.get('count')}. The remote container is "
+                        f"failing deterministically at startup; fix the reported "
+                        f"error before redeploying (v2ctl will not auto-retry).",
+                        file=sys.stderr,
+                    )
                 try:
                     manifest.unlink(missing_ok=True)
                 except OSError:
@@ -1076,6 +1128,7 @@ def cmd_run(args, repo_root: Path) -> int:
         spec = backend_registry.run_only()
         env = env_builder.build(config, host_env=os.environ,
                                 backend_extra={"V2_BENCHMARK_RUNS": str(run_count),
+                                               **_identity_env_for_command("run", config),
                                                **selector_env,
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
         # Forward the canonical selector as the BAT's first positional arg so

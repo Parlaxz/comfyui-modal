@@ -405,6 +405,14 @@ WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
 OUTPUT_MODES = ("original", "preview")
 DEFAULT_OUTPUT_QUALITY = 75
 DEFAULT_PREVIEW_QUALITY = 70
+# E2D: encoder-effort policy.  The historical field name carries the
+# fast/balanced/max vocabulary; the mapped Pillow/libwebp method integer is a
+# speed/size dial at fixed quality and is applied to BOTH WebP modes.
+WEBP_EFFORT_METHODS = {"fast": 0, "balanced": 4, "max": 6}
+DEFAULT_WEBP_EFFORT = "balanced"
+# Preview is a latency-sensitive path: freeze the fast effort unless the
+# accepted request explicitly supplies one.
+PREVIEW_WEBP_EFFORT = "fast"
 
 _OUTPUT_FORMAT_ALIASES = {
     "original": "original",
@@ -492,6 +500,20 @@ def normalize_webp_lossless_compression(value: Any) -> str:
     return raw
 
 
+def resolve_webp_pillow_method(effort: Any) -> int:
+    """Map an encoder-effort label to the Pillow/libwebp method integer.
+
+    Single source of truth for both WebP save seams (direct tensor sink and
+    byte converter).  Unknown values fall back to the historical balanced
+    method so behavior never silently drifts from the pre-E2D encoder.
+    """
+    try:
+        normalized = normalize_webp_lossless_compression(effort)
+    except ValueError:
+        normalized = DEFAULT_WEBP_EFFORT
+    return WEBP_EFFORT_METHODS[normalized]
+
+
 def normalize_output_conversion_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
     """Normalize the serializable output codec contract once at its boundary."""
     source = dict(value) if isinstance(value, Mapping) else {}
@@ -532,6 +554,9 @@ def normalize_output_intent_options(value: Mapping[str, Any] | None) -> dict[str
         conversion.setdefault("format", source.get("preview_codec", "webp"))
         if conversion.get("quality") is None:
             conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
+        # E2D: freeze the fast encoder effort into the accepted Preview intent
+        # so replay/history truth carries the effective lossy method.
+        conversion.setdefault("webp_lossless_compression", PREVIEW_WEBP_EFFORT)
     if conversion:
         normalized["output_conversion_options"] = normalize_output_conversion_options(conversion)
         normalized["output_format"] = normalized["output_conversion_options"]["format"]
@@ -584,6 +609,9 @@ class ExecutionOptions:
             conversion.setdefault("format", "webp")
             if conversion.get("quality") is None:
                 conversion["quality"] = DEFAULT_PREVIEW_QUALITY
+            # E2D: freeze the fast encoder effort into the accepted Preview
+            # options so the serialized plan carries the effective method.
+            conversion.setdefault("webp_lossless_compression", PREVIEW_WEBP_EFFORT)
         object.__setattr__(
             self,
             "output_conversion_options",

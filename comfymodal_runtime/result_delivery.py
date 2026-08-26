@@ -404,6 +404,14 @@ def convert_output_items(
                 str(meta_dict["webp_lossless_compression"])
                 if meta_dict.get("webp_lossless_compression") is not None else None
             ),
+            webp_effort=(
+                str(meta_dict["webp_effort"])
+                if meta_dict.get("webp_effort") is not None else None
+            ),
+            webp_method=(
+                int(meta_dict["webp_method"])
+                if meta_dict.get("webp_method") is not None else None
+            ),
             output_codec_ms=float(meta_dict.get("output_codec_ms", 0) or 0),
             encoded_bytes=int(meta_dict.get("encoded_bytes", len(converted_bytes)) or len(converted_bytes)),
             source_bytes=int(meta_dict.get("source_bytes", 0) or 0),

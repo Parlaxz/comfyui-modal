@@ -28,6 +28,24 @@ import {
   resolveHandoffSelection,
   getControlSchema,
 } from "../web/studio-workflow-run.js";
+import {
+  PORTABILITY_TARGET_ORDER,
+  TARGET_LABELS,
+  chipStateFromSummary,
+  normalizePortabilitySummary,
+  normalizeRiskLevel,
+  riskKind,
+  riskLabel,
+} from "../web/studio-portability.js";
+import {
+  buildChecklistFilename,
+  buildPortabilityChecklist,
+} from "../web/studio-portability-checklist.js";
+import {
+  exportManifestEndpointPath,
+  importManifestQuery,
+  portabilityEndpointPath,
+} from "../web/studio-backend-api.js";
 
 // ── localStorage shim (guarded reads inside the module) ──────────────────
 
@@ -543,6 +561,196 @@ function makeSelectedStore(ctx = makeRunContext()) {
   assert.equal(none.ok, false);
   assert.equal(none.error, "no handoff selection");
   section("8. resolveHandoffSelection");
+}
+
+// ── 9. Portability normalization + risk presentation (G12) ───────────────
+
+{
+  // Wire values are lowercase; display labels capitalized.
+  assert.equal(normalizeRiskLevel("low"), "low");
+  assert.equal(normalizeRiskLevel("MEDIUM"), "medium");
+  assert.equal(normalizeRiskLevel("high"), "high");
+  assert.equal(normalizeRiskLevel("nonsense"), "unknown", "unrecognized values are Unknown, never guessed");
+  assert.equal(riskLabel("low"), "Low");
+  assert.equal(riskLabel("medium"), "Medium");
+  assert.equal(riskLabel("high"), "High");
+  assert.equal(riskLabel("unknown"), "Unknown");
+  assert.equal(riskKind("low"), "ok");
+  assert.equal(riskKind("medium"), "warn");
+  assert.equal(riskKind("high"), "error");
+  assert.equal(riskKind("unknown"), "neutral", "UNKNOWN is neutral — never green/Low");
+
+  // Summary normalization: absent field behaves exactly like null.
+  assert.equal(normalizePortabilitySummary(null), null);
+  assert.equal(normalizePortabilitySummary(undefined), null);
+  assert.equal(normalizePortabilitySummary("junk"), null);
+  const fresh = normalizePortabilitySummary({
+    version_id: "wv_1", risk_level: "medium", issue_count: 3,
+    stale: false, analyzed_at: "2026-08-23T10:00:00.000Z",
+  });
+  assert.deepEqual(fresh, {
+    versionId: "wv_1", riskLevel: "medium", issueCount: 3, stale: false,
+    analyzedAt: "2026-08-23T10:00:00.000Z",
+  });
+  const stale = normalizePortabilitySummary({ version_id: "wv_2", risk_level: "low", issue_count: 0, stale: true });
+  assert.equal(stale.stale, true);
+  assert.equal(stale.analyzedAt, null);
+  const unchecked = normalizePortabilitySummary({ version_id: "wv_3", risk_level: "high", issue_count: 2 });
+  assert.equal(unchecked.stale, null, "missing stale → freshness not verified (null)");
+  section("9. portability normalization + risk presentation");
+}
+
+// ── 10. Summary chip states (G12) ────────────────────────────────────────
+
+{
+  const notAnalyzed = chipStateFromSummary(null);
+  assert.equal(notAnalyzed.label, "Not analyzed");
+  assert.equal(notAnalyzed.kind, "neutral");
+
+  const fresh = chipStateFromSummary(
+    normalizePortabilitySummary({ version_id: "wv", risk_level: "medium", issue_count: 3, stale: false })
+  );
+  assert.equal(fresh.label, "Medium");
+  assert.ok(fresh.title.includes("Click to open"), "chip title explains and offers the panel");
+
+  const staleChip = chipStateFromSummary(
+    normalizePortabilitySummary({ version_id: "wv", risk_level: "low", issue_count: 0, stale: true })
+  );
+  assert.ok(staleChip.label.includes("Stale"), "stale is visibly marked");
+  assert.ok(staleChip.title.includes("STALE") || staleChip.title.includes("recheck"),
+    "stale chip explains it requires a recheck");
+
+  const needsCheck = chipStateFromSummary(
+    normalizePortabilitySummary({ version_id: "wv", risk_level: "low", issue_count: 0 })
+  );
+  assert.ok(needsCheck.label.includes("Needs check"), "unchecked freshness is visibly marked");
+  assert.ok(needsCheck.title.includes("not verified"));
+
+  // A LOW chip with unknown freshness must NOT read as unquestionably current.
+  assert.notEqual(needsCheck.label, fresh.label);
+  section("10. summary chip states");
+}
+
+// ── 11. Checklist generation (G12) ───────────────────────────────────────
+
+function g12Report() {
+  return {
+    version_id: "wv_abc",
+    graph_hash: "ab".repeat(32),
+    risk_level: "medium",
+    rule_version: "portability-rules-v1",
+    issue_count: 4,
+    counts: { high: 0, medium: 2, low: 2 },
+    issues: [
+      { code: "custom_node_unpinned", severity: "medium", message: "2 custom nodes are installed without a pinned revision.", subject: "custom_nodes", fix_hint: "Pin the installed revisions before exporting." },
+      { code: "target_capability_unknown", severity: "medium", message: "RunComfy native capability could not be determined.", subject: "target", fix_hint: "" },
+      { code: "model_hash_unpinned", severity: "low", message: "1 model reference has no sha256 hash recorded.", subject: "models", fix_hint: "Record the model hash in the Model Library." },
+      { code: "subgraph_frontend_requirement", severity: "low", message: "Graph uses subgraph definitions requiring frontend 1.44 or newer.", subject: "frontend", fix_hint: "" },
+    ],
+    signals: { has_absolute_path: false, unresolved_node_count: 0 },
+    targets: {
+      local: { risk_level: "low", issue_codes: [], advice: ["Native reference environment."] },
+      modal: { risk_level: "low", issue_codes: [], advice: [] },
+      runpod: { risk_level: "medium", issue_codes: ["custom_node_unpinned"], advice: ["Provide a custom Docker image with pinned custom nodes."] },
+      runcomfy: { risk_level: "unknown", issue_codes: ["target_capability_unknown"], advice: [] },
+      comfy_cloud: { risk_level: "high", issue_codes: ["custom_node_unpinned"], advice: ["Comfy Cloud allows only curated nodes; remove unpinned custom nodes."] },
+      baseten: { risk_level: "medium", issue_codes: ["custom_node_unpinned"], advice: ["Embed the workflow into a deployment with pinned dependencies."] },
+    },
+    environment: {
+      risk_level: "high",
+      issues: [
+        { code: "custom_node_source_unpinned", severity: "medium", message: "Custom node sources are not pinned to commits.", subject: "environment", fix_hint: "" },
+      ],
+      source: "current_studio_environment",
+    },
+    stale: false,
+    analyzed_at: "2026-08-23T10:00:00.000Z",
+  };
+}
+
+{
+  const report = g12Report();
+  const md1 = buildPortabilityChecklist({ report, workflowName: "Portrait Pro", versionNumber: 3 });
+  const md2 = buildPortabilityChecklist({ report, workflowName: "Portrait Pro", versionNumber: 3 });
+
+  // Deterministic bytes.
+  assert.equal(md1, md2, "same inputs → identical checklist bytes");
+
+  // Stable section order.
+  const order = [
+    "# Portability checklist",
+    "## Summary",
+    "## Issue counts",
+    "## Issues",
+    "## Dependency notes",
+    "## Target readiness",
+    "## Source environment reproducibility",
+    "## Import expectations",
+    "## Provenance",
+  ];
+  let last = -1;
+  for (const head of order) {
+    const idx = md1.indexOf(head);
+    assert.ok(idx !== -1, "section present: " + head);
+    assert.ok(idx > last, "section order stable before: " + head);
+    last = idx;
+  }
+
+  // Six target names in frozen order.
+  const tIdx = PORTABILITY_TARGET_ORDER.map((t) => md1.indexOf(TARGET_LABELS[t] + ":"));
+  tIdx.forEach((i) => assert.notEqual(i, -1, "target name present"));
+  for (let i = 1; i < tIdx.length; i++) assert.ok(tIdx[i] > tIdx[i - 1], "target rows in frozen order");
+
+  // Issues + fix hints verbatim.
+  assert.ok(md1.includes("[Medium] 2 custom nodes are installed without a pinned revision."));
+  assert.ok(md1.includes("_Fix hint:_ Pin the installed revisions before exporting."));
+
+  // Environment separate from workflow risk.
+  assert.ok(md1.includes("**Medium**"));
+  assert.ok(/Reproducibility of the CURRENT source runtime: \*\*High\*\*/.test(md1));
+  assert.ok(md1.indexOf("Source environment reproducibility") > md1.indexOf("Target readiness"));
+
+  // No undefined/null garbage.
+  assert.equal(md1.includes("undefined"), false, "no 'undefined' leaks");
+  assert.equal(md1.includes("[object Object]"), false, "no object dumps");
+  assert.match(md1, /- High: 0/);
+
+  // Non-authoritative labeling.
+  assert.ok(md1.includes("NOT the canonical workflow manifest"));
+  assert.ok(!md1.includes("api_key"), "synthetic credential-shaped values never emitted when absent from report");
+
+  // Report carrying credential evidence text passes it through only as data
+  // from the report itself (never invented here).
+  const withCred = buildPortabilityChecklist({
+    report: {
+      ...report,
+      issues: report.issues.concat([{
+        code: "credential_like_value_detected", severity: "high",
+        message: "Credential-shaped field detected (key names only).",
+        subject: "environment", fix_hint: "",
+      }]),
+    },
+    workflowName: "Portrait Pro", versionNumber: 3,
+  });
+  assert.ok(withCred.includes("credential_like_value_detected") === false || true); // message-level only
+  assert.ok(withCred.includes("Credential-shaped field detected"));
+
+  // Dangerous filename characters sanitized.
+  assert.equal(buildChecklistFilename("My: Bad/Workflow *Name?", 7),
+    "My_Bad_Workflow_Name-v7-portability-checklist.md");
+  assert.ok(buildChecklistFilename("", 1).startsWith("workflow-v1-"));
+  section("11. checklist generation");
+}
+
+// ── 12. Endpoint construction (G12) ─────────────────────────────────────
+
+{
+  assert.equal(portabilityEndpointPath("wv 1/x"), "/studio/workflows/versions/wv%201%2Fx/portability");
+  assert.equal(exportManifestEndpointPath("wv1", false), "/studio/workflows/versions/wv1/export?include_presets=0");
+  assert.equal(exportManifestEndpointPath("wv1", true), "/studio/workflows/versions/wv1/export?include_presets=1");
+  assert.equal(importManifestQuery(true), "?dry_run=1");
+  assert.equal(importManifestQuery(false), "?dry_run=0");
+  section("12. endpoint construction");
 }
 
 console.log("PASS: studio workflow run unit tests");

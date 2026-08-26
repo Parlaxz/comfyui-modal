@@ -887,7 +887,7 @@ def test_serialized_waterfall_dict_contract():
         "partial_waterfall", "partial_flags",
         "pre_python_interval_ms", "pre_python_interval_classification",
         "data_flags", "reconciliation_target_ms", "reconciliation_hard_ms",
-        "validation_status",
+        "diagnostic_status",
     }
     assert data["run_label"] == "remote normal run"
     assert data["request_id"] == "request-1"

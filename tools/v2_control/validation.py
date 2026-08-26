@@ -157,6 +157,164 @@ def _artifact_run_path(record: RunRecord) -> Path | None:
     return run_artifact if run_artifact is not None else None
 
 
+# E40 Lane E: single acceptance authority extensions
+def _runtime_contract_data(record: RunRecord) -> dict[str, Any]:
+    """Return runtime contract fields from telemetry and the persisted record."""
+    data: dict[str, Any] = {}
+    telemetry = record.telemetry if isinstance(record.telemetry, dict) else {}
+    contract_keys = (
+        "runtime_status",
+        "loader_selection",
+        "resolved_config",
+        "resolved_config_fingerprint",
+        "config_snapshot",
+        "provenance",
+        "deploy_inputs",
+    )
+    for key in contract_keys:
+        if key in telemetry:
+            data[key] = telemetry[key]
+        candidate = getattr(record, key, None)
+        if candidate is not None:
+            data[key] = candidate
+    artifact_data = _artifact_data(record)
+    sources = [artifact_data, artifact_data.get("result"), artifact_data.get("telemetry")]
+    result = artifact_data.get("result")
+    if isinstance(result, dict):
+        sources.append(result.get("telemetry"))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in contract_keys:
+            if key in source:
+                data[key] = source[key]
+    return data
+
+
+# E40 Lane E: single acceptance authority extensions
+def _runtime_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# E40 Lane E: single acceptance authority extensions
+def _runtime_status_failures(runtime_status: Any) -> list[str]:
+    if not isinstance(runtime_status, dict):
+        return ["runtime_status_not_nominal:(missing)", "runtime_status_reasons_invalid"]
+    status = runtime_status.get("status")
+    failures: list[str] = []
+    if status != "NOMINAL":
+        failures.append(f"runtime_status_not_nominal:{status or '(missing)'}")
+    reasons = runtime_status.get("reasons")
+    if isinstance(reasons, list):
+        failures.extend(str(reason) for reason in reasons)
+    else:
+        failures.append("runtime_status_reasons_invalid")
+    return failures
+
+
+# E40 Lane E: single acceptance authority extensions
+def _loader_selection_failures(loader_selection: Any) -> list[str]:
+    if loader_selection is None:
+        return ["loader_selection_invalid"]
+    if not isinstance(loader_selection, dict):
+        return ["loader_selection_invalid"]
+    failures: list[str] = []
+    for role in ("clip", "unet", "vae"):
+        if role not in loader_selection:
+            continue
+        selection = loader_selection[role]
+        if not isinstance(selection, dict):
+            failures.append(f"loader_selection_invalid_{role}")
+            continue
+        requested = str(selection.get("requested", ""))
+        effective = str(selection.get("effective", ""))
+        observed = str(selection.get("observed", ""))
+        fallback_loader = str(selection.get("fallback_loader", ""))
+        if _runtime_bool(selection.get("fallback_attempted")):
+            failures.append(f"loader_fallback_{role}:{requested}->{fallback_loader}")
+        if observed != effective:
+            failures.append(f"loader_observed_mismatch_{role}")
+        if requested != effective:
+            failures.append(f"loader_effective_mismatch_{role}")
+    return failures
+
+
+# E40 Lane E: single acceptance authority extensions
+def _fingerprint_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("resolved_config_fingerprint", "fingerprint"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        for key in ("resolved_config", "config_snapshot", "provenance", "deploy_inputs"):
+            nested = _fingerprint_from_value(value.get(key))
+            if nested:
+                return nested
+    for key in ("resolved_config_fingerprint", "fingerprint"):
+        candidate = getattr(value, key, None)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+# E40 Lane E: single acceptance authority extensions
+def _runtime_fingerprint_failures(record: RunRecord, config: Any, data: dict[str, Any]) -> list[str]:
+    resolved_config = data.get("resolved_config")
+    if not isinstance(resolved_config, dict):
+        return []
+    observed = _fingerprint_from_value(resolved_config)
+    if not observed:
+        return []
+
+    comparable: list[Any] = []
+    for source in (data, record.telemetry, getattr(record, "artifacts", None), config):
+        if isinstance(source, dict):
+            comparable.extend(
+                source.get(key)
+                for key in (
+                    "resolved_config_fingerprint",
+                    "config_snapshot",
+                    "provenance",
+                    "deploy_inputs",
+                )
+                if key in source
+            )
+        else:
+            for key in (
+                "resolved_config_fingerprint",
+                "config_snapshot",
+                "provenance",
+                "deploy_inputs",
+                "resolved_config",
+            ):
+                candidate = getattr(source, key, None)
+                if candidate is not None:
+                    comparable.append(candidate)
+    for candidate in comparable:
+        expected = _fingerprint_from_value(candidate)
+        if expected and expected != observed:
+            return ["resolved_config_fingerprint_mismatch"]
+    return []
+
+
+# E40 Lane E: single acceptance authority extensions
+def _validate_runtime_contract(record: RunRecord, config: Any) -> list[str]:
+    data = _runtime_contract_data(record)
+    failures: list[str] = []
+    if "runtime_status" in data:
+        failures.extend(_runtime_status_failures(data["runtime_status"]))
+    if "loader_selection" in data:
+        failures.extend(_loader_selection_failures(data["loader_selection"]))
+    failures.extend(_runtime_fingerprint_failures(record, config, data))
+    return failures
+
+
 # --------------------------------------------------------------------------
 # Built-in structural validators
 # --------------------------------------------------------------------------
@@ -264,6 +422,8 @@ class StructuralValidator(ValidatorPlugin):
         ):
             failures.append("effective-config proof is incomplete")
 
+        # E40 Lane E: single acceptance authority extensions
+        failures.extend(_validate_runtime_contract(record, config))
         return failures
 
 
@@ -1106,6 +1266,14 @@ def _canonical_extra_env(
     extras: dict[str, str],
 ) -> dict[str, str]:
     result = dict(extras)
+    # Gate/confirm use the same resolved target/resource identity channel as
+    # cmd_run.  Do not leave these names to the BAT defaults: that is how a
+    # run-only Golden request can silently land on the restore-only app.
+    from .cli import _identity_env
+
+    result.update({
+        name: str(value) for name, value in _identity_env(config).items()
+    })
     result.update({
         "COMFYMODAL_V2CTL_INVOCATION_ID": invocation_id,
         "COMFYMODAL_V2CTL_PROFILE": str(getattr(config, "profile_name", "") or ""),
@@ -1114,6 +1282,71 @@ def _canonical_extra_env(
         "COMFYMODAL_V2CTL_RUN_FINGERPRINT": run_fp,
     })
     return result
+
+
+_CANONICAL_IDENTITY_ENV = (
+    "COMFYMODAL_V2_APP_NAME",
+    "COMFYMODAL_V2_CLASS_NAME",
+    "COMFYMODAL_V2_GPU",
+    "COMFYMODAL_V2_MEMORY_MB",
+    "COMFYMODAL_V2_CPU_REQUEST",
+    "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST",
+    "COMFYMODAL_V2_BASELINE_CPU_REQUEST",
+)
+
+
+def _assert_canonical_backend_identity(
+    config: Any,
+    extra_env: dict[str, str],
+) -> None:
+    """Refuse Golden backend calls unless the complete identity is explicit.
+
+    The BAT fallback is intentionally retained for non-Golden profiles.  For
+    Golden, however, an omitted or contradictory identity is unsafe: the
+    backend must not get a chance to select its restore-only default.
+    """
+    if str(getattr(config, "profile_name", "") or "") != "golden_p1":
+        return
+
+    target = getattr(config, "target", None)
+    if isinstance(target, dict):
+        target_value = target.get
+    else:
+        target_value = lambda name, default="": getattr(target, name, default)
+    expected_target = {
+        "app": "stable-modal-comfy-v2-golden-p1",
+        "class_name": "ModalRuntimeEntrypointV2",
+        "method": "run_golden_serial_stream",
+    }
+    failures = [
+        f"golden_p1 target.{name} must be {expected!r}; got {target_value(name, '')!r}"
+        for name, expected in expected_target.items()
+        if str(target_value(name, "") or "") != expected
+    ]
+
+    try:
+        from .cli import _identity_env
+
+        expected_env = {
+            name: str(value) for name, value in _identity_env(config).items()
+        }
+    except Exception as exc:  # noqa: BLE001 - fail closed for duck-typed callers
+        raise GateError(f"golden_p1 canonical identity could not be resolved: {exc}") from exc
+    for name in _CANONICAL_IDENTITY_ENV:
+        expected = expected_env.get(name, "").strip()
+        observed = str(extra_env.get(name, "") or "").strip()
+        if not expected or expected.lower() in {"none", "null"}:
+            failures.append(f"golden_p1 canonical identity {name} is missing from config")
+        elif observed != expected:
+            failures.append(
+                f"golden_p1 canonical identity {name} mismatch: "
+                f"expected {expected!r}, got {observed or '(missing)'!r}"
+            )
+
+    if failures:
+        raise GateError(
+            "refusing golden_p1 backend invocation: " + "; ".join(failures)
+        )
 
 
 def _run_backend(
@@ -1181,30 +1414,26 @@ class GateRunner:
         deploy_fp = self._fingerprints.deploy_fingerprint()
         run_fp = self._fingerprints.run_fingerprint()
         profile_config_fp = _profile_config_fingerprint(self._fingerprints)
-        # ── Full-run guard: gate must generate (run_plan_stream), never the
-        # snapshot-restore-only PROBE. ──
-        from .cli import _benchmark_mode
+        # Keep the full-run mode and target-method policy centralized in the
+        # CLI guard so direct GateRunner callers cannot bypass Golden routing.
+        from .cli import _require_full_run_mode
 
-        if _benchmark_mode(config) == "snapshot_restore_only":
-            raise GateError(
-                "gate refuses V2_BENCHMARK_MODE=snapshot_restore_only: that "
-                "mode runs the restore-only PROBE (run_snapshot_restore_only_probe), "
-                "which never invokes run_plan_stream and produces no generation "
-                "artifact. Configure a full-run mode (e.g. e28_single)."
-            )
+        _require_full_run_mode(config, command="v2ctl gate")
         # Keep selector, run count, nonce, and selector env in one canonical
         # construction shared with confirm and CLI dry-run reporting.
         from .cli import _validation_backend_args
 
         extra_args, selector_env = _validation_backend_args(config)
+        extra_env = _canonical_extra_env(
+            config, deploy_fp, run_fp, profile_config_fp, invocation_id,
+            {"V2_BENCHMARK_RUNS": "1", **selector_env},
+        )
+        _assert_canonical_backend_identity(config, extra_env)
         try:
             result = _run_backend(
                 self._backend_runner, backend_spec, config=config,
                 extra_args=extra_args,
-                extra_env=_canonical_extra_env(
-                    config, deploy_fp, run_fp, profile_config_fp, invocation_id,
-                    {"V2_BENCHMARK_RUNS": "1", **selector_env},
-                ),
+                extra_env=extra_env,
                 timeout_seconds=600.0, invocation_id=invocation_id,
                 strict_canonical=True,
             )
@@ -1296,17 +1525,12 @@ class ConfirmRunner:
         invocation_context: str | None = None,
     ) -> GateResult:
         invocation_id = str(invocation_id or invocation_context or uuid.uuid4().hex)
-        # Confirm is a full-generation protocol just like gate.  Keep this
-        # guard here as well as in the CLI so direct callers cannot spend on
-        # the restore-only probe path.
-        from .cli import _benchmark_mode
+        # Confirm is a full-generation protocol just like gate.  Keep the same
+        # centralized method/mode guard here so direct callers cannot spend on
+        # the restore-only probe or an arbitrary target method.
+        from .cli import _require_full_run_mode
 
-        if _benchmark_mode(config) == "snapshot_restore_only":
-            raise GateError(
-                "confirm refuses V2_BENCHMARK_MODE=snapshot_restore_only: that "
-                "mode runs the restore-only PROBE, which produces no generation "
-                "artifact. Configure a full-run mode (e.g. e28_single)."
-            )
+        _require_full_run_mode(config, command="v2ctl confirm")
         path = Path(gate_manifest)
         if not path.is_file():
             raise GateError(f"gate manifest not found: {path}")
@@ -1369,14 +1593,16 @@ class ConfirmRunner:
             # backend invocation.  Separate IDs keep separate confirmations
             # from becoming an ambiguous multi-run invocation.
             run_invocation_id = invocation_id if runs == 1 else uuid.uuid4().hex
+            extra_env = _canonical_extra_env(
+                config, deploy_fp, run_fp, profile_config_fp, run_invocation_id,
+                {"V2_BENCHMARK_RUNS": "1", **selector_env},
+            )
+            _assert_canonical_backend_identity(config, extra_env)
             try:
                 result = _run_backend(
                     self._backend_runner, backend_spec, config=config,
                     extra_args=extra_args,
-                    extra_env=_canonical_extra_env(
-                        config, deploy_fp, run_fp, profile_config_fp, run_invocation_id,
-                        {"V2_BENCHMARK_RUNS": "1", **selector_env},
-                    ),
+                    extra_env=extra_env,
                     timeout_seconds=600.0, invocation_id=run_invocation_id,
                     strict_canonical=True,
                     allow_multiple_run_artifacts=False,

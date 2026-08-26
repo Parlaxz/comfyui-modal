@@ -14,7 +14,11 @@
 //   - reopen same id rebuilds the fixed cell list without resubmitting
 //   - retry identity (failed-only, position + cell_id preserved)
 //   - resume eligibility (skips failed) + double-click guard
-//   - legacy experiment-mode exports retained (legacy rendering compat)
+//   - legacy experiment-mode eligibility exports retained (rendering compat)
+//   - H-WAVE D: legacy creator/run surface fully retired — experimentRunSurface
+//     returns "modern" for every state; no legacy creator anywhere
+//   - H8: missing modern identity fails closed (gated modern surface, zero
+//     requests); rapid-click dedupe; draft-state non-destruction
 //
 // No browser, no DOM, plain Node.  fetch is stubbed; the per-experiment
 // controller is driven with injected actions + a fake event source.
@@ -47,8 +51,6 @@ import {
   canRunExperiment,
   getExperimentPresetIds,
   renderExperimentMode,
-  renderExperimentRunButton,
-  executeExperimentRun,
 } from "../web/studio-experiment-mode.js";
 import {
   createExperimentRunController,
@@ -648,24 +650,37 @@ function statusDetail(overrides) {
   section("11. Workflow-axis labels/values preserved from state");
 }
 
-// ── 12. Run surface selection (one submit button, never two) ─────────────
+// ── 12. Run surface selection (H8: legacy creator never mounts) ──────────
 
 {
   const storage = installLocalStorage();
   try {
-    // Legacy preset-only state (no modern workflow, no experiment id) → the
-    // existing legacy experiment renderer stays mounted.
+    // H-WAVE A4 fallback closure: preset-only state (no modern workflow,
+    // no experiment id) mounts the MODERN section gated — never the legacy
+    // creator button.
     const legacy = makeState({ selectedBackendId: "preset_a", compareBackendIds: ["preset_b"] });
     delete legacy.playground._workflowRun;
-    assert.equal(experimentRunSurface(legacy), "legacy", "preset-only state keeps the legacy renderer");
+    assert.equal(experimentRunSurface(legacy), "modern", "preset-only state gets the GATED modern section");
+    assert.equal(modernExperimentCanRun(legacy), false);
+    assert.equal(
+      modernExperimentDisabledReason(legacy),
+      "Select a Workflow and Version before running an experiment.",
+      "gating reason names Workflow and Version",
+    );
 
     // Modern Workflow/Version selection → the D5 modern section mounts.
     const modern = makeState({ workflowId: "wf_1", workflowVersionId: "ver_1" });
     assert.equal(experimentRunSurface(modern), "modern", "modern workflow/version selection shows the modern section");
 
-    // Workflow without a version is not yet a modern run selection.
+    // Workflow without a version is not yet a modern run selection → still
+    // the modern section, gated with a version-specific reason.
     const noVersion = makeState({ workflowId: "wf_1", workflowVersionId: "" });
-    assert.equal(experimentRunSurface(noVersion), "legacy", "workflow without version stays legacy");
+    assert.equal(experimentRunSurface(noVersion), "modern", "workflow without version stays modern-gated");
+    assert.equal(
+      modernExperimentDisabledReason(noVersion),
+      "Select a Workflow Version before running an experiment.",
+      "version-only gap names the Version",
+    );
 
     // An in-flight/persisted active modern experiment forces the modern
     // surface even without a workflow re-selected.
@@ -676,31 +691,48 @@ function statusDetail(overrides) {
     const persisted = makeState({ workflowId: "", workflowVersionId: "" });
     storage.set("comfymodal.studio.experiment.active.v1", JSON.stringify({ experimentId: "exp_v2_persisted" }));
     assert.equal(experimentRunSurface(persisted), "modern", "persisted active experiment id forces the modern section");
+
+    // H-WAVE D: the legacy surface is fully retired — even an in-flight
+    // legacy runState mounts the modern section (view/control compat gone).
+    storage.delete("comfymodal.studio.experiment.active.v1");
+    const legacyActive = makeState({ workflowId: "", workflowVersionId: "" });
+    legacyActive.playground.runState = { status: "submitted", experimentId: "exp_legacy_active" };
+    assert.equal(experimentRunSurface(legacyActive), "modern",
+      "H-WAVE D: legacy surface retired — in-flight legacy runs also mount modern");
+
+    // Terminal legacy states are NOT active: they fall through to the gated
+    // modern section so no re-run/retry creator can appear.
+    for (const terminal of ["completed", "error", "canceled", "interrupted"]) {
+      const done = makeState({ workflowId: "", workflowVersionId: "" });
+      done.playground.runState = { status: terminal, experimentId: "exp_legacy_done" };
+      assert.equal(experimentRunSurface(done), "modern", `terminal legacy ${terminal} never re-opens a creator`);
+    }
   } finally {
     delete globalThis.localStorage;
   }
 
-  // renderExperimentMode mounts exactly one surface through a shared host
-  // (the legacy run button and the modern section are mutually exclusive).
+  // renderExperimentMode mounts exactly one surface through a shared host.
   assert.equal(MODULE_SRC.includes("experimentRunSurface(state)"), true, "renderExperimentMode branches on the surface");
-  assert.equal(MODULE_SRC.includes("surface === \"modern\""), true, "modern branch mounts the D5 section only");
-  assert.equal(MODULE_SRC.includes("renderExperimentRunButton(state, actions, context)"), true,
-    "legacy branch mounts the existing legacy run button");
+  // H-WAVE D: the legacy surface branch and compat renderer are fully retired.
+  assert.equal(MODULE_SRC.includes('return "legacy";'), false,
+    "H-WAVE D: legacy surface branch retired");
+  assert.equal(MODULE_SRC.includes("renderExperimentRunButton(state, actions, context)"), false,
+    "H-WAVE D: legacy compat renderer retired");
+  assert.equal(MODULE_SRC.includes("_hasActiveLegacyRunState(state)"), false,
+    "H-WAVE D: active-legacy surface gate retired");
 
   // The surface watcher detaches the modern controller when the host is
   // disconnected (navigation/popup close) — event listeners + polling are
   // detached without cancel, and the controller is never disposed here.
   assert.equal(MODULE_SRC.includes("detachModernExperiment(state, actions);"), true,
     "watcher detaches the modern controller on host disconnect");
-  section("12. Run surface selection (one submit button, never two)");
+  section("12. Run surface selection (H8: legacy creator never mounts)");
 }
 
 // ── 13. Legacy rendering compatibility ───────────────────────────────────
 
 {
   assert.equal(typeof renderExperimentMode, "function", "legacy experiment-mode renderer retained");
-  assert.equal(typeof renderExperimentRunButton, "function", "legacy run button renderer retained");
-  assert.equal(typeof executeExperimentRun, "function", "legacy submit retained");
   assert.equal(typeof canRunExperiment, "function", "legacy eligibility retained");
 
   const state = makeState({ selectedBackendId: "preset_a", compareBackendIds: ["preset_b", "preset_a"] });
@@ -708,9 +740,11 @@ function statusDetail(overrides) {
   const onePreset = makeState({ selectedBackendId: "preset_a", compareBackendIds: [] });
   assert.equal(canRunExperiment(onePreset), false, "single preset without multi-value axis is not runnable");
 
-  // The legacy submission path is still defined and uses the legacy route
-  // only there; the modern path never references runStudioExperiment.
-  assert.equal(MODULE_SRC.includes("runStudioExperiment"), true, "legacy import retained for legacy flows");
+  // H-WAVE D: the legacy creator/run helpers are fully retired — zero
+  // references anywhere in the module; the modern V2 import remains.
+  assert.equal(MODULE_SRC.includes("runStudioExperiment"), false, "H-WAVE D: legacy runStudioExperiment retired");
+  assert.equal(MODULE_SRC.includes("executeExperimentRun"), false, "H-WAVE D: legacy executeExperimentRun retired");
+  assert.equal(MODULE_SRC.includes("renderExperimentRunButton"), false, "H-WAVE D: legacy run button renderer retired");
   assert.equal(MODULE_SRC.includes("runExperimentV2"), true, "modern import present");
   section("13. Legacy rendering compatibility");
 }
@@ -857,6 +891,108 @@ function statusDetail(overrides) {
   assert.equal("concurrency" in payload, false, "no concurrency in the definition");
   assert.equal(JSON.stringify(payload).includes("concurrency"), false, "no concurrency anywhere");
   section("15. Flat-flow guards: no concurrency, no partial, distinct statuses");
+}
+
+// ── 16. H8: missing identity fails closed — zero requests, zero writes ───
+
+{
+  const storage = installLocalStorage();
+  storage.set("comfymodal.studio.experiment.draft.v1", JSON.stringify({
+    "preset_a::txt2img": { experimentAxes: { steps: { enabled: true, values: [10, 20] } }, compareBackendIds: ["preset_b"] },
+  }));
+  const before = JSON.stringify(storage.get("comfymodal.studio.experiment.draft.v1"));
+
+  const state = makeState({ workflowId: "", workflowVersionId: "" });
+  delete state.playground._workflowRun;
+  const stub = stubFetch({});
+  try {
+    const result = await executeModernExperimentRun(state, {}, { apiBase: "/comfymodal" });
+    assert.equal(result.status, "error", "missing identity is refused");
+    assert.equal(result.gated, true, "refusal is the truthful gate, not a server error");
+    assert.equal(
+      result.message,
+      "Select a Workflow and Version before running an experiment.",
+      "gating reason surfaced",
+    );
+    assert.equal(stub.calls.length, 0, "ZERO network requests without identity");
+    const legacyCalls = stub.calls.filter((c) => c.url.includes("/studio/experiment"));
+    assert.equal(legacyCalls.length, 0, "never POSTs the legacy creator as a fallback");
+    assert.equal(state.playground._experimentController == null, true, "no controller created");
+    assert.equal(state.playground._activeExperimentId == null, true, "no active id written");
+    assert.equal(
+      JSON.stringify(storage.get("comfymodal.studio.experiment.draft.v1")),
+      before,
+      "experiment draft state untouched (no destructive conversion)",
+    );
+    assert.equal(storage.get("comfymodal.studio.experiment.active.v1") == null, true, "modern active key untouched");
+
+    // Surface/gating evaluation itself never persists anything.
+    experimentRunSurface(state);
+    modernExperimentCanRun(state);
+    modernExperimentDisabledReason(state);
+    assert.equal(storage.get("comfymodal.studio.experiment.active.v1") == null, true, "gating reads never write state");
+  } finally {
+    stub.restore();
+    delete globalThis.localStorage;
+  }
+  section("16. Missing identity fails closed (zero requests, zero writes)");
+}
+
+// ── 17. H8: rapid concurrent Run clicks dedupe to ONE submission ─────────
+
+{
+  installLocalStorage();
+  let postCount = 0;
+  const state = makeState({
+    experimentAxes: { steps: { enabled: true, values: [10, 20] } },
+  });
+  const stub = stubFetch((req) => {
+    if (req.method === "POST" && req.url.endsWith("/studio/experiment-v2")) {
+      postCount++;
+      const sent = JSON.parse(req.body || "{}");
+      return {
+        status: "ok",
+        experiment_id: sent.experiment_id,
+        started: true,
+        item: statusDetail({ experimentId: sent.experiment_id, status: "running", total: 2 }),
+      };
+    }
+    return {};
+  });
+  try {
+    // Two clicks land before either submission resolves — exactly one POST.
+    const [r1, r2] = await Promise.all([
+      executeModernExperimentRun(state, {}, { apiBase: "/comfymodal" }),
+      executeModernExperimentRun(state, {}, { apiBase: "/comfymodal" }),
+    ]);
+    assert.equal(r1.status, "ok");
+    assert.equal(r2.status, "ok");
+    assert.equal(postCount, 1, "rapid double-click submits exactly one definition");
+    assert.equal(r2.guarded === true || r1.guarded === true || r2.experimentId === r1.experimentId, true,
+      "second click is guarded or resolves to the same experiment");
+  } finally {
+    detachModernExperiment(state);
+    stub.restore();
+    delete globalThis.localStorage;
+  }
+  section("17. Rapid concurrent Run clicks dedupe to one submission");
+}
+
+// ── 18. H-WAVE D: legacy helpers fully retired, zero references ───────────
+
+{
+  // The legacy creator/run surface is gone entirely: no import, no call,
+  // no renderer.  The modern execution path re-checks identity itself.
+  assert.equal(MODULE_SRC.includes("runStudioExperiment"), false, "H-WAVE D: legacy API helper retired");
+  assert.equal(MODULE_SRC.includes("executeExperimentRun"), false, "H-WAVE D: legacy submit retired");
+  assert.equal(MODULE_SRC.includes("renderExperimentRunButton"), false, "H-WAVE D: legacy renderer retired");
+  const modernFnStart = MODULE_SRC.indexOf("export async function executeModernExperimentRun");
+  const modernFnEnd = MODULE_SRC.indexOf("async function _submitModernExperimentRun");
+  assert.ok(modernFnStart !== -1 && modernFnEnd > modernFnStart, "modern run entry located");
+  const modernSrc = MODULE_SRC.slice(modernFnStart, MODULE_SRC.indexOf("}", MODULE_SRC.indexOf("pg._experimentSubmitInFlight = false;")));
+  assert.equal(modernSrc.includes("runStudioExperiment"), false, "modern run path never calls the legacy creator");
+  assert.equal(modernSrc.includes("modernExperimentCanRun(state)"), true, "modern run path re-checks identity");
+  section("18. Legacy helpers fully retired; zero references from the modern run path");
 }
 
 console.log("PASS: studio experiment v2 frontend unit tests");

@@ -1,21 +1,21 @@
 // Modal Studio — Settings
 //
 // Seven-section settings page: General, Generation, Outputs, History,
-// Experiments, Interface, Advanced. Legacy testing-suite tabs embed via
-// renderLegacyView → context.mountLegacyTab.
+// Experiments, Interface, Advanced. Preferences-only (H5 §2); the former
+// Settings ▸ Advanced ▸ Legacy group and legacy-tab embedding were retired
+// in Phase H14 Wave E.
 //
 // Contracts:
-//  - Exports renderSettings(state, context) (shell PAGES.settings) and
-//    renderLegacyView(state, context) (shell legacy-tab embedding).
-//  - state.settings.activeLegacyTab / state.settings.activeSection behavior
-//    is preserved; legacy entries set activeLegacyTab then render the
-//    legacy wrapper.
+//  - Exports renderSettings(state, context) (shell PAGES.settings).
+//  - state.settings.activeSection behavior is preserved.
 //  - Each section keeps a data-section attribute so modal-testing.js can
 //    scroll to [data-section=...] via comfymodal.open-section.
 //  - Output preferences go through ./studio-output-preferences.js (dynamic
 //    import) which dual-writes localStorage + POST /comfymodal/config and
 //    keeps its failure-revert behavior.
 //  - All new localStorage keys are flat strings.
+
+import { publishStudioSync, subscribeStudioSync } from "./studio-sync.js";
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -37,8 +37,16 @@ const PREVIEW_DEFAULTS = {
 // Keys managed by the modern Settings page. "Reset all settings" clears
 // exactly this set — nothing under comfymodal.studio.playground.* or the
 // other user-data namespaces is touched.
+//
+// Guard: every key here must be classified with real reader/writer evidence
+// in tests/studio_phase_f4_settings_authority_unit.mjs. Reset-only keys with
+// no consumer fail that registry-equality check; removed stale keys must not
+// reappear anywhere in this file.
+//
+// H12: the canvas Cloud/Local run-mode key left this registry — it has zero
+// modern Studio consumers. The canvas compatibility layer keeps its own
+// browser key + window global; modern Settings never writes or resets it.
 const MODERN_SETTINGS_KEYS = [
-  "comfymodal_enabled",
   "comfymodal_gpu",
   "comfymodal_output_format",
   "comfymodal_quality",
@@ -49,9 +57,7 @@ const MODERN_SETTINGS_KEYS = [
   "comfymodal_preview_default",
   "comfymodal_preview_codec",
   "comfymodal_preview_quality",
-  "comfymodal_preview_auto_save",
   "comfymodal-studio-history-columns",
-  "comfymodal_global_concurrency",
   "comfymodal_heavy_tracing",
   "comfymodal-studio-panel-width",
   "comfymodal.studio.playground.carousel-cleared.v1",
@@ -63,7 +69,6 @@ const HEAVY_TRACING_LEVELS = ["off", "summary", "detailed", "trace", "trace_verb
 // switch, so element-keyed handlers cannot survive a re-render; tracking
 // the last-attached handler at module scope lets us remove it before
 // attaching the new one — fixing the per-render window listener leak.
-let _executionModeListener = null;
 let _outputPrefsListener = null;
 
 let _outputPrefsModulePromise = null;
@@ -158,15 +163,43 @@ function selectWithOptions(options, testid) {
 
 export function renderSettings(state, context) {
   const container = el("div", { class: "comfymodal-studio-settings" });
+  let settingsStale = false;
+  let unsubscribeSettingsSync = null;
 
-  // If a legacy tab is active, render the legacy wrapper view
-  if (state.settings.activeLegacyTab) {
-    container.appendChild(renderLegacyView(state, context));
-    return container;
+  function refreshFromSync() {
+    if (!container.isConnected) {
+      if (unsubscribeSettingsSync) unsubscribeSettingsSync();
+      unsubscribeSettingsSync = null;
+      return;
+    }
+    settingsStale = true;
+    container.dataset.syncStale = "true";
+    rebuildPage();
+    settingsStale = false;
+    container.dataset.syncStale = "false";
   }
 
+  unsubscribeSettingsSync = subscribeStudioSync("settings", refreshFromSync);
+
+  // Truthful page h2 under the shell h1 (I1 §3.3 / I7). Settings has no
+  // visible page title, so the heading is accessible-but-visually-hidden
+  // with the clip pattern — never display:none / visibility:hidden.
+  // Section headings stay h3 and the Runtime & Backend group stays h4,
+  // exactly as frozen.
+  container.appendChild(el("h2", {
+    class: "comfymodal-studio-settings-page-title",
+    "data-testid": "settings-page-title",
+    text: "Settings",
+    style: "position:absolute;width:1px;height:1px;margin:-1px;padding:0;" +
+      "border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;",
+  }));
+
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  let effectiveTracingLevel = "off";
+  // Heavy-tracing server truth: persisted (.profile_config.json) vs what the
+  // current process is executing. Both come from GET /profile/level; the
+  // restart banner compares these, never the browser-stored selection.
+  let persistedTracingLevel = null;
+  let effectiveTracingLevel = null;
 
   // ── Pending-restart banner (persistent across rebuilds) ──
   const bannerEl = el("div", {
@@ -248,10 +281,21 @@ export function renderSettings(state, context) {
   }
 
   // ── Per-section reset implementations ──
+  // F8: the server owns the persisted GPU, so resets POST the canonical
+  // default back to /config (server + persistence) instead of only
+  // clearing the browser display cache.
+  async function fetchDefaultGpu() {
+    try {
+      const resp = await fetch(apiBase + "/config");
+      if (resp.ok) {
+        const cfg = await resp.json();
+        if (cfg && cfg.default_gpu) return cfg.default_gpu;
+      }
+    } catch (_) {}
+    return "rtx-pro-6000";
+  }
+
   const resets = {
-    general: async () => {
-      removeKeys(["comfymodal_enabled"]);
-    },
     generation: async () => {
       removeKeys(["comfymodal_gpu", "comfymodal_preview_default"]);
       try {
@@ -259,11 +303,13 @@ export function renderSettings(state, context) {
         await m.setOutputPreferences({ preview_default: PREVIEW_DEFAULTS.preview_default });
       } catch (_) {}
       try {
-        await fetch(apiBase + "/config", {
+        const defaultGpu = await fetchDefaultGpu();
+        const resp = await fetch(apiBase + "/config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ execution_mode: "v2" }),
+          body: JSON.stringify({ gpu: defaultGpu }),
         });
+        if (resp.ok) publishStudioSync("settings");
       } catch (_) {}
     },
     outputs: async () => {
@@ -286,9 +332,6 @@ export function renderSettings(state, context) {
     history: async () => {
       removeKeys(["comfymodal-studio-history-columns"]);
     },
-    experiments: async () => {
-      removeKeys(["comfymodal_global_concurrency"]);
-    },
     interface: async () => {
       removeKeys(["comfymodal-studio-panel-width", "comfymodal.studio.playground.carousel-cleared.v1"]);
     },
@@ -306,6 +349,7 @@ export function renderSettings(state, context) {
 
   async function runSectionReset(key) {
     await resets[key]();
+    publishStudioSync("settings");
     rebuildPage();
     showTransient("settings-reset-" + key, "Section reset to defaults");
   }
@@ -313,16 +357,19 @@ export function renderSettings(state, context) {
   async function runResetAll() {
     const ok = confirm(
       "Reset all Studio settings (General, Generation, Outputs, History, Experiments, Interface, Advanced) to defaults. " +
+      "The GPU selection is reset to the default. " +
       "Your Workflows, run History, snapshots, presets, drafts, and assets are NOT affected."
     );
     if (!ok) return;
     removeKeys(MODERN_SETTINGS_KEYS);
     try {
-      await fetch(apiBase + "/config", {
+      const defaultGpu = await fetchDefaultGpu();
+      const resp = await fetch(apiBase + "/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ execution_mode: "v2" }),
+        body: JSON.stringify({ gpu: defaultGpu }),
       });
+      if (resp.ok) publishStudioSync("settings");
     } catch (_) {}
     try {
       const m = await loadOutputPrefsModule();
@@ -336,6 +383,7 @@ export function renderSettings(state, context) {
         body: JSON.stringify({ level: "off" }),
       });
     } catch (_) {}
+    publishStudioSync("settings");
     rebuildPage();
     const confirmEl = el("span", { class: "comfymodal-settings-reset-confirm", text: "All settings reset to defaults" });
     footerEl.appendChild(confirmEl);
@@ -347,15 +395,22 @@ export function renderSettings(state, context) {
   function buildSectionHeader(title, resetTestid) {
     const head = el("div", { class: "comfymodal-studio-settings-section-head" });
     head.appendChild(el("h3", { text: title }));
-    const actions = el("div", { class: "comfymodal-settings-section-actions" });
-    actions.appendChild(el("button", {
-      type: "button",
-      class: "comfymodal-settings-reset-section-btn",
-      "data-testid": resetTestid,
-      text: "Reset section",
-      onclick: () => runSectionReset(resetTestid.replace("settings-reset-", "")),
-    }));
-    head.appendChild(actions);
+    // Sections with nothing to reset (informational-only, e.g. Experiments)
+    // pass no resetTestid and render no reset button.
+    if (resetTestid) {
+      const actions = el("div", { class: "comfymodal-settings-section-actions" });
+      actions.appendChild(el("button", {
+        type: "button",
+        class: "comfymodal-settings-reset-section-btn",
+        "data-testid": resetTestid,
+        text: "Reset section",
+        // Every reset control names its section: the five section resets
+        // previously shared the identical accessible name "Reset section".
+        "aria-label": "Reset " + title + " section",
+        onclick: () => runSectionReset(resetTestid.replace("settings-reset-", "")),
+      }));
+      head.appendChild(actions);
+    }
     return head;
   }
 
@@ -379,39 +434,12 @@ export function renderSettings(state, context) {
   // ── 1. General ──
   function buildGeneralSection() {
     const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "general" });
-    section.appendChild(buildSectionHeader("General", "settings-reset-general"));
-
-    // Run mode — segmented Cloud/Local control (mirrors legacy modal-settings.js)
-    const savedEnabled = localStorage.getItem("comfymodal_enabled");
-    let isCloud = savedEnabled === null ? true : savedEnabled === "true";
-
-    const seg = el("div", { class: "comfymodal-settings-segmented", "data-testid": "settings-run-mode" });
-    const cloudBtn = el("button", {
-      type: "button",
-      class: "comfymodal-settings-segment" + (isCloud ? " active" : ""),
-      "data-testid": "settings-run-mode-cloud",
-      text: "Cloud",
-    });
-    const localBtn = el("button", {
-      type: "button",
-      class: "comfymodal-settings-segment" + (!isCloud ? " active" : ""),
-      "data-testid": "settings-run-mode-local",
-      text: "Local",
-    });
-    function updateRunMode(cloud) {
-      isCloud = cloud;
-      cloudBtn.classList.toggle("active", cloud);
-      localBtn.classList.toggle("active", !cloud);
-      try { localStorage.setItem("comfymodal_enabled", String(cloud)); } catch (_) {}
-      window._comfyModalEnabled = cloud;
-    }
-    cloudBtn.addEventListener("click", () => updateRunMode(true));
-    localBtn.addEventListener("click", () => updateRunMode(false));
-    seg.appendChild(cloudBtn);
-    seg.appendChild(localBtn);
-
-    section.appendChild(controlRow("Run mode", seg, "Cloud mode sends generations to Modal. Local mode runs on your machine.", "cloud local"));
-    section.appendChild(infoRow("Primary navigation: Playground / History / Workflows / Settings. Backend remains available in navigation."));
+    // H12: the Cloud/Local Run mode control is retired — it had zero modern
+    // Studio consumers and gated only legacy canvas /prompt interception.
+    // The canvas compatibility layer keeps its own key; nothing here resets
+    // or writes it. Nothing in General is resettable → no reset button.
+    section.appendChild(buildSectionHeader("General", ""));
+    section.appendChild(infoRow("Primary navigation: Playground / History / Workflows / Backend / Settings."));
     return section;
   }
 
@@ -420,27 +448,11 @@ export function renderSettings(state, context) {
     const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "generation" });
     section.appendChild(buildSectionHeader("Generation", "settings-reset-generation"));
 
-    // Execution Engine (server-persisted; v2/v1)
-    const engineSelect = el("select", { class: "comfymodal-input", "data-testid": "settings-execution-engine" });
-    engineSelect.style.cssText = "width:100%;font-size:11px;padding:3px 6px;";
-    const engineStatus = el("div", {
-      class: "comfymodal-studio-settings-status",
-      "data-testid": "settings-execution-engine-status",
-    });
-    const engineReadiness = el("div", {
-      class: "comfymodal-studio-settings-status",
-      "data-testid": "settings-execution-engine-readiness",
-    });
-    const engineWrap = el("div", {
-      class: "comfymodal-settings-control",
-      "data-search": "execution engine v2 v1 applies to future runs only",
-    });
-    engineWrap.appendChild(settingsRow("Execution Engine", engineSelect));
-    engineWrap.appendChild(engineStatus);
-    engineWrap.appendChild(engineReadiness);
-    section.appendChild(engineWrap);
+    // H12: the V1/V2 Execution Engine selector is retired — Modal V2 is the
+    // only public Studio engine, so there is no engine choice to expose.
+    // GPU remains the sole execution-affecting preference in Settings.
 
-    // GPU (server-backed + localStorage comfymodal_gpu + window._comfyModalGpu)
+    // GPU (server-backed; localStorage comfymodal_gpu is a display cache only)
     const gpuSelect = el("select", { class: "comfymodal-input", "data-testid": "settings-gpu" });
     gpuSelect.style.cssText = "width:100%;font-size:11px;padding:3px 6px;";
     section.appendChild(controlRow("GPU", gpuSelect, "You only pay while generating.", "gpu graphics card"));
@@ -456,7 +468,9 @@ export function renderSettings(state, context) {
     });
     section.appendChild(controlRow("Preview default", previewDefault, "Global default for result previews. Applies to new submissions only.", "preview default"));
 
-    section.appendChild(infoRow("V1 engine remains available as a fallback for troubleshooting"));
+    // One-time H12 migration notice (surfaced only when this server process
+    // migrated a persisted retired engine value at startup).
+    section.appendChild(el("div", { "data-testid": "settings-migration-notice-host" }));
     return section;
   }
 
@@ -483,15 +497,17 @@ export function renderSettings(state, context) {
       try { localStorage.setItem("comfymodal-studio-history-columns", columnsSelect.value); } catch (_) {}
     });
     section.appendChild(controlRow("Grid columns", columnsSelect, "Number of columns in the run history grid.", "history grid columns"));
-    section.appendChild(infoRow("Run history is stored locally; no retention limit setting exists today."));
+    section.appendChild(infoRow("Run history is stored locally and is kept until you delete it."));
     return section;
   }
 
   // ── 5. Experiments ──
   function buildExperimentsSection() {
     const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "experiments" });
-    section.appendChild(buildSectionHeader("Experiments", "settings-reset-experiments"));
-    section.appendChild(infoRow("Experiment scheduling uses the fixed global backend width of 6. No per-experiment override is available."));
+    // Informational only: concurrency is backend-fixed at 6, so there is
+    // nothing to reset — no reset button is rendered.
+    section.appendChild(buildSectionHeader("Experiments", ""));
+    section.appendChild(infoRow("Experiments run up to 6 cells concurrently. Per-experiment overrides are not available."));
     return section;
   }
 
@@ -551,7 +567,7 @@ export function renderSettings(state, context) {
     // Runtime & Backend group
     const runtimeGroup = el("div", {
       class: "comfymodal-settings-group",
-      "data-search": "runtime backend deploy state snapshots presets backends",
+      "data-search": "runtime backend deploy state snapshots presets",
     });
     runtimeGroup.appendChild(el("h4", { class: "comfymodal-settings-group-title", text: "Runtime & Backend" }));
 
@@ -579,13 +595,9 @@ export function renderSettings(state, context) {
     })));
     runtimeGroup.appendChild(presetWrap);
 
-    const backendWrap = el("div", { class: "comfymodal-settings-control", "data-search": "backends" });
-    backendWrap.appendChild(settingsRow("Backends", el("span", {
-      class: "comfymodal-studio-settings-row-value",
-      "data-testid": "settings-runtime-backends",
-      text: "\u2014",
-    })));
-    runtimeGroup.appendChild(backendWrap);
+    // H16 Wave F (FD-8): the legacy-compatibility count row for the retired
+    // comparison store was removed here along with its fetch leg. Settings
+    // owns preferences only; the remaining rows stay as recorded debt.
 
     const backendLinkWrap = el("div", { class: "comfymodal-settings-control", "data-search": "open backend tab" });
     const backendLink = el("a", {
@@ -602,50 +614,9 @@ export function renderSettings(state, context) {
     runtimeGroup.appendChild(backendLinkWrap);
     section.appendChild(runtimeGroup);
 
-    // Legacy group — all six legacy tabs embed via renderLegacyView
-    function openLegacyTab(tab) {
-      state.settings.activeLegacyTab = tab;
-      while (container.firstChild) container.removeChild(container.firstChild);
-      container.appendChild(renderLegacyView(state, context));
-    }
-
-    const legacyGroup = el("div", {
-      class: "comfymodal-settings-group",
-      "data-search": "legacy dashboard setup profiles results history settings",
-    });
-    legacyGroup.appendChild(el("h4", { class: "comfymodal-settings-group-title", text: "Legacy" }));
-
-    const openLegacyWrap = el("div", { class: "comfymodal-settings-control", "data-search": "open legacy settings" });
-    openLegacyWrap.appendChild(el("button", {
-      type: "button",
-      class: "comfymodal-secondary-btn comfymodal-settings-legacy-open",
-      "data-testid": "settings-legacy-open",
-      text: "Open Legacy Settings",
-      onclick: () => openLegacyTab("settings"),
-    }));
-    legacyGroup.appendChild(openLegacyWrap);
-
-    const legacyList = el("ul", { class: "comfymodal-studio-legacy-list" });
-    const legacyItems = [
-      { tab: "dashboard", label: "Legacy Dashboard", testid: "settings-legacy-dashboard" },
-      { tab: "setup", label: "Legacy Setup", testid: "settings-legacy-setup" },
-      { tab: "profiles", label: "Legacy Profiles", testid: "settings-legacy-profiles" },
-      { tab: "results", label: "Legacy Results", testid: "settings-legacy-results" },
-      { tab: "history", label: "Legacy History", testid: "settings-legacy-history" },
-      { tab: "settings", label: "Legacy Settings", testid: "settings-legacy-settings" },
-    ];
-    legacyItems.forEach((item) => {
-      const li = el("li", {
-        class: "comfymodal-studio-legacy-item",
-        "data-testid": item.testid,
-        "data-search": item.label.toLowerCase(),
-        text: item.label,
-      });
-      li.addEventListener("click", () => openLegacyTab(item.tab));
-      legacyList.appendChild(li);
-    });
-    legacyGroup.appendChild(legacyList);
-    section.appendChild(legacyGroup);
+    // H14 Wave E: the Settings ▸ Advanced ▸ Legacy group (opener +
+    // Setup/Profiles/Results/Settings entries) is retired. Modern Settings
+    // is preferences-only (H5 §2); no legacy tab remains mountable.
 
     return section;
   }
@@ -665,7 +636,7 @@ export function renderSettings(state, context) {
     const footer = el("div", { class: "comfymodal-settings-footer-inner" }, [
       el("p", {
         class: "comfymodal-settings-footer-note",
-        text: "Reset all Studio settings to defaults. User data (workflows, history, snapshots, presets, drafts, assets) is preserved.",
+        text: "Reset all Studio settings to defaults. The GPU selection resets to the default. User data (workflows, history, snapshots, presets, drafts, assets) is preserved.",
       }),
       el("button", {
         type: "button",
@@ -685,7 +656,7 @@ export function renderSettings(state, context) {
     for (const s of sections) sectionsHost.appendChild(s);
     footerEl.appendChild(footer);
     applyFilter();
-    refreshEngineConfig(apiBase);
+    refreshEngineMigrationNotice(apiBase);
     refreshGpuConfig(apiBase);
     refreshDeployStatus(apiBase);
     refreshRuntimeCounts(apiBase);
@@ -693,96 +664,30 @@ export function renderSettings(state, context) {
     refreshProfileLevel(apiBase);
   }
 
-  // ── Execution Engine refresh (server-backed) ──
-  function refreshEngineConfig(base) {
-    const engineSelect = sectionsHost.querySelector('[data-testid="settings-execution-engine"]');
-    if (!engineSelect) return;
-    const engineStatus = sectionsHost.querySelector('[data-testid="settings-execution-engine-status"]');
-    const engineReadiness = sectionsHost.querySelector('[data-testid="settings-execution-engine-readiness"]');
-
-    function renderEngineConfig(cfg) {
-      const modes = Array.isArray(cfg && cfg.available_execution_modes)
-        ? cfg.available_execution_modes
-        : [
-            { value: "v2", label: "V2 - Recommended" },
-            { value: "v1", label: "V1 - Legacy fallback" },
-          ];
-      while (engineSelect.firstChild) engineSelect.removeChild(engineSelect.firstChild);
-      modes.forEach((mode) => {
-        const option = document.createElement("option");
-        option.value = mode.value;
-        option.textContent = mode.label;
-        engineSelect.appendChild(option);
-      });
-      const current = cfg && cfg.execution_mode ? cfg.execution_mode : "v2";
-      engineSelect.value = current;
-      window._comfyModalExecutionMode = current;
-      const locked = !!(cfg && cfg.execution_mode_locked);
-      engineSelect.disabled = locked;
-      if (engineStatus) {
-        engineStatus.textContent = locked
-          ? "Managed by COMFYMODAL_RUNTIME"
-          : "Current engine: " + String(current).toUpperCase() + " - Applies to future runs only";
-        engineStatus.style.color = locked ? "#fbbf24" : "#888";
-      }
-      if (engineReadiness) {
-        const readiness = cfg && cfg.execution_readiness;
-        if (readiness) {
-          const v1 = readiness.v1 && readiness.v1.status ? readiness.v1.status : "unknown";
-          const v2 = readiness.v2 && readiness.v2.status ? readiness.v2.status : "unknown";
-          engineReadiness.textContent = "V1 deployment: " + v1 + "  V2 deployment: " + v2;
-          engineReadiness.style.color = v2 === "unavailable" ? "#f87171" : "#888";
-        } else {
-          engineReadiness.textContent = "";
-        }
-      }
-    }
-
+  // ── H12 engine migration notice (server-backed, one-time) ──
+  // Surfaced only when this server process migrated a persisted retired
+  // execution_mode (v1/legacy/shadow/garbage) to V2 at startup.
+  function refreshEngineMigrationNotice(base) {
+    const host = sectionsHost.querySelector('[data-testid="settings-migration-notice-host"]');
+    if (!host) return;
     fetch(base + "/config")
-      .then((response) => response.json())
-      .then(renderEngineConfig)
-      .catch(() => {
-        renderEngineConfig({ execution_mode: "v2", execution_mode_locked: false });
-        if (engineStatus) engineStatus.textContent = "Current engine: V2 - Applies to future runs only - server status unknown";
-      });
-
-    engineSelect.addEventListener("change", async () => {
-      const selected = engineSelect.value;
-      engineSelect.disabled = true;
-      try {
-        const response = await fetch(base + "/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ execution_mode: selected }),
+      .then((r) => r.json())
+      .then((cfg) => {
+        const notice = cfg && cfg.engine_migration_notice;
+        if (!notice) return;
+        while (host.firstChild) host.removeChild(host.firstChild);
+        const wrap = el("div", {
+          class: "comfymodal-settings-control",
+          "data-testid": "settings-engine-migration-notice",
+          "data-search": "engine v1 retired migrated v2 notice",
         });
-        const data = await response.json();
-        if (!response.ok || data.status === "error") throw new Error(data.message || "Could not save execution engine");
-        window._comfyModalExecutionMode = selected;
-        window.dispatchEvent(new CustomEvent("comfymodal:execution-mode-changed", { detail: data }));
-        if (engineStatus) engineStatus.textContent = "Current engine: " + selected.toUpperCase() + " - Applies to future runs only";
-      } catch (error) {
-        if (engineStatus) {
-          engineStatus.textContent = error.message || "Could not save execution engine";
-          engineStatus.style.color = "#f87171";
-        }
-      } finally {
-        engineSelect.disabled = false;
-      }
-    });
-
-    // Keyed window listener: remove the previous handler before attaching a
-    // new one so repeated renders do not accumulate listeners.
-    if (_executionModeListener) {
-      window.removeEventListener("comfymodal:execution-mode-changed", _executionModeListener);
-    }
-    _executionModeListener = (event) => {
-      const detail = event && event.detail;
-      if (detail && detail.execution_mode) renderEngineConfig(detail);
-    };
-    window.addEventListener("comfymodal:execution-mode-changed", _executionModeListener);
+        wrap.appendChild(el("p", { class: "comfymodal-studio-settings-info", text: String(notice) }));
+        host.appendChild(wrap);
+      })
+      .catch(() => {});
   }
 
-  // ── GPU refresh (server-backed + localStorage) ──
+  // ── GPU refresh (server truth first; localStorage as cache only) ──
   function refreshGpuConfig(base) {
     const gpuSelect = sectionsHost.querySelector('[data-testid="settings-gpu"]');
     if (!gpuSelect) return;
@@ -791,11 +696,17 @@ export function renderSettings(state, context) {
       .then((r) => r.json())
       .then((cfg) => {
         const options = Array.isArray(cfg && cfg.available_gpus) ? cfg.available_gpus : [];
-        const storedGpu = localStorage.getItem("comfymodal_gpu") || "";
         const values = new Set(options.map((o) => o.value));
-        const selected = storedGpu && values.has(storedGpu)
-          ? storedGpu
-          : (cfg.gpu || cfg.default_gpu || "rtx-pro-6000");
+        const serverGpu = (cfg && cfg.gpu) || "";
+        const storedGpu = localStorage.getItem("comfymodal_gpu") || "";
+        // The server-reported GPU wins over the localStorage cache so a stale
+        // browser value can never mask current server state. LS is consulted
+        // only when the server reports no usable value.
+        const selected = serverGpu && values.has(serverGpu)
+          ? serverGpu
+          : storedGpu && values.has(storedGpu)
+            ? storedGpu
+            : (serverGpu || (cfg && cfg.default_gpu) || "rtx-pro-6000");
         while (gpuSelect.firstChild) gpuSelect.removeChild(gpuSelect.firstChild);
         if (options.length === 0) {
           gpuSelect.appendChild(el("option", { value: "rtx-pro-6000", text: "rtx-pro-6000 (default)" }));
@@ -805,20 +716,20 @@ export function renderSettings(state, context) {
           });
         }
         gpuSelect.value = selected;
-        window._comfyModalGpu = selected;
       })
       .catch(() => {});
 
     gpuSelect.addEventListener("change", async () => {
       const gpu = gpuSelect.value;
       try { localStorage.setItem("comfymodal_gpu", gpu); } catch (_) {}
-      window._comfyModalGpu = gpu;
       try {
-        await fetch(base + "/config", {
+        const resp = await fetch(base + "/config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ gpu: gpu }),
         });
+        if (!resp.ok) throw new Error("GPU setting rejected");
+        publishStudioSync("settings");
       } catch (_) {}
     });
   }
@@ -841,17 +752,14 @@ export function renderSettings(state, context) {
   function refreshRuntimeCounts(base) {
     const snapEl = sectionsHost.querySelector('[data-testid="settings-runtime-snapshots"]');
     const presetEl = sectionsHost.querySelector('[data-testid="settings-runtime-presets"]');
-    const backendEl = sectionsHost.querySelector('[data-testid="settings-runtime-backends"]');
-    if (!snapEl && !presetEl && !backendEl) return;
+    if (!snapEl && !presetEl) return;
 
     Promise.all([
       fetch(base + "/studio/snapshots").then((r) => r.json()).catch(() => ({})),
       fetch(base + "/studio/presets").then((r) => r.json()).catch(() => ({})),
-      fetch(base + "/studio/backends").then((r) => r.json()).catch(() => ({})),
-    ]).then(([snapData, presetData, backendData]) => {
+    ]).then(([snapData, presetData]) => {
       if (snapEl) snapEl.textContent = String((snapData && snapData.snapshots ? snapData.snapshots.length : 0));
       if (presetEl) presetEl.textContent = String((presetData && presetData.presets ? presetData.presets.length : 0));
-      if (backendEl) backendEl.textContent = String((backendData && backendData.backends ? backendData.backends.length : 0));
     });
   }
 
@@ -1061,18 +969,48 @@ export function renderSettings(state, context) {
   }
 
   // ── Heavy tracing level refresh (server-backed) ──
+  // Restart-banner truth model: the banner answers "has the user selected/
+  // persisted a value that differs from what the current process is
+  // executing?" Both sides come from GET /profile/level ({level: persisted,
+  // effective}). The browser-stored selection never participates, so a stale
+  // or missing localStorage default can no longer produce a false
+  // "requires restart" banner while persisted == effective.
   function refreshProfileLevel(base) {
     const tracingSelect = sectionsHost.querySelector('[data-testid="settings-heavy-tracing"]');
+    let userEdited = false;
 
-    function updateBanner(effective) {
-      const stored = localStorage.getItem("comfymodal_heavy_tracing") || "off";
-      bannerEl.style.display = stored !== effective ? "flex" : "none";
+    function updateBanner() {
+      const pendingRestart = persistedTracingLevel !== null
+        && effectiveTracingLevel !== null
+        && persistedTracingLevel !== effectiveTracingLevel;
+      bannerEl.style.display = pendingRestart ? "flex" : "none";
+    }
+
+    function applyServerState(data) {
+      const persisted = data && typeof data.level === "string" && data.level ? data.level : "off";
+      const effective = data && typeof data.effective === "string" && data.effective ? data.effective : persisted;
+      persistedTracingLevel = persisted;
+      effectiveTracingLevel = effective;
+      // Display server truth in the select unless the user is mid-edit; the
+      // localStorage key stays a user-selection cache and is not rewritten.
+      if (tracingSelect && !userEdited && HEAVY_TRACING_LEVELS.indexOf(persisted) !== -1) {
+        tracingSelect.value = persisted;
+      }
+      updateBanner();
+    }
+
+    function fetchProfileLevel() {
+      fetch(base + "/profile/level")
+        .then((r) => r.json())
+        .then(applyServerState)
+        .catch(() => { updateBanner(); });
     }
 
     if (tracingSelect) {
       const stored = localStorage.getItem("comfymodal_heavy_tracing") || "off";
       tracingSelect.value = HEAVY_TRACING_LEVELS.indexOf(stored) !== -1 ? stored : "off";
       tracingSelect.addEventListener("change", async () => {
+        userEdited = true;
         const prev = localStorage.getItem("comfymodal_heavy_tracing") || "off";
         const level = tracingSelect.value;
         try { localStorage.setItem("comfymodal_heavy_tracing", level); } catch (_) {}
@@ -1083,57 +1021,21 @@ export function renderSettings(state, context) {
             body: JSON.stringify({ level: level }),
           });
           if (!resp.ok) throw new Error("profile level rejected");
+          publishStudioSync("settings");
         } catch (_) {
           tracingSelect.value = prev;
           try { localStorage.setItem("comfymodal_heavy_tracing", prev); } catch (e2) {}
         }
-        updateBanner(effectiveTracingLevel);
+        // Re-read server truth after the attempt so the banner reflects the
+        // authoritative persisted-vs-effective pair, not local guesses.
+        fetchProfileLevel();
       });
     }
 
-    fetch(base + "/profile/level")
-      .then((r) => r.json())
-      .then((data) => {
-        const effective = (data && data.effective) || "off";
-        effectiveTracingLevel = effective;
-        updateBanner(effective);
-      })
-      .catch(() => { bannerEl.style.display = "none"; });
+    fetchProfileLevel();
   }
 
   // Initial build
   rebuildPage();
   return container;
-}
-
-// ── Legacy wrapper view ──────────────────────────────────────────────────
-
-export function renderLegacyView(state, context) {
-  const wrapper = document.createElement("div");
-  wrapper.className = "comfymodal-studio-legacy";
-
-  const backBtn = document.createElement("button");
-  backBtn.className = "comfymodal-secondary-btn";
-  backBtn.textContent = "\u2190 Back to Settings";
-  backBtn.style.marginBottom = "16px";
-  backBtn.addEventListener("click", () => {
-    state.settings.activeLegacyTab = "";
-    if (context && context.setPage) {
-      context.setPage("settings");
-    }
-  });
-  wrapper.appendChild(backBtn);
-
-  const legacyBody = document.createElement("div");
-  legacyBody.className = "comfymodal-studio-legacy-body";
-  wrapper.appendChild(legacyBody);
-
-  if (context && context.mountLegacyTab) {
-    context.mountLegacyTab(legacyBody, state.settings.activeLegacyTab, context);
-  } else {
-    legacyBody.innerHTML =
-      '<div class="comfymodal-studio-card"><p>Legacy wrapper not available.</p></div>';
-  }
-
-  return wrapper;
 }

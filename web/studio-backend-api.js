@@ -1,15 +1,40 @@
 // Modal Studio — Backend API Layer
 //
-// All API communication for snapshots, presets, and backend discovery.
-// No rendering logic — only fetch/response helpers.
+// All API communication for snapshots, presets, runs, experiments, workflows,
+// models, and backend operations. No rendering logic — only fetch/response
+// helpers.
+//
+// H18 Wave G: caller-proven dead helpers removed (getBackends,
+// getCompareBackends, runStudioExperiment, listExperiments, listRunHistory,
+// listUnifiedHistory, getModalConfig). Live compatibility helpers retained:
+// updateRunAnnotation/saveRunOutput (run-history COMPAT_WRITE),
+// getStudioRunStatus/stopExperiment (protected Single seams).
 
 // ── Internal fetch helper ─────────────────────────────────────────────────
 
-let _backendCache = null;
+import { publishStudioSync } from "./studio-sync.js";
+
+function syncKindForMutation(path, method) {
+  if (method === "GET" || method === "HEAD") return null;
+  if (
+    path === "/studio/run" ||
+    path === "/studio/experiment-v2" ||
+    /^\/(?:history-v2|run-history|experiments)(?:\/|$)/.test(path)
+  ) return "history";
+  if (/^\/studio\/(?:workflows|models|custom-nodes)(?:\/|$)/.test(path)) return "workflows";
+  if (
+    /^\/(?:workspaces|deploy|manifest\/repair|hf-token|civitai-token)(?:\/|$)/.test(path) ||
+    /^\/studio\/(?:snapshots|presets)(?:\/|$)/.test(path)
+  ) return "workspace";
+  return null;
+}
 
 async function apiFetch(apiBase, path, options) {
   try {
-    const res = await fetch(`${apiBase}${path}`, options || {});
+    const request = options || {};
+    const method = String(request.method || "GET").toUpperCase();
+    const syncKind = syncKindForMutation(path.split("?", 1)[0], method);
+    const res = await fetch(`${apiBase}${path}`, request);
     const data = await res.json();
     // Return error JSON as-is so callers can inspect status/message
     if (!res.ok && data && typeof data === "object") {
@@ -17,35 +42,9 @@ async function apiFetch(apiBase, path, options) {
       return data;
     }
     if (!res.ok) return null;
+    if (syncKind && !(data && data.status === "error")) publishStudioSync(syncKind);
     return data;
   } catch { return null; }
-}
-
-// ── Legacy Backend Discovery API ──────────────────────────────────────────
-
-export async function getBackends(context) {
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  try {
-    const res = await fetch(`${apiBase}/studio/backends`);
-    if (!res.ok) return [];
-    const data = await res.json();
-    _backendCache = (data && data.backends) || [];
-    return _backendCache;
-  } catch {
-    return [];
-  }
-}
-
-export async function getCompareBackends(context) {
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  try {
-    const res = await fetch(`${apiBase}/studio/backends?kind=comparable`);
-    if (!res.ok) return [];
-    const data = await res.json();
-    return (data && data.backends) || [];
-  } catch {
-    return [];
-  }
 }
 
 // ── Snapshots API ─────────────────────────────────────────────────────────
@@ -140,19 +139,6 @@ export async function runStudioPreset(apiBase, payload) {
   return data;
 }
 
-export async function runStudioExperiment(apiBase, payload) {
-  return apiFetch(apiBase, "/studio/experiment", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function getModalConfig(apiBase) {
-  const data = await apiFetch(apiBase, "/config");
-  return data && typeof data === "object" ? data : null;
-}
-
 export async function getStudioRunStatus(apiBase, id) {
   return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
 }
@@ -241,134 +227,11 @@ export async function retryCell(apiBase, experimentId, cellId) {
   });
 }
 
-// ── Run History API (with pagination, filter, sort) ──────────────────────
-
-/**
- * List run history with pagination, filtering, and sorting.
- * @param {string} apiBase
- * @param {object} params - Query parameters.
- * @param {number} [params.limit=50] - Maximum records to return.
- * @param {number} [params.offset=0] - Offset for pagination.
- * @param {string} [params.search] - Search text.
- * @param {string} [params.type] - Filter by type (run, experiment, etc.).
- * @param {string} [params.status] - Filter by status.
- * @param {boolean} [params.favorite] - Filter favorite only.
- * @param {string} [params.preset] - Filter by preset ID.
- * @param {string} [params.feature] - Filter by feature ID.
- * @param {string} [params.date_from] - Start date for range filter.
- * @param {string} [params.date_to] - End date for range filter.
- * @param {boolean} [params.has_image] - Filter runs with images.
- * @param {string} [params.sort] - Sort order (newest, oldest, fastest, slowest, preset_az, preset_za).
- * @returns {Promise<{runs: Array, total: number}|null>}
- */
-/**
- * List real Studio aggregate experiments from /experiments.
- * @param {string} apiBase
- * @returns {Promise<Array|null>}
- */
-export async function listExperiments(apiBase) {
-  const data = await apiFetch(apiBase, "/experiments");
-  if (data === null) return null;
-  return (data && data.experiments) || [];
-}
-
-export async function listRunHistory(apiBase, params) {
-  const query = new URLSearchParams();
-  if (params) {
-    if (params.limit != null) query.set("limit", String(params.limit));
-    if (params.offset != null) query.set("offset", String(params.offset));
-    if (params.search) query.set("search", params.search);
-    if (params.kind) query.set("kind", params.kind);
-    else if (params.type) query.set("kind", params.type);
-    if (params.status) query.set("status", params.status);
-    if (params.favorite_only) query.set("favorite_only", "true");
-    else if (params.favorite) query.set("favorite_only", "true");
-    if (params.preset) query.set("preset", params.preset);
-    if (params.feature) query.set("feature", params.feature);
-    if (params.date_from) query.set("date_from", params.date_from);
-    if (params.date_to) query.set("date_to", params.date_to);
-    if (params.has_image) query.set("has_image", "true");
-    if (params.sort) query.set("sort", params.sort);
-  } else {
-    query.set("limit", "50");
-    query.set("offset", "0");
-  }
-  const qs = query.toString();
-  return apiFetch(apiBase, "/run-history" + (qs ? "?" + qs : ""));
-}
-
-// ── Phase 7: Unified History API ─────────────────────────────────────────
-
-/**
- * Fetch paginated history from the unified /comfymodal/history endpoint.
- * Supports AbortController for request cancellation.
- *
- * @param {string} apiBase
- * @param {object} params - Query parameters (page, page_size, search, kind, status, etc.)
- * @param {AbortSignal} [signal] - Optional AbortSignal to cancel the request.
- * @returns {Promise<{items: Array, page: number, page_size: number, total: number, has_more: boolean}|null>}
- */
-export async function listUnifiedHistory(apiBase, params, signal) {
-  const query = new URLSearchParams();
-  if (params) {
-    if (params.page != null) query.set("page", String(params.page));
-    if (params.page_size != null) query.set("page_size", String(params.page_size));
-    if (params.search) query.set("search", params.search);
-    if (params.kind) query.set("kind", params.kind);
-    else if (params.type) query.set("kind", params.type);
-    if (params.status) query.set("status", params.status);
-    if (params.favorite_only) query.set("favorite_only", "true");
-    else if (params.favorite) query.set("favorite_only", "true");
-    if (params.preset) query.set("preset", params.preset);
-    if (params.feature) query.set("feature", params.feature);
-    if (params.date_from) query.set("date_from", params.date_from);
-    if (params.date_to) query.set("date_to", params.date_to);
-    if (params.has_image) query.set("has_image", "true");
-    if (params.sort) query.set("sort", params.sort);
-  } else {
-    query.set("page", "1");
-    query.set("page_size", "50");
-  }
-  const qs = query.toString();
-  try {
-    const url = apiBase + "/history" + (qs ? "?" + qs : "");
-    const res = await fetch(url, { signal: signal || null });
-    let data = null;
-    try {
-      data = await res.json();
-    } catch (parseError) {
-      data = { status: "error", message: "History endpoint returned an invalid response" };
-    }
-    if (!res.ok) {
-      const message = data && data.message ? data.message : "History request failed";
-      const error = new Error(message);
-      error.status = res.status;
-      error.errorCode = data && data.error_code ? data.error_code : "history_request_failed";
-      error.detail = data && data.detail ? data.detail : "";
-      error.responseBody = data;
-      console.error("[Studio History] history request failed", {
-        url: url,
-        status: res.status,
-        body: data,
-      });
-      throw error;
-    }
-    if (data && data.status === "ok") {
-      return {
-        items: data.items || [],
-        page: data.page || 1,
-        page_size: data.page_size || 50,
-        total: data.total || 0,
-        has_more: !!data.has_more,
-      };
-    }
-    return data || null;
-  } catch (err) {
-    if (err && err.name === "AbortError") return null;
-    console.error("[Studio History] history request error", err);
-    throw err;
-  }
-}
+// ── Run History API ──────────────────────────────────────────────────────
+//
+// listRunHistory/listUnifiedHistory/listExperiments were deleted in Wave G:
+// zero importers since the H13 recent-runs migration (History V2 is the sole
+// feed authority; /run-history reads and /history remain server-side compat).
 
 // ── Run Annotation API ───────────────────────────────────────────────────
 
@@ -657,5 +520,305 @@ export async function updateVersionCompatibility(apiBase, versionId, body) {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+}
+
+// ── Backend Operations API (H6 re-home) ──────────────────────────────────
+//
+// Request helpers for the modern Backend page's operational sections.
+// These consume the SAME server routes the legacy settings panel uses.
+// No state authority lives here — every helper is a fetch/normalize only.
+
+// Workspaces (server authority: .modal_workspaces.json)
+
+export async function listWorkspacesRegistry(apiBase) {
+  return apiFetch(apiBase, "/workspaces");
+}
+
+export async function upsertWorkspace(apiBase, payload) {
+  return apiFetch(apiBase, "/workspaces", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function activateWorkspace(apiBase, workspaceId) {
+  return apiFetch(apiBase, "/workspaces/active", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workspace_id: workspaceId }),
+  });
+}
+
+export function workspaceSwapEndpointPath() {
+  return "/workspaces/swap";
+}
+
+export function workspaceSwapStatusEndpointPath(swapId) {
+  return `/workspaces/swap/${encodeURIComponent(swapId)}`;
+}
+
+export async function requestWorkspaceSwap(apiBase, payload) {
+  return apiFetch(apiBase, workspaceSwapEndpointPath(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getWorkspaceSwapStatus(apiBase, swapId) {
+  if (!swapId) return null;
+  return apiFetch(apiBase, workspaceSwapStatusEndpointPath(swapId));
+}
+
+/** Pure: confirmed-swap request body (exact existing contract). */
+export function buildSwapConfirmPayload(workspaceId, selectedKeys) {
+  return {
+    workspace_id: workspaceId,
+    confirm: true,
+    selected_keys: (selectedKeys || []).slice(),
+  };
+}
+
+/** Pure: bounded progress text for a running swap job payload. */
+export function swapPhaseMessage(data) {
+  const phase = (data && data.phase) || "";
+  if (phase === "downloading_models") {
+    const msg = data.download_message || "";
+    const done = data.download_completed || 0;
+    const total = (data.download_total || 0) + (data.download_skipped || 0);
+    return msg || `Preparing downloads\u2026 ${done}/${total}`;
+  }
+  if (phase === "syncing_custom_nodes") {
+    return data.sync_message || "Syncing custom nodes to Modal\u2026";
+  }
+  if (phase === "deploying") {
+    return data.deploy_message || "Deploying workspace\u2026";
+  }
+  return phase ? `Phase: ${String(phase).replace(/_/g, " ")}` : "";
+}
+
+/** Pure: safe display metadata for a workspace registry envelope. */
+export function summarizeWorkspaces(envelope) {
+  const items = (envelope && Array.isArray(envelope.workspaces)) ? envelope.workspaces : [];
+  const activeId = (envelope && envelope.active_workspace_id) || null;
+  let activeLabel = null;
+  const rows = items.map((ws) => {
+    if (activeId && ws.id === activeId && ws.label) activeLabel = ws.label;
+    return {
+      id: ws.id,
+      label: ws.label || ws.id,
+      isActive: !!activeId && ws.id === activeId,
+      lastDeployStatus: ws.last_deploy_status || "idle",
+      lastUsedAt: ws.last_used_at || null,
+    };
+  });
+  if (!activeLabel && rows.length === 1) activeLabel = rows[0].label;
+  return { activeId, activeLabel, rows };
+}
+
+// Deployment
+
+export function deployStatusEndpointPath() {
+  return "/deploy/status";
+}
+
+export async function getDeployStatus(apiBase) {
+  return apiFetch(apiBase, deployStatusEndpointPath());
+}
+
+export async function triggerDeploy(apiBase) {
+  return apiFetch(apiBase, "/deploy", { method: "POST" });
+}
+
+export async function getDeployLog(apiBase) {
+  return apiFetch(apiBase, "/deploy/log");
+}
+
+/** Pure: verbatim server-truth projection of a deploy status payload. */
+export function normalizeDeployStatus(data) {
+  if (!data || typeof data !== "object") {
+    return { state: "unknown", message: "", details: "", available: false };
+  }
+  const deployState = (data.deploy_state && typeof data.deploy_state === "object")
+    ? data.deploy_state
+    : {};
+  return {
+    state: String(data.state || "unknown"),
+    message: String(data.message || ""),
+    details: String(data.details || ""),
+    comfyappVersion: deployState.comfyapp_version || null,
+    deployedAt: deployState.deployed_at || null,
+    hasLog: !!data.has_log,
+    available: true,
+  };
+}
+
+/** Pure: states in which a deploy is still in flight (no invented states). */
+export function isDeployInFlight(state) {
+  return state === "deploying" || state === "starting" || state === "unknown";
+}
+
+/** Pure: last N lines of a log body. */
+export function tailLines(text, maxLines) {
+  const n = Math.max(1, Number(maxLines) || 50);
+  const lines = String(text || "").split("\n");
+  return lines.slice(-n).join("\n");
+}
+
+// Credentials / auth (existing routes; values are never surfaced here)
+
+export async function getAuthStatus(apiBase) {
+  return apiFetch(apiBase, "/auth/status");
+}
+
+export function credentialEndpointPath(kind) {
+  return kind === "civitai" ? "/civitai-token" : "/hf-token";
+}
+
+export async function getCredentialStatus(apiBase, kind) {
+  return apiFetch(apiBase, credentialEndpointPath(kind));
+}
+
+export async function saveCredentialToken(apiBase, kind, token) {
+  return apiFetch(apiBase, credentialEndpointPath(kind), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+}
+
+/**
+ * Pure: configured/not-configured from a credential GET response.
+ * Deliberately discards any token material — callers can never echo it.
+ */
+export function credentialConfigured(data) {
+  return !!(data && typeof data === "object"
+    && typeof data.token === "string"
+    && data.token !== "");
+}
+
+// Runtime health (read-only readiness probe)
+
+export async function getRuntimeHealth(apiBase) {
+  return apiFetch(apiBase, "/health?mode=deploy");
+}
+
+// Model-manifest repair (deployment-bootstrap prerequisite for swaps)
+
+export async function scanManifestIssues(apiBase) {
+  return apiFetch(apiBase, "/manifest/repair/scan", { method: "POST" });
+}
+
+export async function applyManifestRepairs(apiBase, updates) {
+  return apiFetch(apiBase, "/manifest/repair/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ updates }),
+  });
+}
+
+export async function deleteManifestPlaceholder(apiBase, folder, filename) {
+  return apiFetch(apiBase, "/manifest/repair/delete-placeholder", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ folder, filename }),
+  });
+}
+
+/** Pure: source-kind inference used by the repair URL editor (legacy parity). */
+export function inferSourceKind(url) {
+  if (/huggingface\.co/i.test(url || "")) return "huggingface";
+  if (/civitai\.com/i.test(url || "")) return "civitai";
+  if (/^https?:\/\//i.test(url || "")) return "direct";
+  return "unknown";
+}
+
+// ── Studio Workflow Portability API (Phase G12) ─────────────────────────
+
+/** Endpoint path builder (pure; unit-testable). */
+export function portabilityEndpointPath(versionId) {
+  return `/studio/workflows/versions/${encodeURIComponent(versionId)}/portability`;
+}
+
+/** Endpoint path builder for manifest export (pure; unit-testable). */
+export function exportManifestEndpointPath(versionId, includePresets) {
+  return `/studio/workflows/versions/${encodeURIComponent(versionId)}/export` +
+    `?include_presets=${includePresets ? "1" : "0"}`;
+}
+
+/** Query string for import-manifest (pure; unit-testable). */
+export function importManifestQuery(dryRun) {
+  return "?dry_run=" + (dryRun ? "1" : "0");
+}
+
+/**
+ * Fetch the G5 portability report for one immutable version.
+ * Response envelope: { status:"ok", portability: report }.
+ */
+export async function getVersionPortability(apiBase, versionId) {
+  return apiFetch(apiBase, portabilityEndpointPath(versionId));
+}
+
+function _contentDispositionFilename(header) {
+  if (!header) return "";
+  const ext = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (ext) {
+    try { return decodeURIComponent(ext[1].trim()); } catch (e) { /* fall through */ }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(header);
+  return plain ? plain[1].trim() : "";
+}
+
+/**
+ * Read-only Workflow manifest export download.
+ * Returns { ok:true, blob, filename } on success or
+ * { ok:false, status, message } on failure. The backend is the manifest
+ * authority — no manifest JSON is built in the browser.
+ */
+export async function fetchWorkflowManifestExport(apiBase, versionId, includePresets) {
+  const path = exportManifestEndpointPath(versionId, includePresets);
+  try {
+    const res = await fetch(`${apiBase}${path}`);
+    if (!res.ok) {
+      let payload = null;
+      try { payload = await res.json(); } catch (e) { payload = null; }
+      const message = (payload && payload.message)
+        || (payload && payload.error)
+        || "HTTP " + res.status;
+      return { ok: false, status: res.status, message };
+    }
+    const blob = await res.blob();
+    const filename = _contentDispositionFilename(res.headers.get("Content-Disposition"));
+    return { ok: true, status: res.status, blob, filename };
+  } catch (e) {
+    return { ok: false, status: 0, message: "network error" };
+  }
+}
+
+/**
+ * Manifest import (dry-run preview by default).
+ * body may be a parsed manifest object OR raw text (invalid JSON reaches the
+ * backend so IT stays the authority on malformed manifests). On commit
+ * (dryRun=false) the two frozen policy fields are added to the body.
+ */
+export async function importWorkflowManifest(apiBase, body, opts) {
+  const o = opts || {};
+  const dryRun = o.dryRun !== false;
+  const payload = typeof body === "string"
+    ? body
+    : JSON.stringify(
+        dryRun
+          ? (body || {})
+          : Object.assign({}, body || {}, {
+              import_presets: !!o.importPresets,
+              apply_default_preset: !!o.applyDefaultPreset,
+            })
+      );
+  return apiFetch(apiBase, "/studio/workflows/import-manifest" + importManifestQuery(dryRun), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload,
   });
 }

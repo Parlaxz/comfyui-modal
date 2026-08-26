@@ -1,0 +1,7 @@
+[
+  {
+    "type": "error",
+    "request_id": "golden-p1-0-e5b705236c81",
+    "message": "RuntimeError: clip_dynamic_core_model_patcher_required"
+  }
+]

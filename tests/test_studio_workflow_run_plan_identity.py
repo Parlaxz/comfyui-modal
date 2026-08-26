@@ -22,13 +22,26 @@ generation.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from collections.abc import Mapping
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 from unittest import mock
+
+
+def _norm(value: Any) -> Any:
+    """Normalize frozen-mapping/tuple shapes for structural comparison."""
+    if isinstance(value, Mapping):
+        return {k: _norm(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_norm(v) for v in value]
+    return value
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -308,6 +321,9 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
     def _recording_build(self):
         """Patch canonical build with a recording wrapper around the real one.
 
+        The plan-carried validation proof collector is stubbed to a canned
+        payload so the real builder runs headless (no ComfyUI ``execution``
+        module) while still exercising the E7 proof-collection contract.
         Returns ``(patcher, captured)``; ``captured["canonical"]`` holds the
         canonical plan the real builder returned before reconstruction.
         """
@@ -319,10 +335,15 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
             captured["canonical"] = plan
             return plan
 
-        return (
-            mock.patch("canonical_execution.build_execution_plan", recording_build),
-            captured,
-        )
+        stack = ExitStack()
+        stack.enter_context(mock.patch(
+            "canonical_execution.build_execution_plan", recording_build
+        ))
+        stack.enter_context(mock.patch.object(
+            canonical_execution, "_collect_plan_validation_proof",
+            return_value=dict(_VALIDATION_PAYLOAD),
+        ))
+        return (stack, captured)
 
     # ── 1. non-empty nested deployment_identity preserved (real canonical) ──
 
@@ -359,9 +380,28 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
         registry_proof = dep.get("registry_proof") or {}
         self.assertTrue(registry_proof.get("classes"), "nested registry proof present")
 
-        # validation preserved verbatim (empty for the studio seam: proof off).
-        self.assertEqual(dict(plan.validation), dict(canonical.validation))
-        self.assertEqual(dict(plan.validation), {})
+        # validation preserved verbatim (E7: the studio seam collects the
+        # plan-carried validation proof; the stubbed host collector's payload
+        # must flow through the reconstruction untouched).  The builder
+        # re-stamps validated_workflow_hash / node_type_fingerprint from the
+        # finalized dispatch workflow, so those two are asserted against the
+        # plan itself.
+        self.assertEqual(_norm(plan.validation), _norm(canonical.validation))
+        val = _norm(plan.validation)
+        self.assertEqual(val["validated"], True)
+        self.assertEqual(val["schema_version"], 1)
+        self.assertEqual(val["source"], "host_validate_prompt")
+        self.assertEqual(val["outputs_to_execute"], ["3", "6"])
+        self.assertEqual(val["node_errors"], {"3": {"errors": []}})
+        self.assertEqual(val["validated_workflow_hash"], plan.workflow_hash)
+        self.assertEqual(
+            val["node_type_fingerprint"],
+            sorted(
+                node["class_type"]
+                for node in swr._plain_copy(plan.workflow).values()
+                if isinstance(node, dict)
+            ),
+        )
 
         # Every other unaffected canonical field preserved verbatim.
         self.assertEqual(plan.schema_version, canonical.schema_version)
@@ -445,6 +485,11 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
             plan, err = swr.build_workflow_execution_plan(
                 bundle, values,
                 modal_options={"production": {"enabled": True}},
+                # H20 Wave G: the F8 GPU-freeze overlay stamps
+                # request_metadata.selected_gpu from the builder's resolved gpu
+                # argument (registered F8 tests pin this). Pass an explicit gpu
+                # so the overlay and the canonical fake agree.
+                gpu="gpu_test",
             )
         self.assertIsNone(err, f"production plan build failed: {err}")
         self.assertIsInstance(plan, ExecutionPlan)
@@ -555,8 +600,9 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
 
     def test_production_fail_closed_identity_not_fabricated(self):
         """Real canonical build with NO deployment source fails closed: the
-        rebuilt plan preserves the empty identity fields and empty validation
-        exactly as the canonical plan carried them (never recomputed)."""
+        rebuilt plan preserves the empty identity fields exactly as the
+        canonical plan carried them (never recomputed), while the collected
+        validation proof still flows through verbatim."""
         bundle = self._bundle()
         values = self._merged_values(bundle)
         saved_env = os.environ.pop("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", None)
@@ -591,8 +637,11 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
         self.assertEqual(dep["deployment_combined_hash"], "")
         self.assertEqual(dep["custom_nodes_generation"], "")
         self.assertEqual(dep["registry_fingerprint"], "")
-        self.assertEqual(dict(plan.validation), dict(canonical.validation))
-        self.assertEqual(dict(plan.validation), {})
+        self.assertEqual(_norm(plan.validation), _norm(canonical.validation))
+        val = _norm(plan.validation)
+        self.assertEqual(val["validated"], True)
+        self.assertEqual(val["source"], "host_validate_prompt")
+        self.assertEqual(val["validated_workflow_hash"], plan.workflow_hash)
 
     # ── 5. Phase C repair + hash unchanged ───────────────────────────────
 

@@ -1,0 +1,29 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §1 verdict",
+    "PHASE_G1 §10 corpus results"
+  ],
+  "description": "Compact synthetic restatement of the audited G1 corpus facts. The real 176-node workflow is deliberately NOT copied; ids/names are synthetic.",
+  "evidence_id": "current_corpus_shape",
+  "expected_environment_reproducibility": "high",
+  "expected_workflow_portability_risk": "medium",
+  "facts": {
+    "absolute_paths": 0,
+    "custom_dependency_repos_conceptual_minimum": 4,
+    "exact_roundtrip_proven": true,
+    "functional_external_endpoints": 0,
+    "model_extraction_gap_present": true,
+    "model_hashes_populated": false,
+    "note_text_urls_only": true,
+    "provenance_mix": [
+      "exact",
+      "declared",
+      "inferred"
+    ],
+    "registry_host_fallback_bug_represented": true,
+    "required_user_input_assets": 0,
+    "subgraph_definitions_present": true
+  },
+  "kind": "corpus_shape_evidence",
+  "reconciliation_note": "Both dimensions are simultaneously true because they are different dimensions (PHASE_G5 §2). This fixture is the shared reconciliation proof for the G6 risk engine."
+}

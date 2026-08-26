@@ -46,10 +46,15 @@ execution, running cancel dispatches only to a registered scheduler that
 advertises a truthful remote-cancel capability (otherwise ``503
 CANCELLATION_UNAVAILABLE`` and the running attempts stay durable, while
 queued cells are still atomically canceled so the experiment stops
-launching), and resume/retry delegate attempt creation/claim to the
-scheduler or the guarded single-transaction repository methods
-(``create_resume_attempt`` / ``create_retry_attempt``) — never an unguarded
-append.
+launching), retry delegates attempt creation/claim to the scheduler or the
+guarded single-transaction repository method (``create_retry_attempt``) —
+never an unguarded append.  Resume dispatches through a live scheduler; when
+the registry has none (post-restart), the canonical scheduler is first
+reconstructed from the persisted immutable cell plans via
+``build_experiment_scheduler`` and Resume executes through it; if
+reconstruction is unavailable the route fails closed with ``503
+DISPATCH_UNAVAILABLE`` and writes NOTHING — a successful Resume response can
+never mean "queued forever with no execution owner".
 
 Public functions:
     register_experiment_modern_routes(server, data_root, registry=None, node_dir=None, transport_factory=None)
@@ -57,10 +62,12 @@ Public functions:
     shutdown_experiment_modern_lifecycle(registry=None)             # async, aiohttp-safe
 
 Lifecycle: startup recovery is idempotent and limited to stale ``running``
-attempts belonging to modern experiments (they become ``interrupted``);
-queued and terminal attempts are unchanged.  Shutdown stops new launches,
-shuts down each owned scheduler (best-effort remote close + ``interrupted``
-for its active attempts only), and never repo-wide marks legacy attempts.
+attempts belonging to modern experiments AND stale ``running`` attempts of
+ordinary modern Singles (attempts with no experiment/cell identity); both
+become ``interrupted``.  Queued and terminal attempts are unchanged.
+Shutdown stops new launches, shuts down each owned scheduler (best-effort
+remote close + ``interrupted`` for its active attempts only), and never
+repo-wide marks legacy attempts.
 
 History V2 is the durable state; the planner (``experiment_modern_plan``) and
 scheduler (``experiment_modern_scheduler``) are resolved lazily and never
@@ -389,6 +396,117 @@ def _build_scheduler_for_experiment(
         )
     except Exception:
         _log.exception("scheduler construction failed for %s", experiment_id)
+        return None
+    # The scheduler registers itself in the scheduler module registry; also
+    # register into a test-injected non-module registry so dispatch finds it.
+    if registry is not None and registry is not mod:
+        if isinstance(registry, dict):
+            registry[experiment_id] = scheduler
+        else:
+            register = getattr(registry, "register_scheduler", None)
+            if callable(register):
+                try:
+                    register(scheduler)
+                except Exception:
+                    _log.exception(
+                        "scheduler registration failed for %s", experiment_id
+                    )
+    return scheduler
+
+
+# ── Post-restart scheduler reconstruction (F1A) ──────────────────────────
+
+
+# Serializes no-scheduler Resume handling so two near-concurrent Resume
+# requests cannot reconstruct two competing schedulers for one experiment.
+# The repository's first-wins transaction semantics remain authoritative;
+# this lock only makes the in-process recovery ownership single-winner.
+_SCHEDULER_RECONSTRUCTION_LOCK = asyncio.Lock()
+
+
+def _persisted_cell_plans(detail: Any) -> list[dict[str, Any]]:
+    """The durable immutable cell plans of an accepted modern Experiment.
+
+    The persisted definition carries every ``CellPlan.to_dict()`` frozen at
+    acceptance; these are the exact plans normal execution dispatches, so
+    reconstruction reuses them verbatim (no planner re-run, no mutable
+    Workflow/Preset resolution).
+
+    Fail-closed: returns ``[]`` (reconstruction unavailable) for any
+    malformed or partial persisted state — a non-list ``cells``, duplicate /
+    missing / extra cell IDs versus the durable detail cells, or a
+    queued/interrupted cell whose persisted entry lacks a mapping
+    ``execution_plan``.  The caller must never dispatch partially
+    reconstructed work.
+    """
+    definition = getattr(getattr(detail, "experiment", None), "definition", None)
+    raw = definition.get("cells") if isinstance(definition, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return []
+    durable_cells = list(getattr(detail, "cells", []) or [])
+    durable_ids = [str(cell.cell_id) for cell in durable_cells]
+    if len(set(durable_ids)) != len(durable_ids):
+        return []
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return []
+        cell_id = entry.get("cell_id")
+        if not isinstance(cell_id, str) or not cell_id or cell_id in entries:
+            # Malformed entry or duplicate cell ID.
+            return []
+        entries[cell_id] = dict(entry)
+    if set(entries) != set(durable_ids):
+        # Partial (missing) or stale (extra) persisted plan set.
+        return []
+    for cell in durable_cells:
+        if _canonical_cell_status(cell) in ("queued", "interrupted"):
+            execution_plan = entries[str(cell.cell_id)].get("execution_plan")
+            if not isinstance(execution_plan, dict) or not execution_plan:
+                return []
+    return [entries[cell_id] for cell_id in durable_ids]
+
+
+def _reconstruct_scheduler_for_experiment(
+    registry: Any,
+    repo: HistoryV2Repository,
+    experiment_id: str,
+    detail: Any,
+) -> Any:
+    """Rebuild + register the canonical scheduler after a process restart.
+
+    Uses ``build_experiment_scheduler`` with the persisted immutable cell
+    plans and an experiment-bound repository — the SAME production factory
+    and registry rules as acceptance-time construction.  Returns ``None``
+    (fail-closed, caller must not write queued work) when reconstruction is
+    explicitly unavailable or fails: no transport factory configured, no
+    persisted cell plans, a malformed/partial persisted plan set (duplicate,
+    missing, or extra cell IDs; a queued/interrupted cell without a mapping
+    ``execution_plan``), missing factory, or a construction error.
+    """
+    cells = _persisted_cell_plans(detail)
+    if not cells:
+        return None
+    transport_factory = _DEFAULT_TRANSPORT_FACTORY[0]
+    if transport_factory is None:
+        # Mirrors create-path semantics: construction is explicitly
+        # unavailable, so resumed cells must never be left queued unowned.
+        return None
+    mod = _lazy_module_registry()
+    factory = getattr(mod, "build_experiment_scheduler", None) if mod is not None else None
+    if factory is None:
+        return None
+    try:
+        scheduler = factory(
+            experiment_id=experiment_id,
+            cell_plans=cells,
+            persistence=_bound_repository(repo, experiment_id),
+            transport_factory=transport_factory,
+        )
+    except Exception:
+        _log.exception(
+            "scheduler reconstruction failed for %s", experiment_id
+        )
         return None
     # The scheduler registers itself in the scheduler module registry; also
     # register into a test-injected non-module registry so dispatch finds it.
@@ -1076,12 +1194,72 @@ async def _handle_resume(request: web.Request, data_root: Any, registry: Any) ->
             extra={"experiment_id": experiment_id},
         )
 
-    created_runs: list[dict[str, Any]] = []
     resumed_count = 0
+    created_runs: list[dict[str, Any]] = []
+    reconstructed = False
     resolved = _resolve_registry(registry)
-    scheduler = _resolve_scheduler(resolved, experiment_id) if resolved is not None else None
-    outcome: str = "unavailable"
-    if scheduler is not None:
+    # Single recovery owner: serialize no-scheduler handling so two
+    # near-concurrent Resume requests cannot build two competing schedulers.
+    # The second caller re-resolves the registered scheduler and its resume
+    # stays idempotent (atomic first-wins claims; already-claimed cells are
+    # skipped).
+    #
+    # Race-truthful attempt accounting: the durable detail is RE-READ and
+    # the baseline/after current-attempt identities are captured inside the
+    # SAME lock section as the dispatch, so a concurrent second request can
+    # never report the first request's appended Attempt as newly created.
+    async with _SCHEDULER_RECONSTRUCTION_LOCK:
+        detail = repo.get_experiment(experiment_id)
+        if detail is None:
+            return _json_error(
+                404,
+                "experiment not found",
+                code="EXPERIMENT_NOT_FOUND",
+                extra={"experiment_id": experiment_id},
+            )
+        interrupted = [
+            c for c in detail.cells if _canonical_cell_status(c) == "interrupted"
+        ]
+        queued = [c for c in detail.cells if _canonical_cell_status(c) == "queued"]
+        if not interrupted and not queued:
+            return _json_error(
+                409,
+                "no resumable cells",
+                code="NO_RESUMABLE_CELLS",
+                extra={"experiment_id": experiment_id},
+            )
+
+        # Current attempt identity per interrupted cell, captured BEFORE the
+        # resume dispatch so the response can report which cells received a
+        # fresh appended Attempt (interrupted → new attempt; queued cells reuse
+        # their existing attempt and never appear as created).
+        before_ids: dict[str, Optional[str]] = {}
+        attempts_by_cell = _attempts_map(repo, interrupted)
+        for cell in interrupted:
+            current = current_attempt(attempts_by_cell.get(cell.cell_id, []))
+            before_ids[cell.cell_id] = current.run_id if current is not None else None
+
+        scheduler = (
+            _resolve_scheduler(resolved, experiment_id)
+            if resolved is not None
+            else None
+        )
+        if scheduler is None and resolved is not None:
+            scheduler = _reconstruct_scheduler_for_experiment(
+                resolved, repo, experiment_id, detail
+            )
+            reconstructed = scheduler is not None
+        if scheduler is None:
+            # Fail closed: a successful Resume response must never mean
+            # "queued forever with no execution owner".  No Attempt was
+            # created and nothing was reported as resumed.
+            return _json_error(
+                503,
+                "no Experiment scheduler is available to dispatch resumed "
+                "cells; nothing was resumed",
+                code="DISPATCH_UNAVAILABLE",
+                extra={"experiment_id": experiment_id},
+            )
         outcome, result = await _dispatch_action(resolved, experiment_id, "resume", experiment_id)
         if outcome == "error":
             return _json_error(
@@ -1090,33 +1268,29 @@ async def _handle_resume(request: web.Request, data_root: Any, registry: Any) ->
                 code="PERSISTENCE_ERROR",
                 extra={"experiment_id": experiment_id},
             )
-        if outcome == "ok":
-            resumed_count = _count_of(result, "resumed")
-        # outcome == "unavailable" -> fall through to durable creation below.
-    if scheduler is None or (outcome == "unavailable"):
-        # Route-level durable creation via the guarded single-transaction
-        # repository adapter: an interrupted cell gets a fresh queued attempt
-        # under the same Generation/snapshot (its interrupted attempt is left
-        # untouched, append-only); queued never-started cells keep their
-        # existing queued attempt (the scheduler claims it on dispatch).  The
-        # guard atomically re-checks the CURRENT attempt inside the
-        # transaction, so a None return (cell no longer interrupted, e.g. a
-        # concurrent claim) is skipped — a duplicate resume stays idempotent.
-        # No execution happens here.
+        if outcome == "unavailable":
+            # A registered scheduler without a resume capability cannot own
+            # the work either — refuse truthfully instead of writing queued
+            # Attempts nobody would dispatch.
+            return _json_error(
+                503,
+                "the registered scheduler exposes no resume capability; "
+                "nothing was resumed",
+                code="DISPATCH_UNAVAILABLE",
+                extra={"experiment_id": experiment_id},
+            )
+        resumed_count = _count_of(result, "resumed")
+
+        # Report appended Attempts truthfully by diffing interrupted-cell
+        # current attempt identities across the dispatched resume — still
+        # under the lock so a concurrent request's append cannot leak into
+        # this response (and vice versa).
+        after_by_cell = _attempts_map(repo, interrupted)
         for cell in interrupted:
-            try:
-                claim = repo.create_resume_attempt(cell.cell_id)
-            except Exception as exc:
-                return _json_error(
-                    500,
-                    f"resume failed for cell {cell.cell_id}: {_exc_message(exc)}",
-                    code="PERSISTENCE_ERROR",
-                    extra={"experiment_id": experiment_id, "cell_id": cell.cell_id},
-                )
-            if claim is None or claim.attempt is None:
-                continue  # not eligible anymore (idempotent no-op)
-            created_runs.append({"cell_id": cell.cell_id, "run_id": claim.attempt.run_id})
-            resumed_count += 1
+            current = current_attempt(after_by_cell.get(cell.cell_id, []))
+            run_id = current.run_id if current is not None else None
+            if run_id is not None and run_id != before_ids.get(cell.cell_id):
+                created_runs.append({"cell_id": cell.cell_id, "run_id": run_id})
 
     return _ok_status_response(
         repo,
@@ -1125,6 +1299,8 @@ async def _handle_resume(request: web.Request, data_root: Any, registry: Any) ->
             "resumed": resumed_count,
             "created_attempts": created_runs,
             "resumable_cells": [c.cell_id for c in interrupted + queued],
+            "dispatched": True,
+            "scheduler_reconstructed": reconstructed,
         },
     )
 
@@ -1340,6 +1516,40 @@ def _sweep_stale_running(repo: HistoryV2Repository, experiment_ids: list[str]) -
     return marked
 
 
+def _sweep_stale_running_singles(repo: HistoryV2Repository) -> list[str]:
+    """Idempotent startup recovery for ordinary modern Singles (F1A).
+
+    Marks stale ``running`` attempts that belong to NO experiment (no
+    ``experiment_id``/``cell_id``) as ``interrupted`` so a host crash during
+    an accepted Single can never leave a Generation permanently ``running``.
+    Ownership boundary: this store is intentionally single-host/single-owner
+    (the ComfyUI host process owns ``history_v2.db``), so process start is
+    the same durable ownership boundary the existing modern-Experiment sweep
+    uses — at startup nothing in this process is executing yet, therefore
+    every ``running`` row belongs to a dead process.  Terminal attempts are
+    never reopened (first-wins SQL predicate) and queued/terminal states are
+    untouched, which makes repeated sweeps idempotent.  No Attempt is ever
+    deleted or fabricated; immutable snapshots are untouched.
+    """
+    marked: list[str] = []
+    try:
+        rows = repo._store.execute(
+            "SELECT run_id FROM run_attempts "
+            "WHERE status = 'running' "
+            "AND (experiment_id IS NULL OR experiment_id = '') "
+            "AND (cell_id IS NULL OR cell_id = '')"
+        )
+    except Exception:
+        return marked
+    for row in rows:
+        try:
+            repo.update_attempt_status(row["run_id"], "interrupted", error="startup recovery")
+            marked.append(row["run_id"])
+        except Exception:
+            pass
+    return marked
+
+
 async def _call_with_reason(fn: Any, reason: str = "shutdown") -> Any:
     try:
         return await _maybe_await(fn(reason=reason))
@@ -1350,13 +1560,17 @@ async def _call_with_reason(fn: Any, reason: str = "shutdown") -> Any:
 async def startup_experiment_modern_lifecycle(data_root: Any, registry: Any = None) -> dict[str, Any]:
     """Idempotent startup sweep (aiohttp ``on_startup``-safe, fully awaited).
 
-    Marks only stale ``running`` attempts belonging to modern experiments as
-    ``interrupted``; queued/not-started and terminal attempts are unchanged.
+    Marks only stale ``running`` attempts as ``interrupted`` — modern
+    experiments (scoped by the durable modern contract marker) AND ordinary
+    modern Singles (attempts with no experiment/cell identity).  Queued/
+    not-started and terminal attempts are unchanged.  Startup recovery only
+    repairs stale durable state; it never executes or auto-resumes work.
     """
     _DEFAULT_DATA_ROOT[0] = data_root
     _SHUTDOWN_FLAG[0] = False
     repo = _open_repository(data_root)
     marked = _sweep_stale_running(repo, _modern_experiment_ids(repo))
+    marked_singles = _sweep_stale_running_singles(repo)
     resolved = _resolve_registry(registry)
     hooks: list[str] = []
     if resolved is not None:
@@ -1368,7 +1582,12 @@ async def startup_experiment_modern_lifecycle(data_root: Any, registry: Any = No
                     hooks.append(name)
                 except Exception:
                     _log.exception("experiment modern startup hook failed: %s", name)
-    return {"status": "ok", "marked_interrupted": marked, "registry_hooks": hooks}
+    return {
+        "status": "ok",
+        "marked_interrupted": marked,
+        "marked_interrupted_singles": marked_singles,
+        "registry_hooks": hooks,
+    }
 
 
 async def shutdown_experiment_modern_lifecycle(registry: Any = None) -> dict[str, Any]:

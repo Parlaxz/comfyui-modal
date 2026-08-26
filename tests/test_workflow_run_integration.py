@@ -13,7 +13,7 @@ mirroring the fixture patterns in ``test_workflow_domain.py`` /
 * the V2 handler path through a FAKE ``PlaygroundService`` (injected at the
   most local seam: ``comfymodal_runtime.playground_service.PlaygroundService``)
 * the v1/shadow handler path (submission-time REGISTRY history record with
-  modern identity meta + patched ``direct_studio_run_completion``)
+  modern identity meta + patched V2 execution boundary)
 * ``history_v2_writer`` identity threading for modern vs legacy meta
 * no silent fallback to any legacy preset execution for unrunnable versions
 * the modern V2 FAILURE path: returned error dicts and raised exceptions at
@@ -319,6 +319,35 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         )
         self.preset_id = self.preset["preset_id"]
         self.service.set_default_preset(self.wf["workflow_id"], self.preset_id)
+        # E7: stub host validation proof for headless deterministic runs (no parent ComfyUI execution module).
+        # Mirrors tests/test_studio_workflow_run_plan_identity.py.
+        import canonical_execution as _ce
+
+        self._validation_patcher = patch.object(
+            _ce,
+            "_collect_plan_validation_proof",
+            return_value={
+                "schema_version": 1,
+                "validated": True,
+                "source": "host_validate_prompt",
+                "outputs_to_execute": ["3", "6"],
+                "node_errors": {"3": {"errors": []}},
+                "validated_workflow_hash": "vwh_fixed_0000000000",
+            },
+        )
+        self._validation_patcher.start()
+        self.addCleanup(self._validation_patcher.stop)
+        # H20 Wave G isolation fix: pin the V2 writer seam to its headless
+        # contract. Suites using the stub-server harness (routes_registered /
+        # f8 / h14 / h15 / h12-config) leave a fake ``server`` module in
+        # sys.modules with a non-None PromptServer.instance, which silently
+        # enables the production history_v2_writer singleton for every later
+        # suite in the same process. This suite's handler contract assumes the
+        # writer-unavailable (headless) environment; declare it explicitly
+        # instead of depending on suite order. Tests that exercise the real
+        # writer re-enable it themselves with their own cleanup.
+        set_writer_enabled(False)
+        self.addCleanup(reset_writer_config)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -842,48 +871,35 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(records[0]["meta"]["workflow_id"], self.wf["workflow_id"])
         self.assertIn("workflow_json", records[0]["meta"])
 
-    # ── 6. v1/shadow handler path ────────────────────────────────────────
+    # ── 6. retired-engine requests are rejected before execution (H12) ──
 
-    def test_06_legacy_handler_path(self):
+    def test_06_retired_engine_request_rejected(self):
+        """A NEW Workflow request explicitly carrying execution_mode=v1 is
+        rejected truthfully (EXECUTION_MODE_RETIRED) BEFORE any history
+        record is created and WITHOUT ever reaching the V1 executor."""
         fake_registry = FakeRegistry()
         fake_exp_module = types.ModuleType("experiment_service")
         fake_exp_module.REGISTRY = fake_registry
 
-        async def fake_direct_completion(ctx, node_dir, **kwargs):
-            return {
-                "status": "ok",
-                "runId": ctx.get("run_history_id") or "r_direct",
-                "direct_run": True,
-            }
+        async def _must_never_execute(*args, **kwargs):
+            self.fail("retired engine request must never reach any executor")
 
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
         ), patch(
-            "studio_run_adapter.direct_studio_run_completion",
-            new=fake_direct_completion,
+            "studio_run_adapter.playground_adapter_direct_run",
+            new=_must_never_execute,
         ):
             result = self._run_handler(
                 controls={"steps": 30},
                 modal_options={"execution_mode": "v1"},
             )
 
-        self.assertEqual(result["status"], "ok")
-
-        records = list(fake_registry.history()._runs.values())
-        self.assertEqual(len(records), 1, "submission record created for v1 path")
-        record = records[0]
-        self.assertEqual(record["kind"], "studio_run")
-        # Recorded "submitted" then immediately moved to "running".
-        self.assertIn(record["status"], ("submitted", "running"))
-        meta = record["meta"]
-        # Modern identity threading in the submission-time meta.
-        self.assertEqual(meta["workflow_id"], self.wf["workflow_id"])
-        self.assertEqual(meta["workflow_version_id"], self.version_id)
-        self.assertEqual(meta["preset_id"], self.preset_id)
-        self.assertEqual(meta["workflow_name"], self.wf["name"])
-        self.assertEqual(meta["preset_name"], "Preset A")
-        self.assertNotIn("studio_preset_id", meta)
-        self.assertNotIn("studio_snapshot_id", meta)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "EXECUTION_MODE_RETIRED")
+        self.assertIn("Engine V1 retired", result["message"])
+        # No submission-time record may be created for a rejected request.
+        self.assertEqual(len(fake_registry.history()._runs), 0)
 
     # ── 7. history_v2_writer identity threading ──────────────────────────
 
@@ -957,7 +973,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
             self.fail("unrunnable version must never route to any execution path")
 
         with self._service_patcher(), patch(
-            "studio_run_adapter.direct_studio_run_completion",
+            "studio_run_adapter.playground_adapter_direct_run",
             new=_should_never_run,
         ):
             result = _run(swr.handle_workflow_run_async(
@@ -1081,50 +1097,39 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         _repair_missing_vae_inputs(wf_vae2)
         self.assertEqual(wf_vae2["10"]["inputs"]["vae"], ["8", 0], "existing vae preserved")
 
-    # ── 11. v1/shadow path repairs missing CLIP inputs too ───────────────
+    # ── 11. retired shadow requests are rejected too (H12) ───────────────
 
-    def test_11_legacy_path_repairs_missing_clip_inputs(self):
-        """The legacy v1 path applies the same CLIP repair before hashing."""
+    def test_11_retired_shadow_request_rejected(self):
+        """A NEW Workflow request explicitly carrying execution_mode=shadow
+        is rejected before acceptance — no plan, no history record, no
+        execution of any engine."""
         bundle = self._clip_repair_fixture()
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
         preset_id = bundle["preset"]["preset_id"]
-        stored_pre_repair_hash = bundle["version"]["graph_hash"]
 
         fake_registry = FakeRegistry()
         fake_exp_module = types.ModuleType("experiment_service")
         fake_exp_module.REGISTRY = fake_registry
-        captured: dict = {}
 
-        async def fake_direct_completion(ctx, node_dir, **kwargs):
-            captured["ctx"] = ctx
-            return {
-                "status": "ok",
-                "runId": ctx.get("run_history_id") or "r_direct",
-                "direct_run": True,
-            }
+        async def _must_never_execute(*args, **kwargs):
+            self.fail("retired shadow request must never reach any executor")
 
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
         ), patch(
-            "studio_run_adapter.direct_studio_run_completion",
-            new=fake_direct_completion,
+            "studio_run_adapter.playground_adapter_direct_run",
+            new=_must_never_execute,
         ):
             result = _run(swr.handle_workflow_run_async(
                 wf_id, version_id, preset_id, "txt2img", {}, self.root,
-                modal_options={"execution_mode": "v1"},
+                modal_options={"execution_mode": "shadow"},
             ))
 
-        self.assertEqual(result["status"], "ok")
-        ctx = captured["ctx"]
-        compiled_workflow = ctx["compilation"]["checkpoints"][0]["workflow"]
-        self.assertEqual(compiled_workflow["67"]["inputs"]["clip"], ["62", 0])
-        self.assertEqual(compiled_workflow["169"]["inputs"]["clip"], ["62", 0])
-        # workflow_hash comes from the repaired workflow (≠ stored pre-repair).
-        self.assertEqual(
-            ctx["studio_meta"]["workflow_hash"], prompt_sha256(compiled_workflow)
-        )
-        self.assertNotEqual(ctx["studio_meta"]["workflow_hash"], stored_pre_repair_hash)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "EXECUTION_MODE_RETIRED")
+        self.assertIn("shadow", result["message"])
+        self.assertEqual(len(fake_registry.history()._runs), 0)
 
 
     # ── 12. V2 returned-error failure path ──────────────────────────────

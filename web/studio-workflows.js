@@ -10,8 +10,21 @@
 //
 // All DOM is built through el() from studio-ui.js. No innerHTML with data.
 
-import { el, statusBadge } from "./studio-ui.js";
+import { el, renderEmptyState, statusBadge } from "./studio-ui.js";
+import { renderLoadingState } from "./studio-loading.js";
 import { renderModelLibraryView, renderDependencySection, renderModelPicker } from "./studio-model-library.js";
+import {
+  chipStateFromSummary,
+  normalizePortabilitySummary,
+  normalizeRiskLevel,
+  renderPortabilityPanel,
+  riskKind,
+  riskLabel,
+} from "./studio-portability.js";
+import {
+  buildChecklistFilename,
+  buildPortabilityChecklist,
+} from "./studio-portability-checklist.js";
 import {
   listWorkflows,
   createWorkflow,
@@ -40,8 +53,12 @@ import {
   copyPresetToVersion,
   bulkCopyPresetsToVersion,
   getVersionDependencies,
+  getVersionPortability,
+  fetchWorkflowManifestExport,
+  importWorkflowManifest,
   listModels,
 } from "./studio-backend-api.js";
+import { subscribeStudioSync } from "./studio-sync.js";
 
 // ── Module-level view state ────────────────────────────────────────────────
 // Persists across shell re-renders so navigating away and back preserves
@@ -57,7 +74,41 @@ const _view = {
   revisionConfirm: false,          // mapping immutability confirmation open
   capturingVersion: false,
   importMode: "",                  // "" | "graph" | "manual" (dialog section)
-  filters: { query: "", tag: "", folder: "", favoritesOnly: false },
+  portability: {
+    report: null,                  // current G5 report for the selected version
+    priorStale: false,             // prior report shown after a failed recheck
+    error: "",
+    checking: false,
+  },
+  exportFlow: {
+    open: false,
+    includePresets: false,         // default OFF — never silently export presets
+    busy: false,
+    error: "",
+    done: "",
+  },
+  importManifest: {
+    open: false,
+    phase: "select",               // "select" | "too_large" | "previewing" | "preview" | "committing" | "success"
+    fileName: "",
+    fileBytes: 0,
+    manifestObject: null,          // parsed manifest for the commit request
+    previewing: false,
+    preview: null,
+    previewError: "",
+    committing: false,
+    commitError: "",
+    result: null,
+    importPresets: false,          // explicit choice, default OFF
+    applyDefaultPreset: false,     // explicit choice, default OFF
+  },
+  filters: { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "" },
+  // Session-derived reverse usage index (I6): model filename → Set of
+  // workflow_ids, filled ONLY from dependency payloads the frontend already
+  // fetched through normal navigation.  Purely in-memory — no persistence
+  // authority, no new backend surface.  Counts are therefore scoped to what
+  // was actually observed, never a claimed global total.
+  usageByModel: new Map(),
   modelsData: {
     models: [],
     scanHint: "not_scanned",
@@ -156,9 +207,11 @@ function _stateBadge(state, testid) {
   return badge;
 }
 
-function _chip(text) {
-  return el("span", { class: "comfymodal-studio-wf-chip", text: text });
-}
+  function _chip(text) {
+    // Identity chip (I3 taxonomy): shared base geometry + neutral tone while
+    // keeping the page-specific class for legacy CSS hooks.
+    return el("span", { class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral", text: text });
+  }
 
 function _field(label, input) {
   return el("div", { class: "comfymodal-studio-backend-field" }, [el("label", { text: label }), input]);
@@ -326,6 +379,8 @@ export function renderWorkflows(state, context) {
   const token = ++_currentToken;
 
   const root = el("div", { class: "comfymodal-studio-workflows", "data-testid": "workflows-page" });
+  let workflowsStale = false;
+  let unsubscribeWorkflowsSync = null;
 
   // Mount-local rendering refs
   let gridEl = null;
@@ -335,6 +390,35 @@ export function renderWorkflows(state, context) {
   const expandedVersions = new Set();
 
   function stale() { return token !== _currentToken; }
+
+  function refreshFromSync() {
+    if (!root.isConnected) {
+      if (unsubscribeWorkflowsSync) unsubscribeWorkflowsSync();
+      unsubscribeWorkflowsSync = null;
+      return;
+    }
+    workflowsStale = true;
+    root.dataset.syncStale = "true";
+    if (_view.mode === "detail") {
+      loadDetailData().finally(function () {
+        workflowsStale = false;
+        root.dataset.syncStale = "false";
+      });
+    } else if (_view.mode === "models") {
+      _view.modelsData._loaded = false;
+      _view.modelsData.loading = false;
+      render();
+      workflowsStale = false;
+      root.dataset.syncStale = "false";
+    } else {
+      loadLibrary().finally(function () {
+        workflowsStale = false;
+        root.dataset.syncStale = "false";
+      });
+    }
+  }
+
+  unsubscribeWorkflowsSync = subscribeStudioSync("workflows", refreshFromSync);
 
   function render() {
     while (root.firstChild) root.removeChild(root.firstChild);
@@ -370,8 +454,21 @@ export function renderWorkflows(state, context) {
     _view.data.presets = [];
     _view.data.mapping = null;
     _view.data.dependencies = null;
+    _resetPortabilityState();
     render();
     loadDetailData();
+  }
+
+  function _resetPortabilityState() {
+    _view.portability.report = null;
+    _view.portability.priorStale = false;
+    _view.portability.error = "";
+    _view.portability.checking = false;
+    _view.exportFlow.open = false;
+    _view.exportFlow.includePresets = false;
+    _view.exportFlow.busy = false;
+    _view.exportFlow.error = "";
+    _view.exportFlow.done = "";
   }
 
   function goToLibrary() {
@@ -391,15 +488,37 @@ export function renderWorkflows(state, context) {
 
   function applyFilters(list) {
     const q = _view.filters.query.trim().toLowerCase();
+    const usageSet = _view.filters.usageModel && _view.usageByModel instanceof Map
+      ? (_view.usageByModel.get(_view.filters.usageModel) || new Set())
+      : null;
     return list.filter((w) => {
       if (q) {
         const hay = [w.name, w.description, (w.tags || []).join(" ")].filter(Boolean).join(" ").toLowerCase();
         if (hay.indexOf(q) === -1) return false;
       }
+      if (usageSet && !usageSet.has(w.workflow_id)) return false;
       if (_view.filters.tag && !(w.tags || []).includes(_view.filters.tag)) return false;
       if (_view.filters.folder && !String(w.folder || "").startsWith(_view.filters.folder)) return false;
       if (_view.filters.favoritesOnly && !w.favorite) return false;
       return true;
+    });
+  }
+
+  /** Record reverse usage from a fetched dependency payload (I6). */
+  function _recordDependencyUsage(deps) {
+    if (!deps || deps.status !== "ok") return;
+    const wfId = _view.selectedWorkflowId;
+    if (!wfId) return;
+    const models = Array.isArray(deps.models) ? deps.models : [];
+    models.forEach((m) => {
+      const fn = m && m.filename ? String(m.filename) : "";
+      if (!fn) return;
+      let set = _view.usageByModel.get(fn);
+      if (!set) {
+        set = new Set();
+        _view.usageByModel.set(fn, set);
+      }
+      set.add(wfId);
     });
   }
 
@@ -414,14 +533,48 @@ export function renderWorkflows(state, context) {
   }
 
   function renderLibraryEmpty(noWorkflowsAtAll) {
-    return el("div", { class: "comfymodal-studio-workflows-empty" }, [
-      el("p", { text: noWorkflowsAtAll
-        ? "No workflows yet. Import the current ComfyUI graph or create a new empty workflow."
-        : "No workflows match your filters." }),
-      noWorkflowsAtAll ? null : el("button", {
+    if (noWorkflowsAtAll) {
+      return renderEmptyState({
+        title: "No workflows yet",
+        detail: "Import the current ComfyUI graph or create a new empty workflow.",
+        testid: "workflows-empty",
+      });
+    }
+    return renderEmptyState({
+      title: "No workflows match your filters",
+      action: el("button", {
         class: "comfymodal-secondary-btn",
+        type: "button",
         text: "Clear filters",
-        onclick: () => { _view.filters = { query: "", tag: "", folder: "", favoritesOnly: false }; render(); },
+        onclick: () => {
+          _view.filters = { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "" };
+          render();
+        },
+      }),
+      testid: "workflows-empty",
+    });
+  }
+
+  /**
+   * Session-scoped "Used by" focus (I6): narrows the library to the
+   * workflows whose ALREADY-LOADED dependency payloads reference the model.
+   * The notice states that scope truthfully — this is not a global index.
+   */
+  function renderUsageFocusNotice() {
+    const name = _view.filters.usageModel;
+    return el("div", {
+      class: "comfymodal-studio-notice",
+      "data-testid": "workflows-usage-focus",
+    }, [
+      el("span", {
+        text: "Showing workflows that use \"" + name + "\" (from dependencies loaded in this session).",
+      }),
+      el("button", {
+        type: "button",
+        class: "comfymodal-studio-notice-dismiss",
+        text: "\u00d7",
+        "aria-label": "Clear used-by filter",
+        onclick: () => { _view.filters.usageModel = ""; render(); },
       }),
     ]);
   }
@@ -457,12 +610,89 @@ export function renderWorkflows(state, context) {
         _stateBadge(state, "workflow-card-state"),
         el("span", { text: "v" + (wf.latest_version_number != null ? wf.latest_version_number : "0") }),
         wf.default_preset_name ? el("span", { text: wf.default_preset_name }) : null,
+        renderCardPortabilityChip(wf),
       ]),
       (wf.source_url || wf.source_author)
         ? el("div", { class: "comfymodal-studio-workflow-card-source", text: [wf.source_author, wf.source_url].filter(Boolean).join(" \u00b7 ") })
         : null,
     ]);
     return card;
+  }
+
+  /**
+   * Latest-version portability summary chip (G11 summary contract).
+   * Native button — clicking opens the workflow's Portability panel.
+   * Absent field renders truthfully as "Not analyzed"; stale/unchecked are
+   * visibly distinct and never presented as unquestionably current.
+   */
+  function renderCardPortabilityChip(wf) {
+    const summary = normalizePortabilitySummary(wf.portability_summary);
+    const state = chipStateFromSummary(summary);
+    return el("button", {
+      type: "button",
+      class: "comfymodal-studio-portability-chip " + state.kind + " cm-chip cm-chip--portability",
+      "data-tone": state.kind,
+      "data-testid": "portability-chip",
+      title: state.title,
+      // Disambiguated per workflow (I1 duplicate-name fix): every card in the
+      // grid renders one of these simultaneously.
+      "aria-label": "Portability for " + (wf.name || "this workflow") + ": " +
+        state.label + ". Opens the portability panel.",
+      onclick: (e) => {
+        e.stopPropagation();
+        openWorkflowDetail(wf.workflow_id || "", wf.latest_version_id || "", null);
+      },
+      onkeydown: (e) => {
+        if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+      },
+    }, [el("span", { text: state.label })]);
+  }
+
+  /** Detail-header chip for the SELECTED version (button focuses the panel). */
+  function renderDetailPortabilityChip() {
+    let raw = null;
+    const report = _view.portability.report;
+    if (report && report.version_id === _view.selectedVersionId) {
+      raw = {
+        version_id: report.version_id,
+        risk_level: report.risk_level,
+        issue_count: report.issue_count,
+        stale: report.stale,
+        analyzed_at: report.analyzed_at,
+      };
+    } else {
+      const wf = _view.data.workflow;
+      if (
+        wf &&
+        wf.portability_summary &&
+        (!wf.portability_summary.version_id || wf.portability_summary.version_id === _view.selectedVersionId)
+      ) {
+        raw = wf.portability_summary;
+      }
+    }
+    const state = chipStateFromSummary(normalizePortabilitySummary(raw));
+    const wf = _view.data.workflow;
+    const version = _view.data.versions.find((v) => v.workflow_version_id === _view.selectedVersionId) || _view.data.version;
+    const versionPart = version && version.version_number != null ? " v" + version.version_number : "";
+    return el("button", {
+      type: "button",
+      class: "comfymodal-studio-portability-chip " + state.kind + " cm-chip cm-chip--portability",
+      "data-tone": state.kind,
+      "data-testid": "portability-detail-chip",
+      title: state.title,
+      // Unique on the detail page, but named with workflow/version context so
+      // it stays distinguishable from list chips in accessibility trees that
+      // expose both.
+      "aria-label": "Portability for " + ((wf && wf.name) || "this workflow") + versionPart +
+        ": " + state.label + ". Opens the portability panel.",
+      onclick: () => {
+        const panel = root.querySelector('[data-testid="portability-panel"]');
+        if (panel) {
+          panel.scrollIntoView({ block: "start" });
+          panel.focus();
+        }
+      },
+    }, [el("span", { text: state.label })]);
   }
 
   function renderFavoriteButton(wf, isCard) {
@@ -483,9 +713,9 @@ export function renderWorkflows(state, context) {
       const next = !wf.favorite;
       star.disabled = true;
       updateWorkflow(apiBase, wf.workflow_id, { favorite: next }).then((res) => {
-        if (stale()) return;
         star.disabled = false;
         if (!res || res.status === "error") return;
+        if (stale()) return;
         wf.favorite = next;
         star.textContent = next ? "\u2605" : "\u2606";
         star.setAttribute("aria-pressed", next ? "true" : "false");
@@ -556,6 +786,12 @@ export function renderWorkflows(state, context) {
       el("div", { class: "comfymodal-studio-workflows-header-actions" }, [
         el("button", {
           class: "comfymodal-secondary-btn",
+          "data-testid": "workflows-import-manifest-button",
+          text: "Import workflow manifest",
+          onclick: () => openImportManifestDialog(),
+        }),
+        el("button", {
+          class: "comfymodal-secondary-btn",
           "data-testid": "workflows-import-button",
           text: "Import",
           onclick: () => openImportDialog("graph"),
@@ -613,6 +849,8 @@ export function renderWorkflows(state, context) {
 
     viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-toolbar" }, [searchInput, tagSelect, favToggle]));
 
+    if (_view.filters.usageModel) viewEl.appendChild(renderUsageFocusNotice());
+
     const sidebar = el("div", { class: "comfymodal-studio-workflows-sidebar" }, [
       el("div", { class: "comfymodal-studio-workflows-sidebar-label", text: "Folders" }),
       renderFolderTree(),
@@ -620,7 +858,11 @@ export function renderWorkflows(state, context) {
 
     gridEl = el("div", { class: "comfymodal-studio-workflows-grid" });
     if (!Array.isArray(wfs)) {
-      gridEl.appendChild(el("div", { class: "comfymodal-studio-workflows-empty", text: "Loading workflows\u2026" }));
+      gridEl.appendChild(renderLoadingState({
+        label: "Loading workflows\u2026",
+        size: "page",
+        testid: "workflows-loading",
+      }));
     } else if (_view.data.loadError) {
       gridEl.appendChild(el("div", { class: "comfymodal-studio-workflows-empty" }, [
         el("p", { text: _view.data.loadError, style: "color:#f87171;" }),
@@ -635,6 +877,7 @@ export function renderWorkflows(state, context) {
     viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-body" }, [sidebar, gridEl]));
 
     if (_view.importMode) viewEl.appendChild(renderImportDialog());
+    if (_view.importManifest.open) viewEl.appendChild(renderImportManifestDialog());
     return viewEl;
   }
 
@@ -667,25 +910,37 @@ export function renderWorkflows(state, context) {
 
   function openImportDialog(mode) {
     _view.importMode = mode || "graph";
-    if (!_importEscHandler) {
-      _importEscHandler = (e) => {
-        if (e.key === "Escape" && _view.importMode) {
-          e.stopPropagation();
-          closeImportDialog();
-        }
-      };
-      document.addEventListener("keydown", _importEscHandler, true);
-    }
+    _ensureDialogEscHandler();
     render();
   }
 
   function closeImportDialog() {
     _view.importMode = "";
-    if (_importEscHandler) {
+    _maybeRemoveDialogEscHandler();
+    render();
+  }
+
+  function _ensureDialogEscHandler() {
+    if (!_importEscHandler) {
+      _importEscHandler = (e) => {
+        if (e.key !== "Escape") return;
+        if (_view.importMode) {
+          e.stopPropagation();
+          closeImportDialog();
+        } else if (_view.importManifest.open) {
+          e.stopPropagation();
+          closeImportManifestDialog();
+        }
+      };
+      document.addEventListener("keydown", _importEscHandler, true);
+    }
+  }
+
+  function _maybeRemoveDialogEscHandler() {
+    if (_importEscHandler && !_view.importMode && !_view.importManifest.open) {
       document.removeEventListener("keydown", _importEscHandler, true);
       _importEscHandler = null;
     }
-    render();
   }
 
   function renderImportDialog() {
@@ -831,6 +1086,413 @@ export function renderWorkflows(state, context) {
     openWorkflowDetail(workflow.workflow_id || result.workflow_id || "", "", null);
   }
 
+  // ── Manifest import dialog (Phase G12) ──────────────────────────────────
+
+  const IMPORT_MAX_BYTES = 10 * 1024 * 1024; // client precheck only; backend 413 is authoritative
+
+  function openImportManifestDialog() {
+    _view.importManifest = {
+      open: true,
+      phase: "select",
+      fileName: "",
+      fileBytes: 0,
+      manifestObject: null,
+      previewing: false,
+      preview: null,
+      previewError: "",
+      committing: false,
+      commitError: "",
+      result: null,
+      importPresets: false,
+      applyDefaultPreset: false,
+    };
+    _ensureDialogEscHandler();
+    render();
+  }
+
+  function closeImportManifestDialog() {
+    _view.importManifest.open = false;
+    _maybeRemoveDialogEscHandler();
+    render();
+  }
+
+  function renderImportManifestDialog() {
+    const st = _view.importManifest;
+    const overlay = el("div", { class: "comfymodal-studio-dialog-overlay" });
+    const backdrop = el("div", { class: "comfymodal-studio-dialog-backdrop", onclick: closeImportManifestDialog });
+    const dialog = el("div", {
+      class: "comfymodal-studio-dialog",
+      "data-testid": "import-manifest-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "Import workflow manifest",
+    });
+    dialog.appendChild(el("h3", { class: "comfymodal-studio-dialog-title", text: "Import workflow manifest" }));
+    dialog.appendChild(el("p", {
+      class: "comfymodal-studio-dialog-note",
+      text: "Imports a Studio Workflow Manifest (.workflow.json) exported from this or another Studio. A dry-run preview always runs first \u2014 nothing is created until you confirm.",
+    }));
+
+    // File picker
+    const fileInput = el("input", {
+      type: "file",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "import-manifest-file",
+      accept: ".json,application/json",
+      "aria-label": "Manifest JSON file",
+      onchange: (e) => handleManifestFileSelected(e.currentTarget.files && e.currentTarget.files[0]),
+    });
+    const pickWrap = el("div", { class: "comfymodal-studio-dialog-section" }, [
+      el("h4", { class: "comfymodal-studio-dialog-section-title", text: "1. Choose manifest file" }),
+      fileInput,
+    ]);
+    if (st.fileName) {
+      pickWrap.appendChild(el("p", {
+        class: "comfymodal-studio-dialog-note",
+        "data-testid": "import-manifest-file-name",
+        text: "Selected: " + st.fileName + " (" + st.fileBytes + " bytes)",
+      }));
+    }
+    if (st.phase === "too_large") {
+      pickWrap.appendChild(el("p", {
+        class: "comfymodal-studio-dialog-warning",
+        "data-testid": "import-manifest-too-large",
+        text: "This file exceeds the 10 MiB manifest limit. It was not sent to the server.",
+      }));
+    }
+    dialog.appendChild(pickWrap);
+
+    // Preview section
+    if (st.previewing) {
+      dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-section" }, [
+        el("h4", { class: "comfymodal-studio-dialog-section-title", text: "2. Preview" }),
+        el("p", { class: "comfymodal-studio-dependencies-note", "data-testid": "import-manifest-previewing", text: "Analyzing manifest\u2026" }),
+      ]));
+    } else if (st.previewError) {
+      dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-section" }, [
+        el("h4", { class: "comfymodal-studio-dialog-section-title", text: "2. Preview" }),
+        el("p", {
+          class: "comfymodal-studio-dialog-warning",
+          "data-testid": "import-manifest-preview-error",
+          role: "status",
+          text: st.previewError,
+        }),
+      ]));
+    } else if (st.preview) {
+      dialog.appendChild(renderManifestPreviewSection(st.preview));
+    }
+
+    // Success panel
+    if (st.phase === "success" && st.result) {
+      dialog.appendChild(renderManifestSuccessSection(st.result));
+    }
+
+    dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-actions" }, [
+      el("button", { class: "comfymodal-secondary-btn", text: "Close", onclick: closeImportManifestDialog }),
+    ]));
+
+    overlay.appendChild(backdrop);
+    overlay.appendChild(dialog);
+    return overlay;
+  }
+
+  async function handleManifestFileSelected(file) {
+    const st = _view.importManifest;
+    if (!file) return;
+    st.fileName = file.name;
+    st.fileBytes = file.size;
+    st.preview = null;
+    st.previewError = "";
+    st.commitError = "";
+    st.result = null;
+    if (file.size > IMPORT_MAX_BYTES) {
+      st.phase = "too_large";
+      render();
+      return;
+    }
+    st.phase = "previewing";
+    st.previewing = true;
+    render();
+    let text = "";
+    try {
+      text = await file.text();
+    } catch (err) {
+      st.previewing = false;
+      st.phase = "preview";
+      st.previewError = "Could not read the selected file.";
+      render();
+      return;
+    }
+    if (stale()) return;
+    // Exactly ONE dry-run request per file selection. Invalid JSON is sent
+    // verbatim so the backend stays the authority on malformed manifests.
+    let parsedObject = null;
+    try { parsedObject = JSON.parse(text); } catch (err) { parsedObject = null; }
+    st.manifestObject = parsedObject && typeof parsedObject === "object" ? parsedObject : null;
+    const resp = await importWorkflowManifest(apiBase, text, { dryRun: true });
+    if (stale()) return;
+    st.previewing = false;
+    if (!resp || resp.status === "error" || resp._httpStatus >= 400) {
+      st.phase = "preview";
+      const issues = resp && Array.isArray(resp.issues) ? resp.issues : [];
+      st.preview =
+        issues.length
+          ? { status: "preview", valid: false, manifest_version: null, issues, will_create: null,
+              proposed_name: "", existing_name_matches: [], readiness: null, portability: null,
+              dependency_summary: null }
+          : null;
+      st.previewError = issues.length
+        ? ""
+        : "The server rejected this manifest: " + ((resp && resp.message) || "request failed");
+      render();
+      return;
+    }
+    st.phase = "preview";
+    st.preview = resp;
+    render();
+  }
+
+  /** Separated truth: manifest validity ≠ structural readiness ≠ dependency availability ≠ portability risk. */
+  function renderManifestPreviewSection(preview) {
+    const st = _view.importManifest;
+    const wrap = el("div", { class: "comfymodal-studio-dialog-section", "data-testid": "import-manifest-preview" });
+
+    wrap.appendChild(el("h4", { class: "comfymodal-studio-dialog-section-title", text: "2. Preview (dry run \u2014 nothing created yet)" }));
+
+    // Manifest validity
+    wrap.appendChild(el("div", { class: "comfymodal-studio-portability-summary-row" }, [
+      el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Manifest" }),
+      el("span", {
+        class: "comfymodal-studio-status-badge " + (preview.valid ? "ok" : "error"),
+        "data-testid": "import-manifest-validity",
+        text: preview.valid ? "Valid" : "Invalid",
+      }),
+      preview.manifest_version != null
+        ? el("span", { class: "comfymodal-studio-role-info", text: "manifest version " + String(preview.manifest_version) })
+        : null,
+    ]));
+
+    // Proposed name + existing matches
+    if (preview.proposed_name) {
+      wrap.appendChild(el("p", {
+        class: "comfymodal-studio-dialog-note",
+        "data-testid": "import-manifest-proposed-name",
+        text: "Will be created as \"" + preview.proposed_name + "\"" +
+          (preview.existing_name_matches && preview.existing_name_matches.length
+            ? " \u00b7 existing workflows with a matching name: " + preview.existing_name_matches.join(", ")
+            : ""),
+      }));
+    }
+
+    // All returned issues (readable list)
+    const issues = Array.isArray(preview.issues) ? preview.issues : [];
+    if (issues.length) {
+      const issueBlock = el("div", { "data-testid": "import-manifest-issues" });
+      issueBlock.appendChild(el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Issues" }));
+      issueBlock.appendChild(el("ul", { class: "comfymodal-studio-reason-list" },
+        issues.map((x) => el("li", { text: typeof x === "string" ? x : _reasonText(x) }))));
+      wrap.appendChild(issueBlock);
+    }
+
+    // Structural readiness (separate dimension)
+    const readiness = preview.readiness;
+    if (readiness) {
+      wrap.appendChild(el("div", { class: "comfymodal-studio-portability-summary-row" }, [
+        el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Structural readiness" }),
+        el("span", {
+          class: "comfymodal-studio-status-badge " + (readiness.ready === false ? "warn" : "ok"),
+          "data-testid": "import-manifest-readiness",
+          text: readiness.ready === false ? "Needs attention" : "OK",
+        }),
+      ]));
+    }
+
+    // Dependency availability (separate dimension; never blocks import by itself)
+    const deps = preview.dependency_summary;
+    if (deps && deps.summary) {
+      const s = deps.summary;
+      const missing = (s.missing || 0) + (s.wrong_version || 0) + (s.unknown || 0);
+      wrap.appendChild(el("div", { class: "comfymodal-studio-portability-summary-row" }, [
+        el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Dependencies" }),
+        el("span", {
+          class: "comfymodal-studio-status-badge " + (missing > 0 ? "warn" : "ok"),
+          "data-testid": "import-manifest-dependencies",
+          text: missing > 0 ? missing + " need attention" : "All resolved",
+        }),
+      ]));
+      if (missing > 0) {
+        wrap.appendChild(el("p", {
+          class: "comfymodal-studio-dialog-note",
+          "data-testid": "import-manifest-deps-note",
+          text: "Import is allowed, but the Workflow may not run until dependencies are resolved. Nothing is installed automatically.",
+        }));
+      }
+    }
+
+    // Portability risk (separate dimension)
+    const port = preview.portability;
+    if (port && port.risk_level) {
+      wrap.appendChild(el("div", { class: "comfymodal-studio-portability-summary-row" }, [
+        el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Portability risk" }),
+        el("span", {
+          class: "comfymodal-studio-status-badge " + riskKind(port.risk_level),
+          "data-testid": "import-manifest-portability",
+          text: riskLabel(port.risk_level),
+        }),
+        port.issue_count != null
+          ? el("span", { class: "comfymodal-studio-role-info", text: port.issue_count + " issue" + (port.issue_count === 1 ? "" : "s") })
+          : null,
+      ]));
+    }
+
+    // What will be created
+    const wc = preview.will_create;
+    if (wc) {
+      const bits = [];
+      if (wc.workflow) bits.push("Workflow");
+      if (wc.version) bits.push("Version #1");
+      if (wc.mapping) bits.push("Mapping");
+      bits.push(String(wc.preset_count || 0) + " preset" + ((wc.preset_count || 0) === 1 ? "" : "s"));
+      wrap.appendChild(el("p", {
+        class: "comfymodal-studio-dialog-note",
+        "data-testid": "import-manifest-will-create",
+        text: "Creates: " + bits.join(" \u00b7 "),
+      }));
+    }
+
+    // Explicit preset policy choices — no silent defaults.
+    const presetCount = wc ? Number(wc.preset_count || 0) : 0;
+    const hasCandidate = preview.has_default_preset_candidate === true;
+    const presetsCb = el("input", {
+      type: "checkbox",
+      class: "comfymodal-studio-wf-checkbox",
+      "data-testid": "import-manifest-presets",
+      disabled: presetCount === 0,
+      onchange: (e) => {
+        st.importPresets = !!e.currentTarget.checked;
+        if (!st.importPresets) st.applyDefaultPreset = false;
+        render();
+      },
+    });
+    presetsCb.checked = st.importPresets;
+    const defaultCb = el("input", {
+      type: "checkbox",
+      class: "comfymodal-studio-wf-checkbox",
+      "data-testid": "import-manifest-apply-default",
+      disabled: !(st.importPresets && presetCount > 0 && hasCandidate),
+      onchange: (e) => { st.applyDefaultPreset = !!e.currentTarget.checked; },
+    });
+    defaultCb.checked = st.applyDefaultPreset;
+    wrap.appendChild(el("div", { style: "display:flex;flex-direction:column;gap:6px;margin:10px 0;" }, [
+      el("label", { style: "display:flex;align-items:center;gap:6px;" }, [
+        presetsCb,
+        el("span", { text: "Import workflow presets" + (presetCount ? " (" + presetCount + ")" : " (none in manifest)") }),
+      ]),
+      el("label", { style: "display:flex;align-items:center;gap:6px;" }, [
+        defaultCb,
+        el("span", { text: "Apply imported default preset" + (hasCandidate ? "" : " (no imported default candidate)") }),
+      ]),
+    ]));
+
+    // Commit — absent entirely while invalid; mandatory dry-run means there is
+    // no path from file selection straight to commit.
+    const canCommit = preview.valid === true && !st.committing;
+    wrap.appendChild(el("div", { class: "comfymodal-studio-dialog-actions", style: "justify-content:flex-start;" }, [
+      el("button", {
+        type: "button",
+        class: "comfymodal-primary-btn",
+        "data-testid": "import-manifest-commit",
+        text: st.committing ? "Importing\u2026" : "Import workflow",
+        disabled: !canCommit,
+        "aria-busy": st.committing ? "true" : "false",
+        onclick: commitManifestImport,
+      }),
+    ]));
+    if (st.commitError) {
+      wrap.appendChild(el("p", {
+        class: "comfymodal-studio-dialog-warning",
+        "data-testid": "import-manifest-commit-error",
+        role: "status",
+        text: st.commitError,
+      }));
+    }
+    return wrap;
+  }
+
+  async function commitManifestImport() {
+    const st = _view.importManifest;
+    const preview = st.preview;
+    if (!preview || preview.valid !== true || st.committing) return;
+    st.committing = true;
+    st.commitError = "";
+    render();
+    const resp = await importWorkflowManifest(apiBase, st.manifestObject || {}, {
+      dryRun: false,
+      importPresets: st.importPresets,
+      applyDefaultPreset: st.applyDefaultPreset,
+    });
+    if (stale()) return;
+    st.committing = false;
+    if (!resp || resp.status !== "ok") {
+      const issues = resp && Array.isArray(resp.issues) ? resp.issues : [];
+      st.commitError = "Import failed: " +
+        ((resp && resp.message) || "request failed") +
+        (issues.length ? " \u2014 " + issues.map((x) => (typeof x === "string" ? x : _reasonText(x))).join("; ") : "") +
+        " Nothing was created. You can retry.";
+      render();
+      const btn = root.querySelector('[data-testid="import-manifest-commit"]');
+      if (btn) btn.focus();
+      return;
+    }
+    st.result = resp;
+    st.phase = "success";
+    render();
+  }
+
+  function renderManifestSuccessSection(result) {
+    const wrap = el("div", { class: "comfymodal-studio-dialog-section", "data-testid": "import-manifest-success" });
+    wrap.appendChild(el("h4", { class: "comfymodal-studio-dialog-section-title", text: "3. Imported" }));
+    const bits = [];
+    if (result.workflow_name) bits.push("Workflow \"" + result.workflow_name + "\"");
+    if (result.workflow_version_id) bits.push("Version #1");
+    if (result.mapping_id) bits.push("Mapping");
+    bits.push(((result.preset_ids || []).length) + " preset" + ((result.preset_ids || []).length === 1 ? "" : "s"));
+    wrap.appendChild(el("p", {
+      class: "comfymodal-studio-dialog-note",
+      "data-testid": "import-manifest-created",
+      text: "Created: " + bits.join(" \u00b7 "),
+    }));
+    // Provenance is informational only — foreign ids are never navigation authority.
+    const prov = result.provenance;
+    if (prov && typeof prov === "object") {
+      const provBits = [];
+      if (prov.source_workflow_id) provBits.push("origin workflow " + prov.source_workflow_id);
+      if (prov.source_version_id) provBits.push("origin version " + prov.source_version_id);
+      if (provBits.length) {
+        wrap.appendChild(el("p", {
+          class: "comfymodal-studio-dialog-note",
+          "data-testid": "import-manifest-provenance",
+          text: "Provenance (foreign ids, informational only): " + provBits.join(" \u00b7 "),
+        }));
+      }
+    }
+    wrap.appendChild(el("div", { class: "comfymodal-studio-dialog-actions", style: "justify-content:flex-start;" }, [
+      el("button", {
+        type: "button",
+        class: "comfymodal-primary-btn",
+        "data-testid": "import-manifest-open",
+        text: "Open imported workflow",
+        onclick: () => {
+          const wfId = result.workflow_id || "";
+          const verId = result.workflow_version_id || "";
+          closeImportManifestDialog();
+          openWorkflowDetail(wfId, verId, "Imported workflow created");
+        },
+      }),
+    ]));
+    return wrap;
+  }
+
   // ── Detail data loading ─────────────────────────────────────────────────
 
   async function loadDetailData() {
@@ -885,6 +1547,7 @@ export function renderWorkflows(state, context) {
     // Dependencies payload has top-level models/custom_nodes/summary (no
     // wrapper key). Keep null on failure — the section shows a fallback note.
     _view.data.dependencies = depResp && depResp.status === "ok" ? depResp : null;
+    _recordDependencyUsage(_view.data.dependencies);
     render();
   }
 
@@ -902,6 +1565,7 @@ export function renderWorkflows(state, context) {
     _view.data.presets = [];
     _view.data.mapping = null;
     _view.data.dependencies = null;
+    _resetPortabilityState();
     render();
     loadVersionData();
   }
@@ -982,7 +1646,11 @@ export function renderWorkflows(state, context) {
     }
 
     if (!wf) {
-      wrap.appendChild(el("div", { class: "comfymodal-studio-workflows-empty", text: "Loading workflow\u2026" }));
+      wrap.appendChild(renderLoadingState({
+        label: "Loading workflow\u2026",
+        size: "page",
+        testid: "workflow-detail-loading",
+      }));
       return wrap;
     }
 
@@ -991,6 +1659,7 @@ export function renderWorkflows(state, context) {
     wrap.appendChild(renderRunBar(version, presets, mapping));
     wrap.appendChild(renderVersionsSection(wf));
     if (version) wrap.appendChild(renderDependenciesSection(version));
+    if (version) wrap.appendChild(renderPortabilitySection(version));
     wrap.appendChild(renderMappingSection(wf, version));
     wrap.appendChild(renderPresetsSection(wf, version, presets));
     if (_view.data.copyResults) wrap.appendChild(renderCopyResults());
@@ -1000,7 +1669,10 @@ export function renderWorkflows(state, context) {
   function renderDetailHeader(wf) {
     const card = el("div", { class: "comfymodal-studio-workflow-detail-header" });
     card.appendChild(el("div", { class: "comfymodal-studio-workflow-detail-title-row" }, [
-      el("h1", { class: "comfymodal-studio-workflow-detail-title", "data-testid": "workflow-detail-name", text: wf.name || "Untitled workflow" }),
+      // I1 heading hierarchy: the shell header is the app's single h1 and the
+      // library page title is an h2, so the workflow name is an h3 (was h1).
+      // Text, test id, dialog labeling role and styling are unchanged.
+      el("h3", { class: "comfymodal-studio-workflow-detail-title", "data-testid": "workflow-detail-name", text: wf.name || "Untitled workflow" }),
       renderFavoriteButton(wf, false),
       el("button", {
         class: "comfymodal-secondary-btn",
@@ -1017,6 +1689,7 @@ export function renderWorkflows(state, context) {
     card.appendChild(el("div", { class: "comfymodal-studio-workflow-detail-meta" }, [
       el("span", { "data-testid": "workflow-detail-folder", text: wf.folder || "No folder" }),
       wf.updated_at ? el("span", { text: "Updated " + _shortDate(wf.updated_at) }) : null,
+      _view.selectedVersionId ? renderDetailPortabilityChip() : null,
     ]));
 
     if (wf.description) {
@@ -1053,7 +1726,7 @@ export function renderWorkflows(state, context) {
   }
 
   function renderTagChip(wf, tag) {
-    return el("span", { class: "comfymodal-studio-wf-chip" }, [
+    return el("span", { class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral" }, [
       el("span", { text: tag }),
       el("button", {
         type: "button",
@@ -1160,7 +1833,11 @@ export function renderWorkflows(state, context) {
     let enabled = false;
     const reasons = [];
     if (!version) {
-      info.appendChild(el("span", { class: "comfymodal-studio-run-bar-hint", text: "Loading selected version\u2026" }));
+      info.appendChild(renderLoadingState({
+        label: "Loading selected version\u2026",
+        size: "inline",
+        testid: "workflow-version-loading",
+      }));
     } else {
       const runnable = !!(version.state && version.state.runnable === true);
       const hasPresets = (presets || []).length > 0;
@@ -1296,7 +1973,49 @@ export function renderWorkflows(state, context) {
   function renderDependenciesSection(version) {
     // Thin wrapper: the section body lives in studio-model-library.js; the
     // Refresh button re-fetches the dependencies endpoint for this version.
-    return renderDependencySection(version, _view.data.dependencies, refreshDependencies);
+    return renderDependencySection(version, _view.data.dependencies, refreshDependencies, {
+      apiBase,
+      onFindInLibrary: openModelLibraryFiltered,
+      onFindInRegistry: openRegistryFiltered,
+    });
+  }
+
+  // Contextual handoff (H7 parity): a missing dependency row opens the single
+  // Model Library view with the search prefilled to that filename.  No second
+  // model-management implementation and no new persistence — just a filter on
+  // the canonical library list.
+  function openModelLibraryFiltered(query) {
+    const md = _ensureModelsData();
+    md.filters.query = String(query || "");
+    md._queryDirty = true; // Model Library re-fetches with the prefilled filter
+    md._modelHighlight = String(query || ""); // exact-match highlight when loaded
+    md._registryFocus = "";
+    _view.mode = "models";
+    render();
+  }
+
+  // I6 parity extension: a MISSING custom-node dependency row opens the same
+  // Model Library surface, scoped to its custom-node registry section with a
+  // client-side name/class filter and an exact-match highlight.  Navigation
+  // only — nothing is installed, requested, or fetched automatically.
+  function openRegistryFiltered(nodeName) {
+    const md = _ensureModelsData();
+    md._registryFocus = String(nodeName || "");
+    md._modelHighlight = "";
+    _view.mode = "models";
+    render();
+  }
+
+  function _ensureModelsData() {
+    return _view.modelsData || (_view.modelsData = {
+      models: [],
+      scanHint: "not_scanned",
+      filters: { query: "", type: "", state: "" },
+      types: [],
+      customNodes: [],
+      loading: false,
+      _loaded: false,
+    });
   }
 
   async function refreshDependencies() {
@@ -1305,7 +2024,201 @@ export function renderWorkflows(state, context) {
     const resp = await getVersionDependencies(apiBase, verId);
     if (stale()) return;
     _view.data.dependencies = resp && resp.status === "ok" ? resp : null;
+    _recordDependencyUsage(_view.data.dependencies);
     render();
+  }
+
+  // ── Portability (Phase G12) ─────────────────────────────────────────────
+
+  function renderPortabilitySection(version) {
+    const wf = _view.data.workflow;
+    const section = renderPortabilityPanel({
+      report: _view.portability.report,
+      priorStale: _view.portability.priorStale,
+      error: _view.portability.error,
+      checking: _view.portability.checking,
+      workflowName: (wf && wf.name) || "",
+      versionNumber: version ? version.version_number : null,
+      versionId: _view.selectedVersionId,
+      exportBusy: _view.exportFlow.busy,
+      onCheck: checkPortability,
+      onExportRequest: toggleExportPopover,
+      onChecklist: downloadPortabilityChecklist,
+      onDeepLink: openPortabilityDeepLink,
+    });
+
+    if (_view.exportFlow.open) section.appendChild(renderExportPopover());
+    return section;
+  }
+
+  function renderExportPopover() {
+    const flow = _view.exportFlow;
+    const panel = el("div", { class: "comfymodal-studio-confirm-panel", "data-testid": "portability-export-popover" });
+    panel.appendChild(el("p", {
+      text: "Download this version's Studio Workflow Manifest (.workflow.json). Presets are only included when explicitly chosen.",
+      style: "margin:0 0 8px;",
+    }));
+    if (flow.done) {
+      panel.appendChild(el("p", {
+        "data-testid": "portability-export-done",
+        text: flow.done,
+        style: "margin:0 0 8px;color:#4ade80;",
+      }));
+    }
+    if (flow.error) {
+      panel.appendChild(el("p", {
+        class: "comfymodal-studio-portability-export-error",
+        "data-testid": "portability-export-error",
+        role: "status",
+        text: flow.error,
+        style: "margin:0 0 8px;color:#f87171;",
+      }));
+    }
+    const cb = el("input", {
+      type: "checkbox",
+      class: "comfymodal-studio-wf-checkbox",
+      "data-testid": "portability-export-include-presets",
+      onchange: (e) => { flow.includePresets = !!e.currentTarget.checked; },
+    });
+    cb.checked = flow.includePresets;
+    panel.appendChild(el("label", {
+      style: "display:flex;align-items:center;gap:6px;margin-bottom:10px;",
+    }, [cb, el("span", { text: "Include workflow presets" })]));
+    panel.appendChild(el("div", { class: "comfymodal-studio-dialog-actions", style: "justify-content:flex-start;" }, [
+      el("button", {
+        type: "button",
+        class: "comfymodal-primary-btn",
+        "data-testid": "portability-export-confirm",
+        text: flow.busy ? "Exporting\u2026" : "Confirm export",
+        disabled: flow.busy,
+        "aria-busy": flow.busy ? "true" : "false",
+        onclick: confirmManifestExport,
+      }),
+      el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        text: "Cancel",
+        onclick: () => { flow.open = false; render(); },
+      }),
+    ]));
+    return panel;
+  }
+
+  function toggleExportPopover() {
+    _view.exportFlow.open = !_view.exportFlow.open;
+    _view.exportFlow.error = "";
+    render();
+  }
+
+  /** Issue deep links reuse existing product surfaces only. */
+  function openPortabilityDeepLink(target) {
+    if (target === "models") {
+      _view.mode = "models";
+      render();
+    }
+  }
+
+  async function confirmManifestExport() {
+    const flow = _view.exportFlow;
+    const verId = _view.selectedVersionId;
+    if (!verId || flow.busy) return;
+    flow.busy = true;
+    flow.error = "";
+    flow.done = "";
+    render();
+    const includePresets = flow.includePresets;
+    const result = await fetchWorkflowManifestExport(apiBase, verId, includePresets);
+    if (stale()) return;
+    flow.busy = false;
+    if (!result.ok) {
+      let message = "Export failed: " + result.message;
+      if (result.status === 409) {
+        message =
+          "Export was blocked to avoid embedding credential-like values in the manifest. " +
+          "Remove the credential-like values from the workflow and try again.";
+      } else if (result.status === 404) {
+        message = "Export failed: this workflow version no longer exists.";
+      } else if (!result.status) {
+        message = "Export failed: network error.";
+      }
+      flow.error = message;
+      render();
+      const btn = root.querySelector('[data-testid="portability-export-button"]');
+      if (btn) btn.focus();
+      return;
+    }
+    const filename = result.filename || ("workflow-v" + verId + ".workflow.json");
+    triggerBrowserDownload(result.blob, filename);
+    flow.done = "Downloaded " + filename;
+    flow.open = true;
+    render();
+  }
+
+  function triggerBrowserDownload(blob, filename) {
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      if (a.parentNode) a.parentNode.removeChild(a);
+      URL.revokeObjectURL(objUrl);
+    }, 100);
+  }
+
+  function downloadPortabilityChecklist() {
+    const report = _view.portability.report;
+    const wf = _view.data.workflow;
+    const version = _view.data.version;
+    if (!report) return;
+    const md = buildPortabilityChecklist({
+      report,
+      workflowName: (wf && wf.name) || "Workflow",
+      versionNumber: version ? version.version_number : null,
+    });
+    const filename = buildChecklistFilename((wf && wf.name) || "workflow", version ? version.version_number : 0);
+    triggerBrowserDownload(new Blob([md], { type: "text/markdown" }), filename);
+  }
+
+  async function checkPortability() {
+    const verId = _view.selectedVersionId;
+    if (!verId || _view.portability.checking) return;
+    _view.portability.checking = true;
+    _view.portability.error = "";
+    render();
+    const resp = await getVersionPortability(apiBase, verId);
+    if (stale()) return;
+    _view.portability.checking = false;
+    const report = resp && resp.status === "ok" ? resp.portability : null;
+    if (!report || !report.version_id) {
+      const reason = resp && resp.message ? resp.message : "request failed";
+      _view.portability.error = "Could not check portability: " + reason + ".";
+      if (_view.portability.report) _view.portability.priorStale = true;
+      render();
+      const btn = root.querySelector('[data-testid="portability-check-button"]');
+      if (btn) btn.focus();
+      return;
+    }
+    _view.portability.report = report;
+    _view.portability.priorStale = false;
+    _view.portability.error = "";
+    render();
+    // Refresh the Workflow summary so the G11 cache-backed list/detail chips
+    // reflect the fresh report. Frontend never infers freshness itself.
+    try {
+      const wfResp = await getWorkflow(apiBase, _view.selectedWorkflowId);
+      if (stale()) return;
+      const wf = _unwrap(wfResp, "workflow");
+      if (wf && wf.workflow_id) {
+        _view.data.workflow = wf;
+        const libEntry = (_view.data.workflows || []).find(
+          (w) => w.workflow_id === wf.workflow_id
+        );
+        if (libEntry) libEntry.portability_summary = wf.portability_summary || null;
+        render();
+      }
+    } catch (e) { /* chip refresh is best-effort; the report already rendered */ }
   }
 
   // ── Mapping section ─────────────────────────────────────────────────────
@@ -1372,7 +2285,11 @@ export function renderWorkflows(state, context) {
       : ((_view.data.candidates && _view.data.candidates.entries) || []);
 
     if (!hasMapping && !_view.data.candidates) {
-      container.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "Loading mapping candidates\u2026" }));
+      container.appendChild(renderLoadingState({
+        label: "Loading mapping\u2026",
+        size: "inline",
+        testid: "mapping-loading",
+      }));
       return container;
     }
 
@@ -1591,7 +2508,7 @@ export function renderWorkflows(state, context) {
     }, [
       el("div", { class: "comfymodal-studio-wf-preset-card-top" }, [
         el("span", { class: "comfymodal-studio-wf-preset-card-name", "data-testid": "preset-card-name", text: p.name || "Unnamed preset" }),
-        p.is_default ? el("span", { class: "comfymodal-studio-wf-chip default", text: "Default" }) : null,
+        p.is_default ? el("span", { class: "comfymodal-studio-wf-chip default cm-chip", "data-tone": "running", text: "Default" }) : null,
         _stateBadge(state, "preset-card-state"),
       ]),
       p.description ? el("p", { class: "comfymodal-studio-wf-preset-card-desc", text: p.description }) : null,

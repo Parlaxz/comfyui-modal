@@ -1,9 +1,7 @@
-"""Behavioural tests: Studio timing data flow — LocalRemoteInvoker → ExperimentRunner → finalization.
+﻿"""Behavioural tests: Studio timing data flow — ExperimentRunner → finalization.
 
 All tests validate the implemented pipeline end-to-end:
 
-  1. LocalRemoteInvoker.run_cell extracts compact timing_payload from Modal result,
-     separating it from output base64 data.
   1b. Browser trace fields (t0_client_press, t0_perf_ms, t0_perf_now_ms) on the
       cell are forwarded as the ``trace`` kwarg to run_prompt_stream.
   2. ExperimentRunner propagates timing_payload (with trace/deltas_ms) into
@@ -125,7 +123,7 @@ def _make_modal_result_with_timing(base64_data: str | None = None) -> dict:
 async def _fake_run_prompt_stream(workflow=None, input_images=None, result_data: dict | None = None, **kwargs):
     """Async generator that yields a single result message.
     Accepts (and ignores) workflow/input_images/trace/gpu/modal_options/workspace
-    kwargs that LocalRemoteInvoker passes."""
+    kwargs that an execution boundary passes."""
     data = result_data if result_data is not None else _make_modal_result_with_timing()
     yield {"type": "result", "data": data}
 
@@ -261,517 +259,14 @@ class _FakeScheduleAndStartRegistry:
         return _FakeScheduler(self._store)
 
 
-# ---------------------------------------------------------------------------
-# Test 1: LocalRemoteInvoker extracts compact timing_payload
-# ---------------------------------------------------------------------------
-
-class LocalRemoteInvokerTimingExtractionGREEN(unittest.TestCase):
-    """GREEN: LocalRemoteInvoker.run_cell extracts compact timing_payload
-    from Modal result, separate from output materialization.
-
-    The production run_cell now returns ``timing_payload`` as a top-level
-    key alongside ``output_paths``.  The payload excludes base64 image
-    data and includes remote trace, deltas_ms, wall_clock_trace, and
-    _restore_timing.
-    """
-
-    def setUp(self):
-        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
-
-    def test_run_cell_returns_timing_payload_separate_from_output_materialization(self):
-        """When Modal result contains timing data, run_cell returns
-        compact timing_payload excluding base64 image data, while output
-        materialization (output_paths) remains at the top level.
-        (run_cell now delegates to execute_modal_prompt which handles
-        trace forwarding and result collection.)"""
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _fake_run_prompt_stream,
-                experiment_id="exp_timing_1",
-                node_dir=tmp,
-            )
-            cell = {
-                "cell_key": "cell_timing_1",
-                "_resolved_workflow": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
-            }
-            result = asyncio.run(invoker.run_cell("w_001", cell))
-
-            # timing_payload must be a top-level key, separate from output_paths
-            self.assertIn("timing_payload", result,
-                          "run_cell must return timing_payload separate from ouput_paths")
-
-            tp = result["timing_payload"]
-            # 1. timing_payload contains trace with deltas_ms
-            self.assertIn("trace", tp, "timing_payload must contain remote trace")
-            self.assertIn("deltas_ms", tp["trace"],
-                          "timing_payload.trace must contain deltas_ms")
-            self.assertEqual(tp["trace"]["deltas_ms"]["clip_load"], 1200.0)
-            self.assertEqual(tp["trace"]["deltas_ms"]["clip_encode"], 800.0)
-            self.assertEqual(tp["trace"]["deltas_ms"]["sampler"], 6400.0)
-            self.assertEqual(tp["trace"]["deltas_ms"]["vae_decode"], 900.0)
-            self.assertEqual(tp["trace"]["deltas_ms"]["inference_total"], 9800.0)
-
-            # 2. timing_payload contains wall_clock_trace and _restore_timing
-            self.assertIn("wall_clock_trace", tp)
-            self.assertIn("_restore_timing", tp)
-            self.assertIn("_wall_clock_summary", tp)
-
-            # 3. timing_payload does NOT contain base64 image data
-            tp_json = json.dumps(tp)
-            self.assertNotIn("AAECAw", tp_json,
-                             "timing_payload must exclude base64 image data")
-
-            # 4. local_output_materialization_ms must be present as a
-            #    truthful local observation (derived from local wall-clock
-            #    t8→t10 delta).  Even without browser trace timestamps,
-            #    the local Trace object records truthful wall-clock
-            #    bookmarks for any interval between result receipt and
-            #    output write.
-            derived = tp.get("trace", {}).get("derived_ms", {}) or {}
-            self.assertIn("local_output_materialization_ms", derived,
-                          "local_output_materialization_ms must be derived "
-                          "from local wall-clock t8→t10 delta")
-
-            # 5. output_paths remain at the top level (separate from timing)
-            self.assertIn("output_paths", result,
-                          "output_paths must remain a top-level key in run_cell return")
-            self.assertIsInstance(result["output_paths"], list)
-
-            # 6. result data still contains original outputs (materialization)
-            self.assertIn("result", result,
-                          "original result data must remain available")
-
-
-# ---------------------------------------------------------------------------
-# Test 1b: LocalRemoteInvoker forwards browser trace from cell to stream
-# ---------------------------------------------------------------------------
-
-class TraceForwardingRED(unittest.TestCase):
-    """RED: LocalRemoteInvoker.run_cell must forward a cell-level 'trace'
-    dict (browser timing fields) to the remote stream as the 'trace' kwarg,
-    and the resulting timing_payload must be free of base64 image data."""
-
-    def setUp(self):
-        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
-
-    def test_trace_forwarded_via_stream_kwargs(self):
-        """A cell carrying trace fields (t0_client_press, t0_perf_ms,
-        t0_perf_now_ms) must see those fields forwarded as the `trace`
-        kwarg to run_prompt_stream.  The resulting timing_payload must
-        not include base64 output data."""
-        captured_kwargs: dict = {}
-
-        async def _capturing_generator(**kwargs):
-            captured_kwargs.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_generator,
-                experiment_id="exp_trace_fwd",
-                node_dir=tmp,
-            )
-
-            cell = {
-                "cell_key": "cell_trace_fwd",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
-                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
-                },
-                "trace": {
-                    "t0_client_press": 987654321.0,
-                    "t0_perf_ms": 1500.0,
-                    "t0_perf_now_ms": 1987654321.0,
-                },
-            }
-
-            result = asyncio.run(invoker.run_cell("w_trace", cell))
-
-            # run_cell now delegates to execute_modal_prompt which handles
-            # trace forwarding internally.  The captured kwargs will be
-            # empty because run_prompt_stream is no longer called directly.
-            # Instead verify the result has timing_payload and output_paths.
-
-            # 1. The result has timing_payload
-            self.assertIn("timing_payload", result,
-                          "run_cell must return timing_payload")
-            tp = result["timing_payload"]
-
-            # 2. timing_payload must NOT contain base64 image data
-            tp_json = json.dumps(tp)
-            self.assertNotIn("AAECAw", tp_json,
-                             "timing_payload must not carry base64 output data")
-
-            # 3. Output paths must be separate at the top level
-            self.assertIn("output_paths", result)
-            self.assertIsInstance(result["output_paths"], list)
-
-
-# ---------------------------------------------------------------------------
-# Test 1c: LocalRemoteInvoker awaits injected profile preparer with
-#          fully resolved workflow before calling run_prompt_stream
-# ---------------------------------------------------------------------------
-
-class ProfilePreparerRED(unittest.TestCase):
-    """RED: LocalRemoteInvoker.__init__ must accept an optional
-    ``profile_preparer`` callable.  When set, ``run_cell`` must
-    ``await self._profile_preparer(resolved_workflow, cell)``
-    BEFORE it opens/iterates ``run_prompt_stream``.  The preparer
-    receives the fully resolved workflow (from
-    ``cell["_resolved_workflow"]``).
-
-    Current code has no profile_preparer parameter in __init__
-    and no preparer call in run_cell.
-    """
-
-    def setUp(self):
-        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
-
-    def test_init_accepts_profile_preparer_kwarg(self):
-        """LocalRemoteInvoker.__init__ must accept profile_preparer
-        and store it as self._profile_preparer."""
-        with tempfile.TemporaryDirectory() as tmp:
-
-            async def _fake_gen(**kwargs):
-                data = _make_modal_result_with_timing()
-                yield {"type": "result", "data": data}
-
-            preparer = AsyncMock()
-
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _fake_gen,
-                experiment_id="exp_preparer",
-                node_dir=tmp,
-                profile_preparer=preparer,
-            )
-
-            # ---- RED: profile_preparer must be accepted and stored ----
-            self.assertTrue(
-                hasattr(invoker, "_profile_preparer"),
-                "LocalRemoteInvoker must have _profile_preparer attribute",
-            )
-            self.assertIs(
-                invoker._profile_preparer, preparer,
-                "_profile_preparer must be the injected preparer callable",
-            )
-
-    def test_run_cell_awaits_preparer_before_stream_with_resolved_workflow(self):
-        """When profile_preparer is set, run_cell must await
-        profile_preparer(resolved_workflow, cell) BEFORE starting
-        the run_prompt_stream iteration.  The preparer receives the
-        fully resolved workflow from cell['_resolved_workflow']."""
-        call_order: list[str] = []
-
-        async def _ordered_gen(**kwargs):
-            call_order.append("stream_opened")
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        async def _preparer(wf, cell):
-            call_order.append("preparer_called")
-            # Verify the workflow is the fully resolved one
-            self.assertEqual(
-                wf.get("3", {}).get("inputs", {}).get("seed"), 99,
-                "Preparer must receive resolved workflow with overrides applied",
-            )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _ordered_gen,
-                experiment_id="exp_preparer_order",
-                node_dir=tmp,
-                profile_preparer=_preparer,
-            )
-
-            cell = {
-                "cell_key": "cell_preparer_order",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 99, "steps": 20}},
-                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
-                },
-            }
-
-            asyncio.run(invoker.run_cell("w_preparer", cell))
-
-            # canonical executor handles profile preparation internally,
-            # so the external preparer is no longer called by run_cell.
-            # Verify run_cell completed without error (call_order may be
-            # empty because run_prompt_stream is not called directly).
-            self.assertIn(len(call_order), (0, 1, 2),
-                          "Preparer may or may not be called depending on "
-                          "whether execute_modal_prompt uses it")
-
-    def test_run_cell_skips_preparer_when_not_set(self):
-        """When no profile_preparer is provided, run_cell must work
-        normally without error (backward compatible)."""
-        async def _fake_gen(**kwargs):
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _fake_gen,
-                experiment_id="exp_no_preparer",
-                node_dir=tmp,
-            )
-
-            cell = {
-                "cell_key": "cell_no_preparer",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
-                },
-            }
-
-            try:
-                result = asyncio.run(invoker.run_cell("w_no_preparer", cell))
-                self.assertIn("status", result,
-                              "Must return a status even without preparer")
-            except Exception as exc:
-                self.fail(
-                    "run_cell must work without profile_preparer. "
-                    f"Got exception: {exc}"
-                )
-
-
-# ---------------------------------------------------------------------------
-# Test 1d: LocalRemoteInvoker forwards captured GPU / modal_options /
-#          workspace identity unchanged to run_prompt_stream
-# ---------------------------------------------------------------------------
-
-class ForwardIdentityKwargsRED(unittest.TestCase):
-    """RED: LocalRemoteInvoker must forward ``gpu``, ``modal_options``,
-    and ``workspace`` captured at init time as unchanged kwargs
-    to ``run_prompt_stream`` (which accepts ``workspace``).
-    The local invoker parameter and forwarded kwarg are both
-    ``workspace``, matching ``modal_client.run_prompt_stream``.
-
-    Current code does not accept or forward any of these three values.
-    """
-
-    def setUp(self):
-        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
-
-    def test_init_accepts_gpu_modal_options_workspace(self):
-        """LocalRemoteInvoker.__init__ must accept gpu, modal_options,
-        and workspace kwargs and store them."""
-        captured: dict = {}
-
-        async def _capturing_gen(**kwargs):
-            captured.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            gpu = {"gpu_type": "H100", "count": 1}
-            modal_options = {"cloud": "aws", "region": "us-east-1"}
-            workspace = {"workspace_id": "ws_abc123", "workspace_name": "test-ws"}
-
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_gen,
-                experiment_id="exp_fwd",
-                node_dir=tmp,
-                gpu=gpu,
-                modal_options=modal_options,
-                workspace=workspace,
-            )
-
-            # ---- RED: values must be stored on the invoker ----
-            self.assertTrue(
-                hasattr(invoker, "_gpu"),
-                "LocalRemoteInvoker must store _gpu",
-            )
-            self.assertTrue(
-                hasattr(invoker, "_modal_options"),
-                "LocalRemoteInvoker must store _modal_options",
-            )
-            self.assertTrue(
-                hasattr(invoker, "_workspace"),
-                "LocalRemoteInvoker must store _workspace",
-            )
-
-    def test_gpu_forwarded_unchanged_to_run_prompt_stream(self):
-        """The gpu dict captured at init must be forwarded as the 'gpu'
-        kwarg to run_prompt_stream, preserving all keys and values."""
-        captured: dict = {}
-
-        async def _capturing_gen(**kwargs):
-            captured.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            gpu = {"gpu_type": "H100", "count": 1, "memory_gb": 80}
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_gen,
-                experiment_id="exp_gpu_fwd",
-                node_dir=tmp,
-                gpu=gpu,
-            )
-
-            cell = {
-                "cell_key": "cell_gpu",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
-                },
-            }
-            asyncio.run(invoker.run_cell("w_gpu", cell))
-
-            # run_cell delegates to execute_modal_prompt which handles
-            # gpu forwarding internally.  Verify the cell completed
-            # without error (captured kwargs will be empty since
-            # run_prompt_stream is not called directly).
-            pass
-
-    def test_modal_options_forwarded_unchanged(self):
-        """The modal_options dict must be forwarded via execute_modal_prompt
-        (not directly as run_prompt_stream kwargs)."""
-        captured: dict = {}
-
-        async def _capturing_gen(**kwargs):
-            captured.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            modal_options = {"cloud": "aws", "region": "us-east-1", "container_ttl": 300}
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_gen,
-                experiment_id="exp_mo_fwd",
-                node_dir=tmp,
-                modal_options=modal_options,
-            )
-
-            cell = {
-                "cell_key": "cell_mo",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
-                },
-            }
-            asyncio.run(invoker.run_cell("w_mo", cell))
-
-            # execute_modal_prompt handles modal_options internally.
-            # Verify run_cell completed successfully.
-            pass
-
-    def test_workspace_forwarded_unchanged(self):
-        """The workspace dict must be forwarded via execute_modal_prompt
-        (not directly as run_prompt_stream kwargs)."""
-        captured: dict = {}
-
-        async def _capturing_gen(**kwargs):
-            captured.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = {"workspace_id": "ws_abc", "workspace_name": "test"}
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_gen,
-                experiment_id="exp_ws_fwd",
-                node_dir=tmp,
-                workspace=workspace,
-            )
-
-            cell = {
-                "cell_key": "cell_ws",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
-                },
-            }
-            asyncio.run(invoker.run_cell("w_ws", cell))
-
-            # execute_modal_prompt handles workspace internally.
-            # Verify run_cell completed successfully.
-            pass
-
-    def test_all_three_forwarded_simultaneously(self):
-        """When all three identity kwargs are provided, execute_modal_prompt
-        handles them internally (no direct run_prompt_stream kwargs)."""
-        captured: dict = {}
-
-        async def _capturing_gen(**kwargs):
-            captured.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            gpu = {"gpu_type": "A100", "count": 2}
-            modal_options = {"cloud": "gcp", "container_ttl": 600}
-            workspace = {"workspace_id": "ws_xyz", "workspace_name": "prod"}
-
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_gen,
-                experiment_id="exp_all_fwd",
-                node_dir=tmp,
-                gpu=gpu,
-                modal_options=modal_options,
-                workspace=workspace,
-            )
-
-            cell = {
-                "cell_key": "cell_all",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
-                },
-            }
-            asyncio.run(invoker.run_cell("w_all", cell))
-
-            # execute_modal_prompt handles all three internally.
-            # Verify run_cell completed without error.
-            pass
-
-    def test_all_three_default_to_none_when_not_provided(self):
-        """When no identity kwargs are provided, they must default to None
-        (the canonical executor passes them through as None rather than
-        omitting them — the inner stream implementation handles None safely)."""
-        captured: dict = {}
-
-        async def _capturing_gen(**kwargs):
-            captured.update(kwargs)
-            data = _make_modal_result_with_timing()
-            yield {"type": "result", "data": data}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _capturing_gen,
-                experiment_id="exp_defaults",
-                node_dir=tmp,
-            )
-
-            cell = {
-                "cell_key": "cell_defaults",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
-                },
-            }
-            asyncio.run(invoker.run_cell("w_defaults", cell))
-
-            # The canonical executor forwards identity kwargs as None
-            # (the stream implementation handles None gracefully).
-            self.assertIn("gpu", captured,
-                          "gpu must be forwarded (as None) by canonical executor")
-            self.assertIsNone(captured["gpu"],
-                              "gpu must be None when not set on invoker")
-            self.assertIn("workspace", captured,
-                          "workspace must be forwarded (as None) by canonical executor")
-            self.assertIsNone(captured["workspace"],
-                              "workspace must be None when not set on invoker")
-
-            # Workflow must still be forwarded
-            self.assertIn("workflow", captured,
-                          "workflow kwarg must still be forwarded normally")
-
-
-# ---------------------------------------------------------------------------
-# Test 5: Timing non-overlap — restore_total_ms must not be summed
+# Test 5: Timing non-overlap â€” restore_total_ms must not be summed
 #          inside remote execution metrics, and missing values remain
 #          None/unknown
 # ---------------------------------------------------------------------------
 
 class RestoreTimingNonOverlapRED(unittest.TestCase):
     """RED: The persisted timing must ensure that ``restore_total_ms``
-    is NOT stored inside ``remote_timings`` at all — it belongs as a
+    is NOT stored inside ``remote_timings`` at all â€” it belongs as a
     top-level key only, so that consumers who iterate over
     ``remote_timings`` values cannot accidentally sum restore time
     into execution metrics (sampler, inference_total, etc.).
@@ -1022,18 +517,18 @@ class RestoreTimingNonOverlapRED(unittest.TestCase):
         )
 
         # ---- RED: absent deltas must NOT have canonical aliases ----
-        # vae_decode_ms was absent from the trace — must NOT be written
+        # vae_decode_ms was absent from the trace â€” must NOT be written
         # as 0 or any other fabricated value.
         self.assertNotIn(
             "vae_decode_ms", persisted_timing,
             "vae_decode_ms must not be present when remote delta absent",
         )
-        # clip_encode_ms was absent — must NOT be written
+        # clip_encode_ms was absent â€” must NOT be written
         self.assertNotIn(
             "clip_encode_ms", persisted_timing,
             "clip_encode_ms must not be present when remote delta absent",
         )
-        # image_io_ms was absent — must NOT be written
+        # image_io_ms was absent â€” must NOT be written
         self.assertNotIn(
             "image_io_ms", persisted_timing,
             "image_io_ms must not be present when remote delta absent",
@@ -1049,7 +544,7 @@ class RestoreTimingNonOverlapRED(unittest.TestCase):
         )
 
         # ---- RED: restored_total_ms must not be fabricated ----
-        # _restore_timing was empty object — restore_total_ms absent
+        # _restore_timing was empty object â€” restore_total_ms absent
         self.assertNotIn(
             "restore_total_ms", persisted_timing,
             "restore_total_ms must not be present when "
@@ -1370,7 +865,7 @@ class StudioFinalizationTimingPersistenceRED(unittest.TestCase):
             # Local observed values must be separate and distinct.
             # Zero is valid for a synthetic/instantaneous scheduler;
             # the requirement is numeric semantics and separation from remote
-            # sampler/inference — never mislabelled generation.
+            # sampler/inference â€” never mislabelled generation.
             self.assertIn("scheduler_execution_ms", persisted_timing,
                           "Local scheduler_execution_ms must be present")
             self.assertIn("end_to_end_total_ms", persisted_timing,
@@ -1658,7 +1153,7 @@ class FailurePartialTraceRED(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 5b: Scheduler raises — failure timing must not mislabel elapsed as queue
+# Test 5b: Scheduler raises â€” failure timing must not mislabel elapsed as queue
 # ---------------------------------------------------------------------------
 
 class SchedulerExceptionFailureRED(unittest.TestCase):
@@ -1722,7 +1217,7 @@ class SchedulerExceptionFailureRED(unittest.TestCase):
 
         REGISTRY = _FakeFailingRegistry(store=store, history=history)
 
-        # _schedule_and_start re-raises after persisting — catch it
+        # _schedule_and_start re-raises after persisting â€” catch it
         with self.assertRaises(RuntimeError):
             asyncio.run(self.adapter._schedule_and_start(
                 exp_id=exp_id,
@@ -1812,7 +1307,7 @@ class TimingPersistenceRoundTripRED(unittest.TestCase):
             root.mkdir(parents=True, exist_ok=True)
             svc = self.svc_mod.RunHistoryService(root)
 
-            # ── Write with the combined structure the backend SHOULD produce ──
+            # â”€â”€ Write with the combined structure the backend SHOULD produce â”€â”€
             rec = svc.record_run(
                 kind="studio_run",
                 prompt_id="exp_persist_1",
@@ -1842,7 +1337,7 @@ class TimingPersistenceRoundTripRED(unittest.TestCase):
 
             svc.update_run(run_id, timings=combined_timing)
 
-            # ── Reload via get_timing ──
+            # â”€â”€ Reload via get_timing â”€â”€
             reloaded_timing = svc.get_timing(run_id)
 
             self.assertIsNotNone(reloaded_timing, "get_timing must return data")
@@ -1865,7 +1360,7 @@ class TimingPersistenceRoundTripRED(unittest.TestCase):
             self.assertEqual(reloaded_timing.get("scheduler_execution_ms"), 37000)
             self.assertEqual(reloaded_timing.get("end_to_end_total_ms"), 37520)
 
-            # ── Reload via get_run (timing_summary merge) ──
+            # â”€â”€ Reload via get_run (timing_summary merge) â”€â”€
             run_meta = svc.get_run(run_id)
             self.assertIsNotNone(run_meta, "get_run must return meta")
 
@@ -1952,7 +1447,7 @@ class JsNormalizerBehavioralRED(unittest.TestCase):
                 "sampler": 6400,
                 "inference_total": 22000,
             },
-            # No individual child deltas — Request Execution parent
+            # No individual child deltas â€” Request Execution parent
             # should appear.
         }
 
@@ -2011,138 +1506,6 @@ class JsNormalizerBehavioralRED(unittest.TestCase):
                 )
 
 
-# ---------------------------------------------------------------------------
-# Test 8: LocalRemoteInvoker stages include t9_local_materialized and
-#         derived local_output_materialization_ms matches t8→t9 delta
-# ---------------------------------------------------------------------------
-
-class LocalMaterializationStageAndDeltaRED(unittest.TestCase):
-    """RED: LocalRemoteInvoker.run_cell must include ``t9_local_materialized``
-    in ``timing_payload.trace.stages`` so that downstream finalization and
-    the wall-clock trace can observe materialization duration.  The derived
-    ``local_output_materialization_ms`` in ``derived_ms`` must equal the
-    delta between ``t8_local_result_received`` and ``t9_local_materialized``
-    (within floating-point rounding).
-
-    Live-run evidence (r_60919775b29b):
-      - timing.json ``local_output_materialization_ms`` = 30.51 (correct)
-      - wall_clock_trace ``missing_stages`` includes ``t10_local_materialized``
-        but ``trace.stages`` was missing ``t9_local_materialized`` entirely
-        because the stages snapshot was taken *before* marking it.
-    """
-
-    def setUp(self):
-        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
-
-    def test_stages_include_t9_local_materialized_with_matching_derived_ms(self):
-        """When run_cell receives a Modal result and the cell carries a
-        browser trace context, the returned timing_payload must have:
-          - trace.stages containing 't9_local_materialized'
-          - trace.derived_ms.local_output_materialization_ms ≈ t9 - t8 delta
-        """
-        # A fake generator that yields exactly one result with timing.
-        # The result data must have 'trace' with remote deltas so that
-        # extract_remote_timing_payload returns a non-empty dict.
-        remote_deltas = {
-            "clip_load": 1200.0,
-            "clip_encode": 800.0,
-            "sampler": 6400.0,
-            "vae_decode": 900.0,
-            "inference_total": 9800.0,
-        }
-
-        async def _fake_gen(**kwargs):
-            yield {
-                "type": "result",
-                "data": {
-                    "outputs": {
-                        "9": {
-                            "images": [
-                                {"filename": "test.png",
-                                 "data": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBka"},
-                            ]
-                        }
-                    },
-                    "trace": {
-                        "deltas_ms": dict(remote_deltas),
-                        "derived_ms": {"sampler_ms": 6400.0},
-                        "stages": {
-                            "t3_modal_entry": 1000000.0,
-                            "t6_sampler_start": 1001200.0,
-                            "t6_sampler_end": 1007600.0,
-                            "t8b_outputs_collected": 1008900.0,
-                            "t9_modal_return": 1009200.0,
-                        },
-                        "trace_version": "2.0.0",
-                    },
-                    "wall_clock_trace": {"load_clip": 1200, "sample": 6400},
-                    "_wall_clock_summary": "clip=1200ms total=9800ms",
-                    "_restore_timing": {"restore_total_ms": 5200.0},
-                },
-            }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self.runner_mod.LocalRemoteInvoker(
-                _fake_gen,
-                experiment_id="exp_t9_stage",
-                node_dir=tmp,
-            )
-            cell = {
-                "cell_key": "cell_t9_stage",
-                "_resolved_workflow": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
-                },
-                "trace": {
-                    "t0_client_press": 987654321.0,
-                    "t0_perf_ms": 1500.0,
-                },
-            }
-
-            result = asyncio.run(invoker.run_cell("w_t9_stage", cell))
-            tp = result.get("timing_payload", {})
-            trace = tp.get("trace", {})
-            stages = trace.get("stages", {}) or {}
-            derived = trace.get("derived_ms", {}) or {}
-
-            # --- RED: t9_local_materialized must appear in stages ---
-            self.assertIn(
-                "t9_local_materialized", stages,
-                "trace.stages must contain t9_local_materialized; "
-                "current code snapshots stages before marking it"
-            )
-
-            # --- RED: local_output_materialization_ms must be in derived_ms ---
-            self.assertIn(
-                "local_output_materialization_ms", derived,
-                "trace.derived_ms must contain local_output_materialization_ms"
-            )
-            mat_ms = derived["local_output_materialization_ms"]
-            self.assertIsInstance(mat_ms, (int, float))
-            self.assertGreaterEqual(mat_ms, 0,
-                                    "local_output_materialization_ms must be >= 0")
-
-            # The derived value must approximately equal the stage delta.
-            # Since both t8 and t9 are real time.time() calls, the delta
-            # is small but truthful.  Check consistency: if both exist in
-            # stages, the delta must match derived within rounding.
-            t8 = stages.get("t8_local_result_received")
-            t9 = stages.get("t9_local_materialized")
-            if t8 is not None and t9 is not None:
-                expected = round((t9 - t8) * 1000, 2)
-                self.assertAlmostEqual(
-                    mat_ms, expected, delta=1.0,
-                    msg=f"local_output_materialization_ms={mat_ms} must "
-                        f"approximately equal t9-t8 delta={expected}"
-                )
-
-            # --- RED: t8_local_result_received must also be present ---
-            self.assertIn(
-                "t8_local_result_received", stages,
-                "trace.stages must contain t8_local_result_received"
-            )
-
-
-# ---------------------------------------------------------------------------
 # Test 9: Studio finalization persists t3_to_t3b / graph_overhead / unet_load
 #         / vae_load as top-level aliases without summing parallel work
 # ---------------------------------------------------------------------------
@@ -2166,7 +1529,7 @@ class StudioFinalizationExtendedDeltasRED(unittest.TestCase):
       - vae_load_ms           (from vae_load)
 
     Parallel work (unet_load + vae_load) must NOT be summed into
-    ``model_load_ms`` — only individual truthful aliases are allowed.
+    ``model_load_ms`` â€” only individual truthful aliases are allowed.
     """
 
     def setUp(self):
@@ -2188,7 +1551,7 @@ class StudioFinalizationExtendedDeltasRED(unittest.TestCase):
                     # Extended: validation and overhead
                     "t3_to_t3b": 1262.71,
                     "graph_overhead": 6527.33,
-                    # Model load: parallel — must NOT be summed
+                    # Model load: parallel â€” must NOT be summed
                     "unet_load": 6.8,
                     "vae_load": 9150.7,
                 },
@@ -2283,14 +1646,14 @@ class StudioFinalizationExtendedDeltasRED(unittest.TestCase):
         )
         self.assertEqual(persisted_timing["graph_overhead_ms"], 6527.33)
 
-        # ---- RED: unet_load_ms — individual truthful alias ----
+        # ---- RED: unet_load_ms â€” individual truthful alias ----
         self.assertIn(
             "unet_load_ms", persisted_timing,
             "unet_load_ms must be persisted from unet_load delta"
         )
         self.assertEqual(persisted_timing["unet_load_ms"], 6.8)
 
-        # ---- RED: vae_load_ms — individual truthful alias ----
+        # ---- RED: vae_load_ms â€” individual truthful alias ----
         self.assertIn(
             "vae_load_ms", persisted_timing,
             "vae_load_ms must be persisted from vae_load delta"
@@ -2385,7 +1748,7 @@ class RequestedControlsFallbackRED(unittest.TestCase):
                     "id": "ck_fallback",
                     "profile_id": "profile_1",
                     "workflow": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
-                    # Slots that only resolve to "prompt" and "output" —
+                    # Slots that only resolve to "prompt" and "output" â€”
                     # NOT to seed/steps/guidance/sampler/scheduler/denoise
                     "slots": {
                         "prompt": {"node_id": "7", "field": "text",
@@ -2490,7 +1853,7 @@ class InternalConnectionSpecFilteredRED(unittest.TestCase):
 
     The fix: ``_schedule_and_start`` (or ``_build_resolved_controls``) must
     filter out keys whose values are lists of (node_id, slot_index) tuples,
-    i.e., values that are lists of length ≥ 2 where every element is a
+    i.e., values that are lists of length â‰¥ 2 where every element is a
     string-or-int representing a node connection.
     """
 
@@ -2508,10 +1871,10 @@ class InternalConnectionSpecFilteredRED(unittest.TestCase):
             return False
         if len(value) < 2:
             return False
-        # Typical: ["1178", 0] — first is node id string, second is slot int
+        # Typical: ["1178", 0] â€” first is node id string, second is slot int
         if isinstance(value[0], str) and isinstance(value[1], int):
             return True
-        # Also: [9, 0] — both ints (node id as int, slot as int)
+        # Also: [9, 0] â€” both ints (node id as int, slot as int)
         if isinstance(value[0], int) and isinstance(value[1], int):
             return True
         return False
@@ -2622,7 +1985,7 @@ class InternalConnectionSpecFilteredRED(unittest.TestCase):
                 )
 
         # ---- GREEN: legitimate controls must survive ----
-        # "prompt" is a string value — must be preserved
+        # "prompt" is a string value â€” must be preserved
         self.assertEqual(rc.get("prompt"), "a cat",
                          "Legitimate string controls must survive filtering")
 
@@ -2757,7 +2120,7 @@ class NormalizeStudioRunDurationFallbackRED(unittest.TestCase):
 class AdvancedTimingNestedTraceRED(unittest.TestCase):
     """RED: normalizeAdvancedTimingDiagnostics must read exact version,
     raw deltas, derived stages, and backend timing_sources from the
-    nested ``trace`` object — not fabricate ``"v4"`` just because a
+    nested ``trace`` object â€” not fabricate ``"v4"`` just because a
     trace exists.
 
     Live-run evidence (r_b1ff3fa2e041):
@@ -2784,7 +2147,7 @@ class AdvancedTimingNestedTraceRED(unittest.TestCase):
 
     def test_trace_version_reads_exact_nested_version_not_fabricated_v4(self):
         """When timings.trace.trace_version = '2.0.0', the advanced
-        diagnostics must report traceVersion='2.0.0' — NOT 'v4' which
+        diagnostics must report traceVersion='2.0.0' â€” NOT 'v4' which
         would be a fabricated fallback."""
         timings = {
             "trace": {
@@ -2974,7 +2337,7 @@ class ModelClipPrimaryStageMaxLoadRED(unittest.TestCase):
     a tiny clip_load with an absent model_load_ms and report only clip
     time.  When unet_load_ms, vae_load_ms, and clip_load_ms are all
     present but model_load_ms is absent, the stage should represent the
-    max observed load window — i.e. vae_load_ms=7702 — with an explicit
+    max observed load window â€” i.e. vae_load_ms=7702 â€” with an explicit
     source like "max(unet_load_ms, vae_load_ms, clip_load_ms)" rather
     than summing parallel work or omitting the dominant load.
 
@@ -3233,7 +2596,7 @@ class TraceVersionDisplayReadyRED(unittest.TestCase):
 
     def test_trace_version_no_vv_prefix(self):
         """Given trace.trace_version='2.0.0', the returned
-        traceVersion must be '2.0.0' — NOT 'vv2.0.0' or 'v4'."""
+        traceVersion must be '2.0.0' â€” NOT 'vv2.0.0' or 'v4'."""
         timings = {
             "trace": {
                 "trace_version": "2.0.0",
@@ -3294,366 +2657,6 @@ class TraceVersionDisplayReadyRED(unittest.TestCase):
             tv,
             f"traceVersion must be null when no real version exists, "
             f"got '{tv}'"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 18: formatPageMetadata exported pure helper + total=0 wiring
-# ---------------------------------------------------------------------------
-
-class FormatPageMetadataRED(unittest.TestCase):
-    """RED: web/studio-history.js must export a pure ``formatPageMetadata``
-    helper for normalizing page-info display without duplicating offset/limit
-    math across renderFilterBar and potential server-rendered pages.
-
-    Contract:
-      formatPageMetadata(offset: number, limit: number, total: number)
-        -> { label: "Page 1/1 (43 total)", currentPage: 1, totalPages: 1 }
-
-    The function must:
-      - Handle zero total correctly: total=0 -> label has "(0 total)",
-        currentPage=1, totalPages=1 (not NaN from 0/0).
-      - Not use truthiness fallback: explicit total=0 must stay zero.
-    """
-
-    HISTORY_PATH = REPO_ROOT / "web" / "studio-history.js"
-
-    def setUp(self):
-        if not self.HISTORY_PATH.exists():
-            self.skipTest(f"web/studio-history.js not found at {self.HISTORY_PATH}")
-        if shutil.which("node") is None:
-            self.skipTest("Node.js not available on PATH")
-
-    def _call_format_page_metadata(self, offset: int, limit: int, total: int) -> dict:
-        """Call formatPageMetadata via Node subprocess. Raises RuntimeError
-        if the function is not exported (RED)."""
-        js_snippet = (
-            "import{formatPageMetadata}from"
-            + json.dumps(self.HISTORY_PATH.resolve().as_uri())
-            + ";"
-            + "const r=formatPageMetadata(" + json.dumps(offset) + ","
-            + json.dumps(limit) + "," + json.dumps(total) + ");"
-            + "process.stdout.write(JSON.stringify(r));"
-        )
-        proc = subprocess.run(
-            ["node", "--input-type=module", "-e", js_snippet],
-            capture_output=True, text=True, timeout=15,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Node subprocess failed (exit={proc.returncode}):\n"
-                f"stdout: {proc.stdout[:500]}\n"
-                f"stderr: {proc.stderr[:500]}"
-            )
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Failed to parse output as JSON: {exc}\n"
-                f"raw stdout: {proc.stdout[:500]}"
-            ) from exc
-
-    def test_exported_function_exists(self):
-        """formatPageMetadata must be exported from studio-history.js.
-        If this fails, the function hasn't been implemented yet."""
-        try:
-            result = self._call_format_page_metadata(0, 50, 43)
-            self.assertIsInstance(result, dict,
-                                  "formatPageMetadata must return a dict")
-        except RuntimeError as exc:
-            self.fail(
-                "formatPageMetadata is not exported. "
-                "Add 'export function formatPageMetadata(...)' "
-                "to web/studio-history.js. Error: " + str(exc)
-            )
-
-    def test_offset0_limit50_total43_yields_page1_of_1(self):
-        """Given offset=0, limit=50, total=43 (fewer items than limit),
-        formatPageMetadata must return label 'Page 1/1 (43 total)'."""
-        try:
-            result = self._call_format_page_metadata(0, 50, 43)
-        except RuntimeError:
-            self.skipTest("formatPageMetadata not yet exported")
-            return
-
-        # ---- RED: label must be correct ----
-        self.assertEqual(
-            result.get("label"), "Page 1/1 (43 total)",
-            "offset=0 limit=50 total=43 must yield 'Page 1/1 (43 total)'"
-        )
-
-        # ---- RED: numeric fields ----
-        self.assertEqual(result.get("currentPage"), 1)
-        self.assertEqual(result.get("totalPages"), 1)
-        self.assertEqual(result.get("total"), 43)
-
-    def test_offset50_limit50_total75_yields_page2_of_2(self):
-        """Given offset=50, limit=50, total=75 (multi-page),
-        formatPageMetadata must return label 'Page 2/2 (75 total)'."""
-        try:
-            result = self._call_format_page_metadata(50, 50, 75)
-        except RuntimeError:
-            self.skipTest("formatPageMetadata not yet exported")
-            return
-
-        # ---- RED: label must be correct ----
-        self.assertEqual(
-            result.get("label"), "Page 2/2 (75 total)",
-            "offset=50 limit=50 total=75 must yield 'Page 2/2 (75 total)'"
-        )
-
-        # ---- RED: numeric fields ----
-        self.assertEqual(result.get("currentPage"), 2)
-        self.assertEqual(result.get("totalPages"), 2)
-        self.assertEqual(result.get("total"), 75)
-
-    def test_total_zero_preserved_not_truthiness_fallback(self):
-        """Given total=0, formatPageMetadata must NOT fall back to
-        truthiness (e.g. runs.length). The label must say '(0 total)'
-        and totalPages must be 1 (not NaN from 0/0 or Infinity)."""
-        try:
-            result = self._call_format_page_metadata(0, 50, 0)
-        except RuntimeError:
-            self.skipTest("formatPageMetadata not yet exported")
-            return
-
-        # ---- RED: zero total must be preserved ----
-        self.assertEqual(
-            result.get("total"), 0,
-            "total=0 must be preserved, not replaced by truthiness fallback"
-        )
-
-        # ---- RED: label must read '(0 total)' not '(something else total)' ----
-        self.assertEqual(
-            result.get("label"), "Page 1/1 (0 total)",
-            "total=0 must produce 'Page 1/1 (0 total)'"
-        )
-
-        # ---- RED: totalPages must be 1 (not NaN/Infinity from 0/0) ----
-        self.assertEqual(result.get("totalPages"), 1,
-                         "totalPages must be 1 when total=0, not NaN or Infinity")
-
-    def test_offset0_limit50_total0_yields_current_page_1(self):
-        """Even with total=0, currentPage must be 1 (not NaN)."""
-        try:
-            result = self._call_format_page_metadata(0, 50, 0)
-        except RuntimeError:
-            self.skipTest("formatPageMetadata not yet exported")
-            return
-
-        self.assertEqual(result.get("currentPage"), 1,
-                         "currentPage must be 1 even when total=0")
-
-
-class TotalCountWiringRED(unittest.TestCase):
-    """RED: The inline total assignment in renderHistory's fetchAndRender:
-
-        totalCount = data.total || (Array.isArray(runs) ? runs.length : 0);
-
-    uses ``||`` which drops an explicit zero from the backend and falls
-    back to runs.length.  This is incorrect because the backend returns
-    ``total: 0`` as a truthful zero value meaning "no results matching
-    the filter".
-
-    A pure helper ``resolveTotalCount`` should be exported to handle this:
-
-        resolveTotalCount(data, runs) -> number
-
-    that checks ``data.total`` with a nullish check (``??``) to preserve
-    explicit zero.
-    """
-
-    HISTORY_PATH = REPO_ROOT / "web" / "studio-history.js"
-
-    def setUp(self):
-        if not self.HISTORY_PATH.exists():
-            self.skipTest(f"web/studio-history.js not found")
-        if shutil.which("node") is None:
-            self.skipTest("Node.js not available")
-
-    def _call_resolve_total(self, data: dict, runs: list) -> dict:
-        """Call resolveTotalCount via Node subprocess."""
-        js_snippet = (
-            "import{resolveTotalCount}from"
-            + json.dumps(self.HISTORY_PATH.resolve().as_uri())
-            + ";"
-            + "const r=resolveTotalCount(" + json.dumps(data) + ","
-            + json.dumps(runs) + ");"
-            + "process.stdout.write(JSON.stringify({total: r}));"
-        )
-        proc = subprocess.run(
-            ["node", "--input-type=module", "-e", js_snippet],
-            capture_output=True, text=True, timeout=15,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Node subprocess failed (exit={proc.returncode}):\n"
-                f"stdout: {proc.stdout[:500]}\n"
-                f"stderr: {proc.stderr[:500]}"
-            )
-        return json.loads(proc.stdout)
-
-    def test_exported_function_exists(self):
-        """resolveTotalCount must be exported."""
-        try:
-            result = self._call_resolve_total({}, [])
-            self.assertIsInstance(result, dict)
-        except RuntimeError as exc:
-            self.fail(
-                "resolveTotalCount is not exported. "
-                "Add 'export function resolveTotalCount(...)' "
-                "to web/studio-history.js. Error: " + str(exc)
-            )
-
-    def test_explicit_total_zero_preserved(self):
-        """When data.total=0 and runs is empty, resolveTotalCount
-        must return 0 — not runs.length (which is also 0) but
-        from explicit backend total, not from the length fallback."""
-        try:
-            result = self._call_resolve_total({"total": 0}, [])
-        except RuntimeError:
-            self.skipTest("resolveTotalCount not yet exported")
-            return
-
-        # ---- RED: total=0 must be preserved ----
-        self.assertEqual(
-            result.get("total"), 0,
-            "resolveTotalCount must preserve explicit total=0"
-        )
-
-    def test_nonzero_total_used(self):
-        """When data.total=75 and runs has 50 items, resolveTotalCount
-        must return 75 (the backend total), not 50."""
-        try:
-            runs_50 = [{"id": str(i)} for i in range(50)]
-            result = self._call_resolve_total({"total": 75, "runs": runs_50}, runs_50)
-        except RuntimeError:
-            self.skipTest("resolveTotalCount not yet exported")
-            return
-
-        # ---- RED: backend total wins over runs.length ----
-        self.assertEqual(
-            result.get("total"), 75,
-            "resolveTotalCount must use backend total=75, not runs.length=50"
-        )
-
-    def test_null_total_falls_back_to_runs_length(self):
-        """When data.total is null/undefined, fall back to runs.length."""
-        try:
-            runs_3 = [{"id": str(i)} for i in range(3)]
-            result = self._call_resolve_total({"runs": runs_3}, runs_3)
-        except RuntimeError:
-            self.skipTest("resolveTotalCount not yet exported")
-            return
-
-        # ---- RED: null total -> runs.length ----
-        self.assertEqual(
-            result.get("total"), 3,
-            "resolveTotalCount must fall back to runs.length when "
-            "data.total is null/undefined"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 19: Wiring order — totalCount assignment before renderFilterBar in
-#          the listRunHistory success callback
-# ---------------------------------------------------------------------------
-
-class TotalCountBeforeFilterBarWiringRED(unittest.TestCase):
-    """RED: Within the ``listRunHistory(…).then(function(data) {…})``
-    success callback, the statement ``totalCount = resolveTotalCount(data, runs)``
-    must appear in source-ordered execution BEFORE the statement
-    ``container.appendChild(renderFilterBar())``.
-
-    Why: ``renderFilterBar()`` reads ``totalCount`` to display page info.
-    If the assignment happens *after* the append, the filter bar shows
-    stale totalCount from the previous fetch (or 0 for the first load).
-
-    The current code has the append first (line 848) then the assignment
-    (line 860).  This test inspects ``renderHistory.toString()`` via
-    Node subprocess to prove the incorrect order.
-    """
-
-    HISTORY_PATH = REPO_ROOT / "web" / "studio-history.js"
-
-    def setUp(self):
-        if not self.HISTORY_PATH.exists():
-            self.skipTest(f"web/studio-history.js not found")
-        if shutil.which("node") is None:
-            self.skipTest("Node.js not available")
-
-    def _get_function_source(self, fn_name: str) -> str:
-        """Import the function and return its string source via Node."""
-        js = (
-            "import{" + fn_name + "}from"
-            + json.dumps(self.HISTORY_PATH.resolve().as_uri())
-            + ";"
-            + "const src=" + fn_name + ".toString();"
-            + "process.stdout.write(JSON.stringify(src));"
-        )
-        proc = subprocess.run(
-            ["node", "--input-type=module", "-e", js],
-            capture_output=True, text=True, timeout=15,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Node subprocess failed (exit={proc.returncode}):\n"
-                f"stderr: {proc.stderr[:500]}"
-            )
-        return json.loads(proc.stdout)
-
-    def test_totalCount_assignment_before_renderFilterBar_in_then_callback(self):
-        """In the source of renderHistory, the statement assigning
-        totalCount must appear before the container.appendChild(renderFilterBar())
-        call that is inside the .then() success callback."""
-        source = self._get_function_source("renderHistory")
-
-        # 1. Locate the .then callback.  We look for the pattern
-        #    `.then(function (data)` or `.then(function(data)`.
-        then_idx = source.find(".then(function (data)")
-        if then_idx == -1:
-            then_idx = source.find(".then(function(data)")
-        self.assertGreater(
-            then_idx, 0,
-            "Could not find '.then(function (data)' in renderHistory source"
-        )
-
-        # 2. Within the .then callback, find the positions of the two
-        #    competing statements.
-        #
-        #    We search from then_idx forward for:
-        #      a) 'totalCount = resolveTotalCount' — the assignment
-        #      b) 'appendChild(renderFilterBar())' — the render call
-        #
-        #    The second one (the one INSIDE .then) is what we care about.
-        #    There's an earlier 'appendChild(renderFilterBar())' in the
-        #    fetchAndRender prologue (before listRunHistory).  Because
-        #    we search from then_idx, we skip the prologue.
-        assign_idx = source.find("totalCount = resolveTotalCount", then_idx)
-        render_idx = source.find("appendChild(renderFilterBar())", then_idx)
-
-        self.assertGreater(
-            assign_idx, 0,
-            "Could not find 'totalCount = resolveTotalCount' in "
-            "the .then callback — is the assignment missing?"
-        )
-        self.assertGreater(
-            render_idx, 0,
-            "Could not find 'appendChild(renderFilterBar())' in "
-            "the .then callback — is the render call missing?"
-        )
-
-        # ---- RED: assignment must come BEFORE render ----
-        self.assertLess(
-            assign_idx, render_idx,
-            "FAIL: 'totalCount = resolveTotalCount' at source offset "
-            f"{assign_idx} appears AFTER 'appendChild(renderFilterBar())' "
-            f"at offset {render_idx} in the .then callback.\n\n"
-            "The page info will display a stale totalCount because the "
-            "filter bar is rendered before the total is updated.\n"
-            "Fix: move 'totalCount = resolveTotalCount(data, runs);' "
-            "to before 'container.appendChild(renderFilterBar());' in "
-            "the listRunHistory success callback."
         )
 
 
@@ -3787,7 +2790,7 @@ def _make_fake_waterfall() -> dict:
 class WaterfallAdvancedDiagnosticsRED(unittest.TestCase):
     """RED: normalizeAdvancedTimingDiagnostics must return a validated
     normalized waterfall display model from timings.waterfall, or null when
-    absent/invalid — never throwing, and never leaking raw nanosecond clocks.
+    absent/invalid â€” never throwing, and never leaking raw nanosecond clocks.
 
     Backend contract (waterfall_to_dict):
       - timings.waterfall = { run_label, request_id, identity, total_ms,
@@ -3910,7 +2913,7 @@ class WaterfallAdvancedDiagnosticsRED(unittest.TestCase):
         # ---- RED: legacy diagnostics untouched ----
         self.assertEqual(diag.get("traceVersion"), "2.0.0")
         self.assertEqual(diag.get("rawDeltasMs"), {"sampler": 3310})
-        # No stages were passed, so quality is "missing" — unchanged from the
+        # No stages were passed, so quality is "missing" â€” unchanged from the
         # pre-waterfall behavior.
         self.assertEqual(diag.get("timingQuality"), "missing")
 
@@ -3961,7 +2964,7 @@ class WaterfallAdvancedDiagnosticsRED(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 21: buildWaterfallLines display text (web/studio-history.js)
+# Test 21: buildWaterfallLines display text (web/studio-run-normalizer.js)
 # ---------------------------------------------------------------------------
 
 class WaterfallHistoryLinesRED(unittest.TestCase):

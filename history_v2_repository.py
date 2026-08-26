@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -48,6 +48,37 @@ from history_v2_models import (
 from history_v2_store import HistoryV2Store
 
 _TERMINAL_RUN_STATUS_VALUES = frozenset(s.value for s in TERMINAL_RUN_STATUSES)
+
+# Generate Original (E3B2) retry rejection reason when no failed Original
+# Attempt is available to retry.
+REASON_NOT_RETRYABLE = "not_a_failed_original"
+
+# Single Resume (F1A) refusal reasons for ``create_single_resume_attempt``.
+RESUME_REASON_EXPERIMENT_CELL = "experiment_cell_generation"
+RESUME_REASON_NO_ATTEMPTS = "no_attempts"
+RESUME_REASON_COMPLETED = "generation_completed"
+RESUME_REASON_FAILED = "failed_requires_retry"
+RESUME_REASON_CANCELED = "canceled_not_resumable"
+RESUME_REASON_NOT_INTERRUPTED = "current_attempt_not_interrupted"
+
+
+@dataclass(frozen=True)
+class OriginalClaimOutcome:
+    """Result of the transactional Generate-Original decision.
+
+    ``outcome`` is one of ``created``, ``reused_active``,
+    ``reused_successful``, ``retry_required``, ``busy`` or
+    ``not_retryable``.  ``decision``/``reason`` carry the pure E3B1
+    decision values; ``attempt`` is the relevant (new or existing)
+    attempt; ``generation``/``snapshot`` are the loaded immutable records.
+    """
+
+    outcome: str
+    attempt: Optional[RunAttempt]
+    generation: Generation
+    snapshot: Optional[RequestSnapshot]
+    decision: str = ""
+    reason: str = ""
 
 
 def _compact_json(value: Any) -> str:
@@ -2155,6 +2186,341 @@ class HistoryV2Repository:
                 conn, cell_id, mode=current["mode"], now=now
             )
 
+    # ── Generate Original (E3B2): transactional claim/reuse ─────────────
+
+    def _insert_generation_attempt(
+        self,
+        conn: sqlite3.Connection,
+        generation_row: sqlite3.Row,
+        *,
+        mode: str,
+        now: str,
+    ) -> RunAttempt:
+        """Insert one queued attempt for a generation with an explicit mode.
+
+        Caller owns the open transaction.  Cell-aware: when the generation
+        belongs to a modern Experiment cell the attempt carries the cell/
+        experiment identity and is appended to the cell's attempt_ids; the
+        derived generation/cell/experiment states are recomputed.  The new
+        attempt stays ``queued`` with ``started_at`` NULL until claimed.
+        """
+        generation_id = generation_row["generation_id"]
+        run_id = new_id("run_")
+        cell_row = conn.execute(
+            "SELECT * FROM experiment_cells WHERE generation_id = ?",
+            (generation_id,),
+        ).fetchone()
+        experiment_id = generation_row["experiment_id"]
+        cell_id: Optional[str] = None
+        if cell_row is not None:
+            cell_id = cell_row["cell_id"]
+            experiment_id = cell_row["experiment_id"] or experiment_id
+        conn.execute(
+            """INSERT INTO run_attempts (
+                run_id, generation_id, experiment_id, cell_id, mode, status,
+                started_at, finished_at, error, timing_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, generation_id, experiment_id, cell_id,
+             RunMode(mode).value, RunStatus.QUEUED.value,
+             None, None, None, "{}", now),
+        )
+        if cell_row is not None:
+            attempt_ids = list(self._parse_json(cell_row["attempt_ids_json"], []))
+            if run_id not in attempt_ids:
+                attempt_ids.append(run_id)
+            conn.execute(
+                """UPDATE experiment_cells
+                   SET attempt_ids_json = ?, updated_at = ?
+                   WHERE cell_id = ?""",
+                (_compact_json(attempt_ids), now, cell_id),
+            )
+        self._recompute_generation(conn, generation_id, now)
+        if cell_id:
+            self._recompute_cell(conn, cell_id, now)
+        stored = conn.execute(
+            "SELECT * FROM run_attempts WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return self._row_to_attempt(stored)
+
+    def _insert_original_attempt(
+        self,
+        conn: sqlite3.Connection,
+        generation_row: sqlite3.Row,
+        *,
+        now: str,
+    ) -> RunAttempt:
+        """Insert one queued ``mode="original"`` attempt (E3B2 wrapper)."""
+        return self._insert_generation_attempt(
+            conn, generation_row, mode=RunMode.ORIGINAL.value, now=now
+        )
+
+    def claim_or_reuse_original_attempt(
+        self,
+        generation_id: str,
+        *,
+        explicit_rerender: bool = False,
+    ) -> Optional["OriginalClaimOutcome"]:
+        """Transactional E3B1 decision + guarded Original-attempt creation.
+
+        One ``BEGIN IMMEDIATE`` transaction implements the frozen duplicate
+        policy: an active Original Attempt is returned (never duplicated), the
+        newest successful Original is reused by default, only-failed history
+        reports ``retry_required``, an active Preview reports ``busy``, and a
+        new queued Original Attempt is created only when policy permits.
+        Two racing callers serialize on the write transaction, so a
+        double-submit can never create two active Original Attempts and no
+        orphan Attempt is left behind.  Snapshot capability validation is NOT
+        performed here (the caller validates the immutable snapshot first);
+        this method never consults mutable Workflow/Preset state.
+        """
+        from history_v2_replay import decide_original_action
+
+        now = utc_now_iso()
+        with self._store.transaction() as conn:
+            gen_row = conn.execute(
+                "SELECT * FROM generations WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+            if gen_row is None:
+                return None
+            generation = self._row_to_generation(gen_row)
+            snapshot: Optional[RequestSnapshot] = None
+            if generation.request_snapshot_id:
+                srow = conn.execute(
+                    "SELECT * FROM request_snapshots WHERE snapshot_id = ?",
+                    (generation.request_snapshot_id,),
+                ).fetchone()
+                if srow is not None:
+                    snapshot = self._row_to_snapshot(srow)
+            attempts = self._attempts_for_generation(conn, generation_id)
+            decision = decide_original_action(
+                attempts, explicit_rerender=explicit_rerender
+            )
+            if decision.create_new:
+                attempt = self._insert_original_attempt(
+                    conn, gen_row, now=now
+                )
+                return OriginalClaimOutcome(
+                    outcome="created",
+                    attempt=attempt,
+                    generation=generation,
+                    snapshot=snapshot,
+                    decision=decision.decision,
+                    reason=decision.reason,
+                )
+            relevant: Optional[RunAttempt] = None
+            if decision.attempt_id:
+                relevant = next(
+                    (
+                        a for a in attempts
+                        if a.run_id == decision.attempt_id
+                    ),
+                    None,
+                )
+            return OriginalClaimOutcome(
+                outcome=str(decision.decision),
+                attempt=relevant,
+                generation=generation,
+                snapshot=snapshot,
+                decision=decision.decision,
+                reason=decision.reason,
+            )
+
+    def create_original_retry_attempt(
+        self,
+        generation_id: str,
+    ) -> Optional["OriginalClaimOutcome"]:
+        """Retry path for a failed Original Attempt (one transaction).
+
+        Eligible only when no attempt of the Generation is active and the
+        newest ``mode="original"`` attempt is ``failed`` (validated by the
+        replay core's ``validate_original_retry``).  The failed attempt is
+        never reopened or mutated; a fresh queued ``mode="original"``
+        Attempt is appended under the SAME Generation and its SAME immutable
+        request snapshot.  A Preview Attempt is never retried as an Original.
+        """
+        from history_v2_replay import validate_original_retry
+
+        now = utc_now_iso()
+        with self._store.transaction() as conn:
+            gen_row = conn.execute(
+                "SELECT * FROM generations WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+            if gen_row is None:
+                return None
+            generation = self._row_to_generation(gen_row)
+            snapshot: Optional[RequestSnapshot] = None
+            if generation.request_snapshot_id:
+                srow = conn.execute(
+                    "SELECT * FROM request_snapshots WHERE snapshot_id = ?",
+                    (generation.request_snapshot_id,),
+                ).fetchone()
+                if srow is not None:
+                    snapshot = self._row_to_snapshot(srow)
+            attempts = self._attempts_for_generation(conn, generation_id)
+            if any(
+                a.status in (RunStatus.QUEUED.value, RunStatus.RUNNING.value)
+                for a in attempts
+            ):
+                return OriginalClaimOutcome(
+                    outcome="busy",
+                    attempt=None,
+                    generation=generation,
+                    snapshot=snapshot,
+                    decision="busy",
+                    reason="attempt_active",
+                )
+            originals = [a for a in attempts if a.mode == RunMode.ORIGINAL.value]
+            newest = max(
+                originals,
+                key=lambda a: (a.created_at, a.run_id),
+                default=None,
+            )
+            if newest is None:
+                return OriginalClaimOutcome(
+                    outcome="not_retryable",
+                    attempt=None,
+                    generation=generation,
+                    snapshot=snapshot,
+                    decision="retry_required",
+                    reason="no_original_attempt",
+                )
+            validation = validate_original_retry(
+                newest,
+                generation_id=generation.generation_id,
+                snapshot_id=(
+                    snapshot.snapshot_id if snapshot is not None else ""
+                ),
+                retry_snapshot_id=(
+                    snapshot.snapshot_id if snapshot is not None else ""
+                ),
+            )
+            if not validation.valid:
+                return OriginalClaimOutcome(
+                    outcome="not_retryable",
+                    attempt=newest,
+                    generation=generation,
+                    snapshot=snapshot,
+                    decision="retry_required",
+                    reason=validation.reason or REASON_NOT_RETRYABLE,
+                )
+            attempt = self._insert_original_attempt(conn, gen_row, now=now)
+            return OriginalClaimOutcome(
+                outcome="created",
+                attempt=attempt,
+                generation=generation,
+                snapshot=snapshot,
+                decision="create_original",
+                reason="original_retry",
+            )
+
+    def create_single_resume_attempt(
+        self,
+        generation_id: str,
+    ) -> Optional["OriginalClaimOutcome"]:
+        """Generation-level Single Resume claim/create (F1A, one transaction).
+
+        Eligible only when the Generation is an ordinary modern Single (no
+        Experiment identity and no linked Experiment cell), no attempt of the
+        Generation is active (queued/running), and the CURRENT attempt is
+        ``interrupted``.  The interrupted attempt is never reopened or
+        mutated: a fresh queued Attempt is appended under the SAME Generation
+        and its SAME immutable request snapshot, preserving the interrupted
+        attempt's semantic ``mode`` (the frozen ExecutionPlan's output mode).
+        Refusals are truthful machine-readable outcomes — never silent state
+        conversions:
+
+        - ``busy`` + ``attempt_active``: an active attempt exists;
+        - ``not_resumable`` + ``experiment_cell_generation``: Experiment
+          cells resume through the Experiment surface instead;
+        - ``not_resumable`` + ``failed_requires_retry`` / ``canceled_not_resumable``
+          / ``generation_completed`` / ``no_attempts`` /
+          ``current_attempt_not_interrupted``.
+
+        Two racing callers serialize on the write transaction, so a duplicate
+        Resume can never create two active Attempts.  Snapshot capability
+        validation is NOT performed here (the caller validates first); this
+        method never consults mutable Workflow/Preset state.
+        """
+        now = utc_now_iso()
+        with self._store.transaction() as conn:
+            gen_row = conn.execute(
+                "SELECT * FROM generations WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+            if gen_row is None:
+                return None
+            generation = self._row_to_generation(gen_row)
+            snapshot: Optional[RequestSnapshot] = None
+            if generation.request_snapshot_id:
+                srow = conn.execute(
+                    "SELECT * FROM request_snapshots WHERE snapshot_id = ?",
+                    (generation.request_snapshot_id,),
+                ).fetchone()
+                if srow is not None:
+                    snapshot = self._row_to_snapshot(srow)
+
+            def _refuse(reason: str, attempt: Optional[RunAttempt] = None) -> "OriginalClaimOutcome":
+                return OriginalClaimOutcome(
+                    outcome="not_resumable",
+                    attempt=attempt,
+                    generation=generation,
+                    snapshot=snapshot,
+                    decision="resume_not_available",
+                    reason=reason,
+                )
+
+            cell_row = conn.execute(
+                "SELECT cell_id FROM experiment_cells WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+            if cell_row is not None or gen_row["experiment_id"]:
+                return _refuse(RESUME_REASON_EXPERIMENT_CELL)
+
+            attempts = self._attempts_for_generation(conn, generation_id)
+            if any(
+                a.status in (RunStatus.QUEUED.value, RunStatus.RUNNING.value)
+                for a in attempts
+            ):
+                active = next(
+                    (
+                        a for a in reversed(attempts)
+                        if a.status in (RunStatus.QUEUED.value, RunStatus.RUNNING.value)
+                    ),
+                    None,
+                )
+                return OriginalClaimOutcome(
+                    outcome="busy",
+                    attempt=active,
+                    generation=generation,
+                    snapshot=snapshot,
+                    decision="busy",
+                    reason="attempt_active",
+                )
+            current = current_attempt(attempts)
+            if current is None:
+                return _refuse(RESUME_REASON_NO_ATTEMPTS)
+            if current.status == RunStatus.COMPLETED.value:
+                return _refuse(RESUME_REASON_COMPLETED, current)
+            if current.status == RunStatus.FAILED.value:
+                return _refuse(RESUME_REASON_FAILED, current)
+            if current.status == RunStatus.CANCELED.value:
+                return _refuse(RESUME_REASON_CANCELED, current)
+            if current.status != RunStatus.INTERRUPTED.value:
+                return _refuse(RESUME_REASON_NOT_INTERRUPTED, current)
+            attempt = self._insert_generation_attempt(
+                conn, gen_row, mode=current.mode, now=now
+            )
+            return OriginalClaimOutcome(
+                outcome="created",
+                attempt=attempt,
+                generation=generation,
+                snapshot=snapshot,
+                decision="resume_created",
+                reason="single_resume",
+            )
+
     def list_recoverable_cells(self) -> list[dict[str, Any]]:
         """Cells needing recovery/resume: fixed ``position`` order.
 
@@ -2533,6 +2899,7 @@ class HistoryV2Repository:
         status: Optional[str] = None,
         statuses: Optional[Sequence[str]] = None,
         search: Optional[str] = None,
+        favorite: Optional[bool] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -2540,7 +2907,10 @@ class HistoryV2Repository:
 
         For ``workflow_asc``/``workflow_desc`` the experiment "workflow" sort
         key is its name (``COALESCE(NULLIF(name, ''), '')``) — the sensible
-        equivalent of a generation's workflow_id.
+        equivalent of a generation's workflow_id.  ``favorite`` mirrors the
+        generation filter exactly (True → favorited only, False → truthful
+        inverse, None → no predicate); it is applied inside this SQL query so
+        keyset/mixed pagination stays truthful.
         """
         limit = int(limit)
         if limit < 1 or limit > 200:
@@ -2561,6 +2931,9 @@ class HistoryV2Repository:
             statuses = list(statuses)
             where.append(f"e.status IN ({','.join('?' * len(statuses))})")
             params.extend(statuses)
+        if favorite is not None:
+            where.append("e.favorite = ?")
+            params.append(1 if favorite else 0)
         if date_from is not None:
             where.append("e.created_at >= ?")
             params.append(date_from)

@@ -40,6 +40,14 @@ class _JsModule:
                               self.text))
 
 
+def _code(text: str) -> str:
+    """Strip // line comments so documentation may name retired symbols
+    while code-level absence is still asserted."""
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("//")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Extension registration & sidebar integration
 # ---------------------------------------------------------------------------
@@ -270,33 +278,31 @@ class DiagnosticsKeyTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ModuleReferenceTests(unittest.TestCase):
-    """modal-testing.js must reference the shared dashboard/history/api modules."""
+    """modal-testing.js must reference the shared api module."""
 
     def setUp(self) -> None:
         self.text = _JsModule(WEB / "modal-testing.js").text
 
     def test_references_testing_api_module(self):
-        """Shell must reference the shared api module (testing-api.js)."""
-        self.assertIn(
+        """H14 Wave E: the lazy-tab loader is gone, so the shell no longer
+        imports testing-api.js; the shared api module reference is retired."""
+        self.assertNotIn(
             "testing-api",
             self.text,
-            "Expected reference to testing-api.js in modal-testing.js",
+            "modal-testing.js must no longer import testing-api.js (Wave E)",
         )
 
-    def test_references_testing_dashboard_module(self):
-        """Shell must reference the dashboard module (testing-dashboard.js)."""
-        self.assertIn(
+    def test_no_references_to_retired_tab_modules(self):
+        """Retired Legacy Dashboard/History modules must not be imported (Phase H9)."""
+        self.assertNotIn(
             "testing-dashboard",
             self.text,
-            "Expected reference to testing-dashboard.js in modal-testing.js",
+            "testing-dashboard.js was retired in Phase H9",
         )
-
-    def test_references_testing_history_module(self):
-        """Shell must reference the history module (testing-history.js)."""
-        self.assertIn(
+        self.assertNotIn(
             "testing-history",
             self.text,
-            "Expected reference to testing-history.js in modal-testing.js",
+            "testing-history.js was retired in Phase H9",
         )
 
 
@@ -452,17 +458,23 @@ class ModalAriaTests(unittest.TestCase):
             "Expected inert/aria-hidden applied to background in open_testing_modal",
         )
 
-    def test_parent_modal_tab_trap_calls_focus_trap_helper(self):
-        """open_testing_modal must call a focusTrap or _trapTab function."""
+    def test_parent_modal_tab_containment_via_inert_no_trap_helper(self):
+        """I2: Tab containment is provided by the inert background — no JS
+        focus-trap helper may exist or return (dead _trapTab retired)."""
         has_trap = (
             "focusTrap" in self.text
             or "_trapTab" in self.text
             or "tabTrap" in self.text
             or "_tabTrap" in self.text
         )
-        self.assertTrue(
+        self.assertFalse(
             has_trap,
-            "Expected focusTrap/_trapTab helper in modal-testing.js for Tab containment",
+            "Dead _trapTab/focusTrap helper must stay deleted (I2); containment is inert-based",
+        )
+        self.assertIn(
+            "_inertBackground(true)",
+            self.text,
+            "Expected inert/aria-hidden background containment in open_testing_modal",
         )
 
     def test_parent_modal_close_removes_layer_escape_handler(self):
@@ -544,13 +556,14 @@ class SettingsMountTests(unittest.TestCase):
             "for embedded settings mount hooks",
         )
 
-    def test_secondary_launcher_in_legacy_modal_settings(self):
-        """modal-settings.js must include a secondary Testing Suite launcher."""
+    def test_secondary_launcher_retired_with_overlay(self):
+        """H18 Wave G: the legacy overlay body (and its Testing Suite
+        launcher button) is deleted; modern Settings is the only surface."""
         text = _JsModule(WEB / "modal-settings.js").text
-        self.assertIn(
+        self.assertNotIn(
             "Testing Suite",
             text,
-            "Expected 'Testing Suite' launcher inside the legacy modal-settings.js",
+            "The retired overlay must not carry a Testing Suite launcher",
         )
 
 
@@ -567,7 +580,7 @@ class VisualRedesignTokenTests(unittest.TestCase):
     # ── Phase A: Product name consistency → "Modal GPU" ────────────────
 
     def test_header_shows_modal_gpu_product_name(self):
-        """modal-testing.js buildShell header h2 must display 'Modal GPU'."""
+        """modal-testing.js buildShell header h1 must display 'Modal GPU'."""
         text = _JsModule(WEB / "modal-testing.js").text
         shell_start = text.find("function buildShell")
         self.assertGreater(shell_start, -1)
@@ -634,9 +647,10 @@ class VisualRedesignTokenTests(unittest.TestCase):
         self.assertIn("--duration-normal", self.text)
         self.assertIn("--ease-standard", self.text)
 
-    def test_shared_hero_card_class(self):
-        """testing-styles.js must define a hero card class."""
-        self.assertIn("comfymodal-hero", self.text)
+    def test_shared_hero_card_class_retired(self):
+        """H18 Wave G: the hero card had zero live consumers after the
+        legacy dashboard retirement; the class is deleted."""
+        self.assertNotIn("comfymodal-hero", self.text)
 
     def test_shared_button_variant_classes(self):
         """testing-styles.js must define primary/secondary/destructive buttons."""
@@ -644,9 +658,10 @@ class VisualRedesignTokenTests(unittest.TestCase):
         self.assertIn("comfymodal-secondary-btn", self.text)
         self.assertIn("comfymodal-destructive-btn", self.text)
 
-    def test_shared_status_badge_class(self):
-        """testing-styles.js must define a status badge class."""
-        self.assertIn("comfymodal-status-badge", self.text)
+    def test_shared_status_badge_class_retired(self):
+        """H18 Wave G: the shared status badge had zero live consumers
+        after the legacy results/settings retirement; the class is deleted."""
+        self.assertNotIn("comfymodal-status-badge", self.text)
 
     def test_shared_input_classes(self):
         """testing-styles.js must define input/select/textarea classes."""
@@ -656,13 +671,14 @@ class VisualRedesignTokenTests(unittest.TestCase):
         """testing-styles.js must define focus-visible ring styles."""
         self.assertIn("focus-visible", self.text)
 
-    def test_shared_setup_summary_class(self):
-        """testing-styles.js must define sticky setup summary styling."""
-        self.assertIn("testing-setup-sticky-summary", self.text)
+    def test_shared_setup_summary_class_retired(self):
+        """H18 Wave G: legacy Setup-only CSS is deleted with its module."""
+        self.assertNotIn("testing-setup-sticky-summary", self.text)
 
-    def test_shared_progress_bar_classes(self):
-        """testing-styles.js must define progress bar classes."""
-        self.assertIn("comfymodal-progress-bar", self.text)
+    def test_shared_progress_bar_classes_retired(self):
+        """H18 Wave G: the generic progress-bar classes had zero live
+        consumers (modern pages use comfymodal-studio-* rules); deleted."""
+        self.assertNotIn("comfymodal-progress-bar", self.text)
 
     def test_shared_scrollbar_styles(self):
         """testing-styles.js must style thin scrollbars."""
@@ -684,139 +700,25 @@ class VisualRedesignTokenTests(unittest.TestCase):
 # Visual redesign: dashboard hierarchy
 # ---------------------------------------------------------------------------
 
-class DashboardHierarchyTests(unittest.TestCase):
-    """Dashboard blocked vs healthy state hierarchy tests."""
-
-    def setUp(self) -> None:
-        self.text = _JsModule(WEB / "testing-dashboard.js").text
-
-    def test_dashboard_new_experiment_primary_cta(self):
-        """testing-dashboard.js must include 'New Experiment' as primary CTA."""
-        self.assertIn(
-            "New Experiment",
-            self.text,
-            "Expected 'New Experiment' primary CTA in testing-dashboard.js",
-        )
-
-    def test_dashboard_deployment_hero_card(self):
-        """testing-dashboard.js must use comfymodal-hero for blocked state."""
-        self.assertIn(
-            "comfymodal-hero",
-            self.text,
-            "Expected comfymodal-hero class for blocked/unhealthy deploy state",
-        )
-
-    def test_dashboard_removes_healthy_deploy_strip(self):
-        """testing-dashboard.js must NOT include comfymodal-deploy-strip (removed)."""
-        self.assertNotIn(
-            "comfymodal-deploy-strip",
-            self.text,
-            "comfymodal-deploy-strip must be removed from healthy dashboard",
-        )
-
-    def test_dashboard_utility_toolbar_class(self):
-        """testing-dashboard.js must include testing-dashboard-utility-toolbar."""
-        self.assertIn(
-            "testing-dashboard-utility-toolbar",
-            self.text,
-            "Expected testing-dashboard-utility-toolbar for secondary actions",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Visual redesign: history row layout
-# ---------------------------------------------------------------------------
-
-class HistoryRowLayoutTests(unittest.TestCase):
-    """History row/list layout and metadata markers."""
-
-    def setUp(self) -> None:
-        self.text = _JsModule(WEB / "testing-history.js").text
-
-    def test_history_row_class(self):
-        """testing-history.js must have a row class for list items."""
-        self.assertIn(
-            "testing-history-row",
-            self.text,
-            "Expected testing-history-row class for each run record",
-        )
-
-    def test_history_thumbnail_marker(self):
-        """testing-history.js must have a thumbnail element class."""
-        self.assertIn(
-            "testing-history-thumb",
-            self.text,
-            "Expected testing-history-thumb class for type icon/thumbnail",
-        )
-
-    def test_history_row_main_field(self):
-        """testing-history.js must have a row-main marker."""
-        self.assertIn(
-            "testing-history-row-main",
-            self.text,
-            "Expected testing-history-row-main class for main row line",
-        )
-
-    def test_history_status_dot_and_label(self):
-        """testing-history.js must have a status dot/label area."""
-        has_status_marker = (
-            "testing-history-status" in self.text
-            or "testing-history-status-dot" in self.text
-        )
-        self.assertTrue(
-            has_status_marker,
-            "Expected testing-history-status marker for status dot + label",
-        )
-
-    def test_history_datetime_field(self):
-        """testing-history.js must have a date/time marker."""
-        self.assertIn(
-            "testing-history-time",
-            self.text,
-            "Expected testing-history-time class for date/time display",
-        )
-
-    def test_history_duration_field(self):
-        """testing-history.js must have a duration marker."""
-        self.assertIn(
-            "testing-history-duration",
-            self.text,
-            "Expected testing-history-duration class for run duration",
-        )
-
-    def test_history_model_field(self):
-        """testing-history.js must have a model/profile short label."""
-        self.assertIn(
-            "testing-history-model",
-            self.text,
-            "Expected testing-history-model class for model/profile label",
-        )
-
-
 # ---------------------------------------------------------------------------
 # Visual redesign: settings nav active state
 # ---------------------------------------------------------------------------
 
 class SettingsNavActiveStateTests(unittest.TestCase):
-    """Settings wrapper/nav active-state styling hooks."""
+    """testing-settings.js retired (Wave E unmount, Wave G file deletion)."""
 
-    def test_settings_uses_wrapper_class(self):
-        """testing-settings.js must use a comfymodal-settings-wrapper class."""
-        text = _JsModule(WEB / "testing-settings.js").text
-        self.assertIn(
-            "comfymodal-settings-wrapper",
-            text,
-            "Expected comfymodal-settings-wrapper class in testing-settings.js",
+    def test_settings_module_deleted(self):
+        """The legacy settings tab module must stay deleted."""
+        self.assertFalse(
+            (WEB / "testing-settings.js").exists(),
+            "web/testing-settings.js must stay deleted (Wave G)",
         )
 
-    def test_settings_nav_btn_active_uses_design_tokens(self):
-        """testing-settings.js nav active btn must reference shared token class."""
-        text = _JsModule(WEB / "testing-settings.js").text
-        self.assertIn(
-            "comfymodal-nav-btn-active",
-            text,
-            "Expected comfymodal-nav-btn-active class reference in settings nav",
-        )
+    def test_no_legacy_settings_nav_hooks_in_shared_styles(self):
+        """The shared stylesheet no longer carries legacy settings-nav hooks."""
+        text = _JsModule(WEB / "testing-styles.js").text
+        self.assertNotIn("comfymodal-settings-wrapper", text)
+        self.assertNotIn("comfymodal-nav-btn-active", text)
 
 
 # ── Issue 1: Unused STUDIO_PAGES constant ───────────────────────────────
@@ -918,42 +820,26 @@ class OpenSectionGuardTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class SetupResultsClarityStyleTests(unittest.TestCase):
-    """testing-styles.js must include clarity-specific utility classes."""
+    """Legacy Setup/Results clarity CSS retired with the modules (Wave G)."""
 
     def setUp(self) -> None:
         self.text = _JsModule(WEB / "testing-styles.js").text
 
-    def test_styles_include_testing_setup_field_grid(self):
-        """testing-styles.js must define .testing-setup-field-grid."""
-        self.assertIn(
-            ".testing-setup-field-grid",
-            self.text,
-            "Expected .testing-setup-field-grid in testing-styles.js",
-        )
+    def test_styles_no_legacy_setup_selectors(self):
+        for selector in [".testing-setup-field-grid", ".testing-setup-finish-zone"]:
+            self.assertNotIn(
+                selector,
+                self.text,
+                f"Legacy selector {selector} must be deleted with testing-setup.js",
+            )
 
-    def test_styles_include_testing_setup_finish_zone(self):
-        """testing-styles.js must define .testing-setup-finish-zone."""
-        self.assertIn(
-            ".testing-setup-finish-zone",
-            self.text,
-            "Expected .testing-setup-finish-zone in testing-styles.js",
-        )
-
-    def test_styles_include_testing_results_command_main(self):
-        """testing-styles.js must define .testing-results-command-main."""
-        self.assertIn(
-            ".testing-results-command-main",
-            self.text,
-            "Expected .testing-results-command-main in testing-styles.js",
-        )
-
-    def test_styles_include_testing_results_summary_card(self):
-        """testing-styles.js must define .testing-results-summary-card."""
-        self.assertIn(
-            ".testing-results-summary-card",
-            self.text,
-            "Expected .testing-results-summary-card in testing-styles.js",
-        )
+    def test_styles_no_legacy_results_selectors(self):
+        for selector in [".testing-results-command-main", ".testing-results-summary-card"]:
+            self.assertNotIn(
+                selector,
+                self.text,
+                f"Legacy selector {selector} must be deleted with testing-results.js",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -991,70 +877,16 @@ class ProgressiveClarityShellTests(unittest.TestCase):
         )
 
 
-class ProgressiveClarityDashboardTests(unittest.TestCase):
-    """Dashboard hierarchy markers."""
-
-    def test_dashboard_uses_primary_cta_group_marker(self):
-        """testing-dashboard.js must use testing-dashboard-primary-actions."""
-        text = _JsModule(WEB / "testing-dashboard.js").text
-        self.assertIn(
-            "testing-dashboard-primary-actions",
-            text,
-            "Expected testing-dashboard-primary-actions marker",
-        )
-
-    def test_dashboard_uses_metric_primary_marker(self):
-        """testing-dashboard.js must use testing-dashboard-metric-primary for Experiments."""
-        text = _JsModule(WEB / "testing-dashboard.js").text
-        self.assertIn(
-            "testing-dashboard-metric-primary",
-            text,
-            "Expected testing-dashboard-metric-primary for experiments card",
-        )
-
-
 class ProgressiveClarityResultsTests(unittest.TestCase):
-    """Results emphasis and command grouping."""
+    """Legacy Results emphasis markers retired with the module (Wave G)."""
 
-    def test_results_uses_emphasized_summary_primary(self):
-        """testing-results.js must use testing-results-summary-primary."""
-        text = _JsModule(WEB / "testing-results.js").text
-        self.assertIn(
-            "testing-results-summary-primary",
-            text,
-            "Expected testing-results-summary-primary for dominant run state",
-        )
+    def test_results_module_deleted(self):
+        self.assertFalse((WEB / "testing-results.js").exists())
 
-    def test_results_uses_command_routine_marker(self):
-        """testing-results.js must use testing-results-command-routine."""
-        text = _JsModule(WEB / "testing-results.js").text
-        self.assertIn(
-            "testing-results-command-routine",
-            text,
-            "Expected testing-results-command-routine for routine controls",
-        )
-
-
-class ProgressiveClarityHistoryTests(unittest.TestCase):
-    """History two-line row layout."""
-
-    def test_history_uses_two_line_row_main_marker(self):
-        """testing-history.js must use testing-history-row-main."""
-        text = _JsModule(WEB / "testing-history.js").text
-        self.assertIn(
-            "testing-history-row-main",
-            text,
-            "Expected testing-history-row-main for top line of row",
-        )
-
-    def test_history_uses_two_line_row_meta_marker(self):
-        """testing-history.js must use testing-history-row-meta."""
-        text = _JsModule(WEB / "testing-history.js").text
-        self.assertIn(
-            "testing-history-row-meta",
-            text,
-            "Expected testing-history-row-meta for bottom line of row",
-        )
+    def test_no_legacy_results_markers_in_shared_styles(self):
+        text = _JsModule(WEB / "testing-styles.js").text
+        self.assertNotIn("testing-results-summary-primary", text)
+        self.assertNotIn("testing-results-command-routine", text)
 
 
 # ---------------------------------------------------------------------------
@@ -1096,17 +928,18 @@ class StudioShellContractTests(unittest.TestCase):
         for name in [
             "studio-shell.js",
             "studio-playground.js",
-            "studio-history.js",
+            "studio-history-v2.js",
             "studio-settings.js",
             "studio-feature-registry.js",
             "studio-experiment-mode.js",
-            "studio-legacy.js",
             "studio-styles.js",
         ]:
             self.assertTrue(
                 (WEB / name).exists(),
                 f"Required Studio module web/{name} is missing",
             )
+        # H18 Wave G: the retired loader stays deleted.
+        self.assertFalse((WEB / "studio-legacy.js").exists())
 
     # ── Feature registry content ────────────────────────────────────────
 
@@ -1138,23 +971,48 @@ class StudioShellContractTests(unittest.TestCase):
 
 
 class StudioLegacyContractTests(unittest.TestCase):
-    """Legacy reachability via Settings and truthful placeholder copy."""
+    """Legacy reachability retired (H14 Wave E); truthful placeholder copy."""
 
-    def test_settings_legacy_mentions_all_old_tabs(self):
-        """studio-settings.js must list all old tabs under Legacy section."""
+    @staticmethod
+    def _code(text: str) -> str:
+        """Strip // line comments so documentation can name retired symbols
+        while code-level absence is still asserted."""
+        return "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("//")
+        )
+
+    def test_settings_legacy_group_retired(self):
+        """H14 Wave E: the Settings ▸ Advanced ▸ Legacy group is gone.
+
+        No Legacy heading, no opener, and no Setup/Profiles/Results/Settings
+        entries may remain in modern Settings.
+        """
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        for needle in [
-            "Legacy Dashboard",
+        code = self._code(text)
+        for retired in [
             "Legacy Setup",
             "Legacy Profiles",
             "Legacy Results",
-            "Legacy History",
             "Legacy Settings",
+            "Open Legacy Settings",
+            "settings-legacy-open",
+            "settings-legacy-setup",
+            "settings-legacy-profiles",
+            "settings-legacy-results",
+            "settings-legacy-settings",
         ]:
-            self.assertIn(
-                needle, text,
-                f"Expected '{needle}' in studio-settings.js Legacy section",
+            self.assertNotIn(
+                retired, code,
+                f"'{retired}' must be retired from modern Settings (Wave E)",
             )
+
+    def test_settings_modern_sections_remain(self):
+        """Modern Settings stays preferences-only but complete."""
+        text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
+        for section in ["general", "generation", "outputs", "history", "experiments", "interface", "advanced"]:
+            self.assertIn(section, text)
+        self.assertIn("settings-reset-all", text)
+        self.assertIn("settings-open-backend", text)
 
     def test_playground_uses_honest_future_placeholder_copy(self):
         """studio-playground.js must use honest future-work copy for image-edit tools."""
@@ -1163,24 +1021,6 @@ class StudioLegacyContractTests(unittest.TestCase):
             "future work" in text.lower()
             or "not implemented yet" in text.lower(),
             "Expected honest future-work placeholder copy in studio-playground.js",
-        )
-
-    # ── History uses real data ─────────────────────────────────────────
-
-    def test_history_has_run_history_endpoint(self):
-        """studio-history.js must fetch from the run-history API endpoint."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn(
-            "run-history", text,
-            "Expected run-history endpoint reference in studio-history.js",
-        )
-
-    def test_history_shows_truthful_empty_state(self):
-        """studio-history.js must show a truthful empty state, not decorative text."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertTrue(
-            "No run history" in text or "No history" in text or "No experiments" in text,
-            "Expected truthful empty state text in studio-history.js",
         )
 
     # ── Settings sections with data-section attributes ─────────────────
@@ -1199,12 +1039,20 @@ class StudioLegacyContractTests(unittest.TestCase):
                 f"Expected section '{section}' referenced in studio-settings.js",
             )
 
-    def test_settings_legacy_items_clickable(self):
-        """studio-settings.js must make legacy items clickable to load old screens."""
+    def test_settings_no_legacy_mount_path(self):
+        """H14 Wave E: studio-settings.js must not mount legacy tabs."""
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        self.assertIn(
+        self.assertNotIn(
             "mountLegacyTab", text,
-            "Expected mountLegacyTab reference in studio-settings.js",
+            "studio-settings.js must not reference the retired legacy mounter",
+        )
+        self.assertNotIn(
+            "renderLegacyView", text,
+            "renderLegacyView must be retired (Wave E)",
+        )
+        self.assertNotIn(
+            "activeLegacyTab", text,
+            "activeLegacyTab machinery must be retired (Wave E)",
         )
 
 
@@ -1329,15 +1177,20 @@ class PlaygroundLayoutTests(unittest.TestCase):
 
 
 class PlaygroundDisabledRunTests(unittest.TestCase):
-    """Disabled Run button must give precise reasons and route to Legacy Setup."""
+    """Disabled Run button must give precise reasons without legacy funnels."""
 
-    def test_disabled_run_mentions_legacy_setup(self):
-        """studio-playground.js must reference Legacy Setup when Run is disabled."""
+    def test_disabled_run_has_no_legacy_setup_funnel(self):
+        """H10: studio-playground.js must not funnel users to Legacy Setup."""
         text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
-        self.assertIn(
-            "Legacy Setup",
+        self.assertNotIn(
+            "Configure in Legacy Setup",
             text,
-            "Expected Legacy Setup reference in disabled Run reason",
+            "Legacy Setup funnel copy must be removed (H10)",
+        )
+        self.assertNotIn(
+            "navigateToLegacySetup",
+            text,
+            "Dead Legacy Setup navigation helper must be removed (H10)",
         )
 
     def test_disabled_run_gives_reason(self):
@@ -1436,27 +1289,42 @@ class ExperimentModeTests(unittest.TestCase):
         )
 
     def test_experiment_disabled_run_reason_from_helper(self):
-        """studio-experiment-mode.js must derive the disabled-run reason from getExperimentDisabledReason
-        and render it under the Run Experiment button in renderExperimentRunButton."""
+        """H-WAVE D: the legacy renderer is fully retired; experimentRunSurface
+        unconditionally mounts the gated modern section, which derives its
+        reason from modernExperimentDisabledReason."""
         text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
         self.assertIn(
             "export function getExperimentDisabledReason",
             text,
             "Expected getExperimentDisabledReason export in studio-experiment-mode.js",
         )
-        # renderExperimentRunButton must call it and render the returned reason
-        run_btn_start = text.find("function renderExperimentRunButton")
-        self.assertGreater(run_btn_start, -1)
-        run_btn_region = text[run_btn_start:]
-        self.assertIn(
-            "getExperimentDisabledReason(state)",
-            run_btn_region,
-            "Expected renderExperimentRunButton to call getExperimentDisabledReason",
+        # H-WAVE D: no legacy run-button renderer or creator handler remains.
+        self.assertNotIn(
+            "function renderExperimentRunButton",
+            text,
+            "renderExperimentRunButton must be retired in Wave D",
         )
+        self.assertNotIn(
+            "buildExperimentClickHandler",
+            text,
+            "buildExperimentClickHandler must be retired in Wave D",
+        )
+        # The surface selection is unconditional: every state mounts modern.
         self.assertIn(
-            "reasonEl.textContent = reason",
-            run_btn_region,
-            "Expected the disabled reason rendered under the Run Experiment button",
+            'return "modern";',
+            text,
+            'experimentRunSurface must return "modern" unconditionally',
+        )
+        self.assertNotIn(
+            'return "legacy";',
+            text,
+            "The legacy surface branch must be retired in Wave D",
+        )
+        # The gated modern section renders the reason under its Run button.
+        self.assertIn(
+            'data-testid="modern-experiment-reason"',
+            text,
+            "Expected the modern section's visible gating reason element",
         )
 
     def test_experiment_disabled_gives_reason(self):
@@ -1676,39 +1544,43 @@ class InfoTooltipTests(unittest.TestCase):
 
 
 class LegacyCleanupTriggerTests(unittest.TestCase):
-    """Legacy controller must be stopped when navigating away or closing modal."""
+    """Legacy controller cleanup wiring retired (H14 Wave E); the loader
+    file itself was deleted in Wave G (H18).
 
-    def test_stop_legacy_controller_exported(self):
-        """studio-legacy.js must export stopLegacyController."""
-        text = (WEB / "studio-legacy.js").read_text(encoding="utf-8")
-        self.assertIn(
-            "export function stopLegacyController",
-            text,
-            "Expected stopLegacyController export in studio-legacy.js",
+    No production module may still import or invoke the legacy controller
+    stopper, and studio-legacy.js no longer exists on disk.
+    """
+
+    def test_studio_legacy_file_deleted(self):
+        """H18 Wave G: the unmounted loader module is gone."""
+        self.assertFalse(
+            (WEB / "studio-legacy.js").exists(),
+            "web/studio-legacy.js must stay deleted (Wave G)",
         )
 
-    def test_shell_imports_stop_legacy_controller(self):
-        """studio-shell.js must import stopLegacyController from studio-legacy.js."""
+    def test_shell_no_longer_imports_stop_legacy_controller(self):
+        """H14 Wave E: studio-shell.js must not import stopLegacyController."""
         text = (WEB / "studio-shell.js").read_text(encoding="utf-8")
-        self.assertIn(
+        self.assertNotIn(
             "stopLegacyController",
             text,
-            "Expected stopLegacyController reference in studio-shell.js",
+            "studio-shell.js must not reference the retired legacy controller",
         )
 
     def test_modal_testing_calls_stop_legacy_on_close(self):
-        """modal-testing.js must call stopLegacyController when closing the modal."""
+        """H14 Wave E: modal-testing.js must not reference stopLegacyController."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        self.assertIn(
+        self.assertNotIn(
             "stopLegacyController",
             text,
-            "Expected stopLegacyController call in modal-testing.js close flow",
+            "modal-testing.js must not reference the retired legacy controller",
         )
 
     def test_shell_clears_legacy_controller_on_page_nav(self):
-        """studio-shell.js must clear activeLegacyTab and call stopLegacyController on nav away."""
+        """H14 Wave E: studio-shell.js has no legacy-tab nav cleanup left."""
         text = (WEB / "studio-shell.js").read_text(encoding="utf-8")
-        self.assertIn("stopLegacyController", text)
+        self.assertNotIn("activeLegacyTab", text)
+        self.assertNotIn("stopLegacyController", text)
 
 
 # ---------------------------------------------------------------------------
@@ -1733,20 +1605,21 @@ class StudioBackendContractTests(unittest.TestCase):
             "studio-backend.js must export renderBackend",
         )
 
-    def test_studio_backend_exports_get_backends(self):
-        """studio-backend.js must export getBackends helper for Playground."""
+    def test_dead_backends_exports_removed(self):
+        """H18 Wave G: the dead /studio/backends discovery exports are gone
+        (zero callers since H16 removed the last Settings consumer; FD-8)."""
         m = _JsModule(WEB / "studio-backend.js")
-        self.assertTrue(
+        self.assertFalse(
             m.has_export("getBackends") or m.has_export("fetchBackends"),
-            "studio-backend.js must export a backend-fetching helper",
+            "studio-backend.js must not re-export a backends discovery helper",
         )
 
-    def test_studio_backend_exports_get_compare_backends(self):
-        """studio-backend.js must export getCompareBackends for experiment mode."""
+    def test_dead_compare_backends_export_removed(self):
+        """H18 Wave G: getCompareBackends re-export deleted (zero callers)."""
         m = _JsModule(WEB / "studio-backend.js")
-        self.assertTrue(
-            m.has_export("getCompareBackends") or "compareBackends" in m.text,
-            "studio-backend.js must export or define a compare-backends helper",
+        self.assertFalse(
+            m.has_export("getCompareBackends"),
+            "studio-backend.js must not re-export getCompareBackends",
         )
 
     def test_shell_imports_render_backend(self):
@@ -1794,162 +1667,81 @@ class StudioBackendContractTests(unittest.TestCase):
             "Expected Backend in STUDIO_PAGES or nav labels",
         )
 
-    def test_open_testing_modal_setup_opens_settings_legacy_setup(self):
-        """open_testing_modal('setup') must navigate to Settings > Legacy Setup."""
+    def test_open_testing_modal_setup_never_mounts_legacy_setup(self):
+        """H10: open_testing_modal('setup') must land on Playground, never Legacy Setup."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
         self.assertIn(
+            'setup: "playground"',
+            text,
+            "Expected frozen setup alias → Playground mapping (H10)",
+        )
+        self.assertNotIn(
             "activeLegacyTab",
             text,
-            "Expected activeLegacyTab handling for legacy tab routing",
-        )
-        # The pageMap or routing must map setup to settings
-        self.assertIn(
-            "setup",
-            text,
-            "Expected setup tab mapping in modal-testing.js",
+            "Retired aliases must not set a dead activeLegacyTab",
         )
 
-    def test_open_testing_modal_profiles_opens_settings_legacy_profiles(self):
-        """open_testing_modal('profiles') must navigate to Settings > Legacy Profiles."""
+    def test_open_testing_modal_profiles_never_opens_comparison_editor(self):
+        """H10: open_testing_modal('profiles') must land on Playground without mounting Comparison."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
         self.assertIn(
-            "profiles",
+            'profiles: "playground"',
             text,
-            "Expected profiles tab mapping in modal-testing.js",
+            "Expected frozen profiles alias → Playground mapping (H10)",
         )
 
-    def test_open_testing_modal_results_opens_settings_legacy_results(self):
-        """open_testing_modal('results') must navigate to Settings > Legacy Results."""
+    def test_open_testing_modal_results_lands_on_history(self):
+        """H10 freeze: open_testing_modal('results') must land on History V2."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
         self.assertIn(
-            "results",
+            'results: "history"',
             text,
-            "Expected results tab mapping in modal-testing.js",
+            "Expected frozen results alias → History mapping (H10)",
         )
 
-    def test_onrun_opens_legacy_results(self):
-        """onRun(experimentId) must open Settings > Legacy Results with experiment ID."""
+    def test_onrun_lands_on_history_v2(self):
+        """The results alias (frozen to History) is the only results intent;
+        the legacy onRun experimentId machinery was deleted in Wave G."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        # Must handle experiment ID via activeLegacyTab mechanism or direct navigation
         self.assertIn(
-            "experimentId",
+            'results: "history"',
             text,
-            "Expected experimentId handling in onRun flow",
+            "results alias must land on History V2",
         )
-
-
-class StudioHistorySafetyTests(unittest.TestCase):
-    """History page must be safe: no innerHTML for run data, has retry, groups by experiment_id."""
-
-    def test_history_no_inner_html_for_run_data(self):
-        """studio-history.js must use DOM nodes/textContent, not innerHTML, for run data rows."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        # Check that innerHTML is NOT used to inject user/run data
-        # It's OK to use innerHTML for static loading/error templates
-        rows_html = text.find("innerHTML")
-        # Find any innerHTML assignment that contains run data interpolation
-        # We check that the template does NOT interpolate user data via string concatenation in innerHTML
-        has_dangerous_innerhtml = (
-            'innerHTML = `' in text or 'innerHTML += `' in text
-        )
-        self.assertFalse(
-            has_dangerous_innerhtml,
-            "History page must not use template literal innerHTML for run data — use DOM nodes",
-        )
-
-    def test_history_uses_dom_nodes_for_cards(self):
-        """studio-history.js must use createElement or el() for run data cards."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        has_dom_construction = (
-            "createElement" in text or
-            "el(" in text or
-            "el(" in text[:500]  # el() import/definition earlier in file
-        )
-        self.assertTrue(
-            has_dom_construction,
-            "Expected createElement or el() usage in studio-history.js",
-        )
-
-    def test_history_has_retry_on_error(self):
-        """studio-history.js must have a retry mechanism on failed fetch."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        has_retry = (
-            "retry" in text.lower()
-            or "Retry" in text
-        )
-        self.assertTrue(
-            has_retry,
-            "Expected retry mechanism in studio-history.js error state",
-        )
-
-    def test_history_truthful_empty_state(self):
-        """studio-history.js must show truthful empty state."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertTrue(
-            "No run history" in text or "No history" in text or "No experiments" in text or "no runs" in text.lower(),
-            "Expected truthful empty state text in studio-history.js",
-        )
-
-    def test_history_truthful_error_state(self):
-        """studio-history.js must show a visible error state on failure."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn(
-            "Failed",
-            text,
-            "Expected error state display in studio-history.js",
-        )
-
-    def test_history_groups_by_experiment_id(self):
-        """studio-history.js should group cells by experiment_id if present."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn(
-            "experiment_id",
-            text,
-            "Expected experiment_id handling for cell grouping in studio-history.js",
-        )
+        code = _code(text)
+        self.assertNotIn("onRun", code, "legacy onRun context callback must stay retired")
 
 
 class FreshLegacyOptionsTests(unittest.TestCase):
-    """Legacy options/draft/preview must be fresh each mount."""
+    """H18 Wave G: the legacy draft/preview/experimentId context machinery
+    is deleted — its only consumer was the retired studio-legacy.js mount."""
 
-    def test_legacy_context_uses_getters_not_frozen_values(self):
-        """modal-testing.js must use JS getters or functions for draft/preview/experimentId in context."""
+    def test_legacy_context_machinery_removed(self):
+        """modal-testing.js must not carry draft/preview/experimentId state."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        # Look for getter syntax or function-wrapped state reads
-        has_getter = (
-            "get draft" in text
-            or "get previewState" in text
-            or "get experimentId" in text
-            or "getLegacyOptions" in text
-            or "_readLatestDraft" in text
-            or "_getFresh" in text
-        )
-        self.assertTrue(
-            has_getter,
-            "Expected getter or function-wrapped state reads in modal-testing.js context — "
-            "draft/preview/experimentId must be fresh each mount, not frozen at shell mount",
-        )
+        code = _code(text)
+        for retired in [
+            "get draft",
+            "get previewState",
+            "get experimentId",
+            "onDraftChange",
+            "onRun",
+            "_draftState",
+            "_previewState",
+            "DRAFT_STORAGE_KEY",
+            "EXPERIMENT_ID_KEY",
+        ]:
+            self.assertNotIn(
+                retired,
+                code,
+                f"Legacy context machinery '{retired}' must stay deleted (Wave G)",
+            )
 
-    def test_legacy_context_not_frozen_at_mount(self):
-        """The shell context object must not contain static draft/previewState/experimentId values."""
+    def test_modern_context_remains(self):
+        """The shell context still carries what modern pages consume."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        # Check that draft is NOT evaluated as a static expression at the context level
-        # (it's OK if it's a getter)
-        bad_pattern = re.search(
-            r"draft:\s*_draftState(?!\.)|experimentId:\s*_draftState\.lastExperimentId",
-            text,
-        )
-        if bad_pattern:
-            # Only fail if draft is a static property (not a getter)
-            line_start = max(0, bad_pattern.start() - 40)
-            snippet = text[line_start:bad_pattern.end() + 40]
-            # If there's a 'get' keyword before 'draft:', it's a getter — OK
-            preceding = text[max(0, bad_pattern.start() - 10):bad_pattern.start()]
-            if "get " not in preceding:
-                self.fail(
-                    "draft/previewState/experimentId must be getters or functions, "
-                    f"not static values. Found near: ...{snippet}..."
-                )
+        self.assertIn("apiBase: MODAL_PREFIX", text)
+        self.assertIn("comfyApi: comfyApi", text)
 
 
 class NoNestedStudioBodyTests(unittest.TestCase):
@@ -2019,13 +1811,14 @@ class RootCausePromptPlaceholderTests(unittest.TestCase):
 class RootCauseBackendSelectorAbstractionTests(unittest.TestCase):
     """Backend selector must use the Studio backend abstraction."""
 
-    def test_backend_selector_imports_get_backends(self):
-        """studio-playground.js must import getBackends from studio-backend.js."""
+    def test_backend_selector_has_no_dead_backends_reference(self):
+        """H18 Wave G: the dead getBackends comment reference is removed;
+        the selector loads runtime presets via the presets abstraction."""
         text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
-        self.assertIn(
+        self.assertNotIn(
             "getBackends",
             text,
-            "Expected getBackends import from studio-backend.js in renderBackendSelector",
+            "studio-playground.js must not reference the deleted getBackends helper",
         )
 
     def test_backend_selector_links_to_backend_tab(self):
@@ -2073,30 +1866,21 @@ class RootCauseCompareBackendsStateTests(unittest.TestCase):
 
 
 class RootCauseCachedShellLegacyRoutingTests(unittest.TestCase):
-    """Cached-shell must set activeLegacyTab for legacy tab routing."""
+    """H10: retired aliases never set a dead activeLegacyTab (cached or fresh path)."""
 
-    def test_cached_shell_sets_active_legacy_tab(self):
-        """In cached-shell path, open_testing_modal must set activeLegacyTab
-        for setup/profiles/results before calling setPage."""
-        text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        # The cached-shell path must have duplicate or additional activeLegacyTab setting
-        # similar to the non-cached path (line ~255)
-        self.assertIn(
-            "activeLegacyTab",
-            text,
-            "Expected activeLegacyTab setting in open_testing_modal",
-        )
+    def test_no_active_legacy_tab_writes_in_open_testing_modal(self):
+        """modal-testing.js must no longer write settings.activeLegacyTab anywhere.
 
-    def test_cached_shell_sets_active_tab_for_setup(self):
-        """Cached shell must route legacy setup to Settings > Legacy Setup."""
+        The setup/profiles/results aliases now land on modern pages
+        (Playground/History), so no code path may resurrect the dead
+        activeLegacyTab mechanism for them.
+        """
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        # There must be activeLegacyTab references at TWO locations in open_testing_modal
-        # (not just the non-cached path)
         count = text.count("activeLegacyTab")
-        self.assertGreaterEqual(
-            count, 2,
-            f"Expected at least 2 activeLegacyTab occurrences in modal-testing.js "
-            f"(cached + non-cached paths), found {count}",
+        self.assertEqual(
+            count, 0,
+            f"Expected zero activeLegacyTab occurrences in modal-testing.js "
+            f"(retired aliases land on modern pages), found {count}",
         )
 
 
@@ -2133,16 +1917,30 @@ class RootCauseBackendSavePatchTests(unittest.TestCase):
 
 
 class RootCauseEmptyStateBugTests(unittest.TestCase):
-    """renderEmptyState must receive state parameter."""
+    """renderEmptyState authority lives only in studio-ui.js (I7).
+
+    The old pass-through re-export wrapper in studio-backend.js was deleted in
+    Phase I7 after re-measurement confirmed zero importers; page lanes consume
+    the generic options-API primitive from studio-ui.js directly.
+    """
 
     def test_render_empty_state_receives_state(self):
-        """renderEmptyState must receive state parameter (4 args: listContent, detailPanel, context, state)."""
-        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
-        # The function definition must accept state
+        """studio-ui.js owns renderEmptyState with the generic options API."""
+        text = (WEB / "studio-ui.js").read_text(encoding="utf-8")
+        # The shared primitive must keep its generic frozen API.
         self.assertIn(
-            "function renderEmptyState(listContent",
+            "function renderEmptyState(options",
             text,
-            "Expected renderEmptyState to accept listContent, detailPanel, context, state",
+            "Expected studio-ui.js renderEmptyState to accept an options object",
+        )
+
+    def test_backend_glue_no_longer_reexports_render_empty_state(self):
+        """The dead studio-backend.js re-export wrapper must stay deleted."""
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "renderEmptyState",
+            text,
+            "studio-backend.js must not define or re-export renderEmptyState",
         )
 
 
@@ -2217,51 +2015,81 @@ class RootCauseNoStateContextTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Regression fix — legacy sidebar tabs must opt in explicitly
+# H10 — hidden legacy sidebar registrations removed; Comparison code intact
 # ---------------------------------------------------------------------------
 
 class LegacyComparisonSidebarGuardTests(unittest.TestCase):
-    """modal-comparison.js must not register legacy sidebar tabs by default.
-    Requires explicit opt-in via window.__comfyModalEnableLegacySidebarTabs."""
+    """H10 removed the hidden Comparison sidebar registrations; Wave E
+    retired the overlay globals and canvas menu; Wave G (H18) deleted the
+    inert modal-comparison.js module outright.
+
+    These tests pin the end state: the file is gone and no web module may
+    resurrect a Comparison registration, overlay global, or canvas menu.
+    """
 
     def setUp(self) -> None:
-        self.text = (WEB / "modal-comparison.js").read_text(encoding="utf-8")
+        self.assertFalse(
+            (WEB / "modal-comparison.js").exists(),
+            "web/modal-comparison.js must stay deleted (Wave G)",
+        )
 
-    def test_comparison_guard_uses_explicit_opt_in(self):
-        """Guard must use __comfyModalEnableLegacySidebarTabs === true, not !__comfyModalUnifiedUI."""
-        self.assertIn(
+    def test_no_comparison_module_anywhere(self):
+        """No web file may reference the deleted module path."""
+        for path in WEB.glob("*.js"):
+            code = _code(path.read_text(encoding="utf-8"))
+            self.assertNotIn("modal-comparison", code, f"{path.name} references deleted module")
+
+    def test_no_sidebar_tab_registration_for_comparison(self):
+        """No web module may register a Comparison sidebar tab."""
+        hits = []
+        for path in WEB.glob("*.js"):
+            code = _code(path.read_text(encoding="utf-8"))
+            if "registerSidebarTab" in code and "comfymodal-testing-suite" not in code:
+                hits.append(path.name)
+            if "Comparison Profiles" in code and "retired" not in code:
+                hits.append(path.name)
+        self.assertEqual(hits, [], f"Unexpected Comparison registrations: {hits}")
+
+    def test_comparison_globals_stay_retired_web_wide(self):
+        """Overlay globals + canvas menu wrapper must never return."""
+        for retired in [
+            "openComparisonProfilesOverlay",
+            "openComparisonRunnerOverlay",
+            "mountComparisonProfiles",
+            "mountComparisonRunner",
+            "_initContextMenu",
             "__comfyModalEnableLegacySidebarTabs",
-            self.text,
-            "Expected __comfyModalEnableLegacySidebarTabs opt-in guard in modal-comparison.js",
-        )
-
-    def test_comparison_guard_no_unifiedui(self):
-        """Guard must NOT use !window.__comfyModalUnifiedUI."""
-        self.assertNotIn(
             "!window.__comfyModalUnifiedUI",
-            self.text,
-            "Legacy sidebar guard must not rely on __comfyModalUnifiedUI flag",
-        )
-
-    def test_comparison_still_has_render_helpers(self):
-        """Comparison render/mount helpers must remain intact."""
-        self.assertIn("buildProfilesTab", self.text)
-        self.assertIn("buildRunnerTab", self.text)
+        ]:
+            hits = [p.name for p in WEB.glob("*.js") if retired in _code(p.read_text(encoding="utf-8"))]
+            self.assertEqual(hits, [], f"{retired} must have zero web references")
 
 
 class LegacySettingsSidebarGuardTests(unittest.TestCase):
-    """modal-settings.js must not register legacy modal-gpu sidebar tab by default.
-    Requires explicit opt-in via window.__comfyModalEnableLegacySidebarTabs."""
+    """H10: modal-settings.js registers zero sidebar tabs; overlay retired in E.
+
+    The opt-in flag and the hidden "Modal GPU" registration are removed (H10).
+    The standalone legacy overlay globals were deleted by Wave E (H14) —
+    modern Settings is the only settings surface.
+    """
 
     def setUp(self) -> None:
         self.text = (WEB / "modal-settings.js").read_text(encoding="utf-8")
 
-    def test_settings_guard_uses_explicit_opt_in(self):
-        """Guard must use __comfyModalEnableLegacySidebarTabs === true, not !__comfyModalUnifiedUI."""
-        self.assertIn(
+    def test_hidden_sidebar_flag_removed(self):
+        """__comfyModalEnableLegacySidebarTabs must be gone from modal-settings.js."""
+        self.assertNotIn(
             "__comfyModalEnableLegacySidebarTabs",
             self.text,
-            "Expected __comfyModalEnableLegacySidebarTabs opt-in guard in modal-settings.js",
+            "Hidden legacy sidebar opt-in flag must be removed (H10)",
+        )
+
+    def test_no_sidebar_tab_registration(self):
+        """modal-settings.js must not register any sidebar tab."""
+        self.assertNotIn(
+            "registerSidebarTab",
+            self.text,
+            "Legacy settings panel must not register sidebar tabs (H10 retirement)",
         )
 
     def test_settings_guard_no_unifiedui(self):
@@ -2272,16 +2100,52 @@ class LegacySettingsSidebarGuardTests(unittest.TestCase):
             "Legacy sidebar guard must not rely on __comfyModalUnifiedUI flag",
         )
 
-    def test_settings_still_has_legacy_sections(self):
-        """Legacy settings sections must remain intact."""
-        for section in ["auth", "deploy", "gpu", "workspace", "models",
-                        "sync", "output", "tokens", "logs"]:
-            self.assertIn(section, self.text.lower(),
-                          f"Legacy modal-settings.js missing section: {section}")
+    def test_overlay_compatibility_global_retired(self):
+        """H14 Wave E: the standalone legacy overlay globals are deleted."""
+        code = "\n".join(
+            line for line in self.text.splitlines() if not line.lstrip().startswith("//")
+        )
+        self.assertNotIn(
+            "open_comfymodal_settings", code,
+            "The standalone legacy overlay global must be retired (Wave E)",
+        )
+        self.assertNotIn(
+            "mountSettingsPanel", code,
+            "The legacy panel mount global must be retired (Wave E)",
+        )
+        self.assertNotIn(
+            "comfymodal-settings-overlay", code,
+            "The legacy overlay root must not be constructible (Wave E)",
+        )
 
-    def test_settings_still_has_testing_suite_launcher(self):
-        """Secondary Testing Suite launcher must remain in settings."""
-        self.assertIn("Testing Suite", self.text)
+    def test_canvas_compatibility_shim_present(self):
+        """H5C §15-B: startup initializes window._comfyModalEnabled from the
+        persisted comfymodal_enabled key with identical precedence."""
+        self.assertIn("STORAGE_KEY_ENABLED", self.text)
+        shim = self.text[self.text.index("savedEnabled === null ? true : savedEnabled === \"true\"") - 400:]
+        self.assertIn("window._comfyModalEnabled =", shim)
+        # modal-node.js readers unchanged
+        node_src = (WEB / "modal-node.js").read_text(encoding="utf-8")
+        self.assertEqual(node_src.count("window._comfyModalEnabled !== false"), 2)
+
+    def test_legacy_overlay_sections_deleted(self):
+        """H18 Wave G: the overlay body (auth/deploy/workspace/models/sync/
+        tokens/logs sections and their builders) is deleted; only the
+        canvas/shared compatibility surface remains."""
+        code = _code(self.text)
+        for retired in [
+            "buildPanel", "buildAuthPanel", "loadModels", "renderModelList",
+            "startDeployPoll", "pollDeployStatus", "checkHealth",
+            "createCollapsibleSection", "showConfirmDialog",
+            "Testing Suite",
+        ]:
+            self.assertNotIn(retired, code, f"Retired overlay region '{retired}' must stay deleted")
+
+    def test_shared_sync_regions_survive(self):
+        """The surviving shared regions (H5C §15-C/D) remain wired in setup."""
+        self.assertIn("syncLegacyGpuConfigOnce();", self.text)
+        self.assertIn("syncLegacyOutputPrefsOnce();", self.text)
+        self.assertIn('from "./studio-output-preferences.js"', self.text)
 
 
 # ---------------------------------------------------------------------------
@@ -2300,6 +2164,132 @@ class UnifiedUIFlagTests(unittest.TestCase):
             "__comfyModalUnifiedUI",
             self.text,
             "Expected __comfyModalUnifiedUI flag in modal-testing.js",
+        )
+
+
+# ---------------------------------------------------------------------------
+# H10 — frozen legacy entry-point redirects (H5 §22)
+# ---------------------------------------------------------------------------
+
+class LegacyEntrypointRedirectTests(unittest.TestCase):
+    """H10 frozen opener redirects.
+
+    Contract (H5 §22 + H10 batch):
+      dashboard → Backend · history → History · results → History
+      settings  → Settings · setup → Playground (+ Experiment-mode context,
+      bounded deprecation) · profiles → Playground (+ bounded deprecation).
+    """
+
+    def setUp(self) -> None:
+        self.text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
+        match = re.search(r"const ALIAS_PAGE_MAP = \{(.*?)\};", self.text, re.S)
+        self.assertIsNotNone(match, "Expected ALIAS_PAGE_MAP in modal-testing.js")
+        self.alias_map = match.group(1)
+
+    def test_dashboard_alias_redirects_to_backend(self):
+        """dashboard alias must land on Backend (operational intent re-homed by H6)."""
+        self.assertIn(
+            'dashboard: "backend"',
+            self.alias_map,
+            "Frozen redirect: dashboard → Backend",
+        )
+
+    def test_history_alias_lands_on_history_v2(self):
+        """history alias must land on History (V2 is the sole durable History)."""
+        self.assertIn('history: "history"', self.alias_map)
+
+    def test_results_alias_lands_on_history_v2(self):
+        """results alias must land on History — never a dead Legacy Results mount."""
+        self.assertIn('results: "history"', self.alias_map)
+
+    def test_settings_alias_lands_on_settings(self):
+        """settings alias must land on modern Settings."""
+        self.assertIn('settings: "settings"', self.alias_map)
+
+    def test_setup_alias_never_mounts_legacy_setup(self):
+        """setup alias lands on Playground; no Legacy Setup mount through the alias."""
+        self.assertIn('setup: "playground"', self.alias_map)
+        # The alias navigation helper must not invoke the legacy tab mounter.
+        nav_start = self.text.find("function _applyLegacyAliasNavigation")
+        nav_end = self.text.find("export function open_testing_modal")
+        nav_block = self.text[nav_start:nav_end]
+        self.assertNotIn(
+            "mountLegacyTab",
+            nav_block,
+            "Alias navigation must never mount a legacy tab directly",
+        )
+        # Bounded deprecation guidance exists for the retired surface.
+        self.assertIn(
+            "alias-deprecation-notice",
+            self.text,
+            "Expected bounded deprecation notice for retired aliases",
+        )
+        self.assertIn(
+            "Experiment mode",
+            self.text,
+            "Deprecation guidance must name the modern owner (Experiment mode)",
+        )
+
+    def test_profiles_alias_never_recreates_comparison_editor(self):
+        """profiles alias lands on Playground with deprecation; no Comparison editor mount."""
+        self.assertIn('profiles: "playground"', self.alias_map)
+        self.assertNotIn(
+            'profiles: "settings"',
+            self.alias_map,
+            "profiles must not funnel into the retiring Settings legacy group",
+        )
+        self.assertIn(
+            "Comparison Profiles have retired",
+            self.text,
+            "Expected truthful deprecation copy for the profiles alias",
+        )
+
+    def test_no_dead_active_legacy_tab_for_retired_aliases(self):
+        """No code path may set settings.activeLegacyTab for retired aliases."""
+        self.assertEqual(
+            self.text.count("activeLegacyTab"), 0,
+            "Retired aliases must not set a dead activeLegacyTab",
+        )
+
+    def test_normal_studio_sidebar_entry_remains(self):
+        """The normal modal-testing Studio sidebar registration must remain."""
+        self.assertIn("registerSidebarTab", self.text)
+        self.assertIn("comfymodal-testing-suite", self.text)
+
+    def test_direct_compatibility_global_remains(self):
+        """window.open_testing_modal compatibility global remains exported."""
+        self.assertIn("window.open_testing_modal = open_testing_modal", self.text)
+
+    def test_alias_path_introduces_no_network_or_provider_terms(self):
+        """No provider-selector vocabulary and no new network I/O in the opener."""
+        lowered = self.text.lower()
+        for term in ["runpod", "runcomfy", "comfy_cloud", "baseten", "provider selector"]:
+            self.assertNotIn(
+                term, lowered,
+                f"Provider-selector terminology must not be introduced: {term}",
+            )
+        self.assertNotIn("fetch(", self.text)
+        self.assertNotIn("fetchApi(", self.text)
+
+    def test_modern_copy_has_no_legacy_setup_funnel(self):
+        """Feature-registry/playground copy must not send users to Legacy Setup."""
+        registry_text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Settings > Legacy Setup",
+            registry_text,
+            "Feature-registry placeholder copy must not funnel into Legacy Setup",
+        )
+        playground_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Configure in Legacy Setup",
+            playground_text,
+            "Playground control note must not funnel into Legacy Setup",
+        )
+        # Truthful modern-owner wording exists instead.
+        self.assertIn(
+            "not available in the modern playground yet",
+            registry_text.lower(),
+            "Placeholder features must state truthfully that they are missing",
         )
 
 
@@ -2348,9 +2338,9 @@ class SyntaxRegressionTests(unittest.TestCase):
         """modal-testing.js must pass node --check (real syntax validation)."""
         self._node_check("modal-testing.js")
 
-    def test_modal_comparison_js_syntax(self):
-        """modal-comparison.js must pass node --check (real syntax validation)."""
-        self._node_check("modal-comparison.js")
+    def test_modal_comparison_js_syntax_removed(self):
+        """H18 Wave G: modal-comparison.js is deleted; nothing to check."""
+        self.assertFalse((WEB / "modal-comparison.js").exists())
 
     def test_modal_settings_js_syntax(self):
         """modal-settings.js must pass node --check (real syntax validation)."""

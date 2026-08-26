@@ -175,6 +175,7 @@ def _default_build_execution_plan(
     controls: dict[str, Any],
     *,
     modal_options: dict[str, Any] | None = None,
+    gpu: Any = None,
 ) -> tuple[ExecutionPlan | None, str | None]:
     """Build a frozen ExecutionPlan from Studio preset/snapshot.
 
@@ -189,6 +190,10 @@ def _default_build_execution_plan(
     5. Apply control overrides
     6. Resolve production options
     7. Build and return ExecutionPlan
+
+    F8: *gpu* is the GPU captured at request acceptance; it is frozen into
+    ``request_metadata.selected_gpu`` so replay/resume/retry keep executing
+    on the plan's own GPU regardless of later Settings changes.
     """
     from studio_run_adapter import (
         _AUTO_DERIVE_CONTROLS,
@@ -258,6 +263,7 @@ def _default_build_execution_plan(
             custom_prompt_bundle[ck] = cv
 
     # ── 7. Studio request metadata ──
+    _selected_gpu = str(gpu or "")
     studio_meta = {
         "studio_preset_id": preset.get("id", ""),
         "studio_snapshot_id": snapshot.get("id", ""),
@@ -266,6 +272,7 @@ def _default_build_execution_plan(
         "studio_controls": copy.deepcopy(controls or {}),
         "output_mode": output_mode,
         "variant": output_mode,
+        "selected_gpu": _selected_gpu,
     }
 
     # ── 8. Resolve production options and compile when normalized production
@@ -303,7 +310,7 @@ def _default_build_execution_plan(
             prompt_id=str(uuid.uuid4().hex[:12]),
             modal_options=effective_modal_options,
             production_options=production_options,
-            gpu="",
+            gpu=_selected_gpu,
             request_metadata=studio_meta,
             validate=False,
         )
@@ -504,6 +511,15 @@ async def _default_save_history(
             primary_asset_id = str(result.get("primary_asset_id", "") or "")
         if primary_asset_id:
             meta["primary_asset_id"] = primary_asset_id
+        derivative_asset_ids: list[str] = []
+        if isinstance(result, dict):
+            raw_derivatives = result.get("derivative_asset_ids")
+            if isinstance(raw_derivatives, (list, tuple)):
+                derivative_asset_ids = [
+                    str(value) for value in raw_derivatives if str(value)
+                ]
+        if derivative_asset_ids:
+            meta["derivative_asset_ids"] = list(derivative_asset_ids)
 
         # Extract output paths from result — prefer pre-materialized paths
         # when available (passed by the PlaygroundService after materialization).
@@ -562,7 +578,7 @@ def _sync_materialize(
     """Synchronous materialization body — offloaded to thread by
     ``_default_materialize``.
 
-    Does NOT import or use: ``experiment_runner``, ``LocalRemoteInvoker``,
+    Does NOT import or use: ``experiment_runner``, any legacy invoker,
     scheduler, leases, journals, or worker pool.
     """
     if not isinstance(result, dict) or not result.get("outputs"):
@@ -594,6 +610,7 @@ def _sync_materialize(
     workspace_id = str((workspace or {}).get("id", ""))
     result_mode = str((result or {}).get("output_mode", "original") or "original")
     result_variant = str((result or {}).get("variant", result_mode) or result_mode)
+    derivative_asset_ids: list[str] = []
     if isinstance(descriptors, list) and workspace_id:
         try:
             from experiment_service import REGISTRY
@@ -605,19 +622,21 @@ def _sync_materialize(
                 backend_path = str(descriptor.get("backend_path") or descriptor.get("path") or "")
                 if not asset_id or not backend_path:
                     continue
+                descriptor_variant = str(
+                    descriptor.get("variant")
+                    or descriptor.get("output_mode")
+                    or result_variant
+                )
                 leases.register_asset(
                     asset_id=asset_id,
                     experiment_id="",
                     cell_key=experiment_id,
-                    variant=str(
-                        descriptor.get("variant")
-                        or descriptor.get("output_mode")
-                        or result_variant
-                    ),
+                    variant=descriptor_variant,
                     path=f"modal://{workspace_id}|{str(gpu or '')}|{backend_path}",
                     mime_type=str(descriptor.get("mime_type") or "application/octet-stream"),
                     byte_size=int(descriptor.get("byte_count", 0) or 0),
                     content_hash=asset_id,
+                    parent_asset_id=str(descriptor.get("parent_asset_id", "") or ""),
                     node_id=str(descriptor.get("node_id", "")),
                     output_key=str(descriptor.get("output_key", "")),
                     output_index=int(descriptor.get("output_index", 0) or 0),
@@ -625,8 +644,12 @@ def _sync_materialize(
                     width=int(descriptor.get("width", 0) or 0),
                     height=int(descriptor.get("height", 0) or 0),
                 )
+                if descriptor_variant == "thumbnail":
+                    derivative_asset_ids.append(asset_id)
         except Exception:
             _log.warning("Failed to register Playground output assets")
+    if derivative_asset_ids and isinstance(result, dict):
+        result["derivative_asset_ids"] = derivative_asset_ids
     return paths
 
 
@@ -651,7 +674,7 @@ async def _default_materialize(
     writes and returns a list of relative filenames matching the shape
     produced by the adapter for response compatibility.
 
-    Does NOT import or use: ``experiment_runner``, ``LocalRemoteInvoker``,
+    Does NOT import or use: ``experiment_runner``, any legacy invoker,
     scheduler, leases, journals, or worker pool.
     """
     return await asyncio.to_thread(
@@ -736,9 +759,9 @@ class PlaygroundService:
     ) -> dict[str, Any]:
         """Execute a single playground run.
 
-        Returns a dict with the same shape as
-        ``direct_studio_run_completion`` for adapter compatibility:
-        ``status``, ``runId``, ``experimentId``, ``output_paths``,
+        Returns the canonical single-run response shape (kept stable for
+        adapter compatibility after H19 removed the retired V1 completion
+        helper): ``status``, ``runId``, ``experimentId``, ``output_paths``,
         ``timings``, ``meta``, ``production_plan_used``, ``direct_run``.
         On error returns ``{"status": "error", "message": ...}``.
 
@@ -767,10 +790,21 @@ class PlaygroundService:
             return {"status": "error", "message": validate_err}
 
         # ── Stage 3: Build frozen ExecutionPlan ───────────────────────
+        # F8: forward the captured GPU to builders that accept it so the
+        # plan freezes ``selected_gpu`` at creation.  Injected legacy fakes
+        # with the pre-F8 signature keep working unchanged.
+        _build_kwargs: dict[str, Any] = {"modal_options": modal_options}
+        if gpu:
+            try:
+                import inspect as _inspect
+                if "gpu" in _inspect.signature(self._build_plan).parameters:
+                    _build_kwargs["gpu"] = gpu
+            except (TypeError, ValueError):
+                pass
         plan, build_err = await _offload_or_await(
             self._build_plan,
             preset, snapshot, feature_id, controls,
-            modal_options=modal_options,
+            **_build_kwargs,
         )
         if plan is None:
             _log.warning("Playground plan build failed: %s", build_err)
@@ -934,6 +968,10 @@ class PlaygroundService:
         meta["production_plan_used"] = "yes" if plan.execution_options.production_enabled else "no"
         if isinstance(result, dict) and result.get("primary_asset_id"):
             meta["primary_asset_id"] = result["primary_asset_id"]
+        if isinstance(result, dict):
+            raw_derivatives = result.get("derivative_asset_ids")
+            if isinstance(raw_derivatives, (list, tuple)) and raw_derivatives:
+                meta["derivative_asset_ids"] = [str(v) for v in raw_derivatives if str(v)]
         if output_paths:
             meta["output_paths"] = list(output_paths)
 

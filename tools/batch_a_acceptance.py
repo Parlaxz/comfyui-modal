@@ -32,7 +32,7 @@ Batch-A gates validated here:
 1.  fresh identity (nonempty restored_instance_id, restore_count==1,
     request_count==1)
 2.  waterfall status (reconciliation_status == "OK" OR
-    validation_status == "COMPLETE")
+    diagnostic_status == "COMPLETE")
 3.  reconciliation |delta| <= RECONCILIATION_HARD_MS (50 ms)
 4.  G1 single-execution proof: plan before early UNET schedule, early schedule
     present, snapshot-UNET absent, exactly one UNET active read / bind / H2D,
@@ -353,10 +353,10 @@ def validate_batch_a(artifact: dict) -> BatchAAcceptanceResult:
         )
     else:
         _rs = _wf.get("reconciliation_status")
-        _vs = _wf.get("validation_status")
+        _vs = _wf.get("diagnostic_status")
         status_ok = _rs == "OK" or _vs == "COMPLETE"
         status_detail = (
-            f"reconciliation_status={_rs!r}, validation_status={_vs!r}"
+            f"reconciliation_status={_rs!r}, diagnostic_status={_vs!r}"
         )
         reconciliation_ms = _num(_wf.get("reconciliation_ms"))
         if reconciliation_ms is None:

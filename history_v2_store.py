@@ -203,6 +203,10 @@ class HistoryV2Store:
         Fresh databases already carry the columns via the CREATE TABLE
         statement; pre-existing databases are upgraded in place.  Duplicate
         column errors are expected (column already exists) and pass silently.
+        The favorite index is created here (not in ``_SCHEMA_SQL``) so it is
+        guaranteed to run AFTER the column exists on every database shape;
+        ``IF NOT EXISTS`` keeps it idempotent and mirrors
+        ``idx_generations_favorite`` for the feed's favorite-only filter.
         """
         for ddl in (
             "ALTER TABLE experiments ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0",
@@ -212,6 +216,10 @@ class HistoryV2Store:
                 conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_experiments_favorite "
+            "ON experiments(favorite)"
+        )
 
     def _ensure_request_snapshot_columns(self, conn: sqlite3.Connection) -> None:
         """Idempotently add immutable execution-snapshot columns to existing DBs.

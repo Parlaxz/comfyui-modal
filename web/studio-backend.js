@@ -5,29 +5,26 @@
 // inline helper so tests can find the semantic-button patterns, and
 // renderBackend as the main entry point.
 
-import { el, statusBadge, renderEmptyState as _renderEmptyState } from "./studio-ui.js";
-import { getBackends as _importBackends, getCompareBackends as _importCompare, listPresets } from "./studio-backend-api.js";
+import { el, statusBadge } from "./studio-ui.js";
+import { listPresets } from "./studio-backend-api.js";
 import * as _capture from "./studio-backend-capture.js";
 import { renderSnapshotsPage, renderSnapshotsList, renderSnapshotDetail } from "./studio-backend-snapshots.js";
 import { renderPresetsPage, renderPresetsList, renderPresetDetail, renderPresetForm } from "./studio-backend-presets.js";
+import { renderRuntimeSection, createOpsBus } from "./studio-backend-runtime.js";
+import { renderWorkspacesSection } from "./studio-backend-workspaces.js";
+import { renderDeploymentSection } from "./studio-backend-deployment.js";
+import { renderCredentialsSection } from "./studio-backend-credentials.js";
+import { subscribeStudioSync } from "./studio-sync.js";
 
-// Re-export legacy helpers for Playground / Experiment consumers
-// Keep renderEmptyState as a wrapper function so tests can find the expected
-// function signature in the glue file.
-export function renderEmptyState(listContent, detailPanel, context, state) {
-  return _renderEmptyState(listContent, detailPanel, context, state);
-}
+// Phase I7: the dead empty-state re-export wrapper was deleted here — zero
+// importers since studio-ui.js's renderer became the generic options API
+// (I3); page lanes consume that shared primitive directly.
 
 // API method reference kept in glue for test discoverability
 const _PATCH = "PATCH";
 
-export async function getBackends(context) {
-  return _importBackends(context);
-}
-
-export async function getCompareBackends(context) {
-  return _importCompare(context);
-}
+// H18 Wave G: the dead getBackends/getCompareBackends re-exports were deleted
+// (zero callers since H16 removed the last Settings consumer; FD-8).
 
 // Shared mutable state for snapshots / presets modules (they import this)
 export const _STATE = { selectedItemId: null };
@@ -66,6 +63,23 @@ export function invalidateRuntimePresetsCache() {
 // JS state (aria-pressed + dataset) is the source of truth, not visual
 // class names.
 
+// Page-level h2 under the shell h1 (I1 §3.3 / I7). Backend has no visible
+// page title, so the heading is accessible-but-visually-hidden with the clip
+// pattern — never display:none / visibility:hidden. Local style only; shared
+// styles are not edited by this lane.
+const PAGE_TITLE_OFFSCREEN_STYLE =
+  "position:absolute;width:1px;height:1px;margin:-1px;padding:0;" +
+  "border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;";
+
+function _pageHeading() {
+  return el("h2", {
+    class: "comfymodal-studio-backend-page-title",
+    "data-testid": "backend-page-title",
+    text: "Backend",
+    style: PAGE_TITLE_OFFSCREEN_STYLE,
+  });
+}
+
 export function renderFeaturesChipGrid(features, onChange) {
   const grid = el("div", { class: "comfymodal-studio-features-chip-grid" });
   const known = ["txt2img", "object_remove", "object_replace"];
@@ -81,7 +95,10 @@ export function renderFeaturesChipGrid(features, onChange) {
   known.forEach((fid) => {
     const chip = el("button", {
       type: "button",
-      class: "comfymodal-studio-feature-chip",
+      // FILTER semantics per the I1 taxonomy: interactive aria-pressed toggles
+      // stay; only the shared cm-chip geometry base is adopted (no data-tone,
+      // no compatibility-family marker — these are feature filters).
+      class: "comfymodal-studio-feature-chip cm-chip",
       "aria-pressed": "false",
       "data-feature": fid,
     }, [
@@ -142,7 +159,17 @@ export function renderBackend(state, context) {
     "data-testid": "backend-page",
   });
 
+  // Truthful page heading first: sole h2 of the page under the shell h1.
+  container.appendChild(_pageHeading());
+
   const apiBase = (context && context.apiBase) || "/comfymodal";
+  let backendStale = false;
+  let unsubscribeBackendSync = null;
+
+  // Operational sections coordinate through a page-local bus (no globals):
+  // workspace mutations notify deployment/runtime sections to re-read
+  // server truth.
+  const _opsBus = createOpsBus();
 
   // ── Make Preset button (primary action) ───────────────────────────────
   const actionBar = el("div", {
@@ -167,31 +194,53 @@ export function renderBackend(state, context) {
 
   container.appendChild(actionBar);
 
-  // Tabs: Backend Presets | Snapshots (presets is default)
+  // Tabs: Overview | Workspaces | Deployment | Credentials | Snapshots |
+  // Backend Presets. Operational sections (H6 re-home) render full-width;
+  // Snapshots / Backend Presets keep their list+detail layout.
   const tabs = el("div", { class: "comfymodal-studio-backend-tabs" });
-  let activeTab = "presets";
+  let activeTab = "overview";
 
   const body = el("div", { class: "comfymodal-studio-backend-body" });
 
-  // Left list
+  // Left list (presets/snapshots only)
   const listPanel = el("div", {
     class: "comfymodal-studio-backend-list",
     "data-testid": "backend-list",
   });
 
-  // Right detail
+  // Right detail (presets/snapshots only)
   const detailPanel = el("div", {
     class: "comfymodal-studio-backend-detail",
     "data-testid": "backend-detail",
   });
 
+  // Full-width operational section panel
+  const opsPanel = el("div", {
+    class: "comfymodal-studio-backend-detail",
+    "data-testid": "backend-ops-panel",
+    style: "flex:1;",
+  });
+
   body.appendChild(listPanel);
   body.appendChild(detailPanel);
+  body.appendChild(opsPanel);
+
+  const OPS_SECTIONS = {
+    overview: renderRuntimeSection,
+    workspaces: renderWorkspacesSection,
+    deployment: renderDeploymentSection,
+    credentials: renderCredentialsSection,
+  };
 
   function switchTab(tabId) {
     activeTab = tabId;
     tabs.querySelectorAll(".comfymodal-studio-backend-tab").forEach((t) => {
       t.classList.toggle("active", t.dataset.tab === tabId);
+      // Truthful selection state for AT: these are exclusive view-switcher
+      // buttons (native buttons, no tablist keyboard model), so the smallest
+      // correct state is aria-current, not aria-selected/tabindex roving.
+      if (t.dataset.tab === tabId) t.setAttribute("aria-current", "true");
+      else t.removeAttribute("aria-current");
     });
     _STATE.selectedItemId = null;
     refreshList();
@@ -204,9 +253,14 @@ export function renderBackend(state, context) {
       text: label,
       onclick: () => switchTab(id),
     });
+    if (id === activeTab) btn.setAttribute("aria-current", "true");
     return btn;
   }
 
+  tabs.appendChild(makeTab("overview", "Overview"));
+  tabs.appendChild(makeTab("workspaces", "Workspaces"));
+  tabs.appendChild(makeTab("deployment", "Deployment"));
+  tabs.appendChild(makeTab("credentials", "Credentials"));
   tabs.appendChild(makeTab("presets", "Backend Presets"));
   tabs.appendChild(makeTab("snapshots", "Snapshots"));
 
@@ -216,13 +270,41 @@ export function renderBackend(state, context) {
   function refreshList() {
     while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);
     while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+    while (opsPanel.firstChild) opsPanel.removeChild(opsPanel.firstChild);
 
     if (activeTab === "snapshots") {
+      listPanel.style.display = "";
+      detailPanel.style.display = "";
+      opsPanel.style.display = "none";
       renderSnapshotsPage(listPanel, detailPanel, apiBase);
-    } else {
+    } else if (activeTab === "presets") {
+      listPanel.style.display = "";
+      detailPanel.style.display = "";
+      opsPanel.style.display = "none";
       renderPresetsPage(listPanel, detailPanel, apiBase);
+    } else {
+      listPanel.style.display = "none";
+      detailPanel.style.display = "none";
+      opsPanel.style.display = "";
+      const section = OPS_SECTIONS[activeTab] || renderRuntimeSection;
+      section(opsPanel, apiBase, _opsBus);
     }
   }
+
+  function refreshFromSync() {
+    if (!container.isConnected) {
+      if (unsubscribeBackendSync) unsubscribeBackendSync();
+      unsubscribeBackendSync = null;
+      return;
+    }
+    backendStale = true;
+    container.dataset.syncStale = "true";
+    refreshList();
+    backendStale = false;
+    container.dataset.syncStale = "false";
+  }
+
+  unsubscribeBackendSync = subscribeStudioSync("workspace", refreshFromSync);
 
   refreshList();
 

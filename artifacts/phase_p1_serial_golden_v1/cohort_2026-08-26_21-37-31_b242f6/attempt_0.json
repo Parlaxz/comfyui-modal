@@ -1,0 +1,23 @@
+{
+  "run_index": 0,
+  "request_id": "golden-p1-0-5ec0986d8f4c",
+  "mode": "golden_p1_serial",
+  "method": "run_golden_serial_stream",
+  "dispatch_unix_ms": 1787780252188,
+  "dispatch_iso": "2026-08-26T21:37:32.188000+00:00",
+  "start_ts": "2026-08-26T21:37:32.188352+00:00",
+  "end_ts": "2026-08-26T21:47:36.276453+00:00",
+  "duration_ms": 604088.276,
+  "event_count": 0,
+  "events_file": "attempt_0_events.json",
+  "validation": {},
+  "failures": [
+    "RemoteError: "
+  ],
+  "identity": {},
+  "cold_evidence": {},
+  "true_cold": false,
+  "valid": false,
+  "dnf": true,
+  "error": "RemoteError: "
+}

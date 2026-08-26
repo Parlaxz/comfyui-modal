@@ -228,16 +228,18 @@ test.describe("Studio Settings (redesigned)", () => {
       await openSettings(page);
       guard = installConsoleGuard(page);
 
-      // Settings keys that reset-all clears (and does NOT re-seed to defaults)
+      // Settings keys that reset-all clears (and does NOT re-seed to defaults).
+      // Stale reset-only keys (comfymodal_global_concurrency,
+      // comfymodal_preview_auto_save) were removed from the registry in F4A
+      // and must stay absent — pinned by
+      // tests/studio_phase_f4_settings_authority_unit.mjs.
       const settingsKeys = [
         "comfymodal_enabled",
         "comfymodal_gpu",
         "comfymodal_preview_default",
         "comfymodal_preview_codec",
         "comfymodal_preview_quality",
-        "comfymodal_preview_auto_save",
         "comfymodal-studio-history-columns",
-        "comfymodal_global_concurrency",
         "comfymodal_heavy_tracing",
         "comfymodal-studio-panel-width",
         "comfymodal.studio.playground.carousel-cleared.v1",

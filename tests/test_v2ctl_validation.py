@@ -220,6 +220,34 @@ class TestValidators:
 
 
 class TestGateRunner:
+    def test_arbitrary_target_method_is_rejected_before_backend(self, tmp_path):
+        config = FakeConfig()
+        config.target.method = "arbitrary_method"
+        backend = FakeBackendRunner(stdout=OK_GATE_STDOUT)
+        runner = make_gate_runner(tmp_path, backend=backend)
+        with pytest.raises(GateError, match="non-Golden profiles"):
+            runner.run_gate(config, FakeSpec())
+        assert backend.invocation_count == 0
+
+    def test_golden_target_uses_dedicated_harness_selector(self, tmp_path):
+        config = FakeConfig(profile_name="golden_p1")
+        config.target.app = "stable-modal-comfy-v2-golden-p1"
+        config.target.method = "run_golden_serial_stream"
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        )
+        runner = make_gate_runner(tmp_path, backend=backend)
+
+        result = runner.run_gate(config, FakeSpec())
+
+        assert result.valid is True
+        invocation = backend.invocations[0]
+        assert invocation["config"] is config
+        assert invocation["extra_args"] == ["--run-count", "1"]
+
     def test_exactly_one_invocation_with_benchmark_env(self, tmp_path):
         artifact = tmp_path / "run_1.json"
         artifact.write_text("{}", encoding="utf-8")
@@ -242,6 +270,38 @@ class TestGateRunner:
         assert result.run is not None
         assert result.run.backend_ok is True
         assert result.run.output_sha == SHA_20B1
+
+    def test_gate_propagates_resolved_canonical_identity(self, tmp_path):
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        )
+        config = FakeConfig()
+        runner = make_gate_runner(tmp_path, backend=backend)
+
+        runner.run_gate(config, FakeSpec())
+
+        env = backend.invocations[0]["extra_env"]
+        assert env["COMFYMODAL_V2_APP_NAME"] == config.target.app
+        assert env["COMFYMODAL_V2_CLASS_NAME"] == config.target.class_name
+        assert env["COMFYMODAL_V2_GPU"] == config.resources.gpu
+        assert env["COMFYMODAL_V2_MEMORY_MB"] == str(config.resources.memory_mb)
+        assert env["COMFYMODAL_V2_CPU_REQUEST"] == str(config.resources.cpu)
+        assert env["COMFYMODAL_V2_BASELINE_MEMORY_REQUEST"] == str(config.resources.memory_mb)
+        assert env["COMFYMODAL_V2_BASELINE_CPU_REQUEST"] == str(config.resources.cpu)
+
+    def test_golden_identity_mismatch_fails_before_backend(self, tmp_path):
+        config = FakeConfig(profile_name="golden_p1")
+        config.target.app = "stable-modal-comfy-v2-restore-only-shadow"
+        config.target.method = "run_golden_serial_stream"
+        backend = FakeBackendRunner(stdout=OK_GATE_STDOUT)
+        runner = make_gate_runner(tmp_path, backend=backend)
+
+        with pytest.raises(GateError, match="canonical identity|target.app"):
+            runner.run_gate(config, FakeSpec())
+        assert backend.invocation_count == 0
 
     def test_manifest_persisted_even_when_invalid(self, tmp_path):
         backend = FakeBackendRunner(
@@ -337,6 +397,52 @@ class TestConfirmRunner:
         data = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         assert data["confirm_runs"] == 3
         assert data["gate_manifest"] == str(Path(manifest))
+
+    def test_confirm_propagates_resolved_canonical_identity(self, tmp_path):
+        fingerprints, config, manifest = self._run_valid_gate(tmp_path)
+        backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=tmp_path / "run_1.json"),
+        )
+        confirm = make_confirm_runner(tmp_path, fingerprints=fingerprints, backend=backend)
+
+        confirm.confirm(manifest, config, FakeSpec(), runs=2)
+
+        for invocation in backend.invocations:
+            env = invocation["extra_env"]
+            assert env["COMFYMODAL_V2_APP_NAME"] == config.target.app
+            assert env["COMFYMODAL_V2_CLASS_NAME"] == config.target.class_name
+            assert env["COMFYMODAL_V2_GPU"] == config.resources.gpu
+            assert env["COMFYMODAL_V2_MEMORY_MB"] == str(config.resources.memory_mb)
+            assert env["COMFYMODAL_V2_CPU_REQUEST"] == str(config.resources.cpu)
+            assert env["COMFYMODAL_V2_BASELINE_MEMORY_REQUEST"] == str(config.resources.memory_mb)
+            assert env["COMFYMODAL_V2_BASELINE_CPU_REQUEST"] == str(config.resources.cpu)
+
+    def test_confirm_rejects_missing_golden_identity_before_backend(self, tmp_path):
+        config = FakeConfig(profile_name="golden_p1")
+        config.target.app = "stable-modal-comfy-v2-golden-p1"
+        config.target.method = "run_golden_serial_stream"
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        fingerprints = FakeFingerprints()
+        gate_backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        )
+        gate = make_gate_runner(tmp_path, fingerprints=fingerprints, backend=gate_backend)
+        gate_result = gate.run_gate(config, FakeSpec())
+        assert gate_result.valid is True
+        manifest = gate_result.manifest_path
+        assert manifest is not None
+
+        config.resources.gpu = ""
+        confirm_backend = FakeBackendRunner(stdout=OK_GATE_STDOUT)
+        confirm = make_confirm_runner(
+            tmp_path, fingerprints=fingerprints, backend=confirm_backend
+        )
+        with pytest.raises(GateError, match="canonical identity"):
+            confirm.confirm(manifest, config, FakeSpec())
+        assert confirm_backend.invocation_count == 0
 
     def test_e28_selector_and_nonce_are_forwarded_to_gate_and_confirm(self, tmp_path):
         config = FakeConfig()

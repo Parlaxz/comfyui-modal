@@ -192,7 +192,7 @@ try {
 
   // 5. The active Settings surface no longer presents an inert concurrency input.
   assert.equal(settingsSource.includes('data-testid": "settings-global-concurrency"'), false);
-  assert.equal(settingsSource.includes("fixed global backend width of 6"), true);
+  assert.equal(settingsSource.includes("Experiments run up to 6 cells concurrently"), true);
   assert.equal(settingsSource.includes('data-testid": "settings-preview-auto-save"'), false);
   assert.equal(configSource.includes('"preview_default"'), true);
   assert.equal(configSource.includes('"preview_codec"'), true);

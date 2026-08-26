@@ -1,13 +1,14 @@
 """Backend adapter for Studio Workflow platform runs (modern Studio lane).
 
 Bridges the Studio Workflow domain (``studio_domain``: workflows, immutable
-versions, mappings, presets) into the existing single-run execution paths —
-the SAME hard-stop boundaries as the legacy Studio preset surface:
+versions, mappings, presets) into the canonical single-run execution path —
+the SAME hard-stop boundary as the legacy Studio preset surface:
 
-* **V2**  → ``comfymodal_runtime.playground_service.PlaygroundService``
-  (injectable load/validate/build-plan/save-history hooks).
-* **v1/shadow** → submission-time history record + ``direct_studio_run_completion``
-  (``studio_run_adapter``) which delegates to ``canonical_execution.execute_modal_prompt``.
+* **V2 (only engine, H12)** → ``comfymodal_runtime.playground_service.PlaygroundService``
+  (injectable load/validate/build-plan/save-history hooks).  Requests that
+  explicitly carry a retired engine (v1/legacy/shadow) are rejected with
+  ``EXECUTION_MODE_RETIRED`` before acceptance; the former v1/shadow
+  submission-time path was retired in H12.
 
 All controls are validated verbatim (never coerced) against the version
 mapping's control schema and applied verbatim into the executable prompt.
@@ -526,6 +527,8 @@ def build_workflow_execution_plan(
     values: dict[str, Any],
     modal_options: dict[str, Any] | None = None,
     trace_ctx: dict[str, Any] | None = None,
+    comfyui_root: str = "",
+    gpu: Any = None,
 ) -> tuple[Any, str | None]:
     """Build a frozen ``ExecutionPlan`` for a workflow run.
 
@@ -539,6 +542,10 @@ def build_workflow_execution_plan(
       depends on it).
     * ``workflow_hash`` uses ``workflow_metadata.prompt_sha256``.
     * ``request_metadata`` carries the modern workflow identity meta.
+
+    F8: *gpu* is the GPU captured at request acceptance; it is frozen into
+    ``request_metadata.selected_gpu`` so replay/resume/retry keep executing
+    on the plan's own GPU regardless of later Settings changes.
 
     ``trace_ctx`` is accepted for signature parity with the legacy adapter;
     it is not consumed by plan construction.
@@ -584,6 +591,7 @@ def build_workflow_execution_plan(
         workflow_hash = prompt_sha256(workflow)
         effective_modal_options = normalize_output_intent_options(modal_options)
         output_mode = str(effective_modal_options.get("output_mode", "original"))
+        _selected_gpu = str(gpu or "")
         studio_meta = _build_workflow_studio_meta(
             workflow_id=str(bundle.get("workflow", {}).get("workflow_id", "")),
             version_id=str(bundle.get("version", {}).get("workflow_version_id", "")),
@@ -594,6 +602,7 @@ def build_workflow_execution_plan(
             workflow_hash=workflow_hash,
             output_mode=output_mode,
         )
+        studio_meta["selected_gpu"] = _selected_gpu
 
         output_node_id = str(bundle.get("mapping", {}).get("output_node_id", "") or "")
         if not output_node_id:
@@ -612,9 +621,14 @@ def build_workflow_execution_plan(
                 prompt_id=str(uuid.uuid4().hex[:12]),
                 modal_options=effective_modal_options,
                 production_options=prod_options,
-                gpu="",
+                gpu=_selected_gpu,
                 request_metadata=studio_meta,
+                comfyui_root=str(comfyui_root or ""),
                 validate=False,
+                # E7: freeze the plan-carried validation proof so the saved
+                # snapshot stays replay-capable for Generate Original (E3B2
+                # fail-closed replay validation requires a non-empty proof).
+                collect_validation_proof=True,
             )
             # Rebuild overriding prompt_bundle (intentional — the modern
             # bundle) and overlaying the modern studio metadata onto the
@@ -877,6 +891,16 @@ async def _modern_save_history_success(
         primary_asset_id = str(result.get("primary_asset_id", "") or "")
     if primary_asset_id:
         meta["primary_asset_id"] = primary_asset_id
+
+    # E2C: optional Thumbnail derivative producer ids ride in meta so the
+    # History writer can adopt them under the SAME logical output key as the
+    # required primary asset.  Derivatives are never the required result.
+    if isinstance(result, dict):
+        raw_derivatives = result.get("derivative_asset_ids")
+        if isinstance(raw_derivatives, (list, tuple)):
+            derivative_ids = [str(value) for value in raw_derivatives if str(value)]
+            if derivative_ids:
+                meta["derivative_asset_ids"] = derivative_ids
 
     # ── Output candidates: only known/materialized outputs are attached;
     #    never fabricated assets.  Mirrors the PlaygroundService contract
@@ -1218,11 +1242,13 @@ async def _workflow_v2_run(
         ctrl: dict,
         *,
         modal_options: dict[str, Any] | None = None,
+        gpu: Any = None,
     ) -> tuple[Any, str | None]:
         # The controls argument equals the request overrides; merged values
         # already contain preset + overrides, so use those verbatim.
         return build_workflow_execution_plan(
-            bundle, values, modal_options=modal_options, trace_ctx=trace_ctx
+            bundle, values, modal_options=modal_options, trace_ctx=trace_ctx,
+            comfyui_root=str(node_dir or ""), gpu=gpu,
         )
 
     # ── Post-materialization success capture (capture-only, no History write
@@ -1379,226 +1405,11 @@ async def _workflow_v2_run(
     return normalized
 
 
-async def _async_noop_profile_preparer(resolved_workflow: Any = None, cell: Any = None) -> dict:
-    """Profile-preparer placeholder for the direct path (never invoked there)."""
-    return {}
-
-
-async def _workflow_legacy_run(
-    bundle: dict[str, Any],
-    merged: dict[str, Any],
-    preset_id: str,
-    feature_id: str,
-    node_dir: str | os.PathLike,
-    modal_options: dict[str, Any] | None,
-    gpu: Any,
-    workspace: dict[str, Any] | None,
-    trace_ctx: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """v1/shadow path: submission-time history + direct canonical completion.
-
-    Builds a compilation mirroring ``build_single_run_spec``'s SHAPE from the
-    workflow (single checkpoint + single cell with ``_resolved_workflow`` pre-set),
-    replicates the submission-time ``studio_run`` history record from
-    ``_prepare_studio_run_context`` (with modern identity keys), then delegates
-    to ``direct_studio_run_completion`` → ``execute_modal_prompt`` (the SAME
-    hard-stop boundary as the legacy surface).
-    """
-    from datetime import datetime, timezone
-
-    from comfymodal_runtime.contracts import normalize_output_intent_options
-    from production_workflow import normalize_production_options
-    from studio_run_adapter import (
-        _make_studio_experiment_id,
-        _repair_missing_clip_inputs,
-        _repair_missing_vae_inputs,
-        direct_studio_run_completion,
-    )
-    from workflow_metadata import prompt_sha256
-
-    values = merged.get("values") or {}
-    applied = apply_workflow_values_to_prompt(
-        bundle["executable_prompt"], bundle["control_schema"], values
-    )
-    if "error" in applied:
-        return {"status": "error", "message": applied["error"]}
-    workflow = applied["workflow"]
-    # Repair legacy missing CLIP/VAE inputs for parity with the plan builder.
-    _repair_missing_clip_inputs(workflow)
-    _repair_missing_vae_inputs(workflow)
-    workflow_hash = prompt_sha256(workflow)
-
-    workflow_id = str(bundle.get("workflow", {}).get("workflow_id", "") or "")
-    version_id = str(bundle.get("version", {}).get("workflow_version_id", "") or "")
-    preset_id_resolved = str(bundle.get("preset", {}).get("preset_id", "") or "")
-    workflow_name = str(bundle.get("workflow", {}).get("name", "") or "")
-    preset_name = str(bundle.get("preset", {}).get("name", "") or "")
-
-    effective_modal_options = normalize_output_intent_options(modal_options)
-    output_mode = str(effective_modal_options.get("output_mode", "original"))
-    studio_meta = _build_workflow_studio_meta(
-        workflow_id=workflow_id,
-        version_id=version_id,
-        preset_id=preset_id_resolved,
-        workflow_name=workflow_name,
-        preset_name=preset_name,
-        controls=values,
-        workflow_hash=workflow_hash,
-        output_mode=output_mode,
-    )
-
-    # ── Production options (compile deferred to the canonical executor) ──
-    production_options = normalize_production_options(effective_modal_options)
-    _prod_enabled = bool(production_options.get("enabled"))
-    _output_id = str(bundle.get("mapping", {}).get("output_node_id", "") or "")
-    _prod_output_ids: list[str] = []
-    if _prod_enabled:
-        if not _output_id:
-            return {
-                "status": "error",
-                "message": (
-                    "Production is enabled but no output node ID could be "
-                    "derived from the workflow mapping."
-                ),
-            }
-        _prod_output_ids = [_output_id]
-        production_options["output_node_ids"] = list(_prod_output_ids)
-    prod_opts_for_compilation = production_options if _prod_enabled else None
-    _prod_plan_used = _prod_enabled and bool(_prod_output_ids)
-    _prod_output_source = "mapping" if _prod_enabled else "none"
-
-    exp_id = _make_studio_experiment_id()
-    checkpoint_id = f"ck_{uuid.uuid4().hex[:8]}"
-    cell_key = f"studio_cell_{uuid.uuid4().hex[:8]}"
-
-    axis_values: dict[str, Any] = {
-        k: v for k, v in values.items() if k not in ("prompt", "negative_prompt")
-    }
-    _cell_trace = dict(trace_ctx) if trace_ctx else {}
-
-    compilation: dict[str, Any] = {
-        "experiment_id": exp_id,
-        "revision": 1,
-        "checkpoints": [
-            {
-                "id": checkpoint_id,
-                "profile_id": "",
-                "loader_target_group_id": "g_default",
-                "triple": {},
-                "lora_selection_ids": [],
-                "cell_count": 1,
-                "workflow": workflow,
-                "slots": {},
-                "loader_target_groups": [],
-                "lora_slots": [],
-                "studio_meta": studio_meta,
-                "production_report": None,
-                "production_options": prod_opts_for_compilation,
-            }
-        ],
-        "cells": [
-            {
-                "cell_key": cell_key,
-                "sequence": 0,
-                "checkpoint_id": checkpoint_id,
-                "profile_id": "",
-                "loader_target_group_id": "g_default",
-                "triple": {},
-                "lora_selection_id": "",
-                "lora_signature": [],
-                "prompt_id": "studio_prompt",
-                "prompt": values.get("prompt", ""),
-                "negative_prompt": values.get("negative_prompt", ""),
-                "image_id": "",
-                "axis_values": axis_values,
-                "workflow_hash": "",
-                "studio_meta": studio_meta,
-                "trace": _cell_trace,
-                "production_report": None,
-                "production_options": prod_opts_for_compilation,
-                "_resolved_workflow": workflow,
-            }
-        ],
-        "duplicate_count": 0,
-        "warnings": [],
-        "studio_meta": studio_meta,
-        "production_report": None,
-        "production_options": prod_opts_for_compilation,
-        "execution_surface": "studio_workflow_single",
-        "production_output_source": _prod_output_source,
-        "production_plan_used": _prod_plan_used,
-        "production_output_ids": _prod_output_ids,
-        "execution_mode": "v1",
-        "execution_mode_source": "default",
-    }
-
-    # ── Submission-time history record (mirrors _prepare_studio_run_context) ──
-    run_history_id = ""
-    try:
-        from experiment_service import REGISTRY
-
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        meta_payload: dict[str, Any] = {
-            "requested_controls": dict(values),
-            "studio_feature_id": "workflow",
-            "experiment_id": exp_id,
-            "preset_label": preset_name or preset_id_resolved,
-            "submitted_at": now,
-            "workflow_hash": workflow_hash,
-            "workflow_id": workflow_id,
-            "workflow_version_id": version_id,
-            "preset_id": preset_id_resolved,
-            "workflow_name": workflow_name,
-            "preset_name": preset_name,
-        }
-        try:
-            meta_payload["workflow_json"] = copy.deepcopy(workflow)
-        except Exception:
-            pass
-
-        submission_record = REGISTRY.history().record_run(
-            kind="studio_run",
-            prompt_id=exp_id,
-            status="submitted",
-            started_at=now,
-            meta=meta_payload,
-        )
-        run_history_id = submission_record.get("run_id", "") if submission_record else ""
-        compilation["run_history_id"] = run_history_id
-
-        for ck in compilation.get("checkpoints", []):
-            ck.setdefault("studio_meta", {})["run_history_id"] = run_history_id
-        for cell in compilation.get("cells", []):
-            cell.setdefault("studio_meta", {})["run_history_id"] = run_history_id
-        compilation.setdefault("studio_meta", {})["run_history_id"] = run_history_id
-
-        if run_history_id:
-            REGISTRY.history().update_run(run_history_id, status="running")
-    except Exception:
-        _log.exception("Workflow run history creation failed")
-        return {"status": "error", "message": "Internal error creating run history"}
-
-    ctx: dict[str, Any] = {
-        "status": "ok",
-        "preset": bundle["preset"],
-        "snapshot": {},
-        "controls": dict(values),
-        "feature_id": "workflow",
-        "compilation": compilation,
-        "run_history_id": run_history_id,
-        "exp_id": exp_id,
-        "studio_meta": studio_meta,
-        "profile_preparer": _async_noop_profile_preparer,
-    }
-
-    return await direct_studio_run_completion(
-        ctx,
-        node_dir,
-        gpu=gpu,
-        modal_options=effective_modal_options,
-        workspace=workspace,
-    )
+# H12: the legacy Workflow V1 path (``_workflow_legacy_run`` + its
+# submission-time history record and the hardcoded
+# ``"execution_mode": "v1"`` compilation metadata) retired together with
+# the non-V2 dispatch branch.  Every NEW Workflow run uses the canonical
+# immutable V2 plan path via ``_workflow_v2_run``.
 
 
 # ── Public entrypoint ────────────────────────────────────────────────────
@@ -1623,10 +1434,10 @@ async def handle_workflow_run_async(
        authoritative; unrunnable → error with reasons).
     2. Merge preset + request overrides and validate controls STRICT.
     3. Resolve execution mode (request/env/server-setting/default, captured
-       into ``trace_ctx``) exactly like ``handle_studio_run_async``.
-    4. MODE_V2 → ``PlaygroundService.execute`` with injected hooks.
-       Otherwise → submission-time history + ``direct_studio_run_completion``
-       (the same canonical boundary).
+       into ``trace_ctx``) exactly like ``handle_studio_run_async``; an
+       explicitly retired engine is rejected (``EXECUTION_MODE_RETIRED``).
+    4. V2-only: ``PlaygroundService.execute`` with injected hooks builds the
+       immutable ExecutionPlan and dispatches through Modal V2 transport.
 
     Returns the same result dict shapes as the legacy adapter.
     """
@@ -1649,7 +1460,7 @@ async def handle_workflow_run_async(
             }
 
         # ── Execution-mode resolution (mirrors handle_studio_run_async) ──
-        from execution_runtime import MODE_V2, resolve_execution_mode
+        from execution_runtime import resolve_execution_mode, retired_mode_error
 
         _req_settings: dict = {}
         try:
@@ -1663,21 +1474,42 @@ async def handle_workflow_run_async(
             extra=trace_ctx,
         )
         mode = resolved["mode"]
+
+        # ── H12: V2-only execution ──
+        # A NEW Workflow request explicitly carrying a retired engine
+        # (v1/legacy/shadow) is rejected truthfully before acceptance.
+        if resolved.get("retired"):
+            return {
+                "status": "error",
+                "error_code": "EXECUTION_MODE_RETIRED",
+                "message": retired_mode_error(mode),
+            }
+
         _effective_modal_options = dict(modal_options or {})
         _effective_modal_options["execution_mode"] = mode
+
         if isinstance(trace_ctx, dict):
             trace_ctx["execution_mode"] = mode
             trace_ctx["execution_mode_source"] = resolved["source"]
 
+        # ── F8: capture the GPU once at acceptance ──
+        # Precedence: explicit request override → modal_options.gpu →
+        # canonical persisted/default server GPU.  Frozen into the plan;
+        # later Settings changes affect future submissions only.
+        from studio_run_adapter import resolve_request_gpu as _resolve_request_gpu
+        try:
+            _selected_gpu, _gpu_source = _resolve_request_gpu(gpu, modal_options)
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)}
+        if isinstance(trace_ctx, dict):
+            trace_ctx["selected_gpu"] = _selected_gpu
+            trace_ctx["selected_gpu_source"] = _gpu_source
+
         _preset_id = str(preset_id or "")
-        if mode == MODE_V2:
-            return await _workflow_v2_run(
-                bundle, merged, _preset_id, node_dir,
-                _effective_modal_options, gpu, workspace, trace_ctx,
-            )
-        return await _workflow_legacy_run(
-            bundle, merged, _preset_id, feature_id, node_dir,
-            _effective_modal_options, gpu, workspace, trace_ctx,
+        # H12: V2 is the only executable Workflow path.
+        return await _workflow_v2_run(
+            bundle, merged, _preset_id, node_dir,
+            _effective_modal_options, _selected_gpu, workspace, trace_ctx,
         )
     except Exception as exc:
         _log.warning("Workflow run failed: %s", exc)

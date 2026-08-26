@@ -22,7 +22,7 @@ Tests verify:
    info, and production_plan_used.
 
 6. **Adapter compatibility** — ``playground_adapter_direct_run`` returns the
-   same response shape as ``direct_studio_run_completion``.
+   same response shape as the canonical single-run contract.
 
 All tests use injected fakes — no real Modal or ComfyUI calls.
 """
@@ -1164,8 +1164,8 @@ class AdapterCompatibilityTests(unittest.TestCase):
         fn = self.adapter_mod.playground_adapter_sync_run
         self.assertTrue(callable(fn))
 
-    def test_adapter_returns_same_shape_as_direct_studio_run_completion(self):
-        """Response dict has the same top-level keys as direct_studio_run_completion.
+    def test_adapter_returns_canonical_single_run_shape(self):
+        """Response dict has the canonical single-run top-level keys.
 
         We check the key set rather than exact values since the adapter
         uses fakes in this test environment.
@@ -1213,7 +1213,7 @@ class AdapterCompatibilityTests(unittest.TestCase):
                     node_dir="/tmp/fake",
                 )
                 self.assertEqual(result["status"], "ok")
-                # Required top-level keys matching direct_studio_run_completion
+                # Required canonical single-run top-level keys
                 self.assertIn("runId", result)
                 self.assertIn("experimentId", result)
                 self.assertIn("runHistoryId", result)
@@ -1561,7 +1561,7 @@ class TestEventSinkWiring(unittest.TestCase):
         self.mod = _load_playground_module()
 
     def test_event_sink_passed_to_execute_plan(self):
-        """The event_sink injected into execute reaches execute_modal_prompt."""
+        """The event_sink injected into execute reaches the V2 plan execution."""
         observed_events: list[tuple[str, dict]] = []
 
         def fake_sink(etype, payload):
@@ -1660,88 +1660,6 @@ class TestHandleStudioRunAsyncDispatch(unittest.TestCase):
                 asyncio.run(_test())
         finally:
             self.adapter.playground_adapter_direct_run = original
-
-    def test_direct_false_does_not_call_playground_adapter(self):
-        """handle_studio_run_async(direct=False) does NOT call the playground adapter;
-        it goes through the scheduler path instead."""
-        _playground_called = []
-        _scheduler_called = []
-
-        original_direct = self.adapter.playground_adapter_direct_run
-
-        async def fake_direct_run(preset_id, feature_id, controls, node_dir, **kw):
-            _playground_called.append(kw)
-            return {"status": "ok", "direct_run": True}
-
-        def fake_scheduler(ctx, nd, **kw):
-            _scheduler_called.append((ctx, nd, kw))
-            return {"status": "ok", "runId": "sched_run_123"}
-
-        self.adapter.playground_adapter_direct_run = fake_direct_run
-        # _handle_studio_run_scheduler is a module-level function
-        original_scheduler = getattr(self.adapter, "_handle_studio_run_scheduler", None)
-        setattr(self.adapter, "_handle_studio_run_scheduler", fake_scheduler)
-
-        # We need a valid store to get past _prepare_studio_run_context
-        import tempfile, json
-        with tempfile.TemporaryDirectory() as tmp:
-            snap_path = Path(tmp) / ".studio_snapshots.json"
-            preset_path = Path(tmp) / ".studio_presets.json"
-            snap_path.write_text(json.dumps([{
-                "id": "snap1", "name": "Test",
-                "compatibleFeatures": ["txt2img"],
-                "apiPromptJson": {
-                    "3": {"class_type": "KSampler", "inputs": {
-                        "seed": 42, "steps": 20, "cfg": 7.0,
-                        "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
-                    }},
-                    "107": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
-                },
-                "nodeBindings": {
-                    "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
-                    "output": {"kind": "output", "nodeId": "107"},
-                },
-                "outputNodeId": "107",
-                "archived": False,
-                "status": "runnable",
-                "featureStatus": {"txt2img": {"status": "runnable", "reason": ""}},
-                "disabledReason": "",
-            }]), encoding="utf-8")
-            preset_path.write_text(json.dumps([{
-                "id": "preset1", "label": "Test",
-                "snapshotId": "snap1",
-                "compatibleFeatures": ["txt2img"],
-                "defaults": {}, "sourceType": "snapshot",
-                "archived": False, "status": "runnable",
-                "disabledReason": "",
-            }]), encoding="utf-8")
-
-            from unittest.mock import patch
-            import experiment_service
-            fake_registry = MagicMock()
-            fake_registry.history.return_value.record_run.return_value = {"run_id": "r1"}
-            fake_registry.history.return_value.update_run.return_value = None
-            # Also need experiment_service._fire_and_forget to exist
-            experiment_service._fire_and_forget = MagicMock()
-            experiment_service.REGISTRY = fake_registry
-
-            async def _test():
-                result = await self.adapter.handle_studio_run_async(
-                    "preset1", "txt2img", {"prompt": "hello"}, tmp,
-                    direct=False,
-                )
-                # Playground adapter must NOT have been called
-                self.assertEqual(len(_playground_called), 0,
-                                 "direct=False must NOT call playground adapter")
-                # Scheduler path should have been called
-                self.assertGreaterEqual(len(_scheduler_called), 0)
-
-            try:
-                asyncio.run(_test())
-            finally:
-                self.adapter.playground_adapter_direct_run = original_direct
-                if original_scheduler is not None:
-                    setattr(self.adapter, "_handle_studio_run_scheduler", original_scheduler)
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -1,154 +1,122 @@
-// Modal Studio — Experiment-mode tests against the deterministic fake backend.
+// Modal Studio — seeded experiment records route through History V2 (fake
+// backend).
 //
-// The fake session seeds ONE preset; experiment mode needs 2+ unique presets,
-// so every test creates a compare snapshot+preset via the fake REST API in
-// `beforeMount` (before the Studio's first preset fetch — web/studio-backend.js
-// caches runtime presets per apiBase).
+// H-WAVE D retired the Playground's legacy experiment surface entirely: the
+// experiment-grid-viewport can never render, and "reopening an experiment"
+// now means opening its durable History V2 detail page.  These tests keep
+// coverage for the compatibility behavior that must survive: a seeded V2
+// dataset containing experiments surfaces them as EXP-badged recent-runs
+// filmstrip items, clicking one opens [data-testid="history-v2-page"] +
+// [data-testid="history-v2-experiment-page"], the legacy grid viewport never
+// mounts, and no GET /comfymodal/experiments/ read is made after mount.
+//
+// Every dataset here is seeded through the fake API BEFORE mount
+// (harness-only write); the UI itself only ever reads /history-v2/*.
 
 import { test, expect } from "@playwright/test";
-import {
-  setupFakeTest,
-  createComparePreset,
-  selectPreset,
-  enableExperimentMode,
-  selectComparePreset,
-  submitExperiment,
-} from "./helpers.mjs";
+import { setupFakeTest, seedHistory } from "./helpers.mjs";
 
-const SEEDED_PRESET_ID = "preset_default";
+const LEGACY_EXPERIMENT_READ_RE = /\/comfymodal\/experiments\//;
+const GRID_VIEWPORT = '[data-testid="experiment-grid-viewport"]';
 
-async function cellStatus(grid, cellKey) {
-  const vals = await grid
-    .locator(`[data-testid="experiment-cell-${cellKey}"]`)
-    .evaluateAll((els) => els.map((e) => e.getAttribute("data-cell-status")));
-  return vals[0] || null;
+/** Track page GETs against the retired legacy experiments read API. */
+function trackLegacyExperimentReads(page) {
+  const reads = [];
+  const onRequest = (request) => {
+    if (request.method() === "GET" && LEGACY_EXPERIMENT_READ_RE.test(request.url())) {
+      reads.push(request.url());
+    }
+  };
+  page.on("request", onRequest);
+  return { reads, dispose() { page.off("request", onRequest); } };
 }
 
-test.describe("Studio Experiments (fake backend)", () => {
-  test("a. two-cell experiment renders exactly two cell cards", async ({ page }) => {
-    let compareId = "";
+async function clickFilmstripExperiment(page, selector = ".comfymodal-studio-carousel-item-experiment") {
+  const item = page.locator(selector).first();
+  await expect(item).toBeVisible({ timeout: 20000 });
+  // Read the id BEFORE clicking — the click navigates to History and the
+  // Playground filmstrip unmounts.
+  const expId = await item.getAttribute("data-expid");
+  await item.click();
+  return expId;
+}
+
+async function assertOpensHistoryV2Detail(page, fx, tracker) {
+  await expect(page.locator('[data-testid="history-v2-page"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="history-v2-experiment-page"]')).toBeVisible({ timeout: 15000 });
+
+  // The retired legacy grid can never mount again.
+  expect(await page.locator(GRID_VIEWPORT).count()).toBe(0);
+  // And the reopen never consulted the legacy experiments read API.
+  expect(tracker.reads).toEqual([]);
+  fx.assertNoConsoleErrors();
+}
+
+test.describe("Studio filmstrip EXP opens History V2 detail (fake backend, post-Wave-D)", () => {
+  test("a. filmstrip EXP item from a seeded V2 dataset opens the History V2 experiment detail", async ({ page }) => {
+    let seeded = null;
     const fx = await setupFakeTest(page, {
-      beforeMount: async ({ sessionId }) => {
-        compareId = await createComparePreset(page, sessionId);
+      beforeMount: async ({ page: p, sessionId }) => {
+        seeded = await seedHistory(p, sessionId, "history_v2_large");
       },
     });
+    expect(seeded).toMatchObject({ status: "ok", scenario: "history_v2_large", v2: true });
+    const tracker = trackLegacyExperimentReads(page);
     try {
-      await fx.setScenario("experiment_two_cell");
-      await selectPreset(page, SEEDED_PRESET_ID);
-      await enableExperimentMode(page);
-      await selectComparePreset(page, compareId);
-      await submitExperiment(page);
+      const expId = await clickFilmstripExperiment(page);
+      expect(expId).toBeTruthy();
 
-      const grid = page.locator('[data-testid="experiment-grid-viewport"]');
-      await expect(grid).toBeVisible({ timeout: 20000 });
-      const cells = grid.locator(".comfymodal-studio-experiment-grid-cell");
-      await expect(cells).toHaveCount(2, { timeout: 15000 });
-
-      // Both cells eventually complete (terminal arrives ~700ms after submit,
-      // the UI observes it on the first 3s poll).
-      await expect
-        .poll(async () => {
-          const statuses = await cells.evaluateAll((els) =>
-            els.map((el) => el.getAttribute("data-cell-status"))
-          );
-          return statuses.filter((s) => s === "completed").length;
-        }, { timeout: 20000, message: "both experiment cells should complete" })
-        .toBe(2);
-
-      fx.assertNoConsoleErrors();
+      await assertOpensHistoryV2Detail(page, fx, tracker);
     } finally {
+      tracker.dispose();
       fx.guard.dispose();
     }
   });
 
-  test("b. cells update independently as fake responses arrive", async ({ page }) => {
-    let compareId = "";
+  test("b. several EXP filmstrip items each route to their own History V2 detail", async ({ page }) => {
+    let seeded = null;
     const fx = await setupFakeTest(page, {
-      beforeMount: async ({ sessionId }) => {
-        compareId = await createComparePreset(page, sessionId);
+      beforeMount: async ({ page: p, sessionId }) => {
+        seeded = await seedHistory(p, sessionId, "history_v2_large");
       },
     });
+    expect(seeded).toMatchObject({ status: "ok", v2: true });
+    const tracker = trackLegacyExperimentReads(page);
     try {
-      // delayed_cells: cell_0 completes at ~220ms, cell_1 at ~1500ms,
-      // cell_2 at ~3200ms; terminal at ~3600ms.  The UI observes these on
-      // its 3s poll, so at the first poll cell_0 is done while cell_2 is
-      // still pending, and the second poll shows everything completed.
-      await fx.setScenario("delayed_cells");
-      await selectPreset(page, SEEDED_PRESET_ID);
-      await enableExperimentMode(page);
-      await selectComparePreset(page, compareId);
-      await submitExperiment(page);
-
-      const grid = page.locator('[data-testid="experiment-grid-viewport"]');
-      await expect(grid).toBeVisible({ timeout: 20000 });
-
-      await expect
-        .poll(async () => {
-          const c0 = await cellStatus(grid, "cell_0");
-          const c2 = await cellStatus(grid, "cell_2");
-          return c0 === "completed" && c2 === "pending";
-        }, {
-          timeout: 20000,
-          message: "cell_0 should complete while cell_2 is still pending",
-        })
-        .toBe(true);
-
-      await expect
-        .poll(
-          async () => {
-            const c0 = await cellStatus(grid, "cell_0");
-            const c1 = await cellStatus(grid, "cell_1");
-            const c2 = await cellStatus(grid, "cell_2");
-            return c0 === "completed" && c1 === "completed" && c2 === "completed";
-          },
-          { timeout: 25000, message: "all cells should eventually complete" }
-        )
-        .toBe(true);
-
-      fx.assertNoConsoleErrors();
+      // The default fresh-session seed already yields multiple EXP items;
+      // exercise the first three deterministically.
+      const total = Math.min(3, await page.locator(".comfymodal-studio-carousel-item-experiment").count());
+      expect(total).toBeGreaterThanOrEqual(2);
+      for (let i = 0; i < total; i++) {
+        await fx.gotoPage("playground");
+        const item = page.locator(".comfymodal-studio-carousel-item-experiment").nth(i);
+        await expect(item).toBeVisible({ timeout: 15000 });
+        await item.click();
+        await assertOpensHistoryV2Detail(page, fx, tracker);
+      }
     } finally {
+      tracker.dispose();
       fx.guard.dispose();
     }
   });
 
-  test("c. a failed cell remains failed", async ({ page }) => {
-    let compareId = "";
-    const fx = await setupFakeTest(page, {
-      beforeMount: async ({ sessionId }) => {
-        compareId = await createComparePreset(page, sessionId);
-      },
-    });
+  test("c. a completed-with-failures experiment also opens the History V2 detail (failed cells stay failed)", async ({ page }) => {
+    // Default fresh-session V2 seed: exp_with_failures ("Seed Sweep —
+    // partial") carries permanently failed cells; there is no grid to retry
+    // them in anymore — the durable detail page is the only owner.
+    const fx = await setupFakeTest(page);
+    const tracker = trackLegacyExperimentReads(page);
     try {
-      // experiment_one_failed_cell: 3 cells, cell_1 fails, the other two
-      // complete (partial success terminal).
-      await fx.setScenario("experiment_one_failed_cell");
-      await selectPreset(page, SEEDED_PRESET_ID);
-      await enableExperimentMode(page);
-      await selectComparePreset(page, compareId);
-      await submitExperiment(page);
+      await clickFilmstripExperiment(page, '.comfymodal-studio-carousel-item[data-expid="exp_with_failures"]');
+      await assertOpensHistoryV2Detail(page, fx, tracker);
 
-      const grid = page.locator('[data-testid="experiment-grid-viewport"]');
-      await expect(grid).toBeVisible({ timeout: 20000 });
-
-      const failedCell = grid.locator('[data-testid="experiment-cell-cell_1"]');
-      await expect
-        .poll(() => cellStatus(grid, "cell_1"), {
-          timeout: 20000,
-          message: "cell_1 should be failed",
-        })
-        .toBe("failed");
-      await expect(failedCell.locator(".cm-exp-cell-icon-fail")).toBeVisible({ timeout: 5000 });
-
-      // The other cells completed (partial success is still a valid grid).
-      await expect.poll(() => cellStatus(grid, "cell_0"), { timeout: 20000 }).toBe("completed");
-      await expect.poll(() => cellStatus(grid, "cell_2"), { timeout: 20000 }).toBe("completed");
-
-      // Wait one full poll cadence — the failed cell must NOT flip or vanish.
-      await page.waitForTimeout(3500);
-      expect(await cellStatus(grid, "cell_1")).toBe("failed");
-
-      fx.assertNoConsoleErrors();
+      // The failed-cell aggregate is visible on the detail page.
+      await expect(page.locator('[data-testid="history-v2-experiment-page"]')).toContainText("fail", {
+        timeout: 10000,
+        ignoreCase: true,
+      });
     } finally {
+      tracker.dispose();
       fx.guard.dispose();
     }
   });

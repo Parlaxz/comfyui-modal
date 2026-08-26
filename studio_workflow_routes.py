@@ -51,9 +51,19 @@ Route summary (all under ``/comfymodal/studio/workflows``):
         POST  /comfymodal/studio/workflows/presets/{preset_id}/copy-to-version  -- copy forward
         POST  /comfymodal/studio/workflows/versions/{version_id}/presets/copy-bulk -- bulk copy forward
 
+    Portability (Phase G9 backend, Phase G11 cache integration):
+        GET   /comfymodal/studio/workflows/versions/{version_id}/export      -- manifest v1 download (read-only)
+        POST  /comfymodal/studio/workflows/import-manifest                   -- manifest import (dry_run default)
+        GET   /comfymodal/studio/workflows/versions/{version_id}/portability -- G5 report; G10 cache hit serves directly,
+                                                                                miss/stale/invalid recompute live
+        Workflow list/detail rows carry an optional derived-only
+        ``portability_summary`` chip ({version_id, risk_level, issue_count,
+        stale, analyzed_at} or null) served from the cache WITHOUT any
+        live analysis.
+
 Error responses always include a stable ``"message"`` key and use appropriate
 HTTP status codes (400 validation, 404 not found, 409 already-exists/immutable,
-500 storage).  Internal exceptions are logged.
+413 oversized payload, 500 storage).  Internal exceptions are logged.
 """
 
 from __future__ import annotations
@@ -65,6 +75,17 @@ from typing import Any
 
 from aiohttp import web
 
+import portability_contract as portability_contract
+import studio_workflow_manifest as studio_workflow_manifest
+from custom_node_registry import CustomNodeRegistryStore
+from model_library import ModelLibraryStore
+from portability_cache import DEFAULT_SIDECAR_FILENAME, PortabilityReportCache
+from portability_service import (
+    ExportRefusedError,
+    ImportBlockedError,
+    PortabilityService,
+    load_manifest_payload,
+)
 from studio_domain import (
     GraphHashError,
     ImmutableVersionError,
@@ -141,7 +162,10 @@ def _enrich_workflow_summary(
 
 
 def register_workflow_routes(
-    server: Any, node_dir: str | Path, resolver: Any = None
+    server: Any,
+    node_dir: str | Path,
+    resolver: Any = None,
+    portability_service: PortabilityService | None = None,
 ) -> None:
     """Register all Studio Workflow platform routes on *server*.
 
@@ -152,11 +176,39 @@ def register_workflow_routes(
     *resolver* — optional dependency resolver whose ``reasons_for`` feeds the
     workflow service's derived version state and whose ``resolve_version``
     result is attached to the workflow import response.
+
+    *portability_service* — optional pre-composed PortabilityService
+    (injection seam for tests); by default one is composed here with the
+    canonical G10 derived sidecar (``.studio_portability_reports.json``)
+    under the SAME Studio local data root as the Workflow domain stores,
+    plus Model Library / Custom Node Registry generation authorities for
+    invalidation stamps (import/export semantics are untouched).
     """
     service = WorkflowDomainService(
         str(node_dir),
         dependency_provider=(resolver.reasons_for if resolver is not None else None),
     )
+    if portability_service is not None:
+        portability = portability_service
+    else:
+        cache = PortabilityReportCache(Path(node_dir) / DEFAULT_SIDECAR_FILENAME)
+        try:
+            model_generation_source = ModelLibraryStore(node_dir)
+            registry_generation_source = CustomNodeRegistryStore(node_dir)
+        except Exception:  # noqa: BLE001 — stamp authorities fail open to null
+            _log.warning(
+                "Portability stamp generation authorities unavailable; "
+                "generations will be null (conservative stale)"
+            )
+            model_generation_source = None
+            registry_generation_source = None
+        portability = PortabilityService(
+            service,
+            resolver=resolver,
+            cache=cache,
+            model_library_generation_source=model_generation_source,
+            custom_node_registry_generation_source=registry_generation_source,
+        )
 
     # ── Workflows ─────────────────────────────────────────────────────
 
@@ -183,6 +235,12 @@ def register_workflow_routes(
                 if favorite_only and not wf.get("favorite"):
                     continue
                 enriched.append(_enrich_workflow_summary(service, wf))
+            # Derived-only list chips: cache reads only, ZERO live analysis.
+            summaries = portability.workflow_portability_summaries(enriched)
+            for row in enriched:
+                row["portability_summary"] = summaries.get(
+                    str(row.get("workflow_id", ""))
+                )
             return web.json_response({"status": "ok", "workflows": enriched})
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow list failed")
@@ -277,7 +335,11 @@ def register_workflow_routes(
         wf_id = request.match_info.get("workflow_id", "")
         try:
             workflow = service.get_workflow(wf_id)
-            return web.json_response({"status": "ok", "workflow": workflow})
+            payload = dict(workflow)
+            # Same frozen summary shape as the list rows (cache read only).
+            summaries = portability.workflow_portability_summaries([workflow])
+            payload["portability_summary"] = summaries.get(wf_id)
+            return web.json_response({"status": "ok", "workflow": payload})
         except WorkflowNotFoundError as exc:
             return _json_error(404, str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -667,3 +729,167 @@ def register_workflow_routes(
             _log.exception("Preset bulk copy failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
+
+    # ── Portability (Phase G9) ────────────────────────────────────────
+
+    def _parse_bool_query(request: web.Request, name: str, default: bool):
+        raw = request.query.get(name, "")
+        if raw == "":
+            return default, None
+        if raw == "0":
+            return False, None
+        if raw == "1":
+            return True, None
+        return None, "%s must be 0 or 1" % name
+
+    @server.routes.get(
+        "/comfymodal/studio/workflows/versions/{version_id}/export"
+    )
+    async def version_export(request: web.Request) -> web.Response:
+        """Read-only manifest v1 download for one immutable Version."""
+        version_id = request.match_info.get("version_id", "")
+        include_presets, error = _parse_bool_query(
+            request,
+            portability_contract.EXPORT_QUERY_INCLUDE_PRESETS,
+            portability_contract.EXPORT_DEFAULT_INCLUDE_PRESETS,
+        )
+        if error:
+            return _json_error(400, error)
+        try:
+            result = portability.export_manifest(
+                version_id, include_presets=bool(include_presets)
+            )
+        except WorkflowVersionNotFoundError as exc:
+            return _json_error(404, str(exc))
+        except ExportRefusedError as exc:
+            return web.json_response(
+                {"status": "error", "message": exc.message, "code": exc.code},
+                status=409,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Workflow manifest export failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+        body = studio_workflow_manifest.canonical_bytes(result["manifest"])
+        filename = result["filename"]
+        if '"' in filename or "\\" in filename:
+            filename = portability_contract.sanitize_filename_part(filename)
+        return web.Response(
+            body=body,
+            status=200,
+            content_type="application/json",
+            charset="utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="%s"' % filename
+            },
+        )
+
+    @server.routes.post(
+        portability_contract.IMPORT_MANIFEST_ENDPOINT
+    )
+    async def import_manifest(request: web.Request) -> web.Response:
+        """Manifest import: dry-run preview by default; atomic commit on
+        explicit ``dry_run=0``."""
+        dry_run, error = _parse_bool_query(
+            request,
+            portability_contract.IMPORT_QUERY_DRY_RUN,
+            portability_contract.IMPORT_DEFAULT_DRY_RUN,
+        )
+        if error:
+            return _json_error(400, error)
+        content_length = getattr(request, "content_length", None)
+        max_bytes = portability_contract.MAX_IMPORT_BODY_BYTES
+        if content_length is not None and content_length > max_bytes:
+            return _json_error(
+                413, "manifest payload exceeds %d bytes" % max_bytes
+            )
+        try:
+            raw = await request.read()
+        except Exception:  # noqa: BLE001
+            return _json_error(400, "Invalid request body")
+        if len(raw) > max_bytes:
+            return _json_error(413, "manifest payload exceeds %d bytes" % max_bytes)
+        try:
+            payload = load_manifest_payload(raw)
+        except ImportBlockedError as exc:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": exc.message,
+                    "issues": list(exc.issues),
+                },
+                status=400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Manifest import payload parse failed")
+            return _json_error(500, "Internal error")
+
+        import_presets = payload.pop(
+            portability_contract.IMPORT_FIELD_IMPORT_PRESETS, False
+        )
+        apply_default_preset = payload.pop(
+            portability_contract.IMPORT_FIELD_APPLY_DEFAULT_PRESET, False
+        )
+        if not isinstance(import_presets, bool) or not isinstance(
+            apply_default_preset, bool
+        ):
+            return _json_error(
+                400,
+                "%s and %s must be booleans"
+                % (
+                    portability_contract.IMPORT_FIELD_IMPORT_PRESETS,
+                    portability_contract.IMPORT_FIELD_APPLY_DEFAULT_PRESET,
+                ),
+            )
+
+        try:
+            if dry_run:
+                preview = portability.preview_import(payload)
+                return web.json_response(preview)
+            committed = portability.commit_import(
+                payload,
+                import_presets=import_presets,
+                apply_default_preset=apply_default_preset,
+            )
+            return web.json_response(committed)
+        except ImportBlockedError as exc:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": exc.message,
+                    "issues": list(exc.issues),
+                },
+                status=400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Manifest import failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+
+    @server.routes.get(
+        "/comfymodal/studio/workflows/versions/{version_id}/portability"
+    )
+    async def version_portability(request: web.Request) -> web.Response:
+        """G5 portability report via the G10 derived cache.
+
+        hit → cached validated report, zero recomputation;
+        miss/stale/invalid → live G9 analysis + cache refresh.
+        Cache failures fail open to live analysis.  Stale reports are
+        never served as current from this endpoint.
+        """
+        version_id = request.match_info.get("version_id", "")
+        try:
+            result = portability.cached_portability_report(version_id)
+        except WorkflowVersionNotFoundError as exc:
+            return _json_error(404, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Portability report failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+        return web.json_response(
+            {
+                "status": "ok",
+                "portability": result["report"],
+                "portability_cache": result["cache"],
+            }
+        )

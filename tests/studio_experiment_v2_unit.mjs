@@ -164,6 +164,17 @@ function deferred() {
   const stub = stubFetch((req) => {
     if (req.url.indexOf("/status") !== -1) return statusPayload;
     if (req.url.indexOf("/retry") !== -1) return { accepted: true };
+    if (req.url.indexOf("/original") !== -1) {
+      return {
+        status: "ok",
+        generation_id: "gen_1",
+        run_id: "run_gen_1_original_1",
+        purpose: "original",
+        mode: "original",
+        attempt_status: "queued",
+        reused: false,
+      };
+    }
     return { accepted: true };
   });
   try {
@@ -195,10 +206,19 @@ function deferred() {
     assert.equal(stub.calls.length, 1);
     assert.equal(stub.calls[0].url, "/comfymodal/history-v2/experiments/exp_v2_9/cancel");
 
-    const deferredGen = await repo.generateOriginal("gen_1", 0);
-    assert.equal(deferredGen.accepted, false, "generateOriginal stays deferred");
-    const deferredCell = await repo.generateOriginalForCell("exp_v2_9", "c1");
-    assert.equal(deferredCell.accepted, false, "generateOriginalForCell stays deferred");
+    // E4C: generateOriginal / generateOriginalForCell share the frozen
+    // Generation-scoped route; the optional second arg carries rerender.
+    stub.calls.length = 0;
+    const genResp = await repo.generateOriginal("gen_1");
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].method, "POST");
+    assert.equal(stub.calls[0].url, "/comfymodal/history-v2/generations/gen_1/original");
+    assert.equal(genResp.accepted, true);
+    const cellResp = await repo.generateOriginalForCell("gen_cell_9", { rerender: true });
+    assert.equal(stub.calls[1].url, "/comfymodal/history-v2/generations/gen_cell_9/original",
+      "cell action targets the cell's own generation_id");
+    assert.deepEqual(JSON.parse(stub.calls[1].body), { rerender: true });
+    assert.equal(cellResp.accepted, true);
   } finally { stub.restore(); }
   section("4. Repository: retryCell-only retry; retryExperiment unavailable");
 }
@@ -958,15 +978,20 @@ function deferred() {
   assert.equal(withFailures.status, "completed_with_failures", "completed_with_failures canonical");
   assert.equal(withFailures.status.includes("partial"), false, "no 'partial' in the aggregate status");
 
-  // Generate Original remains deferred on the modern repository (no network).
+  // E4C: Generate Original is active — but only with a Generation identity.
+  // A missing ID never reaches the network; an explicit rerender is the only
+  // request field the browser adds.
   const stub = stubFetch({});
   try {
     const repo = await createHistoryRepository({ mode: "v2", apiBase: "/comfymodal" });
-    const deferredGen = await repo.generateOriginal("gen_guard", 0);
-    assert.equal(deferredGen.accepted, false, "generateOriginal stays deferred");
-    const deferredCell = await repo.generateOriginalForCell("exp_v2_guard", "c0");
-    assert.equal(deferredCell.accepted, false, "generateOriginalForCell stays deferred");
-    assert.equal(stub.calls.length, 0, "deferred generateOriginal never calls the network");
+    const noId = await repo.generateOriginal("");
+    assert.equal(noId.accepted, false, "missing Generation ID → refused without a request");
+    assert.equal(stub.calls.length, 0, "no network without a Generation identity");
+    const resp = await repo.generateOriginal("gen_guard", { rerender: true });
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].url, "/comfymodal/history-v2/generations/gen_guard/original");
+    assert.deepEqual(JSON.parse(stub.calls[0].body), { rerender: true });
+    assert.equal(resp.accepted, true);
   } finally { stub.restore(); }
 
   // Item-wrapped payload (inner lifecycle status) remains fully supported.

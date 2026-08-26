@@ -35,10 +35,12 @@ async function getGeneration(page, sessionId, id) {
   return body.item;
 }
 
-async function getAsset(page, url, sessionId) {
+async function getAsset(page, url, sessionId, mime = "image/png") {
   const res = await page.request.get(`${url}?session=${encodeURIComponent(sessionId)}`);
   expect(res.status()).toBe(200);
-  expect(res.headers()["content-type"]).toMatch(/^image\/png/);
+  // Managed-asset MIME parity: previews are WebP in production; everything
+  // else serves PNG.
+  expect(res.headers()["content-type"]).toMatch(new RegExp("^" + mime));
   expect((await res.body()).length).toBeGreaterThan(20);
 }
 
@@ -68,7 +70,9 @@ test.describe("Studio Phase-E Wave-2 harness (fake backend)", () => {
       ]);
       expect(output.original_urls).toHaveLength(2);
       expect(output.original_url).toContain("gen_wave2_logical_new_orig");
-      for (const url of [output.thumb_url, output.preview_url, output.original_url]) await getAsset(page, url, fx.sessionId);
+      await getAsset(page, output.thumb_url, fx.sessionId);
+      await getAsset(page, output.preview_url, fx.sessionId, "image/webp");
+      await getAsset(page, output.original_url, fx.sessionId);
 
       await fx.gotoPage("history");
       const overlay = await openGeneration(page, IDS.logical);

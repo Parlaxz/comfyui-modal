@@ -35,6 +35,10 @@ COMFYMODAL_V2_CLIP_QD_QD = "4"
 COMFYMODAL_V2_CLIP_QD_BLOCK_MIB = "32"
 COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY = "clean_lane_post_restore"
 COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+# E40: the inherited E28-era speculative CLIP hydration arm is retired from
+# the Golden path. Explicit 0 overrides the e29-tracer base so requested,
+# deployed, effective, and observed loader state cannot disagree.
+COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION = "0"
 COMFYMODAL_V2_E31_FORENSICS = "0"
 COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"
 COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS = "0"

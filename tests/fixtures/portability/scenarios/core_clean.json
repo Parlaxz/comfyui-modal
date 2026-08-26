@@ -1,0 +1,41 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §4.4 exact roundtrip PROVEN",
+    "PHASE_G1 §9 LOW criteria",
+    "PHASE_G5 §4.1 LOW"
+  ],
+  "description": "Minimal clean fixture: one Workflow, Version #1 immutable capture, Mapping, one default WorkflowPreset, core nodes only, one standard-basename model with pinned fake hash, no assets/paths/endpoints/subgraphs; exact roundtrip.",
+  "expected": {
+    "issue_codes": [],
+    "provenance_quality": "exact",
+    "risk_level_hint_nonnormative": "low",
+    "semantic_notes": [
+      "Importable anywhere ComfyUI runs; model needs manual placement."
+    ],
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/core_clean.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "61dcc0fd19145ac9acb9b9838f0bed86611e77fbbc92c9f29651bff60e10b021",
+  "scenario_id": "core_clean",
+  "title": "Canonical clean base workflow"
+}

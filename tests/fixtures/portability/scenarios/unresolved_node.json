@@ -1,0 +1,39 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §8 three unresolved corpus classes",
+    "PHASE_G5 §4.1 HIGH trigger"
+  ],
+  "description": "Graph requires FixtureGhostNode; no custom_nodes entry or class mapping covers it. Manifest stays structurally ready; resolution is an analysis-level finding.",
+  "expected": {
+    "issue_codes": [
+      "unresolved_node_type"
+    ],
+    "provenance_quality": "unresolved",
+    "risk_level_hint_nonnormative": "high",
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": true,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 1,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/unresolved_node.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "5dc703ce57b907a5042a080d051858521d09f27b27407caba4e9afcfaf3d0de1",
+  "scenario_id": "unresolved_node",
+  "title": "Required class without trustworthy source identity"
+}

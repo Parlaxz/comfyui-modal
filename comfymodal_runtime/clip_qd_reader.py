@@ -999,6 +999,21 @@ def _finalize_stats(stats: dict, state: Any, wall_ms: float,
     stats["source_errors"] = errors
     stats["per_read_errors"] = max(int(stats.get("per_read_errors", 0)), len(errors))
     stats["status"] = "ok" if stats["per_read_errors"] == 0 and not errors else "read_errors"
+    # ── E40 Lane B: single loader-observation authority ──────────────────
+    # A completed QD source read is the observed CLIP loader arm. Read
+    # errors mean the caller falls back to the normal hydration path.
+    try:
+        from . import loader_selection as _ls
+        if stats["status"] == "ok":
+            _ls.record_observed("clip", "qd_reader")
+        else:
+            _ls.record_observed(
+                "clip", "native_comfy",
+                fallback_attempted=True,
+                fallback_reason=f"qd_read_errors={stats['per_read_errors']}",
+            )
+    except Exception:
+        pass
     stats["observed_max_outstanding"] = (
         telemetry.max_inflight if telemetry is not None else getattr(state, "max_outstanding", 0)
     )

@@ -169,6 +169,59 @@ class TestVerifyD6FastpathProfile(_D6EnvBase):
             self.assertTrue(details["active"], token)
 
 
+class TestVerifyGoldenP1Profile(unittest.TestCase):
+    """Golden uses the shared D6 gate with its own exact effective tuple."""
+
+    def setUp(self):
+        self.bvd = _bvd()
+        self._env_vars = tuple(self.bvd.GOLDEN_P1_PROFILE) + (
+            "COMFYMODAL_V2CTL_PROFILE",
+            "V2_D6_FASTPATH_VALIDATION",
+            "V2_D10_INTEGRATION_VALIDATION",
+            "V2_E10_BUCKET_FIRST_VALIDATION",
+            "V2_E19_FINAL_COLD_LOADER",
+        )
+        self._saved = {name: os.environ.get(name) for name in self._env_vars}
+        for name in self._env_vars:
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _set_golden_profile(self):
+        os.environ["COMFYMODAL_V2CTL_PROFILE"] = "golden_p1"
+        os.environ.update(self.bvd.GOLDEN_P1_PROFILE)
+
+    def test_golden_profile_accepts_effective_runtime_tuple(self):
+        self._set_golden_profile()
+        # _runtime_env() preserves this absent/empty UNET value; the verifier
+        # must retain the existing empty-is-off normalization contract.
+        os.environ["COMFYMODAL_V2_UNET_FASTSAFETENSORS"] = ""
+
+        ok, details = self.bvd.verify_d6_fastpath_profile()
+
+        self.assertTrue(ok, details)
+        self.assertEqual(details["profile"], "golden_p1")
+        self.assertEqual(details["validation"], "PASS")
+        for key, expected in self.bvd.GOLDEN_P1_PROFILE.items():
+            self.assertEqual(details[key], expected, key)
+
+    def test_golden_profile_rejects_control_mismatch(self):
+        self._set_golden_profile()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+
+        ok, details = self.bvd.verify_d6_fastpath_profile()
+
+        self.assertFalse(ok)
+        self.assertEqual(details["profile"], "golden_p1")
+        self.assertEqual(details["validation"], "FAIL")
+        self.assertEqual(details["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"], "1")
+
+
 class TestRuntimeEnvEffectiveValues(_D6EnvBase):
     """d) _runtime_env() itself returns the effective 8 values."""
 
@@ -321,7 +374,7 @@ class TestLauncherGate(unittest.TestCase):
         tail = "\n".join(lines[verify_idx:verify_idx + 8])
         self.assertIn("if errorlevel 1", tail)
         self.assertIn("exit /b 1", tail)
-        self.assertIn("D6 deploy profile validation FAILED", tail)
+        self.assertIn("deploy profile validation FAILED", tail)
 
     def test_cli_exit_zero_on_correct_profile(self):
         env = dict(os.environ)

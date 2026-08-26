@@ -1,0 +1,48 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §5 zero host-bound values in real corpus (this fixture exercises the detector)",
+    "PHASE_G5 POLICY_ABSOLUTE_PATHS"
+  ],
+  "classification": {
+    "functional_paths": [
+      "C:\\example\\models\\foo.safetensors",
+      "/opt/example/input/foo.png"
+    ],
+    "inert_note_paths": [
+      "/opt/example/notes/related-fixtures.md"
+    ],
+    "policy": "global_finding_with_target_severity_override"
+  },
+  "description": "Windows drive path and POSIX path appear in functional widget positions; a Note node carries a path-like string that is documentation text only. Future analyzer logic must classify the note text as non-functional.",
+  "expected": {
+    "issue_codes": [
+      "local_path_reference"
+    ],
+    "risk_level_hint_nonnormative": "high",
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": true,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": false,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/absolute_path.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "85b105a965a6cca8711c66601eb1fee198811f0867ffc8abb91366b9355acdb7",
+  "scenario_id": "absolute_path",
+  "title": "Host-bound paths baked into graph data"
+}

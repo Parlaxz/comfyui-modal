@@ -608,4 +608,93 @@ function buildLegacyForStatus(status) {
   section("19. Duplicate terminal events cannot duplicate completion");
 }
 
+// ── 20. Phase I8 playground polish source contract ───────────────────────
+//
+// The Playground lane (I8) migrated page/section states onto the shared I3
+// primitives without touching execution behavior. This section pins those
+// production-source contracts (no DOM needed — plain source reads):
+//   - h2 page title marker present
+//   - capabilities/recent-runs loading sites use renderLoadingState;
+//     <select> placeholder options stay textual control states
+//   - ordinary empty states use renderEmptyState; error/handoff states do NOT
+//   - mojibake ellipsis eliminated; frozen Backend copy updated
+//   - carousel accessible names are context-built; "Click to view" gone
+//   - informational chips carry the shared cm-chip geometry + meta tone
+
+{
+  const fs = await import("node:fs");
+  const pg = fs.readFileSync(new URL("../web/studio-playground.js", import.meta.url), "utf8");
+  const em = fs.readFileSync(new URL("../web/studio-experiment-mode.js", import.meta.url), "utf8");
+
+  // Page heading.
+  assert.ok(pg.includes('"data-testid": "playground-page-title"'), "playground h2 testid present");
+  assert.ok(pg.includes("clip:rect(0 0 0 0)"), "h2 uses the visually-hidden clip pattern");
+  assert.ok(!/h3/.test(pg.replace(/\/\/[^\n]*/g, "")), "no card label promoted to an h3");
+
+  // Shared primitives imported by the Playground page module.
+  assert.ok(pg.includes('from "./studio-loading.js"'), "studio-loading.js consumed");
+  assert.ok(pg.includes('renderEmptyState } from "./studio-ui.js"'), "renderEmptyState consumed");
+  assert.ok(pg.includes('testid: "playground-capabilities-loading"'), "capabilities loading primitive");
+  assert.ok(pg.includes('label: "Loading recent runs…"' ), "recent-runs loading primitive");
+  assert.ok(
+    pg.includes('"playground-recent-runs-cleared"')
+      && pg.includes('"playground-recent-runs-empty"')
+      && pg.includes('"playground-backend-empty"'),
+    "ordinary empty states migrated to the shared primitive"
+  );
+
+  // Control-level loading stays textual (intentional, per freeze).
+  assert.ok(pg.includes('text: "Loading backends…"'), "backend select keeps its textual loading option");
+  assert.ok(
+    pg.includes('"Loading\\u2026" : "Loading workflow\\u2026"'),
+    "workflow gating line keeps its textual status"
+  );
+
+  // Mojibake: the double-encoded ellipsis form must be gone everywhere, and
+  // the user-facing double-encoded em-dash strings replaced with real ones.
+  assert.equal(pg.includes("\u00e2\u20ac\u00a6"), false, "no double-encoded ellipsis anywhere");
+  assert.ok(pg.includes("${currentSpec.label} \u2014 Not Implemented"), "real em-dash in canvas placeholder");
+  assert.ok(pg.includes("scope \u2014 value preserved"), "real em-dash in file-selection notice");
+  assert.ok(pg.includes("unavailable \u2014 value preserved"), "real em-dash in schema-options notice");
+
+  // Frozen copy change.
+  assert.ok(pg.includes("Open Backend to create presets"), "frozen Backend copy applied");
+  assert.equal(pg.includes("Go to Backend tab to create presets"), false, "stale wording removed");
+
+  // Carousel accessible names.
+  assert.ok(pg.includes("function _carouselAccessibleNames"), "naming helper present");
+  assert.ok(pg.includes('"aria-label": ariaNames[idx]'), "items use context-built names");
+  assert.equal(pg.includes("Click to view"), false, "generic duplicate label text removed");
+  assert.ok(pg.includes("presetLabel || nr.presetId"), "display-label chain preserved");
+
+  // Informational chips adopt shared geometry + meta tone.
+  assert.ok(pg.includes("comfymodal-studio-timing-tag cm-chip"), "timing tags on shared chip base");
+  assert.ok(pg.includes("comfymodal-studio-carousel-exp-badge cm-chip"), "EXP badge on shared chip base");
+  assert.ok((pg.match(/"data-tone": "meta"/g) || []).length >= 2, "meta tone on both informational families");
+
+  // Error states are NOT empty states: exactly one legacy-class use remains
+  // in playground (the workflow handoff error).
+  assert.equal(
+    (pg.match(/comfymodal-studio-empty-state/g) || []).length,
+    1,
+    "handoff error keeps the legacy class; genuine empties moved to cm-empty-state"
+  );
+
+  // Experiment mode: empties migrated, error retained, cell chips toned.
+  assert.ok(em.includes('from "./studio-ui.js"'), "experiment-mode consumes studio-ui");
+  assert.ok(em.includes('"experiment-presets-empty"'), "presets empty via shared primitive");
+  assert.ok(em.includes('"experiment-matrix-empty"'), "matrix hint via shared primitive");
+  assert.ok(em.includes("Open Backend to create presets."), "frozen copy applies here too");
+  assert.equal(em.includes("Go to Backend tab"), false, "stale wording removed from experiment mode");
+  assert.ok(em.includes('"Could not load presets."'), "fetch-failure message retained (error, not empty)");
+  assert.equal(
+    (em.match(/comfymodal-studio-empty-state/g) || []).length,
+    1,
+    "only the catch-error site keeps the legacy empty-state class in experiment mode"
+  );
+  assert.ok(em.includes('status-" + status + " cm-chip"'), "cell chips on shared base");
+  assert.ok(em.includes("_cellStatusTone"), "truthful status-tone mapping present");
+  section("20. Phase I8 playground polish source contract");
+}
+
 console.log("PASS: studio playground run controller unit tests");

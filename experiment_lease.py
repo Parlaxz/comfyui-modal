@@ -484,7 +484,12 @@ class LeaseRegistry:
         """Register an asset with the extended B3 schema.
 
         Uses INSERT OR IGNORE — the first write for a given asset_id wins,
-        preventing accidental overwrite of ownership records.
+        preventing accidental overwrite of ownership records.  Asset ids are
+        CONTENT hashes, so an identical re-production (same workflow/seed)
+        collides with any older row even when the older row's stored
+        ``modal://`` location belongs to a different workspace volume.  When
+        a NEWER production re-registers the same bytes, refresh the mutable
+        location fields (E7): ownership columns stay first-write.
         """
         if created_at is None:
             from datetime import datetime, timezone
@@ -503,6 +508,13 @@ class LeaseRegistry:
                  parent_asset_id, path, mime_type, byte_size, content_hash,
                  node_id, output_key, output_index, comparison_side,
                  width, height, created_at),
+            )
+            conn.execute(
+                "UPDATE assets SET path = ?, mime_type = ?, byte_size = ?, "
+                "width = ?, height = ?, created_at = ? "
+                "WHERE asset_id = ? AND created_at < ?",
+                (path, mime_type, byte_size, width, height, created_at,
+                 asset_id, created_at),
             )
             conn.execute("COMMIT")
         except Exception:

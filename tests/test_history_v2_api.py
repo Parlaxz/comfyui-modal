@@ -255,8 +255,14 @@ class HistoryV2ApiTests(unittest.IsolatedAsyncioTestCase):
             gen.generation_id, run_id=attempt.run_id, asset_type="original",
             data=_png_bytes(), filename="o.png", fmt="png",
         )
+        # F9: the seeded exported record must point at a REAL destination
+        # file — the detail route now lazily classifies export state through
+        # the F7 checker, so a nonexistent destination would truthfully
+        # project `missing` instead of `exported`.
+        export_dest = self.data_root / "seeded_export_copy.png"
+        export_dest.write_bytes(_png_bytes())
         self.repo.upsert_export_record(
-            original.asset_id, state="exported", destination_path="/tmp/out.png"
+            original.asset_id, state="exported", destination_path=str(export_dest)
         )
 
         resp = await self.client.get(f"/comfymodal/history-v2/generations/{gen.generation_id}")
@@ -274,6 +280,11 @@ class HistoryV2ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["thumb_url"], f"/comfymodal/history-v2/assets/{thumb.asset_id}")
         self.assertEqual(out["original_url"], f"/comfymodal/history-v2/assets/{original.asset_id}")
         self.assertFalse(out["original_failed"])
+        # F9 per-variant export projection (winner identity + lazy state).
+        self.assertIsNone(out.get("preview_asset_id"))
+        self.assertIsNone(out.get("preview_export_state"))
+        self.assertEqual(out["original_asset_id"], original.asset_id)
+        self.assertEqual(out["original_export_state"], "exported")
 
         self.assertEqual(item["attempts"][0]["run_id"], attempt.run_id)
         self.assertEqual(item["attempts"][0]["status"], "completed")

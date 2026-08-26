@@ -1,0 +1,94 @@
+{
+  "stamps": {
+    "stamp_a": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_a2": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_comfyui_version_changed": {
+      "comfyui_version": "0.25.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_custom_node_registry_generation_changed": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 8,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_graph_hash_changed": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "cafefeedcafefeedcafefeedcafefeedcafefeedcafefeedcafefeedcafefeed",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_manifest_version_changed": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 2,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_model_library_generation_changed": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 12,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_null_field": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": null,
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v1",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    },
+    "stamp_rule_version_changed": {
+      "comfyui_version": "0.24.0-fixture",
+      "custom_node_registry_generation": 7,
+      "dependency_metadata_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "graph_hash": "7e5dd79a08830cee9df7f42c267b4fadddfd0f81fda443a7830251fbaa115d19",
+      "manifest_version": 1,
+      "model_library_generation": 11,
+      "rule_version": "portability-rules-v2",
+      "workflow_version_id": "wv_fixture_core_clean_v1"
+    }
+  }
+}

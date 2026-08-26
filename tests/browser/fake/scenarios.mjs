@@ -743,6 +743,23 @@ const delayed_cells = (() => {
   return def;
 })();
 
+// H8 reopen-compat scenario: same shape as delayed_cells but with completions
+// spaced WIDER than the Playground's 3s poll cadence, so a UI observing at
+// its natural cadence deterministically sees partial states before the
+// terminal (used by the post-H8 legacy-reopen compatibility specs).
+const delayed_cells_wide = (() => {
+  const def = experimentDef(3, { cellGap: 120, terminalDelay: 12000 });
+  def.steps = [
+    { at: { ms: 150 }, journal: [attemptCreated(0)], tracker: [cellExecuting(0, "4", "KSampler")] },
+    { at: { ms: 300 }, journal: [cellCompleted(0)], tracker: [samplerStep(0, 12)] },
+    { at: { ms: 4300 }, journal: [attemptCreated(1)], tracker: [cellExecuting(1, "4", "KSampler")] },
+    { at: { ms: 4500 }, journal: [cellCompleted(1)], tracker: [samplerStep(1, 12)] },
+    { at: { ms: 8800 }, journal: [attemptCreated(2)], tracker: [cellExecuting(2, "4", "KSampler")] },
+    { at: { ms: 9000 }, journal: [cellCompleted(2)], tracker: [samplerStep(2, 12)] },
+  ];
+  return def;
+})();
+
 // ── History seed scenarios (kind:"seed", consumed by seedHistory) ────────
 
 const history_large = {
@@ -818,6 +835,33 @@ const history_v2_phase_e_wave2 = {
   v2: "phase_e_wave2",
 };
 
+// Generate Original (E3B2) decision-matrix seed: one record per frozen route
+// outcome (create / active reuse / successful reuse / retry / busy /
+// irreproducible) plus an Experiment cell generation for same-Generation
+// parity. The route behavior itself lives in fake-backend.mjs.
+const history_v2_phase_e_original = {
+  kind: "seed",
+  v2: "phase_e_original",
+};
+
+// F6 Single Resume / Retry-naming seed: one record per durable eligibility
+// state of the frozen F1A resume route plus the conditional retry labels.
+const history_v2_phase_f6_resume = {
+  kind: "seed",
+  v2: "phase_f6_resume",
+};
+
+// H13 Wave D old-record visibility seed: two migrated-legacy-style
+// generations (irreproducible:true; replay_capable absent on one and
+// explicitly false on the other; copied workflow_name labels; one WITH a
+// retained image, one WITHOUT), one mirrored legacy experiment (copied
+// definition labels + cover cells), and one modern generation newer than
+// every migrated record.  Consumed by _buildV2Seed(session, "wave_d").
+const history_v2_wave_d = {
+  kind: "seed",
+  v2: "wave_d",
+};
+
 export const SCENARIOS = {
   // single-run
   success,
@@ -840,6 +884,7 @@ export const SCENARIOS = {
   experiment_large,
   experiment_one_failed_cell,
   delayed_cells,
+  delayed_cells_wide,
   // history seeds
   history_large,
   history_missing_image,
@@ -848,6 +893,9 @@ export const SCENARIOS = {
   history_v2_large,
   history_v2_phase_e,
   history_v2_phase_e_wave2,
+  history_v2_phase_e_original,
+  history_v2_phase_f6_resume,
+  history_v2_wave_d,
 };
 
 export const SCENARIO_NAMES = Object.keys(SCENARIOS);

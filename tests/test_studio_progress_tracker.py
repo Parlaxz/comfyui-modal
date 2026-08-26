@@ -181,67 +181,58 @@ class ExperimentEventHandlerTests(_ProgressSourceMixin, unittest.TestCase):
 
 class ExperimentRunPathTests(unittest.TestCase):
     """Verify the experiment run submission path in studio-playground.js and
-    the scoped-tracker wiring in studio-experiment-mode.js."""
+    the progress wiring in studio-experiment-mode.js.
+
+    H-WAVE D: the legacy executeExperimentRun scoped-tracker wiring
+    (dynamic import of ./comfymodal-progress.js + createScopedTracker) is
+    retired.  The modern experiment path wires progress through the
+    experiment run controller (getModernExperimentController /
+    attachModernExperiment); the single-run path passes the experiment id
+    through the canonical run controller.
+    """
 
     def setUp(self):
         self.source = PLAYGROUND_PATH.read_text(encoding="utf-8")
-        # Scope to the experiment run onclick handler — the first
-        # `btn.onclick = async () => {` in the file (experiment mode).
+        # Scope to the single-run onclick handler — the first
+        # `btn.onclick = async () => {` in the file.
         self._exp_section = self.source[self.source.index("btn.onclick = async () => {"):]
-        # The experiment click handler in studio-experiment-mode.js wires the
-        # scoped tracker after executeExperimentRun returns. Narrow section
-        # covering the import → create → dispose-old → assign-new block.
-        exp_source = EXPERIMENT_MODE_PATH.read_text(encoding="utf-8")
-        self._tracker_section = exp_source[
-            exp_source.index('var { createScopedTracker } = await import("./comfymodal-progress.js")'):exp_source.index("_expTracker.start();")
-        ]
+        self._experiment_mode_source = EXPERIMENT_MODE_PATH.read_text(encoding="utf-8")
 
-    def test_experiment_run_creates_scoped_tracker(self):
-        """Experiment run path must import and call createScopedTracker."""
+    def test_experiment_run_scoped_tracker_wiring_retired(self):
+        """H-WAVE D: legacy executeExperimentRun scoped-tracker wiring is
+        retired — no createScopedTracker dynamic import remains in the
+        experiment mode module."""
+        self.assertNotIn(
+            'createScopedTracker',
+            self._experiment_mode_source,
+            "createScopedTracker wiring must be retired with legacy executeExperimentRun",
+        )
+        self.assertNotIn(
+            './comfymodal-progress.js',
+            self._experiment_mode_source,
+            "No comfymodal-progress.js dynamic import remains in experiment mode",
+        )
+
+    def test_modern_experiment_path_uses_run_controller(self):
+        """The modern experiment run path wires progress via the experiment
+        run controller."""
         self.assertIn(
-            'var { createScopedTracker } = await import("./comfymodal-progress.js")',
-            self._tracker_section,
-            "Experiment run path must import createScopedTracker to wire experiment events",
+            "getModernExperimentController",
+            self._experiment_mode_source,
+            "Modern run path must obtain the experiment run controller",
         )
         self.assertIn(
-            "createScopedTracker(_expApi",
-            self._tracker_section,
-            "Experiment run path must create the scoped tracker with the api",
+            "attachModernExperiment(state, actions, ctx)",
+            self._experiment_mode_source,
+            "Modern run path must attach the controller after submission",
         )
 
     def test_experiment_run_passes_experiment_id(self):
-        """Experiment run path must pass experimentId to scoped tracker."""
+        """Single-run path must pass experimentId to the run controller."""
         self.assertIn(
             "result.experimentId",
             self._exp_section,
-            "Experiment run path must pass result.experimentId to scoped tracker",
-        )
-
-    def test_experiment_run_does_not_only_dispose(self):
-        """Experiment run path must not have the 'experiments use polling' dispose pattern."""
-        self.assertNotIn(
-            "experiments use polling",
-            self._exp_section,
-            "Experiment run path should not have 'experiments use polling' comment"
-            " — scoped tracker is now wired for experiment events",
-        )
-
-    def test_experiment_run_disposes_before_create(self):
-        """Experiment run path must dispose previous tracker before assigning new one."""
-        self.assertIn(
-            "var _old = state.playground._scopedTracker",
-            self._tracker_section,
-            "Experiment run path must capture the previous scoped tracker",
-        )
-        self.assertIn(
-            "_old.dispose()",
-            self._tracker_section,
-            "Experiment run path must dispose the previous scoped tracker",
-        )
-        self.assertIn(
-            "state.playground._scopedTracker = _expTracker",
-            self._tracker_section,
-            "Experiment run path must assign the new scoped tracker after disposing the old one",
+            "Run path must pass result.experimentId to the controller",
         )
 
 

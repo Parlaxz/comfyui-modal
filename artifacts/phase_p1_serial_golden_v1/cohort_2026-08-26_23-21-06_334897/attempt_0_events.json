@@ -1,0 +1,28 @@
+[
+  {
+    "type": "error",
+    "request_id": "golden-p1-0-f44993b66266",
+    "message": "RuntimeError: output_png_sha_mismatch:454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da!=20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+    "golden_activation": {
+      "activated": true,
+      "already_activated": false,
+      "gate_env": {
+        "name": "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM",
+        "value": "1"
+      },
+      "pid": 2,
+      "profile": "inherit",
+      "aimdo_import_version_or_none": null,
+      "init_devices_ok": true,
+      "device_indices": [
+        0
+      ],
+      "patcher_class_module": "comfy.model_patcher",
+      "patcher_class_name": "ModelPatcherDynamic",
+      "is_dynamic_alias": true,
+      "aimdo_enabled": true,
+      "activated_monotonic_ns": 36013435984,
+      "reason": null
+    }
+  }
+]

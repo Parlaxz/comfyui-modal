@@ -126,11 +126,11 @@ class PhaseEWave2ReplayContractTests(unittest.TestCase):
         self.assertEqual(response["purpose"], "original")
 
 
-@unittest.skip("Pending E3B2 production Generate Original route/service")
-class PhaseEWave2ProductionPendingTests(unittest.TestCase):
-    def test_generate_original_is_same_generation_new_attempt(self):
-        self.fail("Generate Original production routing is not proven by the fake contract")
-
+# NOTE: the former "Pending E3B2 production Generate Original route/service"
+# skip was retired: the landed E3B2 suite tests.test_history_v2_generate_original
+# proves same-Generation/new-Attempt semantics against the real repository,
+# service, and routes and is wired into this gate. The fake-side mirror of the
+# same contract lives in tests/browser/fake/studio-fake-phase-e-original.spec.mjs.
 
 if __name__ == "__main__":
     unittest.main()

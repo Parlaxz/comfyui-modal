@@ -3,9 +3,12 @@
 // The Studio's History page is the History V2 feed (web/studio-history-v2.js).
 // helpers.mjs openStudio() defaults to history mode "auto", so the page talks
 // to the real HTTP adapter backed by the fake engine's /comfymodal/history-v2/*
-// endpoints (see fake-backend.mjs).  The fake engine's legacy /history +
-// /run-history endpoints still back the Playground carousel; they are
-// exercised in test "a" via fx.seedHistory (the legacy seed control).
+// endpoints (see fake-backend.mjs).  H-WAVE D: the Playground recent-runs
+// filmstrip hydrates ONLY from GET /history-v2/feed as well — the legacy
+// /history + /run-history endpoints no longer back any UI surface and remain
+// pure backend compatibility routes.  Test "a" still exercises the engine's
+// legacy history-seed control directly (route-parity compatibility coverage);
+// it does not feed the Playground carousel.
 
 import { test, expect } from "@playwright/test";
 import { setupFakeTest } from "./helpers.mjs";
@@ -14,8 +17,8 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
   test("a. history renders the engine-backed grid, cards and pagination", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
-      // Exercise the engine's legacy history-seed control (backs the
-      // Playground carousel via /history — the V2 feed is unaffected).
+      // Exercise the engine's legacy history-seed control directly (backend
+      // compatibility coverage — no UI surface reads this store anymore).
       const seeded = await fx.seedHistory("history_large");
       expect(seeded.total).toBeGreaterThan(0);
 

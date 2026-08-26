@@ -12,6 +12,9 @@ Route summary (all under ``/comfymodal/history-v2``):
 
     GET   /comfymodal/history-v2/feed                         — mixed/single feed
     GET   /comfymodal/history-v2/generations/{generation_id}  — generation detail
+    POST  /comfymodal/history-v2/generations/{generation_id}/original        — Generate Original (E3B2)
+    POST  /comfymodal/history-v2/generations/{generation_id}/original/retry  — Retry failed Original (E3B2)
+    POST  /comfymodal/history-v2/generations/{generation_id}/resume         — Resume interrupted ordinary Single (F1A)
     GET   /comfymodal/history-v2/experiments/{experiment_id}  — experiment detail
     PATCH /comfymodal/history-v2/generations/{generation_id}/favorite
     PATCH /comfymodal/history-v2/generations/{generation_id}/note
@@ -19,9 +22,18 @@ Route summary (all under ``/comfymodal/history-v2``):
     PATCH /comfymodal/history-v2/experiments/{experiment_id}/favorite
     PATCH /comfymodal/history-v2/experiments/{experiment_id}/note
     GET   /comfymodal/history-v2/assets/{asset_id}            — managed asset bytes
+    POST  /comfymodal/history-v2/assets/{asset_id}/export     — configured-folder Export (F9)
 
 The repository is constructed per request (cheap: idempotent store
 initialization) from ``<data_root>/.studio_history_v2/history_v2.db``.
+
+F9 Export: the POST route is BODYLESS — the selected ``asset_id`` uniquely
+identifies the managed source; generation association, logical-output index,
+naming context, and live canonical Output settings are all derived and
+validated SERVER-SIDE (settings via the injected ``settings_provider``,
+wired from ``__init__._load_modal_settings`` at the composition root).
+Export state is projected per variant (Preview/Original independently)
+through the F7 ``HistoryV2ExportService`` lazy checker.
 """
 from __future__ import annotations
 
@@ -43,6 +55,11 @@ from history_v2_models import (
     RequestSnapshot,
     RunAttempt,
     logical_output_key_from_metadata,
+)
+from history_v2_export import (
+    ExportNamingContext,
+    ExportOptions,
+    HistoryV2ExportService,
 )
 from history_v2_repository import HistoryV2Repository
 from history_v2_store import HistoryV2Store
@@ -114,8 +131,18 @@ _CONTENT_TYPES = {
 # ── Small helpers ───────────────────────────────────────────────────────
 
 
-def _json_error(status: int, message: str) -> web.Response:
-    return web.json_response({"status": "error", "message": message}, status=status)
+def _json_error(
+    status: int,
+    message: str,
+    code: Optional[str] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> web.Response:
+    body: dict[str, Any] = {"status": "error", "message": message}
+    if code:
+        body["code"] = code
+    if extra:
+        body.update(extra)
+    return web.json_response(body, status=status)
 
 
 async def _read_json(request: web.Request) -> Optional[dict[str, Any]]:
@@ -322,11 +349,21 @@ def _build_outputs(
     assets: list[Asset],
     gen_thumb_url: str = "",
     attempts: Optional[list[RunAttempt]] = None,
+    export_state_of: Optional[Any] = None,
 ) -> list[dict[str, Any]]:
     """Group assets by logical output identity and build feed outputs.
 
     Keyed assets group by ``logical_output_key``. Legacy assets use run
     provenance when available, otherwise remain isolated by asset id.
+
+    ``export_state_of(asset_id) -> state`` (F9): when provided, each output
+    additionally projects per-variant ``preview_asset_id`` /
+    ``preview_export_state`` / ``original_asset_id`` / ``original_export_state``
+    (None/absent when that variant does not exist — a nonexistent Original is
+    never reported as ``not_exported``).  The projected ids are the SAME
+    winner objects the URLs point at, so URL + asset id + export state always
+    describe one selected Asset.  Without the projector (feed paths) no
+    export fields are emitted and nothing is looked up.
     """
     groups = _logical_output_groups(assets)
 
@@ -339,17 +376,25 @@ def _build_outputs(
         )
         original, original_failed = _original_projection(group, attempts)
         primary = original or preview or thumb or ordered[0]
-        outputs.append(
-            {
-                "index": len(outputs),
-                "asset_id": primary.asset_id,
-                "thumb_url": _asset_url(thumb.asset_id) if thumb else "",
-                "preview_url": _asset_url(preview.asset_id) if preview else "",
-                "original_url": _asset_url(original.asset_id) if original else "",
-                "original_failed": original_failed,
-                "status": "success",
-            }
-        )
+        output = {
+            "index": len(outputs),
+            "asset_id": primary.asset_id,
+            "thumb_url": _asset_url(thumb.asset_id) if thumb else "",
+            "preview_url": _asset_url(preview.asset_id) if preview else "",
+            "original_url": _asset_url(original.asset_id) if original else "",
+            "original_failed": original_failed,
+            "status": "success",
+        }
+        if export_state_of is not None:
+            output["preview_asset_id"] = preview.asset_id if preview else None
+            output["preview_export_state"] = (
+                export_state_of(preview.asset_id) if preview else None
+            )
+            output["original_asset_id"] = original.asset_id if original else None
+            output["original_export_state"] = (
+                export_state_of(original.asset_id) if original else None
+            )
+        outputs.append(output)
     return outputs
 
 
@@ -397,9 +442,17 @@ def _generation_feed_item(
     assets: list[Asset],
     attempts: list[RunAttempt],
     snapshot: Optional[RequestSnapshot] = None,
+    export_state_of: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """Build the raw snake_case generation feed item consumed by the UI."""
-    outputs = _build_outputs(assets, attempts=attempts)
+    """Build the raw snake_case generation feed item consumed by the UI.
+
+    ``export_state_of`` (F9) is passed through to ``_build_outputs`` so
+    detail surfaces project per-variant export state; plain feed pages omit
+    it (no per-asset export lookups there).
+    """
+    outputs = _build_outputs(
+        assets, attempts=attempts, export_state_of=export_state_of
+    )
     has_original = any(output["original_url"] for output in outputs)
     has_preview = any(output["preview_url"] for output in outputs)
 
@@ -462,6 +515,7 @@ def _generation_feed_item(
         "original_available": has_original,
         "featured_output_index": featured_index,
         "outputs": outputs,
+        **_replay_capability_fields(snapshot, g),
     }
 
 
@@ -785,6 +839,49 @@ def _map_params(generation_params: dict[str, Any]) -> dict[str, Any]:
     return mapped
 
 
+def _replay_capability_fields(
+    snapshot: Optional[RequestSnapshot],
+    generation: Any = None,
+) -> dict[str, Any]:
+    """Project immutable-request replay capability (F5, read-only).
+
+    Reuses the CANONICAL validator that gates Generate Original / Retry
+    Original / Single Resume (``load_replay_plan`` = raw-snapshot validation
+    plus the exact plan round-trip check), so ``replay_capable=true`` means
+    the saved immutable request alone passes every action's capability gate.
+    It is deliberately NOT a promise about current Workflow/Preset state,
+    workspace credentials, dispatch availability, or execution success —
+    actual POST routes re-validate independently and stay fail-closed.  Only
+    a stable machine-readable reason code is exposed; validator details and
+    raw exceptions never reach the client and nothing is written.
+    """
+    if snapshot is None:
+        return {
+            "replay_capable": False,
+            "replay_unavailable_reason": "missing_request_snapshot",
+        }
+    from history_v2_replay import (
+        REASON_INVALID_PLAN,
+        ReplayCapabilityError,
+        load_replay_plan,
+    )
+
+    try:
+        load_replay_plan(snapshot, generation=generation)
+    except ReplayCapabilityError as exc:
+        return {
+            "replay_capable": False,
+            "replay_unavailable_reason": exc.capability.reason
+            or REASON_INVALID_PLAN,
+        }
+    except Exception:
+        return {
+            "replay_capable": False,
+            "replay_unavailable_reason": REASON_INVALID_PLAN,
+        }
+    return {"replay_capable": True}
+
+
 def _snapshot_dict(snapshot: RequestSnapshot) -> dict[str, Any]:
     """Immutable RequestSnapshot payload for the experiment-detail enrichment.
 
@@ -810,7 +907,9 @@ def _snapshot_dict(snapshot: RequestSnapshot) -> dict[str, Any]:
     }
 
 
-def _cell_generation_payload(detail: GenerationDetail) -> dict[str, Any]:
+def _cell_generation_payload(
+    detail: GenerationDetail, export_state_of: Optional[Any] = None
+) -> dict[str, Any]:
     """Additive per-cell Generation payload for the experiment detail.
 
     Builds the raw snake_case generation surface a "one card" experiment
@@ -818,7 +917,9 @@ def _cell_generation_payload(detail: GenerationDetail) -> dict[str, Any]:
     record, its full attempts list, the immutable request snapshot when
     linked, grouped outputs/assets, and the existing error/timing
     diagnostics.  Only cells with a generation receive a payload; the route
-    emits ``generation: None`` otherwise.
+    emits ``generation: None`` otherwise.  ``export_state_of`` (F9) gives the
+    embedded outputs EXACTLY the same per-variant export projection as
+    ordinary generation detail — no Experiment-specific export state exists.
     """
     gen = detail.generation
     attempts = detail.attempts
@@ -866,7 +967,9 @@ def _cell_generation_payload(detail: GenerationDetail) -> dict[str, Any]:
         "request_snapshot": (
             _snapshot_dict(snapshot) if snapshot is not None else None
         ),
-        "outputs": _build_outputs(detail.assets, attempts=attempts),
+        "outputs": _build_outputs(
+            detail.assets, attempts=attempts, export_state_of=export_state_of
+        ),
         "featured_output_index": _featured_output_index(
             detail.assets, gen.featured_asset_id
         ),
@@ -876,6 +979,7 @@ def _cell_generation_payload(detail: GenerationDetail) -> dict[str, Any]:
             if a.error
         ],
         "timing": timing,
+        **_replay_capability_fields(snapshot, gen),
     }
 
 
@@ -969,20 +1073,266 @@ def _resolve_workspace_dict(workspace_id: str) -> Optional[dict]:
         return None
 
 
+# ── Managed source resolution (shared by asset GET + F9 Export) ────────
+
+
+class _ManagedAssetError(Exception):
+    """Typed managed-source failure carrying its HTTP serving status.
+
+    ``status`` mirrors the established managed-asset serving truth:
+    400 malformed ``modal://`` origin, 404 missing/unavailable source,
+    502 remote retrieval failure.
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _parse_modal_reference(managed_path: str) -> tuple[str, str, str]:
+    """Split ``modal://<workspace>||<gpu>||<backend_path>`` (serving truth)."""
+    try:
+        workspace_id, gpu, backend_path = managed_path[len("modal://"):].split("|", 2)
+        return workspace_id, gpu, backend_path
+    except ValueError:
+        raise _ManagedAssetError(400, "asset origin invalid") from None
+
+
+def _managed_source_structural_error(asset: Asset) -> Optional[_ManagedAssetError]:
+    """Structural availability check WITHOUT fetching bytes.
+
+    Mirrors the managed-asset GET truth exactly: local path must exist as a
+    file; a ``modal://`` reference must parse and its workspace must resolve.
+    Remote BYTES are never touched here — absence of remote bytes is only
+    truthfully knowable at fetch time.
+    """
+    managed_path = str(asset.managed_path or "")
+    if managed_path.startswith("modal://"):
+        try:
+            workspace_id, _gpu, _backend = _parse_modal_reference(managed_path)
+        except _ManagedAssetError as exc:
+            return exc
+        if _resolve_workspace_dict(workspace_id) is None:
+            return _ManagedAssetError(404, "asset workspace unavailable")
+        return None
+    if not Path(managed_path).is_file():
+        return _ManagedAssetError(404, "asset file not found")
+    return None
+
+
+async def _read_remote_managed_bytes(asset: Asset) -> bytes:
+    """Read ``modal://`` managed bytes with the EXACT serving semantics.
+
+    Single internal helper used by BOTH the managed-asset GET route and the
+    F9 Export byte resolver, so Export can never drift from serving truth:
+    same URI parsing, same lazy workspace resolution, same 3-attempt
+    FileNotFoundError retry ladder, same ``expected_sha256`` verification
+    inside ``modal_client.read_output_asset``, same status classification.
+    """
+    managed_path = str(asset.managed_path)
+    workspace_id, gpu, backend_path = _parse_modal_reference(managed_path)
+    workspace = _resolve_workspace_dict(workspace_id)
+    if workspace is None:
+        raise _ManagedAssetError(404, "asset workspace unavailable")
+    try:
+        from modal_client import read_output_asset
+
+        last_exc: Optional[Exception] = None
+        for _attempt in range(3):
+            try:
+                remote = await read_output_asset(
+                    backend_path,
+                    expected_sha256=str(asset.sha256 or ""),
+                    gpu=gpu or None,
+                    workspace=workspace,
+                )
+                payload = remote.get("data", b"") if isinstance(remote, dict) else b""
+                if not isinstance(payload, bytes):
+                    raise TypeError("remote asset payload is not bytes")
+                return payload
+            except FileNotFoundError as exc:
+                last_exc = exc
+                if _attempt < 2:
+                    await asyncio.sleep(0.25 if _attempt == 0 else 0.5)
+        raise last_exc if last_exc is not None else FileNotFoundError(
+            "remote asset missing"
+        )
+    except FileNotFoundError:
+        raise _ManagedAssetError(404, "asset file missing") from None
+    except Exception as exc:
+        _log.exception("Failed to fetch remote managed asset %s", asset.asset_id)
+        raise _ManagedAssetError(502, f"asset fetch failed: {str(exc)[:200]}") from None
+
+
 # ── Registration ────────────────────────────────────────────────────────
 
 
-def register_history_v2_routes(server: Any, data_root: Any) -> None:
+# Per-asset export serialization (process-local; F9 concurrency guard).
+# Narrowest possible guard: two concurrent POSTs for the SAME asset are
+# serialized so they cannot create conflicting duplicate files or race the
+# record; exports of DIFFERENT assets never block each other.
+_ASSET_EXPORT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _asset_export_lock(asset_id: str) -> asyncio.Lock:
+    lock = _ASSET_EXPORT_LOCKS.get(asset_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ASSET_EXPORT_LOCKS[asset_id] = lock
+    return lock
+
+
+def _derive_output_index(
+    assets: list[Asset], asset: Asset
+) -> Optional[int]:
+    """Real logical-output index of *asset* per current History V2 grouping.
+
+    Uses the SAME ``_logical_output_groups`` grouping/order that
+    ``_build_outputs`` projects as each output's canonical ``index``, so a
+    Preview and an Original sharing a logical key resolve to the SAME index,
+    multi-output generations get distinct real indices, and legacy unkeyed
+    assets remain resolvable via run/asset provenance.  Returns None when the
+    asset cannot be mapped truthfully — callers must fail closed rather than
+    silently assigning index 0.
+    """
+    for index, group in enumerate(_logical_output_groups(assets)):
+        if any(candidate.asset_id == asset.asset_id for candidate in group):
+            return index
+    return None
+
+
+def _export_options_from_settings(raw: Any) -> ExportOptions:
+    """Build the ONE F7 ExportOptions from acknowledged live server settings.
+
+    The provider returns the canonical normalized settings dict (production:
+    ``__init__._load_modal_settings``); this only coerces defensively to the
+    F7 field types.  No Export-specific settings exist or are invented.
+    """
+    defaults = ExportOptions()
+    try:
+        quality = int(raw.get("quality", defaults.quality))
+    except (TypeError, ValueError):
+        quality = defaults.quality
+    return ExportOptions(
+        save_folder=str(raw.get("save_folder", "") or ""),
+        output_format=str(raw.get("output_format", "") or defaults.output_format),
+        quality=max(0, min(100, quality)),
+        webp_lossless_compression=str(
+            raw.get("webp_lossless_compression", "")
+            or defaults.webp_lossless_compression
+        ),
+        save_metadata_sidecar=bool(
+            raw.get("save_metadata_sidecar", defaults.save_metadata_sidecar)
+        ),
+    )
+
+
+def _export_naming_from_detail(
+    detail: GenerationDetail, output_index: int
+) -> ExportNamingContext:
+    """Server-derived naming context from IMMUTABLE/DURABLE data only.
+
+    Prefers the immutable RequestSnapshot (workflow name/hash, seed, preset
+    snapshot) OVER Generation durable metadata (preset ids).  Current
+    mutable Workflow/Preset state is NEVER resolved for naming.  Missing
+    optional metadata is not an export blocker; the real output index is
+    required.
+    """
+    gen = detail.generation
+    snapshot = detail.request_snapshot
+    workflow_name = ""
+    workflow_hash = ""
+    seed = ""
+    preset_id: Any = None
+    preset_name: Any = None
+    if snapshot is not None:
+        workflow_name = (
+            _workflow_name(snapshot.workflow, snapshot.preset_snapshot) or ""
+        )
+        workflow_hash = str(snapshot.workflow_hash or "")
+        params = snapshot.generation_params
+        raw_seed = params.get("seed") if isinstance(params, dict) else None
+        if raw_seed is not None:
+            seed = str(raw_seed)
+        preset_snapshot = (
+            snapshot.preset_snapshot
+            if isinstance(snapshot.preset_snapshot, dict)
+            else {}
+        )
+        preset_id = preset_snapshot.get("preset_id")
+        preset_name = preset_snapshot.get("preset_name")
+    # Generation durable metadata fills only what the snapshot lacked.
+    preset_id = preset_id or gen.preset_id
+    preset_name = preset_name or gen.preset_name
+    return ExportNamingContext(
+        output_index=output_index,
+        workflow_name=workflow_name,
+        workflow_hash=workflow_hash,
+        preset_id=str(preset_id) if preset_id else None,
+        preset_name=str(preset_name) if preset_name else None,
+        seed=seed,
+    )
+
+
+def _export_error_response(
+    status: int,
+    asset_id: str,
+    reason: str,
+    message: str,
+    export_state: str,
+    *,
+    partial: bool = False,
+) -> web.Response:
+    """Stable machine-readable Export error payload (bounded, secret-free)."""
+    return web.json_response(
+        {
+            "status": "error",
+            "asset_id": asset_id,
+            "reason": reason,
+            "message": str(message or "export failed")[:200],
+            "export_state": export_state,
+            "partial": bool(partial),
+        },
+        status=status,
+    )
+
+
+def register_history_v2_routes(
+    server: Any,
+    data_root: Any,
+    *,
+    generate_original_service_factory: Any = None,
+    settings_provider: Any = None,
+) -> None:
     """Register all History V2 routes on *server*.
 
     *server* may be a ComfyUI PromptServer, an aiohttp UrlDispatcher, or an
     aiohttp.web.Application.  Data is read from
     ``<data_root>/.studio_history_v2/history_v2.db``.
+
+    ``generate_original_service_factory(repo)`` optionally supplies the E3B2
+    Generate Original service (tests inject fakes); the default builds the
+    production :class:`~history_v2_replay.GenerateOriginalService`.
+
+    ``settings_provider()`` (F9) supplies the live canonical server settings
+    dict for configured-folder Export; the composition root wires
+    ``__init__._load_modal_settings`` here (dependency injection avoids any
+    circular import from this module into ``__init__``).  When absent, the
+    Export POST fails closed with a truthful configuration error.
     """
 
     def _open_repo() -> HistoryV2Repository:
         db_path = Path(data_root) / ".studio_history_v2" / "history_v2.db"
         return HistoryV2Repository(HistoryV2Store(db_path))
+
+    def _open_generate_original_service() -> Any:
+        repo = _open_repo()
+        if generate_original_service_factory is not None:
+            return generate_original_service_factory(repo)
+        from history_v2_replay import GenerateOriginalService
+
+        return GenerateOriginalService(repo, data_root=data_root)
 
     def _route(method: str, path: str):
         """Return a decorator registering a handler for method/path."""
@@ -1062,6 +1412,7 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
         }
         exp_filters = {
             "search": search,
+            "favorite": favorite,
             "date_from": date_from,
             "date_to": date_to,
         }
@@ -1183,9 +1534,22 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
         detail = repo.get_generation(generation_id)
         if detail is None:
             return _json_error(404, "generation not found")
+        # F9 per-variant export projection: lazily classify each projected
+        # variant through the F7 checker (record + destination existence).
+        # A recorded `exported` whose file vanished becomes (and persists
+        # as) `missing`; unrelated exports are never scanned and the managed
+        # source is never touched.  No remote bytes are fetched here.
+        export_service = HistoryV2ExportService(repo)
+
+        def _export_state_of(asset_id: str) -> str:
+            return export_service.get_export_state(
+                asset_id, persist_missing=True
+            ).state
+
         item = _generation_feed_item(
             detail.generation.to_dict(), detail.assets, detail.attempts,
             snapshot=detail.request_snapshot,
+            export_state_of=_export_state_of,
         )
         item["attempts"] = [_attempt_dict(a) for a in detail.attempts]
         item["errors"] = [
@@ -1193,11 +1557,20 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
             for a in detail.attempts
             if a.error
         ]
-        item["export_state"] = (
-            "exported"
-            if any(er.state == "exported" for er in detail.export_records)
-            else "none"
-        )
+        variant_states = [
+            state
+            for output in item["outputs"]
+            for state in (
+                output.get("preview_export_state"),
+                output.get("original_export_state"),
+            )
+            if state
+        ]
+        # DEPRECATED aggregate compatibility only (F9): the old collapsed
+        # generation-level field, now DERIVED from the lazy per-variant truth
+        # above so it can never contradict it.  Frontends must consume the
+        # per-variant fields; this stays solely for existing consumers.
+        item["export_state"] = "exported" if "exported" in variant_states else "none"
         snapshot = detail.request_snapshot
         item["params"] = _map_params(snapshot.generation_params) if snapshot else {}
         candidates = [a for a in detail.attempts if a.timing and a.finished_at]
@@ -1207,6 +1580,60 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
         response_data = {"status": "ok", "item": item}
         _maybe_timing(request, response_data, ticker)
         return web.json_response(response_data)
+
+    # ── Generate Original (E3B2 production replay action) ──────────────
+
+    @_route("post", f"{BASE}/generations/{{generation_id}}/original")
+    async def history_v2_generation_original(request: web.Request) -> web.Response:
+        """Generate Original from the immutable History snapshot.
+
+        Body (optional): ``{"rerender": true}`` to force a new Attempt when
+        policy permits.  Workflow, seed, preset, controls, plan, and model
+        stack come ONLY from the saved snapshot — never from current mutable
+        state.
+        """
+        generation_id = request.match_info["generation_id"]
+        body = await _read_json(request)
+        if body is None:
+            body = {}
+        rerender = body.get("rerender", False)
+        if not isinstance(rerender, bool):
+            return _json_error(400, "rerender must be a boolean")
+        service = _open_generate_original_service()
+        result = await service.generate(generation_id, rerender=rerender)
+        return web.json_response(dict(result.payload), status=result.http_status)
+
+    @_route("post", f"{BASE}/generations/{{generation_id}}/original/retry")
+    async def history_v2_generation_original_retry(
+        request: web.Request,
+    ) -> web.Response:
+        """Retry the newest failed Original Attempt (append-only).
+
+        Same Generation, same immutable snapshot, new ``mode="original"``
+        Attempt; the failed attempt is retained untouched and a Preview is
+        never retried as an Original.
+        """
+        generation_id = request.match_info["generation_id"]
+        service = _open_generate_original_service()
+        result = await service.retry(generation_id)
+        return web.json_response(dict(result.payload), status=result.http_status)
+
+    @_route("post", f"{BASE}/generations/{{generation_id}}/resume")
+    async def history_v2_generation_resume(request: web.Request) -> web.Response:
+        """Resume an interrupted ordinary modern Single (F1A, append-only).
+
+        Bodyless.  Re-executes the interrupted immutable request with its
+        frozen semantic output mode preserved (never converted to Original);
+        the interrupted Attempt is retained and a fresh queued Attempt is
+        created under the SAME Generation/snapshot inside one guarded
+        transaction.  Failed/canceled/completed/active generations are
+        refused truthfully; Experiment cells resume through the Experiment
+        surface.
+        """
+        generation_id = request.match_info["generation_id"]
+        service = _open_generate_original_service()
+        result = await service.resume_single(generation_id)
+        return web.json_response(dict(result.payload), status=result.http_status)
 
     # ── Experiment detail ──────────────────────────────────────────────
 
@@ -1243,6 +1670,16 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
 
         item = _experiment_feed_item(exp.to_dict(), cells, assets_by_gen)
         axis_names = _axis_labels(cells, exp.definition)
+        # F9: the SAME lazy per-variant export projector as generation
+        # detail, so every embedded cell Generation projects identical
+        # variant asset ids / export states.  No Experiment-specific state.
+        export_service = HistoryV2ExportService(repo)
+
+        def _export_state_of(asset_id: str) -> str:
+            return export_service.get_export_state(
+                asset_id, persist_missing=True
+            ).state
+
         item["cells"] = [
             _detail_cell(
                 c,
@@ -1251,7 +1688,10 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
                 fav_by_gen,
                 axis_names,
                 generation_payload=(
-                    _cell_generation_payload(gen_detail_by_id[c.generation_id])
+                    _cell_generation_payload(
+                        gen_detail_by_id[c.generation_id],
+                        export_state_of=_export_state_of,
+                    )
                     if c.generation_id and c.generation_id in gen_detail_by_id
                     else None
                 ),
@@ -1377,48 +1817,14 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
             return _json_error(404, "asset not found")
         managed_path = str(asset.managed_path)
         if managed_path.startswith("modal://"):
-            # Remote producer reference: serve it using the same
-            # modal_client.read_output_asset behavior as the generic
-            # /comfymodal/assets route (ModalTransport untouched; the
-            # workspace is resolved lazily, equivalently to that route).
+            # Remote producer reference: served through the SHARED internal
+            # byte-resolution helper (F9) so Export reuses the exact same
+            # semantics.  Browser Download (this GET) writes ZERO export
+            # state — it must never enter the Export service.
             try:
-                workspace_id, gpu, backend_path = managed_path[len("modal://"):].split("|", 2)
-            except ValueError:
-                return _json_error(400, "asset origin invalid")
-            workspace = _resolve_workspace_dict(workspace_id)
-            if workspace is None:
-                return _json_error(404, "asset workspace unavailable")
-            body: bytes = b""
-            try:
-                from modal_client import read_output_asset
-
-                last_exc: Optional[Exception] = None
-                for _attempt in range(3):
-                    try:
-                        remote = await read_output_asset(
-                            backend_path,
-                            expected_sha256=str(asset.sha256 or ""),
-                            gpu=gpu or None,
-                            workspace=workspace,
-                        )
-                        payload = remote.get("data", b"") if isinstance(remote, dict) else b""
-                        if not isinstance(payload, bytes):
-                            raise TypeError("remote asset payload is not bytes")
-                        body = payload
-                        break
-                    except FileNotFoundError as exc:
-                        last_exc = exc
-                        if _attempt < 2:
-                            await asyncio.sleep(0.25 if _attempt == 0 else 0.5)
-                else:
-                    raise last_exc if last_exc is not None else FileNotFoundError(
-                        "remote asset missing"
-                    )
-            except FileNotFoundError:
-                return _json_error(404, "asset file missing")
-            except Exception as exc:
-                _log.exception("Failed to fetch remote managed asset %s", asset_id)
-                return _json_error(502, f"asset fetch failed: {str(exc)[:200]}")
+                body: bytes = await _read_remote_managed_bytes(asset)
+            except _ManagedAssetError as exc:
+                return _json_error(exc.status, exc.message)
             return web.Response(body=body, content_type=_content_type_for(asset))
         path = Path(managed_path)
         if not path.is_file():
@@ -1429,3 +1835,137 @@ def register_history_v2_routes(server: Any, data_root: Any) -> None:
             _log.exception("Failed to read managed asset %s", asset_id)
             return _json_error(500, "asset read error")
         return web.Response(body=body, content_type=_content_type_for(asset))
+
+    # ── Configured-folder Export (F9) ──────────────────────────────────
+
+    @_route("post", f"{BASE}/assets/{{asset_id}}/export")
+    async def history_v2_asset_export(request: web.Request) -> web.Response:
+        """Export ONE selected managed asset into the configured output folder.
+
+        BODYLESS by contract: the selected ``asset_id`` uniquely identifies
+        the managed History source.  Generation association, logical-output
+        index, naming context, and the live canonical Output settings are
+        derived and validated SERVER-SIDE; client-supplied generation/
+        output/naming identity is neither read nor honored.
+        """
+        asset_id = request.match_info["asset_id"]
+        repo = _open_repo()
+        asset = repo.get_asset(asset_id)
+        if asset is None:
+            return _export_error_response(
+                404, asset_id, "asset_not_found",
+                "asset not found in History V2 store", "not_exported",
+            )
+
+        # Structural availability WITHOUT fetching bytes (managed-asset GET
+        # truth).  Failing here writes no record — no real attempt occurred.
+        structural = _managed_source_structural_error(asset)
+        if structural is not None:
+            return _export_error_response(
+                structural.status, asset_id, "source_unreadable",
+                structural.message, "not_exported",
+            )
+
+        # Server-owned association truth: derive the Generation from the
+        # asset's own durable generation_id; never trust client identity.
+        detail = repo.get_generation(str(asset.generation_id))
+        if detail is None:
+            return _export_error_response(
+                404, asset_id, "generation_not_found",
+                "asset generation unavailable in History V2 store",
+                "not_exported",
+            )
+
+        # Real logical-output index from current grouping — fail closed
+        # rather than silently assigning index 0.
+        output_index = _derive_output_index(detail.assets, asset)
+        if output_index is None:
+            return _export_error_response(
+                500, asset_id, "output_index_unresolved",
+                "asset cannot be mapped to a logical output", "not_exported",
+            )
+
+        # Live canonical Output settings authority (explicit action NOW).
+        if settings_provider is None:
+            return _export_error_response(
+                503, asset_id, "settings_unavailable",
+                "export settings authority is not wired", "not_exported",
+            )
+        try:
+            raw_settings = settings_provider()
+        except Exception as exc:
+            _log.exception("Export settings provider failed for %s", asset_id)
+            return _export_error_response(
+                500, asset_id, "settings_unavailable",
+                f"export settings unavailable: {str(exc)[:120]}",
+                "not_exported",
+            )
+        options = _export_options_from_settings(
+            raw_settings if isinstance(raw_settings, dict) else {}
+        )
+        naming = _export_naming_from_detail(detail, output_index)
+
+        # Request-scoped classification of remote serving failures so the
+        # F7 `source_unreadable` reason can map to its truthful HTTP status
+        # (404 missing vs 502 retrieval failure) without diverging from the
+        # shared byte-resolution semantics.
+        classified_status: dict[str, int] = {}
+
+        async def _export_byte_resolver(resolved_asset: Asset) -> bytes:
+            try:
+                return await _read_remote_managed_bytes(resolved_asset)
+            except _ManagedAssetError as exc:
+                classified_status["status"] = exc.status
+                raise
+
+        service = HistoryV2ExportService(repo, byte_resolver=_export_byte_resolver)
+        async with _asset_export_lock(asset_id):
+            try:
+                result = await service.export_asset(asset_id, options, naming)
+            except Exception:
+                _log.exception("History V2 export crashed for %s", asset_id)
+                return _export_error_response(
+                    500, asset_id, "export_failed",
+                    "export failed unexpectedly", "failed",
+                )
+
+        if result.ok:
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "asset_id": asset_id,
+                    "export_state": result.state,
+                    # Contract: an already-exported exact reuse reports
+                    # saved=false + already_exported=true (the F7 core's
+                    # ExportResult.saved stays true on reuse; the HTTP
+                    # surface maps it to the frozen response contract).
+                    "saved": bool(result.saved) and not result.already_exported,
+                    "already_exported": bool(result.already_exported),
+                    "destination_path": result.destination_path,
+                    "metadata_path": result.metadata_path,
+                    "byte_count": int(result.byte_count),
+                    "file_ext": result.file_ext,
+                    "mime_type": result.mime_type,
+                    "exported_at": result.exported_at,
+                },
+                status=200,
+            )
+
+        status_map = {
+            "asset_not_found": 404,
+            "remote_resolver_unavailable": 502,
+            "source_unreadable": classified_status.get("status", 502),
+            "hash_mismatch": 502,
+            "conversion_failed": 500,
+            "write_failed": 500,
+            "record_persist_failed": 500,
+        }
+        http_status = status_map.get(result.reason or "", 500)
+        return _export_error_response(
+            http_status,
+            asset_id,
+            result.reason or "export_failed",
+            result.message or "export failed",
+            result.state,
+            partial=result.partial,
+        )

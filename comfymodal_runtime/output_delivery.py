@@ -111,6 +111,9 @@ class ConversionMeta:
     codec: str = ""
     quality: int | None = None
     webp_lossless_compression: str | None = None
+    # E2D: effective WebP encoder-effort label and resolved Pillow method.
+    webp_effort: str | None = None
+    webp_method: int | None = None
     output_codec_ms: float = 0.0
     encoded_bytes: int = 0
     source_bytes: int = 0
@@ -136,6 +139,18 @@ class OutputItem:
     format: str = ""
     animated: bool = False
     conversion_meta: ConversionMeta | None = None
+    # ── E2C: producer-side Thumbnail derivative (optional) ─────────────
+    # Encoded remotely from the same in-memory pixels as the primary item;
+    # never fetched back from a remote managed Original.  ``thumbnail_path``
+    # is the content-addressed relative path assigned by asset persistence.
+    thumbnail_bytes: bytes = b""
+    thumbnail_mime_type: str = ""
+    thumbnail_file_ext: str = ""
+    thumbnail_width: int = 0
+    thumbnail_height: int = 0
+    thumbnail_codec_ms: float = 0.0
+    thumbnail_quality: int | None = None
+    thumbnail_path: str = ""
 
     def __post_init__(self) -> None:
         if self.content_sha256:
@@ -146,6 +161,10 @@ class OutputItem:
             else (hashlib.sha256(self.raw_bytes).hexdigest() if self.raw_bytes else "")
         )
         object.__setattr__(self, "content_sha256", digest)
+
+    @property
+    def has_thumbnail(self) -> bool:
+        return bool(self.thumbnail_bytes)
 
 
 @dataclass(frozen=True)
@@ -252,6 +271,9 @@ class AssetDescriptor:
     codec: str = ""
     quality: int | None = None
     webp_lossless_compression: str | None = None
+    # E2D: effective WebP encoder-effort label and resolved Pillow method.
+    webp_effort: str | None = None
+    webp_method: int | None = None
     output_codec_ms: float = 0.0
     conversion_fallback: bool = False
     source_bytes: int = 0
@@ -313,6 +335,14 @@ def build_asset_descriptor_list(
                 item.conversion_meta.webp_lossless_compression
                 if item.conversion_meta else None
             ),
+            webp_effort=(
+                item.conversion_meta.webp_effort
+                if item.conversion_meta else None
+            ),
+            webp_method=(
+                item.conversion_meta.webp_method
+                if item.conversion_meta else None
+            ),
             output_codec_ms=(
                 item.conversion_meta.output_codec_ms
                 if item.conversion_meta else 0.0
@@ -334,6 +364,70 @@ def build_asset_descriptor_list(
         )
         _opt_output_delivery_print()
     return descriptors
+
+
+def build_derivative_descriptors(
+    attempt: Attempt,
+    *,
+    generation: str = "",
+    output_mode: str = "original",
+    variant: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build Thumbnail derivative descriptors from an *Attempt*'s items.
+
+    E2C multi-asset contract: each item may carry ONE optional producer-side
+    Thumbnail derivative encoded from the same local pixels.  A derivative is
+    NEVER an independent logical output — it shares its parent's
+    ``node_id``/``output_key``/``output_index`` and therefore the exact
+    canonical ``logical_output_key``, carries semantic ``variant``
+    ``"thumbnail"``, and links back to the primary via ``parent_asset_id`` /
+    ``parent_identity``.  Returns plain AssetDescriptor-shaped dicts.
+    """
+    output_mode = normalize_output_mode(output_mode)
+    primary_variant = str(variant or output_mode)
+    derivatives: list[dict[str, Any]] = []
+    for item in attempt.items:
+        if not item.thumbnail_bytes:
+            continue
+        digest = hashlib.sha256(item.thumbnail_bytes).hexdigest()
+        stem = Path(item.filename).stem if item.filename else "output"
+        ext = item.thumbnail_file_ext or ".webp"
+        derivatives.append({
+            "asset_id": digest,
+            "identity": f"sha256:{digest}",
+            "backend_path": item.thumbnail_path,
+            "path": item.thumbnail_path,
+            "filename": f"{stem}_thumb{ext}",
+            "mime_type": item.thumbnail_mime_type or "image/webp",
+            "file_ext": ext,
+            "width": item.thumbnail_width,
+            "height": item.thumbnail_height,
+            "byte_count": len(item.thumbnail_bytes),
+            "node_id": item.node_id,
+            "output_key": item.output_key,
+            "output_index": item.output_index,
+            "comparison_side": item.comparison_side,
+            "generation": generation,
+            "codec": "webp",
+            "quality": (
+                item.thumbnail_quality if item.thumbnail_quality is not None else 75
+            ),
+            "output_codec_ms": item.thumbnail_codec_ms,
+            "conversion_fallback": False,
+            "source_bytes": len(item.raw_bytes),
+            "output_mode": output_mode,
+            "variant": "thumbnail",
+            "logical_output_key": build_logical_output_key(
+                item.node_id, item.output_key, item.output_index
+            ) or "",
+            "parent_asset_id": item.content_sha256,
+            "parent_identity": (
+                f"sha256:{item.content_sha256}" if item.content_sha256 else ""
+            ),
+            "parent_variant": primary_variant,
+            "derivative_kind": "thumbnail",
+        })
+    return derivatives
 
 
 def attempt_to_descriptor_result(
@@ -411,6 +505,8 @@ def attempt_to_descriptor_result(
                 "codec": item.conversion_meta.codec,
                 "quality": item.conversion_meta.quality,
                 "webp_lossless_compression": item.conversion_meta.webp_lossless_compression,
+                "webp_effort": item.conversion_meta.webp_effort,
+                "webp_method": item.conversion_meta.webp_method,
                 "output_codec_ms": item.conversion_meta.output_codec_ms,
                 "conversion_time_ms": item.conversion_meta.conversion_time_ms,
                 "encoded_bytes": item.conversion_meta.encoded_bytes or len(raw),
@@ -440,6 +536,12 @@ def attempt_to_descriptor_result(
             images.append(entry)
 
     descriptors_as_dicts = [dataclasses.asdict(d) for d in descriptors]
+    derivative_descriptors = build_derivative_descriptors(
+        attempt,
+        generation=generation,
+        output_mode=output_mode,
+        variant=variant,
+    )
 
     return {
         "output_mode": output_mode,
@@ -447,7 +549,8 @@ def attempt_to_descriptor_result(
         "images": images,
         "videos": videos,
         "outputs": outputs,
-        "asset_descriptors": descriptors_as_dicts,
+        "asset_descriptors": descriptors_as_dicts + derivative_descriptors,
+        "derivative_descriptors": derivative_descriptors,
         "use_descriptors": True,
         "include_base64": bool(legacy_data),
     }
@@ -527,6 +630,8 @@ def _make_conversion_meta(
     codec: str = "",
     quality: int | None = None,
     webp_lossless_compression: str | None = None,
+    webp_effort: str | None = None,
+    webp_method: int | None = None,
     output_codec_ms: float | None = None,
     encoded_bytes: int = 0,
     source_bytes: int = 0,
@@ -551,6 +656,8 @@ def _make_conversion_meta(
         codec=codec,
         quality=quality,
         webp_lossless_compression=webp_lossless_compression,
+        webp_effort=webp_effort,
+        webp_method=webp_method,
         output_codec_ms=(
             conversion_time_ms if output_codec_ms is None else output_codec_ms
         ),
@@ -622,6 +729,14 @@ def _item_from_entry(
                 str(entry["webp_lossless_compression"])
                 if entry.get("webp_lossless_compression") is not None else None
             ),
+            webp_effort=(
+                str(entry["webp_effort"])
+                if entry.get("webp_effort") is not None else None
+            ),
+            webp_method=(
+                int(entry["webp_method"])
+                if entry.get("webp_method") is not None else None
+            ),
             output_codec_ms=float(entry.get("output_codec_ms", 0) or 0),
             encoded_bytes=int(entry.get("encoded_bytes", len(raw)) or len(raw)),
             source_bytes=int(entry.get("source_bytes", 0) or 0),
@@ -635,6 +750,11 @@ def _item_from_entry(
         if conv_meta is not None and conv_meta.hash_of_raw
         else (hashlib.sha256(raw).hexdigest() if raw else "")
     )
+    # E2C: optional producer-side Thumbnail derivative carried on the entry.
+    thumb_raw = entry.get("thumbnail")
+    if not isinstance(thumb_raw, Mapping):
+        thumb_raw = None
+    thumb_bytes = bytes(thumb_raw.get("bytes") or b"") if thumb_raw else b""
     return (
         OutputItem(
             node_id=str(node_id),
@@ -653,6 +773,23 @@ def _item_from_entry(
             format=str(entry.get("format", "")),
             animated=bool(entry.get("animated", False)),
             conversion_meta=conv_meta,
+            thumbnail_bytes=thumb_bytes,
+            thumbnail_mime_type=(
+                str(thumb_raw.get("mime_type", "image/webp")) if thumb_raw else ""
+            ),
+            thumbnail_file_ext=(
+                str(thumb_raw.get("file_ext", ".webp")) if thumb_raw else ""
+            ),
+            thumbnail_width=int(thumb_raw.get("width", 0) or 0) if thumb_raw else 0,
+            thumbnail_height=int(thumb_raw.get("height", 0) or 0) if thumb_raw else 0,
+            thumbnail_codec_ms=(
+                float(thumb_raw.get("output_codec_ms", 0) or 0) if thumb_raw else 0.0
+            ),
+            thumbnail_quality=(
+                int(thumb_raw["quality"])
+                if thumb_raw and thumb_raw.get("quality") is not None
+                else None
+            ),
         ),
         b64_time_ms,
     )

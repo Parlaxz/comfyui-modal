@@ -542,6 +542,22 @@ RESTORE_ONLY_GAP_SECONDS = float(
 )
 RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 
+# ── Golden P1 serial-stream benchmark (isolated lane; opt-in) ──────────────
+# Strictly serial full-generation cohort driven by the dedicated remote
+# method ``run_golden_serial_stream``.  Each attempt consumes the remote
+# event stream to exhaustion and is validated FAIL-CLOSED: exactly one
+# terminal result, zero error events, true_durable evidence, expected
+# output SHA, zero seriality violations, completed teardown telemetry,
+# snapshot proof, commit→reopen→TRUE_FIRST_DURABLE_RESULT ordering, and
+# runtime-flag agreement when an expectation is configured.  Invalid/DNF
+# attempts are preserved as artifacts and NEVER counted.  True-cold status
+# is labeled ONLY from remote/container identity evidence — never inferred.
+GOLDEN_P1_MODE = "golden_p1_serial"
+GOLDEN_P1_REMOTE_METHOD = "run_golden_serial_stream"
+GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME = "phase_p1_serial_golden_v1"
+GOLDEN_P1_DEFAULT_RUN_COUNT = int(os.environ.get("V2_GOLDEN_P1_RUN_COUNT", "5") or 5)
+GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV = "COMFYMODAL_V2_GOLDEN_P1_EXPECTED_OUTPUT_SHA"
+
 
 def _load_workspace() -> dict[str, Any]:
     data = json.loads(WORKSPACES_PATH.read_text(encoding="utf-8"))
@@ -742,6 +758,27 @@ D10_FASTPATH_PROFILE: dict[str, str] = {
     "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
     "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
     "COMFYMODAL_V2_UNET_FORENSICS": "0",
+}
+
+# Dedicated P1 serial-Golden profile.  Golden intentionally keeps the
+# D6-family diagnostics mostly off while excluding CLIP snapshot weights.
+# Keep the complete tuple here so the pre-deploy verifier cannot accept a
+# partial Golden environment.
+GOLDEN_P1_PROFILE_NAME = "golden_p1"
+GOLDEN_P1_PROFILE: dict[str, str] = {
+    "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0",
+    "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "0",
+    "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "0",
+    "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
+    "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+    "COMFYMODAL_V2_UNET_FORENSICS": "0",
+    "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+    "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "0",
+    "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
+    "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
+    "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": "1",
 }
 
 E19_FINAL_COLD_LOADER_PROFILE_NAME = "E19_FINAL_COLD_LOADER"
@@ -1729,6 +1766,19 @@ def _d10_profile_active() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _golden_p1_profile_active() -> bool:
+    """True when the dedicated Golden profile selector is active.
+
+    This mirrors the runtime's container-side Golden decision: the
+    deploy-baked DynamicVRAM flag is sufficient for direct launcher use, while
+    v2ctl's canonical profile name also activates the profile-only path.
+    """
+    return env_flag("COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM") or (
+        os.environ.get("COMFYMODAL_V2CTL_PROFILE", "").strip().lower()
+        == GOLDEN_P1_PROFILE_NAME
+    )
+
+
 def _d6_normalize(raw: Any) -> str:
     """Normalize one effective flag value for comparison/reporting.
 
@@ -1746,7 +1796,7 @@ def verify_d6_fastpath_profile() -> tuple[bool, dict[str, Any]]:
     """Fail-fast local check of the D6/D10/E19 deploy profile against the
     ACTUAL ``comfymodal_runtime.modal_app._runtime_env()`` construction.
 
-    FOUR-MODE CONTRACT:
+    FIVE-MODE CONTRACT:
       * D10 profile active (``V2_D10_INTEGRATION_VALIDATION`` = 1/true/yes/on):
         the eight fast-path flags MUST equal ``D10_FASTPATH_PROFILE``
         (1,1,1,1,1,0,1,0) — SYNC_CUDA=0 for measurement integrity.
@@ -1760,6 +1810,10 @@ def verify_d6_fastpath_profile() -> tuple[bool, dict[str, Any]]:
         every E19 loader, transport, orchestration, and safety flag MUST equal
         ``E19_FINAL_COLD_LOADER_PROFILE``.  E19 cannot be combined with D6,
         D10, or E10.
+      * Golden profile active (the DynamicVRAM flag or canonical ``golden_p1``
+        profile name): the eight D6-family flags plus the five Golden controls
+        MUST equal ``GOLDEN_P1_PROFILE``.  Golden cannot be combined with E19,
+        D6, D10, or E10.
 
     The effective values are read from ``_runtime_env()`` itself — the exact
     dict the deployment bakes — never from the raw process env (with no spec
@@ -1772,7 +1826,12 @@ def verify_d6_fastpath_profile() -> tuple[bool, dict[str, Any]]:
     d6 = _d6_profile_active()
     e10 = _e10_profile_active()
     e19 = _e19_profile_active()
-    if e19:
+    golden = _golden_p1_profile_active()
+    if golden:
+        expected = dict(GOLDEN_P1_PROFILE)
+        profile_label = GOLDEN_P1_PROFILE_NAME
+        profile_keys = tuple(expected)
+    elif e19:
         expected = dict(E19_FINAL_COLD_LOADER_PROFILE)
         profile_label = E19_FINAL_COLD_LOADER_PROFILE_NAME
         profile_keys = tuple(expected)
@@ -1790,7 +1849,7 @@ def verify_d6_fastpath_profile() -> tuple[bool, dict[str, Any]]:
         profile_keys = _D6_PROFILE_KEYS
     details: dict[str, Any] = {
         "profile": profile_label,
-        "active": bool(e19 or d10 or d6),
+        "active": bool(golden or e19 or d10 or d6),
     }
     try:
         from comfymodal_runtime.modal_app import _runtime_env
@@ -1819,7 +1878,23 @@ def verify_d6_fastpath_profile() -> tuple[bool, dict[str, Any]]:
             if _got != expected[_key]:
                 ok = False
     details["e22_arm"] = e22_arm or None
-    if e19:
+    if golden:
+        _conflicts = []
+        if e19:
+            _conflicts.append(E19_FINAL_COLD_LOADER_SELECTOR)
+        if d10:
+            _conflicts.append("V2_D10_INTEGRATION_VALIDATION")
+        if d6:
+            _conflicts.append("V2_D6_FASTPATH_VALIDATION")
+        if e10:
+            _conflicts.append("V2_E10_BUCKET_FIRST_VALIDATION")
+        if _conflicts:
+            ok = False
+            details["error"] = (
+                f"{GOLDEN_P1_PROFILE_NAME} cannot combine with "
+                + ", ".join(_conflicts)
+            )
+    elif e19:
         _conflicts = []
         if d10:
             _conflicts.append("V2_D10_INTEGRATION_VALIDATION")
@@ -1874,7 +1949,10 @@ def _run_d6_verify_cli() -> int:
     ok, details = verify_d6_fastpath_profile()
     print("[v2.d6_deploy_profile]", flush=True)
     print(f"profile={details.get('profile', 'default')}", flush=True)
-    if details.get("profile") == E19_FINAL_COLD_LOADER_PROFILE_NAME:
+    if details.get("profile") == GOLDEN_P1_PROFILE_NAME:
+        _profile_keys = tuple(GOLDEN_P1_PROFILE)
+        _atomic_name = "GOLDEN_P1"
+    elif details.get("profile") == E19_FINAL_COLD_LOADER_PROFILE_NAME:
         _profile_keys = tuple(E19_FINAL_COLD_LOADER_PROFILE)
         _atomic_name = E19_FINAL_COLD_LOADER_PROFILE_NAME
     elif details.get("profile") == "d10_integration_validation":
@@ -4464,6 +4542,25 @@ async def _run_one(
             artifact["canonical_ledger_status"] = str(_remote_status)
         if _remote_error is not None:
             artifact["canonical_ledger_error"] = _remote_error
+    except Exception:
+        pass
+    # ── E40: single acceptance-authority telemetry blocks ────────────────
+    # loader_selection / runtime_status / resolved_config are emitted once
+    # per run by the runtime (modal_app result assembly) and surfaced here
+    # verbatim so offline validation reads the SAME structures.
+    try:
+        _e40_source = None
+        if isinstance(result, dict):
+            _e40_source = result
+            if not any(k in result for k in ("loader_selection", "runtime_status", "resolved_config")) \
+                    and isinstance(result.get("data"), dict):
+                _e40_source = result["data"]
+        if isinstance(_e40_source, dict):
+            for _e40_key in ("loader_selection", "runtime_status", "resolved_config",
+                             "e40_telemetry_error"):
+                _e40_val = _e40_source.get(_e40_key)
+                if _e40_val is not None:
+                    artifact[_e40_key] = _e40_val
     except Exception:
         pass
     (output_dir / f"run_{index}.json").write_text(
@@ -10082,6 +10179,701 @@ async def _prime_registry_proof() -> None:
         )
 
 
+# ── Golden P1 serial-stream benchmark implementation ───────────────────────
+
+
+def _golden_p1_last_key(path: str) -> str:
+    seg = path.rsplit(".", 1)[-1]
+    return seg.split("[", 1)[0].lower()
+
+
+def _golden_p1_walk(value: Any, path: str = ""):
+    """Depth-first walk yielding ``(dotted_path, value)`` for every node."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            child = f"{path}.{k}" if path else str(k)
+            yield child, v
+            yield from _golden_p1_walk(v, child)
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            child = f"{path}[{i}]"
+            yield child, v
+            yield from _golden_p1_walk(v, child)
+
+
+def _golden_p1_ts_value(raw: Any) -> float | None:
+    """Numeric epoch seconds from int/float or ISO-8601 strings; else None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return datetime.fromisoformat(
+                raw.strip().replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _golden_p1_truthy(raw: Any) -> bool:
+    if isinstance(raw, str):
+        return raw.strip().lower() in {
+            "1", "true", "yes", "on", "ok",
+            "completed", "complete", "success", "succeeded", "done",
+        }
+    return bool(raw)
+
+
+def _golden_p1_load_payload() -> dict[str, Any]:
+    """Exact prompt/extra_data/modal_options from the existing workflow
+    snapshot payload (latest_benchmark_workflow.json), never rewritten."""
+    snapshot = json.loads(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    payload = snapshot.get("payload", snapshot)
+    prompt = payload.get("prompt", payload)
+    extra_data = payload.get("extra_data")
+    modal_options = payload.get("modal_options", {})
+    if not isinstance(prompt, dict):
+        raise RuntimeError("golden-p1: workflow prompt must be an object")
+    return {
+        "prompt": prompt,
+        "extra_data": extra_data if extra_data is not None else {},
+        "modal_options": modal_options if isinstance(modal_options, dict) else {},
+        "workflow_hash": str(snapshot.get("workflow_hash", "") or ""),
+        "captured_at": str(snapshot.get("captured_at", "") or ""),
+    }
+
+
+def _golden_p1_deployed_identity() -> dict[str, Any]:
+    """Deployment identity fields recorded in .deployed_state.json (best
+    effort; absent file yields {} so nothing is fabricated)."""
+    try:
+        data = json.loads((ROOT / ".deployed_state.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    keep = (
+        "app_name", "class_name", "deployment_combined_hash", "gpu",
+        "deployed_at", "deploy_fingerprint", "profile",
+    )
+    return {k: data[k] for k in keep if data.get(k) not in (None, "")}
+
+
+async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> list[Any]:
+    """Call the remote ``run_golden_serial_stream`` method via the existing
+    app/class handle and consume the event stream to exhaustion.  Mirrors the
+    established ``run_plan_stream.remote_gen.aio(...)`` transport pattern."""
+    fn = getattr(handle, GOLDEN_P1_REMOTE_METHOD, None)
+    if fn is None:
+        raise RuntimeError(
+            f"remote method {GOLDEN_P1_REMOTE_METHOD!r} not present on the "
+            "resolved class handle"
+        )
+    remote_gen = getattr(fn, "remote_gen", None)
+    stream: Any
+    if remote_gen is not None and callable(getattr(remote_gen, "aio", None)):
+        stream = remote_gen.aio(payload)
+    elif callable(getattr(fn, "aio", None)):
+        stream = fn.aio(payload)
+    else:
+        stream = fn(payload)
+    events: list[Any] = []
+    if hasattr(stream, "__aiter__"):
+        ait = stream.__aiter__()
+        try:
+            async for event in ait:
+                events.append(event)
+        finally:
+            aclose: Any = getattr(ait, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+    elif hasattr(stream, "__await__"):
+        events.append(await stream)
+    else:
+        events.append(stream)
+    return events
+
+
+def _golden_p1_unit_name(value: Any) -> str:
+    """Name of a telemetry unit (stage/event dict with a ``name`` field)."""
+    if isinstance(value, dict):
+        name = value.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return ""
+
+
+def _golden_p1_unit_ts(unit: Any) -> float | None:
+    """Best epoch-seconds timestamp from a telemetry stage/event unit."""
+    if not isinstance(unit, dict):
+        return None
+    for key in ("end_wall_ns", "wall_ns", "entry_wall_ns"):
+        raw = unit.get(key)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            # wall stamps are epoch nanoseconds; normalize to seconds.
+            value = float(raw)
+            return value / 1e9 if value > 1e14 else value
+    return None
+
+
+def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
+    """Classify fail-closed validation evidence across every stream event.
+
+    Two evidence surfaces are covered: direct dict KEYS (e.g. ``true_durable``
+    on the terminal result) and NAMED telemetry units inside the Golden
+    telemetry document (``stages``/``events`` entries whose ``name`` carries
+    the semantics — e.g. ``golden_durable_commit``, ``golden_teardown``,
+    ``durable_reopen_verified``, ``snapshot_proof_complete``,
+    ``TRUE_FIRST_DURABLE_RESULT``).
+    """
+    scan: dict[str, Any] = {
+        "terminal_results": [],
+        "error_events": [],
+        "true_durable": [],
+        "seriality": [],
+        "teardown": [],
+        "snapshot_proof": [],
+        "commit": [],
+        "reopen": [],
+        "true_first": [],
+        "flags": [],
+        "identities": [],
+        "output_shas": [],
+        "non_dict_events": 0,
+    }
+    for idx, event in enumerate(events):
+        if not isinstance(event, dict):
+            scan["non_dict_events"] += 1
+            continue
+        etype = str(event.get("type") or event.get("event") or "").strip().lower()
+        if etype in {"result", "terminal_result"}:
+            scan["terminal_results"].append((idx, event))
+        if etype in {"error", "failed", "exception"} or event.get("error"):
+            scan["error_events"].append((idx, event))
+        for path, value in _golden_p1_walk(event):
+            # ── Named-unit evidence (Golden telemetry stages/events) ──
+            unit_name = _golden_p1_unit_name(value)
+            if unit_name:
+                ul = unit_name.lower()
+                if "teardown" in ul:
+                    scan["teardown"].append((idx, path, value))
+                elif "snapshot_proof" in ul:
+                    scan["snapshot_proof"].append((idx, path, value))
+                elif "reopen" in ul:
+                    scan["reopen"].append((idx, path, value))
+                elif "commit" in ul:
+                    scan["commit"].append((idx, path, value))
+                elif "true_first_durable_result" in ul:
+                    scan["true_first"].append((idx, path, value))
+            # ── Key-based evidence ─────────────────────────────────────
+            key = _golden_p1_last_key(path)
+            if key == "true_durable":
+                scan["true_durable"].append((idx, path, value))
+            elif "seriality" in key:
+                scan["seriality"].append((idx, path, value))
+            elif "teardown" in key:
+                scan["teardown"].append((idx, path, value))
+            elif "snapshot" in key and any(
+                t in key for t in ("proof", "manifest", "fingerprint", "evidence")
+            ):
+                scan["snapshot_proof"].append((idx, path, value))
+            elif "commit" in key and "count" not in key:
+                ts = _golden_p1_ts_value(value)
+                if ts is not None:
+                    scan["commit"].append((idx, path, ts))
+            elif "reopen" in key:
+                ts = _golden_p1_ts_value(value)
+                if ts is not None:
+                    scan["reopen"].append((idx, path, ts))
+            elif "true_first_durable_result" in key:
+                scan["true_first"].append((idx, path, value))
+            elif key in {"runtime_flags", "flags", "effective_flags", "flag_evidence"} and isinstance(value, dict):
+                scan["flags"].append((idx, path, value))
+            elif key == "identity" and isinstance(value, dict):
+                scan["identities"].append((idx, value))
+            elif key in {"output_sha", "content_sha256", "sha256", "image_sha256"} and isinstance(value, str) and value.strip():
+                scan["output_shas"].append((idx, path, value.strip()))
+    return scan
+
+
+def _golden_p1_entry_ts(entry: tuple[int, str, Any]) -> float | None:
+    """Timestamp for a collected evidence entry (named unit or raw stamp)."""
+    value = entry[2]
+    if isinstance(value, dict):
+        return _golden_p1_unit_ts(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        scaled = float(value)
+        return scaled / 1e9 if scaled > 1e14 else scaled
+    return _golden_p1_ts_value(value)
+
+
+def _golden_p1_teardown_completed(entries: list[tuple[int, str, Any]]) -> bool:
+    for _idx, _path, value in entries:
+        if isinstance(value, dict):
+            # Named stage/unit (e.g. golden_teardown with ok=True) ...
+            if "ok" in value or "status" in value or any(
+                k in value for k in ("completed", "success", "succeeded", "finished")
+            ):
+                if value.get("ok") is True:
+                    return True
+                status = str(value.get("status", "")).strip().lower()
+                if status in {"completed", "complete", "ok", "success", "succeeded", "done"}:
+                    return True
+                if any(_golden_p1_truthy(value.get(k)) for k in ("completed", "success", "succeeded", "finished")):
+                    return True
+            # ... or a dedicated telemetry dict carrying completion fields.
+            elif any(_golden_p1_truthy(value.get(k)) for k in ("completed", "success", "succeeded", "finished")):
+                return True
+        elif isinstance(value, bool):
+            if value:
+                return True
+        elif isinstance(value, str):
+            if _golden_p1_truthy(value):
+                return True
+    return False
+
+
+def _golden_p1_snapshot_proof_present(entries: list[tuple[int, str, Any]]) -> bool:
+    for _idx, _path, value in entries:
+        if isinstance(value, (dict, list)):
+            if len(value) > 0:
+                return True
+        elif _golden_p1_truthy(value):
+            return True
+    return False
+
+
+def _golden_p1_validate_attempt(
+    scan: dict[str, Any],
+    *,
+    expected_output_sha: str,
+    expected_flags: dict[str, Any] | None,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Fail-closed per-attempt validation.  Every required evidence class
+    must be present AND correct; absence is a failure, never a pass."""
+    failures: list[str] = []
+    details: dict[str, Any] = {}
+
+    if len(scan["terminal_results"]) != 1:
+        failures.append(
+            f"terminal result count={len(scan['terminal_results'])}, expected exactly 1"
+        )
+    if scan["error_events"]:
+        failures.append(f"error events present: count={len(scan['error_events'])}")
+    if scan["non_dict_events"]:
+        failures.append(f"non-dict stream events: {scan['non_dict_events']}")
+
+    td_ok = bool(scan["true_durable"]) and all(
+        _golden_p1_truthy(v) for _, _, v in scan["true_durable"]
+    )
+    if not td_ok:
+        failures.append("true_durable evidence missing or false")
+
+    ser_values: list[Any] = []
+    for _i, _p, v in scan["seriality"]:
+        if isinstance(v, list):
+            ser_values.extend(v)
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            ser_values.append(v)
+        elif isinstance(v, dict):
+            for vv in v.values():
+                if isinstance(vv, (int, float)) and not isinstance(vv, bool):
+                    ser_values.append(vv)
+    if not scan["seriality"]:
+        failures.append("seriality telemetry absent (required; fail-closed)")
+    elif any(bool(v) for v in ser_values):
+        failures.append(f"seriality violations reported: {ser_values!r}")
+
+    if not _golden_p1_teardown_completed(scan["teardown"]):
+        failures.append("completed teardown telemetry absent")
+    if not _golden_p1_snapshot_proof_present(scan["snapshot_proof"]):
+        failures.append("snapshot proof absent or empty")
+
+    if not scan["commit"]:
+        failures.append("commit timestamp evidence absent")
+    if not scan["reopen"]:
+        failures.append("reopen timestamp evidence absent")
+    if scan["commit"] and scan["reopen"]:
+        c_entry = min(scan["commit"], key=lambda t: (_golden_p1_entry_ts(t) is None, t[0]))
+        r_entry = min(scan["reopen"], key=lambda t: (_golden_p1_entry_ts(t) is None, t[0]))
+        c_ts = _golden_p1_entry_ts(c_entry)
+        r_ts = _golden_p1_entry_ts(r_entry)
+        # Ordering: by wall timestamp when both are available (the Golden
+        # telemetry nests stages/events inside ONE result event, so stream
+        # indices cannot express intra-document order); fall back to stream
+        # index order for flat event streams.
+        if c_ts is not None and r_ts is not None:
+            ordering_ok = c_ts <= r_ts
+        else:
+            ordering_ok = c_entry[0] <= r_entry[0]
+        details["commit_reopen_ordering_ok"] = ordering_ok
+        details["commit_evidence"] = {"index": c_entry[0], "path": c_entry[1], "ts": c_ts}
+        details["reopen_evidence"] = {"index": r_entry[0], "path": r_entry[1], "ts": r_ts}
+        if not ordering_ok:
+            failures.append(
+                "commit/reopen ordering violated: "
+                f"commit_idx={c_entry[0]} reopen_idx={r_entry[0]} "
+                f"commit_ts={c_ts} reopen_ts={r_ts}"
+            )
+    if not scan["true_first"]:
+        failures.append("TRUE_FIRST_DURABLE_RESULT marker absent")
+    elif scan["commit"]:
+        tf_entries = [
+            t for t in scan["true_first"] if _golden_p1_entry_ts(t) is not None
+        ]
+        c_entries = [
+            t for t in scan["commit"] if _golden_p1_entry_ts(t) is not None
+        ]
+        if tf_entries and c_entries:
+            tf_ts_values = [
+                ts for ts in (_golden_p1_entry_ts(t) for t in tf_entries)
+                if ts is not None
+            ]
+            c_ts_values = [
+                ts for ts in (_golden_p1_entry_ts(t) for t in c_entries)
+                if ts is not None
+            ]
+            if min(tf_ts_values) < min(c_ts_values):
+                failures.append("TRUE_FIRST_DURABLE_RESULT marker precedes commit evidence")
+        elif min(i for i, _p, _v in scan["true_first"]) < min(
+            i for i, _p, _v in scan["commit"]
+        ):
+            failures.append("TRUE_FIRST_DURABLE_RESULT marker precedes commit evidence")
+
+    # Strict candidates: fields whose PATH identifies them as the generated
+    # output hash (output_sha / image_sha256), not incidental hashes.
+    strict_shas = [
+        v for _i, p, v in scan["output_shas"]
+        if "output" in p or "image_sha256" in p
+    ]
+    if not expected_output_sha:
+        failures.append("no expected output SHA configured (fail-closed)")
+    elif not strict_shas:
+        failures.append("observed output SHA absent from terminal result")
+    elif any(s.lower() != expected_output_sha.lower() for s in strict_shas):
+        failures.append(
+            f"output SHA mismatch: observed={sorted(set(strict_shas))} "
+            f"expected={expected_output_sha}"
+        )
+    details["observed_output_shas"] = sorted({v for _i, _p, v in scan["output_shas"]})
+
+    observed_flags: dict[str, Any] = {}
+    for _i, _p, f in scan["flags"]:
+        observed_flags.update({str(k): v for k, v in f.items()})
+    details["observed_flags"] = observed_flags
+    if expected_flags:
+        if not observed_flags:
+            failures.append("runtime flag evidence expected but absent")
+        else:
+            for fk, fv in expected_flags.items():
+                got = observed_flags.get(fk)
+                if isinstance(fv, str) and isinstance(got, str):
+                    if got.strip().lower() != fv.strip().lower():
+                        failures.append(
+                            f"runtime flag mismatch {fk}: observed={got!r} expected={fv!r}"
+                        )
+                elif got != fv:
+                    failures.append(
+                        f"runtime flag mismatch {fk}: observed={got!r} expected={fv!r}"
+                    )
+
+    valid = not failures
+    return valid, failures, details
+
+
+def _golden_p1_cold_evidence(identity: dict[str, Any]) -> dict[str, Any]:
+    """True-cold labeling ONLY from explicit remote/container identity
+    evidence.  Insufficient evidence is reported as NOT cold — never inferred."""
+    def _int(key: str) -> int | None:
+        raw = identity.get(key)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    token_keys = (
+        "container_task_id", "modal_container_id",
+        "container_session_id", "restored_instance_id",
+    )
+    tokens = {k: str(identity.get(k) or "").strip() for k in token_keys}
+    has_token = any(tokens.values())
+    restore_count = _int("restore_count")
+    request_count = _int("request_count")
+    true_cold = bool(has_token and restore_count == 1 and request_count == 1)
+    return {
+        "identity_tokens": tokens,
+        "identity_tokens_present": has_token,
+        "restore_count": restore_count,
+        "request_count": request_count,
+        "true_cold": true_cold,
+        "basis": (
+            "container/task token present AND restore_count==1 AND request_count==1"
+            if true_cold
+            else ""
+        ),
+        "reason_not_cold": (
+            "" if true_cold
+            else "insufficient remote/container identity evidence; never inferred"
+        ),
+    }
+
+
+def _golden_p1_file_hashes(directory: Path) -> dict[str, str]:
+    import hashlib
+    out: dict[str, str] = {}
+    for f in sorted(directory.glob("*")):
+        if f.is_file():
+            out[f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return out
+
+
+async def _run_golden_p1(
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    *,
+    run_count: int,
+    gap_seconds: float,
+    app_name: str,
+    class_name: str,
+    gpu: str,
+    artifacts_dir: str | None,
+    cohort_id: str | None,
+    expected_output_sha: str,
+    expected_flags: dict[str, Any] | None,
+    force: bool,
+) -> dict[str, Any]:
+    """Strictly serial Golden P1 cohort over ``run_golden_serial_stream``.
+
+    One request in flight at all times; exact attempt order preserved with a
+    configurable gap between attempts.  Writes immutable per-attempt raw
+    event JSON + telemetry JSON plus summary.json/manifest.json under the
+    cohort directory.  Raises when fewer than *run_count* attempts validate.
+    """
+    os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
+    os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
+    os.environ["COMFYMODAL_V2_GPU"] = gpu
+    started_iso = datetime.now(timezone.utc).isoformat()
+    print(
+        f"[v2.golden_p1] mode=start run_count={run_count} gap={gap_seconds}s "
+        f"app={app_name} method={GOLDEN_P1_REMOTE_METHOD}",
+        flush=True,
+    )
+
+    source = _golden_p1_load_payload()
+    deployed = _golden_p1_deployed_identity()
+
+    base_dir = (
+        Path(artifacts_dir) if artifacts_dir
+        else ROOT / "artifacts" / GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME
+    )
+    cid = cohort_id or (
+        f"cohort_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}_"
+        f"{uuid.uuid4().hex[:6]}"
+    )
+    cohort_dir = base_dir / cid
+    if cohort_dir.exists() and any(cohort_dir.iterdir()):
+        if force:
+            print(
+                f"[v2.golden_p1] force authorized: reusing existing cohort dir="
+                f"{cohort_dir}",
+                flush=True,
+            )
+        else:
+            n = 2
+            while (base_dir / f"{cid}-{n}").exists() and any(
+                (base_dir / f"{cid}-{n}").iterdir()
+            ):
+                n += 1
+            cohort_dir = base_dir / f"{cid}-{n}"
+            print(
+                f"[v2.golden_p1] cohort dir existed; using unique subdir="
+                f"{cohort_dir.name}",
+                flush=True,
+            )
+    cohort_dir.mkdir(parents=True, exist_ok=True)
+
+    handle = await asyncio.to_thread(transport._v2_handle, workspace=workspace, gpu=gpu)
+    records: list[dict[str, Any]] = []
+    prev_identity_key: tuple[str, ...] = ()
+
+    for index in range(run_count):
+        req_id = f"golden-p1-{index}-{uuid.uuid4().hex[:12]}"
+        dispatch_unix_ms = int(time.time() * 1000)
+        artifact: dict[str, Any] = {
+            "run_index": index,
+            "request_id": req_id,
+            "mode": GOLDEN_P1_MODE,
+            "method": GOLDEN_P1_REMOTE_METHOD,
+            "dispatch_unix_ms": dispatch_unix_ms,
+            "dispatch_iso": datetime.fromtimestamp(
+                dispatch_unix_ms / 1000.0, tz=timezone.utc
+            ).isoformat(),
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "end_ts": None,
+            "duration_ms": None,
+            "event_count": 0,
+            "events_file": f"attempt_{index}_events.json",
+            "validation": {},
+            "failures": [],
+            "identity": {},
+            "cold_evidence": {},
+            "true_cold": False,
+            "valid": False,
+            "dnf": False,
+            "error": None,
+        }
+        attempt_start_ns = time.perf_counter_ns()
+        try:
+            payload = {
+                "request_id": req_id,
+                "prompt": copy.deepcopy(source["prompt"]),
+                "extra_data": copy.deepcopy(source["extra_data"]),
+                "modal_options": copy.deepcopy(source["modal_options"]),
+                "request_origin_info": {
+                    "benchmark_mode": GOLDEN_P1_MODE,
+                    "golden_p1_run_index": index,
+                    "golden_p1_request_id": req_id,
+                    "serial": True,
+                },
+            }
+            # Strict serial: exactly one stream in flight; consumed to
+            # exhaustion before anything else happens.
+            events = await _golden_p1_consume_stream(handle, payload)
+            artifact["event_count"] = len(events)
+            (cohort_dir / artifact["events_file"]).write_text(
+                json.dumps(events, default=str, indent=2), encoding="utf-8"
+            )
+            scan = _golden_p1_scan_events(events)
+            valid, failures, details = _golden_p1_validate_attempt(
+                scan,
+                expected_output_sha=expected_output_sha,
+                expected_flags=expected_flags,
+            )
+            artifact["validation"] = details
+            artifact["failures"] = failures
+            identity: dict[str, Any] = {}
+            for _i, ident in scan["identities"]:
+                identity = ident
+            artifact["identity"] = identity
+            cold = _golden_p1_cold_evidence(identity)
+            cur_key = tuple(
+                v for v in cold["identity_tokens"].values() if v
+            )
+            if cold["true_cold"] and prev_identity_key and cur_key == prev_identity_key:
+                cold["true_cold"] = False
+                cold["reason_not_cold"] = (
+                    "container/task identity identical to previous attempt; not fresh"
+                )
+            prev_identity_key = cur_key
+            artifact["cold_evidence"] = cold
+            artifact["true_cold"] = cold["true_cold"]
+            artifact["valid"] = valid
+        except Exception as exc:  # noqa: BLE001 - DNF attempts never count
+            artifact["dnf"] = True
+            artifact["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            artifact["failures"] = [artifact["error"]]
+
+        artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
+        artifact["duration_ms"] = round(
+            (time.perf_counter_ns() - attempt_start_ns) / 1_000_000, 3
+        )
+        (cohort_dir / f"attempt_{index}.json").write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
+        records.append(artifact)
+        status = "DNF" if artifact["dnf"] else ("VALID" if artifact["valid"] else "INVALID")
+        print(
+            f"[v2.golden_p1] attempt={index} status={status} "
+            f"valid_total={sum(1 for r in records if r['valid'])}/{run_count} "
+            f"events={artifact['event_count']} duration_ms={artifact['duration_ms']} "
+            f"true_cold={artifact['true_cold']}",
+            flush=True,
+        )
+        if artifact["failures"]:
+            print(
+                f"[v2.golden_p1] attempt={index} failures={artifact['failures']}",
+                flush=True,
+            )
+        if index + 1 < run_count:
+            print(f"[v2.golden_p1] phase=gap seconds={gap_seconds}", flush=True)
+            await asyncio.sleep(gap_seconds)
+
+    completed_iso = datetime.now(timezone.utc).isoformat()
+    valid_records = [r for r in records if r["valid"]]
+    summary: dict[str, Any] = {
+        "mode": GOLDEN_P1_MODE,
+        "method": GOLDEN_P1_REMOTE_METHOD,
+        "target": {"app_name": app_name, "class_name": class_name, "gpu": gpu},
+        "deployment_identity": deployed,
+        "workflow": {
+            "source_path": str(WORKFLOW_PATH),
+            "workflow_hash": source["workflow_hash"],
+            "prompt_sha256": prompt_sha256(source["prompt"]),
+            "captured_at": source["captured_at"],
+        },
+        "expected_output_sha": expected_output_sha,
+        "expected_flags": expected_flags or {},
+        "run_count_requested": run_count,
+        "attempt_count": len(records),
+        "valid_count": len(valid_records),
+        "invalid_count": len(records) - len(valid_records),
+        "dnf_count": sum(1 for r in records if r["dnf"]),
+        "gap_seconds": gap_seconds,
+        "strict_serial": True,
+        "started_utc": started_iso,
+        "completed_utc": completed_iso,
+        "cohort_dir": str(cohort_dir),
+        "attempts": [{
+            "run_index": r["run_index"],
+            "request_id": r["request_id"],
+            "dispatch_unix_ms": r["dispatch_unix_ms"],
+            "duration_ms": r["duration_ms"],
+            "event_count": r["event_count"],
+            "valid": r["valid"],
+            "dnf": r["dnf"],
+            "true_cold": r["true_cold"],
+            "failures": r["failures"],
+            "observed_output_shas": (r.get("validation") or {}).get("observed_output_shas"),
+            "observed_flags": (r.get("validation") or {}).get("observed_flags"),
+            "identity": r["identity"],
+            "cold_evidence": r["cold_evidence"],
+        } for r in records],
+    }
+    (cohort_dir / "summary.json").write_text(
+        json.dumps(summary, default=str, indent=2), encoding="utf-8"
+    )
+    manifest = dict(summary)
+    manifest["artifact_file_hashes"] = _golden_p1_file_hashes(cohort_dir)
+    manifest_path = cohort_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, default=str, indent=2), encoding="utf-8"
+    )
+    print(
+        json.dumps({
+            "output_dir": str(cohort_dir),
+            "manifest": str(manifest_path),
+            "attempt_count": summary["attempt_count"],
+            "valid_count": summary["valid_count"],
+            "invalid_count": summary["invalid_count"],
+            "dnf_count": summary["dnf_count"],
+        }, default=str),
+        flush=True,
+    )
+    if len(valid_records) != run_count:
+        raise RuntimeError(
+            f"golden-p1 incomplete: {len(valid_records)}/{run_count} valid "
+            "attempts (invalid/DNF runs never counted)"
+        )
+    return summary
+
+
 async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False,
                acceptance: bool = False, variance_cold: bool = False,
                variance_matrix: bool = False, transfer_ab: bool = False,
@@ -10097,9 +10889,15 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                batch_a_acceptance: bool = False,
                batch_b_acceptance: bool = False,
                batch_c_acceptance: bool = False,
-               prime_registry_proof: bool = False,
-               unique_prompt_suffix: str = "",
-               conditioning_cache_nonce: str = "") -> None:
+                prime_registry_proof: bool = False,
+                unique_prompt_suffix: str = "",
+                conditioning_cache_nonce: str = "",
+                golden_p1: bool = False,
+                golden_p1_artifacts_dir: str | None = None,
+                golden_p1_cohort_id: str | None = None,
+                golden_p1_expected_output_sha: str = "",
+                golden_p1_expected_flags: dict[str, Any] | None = None,
+                golden_p1_force: bool = False) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
@@ -10169,6 +10967,31 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
 
     if prime_registry_proof:
         await _prime_registry_proof()
+        return
+
+    # ── Golden P1 serial-stream mode (explicit opt-in; isolated lane) ─────
+    # Strictly serial cohort over the dedicated run_golden_serial_stream
+    # remote method.  Needs only the workspace + class handle (no local plan
+    # build / node-registry preload), so it dispatches before the registry
+    # preload and returns without touching any other benchmark mode.
+    if golden_p1:
+        _gp_workspace = _load_workspace()
+        _gp_runs = GOLDEN_P1_DEFAULT_RUN_COUNT if run_count is None else int(run_count)
+        _gp_gap = GAP_SECONDS if gap_seconds is None else float(gap_seconds)
+        await _run_golden_p1(
+            workspace=_gp_workspace,
+            transport=ModalTransport(),
+            run_count=_gp_runs,
+            gap_seconds=_gp_gap,
+            app_name=os.environ.get("COMFYMODAL_V2_APP_NAME", APP_NAME) or APP_NAME,
+            class_name=os.environ.get("COMFYMODAL_V2_CLASS_NAME", CLASS_NAME) or CLASS_NAME,
+            gpu=os.environ.get("COMFYMODAL_V2_GPU", GPU) or GPU,
+            artifacts_dir=golden_p1_artifacts_dir,
+            cohort_id=golden_p1_cohort_id,
+            expected_output_sha=golden_p1_expected_output_sha,
+            expected_flags=golden_p1_expected_flags,
+            force=golden_p1_force,
+        )
         return
 
     # ── One-time full node-registry preload (D1 local-dispatch fix) ───────
@@ -11002,7 +11825,111 @@ if __name__ == "__main__":
         help="Fail-closed local check of the exact E37 CLEAN_LANE QD4 tuple; "
              "rejects E19/E28/E31 conflicts and aborts before deploy.",
     )
+    _parser.add_argument(
+        "--golden-p1",
+        action="store_true",
+        default=False,
+        help="Run the isolated Golden P1 serial benchmark: a strictly serial "
+             "cohort (default 5 attempts; --run-count overrides, e.g. 1 for a "
+             "structural run) over the dedicated remote method "
+             "run_golden_serial_stream, using the existing app/class lookup. "
+             "Each attempt consumes the remote event stream to exhaustion and "
+             "is validated fail-closed: exactly one terminal result, zero "
+             "error events, true_durable, expected output SHA, zero seriality "
+             "violations, completed teardown telemetry, snapshot proof, "
+             "commit/reopen/TRUE_FIRST_DURABLE_RESULT ordering, and runtime-"
+             "flag agreement when expected flags are configured. Invalid/DNF "
+             "attempts are preserved but never counted; true-cold status is "
+             "labeled only from remote/container identity evidence. Writes "
+             "immutable per-attempt event/telemetry JSON plus summary.json/"
+             "manifest.json under artifacts/phase_p1_serial_golden_v1/. "
+             "Opt-in; mutually exclusive with every other special mode.",
+    )
+    _parser.add_argument(
+        "--golden-p1-artifacts-dir",
+        default=None,
+        metavar="DIR",
+        help="Base directory for golden-p1 artifacts (default: "
+             "<repo>/artifacts/phase_p1_serial_golden_v1).",
+    )
+    _parser.add_argument(
+        "--golden-p1-cohort-id",
+        default=None,
+        metavar="ID",
+        help="Explicit cohort subdirectory id (default: unique timestamp+uuid).",
+    )
+    _parser.add_argument(
+        "--golden-p1-expected-output-sha",
+        default=os.environ.get(GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV, ""),
+        metavar="SHA",
+        help="Expected deterministic output SHA256 every attempt must match "
+             f"(default: env {GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV}). Required "
+             "for valid runs — attempts without a configured expectation "
+             "fail closed.",
+    )
+    _parser.add_argument(
+        "--golden-p1-expected-flags",
+        default="",
+        metavar="JSON",
+        help='JSON object of expected runtime flags (e.g. '
+             '\'{"COMFYMODAL_V2_X":"1"}\') compared against the runtime flag '
+             "evidence observed in the stream when the stream provides it.",
+    )
+    _parser.add_argument(
+        "--golden-p1-force",
+        action="store_true",
+        default=False,
+        help="Authorize reuse/overwrite of an existing non-empty cohort "
+             "directory. Without this flag a colliding cohort gets a fresh "
+             "unique subdirectory instead.",
+    )
     _args = _parser.parse_args()
+
+    # Special benchmark modes are mutually exclusive — including the new
+    # golden-p1 lane.  Fail fast before any guard or Modal work.
+    _gp_special_modes = {
+        "variance_cold": bool(_args.variance_cold),
+        "variance_matrix": bool(_args.variance_matrix),
+        "transfer_ab": bool(_args.transfer_ab),
+        "region_ab": bool(_args.region_ab),
+        "host_ab": bool(_args.host_ab),
+        "backing_ab": bool(_args.backing_ab),
+        "provider_ab": bool(_args.provider_ab),
+        "volume_read": bool(_args.volume_read),
+        "snapshot_restore_only": bool(_args.snapshot_restore_only),
+        "snapshot_restore_only_backfill": bool(_args.snapshot_restore_only_backfill),
+        "acceptance": bool(_args.acceptance),
+        "cpu_snapshot_unet_ab": bool(_args.cpu_snapshot_unet_ab),
+        "report_only": bool(_args.report_only),
+        "golden_p1": bool(_args.golden_p1),
+    }
+    _gp_active = [k for k, v in _gp_special_modes.items() if v]
+    if len(_gp_active) > 1:
+        print(
+            "=== ERROR: special benchmark modes are mutually exclusive; "
+            f"active={_gp_active} ===",
+            flush=True,
+        )
+        sys.exit(2)
+
+    _gp_expected_flags: dict[str, Any] | None = None
+    if str(_args.golden_p1_expected_flags or "").strip():
+        try:
+            _gp_parsed_flags = json.loads(_args.golden_p1_expected_flags)
+        except json.JSONDecodeError as _gp_flags_exc:
+            print(
+                f"=== ERROR: --golden-p1-expected-flags is not valid JSON: "
+                f"{_gp_flags_exc} ===",
+                flush=True,
+            )
+            sys.exit(2)
+        if not isinstance(_gp_parsed_flags, dict):
+            print(
+                "=== ERROR: --golden-p1-expected-flags must be a JSON object ===",
+                flush=True,
+            )
+            sys.exit(2)
+        _gp_expected_flags = _gp_parsed_flags
 
     # run_v2_single.bat forwards the positional selector to this parser when
     # it has no selector-specific branch of its own.  Project the selector
@@ -11488,6 +12415,14 @@ if __name__ == "__main__":
                 prime_registry_proof=_args.prime_registry_proof,
                 unique_prompt_suffix=_args.unique_prompt_suffix,
                 conditioning_cache_nonce=_args.conditioning_cache_nonce,
+                golden_p1=_args.golden_p1,
+                golden_p1_artifacts_dir=_args.golden_p1_artifacts_dir,
+                golden_p1_cohort_id=_args.golden_p1_cohort_id,
+                golden_p1_expected_output_sha=str(
+                    _args.golden_p1_expected_output_sha or ""
+                ).strip(),
+                golden_p1_expected_flags=_gp_expected_flags,
+                golden_p1_force=bool(_args.golden_p1_force),
             )
         finally:
             # Process/loop teardown: join any remaining persistence drains with

@@ -55,6 +55,21 @@ if /i "%~1"=="E31_VALIDATION" set "V2_E31_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%
 if /i "%~1"=="E31_VALIDATION" set "V2_BENCHMARK_RUNS=1"
 if /i "%~1"=="E31_VALIDATION" set "V2_E19_FINAL_COLD_LOADER=1"
 
+REM -- golden_p1 serial-Golden profile selector (atomic opt-in) -------------
+REM Same %~1 mechanism as the validation selectors above.  golden_p1 keeps
+REM the production deploy default (snapshot construction, no probes) and only
+REM establishes the profile's deploy-baked dynamic-VRAM flag.  The flag is
+REM set ONLY when not already defined so a v2ctl-resolved child environment
+REM (profile golden_p1) is never overwritten after resolution.
+set "V2_GOLDEN_P1_ACTIVE=0"
+if /i "%~1"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="1" set "V2_GOLDEN_P1_ACTIVE=1"
+if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
+    if not defined COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM set "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1"
+    echo [v2.golden_p1] selector=ACTIVE golden_enable_dynamic_vram=!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!
+)
+
+
 REM -- E22 arm arguments: establish selectors inside cmd.exe ---------------
 if /i "%~1"=="E22_PREFETCH_OFF" (
     set "V2_E19_FINAL_COLD_LOADER=1"
@@ -84,7 +99,10 @@ set "V2_IS_VARIANCE=0"
 if /i "!V2_BENCHMARK_MODE!"=="variance_cold" set "V2_IS_VARIANCE=1"
 if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" set "V2_IS_VARIANCE=1"
 if /i "!V2_BENCHMARK_MODE!"=="host_ab" set "V2_IS_VARIANCE=1"
-if not defined V2_DEPLOY_IDENT set "V2_DEPLOY_IDENT=stable-modal-comfy-v2-restore-only-shadow"
+REM v2ctl owns the target identity.  Keep the legacy default only when no
+REM target was supplied; never validate every profile against the production
+REM restore-only app name.
+if not defined V2_DEPLOY_IDENT set "V2_DEPLOY_IDENT=!COMFYMODAL_V2_APP_NAME!"
 set "COMFYMODAL_V2_ATOMIC_PROFILE="
 set "V2_PROFILE_PRETOUCH=0"
 REM -- Production default mode: snapshot_restore_only --------------------
@@ -904,7 +922,7 @@ if "!V1_EXISTS!"=="1" (
     REM Validate V2 identifiers
     python -c "import sys; s=''.join(open(sys.argv[1],encoding='utf-8',errors='replace').read().split()); sys.exit(0 if ''.join(sys.argv[2].split()) in s else 1)" "!V2_LOG!" "!V2_DEPLOY_IDENT!"
     if errorlevel 1 (
-        echo === ERROR: V2 deploy output missing shadow app identifier !V2_DEPLOY_IDENT! ===
+        echo === ERROR: V2 deploy output missing target app identifier !V2_DEPLOY_IDENT! ===
         if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
         exit /b 1
     )
@@ -1035,7 +1053,7 @@ if "!V1_EXISTS!"=="1" (
     REM Validate V2 identifiers
     python -c "import sys; s=''.join(open(sys.argv[1],encoding='utf-8',errors='replace').read().split()); sys.exit(0 if ''.join(sys.argv[2].split()) in s else 1)" "!V2_LOG!" "!V2_DEPLOY_IDENT!"
     if errorlevel 1 (
-        echo === ERROR: V2 deploy output missing shadow app identifier !V2_DEPLOY_IDENT! ===
+        echo === ERROR: V2 deploy output missing target app identifier !V2_DEPLOY_IDENT! ===
         if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
         if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
         exit /b 1

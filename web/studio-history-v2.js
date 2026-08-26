@@ -11,8 +11,10 @@
 // fixture/bridge implementation can be swapped later without touching this
 // module.
 
-import { el } from "./studio-ui.js";
+import { el, renderEmptyState } from "./studio-ui.js";
+import { renderLoadingState } from "./studio-loading.js";
 import { createHistoryRepository, selectFeedAsset } from "./history-v2-repository.js";
+import { subscribeStudioSync } from "./studio-sync.js";
 import { loadHistoryViewState, saveHistoryViewState, DEFAULT_HIDDEN_STATUSES } from "./history-v2-view-state.js";
 import { _formatDuration } from "./studio-run-normalizer.js";
 import { renderGenerationDetail } from "./studio-history-v2-detail.js";
@@ -28,6 +30,62 @@ const BOOL_FILTER_KEYS = ["favoriteOnly", "previewOnly", "originalAvailable", "h
 
 const PAGE_LIMIT = 24;
 
+// ── Cross-page record focus (H13) ─────────────────────────────────────────
+//
+// One-shot in-memory navigation request: another page (Playground recent-runs
+// filmstrip) can ask the NEXT History mount to open a specific durable record
+// instead of the feed.  No URL routing, no persistence — the request is
+// consumed exactly once by renderHistoryV2 and silently dropped when the
+// record no longer resolves (the History page then renders normally).
+let _pendingRecordFocus = null;
+
+export function requestHistoryRecordFocus(recordId, kind) {
+  _pendingRecordFocus = {
+    id: String(recordId == null ? "" : recordId),
+    kind: kind === "generation" ? "generation" : "experiment",
+  };
+}
+
+function _consumeRecordFocus() {
+  const focus = _pendingRecordFocus;
+  _pendingRecordFocus = null;
+  return focus && focus.id ? focus : null;
+}
+
+// ── Grid columns setting (Settings → History → Grid columns) ──────────────
+// History V2 is the consuming surface for this modern setting.  The value is
+// read once per mount, normalized, and applied as an inline CSS custom
+// property on the page root; the feed grid resolves its track count from it
+// (see studio-styles.js).  The shell re-renders the active page on every tab
+// activation, so a change made in Settings applies when the user returns to
+// History without a browser reload.  Presentation only: no view-state,
+// filter, pagination, or favorite code path consults it.
+export const HISTORY_COLUMNS_KEY = "comfymodal-studio-history-columns";
+export const HISTORY_COLUMNS_MIN = 2;
+export const HISTORY_COLUMNS_MAX = 8;
+export const HISTORY_COLUMNS_DEFAULT = 6;
+
+// Canonical normalization with the same semantics as the Settings control:
+// parseInt truncation (Settings reads with parseInt), NaN/empty/corrupt →
+// default 6, then clamp to [2, 8].  Malformed persisted state can never
+// break History rendering.
+export function normalizeHistoryColumns(raw) {
+  const n = parseInt(raw, 10);
+  if (isNaN(n)) return HISTORY_COLUMNS_DEFAULT;
+  if (n < HISTORY_COLUMNS_MIN) return HISTORY_COLUMNS_MIN;
+  if (n > HISTORY_COLUMNS_MAX) return HISTORY_COLUMNS_MAX;
+  return n;
+}
+
+function _readStoredColumns() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return null;
+    return localStorage.getItem(HISTORY_COLUMNS_KEY);
+  } catch (err) {
+    return null; // corrupt/unavailable storage → default columns
+  }
+}
+
 const STATUS_LABELS = {
   completed: "Completed",
   completed_with_failures: "Completed with failures",
@@ -35,6 +93,18 @@ const STATUS_LABELS = {
   canceled: "Canceled",
   interrupted: "Interrupted",
   running: "Running",
+};
+
+// Shared chip tones (I3 taxonomy): STATUS → data-tone.  Legacy status-*
+// classes stay verbatim; the tone recolors nothing that the legacy rules
+// already decide — meaning never changes.
+const STATUS_TONES = {
+  completed: "ok",
+  completed_with_failures: "warn",
+  failed: "error",
+  canceled: "neutral",
+  interrupted: "warn",
+  running: "running",
 };
 
 const SORT_OPTIONS = [
@@ -68,7 +138,31 @@ function _resultCountLabel(total) {
 function _statusChip(status) {
   const key = STATUS_LABELS[status] ? status : "running";
   const label = STATUS_LABELS[status] || status || "Running";
-  return el("span", { class: "comfymodal-studio-history-v2-chip status-" + key, text: label });
+  return el("span", {
+    class: "comfymodal-studio-history-v2-chip status-" + key + " cm-chip",
+    "data-tone": STATUS_TONES[key] || "neutral",
+    text: label,
+  });
+}
+
+// ── Page heading (I1 §3.3 / I2 shell h1) ──────────────────────────────────
+//
+// Truthful page-level h2 under the shell h1.  History has no visible page
+// title, so the heading is accessible-visually-hidden with the clip
+// pattern — never display:none / visibility:hidden / hidden.  Inline local
+// style only; shared styles are not edited by this lane.
+
+const PAGE_TITLE_OFFSCREEN_STYLE =
+  "position:absolute;width:1px;height:1px;margin:-1px;padding:0;" +
+  "border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;";
+
+function _pageHeading() {
+  return el("h2", {
+    class: "comfymodal-studio-history-v2-page-title",
+    "data-testid": "history-v2-page-title",
+    text: "History",
+    style: PAGE_TITLE_OFFSCREEN_STYLE,
+  });
 }
 
 export function selectGenerationFeedAsset(record) {
@@ -126,10 +220,34 @@ function _cardThumb(output, alt, containerClass) {
 // ── Main render entry point ───────────────────────────────────────────────
 
 export function renderHistoryV2(state, context) {
+  // Presentation-only setting read at mount (see HISTORY_COLUMNS_KEY).
+  const gridColumns = normalizeHistoryColumns(_readStoredColumns());
   const root = el("div", {
     class: "comfymodal-studio-history-v2",
     "data-testid": "history-v2-page",
+    "data-grid-columns": String(gridColumns),
+    style: "--comfymodal-studio-history-columns: " + gridColumns,
   });
+  let historyStale = false;
+  let unsubscribeHistorySync = null;
+
+  function refreshFromSync() {
+    if (!root.isConnected) {
+      if (unsubscribeHistorySync) unsubscribeHistorySync();
+      unsubscribeHistorySync = null;
+      return;
+    }
+    historyStale = true;
+    root.dataset.syncStale = "true";
+    if (repo) {
+      fetchFeed(true).finally(function () {
+        historyStale = false;
+        root.dataset.syncStale = "false";
+      });
+    }
+  }
+
+  unsubscribeHistorySync = subscribeStudioSync("history", refreshFromSync);
 
   // ── Per-render state (fresh on every page mount, seeded from storage) ──
   const viewState = loadHistoryViewState();
@@ -317,7 +435,11 @@ export function renderHistoryV2(state, context) {
     while (resultsEl.firstChild) resultsEl.removeChild(resultsEl.firstChild);
 
     if (loading && items.length === 0) {
-      resultsEl.appendChild(el("div", { class: "comfymodal-studio-history-v2-state", text: "Loading\u2026" }));
+      resultsEl.appendChild(renderLoadingState({
+        label: "Loading history\u2026",
+        size: "page",
+        testid: "history-v2-loading",
+      }));
       return;
     }
     if (error && items.length === 0) {
@@ -346,15 +468,16 @@ export function renderHistoryV2(state, context) {
   }
 
   function emptyStateEl() {
-    return el("div", { class: "comfymodal-studio-history-v2-state" }, [
-      el("p", { class: "comfymodal-studio-history-v2-state-copy", text: "No history matches your filters" }),
-      el("button", {
+    return renderEmptyState({
+      title: "No history matches your filters",
+      action: el("button", {
         class: "comfymodal-secondary-btn",
         type: "button",
         text: "Clear filters",
         onclick: function () { clearFilters(); },
       }),
-    ]);
+      testid: "history-v2-empty",
+    });
   }
 
   function errorStateEl() {
@@ -384,35 +507,84 @@ export function renderHistoryV2(state, context) {
   }
 
   // ── Cards ───────────────────────────────────────────────────────────────
+  // Durable-first favorite toggle shared by generation and experiment feed
+  // cards.  The glyph flips only after the server acknowledges the PATCH; a
+  // rejected request restores the prior durable state, re-enables the star,
+  // and surfaces a bounded truthful error via the existing action-note
+  // pattern — never an unhandled rejection and never a stranded control.
+  //
+  // Accessible names carry record context (I1 §3.1 duplicate-label fix): all
+  // simultaneously visible stars must be distinguishable.  Short id tails
+  // keep names unique without exposing full UUIDs.
+  function _favoriteAccessibleName(rec, favorite) {
+    const isExperiment = !!(rec && rec.kind === "experiment");
+    const kind = isExperiment ? "experiment" : "generation";
+    const idTail = String((rec && rec.id) == null ? "" : rec.id).slice(-6);
+    const namePart = isExperiment && rec && rec.name ? String(rec.name) : "";
+    const timePart = namePart ? "" : _shortDateTime(rec && rec.startedAt);
+    let context = "";
+    if (namePart && idTail) context = namePart + " (" + idTail + ")";
+    else if (namePart) context = namePart;
+    else if (timePart && idTail) context = timePart + " (" + idTail + ")";
+    else if (timePart) context = timePart;
+    else if (idTail) context = idTail;
+    return (favorite ? "Remove " : "Add ") + kind +
+      (context ? " " + context : "") +
+      (favorite ? " from favorites" : " to favorites");
+  }
+
   function renderFavoriteStar(record) {
+    const wrap = el("span", { class: "comfymodal-studio-history-v2-fav-wrap" });
+    const note = el("span", {
+      class: "comfymodal-studio-history-v2-action-note",
+      role: "status",
+      "aria-live": "polite",
+    });
+    function paint(value) {
+      star.textContent = value ? "\u2605" : "\u2606";
+      star.setAttribute("aria-pressed", value ? "true" : "false");
+      star.setAttribute("aria-label", _favoriteAccessibleName(record, value));
+      star.title = _favoriteAccessibleName(record, value);
+    }
     const star = el("button", {
       type: "button",
       class: "comfymodal-studio-history-v2-fav",
       "data-testid": "history-v2-favorite-star",
-      "aria-label": record.favorite ? "Remove from favorites" : "Add to favorites",
+      "aria-label": _favoriteAccessibleName(record, !!record.favorite),
       "aria-pressed": record.favorite ? "true" : "false",
-      title: record.favorite ? "Remove from favorites" : "Add to favorites",
+      title: _favoriteAccessibleName(record, !!record.favorite),
       text: record.favorite ? "\u2605" : "\u2606",
     });
     star.addEventListener("click", function (e) {
       e.stopPropagation();
       e.preventDefault();
       if (star.disabled) return;
-      const next = !record.favorite;
+      const prior = !!record.favorite;
+      const next = !prior;
       star.disabled = true;
-      repo.setFavorite(record.id, next).then(function () {
-        record.favorite = next;
+      note.textContent = "";
+      repo.setFavorite(record.id, next).then(function (ack) {
+        record.favorite = ack && typeof ack.favorite === "boolean" ? ack.favorite : next;
+        paint(record.favorite);
         star.disabled = false;
-        star.textContent = next ? "\u2605" : "\u2606";
-        star.setAttribute("aria-pressed", next ? "true" : "false");
-        star.setAttribute("aria-label", next ? "Remove from favorites" : "Add to favorites");
+      }).catch(function () {
+        record.favorite = prior;
+        paint(prior);
+        note.textContent = "Favorite failed";
+        star.disabled = false;
       });
     });
-    return star;
+    wrap.appendChild(star);
+    wrap.appendChild(note);
+    return wrap;
   }
 
   function _cardKeydown(e, handler) {
     if (e.key === "Enter" || e.key === " ") {
+      // Interactive controls inside the card keep their native activation:
+      // Enter/Space on an inner button toggles THAT control, never opens the
+      // card.
+      if (e.target && e.target.closest && e.target.closest("button, input, select, textarea")) return;
       e.preventDefault();
       handler();
     }
@@ -524,7 +696,10 @@ export function renderHistoryV2(state, context) {
   function openGeneration(id) {
     renderGenerationDetail(id, repo, {
       onClose: function () {
-        // Focus returns to the shell page; nothing else to clean up.
+        // Route truth (I9A): closing a focused detail drops the stale focus
+        // identity from the URL through the shell's routing authority, so a
+        // cached reopen or reload cannot resurrect the dismissed record.
+        if (typeof context.clearRouteFocus === "function") context.clearRouteFocus();
       },
       onChanged: function () {
         // Refetch the first page so card state (favorite/note/featured)
@@ -536,7 +711,11 @@ export function renderHistoryV2(state, context) {
 
   function showExperiment(id) {
     while (root.firstChild) root.removeChild(root.firstChild);
-    root.appendChild(el("div", { class: "comfymodal-studio-history-v2-state", text: "Loading\u2026" }));
+    root.appendChild(renderLoadingState({
+      label: "Loading experiment\u2026",
+      size: "page",
+      testid: "history-v2-experiment-loading",
+    }));
     renderExperimentDetail(id, repo, {
       onBack: function () {
         renderFeedPage();
@@ -546,21 +725,33 @@ export function renderHistoryV2(state, context) {
       },
     }).then(function (page) {
       while (root.firstChild) root.removeChild(root.firstChild);
-      if (page) root.appendChild(page);
+      if (page) {
+        root.appendChild(page);
+        // Focus-in for the experiment sub-page (the page-swap analog of the
+        // generation detail overlay's focus-in): the first enabled control
+        // is Back to history — on the not-found placeholder it is the same
+        // back action.
+        var firstBtn = page.querySelector("button:not([disabled])");
+        if (firstBtn && typeof firstBtn.focus === "function") firstBtn.focus();
+      }
     }).catch(function () {
-      while (root.firstChild) root.removeChild(root.firstChild);
       renderFeedPage();
     });
   }
 
-  // Rebuild the whole feed page inside the same root container.
+  // Rebuild the whole feed page inside the same root container.  Only
+  // reached after an experiment sub-page (back navigation or load failure),
+  // so returning focus to Search restores a deterministic keyboard anchor
+  // instead of dropping focus to <body>.
   function renderFeedPage() {
     while (root.firstChild) root.removeChild(root.firstChild);
+    root.appendChild(_pageHeading());
     root.appendChild(renderToolbar());
     root.appendChild(resultsEl);
     refreshControls();
     renderResultCount();
     renderResults();
+    if (searchInput && typeof searchInput.focus === "function") searchInput.focus();
   }
 
   // ── Toolbar ─────────────────────────────────────────────────────────────
@@ -785,6 +976,7 @@ export function renderHistoryV2(state, context) {
   }
 
   // ── Mount ───────────────────────────────────────────────────────────────
+  root.appendChild(_pageHeading());
   root.appendChild(renderToolbar());
   root.appendChild(resultsEl);
   refreshControls();
@@ -807,7 +999,18 @@ export function renderHistoryV2(state, context) {
     if (typeof r.listFacets === "function") {
       r.listFacets().then(function (f) { mergeFacets(f); }).catch(function () {});
     }
-    return fetchFeed(true);
+    // H13: a pending cross-page focus request (e.g. Playground filmstrip
+    // experiment click) opens the durable record directly.  Experiment
+    // detail replaces the feed page entirely; generation detail overlays it.
+    // showExperiment falls back to the feed page on lookup failure.
+    var focus = _consumeRecordFocus();
+    if (focus && focus.kind === "experiment") {
+      showExperiment(focus.id);
+      return null;
+    }
+    var initialFeed = fetchFeed(true);
+    if (focus) openGeneration(focus.id);
+    return initialFeed;
   }).catch(function (err) {
     error = "Could not initialize history: " + ((err && err.message) || "unknown error");
     loading = false;

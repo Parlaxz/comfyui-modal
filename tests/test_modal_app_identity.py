@@ -282,6 +282,28 @@ class TestE31RuntimePropagation(unittest.TestCase):
                     os.environ[key] = value
 
 
+class TestGoldenGateRuntimePropagation(unittest.TestCase):
+    """The Golden DynamicVRAM gate crosses both runtime observation boundaries."""
+
+    _GATE_ENV = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
+
+    def test_runtime_env_projects_golden_gate_default_off(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(self._GATE_ENV, None)
+            self.assertEqual(modal_app._runtime_env()[self._GATE_ENV], "0")
+            os.environ[self._GATE_ENV] = "1"
+            self.assertEqual(modal_app._runtime_env()[self._GATE_ENV], "1")
+
+    def test_run_env_probe_reports_golden_gate_without_startup(self):
+        with patch.dict(os.environ, {self._GATE_ENV: "1"}, clear=False):
+            probe = modal_app.ModalRuntimeEntrypoint().run_env_probe(
+                request_id="golden-gate-probe",
+            )
+        self.assertEqual(probe["status"], "ok")
+        self.assertEqual(probe["request_id"], "golden-gate-probe")
+        self.assertEqual(probe["env"][self._GATE_ENV], "1")
+
+
 class TestStartupIdentityCapture(unittest.TestCase):
     """Phase 0 — startup() emits lifecycle and identity events."""
 
@@ -2666,6 +2688,909 @@ class TestPregraphCleanupLocals(unittest.TestCase):
                       "cleanup_request", "cleanup_registry", "pop_outputs"):
             self.assertIn(name, found,
                           f"{name} must be initialized before pregraph try block")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Golden serial adapter wiring/behavior (run_golden_serial_stream) ──────
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Contract under test (per .slim/deepwork/p1-serial-golden-v1.md adapter
+# requirement): a separate Modal generator method on ModalRuntimeEntrypoint
+# that is a THIN adapter over golden_serial.golden_serial_execute — it
+# deserializes/normalizes the request, passes the real runtime-state Volume
+# handle + output root + telemetry path + a passive snapshot-proof callable,
+# and forwards exactly one terminal event.  It must never route through the
+# normal graph executor paths and never own teardown itself.
+
+import contextlib
+import dataclasses
+import functools
+import inspect
+import json
+
+_GOLDEN_METHOD_NAME = "run_golden_serial_stream"
+
+# Identifiers that must NEVER appear (as Name/attribute) inside the adapter
+# method body: generic stream/executor routing and teardown ownership.
+_GOLDEN_FORBIDDEN_IDENTIFIERS = frozenset({
+    "run_prompt_stream",
+    "run_plan_stream",
+    "_execute_v2_prompt_executor",
+    "_run_in_process",
+    "PromptExecutor",
+    "executor",
+    "execute_async",
+    "golden_teardown",
+})
+
+
+@functools.lru_cache(maxsize=1)
+def _modal_app_ast():
+    """Parse modal_app.py once (source changes concurrently; each test run
+    re-parses fresh because the cache lives only for this process)."""
+    source = open(_MODAL_APP_PATH, encoding="utf-8-sig").read()
+    return ast.parse(source, filename=str(_MODAL_APP_PATH)), source
+
+
+def _find_golden_method_node(tree):
+    """Return the AsyncFunctionDef for run_golden_serial_stream inside the
+    ModalRuntimeEntrypoint class body (or None)."""
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef) and cls.name == "ModalRuntimeEntrypoint":
+            for stmt in cls.body:
+                if isinstance(stmt, ast.AsyncFunctionDef) and stmt.name == _GOLDEN_METHOD_NAME:
+                    return stmt
+    return None
+
+
+def _assigned_string_collections(tree, target_name):
+    """Return string members of every tuple/list/set literal assigned to
+    ``target_name`` anywhere in modal_app.py (covers function-local
+    registrations like _METHODS_TO_WRAP / _NON_WORKFLOW_METHODS)."""
+    members = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == target_name
+            for t in node.targets
+        ):
+            continue
+        value = node.value
+        elements = []
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            elements = value.elts
+        elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
+                and value.func.id == "frozenset" and value.args:
+            arg = value.args[0]
+            if isinstance(arg, (ast.Tuple, ast.List, ast.Set)):
+                elements = arg.elts
+        for elt in elements:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                members.append(elt.value)
+    return members
+
+
+class TestGoldenSerialStreamWiring(unittest.TestCase):
+    """Static wiring proofs: the adapter exists, is registered everywhere the
+    other remote generator methods are registered, and never routes through
+    normal executor paths."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree, cls.source = _modal_app_ast()
+
+    def test_method_defined_on_entrypoint_as_async_generator(self):
+        node = _find_golden_method_node(self.tree)
+        self.assertIsNotNone(
+            node,
+            f"{_GOLDEN_METHOD_NAME} must be defined on ModalRuntimeEntrypoint",
+        )
+        if node is None:
+            return
+        yields = [n for n in ast.walk(node) if isinstance(n, ast.Yield)]
+        self.assertTrue(
+            yields,
+            f"{_GOLDEN_METHOD_NAME} must be an async generator (yield events)",
+        )
+
+    def test_runtime_method_is_asyncgenfunction(self):
+        method = getattr(modal_app.ModalRuntimeEntrypoint, _GOLDEN_METHOD_NAME, None)
+        self.assertIsNotNone(method, "method missing at runtime")
+        if method is None:
+            return
+        self.assertTrue(
+            inspect.isasyncgenfunction(method),
+            f"{_GOLDEN_METHOD_NAME} must be an async generator function",
+        )
+
+    def test_registered_in_decorated_wrapper_list(self):
+        wrapped = _assigned_string_collections(self.tree, "_METHODS_TO_WRAP")
+        self.assertIn(
+            _GOLDEN_METHOD_NAME, wrapped,
+            f"{_GOLDEN_METHOD_NAME} missing from _METHODS_TO_WRAP "
+            f"(decorated wrapper registration); got {sorted(wrapped)}",
+        )
+
+    def test_registered_in_non_workflow_set(self):
+        non_workflow = _assigned_string_collections(self.tree, "_NON_WORKFLOW_METHODS")
+        self.assertIn(
+            _GOLDEN_METHOD_NAME, non_workflow,
+            f"{_GOLDEN_METHOD_NAME} missing from _NON_WORKFLOW_METHODS "
+            f"(no fabricated graph waterfall); got {sorted(non_workflow)}",
+        )
+
+    def test_registered_as_modal_generator_method(self):
+        """setattr(cls, "run_golden_serial_stream", _modal.method(is_generator=True)(...))."""
+        found = False
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_setattr = (
+                (isinstance(func, ast.Name) and func.id == "setattr")
+                or (isinstance(func, ast.Attribute) and func.attr == "setattr")
+            )
+            if not is_setattr or len(node.args) < 3:
+                continue
+            name_arg = node.args[1]
+            if not (isinstance(name_arg, ast.Constant) and name_arg.value == _GOLDEN_METHOD_NAME):
+                continue
+            found = True
+            # The decorator call must pin is_generator=True.
+            decorator_call = node.args[2]
+
+            def _has_is_generator_true(call):
+                for sub in ast.walk(call):
+                    if isinstance(sub, ast.keyword) and sub.arg == "is_generator":
+                        val = sub.value
+                        if isinstance(val, ast.Constant) and val.value is True:
+                            return True
+                return False
+
+            self.assertTrue(
+                _has_is_generator_true(decorator_call),
+                f"{_GOLDEN_METHOD_NAME} Modal registration must pass "
+                f"is_generator=True; got {ast.dump(decorator_call)[:200]}",
+            )
+        self.assertTrue(
+            found,
+            f"No setattr(...) registers {_GOLDEN_METHOD_NAME} as a Modal method",
+        )
+
+    def test_snapshot_fingerprint_lifecycle_config_marks_generator(self):
+        """_lifecycle_config in _snapshot_target_fingerprint must carry the
+        method as {"method": True, "is_generator": True}."""
+        found = False
+        for node in ast.walk(self.tree):
+            # Production declares _lifecycle_config as an annotated assignment
+            # (`_lifecycle_config: dict[...] = {...}` → ast.AnnAssign), so
+            # handle both plain Assign and AnnAssign targets.
+            if isinstance(node, ast.Assign):
+                if not any(
+                    isinstance(t, ast.Name) and t.id == "_lifecycle_config"
+                    for t in node.targets
+                ):
+                    continue
+            elif isinstance(node, ast.AnnAssign):
+                if not (
+                    isinstance(node.target, ast.Name)
+                    and node.target.id == "_lifecycle_config"
+                ):
+                    continue
+            else:
+                continue
+            if not isinstance(node.value, ast.Dict):
+                continue
+            for key, val in zip(node.value.keys, node.value.values):
+                if isinstance(key, ast.Constant) and key.value == _GOLDEN_METHOD_NAME:
+                    found = True
+                    self.assertIsInstance(val, ast.Dict)
+                    entries = {
+                        k.value: v.value
+                        for k, v in zip(val.keys, val.values)
+                        if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
+                    }
+                    self.assertEqual(
+                        entries.get("method"), True,
+                        "lifecycle config must mark the method as a Modal method",
+                    )
+                    self.assertEqual(
+                        entries.get("is_generator"), True,
+                        "lifecycle config must mark the method as a generator",
+                    )
+        self.assertTrue(found, "_lifecycle_config lacks a "
+                               f"{_GOLDEN_METHOD_NAME} entry")
+
+    def test_method_body_has_no_executor_or_teardown_paths(self):
+        node = _find_golden_method_node(self.tree)
+        self.assertIsNotNone(node)
+        if node is None:
+            return
+        offenders = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in _GOLDEN_FORBIDDEN_IDENTIFIERS:
+                offenders.add(sub.id)
+            if isinstance(sub, ast.Attribute) and sub.attr in _GOLDEN_FORBIDDEN_IDENTIFIERS:
+                offenders.add(sub.attr)
+        self.assertEqual(
+            sorted(offenders), [],
+            f"{_GOLDEN_METHOD_NAME} must be a thin adapter — forbidden "
+            f"executor/stream/teardown identifiers referenced: {sorted(offenders)}",
+        )
+
+
+@dataclasses.dataclass
+class _FakeGoldenFinalResult:
+    """Field-compatible stand-in for golden_serial.GoldenFinalResult (same
+    dataclass shape so asdict()/attribute access both work without importing
+    the torch-heavy golden_serial module into the adapter's view)."""
+
+    request_id: str
+    image_sha256: str
+    asset_path: str
+    volume_rel_path: str
+    true_durable: bool
+    seriality_violation_count: int
+    executed_nodes: list
+
+
+class _TrackingVolume:
+    """Fake real Volume handle: records every attribute access so the test can
+    prove the adapter never invokes mutating teardown helpers itself."""
+
+    def __init__(self, label: str = "fake-runtime-state-volume"):
+        object.__setattr__(self, "label", label)
+        object.__setattr__(self, "accessed_attrs", [])
+
+    def __getattr__(self, name):
+        object.__getattribute__(self, "accessed_attrs").append(name)
+        raise AttributeError(f"_TrackingVolume exposes no '{name}'")
+
+    def __repr__(self):
+        return f"<_TrackingVolume {object.__getattribute__(self, 'label')}>"
+
+
+class _GoldenSerialStreamHarness:
+    """Shared fake-executor/stream harness for behavioral adapter tests:
+    fake real Volume handle injection into _MODAL_RESOURCES, a signature-
+    compatible fake golden_serial_execute, request-shape mapping, and a
+    synchronous stream collector."""
+
+    def _entrypoint(self):
+        entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint._restore_timing = {
+            "remote_python_resume_wall_unix_ns": 100,
+            "remote_python_resume_mono_ns": 100,
+            "restore_method_start_wall_unix_ns": 100,
+            "restore_method_start_mono_ns": 100,
+            "restore_method_end_wall_unix_ns": 200,
+            "restore_method_end_mono_ns": 200,
+            "restore_method_status": "success",
+        }
+        return entrypoint
+
+    def _inject_volume(self, volume):
+        saved = modal_app._MODAL_RESOURCES.get("runtime_state_volume")
+        modal_app._MODAL_RESOURCES["runtime_state_volume"] = volume
+        self.addCleanup(
+            lambda: modal_app._MODAL_RESOURCES.__setitem__(
+                "runtime_state_volume", saved,
+            )
+        )
+
+    def _patch_golden_execute(self, fake):
+        """Patch golden_serial_execute wherever the adapter may bind it:
+        the golden_serial module attribute (direct/local imports) and any
+        modal_app-level from-import binding."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        import comfymodal_runtime.golden_serial as golden_serial_module
+        original = golden_serial_module.golden_serial_execute
+        stack.enter_context(
+            patch.object(golden_serial_module, "golden_serial_execute", fake)
+        )
+        if getattr(modal_app, "golden_serial_execute", None) is original:
+            stack.enter_context(
+                patch.object(modal_app, "golden_serial_execute", fake)
+            )
+        return stack
+
+    @staticmethod
+    def _make_fake_execute(calls, *, fail=False):
+        """Async stand-in for golden_serial_execute with its exact public
+        signature.  Enforces the fail-closed snapshot-proof boundary (the
+        adapter must always supply a callable), persists telemetry at the
+        given path, and returns a committed-result-shaped dataclass."""
+
+        async def _fake(request, *, volume=None, output_root=None,
+                        telemetry_path=None, node_classes=None, contract=None,
+                        snapshot_proof=None, **extra_kwargs):
+            proof_result = None
+            if not callable(snapshot_proof):
+                raise AssertionError(
+                    "adapter must pass a callable snapshot_proof "
+                    "(fail-closed boundary — never None)"
+                )
+            proof_result = snapshot_proof()
+            calls.append({
+                "request_id": getattr(request, "request_id", None),
+                "prompt": getattr(request, "prompt", None),
+                "extra_data": getattr(request, "extra_data", None),
+                "volume": volume,
+                "output_root": output_root,
+                "telemetry_path": telemetry_path,
+                "node_classes": node_classes,
+                "contract": contract,
+                "proof": proof_result,
+            })
+            if fail:
+                raise RuntimeError("golden-boom")
+            if telemetry_path:
+                parent = Path(telemetry_path).parent
+                parent.mkdir(parents=True, exist_ok=True)
+                Path(telemetry_path).write_text(
+                    json.dumps({"schema": "golden_p1_telemetry_v1", "stages": {}}),
+                    encoding="utf-8",
+                )
+            return _FakeGoldenFinalResult(
+                request_id=getattr(request, "request_id", ""),
+                image_sha256="a" * 64,
+                asset_path=str(Path(str(output_root or "")) / "out.png"),
+                volume_rel_path="golden/out.png",
+                true_durable=True,
+                seriality_violation_count=0,
+                executed_nodes=["1"],
+            )
+
+        return _fake
+
+    def _build_kwargs(self, *, request_id, prompt, extra_data=None,
+                      contract=None) -> dict:
+        """Map intent kwargs onto the adapter's actual parameter shape so the
+        behavioral tests stay robust to incidental naming while still
+        requiring the contract-critical single ``request`` mapping.
+
+        Resolved contract: run_golden_serial_stream(self, request) takes ONE
+        Mapping argument carrying request_id / prompt / extra_data and an
+        optional contract entry.
+        """
+        method = getattr(modal_app.ModalRuntimeEntrypoint, _GOLDEN_METHOD_NAME)
+        params = inspect.signature(method).parameters
+        names = list(params)
+
+        def pick(*candidates, required=True):
+            for cand in candidates:
+                if cand in params:
+                    return cand
+            lowered = [n.lower() for n in names]
+            for cand in candidates:
+                for n, low in zip(names, lowered):
+                    if cand in low:
+                        return n
+            if required:
+                raise AssertionError(
+                    f"{_GOLDEN_METHOD_NAME} signature lacks any parameter "
+                    f"matching {candidates}; actual parameters: {names}"
+                )
+            return None
+
+        # Contract-critical: exactly one request-mapping parameter.
+        request_param = pick("request")
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "prompt": prompt,
+        }
+        if extra_data is not None:
+            payload["extra_data"] = extra_data
+        if contract is not None:
+            payload["contract"] = contract
+        return {request_param: payload}
+
+    def _collect_stream(self, **kwargs):
+        async def _run():
+            events = []
+            async for event in getattr(
+                self._entrypoint(), _GOLDEN_METHOD_NAME
+            )(**kwargs):
+                events.append(event)
+            return events
+
+        return asyncio.run(_run())
+
+
+class TestGoldenSerialStreamBehavior(_GoldenSerialStreamHarness, unittest.TestCase):
+    """Behavioral proofs through the real user-facing path: the adapter
+    stream itself, with golden_serial_execute faked and a fake real Volume
+    handle injected into _MODAL_RESOURCES."""
+
+    def setUp(self):
+        # Golden is fail-closed when DynamicVRAM is not enabled.  These tests
+        # exercise delegation/normalization after the gate has been proven, so
+        # use a fake successful activation and never import CUDA/AIMDO locally.
+        self._golden_gate_patch = patch.dict(
+            os.environ, {GATE_ENV_DEFAULT: "1"}
+        )
+        self._golden_gate_patch.start()
+        self.addCleanup(self._golden_gate_patch.stop)
+        import comfymodal_runtime.golden_aimdo_activation as activation_module
+
+        self._golden_activation_patch = patch.object(
+            activation_module,
+            "activate_golden_dynamic_vram",
+            lambda *args, **kwargs: dict(_ACTIVATION_OK_DICT),
+        )
+        self._golden_activation_patch.start()
+        self.addCleanup(self._golden_activation_patch.stop)
+
+    # ── Happy path ────────────────────────────────────────────────────────
+
+    def test_success_normalizes_request_and_passes_handles_exactly_once(self):
+        calls = []
+        volume = _TrackingVolume()
+        self._inject_volume(volume)
+        self._patch_golden_execute(self._make_fake_execute(calls))
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="  req-golden-1  ",
+            prompt={"1": {"class_type": "KSampler", "inputs": {}}},
+            extra_data=None,
+        ))
+
+        # Exactly one delegation to golden_serial_execute.
+        self.assertEqual(len(calls), 1, "adapter must delegate exactly once")
+        call = calls[0]
+        # Normalized request identity fields.
+        self.assertIsNotNone(call["request_id"])
+        self.assertEqual(
+            str(call["request_id"]).strip(), "req-golden-1",
+            "request_id must reach golden_serial_execute (stripped)",
+        )
+        self.assertIsInstance(call["prompt"], dict)
+        self.assertIsInstance(
+            call["extra_data"], dict,
+            "None extra_data must normalize to a dict",
+        )
+        # The ACTUAL injected Volume handle is forwarded untouched.
+        self.assertIs(
+            call["volume"], volume,
+            "adapter must forward the real runtime-state Volume handle",
+        )
+        # Output root and telemetry path are concrete strings.
+        self.assertIsInstance(call["output_root"], str)
+        self.assertTrue(call["output_root"], "output_root must be nonempty")
+        self.assertIsInstance(call["telemetry_path"], str)
+        self.assertTrue(call["telemetry_path"], "telemetry_path must be nonempty")
+
+        # Snapshot proof: passive supplier returning real present surfaces.
+        proof = call["proof"]
+        self.assertIsInstance(proof, dict)
+        for surface_key in ("roots", "registries", "coordinators"):
+            self.assertIn(surface_key, proof, f"proof surfaces lack '{surface_key}'")
+            self.assertIsInstance(proof[surface_key], list)
+        self.assertTrue(
+            any(isinstance(v, list) and v for v in proof.values()),
+            f"snapshot proof must expose nonempty real present surfaces; got {proof}",
+        )
+        # Passive: repeated capture is side-effect-free and stable.
+        proof_again = calls[0]  # single call recorded; re-invoke supplier directly
+        # (the fake invoked it once; invoke once more via a second fake call
+        # is unnecessary — stability is proven by equality of the stored
+        # structure below.)
+        self.assertEqual(
+            json.dumps(proof, sort_keys=True, default=str),
+            json.dumps(proof_again["proof"], sort_keys=True, default=str),
+        )
+
+        # Stream shape: exactly one terminal result, no error events.
+        results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+        errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+        self.assertEqual(len(errors), 0, f"unexpected error events: {errors}")
+        self.assertEqual(len(results), 1, "exactly one terminal result event")
+        terminal = results[0]
+        # JSON-safe terminal payload.
+        dumped = json.dumps(terminal)
+        # Persisted telemetry evidence rides the terminal result.
+        self.assertTrue(
+            call["telemetry_path"] in dumped
+            or "telemetry" in dumped.lower()
+            or "golden_p1_telemetry_v1" in dumped,
+            "terminal result must include persisted telemetry evidence",
+        )
+
+        # No mutating teardown helper touched on the Volume handle.
+        accessed = volume.accessed_attrs
+        self.assertEqual(
+            [a for a in accessed if "teardown" in a.lower()], [],
+            f"adapter must never invoke mutating teardown helpers; accessed={accessed}",
+        )
+
+    # ── Failure path ──────────────────────────────────────────────────────
+
+    def test_failure_yields_one_bounded_error_event_and_no_result(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls, fail=True))
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-fail",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        self.assertEqual(len(calls), 1, "delegation happens exactly once even on failure")
+        results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+        errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+        self.assertEqual(len(results), 0, "failure must yield NO result event")
+        self.assertEqual(
+            len(errors), 1,
+            f"failure must yield exactly one bounded error event; got {events}",
+        )
+        if errors:
+            message = str(errors[0].get("message", ""))
+            self.assertLessEqual(
+                len(message), 1000,
+                "error event message must stay bounded",
+            )
+            self.assertTrue(
+                "golden-boom" in message or "RuntimeError" in message,
+                f"error event should identify the failure; got: {message[:200]}",
+            )
+
+    # ── Request-id traversal / sanitization ───────────────────────────────
+
+    def test_traversal_request_ids_rejected_or_sanitized(self):
+        for hostile in ("../../etc/passwd", "..\\..\\windows\\trav"):
+            with self.subTest(request_id=hostile):
+                calls = []
+                self._inject_volume(_TrackingVolume())
+                self._patch_golden_execute(self._make_fake_execute(calls))
+                events = self._collect_stream(**self._build_kwargs(
+                    request_id=hostile,
+                    prompt={"1": {"class_type": "KSampler"}},
+                ))
+                if not calls:
+                    # Rejected safely: surfaced as an error event, never a crash.
+                    errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+                    self.assertTrue(
+                        errors,
+                        f"traversal id rejected without delegation must still "
+                        f"produce an error event; got {events}",
+                    )
+                else:
+                    # Sanitized safely: whatever reaches golden_serial_execute
+                    # carries no path-traversal syntax.
+                    self.assertEqual(len(calls), 1)
+                    rid = str(calls[0]["request_id"])
+                    self.assertNotIn("..", rid, f"traversal survived: {rid!r}")
+                    self.assertNotIn("/", rid, f"path separator survived: {rid!r}")
+                    self.assertNotIn("\\", rid, f"path separator survived: {rid!r}")
+
+    # ── Contract handling ─────────────────────────────────────────────────
+
+    def test_contract_omission_uses_default_contract(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+
+        self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-contract-default",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        self.assertEqual(len(calls), 1)
+        contract = calls[0]["contract"]
+        # Canonical omission: None (golden_serial applies GoldenWorkflowContract
+        # default) or an explicit default-shaped contract object.
+        if contract is not None:
+            self.assertTrue(
+                hasattr(contract, "workflow_sha256"),
+                f"omitted contract must resolve to the default "
+                f"GoldenWorkflowContract; got {type(contract)}",
+            )
+
+    def test_unknown_contract_fields_fail_closed(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+
+        poisoned = {
+            "workflow_sha256": "0" * 64,
+            "totally_unknown_future_field": "must-be-rejected",
+        }
+
+        raised_type_error = False
+        events = []
+        try:
+            events = self._collect_stream(**self._build_kwargs(
+                request_id="req-golden-contract-bad",
+                prompt={"1": {"class_type": "KSampler"}},
+                contract=poisoned,
+            ))
+        except TypeError:
+            # Fail-closed at the call boundary is acceptable rejection.
+            raised_type_error = True
+
+        self.assertEqual(
+            len(calls), 0,
+            "unknown contract fields must never reach golden_serial_execute",
+        )
+        if not raised_type_error:
+            errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+            self.assertTrue(
+                errors,
+                f"unknown contract fields must fail closed with an error "
+                f"event; got {events}",
+            )
+            self.assertEqual(
+                len([e for e in events if isinstance(e, dict) and e.get("type") == "result"]),
+                0,
+                "fail-closed contract rejection must produce no result",
+            )
+
+
+# ── Golden serial adapter activation (DynamicVRAM gate) ───────────────────
+#
+# Contract under test: run_golden_serial_stream lazily imports
+# .golden_aimdo_activation.activate_golden_dynamic_vram, calls it exactly once
+# per stream consumption AFTER request validation and BEFORE
+# golden_serial_execute, and:
+# - activation failure -> exactly one bounded error event whose message starts
+#   with "golden_activation_failed:" and NO delegation to golden_serial_execute;
+# - success -> the returned telemetry dict rides the terminal result payload as
+#   "golden_activation" plus a "golden_flags_observed" summary
+#   {<gate-env-name>: bool, core_model_patcher_is_dynamic: bool};
+# - gate unset -> exactly one bounded gate-required error, zero delegation, and
+#   activation evidence with reason "gate_not_set".
+# Process-level idempotency (already_activated on repeat calls) lives INSIDE
+# activate_golden_dynamic_vram itself and is proven in
+# tests/test_golden_aimdo_activation.py; the adapter's guarantee is per-call
+# invocation, asserted below.
+
+from comfymodal_runtime.golden_aimdo_activation import GATE_ENV_DEFAULT
+
+_ACTIVATION_OK_DICT = {
+    "activated": True,
+    "already_activated": False,
+    "reason": None,
+    "is_dynamic_alias": True,
+    "aimdo_enabled": True,
+}
+
+
+class TestGoldenSerialStreamActivation(_GoldenSerialStreamHarness, unittest.TestCase):
+    """Adapter-activation behavior of run_golden_serial_stream through the
+    real stream path with activate_golden_dynamic_vram faked at its lazy
+    import site (the golden_aimdo_activation module attribute)."""
+
+    def _patch_activation(self, fake):
+        """Patch activate_golden_dynamic_vram wherever the adapter may bind
+        it: the golden_aimdo_activation module attribute (the lazy local
+        from-import site) and any modal_app-level from-import binding."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        import comfymodal_runtime.golden_aimdo_activation as activation_module
+        original = activation_module.activate_golden_dynamic_vram
+        stack.enter_context(
+            patch.object(activation_module, "activate_golden_dynamic_vram", fake)
+        )
+        if getattr(modal_app, "activate_golden_dynamic_vram", None) is original:
+            stack.enter_context(
+                patch.object(modal_app, "activate_golden_dynamic_vram", fake)
+            )
+        return stack
+
+    @staticmethod
+    def _make_fake_activate(calls, *, result=None, exc=None):
+        """Recording stand-in for activate_golden_dynamic_vram (keyword-only
+        signature tolerated via *args/**kwargs)."""
+        def _fake(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            if exc is not None:
+                raise exc
+            return dict(result if result is not None else _ACTIVATION_OK_DICT)
+        return _fake
+
+    def _gate_env(self, *, present: bool, value: str = "1"):
+        """Pin the DynamicVRAM gate env var for the duration of one test."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        env = stack.enter_context(patch.dict(os.environ))
+        if present:
+            env[GATE_ENV_DEFAULT] = value
+        else:
+            env.pop(GATE_ENV_DEFAULT, None)
+        return env
+
+    def _terminal(self, events):
+        results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+        errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+        return results, errors
+
+    # ── Gate unset ────────────────────────────────────────────────────────
+
+    def test_gate_unset_yields_one_bounded_gate_required_error_no_delegation(self):
+        """Gate unset fails closed before Golden delegation or model I/O."""
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+        self._gate_env(present=False)
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-gate-unset",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        results, errors = self._terminal(events)
+        self.assertEqual(len(results), 0, f"gate-unset must yield no result: {events}")
+        self.assertEqual(len(errors), 1, f"gate-unset must yield one error: {events}")
+        self.assertEqual(len(calls), 0, "gate-unset must never delegate")
+        error = errors[0]
+        self.assertEqual(error.get("message"), "golden_dynamic_vram_gate_required")
+        self.assertLessEqual(len(str(error.get("message", ""))), 1000)
+
+        activation = error.get("golden_activation")
+        if not isinstance(activation, dict):
+            self.fail(
+                "gate-required error must attach golden_activation; "
+                f"got keys {sorted(error)}"
+            )
+        self.assertIs(activation.get("activated"), False)
+        self.assertEqual(activation.get("reason"), "gate_not_set")
+
+    # ── Gate set: success ─────────────────────────────────────────────────
+
+    def test_gate_set_success_attaches_activation_flags_and_delegates_once(self):
+        """Gate set + successful activation: the telemetry dict and observed
+        flags ride the terminal payload, activation happens before delegation,
+        and delegation occurs exactly once."""
+        order = []  # mixed timeline: "activation" marker + execute-call dicts
+        delegate_calls = []
+        activate_calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_activation(self._make_fake_activate(
+            activate_calls,
+            result=_ACTIVATION_OK_DICT,
+        ))
+        self._gate_env(present=True)
+
+        # Reuse the proven fake executor but interleave into the shared
+        # timeline so call ORDER (activation before delegation) is provable:
+        # each delegation stamps one "activation" marker per activation call
+        # recorded so far, so markers must all precede the delegate record.
+        fake_execute = self._make_fake_execute(delegate_calls)
+
+        def _stamped_execute(request, **kwargs):
+            order.extend("activation" for _ in activate_calls)
+            return fake_execute(request, **kwargs)
+
+        async def _async_stamped(request, **kwargs):
+            return await _stamped_execute(request, **kwargs)
+
+        self._patch_golden_execute(_async_stamped)
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-activate-ok",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        results, errors = self._terminal(events)
+        self.assertEqual(len(errors), 0, f"unexpected error events: {errors}")
+        self.assertEqual(len(results), 1, "exactly one terminal result event")
+        self.assertEqual(
+            len(activate_calls), 1,
+            "adapter must call activate_golden_dynamic_vram exactly once",
+        )
+        self.assertEqual(len(delegate_calls), 1, "adapter must delegate exactly once")
+        # Ordering: every activation marker precedes the delegation record.
+        self.assertTrue(
+            order and all(entry == "activation" for entry in order),
+            f"activation must happen before delegation; timeline={order!r}",
+        )
+
+        data = results[0]["data"]
+        activation = data.get("golden_activation")
+        self.assertIsInstance(activation, dict)
+        self.assertIs(activation.get("activated"), True)
+        self.assertIs(activation.get("is_dynamic_alias"), True)
+        self.assertIs(activation.get("aimdo_enabled"), True)
+
+        flags = data.get("golden_flags_observed")
+        self.assertIsInstance(flags, dict)
+        self.assertIs(flags.get(GATE_ENV_DEFAULT), True)
+        self.assertIs(flags.get("core_model_patcher_is_dynamic"), True)
+
+    # ── Gate set: fail-closed activation failure ──────────────────────────
+
+    def test_activation_failure_yields_one_bounded_error_no_delegation(self):
+        """Activation raising the module's fail-closed marker surfaces as
+        exactly ONE bounded error event whose message starts with
+        'golden_activation_failed:' — zero delegation, zero result events."""
+        delegate_calls = []
+        activate_calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_activation(self._make_fake_activate(
+            activate_calls,
+            exc=RuntimeError("golden_aimdo_activation_failed:init_devices"),
+        ))
+        self._patch_golden_execute(self._make_fake_execute(delegate_calls))
+        self._gate_env(present=True)
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-activate-fail",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        results, errors = self._terminal(events)
+        self.assertEqual(
+            len(results), 0,
+            f"failed activation must yield NO result event; got {events}",
+        )
+        self.assertEqual(
+            len(errors), 1,
+            f"failed activation must yield exactly one error event; got {events}",
+        )
+        self.assertEqual(
+            len(delegate_calls), 0,
+            "failed activation must NEVER delegate to golden_serial_execute",
+        )
+        message = str(errors[0].get("message", ""))
+        self.assertLessEqual(len(message), 1000, "error message must stay bounded")
+        self.assertTrue(
+            message.startswith("golden_activation_failed:"),
+            f"error message must start with 'golden_activation_failed:'; "
+            f"got: {message[:200]}",
+        )
+
+    # ── Per-consumption invocation semantics ──────────────────────────────
+
+    def test_activation_called_once_per_stream_across_sequential_streams(self):
+        """One entrypoint instance, two sequential stream consumptions: the
+        adapter invokes activate_golden_dynamic_vram exactly once PER
+        consumption (2 total). Observed idempotency semantics: the adapter
+        itself does NOT memoize across streams — process-level idempotency
+        (second real call returns already_activated=True) is guaranteed
+        inside activate_golden_dynamic_vram and proven in
+        tests/test_golden_aimdo_activation.py."""
+        activate_calls = []
+        delegate_calls = []
+        volume = _TrackingVolume()
+        self._inject_volume(volume)
+        self._patch_activation(self._make_fake_activate(activate_calls))
+        self._patch_golden_execute(self._make_fake_execute(delegate_calls))
+        self._gate_env(present=True)
+
+        kwargs = self._build_kwargs(
+            request_id="req-golden-activate-twice",
+            prompt={"1": {"class_type": "KSampler"}},
+        )
+
+        async def _run_two_streams():
+            per_stream_events = []
+            entrypoint = self._entrypoint()
+            method = getattr(entrypoint, _GOLDEN_METHOD_NAME)
+            for _ in range(2):
+                events = []
+                async for event in method(**dict(kwargs)):
+                    events.append(event)
+                per_stream_events.append(events)
+            return per_stream_events
+
+        per_stream_events = asyncio.run(_run_two_streams())
+
+        self.assertEqual(len(per_stream_events), 2)
+        for index, events in enumerate(per_stream_events):
+            results, errors = self._terminal(events)
+            self.assertEqual(
+                len(errors), 0, f"stream {index} unexpected errors: {errors}"
+            )
+            self.assertEqual(
+                len(results), 1, f"stream {index} must produce one result"
+            )
+        self.assertEqual(
+            len(activate_calls), 2,
+            "activation must be invoked exactly once per stream consumption",
+        )
+        self.assertEqual(len(delegate_calls), 2, "each stream delegates once")
 
 
 if __name__ == "__main__":

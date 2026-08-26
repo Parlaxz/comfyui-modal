@@ -804,6 +804,39 @@ class _FakeModernScheduler:
         return "canceled_running"
 
 
+class _FakeResumeScheduler:
+    """Minimal live-scheduler stand-in mirroring real ``resume()`` semantics.
+
+    Interrupted cells receive a fresh appended attempt via the guarded repo
+    seam; queued/not-started cells claim their EXISTING queued attempt;
+    failed/canceled/completed cells are skipped; each cell resumes at most
+    once per instance (in-memory ownership like the real dispatch loop).
+    """
+
+    def __init__(self, repo: HistoryV2Repository, experiment_id: str):
+        self.repo = HistoryV2Repository(repo._store, experiment_id=experiment_id)
+        self.resume_calls = 0
+        self._claimed: set[str] = set()
+
+    async def resume_experiment(self, experiment_id=None, *, reason="resume"):
+        self.resume_calls += 1
+        resumed = 0
+        for record in self.repo.list_recoverable_cells():
+            cell_id = record["cell_id"]
+            status = record["status"]
+            if cell_id in self._claimed or status == "running":
+                continue
+            if status == "interrupted":
+                claim = self.repo.create_resume_attempt(cell_id)
+            else:
+                claim = self.repo.atomically_claim_queued_attempt(cell_id)
+            if claim is None:
+                continue
+            self._claimed.add(cell_id)
+            resumed += 1
+        return {"resumed": resumed, "skipped": 0}
+
+
 class HistoryV2ModernRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1055,10 +1088,17 @@ class HistoryV2ModernRouteTests(unittest.IsolatedAsyncioTestCase):
         gen_before = self.repo.get_experiment_cell("a").generation_id
         attempts_before = len(self.repo.get_attempts_for_cells(["a"]))
 
+        # A live scheduler owns the resume (post-restart requests reconstruct
+        # one instead — see the dedicated reconstruction coverage).
+        sched = _FakeResumeScheduler(self.repo, "exp_resume")
+        self.registry["exp_resume"] = sched
+
         data = await self._post(
             f"/comfymodal/history-v2/experiments/exp_resume/resume"
         )
-        self.assertEqual(data["resumed"], 1)
+        self.assertEqual(data["resumed"], 2)
+        self.assertTrue(data["dispatched"])
+        self.assertFalse(data["scheduler_reconstructed"])
         self.assertEqual(len(data["created_attempts"]), 1)
         self.assertEqual(data["created_attempts"][0]["cell_id"], "a")
         self.assertEqual(data["resumable_cells"], ["a", "b"])
@@ -1070,13 +1110,33 @@ class HistoryV2ModernRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts[-1].generation_id, gen_before)
         self.assertEqual(self.repo.get_experiment_cell("a").status, "queued")
 
-        # Double resume: the interrupted cell is now queued → no new attempts.
+        # Double resume: the interrupted cell is now claimed → no new attempts.
         again = await self._post(
             f"/comfymodal/history-v2/experiments/exp_resume/resume"
         )
         self.assertEqual(again["resumed"], 0)
         self.assertEqual(again["created_attempts"], [])
         self.assertEqual(len(self.repo.get_attempts_for_cells(["a"])), attempts_before + 1)
+
+    async def test_resume_without_scheduler_fails_closed_with_no_orphan(self):
+        self._matrix("exp_resume_closed")
+        run_a = self._claim("a")
+        self.repo.record_terminal(run_a, "a", "interrupted")
+        before = len(self.repo.get_attempts_for_cells(["a"]))
+
+        # No scheduler registered AND scheduler construction explicitly
+        # unavailable (no transport factory): Resume must fail closed with
+        # zero durable writes — never queue work nobody would dispatch.
+        with mock.patch.object(emr, "_DEFAULT_TRANSPORT_FACTORY", [None]):
+            resp = await self.client.post(
+                f"/comfymodal/history-v2/experiments/exp_resume_closed/resume"
+            )
+        self.assertEqual(resp.status, 503)
+        body = await resp.json()
+        self.assertEqual(body["code"], "DISPATCH_UNAVAILABLE")
+        self.assertEqual(len(self.repo.get_attempts_for_cells(["a"])), before)
+        self.assertEqual(self.repo.read_active_attempt("a").status, "interrupted")
+        self.assertEqual(self.repo.read_active_attempt("b").status, "queued")
 
     async def test_resume_409_when_nothing_resumable(self):
         self._matrix("exp_none")

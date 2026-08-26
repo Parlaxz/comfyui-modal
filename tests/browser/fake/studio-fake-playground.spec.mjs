@@ -87,10 +87,14 @@ test.describe("Studio Playground (fake backend)", () => {
       await expect(canvas).toBeVisible({ timeout: 20000 });
       const src = await canvas.getAttribute("src");
       expect(src).toBeTruthy();
-      expect(src).toMatch(/\/comfymodal\/(assets|studio\/outputs)\//);
+      // H-WAVE D: the finalized run is selected from the History V2 feed, so
+      // the canvas displays a durable history-v2 asset URL (legacy run
+      // outputs may still surface as /assets/ or /studio/outputs/ paths).
+      expect(src).toMatch(/\/comfymodal\/(history-v2\/assets|assets|studio\/outputs)\//);
 
-      // Cross-check against the engine's journal: the rendered image must be
-      // the primary asset of the cell.completed event for this run.
+      // Cross-check against the engine's journal: the rendered image must
+      // belong to this run — the V2 mirror keys its asset ids off the
+      // experiment id, and legacy-shaped URLs embed the primary asset id.
       const state = await fx.getState();
       const experiment = state.experiments && state.experiments[0];
       expect(experiment, "expected one experiment in session state").toBeTruthy();
@@ -98,7 +102,12 @@ test.describe("Studio Playground (fake backend)", () => {
       expect(cellCompleted, "expected a cell.completed journal entry").toBeTruthy();
       const assetId = cellCompleted.payload && cellCompleted.payload.primary_asset_id;
       if (assetId) {
-        expect(src).toContain(encodeURIComponent(assetId));
+        const srcMatchesAsset =
+          src.indexOf(encodeURIComponent(assetId)) !== -1 ||
+          src.indexOf(assetId) !== -1 ||
+          src.indexOf(encodeURIComponent(experiment.experiment_id)) !== -1 ||
+          src.indexOf(experiment.experiment_id) !== -1;
+        expect(srcMatchesAsset, "canvas src correlates to the completed run").toBe(true);
       }
       fx.assertNoConsoleErrors();
     } finally {

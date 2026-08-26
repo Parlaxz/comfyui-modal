@@ -35,13 +35,7 @@
 //     gating line) until a compatible model is selected.
 
 import { test, expect } from "@playwright/test";
-import {
-  setupFakeTest,
-  createComparePreset,
-  enableExperimentMode,
-  selectComparePreset,
-  submitExperiment,
-} from "./helpers.mjs";
+import { setupFakeTest } from "./helpers.mjs";
 
 const RUN_BTN = '[data-testid="run-btn"]';
 const WF_SELECTOR = '[data-testid="workflow-selector"]';
@@ -890,39 +884,49 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     }
   });
 
-  test("28. experiment fallback remains functional", async ({ page }) => {
-    let compareId = "";
+  test("28. seeded experiment routes through History V2 detail; modern workflow lane untouched", async ({ page }) => {
+    // H-WAVE D removed the legacy experiment grid entirely.  A V2 dataset
+    // containing experiments is seeded through the fake API BEFORE mount
+    // (harness-only write); the filmstrip EXP item must open the History V2
+    // detail page, the retired grid viewport can never mount, and the modern
+    // workflow lane must stay untouched.
+    let seeded = null;
     const fx = await setupFakeTest(page, {
-      beforeMount: async ({ sessionId }) => {
-        compareId = await createComparePreset(page, sessionId);
+      beforeMount: async ({ page: p, sessionId }) => {
+        const res = await p.request.post("/__comfymodal_test/history-seed", {
+          data: { sessionId, scenario: "history_v2_large" },
+        });
+        expect(res.ok()).toBe(true);
+        seeded = await res.json();
       },
     });
+    expect(seeded).toMatchObject({ status: "ok", v2: true });
+    const legacyCreates = [];
+    const onRequest = (request) => {
+      if (request.method() === "POST" && /\/comfymodal\/studio\/experiment$/.test(request.url())) {
+        legacyCreates.push(request.url());
+      }
+    };
+    page.on("request", onRequest);
     try {
-      await fx.setScenario("experiment_two_cell");
-      // Drive the LEGACY experiment path (preset selection, experiment mode).
-      await page.locator('[data-testid="backend-select"]').selectOption("preset_default");
-      await expect(page.locator('[data-testid="input-prompt"]')).toBeVisible({ timeout: 10000 });
-      await enableExperimentMode(page);
-      await selectComparePreset(page, compareId);
-      await submitExperiment(page);
+      // Open the seeded experiment through the filmstrip EXP item.
+      const item = page.locator(".comfymodal-studio-carousel-item-experiment").first();
+      await expect(item).toBeVisible({ timeout: 20000 });
+      await item.click();
 
-      const grid = page.locator('[data-testid="experiment-grid-viewport"]');
-      await expect(grid).toBeVisible({ timeout: 20000 });
-      await expect
-        .poll(async () => {
-          const cells = grid.locator(".comfymodal-studio-experiment-grid-cell");
-          const statuses = await cells.evaluateAll((els) =>
-            els.map((el) => el.getAttribute("data-cell-status"))
-          );
-          return statuses.filter((s) => s === "completed").length;
-        }, { timeout: 20000, message: "legacy experiment cells should complete" })
-        .toBe(2);
+      await expect(page.locator('[data-testid="history-v2-page"]')).toBeVisible({ timeout: 15000 });
+      await expect(page.locator('[data-testid="history-v2-experiment-page"]')).toBeVisible({ timeout: 15000 });
+      expect(await page.locator('[data-testid="experiment-grid-viewport"]').count()).toBe(0);
 
-      // The modern workflow lane was not touched by the legacy run.
+      // The UI itself never POSTed the legacy creator.
+      expect(legacyCreates.length).toBe(0);
+
+      // The modern workflow lane was not touched by the navigation.
       const state = await fx.getState();
       expect(state.workflowRuns.length).toBe(0);
       fx.assertNoConsoleErrors();
     } finally {
+      page.off("request", onRequest);
       fx.guard.dispose();
     }
   });

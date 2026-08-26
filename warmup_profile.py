@@ -2,7 +2,7 @@
 
 Both the normal ComfyUI graph path (``__init__._execute_job``) and the
 Studio run path (``studio_run_adapter._schedule_and_start`` →
-``LocalRemoteInvoker.run_cell``) call ``prepare_active_next_profile``
+the experiment invokers) call ``prepare_active_next_profile``
 so that model-stack extraction, profile-token generation, prompt-bundle
 injection, and workspace-scoped dedup are unified in a single
 dependency-light helper.

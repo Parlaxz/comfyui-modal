@@ -5,6 +5,7 @@
 // from the glue module (studio-backend.js).
 
 import { el, statusBadge } from "./studio-ui.js";
+import { renderLoadingState } from "./studio-loading.js";
 import { listSnapshots, updateSnapshot, duplicateSnapshot, archiveSnapshot } from "./studio-backend-api.js";
 import { _STATE, renderFeaturesChipGrid, invalidateRuntimePresetsCache } from "./studio-backend.js";
 import { getPresetCapabilitySummary } from "./studio-preset-capabilities.js";
@@ -35,7 +36,11 @@ export function renderSnapshotsPage(listPanel, detailPanel, apiBase) {
   const listContent = el("div", { style: "flex:1;overflow-y:auto;" });
   listPanel.appendChild(listContent);
 
-  listContent.textContent = "Loading snapshots...";
+  listContent.appendChild(renderLoadingState({
+    label: "Loading snapshots\u2026",
+    size: "page",
+    testid: "backend-snapshots-loading",
+  }));
   listSnapshots(apiBase).then((snapshots) => {
     while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
     // null or undefined means network/API error

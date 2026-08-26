@@ -35,10 +35,12 @@ async function getGeneration(page, sessionId, id) {
   return body.item;
 }
 
-async function getAsset(page, url, sessionId) {
+async function getAsset(page, url, sessionId, mime = "image/png") {
   const res = await page.request.get(`${url}?session=${encodeURIComponent(sessionId)}`);
   expect(res.status()).toBe(200);
-  expect(res.headers()["content-type"]).toMatch(/^image\/png/);
+  // Managed-asset MIME parity: previews are WebP in production; everything
+  // else serves PNG.
+  expect(res.headers()["content-type"]).toMatch(new RegExp("^" + mime));
   expect((await res.body()).length).toBeGreaterThan(20);
   return res;
 }
@@ -65,7 +67,7 @@ test.describe("Studio Phase-E contract harness (fake backend)", () => {
       expect(output.original_url).toBe("");
       expect(output.original_failed).toBe(false);
       expect(item.attempts.map((a) => [a.mode, a.status])).toEqual([["preview", "completed"]]);
-      await getAsset(page, output.preview_url, fx.sessionId);
+      await getAsset(page, output.preview_url, fx.sessionId, "image/webp");
 
       await fx.gotoPage("history");
       const overlay = await openGenerationDetail(page, PHASE_E_IDS.previewOnly);
@@ -93,7 +95,7 @@ test.describe("Studio Phase-E contract harness (fake backend)", () => {
         ["original", "failed"],
       ]);
       expect(item.errors).toEqual([{ code: "attempt_failed", message: "Original replay failed" }]);
-      await getAsset(page, output.preview_url, fx.sessionId);
+      await getAsset(page, output.preview_url, fx.sessionId, "image/webp");
 
       await fx.gotoPage("history");
       const overlay = await openGenerationDetail(page, PHASE_E_IDS.failedOriginal);
@@ -120,13 +122,19 @@ test.describe("Studio Phase-E contract harness (fake backend)", () => {
         ["preview", "completed"],
         ["original", "completed"],
       ]);
-      await getAsset(page, output.preview_url, fx.sessionId);
+      await getAsset(page, output.preview_url, fx.sessionId, "image/webp");
       await getAsset(page, output.original_url, fx.sessionId);
 
       await fx.gotoPage("history");
       const overlay = await openGenerationDetail(page, PHASE_E_IDS.successfulOriginal);
-      await expect(overlay.locator('img[alt="Original"]')).toBeVisible();
+      // Intentional Phase-E policy (E4B): the detail view never auto-fetches
+      // the full Original. It renders an availability placeholder and loads
+      // the bytes only after the explicit "View Original" action.
       await expect(overlay.locator('img[alt="Preview"]')).toBeVisible();
+      await expect(overlay.locator('img[alt="Original"]')).toHaveCount(0);
+      await expect(overlay.getByTestId("history-v2-view-original")).toBeVisible();
+      await overlay.getByTestId("history-v2-view-original").click();
+      await expect(overlay.locator('img[alt="Original"]')).toBeVisible();
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();
@@ -192,14 +200,54 @@ test.describe("Studio Phase-E contract harness (fake backend)", () => {
     }
   });
 
-  test.fixme("F2. Sparse detail overlay waits for E4 nullable-section guard", async ({ page }) => {
+  test("F2. Sparse failed Generation opens a truthful zero-output detail overlay", async ({ page }) => {
+    // Root cause of the former fixme was TEST-side, not production: the
+    // default feed hides failed/canceled statuses
+    // (web/history-v2-view-state.js DEFAULT_HIDDEN_STATUSES), so the sparse
+    // failed card never rendered and the click timed out. Enable the Failed
+    // toggle first; the E4A nullable-section guards then render the record.
     const fx = await setupFakeTest(page);
     try {
       await seedPhaseE(fx);
       await fx.gotoPage("history");
+      const failedToggle = page.locator(
+        'button.comfymodal-studio-history-v2-toggle[data-status="failed"]'
+      );
+      await expect(failedToggle).toBeVisible();
+      await failedToggle.click();
+
       const overlay = await openGenerationDetail(page, PHASE_E_IDS.sparseFailed);
+      await expect(overlay.locator(".comfymodal-studio-history-v2-chip.status-failed").first()).toContainText("Failed");
+      await expect(overlay).toContainText("sparse phase e failure");
       await expect(overlay).toContainText("No outputs");
-      await expect(overlay).toContainText("Failed");
+      await expect(overlay.locator(".comfymodal-studio-history-v2-thumb-img")).toHaveCount(0);
+      await expect(
+        overlay.locator(".comfymodal-studio-history-v2-section-title").filter({ hasText: "Parameters" })
+      ).toHaveCount(0);
+
+      await overlay.locator(".comfymodal-studio-history-v2-overlay-close").click();
+      await expect(overlay).toBeHidden();
+      fx.assertNoConsoleErrors();
+    } finally {
+      fx.guard.dispose();
+    }
+  });
+
+  test("F3. Sparse interrupted Generation detail renders and closes cleanly", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    try {
+      await seedPhaseE(fx);
+      await fx.gotoPage("history");
+      const overlay = await openGenerationDetail(page, PHASE_E_IDS.sparseInterrupted);
+      await expect(overlay.locator(".comfymodal-studio-history-v2-chip.status-interrupted").first()).toContainText("Interrupted");
+      await expect(overlay).toContainText("No outputs");
+      await expect(overlay.locator(".comfymodal-studio-history-v2-thumb-img")).toHaveCount(0);
+      await expect(
+        overlay.locator(".comfymodal-studio-history-v2-section-title").filter({ hasText: "Parameters" })
+      ).toHaveCount(0);
+
+      await overlay.locator(".comfymodal-studio-history-v2-overlay-close").click();
+      await expect(overlay).toBeHidden();
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();

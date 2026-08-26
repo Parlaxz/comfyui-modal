@@ -1,0 +1,52 @@
+{
+  "mode": "golden_p1_serial",
+  "method": "run_golden_serial_stream",
+  "target": {
+    "app_name": "stable-modal-comfy-v2-golden-p1",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "gpu": "rtx-pro-6000"
+  },
+  "deployment_identity": {
+    "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "deployment_combined_hash": "bf0ac45a6b04ed73bc6e8c5be93907ff43e3c7be9210cc41136571d17dd851a7",
+    "deployed_at": "2026-08-26T22:01:29.762834+00:00"
+  },
+  "workflow": {
+    "source_path": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\latest_benchmark_workflow.json",
+    "workflow_hash": "5f5d5e73b311748300b1fa60ac1663488e0650cd6f10cc545c8e176e7255eae3",
+    "prompt_sha256": "5f5d5e73b311748300b1fa60ac1663488e0650cd6f10cc545c8e176e7255eae3",
+    "captured_at": "1787068470.161359"
+  },
+  "expected_output_sha": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+  "expected_flags": {},
+  "run_count_requested": 1,
+  "attempt_count": 1,
+  "valid_count": 0,
+  "invalid_count": 1,
+  "dnf_count": 1,
+  "gap_seconds": 35.0,
+  "strict_serial": true,
+  "started_utc": "2026-08-26T22:02:15.436242+00:00",
+  "completed_utc": "2026-08-26T22:04:12.223306+00:00",
+  "cohort_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\artifacts\\phase_p1_serial_golden_v1\\cohort_2026-08-26_22-02-15_528bef",
+  "attempts": [
+    {
+      "run_index": 0,
+      "request_id": "golden-p1-0-2f5ad72cfc4a",
+      "dispatch_unix_ms": 1787781735799,
+      "duration_ms": 116422.579,
+      "event_count": 0,
+      "valid": false,
+      "dnf": true,
+      "true_cold": false,
+      "failures": [
+        "RemoteError: "
+      ],
+      "observed_output_shas": null,
+      "observed_flags": null,
+      "identity": {},
+      "cold_evidence": {}
+    }
+  ]
+}

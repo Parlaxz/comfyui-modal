@@ -206,3 +206,91 @@ def run_capture_hygiene(*, manifest_captured: bool = False) -> dict[str, Any]:
 
 def latest_hygiene_event() -> dict[str, Any] | None:
     return _LATEST_HYGIENE
+
+
+def prove_snapshot_quiescence(*, timeout_s: float = 10.0) -> dict[str, Any]:
+    """Prove cache and registered executor work are quiescent.
+
+    This is deliberately fail-closed.  Executor enumeration is shared with
+    the snapshot manifest so the proof and the diagnostic describe the same
+    global executor registry.
+    """
+    checks: list[dict[str, Any]] = []
+    try:
+        from .clip_conditioning_cache import quiesce_for_snapshot
+
+        cache_result = quiesce_for_snapshot(timeout_s=timeout_s)
+    except Exception as exc:
+        cache_result = {
+            "quiesced": False,
+            "joined_workers": 0,
+            "pending_dropped": 0,
+            "details": [f"conditioning cache proof failed: {type(exc).__name__}: {exc}"],
+        }
+    checks.append({"name": "exact_clip_conditioning_cache", **cache_result})
+
+    try:
+        from .snapshot_build_manifest import enumerate_registered_executors
+
+        executors = enumerate_registered_executors()
+    except Exception as exc:
+        checks.append({
+            "name": "registered_executors",
+            "proven": False,
+            "details": [f"executor registry enumeration failed: {type(exc).__name__}: {exc}"],
+        })
+        executors = []
+
+    for item in executors:
+        executor = item.get("object")
+        pending: int | None = None
+        observations: list[str] = []
+        try:
+            work_queue = getattr(executor, "_work_queue", None)
+            if work_queue is not None and callable(getattr(work_queue, "qsize", None)):
+                pending = int(work_queue.qsize())
+                observations.append("work_queue")
+        except Exception:
+            pending = None
+        try:
+            pending_items = getattr(executor, "_pending_work_items", None)
+            if pending_items is not None:
+                count = len(pending_items)
+                pending = max(pending or 0, count)
+                observations.append("pending_work_items")
+        except Exception:
+            pass
+        proven = pending == 0
+        if pending is None:
+            proven = False
+            observations.append("pending_work_unobservable")
+        checks.append({
+            "name": f"{item.get('module', '')}.{item.get('attr', '')}",
+            "type": item.get("type"),
+            "pending_work": pending,
+            "proven": proven,
+            "observations": observations,
+        })
+
+    if not executors:
+        checks.append({
+            "name": "registered_executors",
+            "registered": 0,
+            "pending_work": 0,
+            "proven": True,
+        })
+    def _check_ok(check: dict[str, Any]) -> bool:
+        # Checks report their boolean under different semantic keys:
+        # cache quiesce uses "quiesced", executor proofs use "proven".
+        # (E40 hotfix: aggregating on "proven" alone made every proof
+        # False whenever the conditioning-cache check was present.)
+        if "proven" in check:
+            return bool(check["proven"])
+        if "quiesced" in check:
+            return bool(check["quiesced"])
+        return False
+
+    return {
+        "proven": all(_check_ok(check) for check in checks),
+        "checks": checks,
+    }

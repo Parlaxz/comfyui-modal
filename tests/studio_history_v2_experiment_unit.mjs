@@ -10,8 +10,8 @@
 //   - attempts surfaced when the record carries them
 //   - cell Retry only for failed cells; Resume only when interrupted or
 //     queued/not-started cells exist (never while running)
-//   - Generate Original deferred: visibly unavailable, never calls
-//     repository generation or asset export
+//   - Generate Original (E4C): routed through the cell's generation_id,
+//     one call site, disabled gate when no Generation identity exists.
 //   - legacy rendering compatibility: renderExperimentDetail retained, the
 //     counts line and axis line builders unchanged ("12 results · 12 total
 //     cells", "Axis X: ... · Axis Y: ...")
@@ -30,6 +30,7 @@ import {
   historyCellIdentity,
   historyResumeEligible,
   historyRetryEligible,
+  historyExperimentCancelEligible,
   historyCellAttemptCount,
   cellWorkflowMeta,
   buildExperimentCountsText,
@@ -276,27 +277,30 @@ function makeCell(overrides) {
   section("6. Resume eligibility");
 }
 
-// ── 7. Generate Original deferred; never calls repository generation ─────
+// ── 7. Generate Original uses the cell's Generation identity (E4C) ───────
 
 {
-  // The module must not call the repository's generation/asset-export
-  // methods anywhere — the gate is a disabled control, not a request.
-  assert.equal(MODULE_SRC.includes("generateOriginalForCell"), false, "no repository generateOriginalForCell call");
-  assert.equal(MODULE_SRC.includes("generateOriginal("), false, "no repository generateOriginal call");
-  assert.equal(MODULE_SRC.includes("Generate Original (unavailable"), true, "the disabled gate label is rendered");
+  // E4C: the cell action POSTs through repo.generateOriginalForCell with the
+  // CELL'S generation_id — one call site, no fanout, no legacy endpoint, and
+  // cells without a generation_id render a truthful disabled gate.
+  assert.equal(MODULE_SRC.includes("repo.generateOriginalForCell(genId,"), true,
+    "single repository generateOriginalForCell call with generation identity");
+  assert.equal(MODULE_SRC.split("repo.generateOriginalForCell(").length - 1, 1,
+    "no browser fanout — exactly one call site");
+  assert.equal(MODULE_SRC.includes("_cellGenerationId(cell)"), true);
+  assert.equal(MODULE_SRC.includes("Generate Original unavailable"), true,
+    "cells without a generation_id keep a disabled gate label");
 
-  // A repo stub that throws if generation is requested proves the detail
-  // page never triggers it (the entry point remains exported and callable
-  // only with a DOM, so the contract is enforced statically above).
+  // A repo stub that throws if generation is requested proves the pure gate
+  // helpers above never touch the repo on their own.
   const repo = {
     getExperiment: async () => makeRecord({
       cells: [makeCell({ key: "c0", status: "completed" })],
     }),
     generateOriginalForCell: async () => { throw new Error("must never be called"); },
   };
-  // Import-time contract: the pure gate helpers above do not touch the repo.
   assert.equal(typeof repo.generateOriginalForCell, "function");
-  section("7. Generate Original deferred, no repository generation");
+  section("7. Generate Original routed through the cell's generation_id");
 }
 
 // ── 8. Legacy rendering compatibility ────────────────────────────────────
@@ -333,6 +337,114 @@ function makeCell(overrides) {
   assert.equal(MODULE_SRC.includes("Retry experiment"), true, "retry button label retained (disabled)");
   assert.equal(MODULE_SRC.includes("disabled: true"), true, "the retry-all button is disabled");
   section("8. Legacy rendering compatibility");
+}
+
+// ── 9. Experiment Cancel eligibility (durable-state truth table) ─────────
+
+{
+  // Backend truth (experiment_modern_routes._handle_cancel): cancel applies
+  // exactly when at least one cell is queued or running; an all-terminal
+  // aggregate is refused (409 EXPERIMENT_TERMINAL / idempotent 200).
+  const queuedOnly = makeRecord({
+    status: "running",
+    cells: [makeCell({ key: "c0", status: "queued" }), makeCell({ key: "c1", status: "queued" })],
+  });
+  assert.equal(historyExperimentCancelEligible(queuedOnly), true, "queued cells are cancelable");
+
+  const running = makeRecord({
+    status: "running",
+    cells: [
+      makeCell({ key: "c0", status: "completed" }),
+      makeCell({ key: "c1", status: "running" }),
+      makeCell({ key: "c2", status: "queued" }),
+    ],
+  });
+  assert.equal(historyExperimentCancelEligible(running), true, "any running cell keeps Cancel available");
+
+  const mixedTerminalPlusQueued = makeRecord({
+    status: "running",
+    cells: [
+      makeCell({ key: "c0", status: "completed" }),
+      makeCell({ key: "c1", status: "failed" }),
+      makeCell({ key: "c2", status: "canceled" }),
+      makeCell({ key: "c3", status: "queued" }),
+    ],
+  });
+  assert.equal(historyExperimentCancelEligible(mixedTerminalPlusQueued), true,
+    "terminal siblings do not block a queued cell");
+
+  // Terminal aggregates — no enabled Cancel that can only fail.
+  const completed = makeRecord({
+    status: "completed",
+    cells: [makeCell({ key: "c0", status: "completed" }), makeCell({ key: "c1", status: "success" })],
+  });
+  assert.equal(historyExperimentCancelEligible(completed), false, "completed is terminal");
+
+  const withFailures = makeRecord({
+    status: "completed_with_failures",
+    cells: [makeCell({ key: "c0", status: "completed" }), makeCell({ key: "c1", status: "failed" })],
+  });
+  assert.equal(historyExperimentCancelEligible(withFailures), false, "completed_with_failures is terminal");
+
+  const failedAggregate = makeRecord({
+    status: "failed",
+    cells: [makeCell({ key: "c0", status: "error" })],
+  });
+  assert.equal(historyExperimentCancelEligible(failedAggregate), false, "failed aggregate is terminal");
+
+  const canceled = makeRecord({
+    status: "canceled",
+    cells: [makeCell({ key: "c0", status: "cancelled" })],
+  });
+  assert.equal(historyExperimentCancelEligible(canceled), false, "already-canceled is terminal");
+
+  // interrupted-only is terminal-like per the backend truth table (all cells
+  // in _TERMINAL_CANONICAL → 409); eligibility must not broaden it.
+  const interruptedOnly = makeRecord({
+    status: "interrupted",
+    cells: [makeCell({ key: "c0", status: "interrupted" }), makeCell({ key: "c1", status: "aborted" })],
+  });
+  assert.equal(historyExperimentCancelEligible(interruptedOnly), false,
+    "interrupted-only follows backend terminal truth");
+
+  assert.equal(historyExperimentCancelEligible(null), false, "no record → not eligible");
+  assert.equal(historyExperimentCancelEligible(makeRecord({})), false, "no cells → not eligible");
+  section("9. Experiment Cancel eligibility from durable state");
+}
+
+// ── 10. History Cancel UI contract + cell-menu focus fix (F1B) ───────────
+
+{
+  // Cancel parity: exactly one repository call site; no second cancellation
+  // concept; eligibility gates the control.
+  assert.equal(MODULE_SRC.split("repo.cancelExperiment(").length - 1, 1,
+    "exactly one repo.cancelExperiment call site in History UI");
+  assert.equal(MODULE_SRC.includes("historyExperimentCancelEligible(rec)"), true,
+    "Cancel visibility derives from durable eligibility");
+  assert.equal(MODULE_SRC.includes('"history-v2-experiment-cancel"'), true, "cancel testid present");
+
+  // No optimistic canceled state: the module never writes canceled onto
+  // cells or fabricates a terminal aggregate locally.
+  assert.equal(/\.status\s*=\s*["']canceled["']/.test(MODULE_SRC), false,
+    "no local cell.status = 'canceled' fabrication");
+  assert.equal(MODULE_SRC.includes("CANCELLATION_UNAVAILABLE"), true,
+    "structured refusal code handled without parsing human text");
+
+  // Cell menu focus fix (F1 audit latent defect): the unbound `item.focus()`
+  // is gone and focus lands on the first actionable menu button.
+  assert.equal(/\bitem\.focus\(\)/.test(MODULE_SRC), false, "unbound item.focus() removed");
+  assert.equal(MODULE_SRC.includes('menu.querySelector("button:not([disabled])")'), true,
+    "focus targets the first actionable menu item");
+
+  // Original cell-menu actions stay intact through the fix.
+  assert.equal(MODULE_SRC.includes("_runCellGenerateOriginal(genId, rerender)"), true,
+    "Generate Original callback intact");
+  assert.equal(MODULE_SRC.includes("_runCellRetryOriginal(genId)"), true, "Retry Original callback intact");
+
+  // F2A canonical cell favorite ownership preserved (Generation-backed).
+  assert.equal(MODULE_SRC.includes("repo.setFavorite(genId, next)"), true,
+    "cell favorite still drives the Generation route");
+  section("10. History Cancel UI contract + cell-menu focus fix");
 }
 
 console.log("PASS: studio history v2 experiment detail unit tests");

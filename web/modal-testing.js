@@ -1,39 +1,15 @@
 import { app } from "../../scripts/app.js";
 import { api as comfyApi } from "../../scripts/api.js";
 import { ensureTestingStyles } from "./testing-styles.js";
-import { bootstrapLoader } from "./testing-api.js";
-import { createDefaultDraft, createPreviewState, normalizeDraft } from "./testing-setup-adapter.js";
 import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
-import { mountLegacyTab, stopLegacyController } from "./studio-legacy.js";
+import { parseStudioHash } from "./studio-routing.js";
 import { el, registerLayerHandler } from "./studio-ui.js";
 
 // Backward-compat flag preserved for external scripts/custom nodes that may
-// still read it. Legacy sidebar tabs are now controlled by an explicit opt-in.
+// still read it. Hidden legacy sidebar registrations were removed (H10);
+// this module provides the single Studio sidebar entry.
 window.__comfyModalUnifiedUI = true;
-
-// ── Focus trap helper (Tab/Shift+Tab containment for modals) ────────────
-
-function _trapTab(e, containerEl) {
-  if (e.key !== "Tab" || !containerEl) return;
-  var focusable = containerEl.querySelectorAll(
-    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-  );
-  if (focusable.length === 0) return;
-  var first = focusable[0];
-  var last = focusable[focusable.length - 1];
-  if (e.shiftKey) {
-    if (document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    }
-  } else {
-    if (document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  }
-}
 
 // ── Inert helper for background content ─────────────────────────────────
 
@@ -85,11 +61,7 @@ function _syncModalWizardState() {
 }
 
 const MODAL_PREFIX = "/comfymodal";
-const TAB_DASHBOARD = "dashboard";
 const TAB_SETUP = "setup";
-const TAB_PROFILES = "profiles";
-const TAB_RESULTS = "results";
-const TAB_HISTORY = "history";
 const TAB_SETTINGS = "settings";
 const PREFIX = "[comfymodal.testing]";
 const HOST_CLASS = "comfymodal-testing-host";
@@ -134,7 +106,7 @@ function buildShell() {
     "aria-labelledby": "comfymodal-studio-heading",
   });
   const header = el("div", { class: "comfymodal-studio-header" }, [
-    el("h2", { id: "comfymodal-studio-heading", text: "Modal GPU" }),
+    el("h1", { id: "comfymodal-studio-heading", text: "Modal GPU" }),
     el("button", {
       class: "comfymodal-testing-close",
       "aria-label": "Close modal",
@@ -151,70 +123,65 @@ function buildShell() {
 let _hostEl = null;
 let _isOpen = false;
 let _shellCache = null;
-let _currentTab = null;
-let _currentController = null;
 let _triggerEl = null;
 
-// Draft state: persists across modal close/reopen within a session.
-// Keys: "setup" -> normalized draft (user intent), "results" -> experimentId, etc.
-const _draftState = {};
+// ── Frozen legacy-opener redirects (H5 §22 / H10) ────────────────────────
+//
+// Old opener aliases land on modern owners:
+//   dashboard → Backend (operational launchpad intent, re-homed by H6)
+//   setup     → Playground (Experiment mode context surfaced)
+//   profiles  → Playground (Comparison Profiles UI retires in Wave E)
+//   results   → History (History V2 is the sole durable History)
+//   history   → History
+//   settings  → Settings
+// Retired aliases land directly on modern pages — no dead legacy-tab state.
 
-// Runtime preview state: kept separate from the persisted draft.
-// Used for preview counts, validation summaries, etc.
-// This is NOT persisted and resets on each tab mount.
-const _previewState = { setup: null };
+const ALIAS_PAGE_MAP = {
+  playground: "playground",
+  dashboard: "backend",
+  setup: "playground",
+  profiles: "playground",
+  results: "history",
+  history: "history",
+  settings: "settings",
+};
 
-// ── Browser-refresh persistence via localStorage ──────────────────────────
+const ALIAS_DEPRECATION_MESSAGES = {
+  setup: "Legacy Setup has retired. Experiments now live in Playground \u2192 Experiment mode.",
+  profiles: "Comparison Profiles have retired. Preset comparisons live in Playground \u2192 Experiment mode; workflow configuration lives in Workflows.",
+};
 
-const DRAFT_STORAGE_KEY = "comfymodal_setup_draft";
-const EXPERIMENT_ID_KEY = "comfymodal_last_experiment_id";
-
-function _debounce(fn, ms) {
-  let timer = null;
-  return function (...args) {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => { timer = null; fn.apply(this, args); }, ms);
-  };
+function _showAliasDeprecationNotice(alias) {
+  const message = ALIAS_DEPRECATION_MESSAGES[alias];
+  if (!message || !_shellCache || !_hostEl || !_hostEl.contains(_shellCache.overlay)) return;
+  try { console.info(PREFIX, message); } catch (_) { }
+  const body = _shellCache.body;
+  if (!body) return;
+  const notice = el("div", {
+    "data-testid": "alias-deprecation-notice",
+    text: message,
+    style: "margin:0 0 12px;padding:8px 12px;border:1px solid var(--color-warning,#b45309);border-radius:6px;background:var(--color-warning-bg,#3a2e14);color:var(--color-text-primary,#e1e4ea);font-size:var(--font-size-sm,12px);",
+  });
+  body.insertBefore(notice, body.firstChild);
+  setTimeout(() => {
+    if (notice.parentNode) notice.parentNode.removeChild(notice);
+  }, 6000);
 }
 
-function _setStorageJSON(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) { /* quota or private mode */ }
-}
-
-function _getStorageJSON(key) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : null;
-  } catch (_) { return null; }
-}
-
-function _removeStorage(key) {
-  try { localStorage.removeItem(key); } catch (_) { /* noop */ }
-}
-
-const _saveDraftToStorage = _debounce((draft) => {
-  _setStorageJSON(DRAFT_STORAGE_KEY, draft);
-}, 300);
-
-function _loadDraftFromStorage() {
-  return _getStorageJSON(DRAFT_STORAGE_KEY);
-}
-
-function _saveExperimentIdToStorage(id) {
-  _setStorageJSON(EXPERIMENT_ID_KEY, id);
-}
-
-function _loadExperimentIdFromStorage() {
-  return _getStorageJSON(EXPERIMENT_ID_KEY);
-}
-
-function _stopCurrentController() {
-  if (_currentController && typeof _currentController.stop === "function") {
-    try { _currentController.stop(); } catch (e) { }
+function _applyLegacyAliasNavigation(tabName, studioApi) {
+  if (!studioApi || typeof studioApi.setPage !== "function") return;
+  const page = ALIAS_PAGE_MAP[tabName] || "playground";
+  // Surface the existing Experiment-mode context for the retired Setup alias.
+  // Uses only the pre-existing in-memory playground.experimentMode flag —
+  // no new state semantics, nothing persisted.
+  if (tabName === TAB_SETUP && typeof studioApi.getState === "function") {
+    const shellState = studioApi.getState();
+    if (shellState && shellState.playground) shellState.playground.experimentMode = true;
   }
-  _currentController = null;
+  studioApi.setPage(page);
 }
 
+// Modal host element: the persistent mount point for the shell overlay.
 function ensureHost() {
   if (_hostEl && document.body.contains(_hostEl)) return _hostEl;
   _hostEl = document.createElement("div");
@@ -240,17 +207,6 @@ export function open_testing_modal(tabName) {
   // Inert/aria-hidden background content so screen readers don't reach behind modal
   _inertBackground(true);
 
-  // Map old tab names to Studio pages
-  const pageMap = {
-    playground: "playground",
-    dashboard: "settings",
-    setup: "settings",
-    profiles: "settings",
-    results: "settings",
-    history: "history",
-    settings: "settings",
-  };
-
   if (_shellCache && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "flex";
     if (!_shellCache._escHandler && !_shellCache._layerBased) {
@@ -275,13 +231,19 @@ export function open_testing_modal(tabName) {
     var focusTarget = _shellCache.overlay.querySelector(".comfymodal-testing-close, .comfymodal-studio-topnav button, [data-page]");
     if (focusTarget) focusTarget.focus();
     if (tabName && _shellCache._studioApi) {
-      const page = pageMap[tabName] || "playground";
-      // Set activeLegacyTab for legacy tabs when shell is cached
-      if (page === "settings" && (tabName === "setup" || tabName === "profiles" || tabName === "results")) {
-        const shellState = _shellCache._studioApi.getState();
-        shellState.settings.activeLegacyTab = tabName;
+      _applyLegacyAliasNavigation(tabName, _shellCache._studioApi);
+      _showAliasDeprecationNotice(tabName);
+    } else if (_shellCache._studioApi && typeof _shellCache._studioApi.applyRoute === "function") {
+      // I9 reopen contract: a #comfymodal= hash present in the URL (copied
+      // link or set before close) is honored on the next open. Explicit
+      // programmatic alias intent above takes precedence for its invocation.
+      const parsed = parseStudioHash(window.location.hash);
+      if (parsed.matched) {
+        _shellCache._studioApi.applyRoute(
+          { page: parsed.page, focus: parsed.focus },
+          { rerender: true }
+        );
       }
-      _shellCache._studioApi.setPage(page);
     }
     return _shellCache;
   }
@@ -294,7 +256,8 @@ export function open_testing_modal(tabName) {
     if (e.target === shell.overlay) close_testing_modal();
   });
 
-  // Layer-based Escape handler (layer 2 = dialog/shell) + Tab trap
+  // Layer-based Escape handler (layer 2 = dialog/shell). Tab containment is
+  // provided by the inert background, not a JS focus trap.
   shell._escHandler = registerLayerHandler(2, {
     escape: function () {
       if (shell._destroyed) return false;
@@ -304,53 +267,36 @@ export function open_testing_modal(tabName) {
   });
   shell._layerBased = true;
 
-  // Mount the Studio shell (replaces old 6-tab nav)
-  // Build context with apiBase, comfyApi, mountLegacyTab, and draft callbacks.
-  // draft/previewState/experimentId use getters so they are read FRESH each
-  // mount instead of freezing state at initial shell mount time.
+  // Mount the Studio shell (replaces old 6-tab nav).
+  // H18 Wave G: the legacy draft/preview/experimentId context machinery is
+  // deleted — its only consumer was the retired studio-legacy.js mount
+  // surface. The context now carries only what modern pages consume.
   const studioContext = {
     apiBase: MODAL_PREFIX,
     comfyApi: comfyApi,
-    mountLegacyTab: mountLegacyTab,
-    // Draft state and callbacks for legacy setup tab (getter = fresh each mount)
-    get draft() { return _draftState.setup ? normalizeDraft(_draftState.setup) : null; },
-    onDraftChange: (draft) => {
-      _draftState.setup = normalizeDraft(draft);
-      _saveDraftToStorage(_draftState.setup);
-      _previewState.setup = createPreviewState(draft);
-    },
-    onRun: (expId) => {
-      if (expId) {
-        _draftState.lastExperimentId = expId;
-        _saveExperimentIdToStorage(expId);
-        // Navigate to Settings > Legacy Results when run starts
-        if (_shellCache && _shellCache._studioApi) {
-          _shellCache._studioApi.setPage("settings");
-          _shellCache._studioApi.getState().settings.activeLegacyTab = "results";
-        }
-        open_testing_modal(TAB_RESULTS);
-      }
-    },
-    get previewState() { return _previewState.setup ? { ..._previewState.setup } : null; },
-    get experimentId() { return _draftState.lastExperimentId || _loadExperimentIdFromStorage() || ""; },
     setPage: (page) => { if (_shellCache && _shellCache._studioApi) _shellCache._studioApi.setPage(page); },
   };
-  const studioApi = mountStudioShell(shell.body, studioContext);
+  // I9 routing precedence for THIS invocation: an explicit programmatic
+  // alias opener wins over a stale URL hash — the alias target is passed as
+  // the shell's initial route so the hash can never silently override it.
+  // The resulting canonical route is serialized by the shell's setPage.
+  // Without tabName, the shell itself honors a present #comfymodal= hash
+  // (copied link / pre-reload marker) and otherwise lands on Playground.
+  const mountOptions = tabName
+    ? { initialRoute: { page: ALIAS_PAGE_MAP[tabName] || "playground", focus: null } }
+    : {};
+  const studioApi = mountStudioShell(shell.body, studioContext, mountOptions);
   shell._studioApi = studioApi;
 
   // Navigate to initial page if specified
   if (tabName) {
-    const page = pageMap[tabName] || "playground";
-    // For legacy tabs mapped to settings, set activeLegacyTab BEFORE setting
-    // the page so the settings renderer shows the legacy view directly
-    if (page === "settings" && (tabName === "setup" || tabName === "profiles" || tabName === "results")) {
-      const shellState = studioApi.getState();
-      shellState.settings.activeLegacyTab = tabName;
-    }
-    studioApi.setPage(page);
+    _applyLegacyAliasNavigation(tabName, studioApi);
   }
 
   _hostEl.appendChild(shell.overlay);
+  if (tabName) {
+    _showAliasDeprecationNotice(tabName);
+  }
   _isOpen = true;
   updateDiag("modalOpen", true);
 
@@ -367,8 +313,6 @@ export function open_testing_modal(tabName) {
 }
 
 function close_testing_modal() {
-  // Stop any active legacy controller (e.g. results polling) when modal closes
-  stopLegacyController();
   if (_shellCache && _hostEl && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "none";
     // Clean up layer keyboard handler (idempotent)
@@ -391,82 +335,11 @@ function close_testing_modal() {
   }
 }
 
-async function resolveModule(path) {
-  try {
-    return await import(path);
-  } catch (e) {
-    console.warn(PREFIX, "module load failed:", path, e);
-    return null;
-  }
-}
-
-const TAB_MODULES = {
-  [TAB_DASHBOARD]: { path: "./testing-dashboard.js", fn: "dashboard_tab_render" },
-  [TAB_SETUP]:    { path: "./testing-setup.js", fn: "setup_tab_render" },
-  [TAB_PROFILES]: { path: "./testing-profiles.js", fn: "profiles_tab_render" },
-  [TAB_RESULTS]:  { path: "./testing-results.js", fn: "results_tab_render" },
-  [TAB_HISTORY]:  { path: "./testing-history.js", fn: "history_tab_render" },
-  [TAB_SETTINGS]: { path: "./testing-settings.js", fn: "settings_tab_render" },
-};
-
-function mountLazyTab(container, tabName) {
-  const mod = TAB_MODULES[tabName];
-  if (!mod) {
-    container.textContent = `Unknown tab: ${tabName}`;
-    return;
-  }
-
-  const loader = bootstrapLoader(container, async () => {
-    const m = await resolveModule(mod.path);
-    if (m && typeof m[mod.fn] === "function") {
-      while (container.firstChild) container.removeChild(container.firstChild);
-
-      // Build options with draft state and experiment context
-      const tabOptions = { apiBase: MODAL_PREFIX };
-
-      // Inject draft state for setup
-      // The normalized draft persists across close/reopen/tab switches.
-      // Runtime preview state is held separately in _previewState.
-      if (tabName === TAB_SETUP) {
-        // Ensure stored draft is normalized; lazily create default if none
-        if (!_draftState.setup) {
-          _draftState.setup = _loadDraftFromStorage() || createDefaultDraft();
-        }
-        tabOptions.draft = normalizeDraft(_draftState.setup);
-        tabOptions.onDraftChange = (draft) => {
-          _draftState.setup = normalizeDraft(draft);
-          _saveDraftToStorage(_draftState.setup);
-          // Recompute preview state on draft change
-          _previewState.setup = createPreviewState(draft);
-        };
-        tabOptions.onRun = (expId) => {
-          if (expId) {
-            _draftState.lastExperimentId = expId;
-            _saveExperimentIdToStorage(expId);
-            // Open Results tab after run starts
-            open_testing_modal(TAB_RESULTS);
-          }
-        };
-        // Attach preview state if available (null on first mount)
-        tabOptions.previewState = _previewState.setup
-          ? { ..._previewState.setup }
-          : null;
-      }
-
-      // Inject experiment context for results
-      if (tabName === TAB_RESULTS) {
-        tabOptions.experimentId = _draftState.lastExperimentId || _loadExperimentIdFromStorage() || "";
-      }
-
-      const result = m[mod.fn](container, comfyApi, tabOptions);
-      _currentController = result || null;
-      _currentTab = tabName;
-    } else {
-      throw new Error(`Module ${mod.path} missing export ${mod.fn}`);
-    }
-  });
-  loader.attempt();
-}
+// H14 Wave E: the lazy legacy-tab machinery (TAB_MODULES/mountLazyTab) and
+// the studio-legacy.js mount surface are retired. H18 Wave G deleted the
+// studio-legacy.js and testing-*.js files themselves. No legacy tab is
+// mountable from the Studio shell. Modern alias routing below is preserved
+// unchanged (H10).
 
 function buildSidebarPanel() {
   const statusEl = el("div", { class: "launcher-status", text: "Studio shell ready" });
@@ -475,16 +348,11 @@ function buildSidebarPanel() {
     el("div", { class: "launcher-subtitle", text: "Playground, History, Backend, Settings" }),
     el("button", { text: "Open Studio", onclick: () => open_testing_modal() }),
     el("button", {
-      text: "Open Legacy Settings",
+      text: "Open Settings",
       onclick: () => {
-        if (typeof window.open_comfymodal_settings === "function") {
-          statusEl.style.color = "";
-          statusEl.textContent = "Opening legacy settings…";
-          window.open_comfymodal_settings();
-          return;
-        }
-        statusEl.style.color = "#e05050";
-        statusEl.textContent = "Legacy settings unavailable.";
+        statusEl.style.color = "";
+        statusEl.textContent = "Opening Settings\u2026";
+        open_testing_modal(TAB_SETTINGS);
       },
     }),
     statusEl,

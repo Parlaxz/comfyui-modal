@@ -182,9 +182,15 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
       const notes = overlay.locator("textarea.comfymodal-studio-history-v2-notes");
       await notes.fill("persisted deterministic note");
       await overlay.getByRole("button", { name: "Save note" }).click();
-      // The notes section's status line is the first action-note in the overlay
-      // (the Actions/Generate section has its own action-note span).
-      await expect(overlay.locator(".comfymodal-studio-history-v2-action-note").first()).toHaveText("Saved", {
+      // The note-save status lives in the Note section's action row — scope
+      // to the row containing the Save control (the overlay now carries other
+      // action-note elements, e.g. the F6 download note).
+      await expect(
+        overlay
+          .locator(".comfymodal-studio-history-v2-action-row")
+          .filter({ hasText: "Save note" })
+          .locator(".comfymodal-studio-history-v2-action-note")
+      ).toHaveText("Saved", {
         timeout: 5000,
       });
 
@@ -630,11 +636,12 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
       );
 
       // Unavailable output/snapshot sections are omitted: no featured image,
-      // no other-output thumbnails, and the Generate Original action is
-      // disabled (nothing to generate from).
+      // no other-output thumbnails.  A plain failed ordinary run offers the
+      // truthful "Retry run" verb (F6) — never an idle Generate Original.
       await expect(overlay.locator(".comfymodal-studio-history-v2-featured-img")).toHaveCount(0);
       await expect(overlay.locator(".comfymodal-studio-history-v2-output-thumb")).toHaveCount(0);
-      await expect(overlay.locator('[data-testid="history-v2-generate-original"]')).toBeDisabled();
+      await expect(overlay.locator('[data-testid="history-v2-retry-original"]')).toHaveText("Retry run");
+      await expect(overlay.locator('[data-testid="history-v2-generate-original"]')).toHaveCount(0);
 
       // Metadata still renders (Run ID row present).
       await expect(overlay.locator(".comfymodal-studio-history-v2-row-key", { hasText: "Run ID" })).toBeVisible();

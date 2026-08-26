@@ -832,6 +832,17 @@ change_requires = "deploy"
 owner = "v2-core"
 description = "Pin deployment to a single Modal region (empty = provider default)."
 
+# ── P1 serial-Golden runtime (deploy-baked; consumed during restore) ────────
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "P1 serial-Golden dynamic-VRAM path: hydrate model payloads directly into GPU memory during restore instead of the CPU-snapshot defaults. Deploy-baked via modal_app _runtime_env(); a changed value requires a redeploy."
+
 # ── Harness selectors (consumed by the request harness; run-only) ───────────
 
 [[flag]]

@@ -298,11 +298,8 @@ class CanonicalExecuteFallbackTests(unittest.TestCase):
         )
         self.assertIn("result[\"trace\"] = remote_trace", CANONICAL)
 
-    def test_execute_modal_prompt_local_fallback_present(self):
-        self.assertIn(
-            'attach_waterfall(result, run_label="canonical execute_modal_prompt")',
-            CANONICAL,
-        )
+    # H19 Wave G: test_execute_modal_prompt_local_fallback_present removed
+    # with its deleted subject; execute_plan is the only canonical fallback.
 
     def test_local_fallback_is_idempotent(self):
         # Simulate exactly what execute_plan does: the remote already attached a

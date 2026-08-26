@@ -19,7 +19,7 @@ export const FEATURE_SPECS = [
     supportsImageCanvas: true,
     futureTools: ["SAM click selection", "Text object selection", "Brush refine"],
     isPlaceholder: true,
-    placeholderReason: "Image-edit tools are not implemented in this release. Use Settings > Legacy Setup for the full experiment suite.",
+    placeholderReason: "Image-edit tools are not available in the modern Playground yet.",
     controls: ["prompt", "instruction", "steps", "guidance", "denoise", "seed", "lora", "lora_strength", "mask_blur", "mask_expand"],
   },
   {
@@ -29,7 +29,7 @@ export const FEATURE_SPECS = [
     supportsImageCanvas: true,
     futureTools: ["SAM click selection", "Text object selection", "Reference image"],
     isPlaceholder: true,
-    placeholderReason: "Image-edit tools are not implemented in this release. Use Settings > Legacy Setup for the full experiment suite.",
+    placeholderReason: "Image-edit tools are not available in the modern Playground yet.",
     controls: ["prompt", "instruction", "steps", "guidance", "denoise", "seed", "lora", "lora_strength", "mask_blur", "mask_expand"],
   },
 ];
@@ -163,7 +163,7 @@ export const CONTROL_DEFS = {
     type: "select",
     defaultValue: "",
     experimentEligible: false,
-    helpText: "LoRA model to apply. Configured in Settings > Legacy Setup.",
+    helpText: "LoRA model to apply. Not configurable in the modern Playground yet.",
     applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   lora_strength: {

@@ -1,0 +1,74 @@
+{
+  "mode": "golden_p1_serial",
+  "method": "run_golden_serial_stream",
+  "target": {
+    "app_name": "stable-modal-comfy-v2-golden-p1",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "gpu": "rtx-pro-6000"
+  },
+  "deployment_identity": {
+    "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "deployment_combined_hash": "bf0ac45a6b04ed73bc6e8c5be93907ff43e3c7be9210cc41136571d17dd851a7",
+    "deployed_at": "2026-08-26T16:29:18.840267+00:00"
+  },
+  "workflow": {
+    "source_path": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\latest_benchmark_workflow.json",
+    "workflow_hash": "5f5d5e73b311748300b1fa60ac1663488e0650cd6f10cc545c8e176e7255eae3",
+    "prompt_sha256": "5f5d5e73b311748300b1fa60ac1663488e0650cd6f10cc545c8e176e7255eae3",
+    "captured_at": "1787068470.161359"
+  },
+  "expected_output_sha": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+  "expected_flags": {},
+  "run_count_requested": 1,
+  "attempt_count": 1,
+  "valid_count": 0,
+  "invalid_count": 1,
+  "dnf_count": 0,
+  "gap_seconds": 35.0,
+  "strict_serial": true,
+  "started_utc": "2026-08-26T16:36:11.043171+00:00",
+  "completed_utc": "2026-08-26T16:38:39.894049+00:00",
+  "cohort_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\artifacts\\phase_p1_serial_golden_v1\\cohort_2026-08-26_16-36-11_938a7d",
+  "attempts": [
+    {
+      "run_index": 0,
+      "request_id": "golden-p1-0-4afb6d6831e1",
+      "dispatch_unix_ms": 1787762171365,
+      "duration_ms": 148528.151,
+      "event_count": 1,
+      "valid": false,
+      "dnf": false,
+      "true_cold": false,
+      "failures": [
+        "terminal result count=0, expected exactly 1",
+        "error events present: count=1",
+        "true_durable evidence missing or false",
+        "seriality telemetry absent (required; fail-closed)",
+        "completed teardown telemetry absent",
+        "snapshot proof absent or empty",
+        "commit timestamp evidence absent",
+        "reopen timestamp evidence absent",
+        "TRUE_FIRST_DURABLE_RESULT marker absent",
+        "observed output SHA absent from terminal result"
+      ],
+      "observed_output_shas": [],
+      "observed_flags": {},
+      "identity": {},
+      "cold_evidence": {
+        "identity_tokens": {
+          "container_task_id": "",
+          "modal_container_id": "",
+          "container_session_id": "",
+          "restored_instance_id": ""
+        },
+        "identity_tokens_present": false,
+        "restore_count": null,
+        "request_count": null,
+        "true_cold": false,
+        "basis": "",
+        "reason_not_cold": "insufficient remote/container identity evidence; never inferred"
+      }
+    }
+  ]
+}

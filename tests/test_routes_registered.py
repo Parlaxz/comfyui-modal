@@ -466,7 +466,9 @@ class ComparisonProfileNormalizedViewTests(unittest.TestCase):
 
 
 class ExperimentCreateDetailNormalizedDraftTests(unittest.TestCase):
-    """The experiment create route should persist and return normalized_draft."""
+    """Legacy create is RETIRED_EXECUTION (Phase H Wave F): bounded 410,
+    zero store mutation. Detail still serves stored definitions, including
+    normalized_draft preserved from the pre-freeze era."""
 
     @classmethod
     def setUpClass(cls):
@@ -478,69 +480,82 @@ class ExperimentCreateDetailNormalizedDraftTests(unittest.TestCase):
         # on the filesystem store.
         self.exp_id = f"test_nd_{id(self)}"
 
-    # ── compile → create → detail round-trip with normalized_draft ─────
+    _DRAFT = {
+        "experiment_id": "PLACEHOLDER",
+        "revision": 1,
+        "profile_type": "t2i",
+        "generation_type": "t2i",
+        "workflows": [{
+            "profile_id": "p1",
+            "stacks": [{
+                "stack_id": "s1",
+                "loader_target_group_id": "g_default",
+                "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                "selected_triple_ids": ["main"],
+                "lora_selections": [
+                    {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
+                ],
+            }],
+        }],
+        "prompts": {"items": [
+            {"id": "p_a", "label": "a", "text": "hi", "negative": None, "enabled": True},
+        ]},
+        "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+    }
 
-    def test_create_with_normalized_draft_returns_ok(self):
-        """POST /experiments with normalized_draft returns 200."""
-        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
-        draft = {
+    def _draft(self):
+        draft = json.loads(json.dumps(self._DRAFT))
+        draft["experiment_id"] = self.exp_id
+        return draft
+
+    def _seed_definition(self, normalized_draft=None):
+        """Seed a stored definition + created event the way the retired
+        create route used to (direct REGISTRY store write)."""
+        import copy as _copy
+        from experiment_models import CURRENT_SCHEMA_VERSION
+        store = self.init_mod.REGISTRY.store(self.exp_id)
+        now = "2026-08-24T00:00:00Z"
+        definition = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "experiment_id": self.exp_id,
             "revision": 1,
-            "profile_type": "t2i",
-            "generation_type": "t2i",
-            "workflows": [{
-                "profile_id": "p1",
-                "stacks": [{
-                    "stack_id": "s1",
-                    "loader_target_group_id": "g_default",
-                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
-                    "selected_triple_ids": ["main"],
-                    "lora_selections": [
-                        {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
-                    ],
-                }],
-            }],
-            "prompts": {"items": [
-                {"id": "p_a", "label": "a", "text": "hi", "negative": None, "enabled": True},
-            ]},
-            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+            "name": self.exp_id,
+            "notes": "",
+            "created_at": now,
+            "updated_at": now,
         }
-        req = _MockRequest(json_body={"normalized_draft": draft})
+        if normalized_draft is not None:
+            definition["normalized_draft"] = _copy.deepcopy(normalized_draft)
+        store.write_definition(definition)
+        payload = {
+            "experiment_id": self.exp_id,
+            "name": definition["name"],
+            "compilation": {},
+        }
+        if normalized_draft is not None:
+            payload["normalized_draft"] = _copy.deepcopy(normalized_draft)
+        store.append_event({"type": "experiment.created", "payload": payload})
+        return definition
+
+    def test_create_route_retired_bounded_response_no_mutation(self):
+        """POST /experiments answers 410 EXPERIMENT_RETIRED and writes
+        nothing to the REGISTRY store."""
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
+        req = _MockRequest(json_body={"normalized_draft": self._draft()})
         resp = _run(fn(req))
-        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.status, 410)
         body = json.loads(resp.body)
-        self.assertEqual(body.get("status"), "ok")
+        self.assertEqual(body.get("status"), "error")
+        self.assertEqual(body.get("error_code"), "EXPERIMENT_RETIRED")
+        store = self.init_mod.REGISTRY.store(self.exp_id)
+        self.assertIsNone(store.read_definition(), "retired create must not persist a definition")
 
     def test_detail_returns_normalized_draft_when_present(self):
         """GET /experiments/{id} returns normalized_draft when present
         in the stored experiment."""
-        # Create first.
-        create_fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
-        draft = {
-            "experiment_id": self.exp_id,
-            "revision": 1,
-            "profile_type": "t2i",
-            "generation_type": "t2i",
-            "workflows": [{
-                "profile_id": "p1",
-                "stacks": [{
-                    "stack_id": "s1",
-                    "loader_target_group_id": "g_default",
-                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
-                    "selected_triple_ids": ["main"],
-                    "lora_selections": [
-                        {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
-                    ],
-                }],
-            }],
-            "prompts": {"items": [
-                {"id": "p_a", "label": "a", "text": "hi", "negative": None, "enabled": True},
-            ]},
-            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
-        }
-        _run(create_fn(_MockRequest(json_body={"normalized_draft": draft})))
+        draft = self._draft()
+        self._seed_definition(normalized_draft=draft)
 
-        # Detail.
         detail_fn = _handler_for(self.init_mod, "GET",
                                  "/comfymodal/experiments/{experiment_id}")
         req = _MockRequest(match_info={"experiment_id": self.exp_id})
@@ -565,29 +580,9 @@ class ExperimentCreateDetailNormalizedDraftTests(unittest.TestCase):
         )
 
     def test_detail_missing_normalized_draft_no_error(self):
-        """Detail for an experiment created without normalized_draft
+        """Detail for an experiment stored without normalized_draft
         must not error."""
-        create_fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
-        spec = {
-            "experiment_id": self.exp_id,
-            "revision": 1,
-            "name": "legacy",
-            "workflows": [{
-                "profile_id": "p1",
-                "loader_target_group_id": "g_default",
-                "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
-                "subprofile_triples": [],
-                "selected_triple_ids": ["main"],
-                "lora_slots": [],
-            }],
-            "prompts": {"items": [
-                {"id": "p", "label": "t", "text": "hi", "negative": None, "enabled": True},
-            ]},
-            "images": {"mode": "cartesian", "items": []},
-            "loras": {"selections": []},
-            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
-        }
-        _run(create_fn(_MockRequest(json_body={"spec": spec})))
+        self._seed_definition(normalized_draft=None)
 
         detail_fn = _handler_for(self.init_mod, "GET",
                                  "/comfymodal/experiments/{experiment_id}")

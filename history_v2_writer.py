@@ -34,6 +34,7 @@ from history_v2_models import (
     Asset,
     TERMINAL_RUN_STATUSES,
     logical_output_key_from_metadata,
+    normalize_logical_output_key,
     utc_now_iso,
 )
 from history_v2_repository import HistoryV2Repository
@@ -225,6 +226,45 @@ _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 _OUTPUT_ASSET_TYPES = frozenset({"thumbnail", "preview", "original"})
 
 _THUMBNAIL_MAX = 256
+
+# Asset types that count as REQUIRED workflow results (never derivatives).
+# A Thumbnail alone must never satisfy the required-output association gate.
+_REQUIRED_ASSET_TYPES = frozenset({"preview", "original"})
+
+# Semantic variant values that map a producer/result record onto a History
+# Asset type.  Unknown variants stay backward-compatible Originals.
+_VARIANT_ASSET_TYPES = {
+    "preview": "preview",
+    "original": "original",
+    "main": "original",
+    "thumbnail": "thumbnail",
+}
+
+
+def semantic_output_mode(meta: Any) -> str:
+    """Explicit immutable output mode from E2B request/result metadata.
+
+    Reads ``output_mode`` (then ``variant``) from *meta* and returns exactly
+    ``"preview"`` or ``"original"``.  Preview is NEVER inferred from codec,
+    quality, extension, filename, or MIME type; a legacy call without the
+    semantic field safely defaults to ``"original"``.
+    """
+    if not isinstance(meta, dict):
+        return "original"
+    for key in ("output_mode", "variant"):
+        value = meta.get(key)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("preview", "original"):
+                return normalized
+    return "original"
+
+
+def _asset_type_for_variant(variant: Any) -> str:
+    """History Asset type for a producer/result variant (default original)."""
+    if isinstance(variant, str):
+        return _VARIANT_ASSET_TYPES.get(variant.strip().lower(), "original")
+    return "original"
 
 
 def map_status(status: Any) -> str:
@@ -511,6 +551,70 @@ def _producer_dimension(value: Any) -> Optional[int]:
     return None
 
 
+def _descriptor_for_asset(meta: Any, asset_id: str) -> Optional[dict]:
+    """Find the descriptor dict for *asset_id* in result/history metadata.
+
+    Searches ``derivative_descriptors``, ``asset_descriptors`` and
+    ``output_descriptors``; matches on ``asset_id`` (the content-addressed
+    producer identity).  Returns None when absent.
+    """
+    if not isinstance(meta, dict) or not asset_id:
+        return None
+    for field in ("derivative_descriptors", "asset_descriptors", "output_descriptors"):
+        value = meta.get(field)
+        if not isinstance(value, (list, tuple)):
+            continue
+        for item in value:
+            if isinstance(item, dict) and str(item.get("asset_id") or "") == asset_id:
+                return item
+    return None
+
+
+def _compact_json(value: dict) -> str:
+    """Compact JSON encoding matching the repository's metadata storage."""
+    import json as _json
+    return _json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _derivative_ids_from_meta(meta: Any) -> list[str]:
+    """Producer asset ids for Thumbnail derivatives referenced by *meta*.
+
+    Sources: an explicit ``derivative_asset_ids`` list, plus any descriptor
+    entry under ``derivative_descriptors`` / ``asset_descriptors`` /
+    ``output_descriptors`` whose semantic ``variant`` is exactly
+    ``thumbnail``.  Order-preserving de-duplication.
+    """
+    if not isinstance(meta, dict):
+        return []
+    ids: list[str] = []
+    raw_ids = meta.get("derivative_asset_ids")
+    if isinstance(raw_ids, (list, tuple)):
+        ids.extend(
+            str(value) for value in raw_ids
+            if not isinstance(value, bool) and str(value)
+        )
+    for field in ("derivative_descriptors", "asset_descriptors", "output_descriptors"):
+        value = meta.get(field)
+        if not isinstance(value, (list, tuple)):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            variant = item.get("variant")
+            if not isinstance(variant, str) or variant.strip().lower() != "thumbnail":
+                continue
+            asset_id = str(item.get("asset_id") or "")
+            if asset_id:
+                ids.append(asset_id)
+    seen: set[str] = set()
+    out: list[str] = []
+    for asset_id in ids:
+        if asset_id not in seen:
+            seen.add(asset_id)
+            out.append(asset_id)
+    return out
+
+
 class HistoryV2ProductionWriter:
     """Mirrors production run/experiment events into the History V2 store.
 
@@ -611,7 +715,8 @@ class HistoryV2ProductionWriter:
 
         if self._repo.get_attempt(attempt_run_id) is None:
             self._repo.add_attempt(
-                generation_id, run_id=attempt_run_id, mode="original",
+                generation_id, run_id=attempt_run_id,
+                mode=semantic_output_mode(meta),
                 started_at=started,
             )
 
@@ -628,6 +733,7 @@ class HistoryV2ProductionWriter:
             self._attach_producer_asset(
                 generation_id, attempt_run_id, str(meta.get("primary_asset_id")), meta,
             )
+        self._attach_derivative_assets(generation_id, attempt_run_id, meta)
 
         return {
             "generation_id": generation_id,
@@ -666,7 +772,8 @@ class HistoryV2ProductionWriter:
 
         if self._repo.get_attempt(attempt_run_id) is None:
             self._repo.add_attempt(
-                generation_id, run_id=attempt_run_id, mode="original",
+                generation_id, run_id=attempt_run_id,
+                mode=semantic_output_mode(meta),
             )
 
         if (
@@ -721,6 +828,8 @@ class HistoryV2ProductionWriter:
         elif len(new_assets) == 1:
             self._repo.set_featured_asset(generation_id, new_assets[0].asset_id)
 
+        self._attach_derivative_assets(generation_id, attempt_run_id, meta)
+
         return {
             "generation_id": generation_id,
             "run_id": attempt_run_id,
@@ -729,19 +838,21 @@ class HistoryV2ProductionWriter:
 
     def generation_has_output_association(self, run_id: Any) -> bool:
         """True when the mirrored generation for a production run has at
-        least one visible output asset (thumbnail/preview/original) attached.
+        least one REQUIRED output asset (preview/original) attached.
 
         Exception-isolated public query intended for use after the
         nonterminal ``running`` record so a modern output-producing run can
         verify its History output association before the terminal
-        ``completed`` write.  Returns False for unknown generations.
+        ``completed`` write.  A Thumbnail derivative alone never satisfies
+        this gate — the required Preview/Original must exist first.
+        Returns False for unknown generations.
         """
         try:
             generation_id = _gen_id(str(run_id))
             detail = self._repo.get_generation(generation_id)
             if detail is None:
                 return False
-            return any(a.type in _OUTPUT_ASSET_TYPES for a in detail.assets)
+            return any(a.type in _REQUIRED_ASSET_TYPES for a in detail.assets)
         except Exception:
             logger.exception(
                 "history_v2_writer: generation_has_output_association failed "
@@ -764,6 +875,11 @@ class HistoryV2ProductionWriter:
         the acceptance transaction, so they cannot use ``record_run``'s
         single-run identity mapping.  This small public seam reuses the same
         path/producer adoption and thumbnail logic for that existing identity.
+
+        E2C: optional Thumbnail derivative producer ids/descriptors in *meta*
+        are adopted under the SAME logical output key as the required primary;
+        derivative failure is logged truthfully and never fails the result.
+        Success still requires a REQUIRED (preview/original) association.
         """
         try:
             metadata = dict(meta or {})
@@ -776,11 +892,12 @@ class HistoryV2ProductionWriter:
                 self._attach_producer_asset(
                     str(generation_id), str(run_id), str(primary_asset_id), metadata,
                 )
+            self._attach_derivative_assets(str(generation_id), str(run_id), metadata)
             detail = self._repo.get_generation(str(generation_id))
             return bool(
                 detail is not None
                 and any(
-                    asset.type in _OUTPUT_ASSET_TYPES
+                    asset.type in _REQUIRED_ASSET_TYPES
                     for asset in detail.assets
                 )
             )
@@ -899,7 +1016,12 @@ class HistoryV2ProductionWriter:
 
     def _attach_output_assets(self, generation_id, run_id, candidates,
                               meta) -> list[Asset]:
-        """Resolve + attach output files, generate thumbnails, set featured."""
+        """Resolve + attach output files, generate thumbnails, set featured.
+
+        E2C: the attached primary asset type follows the frozen semantic
+        output mode (``preview`` or ``original``) from the request/result
+        metadata — never the file extension or codec.
+        """
         existing = self._repo.get_generation_assets(generation_id)
         existing_names = {(a.run_id, a.filename) for a in existing}
         existing_thumb_keys = {
@@ -908,6 +1030,7 @@ class HistoryV2ProductionWriter:
         }
         attached: list[Asset] = []
         studio_outputs: Optional[Path] = None
+        primary_type = semantic_output_mode(meta)
 
         for index, candidate in enumerate(candidates):
             candidate_path = Path(candidate)
@@ -943,7 +1066,7 @@ class HistoryV2ProductionWriter:
             asset = self._repo.attach_asset(
                 generation_id,
                 run_id=run_id,
-                asset_type="original",
+                asset_type=primary_type,
                 source_path=str(full),
                 copy=True,
                 width=_asset_dimension(meta, "width"),
@@ -976,14 +1099,15 @@ class HistoryV2ProductionWriter:
                 )
             return attached
 
-        # Featured: first attached original, else first thumbnail (only when
-        # the generation does not already have a featured asset).
+        # Featured: first attached required-type asset (preview/original),
+        # else first thumbnail (only when the generation does not already
+        # have a featured asset).
         detail = self._repo.get_generation(generation_id)
         if detail is not None and detail.generation.featured_asset_id is None:
-            originals = [a for a in attached if a.type == "original"]
+            required = [a for a in attached if a.type in _REQUIRED_ASSET_TYPES]
             thumbs = [a for a in attached if a.type == "thumbnail"]
-            if originals:
-                self._repo.set_featured_asset(generation_id, originals[0].asset_id)
+            if required:
+                self._repo.set_featured_asset(generation_id, required[0].asset_id)
             elif thumbs:
                 self._repo.set_featured_asset(generation_id, thumbs[0].asset_id)
         return attached
@@ -1037,13 +1161,15 @@ class HistoryV2ProductionWriter:
         if height is None:
             height = _asset_dimension(meta, "height")
 
+        descriptor = _descriptor_for_asset(meta, producer_id)
         logical_key = (
             logical_output_key_from_metadata(record)
+            or logical_output_key_from_metadata(descriptor or {})
             or logical_output_key_from_metadata(meta)
         )
         metadata: dict[str, Any] = {"producer_asset_id": producer_id}
         for key in ("variant", "experiment_id", "cell_key", "attempt_id",
-                    "node_id", "output_key", "output_index"):
+                    "node_id", "output_key", "output_index", "parent_asset_id"):
             value = record.get(key)
             if value not in (None, "", 0):
                 metadata[key] = value
@@ -1051,22 +1177,52 @@ class HistoryV2ProductionWriter:
             value = record.get(key)
             if value not in (None, ""):
                 metadata[key] = value
+        if descriptor:
+            for key in ("codec", "quality", "output_codec_ms", "comparison_side"):
+                value = descriptor.get(key)
+                if value not in (None, "", 0):
+                    metadata.setdefault(key, value)
+            metadata.setdefault(
+                "parent_identity", str(descriptor.get("parent_identity") or "")
+            )
+            metadata.setdefault("derivative_kind", "thumbnail")
         if logical_key:
             metadata["logical_output_key"] = logical_key
 
-        asset = self._repo.adopt_asset(
-            generation_id,
-            run_id=run_id,
-            asset_id=producer_id,
-            source_path=source_path,
-            reference=reference,
-            width=width,
-            height=height,
-            fmt=_fmt_from_mime(record.get("mime_type")),
-            metadata=metadata,
-            sha256=content_hash,
-            logical_output_key=logical_key,
-        )
+        # E2C: the producer/result variant drives the History Asset type.
+        # Preview producer results adopt as `preview`, Thumbnail derivatives
+        # as `thumbnail`; everything else stays a backward-compatible
+        # Original.  The type is NEVER inferred from extension/codec/MIME.
+        asset_type = _asset_type_for_variant(record.get("variant"))
+        if asset_type == "original":
+            asset = self._repo.adopt_asset(
+                generation_id,
+                run_id=run_id,
+                asset_id=producer_id,
+                source_path=source_path,
+                reference=reference,
+                width=width,
+                height=height,
+                fmt=_fmt_from_mime(record.get("mime_type")),
+                metadata=metadata,
+                sha256=content_hash,
+                logical_output_key=logical_key,
+            )
+        else:
+            asset = self._adopt_typed_asset(
+                generation_id,
+                run_id=run_id,
+                asset_id=producer_id,
+                source_path=source_path,
+                reference=reference,
+                asset_type=asset_type,
+                width=width,
+                height=height,
+                fmt=_fmt_from_mime(record.get("mime_type")),
+                metadata=metadata,
+                sha256=content_hash,
+                logical_key=logical_key,
+            )
         if asset is None:
             logger.debug(
                 "history_v2_writer: producer asset %r adoption returned no row "
@@ -1077,6 +1233,134 @@ class HistoryV2ProductionWriter:
         if detail is not None and detail.generation.featured_asset_id is None:
             self._repo.set_featured_asset(generation_id, asset.asset_id)
         return asset
+
+    def _adopt_typed_asset(
+        self,
+        generation_id,
+        run_id,
+        *,
+        asset_id,
+        source_path,
+        reference,
+        asset_type,
+        width,
+        height,
+        fmt,
+        metadata,
+        sha256,
+        logical_key,
+    ) -> Optional[Asset]:
+        """Insert a managed-reference asset with an EXPLICIT History type.
+
+        Narrow typed analogue of ``HistoryV2Repository.adopt_asset`` (which
+        hardcodes ``original``): same assets table, same idempotency rules —
+        an *asset_id* already present in this generation returns None; an id
+        owned by ANOTHER generation mints a deterministic History-local id
+        with the producer identity retained in ``metadata["producer_asset_id"]``
+        so replayed terminals never duplicate.  Bytes are never copied or
+        re-encoded: remote ``modal://`` references stay verbatim managed paths
+        and local paths become resolved path references.  The digest comes
+        from *sha256* (the producer content hash); it is computed from the
+        local file only when omitted — bytes are never fabricated.
+        """
+        import sqlite3 as _sqlite3
+
+        resolved_id = str(asset_id or "")
+        metadata_dict = dict(metadata or {})
+        if resolved_id:
+            existing = self._repo.get_asset(resolved_id)
+            if existing is not None:
+                if existing.generation_id == generation_id:
+                    return None
+                minted = "ast_" + _digest(f"v2typed:{resolved_id}:{generation_id}")
+                metadata_dict.setdefault("producer_asset_id", resolved_id)
+                resolved_id = minted
+        else:
+            resolved_id = "ast_" + _digest(
+                f"v2typed:{generation_id}:{run_id}:{logical_key or ''}:{sha256 or ''}"
+            )
+
+        if reference is not None:
+            managed_path_str = str(reference)
+            try:
+                out_name = (
+                    Path(str(reference).split("|", 2)[-1]).name or "asset"
+                )
+            except Exception:
+                out_name = "asset"
+            if not sha256:
+                sha256 = None
+        elif source_path is not None:
+            src_path = Path(source_path)
+            managed_path_str = str(src_path.resolve())
+            out_name = src_path.name
+            ext = src_path.suffix.lstrip(".").lower()
+            if not sha256:
+                try:
+                    sha256 = hashlib.sha256(src_path.read_bytes()).hexdigest()
+                except OSError:
+                    sha256 = None
+        else:
+            raise ValueError("exactly one of source_path/reference is required")
+
+        now = utc_now_iso()
+        logical_value = normalize_logical_output_key(logical_key)
+        stored_format = fmt or (
+            Path(out_name).suffix.lstrip(".").lower() or None
+        )
+        try:
+            with self._store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO assets (
+                        asset_id, generation_id, run_id, type, managed_path, filename,
+                        width, height, format, sha256, metadata_json,
+                        logical_output_key, created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (resolved_id, generation_id, run_id, asset_type,
+                     managed_path_str, out_name, width, height,
+                     stored_format,
+                     sha256, _compact_json(metadata_dict), logical_value, now),
+                )
+        except _sqlite3.IntegrityError:
+            return None
+        return Asset(
+            asset_id=resolved_id,
+            generation_id=str(generation_id),
+            type=asset_type,
+            managed_path=managed_path_str,
+            filename=out_name,
+            created_at=now,
+            run_id=run_id,
+            width=width,
+            height=height,
+            format=stored_format,
+            sha256=sha256,
+            metadata=metadata_dict,
+            logical_output_key=logical_value,
+        )
+
+    def _attach_derivative_assets(self, generation_id, run_id, meta) -> list[Asset]:
+        """Adopt optional Thumbnail derivative producer assets for one result.
+
+        Derivatives share the primary's canonical logical output key and are
+        never the required workflow result: any single derivative failure is
+        logged truthfully and never fails the required Preview/Original
+        association (graceful derivative-failure policy).
+        """
+        attached: list[Asset] = []
+        for derivative_id in _derivative_ids_from_meta(meta):
+            try:
+                asset = self._attach_producer_asset(
+                    generation_id, run_id, derivative_id, meta,
+                )
+                if asset is not None:
+                    attached.append(asset)
+            except Exception as exc:
+                logger.warning(
+                    "history_v2_writer: thumbnail derivative %r adoption failed "
+                    "(non-fatal): %s: %s", derivative_id, type(exc).__name__, exc,
+                )
+        return attached
 
     def _make_thumbnail_asset(self, generation_id, run_id, asset) -> Optional[Asset]:
         """WebP thumbnail for a managed original asset, or None on failure."""
@@ -1212,7 +1496,8 @@ class HistoryV2ProductionWriter:
         # ── ensure cell attempt ──────────────────────────────────────────
         if self._repo.get_attempt(cell_run_id) is None:
             self._repo.add_attempt(
-                gen_id, run_id=cell_run_id, mode="original",
+                gen_id, run_id=cell_run_id,
+                mode=semantic_output_mode(meta),
                 experiment_id=experiment_id, cell_id=cell_id, started_at=now,
             )
 
@@ -1258,7 +1543,9 @@ class HistoryV2ProductionWriter:
 
     def _attach_cell_assets(self, generation_id, run_id, cell_dir,
                             output_paths, meta=None) -> list[Asset]:
-        """Attach experiment-cell output files (originals + thumbs)."""
+        """Attach experiment-cell output files (semantic primaries + thumbs)."""
+        metadata = meta if isinstance(meta, dict) else {}
+        primary_type = semantic_output_mode(metadata)
         existing = self._repo.get_generation_assets(generation_id)
         existing_names = {(a.run_id, a.filename) for a in existing}
         attached: list[Asset] = []
@@ -1299,7 +1586,7 @@ class HistoryV2ProductionWriter:
             asset_type = (
                 "thumbnail"
                 if lower.endswith(("_thumb.webp", "_thumb.jpg"))
-                else "original"
+                else primary_type
             )
             logical_key = _candidate_logical_output_key(
                 meta if isinstance(meta, dict) else {},
@@ -1324,10 +1611,10 @@ class HistoryV2ProductionWriter:
             return attached
         detail = self._repo.get_generation(generation_id)
         if detail is not None and detail.generation.featured_asset_id is None:
-            originals = [a for a in attached if a.type == "original"]
+            required = [a for a in attached if a.type in _REQUIRED_ASSET_TYPES]
             thumbs = [a for a in attached if a.type == "thumbnail"]
-            if originals:
-                self._repo.set_featured_asset(generation_id, originals[0].asset_id)
+            if required:
+                self._repo.set_featured_asset(generation_id, required[0].asset_id)
             elif thumbs:
                 self._repo.set_featured_asset(generation_id, thumbs[0].asset_id)
         return attached

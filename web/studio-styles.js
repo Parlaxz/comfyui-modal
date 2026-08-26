@@ -1524,31 +1524,6 @@ body.comfymodal-body-scroll-lock {
   font-size: 12px;
 }
 
-.comfymodal-studio-legacy-list {
-  list-style: none;
-  margin: 8px 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.comfymodal-studio-legacy-list li {
-  padding: 6px 12px;
-  background: #0a0a0a;
-  border: 1px solid #2a2a2a;
-  border-radius: 3px;
-  font-size: 12px;
-  color: #888;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-.comfymodal-studio-legacy-list li:hover {
-  background: #1a1a1a;
-  color: #d0d0d0;
-}
-
 /* ── Backend page ────────────────────────────────────────── */
 
 .comfymodal-studio-backend {
@@ -2117,13 +2092,6 @@ button.comfymodal-studio-feature-chip {
   border-radius: 3px;
   padding: 12px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-}
-
-/* ── Legacy wrapper ──────────────────────────────────────── */
-
-.comfymodal-studio-legacy {
-  height: 100%;
-  overflow-y: auto;
 }
 
 /* ── Metadata Section ──────────────────────────────────────── */
@@ -3296,11 +3264,7 @@ button.comfymodal-studio-feature-chip {
   border: 2px solid #333;
   border-top-color: var(--color-accent, #5a7fdb);
   border-radius: 50%;
-  animation: cm-exp-spin 0.8s linear infinite;
-}
-
-@keyframes cm-exp-spin {
-  to { transform: rotate(360deg); }
+  animation: comfymodal-spin 0.8s linear infinite;
 }
 
 .cm-exp-cell-icon {
@@ -3785,8 +3749,37 @@ button.comfymodal-studio-feature-chip {
 
 .comfymodal-studio-history-v2-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  /* Column count comes from Settings → History → Grid columns via the
+     --comfymodal-studio-history-columns custom property set inline on the
+     page root (integer 2–8, default 6).  auto-fill + max() makes the user
+     value the exact desktop track count — the calc term is one track's
+     perfect share of the container including gap compensation (gap must
+     stay 12px) minus a 0.5px rounding guard — while the 132px floor
+     reflows to fewer equal columns on narrow containers instead of
+     crushing cards. */
+  grid-template-columns: repeat(
+    auto-fill,
+    minmax(
+      max(
+        132px,
+        calc(
+          (100% - (var(--comfymodal-studio-history-columns, 6) - 1) * 12px)
+          / var(--comfymodal-studio-history-columns, 6)
+          - 0.5px
+        )
+      ),
+      1fr
+    )
+  );
   gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .comfymodal-studio-history-v2-grid {
+    /* Narrow viewports keep the pre-setting legacy density (230px cards)
+       regardless of the configured desktop column count. */
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  }
 }
 
 .comfymodal-studio-history-v2-state {
@@ -5901,6 +5894,529 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-model-picker:focus {
   border-color: var(--color-border-focus, #5a7fdb);
   outline: none;
+}
+
+/* ── Workflow Portability (Phase G12) ────────────────────── */
+
+.comfymodal-studio-portability-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--color-border, #333);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.comfymodal-studio-portability-chip.ok {
+  border-color: var(--color-success, #4ade80);
+  color: var(--color-success, #4ade80);
+}
+.comfymodal-studio-portability-chip.warn {
+  border-color: var(--color-warning, #fbbf24);
+  color: var(--color-warning, #fbbf24);
+}
+.comfymodal-studio-portability-chip.error {
+  border-color: var(--color-danger, #f87171);
+  color: var(--color-danger, #f87171);
+}
+.comfymodal-studio-portability-chip.neutral {
+  color: var(--color-text-muted, #9ca3af);
+}
+.comfymodal-studio-portability-chip:hover {
+  filter: brightness(1.15);
+}
+.comfymodal-studio-portability-chip:focus-visible {
+  outline: 2px solid var(--color-border-focus, #5a7fdb);
+  outline-offset: 1px;
+}
+
+.comfymodal-studio-portability-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.comfymodal-studio-portability-summary-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.comfymodal-studio-portability-meta {
+  font-size: 11px;
+  color: var(--color-text-muted, #9ca3af);
+}
+.comfymodal-studio-portability-version-context {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.comfymodal-studio-portability-counts {
+  font-size: 11px;
+  color: var(--color-text-muted, #9ca3af);
+}
+
+.comfymodal-studio-portability-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.comfymodal-studio-portability-issue {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border, #2a2a2a);
+  border-radius: 6px;
+}
+.comfymodal-studio-portability-issue-severity {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+}
+.comfymodal-studio-portability-issue.severity-high .comfymodal-studio-portability-issue-severity { color: var(--color-danger, #f87171); }
+.comfymodal-studio-portability-issue.severity-medium .comfymodal-studio-portability-issue-severity { color: var(--color-warning, #fbbf24); }
+.comfymodal-studio-portability-issue.severity-low .comfymodal-studio-portability-issue-severity,
+.comfymodal-studio-portability-issue.severity-unknown .comfymodal-studio-portability-issue-severity { color: var(--color-text-muted, #9ca3af); }
+.comfymodal-studio-portability-issue-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.comfymodal-studio-portability-issue-message {
+  font-size: 11px;
+}
+.comfymodal-studio-portability-issue-hint {
+  font-size: 10px;
+  color: var(--color-text-muted, #9ca3af);
+}
+
+.comfymodal-studio-portability-targets {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 10px;
+}
+.comfymodal-studio-portability-target-head,
+.comfymodal-studio-portability-target-row {
+  display: grid;
+  grid-template-columns: 110px 90px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 4px 0;
+}
+.comfymodal-studio-portability-target-head {
+  border-bottom: 1px solid var(--color-border, #2a2a2a);
+}
+.comfymodal-studio-portability-target-name {
+  font-size: 11px;
+  font-weight: 600;
+}
+.comfymodal-studio-portability-target-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.comfymodal-studio-portability-target-reason {
+  font-size: 10px;
+  color: var(--color-text-muted, #9ca3af);
+}
+.comfymodal-studio-portability-target-advice {
+  font-size: 10px;
+  color: var(--color-text-muted, #9ca3af);
+  font-style: italic;
+}
+
+.comfymodal-studio-portability-environment {
+  border-top: 1px dashed var(--color-border, #2a2a2a);
+  margin-top: 8px;
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.comfymodal-studio-portability-env-risk {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* ══════════════════════════════════════════════════════════
+   Phase I3 — Shared UI primitives foundation.
+   Appended by the I3 primitives lane ONLY.  Page lanes
+   (I4 History / I6 Workflows+Models / I7 Backend+Settings /
+   I8 Playground) consume these classes; they do not redefine them.
+   ══════════════════════════════════════════════════════════ */
+
+/* ── I3: Shared loading state ────────────────────────────── */
+
+.cm-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-text-secondary, #9aa3b2);
+  font-size: 12px;
+}
+.cm-loading[data-size="page"] {
+  justify-content: center;
+  padding: 24px 0;
+}
+.cm-loading[data-size="inline"] {
+  justify-content: flex-start;
+  padding: 2px 0;
+}
+.cm-loading-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #2a2a2a;
+  border-top-color: var(--color-accent, #5a7fdb);
+  border-radius: 50%;
+  flex-shrink: 0;
+  /* ONE shared spinner animation source (the wizard keyframe). */
+  animation: comfymodal-spin 0.8s linear infinite;
+}
+.cm-loading-label {
+  white-space: nowrap;
+}
+
+/* ── I3: Shared chip base + tone system ──────────────────── */
+/* Geometry/typography only — semantics live in [data-tone]. */
+
+.cm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid #2a2a2a;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/* Shared tones. Existing Studio token palette only — no second color system. */
+.cm-chip[data-tone="neutral"] {
+  background: #111;
+  color: var(--color-text-muted, #888);
+  border-color: #2a2a2a;
+}
+.cm-chip[data-tone="ok"] {
+  background: var(--color-success-bg, rgba(74, 222, 128, 0.12));
+  color: var(--color-success, #4ade80);
+  border-color: rgba(74, 222, 128, 0.35);
+}
+.cm-chip[data-tone="warn"] {
+  background: var(--color-warning-bg, rgba(245, 158, 11, 0.12));
+  color: var(--color-warning, #fbbf24);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+.cm-chip[data-tone="error"] {
+  background: var(--color-danger-bg, rgba(239, 68, 68, 0.12));
+  color: var(--color-danger, #ef4444);
+  border-color: rgba(239, 68, 68, 0.35);
+}
+.cm-chip[data-tone="running"] {
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
+  color: var(--color-accent, #5a7fdb);
+  border-color: rgba(90, 127, 219, 0.45);
+}
+.cm-chip[data-tone="meta"] {
+  background: transparent;
+  color: var(--color-text-secondary, #9aa3b2);
+  border-color: var(--color-border-default, #2d2d3a);
+}
+
+/* Semantic family guards. Portability and Compatibility share geometry but
+   MUST stay visually and semantically distinct families. */
+
+/* Portability targets keep their Phase-G12 outline-pill presentation:
+   transparent fill, tone-colored text/border only. */
+.cm-chip.cm-chip--portability {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Compatibility keeps its filled toggle-family presentation
+   (feature/capability semantics): tinted fill + interactive affordance. */
+.cm-chip.cm-chip--compatibility {
+  cursor: pointer;
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
+}
+
+/* ── I3: Generic focus-visible fallback ──────────────────── */
+/* Frozen catch-all for previously weak keyboard targets. Arms: the literal
+   frozen scope; the real Studio dialog root (.comfymodal-studio-modal); and
+   the shell page container (.comfymodal-studio-pagecontainer), which hosts
+   every page surface in both the production dialog and the standalone
+   harness. Pointer users get no permanent ring (:focus-visible only).
+   Specific feature rules override this cleanly via the cascade — outline is
+   a single property, so no double ring can result. */
+.comfymodal-studio :is(button, [role="button"], [tabindex="0"], a):focus-visible,
+.comfymodal-studio-modal :is(button, [role="button"], [tabindex="0"], a):focus-visible,
+.comfymodal-studio-pagecontainer :is(button, [role="button"], [tabindex="0"], a):focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+
+/* ── I3: Shared empty-state base ─────────────────────────── */
+/* Minimal foundation only — page cards are redesigned by their own lanes.
+   No illustrations, no icons, caller-supplied copy exclusively. */
+
+.cm-empty-state {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #555;
+  font-size: 12px;
+}
+.cm-empty-state-title {
+  font-weight: 600;
+  color: #999;
+}
+.cm-empty-state-detail {
+  color: #555;
+  font-size: 11px;
+}
+.cm-empty-state-action {
+  margin-top: 6px;
+}
+
+/* ── Phase I5 — Image compare/viewer region ────────────────────────────── */
+/* Lightweight client-only A/B comparison (transient session tray + modal   */
+/* view). Uses existing Studio tokens only; no second design system.        */
+
+.cm-compare-tray {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 14px;
+  z-index: 10070;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: calc(100vw - 24px);
+  padding: 6px 10px;
+  background: #1a1a1a;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #ccc;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+.cm-compare-tray-title {
+  font-weight: 600;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.cm-compare-tray-slot {
+  white-space: nowrap;
+}
+.cm-compare-tray-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+}
+.cm-compare-replace-hint {
+  margin-left: 6px;
+  font-size: 10px;
+  color: #999;
+  border: 1px solid #444;
+  border-radius: 999px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.cm-compare-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10080;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cm-compare-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+}
+.cm-compare-dialog {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(1100px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  padding: 12px;
+  background: #141414;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+.cm-compare-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cm-compare-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ddd;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cm-compare-close {
+  background: transparent;
+  border: none;
+  color: #ccc;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.cm-compare-stage {
+  position: relative;
+  width: 100%;
+  height: min(66vh, 720px);
+  background: #0c0c0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+}
+.cm-compare-frame {
+  position: absolute;
+  inset: 0;
+}
+.cm-compare-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+.cm-compare-bwrap {
+  position: absolute;
+  inset: 0;
+}
+.cm-compare-unavailable {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 11px;
+  color: #999;
+  border: 1px dashed #444;
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: rgba(20, 20, 20, 0.85);
+  pointer-events: none;
+}
+.cm-compare-label {
+  position: absolute;
+  top: 8px;
+  z-index: 3;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: #ddd;
+  background: rgba(10, 10, 12, 0.78);
+  border: 1px solid #3a3a3a;
+  border-radius: 999px;
+  padding: 2px 8px;
+  pointer-events: none;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cm-compare-label-a {
+  left: 8px;
+}
+.cm-compare-label-b {
+  right: 8px;
+}
+.cm-compare-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--color-accent, #5a7fdb);
+  z-index: 2;
+  pointer-events: none;
+}
+.cm-compare-slider {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 4;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--color-accent, #5a7fdb);
+  color: #fff;
+  font-size: 13px;
+  cursor: ew-resize;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
+}
+.cm-compare-stage[data-mode="stacked"] .cm-compare-slider {
+  cursor: ns-resize;
+}
+.cm-compare-hint {
+  font-size: 11px;
+  color: #999;
+}
+
+/* Narrow responsive mode (≤640px): stacked presentation with a horizontal
+   divider axis; both labels stay visible; nothing overflows horizontally. */
+@media (max-width: 640px) {
+  .cm-compare-dialog {
+    width: calc(100vw - 16px);
+    padding: 8px;
+  }
+  .cm-compare-stage {
+    height: min(72vh, 640px);
+  }
+}
+.cm-compare-stage[data-mode="stacked"] .cm-compare-divider {
+  top: 50%;
+  bottom: auto;
+  left: 0;
+  right: 0;
+  width: auto;
+  height: 2px;
+  margin-top: -1px;
+  margin-left: 0;
+}
+.cm-compare-stage[data-mode="stacked"] .cm-compare-label-b {
+  top: auto;
+  bottom: 8px;
 }
 `;
 

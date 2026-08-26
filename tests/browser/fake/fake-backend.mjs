@@ -116,7 +116,41 @@ export function createSession() {
     workflowRuns: [],       // captured POST /studio/run bodies (modern workflow lane)
     workflowRunSeq: 0,      // per-session sequence for deterministic run ids
     workflowSeed: null,     // lazy-built Studio Workflow platform seed dataset
+    originalRuns: new Map(),   // run_id → in-flight Original replay (E3B2 mirror)
+    originalScripts: new Map(), // generation_id → { behavior, error } test script
+    originalSeqByGen: new Map(), // generation_id → created-Original counter
+    assetGets: Object.create(null), // assetId → GET request count (F3 download tests)
+    assetFailOnce: new Map(),       // assetId → { remaining, status } one-shot failures
+    // F10 configured-folder Export state (frozen F9 contract mirror):
+    // per-asset durable records, simulated destination files, one-shot
+    // failure arming, and the captured export POST log.
+    exportRecords: new Map(),       // assetId → { state, destination_path, ... }
+    exportFiles: new Map(),         // assetId → true (simulated exported copy exists)
+    exportFailOnce: new Map(),      // assetId → { remaining, reason, message, partial }
+    exportRequests: [],             // [{ asset_id }] — every export POST received
+    // G12 Workflow Portability state (deterministic contract payloads):
+    portabilityMode: "matrix",      // armed report mode: matrix|low|high|unknown_main
+    portabilityReports: {},         // versionId → last served report (chip derivation)
+    portabilityRequests: [],        // [{ version_id }] every portability GET
+    manifestExports: [],            // [{ version_id, include_presets, filename }]
+    manifestImports: [],            // [{ dry_run, import_presets?, apply_default_preset? }]
+    exportCredentialFailArmed: false, // one-shot 409 credential refusal
+    importCommitFailArmed: false,   // one-shot atomic commit failure
+    importPreviewMode: "valid",     // valid | invalid | missing_deps
+    importSeq: 0,                   // deterministic imported-workflow sequence
+    // H8 route assertion: every experiment CREATOR POST received, regardless
+    // of outcome.  Lets specs prove zero NEW legacy creation from the modern
+    // Playground UI (view/control compat routes are not logged here).
+    experimentCreateRequests: [],   // [{ route, at, ... }]
+    workspaces: new Map(),           // workspace_id -> safe registry record
+    activeWorkspaceId: "workspace_default",
   };
+  session.workspaces.set("workspace_default", {
+    id: "workspace_default",
+    label: "Default Workspace",
+    last_deploy_status: "idle",
+    last_used_at: null,
+  });
   _seedPresetAndSnapshot(session);
   _seedDefaultHistory(session);
   _seedDefaultHistoryV2(session);
@@ -148,6 +182,14 @@ export function resetSession(id) {
   session.historyV2.length = 0;
   session.historyV2Fail = {};
   session.profileLevel = "off";
+  session.workspaces.clear();
+  session.workspaces.set("workspace_default", {
+    id: "workspace_default",
+    label: "Default Workspace",
+    last_deploy_status: "idle",
+    last_used_at: null,
+  });
+  session.activeWorkspaceId = "workspace_default";
   session.eventQueue.length = 0;
   session.assets.clear();
   session.assetOrigins.clear();
@@ -157,6 +199,25 @@ export function resetSession(id) {
   session.workflowRunSeq = 0;
   session.workflowSeed = null;
   session.pendingScenario = null;
+  session.originalRuns.clear();
+  session.originalScripts.clear();
+  session.originalSeqByGen.clear();
+  session.assetGets = Object.create(null);
+  session.assetFailOnce.clear();
+  session.exportRecords.clear();
+  session.exportFiles.clear();
+  session.exportFailOnce.clear();
+  session.exportRequests.length = 0;
+  session.portabilityMode = "matrix";
+  session.portabilityReports = {};
+  session.portabilityRequests.length = 0;
+  session.manifestExports.length = 0;
+  session.manifestImports.length = 0;
+  session.exportCredentialFailArmed = false;
+  session.importCommitFailArmed = false;
+  session.importPreviewMode = "valid";
+  session.importSeq = 0;
+  session.experimentCreateRequests.length = 0;
   _seedPresetAndSnapshot(session);
   _seedDefaultHistory(session);
   _seedDefaultHistoryV2(session);
@@ -625,7 +686,50 @@ function _canonicalTimings() {
   };
 }
 
+// H13: the production backend mirrors every accepted single run into
+// History V2 (history_v2_writer) alongside the legacy .run_history record.
+// The fake mirrors that behavior for the preset-path POST /studio/run so the
+// Playground recent-runs filmstrip — which reads ONLY the History V2 feed
+// since Wave D — sees newly submitted single runs.  The V2 record id equals
+// experiment_id so completion correlation stays deterministic.
+function _mirrorSingleRunToHistoryV2(session, experiment, payload) {
+  const controls = (payload && payload.controls) || {};
+  session.historyV2.unshift(_makeV2Generation(session, {
+    id: experiment.experiment_id,
+    status: "running",
+    workflow_id: "wf_preset_run",
+    workflow_name: "Preset Run",
+    preset_id: (payload && payload.presetId) || "",
+    prompt: controls.prompt || "",
+    createdAtMs: Date.now(),
+    durationMs: null,
+    outputs: [],
+  }));
+}
+
+function _syncV2MirrorOnTerminal(session, experiment, status) {
+  const idx = session.historyV2.findIndex(
+    (r) => r && r.kind === "generation" && r.id === experiment.experiment_id);
+  if (idx === -1) return;
+  const completed = status === "completed" || status === "succeeded";
+  const failed = status === "failed_fatal" || status === "error" || status === "failed";
+  session.historyV2[idx] = _makeV2Generation(session, {
+    id: experiment.experiment_id,
+    status: completed ? "completed" : (failed ? "failed" : "canceled"),
+    workflow_id: "wf_preset_run",
+    workflow_name: "Preset Run",
+    prompt: (experiment.definition && experiment.definition.prompts
+      && experiment.definition.prompts[0] && experiment.definition.prompts[0].text) || "",
+    createdAtMs: Date.now() - 4200,
+    durationMs: completed ? 4200 : null,
+    outputs: completed && experiment.firstOutputFilename
+      ? [{ thumb: true, preview: true, original: true, originalFilename: experiment.firstOutputFilename }]
+      : [],
+  });
+}
+
 function _syncHistoryOnTerminal(session, experiment, status) {
+  _syncV2MirrorOnTerminal(session, experiment, status);
   const record = session.history.find((r) => r.experiment_id === experiment.experiment_id);
   if (!record) return;
   if (status === "completed" || status === "succeeded") {
@@ -671,6 +775,7 @@ export function handleStudioRun(id, payload = {}) {
   const record = _makeHistoryRecord(session, experiment, payload, def, "single");
   session.history.unshift(record);
   experiment._historyRecord = record;
+  _mirrorSingleRunToHistoryV2(session, experiment, payload);
 
   return {
     status: "ok",
@@ -683,6 +788,11 @@ export function handleStudioRun(id, payload = {}) {
 export function handleStudioExperiment(id, payload = {}) {
   const session = getSession(id);
   const uniquePresetIds = [...new Set((payload.presetIds || []).filter(Boolean))];
+  session.experimentCreateRequests.push({
+    route: "/comfymodal/studio/experiment",
+    at: _now(),
+    presetIds: uniquePresetIds,
+  });
   if (uniquePresetIds.length === 0) {
     return { status: "error", message: "At least one preset is required" };
   }
@@ -1060,6 +1170,7 @@ function _makeV2Generation(session, cfg) {
     featuredAssetId: null,
     previewCodec: null,
     previewQuality: null,
+    irreproducible: false, // legacy snapshot that can never replay an Original
   }, cfg);
   const createdAt = new Date(o.createdAtMs).toISOString();
   const finishedAt = o.durationMs == null ? null : new Date(o.createdAtMs + o.durationMs).toISOString();
@@ -1168,6 +1279,10 @@ function _makeV2Generation(session, cfg) {
     featured_asset_id: o.featuredAssetId || null,
     preview_codec: o.previewCodec,
     preview_quality: o.previewQuality,
+    irreproducible: !!o.irreproducible,
+    // F5-tolerant projection: only present when a fixture explicitly sets it
+    // (production may not send it on older payloads; absent ≠ false).
+    replay_capable: o.replayCapable === undefined ? undefined : !!o.replayCapable,
     attempts,
     // Feed-level duration (mirrors production's computed attempt duration;
     // used as the fastest/slowest sort key).
@@ -1190,7 +1305,10 @@ function _makeV2Experiment(session, cfg) {
     favorite: false,
     note: "",
     axisLabels: { x: "seed", y: "steps" },
-    cells: [], // [{ status, axisX, axisY, durationMs, error, thumb, preview, original, originalFailed, favorite }]
+    // Cells carry NO favorite of their own (production parity): a cell's
+    // favorite is derived on read from its Generation record.  Fixtures that
+    // need a favorited cell must favorite the cell's Generation.
+    cells: [], // [{ status, axisX, axisY, durationMs, error, thumb, preview, original, originalFailed, genId }]
     modalOptions: null,
   }, cfg);
   const createdAt = new Date(o.createdAtMs).toISOString();
@@ -1215,7 +1333,6 @@ function _makeV2Experiment(session, cfg) {
       original_asset_id: original,
       original_failed: !!c.originalFailed,
       duration_ms: c.durationMs != null ? c.durationMs : null,
-      favorite: !!c.favorite,
     };
   });
   const cellDurations = cells
@@ -1262,7 +1379,6 @@ function _modernHistoryRecord(exp) {
       original_asset_id: null,
       original_failed: false,
       duration_ms: cell.duration_ms != null ? cell.duration_ms : null,
-      favorite: false,
     };
   });
   const first = exp.cells[0] || {};
@@ -1314,6 +1430,17 @@ function _seedDefaultHistoryV2(session) {
     createdAtMs: V2_BASE_MS + 5 * hour, durationMs: 1832,
     error: "Modal worker crashed: CUDA out of memory",
     outputs: [],
+    // Production semantic mode: a failed ordinary Single carries an
+    // original-mode workflow Attempt (F1 audit §3 / F6 verb matrix).
+    attempts: [{
+      run_id: "run_gen_failed",
+      mode: "original",
+      status: "failed",
+      started_at: new Date(V2_BASE_MS + 5 * hour).toISOString(),
+      finished_at: new Date(V2_BASE_MS + 5 * hour + 1832).toISOString(),
+      error: "Modal worker crashed: CUDA out of memory",
+      timing: { end_to_end_total_ms: 1200 },
+    }],
   }));
   // 3. canceled generation
   records.push(_makeV2Generation(session, {
@@ -1591,8 +1718,10 @@ function _buildV2Seed(session, key) {
       remoteAssetIds: ["gen_phase_e_remote_original_o0_orig"],
     }));
 
-    // Sparse records intentionally have no output or parameter rows. This is
-    // a pending frontend proof until nullable detail sections are guarded.
+    // Sparse records intentionally have no output or parameter rows. The
+    // failed record is hidden by the DEFAULT feed status filter; browser
+    // coverage enables the Failed toggle first (studio-fake-phase-e.spec.mjs
+    // F2/F3) and asserts truthful zero-output detail rendering.
     records.push(_makeV2Generation(session, {
       id: "gen_phase_e_sparse_failed",
       status: "failed",
@@ -1829,6 +1958,361 @@ function _buildV2Seed(session, key) {
     }));
     return records;
   }
+  if (key === "phase_e_original") {
+    // Generate Original (E3B2) decision-matrix seed. Each record isolates one
+    // outcome of the frozen route contract; the route itself is implemented by
+    // generateHistoryV2Original below and mirrors history_v2_replay's
+    // decide_original_action policy exactly.
+    const records = [];
+    const previewAttempt = (runId, logicalKey, offset, status = "completed") => ({
+      run_id: runId,
+      mode: "preview",
+      status,
+      logical_output_key: logicalKey,
+      codec: "webp",
+      quality: 70,
+      started_at: _v2T(V2_BASE_MS + 20 * 3600000, offset),
+      finished_at: status === "queued" || status === "running" ? null : _v2T(V2_BASE_MS + 20 * 3600000, offset + 1),
+      timing: status === "completed" ? _canonicalTimings() : null,
+    });
+    const originalAttempt = (runId, logicalKey, offset, status = "completed", error = null) => ({
+      run_id: runId,
+      mode: "original",
+      status,
+      logical_output_key: logicalKey,
+      started_at: _v2T(V2_BASE_MS + 20 * 3600000, offset),
+      finished_at: status === "queued" || status === "running" ? null : _v2T(V2_BASE_MS + 20 * 3600000, offset + 1),
+      error,
+      timing: status === "completed" ? _canonicalTimings() : (error ? { end_to_end_total_ms: 1200 } : null),
+    });
+
+    // create path: Preview-only Generation with no Original Attempt yet.
+    const createKey = "gen_orig_create_o0";
+    records.push(_makeV2Generation(session, {
+      id: "gen_orig_preview_only",
+      status: "completed",
+      prompt: "phase e original create",
+      createdAtMs: V2_BASE_MS + 20 * 3600000,
+      attempts: [previewAttempt("run_orig_create_preview", createKey, 0)],
+      outputs: [{
+        thumb: true,
+        preview: true,
+        logicalOutputKey: createKey,
+        originalAssetIds: [],
+        attemptIds: ["run_orig_create_preview"],
+      }],
+      previewCodec: "webp",
+      previewQuality: 70,
+    }));
+
+    // active reuse: an Original Attempt is already queued/running.
+    const activeKey = "gen_orig_active_o0";
+    records.push(_makeV2Generation(session, {
+      id: "gen_orig_active_original",
+      status: "completed",
+      prompt: "phase e original active reuse",
+      createdAtMs: V2_BASE_MS + 19 * 3600000,
+      attempts: [
+        previewAttempt("run_orig_active_preview", activeKey, 0),
+        originalAttempt("run_orig_active_running", activeKey, 2, "running"),
+      ],
+      outputs: [{
+        thumb: true,
+        preview: true,
+        logicalOutputKey: activeKey,
+        originalAssetIds: [],
+        attemptIds: ["run_orig_active_preview", "run_orig_active_running"],
+      }],
+      previewCodec: "webp",
+      previewQuality: 70,
+    }));
+
+    // successful reuse: newest successful Original wins without rerender.
+    const successKey = "gen_orig_success_o0";
+    records.push(_makeV2Generation(session, {
+      id: "gen_orig_success_original",
+      status: "completed",
+      prompt: "phase e original successful reuse",
+      createdAtMs: V2_BASE_MS + 18 * 3600000,
+      attempts: [
+        previewAttempt("run_orig_success_preview", successKey, 0),
+        originalAttempt("run_orig_success_old", successKey, 2),
+      ],
+      outputs: [{
+        thumb: true,
+        preview: true,
+        logicalOutputKey: successKey,
+        originalAssetIds: ["gen_orig_success_old_orig"],
+        attemptIds: ["run_orig_success_preview", "run_orig_success_old"],
+      }],
+      previewCodec: "webp",
+      previewQuality: 70,
+    }));
+
+    // retry path: only failed Original Attempts exist.
+    const retryKey = "gen_orig_retry_o0";
+    records.push(_makeV2Generation(session, {
+      id: "gen_orig_failed_original",
+      status: "completed",
+      prompt: "phase e original retry",
+      createdAtMs: V2_BASE_MS + 17 * 3600000,
+      attempts: [
+        previewAttempt("run_orig_retry_preview", retryKey, 0),
+        originalAttempt("run_orig_retry_failed", retryKey, 2, "failed", "Original replay failed"),
+      ],
+      outputs: [{
+        thumb: true,
+        preview: true,
+        logicalOutputKey: retryKey,
+        originalAssetIds: [],
+        attemptIds: ["run_orig_retry_preview", "run_orig_retry_failed"],
+        originalFailed: true,
+      }],
+      previewCodec: "webp",
+      previewQuality: 70,
+    }));
+
+    // busy path: a Preview Attempt is still running.
+    const busyKey = "gen_orig_busy_o0";
+    records.push(_makeV2Generation(session, {
+      id: "gen_orig_busy_preview",
+      status: "running",
+      prompt: "phase e original busy",
+      createdAtMs: V2_BASE_MS + 16 * 3600000,
+      attempts: [previewAttempt("run_orig_busy_preview", busyKey, 0, "running")],
+      outputs: [{
+        thumb: false,
+        preview: false,
+        logicalOutputKey: busyKey,
+        originalAssetIds: [],
+        attemptIds: ["run_orig_busy_preview"],
+      }],
+    }));
+
+    // irreproducible path: legacy snapshot can never replay; zero writes.
+    records.push(_makeV2Generation(session, {
+      id: "gen_orig_irreproducible",
+      status: "completed",
+      prompt: "phase e original irreproducible legacy",
+      createdAtMs: V2_BASE_MS + 15 * 3600000,
+      attempts: [originalAttempt("run_orig_legacy_original", "gen_orig_irreproducible_o0", 0)],
+      outputs: [{ thumb: true, preview: false, original: true }],
+      irreproducible: true,
+    }));
+
+    // Experiment cell parity: one completed cell whose own Generation exists
+    // as a first-class History V2 generation record (production model), so
+    // the frozen generation-scoped route serves cells identically.
+    const cellKey = "gen_phase_e_original_cell_0_o0";
+    records.push(_makeV2Generation(session, {
+      id: "gen_phase_e_original_cell_0",
+      status: "completed",
+      prompt: "phase e original experiment cell",
+      createdAtMs: V2_BASE_MS + 14 * 3600000 + 30000,
+      attempts: [previewAttempt("run_orig_cell_preview", cellKey, 0)],
+      outputs: [{
+        thumb: true,
+        preview: true,
+        logicalOutputKey: cellKey,
+        originalAssetIds: [],
+        attemptIds: ["run_orig_cell_preview"],
+      }],
+      previewCodec: "webp",
+      previewQuality: 70,
+    }));
+
+    // Experiment cell parity: one completed cell with its own Generation id.
+    records.push(_makeV2Experiment(session, {
+      id: "exp_phase_e_original",
+      status: "completed",
+      name: "Phase E Original Cell Sweep",
+      workflow: "Portrait Pro",
+      preset: "preset_a",
+      createdAtMs: V2_BASE_MS + 14 * 3600000,
+      modalOptions: { enabled: true, codec: "webp", quality: 70 },
+      cells: [{
+        status: "completed",
+        axisX: "111",
+        axisY: "20",
+        durationMs: 4300,
+        genId: "gen_phase_e_original_cell_0",
+        thumb: true,
+        preview: true,
+      }],
+    }));
+    return records;
+  }
+  if (key === "phase_f6_resume") {
+    // F6 Single Resume / Retry-naming seed. Each record isolates one durable
+    // eligibility state of the frozen F1A resume route and the conditional
+    // retry presentation; the route mirror below (resumeHistoryV2Generation)
+    // mirrors GenerateOriginalService.resume_single exactly.
+    const records = [];
+    const t = (runId, mode, status, offset, error = null) => ({
+      run_id: runId,
+      mode,
+      status,
+      started_at: _v2T(V2_BASE_MS + 30 * 3600000, offset),
+      finished_at: status === "queued" || status === "running" || status === "interrupted"
+        ? null
+        : _v2T(V2_BASE_MS + 30 * 3600000, offset + 1),
+      error,
+      timing: status === "completed" ? _canonicalTimings() : (error ? { end_to_end_total_ms: 1200 } : null),
+    });
+
+    // Interrupted Preview-mode ordinary Single: Resume keeps it a Preview run
+    // (never /original) and the retained Preview stays downloadable.
+    records.push(_makeV2Generation(session, {
+      id: "gen_f6_resume_preview",
+      status: "interrupted",
+      prompt: "f6 interrupted preview run",
+      createdAtMs: V2_BASE_MS + 30 * 3600000,
+      params: { seed: 424242 },
+      attempts: [t("run_f6_resume_preview", "preview", "interrupted", 0)],
+      outputs: [{ thumb: true, preview: true }],
+      previewCodec: "webp",
+      previewQuality: 70,
+    }));
+
+    // Plain failed ordinary Single: single original-mode workflow Attempt
+    // simply failed → truthful label is "Retry run" (still /original/retry).
+    records.push(_makeV2Generation(session, {
+      id: "gen_f6_retry_run_plain",
+      status: "failed",
+      prompt: "f6 plain failed run",
+      createdAtMs: V2_BASE_MS + 29 * 3600000,
+      params: { seed: 777 },
+      error: "workflow execution failed",
+      attempts: [t("run_f6_plain_failed", "original", "failed", 0, "workflow execution failed")],
+      outputs: [],
+    }));
+
+    // Interrupted but durably replay-incapable (F5 projection present):
+    // Resume renders disabled with a truthful reason BEFORE any click.
+    records.push(_makeV2Generation(session, {
+      id: "gen_f6_resume_blocked",
+      status: "interrupted",
+      prompt: "f6 interrupted irreproducible run",
+      createdAtMs: V2_BASE_MS + 28 * 3600000,
+      attempts: [t("run_f6_blocked", "original", "interrupted", 0)],
+      outputs: [],
+      irreproducible: true,
+    }));
+
+    // Interrupted with an explicit replay_capable=false projection (field
+    // present and false — distinct from absent).
+    records.push(_makeV2Generation(session, {
+      id: "gen_f6_resume_replay_false",
+      status: "interrupted",
+      prompt: "f6 interrupted replay_capable false",
+      createdAtMs: V2_BASE_MS + 27 * 3600000,
+      attempts: [t("run_f6_replay_false", "preview", "interrupted", 0)],
+      outputs: [{ thumb: true, preview: true }],
+      replayCapable: false,
+    }));
+
+    // Canceled / completed / active never offer Resume.
+    records.push(_makeV2Generation(session, {
+      id: "gen_f6_canceled",
+      status: "canceled",
+      prompt: "f6 canceled run",
+      createdAtMs: V2_BASE_MS + 26 * 3600000,
+      attempts: [t("run_f6_canceled", "original", "canceled", 0)],
+      outputs: [],
+    }));
+    records.push(_makeV2Generation(session, {
+      id: "gen_f6_completed",
+      status: "completed",
+      prompt: "f6 completed run",
+      createdAtMs: V2_BASE_MS + 25 * 3600000,
+      durationMs: 3200,
+      attempts: [
+        t("run_f6_done_preview", "preview", "completed", 0),
+        t("run_f6_done_original", "original", "completed", 2),
+      ],
+      outputs: [{ thumb: true, preview: true, original: true }],
+    }));
+    return records;
+  }
+  if (key === "wave_d") {
+    // H13 Wave D old-record visibility seed (history_v2_wave_d scenario).
+    // Mirrors the production migration shape: legacy-era records arrive in
+    // History V2 with copied labels, no durable replay data
+    // (irreproducible:true), and — for older rows — an explicit
+    // replay_capable:false projection.  One migrated single retains an
+    // image; one does not.  A mirrored legacy experiment keeps its copied
+    // definition labels and cover cells.  A modern generation is newer than
+    // everything else so newest-first ordering is assertable.
+    const hour = 3600000;
+    const records = [];
+
+    // Migrated legacy single WITH a retained image (replay_capable absent).
+    records.push(_makeV2Generation(session, {
+      id: "gen_wave_d_legacy_image",
+      status: "completed",
+      workflow_id: "wf_legacy_portrait",
+      workflow_name: "Legacy Portrait (migrated)",
+      preset_id: "preset_legacy_a",
+      preset_name: "Legacy Preset A",
+      prompt: "migrated legacy single with retained image",
+      createdAtMs: V2_BASE_MS + 42 * hour,
+      durationMs: 3100,
+      irreproducible: true,
+      outputs: [{ thumb: true, preview: true, original: true }],
+    }));
+
+    // Migrated legacy single WITHOUT any image (explicit replay_capable:false).
+    records.push(_makeV2Generation(session, {
+      id: "gen_wave_d_legacy_noimage",
+      status: "completed",
+      workflow_id: "wf_legacy_landscape",
+      workflow_name: "Legacy Landscape (migrated)",
+      preset_id: "preset_legacy_b",
+      preset_name: "Legacy Preset B",
+      prompt: "migrated legacy single without image",
+      createdAtMs: V2_BASE_MS + 41 * hour,
+      durationMs: 2400,
+      irreproducible: true,
+      replayCapable: false,
+      outputs: [],
+    }));
+
+    // Mirrored legacy experiment: copied definition labels + cover cells.
+    records.push(_makeV2Experiment(session, {
+      id: "exp_wave_d_legacy",
+      status: "completed",
+      name: "Migrated Legacy Sweep",
+      workflow: "Legacy Portrait (migrated)",
+      preset: "Legacy Preset A",
+      axisLabels: { x: "seed", y: "steps" },
+      createdAtMs: V2_BASE_MS + 40 * hour,
+      updatedMs: V2_BASE_MS + 40 * hour + 4200,
+      cells: [0, 1].map((i) => ({
+        status: "completed",
+        axisX: String(111 + i),
+        axisY: "20",
+        durationMs: 4100 + i * 100,
+        thumb: true,
+        preview: true,
+        original: true,
+      })),
+    }));
+
+    // Modern generation newer than every migrated record.
+    records.push(_makeV2Generation(session, {
+      id: "gen_wave_d_modern",
+      status: "completed",
+      workflow_id: "wf_portrait",
+      workflow_name: "Portrait Pro",
+      preset_id: "preset_a",
+      preset_name: "Preset A",
+      prompt: "modern wave d run newer than every migrated record",
+      createdAtMs: V2_BASE_MS + 44 * hour,
+      durationMs: 4023,
+      outputs: [{ thumb: true, preview: true, original: true }],
+    }));
+    return records;
+  }
   if (key !== "large") return [];
   const records = [];
   for (let i = 0; i < 60; i++) {
@@ -1915,7 +2399,21 @@ function _featuredIndex(rec) {
   return 0;
 }
 
-function _generationFeedItem(rec) {
+// F10 configured-folder Export state of one asset (frozen F9 vocabulary).
+// An exported record whose simulated destination file was deleted externally
+// classifies (and persists) as `missing` on read — the F7/F9 lazy
+// classification semantics.  Assets without any record are not_exported.
+function _exportStateOf(session, assetId) {
+  if (!assetId) return null;
+  const record = session.exportRecords.get(assetId);
+  if (!record) return "not_exported";
+  if (record.state === "exported" && !session.exportFiles.has(assetId)) {
+    record.state = "missing";
+  }
+  return record.state;
+}
+
+function _generationFeedItem(session, rec) {
   const attempts = rec.attempts || [];
   let completedAt = null;
   let durationMs = null;
@@ -1940,6 +2438,15 @@ function _generationFeedItem(rec) {
     thumb_url: _v2AssetUrl(o.thumb_asset_id),
     preview_url: _v2AssetUrl(o.preview_asset_id),
     original_url: _v2AssetUrl(o.original_asset_id),
+    // F10 per-variant Export identity/state (frozen F9 projection).  The
+    // Asset IDs are authoritative — the frontend never parses them out of
+    // URL text.  An Asset ID is projected ONLY for a servable managed asset:
+    // a failed producer Attempt whose bytes were never retained projects
+    // null so no dead Export action renders.  Absent variants project null.
+    preview_asset_id: (o.preview_asset_id && session.assets.has(o.preview_asset_id)) ? o.preview_asset_id : null,
+    original_asset_id: (o.original_asset_id && session.assets.has(o.original_asset_id)) ? o.original_asset_id : null,
+    preview_export_state: (o.preview_asset_id && session.assets.has(o.preview_asset_id)) ? _exportStateOf(session, o.preview_asset_id) : null,
+    original_export_state: (o.original_asset_id && session.assets.has(o.original_asset_id)) ? _exportStateOf(session, o.original_asset_id) : null,
     original_urls: (o.original_asset_ids || []).map(_v2AssetUrl),
     attempt_ids: (o.attempt_ids || []).slice(),
     asset_provenance: (o.asset_provenance || []).map((entry) => Object.assign({}, entry, { url: _v2AssetUrl(entry.asset_id) })),
@@ -1978,6 +2485,12 @@ function _generationFeedItem(rec) {
     featured_output_index: _featuredIndex(rec),
     featured_asset_id: rec.featured_asset_id || null,
     preview_codec: rec.preview_codec || null,
+    // F5-tolerant replay-capability projection (absent on older payloads).
+    ...(rec.replay_capable === undefined ? {} : { replay_capable: !!rec.replay_capable }),
+    // Durable replay-incapability marker: projected so the frontend can
+    // disable Resume/Generate Original BEFORE a click instead of failing on
+    // one (mirrors the F5 projection family).
+    ...(rec.irreproducible ? { irreproducible: true } : {}),
     preview_quality: rec.preview_quality != null ? rec.preview_quality : null,
     outputs,
   };
@@ -2023,8 +2536,8 @@ function _experimentFeedItem(rec) {
   };
 }
 
-function _generationDetailItem(rec) {
-  const item = _generationFeedItem(rec);
+function _generationDetailItem(session, rec) {
+  const item = _generationFeedItem(session, rec);
   item.attempts = (rec.attempts || []).map((a) => {
     // Mirror production _attempt_dict (routes.py:533-549): duration_ms is
     // computed from started_at/finished_at, not stored on the attempt.
@@ -2066,8 +2579,15 @@ function _generationDetailItem(rec) {
   return item;
 }
 
-function _experimentDetailItem(rec) {
+function _experimentDetailItem(session, rec) {
   const item = _experimentFeedItem(rec);
+  // Production parity: a cell's favorite IS the favorite of its associated
+  // Generation (routes derive it from fav_by_gen).  Cells carry no favorite
+  // storage of their own — unknown/null generation ids project false.
+  const favByGen = new Map();
+  for (const r of session.historyV2) {
+    if (r && r.kind === "generation") favByGen.set(r.id, !!r.favorite);
+  }
   item.cells = (rec.cells || []).map((c) => ({
     key: c.key,
     index: c.index != null ? c.index : 0,
@@ -2078,9 +2598,16 @@ function _experimentDetailItem(rec) {
     thumb_url: _v2AssetUrl(c.thumb_asset_id),
     preview_url: _v2AssetUrl(c.preview_asset_id),
     original_url: _v2AssetUrl(c.original_asset_id),
+    // F10 per-cell Export identity/state — the cell's OWN Generation output
+    // projection (no Experiment-specific route, no featured redirect).  An
+    // Asset ID is projected only for a servable managed asset.
+    preview_asset_id: (c.preview_asset_id && session.assets.has(c.preview_asset_id)) ? c.preview_asset_id : null,
+    original_asset_id: (c.original_asset_id && session.assets.has(c.original_asset_id)) ? c.original_asset_id : null,
+    preview_export_state: (c.preview_asset_id && session.assets.has(c.preview_asset_id)) ? _exportStateOf(session, c.preview_asset_id) : null,
+    original_export_state: (c.original_asset_id && session.assets.has(c.original_asset_id)) ? _exportStateOf(session, c.original_asset_id) : null,
     original_failed: !!c.original_failed,
     duration_ms: c.duration_ms != null ? c.duration_ms : null,
-    favorite: !!c.favorite,
+    favorite: !!(c.generation_id && favByGen.get(c.generation_id)),
   }));
   const cover = (rec.cells || []).slice(0, 4).map((c) => ({
     thumb_url: _cellThumbUrl(c),
@@ -2309,6 +2836,11 @@ function _genMatchesV2(rec, f) {
 
 function _expMatchesV2(rec, f) {
   if (f.statuses && f.statuses.length && f.statuses.indexOf(rec.status) === -1) return false;
+  // F5 fake parity (closes F5 §F5.3): the favorite filter constrains the
+  // Experiment stream exactly like the Generation stream — true requires
+  // favorited, false requires unfavorited, absent → no constraint.  Applied
+  // INSIDE the stream match (never post-pagination).
+  if (f.favorite != null && !!rec.favorite !== f.favorite) return false;
   if (f.date_from && rec.created_at < f.date_from) return false;
   if (f.date_to && rec.created_at > f.date_to) return false;
   if (f.search) {
@@ -2383,15 +2915,16 @@ export function listHistoryV2(id, params = {}) {
   const hasImage = _parseV2Bool(params.has_image);
   const search = params.search || null;
 
-  // Generation filters include every supported filter; experiments only
-  // receive search/date_from/date_to (production routes.py:690-709).
+  // Generation filters include every supported filter; experiments receive
+  // search/date_from/date_to AND the favorite filter (F5 production parity —
+  // routes.py threads `favorite` into exp_filters for experiment+mixed kinds).
   const genFilters = {
     statuses: null, workflow_id: workflowId, preset_id: presetId, favorite,
     date_from: dateFrom, date_to: dateTo, has_preview: hasPreview, has_original: hasOriginal,
     preview_only: previewOnly, interrupted, failed_or_canceled: failedOrCanceled,
     model_name: model, has_image: hasImage, search,
   };
-  const expFilters = { statuses: null, date_from: dateFrom, date_to: dateTo, search };
+  const expFilters = { statuses: null, favorite, date_from: dateFrom, date_to: dateTo, search };
 
   const genMapped = _mapV2Statuses("generation", status, statuses);
   const expMapped = _mapV2Statuses("experiment", status, statuses);
@@ -2418,7 +2951,7 @@ export function listHistoryV2(id, params = {}) {
           limit,
           order
         );
-        items = res.items.map((r) => (kind === "generation" ? _generationFeedItem(r) : _experimentFeedItem(r)));
+        items = res.items.map((r) => (kind === "generation" ? _generationFeedItem(session, r) : _experimentFeedItem(r)));
         const last = res.items[res.items.length - 1];
         nextCursor = res.has_more && res.items.length
           ? _encodeKeyset(last.created_at, last.id, _v2CursorSortKey(order, last))
@@ -2483,7 +3016,7 @@ export function listHistoryV2(id, params = {}) {
         nextCursor = _encodeMixedCursor(newGCursor, newECursor);
       }
       total = genRes.total + expRes.total;
-      items = emitted.map((m) => (m.kind === "generation" ? _generationFeedItem(m) : _experimentFeedItem(m)));
+      items = emitted.map((m) => (m.kind === "generation" ? _generationFeedItem(session, m) : _experimentFeedItem(m)));
     } catch (err) {
       if (err && err._httpStatus) return err;
       throw err;
@@ -2510,14 +3043,556 @@ export function getHistoryV2Generation(id, genId) {
   const session = getSession(id);
   const rec = session.historyV2.find((r) => r.kind === "generation" && r.id === genId);
   if (!rec) return _v2Error("generation not found", 404);
-  return { status: "ok", item: _generationDetailItem(rec) };
+  _advanceOriginalAttempts(session, rec);
+  return { status: "ok", item: _generationDetailItem(session, rec) };
 }
 
 export function getHistoryV2Experiment(id, expId) {
   const session = getSession(id);
   const rec = _historyV2Records(session).find((r) => r.kind === "experiment" && r.id === expId);
   if (!rec) return _v2Error("experiment not found", 404);
-  return { status: "ok", item: _experimentDetailItem(rec) };
+  return { status: "ok", item: _experimentDetailItem(session, rec) };
+}
+
+// ── Public: Generate Original (E3B2 route mirror) ────────────────────────
+//
+// Mirrors the LANDED production contract (history_v2_routes.py +
+// history_v2_replay.GenerateOriginalService, pinned by
+// tests/test_history_v2_generate_original.py):
+//
+//   POST /comfymodal/history-v2/generations/{generation_id}/original
+//     200 {status:"ok", generation_id, purpose:"original", decision, reason,
+//          outcome:"original_created"|"original_already_active"|
+//                  "original_already_completed"|"retry_required",
+//          run_id, attempt_status, reused,
+//          executor? ("canonical_execution.execute_plan" when created)}
+//     409 {status:"error", code:"generation_busy"|
+//          "generation_not_reproducible", message, generation_id?, reason?}
+//     404 {status:"error", code:"generation_not_found", ...}
+//     400 non-boolean rerender
+//
+//   POST /comfymodal/history-v2/generations/{generation_id}/original/retry
+//     creates a queued Original only when the newest original Attempt is
+//     failed and nothing is active; otherwise 409 retry_not_available /
+//     generation_busy.
+//
+// The decision policy mirrors history_v2_replay.decide_original_action
+// exactly; the fake adds NO behavior production does not have. In-flight
+// created attempts progress lazily on detail reads (queued → running at +1s,
+// terminal at +2.5s) so UI polling observes realistic durable state.
+
+const _ORIGINAL_ACTIVE_STATUSES = ["queued", "running"];
+const ORIGINAL_RUNNING_AFTER_MS = 1000;
+const ORIGINAL_TERMINAL_AFTER_MS = 2500;
+
+function _originalBase(rec, decision, reason) {
+  return {
+    generation_id: rec.id,
+    purpose: "original",
+    decision,
+    reason,
+  };
+}
+
+function _originalCreated(rec, attempt, decision, reason) {
+  return Object.assign(_originalBase(rec, decision, reason), {
+    status: "ok",
+    outcome: "original_created",
+    run_id: attempt.run_id,
+    attempt_status: attempt.status,
+    reused: false,
+    executor: "canonical_execution.execute_plan",
+  });
+}
+
+function _originalReused(rec, attempt, decision, reason, outcome) {
+  return Object.assign(_originalBase(rec, decision, reason), {
+    status: "ok",
+    outcome,
+    run_id: attempt.run_id,
+    attempt_status: attempt.status,
+    reused: true,
+  });
+}
+
+function _originalErrorCode(status, code, message, extra) {
+  return Object.assign({ status: "error", code, message }, extra || {}, {
+    _httpStatus: status,
+  });
+}
+
+function _createOriginalAttempt(session, rec, decision, reason) {
+  const script = session.originalScripts.get(rec.id) || null;
+  const seq = (session.originalSeqByGen.get(rec.id) || 0) + 1;
+  session.originalSeqByGen.set(rec.id, seq);
+  const runId = "run_" + rec.id + "_original_" + seq;
+  const firstOutput = (rec.outputs || [])[0];
+  const attempt = {
+    run_id: runId,
+    mode: "original",
+    status: "queued",
+    started_at: new Date().toISOString(),
+    finished_at: null,
+    error: null,
+    timing: null,
+  };
+  if (firstOutput && firstOutput.logical_output_key) {
+    attempt.logical_output_key = firstOutput.logical_output_key;
+  }
+  rec.attempts.push(attempt);
+  // fail_once consumes itself on the first created attempt only; later
+  // attempts on the same generation succeed again.
+  let behavior = "success";
+  if (script && (script.behavior === "fail_always" || (script.behavior === "fail_once" && !script.used))) {
+    behavior = script.behavior;
+    script.used = true;
+  }
+  session.originalRuns.set(runId, {
+    generationId: rec.id,
+    runId,
+    createdAtMs: Date.now(),
+    behavior,
+    error: script && script.error ? String(script.error) : "Original replay failed",
+    terminal: false,
+    attachedAssetId: null,
+    mode: "original",
+  });
+  return attempt;
+}
+
+export function generateHistoryV2Original(id, generationId, body) {
+  const session = getSession(id);
+  const b = body && typeof body === "object" && body._raw === undefined ? body : {};
+  if (!_v2BodyIsValid(b)) return _v2Error("Invalid JSON body", 400);
+  const rerender = b.rerender === true;
+  if (b.rerender !== undefined && typeof b.rerender !== "boolean") {
+    return _v2Error("rerender must be a boolean", 400);
+  }
+  const rec = session.historyV2.find((r) => r.kind === "generation" && r.id === generationId);
+  if (!rec) {
+    return _originalErrorCode(404, "generation_not_found", "generation not found", {
+      generation_id: String(generationId),
+    });
+  }
+
+  // Replay capability precedes every decision: an irreproducible snapshot is
+  // refused without consulting current Workflow/Preset state, zero writes.
+  if (rec.irreproducible) {
+    return _originalErrorCode(
+      409,
+      "generation_not_reproducible",
+      "generation snapshot is not reproducible",
+      {
+        generation_id: rec.id,
+        reason: "missing_request_snapshot",
+        details: {},
+      }
+    );
+  }
+
+  const attempts = rec.attempts || [];
+  const originals = attempts.filter((a) => a.mode === "original");
+
+  // 1. Active Original reuse: duplicate requests serialize onto the existing
+  //    active Attempt; no second Attempt is created.
+  const active = originals.filter((a) => _ORIGINAL_ACTIVE_STATUSES.indexOf(a.status) !== -1);
+  if (active.length) {
+    const selected = active[active.length - 1];
+    return _originalReused(rec, selected, "reuse_active", "original_attempt_active", "original_already_active");
+  }
+
+  // 2. Successful reuse: the default spends no extra execution; explicit
+  //    rerender is the ONLY path past a successful Original.
+  const successful = originals.filter((a) => a.status === "completed");
+  if (successful.length && !rerender) {
+    const selected = successful[successful.length - 1];
+    return _originalReused(rec, selected, "reuse_successful", "newest_successful_original", "original_already_completed");
+  }
+
+  // 3. Busy: an active Preview Attempt blocks a new Original (authoritative
+  //    flow is Preview completed then Original).
+  const activePreview = attempts.some(
+    (a) => a.mode === "preview" && _ORIGINAL_ACTIVE_STATUSES.indexOf(a.status) !== -1
+  );
+  if (activePreview) {
+    return _originalErrorCode(409, "generation_busy", "a preview attempt of this generation is still active",
+      Object.assign(_originalBase(rec, "busy", "preview_attempt_active")));
+  }
+
+  // 4. Explicit rerender or a fresh create appends ONE queued Attempt under
+  //    the SAME Generation identity.
+  if (rerender) {
+    const created = _createOriginalAttempt(session, rec, "create_original", "explicit_rerender");
+    return _originalCreated(rec, created, "create_original", "explicit_rerender");
+  }
+
+  // 5. Only failed Original Attempts exist → report retry_required without
+  //    silently reinterpreting Generate Original as Retry (the explicit
+  //    /original/retry route owns retry creation).
+  const failed = originals.filter((a) => a.status === "failed");
+  if (failed.length) {
+    const selected = failed[failed.length - 1];
+    return Object.assign(_originalBase(rec, "retry_required", "only_failed_original_attempts"), {
+      status: "ok",
+      outcome: "retry_required",
+      run_id: selected.run_id,
+      attempt_status: selected.status,
+      reused: false,
+    });
+  }
+
+  const created = _createOriginalAttempt(session, rec, "create_original", "no_successful_or_active_original");
+  return _originalCreated(rec, created, "create_original", "no_successful_or_active_original");
+}
+
+export function retryHistoryV2Original(id, generationId) {
+  const session = getSession(id);
+  const rec = session.historyV2.find((r) => r.kind === "generation" && r.id === generationId);
+  if (!rec) {
+    return _originalErrorCode(404, "generation_not_found", "generation not found", {
+      generation_id: String(generationId),
+    });
+  }
+  if (rec.irreproducible) {
+    return _originalErrorCode(
+      409,
+      "generation_not_reproducible",
+      "generation snapshot is not reproducible",
+      { generation_id: rec.id, reason: "missing_request_snapshot", details: {} }
+    );
+  }
+  const attempts = rec.attempts || [];
+  // Any active attempt on the Generation blocks a retry.
+  if (attempts.some((a) => _ORIGINAL_ACTIVE_STATUSES.indexOf(a.status) !== -1)) {
+    return _originalErrorCode(409, "generation_busy", "an attempt of this generation is already active", {
+      generation_id: rec.id,
+    });
+  }
+  const originals = attempts.filter((a) => a.mode === "original");
+  const newest = originals.length ? originals[originals.length - 1] : null;
+  if (!newest || newest.status !== "failed") {
+    return _originalErrorCode(409, "retry_not_available", "only a failed original attempt can be retried", {
+      generation_id: rec.id,
+      reason: newest ? "not_original_failure" : "no_original_attempt",
+    });
+  }
+  const created = _createOriginalAttempt(session, rec, "create_original", "original_retry");
+  return _originalCreated(rec, created, "create_original", "original_retry");
+}
+
+// ── Public: Single Resume (F1A route mirror) ─────────────────────────────
+//
+// Mirrors POST /comfymodal/history-v2/generations/{generation_id}/resume
+// (history_v2_routes.py → GenerateOriginalService.resume_single, pinned by
+// tests/test_f1_followup_a_durable_resume.py):
+//
+//   200 {status:"ok", generation_id, purpose:"resume",
+//        decision:"create_resume", reason:"interrupted_single",
+//        outcome:"resume_created", run_id, attempt_status:"queued",
+//        reused:false, executor:"canonical_execution.execute_plan"}
+//   404 generation_not_found · 409 generation_busy ·
+//   409 generation_not_reproducible · 409 resume_not_available
+//
+// Interrupted ordinary Singles only: the frozen semantic output mode is
+// preserved verbatim (Preview stays Preview), the interrupted Attempt is
+// retained, and ONE queued Attempt is appended under the SAME Generation.
+export function resumeHistoryV2Generation(id, generationId) {
+  const session = getSession(id);
+  const rec = session.historyV2.find((r) => r.kind === "generation" && r.id === generationId);
+  if (!rec) {
+    return _originalErrorCode(404, "generation_not_found", "generation not found", {
+      generation_id: String(generationId),
+    });
+  }
+  if (rec.irreproducible || rec.replay_capable === false) {
+    return _originalErrorCode(
+      409,
+      "generation_not_reproducible",
+      "generation snapshot is not reproducible",
+      { generation_id: rec.id, reason: "missing_request_snapshot", details: {} }
+    );
+  }
+  const attempts = rec.attempts || [];
+  if (attempts.some((a) => _ORIGINAL_ACTIVE_STATUSES.indexOf(a.status) !== -1)) {
+    return _originalErrorCode(409, "generation_busy", "an attempt of this generation is already active", {
+      generation_id: rec.id,
+    });
+  }
+  const current = attempts.length ? attempts[attempts.length - 1] : null;
+  if (!current || current.status !== "interrupted") {
+    return _originalErrorCode(409, "resume_not_available", "only an interrupted ordinary Single can be resumed", {
+      generation_id: rec.id,
+      reason: current ? "not_interrupted" : "no_attempt",
+    });
+  }
+  const seq = (session.originalSeqByGen.get(rec.id) || 0) + 1;
+  session.originalSeqByGen.set(rec.id, seq);
+  const runId = "run_" + rec.id + "_resume_" + seq;
+  // F1A semantic preservation: the resumed Attempt keeps the interrupted
+  // attempt's frozen mode — never converted to Original.
+  const attempt = {
+    run_id: runId,
+    mode: current.mode === "preview" ? "preview" : (current.mode === "original" ? "original" : String(current.mode || "original")),
+    status: "queued",
+    started_at: new Date().toISOString(),
+    finished_at: null,
+    error: null,
+    timing: null,
+  };
+  if (current.logical_output_key != null) attempt.logical_output_key = current.logical_output_key;
+  rec.attempts.push(attempt);
+  session.originalRuns.set(runId, {
+    generationId: rec.id,
+    runId,
+    createdAtMs: Date.now(),
+    behavior: "success",
+    error: "",
+    terminal: false,
+    attachedAssetId: null,
+    mode: attempt.mode,
+    resume: true,
+  });
+  // Durable aggregate follows the appended active attempt (production
+  // derive_generation_status precedence); terminal read flips it back.
+  rec.status = "running";
+  return Object.assign({}, _originalBase(rec, "create_resume", "interrupted_single"), {
+    status: "ok",
+    outcome: "resume_created",
+    purpose: "resume",
+    run_id: attempt.run_id,
+    attempt_status: attempt.status,
+    reused: false,
+    executor: "canonical_execution.execute_plan",
+  });
+}
+
+// ── Public: Configured-folder Export (F9 frozen contract mirror) ──────────
+//
+// Mirrors POST /comfymodal/history-v2/assets/{asset_id}/export:
+//
+//   BODYLESS by contract — any client-provided semantic payload
+//   (generation, output index, logical key, variant, Settings, filename)
+//   is a violation and is rejected 400.
+//
+//   200 {status:"ok", asset_id, export_state:"exported", saved,
+//        already_exported, destination_path, metadata_path, byte_count,
+//        file_ext, mime_type, exported_at}
+//   404 {status:"error", asset_id, reason:"asset_not_found", message,
+//        export_state:"not_exported", partial:false}
+//   500 {status:"error", asset_id, reason, message, export_state:"failed",
+//        partial}          (armed one-shot failures; partial:true marks a
+//                          distinct partially-failed class)
+//
+// Semantics (F7/F9 parity): per-asset records give independent
+// Preview/Original/multi-output state; already_exported is an idempotent
+// SUCCESS (saved:false); missing destinations re-export; rerender
+// successors are NEW asset ids and start not_exported; auto-save/local
+// materialization NEVER touches this state (only this route mutates it).
+export function exportHistoryV2Asset(id, assetId, body) {
+  const session = getSession(id);
+  const aid = String(assetId || "");
+  if (body != null && !(typeof body === "object" && Object.keys(body).length === 0)) {
+    return {
+      status: "error", asset_id: aid, reason: "unexpected_body",
+      message: "history-v2 asset export requests must be bodyless",
+      export_state: "not_exported", partial: false, _httpStatus: 400,
+    };
+  }
+  const bytes = session.assets.get(aid);
+  if (!bytes) {
+    return {
+      status: "error", asset_id: aid, reason: "asset_not_found",
+      message: "asset not found", export_state: "not_exported", partial: false,
+      _httpStatus: 404,
+    };
+  }
+  session.exportRequests.push({ asset_id: aid });
+
+  const contentType = _assetContentType(aid);
+  const ext = contentType === "image/webp" ? "webp" : "png";
+  const destinationPath = "/fake-outputs/images/" + aid + "." + ext;
+
+  // Armed one-shot failure (remote source unavailable / hash mismatch /
+  // conversion failure / write failure / record persistence failure…).
+  const fail = session.exportFailOnce.get(aid);
+  if (fail && fail.remaining > 0) {
+    fail.remaining -= 1;
+    if (fail.remaining <= 0) session.exportFailOnce.delete(aid);
+    session.exportRecords.set(aid, {
+      state: "failed",
+      reason: fail.reason,
+      message: fail.message,
+      partial: fail.partial === true,
+      destination_path: null,
+      exported_at: _now(),
+    });
+    return {
+      status: "error", asset_id: aid, reason: fail.reason, message: fail.message,
+      export_state: "failed", partial: fail.partial === true, _httpStatus: 500,
+    };
+  }
+
+  const existing = session.exportRecords.get(aid);
+  if (existing && existing.state === "exported" && session.exportFiles.has(aid)) {
+    // Idempotent reuse: the exact asset is already durably exported.
+    return _exportOk(aid, {
+      saved: false, already_exported: true,
+      destination_path: existing.destination_path,
+      metadata_path: existing.metadata_path ?? null,
+      byte_count: existing.byte_count ?? null,
+      file_ext: existing.file_ext ?? ext,
+      mime_type: existing.mime_type ?? contentType,
+      exported_at: existing.exported_at ?? _now(),
+    });
+  }
+
+  // New export or explicit re-export after missing/failed.
+  const record = {
+    state: "exported",
+    destination_path: destinationPath,
+    metadata_path: null,
+    byte_count: bytes.length,
+    file_ext: ext,
+    mime_type: contentType,
+    exported_at: _now(),
+  };
+  session.exportRecords.set(aid, record);
+  session.exportFiles.set(aid, true);
+  return _exportOk(aid, {
+    saved: true, already_exported: false,
+    destination_path: record.destination_path,
+    metadata_path: record.metadata_path,
+    byte_count: record.byte_count,
+    file_ext: record.file_ext,
+    mime_type: record.mime_type,
+    exported_at: record.exported_at,
+  });
+}
+
+function _exportOk(assetId, fields) {
+  return Object.assign({
+    status: "ok",
+    asset_id: assetId,
+    export_state: "exported",
+  }, fields);
+}
+
+// Test control: arm N one-shot export failures for one asset with a truthful
+// machine reason (mirrors production failure classes).  Later exports succeed.
+export function armExportFailure(id, body = {}) {
+  const session = getSession(id);
+  const assetId = String(body.assetId || "");
+  if (!assetId) return { status: "error", message: "assetId is required" };
+  const times = Math.max(1, Number(body.times) || 1);
+  session.exportFailOnce.set(assetId, {
+    remaining: times,
+    reason: String(body.reason || "source_unreadable"),
+    message: String(body.message || "simulated configured-folder export failure"),
+    partial: body.partial === true,
+  });
+  return { status: "ok", assetId, times, reason: session.exportFailOnce.get(assetId).reason };
+}
+
+// Test control: simulate EXTERNAL deletion of an exported copy in the
+// destination folder.  The managed History asset remains fully available;
+// the next detail read lazily classifies (and persists) `missing`.
+export function deleteExportedFile(id, body = {}) {
+  const session = getSession(id);
+  const assetId = String((body && body.assetId) || "");
+  if (!assetId) return { status: "error", message: "assetId is required" };
+  session.exportFiles.delete(assetId);
+  return { status: "ok", assetId, deleted: true };
+}
+
+// Lazy-on-read progression of in-flight Original replays. Deterministic per
+// creation time; asset attachment happens exactly once at the terminal read.
+function _advanceOriginalAttempts(session, rec) {
+  const now = Date.now();
+  for (const attempt of rec.attempts || []) {
+    const run = session.originalRuns.get(attempt.run_id);
+    if (!run || run.generationId !== rec.id || run.terminal) continue;
+    const elapsed = now - run.createdAtMs;
+    if (elapsed < ORIGINAL_RUNNING_AFTER_MS) {
+      if (attempt.status !== "queued") attempt.status = "queued";
+      continue;
+    }
+    if (elapsed < ORIGINAL_TERMINAL_AFTER_MS) {
+      if (attempt.status !== "running") {
+        attempt.status = "running";
+        attempt.started_at = new Date(run.createdAtMs + ORIGINAL_RUNNING_AFTER_MS).toISOString();
+      }
+      continue;
+    }
+    run.terminal = true;
+    const finishedAt = new Date(run.createdAtMs + ORIGINAL_TERMINAL_AFTER_MS).toISOString();
+    attempt.started_at = new Date(run.createdAtMs + ORIGINAL_RUNNING_AFTER_MS).toISOString();
+    attempt.finished_at = finishedAt;
+    if (run.behavior === "success") {
+      attempt.status = "completed";
+      attempt.timing = _canonicalTimings();
+      // F1A semantic preservation: a resumed Preview Attempt completes as a
+      // Preview — it never attaches an Original asset.
+      if ((run.mode || "original") === "original") {
+        const out = (rec.outputs || []).find(
+          (o) => o.logical_output_key && o.logical_output_key === attempt.logical_output_key
+        ) || (rec.outputs || [])[0];
+        if (out) {
+          let assetId = run.attachedAssetId;
+          if (!assetId) {
+            assetId = out.logical_output_key + "_orig_r" + (session.originalSeqByGen.get(rec.id) || 1)
+              + "_" + attempt.run_id.slice(-4);
+            run.attachedAssetId = assetId;
+          }
+          if ((out.original_asset_ids || []).indexOf(assetId) === -1) {
+            out.original_asset_ids.push(assetId);
+            out.original_asset_id = assetId; // newest success preferred
+            out.attempt_ids.push(attempt.run_id);
+            out.asset_provenance.push({
+              asset_id: assetId,
+              asset_type: "original",
+              attempt_id: attempt.run_id,
+            });
+            _registerV2Asset(session, assetId, "modal://phase-e/fake/" + assetId);
+          }
+          out.original_failed = false;
+        }
+      }
+    } else {
+      attempt.status = "failed";
+      attempt.error = run.error;
+      attempt.timing = { end_to_end_total_ms: 1200 };
+      // Truthful failure: no Original asset is invented. original_failed only
+      // when this logical output has no earlier usable success.
+      const out = (rec.outputs || []).find(
+        (o) => o.logical_output_key && o.logical_output_key === attempt.logical_output_key
+      ) || (rec.outputs || [])[0];
+      if (out && (out.original_asset_ids || []).length === 0) {
+        out.original_failed = true;
+      }
+    }
+    // Resume flipped the aggregate to running; a terminal resumed attempt
+    // resolves it truthfully (production derive_generation_status parity).
+    if (run.resume && rec.status === "running") {
+      rec.status = run.behavior === "success" ? "completed" : "failed";
+    }
+  }
+}
+
+export function setOriginalScript(id, body) {
+  const session = getSession(id);
+  const b = body && typeof body === "object" ? body : {};
+  const generationId = String(b.generation_id || b.generationId || "");
+  if (!generationId) return _v2Error("generation_id is required", 400);
+  const behavior = String(b.behavior || "success");
+  if (["success", "fail_once", "fail_always"].indexOf(behavior) === -1) {
+    return _v2Error("behavior must be success | fail_once | fail_always", 400);
+  }
+  session.originalScripts.set(generationId, {
+    behavior,
+    error: b.error != null ? String(b.error) : "Scripted Original replay failure",
+    used: false,
+  });
+  return { status: "ok", generation_id: generationId, behavior };
 }
 
 // ── Public: mutations (mutate in place → persist for session lifetime) ──
@@ -2529,6 +3604,13 @@ function _v2BodyIsValid(body) {
 export function setHistoryV2Favorite(id, kind, recordId, body) {
   const session = getSession(id);
   if (!_v2BodyIsValid(body)) return _v2Error("Invalid JSON body", 400);
+  // One-shot/request-scoped failure injection (test control): the NEXT
+  // favorite PATCH fails once with 500, then the flag clears so later
+  // retries succeed.  Never a global breakage.
+  if (session.historyV2Fail && session.historyV2Fail.favoriteOnce) {
+    session.historyV2Fail.favoriteOnce = false;
+    return _v2Error("simulated favorite failure", 500);
+  }
   const favorite = body.favorite;
   if (typeof favorite !== "boolean") return _v2Error("favorite must be a boolean", 400);
   const rec = session.historyV2.find((r) => r.kind === kind && r.id === recordId);
@@ -2634,6 +3716,46 @@ export function setProfileLevel(id, body) {
   return { status: "ok", level };
 }
 
+// ── Public: deterministic Backend workspace registry ────────────────────
+
+function _workspaceEnvelope(session) {
+  return {
+    status: "ok",
+    active_workspace_id: session.activeWorkspaceId,
+    workspaces: Array.from(session.workspaces.values()).map((workspace) => Object.assign({}, workspace)),
+  };
+}
+
+export function listWorkspaces(id) {
+  return _workspaceEnvelope(getSession(id));
+}
+
+export function upsertWorkspace(id, body) {
+  const session = getSession(id);
+  const payload = body && typeof body === "object" ? body : {};
+  const workspaceId = String(payload.workspace_id || "workspace_" + (session.workspaces.size + 1));
+  if (!payload.label) return _v2Error("Workspace label required", 400);
+  const prior = session.workspaces.get(workspaceId) || {
+    id: workspaceId,
+    last_deploy_status: "idle",
+    last_used_at: null,
+  };
+  session.workspaces.set(workspaceId, Object.assign({}, prior, {
+    id: workspaceId,
+    label: String(payload.label),
+  }));
+  return _workspaceEnvelope(session);
+}
+
+export function activateWorkspace(id, body) {
+  const session = getSession(id);
+  const workspaceId = body && body.workspace_id;
+  if (!workspaceId || !session.workspaces.has(workspaceId)) return _v2Error("Workspace not found", 404);
+  session.activeWorkspaceId = workspaceId;
+  session.workspaces.get(workspaceId).last_used_at = _now();
+  return _workspaceEnvelope(session);
+}
+
 // ── Public: test control (simulated feed failure) ───────────────────────
 
 export function setHistoryV2FailMode(id, mode) {
@@ -2644,6 +3766,12 @@ export function setHistoryV2FailMode(id, mode) {
   }
   if (mode === "feed") {
     session.historyV2Fail = { feed: true };
+    return { status: "ok", mode };
+  }
+  if (mode === "favorite_once") {
+    // One-shot: the next favorite PATCH (generation or experiment route)
+    // returns 500 once and the flag self-clears.
+    session.historyV2Fail = { favoriteOnce: true };
     return { status: "ok", mode };
   }
   return { status: "error", message: `unknown fail mode "${mode}"` };
@@ -2889,6 +4017,11 @@ function _modernCellRecord(rawCell, index, definition, experimentId) {
 export function handleModernExperimentCreate(id, payload = {}) {
   const session = getSession(id);
   const body = payload && typeof payload === "object" ? payload : {};
+  session.experimentCreateRequests.push({
+    route: "/comfymodal/studio/experiment-v2",
+    at: _now(),
+    experiment_id: body && body.experiment_id != null ? String(body.experiment_id) : "",
+  });
   const validation = _validateModernCreateBody(body);
   if (validation) {
     return _modernExperimentError(validation.error, "INVALID_DEFINITION", 400, {
@@ -2950,6 +4083,31 @@ export function cancelModernExperiment(id, experimentId) {
       "EXPERIMENT_TERMINAL",
       409,
       { experiment_id: experimentId }
+    );
+  }
+
+  // Production parity (experiment_modern_routes._handle_cancel): when no
+  // truthful remote-cancel primitive is available (remote_cancel_available
+  // === false, set via the modern-experiment-state test control), running
+  // cells stay durable while queued cells still cancel atomically; the
+  // refusal is the machine-readable 503 CANCELLATION_UNAVAILABLE.
+  const runningCells = [];
+  const queuedCells = [];
+  for (const cell of exp.cells) {
+    const s = _modernCanonicalCellStatus(cell.status);
+    if (s === "running") runningCells.push(cell);
+    else if (s === "queued") queuedCells.push(cell);
+  }
+  if (runningCells.length > 0 && exp.remote_cancel_available === false) {
+    for (const cell of queuedCells) {
+      cell.status = "canceled";
+      cell.active_attempt_id = null;
+    }
+    return _modernExperimentError(
+      "running-cell cancellation is unavailable; running cells remain durable",
+      "CANCELLATION_UNAVAILABLE",
+      503,
+      { experiment_id: experimentId, running_cells: runningCells.map((c) => c.cell_id) }
     );
   }
 
@@ -3050,7 +4208,8 @@ export function setModernExperimentState(id, body = {}) {
   if (!exp) return _modernNotFound(experimentId);
 
   const changes = Array.isArray(body.cells) ? body.cells : [];
-  if (changes.length === 0) {
+  const wantsRemoteFlag = body && body.remote_cancel_available !== undefined;
+  if (changes.length === 0 && !wantsRemoteFlag) {
     return _modernExperimentError("no cells supplied", "INVALID_REQUEST", 400, { experiment_id: experimentId });
   }
   for (const change of changes) {
@@ -3079,6 +4238,10 @@ export function setModernExperimentState(id, body = {}) {
     if (change.error !== undefined) cell.error = change.error;
     if (change.duration_ms !== undefined) cell.duration_ms = change.duration_ms;
   }
+  // Test-control parity switch: mirrors production's truthful
+  // remote-cancel capability probe (absent/unavailable → 503
+  // CANCELLATION_UNAVAILABLE on cancel with running cells).
+  if (wantsRemoteFlag) exp.remote_cancel_available = !!body.remote_cancel_available;
   exp.updated_at = _now();
   const envelope = _modernFlatEnvelope(exp);
   return Object.assign({}, envelope, { experiment_id: experimentId });
@@ -3337,6 +4500,15 @@ function _buildWorkflowSeed() {
       },
       default_preset_id: "", default_preset_name: null,
       compatible_models: [], version_count: 1, updated_at: "2026-01-01T00:00:00.000Z",
+      // Seeded STALE cached summary (G11 contract): the list chip must render
+      // the stale state until a fresh Check portability replaces it.
+      portability_summary: {
+        version_id: "wv_incomplete",
+        risk_level: "medium",
+        issue_count: 4,
+        stale: true,
+        analyzed_at: "2026-08-20T09:00:00.000Z",
+      },
     },
     {
       workflow_id: "wf_fail", name: "Fail Workflow",
@@ -3367,6 +4539,15 @@ function _buildWorkflowSeed() {
       default_preset_id: "wpres_interrupt", default_preset_name: "Interrupt Preset",
       compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
       version_count: 1, updated_at: "2026-01-01T00:00:00.000Z",
+      // Seeded UNCHECKED cached summary (stale=null): freshness was not
+      // cheaply verified — the chip must say "Needs check", never current.
+      portability_summary: {
+        version_id: "wv_interrupt",
+        risk_level: "low",
+        issue_count: 0,
+        stale: null,
+        analyzed_at: "2026-08-21T08:00:00.000Z",
+      },
     },
   ];
 
@@ -3398,7 +4579,29 @@ export function listFakeWorkflows(id, opts = {}) {
     list = list.filter((w) => String(w.folder || "") === folder ||
       String(w.folder || "").startsWith(folder + "/"));
   }
-  return { status: "ok", workflows: list.map((w) => Object.assign({}, w)) };
+  return { status: "ok", workflows: list.map((w) => _withPortabilitySummary(session, w)) };
+}
+
+/**
+ * G11 chip derivation: a served portability report for the workflow's latest
+ * version becomes a FRESH summary (stale=false); otherwise the seeded
+ * summary (possibly stale) or null (not analyzed) passes through.
+ */
+function _withPortabilitySummary(session, wf) {
+  const copy = Object.assign({}, wf);
+  const report = session.portabilityReports[copy.latest_version_id];
+  if (report) {
+    copy.portability_summary = {
+      version_id: report.version_id,
+      risk_level: report.risk_level,
+      issue_count: report.issue_count,
+      stale: false,
+      analyzed_at: report.analyzed_at,
+    };
+  } else if (copy.portability_summary === undefined) {
+    copy.portability_summary = null;
+  }
+  return copy;
 }
 
 export function getFakeWorkflow(id, wfId) {
@@ -3406,7 +4609,24 @@ export function getFakeWorkflow(id, wfId) {
   const seed = _workflowSeed(session);
   const wf = seed.workflows.find((w) => w.workflow_id === wfId);
   if (!wf) return { status: "error", message: "workflow not found", _httpStatus: 404 };
-  return { status: "ok", workflow: Object.assign({}, wf) };
+  return { status: "ok", workflow: _withPortabilitySummary(session, wf) };
+}
+
+export function updateFakeWorkflow(id, wfId, body) {
+  const session = getSession(id);
+  const seed = _workflowSeed(session);
+  const wf = seed.workflows.find((w) => w.workflow_id === wfId);
+  if (!wf) return { status: "error", message: "workflow not found", _httpStatus: 404 };
+  const payload = body && typeof body === "object" ? body : {};
+  if (payload.favorite !== undefined) wf.favorite = Boolean(payload.favorite);
+  if (payload.tags !== undefined) wf.tags = Array.isArray(payload.tags) ? payload.tags.map(String) : [];
+  if (payload.name !== undefined) wf.name = String(payload.name);
+  if (payload.description !== undefined) wf.description = String(payload.description);
+  if (payload.folder !== undefined) wf.folder = String(payload.folder);
+  if (payload.source_url !== undefined) wf.source_url = String(payload.source_url);
+  if (payload.source_author !== undefined) wf.source_author = String(payload.source_author);
+  wf.updated_at = _now();
+  return { status: "ok", workflow: _withPortabilitySummary(session, wf) };
 }
 
 export function listFakeWorkflowVersions(id, wfId) {
@@ -3502,6 +4722,414 @@ function _cloneWfMapping(m) {
     workflow_version_id: m.workflow_version_id,
     output_node_id: m.output_node_id,
     entries: (m.entries || []).map((e) => Object.assign({}, e)),
+  };
+}
+
+// ── Public: Workflow Portability (G12 deterministic contract payloads) ───
+//
+// The fake NEVER simulates backend rule logic: every response is a seeded,
+// exact, predetermined G5-shaped payload. Modes only switch WHICH seeded
+// payload is served.
+
+const PORTABILITY_ANALYZED_AT = "2026-08-23T10:00:00.000Z";
+const PORTABILITY_RULE_VERSION = "portability-rules-v1";
+const PORTABILITY_GRAPH_HASH = "3f7a1c9e2b64d5081f7a1c9e2b64d5081f7a1c9e2b64d5081f7a1c9e2b64d508";
+
+function _pIssue(code, severity, message, subject, fixHint) {
+  return { code, severity, message, subject, fix_hint: fixHint || "" };
+}
+
+function _pTarget(riskLevel, issueCodes, advice) {
+  return { risk_level: riskLevel, issue_codes: issueCodes || [], advice: advice || [] };
+}
+
+function _pBase(versionId, riskLevel, issues, targets, environment) {
+  const counts = { high: 0, medium: 0, low: 0 };
+  issues.forEach((i) => { counts[i.severity] = (counts[i.severity] || 0) + 1; });
+  return {
+    version_id: versionId,
+    graph_hash: PORTABILITY_GRAPH_HASH,
+    risk_level: riskLevel,
+    rule_version: PORTABILITY_RULE_VERSION,
+    issue_count: issues.length,
+    counts,
+    issues,
+    signals: { has_absolute_path: false, unresolved_node_count: 0 },
+    targets,
+    environment,
+    stale: false,
+    invalidation: {
+      workflow_version_id: versionId,
+      graph_hash: PORTABILITY_GRAPH_HASH,
+      dependency_metadata_hash: null,
+      model_library_generation: null,
+      custom_node_registry_generation: null,
+      rule_version: PORTABILITY_RULE_VERSION,
+      manifest_version: 1,
+      comfyui_version: null,
+    },
+    analyzed_at: PORTABILITY_ANALYZED_AT,
+  };
+}
+
+function _portabilityPayload(mode, versionId) {
+  if (mode === "low") {
+    return _pBase(versionId, "low", [], {
+      local: _pTarget("low", [], ["Native reference environment."]),
+      modal: _pTarget("low", [], ["Broad dependency control on the Modal image."]),
+      runpod: _pTarget("low", [], ["Standard image covers all dependencies."]),
+      runcomfy: _pTarget("low", [], ["Managed import accepted the graph."]),
+      comfy_cloud: _pTarget("low", [], ["Only curated core nodes are used."]),
+      baseten: _pTarget("low", [], ["Graph embeds cleanly into a deployment."]),
+    }, { risk_level: "low", issues: [], source: "current_studio_environment" });
+  }
+  if (mode === "high") {
+    const issues = [
+      _pIssue(
+        "dependency_missing", "high",
+        "Required checkpoint 'krea_model.safetensors' is missing and has no source URLs.",
+        "models", "Add the model to the Model Library with a source URL."
+      ),
+    ];
+    return _pBase(versionId, "high", issues, {
+      local: _pTarget("medium", ["dependency_missing"], ["Install the missing checkpoint locally."]),
+      modal: _pTarget("high", ["dependency_missing"], ["Modal cannot start without the checkpoint in the volume."]),
+      runpod: _pTarget("high", ["dependency_missing"], []),
+      runcomfy: _pTarget("medium", ["dependency_missing"], []),
+      comfy_cloud: _pTarget("high", ["dependency_missing"], []),
+      baseten: _pTarget("medium", ["dependency_missing"], []),
+    }, {
+      risk_level: "medium",
+      issues: [_pIssue("model_hash_unpinned", "low", "Model hashes are not pinned for this environment.", "environment", "")],
+      source: "current_studio_environment",
+    });
+  }
+  if (mode === "unknown_main") {
+    const issues = [
+      _pIssue(
+        "target_capability_unknown", "medium",
+        "The analyzer could not make a defensible portability determination for this version.",
+        "graph", ""
+      ),
+    ];
+    return _pBase(versionId, "unknown", issues, {
+      local: _pTarget("low", [], []),
+      modal: _pTarget("medium", [], []),
+      runpod: _pTarget("medium", [], []),
+      runcomfy: _pTarget("unknown", ["target_capability_unknown"], []),
+      comfy_cloud: _pTarget("medium", [], []),
+      baseten: _pTarget("low", [], []),
+    }, { risk_level: "unknown", issues: [], source: "current_studio_environment" });
+  }
+  // Default "matrix": MEDIUM workflow + HIGH environment + the frozen
+  // six-target UX case (Local low / Modal low / RunPod medium / RunComfy
+  // unknown / Comfy Cloud high / Baseten medium).
+  const issues = [
+    _pIssue(
+      "custom_node_unpinned", "medium",
+      "2 custom nodes are installed without a pinned revision.",
+      "custom_nodes", "Pin the installed revisions before exporting."
+    ),
+    _pIssue(
+      "target_capability_unknown", "medium",
+      "RunComfy native capability could not be determined.",
+      "target", ""
+    ),
+    _pIssue(
+      "model_hash_unpinned", "low",
+      "1 model reference has no sha256 hash recorded.",
+      "models", "Record the model hash in the Model Library."
+    ),
+    _pIssue(
+      "subgraph_frontend_requirement", "low",
+      "Graph uses subgraph definitions requiring frontend 1.44 or newer.",
+      "frontend", ""
+    ),
+  ];
+  return _pBase(versionId, "medium", issues, {
+    local: _pTarget("low", [], ["Native reference environment."]),
+    modal: _pTarget("low", [], ["Broad dependency control on the Modal image."]),
+    runpod: _pTarget("medium", ["custom_node_unpinned"], ["Provide a custom Docker image with pinned custom nodes."]),
+    runcomfy: _pTarget("unknown", ["target_capability_unknown"], []),
+    comfy_cloud: _pTarget("high", ["custom_node_unpinned"], ["Comfy Cloud allows only curated nodes; remove unpinned custom nodes."]),
+    baseten: _pTarget("medium", ["custom_node_unpinned"], ["Embed the workflow into a deployment with pinned dependencies."]),
+  }, {
+    risk_level: "high",
+    issues: [
+      _pIssue("custom_node_source_unpinned", "medium", "Custom node sources are not pinned to commits.", "environment", ""),
+      _pIssue("model_hash_unpinned", "low", "Model hashes are not pinned for this environment.", "environment", ""),
+    ],
+    source: "current_studio_environment",
+  });
+}
+
+export function getFakePortabilityReport(sid, versionId) {
+  const session = getSession(sid);
+  const seed = _workflowSeed(session);
+  const known = seed.versions.some((v) => v.workflow_version_id === versionId);
+  if (!known) {
+    return { status: "error", message: "version not found", _httpStatus: 404 };
+  }
+  session.portabilityRequests.push({ version_id: versionId });
+  const report = _portabilityPayload(session.portabilityMode || "matrix", versionId);
+  session.portabilityReports[versionId] = report;
+  return { status: "ok", portability: JSON.parse(JSON.stringify(report)) };
+}
+
+export function armPortability(sid, body) {
+  const session = getSession(sid);
+  const mode = body && body.mode;
+  const allowed = ["matrix", "low", "high", "unknown_main"];
+  if (!allowed.includes(mode)) {
+    return { status: "error", message: "mode must be one of " + allowed.join("|"), _httpStatus: 400 };
+  }
+  session.portabilityMode = mode;
+  return { status: "ok", mode };
+}
+
+export function armPortabilityExportFail(sid, body) {
+  const session = getSession(sid);
+  const mode = (body && body.mode) || "";
+  if (mode !== "" && mode !== "credential") {
+    return { status: "error", message: "mode must be '' or 'credential'", _httpStatus: 400 };
+  }
+  session.exportCredentialFailArmed = mode === "credential";
+  return { status: "ok", mode };
+}
+
+export function armManifestImport(sid, body) {
+  const session = getSession(sid);
+  const b = body || {};
+  if (b.preview_mode !== undefined) {
+    if (!["valid", "invalid", "missing_deps"].includes(b.preview_mode)) {
+      return { status: "error", message: "preview_mode must be valid|invalid|missing_deps", _httpStatus: 400 };
+    }
+    session.importPreviewMode = b.preview_mode;
+  }
+  if (b.commit_fail_once !== undefined) {
+    session.importCommitFailArmed = !!b.commit_fail_once;
+  }
+  return {
+    status: "ok",
+    preview_mode: session.importPreviewMode,
+    commit_fail_once: session.importCommitFailArmed,
+  };
+}
+
+export function exportFakeWorkflowManifest(sid, versionId, includePresets) {
+  const session = getSession(sid);
+  const seed = _workflowSeed(session);
+  const v = seed.versions.find((x) => x.workflow_version_id === versionId);
+  if (!v) {
+    return { ok: false, status: 404, error_code: "not_found", message: "workflow version not found" };
+  }
+  if (session.exportCredentialFailArmed) {
+    session.exportCredentialFailArmed = false;
+    return {
+      ok: false,
+      status: 409,
+      error_code: "credential_like_value_detected",
+      message: "Export blocked: the manifest would embed credential-like values.",
+    };
+  }
+  const wf = seed.workflows.find((w) => w.workflow_id === v.workflow_id) || {};
+  const name = String(wf.name || "Workflow");
+  const sanitized =
+    name.trim().replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "workflow";
+  const hash8 = String(v.graph_hash || "").slice(0, 8) || "00000000";
+  const filename = sanitized + "-v" + (v.version_number != null ? v.version_number : 1) + "-" + hash8 + ".workflow.json";
+  const presets = includePresets
+    ? Object.values(seed.presets)
+        .filter((p) => p.workflow_version_id === versionId)
+        .map((p) => ({ preset_id: p.preset_id, name: p.name, is_default: !!p.is_default }))
+    : [];
+  const manifest = {
+    manifest_version: 1,
+    workflow: { display: { name, description: wf.description || "" }, graph_hash: v.graph_hash },
+    version: { version_number: v.version_number, graph_json: {}, api_prompt_json: {} },
+    mapping: { mapping_id: v.mapping_id || "", entries: [] },
+    presets,
+    models: [],
+    custom_nodes: [],
+    assets: [],
+    metadata: { exporter: "fake-backend" },
+  };
+  session.manifestExports.push({
+    version_id: versionId,
+    include_presets: !!includePresets,
+    filename,
+  });
+  return { ok: true, body: JSON.stringify(manifest, null, 2), filename };
+}
+
+function _importPreviewPayload(mode) {
+  if (mode === "invalid") {
+    return {
+      status: "preview",
+      valid: false,
+      manifest_version: 1,
+      issues: [
+        "graph hash mismatch: manifest declares aa00 but the captured graph hashes to bb11",
+        "unknown root section 'extras' is not part of manifest v1",
+        "preset 'Preset B' has no values object",
+      ],
+      readiness: { ready: false, issues: ["missing model hash for 'krea_model.safetensors'"] },
+      portability: null,
+      existing_name_matches: [],
+      proposed_name: "",
+      will_create: null,
+      dependency_summary: null,
+      security_findings: [],
+    };
+  }
+  if (mode === "missing_deps") {
+    return {
+      status: "preview",
+      valid: true,
+      manifest_version: 1,
+      issues: [],
+      readiness: { ready: true, issues: [] },
+      portability: { risk_level: "medium", issue_count: 2 },
+      existing_name_matches: ["Portrait Pro"],
+      proposed_name: "Portrait Pro (imported)",
+      will_create: { workflow: true, version: true, mapping: true, preset_count: 0 },
+      dependency_summary: {
+        models: [{ filename: "krea_model.safetensors", state: "missing" }],
+        custom_nodes: [{ name: "SomeCustomClass", state: "installed" }],
+        summary: { installed: 1, missing: 1, wrong_version: 0, unknown: 0, attention: 1, ready: false },
+      },
+      security_findings: [],
+    };
+  }
+  return {
+    status: "preview",
+    valid: true,
+    manifest_version: 1,
+    issues: [],
+    readiness: { ready: true, issues: [] },
+    portability: { risk_level: "medium", issue_count: 2 },
+    existing_name_matches: ["Portrait Pro"],
+    proposed_name: "Portrait Pro (imported)",
+    will_create: { workflow: true, version: true, mapping: true, preset_count: 2 },
+    has_default_preset_candidate: true,
+    dependency_summary: {
+      models: [{ filename: "sd15_v2.safetensors", state: "installed" }],
+      custom_nodes: [],
+      summary: { installed: 1, missing: 0, wrong_version: 0, unknown: 0, attention: 0, ready: true },
+    },
+    security_findings: [],
+  };
+}
+
+export function previewFakeManifestImport(sid, body) {
+  const session = getSession(sid);
+  session.manifestImports.push({ dry_run: true });
+  return _importPreviewPayload(session.importPreviewMode || "valid");
+}
+
+export function commitFakeManifestImport(sid, body) {
+  const session = getSession(sid);
+  const importPresets = !!(body && body.import_presets === true);
+  const applyDefault = !!(body && body.apply_default_preset === true);
+  session.manifestImports.push({
+    dry_run: false,
+    import_presets: importPresets,
+    apply_default_preset: applyDefault,
+  });
+  if (session.importCommitFailArmed) {
+    session.importCommitFailArmed = false;
+    return {
+      status: "error",
+      message: "Simulated atomic import failure \u2014 nothing was created.",
+      _httpStatus: 500,
+    };
+  }
+  const seed = _workflowSeed(session);
+  session.importSeq += 1;
+  const n = session.importSeq;
+  const wfId = "wf_import_" + n;
+  const verId = "wv_import_" + n;
+  const mapId = "wm_import_" + n;
+  const presetIds = [];
+  let appliedDefault = null;
+  let note = "";
+  if (importPresets) {
+    for (let i = 1; i <= 2; i++) {
+      const pid = "wpres_import_" + n + "_" + i;
+      presetIds.push(pid);
+      seed.presets[pid] = {
+        preset_id: pid,
+        workflow_version_id: verId,
+        workflow_id: wfId,
+        name: "Imported Preset " + i,
+        values: {},
+        model_choices: {},
+        is_default: false,
+      };
+    }
+    if (applyDefault && presetIds.length) {
+      appliedDefault = presetIds[0];
+      seed.presets[appliedDefault].is_default = true;
+    } else if (applyDefault) {
+      note = "apply_default_preset requested without import_presets; no default applied";
+    }
+  } else if (applyDefault) {
+    note = "apply_default_preset requested without import_presets; no default applied";
+  }
+  const now = _now();
+  const wf = {
+    workflow_id: wfId,
+    name: "Portrait Pro (imported)",
+    description: "",
+    folder: "",
+    tags: [],
+    favorite: false,
+    latest_version_id: verId,
+    latest_version_number: 1,
+    latest_version_state: { status: "ready", reasons: [], runnable: true },
+    default_preset_id: appliedDefault || "",
+    compatible_models: ["krea_model.safetensors"],
+    version_count: 1,
+    updated_at: now,
+  };
+  const version = {
+    workflow_version_id: verId,
+    workflow_id: wfId,
+    version_number: 1,
+    created_at: now,
+    updated_at: now,
+    graph_hash: "feedface" + "0".repeat(56),
+    mapping_id: mapId,
+    mapping: { mapping_id: mapId, workflow_version_id: verId, output_node_id: "4", entries: [] },
+    preset_count: presetIds.length,
+    executable_prompt: {},
+    state: { status: "ready", reasons: [], runnable: true },
+    compatible_models: ["krea_model.safetensors"],
+    default_preset_id: appliedDefault || "",
+  };
+  seed.workflows.push(wf);
+  seed.versions.push(version);
+  seed.mappings[mapId] = { mapping_id: mapId, workflow_version_id: verId, output_node_id: "4", entries: [] };
+  return {
+    status: "ok",
+    workflow_id: wfId,
+    workflow_version_id: verId,
+    mapping_id: mapId,
+    preset_ids: presetIds,
+    applied_default_preset_id: appliedDefault,
+    default_application_note: note,
+    workflow_name: wf.name,
+    provenance: {
+      source_workflow_id: "wf_foreign_src",
+      source_version_id: "wv_foreign_src",
+    },
+    dependency_summary: {
+      models: [{ filename: "krea_model.safetensors", state: "missing" }],
+      custom_nodes: [],
+      summary: { installed: 0, missing: 1, wrong_version: 0, unknown: 0, attention: 1, ready: false },
+    },
+    portability_risk_level: "medium",
+    manifest_hash: "deadbeef1234567890",
   };
 }
 
@@ -3883,11 +5511,41 @@ export function setConfig(id, body = {}) {
   return { status: "ok", config: getConfig(id), applied: body };
 }
 
+// Managed-asset content type (F3): previews are WebP in production, so a
+// `_preview` asset serves image/webp while everything else stays PNG.  The
+// bytes remain the deterministic PNG table — browsers sniff <img> content,
+// and download tests assert the RESPONSE MIME as extension authority.
+function _assetContentType(assetId) {
+  if (/_preview$/.test(String(assetId || ""))) return "image/webp";
+  return "image/png";
+}
+
 export function getAsset(id, assetId) {
   const session = getSession(id);
+  const fail = session.assetFailOnce.get(assetId);
+  if (fail && fail.remaining > 0) {
+    fail.remaining -= 1;
+    if (fail.remaining <= 0) session.assetFailOnce.delete(assetId);
+    session.assetGets[assetId] = (session.assetGets[assetId] || 0) + 1;
+    return { ok: false, status: fail.status || 502 };
+  }
   const bytes = session.assets.get(assetId);
   if (!bytes) return { ok: false };
-  return { ok: true, contentType: "image/png", bytes };
+  session.assetGets[assetId] = (session.assetGets[assetId] || 0) + 1;
+  return { ok: true, contentType: _assetContentType(assetId), bytes };
+}
+
+// Test control: arm N one-shot failures for one asset GET (default 502 —
+// mirrors a remote modal:// upstream failure; use status 404 for a missing
+// managed file).  Later GETs succeed again.
+export function armAssetFailure(id, body = {}) {
+  const session = getSession(id);
+  const assetId = String(body.assetId || "");
+  if (!assetId) return { status: "error", message: "assetId is required" };
+  const times = Math.max(1, Number(body.times) || 1);
+  const status = Number(body.status) || 502;
+  session.assetFailOnce.set(assetId, { remaining: times, status });
+  return { status: "ok", assetId, times, httpStatus: status };
 }
 
 export function getOutput(id, filename) {
@@ -4077,9 +5735,20 @@ export function dumpState(id) {
     eventQueue: session.eventQueue.slice(0, 200),
     assetIds: [...session.assets.keys()],
     outputFilenames: [...session.outputs.keys()],
+    assetGets: Object.assign({}, session.assetGets),
     saveRequests: session.saveRequests,
+    exportRecords: Object.fromEntries(
+      [...session.exportRecords.entries()].map(([k, v]) => [k, Object.assign({}, v)])
+    ),
+    exportFiles: [...session.exportFiles.keys()],
+    exportRequests: session.exportRequests.slice(),
     workflowRuns: JSON.parse(JSON.stringify(session.workflowRuns)),
     workflowRunSeq: session.workflowRunSeq,
+    portabilityMode: session.portabilityMode,
+    portabilityRequests: session.portabilityRequests.slice(),
+    manifestExports: session.manifestExports.map((e) => Object.assign({}, e)),
+    manifestImports: session.manifestImports.map((i) => Object.assign({}, i)),
+    experimentCreateRequests: session.experimentCreateRequests.map((r) => Object.assign({}, r)),
   };
 }
 

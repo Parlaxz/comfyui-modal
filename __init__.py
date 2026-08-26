@@ -109,46 +109,37 @@ from warmup_profile import prepare_active_next_profile as prepare_active_next_pr
 from canonical_execution import (
     RunTrace,
     build_execution_plan,
-    execute_modal_prompt,
     execute_plan,
-    prepare_modal_execution,
     _reset_profile_prep_cache,
 )
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.result_delivery import materialize_modal_result as _materialize_v2_result
 from comfymodal_runtime.trace import RuntimeTrace
 from comfymodal_runtime.v2_waterfall import attach_waterfall, is_graph_result
+# H19 Wave G: retired Comparison writer/executor imports removed with their
+# zero-caller residue; COMPAT_READ surface (list/get/validate/detect/config/
+# workflow/gallery readers) is unchanged.
 from comparison import (
-    create_profile,
-    update_profile,
-    delete_profile,
-    duplicate_profile,
     list_profiles,
     get_profile,
     auto_detect_slots,
-    set_slots,
     validate_profile,
-    run_comparison,
-    save_comparison_manifest,
-    save_comparison_result,
     get_comparison_results,
     list_comparison_runs,
-    detect_slots,
     load_comparison_config,
-    save_comparison_config,
     get_workflow_nodes,
     get_profile_workflow,
 )
 
 from execution_runtime import (
-    MODE_V1,
     MODE_V2,
-    MODE_SHADOW,
     resolve_execution_mode,
     normalize_mode,
     capture_execution_mode,
     validate_config_payload,
-    AVAILABLE_EXECUTION_MODES as _AVAILABLE_EXECUTION_MODES,
+    retired_request_mode,
+    retired_mode_error,
+    engine_v1_retired_notice,
 )
 
 import model_manifest as _model_manifest
@@ -895,6 +886,7 @@ _swap_jobs_lock = threading.Lock()
 
 # ── Output settings (server-side, persisted to .modal_settings.json) ──
 def _default_modal_settings() -> dict:
+    from gpu_catalog import get_default_gpu as _catalog_default_gpu
     return {
         "output_format": _CONVERTER_DEFAULTS["output_format"],
         "quality": _CONVERTER_DEFAULTS["quality"],
@@ -907,6 +899,8 @@ def _default_modal_settings() -> dict:
         "preview_quality": 70,
         # ── Phase 8: execution mode ──
         "execution_mode": MODE_V2,
+        # ── F8: canonical selected GPU (persisted server authority) ──
+        "gpu": _catalog_default_gpu(),
     }
 
 _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {
@@ -1071,6 +1065,29 @@ def _normalize_preview_settings(settings: dict) -> dict:
     return settings
 
 
+def _normalize_gpu_setting(settings: dict) -> dict:
+    """F8: normalize the persisted GPU against the canonical catalog.
+
+    A missing/non-string value falls back to the catalog default; an
+    invalid or retired value normalizes truthfully to the catalog default
+    instead of silently persisting nonsense (mirrors ``set_gpu``
+    rejection semantics, fail-closed to the default rather than erroring
+    during settings load).
+    """
+    from gpu_catalog import GPU_BY_VALUE, get_default_gpu as _catalog_default_gpu, normalize_gpu_value
+    gpu = settings.get("gpu")
+    if isinstance(gpu, str) and gpu.strip():
+        normalized = normalize_gpu_value(gpu)
+        if normalized not in GPU_BY_VALUE:
+            normalized = ""
+    else:
+        normalized = ""
+    if not normalized:
+        normalized = _catalog_default_gpu()
+    settings["gpu"] = normalized
+    return settings
+
+
 def _load_modal_settings() -> dict:
     """Load persisted output/auto-save settings from disk."""
     global _modal_settings_cache
@@ -1086,12 +1103,8 @@ def _load_modal_settings() -> dict:
                 if key in saved and isinstance(saved[key], type(defaults[key])):
                     merged[key] = saved[key]
             _normalize_preview_settings(merged)
-            # Settings are user-facing and may only select V1/V2.  Treat old
-            # or hand-edited values as the safe V2 default; shadow is an
-            # internal comparison mode and never a persisted UI setting.
-            _saved_mode = normalize_mode(merged.get("execution_mode"))
-            if _saved_mode not in (MODE_V1, MODE_V2):
-                merged["execution_mode"] = MODE_V2
+            _migrate_persisted_execution_mode(merged)
+            _normalize_gpu_setting(merged)
             _modal_settings_cache = merged
             return dict(merged)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -1100,24 +1113,92 @@ def _load_modal_settings() -> dict:
     return dict(defaults)
 
 
+# ── H12: one-time persisted execution_mode migration (v1 → v2) ──────────────
+# Surfaced via GET /config until the process restarts; after the rewrite the
+# persisted value is "v2", so subsequent loads are no-ops (idempotent).
+_EXECUTION_MODE_MIGRATION_NOTICE: str | None = None
+
+
+def _migrate_persisted_execution_mode(merged: dict) -> None:
+    """Migrate a retired persisted execution_mode to V2 exactly once.
+
+    Idempotent: an already-clean ``"v2"`` value is untouched.  Retired values
+    (``v1`` / ``legacy`` / ``shadow``) and unknown garbage safely normalize to
+    ``v2``, the rewritten file is persisted immediately, and a one-time notice
+    is logged + surfaced.  Never touches in-flight requests (capture at
+    acceptance makes that impossible) and never maps ``comfymodal_enabled``.
+    """
+    global _EXECUTION_MODE_MIGRATION_NOTICE
+    raw = merged.get("execution_mode")
+    if raw == MODE_V2:
+        return
+    normalized = normalize_mode(raw)
+    merged["execution_mode"] = MODE_V2
+    notice = engine_v1_retired_notice()
+    _EXECUTION_MODE_MIGRATION_NOTICE = notice
+    print(
+        f"[comfyui-modal] Settings migration: persisted execution_mode="
+        f"{raw!r} is retired; normalized to 'v2'. {notice}"
+    )
+    try:
+        tmp_path = f"{_MODAL_SETTINGS_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, _MODAL_SETTINGS_FILE)
+    except OSError as exc:
+        print(
+            f"[comfyui-modal] WARNING: execution_mode migration could not "
+            f"persist yet ({exc}); retried on next startup."
+        )
+
+
 def _save_modal_settings(settings: dict) -> dict:
-    """Persist settings to disk, merging with defaults."""
+    """Persist settings to disk, merging with defaults and current state.
+
+    F8: keys absent from *settings* keep their CURRENT persisted value
+    (read-modify-write) instead of reverting to defaults, so a partial
+    POST (e.g. output settings only) can never silently reset the
+    persisted execution mode or GPU.
+    """
     global _modal_settings_cache
     defaults = _default_modal_settings()
+    current = _load_modal_settings()
     merged = dict(defaults)
     for key in defaults:
         if key in settings and isinstance(settings[key], type(defaults[key])):
             merged[key] = settings[key]
+        elif key in current and isinstance(current[key], type(defaults[key])):
+            merged[key] = current[key]
     _normalize_preview_settings(merged)
-    _saved_mode = normalize_mode(merged.get("execution_mode"))
-    if _saved_mode not in (MODE_V1, MODE_V2):
+    # H12: V2 is the only persistable engine.  Retired or invalid values can
+    # never be written back to disk (POST /config rejects them upstream).
+    if merged.get("execution_mode") != MODE_V2:
         merged["execution_mode"] = MODE_V2
+    _normalize_gpu_setting(merged)
     tmp_path = f"{_MODAL_SETTINGS_FILE}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
     os.replace(tmp_path, _MODAL_SETTINGS_FILE)
     _modal_settings_cache = merged
     return dict(merged)
+
+
+def _seed_server_gpu_from_settings() -> str:
+    """F8: initialize the server's current-GPU authority from persisted settings.
+
+    Called once at startup so the in-memory ``modal_client._current_gpu``
+    reflects the canonical persisted selection across ComfyUI restarts.
+    Never raises: a seeding failure leaves the catalog default in place.
+    """
+    try:
+        settings = _load_modal_settings()
+        gpu = str(settings.get("gpu", "") or "")
+        if gpu:
+            set_gpu(gpu)
+        return get_gpu()
+    except Exception as exc:
+        print(f"[comfyui-modal] WARNING: GPU settings seed failed: {exc}")
+        return ""
 
 def _custom_nodes_root() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(_NODE_DIR)), "custom_nodes")
@@ -1756,7 +1837,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, check_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target, persist_validation_certificate
+    from modal_client import run_prompt, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, check_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target, persist_validation_certificate
 
     # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
     _runtime_flag_funcs: dict = {}
@@ -1783,6 +1864,9 @@ try:
 
     _modal_available = True
     set_workspace_resolver(_active_workspace)
+    # F8: seed the server's current-GPU authority from the persisted
+    # canonical settings so the selection survives ComfyUI restarts.
+    _seed_server_gpu_from_settings()
     _maybe_auto_deploy()
 except ImportError:
     _err_detail = f" (install error: {_pip_install_error})" if _pip_install_error else ""
@@ -2196,76 +2280,6 @@ _last_written_stable_profile: dict[tuple[str, str], float] = {}
 _ACTIVE_NEXT_REFRESH_MIN_S = 30.0
 
 
-def _ws_id_for_active_next(workspace: dict | None) -> str:
-    if isinstance(workspace, dict):
-        _wid = workspace.get("id") or workspace.get("workspace_id") or ""
-        if _wid:
-            return str(_wid)
-    return "__default__"
-
-
-def _normalize_stable_warmup_profile(
-    warmup_profile: dict | None,
-) -> dict:
-    """Return a canonical warmup profile with only restore-relevant fields.
-
-    Rules:
-    - Missing fields become "".
-    - disable_warmup becomes bool.
-    - For mode=="checkpoint": preserve checkpoint, clear model fields.
-    - For mode=="split": preserve model fields, clear checkpoint.
-    - For other modes: preserve only mode and disable_warmup.
-    - When clip2 == clip1, set clip2 = "".
-    - Does not include workflow hash, UUIDs, timestamps, output nodes,
-      seed, prompt, Production settings, or raw stack lists.
-    """
-    if not isinstance(warmup_profile, dict):
-        warmup_profile = {}
-    stable = {
-        "mode": str(warmup_profile.get("mode", "")).strip(),
-        "checkpoint": "",
-        "unet": "",
-        "clip1": "",
-        "clip2": "",
-        "vae": "",
-        "clip_type": "",
-        "disable_warmup": bool(warmup_profile.get("disable_warmup", False)),
-    }
-    _mode = stable["mode"]
-    if _mode == "checkpoint":
-        stable["checkpoint"] = str(warmup_profile.get("checkpoint", "")).strip()
-    elif _mode == "split":
-        stable["unet"] = str(warmup_profile.get("unet", "")).strip()
-        stable["clip1"] = str(warmup_profile.get("clip1", "")).strip()
-        stable["clip2"] = str(warmup_profile.get("clip2", "")).strip()
-        stable["vae"] = str(warmup_profile.get("vae", "")).strip()
-        stable["clip_type"] = str(warmup_profile.get("clip_type", "")).strip()
-    # Collapse duplicate CLIP
-    if stable["clip2"] and stable["clip2"] == stable["clip1"]:
-        stable["clip2"] = ""
-    return stable
-
-
-def _compute_stable_warmup_profile_key(warmup_profile: dict) -> str:
-    """Return a canonical stable key from only restore-relevant stacks.
-
-    This excludes UUIDs, timestamps, workflow_hash, output nodes, and
-    Production-mode settings so identical model stacks always produce
-    the same key regardless of workflow display state.
-    """
-    _stable = _normalize_stable_warmup_profile(warmup_profile)
-    return hashlib.sha256(
-        json.dumps(_stable, sort_keys=True, separators=(",", ":"),
-                   ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
-
-
-def _build_next_warmup_activation(workflow: dict, workflow_hash: str, production_options: dict | None = None) -> dict:
-    """Compatibility wrapper delegating to ``warmup_profile._build_activation_payload``."""
-    from warmup_profile import build_activation_payload
-    return build_activation_payload(workflow, workflow_hash, production_options)
-
-
 async def _execute_job(item: tuple, item_id: int):
     # Per audit round 7: the dedup dict is module-global;
     # mutations must be marked global so the
@@ -2421,106 +2435,79 @@ async def _execute_job(item: tuple, item_id: int):
                 _forward_execution_start_once()
 
         # ── Delegate to canonical executor ──
-        # execute_modal_prompt handles: compile (from production_options),
+        # execute_plan handles: compile (from production_options),
         # hash validation, API structure, class-type validation, input image
         # collection, profile preparation, run-prompt-options construction,
-        # and the run_prompt_stream call with event forwarding.
-        # This is the single canonical call — no second compile/hash path.
-        # Phase 8: use captured mode from submission (immutable), fall back to resolver.
+        # and the Modal V2 transport call with event forwarding.
+        # H12: canvas Cloud execution is Modal V2 ONLY.  Retired engine
+        # selections are rejected at acceptance; no v1/shadow dispatch
+        # remains on this path.
         _mode_resolution = resolve_execution_mode(
             modal_options=extra_data.get("modal_options"),
             extra=extra_data,
             modal_settings=_load_modal_settings(),
         )
         _mode = _mode_resolution["mode"]
-        _v2_plan = None
-        _v2_trace = None
-        if _mode in {"v2", "shadow"}:
-            _v2_trace = RuntimeTrace(request_id=prompt_id, process="local")
-            # ── Phase 0: deployment/invocation identity ──
-            _v2_gpu = extra_data.get("gpu") or get_gpu() or ""
-            _v2_app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow").strip() or "stable-modal-comfy-v2-shadow"
-            _v2_class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2").strip() or "ModalRuntimeEntrypointV2"
-            _v2_method_name = "run_plan_stream"
-            _origin_info = trace_payload.get("request_origin_info", {}) if isinstance(trace_payload, dict) else {}
-            _v2_trace.set_metadata(
-                runtime_mode=_mode,
-                app_name=_v2_app_name,
-                class_name=_v2_class_name,
-                method_name=_v2_method_name,
-                gpu=_v2_gpu,
-                cloud=os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip(),
-                region=os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip(),
-                image_id=os.environ.get("MODAL_IMAGE_ID", "").strip(),
-                container_task_id=os.environ.get("MODAL_TASK_ID", "").strip(),
-                request_origin_info=dict(_origin_info) if isinstance(_origin_info, dict) else {},
-            )
-            # Emit worker_start at the true dequeue boundary
-            _ws_wall = _origin_info.get("queue_worker_start_wall_ns") if isinstance(_origin_info, dict) else None
-            _ws_mono = _origin_info.get("queue_worker_start_mono_ns") if isinstance(_origin_info, dict) else None
-            if _ws_wall is not None and _ws_mono is not None:
-                _v2_trace.emit_at("worker_start", wall_unix_ns=_ws_wall, monotonic_ns=_ws_mono, phase="local")
-            _v2_plan = build_execution_plan(
-                execution_workflow,
-                prompt_id=prompt_id,
-                client_id=sid,
-                modal_options=_mo if _mo else None,
-                production_options=production_options if production_options.get("enabled") else None,
-                production_report=extra_data.get("production_report") if isinstance(extra_data, dict) else None,
-                gpu=_v2_gpu,
-                workspace=_request_workspace or None,
-                comfyui_root=_COMFYUI_ROOT,
-                trace=_v2_trace,
-                validate=False,
-                collect_validation_proof=True,
-            )
-            _v2_trace.set_metadata(
-                workflow_hash_prefix=_v2_plan.workflow_hash[:12],
-                container_session_id="",  # placeholder; populated from remote
-                workspace_id=_v2_plan.request_metadata.get("workspace_id", ""),
-            )
-            _run_trace.set_meta(
-                execution_mode=_mode,
-                execution_mode_source=_mode_resolution["source"],
-                v2_runtime_mode=_mode,
-                v2_plan_hash=_v2_plan.workflow_hash,
-                v2_source_workflow_hash=_v2_plan.source_workflow_hash,
-            )
-            if _mode == "shadow":
-                print(f"[comfyui-modal] v2 shadow plan built hash={_v2_plan.workflow_hash[:12]}")
-
-        if _mode == "v2" and _v2_plan is not None:
-            _v2_transport = ModalTransport()
-            result = await execute_plan(
-                _v2_plan,
-                transport=_v2_transport,
-                profile_setter=None,
-                gpu=extra_data.get("gpu"),
-                workspace=_request_workspace or None,
-                trace=_v2_trace,
-                event_sink=_event_sink,
-            )
-        else:
-            _run_trace.set_meta(
-                execution_mode=_mode,
-                execution_mode_source=_mode_resolution["source"],
-            )
-            result = await execute_modal_prompt(
-                execution_workflow,
-                prompt_id=prompt_id,
-                client_id=sid,
-                input_images=None,
-                modal_options=_mo if _mo else None,
-                production_options=production_options if production_options.get("enabled") else None,
-                gpu=extra_data.get("gpu"),
-                workspace=_request_workspace or None,
-                trace_payload={**trace.fields(), "prompt_id": prompt_id, "client_id": sid},
-                profile_setter=set_active_warmup_profile,
-                profile_checker=check_active_warmup_profile,
-                run_trace=_run_trace,
-                comfyui_root=_COMFYUI_ROOT,
-                event_sink=_event_sink,
-            )
+        _v2_trace = RuntimeTrace(request_id=prompt_id, process="local")
+        # ── Phase 0: deployment/invocation identity ──
+        _v2_gpu = extra_data.get("gpu") or get_gpu() or ""
+        _v2_app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow").strip() or "stable-modal-comfy-v2-shadow"
+        _v2_class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2").strip() or "ModalRuntimeEntrypointV2"
+        _v2_method_name = "run_plan_stream"
+        _origin_info = trace_payload.get("request_origin_info", {}) if isinstance(trace_payload, dict) else {}
+        _v2_trace.set_metadata(
+            runtime_mode=_mode,
+            app_name=_v2_app_name,
+            class_name=_v2_class_name,
+            method_name=_v2_method_name,
+            gpu=_v2_gpu,
+            cloud=os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip(),
+            region=os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip(),
+            image_id=os.environ.get("MODAL_IMAGE_ID", "").strip(),
+            container_task_id=os.environ.get("MODAL_TASK_ID", "").strip(),
+            request_origin_info=dict(_origin_info) if isinstance(_origin_info, dict) else {},
+        )
+        # Emit worker_start at the true dequeue boundary
+        _ws_wall = _origin_info.get("queue_worker_start_wall_ns") if isinstance(_origin_info, dict) else None
+        _ws_mono = _origin_info.get("queue_worker_start_mono_ns") if isinstance(_origin_info, dict) else None
+        if _ws_wall is not None and _ws_mono is not None:
+            _v2_trace.emit_at("worker_start", wall_unix_ns=_ws_wall, monotonic_ns=_ws_mono, phase="local")
+        _v2_plan = build_execution_plan(
+            execution_workflow,
+            prompt_id=prompt_id,
+            client_id=sid,
+            modal_options=_mo if _mo else None,
+            production_options=production_options if production_options.get("enabled") else None,
+            production_report=extra_data.get("production_report") if isinstance(extra_data, dict) else None,
+            gpu=_v2_gpu,
+            workspace=_request_workspace or None,
+            comfyui_root=_COMFYUI_ROOT,
+            trace=_v2_trace,
+            validate=False,
+            collect_validation_proof=True,
+        )
+        _v2_trace.set_metadata(
+            workflow_hash_prefix=_v2_plan.workflow_hash[:12],
+            container_session_id="",  # placeholder; populated from remote
+            workspace_id=_v2_plan.request_metadata.get("workspace_id", ""),
+        )
+        _run_trace.set_meta(
+            execution_mode=_mode,
+            execution_mode_source=_mode_resolution["source"],
+            v2_runtime_mode=_mode,
+            v2_plan_hash=_v2_plan.workflow_hash,
+            v2_source_workflow_hash=_v2_plan.source_workflow_hash,
+        )
+        _v2_transport = ModalTransport()
+        result = await execute_plan(
+            _v2_plan,
+            transport=_v2_transport,
+            profile_setter=None,
+            gpu=extra_data.get("gpu"),
+            workspace=_request_workspace or None,
+            trace=_v2_trace,
+            event_sink=_event_sink,
+        )
         if isinstance(result, dict) and result.get("use_descriptors"):
             _register_remote_result_assets(
                 result,
@@ -2537,7 +2524,7 @@ async def _execute_job(item: tuple, item_id: int):
                          _rt_meta.get("compiled_workflow_hash", ""))
             prompt_summary = _rt_meta.get("prompt_summary", {})
             model_stack = _rt_meta.get("model_stack", {})
-        elif _v2_plan is not None and _mode in {"v2", "shadow"}:
+        elif _v2_plan is not None:
             # v2 path fallback: extract from v2 plan metadata when the
             # legacy _run_trace envelope is absent.
             prompt_hash = _v2_plan.source_workflow_hash or _v2_plan.workflow_hash
@@ -2790,7 +2777,7 @@ async def _execute_job(item: tuple, item_id: int):
 
         # Stash active-next preparer metrics into the merged trace.
         # Extract from the _run_trace spans and counts which were recorded
-        # by execute_modal_prompt / prepare_modal_execution.  When the
+        # by the retired V1 canonical executor (deleted H19).  When the
         # legacy RunTrace envelope is absent (v2 path), fall back to
         # metadata fields carried by the v2 RuntimeTrace.
         _MERGED_DERIVED = _merged_trace.setdefault("derived_ms", {})
@@ -3511,35 +3498,25 @@ if _server:
 
     @_server.routes.post("/comfymodal/auth/setup")
     async def modal_auth_setup(request: web.Request) -> web.Response:
-        body = await request.json()
-        token_id = body.get("token_id", "").strip()
-        token_secret = body.get("token_secret", "").strip()
-        if not token_id or not token_secret:
-            return web.json_response({"status": "error", "message": "token_id and token_secret required"}, status=400)
-        if not token_id.startswith("ak-") or not token_secret.startswith("as-"):
-            return web.json_response({"status": "error", "message": "Invalid token format. Token ID starts with ak-, Secret starts with as-"}, status=400)
-        try:
-            _write_modal_toml(token_id, token_secret)
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
-        # Update/save workspace in registry for backward compat
-        _workspace_store.upsert_workspace(
-            _WORKSPACES_FILE,
-            "Primary",
-            token_id,
-            token_secret,
-            set_active=True,
-        )
-        # Use active workspace or create a minimal workspace for backward compat
-        workspace = _active_workspace()
-        if workspace is None:
-            label = body.get("label", "").strip() or "default"
-            registry = _workspace_store.upsert_workspace(_WORKSPACES_FILE, label, token_id, token_secret, set_active=True)
-            workspace = _workspace_store.get_active_workspace(registry)
-        if workspace:
-            t = threading.Thread(target=_run_deploy_background, kwargs={"workspace": workspace}, daemon=True)
-            t.start()
-        return web.json_response({"status": "ok"})
+        """RETIRED_WRITE (Phase H Wave F, FD-15/FD-17).
+
+        Zero callers post-Wave-E; superseded by the workspace-scoped
+        credential APIs. The route used to validate ak-/as- tokens, write
+        the global modal.toml, upsert/activate a "Primary" workspace and
+        fire a background deploy thread; all of that is retired. Bounded
+        truthful response before any token validation, file write,
+        workspace mutation, or deploy thread.
+        """
+        return web.json_response({
+            "status": "error",
+            "error_code": "AUTH_SETUP_RETIRED",
+            "message": (
+                "Auth setup was retired in Phase H (Wave F). Use the "
+                "workspace-scoped credential APIs (Backend > Workspaces / "
+                "Credentials); existing credentials and modal.toml remain "
+                "in place."
+            ),
+        }, status=409)
 
     # ── Local pre-dispatch instrumentation infrastructure ───────────────────
     # Configuration
@@ -3632,7 +3609,7 @@ def _derive_active_read_owner(
 
     Restore preload roles map to canonical restore names:
 
-      clip → restore_clip_loader
+      clip → restore_preload
       unet → restore_background_unet
       vae  → restore_vae_loader
 
@@ -3643,8 +3620,9 @@ def _derive_active_read_owner(
     Returns the resolved owner string; falls back to ``explicit_owner``
     when role is empty and no lane context resolves.
     """
+    # E40 Lane D: must mirror comfyapp.RESTORE_ROLE_OWNER_MAP exactly.
     _ROLE_MAP: dict[str, str] = {
-        "clip": "restore_clip_loader",
+        "clip": "restore_preload",
         "unet": "restore_background_unet",
         "vae": "restore_vae_loader",
     }
@@ -3986,6 +3964,17 @@ if _server:
         # Extract modal_options from body
         modal_options = modal_options_raw
         scheduler_test = body.get("comfymodal_scheduler_test")
+
+        # ── H12: reject explicit retired-engine requests before acceptance ──
+        # A NEW canvas request carrying v1/legacy/shadow must never execute
+        # the retired engine (and is never silently relabeled as V2).
+        _retired_mode = retired_request_mode(modal_options=modal_options)
+        if _retired_mode:
+            return web.json_response({
+                "status": "error",
+                "error": "execution_mode_retired",
+                "message": retired_mode_error(_retired_mode),
+            }, status=400)
 
         # ── Lock + enqueue ──
         _lock_trace = await _timed_async_lock_acquire(_counter_lock, "counter_lock", prompt_id)
@@ -4578,20 +4567,11 @@ if _server:
     async def modal_get_config(request: web.Request) -> web.Response:
         settings = _load_modal_settings()
         resolved = resolve_execution_mode(modal_settings=settings)
-        _v1_app = get_modal_app_name() or "comfyui"
-        _v2_app = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
-        _readiness = {
-            "v1": {"status": "unknown", "app": _v1_app},
-            "v2": {
-                "status": "unknown",
-                "app": _v2_app,
-                "class": os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2"),
-            },
-        }
         return web.json_response({
             "gpu": get_gpu(),
             "default_gpu": get_default_gpu(),
             "available_gpus": get_available_gpus(),
+            "persisted_gpu": settings.get("gpu", ""),
             "output_format": settings.get("output_format", "original"),
             "quality": settings.get("quality", 75),
             "webp_lossless_compression": settings.get("webp_lossless_compression", "balanced"),
@@ -4601,12 +4581,15 @@ if _server:
             "preview_default": settings.get("preview_default", "off"),
             "preview_codec": settings.get("preview_codec", "webp"),
             "preview_quality": settings.get("preview_quality", 70),
-            # ── Phase 8: execution mode ──
+            # ── H12: V2-only public execution ──
+            # execution_mode is always the executable V2; the retired
+            # available_execution_modes / execution_readiness engine lists
+            # are removed.  The one-time migration notice is surfaced here
+            # when this process migrated a persisted retired value.
             "execution_mode": resolved["mode"],
             "execution_mode_source": resolved["source"],
             "execution_mode_locked": resolved["locked"],
-            "available_execution_modes": _AVAILABLE_EXECUTION_MODES,
-            "execution_readiness": _readiness,
+            "engine_migration_notice": _EXECUTION_MODE_MIGRATION_NOTICE,
         })
 
     @_server.routes.post("/comfymodal/config")
@@ -4614,14 +4597,32 @@ if _server:
         body = await request.json()
         response_data = {"status": "ok"}
 
-        # Handle GPU setting (existing behavior)
+        # Handle GPU setting: validate → update server authority → persist.
+        # F8: the successful path persists the canonical settings so the
+        # selection survives ComfyUI restarts; a persistence failure rolls
+        # the in-memory value back (no split-brain) and reports truthfully.
         gpu = body.get("gpu", "")
         if gpu:
+            _previous_gpu = get_gpu()
             try:
                 set_gpu(gpu)
-                response_data["gpu"] = get_gpu()
             except ValueError as e:
                 return web.json_response({"status": "error", "message": str(e) or "Unsupported GPU"}, status=400)
+            try:
+                _gpu_settings = _load_modal_settings()
+                _gpu_settings["gpu"] = get_gpu()
+                _save_modal_settings(_gpu_settings)
+                response_data["gpu"] = get_gpu()
+            except OSError as e:
+                try:
+                    set_gpu(_previous_gpu)
+                except ValueError:
+                    pass
+                return web.json_response({
+                    "status": "error",
+                    "message": f"GPU acknowledged but persistence failed: {e}",
+                    "gpu": get_gpu(),
+                }, status=500)
 
         # Handle output settings
         _setting_keys = {
@@ -4676,22 +4677,24 @@ if _server:
                 )
             _save_modal_settings(_settings_update)
 
-        # ── Phase 8: execution mode (only v1/v2 accepted, not shadow) ──
+        # ── H12: execution mode (V2 only; v1/legacy/shadow rejected) ──
         if "execution_mode" in body:
             err = validate_config_payload(body)
             if err:
                 return web.json_response({"status": "error", "message": err}, status=400)
-            _env_mode = os.environ.get("COMFYMODAL_RUNTIME", "").strip().lower()
-            _env_normalized = normalize_mode(_env_mode)
+            # Env lock: only an explicit COMFYMODAL_RUNTIME=v2 locks the
+            # engine (retired env values are refused at resolution time and
+            # never lock anything).
+            _env_raw = os.environ.get("COMFYMODAL_RUNTIME", "").strip().lower()
             _requested_mode = str(body.get("execution_mode", "")).strip().lower()
-            if _env_normalized and _requested_mode != _env_normalized:
+            if _env_raw == MODE_V2 and _requested_mode != MODE_V2:
                 return web.json_response({
                     "status": "error",
                     "message": "Execution engine is managed by COMFYMODAL_RUNTIME.",
                     "execution_mode_locked": True,
                 }, status=409)
             new_mode = normalize_mode(body["execution_mode"])
-            if new_mode:
+            if new_mode == MODE_V2:
                 _save_modal_settings({"execution_mode": new_mode})
                 response_data["execution_mode"] = new_mode
 
@@ -5125,224 +5128,6 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    # ── Comparison profile execution helper ───────────────────────────
-    # Submits a single resolved comparison-profile workflow to the Modal
-    # pipeline and saves the result image + metadata to the comparison folder.
-    async def _execute_comparison_profile(
-        entry: dict,
-        original_body: dict,
-        manifest: dict,
-        output_format: str,
-        quality: int,
-        webp_lossless_compression: str,
-        auto_save_local: bool,
-        save_folder: str,
-        save_metadata_sidecar: bool,
-        workspace: dict | None = None,
-    ) -> dict:
-        import time as _time_module
-        import base64 as _b64
-
-        pid = entry.get("profile_id", "unknown")
-        pname = entry.get("profile_name", pid)
-        workflow = entry.get("workflow", {})
-        workflow_hash = entry.get("workflow_hash", "")
-        model_stack = entry.get("model_stack", {})
-        slots = entry.get("slots", {})
-
-        comparison_id = manifest["comparison_id"]
-        prompt_text = manifest.get("prompt", "")
-        seed = manifest.get("seed", 0)
-        width = manifest.get("width", 0)
-        height = manifest.get("height", 0)
-        steps = manifest.get("steps")
-        guidance = manifest.get("guidance")
-        inp_img = manifest.get("input_image", "")
-
-        trace_payload = original_body.get("trace", {}) if isinstance(original_body, dict) else {}
-
-        # Build extra_data like _execute_job does
-        extra_data = {
-            "client_id": original_body.get("client_id", str(uuid.uuid4())),
-            "workflow_hash": workflow_hash,
-            "prompt_summary": {
-                "seed": seed,
-                "width": width,
-                "height": height,
-                "steps": steps,
-                "cfg": guidance,
-            },
-            "model_stack": model_stack,
-            "gpu": get_gpu(),
-            "modal_options": {
-                "output_format": output_format,
-                "quality": quality,
-                "webp_lossless_compression": webp_lossless_compression,
-                "auto_save_local": auto_save_local,
-                "save_folder": save_folder,
-                "save_metadata_sidecar": save_metadata_sidecar,
-            },
-            "comparison": {
-                "comparison_id": comparison_id,
-                "profile_id": pid,
-                "profile_name": pname,
-            },
-            "trace": trace_payload,
-        }
-        prompt_id = str(uuid.uuid4())
-
-        result_data = {
-            "comparison_id": comparison_id,
-            "profile_id": pid,
-            "profile_name": pname,
-            "workflow_hash": workflow_hash,
-            "model_stack": model_stack,
-            "prompt": prompt_text,
-            "seed": seed,
-            "width": width,
-            "height": height,
-            "steps": steps,
-            "guidance": guidance,
-            "output_format": output_format,
-        }
-
-        try:
-            t0 = _time_module.time()
-            input_images = _collect_input_images(workflow)
-
-            # Submit to Modal via the existing streaming pipeline
-            _modal_result = None
-            async for _msg in run_prompt_stream(
-                workflow,
-                input_images,
-                trace=extra_data.get("trace", {}),
-                gpu=extra_data.get("gpu"),
-                modal_options=extra_data.get("modal_options"),
-                workspace=workspace,
-            ):
-                if not isinstance(_msg, dict):
-                    continue
-                if _msg["type"] == "result":
-                    _modal_result = _msg["data"]
-                    break
-                elif _msg["type"] == "error":
-                    raise RuntimeError(_msg.get("message", "Modal error"))
-
-            if _modal_result is None:
-                raise RuntimeError("No result from Modal pipeline")
-
-            wall_time_sec = round(_time_module.time() - t0, 2)
-
-            # Extract images from result
-            image_data_b64 = None
-            mime_type = "image/png"
-            file_ext = ".png"
-
-            primary_entry = _select_primary_result_entry(_modal_result)
-            if primary_entry:
-                image_data_b64 = primary_entry.get("data")
-                mime_type = primary_entry.get("mime_type", "image/png")
-                file_ext = primary_entry.get("file_ext", ".png")
-
-            if not image_data_b64:
-                raise RuntimeError("No image data in Modal result")
-
-            # Save output image
-            img_bytes = _b64.b64decode(image_data_b64)
-
-            # Save to comparison folder
-            compare_result = save_comparison_result(
-                _COMFYUI_ROOT, comparison_id, {
-                    **result_data,
-                    "mime_type": mime_type,
-                    "file_ext": file_ext,
-                    "wall_time_sec": wall_time_sec,
-                    "status": "success",
-                    "primary_output": {
-                        "node_id": str(primary_entry.get("node_id", "")) if primary_entry else "",
-                        "output_key": str(primary_entry.get("output_key", "images")) if primary_entry else "images",
-                        "comparison_side": primary_entry.get("comparison_side", "") if primary_entry else "",
-                        "filename": primary_entry.get("filename", "") if primary_entry else "",
-                        "path": primary_entry.get("path", "") if primary_entry else "",
-                        "mime_type": mime_type,
-                        "file_ext": file_ext,
-                    },
-                },
-                image_bytes=img_bytes,
-            )
-
-            # Apply format conversion if needed
-            converted_bytes = img_bytes
-            if output_format != "original":
-                from output_converter import convert_image_bytes
-                conv = convert_image_bytes(
-                    img_bytes,
-                    output_format=output_format,
-                    quality=quality,
-                    webp_lossless_compression=webp_lossless_compression,
-                )
-                if not conv.get("fallback") and not conv.get("error"):
-                    converted_bytes = conv["bytes"]
-                    mime_type = conv.get("mime_type", mime_type)
-                    file_ext = conv.get("file_ext", file_ext)
-
-            # Auto-save to the standard output location if enabled
-            if auto_save_local:
-                try:
-                    from output_saver import save_output_image
-                    saver_result = save_output_image(
-                        converted_bytes,
-                        output_format=output_format,
-                        file_ext=file_ext,
-                        mime_type=mime_type,
-                        quality=quality,
-                        webp_lossless_compression=webp_lossless_compression,
-                        original_size_bytes=len(img_bytes),
-                        conversion_time_ms=0,
-                        save_folder=save_folder,
-                        save_metadata_sidecar=save_metadata_sidecar,
-                        workflow_hash=workflow_hash,
-                        workflow_name=pname,
-                        seed=str(seed),
-                        width=width,
-                        height=height,
-                        index=0,
-                        comfyui_root=_COMFYUI_ROOT,
-                        extra_meta={
-                            "comparison_id": comparison_id,
-                            "profile_id": pid,
-                            "comparison": True,
-                            "node_id": str(primary_entry.get("node_id", "")) if primary_entry else "",
-                            "output_key": str(primary_entry.get("output_key", "images")) if primary_entry else "images",
-                            "comparison_side": primary_entry.get("comparison_side", "") if primary_entry else "",
-                            "source_filename": primary_entry.get("filename", "") if primary_entry else "",
-                        },
-                    )
-                    if saver_result.get("error"):
-                        compare_result["auto_save_error"] = saver_result["error"]
-                    else:
-                        compare_result["auto_save_path"] = saver_result.get("path", "")
-                except Exception as save_exc:
-                    compare_result["auto_save_error"] = str(save_exc)
-
-            compare_result["mime_type"] = mime_type
-            compare_result["file_ext"] = file_ext
-
-            return compare_result
-
-        except Exception as e:
-            import traceback as _tb
-            _tb.print_exc()
-            error_result = {
-                **result_data,
-                "status": "error",
-                "error": str(e),
-            }
-            save_comparison_result(_COMFYUI_ROOT, comparison_id, error_result)
-            return error_result
-
-    # ── Comparison Runner Routes ──────────────────────────────────────
-
     @_server.routes.get("/comfymodal/comparison/profiles")
     async def comparison_list_profiles(request: web.Request) -> web.Response:
         try:
@@ -5353,19 +5138,16 @@ if _server:
 
     @_server.routes.post("/comfymodal/comparison/profiles")
     async def comparison_create_profile(request: web.Request) -> web.Response:
-        body = await request.json()
-        name = body.get("name", "").strip()
-        workflow_api = body.get("workflow_api")
-        workflow = body.get("workflow")
-        if not name:
-            return web.json_response({"status": "error", "message": "Profile name required"}, status=400)
-        if not workflow_api or not isinstance(workflow_api, dict):
-            return web.json_response({"status": "error", "message": "workflow_api required"}, status=400)
-        try:
-            profile = create_profile(_COMFYUI_ROOT, name, workflow_api, workflow=workflow)
-            return web.json_response({"status": "ok", "profile": profile})
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-10/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_READ_ONLY",
+            "message": (
+                "Comparison stores are read-only compatibility data "
+                "(Phase H Wave F). Stored profiles and historical results "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.get("/comfymodal/comparison/profiles/{profile_id}")
     async def comparison_get_profile(request: web.Request) -> web.Response:
@@ -5380,41 +5162,42 @@ if _server:
 
     @_server.routes.put("/comfymodal/comparison/profiles/{profile_id}")
     async def comparison_update_profile(request: web.Request) -> web.Response:
-        profile_id = request.match_info.get("profile_id", "")
-        body = await request.json()
-        try:
-            profile = update_profile(_COMFYUI_ROOT, profile_id, body)
-            if profile is None:
-                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
-            return web.json_response({"status": "ok", "profile": profile})
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-10/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_READ_ONLY",
+            "message": (
+                "Comparison stores are read-only compatibility data "
+                "(Phase H Wave F). Stored profiles and historical results "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.delete("/comfymodal/comparison/profiles/{profile_id}")
     async def comparison_delete_profile(request: web.Request) -> web.Response:
-        profile_id = request.match_info.get("profile_id", "")
-        try:
-            ok = delete_profile(_COMFYUI_ROOT, profile_id)
-            if not ok:
-                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
-            return web.json_response({"status": "ok"})
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-10/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_READ_ONLY",
+            "message": (
+                "Comparison stores are read-only compatibility data "
+                "(Phase H Wave F). Stored profiles and historical results "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/duplicate")
     async def comparison_duplicate_profile(request: web.Request) -> web.Response:
-        profile_id = request.match_info.get("profile_id", "")
-        body = await request.json()
-        new_name = body.get("name", "").strip()
-        if not new_name:
-            return web.json_response({"status": "error", "message": "New profile name required"}, status=400)
-        try:
-            profile = duplicate_profile(_COMFYUI_ROOT, profile_id, new_name)
-            if profile is None:
-                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
-            return web.json_response({"status": "ok", "profile": profile})
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-10/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_READ_ONLY",
+            "message": (
+                "Comparison stores are read-only compatibility data "
+                "(Phase H Wave F). Stored profiles and historical results "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/validate")
     async def comparison_validate_profile(request: web.Request) -> web.Response:
@@ -5438,160 +5221,38 @@ if _server:
 
     @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/slots")
     async def comparison_set_slots(request: web.Request) -> web.Response:
-        profile_id = request.match_info.get("profile_id", "")
-        body = await request.json()
-        slots = body.get("slots", {})
-        try:
-            profile = set_slots(_COMFYUI_ROOT, profile_id, slots)
-            if profile is None:
-                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
-            return web.json_response({"status": "ok", "profile": profile})
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-10/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_READ_ONLY",
+            "message": (
+                "Comparison stores are read-only compatibility data "
+                "(Phase H Wave F). Stored profiles and historical results "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/comparison/run")
     async def comparison_run(request: web.Request) -> web.Response:
-        """Execute a comparison run by preparing manifests and submitting each
-        resolved workflow to the Modal pipeline.
+        """RETIRED (Phase H14 Wave E, H5C §9 EXECUTION_RETIRE disposition).
 
-        The comparison may run sequentially or in parallel (up to
-        max_parallel_jobs concurrently).  Results are saved to the comparison
-        output folder.
+        The Comparison product surface is gone; this endpoint no longer
+        executes anything. It performs zero executor invocation, zero Modal
+        invocation, zero history write, and zero stored-profile mutation,
+        and returns a bounded truthful retired response so old clients get
+        an explicit machine-readable error instead of silence. Stored
+        profiles and historical results remain readable through the frozen
+        READ_COMPAT routes.
         """
-        body = await request.json()
-        profile_ids = body.get("profile_ids", [])
-        prompt_text = body.get("prompt", "").strip()
-        seed = body.get("seed", 0)
-        width = body.get("width", 1024)
-        height = body.get("height", 1024)
-        steps = body.get("steps")
-        guidance = body.get("guidance")
-        negative_prompt = body.get("negative_prompt", "").strip() or None
-        input_image = body.get("input_image", "").strip() or None
-        execution_mode = body.get("execution_mode", "sequential")
-        max_parallel_jobs = int(body.get("max_parallel_jobs", 2))
-
-        # Per-profile override settings (skip shared steps/guidance/resolution)
-        per_profile_overrides = body.get("per_profile_overrides", {})
-
-        # Output settings
-        output_format = body.get("output_format", "original")
-        quality = int(body.get("quality", 75))
-        webp_lossless_compression = body.get("webp_lossless_compression", "balanced")
-        auto_save_local = bool(body.get("auto_save_local", False))
-        save_folder = body.get("save_folder", "")
-        save_metadata_sidecar = bool(body.get("save_metadata_sidecar", True))
-
-        if not profile_ids:
-            return web.json_response({"status": "error", "message": "No profiles selected"}, status=400)
-        if not prompt_text:
-            prompt_text = ""
-        if not isinstance(seed, int):
-            try:
-                seed = int(seed)
-            except (TypeError, ValueError):
-                seed = 0
-
-        # Per audit round 7: capture workspace once for all profile
-        # executions so detached background tasks do not resolve
-        # whichever workspace happens to be active later.
-        _comparison_workspace = _active_workspace() or {}
-
-        try:
-            manifest = run_comparison(
-                comfyui_root=_COMFYUI_ROOT,
-                prompt_text=prompt_text,
-                seed=seed,
-                width=width,
-                height=height,
-                steps=steps,
-                guidance=guidance,
-                negative_prompt=negative_prompt,
-                input_image=input_image,
-                profile_ids=profile_ids,
-                execution_mode=execution_mode,
-                max_parallel_jobs=max_parallel_jobs,
-                output_format=output_format,
-                quality=quality,
-                webp_lossless_compression=webp_lossless_compression,
-                auto_save_local=auto_save_local,
-                save_folder=save_folder,
-                save_metadata_sidecar=save_metadata_sidecar,
-                per_profile_overrides=per_profile_overrides,
-            )
-
-            resolved = manifest.get("resolved_profiles", [])
-
-            # Persist the manifest immediately (results appended as they arrive)
-            save_comparison_manifest(_COMFYUI_ROOT, manifest)
-
-            # Dispatch resolved workflows to the Modal pipeline
-            results = []
-            errors = []
-
-            if execution_mode == "parallel":
-                import asyncio
-                sem = asyncio.Semaphore(max_parallel_jobs)
-
-                async def _run_one(entry: dict) -> dict:
-                    async with sem:
-                        return await _execute_comparison_profile(
-                            entry, body, manifest, output_format, quality,
-                            webp_lossless_compression, auto_save_local,
-                            save_folder, save_metadata_sidecar,
-                            workspace=_comparison_workspace,
-                        )
-
-                tasks = [_run_one(e) for e in resolved if e.get("status") == "ready"]
-                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-                for outcome in outcomes:
-                    if isinstance(outcome, Exception):
-                        errors.append({"error": str(outcome)})
-                    elif outcome:
-                        results.append(outcome)
-            else:
-                for entry in resolved:
-                    if entry.get("status") != "ready":
-                        if entry.get("error"):
-                            errors.append({
-                                "profile_id": entry.get("profile_id", ""),
-                                "profile_name": entry.get("profile_name", ""),
-                                "error": entry.get("error", "Unknown error"),
-                            })
-                        continue
-                    try:
-                        result = await _execute_comparison_profile(
-                            entry, body, manifest, output_format, quality,
-                            webp_lossless_compression, auto_save_local,
-                            save_folder, save_metadata_sidecar,
-                            workspace=_comparison_workspace,
-                        )
-                        if result:
-                            results.append(result)
-                    except Exception as e:
-                        errors.append({
-                            "profile_id": entry.get("profile_id", ""),
-                            "profile_name": entry.get("profile_name", ""),
-                            "error": str(e),
-                        })
-
-            manifest["results"] = results
-            manifest["errors"] = errors
-            manifest["completed_at"] = __import__("time").time()
-
-            # Update manifest on disk with results
-            save_comparison_manifest(_COMFYUI_ROOT, manifest)
-
-            return web.json_response({
-                "status": "ok",
-                "comparison_id": manifest["comparison_id"],
-                "results": results,
-                "errors": errors,
-            })
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_RETIRED",
+            "message": (
+                "Comparison execution was retired in Phase H14 (Wave E). "
+                "Modern execution is Modal V2 only via the Studio Playground. "
+                "Stored profiles and historical results remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.get("/comfymodal/comparison/results")
     async def comparison_list_runs(request: web.Request) -> web.Response:
@@ -5644,12 +5305,16 @@ if _server:
 
     @_server.routes.post("/comfymodal/comparison/config")
     async def comparison_set_config(request: web.Request) -> web.Response:
-        body = await request.json()
-        try:
-            config = save_comparison_config(_COMFYUI_ROOT, body)
-            return web.json_response({"status": "ok", "config": config})
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-10/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "COMPARISON_READ_ONLY",
+            "message": (
+                "Comparison stores are read-only compatibility data "
+                "(Phase H Wave F). Stored profiles and historical results "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.get("/comfymodal/comparison/gallery/{comparison_id}")
     async def comparison_gallery(request: web.Request) -> web.Response:
@@ -5681,23 +5346,24 @@ if _server:
         blobs_root, leases_db_path, warmup_state_path, experiment_dir,
     )
     from matrix_compiler import compile_experiment
+    # H19 Wave G: execution-only warmup helpers (ensure_warmup,
+    # gate_experiment*, WarmupRequiredError, deployment_generation) removed —
+    # their only consumers were the retired start/warmup routes, now inert.
+    # WarmupState stays: live deployment/readiness truth (deploy status +
+    # GET /deploy-warmup/status).
     from deploy_warmup import (
-        WarmupState, deployment_generation, ensure_warmup, gate_experiment,
-        gate_experiment_on_stored_generation, WarmupRequiredError,
+        WarmupState,
     )
+    # H19 Wave G: legacy preset writer imports removed with their zero-caller
+    # frozen routes; COMPAT_READ list/get survives.
     from presets import (
-        list_prompt_presets, get_prompt_preset, create_prompt_preset,
-        rename_prompt_preset, delete_prompt_preset, duplicate_prompt_preset,
-        import_prompts_from_text,
-        list_image_presets, get_image_preset, create_image_preset,
-        rename_image_preset, delete_image_preset,
+        list_prompt_presets, get_prompt_preset,
+        list_image_presets, get_image_preset,
     )
     from run_history import redact_log, format_timing
-    from experiment_runner import (
-        CheckpointStreamInvoker, LocalRemoteInvoker,
-    )
-    from experiment_models import CURRENT_SCHEMA_VERSION, validate_definition
-    from experiment_lease import StaleEventError, LeaseActiveError, LeaseError, LeaseOwnershipError, UnknownCheckpointError
+    # H19 Wave G: CheckpointStreamInvoker import removed — unused in this
+    # module (recovery constructs its own invoker in experiment_service).
+    from experiment_lease import LeaseError
 
     _experiments_root = experiments_root()
     _leases_db_path = leases_db_path()
@@ -5804,106 +5470,24 @@ if _server:
 
     @_server.routes.post("/comfymodal/experiments")
     async def experiment_create(request: web.Request) -> web.Response:
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "invalid JSON body"}, status=400)
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17).
 
-        # Accept either a normalised draft (backend-authoritative new path)
-        # or a raw spec (existing path).
-        normalized_draft = payload.get("normalized_draft")
-        if normalized_draft is not None:
-            if not isinstance(normalized_draft, dict):
-                return web.json_response(
-                    {"status": "error", "message": "normalized_draft must be an object"},
-                    status=400,
-                )
-            validation = _experiment_setup_adapter.validate_normalized_draft(normalized_draft)
-            if not validation.get("valid"):
-                return web.json_response(
-                    {"status": "error", "message": f"draft validation failed: {validation.get('errors', 'unknown')}"},
-                    status=400,
-                )
-            spec = _experiment_setup_adapter.normalized_draft_to_compiler_spec(normalized_draft)
-            exp_id = str(normalized_draft.get("experiment_id", ""))
-            if not exp_id:
-                return web.json_response({"status": "error", "message": "normalized_draft.experiment_id required"}, status=400)
-        else:
-            spec = payload.get("spec", {})
-            if not isinstance(spec, dict) or "experiment_id" not in spec:
-                return web.json_response({"status": "error", "message": "spec.experiment_id required"}, status=400)
-            exp_id = str(spec["experiment_id"])
-
-        # Compile to validate spec shape
-        try:
-            compilation = compile_experiment(spec)
-        except Exception as e:
-            return web.json_response({"status": "error", "message": f"compile failed: {e}"}, status=400)
-        # Resolve profile metadata per checkpoint
-        for ck in compilation.get("checkpoints", []):
-            _enrich_checkpoint_from_profile(ck)
-        store = REGISTRY.store(exp_id)
-        now = _utc_now_iso()
-        definition = {
-            "schema_version": CURRENT_SCHEMA_VERSION,
-            "experiment_id": exp_id,
-            "revision": 1,
-            "name": str(spec.get("name", exp_id)),
-            "notes": str(spec.get("notes", "")),
-            "created_at": now,
-            "updated_at": now,
-        }
-        # Preserve the normalised draft in the definition so it survives
-        # refresh / restart without browser reconstruction.
-        if normalized_draft is not None:
-            definition["normalized_draft"] = normalized_draft
-
-        validate_definition(type("D", (), definition)())  # cheap shape check
-        store.write_definition(definition)
-        event_payload: dict = {
-            "experiment_id": exp_id,
-            "name": definition["name"],
-            "compilation": compilation,
-        }
-        if normalized_draft is not None:
-            event_payload["normalized_draft"] = normalized_draft
-        store.append_event({
-            "type": "experiment.created",
-            "payload": event_payload,
-        })
-        # History V2: create the durable experiment with fixed-position cells.
-        try:
-            from history_v2_writer import get_writer as _get_v2_writer
-            _v2_writer = _get_v2_writer()
-            if _v2_writer is not None:
-                _v2_cells = []
-                for _i, _cell in enumerate(compilation.get("cells", []) or []):
-                    if not isinstance(_cell, dict):
-                        continue
-                    _v2_cells.append({
-                        "cell_key": str(_cell.get("cell_key", "")),
-                        "sequence": _cell.get("sequence", _i),
-                        "axis_values": dict(_cell.get("axis_values") or {}),
-                    })
-                _v2_writer.ensure_experiment(
-                    exp_id,
-                    name=str(definition.get("name", exp_id)),
-                    definition={
-                        "production": True,
-                        "schema_version": CURRENT_SCHEMA_VERSION,
-                        "revision": definition.get("revision", 1),
-                        "workflow_hash": str(compilation.get("workflow_hash", "") or ""),
-                    },
-                    cells=_v2_cells,
-                )
-        except Exception:
-            print(f"[comfyui-modal.history-v2] ensure_experiment failed for {exp_id}")
+        Legacy experiment creation started a scheduler and ensured a
+        History V2 record; both are permanently retired here. The route
+        stays registered and returns a bounded truthful response before
+        any body parse, REGISTRY store creation, History V2 ensure, or
+        scheduler start. Historical experiment records remain readable.
+        """
         return web.json_response({
-            "status": "ok",
-            "experiment_id": exp_id,
-            "definition": definition,
-            "compilation": compilation,
-        })
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment creation was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.get("/comfymodal/experiments")
     async def experiment_list(request: web.Request) -> web.Response:
@@ -5972,95 +5556,23 @@ if _server:
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/start")
     async def experiment_start(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        try:
-            body = await request.json() if request.body_exists else {}
-        except Exception:
-            body = {}
-        store = REGISTRY.store(exp_id)
-        defn = store.read_definition()
-        if defn is None:
-            return web.json_response({"status": "error", "message": "unknown experiment"}, status=404)
-        spec = body.get("spec", {}) if isinstance(body, dict) else {}
-        max_containers = int((body or {}).get("max_containers", 1))
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17).
 
-        # C6: detect stored compilation from clone events when spec is empty
-        compilation = None
-        if not spec:
-            # Look for a stored compilation in the journal
-            for ev in store.read_events():
-                if ev.get("type") == "experiment.cloned":
-                    p = ev.get("payload", {}) or {}
-                    compilation = p.get("compilation", None)
-                    if compilation:
-                        compilation = copy.deepcopy(compilation)
-                        compilation["experiment_id"] = exp_id
-                        break
-                if ev.get("type") == "experiment.created":
-                    p = ev.get("payload", {}) or {}
-                    compilation = p.get("compilation", None)
-                    if compilation:
-                        compilation = copy.deepcopy(compilation)
-                        compilation["experiment_id"] = exp_id
-                        break
-            if compilation is None:
-                # Try loading from scheduler state
-                from experiment_service import experiment_dir as _exp_dir
-                state_file = _exp_dir(exp_id) / ".scheduler_state.json"
-                if state_file.exists():
-                    try:
-                        import json as _json
-                        state = _json.loads(state_file.read_text(encoding="utf-8"))
-                        compilation = state.get("compilation", None)
-                    except Exception:
-                        pass
-            if compilation is None:
-                return web.json_response({"status": "error", "message": "spec required and no stored compilation"}, status=400)
-        else:
-            # Gate the experiment on warmup: if the active deployment is
-            # not warmed, refuse to start scored cells. The client is
-            # expected to call the /comfymodal/deploy-warmup/run route
-            # first.
-            # Use gate_experiment_on_stored_generation — NOT gate_experiment
-            # which regenerates a fresh timestamp and will never match
-            # the generation stored at deploy time.
-            # NOTE: only WarmupRequiredError is caught here. Unexpected
-            # errors (typos, missing imports) propagate to the caller
-            # as a 500 response rather than silently bypassing the gate.
-            try:
-                warmup_state = WarmupState(_warmup_state_path)
-                gate_experiment_on_stored_generation(warmup_state)
-            except WarmupRequiredError as exc:
-                return web.json_response(
-                    {"status": "error", "message": f"warmup required: {exc}"},
-                    status=409,
-                )
-            try:
-                compilation = compile_experiment(spec)
-            except Exception as e:
-                return web.json_response({"status": "error", "message": f"compile failed: {e}"}, status=400)
-            for ck in compilation.get("checkpoints", []):
-                _enrich_checkpoint_from_profile(ck)
-        try:
-            from modal_client import run_checkpoint_stream
-            warmup_state = WarmupState(_warmup_state_path)
-            dep_gen = warmup_state.deployment_generation() or ""
-            invoker = CheckpointStreamInvoker(
-                run_checkpoint_stream,
-                experiment_id=exp_id,
-                stream_event_sink=lambda ev: _on_remote_event(exp_id, ev),
-            )
-        except Exception:
-            invoker = None
-        sched = await REGISTRY.get_or_create_scheduler(
-            exp_id, compilation=compilation, invoker=invoker,
-            max_containers=max_containers,
-        )
-        REGISTRY.save_scheduler_state(exp_id, compilation, max_containers)
-        REGISTRY.start_bridge(exp_id)
-        import asyncio as _asyncio
-        _asyncio.create_task(sched.start())
-        return web.json_response({"status": "ok", "started": True, "experiment_id": exp_id})
+        Legacy experiment start compiled specs, gated on warmup state,
+        created schedulers and launched checkpoint streams; all of that
+        is permanently retired. Bounded truthful response before any
+        body parse, scheduler creation, or executor invocation.
+        """
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     # Phase 7: register the production event handler for recovered schedulers
     try:
@@ -6373,25 +5885,29 @@ if _server:
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/pause")
     async def experiment_pause(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
-        await sched.pause()
-        return web.json_response({"status": "ok"})
+        """RETIRED_WRITE (Phase H Wave F, FD-12/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_READ_ONLY",
+            "message": (
+                "Legacy experiment stores are read-only compatibility "
+                "data (Phase H Wave F). Historical experiment records "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/stop-after-current")
     async def experiment_stop_after_current(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
-        await sched.stop_after_current()
-        return web.json_response({"status": "ok"})
+        """RETIRED_WRITE (Phase H Wave F, FD-12/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_READ_ONLY",
+            "message": (
+                "Legacy experiment stores are read-only compatibility "
+                "data (Phase H Wave F). Historical experiment records "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/stop-now")
     async def experiment_stop_now(request: web.Request) -> web.Response:
@@ -6415,181 +5931,112 @@ if _server:
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/resume")
     async def experiment_resume(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
-        import asyncio as _asyncio
-        _asyncio.create_task(sched.resume())
-        return web.json_response({"status": "ok", "resumed": True, "current_status": sched.status().get("status", "?")})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/clone")
     async def experiment_clone(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        new_id = str((body or {}).get("experiment_id", f"{exp_id}_clone_{int(time.time())}"))
-        store = REGISTRY.store(exp_id)
-        defn = dict(store.read_definition() or {})
-        if not defn:
-            return web.json_response({"status": "error", "message": "unknown experiment"}, status=404)
-
-        # Find compilation from journal
-        events = list(store.read_events())
-        compilation = None
-        for ev in events:
-            if ev.get("type") == "experiment.created":
-                p = ev.get("payload", {}) or {}
-                compilation = p.get("compilation", {})
-                break
-        if compilation:
-            compilation = copy.deepcopy(compilation)
-            compilation["experiment_id"] = new_id
-            compilation["revision"] = 1
-            # Rewrite checkpoint IDs
-            old_to_new_ck: dict = {}
-            for ck in compilation.get("checkpoints", []):
-                old_id = ck.get("id", "")
-                new_ck_id = f"ck_{uuid.uuid4().hex[:8]}"
-                old_to_new_ck[old_id] = new_ck_id
-                ck["id"] = new_ck_id
-            # Rewrite cell keys and checkpoint references
-            for cell in compilation.get("cells", []):
-                old_key = cell.get("cell_key", "")
-                if old_key:
-                    cell["cell_key"] = hashlib.sha256(f"{new_id}:{old_key}".encode()).hexdigest()
-                old_ck = cell.get("checkpoint_id", "")
-                if old_ck in old_to_new_ck:
-                    cell["checkpoint_id"] = old_to_new_ck[old_ck]
-            # Rewrite cells_by_ck checkpoint references
-            cells_by_ck = compilation.get("cells_by_ck", {})
-            if isinstance(cells_by_ck, dict):
-                for ck_id, cell_list in list(cells_by_ck.items()):
-                    if ck_id in old_to_new_ck:
-                        new_ck_id = old_to_new_ck[ck_id]
-                        compilation["cells_by_ck"][new_ck_id] = compilation["cells_by_ck"].pop(ck_id)
-
-        defn["experiment_id"] = new_id
-        defn["revision"] = 1
-        defn["created_at"] = _utc_now_iso()
-        defn["updated_at"] = _utc_now_iso()
-        defn["name"] = (defn.get("name", "") or "") + " (clone)"
-
-        new_store = REGISTRY.store(new_id)
-        new_store.write_definition(defn)
-        new_store.append_event({
-            "type": "experiment.cloned",
-            "payload": {
-                "source_experiment_id": exp_id,
-                "experiment_id": new_id,
-                "compilation": compilation,
-            },
-        })
-        # Enrich checkpoint profiles for the clone so recovered experiments
-        # remain runnable after restart.
-        if compilation:
-            for ck in compilation.get("checkpoints", []):
-                _enrich_checkpoint_from_profile(ck)
-
-        # Persist scheduler state for the clone
-        REGISTRY.save_scheduler_state(
-            new_id, compilation=compilation, status="draft"
-        )
+        """RETIRED_WRITE (Phase H Wave F, FD-12/FD-17): read-only compat data."""
         return web.json_response({
-            "status": "ok",
-            "experiment_id": new_id,
-            "definition": defn,
-        })
+            "status": "error",
+            "error_code": "EXPERIMENT_READ_ONLY",
+            "message": (
+                "Legacy experiment stores are read-only compatibility "
+                "data (Phase H Wave F). Historical experiment records "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/run-missing")
     async def experiment_run_missing(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
-        import asyncio as _asyncio
-        _asyncio.create_task(sched.run_missing())
-        return web.json_response({"status": "ok"})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/continue")
     async def experiment_checkpoint_continue(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        ck_id = request.match_info.get("checkpoint_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
-        import asyncio as _asyncio
-        if hasattr(sched, "continue_checkpoint"):
-            _asyncio.create_task(sched.continue_checkpoint(ck_id))
-        else:
-            _asyncio.create_task(sched.continue_here())
-        return web.json_response({"status": "ok", "checkpoint_id": ck_id})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/restart")
     async def experiment_checkpoint_restart(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        ck_id = request.match_info.get("checkpoint_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
-        import asyncio as _asyncio
-        _asyncio.create_task(sched.restart_block(ck_id))
-        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "restart": "block"})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/restart-from")
     async def experiment_checkpoint_restart_from(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        ck_id = request.match_info.get("checkpoint_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
-        import asyncio as _asyncio
-        _asyncio.create_task(sched.restart_from(ck_id))
-        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "restart": "from"})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/skip")
     async def experiment_checkpoint_skip(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        ck_id = request.match_info.get("checkpoint_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
-        await sched.skip_block(ck_id)
-        REGISTRY.save_scheduler_state(
-            exp_id,
-            skipped_checkpoints=list(sched._skipped_checkpoints),
-        )
-        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "skipped": True})
+        """RETIRED_WRITE (Phase H Wave F, FD-12/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_READ_ONLY",
+            "message": (
+                "Legacy experiment stores are read-only compatibility "
+                "data (Phase H Wave F). Historical experiment records "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/unskip")
     async def experiment_checkpoint_unskip(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        ck_id = request.match_info.get("checkpoint_id", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
-        await sched.unskip_block(ck_id)
-        REGISTRY.save_scheduler_state(
-            exp_id,
-            skipped_checkpoints=list(sched._skipped_checkpoints),
-        )
-        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "unskipped": True})
+        """RETIRED_WRITE (Phase H Wave F, FD-12/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_READ_ONLY",
+            "message": (
+                "Legacy experiment stores are read-only compatibility "
+                "data (Phase H Wave F). Historical experiment records "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.get("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/logs")
     async def experiment_checkpoint_logs(request: web.Request) -> web.Response:
@@ -6627,37 +6074,31 @@ if _server:
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/cells/{cell_key}/rerun")
     async def experiment_cell_rerun(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        cell_key = request.match_info.get("cell_key", "")
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
-        import asyncio as _asyncio
-        _asyncio.create_task(sched.rerun_cell(cell_key))
-        return web.json_response({"status": "ok", "cell_key": cell_key, "rerun": True})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/rerun-selected")
     async def experiment_rerun_selected(request: web.Request) -> web.Response:
-        exp_id = request.match_info.get("experiment_id", "")
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        cell_keys = (body or {}).get("cell_keys", [])
-        if not cell_keys:
-            return web.json_response({"status": "error", "message": "no cell_keys provided"}, status=400)
-        sched = REGISTRY.get_scheduler(exp_id)
-        if sched is None:
-            sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
-        # Rerun each cell
-        for ck in cell_keys:
-            import asyncio as _asyncio
-            _asyncio.create_task(sched.rerun_cell(ck))
-        return web.json_response({"status": "ok", "cell_keys": cell_keys})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17)."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy experiment execution was retired in Phase H "
+                "(Wave F). Modern experiments run through "
+                "/studio/experiment-v2; historical experiment records "
+                "remain readable."
+            ),
+        }, status=410)
 
     # ── Prompt presets ────────────────────────────────────────────────
     @_server.routes.get("/comfymodal/presets/prompts")
@@ -6666,17 +6107,16 @@ if _server:
 
     @_server.routes.post("/comfymodal/presets/prompts")
     async def presets_prompts_create(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
-        name = body.get("name", "")
-        if not name:
-            return web.json_response({"status": "error", "message": "name required"}, status=400)
-        shared_negative = body.get("shared_negative", "")
-        items = body.get("items", [])
-        preset = create_prompt_preset(root=_NODE_DIR, name=name, shared_negative=shared_negative, items=items)
-        return web.json_response({"status": "ok", "preset": preset})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.get("/comfymodal/presets/prompts/{preset_id}")
     async def presets_prompts_get(request: web.Request) -> web.Response:
@@ -6688,49 +6128,55 @@ if _server:
 
     @_server.routes.put("/comfymodal/presets/prompts/{preset_id}")
     async def presets_prompts_update(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
-        new_name = body.get("name", "")
-        if new_name:
-            preset = rename_prompt_preset(root=_NODE_DIR, preset_id=preset_id, new_name=new_name)
-        else:
-            preset = get_prompt_preset(root=_NODE_DIR, preset_id=preset_id)
-        if preset is None:
-            return web.json_response({"status": "error", "message": "not found"}, status=404)
-        return web.json_response({"status": "ok", "preset": preset})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.delete("/comfymodal/presets/prompts/{preset_id}")
     async def presets_prompts_delete(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        delete_prompt_preset(root=_NODE_DIR, preset_id=preset_id)
-        return web.json_response({"status": "ok", "deleted": preset_id})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/presets/prompts/{preset_id}/duplicate")
     async def presets_prompts_duplicate(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        new_name = (body or {}).get("name", f"Copy of {preset_id}")
-        preset = duplicate_prompt_preset(root=_NODE_DIR, preset_id=preset_id, new_name=new_name)
-        if preset is None:
-            return web.json_response({"status": "error", "message": "not found"}, status=404)
-        return web.json_response({"status": "ok", "preset": preset})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/presets/prompts/import")
     async def presets_prompts_import(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
-        text = body.get("text", "")
-        shared_negative = body.get("shared_negative", "")
-        items = import_prompts_from_text(text, shared_negative=shared_negative)
-        return web.json_response({"status": "ok", "imported": items})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     # ── Image presets ─────────────────────────────────────────────────
     @_server.routes.get("/comfymodal/presets/images")
@@ -6739,16 +6185,16 @@ if _server:
 
     @_server.routes.post("/comfymodal/presets/images")
     async def presets_images_create(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
-        name = body.get("name", "")
-        if not name:
-            return web.json_response({"status": "error", "message": "name required"}, status=400)
-        items = body.get("items", [])
-        preset = create_image_preset(root=_NODE_DIR, name=name, items=items)
-        return web.json_response({"status": "ok", "preset": preset})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.get("/comfymodal/presets/images/{preset_id}")
     async def presets_images_get(request: web.Request) -> web.Response:
@@ -6760,25 +6206,29 @@ if _server:
 
     @_server.routes.put("/comfymodal/presets/images/{preset_id}")
     async def presets_images_update(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
-        new_name = body.get("name", "")
-        if new_name:
-            preset = rename_image_preset(root=_NODE_DIR, preset_id=preset_id, new_name=new_name)
-        else:
-            preset = get_image_preset(root=_NODE_DIR, preset_id=preset_id)
-        if preset is None:
-            return web.json_response({"status": "error", "message": "not found"}, status=404)
-        return web.json_response({"status": "ok", "preset": preset})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     @_server.routes.delete("/comfymodal/presets/images/{preset_id}")
     async def presets_images_delete(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        delete_image_preset(root=_NODE_DIR, preset_id=preset_id)
-        return web.json_response({"status": "ok", "deleted": preset_id})
+        """RETIRED_WRITE (Phase H Wave F, FD-16/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "LEGACY_PRESETS_READ_ONLY",
+            "message": (
+                "Legacy prompt/image preset stores are read-only "
+                "compatibility data (Phase H Wave F). Stored presets "
+                "remain readable."
+            ),
+        }, status=409)
 
     # ── Asset serving (path-traversal-safe) ───────────────────────────
     _ALLOWED_ASSET_MIME = {
@@ -7156,9 +6606,17 @@ if _server:
 
     # History V2 HTTP API (history_v2_routes.py) backed by the local
     # History V2 SQLite database under the default local data root.
+    # F9: settings_provider injects the live canonical Output-settings
+    # authority (_load_modal_settings) for configured-folder Export —
+    # dependency injection avoids any circular import from the routes
+    # module back into __init__.
     from history_v2_store import default_data_root as _history_v2_default_data_root
     from history_v2_routes import register_history_v2_routes
-    register_history_v2_routes(_server, _history_v2_default_data_root())
+    register_history_v2_routes(
+        _server,
+        _history_v2_default_data_root(),
+        settings_provider=_load_modal_settings,
+    )
 
     # ── D4: Modern Experiment surface (additive) ─────────────────────
     # Modern Experiment REST + lifecycle (experiment_modern_routes.py).
@@ -7308,87 +6766,55 @@ if _server:
 
     @_server.routes.post("/comfymodal/studio/backends")
     async def studio_backends_create(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-            import datetime as _dt
-            now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            entry = {
-                "id": body.get("id", ""),
-                "name": body.get("name", ""),
-                "studio_metadata": body.get("studio_metadata", {}),
-                "source_profile_id": body.get("source_profile_id", ""),
-                "created_at": now,
-            }
-            if not entry["id"]:
-                entry["id"] = uuid.uuid4().hex[:12]
-            stored = _BACKENDS_STORE.read()
-            stored.append(entry)
-            _BACKENDS_STORE.write_atomic(stored)
-            return web.json_response({"status": "ok", "backend": entry})
-        except StudioStoreError as exc:
-            return web.json_response({"status": "error", "message": str(exc)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-8/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "BACKENDS_READ_ONLY",
+            "message": (
+                "The legacy backend registry is read-only compatibility "
+                "data (Phase H Wave F). Stored entries remain readable via "
+                "GET /studio/backends."
+            ),
+        }, status=409)
 
     @_server.routes.patch("/comfymodal/studio/backends/{backend_id}")
     async def studio_backends_update(request: web.Request) -> web.Response:
-        backend_id = request.match_info.get("backend_id", "")
-        try:
-            body = await request.json()
-            stored = _BACKENDS_STORE.read()
-            for entry in stored:
-                if entry.get("id") == backend_id:
-                    if "name" in body:
-                        entry["name"] = body["name"]
-                    if "studio_metadata" in body:
-                        entry["studio_metadata"] = body["studio_metadata"]
-                    if "disabled_reason" in body:
-                        entry["disabled_reason"] = body["disabled_reason"]
-                    flat_fields = ["label", "description", "sourceType", "sourceId",
-                                   "workflowId", "modelLabel", "modelTriple", "compatibleFeatures",
-                                   "disabledReason", "archived"]
-                    for f in flat_fields:
-                        if f in body:
-                            if "studio_metadata" not in entry:
-                                entry["studio_metadata"] = {}
-                            entry["studio_metadata"][f] = body[f]
-                    _BACKENDS_STORE.write_atomic(stored)
-                    return web.json_response({"status": "ok", "backend": entry})
-            return web.json_response({"status": "error", "message": "Backend not found"}, status=404)
-        except StudioStoreError as exc:
-            return web.json_response({"status": "error", "message": str(exc)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-8/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "BACKENDS_READ_ONLY",
+            "message": (
+                "The legacy backend registry is read-only compatibility "
+                "data (Phase H Wave F). Stored entries remain readable via "
+                "GET /studio/backends."
+            ),
+        }, status=409)
 
     @_server.routes.delete("/comfymodal/studio/backends/{backend_id}")
     async def studio_backends_delete(request: web.Request) -> web.Response:
-        backend_id = request.match_info.get("backend_id", "")
-        try:
-            stored = _BACKENDS_STORE.read()
-            filtered = [e for e in stored if e.get("id") != backend_id]
-            if len(filtered) == len(stored):
-                return web.json_response({"status": "error", "message": "Backend not found"}, status=404)
-            _BACKENDS_STORE.write_atomic(filtered)
-            return web.json_response({"status": "ok"})
-        except StudioStoreError as exc:
-            return web.json_response({"status": "error", "message": str(exc)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-8/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "BACKENDS_READ_ONLY",
+            "message": (
+                "The legacy backend registry is read-only compatibility "
+                "data (Phase H Wave F). Stored entries remain readable via "
+                "GET /studio/backends."
+            ),
+        }, status=409)
 
     @_server.routes.post("/comfymodal/studio/backends/{backend_id}/duplicate")
     async def studio_backends_duplicate(request: web.Request) -> web.Response:
-        backend_id = request.match_info.get("backend_id", "")
-        try:
-            stored = _BACKENDS_STORE.read()
-            source = None
-            for e in stored:
-                if e.get("id") == backend_id:
-                    source = e
-                    break
-            if source is None:
-                return web.json_response({"status": "error", "message": "Backend not found"}, status=404)
-            dup = copy.deepcopy(source)
-            dup["id"] = uuid.uuid4().hex[:12]
-            dup["name"] = (dup.get("name", "Unnamed") or "Unnamed") + " (Copy)"
-            stored.append(dup)
-            _BACKENDS_STORE.write_atomic(stored)
-            return web.json_response({"status": "ok", "backend": dup})
-        except StudioStoreError as exc:
-            return web.json_response({"status": "error", "message": str(exc)}, status=500)
+        """RETIRED_WRITE (Phase H Wave F, FD-8/FD-17): read-only compat data."""
+        return web.json_response({
+            "status": "error",
+            "error_code": "BACKENDS_READ_ONLY",
+            "message": (
+                "The legacy backend registry is read-only compatibility "
+                "data (Phase H Wave F). Stored entries remain readable via "
+                "GET /studio/backends."
+            ),
+        }, status=409)
 
     # ── Studio run / experiment routes ─────────────────────────────────
     @_server.routes.post("/comfymodal/studio/run")
@@ -7549,58 +6975,23 @@ if _server:
 
     @_server.routes.post("/comfymodal/studio/experiment")
     async def studio_experiment(request: web.Request) -> web.Response:
-        """Execute a Studio experiment (matrix expansion).
+        """RETIRED_EXECUTION (Phase H Wave F, FD-12/FD-17).
 
-        Expects JSON body:
-            presetIds: string[]  — one or more preset IDs to include
-            featureId: str      — which feature
-            experiment: dict    — experiment definition (prompts, axes, …)
-
-        All presets share a single unified experiment with one checkpoint
-        per preset.  Returns ``{"status": "ok", experimentId, cellCount,
-        message}`` or ``{"status": "error", "message"}``.
+        The legacy Studio experiment creator had zero modern callers
+        (modern Experiments use POST /studio/experiment-v2). It used to
+        load presets, validate controls, create a REGISTRY experiment,
+        ensure a History V2 record and start a scheduler; all of that is
+        permanently retired. Bounded truthful response before any body
+        parse or side effect.
         """
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
-        preset_ids = (body or {}).get("presetIds", [])
-        if isinstance(preset_ids, str):
-            preset_ids = [preset_ids]
-        preset_ids = [pid.strip() for pid in preset_ids if pid and pid.strip()]
-        feature_id = (body or {}).get("featureId", "").strip()
-        experiment_def = (body or {}).get("experiment", {}) or {}
-        if not preset_ids or not feature_id or not experiment_def:
-            return web.json_response(
-                {"status": "error", "message": "presetIds (non-empty array), featureId, and experiment are required"},
-                status=400,
-            )
-        try:
-            from studio_run_adapter import handle_studio_experiment, validate_studio_request_controls
-            # Validate experiment controls/axes against ALL preset schemas
-            # (no first-valid-preset shortcut — heterogeneous presets must
-            # reject values valid for A but invalid for B)
-            _exp_defaults = experiment_def.get("defaults", {}) or {}
-            _exp_axes = experiment_def.get("axes", {}) or {}
-            _exp_validation_errors = validate_studio_request_controls(
-                preset_ids, feature_id, _exp_defaults, _exp_axes, _NODE_DIR,
-            )
-            if _exp_validation_errors:
-                return web.json_response({
-                    "status": "error",
-                    "message": "Experiment control validation failed",
-                    "errors": _exp_validation_errors,
-                }, status=400)
-            _studio_mo_exp = (body or {}).get("modal_options")
-            result = handle_studio_experiment(
-                preset_ids, feature_id, experiment_def, _NODE_DIR,
-                modal_options=_studio_mo_exp,
-            )
-            status_code = 200 if result.get("status") == "ok" else 400
-            return web.json_response(result, status=status_code)
-        except Exception:
-            _log.exception("Studio experiment error")
-            return web.json_response({"status": "error", "message": "Internal error processing experiment"}, status=500)
+        return web.json_response({
+            "status": "error",
+            "error_code": "EXPERIMENT_RETIRED",
+            "message": (
+                "Legacy Studio experiment creation was retired in Phase H "
+                "(Wave F). Modern experiments use POST /studio/experiment-v2."
+            ),
+        }, status=410)
 
     # ── Warmup ────────────────────────────────────────────────────────
     @_server.routes.get("/comfymodal/deploy-warmup/status")
@@ -7613,87 +7004,42 @@ if _server:
 
     @_server.routes.post("/comfymodal/deploy-warmup/run")
     async def warmup_run(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        state = WarmupState(_warmup_state_path)
-        version = (body or {}).get("version") or "manual"
-        fingerprint = (body or {}).get("fingerprint") or "manual"
-        # Resolve the warmup workflow.  If the body does not supply one,
-        # try the latest saved benchmark workflow as a reasonable default.
-        warmup_workflow = (body or {}).get("workflow", {})
-        if not warmup_workflow:
-            try:
-                wf = _load_latest_benchmark_workflow().get("payload", {}).get("prompt", {})
-                if wf:
-                    warmup_workflow = wf
-            except Exception:
-                pass
-        if not warmup_workflow:
-            return web.json_response(
-                {
-                    "status": "error",
-                    "message": (
-                        "No workflow supplied and no known-safe default available. "
-                        "Submit a workflow or save one first."
-                    ),
-                },
-                status=400,
-            )
-        # Run the warmup workflow remotely and inspect the stream outcome.
-        had_result = False
-        try:
-            from modal_client import run_prompt_stream
-            async for ev in run_prompt_stream(
-                warmup_workflow,
-                input_images=None,
-                modal_options={"comfymodal_warmup": True, "discard": True},
-            ):
-                if ev.get("type") == "result":
-                    had_result = True
-                    break
-                if ev.get("type") == "error":
-                    state = WarmupState(_warmup_state_path)
-                    state.mark_warmup_failed(
-                        state.deployment_generation() or f"manual_{int(time.time())}",
-                        ev.get("message", "warmup error"),
-                    )
-                    return web.json_response({
-                        "status": "error",
-                        "message": f"warmup workflow execution failed: {ev.get('message', 'unknown')}",
-                        "state": state.snapshot(),
-                    }, status=500)
-        except Exception as exc:
-            state = WarmupState(_warmup_state_path)
-            state.mark_warmup_failed(
-                state.deployment_generation() or f"manual_{int(time.time())}",
-                str(exc),
-            )
-            return web.json_response({
-                "status": "error",
-                "message": f"warmup exception: {exc}",
-                "state": state.snapshot(),
-            }, status=500)
-        if not had_result:
-            return web.json_response({
-                "status": "error",
-                "message": "warmup stream ended without result",
-                "state": state.snapshot(),
-            }, status=500)
-        # Stream completed with a result — mark warmed.
-        gen = state.deployment_generation() or deployment_generation(
-            version, fingerprint, time.time()
-        )
-        warmup_run_id = f"warm_{uuid.uuid4().hex[:8]}"
-        state.mark_warmed(gen, warmup_run_id=warmup_run_id)
-        return web.json_response({"status": "ok", "state": state.snapshot()})
+        """RETIRED_EXECUTION (Phase H Wave F, FD-14/FD-17).
+
+        The manual warmup route used to resolve a workflow and stream it
+        through modal_client.run_prompt_stream, then mark the deployment
+        warmed/failed. After Wave F NO warmup route can trigger model
+        execution; the shared streaming transport itself remains for the
+        V2 ModalTransport. Bounded truthful response before any workflow
+        resolution or state mutation.
+        """
+        return web.json_response({
+            "status": "error",
+            "error_code": "WARMUP_RETIRED",
+            "message": (
+                "Deploy warmup execution was retired in Phase H (Wave F). "
+                "No warmup route can trigger model execution; deployment "
+                "state remains readable via GET /deploy-warmup/status."
+            ),
+        }, status=410)
 
     @_server.routes.post("/comfymodal/deploy-warmup/invalidate")
     async def warmup_invalidate(request: web.Request) -> web.Response:
-        state = WarmupState(_warmup_state_path)
-        state.invalidate()
-        return web.json_response({"status": "ok", "state": state.snapshot()})
+        """RETIRED_WRITE (Phase H Wave F, FD-14/FD-17): frozen state file.
+
+        The odd code name (WARMUP_RETIRED on a 409) is intentional and
+        frozen by FD-17. Zero WarmupState mutation; the warmup state file
+        stays byte-identical.
+        """
+        return web.json_response({
+            "status": "error",
+            "error_code": "WARMUP_RETIRED",
+            "message": (
+                "Warmup invalidation was retired in Phase H (Wave F); the "
+                "warmup state file is frozen read-only compatibility data "
+                "and remains readable via GET /deploy-warmup/status."
+            ),
+        }, status=409)
 
     # ── Phase 7: Unified history endpoint ─────────────────────────────────
     # One paginated GET endpoint that runs filter/sort/pagination in SQLite.

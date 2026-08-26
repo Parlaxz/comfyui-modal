@@ -1,0 +1,44 @@
+# v2ctl profile: P1 serial-Golden (golden_p1).
+# Dedicated forced profile for the P1 Serial Golden runtime: existing
+# defaults enable CPU-model/CLIP/VAE snapshot behaviors, which the Golden
+# path replaces with the deploy-baked dynamic-VRAM hydration flag.
+schema_version = 1
+name = "golden_p1"
+extends = "production"
+owner = "golden-p1"
+
+[target]
+app = "stable-modal-comfy-v2-golden-p1"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_serial_stream"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+# v2ctl gate is one structural generation; the frozen final cohort uses
+# `v2ctl confirm --runs 5`, with single-use containers for each run.
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# ── Golden snapshot contract (all registry flags are deploy-baked) ───────
+# Golden uses a runtime-only memory snapshot: model payloads are hydrated by
+# the adapter during the request, never retained by the legacy snapshot path.
+# Keep this profile out of production's CPU-model invariant when disabling
+# that legacy path.
+COMFYMODAL_V2_ENV_PROFILE = "inherit"
+COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "0"
+COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "1"
+COMFYMODAL_V2_VAE_SNAPSHOT = "0"
+COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
+
+# Modal memory snapshots remain enabled by the runtime default.  The
+# COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT control is not in the v2ctl flag
+# registry, so it is intentionally not invented as a profile key.
+
+# ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
+COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"

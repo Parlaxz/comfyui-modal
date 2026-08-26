@@ -244,33 +244,13 @@ class WorkspaceIsolationTests(unittest.TestCase):
             "_execute_job must pass workspace to set_active_warmup_profile",
         )
 
-    def test_normal_prompt_passes_workspace_to_run_prompt_stream(self):
-        src = _read_stripped(REPO_ROOT / "__init__.py")
-        self.assertIn(
-            "run_prompt_stream(",
-            src,
-        )
-        self.assertIn(
-            "workspace=_request_workspace or None",
-            src,
-            "_execute_job must pass workspace to run_prompt_stream",
-        )
-
-    def test_comparison_profile_captures_workspace(self):
-        src = _read_stripped(REPO_ROOT / "__init__.py")
-        self.assertIn(
-            "_comparison_workspace = _active_workspace() or {}",
-            src,
-            "comparison_run handler must capture workspace once",
-        )
-
-    def test_comparison_profile_passes_workspace_to_run_prompt_stream(self):
-        src = _read_stripped(REPO_ROOT / "__init__.py")
-        self.assertIn(
-            "workspace=workspace,",
-            src,
-            "_execute_comparison_profile must pass workspace to run_prompt_stream",
-        )
+    # H19 Wave G: test_normal_prompt_passes_workspace_to_run_prompt_stream
+    # and both comparison-workspace stream tests were removed — their
+    # subjects (the V1 direct stream call in _execute_job and the deleted
+    # _execute_comparison_profile body) no longer exist; __init__.py has
+    # ZERO direct run_prompt_stream calls (V2 owns streaming via
+    # ModalTransport). Workspace threading into V2 plans is pinned by the
+    # runtime/playground suites.
 
 
 # ── Phase 8: Active-next bounding ───────────────────────────────────────
