@@ -723,3 +723,133 @@ not substitute filename, content hash, Attempt id, or creation time.
 - Generate Original execution and replay-core preparation were not modified.
 - No deployment, live Modal generation, GPU spend, commit, or push was
   performed.
+
+## E1 Implementation Follow-Up C - Production Grouping Proof
+
+Date: 2026-08-22
+Status: Deterministic production evidence complete.
+
+**E5C featured/variant-grouping production blocker = CLOSED.**
+
+### Scope
+
+E5C reported E6 acceptance items 6 (variant grouping) and 8 (featured
+mapping) as only "partially proven" because the E1B suite exercised the
+route projection with hand-constructed in-memory Asset lists. This follow-up
+adds a cross-layer deterministic suite that proves the LANDED E1B behavior
+against real production seams end to end, without changing any production
+code:
+
+- repository writes through `HistoryV2Repository` (`attach_asset`,
+  `adopt_asset`, attempts, `set_featured_asset`);
+- producer adoption through `HistoryV2ProductionWriter` with the LeaseRegistry
+  resolver seam (`record_run`/`update_run`, `attach_result_assets`);
+- the modern Experiment cell shape (`create_modern_matrix`, CAS claim,
+  `record_result`, `record_terminal`) and the cell-aware E3B2 Generate
+  Original decision (`claim_or_reuse_original_attempt`);
+- route projection exactly as the production routes build it:
+  `_generation_feed_item` over `repo.get_generation`, the mixed-feed batch
+  path `_build_generation_items`, plus `_cell_generation_payload` and
+  `_detail_cell` over the experiment-detail loaders;
+- the exact E3B2 result passthrough (`_META_PASSTHROUGH_KEYS` ->
+  `attach_result_assets`).
+
+### Cases Proven
+
+New file: `tests/test_phase_e_logical_output_integration.py` (16 tests).
+
+1. Producer Preview Attempt + Preview asset + Thumbnail derivative + later
+   Original Attempt all carry one canonical key and project as ONE logical
+   output; `output_count == 1`; Preview, Thumbnail, and Original URLs all
+   present (writer adoption -> route projection).
+2. Retry grouping: Preview success -> failed Original -> successful Original
+   retry keeps three Attempts on ONE Generation, ONE logical output,
+   `output_count == 1`; the retry Original becomes the preferred Original;
+   Preview and Thumbnail remain associated. The intermediate state also
+   proves `original_failed: true` while only the failed Attempt exists.
+3. Later failed rerender after a successful Original retains the earlier
+   winner (`original_failed == false`), keeps one logical output, and leaves
+   the retry failure visible through Attempt/error projections.
+4. Two successful Original Attempts collapse to one group with the newest as
+   winner.
+5. E2C multi-asset handoff: primary preview descriptor + thumbnail derivative
+   descriptor inside `asset_descriptors` become Preview + Thumbnail Assets
+   sharing one logical key and ONE projected output group (consumer side of
+   the E2C seam; encoder behavior not duplicated).
+6. E3B2-shaped Original result persisted by a later Attempt joins the
+   existing Preview logical output; `output_count` stays fixed at 1; the
+   newest-success winner rule selects it.
+7. Featured derivative membership: featured Thumbnail, featured Preview, and
+   featured older Original each resolve to their own logical group's
+   `featured_output_index` (proven against a second group so default-0
+   masking cannot pass); attaching a newer successful Original to the same
+   logical output keeps the featured identity stable while the winner URL
+   moves.
+8. Multiple outputs: two item indexes (`node:A:slot:images:item:0/1`) plus a
+   second node produce exactly three groups in deterministic earliest-asset
+   order; a Thumbnail variant does not inflate the count; featured selects
+   the intended group; the same counts hold through the production feed
+   batch path. Metadata-derived keys (`node_id`/`output_key`/
+   `output_index` without an explicit key) are proven at persistence time.
+9. Experiment parity: a modern matrix cell driven through claim ->
+   `record_result` (preview + thumbnail descriptors) -> terminal, then the
+   cell-aware Generate Original action appending a keyed Original, projects
+   IDENTICAL thumb/preview/original URLs, `original_failed`, outputs, and
+   featured index on both the Generation surface and the Experiment
+   cell/detail surface (`_detail_cell` + `_cell_generation_payload`). A
+   failure-parity case proves the cell detail retains the Preview, reports
+   `original_failed: true`, and surfaces the retry error identically.
+10. Remote `modal://`: a keyed remote Original adopted via the repository
+    reference seam remains structurally usable without any fetch, is never
+    falsely failed, groups into the single logical output, and obeys
+    newest-wins in both directions (remote-newer wins; remote-older loses to
+    a newer local) with both provenance rows retained.
+11. Legacy compatibility: a v1-shaped database migrates idempotently
+    (double `initialize()`, `user_version == 2`), unkeyed rows stay readable
+    and projectable with `logical_output_key` NULL, and mixed keyed/unkeyed
+    generations keep independently proven groups - no fabricated identities
+    are written onto legacy rows.
+
+### Tests and Results
+
+- `python -m pytest tests/test_phase_e_history_projection.py tests/test_phase_e_logical_outputs.py tests/test_phase_e_logical_output_integration.py -q`
+  -> 42 passed, 1 skipped (the pre-existing explicit E1B pending
+  description), 2 subtests passed.
+- `python -m pytest tests/test_history_v2_api.py tests/test_history_v2_repository.py tests/test_history_v2_production_writer.py tests/test_history_v2_modern_experiment.py -q`
+  -> 120 passed.
+- `python -m pytest tests/test_e2c_history_handoff.py tests/test_history_v2_generate_original.py -q`
+  -> 65 passed.
+- `python -m pytest tests/test_phase_e_contract.py tests/test_phase_e_wave2_contract.py -q`
+  -> 19 passed, 3 subtests passed.
+- `python -m pytest tests/test_history_v2_migration.py tests/test_history_v2_replay_core.py -q`
+  -> 19 passed.
+
+### Production Bug Found/Fixed
+
+NONE. No E1-owned production file was modified; the landed E1B
+implementation satisfied every requested semantic against production seams.
+Two harness findings are recorded for future test authors (existing
+production behavior, not defects): `assets.run_id` carries a real foreign
+key to `run_attempts`, so adoption fixtures must create the producing
+Attempt row first; and `record_result` treats a result without
+`_history_output_required` as optional-output, returning True even when no
+asset attached - required-output results must set that flag.
+
+### Files Changed
+
+- `tests/test_phase_e_logical_output_integration.py` (new, 16 tests)
+- This audit document (append-only follow-up)
+
+No production source file was modified. No `comfyapp.py`, runtime, replay,
+frontend, browser-fake, or `__init__.py` change.
+
+### Cross-Lane Notes
+
+- E2D (codec/runtime), E4D (frontend Retry), and the E5 harness lane run in
+  parallel; this lane touched none of their files.
+- E4D can rely on `featured_output_index`, `output_count`, and
+  `original_failed` semantics as proven here at the route-projection level.
+- E5 can retire the "featured/variant-grouping production tests partial"
+  blocker wording and cite this suite as the executable production evidence.
+- No deployment, live Modal generation, GPU spend, commit, or push was
+  performed.

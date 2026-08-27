@@ -194,9 +194,14 @@ function ensureHost() {
 }
 
 export function open_testing_modal(tabName) {
-  ensureHost();
-  ensureTestingStyles();
-  ensureStudioStyles();
+  try {
+    ensureHost();
+    ensureTestingStyles();
+    ensureStudioStyles();
+  } catch (err) {
+    console.error(PREFIX, "open_testing_modal style/host setup failed:", err);
+    throw err;
+  }
 
   // Store the current active element for focus restoration on close
   _triggerEl = document.activeElement;
@@ -341,20 +346,60 @@ function close_testing_modal() {
 // mountable from the Studio shell. Modern alias routing below is preserved
 // unchanged (H10).
 
+function _wrapSidebarOpener(fn, statusEl) {
+  return function (ev) {
+    if (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+    try {
+      const result = fn();
+      if (statusEl) {
+        statusEl.textContent = "Studio open";
+        statusEl.style.color = "";
+      }
+      return result;
+    } catch (err) {
+      console.error(PREFIX, "sidebar opener failed:", err);
+      if (statusEl) {
+        statusEl.textContent = "Open failed: " + (err && err.message ? err.message : String(err));
+        statusEl.style.color = "#ef4444";
+      }
+      try {
+        window.__comfyModalLastOpenerError = String(err && err.stack ? err.stack : err);
+      } catch (_) {}
+      return null;
+    }
+  };
+}
+
 function buildSidebarPanel() {
-  const statusEl = el("div", { class: "launcher-status", text: "Studio shell ready" });
-  const panel = el("div", { class: "comfymodal-testing-sidebar-panel" }, [
+  const statusEl = el("div", { class: "launcher-status", "data-testid": "sidebar-launcher-status", text: "Studio shell ready" });
+  const openStudioBtn = el("button", {
+    text: "Open Studio",
+    type: "button",
+    "data-testid": "sidebar-open-studio",
+    "aria-label": "Open Studio",
+  });
+  openStudioBtn.addEventListener("click", _wrapSidebarOpener(function () { return open_testing_modal(); }, statusEl));
+  const openSettingsBtn = el("button", {
+    text: "Open Settings",
+    type: "button",
+    "data-testid": "sidebar-open-settings",
+    "aria-label": "Open Studio Settings",
+  });
+  openSettingsBtn.addEventListener("click", _wrapSidebarOpener(function () {
+    if (statusEl) {
+      statusEl.style.color = "";
+      statusEl.textContent = "Opening Settings\u2026";
+    }
+    return open_testing_modal(TAB_SETTINGS);
+  }, statusEl));
+  const panel = el("div", { class: "comfymodal-testing-sidebar-panel", "data-testid": "sidebar-panel" }, [
     el("div", { class: "launcher-title", text: "Modal GPU" }),
     el("div", { class: "launcher-subtitle", text: "Playground, History, Backend, Settings" }),
-    el("button", { text: "Open Studio", onclick: () => open_testing_modal() }),
-    el("button", {
-      text: "Open Settings",
-      onclick: () => {
-        statusEl.style.color = "";
-        statusEl.textContent = "Opening Settings\u2026";
-        open_testing_modal(TAB_SETTINGS);
-      },
-    }),
+    openStudioBtn,
+    openSettingsBtn,
     statusEl,
   ]);
   return panel;

@@ -290,6 +290,26 @@ The fake mirrors production where it matters and deviates only on purpose:
 | 4 | mixed-kind cursor V2 `{"v":2,"g","e"}` (routes.py:572-616), stateless per-stream keysets anchored at the last emitted item | identical `{"v":2,"g","e"}` shape; legacy V1 `{g,e,gs,es}` payloads tolerated on decode, responses upgrade to V2 | pagination is gap-free (test requirement) |
 | 5 | profile level persists in `.profile_config.json` (file-level) | per-session (`session.profileLevel`) | cleared on session reset |
 
+### 3.9 Workflow Portability (G12)
+
+Deterministic G5-shaped contract payloads — NO rule logic is simulated. Routes:
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /studio/workflows/versions/:vid/portability` | `{status:"ok", portability}` from the armed mode (`matrix` default = Medium workflow + High environment + Local low/Modal low/RunPod medium/RunComfy unknown/Comfy Cloud high/Baseten medium); other modes `low`/`high`/`unknown_main`; 404 unknown version. Every served report is cached per-session so list/detail chips derive fresh summaries (`stale:false`). |
+| `GET /studio/workflows/versions/:vid/export?include_presets=0\|1` | deterministic manifest bytes + `Content-Disposition` filename `<name>-v<n>-<hash8>.workflow.json`; one-shot 409 credential refusal when armed; every success logged to `manifestExports`. NOTE: Chromium re-requests attachment URLs internally for its download manager, so one user click can log >1 server hit — assert dedupe on PAGE network requests. |
+| `POST /studio/workflows/import-manifest?dry_run=1\|0` | seeded previews (`valid` default / `invalid` / `missing_deps`) or atomic commit creating `wf_import_<n>` + Version #1 + Mapping + optional presets honoring `import_presets`/`apply_default_preset`; every request logged to `manifestImports`. |
+
+Test-control endpoints:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /__comfymodal_test/portability {sessionId, mode}` | arm report mode: `matrix\|low\|high\|unknown_main` |
+| `POST /__comfymodal_test/portability-export-fail {sessionId, mode}` | `credential` arms a one-shot 409 credential-like refusal; `""` clears |
+| `POST /__comfymodal_test/import-manifest-arm {sessionId, preview_mode?, commit_fail_once?}` | seed preview scenario and/or arm a one-shot atomic commit failure |
+
+`dumpState` extras: `portabilityMode`, `portabilityRequests`, `manifestExports`, `manifestImports`. The seeded `wf_incomplete` carries a STALE `portability_summary` for chip-transition tests; imported workflows are appended to the platform seed so list/detail see them.
+
 ---
 
 ## 4. Legacy history endpoints + record field contract

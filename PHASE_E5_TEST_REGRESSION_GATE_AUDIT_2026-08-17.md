@@ -698,3 +698,390 @@ following blockers remain:
 
 E7 was not performed. No deployment, live generation, GPU operation, or commit
 was performed in this follow-up.
+
+## E5 Implementation Follow-Up C - Generate Original / E6 Preflight
+
+Date: 2026-08-22
+Owner: deterministic test and fake-harness lane
+Verdict: **Full gate ALL STUDIO LANES GREEN (exit 0); E6 NOT GREEN**
+
+### Concurrent-Lane State Observed At Execution Time
+
+This lane started while E3B2/E4C were mid-flight and finished after they
+landed. The fake Generate Original route was therefore built twice: first
+against the documented conceptual contract, then re-mirrored EXACTLY to the
+landed production code (`history_v2_routes.py` routes +
+`history_v2_replay.GenerateOriginalService`, pinned by
+`tests/test_history_v2_generate_original.py`). The fake adds no behavior
+production does not have.
+
+### Fake Generate Original Route (exact production mirror)
+
+`POST /comfymodal/history-v2/generations/{generation_id}/original`
+(`tests/browser/fake/fake-backend.mjs` `generateHistoryV2Original`) supports
+every required outcome with production payloads:
+
+- create queued Original: 200 `{status:"ok", outcome:"original_created",
+  decision:"create_original", reason, run_id, attempt_status:"queued",
+  reused:false, executor:"canonical_execution.execute_plan"}`;
+- active reuse: 200 `outcome:"original_already_active", reused:true`;
+- successful reuse: 200 `outcome:"original_already_completed", reused:true`;
+- retry required: 200 `outcome:"retry_required"` reporting the newest failed
+  Attempt with ZERO writes (retry creation is owned by the explicit retry
+  route, never silently reinterpreted);
+- busy: 409 `{code:"generation_busy", decision:"busy",
+  reason:"preview_attempt_active"}`;
+- irreproducible: 409 `{code:"generation_not_reproducible",
+  reason:"missing_request_snapshot"}` with zero writes;
+- explicit rerender: body `{"rerender":true}` is the only path past a
+  successful Original; non-boolean rerender is a 400;
+- execution failure: created attempts progress lazily on detail reads
+  (queued -> running at +1s, terminal at +2.5s); failure retains Preview,
+  invents no Original asset, and keeps prior successes preferred;
+- success: asset attaches exactly once before terminal completion.
+
+`POST .../generations/{id}/original/retry` mirrors the landed retry route:
+creates one queued Original only when the newest original Attempt is failed
+and nothing is active; otherwise 409 `retry_not_available` /
+`generation_busy`. A new seed `history_v2_phase_e_original` isolates one
+record per outcome plus an Experiment cell generation; a test-control
+endpoint `/__comfymodal_test/original-script` scripts fail_once/fail_always.
+
+### Same Generation / Logical Output / Failure / Retry / Multiple Originals
+
+New spec `tests/browser/fake/studio-fake-phase-e-original.spec.mjs` (14
+cases) proves against the real frontend modules and the exact-mirror fake:
+Preview -> Generate Original keeps the SAME Generation id and ONE logical
+output (`output_count` unchanged, `logical_output_key` stable, feed still
+shows one record); duplicate POSTs serialize onto the existing active
+Attempt; successful reuse spends no execution; explicit rerender creates a
+new Attempt and prefers the newest success while retaining the earlier
+Original; a failed rerender keeps the older usable Original available;
+retry creates a new Attempt and retains the failed one; busy/irreproducible
+refuse without writes; execution failure retains Preview.
+
+### Eager-Original Reconciliation
+
+The old E5A assertion expecting an eager `img[alt="Original"]` was REPLACED
+(not skipped) in `studio-fake-phase-e.spec.mjs` test C with the approved
+E4B contract: availability placeholder visible, zero eager Original images,
+explicit `View Original` triggers the only full-asset GET. The same
+no-eager policy remains covered by the Wave-2 remote-only case and the
+presentation unit.
+
+### Visual Baseline
+
+The remaining E5B history-grid mismatch was inspected pixel-by-pixel: the
+only difference is the intentional E4 presentation change where missing
+cells now render a visible "No image" placeholder label
+(`_assetPlaceholder` / `data-asset-kind`). Rendering is deterministic and
+correct, so ONLY `history-grid-fake-chromium-win32.png` was regenerated;
+the other three baselines are untouched and all four visual tests pass.
+
+### Cross-Layer Gap Found (reported, not papered over)
+
+The landed E4C Retry control POSTs `/original` (frozen by
+`studio_phase_e4c_generate_original_unit.mjs` "same POST, no rerender"),
+but the landed E3B2 backend answers that POST with 200 `retry_required`
+WITHOUT creating an Attempt - creation requires the explicit
+`/original/retry` route. Executable evidence: the new spec asserts the
+truthful current behavior (one POST, note stays "Original failed",
+attempts unchanged) and a `fixme` pins the intended end state. This is an
+E6 blocker until the frontend consumes `retry_required` or calls the retry
+route.
+
+### Gate Wiring And Counts
+
+`tests/run_studio_tests.py` now includes the green production suites
+`test_history_v2_replay_core`, `test_history_v2_generate_original`,
+`test_history_v2_modern_experiment` (Python) and
+`studio_phase_e4c_generate_original_unit.mjs`,
+`studio_phase_e_preview_settings_unit.mjs`,
+`studio_phase_e_history_presentation_unit.mjs` (Node). Two obsolete
+Generate Original pending skips were retired because their coverage now
+exists as green production tests; the E2C preview-persistence skip remains
+truthfully pending. The sparse-detail browser case stays `fixme` (verified
+still blocked at browser level).
+
+Observed full gate:
+
+```text
+python tests/run_studio_tests.py --fake
+Python: 1584 run, 0 failures, 0 errors, 1 skip
+Node: 16 files passed
+Fake Playwright: 124 discovered in 15 files; 122 passed, 2 skipped (fixme), 0 failed
+Gate result: ALL STUDIO LANES GREEN (exit code 0)
+```
+
+### E6 Acceptance Matrix
+
+Proven (production or real-module evidence): 5 logical-output identity,
+7 output_count grouping, 9 same-Generation, 10 new Attempt, 11 immutable
+exact replay, 12 no mutable resolution, 13 duplicate suppression,
+14 successful reuse, 15 Retry semantics (backend; frontend gap above),
+16 explicit rerender, 17 Preview retained on failure, 18 earlier Original
+retained on failed rerender, 19 Experiment cell parity, 20 no eager
+Original display, 23 required asset before terminal, 24 wrapper exits
+zero. Partially proven: 6 variant grouping, 8 featured mapping.
+Unproven: 1/2 Preview OFF/ON request freezing end-to-end, 3/4 Preview
+Attempt/Asset persistence (E2C pending skip), 21 sparse detail (browser
+fixme), 22 remote `modal://` live transport (deterministic projection only).
+
+**E6: NOT GREEN.** Exact blockers: E2C preview persistence unproven;
+frontend retry wiring gap; sparse-detail browser rendering; featured/
+variant-grouping production tests partial; live `modal://` transport
+remains E7 evidence.
+
+Production files modified by THIS lane: NONE. Deploy/live/GPU/commit: NONE.
+
+## E5 Implementation Follow-Up D1 - Preview/Sparse Gate Reconciliation
+
+Date: 2026-08-22
+Owner: parallel test/harness lane (E5D1)
+Verdict: **Full gate ALL STUDIO LANES GREEN (exit 0); E6 verdict DEFERRED until E1C + E2D + E4D reconciliation**
+
+### Scope And Constraints
+
+Parallel test/harness lane only. No production edits, no deployment, no live
+Modal generation, no GPU, no commits. E1C, E2D, and E4D ran concurrently and
+were not duplicated. The final E6 declaration was NOT attempted here.
+
+### 1. Stale E2C Production Preview Skip - RETIRED
+
+`tests/test_phase_e_contract.py` carried
+`@unittest.skip("Pending E2C production Preview persistence; fake fixtures are not proof")`
+on `PhaseEProductionPendingTests`. E2C has since landed with production
+deterministic coverage, so the skip was stale. It was replaced by an
+executable cross-layer contract test, `PhaseEE2CPreviewHandoffTests`, which
+drives the REAL writer/result handoff (record_run -> producer descriptor
+resolution via set_asset_resolver -> update_run attach -> HistoryV2Repository
+read-back against a temp store) rather than fake fixtures. One concise test
+asserts exactly the required contract:
+
+- Attempt mode is `preview` and terminal status is `completed`;
+- asset types are exactly `preview` + `thumbnail` (no managed Original in
+  Preview-only mode);
+- `logical_output_key` (`node:6:slot:images:item:0`) persists on the Preview;
+- the Thumbnail derivative shares the SAME logical output key;
+- the required Preview association exists BEFORE terminal completion
+  (`generation_has_output_association` true while still running).
+
+Observed: `python -m unittest -q tests.test_phase_e_contract` -> Ran 9 tests,
+OK, 0 skips (previously 8 tests + 1 skip).
+
+### 2. E2C Suite Gate Membership - KEPT OUTSIDE (documented)
+
+`tests/test_e2c_history_handoff.py` (32 tests, all OK when run standalone)
+was evaluated for the authoritative allowlist and deliberately NOT added:
+its ~40s runtime is dominated by torch/comfyapp-gated producer thumbnail
+encoding tests, so allowlisting the module would import torch into the
+deterministic Studio gate. Its non-torch writer/repository/routes seam is
+pinned by the allowlisted cross-layer contract test above. Revisit only if
+the module is split away from the torch-gated class. The gate was not
+inflated gratuitously.
+
+### 3. Sparse-Detail FIXME - ROOT CAUSE B (test-side), FIXED IN HARNESS
+
+The former `test.fixme` F2 claimed "card click never opens the overlay" and
+blamed a browser-level nullable-section gap. Investigation after E4A's
+unit-level fix found production code already correct:
+
+- `web/studio-history-v2-detail.js` guards every nullable section
+  (`appendIfPresent`, `_section` filtering, flat children arrays);
+- `_isNotFound` explicitly distinguishes a legitimate failed zero-output
+  generation (`attempt_failed`) from repository `load_failed`/`not_found`
+  sentinels;
+- `_v2GetGeneration` normalization is nil-safe for empty outputs/params.
+
+Actual root cause (classification B - stale test action): the default feed
+hides failed/canceled statuses (`web/history-v2-view-state.js`
+`DEFAULT_HIDDEN_STATUSES = ["failed", "canceled"]`), so the sparse FAILED
+card never rendered and `openGenerationDetail` timed out waiting for the
+click locator. No production defect exists; nothing was reported to E4.
+
+Fix (test/fake harness only): F2 now enables the Failed status toggle
+(`button[data-status="failed"]`) before opening the detail; a new F3 covers
+the sparse INTERRUPTED record (visible by default). Both assert: overlay
+opens, terminal/error state shown (Failed/Interrupted chip plus the exact
+`sparse phase e failure` error text for F2), zero assets (no thumb images),
+zero params (no Parameters section), clean close via the close button, and
+no console/page errors. Observed: `studio-fake-phase-e.spec.mjs` 9/9 passed.
+The stale seed comment in `fake-backend.mjs` was updated accordingly.
+
+### 4. modal:// Taxonomy Correction
+
+Previous E5C text listed "live remote modal:// transport" among reasons E6
+itself could not become green. Corrected classification:
+
+> E7 LIVE-ONLY PROOF - required before Phase E live closure, not a
+> deterministic E6 blocker.
+
+The deterministic gate proves URI-aware projection, route shape, the
+fake/production reader contract, and absence of local `Path.is_file()` misuse
+(`test_remote_modal_reference_derivative_remains_valid`,
+`test_remote_original_uses_managed_url_not_raw_uri`, Wave-2 remote-only
+browser case). An actual live remote producer fetch is inherently E7
+evidence. E7 is not weakened by this reclassification.
+
+### 5. Concurrent-Lane Blockers (NOT duplicated)
+
+- Featured/variant-grouping production coverage: `pending E1C result`.
+- Frontend Retry completion (the one remaining Playwright `fixme`):
+  `pending E4D`.
+
+Both stay listed for final E6 reconciliation; this lane did not touch retry
+frontend/fake contracts or E1C production tests.
+
+### Full Gate After This Lane's Changes
+
+```text
+python tests/run_studio_tests.py --fake
+Python: 1584 run, 0 failures, 0 errors, 0 skips
+Node: 16 files passed
+Fake Playwright: 125 discovered in 15 files; 124 passed, 1 skipped (fixme:
+  retry completion, owned by E4D), 0 failed
+Gate result: ALL STUDIO LANES GREEN (exit code 0)
+```
+
+No concurrent-lane failures were observed in this run; every lane touched by
+this lane passed. This is NOT the final E6 verdict.
+
+FINAL E6 VERDICT DEFERRED UNTIL E1C + E2D + E4D RECONCILIATION.
+
+Production files modified by THIS lane: NONE.
+Deploy/live/GPU/commit: NONE.
+
+## E5 Implementation Follow-Up D2 — Final E6 Reconciliation (2026-08-22)
+
+This is the FINAL deterministic Phase-E reconciliation batch before any E7
+live validation. Lane ownership: tests / harness / documentation only. No
+production file was modified; no deploy, no Modal, no GPU, no live
+generation, no commit.
+
+### 1. E4D fake reconciliation (stale Retry assertion corrected)
+
+`tests/browser/fake/studio-fake-phase-e-original.spec.mjs` contained one
+stale E4C-era assertion ("Retry Original surfaces retry_required without
+inventing an Attempt") encoding the PRE-E4D contract: click Retry -> POST
+ordinary `/original` -> receive `retry_required`. That was evidence of the
+old bug, not the landed seam. Replaced with the FINAL E4D contract:
+
+- opening a failed-only Generation detail fires ZERO Original POSTs (no
+  auto-retry) and offers the explicit `Retry Original` control;
+- one explicit click performs exactly ONE bodyless POST to
+  `/comfymodal/history-v2/generations/{generation_id}/original/retry` and
+  ZERO ordinary `/original` POSTs;
+- durable fake-backend state shows the SAME Generation gaining exactly one
+  new queued/running Original Attempt while failed Attempt A, its error,
+  and the Preview asset all remain retained;
+- polling reaches terminal success: Attempt B attaches an Original under
+  the unchanged logical output (`output_count` stays 1), Generate Again
+  becomes visible, and full Original bytes are NOT fetched until the
+  explicit `View Original` click performs that fetch.
+
+### 2. Retry fixme retirement
+
+The adjacent `test.fixme("detail UI: Retry Original completes a new
+successful Attempt")` was converted into a normal executable test proving
+the completed Retry lifecycle through rendered UI state only: active
+queued/running note, three rendered Attempts, retained failed-Attempt text,
+retained Preview image, terminal success flipping the action to Generate
+Again with a View Original note. No skip, no expected-failure, no deletion.
+
+### 3. Three-way action distinction (request interception)
+
+Added a browser case proving Generate Again is the ONLY rerender path:
+successful Generation open fires nothing; clicking Generate Again posts
+ordinary `/original` with body exactly `{"rerender": true}`, never touches
+`/original/retry`, creates one new Attempt whose success becomes the newest
+winner while the earlier successful Original stays retained. Together with
+the first-generate UI case and the rewritten Retry case, accidental route
+collapse is detectable at interception level.
+
+### 4. Same-Generation retry proof strengthened
+
+The API-level retry test now additionally asserts from durable state: new
+run id != failed run id, generation id unchanged, feed contains exactly one
+Generation record, `output_count` remains 1 after Attempt B exists, and the
+Preview asset still serves 200 after completion.
+
+### 5. Fake backend verification (no redesign)
+
+The E5C fake backend already mirrors landed E3B2 exactly (create/reuse/
+rerender/retry_required/busy/irreproducible on `/original`; dedicated
+`/original/retry` with retry_not_available/generation_busy refusals; lazy
+queued->running->terminal progression on detail reads; single asset
+attachment; newest-success preference). Verified by inspection; zero
+changes required.
+
+### 6. E1C production proof integrated into the gate
+
+`tests/test_phase_e_logical_output_integration.py` (16 focused integration
+tests over real HistoryV2Repository/ProductionWriter/route projection seams;
+sqlite3/tempfile only, ~2.5s) is now allowlisted in
+`tests/run_studio_tests.py`. Focused result: 16 passed / 0 fail. The former
+"E1C featured/variant-grouping coverage partial" blocker is closed INSIDE
+the deterministic gate. The stale historical E1B-pending skip in
+`test_phase_e_history_projection.py` was retired into an executable
+projection-level logical-output grouping test (10/10 pass, no skips).
+
+### 7. E2D semantic gate coverage
+
+New lightweight module `tests/test_e2d_preview_method_contract.py`
+(9 tests, ~0.16s, NO torch/comfyapp import) allowlisted: proves the frozen
+Preview accepted options (`format=webp_lossy`, `quality=70`,
+`webp_lossless_compression=fast`) through ExecutionOptions incl. canonical
+round-trip and legacy projection, the effort vocabulary
+(`fast->0, balanced->4, max->6`, unknown falls back to 4), the fallback
+converter seam selecting method 0 for the Preview default, and Experiment
+cell plans freezing fast effort. The full production-seam suite
+`tests/test_e2_preview_effort.py` (15 tests, both encode seams incl. direct
+tensor sink) passes but costs ~24s of comfyapp/torch initialization and
+therefore stays OUTSIDE the wrapper as focused diagnostic evidence — same
+treatment as the E2C seam suite in D1. Latency benchmarking is diagnostic,
+not deterministic acceptance; remote CPU/libwebp behavior is E7-only.
+
+### 8. E2C + sparse-detail + no-eager-Original status
+
+E2C cross-layer handoff proof remains executable and non-skipped
+(PhaseEE2CPreviewHandoffTests: preview-mode Attempt, Preview Asset type, no
+managed Original in Preview-only mode, logical key, same-key Thumbnail,
+required association before completed). Sparse-detail F2/F3 cases remain
+executable with the Failed toggle activated intentionally; no sparse fixme;
+no console errors. No-eager-Original evidence retained and extended: feed/
+grid/detail never auto-fetch Original; Generate, Retry, and Generate Again
+successes never fetch it; only explicit View Original does.
+
+### 9. Exact deterministic counts (authoritative wrapper)
+
+```text
+python tests/run_studio_tests.py --fake
+Python: 1609 run, 0 failures, 0 errors, 0 skips
+Node:   16 files passed
+Fake Playwright: 126 discovered in 15 files; 126 passed, 0 skipped,
+  0 failed
+Gate result: ALL STUDIO LANES GREEN (exit code 0)
+```
+
+(The Python count grew 1584 -> 1609 from the two newly allowlisted modules
+[16 + 9]; the retired E1B skip lives in `test_phase_e_history_projection.py`,
+which is outside the gate allowlist and does not change wrapper counts.
+Playwright grew 125 -> 126 because the former fixme now executes and one
+rerender-distinction case was added.)
+
+### 10. E6 verdict
+
+E6 GREEN - deterministic Phase-E gate complete. Full 49-item acceptance
+matrix: `PHASE_E6_DETERMINISTIC_RELEASE_GATE_2026-08-22.md`. Remaining
+LIVE-E7-ONLY proofs: real Modal Preview write, real remote `modal://`
+replay/fetch, container libwebp effective method 0, live
+`output_codec_ms`, live Preview->Generate Original same-Generation pair.
+Next authorized batch is the minimal E7 live gate; do not start it from
+this lane.
+
+Files modified by THIS lane: tests/browser/fake/studio-fake-phase-e-original.spec.mjs,
+tests/test_phase_e_history_projection.py, tests/test_e2d_preview_method_contract.py (new),
+tests/run_studio_tests.py, STUDIO_TEST_GATE.md, this audit,
+PHASE_E6_DETERMINISTIC_RELEASE_GATE_2026-08-22.md (new).
+Production files modified by THIS lane: NONE.
+Deploy/live/GPU/commit/push: NONE.

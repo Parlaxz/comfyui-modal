@@ -1,0 +1,74 @@
+{
+  "mode": "golden_p1_serial",
+  "method": "run_golden_serial_stream",
+  "target": {
+    "app_name": "stable-modal-comfy-v2-golden-p1",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "gpu": "rtx-pro-6000"
+  },
+  "deployment_identity": {
+    "app_name": "stable-modal-comfy-v2-golden-p1",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "deployment_combined_hash": "ab439cb4032026c269ec1cc807d9208672729497cf14ec2a065e9822444a26f7",
+    "deployed_at": "2026-08-27T01:38:00.001055+00:00"
+  },
+  "workflow": {
+    "source_path": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\latest_benchmark_workflow.json",
+    "workflow_hash": "5f5d5e73b311748300b1fa60ac1663488e0650cd6f10cc545c8e176e7255eae3",
+    "prompt_sha256": "5f5d5e73b311748300b1fa60ac1663488e0650cd6f10cc545c8e176e7255eae3",
+    "captured_at": "1787068470.161359"
+  },
+  "expected_output_sha": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+  "expected_flags": {},
+  "run_count_requested": 1,
+  "attempt_count": 1,
+  "valid_count": 0,
+  "invalid_count": 1,
+  "dnf_count": 0,
+  "gap_seconds": 35.0,
+  "strict_serial": true,
+  "started_utc": "2026-08-27T01:39:37.614120+00:00",
+  "completed_utc": "2026-08-27T01:39:48.573346+00:00",
+  "cohort_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\artifacts\\phase_p1_serial_golden_v1\\cohort_2026-08-27_01-39-37_682fca",
+  "attempts": [
+    {
+      "run_index": 0,
+      "request_id": "golden-p1-0-a340c75791e3",
+      "dispatch_unix_ms": 1787794777967,
+      "duration_ms": 10604.461,
+      "event_count": 1,
+      "valid": false,
+      "dnf": false,
+      "true_cold": false,
+      "failures": [
+        "terminal result count=0, expected exactly 1",
+        "error events present: count=1",
+        "true_durable evidence missing or false",
+        "seriality telemetry absent (required; fail-closed)",
+        "completed teardown telemetry absent",
+        "snapshot proof absent or empty",
+        "commit timestamp evidence absent",
+        "reopen timestamp evidence absent",
+        "TRUE_FIRST_DURABLE_RESULT marker absent",
+        "observed output SHA absent from terminal result"
+      ],
+      "observed_output_shas": [],
+      "observed_flags": {},
+      "identity": {},
+      "cold_evidence": {
+        "identity_tokens": {
+          "container_task_id": "",
+          "modal_container_id": "",
+          "container_session_id": "",
+          "restored_instance_id": ""
+        },
+        "identity_tokens_present": false,
+        "restore_count": null,
+        "request_count": null,
+        "true_cold": false,
+        "basis": "",
+        "reason_not_cold": "insufficient remote/container identity evidence; never inferred"
+      }
+    }
+  ]
+}

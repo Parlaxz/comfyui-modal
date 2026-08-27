@@ -1,0 +1,692 @@
+E40 CONTROL REMOTE GATE — COMPLETE RAW EVIDENCE
+Gate record: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\gates\gate_20260822-121609_849cb536.json
+Deploy record: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260822-070931_f15874bd.json
+Gate run output dir: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-22_12-07-21
+Invoked by: python tools/v2ctl.py deploy-run --profile e37-clean-lane-qd4 --owner E40
+Gate command: python tools/v2ctl.py gate --profile e37-clean-lane-qd4 --owner E40
+Note: E40 is the only remote deployment owner while E40/R41 run in parallel. One cold gate; no performance cohort; no G1.
+
+==============================================================================
+SECTION 1 — V2CTL COMMAND AND DEPLOY RECORD (EXACT)
+==============================================================================
+backend.command: "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\deploy_and_run_v2_single.bat" E37_CLEAN_LANE_VALIDATION
+backend.started_at: 2026-08-22T11:57:43+00:00
+backend.ended_at: 2026-08-22T12:08:50+00:00
+backend.elapsed_seconds: 667.4839999999967
+backend.exit_code: 0
+deploy_fingerprint: f15874bd3012b164e883e9089e0e459317ec03c58563325e9b3633d004fecb41
+deploy_inputs.deploy_flags: {"COMFYMODAL_MINIMAL_RESTORE": "1", "COMFYMODAL_V2_ALLOCATOR_PURGE": "0", "COMFYMODAL_V2_ATOMIC_PROFILE": "0", "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS": "0", "COMFYMODAL_V2_BACKGROUND_PERSISTENCE": "0", "COMFYMODAL_V2_BASELINE_CPU_REQUEST": "12", "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST": "32768", "COMFYMODAL_V2_C9QD_EXTRAS": "0", "COMFYMODAL_V2_CHECKPOINT_PREWARM": "0", "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": "0", "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": "0", "COMFYMODAL_V2_CLEAN_LANE": "1", "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "0", "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "0", "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0", "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE": "1", "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1", "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "0", "COMFYMODAL_V2_CLIP_QD_ARTIFACT": "", "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": "32", "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": "clean_lane_post_restore", "COMFYMODAL_V2_CLIP_QD_QD": "4", "COMFYMODAL_V2_CLIP_QD_READER": "1", "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1", "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": "0", "COMFYMODAL_V2_CLOUD": "", "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "1", "COMFYMODAL_V2_CPU_REQUEST": "12", "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": "1", "COMFYMODAL_V2_CRITICAL_PATH_LEDGER": "1", "COMFYMODAL_V2_DEEP_MODEL_DIAG": "0", "COMFYMODAL_V2_E27_FORENSICS": "0", "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT": "1024", "COMFYMODAL_V2_E31_FORENSICS": "0", "COMFYMODAL_V2_E31_FORWARD_PROFILE": "0", "COMFYMODAL_V2_E37_CLEAN_LANE": "1", "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260", "COMFYMODAL_V2_ENV_PROFILE": "inherit", "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT": "0", "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS": "0", "COMFYMODAL_V2_EVICT_RETAIN_ROLE": "none", "COMFYMODAL_V2_EXACT_CACHE_PERSIST": "0", "COMFYMODAL_V2_EXECUTION_PREFILL": "0", "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "1", "COMFYMODAL_V2_FULL_TRACE": "0", "COMFYMODAL_V2_GANTT_TELEMETRY": "1", "COMFYMODAL_V2_GPU_FAST_RETURN": "0", "COMFYMODAL_V2_GRAPH_PRELOAD": "0", "COMFYMODAL_V2_INPUT_TYPES_WARM": "0", "COMFYMODAL_V2_MEMORY_MB": "32768", "COMFYMODAL_V2_MODEL_PRELOAD": "0", "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": "1", "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": "0", "COMFYMODAL_V2_PAGEFAULT_TRACKING": "0", "COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE": "1", "COMFYMODAL_V2_PREFILL_LANES": "none", "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": "0", "COMFYMODAL_V2_REGION": "", "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": "1", "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS": "0", "COMFYMODAL_V2_SCOPED_CUDA_READINESS": "0", "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1", "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": "0", "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": "0", "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER": "O0", "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "0", "COMFYMODAL_V2_STAGED_SAFETENSORS": "0", "COMFYMODAL_V2_STAGED_SOURCE_ORDER": "0", "COMFYMODAL_V2_THREAD_POLICY": "TBASE", "COMFYMODAL_V2_UNET_ACTIVATION_MODE": "late", "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1", "COMFYMODAL_V2_UNET_FORENSICS": "0", "COMFYMODAL_V2_VAE_ACTIVATION_MODE": "late", "COMFYMODAL_V2_VAE_POLICY": "v1", "COMFYMODAL_V2_VAE_SNAPSHOT": "1", "V2_D10_INTEGRATION_VALIDATION": "0", "V2_D6_FASTPATH_VALIDATION": "0", "V2_E10_BUCKET_FIRST_VALIDATION": "0", "V2_E19_FINAL_COLD_LOADER": "1", "V2_E25_VALIDATION": "0", "V2_E26_VALIDATION": "0", "V2_E28_VALIDATION": "1"}
+
+==============================================================================
+SECTION 2 — GATE VERDICT (EXACT STRUCTURED)
+==============================================================================
+schema_version: 1
+created_at: 2026-08-22T12:16:09.239230+00:00
+profile: e37-clean-lane-qd4
+profile_config_fingerprint: a3522d1d478c480abb662d648e54a5d718a4e1772284c25bc875778c169eae90
+provenance_validation_status: validated
+request_id: v2-benchmark-0-5eb47f02b5f7
+v2ctl_invocation_id: a5fd80e5c055404682b24f57270355e5
+gate_valid: True
+reasons: []
+run.backend_exit_code: 0
+run.backend_ok: True
+run.expected_output_sha: 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+run.output_sha: 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+run.fresh_required: True
+run.target_app: stable-modal-comfy-v2-restore-only-shadow
+run.target_class: ModalRuntimeEntrypointV2
+run.run_fingerprint: 849cb53684d9495a2a8e521cd91ed0c2b49b4c62b723c329aa147a143e123d4e
+run.deploy_fingerprint: f15874bd3012b164e883e9089e0e459317ec03c58563325e9b3633d004fecb41
+
+==============================================================================
+SECTION 3 — E40 ACCEPTANCE TELEMETRY BLOCKS (EXACT, FROM run_001_sample.json)
+==============================================================================
+loader_selection: {"clip": {"effective": "qd4_reader", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": "", "observed": "qd4_reader", "requested": "qd4_reader"}, "unet": {"effective": "cpu_snapshot_native", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": "", "observed": "cpu_snapshot_native", "requested": "cpu_snapshot_native"}, "vae": {"effective": "policy_v1", "fallback_attempted": false, "fallback_loader": "", "fallback_reason": "", "observed": "policy_v1", "requested": "policy_v1"}}
+runtime_status: {"reasons": [], "status": "NOMINAL"}
+resolved_config: {"controls": {"COMFYMODAL_ACTUAL_LOAD_MODE": "clip_vae_only", "COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET": true, "COMFYMODAL_DEFER_VAE_INCLUDING_PRODUCTION_UNET": false, "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": true, "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": true, "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": false, "COMFYMODAL_ENABLE_WARMUP": true, "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE": false, "COMFYMODAL_EXECUTION_BACKEND": "in_process", "COMFYMODAL_FASTPATH_V21621": true, "COMFYMODAL_FASTPATH_V21621_BACKGROUND_UNET": true, "COMFYMODAL_FASTPATH_V21621_CLIP_LOAD_ONLY": true, "COMFYMODAL_FASTPATH_V21621_CLIP_READ_BYTES": true, "COMFYMODAL_FUSE_READ_GOVERNOR": false, "COMFYMODAL_MINIMAL_RESTORE": true, "COMFYMODAL_PRELOAD_MODE": "clip_only", "COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY": "auto", "COMFYMODAL_SAFETENSORS_READ_MODE": "normal", "COMFYMODAL_V2_ATOMIC_PROFILE": false, "COMFYMODAL_V2_BACKGROUND_PERSISTENCE": false, "COMFYMODAL_V2_C9QD_EXTRAS": false, "COMFYMODAL_V2_CHECKPOINT_PREWARM": false, "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": 0, "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB": 0, "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS": 0, "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": 0, "COMFYMODAL_V2_CLEAN_LANE": true, "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE": true, "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": 524288, "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": 67108864, "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": 8, "COMFYMODAL_V2_CLIP_FAST_HYDRATION": true, "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": false, "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": 32, "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": "clean_lane_post_restore", "COMFYMODAL_V2_CLIP_QD_QD": 4, "COMFYMODAL_V2_CLIP_QD_READER": true, "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": false, "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": false, "COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU": false, "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": false, "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": true, "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": true, "COMFYMODAL_V2_CRITICAL_PATH_LEDGER": true, "COMFYMODAL_V2_E37_CLEAN_LANE": true, "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260", "COMFYMODAL_V2_E37_STRICT_PROOF": false, "COMFYMODAL_V2_ENV_PROFILE": "inherit", "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT": false, "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS": 0, "COMFYMODAL_V2_EVICT_RETAIN_ROLE": "none", "COMFYMODAL_V2_EXACT_CACHE_PERSIST": false, "COMFYMODAL_V2_EXECUTION_PREFILL": false, "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS": 0, "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": false, "COMFYMODAL_V2_GANTT_TELEMETRY": true, "COMFYMODAL_V2_GPU_FAST_RETURN": false, "COMFYMODAL_V2_GRAPH_PRELOAD": false, "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS": false, "COMFYMODAL_V2_INPUT_TYPES_WARM": false, "COMFYMODAL_V2_MODEL_PRELOAD": false, "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": true, "COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE": true, "COMFYMODAL_V2_PIN_UNET_TRANSFER": false, "COMFYMODAL_V2_PREFILL_LANES": "none", "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": false, "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE": false, "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": true, "COMFYMODAL_V2_RESTORE_TOTAL_VRAM_FROZEN": false, "COMFYMODAL_V2_SCOPED_CUDA_READINESS": false, "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": true, "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": false, "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER": "O0", "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": false, "COMFYMODAL_V2_STAGED_ASYNC_H2D": true, "COMFYMODAL_V2_STAGED_BUCKET_MB": 256, "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS": false, "COMFYMODAL_V2_STAGED_CPU_CAST": true, "COMFYMODAL_V2_STAGED_POOL_MB": 1024, "COMFYMODAL_V2_STAGED_PRODUCERS": 4, "COMFYMODAL_V2_STAGED_SAFETENSORS": false, "COMFYMODAL_V2_STAGED_SOURCE_ORDER": false, "COMFYMODAL_V2_THREAD_POLICY": "TBASE", "COMFYMODAL_V2_UNET_ACTIVATION_MODE": "late", "COMFYMODAL_V2_UNET_FASTSAFETENSORS": false, "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": 524288, "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": 268435456, "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": 8, "COMFYMODAL_V2_UNET_META_DIRECT": false, "COMFYMODAL_V2_UNET_PINNED_RING": "", "COMFYMODAL_V2_UNET_PINNED_STAGING": false, "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER": false, "COMFYMODAL_V2_UNET_READ_H2D_PIPELINE": "", "COMFYMODAL_V2_UNET_STAGING_CHUNK_MB": 512, "COMFYMODAL_V2_VAE_ACTIVATION_MODE": "late", "COMFYMODAL_V2_VAE_EARLY_START_MS": 0, "COMFYMODAL_V2_VAE_POLICY": "v1", "COMFYMODAL_V2_VAE_PREFETCH_MODE": "off", "COMFYMODAL_V2_VAE_SNAPSHOT": true}, "fingerprint": "3480ad938dd4e7784b1d4f3010deb32922ed1c6dd2ae1d5e5197024868b81b08"}
+e40_telemetry_error: None
+
+==============================================================================
+SECTION 4 — REMOTE OUTPUT AS CAPTURED BY V2CTL TELEMETRY (174 KEYS, EXACT)
+==============================================================================
+[remote] ATOMIC_PROFILE = E37_CLEAN_LANE == deployed E37_CLEAN_LANE
+[remote] BASELINE_CPU = 12 == deployed 12
+[remote] BASELINE_MEMORY = 32768 == deployed 32768
+[remote] COMFYAPP_VERSION = 2.16.30
+[remote] CPU = 12 == deployed 12
+[remote] D1_PROOF_COVERS = true
+[remote] FINAL_REQUEST_PREFLIGHT = PASS
+[remote] FORCE_BUILD = ''
+[remote] MEMORY = 32768 == deployed 32768
+[remote] MODAL_FORCE_BUILD = ''
+[remote] MODAL_IGNORE_CACHE = ''
+[remote] RUNTIME_FINGERPRINT = f504e296c398bdcb2c4c07e2 == deployed f504e296c398bdcb2c4c07e2
+[remote] RUN_COUNT = 1
+[remote] TARGET_APP = stable-modal-comfy-v2-restore-only-shadow
+[remote] TARGET_CLASS = ModalRuntimeEntrypointV2
+[remote] TARGET_DEPLOYMENT = bc24c7ae930ebae10b36427a
+[remote] TARGET_MATCH = YES
+[remote] [comfyapp] = ==========================================
+[remote] __file__ = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\timing_trace.py TRACE_VERSION=2.0.0
+[remote] action = allow name=rgthree-comfy reason=production_custom_node
+[remote] allocator_purge = 0
+[remote] atomic_profile = E37_CLEAN_LANE
+[remote] background_diagnostics = 0
+[remote] background_persistence = 0
+[remote] base_key = 5bcfb0d47e431370db7434945f13d7372a7c8183ade97eef1be49b724b6513a2
+[remote] baseline_cpu_request = 12
+[remote] baseline_memory_request = 32768
+[remote] batch_c_expect_plan_fast_path = 1
+[remote] c9qd_extras = 0
+[remote] cachedit_lock_key = 1548d5f36612f3e82d8e7bf1b3a3266c778eaf8dc677de2ebe3d05a9f0a6545e
+[remote] canonical_ledger = present
+[remote] canonical_ledger_endpoint_status = ok
+[remote] canonical_ledger_status = ok
+[remote] canonical_ledger_zero_gap = True
+[remote] checkpoint_prewarm = 0
+[remote] checkpoint_prewarm_chunk_mb = 0
+[remote] checkpoint_prewarm_threads = 0
+[remote] clean_lane = 1
+[remote] clip_conditioning_cache = 1
+[remote] clip_fast_hydration = 1
+[remote] clip_fastsafe_bbuf_kb = 524288
+[remote] clip_fastsafe_block_bytes = 67108864
+[remote] clip_fastsafe_threads = 8
+[remote] clip_fp32_cast_once = 0
+[remote] clip_qd_block_mib = 32
+[remote] clip_qd_launch_policy = clean_lane_post_restore
+[remote] clip_qd_qd = 4
+[remote] clip_qd_reader = 1
+[remote] clip_snapshot_exclude_weights = 0
+[remote] clip_staged_hydration = 0
+[remote] combined_ignore_has_local_only_dir = 1
+[remote] comfyapp_dir = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[remote] comfymodal_minimal_restore = 1
+[remote] comfyui_modal_excluded_baked_custom_node_deps = check_logs
+[remote] comfyui_modal_excluded_custom_node_requirements = check_logs
+[remote] conditioning_cache = forced_miss
+[remote] conditioning_cache_prefetch = 0
+[remote] correlation_id = v2-benchmark-0-5eb47f02b5f7
+[remote] cpu_model_snapshot = 1
+[remote] cpu_snapshot_unet_mode = reuse
+[remote] critical_gpu_coordination = 1
+[remote] critical_path = 1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[remote] custom_node_copy_mode = combined
+[remote] custom_node_requirements_context_hash = b604c14479dc289b...
+[remote] decision = persistent_hit
+[remote] deep_model_diag = 0
+[remote] dependency_key = 1f8b9d8d610849a8553c50ecd61027064976b959c6504c605d9ea735eb20905c
+[remote] dependency_manifest_hash = be68be1945de2a29...
+[remote] deploy = f15874bd run=849cb536 profile=e37-clean-lane-qd4
+[remote] direct_legacy_files_present = []
+[remote] e10_bucket_first_validation = 0
+[remote] e31_forensics = 0
+[remote] e31_forward_profile = 0
+[remote] e37_clean_lane = 1
+[remote] e37_expected_output_sha = 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+[remote] e37_strict_proof = 1
+[remote] enabled = 1 source=env
+[remote] env_profile = inherit
+[remote] evict_models_before_snapshot = 0
+[remote] evict_restore_idle_seconds = 0
+[remote] evict_retain_role = none
+[remote] eviction_enabled = 0
+[remote] eviction_idle_seconds = 0
+[remote] eviction_role = none
+[remote] exact_cache_persist = 0
+[remote] execution_prefill = 0
+[remote] fast_cold_orchestration = 0
+[remote] fresh = True
+[remote] full_trace = 0
+[remote] gpu_fast_return = 0
+[remote] graph_preload = 0
+[remote] input_types_warm = 0
+[remote] installer_key = 20da617e65903391ce1e690a560347ea68c43190344c5bd15ebafe536113ff7a
+[remote] local_custom_node_root = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes
+[remote] local_node_names = ['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+[remote] local_only_dir_exists = 1 path=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.comfymodal_experiments
+[remote] local_source = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes
+[remote] local_syncable_nodes = 24 nodes_with_dep_files=22
+[remote] manifest = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-22_12-15-23\campaign_manifest.json
+[remote] maxRSS = 34.98 GiB
+[remote] memory_request_mb = 32768
+[remote] modal_dir = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[remote] modal_ignore_has_local_only_dir = 1
+[remote] model_preload = 0
+[remote] mutable_state_location = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.comfymodal_experiments\comfymodal_experiment_state.json
+[remote] native_fast_disk_unet = 1
+[remote] node = rgthree-comfy file=pyproject.toml hash=9cee2c6c6ac87d48 size=351 has_reqtxt=True
+[remote] nodes = 24 deps_nodes=22 hash=be68be1945de2a29...
+[remote] nodes_with_dep_files = 22 dep_nodes=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'rgthree-comfy']
+[remote] nonce = 8d0ef45b3d494b5db4597429800a84a8
+[remote] optimization_diagnostics = 0
+[remote] pagefault_tracking = 0
+[remote] persistent_local_handle = 1
+[remote] phase = execute_plan_start
+[remote] pid = 16608
+[remote] prefill_lanes = none
+[remote] prefill_wait_for_unet = 0
+[remote] prewarm_chunk_mb = 0
+[remote] prewarm_threads = 0
+[remote] production_adjusted_total_wall_ms = absent
+[remote] profile = E37_CLEAN_LANE
+[remote] publish_restore_plan = 0
+[remote] python_first_line_wall_unix_ns = 1787400922619291900
+[remote] reason = flag_disabled
+[remote] region = unpinned cloud=unpinned source=COMFYMODAL_V2_REGION/COMFYMODAL_V2_CLOUD
+[remote] registry_load = skipped store_hit=yes
+[remote] release_gpu_after_request = 1
+[remote] request_id = v2-benchmark-0-5eb47f02b5f7 process_start_to_response_ms=28758.75 user_equivalent_trigger_to_response_ms=35370.042 user_equivalent_trigger_to_modal_submission_ms=7147.292 registry_store_hit=True registry_load_ms=0.0
+[remote] requirements_context_file_count = 228
+[remote] requirements_context_node_dirs = 22
+[remote] requirements_context_total_bytes = 6217574
+[remote] requirements_context_unchanged = 1
+[remote] requirements_dir = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.custom_node_requirements
+[remote] requirements_key = b604c14479dc289b3ef39fdf8059f3043d02f04cfb3fca51035e77914a6b85ec
+[remote] residency_diagnostics = 0
+[remote] restore_only_app = stable-modal-comfy-v2-restore-only-shadow
+[remote] restore_only_run_count = 6
+[remote] restore_torch_threads = none
+[remote] run_count = 1
+[remote] run_selector = ACTIVE full_run=1 e19=0 nonce=present
+[remote] runtime_revision = 55722c892d7331d2
+[remote] runtime_revision_part_of_dependency_key = 0
+[remote] saved = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-22_12-15-23\run_001_sample.json
+[remote] schema = 1 payload=yes validated=True outputs=2 wf_hash=2e43d4c0ba3b82c0 dep_complete=True reg_proof=1 memo=hit
+[remote] scoped_cuda_readiness = 0
+[remote] snapshot_exclude_unet = 0
+[remote] snapshot_model_order = O0
+[remote] source = invocation_plan schema=2 topology_available=1 persisted=1 workflow_hash=2e43d4c0ba3b82c0 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[remote] source_copy_layers = 1
+[remote] source_copy_node_count = 24
+[remote] source_root = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes
+[remote] stage = container_python_import event=start wall_unix_ns=1787400917415171200 monotonic_ns=511261218000000
+[remote] staged_requirements = C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.custom_node_requirements staged_nodes=22
+[remote] staged_safetensors = 0
+[remote] staged_source_order = 0
+[remote] state_inside_ignored_dir = 1
+[remote] store_generation_entry = yes
+[remote] syncable_custom_nodes = 24
+[remote] thread_policy = TBASE
+[remote] unet_activation_mode = late
+[remote] unet_fastsafe_bbuf_kb = 524288
+[remote] unet_fastsafe_block_bytes = 268435456
+[remote] unet_fastsafe_threads = 8
+[remote] unet_fastsafetensors = 0
+[remote] v2_benchmark_mode = e37_single
+[remote] v2_benchmark_runs = 1
+[remote] v2ctl_config = deploy=f15874bd run=849cb536 profile=e37-clean-lane-qd4
+[remote] vae_activation_mode = late
+[remote] vae_policy = v1
+[remote] vae_snapshot = 1
+[remote] validation = PASS
+[remote] variance_pretouch = 0
+[remote] visible = 28
+[remote] volume_read_run_count = 3
+
+==============================================================================
+SECTION 5 — RUN SAMPLE FACTS (EXACT)
+==============================================================================
+request_id: v2-benchmark-0-30f732a8a05a
+run_fingerprint: 849cb53684d9495a2a8e521cd91ed0c2b49b4c62b723c329aa147a143e123d4e
+deploy_fingerprint: f15874bd3012b164e883e9089e0e459317ec03c58563325e9b3633d004fecb41
+profile: e37-clean-lane-qd4
+output_sha: 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+canonical_ledger_status: ok
+provider: CLOUD_PROVIDER_AWS
+region: us-east-2
+gpu: ['RTX-PRO-6000']
+snapshot_identity: im-0xAL8HKh1z5p2BTcUbKqMK|e42eb92ce42e4ada826b2b4485a2c8d0
+wall_ms: 85238.4
+total_wall_ms: 13620.826840000009
+generated_at_utc: 2026-08-22T12:08:46.957020+00:00
+persisted_at_utc: 2026-08-22T12:08:50.772433+00:00
+run_role: sample
+retained: True
+
+==============================================================================
+SECTION 5A — CANONICAL LEDGER SUMMARY (EXACT)
+==============================================================================
+ledger.endpoint_status: ok
+ledger.event_count: 31
+ledger.span_count: 21
+ledger.request_span_count: 14
+ledger.restore_span_count: 7
+ledger.events:
+  - modal_restore_entry @ 69297385698
+  - bootstrap_restore_entry @ 69656727862
+  - modal_restore_exit @ 70442126092
+  - modal_method_entry @ 70478309956
+  - plan_deserialize_start @ 70479044999
+  - plan_received @ 70563613803
+  - clip_loader_start @ 70974457299
+  - clip_qd_source_submit_start @ 70995439283
+  - clip_qd_copy_to_device_start @ 71064777014
+  - clip_qd_source_first_completion @ 72199016620
+  - clip_qd_source_last_completion @ 72199032959
+  - clip_qd_source_submit_end @ 72199053204
+  - clip_qd_copy_to_device_end @ 72201699266
+  - clip_qd_stats @ 72201719312
+  - clip_qd_device_ready @ 72205520695
+  - clip_qd_owner_created @ 72206597192
+  - clip_qd_spec_record_publish @ 72206886094
+  - clip_qd_take @ 72206894708
+  - clip_qd_bind @ 72206902169
+  - clip_qd_owner_retained @ 72206908604
+  - clip_qd_take @ 72207462708
+  - clip_qd_bind @ 72207491741
+  - clip_qd_owner_retained @ 72207511921
+  - clip_device_ready @ 72266433546
+  - sampling_end @ 80961300804
+  - sampler_finally_done @ 80961477135
+  - post_vae_decode @ 81950507761
+  - graph_next_node_after_sampler @ 82239795338
+  - result_assembly_start @ 82242996265
+  - output_persist_done @ 82364321874
+  - first_durable_result @ 82364321874
+
+==============================================================================
+SECTION 6 — SUMMARY.JSON (EXACT)
+==============================================================================
+{
+ "deploy_fingerprint": "f15874bd3012b164e883e9089e0e459317ec03c58563325e9b3633d004fecb41",
+ "gap_seconds": 35.0,
+ "intentional_cold_waits": [],
+ "node_registry_preload_ms": 0.0,
+ "profile": "e37-clean-lane-qd4",
+ "profile_config_fingerprint": "a3522d1d478c480abb662d648e54a5d718a4e1772284c25bc875778c169eae90",
+ "profile_name": "e37-clean-lane-qd4",
+ "run_count": 1,
+ "run_fingerprint": "849cb53684d9495a2a8e521cd91ed0c2b49b4c62b723c329aa147a143e123d4e",
+ "runs": [
+  {
+   "identity": {
+    "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+    "class_name": "ModalRuntimeEntrypoint",
+    "cloud": "CLOUD_PROVIDER_AWS",
+    "container_session_id": "20c68f2e0ea84793",
+    "container_task_id": "ta-01M0MNWPTS5CKECFJGAM1ZMGJR",
+    "cpu": 12,
+    "fingerprint": "bee498f4cc5fce563cfe898670ffef67c543d059f460730539ba53aebeff0678",
+    "gpu": [
+     "RTX-PRO-6000"
+    ],
+    "image_id": "im-0xAL8HKh1z5p2BTcUbKqMK",
+    "memory_mb": 32768,
+    "method_name": "run_plan_stream",
+    "modal_container_id": "",
+    "modal_input_id": "in-01M0MNWPF0ZJ092QMPK8ERA99C:1787400444385-0",
+    "region": "us-east-2",
+    "request_count": 1,
+    "restore_count": 1,
+    "restore_session_id": "e42eb92ce42e4ada826b2b4485a2c8d0",
+    "restored_instance_id": "9102027c98944537bf97c61edea5a872",
+    "runtime_shape": {
+     "cpu_request": 12,
+     "malloc_arena_max": null,
+     "memory_request": 32768,
+     "mkl_num_threads": null,
+     "numexpr_num_threads": null,
+     "omp_num_threads": null,
+     "openblas_num_threads": null,
+     "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+     "runtime_shape_label": null,
+     "snapshot_model_order": "O0",
+     "thread_policy": "TBASE",
+     "torch_interop_threads": null,
+     "torch_intraop_threads": null
+    },
+    "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+    "runtime_shape_label": null,
+    "stored_snapshot_model_order": "O0"
+   },
+   "request_id": "v2-benchmark-0-30f732a8a05a",
+   "run_index": 0,
+   "runtime_shape": {
+    "construction_order_semantics": "model_construction_order_only",
+    "deployed": {
+     "cpu_request": 12,
+     "malloc_arena_max": null,
+     "memory_request": 32768,
+     "mkl_num_threads": null,
+     "numexpr_num_threads": null,
+     "omp_num_threads": null,
+     "openblas_num_threads": null,
+     "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+     "runtime_shape_label": null,
+     "snapshot_model_order": "O0",
+     "thread_policy": "TBASE",
+     "torch_interop_threads": null,
+     "torch_intraop_threads": null
+    },
+    "guard": {
+     "allow_multi_axis": false,
+     "baseline_cpu_request": 12,
+     "baseline_memory_request": 32768,
+     "changed_axes": []
+    },
+    "observed": {
+     "actual_torch_interop_threads": 28,
+     "actual_torch_intraop_threads": 12,
+     "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+     "class_name": "ModalRuntimeEntrypoint",
+     "cloud": "CLOUD_PROVIDER_AWS",
+     "configured_mkl": null,
+     "configured_numexpr": null,
+     "configured_omp": null,
+     "configured_openblas": null,
+     "container_task_id": "ta-01M0MNWPTS5CKECFJGAM1ZMGJR",
+     "cpu_request": 12,
+     "error": "",
+     "image_id": "im-0xAL8HKh1z5p2BTcUbKqMK",
+     "legacy_container_session_id": "20c68f2e0ea84793",
+     "malloc_arena_max": null,
+     "memory_request": 32768,
+     "modal_input_id": "in-01M0MNWPF0ZJ092QMPK8ERA99C:1787400444385-0",
+     "native_library_settings": {
+      "MALLOC_ARENA_MAX": null,
+      "MKL_NUM_THREADS": "12",
+      "NUMEXPR_NUM_THREADS": null,
+      "OMP_NUM_THREADS": "12",
+      "OPENBLAS_NUM_THREADS": "12"
+     },
+     "native_thread_count": 51,
+     "pid": 2,
+     "region": "us-east-2",
+     "requested_torch_interop_threads": null,
+     "requested_torch_intraop_threads": null,
+     "requested_vs_actual_match": true,
+     "restore_session_id": "e42eb92ce42e4ada826b2b4485a2c8d0",
+     "restored_instance_id": "9102027c98944537bf97c61edea5a872",
+     "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+     "runtime_shape_label": null,
+     "snapshot_model_order": "O0",
+     "stage": "request_entry",
+     "status": "baseline_passthrough",
+     "thread_native_id": 2,
+     "thread_policy": "TBASE",
+     "torch_interop_threads": 28,
+     "torch_intraop_threads": 12,
+     "trace_id": "168c61558c6645e7"
+    },
+    "requested": {
+     "cpu_request": 12,
+     "malloc_arena_max": null,
+     "memory_request": 32768,
+     "mkl_num_threads": null,
+     "numexpr_num_threads": null,
+     "omp_num_threads": null,
+     "openblas_num_threads": null,
+     "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+     "runtime_shape_label": null,
+     "snapshot_model_order": "O0",
+     "thread_policy": "TBASE",
+     "torch_interop_threads": null,
+     "torch_intraop_threads": null
+    },
+    "snapshot_target_fingerprint": "bee498f4cc5fce563cfe898670ffef67c543d059f460730539ba53aebeff0678",
+    "stored_snapshot_model_order": "O0"
+   },
+   "timing": {
+    "command_start_to_restore_start_ms": 74856.043,
+    "command_to_response_ms": 85951.0,
+    "cpu_snapshot_wait_ms": null,
+    "dtype_layout_preparation_ms": null,
+    "early_activation_total_ms": null,
+    "first_remote_event_to_final_result_ms": 11972.6,
+    "graph_activity_ms": 3715.317,
+    "handle_lookup_ms": 17.0,
+    "local_timing": {
+     "active_profile_ms": 0.0,
+     "caller_return_mono_ns": 510870750000000,
+     "caller_return_wall_unix_ns": 1787400526955017900,
+     "clock_reconciliation_residual_ms": 0.0,
+     "first_iteration_to_first_remote_event_ms": 73215.576,
+     "generator_create_ms": 16.0,
+     "generator_create_to_first_iteration_ms": 0.0,
+     "generator_created_to_first_iteration_ms": 0.0,
+     "handle_lookup_ms": 31.0,
+     "local_body_read_ms": null,
+     "local_json_parse_ms": null,
+     "local_preflight_ms": null,
+     "local_queue_enqueue_ms": null,
+     "local_queue_lock_wait_ms": null,
+     "local_receive_to_actual_submission_ms": 156.0,
+     "local_receive_to_enqueue_ms": null,
+     "local_receive_to_generator_create_ms": 141.0,
+     "local_receive_to_generator_create_start_ms": 139.0,
+     "local_receive_to_result_return_ms": 85343.176,
+     "local_residual_ms": 0.0,
+     "local_result_received_mono_ns": 510870734000000,
+     "local_result_received_to_caller_return_ms": 16.0,
+     "local_result_received_wall_ns": 1787400526928017600,
+     "missing_stages": [
+      "local_receive_to_enqueue_ms"
+     ],
+     "modal_method_entry_to_executor_ms": 129.808,
+     "modal_restore_begin_wall_unix_ns": null,
+     "overlap_error": "",
+     "payload_materialization_ms": 0.0,
+     "payload_serialize_ms": 0.0,
+     "payload_size_measurement_ms": 0.0,
+     "plan_build_ms": 125.0,
+     "queue_wait_before_worker_ms": null,
+     "reconciliation_status": "incomplete",
+     "remote_python_resume_to_restore_start_ms": 0.0,
+     "remote_result_emit_to_local_receipt_ms": null,
+     "remote_result_emit_wall_unix_ns": 1787400528927991070,
+     "restore_end_to_modal_method_entry_ms": 27.587,
+     "restore_method_ms": 1153.351,
+     "restore_plan_build_ms": null,
+     "restore_publish_ms": null,
+     "result_received_to_return_ms": 27.0,
+     "route_unattributed_ms": null,
+     "stage_attribution_residual_ms": {
+      "missing_stages": [
+       "local_receive_to_enqueue_ms"
+      ],
+      "overlap_error": "",
+      "reconciliation_status": "incomplete",
+      "route_unattributed_ms": null,
+      "worker_unattributed_ms": null
+     },
+     "submission_to_remote_python_resume_ms": 74121.201,
+     "t0_to_t1_ms": 0.842,
+     "t1_to_queue_enqueue_ms": null,
+     "trigger_to_local_receive_ms": 0.842,
+     "unexplained_pre_remote_ms": "absent",
+     "worker_unattributed_ms": null
+    },
+    "method_entry_to_first_remote_event_ms": null,
+    "output_collection_ms": 11.587,
+    "post_load_bookkeeping_ms": null,
+    "pre_sampler_ms": 6662.643,
+    "queue_delay_ms": null,
+    "quiesce_wait_ms": null,
+    "quiesced_transfer": null,
+    "remote_python_resume_to_restore_start_ms": 0.0,
+    "restore_breakdown": {
+     "backend_startup_ms": 18519.9,
+     "comfyui_path_setup_ms": 0.14,
+     "cpu_snapshot_retargeting_ms": 0.0,
+     "cuda_init_ms": 154.32,
+     "folder_warm_ms": 1441.255,
+     "initialize_cuda_ms": 154.259,
+     "install_requirements_ms": 0.02,
+     "manager_offline_ms": 1.17,
+     "models_symlink_ms": 3.77,
+     "observe_generations_ms": 2.19,
+     "reload_models_ms": 0.0,
+     "reload_runtime_state_ms": 106.276,
+     "restore_gpu_state_ms": 385.671,
+     "restore_total_ms": 857.927,
+     "snapshot_callback_age_at_restore_ms": 33928.926,
+     "snapshot_identity_checks_ms": 0.0,
+     "snapshot_restore_ms": 779.77,
+     "sync_custom_nodes_ms": 160.82,
+     "v2_startup_backend_startup_ms": 18519.44,
+     "v2_startup_comfyui_path_startup_ms": 0.07,
+     "v2_startup_custom_node_source_copy_ms": 160.72,
+     "v2_startup_snapshot_execution_seed_ms": 2.76
+    },
+    "restore_to_method_entry_ms": 27.587,
+    "restore_total_ms": 857.927,
+    "sampler_lane_wait_ms": 0.048,
+    "sampler_ms": 3682.223,
+    "snapshot_callback_age_at_restore_ms": 33928.926,
+    "snapshot_callback_to_command_start_ms": null,
+    "submission_to_first_remote_event_ms": 73215.576,
+    "submission_to_remote_python_resume_ms": 74121.201,
+    "submit2entry_ms": 75319.139,
+    "synchronized_transfer_ms": null,
+    "t3b_to_t8_ms": 11644.531,
+    "transfer_queue_delay_ms": null,
+    "vae_decode_ms": 484.213,
+    "wall_ms": 85238.4
+   }
+  }
+ ],
+ "runtime_shape": {
+  "guard": {
+   "allow_multi_axis": false,
+   "baseline_cpu_request": 12,
+   "baseline_memory_request": 32768,
+   "changed_axes": []
+  },
+  "requested": {
+   "cpu_request": 12,
+   "malloc_arena_max": null,
+   "memory_request": 32768,
+   "mkl_num_threads": null,
+   "numexpr_num_threads": null,
+   "omp_num_threads": null,
+   "openblas_num_threads": null,
+   "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+   "runtime_shape_label": null,
+   "snapshot_model_order": "O0",
+   "thread_policy": "TBASE",
+   "torch_interop_threads": null,
+   "torch_intraop_threads": null
+  }
+ },
+ "target": {
+  "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+  "class_name": "ModalRuntimeEntrypointV2",
+  "gpu": "rtx-pro-6000"
+ },
+ "trace_handoff_errors": 0,
+ "v2ctl_invocation_id": "8c112642d0ec48e987e6d9da4e1e6b7f",
+ "waterfall_runs": 1
+}
+==============================================================================
+SECTION 7 — CAMPAIGN MANIFEST (EXACT)
+==============================================================================
+{
+ "campaign_timestamp": "2026-08-22T12:08:50.844433+00:00",
+ "discarded": 0,
+ "generations_total": 1,
+ "profile": "e37-clean-lane-qd4",
+ "profile_config_fingerprint": "a3522d1d478c480abb662d648e54a5d718a4e1772284c25bc875778c169eae90",
+ "record_files": [
+  "run_001_sample.json"
+ ],
+ "records": [
+  {
+   "arm": "",
+   "command_response_ms": 85950.0179,
+   "cpu": "",
+   "deploy_fingerprint": "f15874bd3012b164e883e9089e0e459317ec03c58563325e9b3633d004fecb41",
+   "discard_reason": "",
+   "experiment": "",
+   "generated_at_utc": "2026-08-22T12:08:46.957020+00:00",
+   "gpu": "['RTX-PRO-6000']",
+   "image_id": "",
+   "output_sha": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+   "persisted_at_utc": "2026-08-22T12:08:50.772433+00:00",
+   "profile": "e37-clean-lane-qd4",
+   "profile_config_fingerprint": "a3522d1d478c480abb662d648e54a5d718a4e1772284c25bc875778c169eae90",
+   "provider": "CLOUD_PROVIDER_AWS",
+   "ram": "",
+   "record_file": "run_001_sample.json",
+   "region": "us-east-2",
+   "request_id": "v2-benchmark-0-30f732a8a05a",
+   "retained": true,
+   "run_fingerprint": "849cb53684d9495a2a8e521cd91ed0c2b49b4c62b723c329aa147a143e123d4e",
+   "run_ordinal": 1,
+   "run_role": "sample",
+   "sampling_boundary_ms": 3682.223,
+   "scheduling_ms": 72329.19106,
+   "snapshot_identity": "im-0xAL8HKh1z5p2BTcUbKqMK|e42eb92ce42e4ada826b2b4485a2c8d0",
+   "total_wall_ms": 13620.826840000009,
+   "v2ctl_invocation_id": "8c112642d0ec48e987e6d9da4e1e6b7f",
+   "wall_ms": 85238.4
+  }
+ ],
+ "retained": 1,
+ "v2ctl_invocation_id": "8c112642d0ec48e987e6d9da4e1e6b7f",
+ "v2ctl_invocation_ids": [
+  "8c112642d0ec48e987e6d9da4e1e6b7f"
+ ]
+}
+==============================================================================
+SECTION 8 — PROVENANCE SIDECAR (EXACT)
+==============================================================================
+{
+ "note": "provenance_validation_status carried in gate record = validated",
+ "status": "not_persisted_as_sidecar"
+}
+==============================================================================
+SECTION 9 — DEPLOY/RETRY HISTORY THIS BATCH (EXACT RECORDS)
+==============================================================================
+[v2ctl.deploy-run] attempt-1 exit=1 cause=output/studio png modified during Modal build
+  (concurrent local browser-test activity writes transient artifacts inside the
+  combined custom-node image layer). Fix: E40 added comfyui-modal/output/,
+  test-results/, playwright-report/ to _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS.
+[v2ctl.deploy-run] attempt-2 timeout (shell) — no record persisted; stale lock force-released via v2ctl lock force-release
+[v2ctl.deploy-run] attempt-3 timeout (shell) — no record persisted; stale lock force-released
+[v2ctl.deploy-run] attempt-4 exit=0 manifest=deploy_20260822-061740_43551974.json
+  run dir=v2_2026-08-22_11-16-22 output_sha MATCH; E40 telemetry blocks present in
+  remote result but absent from sample projection (projection whitelist gap).
+  Crash-loop root cause found and fixed: snapshot quiescence aggregation bug
+  (snapshot_capture_hygiene aggregated on 'proven' key only while the
+  conditioning-cache check reports 'quiesced'), which had crash-looped the
+  previous deployment's containers at snapshot construction.
+[v2ctl.deploy-run] attempt-5 exit=1 transient packaging race (same class as attempt-1)
+[v2ctl.deploy-run] attempt-6 exit=0 manifest=deploy_20260822-064121_5159aa07.json
+  run dir=v2_2026-08-22_11-40-02 output_sha MATCH; benchmark_v2_direct extraction
+  added but sample projection still whitelisted remotely.
+[v2ctl.deploy-run] attempt-7 exit=0 manifest=deploy_20260822-070931_f15874bd.json
+  run dir=v2_2026-08-22_12-07-21 output_sha MATCH; experiment_result_store sample
+  projection extended with loader_selection/runtime_status/resolved_config.
+[v2ctl.gate] valid=1 manifest=gate_20260822-121609_849cb536.json reasons=[]
+
+==============================================================================
+SECTION 10 — SECRET SCAN NOTE
+==============================================================================
+This file contains only fingerprints, hashes, identifiers, paths and timings.
+
+==============================================================================
+SECTION 13 - POST-GATE STABILITY RUNS (3, EXACT RECORDS)
+==============================================================================
+Command (each): python tools/v2ctl.py run --profile e37-clean-lane-qd4 --owner E40
+Deployment: deploy_20260822-070931_f15874bd.json (unchanged; no redeploy)
+Expected output SHA: 20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+
+run 1: .v2ctl/runs/run_20260822-092728_849cb536.json
+  dir=v2_2026-08-22_14-26-10 sha_match=True ledger=ok status=NOMINAL reasons=[]
+  arms_ok=True cfg_fp=3480ad938dd4 wall_ms=18908.7 total_wall_ms=49824.9
+  request_id=v2-benchmark-0-b5ebaa69fbe6 nonce=62b3034a40fd4a2bab421cd281b406cc
+run 2: .v2ctl/runs/run_20260822-092833_849cb536.json
+  dir=v2_2026-08-22_14-27-52 sha_match=True ledger=ok status=NOMINAL reasons=[]
+  arms_ok=True cfg_fp=3480ad938dd4 wall_ms=19669.3 total_wall_ms=23061.2
+  request_id=v2-benchmark-0-1c88e65a8801 nonce=a17d6dde83c74141bf63c15cff566003
+run 3: .v2ctl/runs/run_20260822-093001_849cb536.json
+  dir=v2_2026-08-22_14-29-01 sha_match=True ledger=ok status=NOMINAL reasons=[]
+  arms_ok=True cfg_fp=3480ad938dd4 wall_ms=35372.1 total_wall_ms=43624.3
+  request_id=v2-benchmark-0-df442570ad55 nonce=81d88c0c698c49a8b09df259a014b12f
+
+arms_ok definition: for each role in (clip, unet, vae):
+  requested == observed AND fallback_attempted == false
+Structural stability proven: identical exact output SHA, ok ledger,
+RuntimeStatus=NOMINAL, and identical loader arms across all three cold runs.

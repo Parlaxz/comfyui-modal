@@ -746,3 +746,343 @@ producer/History contract, then add deterministic Thumbnail success/failure,
 dimensions, same-logical-key, and independent-timing tests. E1B still owns
 History persistence/grouping and must consume the explicit mode, variant, and
 logical key fields; E3 owns Generate Original replay.
+
+## E2 Implementation Follow-Up C — History Handoff & Derivatives
+
+Date: 2026-08-17
+Scope: semantic Attempt mode, Preview/Original/Thumbnail asset-type handoff,
+multi-asset producer results, producer-side Thumbnail derivatives, and the
+required-association ordering gate.
+
+### Executive Result
+
+**IMPLEMENTED — E2C_THUMBNAIL_DESCRIPTOR_BLOCKER RESOLVED**
+
+The production History handoff is now semantically correct for Preview. The
+frozen E2B output mode drives the History Attempt mode and the Asset type;
+the producer/result variant (never extension, codec, quality, filename, or
+MIME) selects the asset type; one logical output can carry one REQUIRED
+primary (Preview or Original) plus an optional Thumbnail derivative that
+shares the exact E1B `logical_output_key`; and the required
+association-before-completed gate now counts only required-type assets.
+
+### Attempt-Mode Handoff
+
+`history_v2_writer.py` adds `semantic_output_mode(meta)`: it reads the
+explicit immutable `output_mode` (then `variant`) from request/result
+metadata and returns exactly `preview` or `original`. It is applied at every
+writer attempt-creation site — single-run `_record_single_run`, the
+`update_run` fallback attempt, and Experiment `_mirror_cell_terminal`. A
+legacy call without the semantic field safely defaults to `original`.
+Preview is never inferred from `.webp`, quality 70, producer filename, or
+MIME type.
+
+### Asset-Type Handoff
+
+Producer adoption (`_attach_producer_asset`) maps the resolved producer
+record's variant onto the History type via `_VARIANT_ASSET_TYPES`:
+`preview` → `preview`, `thumbnail` → `thumbnail`, `original`/`main`/
+unknown → backward-compatible `original`. Because
+`HistoryV2Repository.adopt_asset` hardcodes `original` (E1B-owned, not
+modified), the writer adds a narrow private typed analogue
+(`_adopt_typed_asset`) with identical semantics: same assets table, same
+idempotency (same-generation duplicate → None; cross-generation id →
+deterministic minted `ast_*` id + `producer_asset_id` metadata), verbatim
+remote `modal://` references, digest from the producer content hash, bytes
+never copied or fabricated. Path-attached outputs (`_attach_output_assets`,
+`_attach_cell_assets`) use the frozen semantic mode as their primary type;
+the cell path keeps its explicit `_thumb.` suffix classification for local
+derivative files.
+
+### Multi-Asset Result Contract
+
+Additive primary-plus-derivative shape (no output/result structure was
+replaced):
+
+- `OutputItem` gains optional thumbnail fields (`thumbnail_bytes`,
+  mime/ext/width/height/codec-ms/quality/path) populated by
+  `_item_from_entry` from a registry entry's `thumbnail` dict.
+- `attempt_to_descriptor_result` emits a new top-level
+  `derivative_descriptors` list AND appends those descriptors to
+  `asset_descriptors` so the existing lease-registration seam
+  (`playground_service._sync_materialize`) and the Experiment result
+  forwarding (`record_result` whitelisted keys) transport them unchanged.
+  Derivatives never enter `images`/`videos`/`outputs`, so they are not
+  independent workflow outputs.
+- The writer consumes derivatives from meta `derivative_asset_ids` plus any
+  thumbnail-variant descriptor under `derivative_descriptors` /
+  `asset_descriptors` / `output_descriptors`
+  (`_derivative_ids_from_meta`), adopting each through the typed path.
+  Old single-descriptor results are untouched.
+
+### Producer-Side Thumbnail
+
+`comfyapp.py` adds `encode_thumbnail_batch`: from the SAME already-clamped
+tensor (no remote fetch-back, no extra full-resolution retention) each batch
+item is resized to the existing writer 256px policy (aspect preserved) and
+encoded WebP quality 75 with its own codec timing, dimensions, and byte
+count. Both production sink nodes attach the derivative to their registry
+entries; per-item failure is graceful (entry simply carries no thumbnail).
+`modal_app._persist_output_assets` persists thumbnail bytes content-addressed
+under `output_assets/<sha>.webp` alongside primaries; a thumbnail write
+failure is logged truthfully and never fails the attempt.
+
+### Logical Key Preservation
+
+Derivative descriptors repeat the parent's `node_id`/`output_key`/
+`output_index`, so `build_logical_output_key` derives the identical
+canonical key; an explicit key in producer metadata is persisted unchanged.
+No second key format exists; no Attempt/run ID participates. Preview,
+Thumbnail, and a later Original for the same workflow output share one key.
+
+### Required/Optional Ordering and Retention
+
+`generation_has_output_association` and `attach_result_assets` now require a
+REQUIRED-type (`preview`/`original`) visible asset — a Thumbnail alone can
+never justify `completed`. The proven Phase-D order is unchanged:
+running → execution → required producer result → History association →
+required-association verification → completed. For Preview mode the full
+transient Original is never attached: Preview-only runs persist exactly
+`preview` (+ optional `thumbnail`) rows and zero managed Originals.
+
+### Descriptor Metadata
+
+History-bound producer descriptors retain variant, output mode,
+`logical_output_key`, node/slot/index, parent identity, codec, quality,
+`output_codec_ms`, dimensions, MIME, byte count, content hash, and producer
+identity (enriched from matching result descriptors). No E2A/E2B diagnostic
+is stripped during handoff.
+
+### E4B Failure Result
+
+The reported backend failure (`test_failed_original_preserves_preview_and_
+sets_failure` returning an empty `preview_url` for a missing local Preview)
+was reproduced against current source and is ALREADY RESOLVED by the E1A/E1B
+projection work: the focused case passes deterministically, and a dedicated
+regression (`E4BMissingPreviewUrlRegressionTests`) pins it. No E4 frontend
+file was touched.
+
+### Tests and Results
+
+New `tests/test_e2c_history_handoff.py`: **32 passed**. Covers Preview/
+Original/legacy Attempt modes (single, update-fallback, Experiment cell),
+Preview/Original/WebP-Original/unknown-variant asset typing, explicit-key
+preservation, component-field derivation of the exact E1B key, Preview+
+Thumbnail and Original+Thumbnail shared keys, thumbnail typing/parent links,
+descriptor-driven derivative adoption with retained codec diagnostics,
+old single-descriptor compatibility, remote `modal://` derivative validity,
+non-fatal derivative failure, Preview-only retention (zero managed
+Originals), required-association gates for Preview and Original,
+thumbnail-only gate rejection, primary+derivative descriptor contract, and
+producer-side thumbnail encoding (aspect, decodability, graceful failure).
+
+Focused regression sweep (all deterministic, local):
+
+- `test_phase_e_history_projection.py` + `test_phase_e_logical_outputs.py`
+  + `test_e2_preview_codec.py` + `test_e2_preview_mode.py`: **51 passed,
+  1 skipped, 2 subtests** (E1A remote/original-failure semantics and E1B
+  grouping/output_count semantics remain green);
+- `test_history_v2_production_writer.py` + `test_history_v2_api.py` +
+  `test_history_v2_repository.py`: **75 passed**;
+- `test_runtime_output_delivery.py` + `test_runtime_result_delivery.py` +
+  `test_lane_c_descriptors.py`: **130 passed**;
+- `test_history_v2_modern_experiment.py` +
+  `test_modern_experiment_scheduler.py` +
+  `test_experiment_modern_binding.py`: **106 passed**;
+- `test_runtime_contracts.py` + `test_milestone1_v2_runtime.py`: **79
+  passed**; `test_v2_ab_experiments.py`: **10 passed**;
+- `test_runtime_playground_v2.py` + `test_studio_workflow_run_plan_identity.py`
+  + `test_experiment_modern_plan.py`: **105 passed, 21 subtests**;
+- `py_compile` passed for all changed modules; `git diff --check` clean for
+  the E2C-owned files.
+
+### Protected-Runtime Classification
+
+**B — narrow protected-runtime changes were required.**
+`comfymodal_runtime/modal_app.py` changed only in `_persist_output_assets`
+(additive thumbnail persistence/diagnostics); `comfyapp.py` changed only in
+the two production sink nodes plus the new additive encoder helper. No
+snapshot/restore, model loading, PromptExecutor cache, cancellation, GPU
+teardown, or deployment-performance path was modified.
+
+### Files Changed
+
+- `history_v2_writer.py`: semantic mode helper, attempt-mode threading,
+  variant-driven typed adoption (`_adopt_typed_asset`), multi-asset
+  derivative seam, required-type association gates, featured selection over
+  required types.
+- `comfymodal_runtime/output_delivery.py`: OutputItem thumbnail fields,
+  entry propagation, `build_derivative_descriptors`, additive
+  `derivative_descriptors` result contract.
+- `comfymodal_runtime/result_delivery.py`: no code change was required —
+  materialized-entry metadata already preserves the semantic fields end-to-end.
+- `comfymodal_runtime/playground_service.py`: lease registration carries
+  `parent_asset_id`; derivative ids collected into
+  `result["derivative_asset_ids"]` and both history-meta paths.
+- `studio_workflow_run.py`: narrow additive flow of
+  `meta["derivative_asset_ids"]` in the modern Single success handoff.
+- `comfymodal_runtime/modal_app.py`: content-addressed thumbnail persistence
+  (graceful) inside `_persist_output_assets`.
+- `comfyapp.py`: `encode_thumbnail_batch` + sink-node attachment.
+- `tests/test_e2c_history_handoff.py`: new deterministic suite.
+
+E1B-owned `history_v2_models/store/repository/routes`, replay, Generate
+Original routes/services, Experiment routes/scheduler, `web/**`, and
+`__init__.py` were NOT modified.
+
+### Remaining E2 Issues
+
+- Live compression latency (`<100 ms` target) remains UNKNOWN until the
+  benchmark/live gate; the thumbnail encode adds a small measured cost at
+  the sink recorded per item.
+- `history_v2_routes` newest-successful-Original preference within a logical
+  group is E1B-owned projection behavior and unchanged here.
+- Generate Original replay (E3) must create its own `original` Attempt under
+  the same logical key; the writer now accepts this without further change.
+
+## E2 Implementation Follow-Up D — Fast Lossy Preview Effort
+
+Date: 2026-08-22
+Scope: fast encoder effort for the approved lossy Preview path (WebP q70,
+Pillow/libwebp method 0) at both production encode seams, frozen into the
+accepted contract. No deployment, no Modal run, no GPU spend, no commit.
+
+### Executive Result
+
+**IMPLEMENTED LOCALLY — NOT LIVE-DEPLOYED**
+
+The lossy WebP save seams now resolve their Pillow method from the existing
+`webp_lossless_compression` effort vocabulary (`fast`→0, `balanced`→4,
+`max`→6) instead of the hardcoded constant 4. Preview normalization freezes
+the fast effort into the accepted ExecutionOptions, so the serialized plan,
+legacy/runtime projection, remote request registration, direct tensor sink,
+and fallback byte converter all carry and apply method 0 for the Preview
+default. Codec, quality (70), workflow, Preview/Original semantics, logical
+output keys, and required-association-before-completed ordering are
+unchanged.
+
+### Final Canonical Option Shape
+
+Accepted Preview options are now explicitly frozen as:
+
+```json
+{
+  "output_mode": "preview",
+  "output_conversion_options": {
+    "format": "webp_lossy",
+    "quality": 70,
+    "webp_lossless_compression": "fast"
+  }
+}
+```
+
+`to_legacy_dict()` projects these to top-level `output_format`,
+`quality`, and `webp_lossless_compression`, which is exactly the shape the
+existing production-request registration and fallback-converter invocation
+already consumed — so `modal_app.py` required ZERO changes. No user-facing
+setting was added; effort is an implementation/performance policy. An
+explicit caller-supplied effort is respected everywhere (Preview included);
+generic non-Preview WebP without an explicit effort keeps the historical
+balanced/method-4 behavior because the runtime default remains `balanced`.
+
+### Files Changed
+
+- `comfymodal_runtime/contracts.py`: canonical `WEBP_EFFORT_METHODS`,
+  `DEFAULT_WEBP_EFFORT`, `PREVIEW_WEBP_EFFORT`, and
+  `resolve_webp_pillow_method()` (single source of truth for both seams;
+  unknown labels fall back to the historical method 4). Preview-mode
+  normalization freezes `webp_lossless_compression=fast` in both
+  `normalize_output_intent_options` and `ExecutionOptions.__post_init__`.
+- `comfyapp.py`: direct-sink lossy branch saves with the mapped method;
+  additive `webp_effort` (label) and `webp_method` (integer) diagnostics in
+  the last-encode record, its per-item entries, and
+  `_encode_entry_metadata`. `_WEBP_LOSSY_METHOD = 4` retained only as the
+  defensive fallback default.
+- `output_converter.py`: duplicate/post-hoc converter lossy branch resolves
+  the same mapped method via the shared contract helper; converter meta
+  gains additive `webp_effort`/`webp_method` (populated for lossless too).
+  Existing `webp_lossless_compression` semantics unchanged (lossless-only
+  label; None for lossy).
+- `comfymodal_runtime/output_delivery.py`: `ConversionMeta` and
+  `AssetDescriptor` gain additive `webp_effort`/`webp_method`; propagated in
+  `_make_conversion_meta`, `_item_from_entry`, descriptor building, and
+  result-entry metadata so descriptors/results expose the effective method.
+- `comfymodal_runtime/result_delivery.py`: `convert_output_items` propagates
+  the two new keys from converter meta dicts.
+- `tests/test_e2_preview_effort.py`: new deterministic E2D suite (24 tests).
+- `tests/benchmarks/benchmark_e2_preview_codec_method_local.py`: rewritten
+  post-E2D to sweep the REAL effort argument (monkey-patch mechanism
+  retired) and assert each arm's observed `webp_method`.
+
+NOT modified: `comfymodal_runtime/modal_app.py` (zero diff), History V2
+models/store/repository/routes/writer, replay backend, Experiment scheduler,
+`web/**`, `__init__.py`.
+
+### Diagnostics
+
+Existing E2A fields are untouched and `output_codec_ms` is kept. Additive
+fields expose the effective effort label and Pillow method integer at the
+registry entry, ConversionMeta, descriptor, and result layers, letting E7
+prove the live request actually used method 0 without inference.
+
+### Compatibility Proof
+
+- Preview alias (`format=webp`) → `webp_lossy` / q70 / fast / method 0
+  (contract test + direct-sink test).
+- Explicit balanced/max map to methods 4/6 at BOTH seams (parametrized
+  tests; parity test asserts direct and fallback methods match).
+- Lossless WebP fast/balanced/max still maps 0/4/6 identically at both
+  seams; lossless labels unchanged.
+- Original/OFF remains Original PNG no-op with no webp fields anywhere;
+  an Original-mode request never gains the Preview effort freeze, and a
+  replayed Original builds fresh Original options without inheriting
+  Preview encoding.
+- Legacy filesystem conversion path delegates to the canonical converter,
+  so it inherits the same mapping automatically.
+
+### Tests and Results
+
+- `tests/test_e2_preview_effort.py`: **24 passed** (mapping/resolver,
+  Preview alias defaults, round-trips, Experiment cell-plan freeze,
+  direct-sink method selection + decode, fallback parity + decode,
+  descriptor/result propagation, Original/lossless preservation).
+- E2A/B/C regression: `test_e2_preview_codec.py` +
+  `test_e2_preview_mode.py` + `test_e2c_history_handoff.py`: **57 passed**.
+- Runtime delivery/contracts/history-save: `test_runtime_output_delivery.py`
+  + `test_runtime_result_delivery.py` + `test_runtime_contracts.py` +
+  `test_run_history_save.py`: **148 passed**.
+- Milestone/experiment/planner suites: **126 passed, 21 subtests**.
+- Lane C + Phase E logical-output/history-projection suites: **55 passed,
+  1 skipped, 2 subtests**.
+- Plan identity/fast-paths/production-writer suites: **52 passed**; the one
+  failure (`test_snapshot_cert_built_during_restore`) was verified
+  pre-existing by stashing all working-tree changes and re-running against
+  the clean tree (fails there too; unrelated snapshot-certificate test).
+- `py_compile` passed for all changed modules.
+
+### Local Actual-Production Timing (deterministic, non-monkey-patched)
+
+Rerun after the production change via the real effort argument (12 reps,
+q70, this host; codec-only `output_codec_ms`). Every arm's observed
+`webp_method` matched its expected mapping — fast→0 proven WITHOUT any
+patching:
+
+| Case | Effort | Method | Median ms | P95 ms | Class |
+|---|---|---:|---:|---:|---|
+| d7r2-derived-target (realistic) | fast | 0 | 62.000 | 69.750 | A |
+| gradient-target | fast | 0 | 47.000 | 62.450 | A |
+| noise-target (stress) | fast | 0 | 171.500 | 194.650 | C |
+| d7r2-derived-target | balanced | 4 | 312.000 | 335.200 | C |
+| gradient-target | balanced | 4 | 219.000 | 255.600 | C |
+| noise-target | balanced | 4 | 578.000 | 654.400 | C |
+
+Speedup vs the historical method-4 default: realistic 5.03x, gradient
+4.66x, noise 3.37x; size delta +32.9%/+67.0%/-1.0%; PSNR delta
+-0.60/-0.62/-0.01 dB. These are LOCAL CPU numbers only; remote performance
+remains UNKNOWN until the E7 live gate validates actual method,
+`output_codec_ms`, and total live cost.
+
+### Deployment Status
+
+No deployment, no live Modal generation, no GPU spend, no commit/push. The
+change ships in source only; E1C/E4D/E5 lanes were not touched.

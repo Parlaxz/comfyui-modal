@@ -1,0 +1,7 @@
+[
+  {
+    "type": "error",
+    "request_id": "golden-p1-0-4dcd633b316f",
+    "message": "RuntimeError: CUDA unavailable after snapshot restore; refusing to execute the request in ComfyUI CPU mode (reason=non_cuda_device)."
+  }
+]

@@ -8066,7 +8066,7 @@ _image_base = (
         "python -m pip install --upgrade 'triton>=3.0.0'",
     )
     .run_commands(
-        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=4 "
+        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=1 "
         "python -m pip install --upgrade --force-reinstall "
         "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
         "--no-build-isolation --no-deps",

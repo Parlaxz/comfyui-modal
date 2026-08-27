@@ -208,18 +208,29 @@ def latest_hygiene_event() -> dict[str, Any] | None:
     return _LATEST_HYGIENE
 
 
-def prove_snapshot_quiescence(*, timeout_s: float = 10.0) -> dict[str, Any]:
+def prove_snapshot_quiescence(
+    *, timeout_s: float = 10.0, passive: bool = False
+) -> dict[str, Any]:
     """Prove cache and registered executor work are quiescent.
 
     This is deliberately fail-closed.  Executor enumeration is shared with
     the snapshot manifest so the proof and the diagnostic describe the same
-    global executor registry.
+    global executor registry.  The default path retains the historical
+    mutating cache quiescence behavior.  ``passive=True`` is for Golden
+    capture: it only observes already-clean surfaces and never stops work,
+    flushes persistence, or changes cache state.
     """
     checks: list[dict[str, Any]] = []
     try:
-        from .clip_conditioning_cache import quiesce_for_snapshot
+        from .clip_conditioning_cache import (
+            inspect_for_snapshot,
+            quiesce_for_snapshot,
+        )
 
-        cache_result = quiesce_for_snapshot(timeout_s=timeout_s)
+        if passive:
+            cache_result = inspect_for_snapshot()
+        else:
+            cache_result = quiesce_for_snapshot(timeout_s=timeout_s)
     except Exception as exc:
         cache_result = {
             "quiesced": False,
@@ -292,5 +303,6 @@ def prove_snapshot_quiescence(*, timeout_s: float = 10.0) -> dict[str, Any]:
 
     return {
         "proven": all(_check_ok(check) for check in checks),
+        "passive": bool(passive),
         "checks": checks,
     }

@@ -320,3 +320,153 @@ node --check web/studio-history-v2-experiment.js
 ### Remaining E4C Work
 
 Generate Original remains unavailable. The later action must use the existing Generation or Experiment-cell identity, create a new Original Attempt, preserve Preview and prior successful Originals, expose queued/running/failed/successful state from durable backend data, and refresh the same History record. E4B intentionally adds no POST, retry, fake success, browser fanout, or Original generation behavior.
+
+## E4 Implementation Follow-Up C — Generate Original UI
+
+### E4C Verdict
+
+Generate Original is now a real Generation-scoped backend action. The frontend consumes the frozen E3B2 contract (`POST /comfymodal/history-v2/generations/{generation_id}/original`, optional `{rerender}` body) through the v2 repository; the bridge/fixture repositories keep honest unavailable placeholders because legacy endpoints cannot replay. Generation Detail and Experiment cells derive every action state from durable backend data (attempts + output projection), Preview is never replaced by a loading state in any phase, and success still never auto-loads Original bytes. E3B2 was not present in the working tree at implementation time, so the frozen contract above is consumed verbatim; `normalizeOriginalGenerationResponse` accepts snake_case/camelCase so a close naming variation hydrates without a parallel endpoint.
+
+### Backend Contract Consumed
+
+- One route: `POST {apiBase}/history-v2/generations/{generation_id}/original`.
+- Body carries only an explicit `rerender` boolean when provided (`{}` on first run/retry); immutable workflow parameters are never resent and no Generation is created client-side.
+- Response normalized to `{accepted, reused, status, generationId, runId, purpose="original", attemptStatus, outcome, errorCode, errorMessage, message, httpStatus}`.
+- Machine-readable refusals arriving on non-200 bodies (`outcome: busy | irreproducible | ...`) are parsed into the same shape instead of surfacing as bare HTTP errors; opaque failures still reject truthfully.
+
+### Generation Detail States
+
+`deriveOriginalActionState(record)` (shared, exported) classifies from the latest original-mode attempt plus the output projection:
+
+- **Preview exists, no Original** → enabled `Generate Original` (`history-v2-generate-original`).
+- **Queued/running attempt** → disabled `Generating Original…` with "Preview retained" note; duplicate clicks guarded by `_originalInFlight`; polling re-renders durable state only.
+- **Success** → slots keep showing `Original available` with explicit `View Original`; primary control becomes `Generate Again` (`history-v2-generate-again`) — the ONLY rerender path, always sending `rerender=true`. No silent rerender while an Original exists.
+- **Failed latest attempt** → `Retry Original` (`history-v2-retry-original`) calling the same backend POST (backend retry contract, no browser rebuild); the failed Attempt stays listed alongside prior attempts and Preview remains.
+- **Busy generation** (record running, or `outcome=busy`) → disabled button + non-destructive status note; no retry spam.
+- **Irreproducible / legacy** → `generateOriginalEligibility` disables the action for bridge/fixture modes, records flagged irreproducible, or runtime refusals, explaining that the saved generation does not contain the exact immutable execution data required. Nothing is rebuilt from current Workflow/Preset.
+
+Polling reuses `repo.getGeneration` on a 2s bounded loop (150-tick cap) until the latest original attempt reaches a terminal status, then fires `onChanged` once to refresh feed cards. No websocket/SSE; closing the overlay cancels the timer.
+
+### Reuse Handling
+
+`reused=true` responses never invent an optimistic Attempt: the UI reloads/polls the returned existing run (active reuse polls; successful reuse renders `Original available` immediately).
+
+### Experiment Cell Action
+
+Cell menu item and cell-detail pane share `buildCellOriginalAction`, which uses the cell's own `generationId` (now preserved by `_v2GetExperiment` normalization from `cell.generation_id`/embedded generation). One call site posts `repo.generateOriginalForCell(genId, opts)` — never the cell index, never a legacy endpoint, no fanout, no second Generation. Cells without a generation_id render a truthful disabled gate and never fetch. Accepted actions start the same bounded poll via `repo.getExperiment` + in-place page re-render (selection preserved).
+
+### Eager Original Prohibition (E4B preserved)
+
+Generate Original success does not download or display Original bytes: Original-only records remain `Original available` placeholders, and `feat.originalUrl` is assigned to an image element only inside the explicit `View Original` click handler.
+
+### Tests and Results
+
+Added `tests/studio_phase_e4c_generate_original_unit.mjs` (21 sections): single-POST route/body contract, rerender-only request field, no browser request reconstruction, queued/running/success/failed phase derivation, terminal gating, active+successful reuse, busy and irreproducible machine-readable refusals, truthful opaque failures, legacy eligibility, missing-generation-id inertness, retry/rerender/duplicate/busy controls, experiment generation-id identity + single call site + normalization, purpose/status label separation, and preserved E4B remote-only placeholder/click-only loading rules.
+
+Updated stale deferred-state guards in `tests/studio_phase_e_history_presentation_unit.mjs` (section 16), `tests/studio_history_v2_experiment_unit.mjs` (section 7), and `tests/studio_experiment_v2_unit.mjs` (sections 4, 15) to assert the activated contract.
+
+Passed:
+
+```text
+node tests/studio_phase_e4c_generate_original_unit.mjs
+node tests/studio_phase_e_history_presentation_unit.mjs
+node tests/studio_history_v2_experiment_unit.mjs
+node tests/studio_experiment_v2_unit.mjs
+node tests/studio_phase_e_preview_settings_unit.mjs
+node tests/studio_history_v2_persisted_status_unit.mjs
+node tests/studio_phase_e_contract_unit.mjs
+node tests/studio_playground_run_unit.mjs
+python -m unittest tests.test_studio_history_v2_js      (49 OK)
+python -m unittest tests.test_history_v2_repository     (22 OK)
+python -m unittest tests.test_phase_e_wave2_contract    (11 OK, 1 skipped = E3B2-owned)
+python -m unittest tests.test_history_v2_api            (20 OK)
+node --check web/history-v2-repository.js
+node --check web/studio-history-v2-detail.js
+node --check web/studio-history-v2-experiment.js
+```
+
+Files modified: `web/history-v2-repository.js`, `web/studio-history-v2-detail.js`, `web/studio-history-v2-experiment.js`, plus the four test files above. No Python backend, Settings/Playground runtime, or fake-backend changes.
+
+### Remaining Frontend Gaps
+
+1. If E3B2 lands with different refusal outcome names (e.g. `not_reproducible` vs `irreproducible`), only `normalizeOriginalGenerationResponse`'s outcome mapping needs updating.
+2. Experiment cells do not yet expose per-cell View Original display; availability text only (E4B policy unchanged).
+3. Poll cadence is fixed at 2s; no backoff signal exists in the frozen contract.
+4. No deployment, live generation, GPU work, or commit was performed.
+
+## E4 Implementation Follow-Up D — Original Retry Wiring
+
+### Root Cause
+
+The E4C implementation wired the failed-Attempt "Retry Original" control to the SAME ordinary Generate Original POST (`repo.generateOriginal(generationId)` -> `POST .../original`). Against the final landed E3B2 backend contract this is a deterministic frontend blocker: for failed-only Original state the ordinary route deliberately does NOT reinterpret the state as a Retry — it answers `outcome = retry_required` (HTTP 200, no new Attempt). The sequence was therefore: failed Original -> user clicks Retry Original -> `POST /original` -> `retry_required` -> no Attempt created -> the frontend never reached the dedicated retry route. E3B2 provides the dedicated `POST /comfymodal/history-v2/generations/{generation_id}/original/retry` (bodyless) precisely for this case; the frontend simply did not call it.
+
+### Why E3B2 Returns retry_required
+
+`history_v2_replay.py` claim resolution maps failed-only Original state to OUTCOME_RETRY_REQUIRED and returns `{"status": "ok", "outcome": "retry_required", "attempt_status": "failed", "reused": false}` from the ordinary `/original` route. Only `/original/retry` (`service.retry(generation_id)`) appends a new `mode="original"` Attempt under the same Generation, leaving the failed Attempt immutable and any Preview retained. The refusal vocabulary is machine-readable: `retry_required`, `generation_busy`, `generation_not_reproducible`, `dispatch_unavailable`, `generation_not_found`, `retry_not_available`.
+
+### Final Three-Action Frontend Contract
+
+1. Generate Original (Preview/no Original): `POST .../generations/{id}/original` with body `{}` via `repo.generateOriginal(generationId)`.
+2. Retry Original (failed latest Original): `POST .../generations/{id}/original/retry` with NO body via `repo.retryOriginal(generationId)` / `repo.retryOriginalForCell(generationId)`. No rerender flag, no workflow/request reconstruction, same Generation identity.
+3. Generate Again (successful Original present): `POST .../generations/{id}/original` with `{"rerender": true}` — unchanged.
+
+The actions are semantically separate in both UI modules; the stale same-POST wiring is gone.
+
+### Repository Method Added
+
+`web/history-v2-repository.js`: `_v2RetryOriginal(apiBase, generationId)` performs one bodyless `fetch(url, { method: "POST" })` against `/history-v2/generations/{id}/original/retry` and normalizes through the SHARED `_v2OriginalActionResponse` helper (extracted from `_v2GenerateOriginal`; both actions now share response interpretation — no duplicated HTTP logic, no new response vocabulary). Interface additions: `retryOriginal` / `retryOriginalForCell` on the v2 repository (same implementation, Generation-scoped identity); bridge repository gains truthful `_notAvailable()` stubs. `normalizeOriginalGenerationResponse` now classifies the full landed refusal vocabulary: `retry_required` is a machine-readable refusal/state transition (never success, even on HTTP 200), a `generation_busy` code maps to canonical `busy`, and the irreproducible family (`irreproducible` / `not_reproducible` / `generation_not_reproducible`) canonicalizes to `irreproducible`. Fixture repository untouched (the eligibility gate already keeps fixture/bridge modes inert).
+
+### Generation Detail Behavior
+
+Failed phase renders "Retry Original" (`history-v2-retry-original`) dispatching `_runRetryOriginal()` -> exactly one `repo.retryOriginal(generationId)` call. Accepted responses start the existing bounded poll + reload; durable backend state renders queued/running Attempt N+1 while failed Attempt N stays listed immutable and Preview stays visible. `retry_required` from ordinary `/original` is handled as a state transition: truthful note, NO automatic retry, NO loop back into `/original`, re-render of durable failed state exposing Retry Original as the explicit next action. Refusals (`busy`, irreproducible family, `retry_not_available`, `dispatch_unavailable`, `generation_not_found`, opaque HTTP/network failures) keep Preview and any retained earlier successful Original and never fabricate terminal or retry success.
+
+### Experiment Behavior
+
+Cell menu and cell detail pane share `buildCellOriginalAction`; the failed phase now selects `action = "retry"` and dispatches `_runCellRetryOriginal(genId)` where genId is the CELL'S OWN generationId (`_cellGenerationId(cell)`) — never the cell index, never the experiment id, no new Generation, no browser fanout (single `repo.retryOriginalForCell(` call site). Same shared cell runner, same refusals, same per-generation single-flight guard.
+
+### Duplicate Guards and Polling
+
+Detail: `_originalInFlight` single-flight flag + `if (_originalInFlight || _closed) return;` inside the shared `_postOriginalAction` runner — double-click creates at most one request; in-flight button shows "Queuing..." disabled. Cells: `_inFlightOriginal[genId]` keyed by generation id plus disabled rendering. Polling reuses the existing E4C bounded architectures verbatim (`_startOriginalPolling` via `repo.getGeneration`, `_startCellOriginalPolling` via `repo.getExperiment`, 2s x 150-tick cap, terminal-status stop, in-place re-render); no second polling system, no websocket/SSE, no browser-owned synthetic lifecycle, no optimistic Attempts.
+
+### Tests and Results
+
+Added `tests/studio_phase_e4d_original_retry_unit.mjs` (15 sections) proving with actually-stubbed fetch transport: failed latest Original derives Retry Original; explicit Retry performs exactly ONE bodyless POST ending in `/original/retry` with ZERO ordinary `/original` calls; no workflow/rerender reconstruction in the retry method; Generate Again still `/original` + `{"rerender":true}` and first Generate still `/original` + `{}`; ordinary `/original` returning HTTP 200 `retry_required` normalizes to accepted=false; retry_required never auto-invokes Retry and never loops (runner-slice guards, single call sites, `_runRetryOriginal` referenced only by definition + failed-phase onclick); duplicate-click guards; same Generation ID end-to-end for Single and cells; failed Attempt immutability (no `.status =` writes) with new Attempts loaded only from backend polling; Preview retained while queued/running; prior successful Original retained after later failure; click-only View Original preserved; truthful busy/refusal/opaque errors on the retry route; legacy/irreproducible gate intact.
+
+Updated stale assertions to the final contract (replaced, not deleted): `tests/studio_phase_e4c_generate_original_unit.mjs` section 15 (failed branch must dispatch `_runRetryOriginal()`; exactly ONE ordinary-generate call site remains — the idle Generate Original action) and section 16 slice boundary; `tests/studio_phase_e_history_presentation_unit.mjs` section 16 (same contract).
+
+Passed:
+
+```text
+node tests/studio_phase_e4d_original_retry_unit.mjs          (15 sections)
+node tests/studio_phase_e4c_generate_original_unit.mjs       (21 sections)
+node tests/studio_phase_e_history_presentation_unit.mjs      (16 sections)
+node tests/studio_history_v2_experiment_unit.mjs             (8 sections)
+node tests/studio_experiment_v2_unit.mjs                     (all sections)
+node tests/studio_phase_e_preview_settings_unit.mjs
+node tests/studio_history_v2_persisted_status_unit.mjs
+node tests/studio_phase_e_contract_unit.mjs
+node tests/studio_phase_e_wave2_unit.mjs
+python -m pytest tests/test_studio_history_v2_js.py -q       (49 passed, 64 subtests passed)
+node --check web/history-v2-repository.js | detail.js | experiment.js
+```
+
+### Full-Gate Observation
+
+`python tests/run_studio_tests.py --fake` (shared-worktree regression check):
+
+```text
+STUDIO GATE SUMMARY
+  python             run=1584  fail=0    error=0    skip=0
+  node-unit          run=16    fail=0    error=0    skip=0
+  fake-playwright    run=125   fail=1    skip=1     (123 passed)
+FAILED LANES: fake-playwright
+```
+
+The single fake-browser failure is `tests/browser/fake/studio-fake-phase-e-original.spec.mjs:431` ("detail UI: Retry Original surfaces retry_required without inventing an Attempt"). That spec codifies the PRE-E4D behavior this batch corrects: it asserts clicking Retry Original produces exactly one POST ending in `/original` (comment: "The E4C Retry control POSTs /original... answers 200 retry_required WITHOUT creating an Attempt"). Under the final contract Retry posts `/original/retry`, so that filtered counter stays 0. The adjacent `test.fixme` in the same file already documents this exact follow-up ("the Retry control must consume the backend's retry_required outcome by calling the explicit POST /generations/{id}/original/retry route"). Fake Playwright backend/specs are outside this lane's ownership; E5/E6 owns their reconciliation. All Python and Node-unit lanes are fully green.
+
+### Remaining E4 Blockers
+
+1. Fake-browser spec reconciliation for the corrected Retry route (E5/E6-owned; includes un-fixturing the adjacent `test.fixme` once the fake backend exposes `/original/retry`).
+2. None otherwise known in the History frontend Retry seam.
+
+No deployment, live Modal run, GPU work, or commit/push was performed.

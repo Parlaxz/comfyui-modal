@@ -15,6 +15,7 @@ import { renderWorkspacesSection } from "./studio-backend-workspaces.js";
 import { renderDeploymentSection } from "./studio-backend-deployment.js";
 import { renderCredentialsSection } from "./studio-backend-credentials.js";
 import { subscribeStudioSync } from "./studio-sync.js";
+import { parseStudioHash } from "./studio-routing.js";
 
 // Phase I7: the dead empty-state re-export wrapper was deleted here — zero
 // importers since studio-ui.js's renderer became the generic options API
@@ -154,6 +155,19 @@ export function launchPresetWizardForEdit(preset, snapshot, apiBase) {
 // ── Main render entry point ──────────────────────────────────────────────
 
 export function renderBackend(state, context) {
+  const FOCUS_TABS = ["overview", "workspaces", "deployment", "credentials", "presets", "snapshots"];
+  function resolveInitialTab() {
+    if (typeof window === "undefined") return "overview";
+    try {
+      const route = parseStudioHash(window.location.hash);
+      if (route.matched && route.page === "backend" && FOCUS_TABS.indexOf(route.focus) !== -1) {
+        return route.focus;
+      }
+    } catch (_) {}
+    return "overview";
+  }
+  let activeTab = resolveInitialTab();
+
   const container = el("div", {
     class: "comfymodal-studio-backend",
     "data-testid": "backend-page",
@@ -198,7 +212,6 @@ export function renderBackend(state, context) {
   // Backend Presets. Operational sections (H6 re-home) render full-width;
   // Snapshots / Backend Presets keep their list+detail layout.
   const tabs = el("div", { class: "comfymodal-studio-backend-tabs" });
-  let activeTab = "overview";
 
   const body = el("div", { class: "comfymodal-studio-backend-body" });
 
@@ -305,6 +318,22 @@ export function renderBackend(state, context) {
   }
 
   unsubscribeBackendSync = subscribeStudioSync("workspace", refreshFromSync);
+
+  // Deep-link support: Settings' "Open Workspaces"/"Open legacy settings"
+  // pushes #comfymodal=backend&focus=workspaces after mounting; the initial
+  // hash check above handles reloads, this handles in-session navigation.
+  let _hashHandler = null;
+  if (typeof window !== "undefined") {
+    _hashHandler = () => {
+      try {
+        const route = parseStudioHash(window.location.hash);
+        if (route.matched && route.page === "backend" && FOCUS_TABS.indexOf(route.focus) !== -1 && route.focus !== activeTab) {
+          switchTab(route.focus);
+        }
+      } catch (_) {}
+    };
+    window.addEventListener("hashchange", _hashHandler);
+  }
 
   refreshList();
 

@@ -111,6 +111,13 @@ print("Has restore_timing:", "restore_timing" in meta)
 
 ### Full benchmark (benchmark_modal.py)
 
+**Control-plane rule:** For current deployment or benchmark work, use the
+authoritative `python tools/v2ctl.py` flow (`deploy-run`, `run`, and `gate` with
+the resolved profile). Do not invoke legacy BAT wrappers directly or substitute
+the default/restore-only app. Record the v2ctl manifests and resolved flags.
+The BAT workaround below is retained only for explicitly requested legacy
+reproduction.
+
 **Known issues:**
 - `benchmark_modal.py run2` terminates existing ComfyUI and redeploys Modal via a batch script
 - The batch script (`redeploy_modal_and_run_comfyui.bat`) can hang on Windows due to `'charmap' codec` encoding errors when Modal outputs Unicode chars (✓)

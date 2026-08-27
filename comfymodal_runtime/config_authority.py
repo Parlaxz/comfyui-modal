@@ -62,6 +62,13 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
         EXECUTION_POLICY,
         "Enable the fail-closed Golden DynamicVRAM activation path.",
     ),
+    "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": _spec(
+        "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK",
+        "bool",
+        True,
+        EXECUTION_POLICY,
+        "Enforce Golden workflow SHA equality during request setup.",
+    ),
     # CLIP loader and hydration controls.
     "COMFYMODAL_V2_CLIP_QD_READER": _spec("COMFYMODAL_V2_CLIP_QD_READER", "bool", False, LOADER_SELECTION, "Enable the genuine queue-depth CLIP reader."),
     "COMFYMODAL_V2_CLIP_QD_QD": _spec("COMFYMODAL_V2_CLIP_QD_QD", "int", 4, LOADER_SELECTION, "CLIP queue depth."),

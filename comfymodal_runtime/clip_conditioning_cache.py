@@ -2564,6 +2564,109 @@ class ExactConditioningCache:
             "details": details,
         }
 
+    def inspect_for_snapshot(self) -> dict[str, Any]:
+        """Inspect snapshot-relevant cache state without changing it.
+
+        This is intentionally separate from :meth:`quiesce_for_snapshot`.
+        Golden capture cannot set the quiescing/closing flags, stop workers, or
+        flush the mounted cache because those mutations become part of the
+        memory snapshot.  A passive proof therefore succeeds only when every
+        work surface is observable and already clean; it never waits for work
+        to finish or repairs an unclean cache.
+        """
+        details: list[Any] = []
+        try:
+            with self._queue_cond:
+                pending_persistence = max(len(self._pending), len(self._pending_keys))
+                worker = self._worker
+                worker_alive = worker is not None and worker.is_alive()
+                worker_broken = bool(self._worker_broken)
+                dirty_since_commit = bool(self._dirty_since_commit)
+                snapshot_quiescing = bool(self._snapshot_quiescing)
+                closing = bool(self._closing)
+        except Exception as exc:
+            return {
+                "quiesced": False,
+                "joined_workers": 0,
+                "pending_dropped": 0,
+                "details": [
+                    f"conditioning cache persistence state unobservable: "
+                    f"{type(exc).__name__}: {exc}"
+                ],
+            }
+
+        try:
+            with self._lru_cond:
+                pending_lru = len(self._pending_lru)
+                lru_worker = self._lru_worker
+                lru_worker_alive = lru_worker is not None and lru_worker.is_alive()
+                lru_closing = bool(self._lru_closing)
+        except Exception as exc:
+            return {
+                "quiesced": False,
+                "joined_workers": 0,
+                "pending_dropped": 0,
+                "details": [
+                    f"conditioning cache LRU state unobservable: "
+                    f"{type(exc).__name__}: {exc}"
+                ],
+            }
+
+        try:
+            with self._prefetch_lock:
+                pending_prefetch = len(self._prefetch_events)
+        except Exception as exc:
+            return {
+                "quiesced": False,
+                "joined_workers": 0,
+                "pending_dropped": 0,
+                "details": [
+                    f"conditioning cache prefetch state unobservable: "
+                    f"{type(exc).__name__}: {exc}"
+                ],
+            }
+
+        pending = pending_persistence + pending_lru + pending_prefetch
+        if pending:
+            details.append({
+                "pending_persistence": pending_persistence,
+                "pending_lru": pending_lru,
+                "pending_prefetch": pending_prefetch,
+            })
+        if worker_alive:
+            details.append("persistence worker is still alive")
+        if lru_worker_alive:
+            details.append("async-LRU worker is still alive")
+        if worker_broken:
+            details.append("persistence worker is broken")
+        if dirty_since_commit:
+            details.append("cache has uncommitted persistence state")
+        if snapshot_quiescing:
+            details.append("cache is already in mutating snapshot-quiescing state")
+        if closing:
+            details.append("persistence cache is already closing")
+        if lru_closing:
+            details.append("async-LRU cache is already closing")
+
+        clean = not pending and not worker_alive and not lru_worker_alive
+        clean = clean and not worker_broken and not dirty_since_commit
+        clean = clean and not snapshot_quiescing and not closing and not lru_closing
+        return {
+            "quiesced": bool(clean),
+            "joined_workers": 0,
+            "pending_dropped": 0,
+            "details": details,
+            "passive": True,
+            "pending_persistence": pending_persistence,
+            "pending_lru": pending_lru,
+            "pending_prefetch": pending_prefetch,
+            "worker_alive": bool(worker_alive),
+            "lru_worker_alive": bool(lru_worker_alive),
+            "snapshot_quiescing": snapshot_quiescing,
+            "closing": closing,
+            "lru_closing": lru_closing,
+        }
+
     def _record_flush(
         self, flush_ms: float, status: str, drained_count: int, final_commit_ms: float
     ) -> None:
@@ -2760,6 +2863,23 @@ def quiesce_for_snapshot(timeout_s: float = 10.0) -> dict[str, Any]:
             "details": ["conditioning cache was never initialized or is disabled"],
         }
     return cache.quiesce_for_snapshot(timeout_s=timeout_s)
+
+
+def inspect_for_snapshot() -> dict[str, Any]:
+    """Inspect the initialized exact-conditioning cache without initializing
+    or mutating it.  An uninitialized/disabled cache has no work surface."""
+    with _SINGLETON_LOCK:
+        cache = _SINGLETON
+        resolved = _SINGLETON_RESOLVED
+    if not resolved or cache is None:
+        return {
+            "quiesced": True,
+            "joined_workers": 0,
+            "pending_dropped": 0,
+            "details": ["conditioning cache was never initialized or is disabled"],
+            "passive": True,
+        }
+    return cache.inspect_for_snapshot()
 
 
 def _register_commit_hook_from_comfyapp(cache: ExactConditioningCache) -> None:

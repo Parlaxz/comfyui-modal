@@ -40,6 +40,18 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     swapTimer: null,
     formMode: null,       // null | "add" | "edit"
     repair: { open: false, loading: false, issues: null, message: "" },
+    manifestInstall: {
+      open: false,
+      loading: false,
+      data: null,
+      message: "",
+      installingKey: null,
+      swapId: null,
+      progress: null,
+      installedKeys: {},
+      collapsedGroups: {},
+      timer: null,
+    },
   };
 
   const root = el("div", { class: "comfymodal-studio-backend-detail", "data-testid": "backend-workspaces" });
@@ -97,11 +109,18 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     title: "Scan and repair model-manifest entries that block workspace swaps",
     style: "width:auto;padding:5px 12px;font-size:11px;",
   });
+  const installBtn = el("button", {
+    type: "button", class: "comfymodal-primary-btn", text: "Install from Manifest",
+    "data-testid": "backend-manifest-install",
+    title: "Install missing manifest models to the active workspace (reuses workspace swap pipeline)",
+    style: "width:auto;padding:5px 12px;font-size:11px;",
+  });
   actionsRow.appendChild(activateBtn);
   actionsRow.appendChild(addBtn);
   actionsRow.appendChild(editBtn);
   actionsRow.appendChild(swapBtn);
   actionsRow.appendChild(repairBtn);
+  actionsRow.appendChild(installBtn);
 
   // ── Inline form panel (add/edit) ────────────────────────────────────────
   const formPanel = el("div", {
@@ -112,6 +131,12 @@ export function renderWorkspacesSection(container, apiBase, bus) {
   // ── Swap review / confirm panel ─────────────────────────────────────────
   const swapPanel = el("div", {
     "data-testid": "backend-workspace-swap-panel",
+    style: "display:none;border:1px solid #2a2a2a;border-radius:3px;padding:12px;margin-bottom:8px;",
+  });
+
+  // ── Manifest install panel ───────────────────────────────────────────────
+  const manifestInstallPanel = el("div", {
+    "data-testid": "backend-manifest-install-panel",
     style: "display:none;border:1px solid #2a2a2a;border-radius:3px;padding:12px;margin-bottom:8px;",
   });
 
@@ -138,6 +163,7 @@ export function renderWorkspacesSection(container, apiBase, bus) {
   root.appendChild(actionsRow);
   root.appendChild(formPanel);
   root.appendChild(swapPanel);
+  root.appendChild(manifestInstallPanel);
   root.appendChild(progressLine);
   root.appendChild(repairPanel);
 
@@ -195,11 +221,13 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     const s = state.summary;
     const hasSelection = !!state.selectedId;
     const selectionIsActive = !!(s && state.selectedId && state.selectedId === s.activeId);
+    const hasActive = !!(s && s.activeId);
     activateBtn.disabled = state.busy || !hasSelection || selectionIsActive;
     editBtn.disabled = state.busy || !hasSelection;
     swapBtn.disabled = state.busy || !hasSelection || selectionIsActive;
     addBtn.disabled = state.busy;
     repairBtn.disabled = state.busy;
+    installBtn.disabled = state.busy || !hasActive;
   }
 
   function renderFromTruth() {
@@ -649,12 +677,358 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     if (state.repair.open) renderRepair();
   }
 
+  // ── Install models from the active workspace manifest ────────────────────
+
+  function manifestFolder(model) {
+    return String(model.folder || model.save_path || "").replace(/[\\/]+$/, "");
+  }
+
+  function manifestModelKey(model) {
+    return `${manifestFolder(model)}/${model.filename || ""}`;
+  }
+
+  function manifestModels(data) {
+    const byKey = new Map();
+    (data && data.already_present || []).forEach((model) => {
+      const normalized = Object.assign({}, model, { folder: manifestFolder(model), installed: true });
+      byKey.set(manifestModelKey(normalized), normalized);
+    });
+    (data && data.to_install || []).forEach((model) => {
+      const normalized = Object.assign({}, model, { folder: manifestFolder(model), installed: false });
+      const key = manifestModelKey(normalized);
+      if (!byKey.has(key)) byKey.set(key, normalized);
+    });
+    return Array.from(byKey.entries()).map(([key, model]) => ({
+      key,
+      model,
+      installed: model.installed || !!state.manifestInstall.installedKeys[key],
+    }));
+  }
+
+  function manifestProgressPercent(data) {
+    const direct = Number(data && data.download_pct_current);
+    if (Number.isFinite(direct)) return Math.max(0, Math.min(100, direct));
+    const completed = Number(data && data.download_completed) || 0;
+    const total = Number(data && data.download_total) || 0;
+    return total ? Math.max(0, Math.min(100, (completed / total) * 100)) : 0;
+  }
+
+  function closeManifestInstall() {
+    state.manifestInstall.open = false;
+    renderManifestInstall();
+  }
+
+  function renderManifestInstall() {
+    while (manifestInstallPanel.firstChild) manifestInstallPanel.removeChild(manifestInstallPanel.firstChild);
+    manifestInstallPanel.style.display = state.manifestInstall.open ? "block" : "none";
+    if (!state.manifestInstall.open) return;
+
+    const closeBtn = el("button", {
+      type: "button", text: "Close", "data-testid": "backend-manifest-install-close",
+      style: "width:auto;padding:3px 9px;font-size:10px;",
+    });
+    closeBtn.addEventListener("click", closeManifestInstall);
+    manifestInstallPanel.appendChild(el("div", { style: "display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;" }, [
+      el("div", { text: "Install from Manifest", style: "font-weight:600;font-size:12px;" }),
+      closeBtn,
+    ]));
+
+    const body = el("div", { "data-testid": "backend-manifest-install-body" });
+    manifestInstallPanel.appendChild(body);
+    const installState = state.manifestInstall;
+    if (installState.loading) {
+      body.appendChild(el("div", { text: "Scanning manifest and remote workspace...", style: "font-size:11px;color:#888;" }));
+      return;
+    }
+    if (installState.message) {
+      body.appendChild(el("div", {
+        text: installState.message,
+        style: "font-size:11px;color:#e05050;margin-bottom:8px;",
+      }));
+    }
+    if (!installState.data) return;
+
+    const models = manifestModels(installState.data);
+    if (!models.length) {
+      body.appendChild(el("div", { text: "No manifest models found.", style: "font-size:11px;color:#aaa;" }));
+      return;
+    }
+
+    const groups = new Map();
+    models.forEach((entry) => {
+      if (!groups.has(entry.model.folder)) groups.set(entry.model.folder, []);
+      groups.get(entry.model.folder).push(entry);
+    });
+    Array.from(groups.keys()).sort((a, b) => a.localeCompare(b)).forEach((folder) => {
+      const rows = groups.get(folder).sort((a, b) => String(a.model.filename || "").localeCompare(String(b.model.filename || "")));
+      const group = el("div", { style: "margin-bottom:10px;" });
+      const collapsed = !!installState.collapsedGroups[folder];
+      const header = el("button", {
+        type: "button",
+        "data-testid": `backend-manifest-install-group-${folder}`,
+        style: "display:flex;align-items:center;gap:6px;width:100%;text-align:left;background:transparent;border:none;border-bottom:1px solid #2a2a2a;padding:6px 0 6px 0;margin-bottom:2px;cursor:pointer;font-weight:800;font-size:14px;color:#e8e8e8;letter-spacing:0.2px;",
+      });
+      const chevron = el("span", { text: collapsed ? "▶" : "▼", style: "font-size:10px;color:#888;width:12px;display:inline-block;text-align:center;" });
+      header.appendChild(chevron);
+      header.appendChild(el("span", { text: `${folder} (${rows.length})` }));
+      header.addEventListener("click", () => {
+        installState.collapsedGroups[folder] = !installState.collapsedGroups[folder];
+        renderManifestInstall();
+      });
+      group.appendChild(header);
+      if (collapsed) {
+        body.appendChild(group);
+        return;
+      }
+      rows.forEach((entry) => {
+        const row = el("div", {
+          style: "display:flex;flex-direction:column;gap:3px;padding:5px 0;border-bottom:1px solid #1d1d1d;",
+          "data-testid": "backend-manifest-install-row",
+        });
+        const info = el("div", { style: "display:flex;align-items:center;justify-content:space-between;gap:8px;" });
+        info.appendChild(el("div", { style: "min-width:0;" }, [
+          el("span", { text: entry.model.filename || "", style: "color:#d0d0d0;word-break:break-all;" }),
+          el("span", { text: ` (${entry.model.folder || "?"})`, style: "color:#888;" }),
+        ]));
+        if (entry.installed) {
+          info.appendChild(el("span", {
+            text: "✓ Installed",
+            "data-testid": "backend-manifest-installed-mark",
+            style: "color:#7ed321;white-space:nowrap;font-weight:600;",
+          }));
+        } else {
+          const installing = installState.installingKey === entry.key;
+          const installRowBtn = el("button", {
+            type: "button", text: installing ? "Installing..." : "Install",
+            "data-testid": `backend-manifest-install-row-${entry.model.folder}-${entry.model.filename}`,
+            style: "width:auto;padding:3px 9px;font-size:10px;white-space:nowrap;",
+          });
+          installRowBtn.disabled = state.busy || (installState.installingKey && !installing);
+          installRowBtn.addEventListener("click", () => startManifestInstall(entry.model));
+          info.appendChild(installRowBtn);
+        }
+        row.appendChild(info);
+
+        if (installState.installingKey === entry.key && installState.progress) {
+          const pct = Math.max(0, Math.min(100, Number(installState.progress.pct) || 0));
+          const progressBar = el("div", {
+            style: "height:6px;background:#2a2a2a;border-radius:3px;overflow:hidden;",
+            "data-testid": "backend-manifest-install-progress",
+          }, [el("div", {
+            style: `height:100%;width:${pct}%;background:#6a9fd8;transition:width 200ms ease;`,
+          })]);
+          row.appendChild(progressBar);
+          row.appendChild(el("div", {
+            text: `${installState.progress.message || "Installing..."} ${Math.round(pct)}%`,
+            style: "font-size:10px;color:#f5a623;",
+          }));
+        }
+        group.appendChild(row);
+      });
+      body.appendChild(group);
+    });
+  }
+
+  function finishManifestInstall(key, message, color, success) {
+    if (success) {
+      state.manifestInstall.installedKeys[key] = true;
+      if (state.manifestInstall.data) {
+        const model = manifestModels(state.manifestInstall.data).find((entry) => entry.key === key);
+        if (model && !(state.manifestInstall.data.already_present || []).some((item) => manifestModelKey(item) === key)) {
+          state.manifestInstall.data.already_present = (state.manifestInstall.data.already_present || []).concat([{
+            folder: model.model.folder,
+            filename: model.model.filename,
+          }]);
+        }
+      }
+    }
+    state.manifestInstall.swapId = null;
+    state.manifestInstall.installingKey = null;
+    state.manifestInstall.progress = null;
+    state.manifestInstall.message = success ? "" : message;
+    setBusy(false);
+    renderManifestInstall();
+    setProgress(message, color);
+    if (success) {
+      refreshTruth();
+      emitChanged();
+    }
+  }
+
+  async function pollManifestInstall() {
+    const swapId = state.manifestInstall.swapId;
+    if (!swapId) return;
+    let data = null;
+    try {
+      data = await getWorkspaceSwapStatus(apiBase, swapId);
+    } catch { data = null; }
+    if (state.manifestInstall.swapId !== swapId) return;
+    if (!data || data.status === "not_found") {
+      finishManifestInstall(state.manifestInstall.installingKey, "Manifest install status unavailable.", "#e05050", false);
+      return;
+    }
+    if (data.status === "running" || data.status === "pending") {
+      state.manifestInstall.progress = {
+        pct: manifestProgressPercent(data),
+        message: swapPhaseMessage(data) || data.download_message || "Installing...",
+      };
+      renderManifestInstall();
+      setProgress(`${state.manifestInstall.progress.message} ${Math.round(state.manifestInstall.progress.pct)}%`, "#f5a623");
+      state.manifestInstall.timer = setTimeout(pollManifestInstall, SWAP_POLL_MS);
+      return;
+    }
+    const key = state.manifestInstall.installingKey;
+    if (data.status === "ok") {
+      finishManifestInstall(key, "Manifest model installed successfully.", "#7ed321", true);
+      return;
+    }
+    if (data.status === "repair_required") {
+      finishManifestInstall(key, `Install blocked: ${data.message || "manifest repair required"}`, "#e07070", false);
+      openRepair();
+      return;
+    }
+    // Swap pipeline includes post-download phases (custom-node sync / deploy).
+    // A model can be downloaded successfully even if sync/deploy later errors.
+    // Treat sync/deploy/removing errors as success for the manifest-model itself.
+    if (data.status === "error") {
+      const phase = String(data.phase || "");
+      const isPostDownloadPhase = phase === "syncing_custom_nodes" || phase === "deploying" || phase === "removing_models";
+      const hasDownloadFailure = Array.isArray(data.failures) && data.failures.length > 0;
+      if (isPostDownloadPhase && !hasDownloadFailure) {
+        const warn = data.sync_message || data.deploy_message || data.message || "sync warning";
+        finishManifestInstall(key, `Manifest model installed (${warn})`, "#7ed321", true);
+        return;
+      }
+    }
+    finishManifestInstall(key, data.message || data.error || data.download_message || "Manifest install failed.", "#e05050", false);
+  }
+
+  async function startManifestInstall(model) {
+    if (state.busy || !model) return;
+    const activeId = state.summary && state.summary.activeId;
+    if (!activeId) {
+      setProgress("No active workspace.", "#e05050");
+      return;
+    }
+    const key = manifestModelKey(model);
+    state.manifestInstall.installingKey = key;
+    state.manifestInstall.progress = { pct: 0, message: `Starting ${model.filename || "model"}...` };
+    state.manifestInstall.message = "";
+    setBusy(true);
+    renderManifestInstall();
+
+    let data = null;
+    try {
+      data = await requestWorkspaceSwap(apiBase, buildSwapConfirmPayload(activeId, [key]));
+    } catch { data = null; }
+    if (!data) {
+      finishManifestInstall(key, "Manifest install failed: no response.", "#e05050", false);
+      return;
+    }
+    if (data.status === "busy" || data.status === "confirm_required") {
+      finishManifestInstall(key, data.message || "Deploy or prompt execution is active - try again later.", "#888", false);
+      return;
+    }
+    if (data.status === "error") {
+      finishManifestInstall(key, data.message || "Manifest install failed.", "#e05050", false);
+      return;
+    }
+    if (data.status === "repair_required") {
+      finishManifestInstall(key, data.message || "Manifest repair required.", "#e07070", false);
+      openRepair();
+      return;
+    }
+    if (data.status === "started" && data.swap_id) {
+      state.manifestInstall.swapId = data.swap_id;
+      state.manifestInstall.progress = { pct: 0, message: `Installing ${model.filename || "model"}...` };
+      renderManifestInstall();
+      pollManifestInstall();
+      return;
+    }
+    finishManifestInstall(key, data.message || "Unexpected manifest install response.", "#e05050", false);
+  }
+
+  async function scanManifestForInstall() {
+    const activeId = state.summary && state.summary.activeId;
+    if (!activeId) {
+      state.manifestInstall.loading = false;
+      state.manifestInstall.message = "No active workspace.";
+      setBusy(false);
+      renderManifestInstall();
+      return;
+    }
+    setBusy(true);
+    let data = null;
+    try {
+      data = await requestWorkspaceSwap(apiBase, { workspace_id: activeId });
+    } catch { data = null; }
+    if (!data) {
+      state.manifestInstall.loading = false;
+      state.manifestInstall.message = "Manifest scan failed: no response.";
+      setBusy(false);
+      renderManifestInstall();
+      return;
+    }
+    if (data.status === "busy") {
+      state.manifestInstall.loading = false;
+      state.manifestInstall.message = data.message || "Deploy already running - try again later.";
+      setBusy(false);
+      renderManifestInstall();
+      return;
+    }
+    if (data.status === "error") {
+      state.manifestInstall.loading = false;
+      state.manifestInstall.message = data.message || "Manifest scan failed.";
+      setBusy(false);
+      renderManifestInstall();
+      return;
+    }
+    if (data.status === "repair_required") {
+      state.manifestInstall.loading = false;
+      state.manifestInstall.message = data.message || "Manifest repair required.";
+      setBusy(false);
+      renderManifestInstall();
+      openRepair();
+      return;
+    }
+    if (data.status === "review_required") {
+      state.manifestInstall.data = data;
+      state.manifestInstall.loading = false;
+      state.manifestInstall.message = "";
+      state.manifestInstall.installedKeys = {};
+      setBusy(false);
+      renderManifestInstall();
+      return;
+    }
+    state.manifestInstall.loading = false;
+    state.manifestInstall.message = data.message || "Unexpected manifest scan response.";
+    setBusy(false);
+    renderManifestInstall();
+  }
+
   // ── Wiring ──────────────────────────────────────────────────────────────
+
+  async function onInstallClicked() {
+    if (installBtn.disabled) return;
+    if (state.manifestInstall.open) {
+      closeManifestInstall();
+      return;
+    }
+    state.manifestInstall.open = true;
+    state.manifestInstall.loading = true;
+    state.manifestInstall.data = null;
+    state.manifestInstall.message = "";
+    state.manifestInstall.installedKeys = {};
+    renderManifestInstall();
+    setProgress("Scanning manifest for active workspace...", "#888");
+    scanManifestForInstall();
+  }
 
   activateBtn.addEventListener("click", activateSelected);
   addBtn.addEventListener("click", () => openForm("add"));
   editBtn.addEventListener("click", () => openForm("edit"));
   swapBtn.addEventListener("click", onSwapClicked);
+  installBtn.addEventListener("click", onInstallClicked);
   repairBtn.addEventListener("click", () => {
     if (state.repair.open) closeRepair(); else openRepair();
   });

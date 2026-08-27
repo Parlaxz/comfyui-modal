@@ -926,3 +926,202 @@ active/success/failed/rerender/busy decisions, Original retry purpose, and the
 non-executing canonical dispatch contract. No route/repository transaction,
 SQLite mutation, Modal call, deployment, live generation, GPU work, or commit
 was performed in B1.
+
+## E3 Implementation Follow-Up B2 — Production Generate Original
+
+Date: 2026-08-22
+
+### Verdict
+
+Production Generate Original is implemented end-to-end behind the frozen
+Generation-scoped contract. One POST creates at most one queued
+`mode="original"` Attempt under the SAME Generation, replays ONLY the exact
+persisted immutable ExecutionPlan through `canonical_execution.execute_plan`
+with an output-intent-only delta, persists required outputs/History
+association BEFORE the terminal `completed` write, and leaves Preview assets,
+prior Attempts, and Generation logical identity untouched. No deployment, no
+live Modal generation, no GPU spend, no commit.
+
+### Exact routes
+
+- `POST /comfymodal/history-v2/generations/{generation_id}/original`
+  body optional `{"rerender": bool}` (non-bool → 400). Workflow, seed,
+  preset, controls, plan, and model stack come ONLY from the immutable
+  snapshot; the browser never resends them.
+- `POST /comfymodal/history-v2/generations/{generation_id}/original/retry`
+  narrowly scoped Retry for a failed Original Attempt (no body needed).
+- No `/experiments/.../generate-original` route was created; Experiment cells
+  use the SAME Generation-scoped action. Polling stays on the existing
+  `GET /comfymodal/history-v2/generations/{generation_id}` surface; no new
+  polling architecture.
+
+### Transaction semantics
+
+`HistoryV2Repository.claim_or_reuse_original_attempt(generation_id,
+*, explicit_rerender)` runs ONE `BEGIN IMMEDIATE` transaction: load
+Generation → linked RequestSnapshot → all Attempts → pure
+`decide_original_action` → on `create_original` insert one queued
+`mode="original"` Attempt (`started_at` NULL until claimed), cell-aware via
+`experiment_cells.generation_id` (appends to `attempt_ids`, recomputes
+generation/cell/experiment derived status) → commit. Two racing callers
+serialize on the write transaction, so a double-click/two-tab storm can never
+create two active Original Attempts and no orphan Attempt is left.
+`create_original_retry_attempt(generation_id)` is the retry twin: busy when
+ANY attempt is active; requires the newest `mode="original"` Attempt to be
+`failed` via `validate_original_retry`; append-only insert; the failed
+Attempt is never reopened or mutated. Duplicate checking is never bolted on
+outside the transaction.
+
+### Duplicate / rerender / retry behavior
+
+- Active Original (queued/running): returned as-is (`reuse_active`,
+  `reused: true`); nothing inserted, no execution spent.
+- Newest successful Original by default: returned (`reuse_successful`,
+  `reused: true`); zero execution.
+- Only failed Originals: `retry_required` identifying the newest failed
+  run_id; Generate Original is never silently reinterpreted as Retry.
+- Active Preview with no reusable Original: HTTP 409 `GENERATION_BUSY`.
+- Explicit `rerender=true`: exactly one new Attempt unless an Original is
+  already active (then reuse_active) or a Preview is active (busy).
+- Retry: new queued Original Attempt, same Generation, same immutable
+  snapshot, old failed Attempt retained; a Preview is never retried as an
+  Original (`409 RETRY_NOT_AVAILABLE`).
+
+### Replay core usage (immutable proof)
+
+Service sequence per action: load detail → `validate_replay_capability`
+(raw serialized snapshot, BEFORE any write; failure ⇒ non-destructive
+`409 GENERATION_NOT_REPRODUCIBLE` with machine reason/details and ZERO
+attempt writes) → transactional claim → `build_replay_dispatch` (re-validates
+raw hashes before `ExecutionPlan.from_dict`, requires exact `to_dict()`
+round-trip, applies the sole approved delta
+`execution_options.output_conversion_options = {"format": "original"}` plus
+correlation keys only). Tests prove `validate_replay_delta(saved, executed)`
+is allowed, and that workflow graph, both hashes, seed (including 0), false
+controls, Workflow Version, Preset identity, model stack, input images,
+validation proof, and deployment identity are byte-identical; the saved
+snapshot dict is unchanged after the whole flow. Current Workflow/Mapping/
+Preset/planner/Settings are never consulted.
+
+### Single dispatch
+
+Fresh per-Attempt correlation identity (new request_id/prompt_id plus
+run_id/attempt_id metadata; deployment identity preserved). A background task
+CAS-claims queued→running via `claim_attempt`, executes through the injected
+executor seam whose production default is
+`canonical_execution.execute_plan(plan, transport=ModalTransport(),
+trace=RuntimeTrace(request_id=fresh))` — the response carries
+`"executor": "canonical_execution.execute_plan"` and no runtime logic is
+duplicated. Materialization reuses `result_delivery.materialize_modal_result`
+off-loop into the studio outputs dir; assets attach ONLY via the existing
+`HistoryV2ProductionWriter.attach_result_assets` writer/result path (no
+direct Asset insertion from the replay route).
+
+### Experiment dispatch
+
+Lane resolved from `generation.experiment_id`. The scheduler is resolved via
+`experiment_modern_scheduler.get_scheduler`; when absent (restart), a narrow
+reconstruction seam rebuilds the EXISTING production binding with
+`build_experiment_scheduler(experiment_id, [cell_plan],
+persistence=experiment-bound repository, transport_factory=...)` from the
+persisted cell plan in `request_snapshots.request_json`. The submitted cell
+plan is the persisted dict with `execution_plan` replaced by the validated
+replay plan; `_make_binding_execute` still reaches
+`canonical_execution.execute_plan`. No second Experiment execution engine and
+no special executor exist.
+
+### No-scheduler behavior
+
+Dispatch capability is constructed BEFORE the claim transaction: transport
+construction failure (Single) or unresolvable/unconstructable scheduler
+(Experiment) returns `503 DISPATCH_UNAVAILABLE` with zero attempt writes —
+never an orphan queued Attempt. If `submit_cell` fails after creation, the
+Attempt is truthfully marked `failed` and 503 is returned.
+
+### Terminal ordering
+
+queued → running (CAS claim) → execution → materialization → required-output
+persistence/History association via the writer → `completed` → deliberate
+featured promotion of this Attempt's newest original (Preview retained).
+Required-output gate: execution without remote output ⇒ `failed` ("v2
+execution returned no output"); writer attach failure ⇒ `failed` ("History
+output finalization failed") — completed-before-asset is impossible.
+Execution failure marks the Attempt failed with persisted error while prior
+Preview and prior successful Original remain; E1A/E1B projection owns winner
+truth (tests prove the prior success stays selected after a later rerender
+failure). Restart/recovery truthfulness: pre-existing queued/running Original
+Attempts are REUSED, never duplicated, matching current lifecycle rules;
+logical_output_key from result descriptors survives into E1B grouping
+(`node:<id>:slot:<key>:item:<n>` verified end-to-end through GET detail).
+
+### Files changed
+
+- `history_v2_repository.py` — `OriginalClaimOutcome`,
+  `claim_or_reuse_original_attempt`, `create_original_retry_attempt`,
+  cell-aware `_insert_original_attempt`.
+- `history_v2_replay.py` — E3B2 production section: outcome/code constants,
+  `GenerateOriginalResult`, `GenerateOriginalService` with injectable
+  transport/executor/materializer/writer/scheduler seams and the Single
+  attempt runner; pure B1 core unchanged.
+- `history_v2_routes.py` — the two POST routes, service factory injection
+  point, `_json_error` code/extra extension (backward compatible).
+- `tests/test_history_v2_generate_original.py` — new focused suite.
+- NOT modified: `history_v2_store.py`, `history_v2_models.py`,
+  `history_v2_writer.py`, `comfyapp.py`, output conversion runtime, `web/**`,
+  `__init__.py` (routes were already registered).
+
+### Tests and results (all offline)
+
+- `tests/test_history_v2_generate_original.py`: 33 passed — preview-only
+  create, same-Generation retention, mode/snapshot/seed/version/preset/
+  controls/graph/hashes preservation, delta-only output intent + correlation,
+  sequential + concurrent double-submit single-Attempt, running reuse,
+  success reuse without execution, explicit rerender, failed-only
+  retry-required, Retry append-only with retained failure, retry busy /
+  not-available, active-Preview busy, legacy irreproducible 409 with no
+  Attempt, invalid raw hash fail-closed with no Attempt, canonical-executor
+  seam proof, Experiment same-service/scheduler dispatch with delta plan,
+  no-scheduler 503 with zero orphan Attempts, execution-failure Preview +
+  prior-success retention with E1B winner projection, no-output and
+  finalization-failure gates blocking completion, polling surface (new
+  Attempt, error entry, attached Original, retained Preview),
+  logical_output_key survival, restart-truthful reuse, cell-aware creation.
+- Adjacent suites green: replay_core+repository+api 55 passed;
+  modern_experiment+single_snapshot_replay 48 passed;
+  modern_experiment_scheduler 50 passed; production_writer+migration
+  39 passed. Temp SQLite + fake seams only; no Modal, deployment, live
+  generation, GPU work, or commit.
+
+### Exact frontend contract (frozen for E4)
+
+Success (HTTP 200):
+
+```json
+{
+  "status": "ok",
+  "outcome": "original_created",
+  "generation_id": "gen_...",
+  "run_id": "run_...",
+  "purpose": "original",
+  "attempt_status": "queued",
+  "reused": false,
+  "decision": "create_original",
+  "reason": "no_successful_or_active_original",
+  "executor": "canonical_execution.execute_plan"
+}
+```
+
+`outcome` ∈ `original_created` | `original_already_active` |
+`original_already_completed` | `retry_required`. Reuse responses set
+`reused: true` and report the existing Attempt's `run_id`/`attempt_status`;
+`retry_required` reports the newest failed Attempt and `reused: false`;
+`executor` appears only on created. Errors (HTTP status + stable code):
+`404 generation_not_found`, `409 generation_not_reproducible` (+`reason`,
+`details`), `409 generation_busy`, `409 retry_not_available`,
+`503 dispatch_unavailable`; bodies are
+`{"status":"error","code","message",...}`. Body schema:
+`{"rerender": bool}` optional; anything non-bool is 400. Retry:
+`POST .../original/retry` with no body. Polling: unchanged Generation detail
+GET already exposes new Attempts, statuses, failures (`errors[]`), newly
+attached Original (`outputs[].original_url`), `original_failed`, and the
+retained Preview. This shape is frozen; E4C reconciles against it as-is.

@@ -567,7 +567,7 @@ export function renderSettings(state, context) {
     // Runtime & Backend group
     const runtimeGroup = el("div", {
       class: "comfymodal-settings-group",
-      "data-search": "runtime backend deploy state snapshots presets",
+      "data-search": "runtime backend deploy state snapshots presets workspace workspaces legacy settings edit",
     });
     runtimeGroup.appendChild(el("h4", { class: "comfymodal-settings-group-title", text: "Runtime & Backend" }));
 
@@ -612,11 +612,80 @@ export function renderSettings(state, context) {
     });
     backendLinkWrap.appendChild(settingsRow("Backend", backendLink));
     runtimeGroup.appendChild(backendLinkWrap);
+
+    // Workspace editing now owns the retired legacy Settings entry point.
+    // Keep both the explicit workspace link and the legacy-compatible label
+    // pointed at the same Backend tab, with a hash deep-link for reloads and
+    // embeds that do not expose the shell's focus API.
+    function openWorkspaces(e) {
+      e.preventDefault();
+      if (context && typeof context.setPage === "function") {
+        context.setPage("backend");
+      }
+
+      const targetHash = "#comfymodal=backend&focus=workspaces";
+      if (typeof window !== "undefined") {
+        try {
+          const loc = window.location || {};
+          const base = (loc.pathname || "") + (loc.search || "");
+          window.history.pushState(window.history.state, "", base + targetHash);
+        } catch (_) {
+          try { window.location.hash = targetHash; } catch (_) {}
+        }
+      }
+
+      if (typeof setTimeout === "function") {
+        setTimeout(() => {
+          if (typeof document === "undefined") return;
+          const workspacesTab = document.querySelector('[data-tab="workspaces"]');
+          if (workspacesTab && typeof workspacesTab.click === "function") {
+            workspacesTab.click();
+          }
+        }, 160);
+        setTimeout(() => {
+          if (typeof document === "undefined") return;
+          const workspacesTab2 = document.querySelector('[data-tab="workspaces"]');
+          if (workspacesTab2 && typeof workspacesTab2.click === "function") {
+            const isActive = workspacesTab2.classList.contains("active") || workspacesTab2.getAttribute("aria-current") === "true";
+            if (!isActive) workspacesTab2.click();
+          }
+        }, 420);
+      }
+    }
+
+    const workspacesLinkWrap = el("div", {
+      class: "comfymodal-settings-control",
+      "data-search": "workspace workspaces legacy edit",
+    });
+    const workspacesLink = el("a", {
+      class: "comfymodal-settings-link",
+      "data-testid": "settings-open-workspaces",
+      text: "Open Workspaces",
+      href: "#",
+      "aria-label": "Open workspace editor",
+    });
+    workspacesLink.addEventListener("click", openWorkspaces);
+    workspacesLinkWrap.appendChild(settingsRow("Workspaces", workspacesLink));
+    runtimeGroup.appendChild(workspacesLinkWrap);
+
+    const legacyLinkWrap = el("div", {
+      class: "comfymodal-settings-control",
+      "data-search": "legacy settings workspaces",
+    });
+    const legacyLink = el("a", {
+      class: "comfymodal-settings-link",
+      "data-testid": "settings-open-legacy",
+      text: "Open legacy settings",
+      href: "#",
+      "aria-label": "Open legacy settings",
+    });
+    legacyLink.addEventListener("click", openWorkspaces);
+    legacyLinkWrap.appendChild(settingsRow("Legacy settings", legacyLink));
+    runtimeGroup.appendChild(legacyLinkWrap);
     section.appendChild(runtimeGroup);
 
-    // H14 Wave E: the Settings ▸ Advanced ▸ Legacy group (opener +
-    // Setup/Profiles/Results/Settings entries) is retired. Modern Settings
-    // is preferences-only (H5 §2); no legacy tab remains mountable.
+    // The retired Legacy entry point is retained as a deep-link to the
+    // Backend-owned workspace editor; no legacy overlay is mounted.
 
     return section;
   }
