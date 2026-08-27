@@ -131,8 +131,9 @@ class ClipLoadSpec:
     CLIPType name, and the folder_paths directory they resolve in.
 
     ``embedding_directory`` overrides the default embeddings folders when
-    non-None; ``model_options_overrides`` is merged over the zero-copy base
-    model_options (canonical spec keeps it empty).  ``dtype_policy`` is
+    non-None; ``model_options_overrides`` is merged over native empty
+    ``model_options`` (the canonical spec keeps it empty).  ``initial_device``
+    is reserved for the scoped Golden seam below.  ``dtype_policy`` is
     ``"uniform"`` only — mixed-dtype sources are an explicit opt-in that does
     not exist yet and fail closed.  Validation runs at construction; there is
     no repair/fallback path.
@@ -2283,11 +2284,11 @@ async def golden_clip_load(session: GoldenSession) -> Any:
     ``comfy.sd.load_text_encoder_state_dicts`` ONCE with the ordered shallow
     copies of every checkpoint's QD views, the spec's CLIPType resolved
     dynamically from ``comfy.sd.CLIPType`` by normalized name (unknown names
-    fail closed — no silent fallback), and explicit exact-dtype
-    model_options (initial_device=meta, load_device=offload_device=current
-    CUDA device, uniform source dtype across ALL checkpoints) so the
-    constructor never calls ``load_models_gpu`` and weights are adopted
-    zero-copy via ``assign=True`` under a dynamic CoreModelPatcher.
+    fail closed — no silent fallback), and native CLIP model options (empty for
+    the canonical path) so Comfy derives dtype and load/offload devices.  A
+    scoped ``text_encoder_initial_device -> meta`` seam keeps the constructor
+    from calling ``load_models_gpu``; weights are adopted zero-copy via
+    ``assign=True`` under a dynamic CoreModelPatcher.
 
     NOTE: upstream ``comfy.sd.load_clip`` reads each file itself via
     ``load_torch_file``, which would force a second payload read; this stage
@@ -2339,36 +2340,43 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         # reference (assign=True) instead of copying.
         if spec.require_dynamic_patcher:
             require_dynamic_core_model_patcher(tag="clip")
-        source_dtype = uniform_source_dtype_across(state_dicts, tag="clip")
-
-        # Exact-dtype zero-copy construction: initial_device(meta) !=
-        # load_device(cuda) keeps the CLIP constructor from calling
-        # load_models_gpu; explicit dtype pins the TE to the transported
-        # uniform source dtype across ALL checkpoints.  Shallow dict copies
-        # retain the SAME tensor objects (zero-copy preserved) while shielding
-        # our retained views dicts from upstream key mutations inside
-        # load_text_encoder_state_dicts.
-        cuda_device = torch.device("cuda", torch.cuda.current_device())
-        model_options = {
-            "initial_device": torch.device("meta"),
-            "dtype": source_dtype,
-            "load_device": cuda_device,
-            "offload_device": cuda_device,
-        }
+        # Keep the uniform source-dtype proof, but use native CLIP construction
+        # semantics.  The canonical spec therefore passes an empty options
+        # dict, allowing Comfy to derive dtype and load/offload devices.  The
+        # initial-device override is deliberately a scoped seam below rather
+        # than a model option (which would change native policy selection).
+        uniform_source_dtype_across(state_dicts, tag="clip")
+        model_options = {}
         if spec.model_options_overrides:
             model_options.update(dict(spec.model_options_overrides))
+        if "initial_device" in model_options:
+            raise RuntimeError("clip_initial_device_override_unsupported")
         embedding_directory = (
             list(spec.embedding_directory)
             if spec.embedding_directory is not None
             else folder_paths.get_folder_paths("embeddings")
         )
         clip_type_value = resolve_clip_type(spec.clip_type)
-        clip = comfy.sd.load_text_encoder_state_dicts(
-            [dict(sd) for sd in state_dicts],
-            embedding_directory=embedding_directory,
-            clip_type=clip_type_value,
-            model_options=model_options,
-        )
+        import comfy.model_management as model_management
+
+        native_initial_device = model_management.text_encoder_initial_device
+
+        def golden_initial_device(load_device, offload_device, model_size=0):
+            return torch.device("meta")
+
+        model_management.text_encoder_initial_device = golden_initial_device
+        try:
+            # Shallow dict copies retain the SAME tensor objects (zero-copy
+            # preserved) while shielding our retained view dicts from upstream
+            # key mutations inside load_text_encoder_state_dicts.
+            clip = comfy.sd.load_text_encoder_state_dicts(
+                [dict(sd) for sd in state_dicts],
+                embedding_directory=embedding_directory,
+                clip_type=clip_type_value,
+                model_options=model_options,
+            )
+        finally:
+            model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
             raise RuntimeError("clip_construct_failed")
         # Postflight: a non-dynamic patcher (e.g. a disable_offload wrapper)

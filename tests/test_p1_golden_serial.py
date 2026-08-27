@@ -19,10 +19,10 @@ exact downstream handoff and fail-closed block/expand, the exact
 88 EmptySD3LatentImage -> 214 Any Switch -> 1242 sampler-dependency chain,
 the dynamic-patcher preflight (legacy CoreModelPatcher rejected BEFORE
 CLIP/VAE construction; CoreModelPatcher is ModelPatcherDynamic accepted),
-explicit CLIP model_options (meta initial device, exact source dtype, current
-CUDA load/offload devices, dynamic patcher retained, state-dict copy
-preserving tensor data_ptrs), and explicit VAE source dtype/device with the
-dynamic patcher while keeping the one-header/one-payload no-reread proof.
+native CLIP model_options plus a scoped meta initial-device seam (dynamic
+patcher retained, state-dict copy preserving tensor data_ptrs), and explicit
+VAE source dtype/device with the dynamic patcher while keeping the
+one-header/one-payload no-reread proof.
 
 Section 8c adds model-agnostic CLIP adoption scope-contract tests: the
 generic helper is DISCOVERED at run time (never hard-coded) and every test
@@ -2442,15 +2442,20 @@ def _fake_model_patcher_module(dynamic: bool):
     return mod
 
 
-def _install_fake_comfy(monkeypatch, fake_sd, fake_mp):
+def _install_fake_comfy(monkeypatch, fake_sd, fake_mp, fake_mm=None):
     import types
 
+    if fake_mm is None:
+        fake_mm = types.ModuleType("comfy.model_management")
+        fake_mm.text_encoder_initial_device = lambda *args, **kwargs: "native"
     fake_comfy = types.ModuleType("comfy")
     fake_comfy.sd = fake_sd
     fake_comfy.model_patcher = fake_mp
+    fake_comfy.model_management = fake_mm
     monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
     monkeypatch.setitem(sys.modules, "comfy.sd", fake_sd)
     monkeypatch.setitem(sys.modules, "comfy.model_patcher", fake_mp)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
     monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
 
 
@@ -2642,19 +2647,18 @@ class _AliasModule(_torch.nn.Module):
             )
 
 
-# ── 20. Explicit CLIP loader contract (model_options + pointer preservation) ─
+# ── 20. Native CLIP loader contract (model_options + pointer preservation) ──
 
 
 @pytest.mark.skipif(
     not __import__("torch").cuda.is_available(),
-    reason="asserts current CUDA load/offload devices",
+    reason="requires CUDA for synthetic QD views",
 )
-def test_clip_loader_fake_asserts_explicit_model_options_and_state_dict_pointer_preservation(monkeypatch):
-    """The CLIP stage must call load_text_encoder_state_dicts with EXPLICIT
-    model_options — meta initial device, exact source dtype, current CUDA
-    load/offload devices — retain the dynamic patcher on the returned clip,
-    and pass a COPY of the state dict whose tensors preserve the QD view
-    data_ptrs exactly (upstream pops keys from the dict it receives)."""
+def test_clip_loader_fake_asserts_native_model_options_and_state_dict_pointer_preservation(monkeypatch):
+    """The CLIP stage must pass native model_options (empty for the canonical
+    path), use a scoped meta initial-device seam, retain the dynamic patcher on
+    the returned clip, and pass a COPY of the state dict whose tensors preserve
+    the QD view data_ptrs exactly (upstream pops keys from the dict it receives)."""
     import types
 
     import torch
@@ -2662,6 +2666,9 @@ def test_clip_loader_fake_asserts_explicit_model_options_and_state_dict_pointer_
     flat, views = _cuda_bf16_views(3)
     owner, _calls = _stub_qd_transport(monkeypatch, views, role="clip")
     fake_mp = _fake_model_patcher_module(dynamic=True)
+    fake_mm = types.ModuleType("comfy.model_management")
+    native_initial_device = lambda *args, **kwargs: torch.device("cpu")
+    fake_mm.text_encoder_initial_device = native_initial_device
 
     captured = {}
 
@@ -2671,6 +2678,9 @@ def test_clip_loader_fake_asserts_explicit_model_options_and_state_dict_pointer_
         mo = model_options or {}
         sd_copy = state_dicts[0]
         captured["model_options"] = mo
+        captured["initial_device"] = fake_mm.text_encoder_initial_device(
+            torch.device("cuda"), torch.device("cpu"), 123
+        )
         captured["is_copy"] = sd_copy is not views
         captured["ptr_preserved"] = set(sd_copy) == set(views) and all(
             int(t.data_ptr()) == int(views[k].data_ptr()) for k, t in sd_copy.items()
@@ -2685,7 +2695,7 @@ def test_clip_loader_fake_asserts_explicit_model_options_and_state_dict_pointer_
     fake_sd = types.ModuleType("comfy.sd")
     fake_sd.load_text_encoder_state_dicts = fake_load_text_encoder_state_dicts
     fake_sd.CLIPType = types.SimpleNamespace(LUMINA2="LUMINA2")
-    _install_fake_comfy(monkeypatch, fake_sd, fake_mp)
+    _install_fake_comfy(monkeypatch, fake_sd, fake_mp, fake_mm)
 
     session = _stage_session("clip", "/fake/qwen_3_4b.safetensors")
     clip = asyncio.run(gs.golden_clip_load(session))
@@ -2693,11 +2703,10 @@ def test_clip_loader_fake_asserts_explicit_model_options_and_state_dict_pointer_
     mo = captured["model_options"]
     assert captured["is_copy"], "state dict passed upstream must be a copy of the QD view dict"
     assert captured["ptr_preserved"], "state-dict copy must preserve every tensor data_ptr"
-    # explicit model_options contract
-    assert str(mo.get("initial_device")) == "meta"
-    assert mo.get("dtype") == torch.bfloat16  # exact transported source dtype
-    assert torch.device(mo.get("load_device")) == torch.device("cuda", torch.cuda.current_device())
-    assert torch.device(mo.get("offload_device")).type == "cuda"
+    # Native model_options contract and scoped initial-device seam.
+    assert mo == {}
+    assert captured["initial_device"] == torch.device("meta")
+    assert fake_mm.text_encoder_initial_device is native_initial_device
     # dynamic patcher retained on the published clip
     assert fake_mp.CoreModelPatcher is fake_mp.ModelPatcherDynamic
     assert clip.patcher.__class__ is fake_mp.CoreModelPatcher
