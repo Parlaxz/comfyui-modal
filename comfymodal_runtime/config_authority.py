@@ -67,7 +67,7 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
         "bool",
         True,
         EXECUTION_POLICY,
-        "Enforce Golden workflow SHA equality during request setup.",
+        "Require Golden workflow SHA equality during request setup; disabled is fail-closed.",
     ),
     # CLIP loader and hydration controls.
     "COMFYMODAL_V2_CLIP_QD_READER": _spec("COMFYMODAL_V2_CLIP_QD_READER", "bool", False, LOADER_SELECTION, "Enable the genuine queue-depth CLIP reader."),

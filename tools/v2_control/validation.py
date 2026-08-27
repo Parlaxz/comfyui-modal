@@ -40,8 +40,11 @@ from .errors import GateError
 
 try:  # Keep direct-script/package imports usable in both test and CLI paths.
     from tools.golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
-except ImportError:  # pragma: no cover - package-relative fallback
-    from ..golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+except ImportError:  # pragma: no cover - direct tools-script fallback
+    try:
+        from golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+    except ImportError:  # pragma: no cover - package-relative fallback
+        from ..golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
 
 LOG = logging.getLogger("v2ctl.validation")
 
