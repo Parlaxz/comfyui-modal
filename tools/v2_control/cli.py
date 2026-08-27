@@ -56,6 +56,7 @@ E31_VALIDATION_SELECTOR = "E31_VALIDATION"
 GOLDEN_P1_PROFILE = "golden_p1"
 GOLDEN_P1_SELECTOR = "golden_p1"
 GOLDEN_P1_METHOD = "run_golden_serial_stream"
+GOLDEN_P1_MODE = "golden_p1_serial"
 FULL_RUN_METHOD = "run_plan_stream"
 
 # E37 deliberately inherits the E29/E28 workload shape, but its late CLIP
@@ -311,7 +312,11 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
         # therefore still forwards the strict expected-output contract.
         if expected_sha:
             args += ["--golden-p1-expected-output-sha", expected_sha]
-        return args, {}
+        # The registry default is e28_single, whose BAT branch invokes the
+        # ordinary run_plan_stream path.  Project the effective Golden mode
+        # explicitly so the request reaches the serial-Golden branch.  An
+        # explicit V2_BENCHMARK_MODE remains authoritative.
+        return args, {"V2_BENCHMARK_MODE": _benchmark_mode(config)}
 
     selector = _backend_selector(config)
     args = ([selector] if selector else []) + ["--run-count", "1"]
@@ -365,12 +370,23 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
 def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
     """The effective ``V2_BENCHMARK_MODE`` from the resolved config.
 
-    Returns the mode string (defaulting to ``e28_single`` — one full
-    ``run_plan_stream`` generation) or the profile's explicit mode.
+    Golden P1 has a dedicated mode because the registry default
+    (``e28_single``) routes to the ordinary ``run_plan_stream`` branch.
+    Explicit mode selectors remain authoritative.  Non-Golden profiles keep
+    the registry default and existing explicit-mode behavior.
     """
     try:
         env = {f.name: f.value for f in config.flags}
+        mode_flag = next(
+            (flag for flag in config.flags if flag.name == "V2_BENCHMARK_MODE"),
+            None,
+        )
         mode = str(env.get("V2_BENCHMARK_MODE", "") or "e28_single").strip()
+        if (
+            config.profile_name == GOLDEN_P1_PROFILE
+            and (mode_flag is None or getattr(mode_flag, "source", "") == "default")
+        ):
+            return GOLDEN_P1_MODE
         return mode or "e28_single"
     except Exception:
         return "e28_single"

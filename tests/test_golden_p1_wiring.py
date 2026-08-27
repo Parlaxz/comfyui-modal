@@ -103,6 +103,21 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
 
 
+def test_golden_p1_uses_serial_mode_but_preserves_explicit_mode_selector():
+    assert cli._benchmark_mode(_config("golden_p1")) == "golden_p1_serial"
+    assert cli._validation_backend_args(_config("golden_p1"))[1] == {
+        "V2_BENCHMARK_MODE": "golden_p1_serial"
+    }
+
+    explicit = _config("golden_p1", sets=["V2_BENCHMARK_MODE=e28_single"])
+    assert cli._benchmark_mode(explicit) == "e28_single"
+    assert cli._validation_backend_args(explicit)[1] == {
+        "V2_BENCHMARK_MODE": "e28_single"
+    }
+
+    assert cli._benchmark_mode(_config("production")) == "e28_single"
+
+
 # ── Batch wrapper routing (static analysis) ───────────────────────────────
 
 
