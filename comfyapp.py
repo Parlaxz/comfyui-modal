@@ -6856,6 +6856,7 @@ _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
 ]
 _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     ".gitignore",
+    ".slim/",
     "*.md",
     ".deploy_log",
     ".tmp",
@@ -6916,6 +6917,8 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/playwright-report/*",
     "comfyui-modal/.custom_node_requirements/",
     "comfyui-modal/.baked_custom_node_deps/",
+    "comfyui-modal/.slim/",
+    "comfyui-modal/.slim/*",
     "comfyui-modal/*.md",
     "comfyui-modal/comfymodal_experiment_presets.json",
     "comfyui-modal/comfymodal_experiment_state.json",
