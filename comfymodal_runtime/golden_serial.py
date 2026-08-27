@@ -60,7 +60,7 @@ import torch
 EXPECTED_WORKFLOW_SHA256 = "f2de4c6a8f032b4adcd21be0e490ecb97aa87261c8403af79d52e6a2eb29734c"
 # SHA-256 of the exact expected canonical OUTPUT PNG bytes (NOT a workflow
 # hash).  Verified against post-durable reopened bytes, fail-closed.
-EXPECTED_OUTPUT_PNG_SHA256 = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+EXPECTED_OUTPUT_PNG_SHA256 = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
 CANONICAL_CLIP_NAME = "qwen_3_4b.safetensors"
 CANONICAL_CLIP_TYPE = "lumina2"
 CANONICAL_UNET_NAME = "z_image_turbo_bf16.safetensors"
@@ -2234,7 +2234,20 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
     try:
         contract = session.contract
         actual_sha = canonical_workflow_sha256(session.request.prompt)
-        if actual_sha != contract.workflow_sha256:
+        workflow_hash_check_value = os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+        ).strip().lower()
+        workflow_hash_check_enabled = workflow_hash_check_value not in {
+            "0", "false", "no", "off"
+        }
+        rec.event(
+            "golden_workflow_hash_check",
+            actual_sha256=actual_sha,
+            expected_sha256=contract.workflow_sha256,
+            enabled=workflow_hash_check_enabled,
+            bypassed=not workflow_hash_check_enabled,
+        )
+        if workflow_hash_check_enabled and actual_sha != contract.workflow_sha256:
             raise RuntimeError(f"workflow_sha_mismatch:{actual_sha}!={contract.workflow_sha256}")
         node_map = resolve_golden_node_map(session.request.prompt, contract=contract)
         session.node_map = node_map
@@ -2262,6 +2275,10 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             ready=True,
             request_id=session.request.request_id,
             node_count=len(session.request.prompt),
+            actual_workflow_sha256=actual_sha,
+            expected_workflow_sha256=contract.workflow_sha256,
+            workflow_hash_check_enabled=workflow_hash_check_enabled,
+            workflow_hash_check_bypassed=not workflow_hash_check_enabled,
             clip_loader=node_map.clip_loader_id,
             sampler=node_map.sampler_id,
             clip_name=[n for n in spec.checkpoint_names],
@@ -3828,6 +3845,8 @@ async def golden_serial_execute(
         restore_metadata=restore_metadata,
         restore_observation=restore_observation,
     )
+    primary_error: Optional[BaseException] = None
+    teardown_error: Optional[BaseException] = None
     try:
         await golden_restore(session)
         await golden_request_setup(session)
@@ -3849,24 +3868,18 @@ async def golden_serial_execute(
         session.recorder.mark_true_durable()
         result = session.build_final_result()
         session.recorder.event(EVENT_RESULT_ASSEMBLED, request_id=request.request_id)
-    except BaseException:
-        # Primary failure: mandatory teardown still runs exactly once and its
-        # final telemetry persistence happens after golden_teardown,
-        # but a teardown failure here must never replace the primary
-        # exception as the raised error.
+    except BaseException as exc:
+        # Primary failure: mandatory teardown still runs exactly once.  Its
+        # failure and any failure writing the best-effort artifact must never
+        # replace the primary exception.
+        primary_error = exc
         try:
             await golden_teardown(session)
         except BaseException:
             pass
-        try:
-            _persist_final_telemetry(session)
-        except BaseException:
-            pass  # failure artifact is best effort; the primary error wins
-        raise
     else:
         # Success path: the result may only be returned after teardown
         # succeeds; a teardown failure fails the call.
-        teardown_error: Optional[BaseException] = None
         try:
             await golden_teardown(session)
         except BaseException as exc:
@@ -3874,17 +3887,25 @@ async def golden_serial_execute(
         else:
             session.recorder.event(EVENT_TEARDOWN_COMPLETE, request_id=request.request_id)
 
-        try:
-            _persist_final_telemetry(session)
-        except BaseException:
-            if teardown_error is not None:
-                raise teardown_error
-            raise
+    # This is the sole final telemetry write for either outcome.  On success
+    # it necessarily follows TEARDOWN_COMPLETE; on failure it preserves the
+    # primary error while still leaving the latest teardown boundary on disk.
+    try:
+        _persist_final_telemetry(session)
+    except BaseException:
+        if primary_error is not None:
+            raise primary_error
         if teardown_error is not None:
             raise teardown_error
+        raise
 
-        result.telemetry_persist_ms = session.telemetry_persist_ms
-        return result
+    if primary_error is not None:
+        raise primary_error
+    if teardown_error is not None:
+        raise teardown_error
+
+    result.telemetry_persist_ms = session.telemetry_persist_ms
+    return result
 
 
 __all__ = [

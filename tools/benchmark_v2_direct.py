@@ -549,14 +549,34 @@ RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 # terminal result, zero error events, true_durable evidence, expected
 # output SHA, zero seriality violations, completed teardown telemetry,
 # snapshot proof, commit→reopen→TRUE_FIRST_DURABLE_RESULT ordering, and
-# runtime-flag agreement when an expectation is configured.  Invalid/DNF
-# attempts are preserved as artifacts and NEVER counted.  True-cold status
+# canonical runtime-flag agreement.  Invalid/DNF attempts are preserved as
+# artifacts and NEVER counted.  True-cold status
 # is labeled ONLY from remote/container identity evidence — never inferred.
 GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_P1_REMOTE_METHOD = "run_golden_serial_stream"
 GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME = "phase_p1_serial_golden_v1"
 GOLDEN_P1_DEFAULT_RUN_COUNT = int(os.environ.get("V2_GOLDEN_P1_RUN_COUNT", "5") or 5)
 GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV = "COMFYMODAL_V2_GOLDEN_P1_EXPECTED_OUTPUT_SHA"
+GOLDEN_P1_REQUIRED_FLAGS: dict[str, Any] = {
+    "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": True,
+    "core_model_patcher_is_dynamic": True,
+}
+GOLDEN_P1_SNAPSHOT_PROOF_SCHEMA = "golden_snapshot_content_proof_v1"
+GOLDEN_P1_SNAPSHOT_SIZE_SOURCE = "process_rss_pre_capture_resident_memory_proxy"
+GOLDEN_P1_SNAPSHOT_COUNTERS = (
+    "tensor_count",
+    "parameter_bytes",
+    "model_patcher_count",
+    "qd_owner_count",
+    "open_payload_reader_count",
+    "preload_worker_count",
+    "future_count",
+)
+GOLDEN_P1_SNAPSHOT_ROLE_COUNTERS = (
+    "tensor_count",
+    "parameter_bytes",
+    "qd_owner_count",
+)
 
 
 def _load_workspace() -> dict[str, Any]:
@@ -935,7 +955,7 @@ E37_VALIDATION_PROFILE_NAME = "E37_VALIDATION"
 E37_CLEAN_LANE_SELECTOR = "V2_E37_CLEAN_LANE_VALIDATION"
 E37_CLEAN_LANE_PROFILE_NAME = "E37_CLEAN_LANE"
 E37_CLEAN_LANE_EXPECTED_OUTPUT_SHA = (
-    "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+    "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
 )
 E37_HARNESS_PROFILE: dict[str, str] = {
     "COMFYMODAL_MINIMAL_RESTORE": "1",
@@ -10297,6 +10317,28 @@ async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> lis
     return events
 
 
+def _golden_p1_extract_telemetry(events: list[Any]) -> dict[str, Any] | None:
+    """Project the adapter's returned telemetry onto the attempt artifact.
+
+    The adapter puts it under ``data`` for results and directly on error
+    events.  Keeping this explicit top-level copy means host artifacts retain
+    the same persisted document on either terminal path, independently of
+    remote stdout.
+    """
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        candidates = [event]
+        data = event.get("data")
+        if isinstance(data, dict):
+            candidates.append(data)
+        for candidate in candidates:
+            telemetry = candidate.get("golden_telemetry")
+            if isinstance(telemetry, dict):
+                return telemetry
+    return None
+
+
 def _golden_p1_unit_name(value: Any) -> str:
     """Name of a telemetry unit (stage/event dict with a ``name`` field)."""
     if isinstance(value, dict):
@@ -10372,7 +10414,10 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
             key = _golden_p1_last_key(path)
             if key == "true_durable":
                 scan["true_durable"].append((idx, path, value))
-            elif "seriality" in key:
+            elif key in {
+                "seriality", "seriality_proof", "golden_seriality",
+                "golden_seriality_proof",
+            } and isinstance(value, dict):
                 scan["seriality"].append((idx, path, value))
             elif "teardown" in key:
                 scan["teardown"].append((idx, path, value))
@@ -10390,7 +10435,10 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
                     scan["reopen"].append((idx, path, ts))
             elif "true_first_durable_result" in key:
                 scan["true_first"].append((idx, path, value))
-            elif key in {"runtime_flags", "flags", "effective_flags", "flag_evidence"} and isinstance(value, dict):
+            elif key in {
+                "runtime_flags", "flags", "effective_flags", "flag_evidence",
+                "golden_flags_observed",
+            } and isinstance(value, dict):
                 scan["flags"].append((idx, path, value))
             elif key == "identity" and isinstance(value, dict):
                 scan["identities"].append((idx, value))
@@ -10439,13 +10487,95 @@ def _golden_p1_teardown_completed(entries: list[tuple[int, str, Any]]) -> bool:
 
 
 def _golden_p1_snapshot_proof_present(entries: list[tuple[int, str, Any]]) -> bool:
-    for _idx, _path, value in entries:
-        if isinstance(value, (dict, list)):
-            if len(value) > 0:
+    """Return whether entries contain a complete, proven clean snapshot proof.
+
+    The adapter emits the proof more than once (terminal timing and trace
+    metadata). Named ``snapshot_proof_complete`` markers are not content
+    proofs, so only proof-bearing mappings are candidates. Every candidate
+    must be valid; accepting a clean copy alongside a failed copy is not
+    fail-closed.
+    """
+    candidates: list[dict[str, Any]] = []
+    for _idx, path, value in entries:
+        if not isinstance(value, dict):
+            continue
+        normalized_path = path.lower()
+        if "snapshot_proof" in normalized_path or any(
+            key in value for key in (
+                "schema", "proven", "surface_count", "tensor_count",
+                "parameter_bytes", "nonzero", "nonzero_roles",
+            )
+        ):
+            candidates.append(value)
+    if not candidates:
+        return False
+
+    for proof in candidates:
+        if proof.get("schema") != GOLDEN_P1_SNAPSHOT_PROOF_SCHEMA:
+            return False
+        if proof.get("passive") is not True or proof.get("proven") is not True:
+            return False
+        surface_count = proof.get("surface_count")
+        if (
+            isinstance(surface_count, bool)
+            or not isinstance(surface_count, int)
+            or surface_count <= 0
+        ):
+            return False
+        snapshot_size = proof.get("snapshot_size_bytes")
+        snapshot_limit = proof.get("snapshot_size_limit_bytes")
+        if (
+            isinstance(snapshot_size, bool)
+            or not isinstance(snapshot_size, int)
+            or snapshot_size <= 0
+            or isinstance(snapshot_limit, bool)
+            or not isinstance(snapshot_limit, int)
+            or snapshot_limit <= snapshot_size
+        ):
+            return False
+        if proof.get("snapshot_size_source") != GOLDEN_P1_SNAPSHOT_SIZE_SOURCE:
+            return False
+        if proof.get("snapshot_size_is_serialized") is not False:
+            return False
+
+        for key in GOLDEN_P1_SNAPSHOT_COUNTERS:
+            value = proof.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                return False
+        if proof.get("nonzero") != {} or proof.get("nonzero_roles") != {}:
+            return False
+
+        roles = proof.get("roles")
+        if not isinstance(roles, dict) or not roles:
+            return False
+        for role in roles.values():
+            if not isinstance(role, dict):
+                return False
+            for key in GOLDEN_P1_SNAPSHOT_ROLE_COUNTERS:
+                value = role.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                    return False
+    return True
+
+
+def _golden_p1_flag_equal(expected: Any, observed: Any) -> bool:
+    """Compare JSON/env flag spellings without weakening non-boolean values."""
+    truthy = {"1", "true", "yes", "on", "ok"}
+    falsy = {"0", "false", "no", "off"}
+
+    def normalized(value: Any) -> Any:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in truthy:
                 return True
-        elif _golden_p1_truthy(value):
-            return True
-    return False
+            if lowered in falsy:
+                return False
+            return lowered
+        return value
+
+    return normalized(expected) == normalized(observed)
 
 
 def _golden_p1_validate_attempt(
@@ -10474,33 +10604,61 @@ def _golden_p1_validate_attempt(
     if not td_ok:
         failures.append("true_durable evidence missing or false")
 
-    ser_values: list[Any] = []
-    for _i, _p, v in scan["seriality"]:
-        if isinstance(v, list):
-            ser_values.extend(v)
-        elif isinstance(v, (int, float)) and not isinstance(v, bool):
-            ser_values.append(v)
-        elif isinstance(v, dict):
-            for vv in v.values():
-                if isinstance(vv, (int, float)) and not isinstance(vv, bool):
-                    ser_values.append(vv)
     if not scan["seriality"]:
         failures.append("seriality telemetry absent (required; fail-closed)")
-    elif any(bool(v) for v in ser_values):
-        failures.append(f"seriality violations reported: {ser_values!r}")
+    else:
+        seriality_values = [v for _i, _p, v in scan["seriality"]]
+        invalid_seriality = [
+            value for value in seriality_values
+            if not isinstance(value, dict)
+            or value.get("ok") is not True
+            or value.get("violations") != []
+            or (
+                "count" in value
+                and (
+                    isinstance(value.get("count"), bool)
+                    or not isinstance(value.get("count"), (int, float))
+                    or value.get("count") != 0
+                )
+            )
+        ]
+        if invalid_seriality:
+            failures.append(
+                "seriality proof invalid: expected ok=True, violations=[], "
+                f"count=0; observed={invalid_seriality!r}"
+            )
 
     if not _golden_p1_teardown_completed(scan["teardown"]):
         failures.append("completed teardown telemetry absent")
     if not _golden_p1_snapshot_proof_present(scan["snapshot_proof"]):
-        failures.append("snapshot proof absent or empty")
+        failures.append(
+            "snapshot proof absent, unproven, malformed, or contaminated"
+        )
 
     if not scan["commit"]:
         failures.append("commit timestamp evidence absent")
     if not scan["reopen"]:
         failures.append("reopen timestamp evidence absent")
     if scan["commit"] and scan["reopen"]:
-        c_entry = min(scan["commit"], key=lambda t: (_golden_p1_entry_ts(t) is None, t[0]))
-        r_entry = min(scan["reopen"], key=lambda t: (_golden_p1_entry_ts(t) is None, t[0]))
+        def _earliest_evidence(entries: list[tuple[int, str, Any]]) -> tuple[int, str, Any]:
+            timestamped = [
+                (entry, _golden_p1_entry_ts(entry))
+                for entry in entries
+            ]
+            valid_timestamps = [
+                (entry, timestamp)
+                for entry, timestamp in timestamped
+                if timestamp is not None
+            ]
+            if valid_timestamps:
+                return min(
+                    valid_timestamps,
+                    key=lambda item: (item[1], item[0][0], item[0][1]),
+                )[0]
+            return min(entries, key=lambda entry: (entry[0], entry[1]))
+
+        c_entry = _earliest_evidence(scan["commit"])
+        r_entry = _earliest_evidence(scan["reopen"])
         c_ts = _golden_p1_entry_ts(c_entry)
         r_ts = _golden_p1_entry_ts(r_entry)
         # Ordering: by wall timestamp when both are available (the Golden
@@ -10566,21 +10724,21 @@ def _golden_p1_validate_attempt(
     for _i, _p, f in scan["flags"]:
         observed_flags.update({str(k): v for k, v in f.items()})
     details["observed_flags"] = observed_flags
+    required_flags = dict(GOLDEN_P1_REQUIRED_FLAGS)
     if expected_flags:
-        if not observed_flags:
-            failures.append("runtime flag evidence expected but absent")
-        else:
-            for fk, fv in expected_flags.items():
-                got = observed_flags.get(fk)
-                if isinstance(fv, str) and isinstance(got, str):
-                    if got.strip().lower() != fv.strip().lower():
-                        failures.append(
-                            f"runtime flag mismatch {fk}: observed={got!r} expected={fv!r}"
-                        )
-                elif got != fv:
-                    failures.append(
-                        f"runtime flag mismatch {fk}: observed={got!r} expected={fv!r}"
-                    )
+        required_flags.update(expected_flags)
+    if not observed_flags:
+        failures.append("runtime flag evidence expected but absent")
+    else:
+        for fk, fv in required_flags.items():
+            if fk not in observed_flags:
+                failures.append(f"runtime flag evidence missing: {fk}")
+                continue
+            got = observed_flags[fk]
+            if not _golden_p1_flag_equal(fv, got):
+                failures.append(
+                    f"runtime flag mismatch {fk}: observed={got!r} expected={fv!r}"
+                )
 
     valid = not failures
     return valid, failures, details
@@ -10728,6 +10886,7 @@ async def _run_golden_p1(
             "valid": False,
             "dnf": False,
             "error": None,
+            "golden_telemetry": None,
         }
         attempt_start_ns = time.perf_counter_ns()
         try:
@@ -10747,6 +10906,7 @@ async def _run_golden_p1(
             # exhaustion before anything else happens.
             events = await _golden_p1_consume_stream(handle, payload)
             artifact["event_count"] = len(events)
+            artifact["golden_telemetry"] = _golden_p1_extract_telemetry(events)
             (cohort_dir / artifact["events_file"]).write_text(
                 json.dumps(events, default=str, indent=2), encoding="utf-8"
             )
@@ -10844,6 +11004,7 @@ async def _run_golden_p1(
             "observed_flags": (r.get("validation") or {}).get("observed_flags"),
             "identity": r["identity"],
             "cold_evidence": r["cold_evidence"],
+            "golden_telemetry": r.get("golden_telemetry"),
         } for r in records],
     }
     (cohort_dir / "summary.json").write_text(
@@ -11871,9 +12032,9 @@ if __name__ == "__main__":
         "--golden-p1-expected-flags",
         default="",
         metavar="JSON",
-        help='JSON object of expected runtime flags (e.g. '
-             '\'{"COMFYMODAL_V2_X":"1"}\') compared against the runtime flag '
-             "evidence observed in the stream when the stream provides it.",
+        help='JSON object of additional expected runtime flags (e.g. '
+             '\'{"COMFYMODAL_V2_X":"1"}\'); canonical Golden flags are always '
+             "required and every configured flag must be observed and match.",
     )
     _parser.add_argument(
         "--golden-p1-force",

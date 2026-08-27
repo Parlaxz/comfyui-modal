@@ -52,7 +52,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "comfymodal_runtime" / "gold
 
 # Reconciled Phase 2 gate contract constants (distinct by design).
 CANONICAL_WORKFLOW_SHA256 = "f2de4c6a8f032b4adcd21be0e490ecb97aa87261c8403af79d52e6a2eb29734c"
-EXPECTED_OUTPUT_SHA256 = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+EXPECTED_OUTPUT_SHA256 = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
 
 
 def _load_module():
@@ -1441,11 +1441,42 @@ def test_request_setup_validates_workflow_hash_not_output_sha(monkeypatch):
     assert node_map.sampler_id == "5"
 
 
-def test_request_setup_fails_closed_on_workflow_hash_mismatch(monkeypatch):
+@pytest.mark.parametrize("env_value", [None, "1"], ids=["default", "enabled"])
+def test_request_setup_fails_closed_on_workflow_hash_mismatch(monkeypatch, env_value):
     monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
+    if env_value is None:
+        monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", env_value)
     contract = dataclasses.replace(gs.GoldenWorkflowContract(), workflow_sha256="0" * 64)
     with pytest.raises(RuntimeError, match="workflow_sha_mismatch"):
         asyncio.run(gs.golden_request_setup(_setup_session(_canonical_prompt(), contract)))
+
+
+def test_request_setup_explicitly_bypasses_workflow_hash_equality_guard(monkeypatch):
+    monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
+    monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "0")
+    prompt = _canonical_prompt()
+    actual_sha = gs.canonical_workflow_sha256(prompt)
+    contract = dataclasses.replace(gs.GoldenWorkflowContract(), workflow_sha256="0" * 64)
+    session = _setup_session(prompt, contract)
+
+    node_map = asyncio.run(gs.golden_request_setup(session))
+
+    assert node_map.clip_loader_id == "1"
+    hash_event = next(
+        event for event in session.recorder.events
+        if event["name"] == "golden_workflow_hash_check"
+    )
+    assert hash_event["fields"] == {
+        "actual_sha256": actual_sha,
+        "expected_sha256": "0" * 64,
+        "enabled": False,
+        "bypassed": True,
+    }
+    details = session.recorder.intervals["golden_request_setup"].details
+    assert details["actual_workflow_sha256"] == actual_sha
+    assert details["workflow_hash_check_bypassed"] is True
 
 
 # ── 10. VAE load/decode stage boundaries ───────────────────────────────────

@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import math
 import os
 import platform
 import posixpath
@@ -1314,6 +1315,334 @@ def _golden_path_contained(path: str | os.PathLike, root: str) -> bool:
         return os.path.commonpath((path_real, os.path.realpath(root))) == os.path.realpath(root)
     except (OSError, ValueError, TypeError):
         return False
+
+
+_GOLDEN_LOG_VALUE_LIMIT = 240
+_GOLDEN_LOG_COLLECTION_LIMIT = 64
+_GOLDEN_LOG_DEPTH_LIMIT = 5
+_GOLDEN_LOG_SENSITIVE_PARTS = (
+    "prompt", "text", "secret", "token", "password", "credential",
+    "authorization", "api_key", "access_key", "cookie",
+)
+
+
+def _golden_log_sanitize(value: Any, key: str = "", depth: int = 0) -> Any:
+    """Return a bounded JSON-safe value suitable for container logs."""
+    lowered = str(key).lower().replace("-", "_")
+    if any(part in lowered for part in _GOLDEN_LOG_SENSITIVE_PARTS):
+        return "<redacted>"
+    if depth >= _GOLDEN_LOG_DEPTH_LIMIT:
+        return "<depth-limited>"
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        result = {
+            str(k): _golden_log_sanitize(v, str(k), depth + 1)
+            for k, v in items[:_GOLDEN_LOG_COLLECTION_LIMIT]
+        }
+        if len(items) > _GOLDEN_LOG_COLLECTION_LIMIT:
+            result["__omitted_keys__"] = len(items) - _GOLDEN_LOG_COLLECTION_LIMIT
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [
+            _golden_log_sanitize(item, key, depth + 1)
+            for item in value[:_GOLDEN_LOG_COLLECTION_LIMIT]
+        ]
+        if len(value) > _GOLDEN_LOG_COLLECTION_LIMIT:
+            result.append(f"<omitted {len(value) - _GOLDEN_LOG_COLLECTION_LIMIT} items>")
+        return result
+    if isinstance(value, str):
+        clean = " ".join(value.split())
+        if len(clean) > _GOLDEN_LOG_VALUE_LIMIT:
+            return clean[:_GOLDEN_LOG_VALUE_LIMIT] + "..."
+        return clean
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _golden_log_sanitize(str(value), key, depth + 1)
+
+
+def _golden_log_json(value: Any) -> str:
+    rendered = json.dumps(
+        _golden_log_sanitize(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return rendered if len(rendered) <= _GOLDEN_LOG_VALUE_LIMIT * 4 else (
+        rendered[: _GOLDEN_LOG_VALUE_LIMIT * 4] + "..."
+    )
+
+
+def _golden_telemetry_stage_duration_ms(stage: Mapping[str, Any]) -> float | None:
+    started = stage.get("entry_monotonic_ns")
+    ended = stage.get("end_monotonic_ns")
+    if isinstance(started, int) and isinstance(ended, int) and ended >= started:
+        return round((ended - started) / 1_000_000, 3)
+    started = stage.get("entry_wall_ns")
+    ended = stage.get("end_wall_ns")
+    if isinstance(started, int) and isinstance(ended, int) and ended >= started:
+        return round((ended - started) / 1_000_000, 3)
+    return None
+
+
+_GOLDEN_WATERFALL_STAGE_LIMIT = _GOLDEN_LOG_COLLECTION_LIMIT
+_GOLDEN_WATERFALL_STAGE_WIDTH = 42
+_GOLDEN_WATERFALL_VALUE_WIDTH = 10
+_GOLDEN_WATERFALL_STATUS_WIDTH = 10
+
+
+def _golden_waterfall_ms(value: Any) -> str:
+    """Format a measured millisecond value without filling in missing data."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "N/A"
+    try:
+        if not math.isfinite(float(value)):
+            return "N/A"
+    except (OverflowError, TypeError, ValueError):
+        return "N/A"
+    return f"{float(value):.3f} ms"
+
+
+def _golden_waterfall_cell(value: Any, width: int) -> str:
+    """Make a bounded, single-line table cell using the existing log sanitizer."""
+    text = str(_golden_log_sanitize(value)).replace("|", "/")
+    text = " ".join(text.split())
+    if len(text) > width:
+        text = text[: max(width - 3, 0)] + "..."
+    return text.ljust(width)
+
+
+def _format_golden_waterfall(
+    telemetry: Mapping[str, Any], *, timing: Mapping[str, Any] | None = None
+) -> str:
+    """Render bounded persisted Golden timings for plain Modal/container logs.
+
+    Restore and adapter rows are boundaries, not Golden model-execution stages.
+    Missing interval endpoints remain ``N/A`` rather than being inferred from
+    aggregate timings.
+    """
+    raw_stages = telemetry.get("stages")
+    stages = raw_stages if isinstance(raw_stages, list) else []
+    external_restore = telemetry.get("external_restore")
+    external_restore = external_restore if isinstance(external_restore, Mapping) else {}
+
+    stage_border = (
+        "+-----+"
+        + "-" * (_GOLDEN_WATERFALL_STAGE_WIDTH + 2)
+        + "+"
+        + "-" * (_GOLDEN_WATERFALL_VALUE_WIDTH + 2)
+        + "+"
+        + "-" * (_GOLDEN_WATERFALL_VALUE_WIDTH + 2)
+        + "+"
+        + "-" * (_GOLDEN_WATERFALL_STATUS_WIDTH + 2)
+        + "+"
+    )
+
+    def row(number: Any, stage: Any, duration: Any, cumulative: Any, status: Any) -> str:
+        number_text = str(number).rjust(3)
+        return (
+            f"| {number_text} | {_golden_waterfall_cell(stage, _GOLDEN_WATERFALL_STAGE_WIDTH)}"
+            f" | {_golden_waterfall_cell(duration, _GOLDEN_WATERFALL_VALUE_WIDTH)}"
+            f" | {_golden_waterfall_cell(cumulative, _GOLDEN_WATERFALL_VALUE_WIDTH)}"
+            f" | {_golden_waterfall_cell(status, _GOLDEN_WATERFALL_STATUS_WIDTH)} |"
+        )
+
+    lines = [
+        "V2 GOLDEN WATERFALL - REMOTE",
+        stage_border,
+        row("#", "Stage", "Duration", "Cum.", "Status"),
+        stage_border,
+    ]
+
+    if "restore_total_ms" in external_restore:
+        lines.append(
+            row(
+                "",
+                "External restore [ADAPTER BOUNDARY]",
+                _golden_waterfall_ms(external_restore.get("restore_total_ms")),
+                "N/A",
+                "ADAPTER",
+            )
+        )
+
+    cumulative_ms = 0.0
+    cumulative_known = True
+    for index, raw_stage in enumerate(stages[:_GOLDEN_WATERFALL_STAGE_LIMIT], 1):
+        stage = raw_stage if isinstance(raw_stage, Mapping) else {"value": raw_stage}
+        duration = _golden_telemetry_stage_duration_ms(stage)
+        duration_text = _golden_waterfall_ms(duration)
+        if duration is None:
+            cumulative_known = False
+        elif cumulative_known:
+            cumulative_ms = round(cumulative_ms + duration, 3)
+        cumulative_text = _golden_waterfall_ms(cumulative_ms) if cumulative_known else "N/A"
+        if stage.get("ok") is False:
+            status = "FAILED"
+        elif stage.get("ok") is True and duration is not None:
+            status = "OK"
+        elif duration is None:
+            status = "INCOMPLETE"
+        else:
+            status = "UNKNOWN"
+        safe_stage_name = _golden_log_sanitize(
+            stage.get("name", f"stage_{index - 1}"), "name"
+        )
+        stage_name = f"{safe_stage_name} [GOLDEN STAGE]"
+        lines.append(row(index, stage_name, duration_text, cumulative_text, status))
+
+    if len(stages) > _GOLDEN_WATERFALL_STAGE_LIMIT:
+        lines.append(
+            row(
+                "",
+                f"... {_golden_log_sanitize(len(stages) - _GOLDEN_WATERFALL_STAGE_LIMIT)} stages omitted",
+                "N/A",
+                "N/A",
+                "BOUNDED",
+            )
+        )
+    lines.append(stage_border)
+    lines.append("V2 GOLDEN BOUNDARIES / TIMING")
+
+    timing = timing if isinstance(timing, Mapping) else {}
+    timing_labels = (
+        ("Golden call wall [ADAPTER CALL]", "golden_call_wall_ms"),
+        ("Golden stage span [GOLDEN STAGES]", "golden_stage_span_ms"),
+        ("Golden stage sum [GOLDEN STAGES]", "golden_stage_sum_ms"),
+        ("Pre-stage overhead [ADAPTER]", "golden_pre_stage_overhead_ms"),
+        ("Post-stage overhead [ADAPTER]", "golden_post_stage_overhead_ms"),
+        ("Telemetry persistence [ADAPTER]", "golden_telemetry_persist_ms"),
+    )
+    for label, key in timing_labels:
+        value = _golden_waterfall_ms(timing.get(key))
+        if key == "golden_telemetry_persist_ms" and value == "N/A":
+            persistence = telemetry.get("telemetry_persistence")
+            if isinstance(persistence, Mapping) and persistence.get("telemetry_persisted") is True:
+                value = "persisted (duration N/A)"
+        lines.append(f"  {label}: {value}")
+    return "\n".join(lines)
+
+
+def _emit_golden_telemetry(
+    telemetry: Any, *, timing: Mapping[str, Any] | None = None
+) -> None:
+    """Print persisted Golden telemetry as readable, flushed, safe lines."""
+    if not isinstance(telemetry, Mapping):
+        print(
+            f"[v2.golden_telemetry] unavailable reason={_golden_log_json(telemetry)}",
+            flush=True,
+        )
+        return
+    print(_format_golden_waterfall(telemetry, timing=timing), flush=True)
+    stages = telemetry.get("stages")
+    events = telemetry.get("events")
+    stages = stages if isinstance(stages, list) else []
+    events = events if isinstance(events, list) else []
+    print(
+        f"[v2.golden_telemetry] schema={_golden_log_json(telemetry.get('schema'))} "
+        f"stages={len(stages)} events={len(events)} "
+        f"seriality={_golden_log_json(telemetry.get('seriality'))} "
+        f"true_durable={_golden_log_json(telemetry.get('true_durable_marked'))} "
+        f"persistence={_golden_log_json(telemetry.get('telemetry_persistence', {}))}",
+        flush=True,
+    )
+    if timing:
+        print(f"[v2.golden_telemetry] timing={_golden_log_json(timing)}", flush=True)
+    print(
+        f"[v2.golden_telemetry] external_restore="
+        f"{_golden_log_json(telemetry.get('external_restore', {}))}",
+        flush=True,
+    )
+    for index, raw_stage in enumerate(stages):
+        stage = raw_stage if isinstance(raw_stage, Mapping) else {"value": raw_stage}
+        duration = _golden_telemetry_stage_duration_ms(stage)
+        duration_text = str(duration) if duration is not None else "incomplete"
+        name = _golden_log_sanitize(stage.get("name", f"stage_{index}"))
+        print(
+            f"[v2.golden_telemetry] stage={name} duration_ms={duration_text} "
+            f"ok={_golden_log_json(stage.get('ok', 'unknown'))} "
+            f"details={_golden_log_json(stage.get('details', {}))}",
+            flush=True,
+        )
+    for index, raw_event in enumerate(events):
+        event = raw_event if isinstance(raw_event, Mapping) else {"value": raw_event}
+        name = _golden_log_sanitize(event.get("name", f"event_{index}"))
+        print(
+            f"[v2.golden_telemetry] event={name} "
+            f"fields={_golden_log_json(event.get('fields', {}))}",
+            flush=True,
+        )
+
+
+def _read_golden_telemetry(
+    path: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read the already-persisted telemetry document without changing errors."""
+    if path is None:
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            document = json.load(fh)
+        if not isinstance(document, dict):
+            return None, "golden_telemetry_document_not_mapping"
+        return document, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:500]
+
+
+def _golden_adapter_timing(
+    telemetry: Mapping[str, Any] | None,
+    *,
+    call_start_wall_ns: int | None,
+    call_start_mono_ns: int | None,
+    call_end_wall_ns: int | None,
+    call_end_mono_ns: int | None,
+    telemetry_persist_ms: Any = None,
+) -> dict[str, Any]:
+    """Build explicit adapter-call, stage-span/sum, and outside-stage bounds."""
+    timing: dict[str, Any] = {
+        "golden_call_start_wall_unix_ns": call_start_wall_ns,
+        "golden_call_start_mono_ns": call_start_mono_ns,
+        "golden_call_end_wall_unix_ns": call_end_wall_ns,
+        "golden_call_end_mono_ns": call_end_mono_ns,
+        "golden_call_wall_ms": None,
+        "golden_stage_span_ms": None,
+        "golden_stage_sum_ms": None,
+        "golden_pre_stage_overhead_ms": None,
+        "golden_post_stage_overhead_ms": None,
+        "golden_telemetry_persist_ms": telemetry_persist_ms,
+    }
+    if (
+        isinstance(call_start_mono_ns, int)
+        and isinstance(call_end_mono_ns, int)
+        and call_end_mono_ns >= call_start_mono_ns
+    ):
+        timing["golden_call_wall_ms"] = round(
+            (call_end_mono_ns - call_start_mono_ns) / 1_000_000, 3
+        )
+    raw_stages = telemetry.get("stages") if isinstance(telemetry, Mapping) else None
+    stages = [s for s in (raw_stages or []) if isinstance(s, Mapping)]
+    spans = [
+        (int(s["entry_monotonic_ns"]), int(s["end_monotonic_ns"]))
+        for s in stages
+        if isinstance(s.get("entry_monotonic_ns"), int)
+        and isinstance(s.get("end_monotonic_ns"), int)
+        and s["end_monotonic_ns"] >= s["entry_monotonic_ns"]
+    ]
+    if spans:
+        first_entry = min(start for start, _end in spans)
+        last_end = max(end for _start, end in spans)
+        timing["golden_stage_span_ms"] = round((last_end - first_entry) / 1_000_000, 3)
+        timing["golden_stage_sum_ms"] = round(
+            sum(end - start for start, end in spans) / 1_000_000, 3
+        )
+        if isinstance(call_start_mono_ns, int):
+            timing["golden_pre_stage_overhead_ms"] = round(
+                max(first_entry - call_start_mono_ns, 0) / 1_000_000, 3
+            )
+        if isinstance(call_end_mono_ns, int):
+            timing["golden_post_stage_overhead_ms"] = round(
+                max(call_end_mono_ns - last_end, 0) / 1_000_000, 3
+            )
+    return timing
 
 
 def _is_production_profile() -> bool:
@@ -3135,6 +3464,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # is too late for AIMDO modules that capture control.lib at import.
         "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM", "0"
+        ),
+        # Golden workflow hash checking defaults on and must cross Modal's
+        # class-env boundary so profile values (including golden_p1's "0")
+        # reach the deployed runtime.
+        "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
         ),
         # Preserve the v2ctl profile selector beside the Golden gate so the
         # container can make the same profile decision as the deploy process.
@@ -10182,11 +10517,14 @@ class ModalRuntimeEntrypoint:
             pass
 
         # ── Snapshot quiescence proof (fail closed) ───────────────────────
-        # Golden must prove quiescence before capture.  Other startup profiles
-        # retain their existing callback contract without running this proof.
+        # Golden must prove quiescence before capture, but this proof must be
+        # read-only: stopping a cache worker or flushing it here changes the
+        # process state serialized into the snapshot.  The default
+        # prove_snapshot_quiescence() contract remains mutating for callers
+        # outside the Golden path.
         from .snapshot_capture_hygiene import prove_snapshot_quiescence
         if _golden_serial_active:
-            _snapshot_quiescence = prove_snapshot_quiescence()
+            _snapshot_quiescence = prove_snapshot_quiescence(passive=True)
         else:
             _snapshot_quiescence = {
                 "proven": True,
@@ -20407,6 +20745,10 @@ class ModalRuntimeEntrypoint:
 
         request_id_raw: Any = ""
         telemetry_path: Path | None = None
+        golden_call_start_wall_ns: int | None = None
+        golden_call_start_mono_ns: int | None = None
+        golden_call_end_wall_ns: int | None = None
+        golden_call_end_mono_ns: int | None = None
         try:
             if not isinstance(request, Mapping):
                 raise ValueError("golden_request_must_be_mapping")
@@ -20538,6 +20880,8 @@ class ModalRuntimeEntrypoint:
                 extra_data=dict(extra_data_raw),
             )
             self._golden_execution_active = True
+            golden_call_start_wall_ns = time.time_ns()
+            golden_call_start_mono_ns = time.monotonic_ns()
             try:
                 result = await golden_serial_execute(
                     golden_request,
@@ -20550,6 +20894,8 @@ class ModalRuntimeEntrypoint:
                     restore_metadata=restore_metadata,
                 )
             finally:
+                golden_call_end_wall_ns = time.time_ns()
+                golden_call_end_mono_ns = time.monotonic_ns()
                 self._golden_execution_active = False
         except Exception as exc:
             rid = request_id_raw if isinstance(request_id_raw, str) else ""
@@ -20560,6 +20906,30 @@ class ModalRuntimeEntrypoint:
             }
             if isinstance(locals().get("activation_evidence"), dict):
                 error_event["golden_activation"] = locals()["activation_evidence"]
+            telemetry, telemetry_error = _read_golden_telemetry(telemetry_path)
+            timing = _golden_adapter_timing(
+                telemetry,
+                call_start_wall_ns=golden_call_start_wall_ns,
+                call_start_mono_ns=golden_call_start_mono_ns,
+                call_end_wall_ns=golden_call_end_wall_ns,
+                call_end_mono_ns=golden_call_end_mono_ns,
+            )
+            error_event["golden_adapter_timing"] = timing
+            if telemetry is not None:
+                error_event["golden_telemetry"] = telemetry
+                try:
+                    _emit_golden_telemetry(telemetry, timing=timing)
+                except Exception as log_exc:
+                    # Logging must never replace the primary Golden failure.
+                    error_event["golden_telemetry_log_error"] = (
+                        f"{type(log_exc).__name__}: {log_exc}"[:300]
+                    )
+            elif telemetry_error:
+                error_event["golden_telemetry_error"] = telemetry_error
+                try:
+                    _emit_golden_telemetry(None)
+                except Exception:
+                    pass
             yield error_event
             return
 
@@ -20592,14 +20962,33 @@ class ModalRuntimeEntrypoint:
             ),
         }
         # Evidence, never fabrication: attach the telemetry document Golden
-        # actually persisted at the known local path (bounded only by normal
-        # JSON size).  A read failure is reported honestly instead of being
-        # papered over.
-        try:
-            with open(telemetry_path, "r", encoding="utf-8") as fh:
-                result_data["golden_telemetry"] = json.load(fh)
-        except Exception as exc:
-            result_data["golden_telemetry_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        # actually persisted at the known local path.  The same document is
+        # printed on success and failure, so container logs and host artifacts
+        # have one canonical breakdown.
+        telemetry, telemetry_error = _read_golden_telemetry(telemetry_path)
+        timing = _golden_adapter_timing(
+            telemetry,
+            call_start_wall_ns=golden_call_start_wall_ns,
+            call_start_mono_ns=golden_call_start_mono_ns,
+            call_end_wall_ns=golden_call_end_wall_ns,
+            call_end_mono_ns=golden_call_end_mono_ns,
+            telemetry_persist_ms=getattr(result, "telemetry_persist_ms", None),
+        )
+        result_data["golden_adapter_timing"] = timing
+        if telemetry is not None:
+            result_data["golden_telemetry"] = telemetry
+            try:
+                _emit_golden_telemetry(telemetry, timing=timing)
+            except Exception as log_exc:
+                result_data["golden_telemetry_log_error"] = (
+                    f"{type(log_exc).__name__}: {log_exc}"[:300]
+                )
+        elif telemetry_error:
+            result_data["golden_telemetry_error"] = telemetry_error
+            try:
+                _emit_golden_telemetry(None)
+            except Exception:
+                pass
         _yield_wall_unix_ns = time.time_ns()
         _yield_mono_ns = time.monotonic_ns()
         _terminal_timing.update({

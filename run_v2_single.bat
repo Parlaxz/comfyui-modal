@@ -540,9 +540,18 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     python tools\benchmark_v2_direct.py --snapshot-restore-only %*
 ) else if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
     echo === Running V2 golden_p1 serial-Golden generation - explicit opt-in ===
-    set "V2_TOOL_ARGS="
-    for %%a in (%*) do if /i not "%%~a"=="golden_p1" set "V2_TOOL_ARGS=!V2_TOOL_ARGS! %%a"
-    python tools\benchmark_v2_direct.py --golden-p1!V2_TOOL_ARGS!
+    REM Keep the original argument string and remove only a leading selector.
+    REM CALL's second expansion applies the substring operation after the
+    REM selector check, without reparsing or losing quoted remaining args.
+    set "V2_GOLDEN_ARGS=%*"
+    if /i "%~1"=="golden_p1" (
+        if "%~2"=="" (
+            set "V2_GOLDEN_ARGS="
+        ) else (
+            call set "V2_GOLDEN_ARGS=%%V2_GOLDEN_ARGS:* =%%"
+        )
+    )
+    python tools\benchmark_v2_direct.py --golden-p1 !V2_GOLDEN_ARGS!
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===

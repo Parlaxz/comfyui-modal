@@ -15,7 +15,8 @@ is ``f'"{bat_path}" {list2cmdline(extra_args)}'`` executed via
 
 Artifacts are discovered best-effort under the well-known experiment output
 candidates plus any ``output dir`` / ``output_dir`` line in the backend
-stdout.
+stdout.  The dedicated Golden profile is bound separately to the cohort
+manifest and attempt artifact emitted by that invocation.
 
 Python 3.11 stdlib only; no network calls, no modal/deploy invocations.
 """
@@ -42,6 +43,26 @@ from .provenance import read_provenance_sibling
 _OUTPUT_DIR_RE = re.compile(
     r"[Oo]utput[ _]?dir[=: ]+(?:\"([^\"]+)\"|'([^']+)'|(\S+))"
 )
+_MANIFEST_PATH_RE = re.compile(
+    r"[\"']manifest[\"']\s*:\s*[\"']([^\"']+)"
+)
+
+
+def _is_golden_config(config: "ResolvedConfig") -> bool:
+    """Return whether this request uses the dedicated Golden harness."""
+    return str(getattr(config, "profile_name", "") or "") == "golden_p1"
+
+
+def _normalize_logged_path(raw: str) -> Path:
+    """Normalize a path copied from JSON/log output without guessing a file."""
+    # json.dumps escapes Windows separators.  Path accepts repeated separators
+    # on Windows, but collapsing them also keeps the helper deterministic in
+    # POSIX test runs that consume Windows-shaped logs.
+    normalized = raw.replace("\\\\", "\\").strip()
+    path = Path(normalized)
+    if not path.exists() and "\\" in normalized:
+        path = Path(normalized.replace("\\", os.sep))
+    return path
 
 
 def _first_nonempty_value(data: dict, *names: str) -> str | None:
@@ -669,6 +690,21 @@ class BackendRunner:
         legacy_mode = True if legacy is None else bool(legacy)
         if strict_canonical and not invocation_id:
             raise ProvenanceError("canonical artifact discovery requires an invocation ID")
+        # The Golden backend persists a cohort manifest plus attempt_N.json
+        # rather than the generic run_N.json/campaign_manifest.json shape.
+        # More importantly, old generic artifacts are present in the external
+        # benchmark archive.  Never let that archive win a Golden call: the
+        # Golden harness prints the cohort output directory for this exact
+        # invocation, which is the only discovery root accepted here.
+        if _is_golden_config(config):
+            return self._discover_golden_artifacts(
+                config,
+                backend_result_stdout,
+                invocation_id=invocation_id,
+                strict_canonical=strict_canonical,
+                expected_profile=expected_profile,
+                expected_profile_config_fingerprint=expected_profile_config_fingerprint,
+            )
         candidate_dirs: list[Path] = []
         seen: set[Path] = set()
         for d in self._candidate_dirs(config):
@@ -988,4 +1024,159 @@ class BackendRunner:
             profile=expected_profile if strict_canonical else None,
             profile_config_fingerprint=expected_profile_config_fingerprint,
             provenance_validation_status=status,
+        )
+
+    def _discover_golden_artifacts(
+        self,
+        config: "ResolvedConfig",
+        backend_result_stdout: str,
+        *,
+        invocation_id: str | None,
+        strict_canonical: bool,
+        expected_profile: str | None,
+        expected_profile_config_fingerprint: str | None,
+    ) -> ArtifactSet:
+        """Bind one Golden cohort emitted by the current backend process.
+
+        Golden artifacts intentionally have their own schema.  They are not
+        interchangeable with a generic ``run_*.json`` projection: selecting a
+        stale external run would make the gate validate the wrong method and
+        output.  The child must therefore identify its cohort in stdout, and
+        that cohort must prove the resolved Golden identity and request ID.
+        Detailed cohort validity remains the responsibility of the Golden
+        validator; discovery only establishes the artifact binding.
+        """
+        if not strict_canonical:
+            raise ProvenanceError(
+                "Golden artifact discovery requires canonical invocation binding"
+            )
+
+        cohort_paths = {
+            _normalize_logged_path(raw)
+            for match in _OUTPUT_DIR_RE.finditer(backend_result_stdout or "")
+            for raw in match.groups()
+            if raw
+        }
+        manifest_paths = {
+            _normalize_logged_path(match.group(1))
+            for match in _MANIFEST_PATH_RE.finditer(backend_result_stdout or "")
+        }
+        if len(cohort_paths) > 1:
+            raise ProvenanceError(
+                "Golden backend stdout identifies multiple cohort output directories"
+            )
+        if len(manifest_paths) > 1:
+            raise ProvenanceError(
+                "Golden backend stdout identifies multiple cohort manifests"
+            )
+        if manifest_paths:
+            manifest_from_stdout = next(iter(manifest_paths))
+            manifest_cohort = manifest_from_stdout.parent
+            if cohort_paths and next(iter(cohort_paths)).resolve() != manifest_cohort.resolve():
+                raise ProvenanceError(
+                    "Golden backend stdout cohort directory and manifest disagree"
+                )
+            cohort_paths.add(manifest_cohort)
+        if len(cohort_paths) != 1:
+            raise ProvenanceError(
+                "Golden backend did not identify the current cohort output directory"
+            )
+
+        cohort_dir = next(iter(cohort_paths)).resolve()
+        expected_root = (
+            self._repo_root / "artifacts" / "phase_p1_serial_golden_v1"
+        ).resolve()
+        try:
+            cohort_dir.relative_to(expected_root)
+        except ValueError as exc:
+            raise ProvenanceError(
+                f"Golden cohort is outside the canonical artifact root: {cohort_dir}"
+            ) from exc
+
+        manifest = cohort_dir / "manifest.json"
+        if manifest_paths and manifest.resolve() != next(iter(manifest_paths)).resolve():
+            raise ProvenanceError(
+                "Golden backend manifest path does not name cohort manifest.json"
+            )
+        try:
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ProvenanceError(f"Golden cohort manifest is unreadable: {manifest}") from exc
+        if not isinstance(manifest_data, dict):
+            raise ProvenanceError(f"Golden cohort manifest is not an object: {manifest}")
+
+        target = getattr(config, "target", None)
+        expected_target = {
+            "app_name": str(getattr(target, "app", "") or ""),
+            "class_name": str(getattr(target, "class_name", "") or ""),
+            "gpu": str(getattr(getattr(config, "resources", None), "gpu", "") or ""),
+        }
+        observed_target = manifest_data.get("target")
+        if (
+            manifest_data.get("mode") != "golden_p1_serial"
+            or manifest_data.get("method") != "run_golden_serial_stream"
+            or not isinstance(observed_target, dict)
+            or any(observed_target.get(key) != value for key, value in expected_target.items())
+        ):
+            raise ProvenanceError(
+                f"Golden cohort identity does not match the requested configuration: {manifest}"
+            )
+
+        attempts = manifest_data.get("attempts")
+        if not isinstance(attempts, list) or len(attempts) != 1:
+            raise ProvenanceError(
+                f"Golden cohort must contain exactly one gate/confirmation attempt: {manifest}"
+            )
+        attempt_files = sorted(
+            (p for p in cohort_dir.glob("attempt_*.json") if not p.stem.endswith("_events")),
+            key=lambda p: p.name.casefold(),
+        )
+        if len(attempt_files) != 1:
+            raise ProvenanceError(
+                f"Golden cohort must contain exactly one attempt artifact: {cohort_dir}"
+            )
+        attempt = attempt_files[0]
+        try:
+            attempt_data = json.loads(attempt.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ProvenanceError(f"Golden attempt artifact is unreadable: {attempt}") from exc
+        if not isinstance(attempt_data, dict):
+            raise ProvenanceError(f"Golden attempt artifact is not an object: {attempt}")
+        request_id = str(attempt_data.get("request_id") or "").strip()
+        if not request_id or str(attempts[0].get("request_id") or "").strip() != request_id:
+            raise ProvenanceError(
+                f"Golden cohort attempt/request identity is incomplete or inconsistent: {attempt}"
+            )
+        stdout_request_ids = {
+            value.strip()
+            for value in re.findall(
+                r"['\"]?(?:request_id|REQUEST_ID)['\"]?\s*[=:]\s*['\"]?([^\s,'\"}]+)",
+                backend_result_stdout or "",
+                flags=re.MULTILINE,
+            )
+            if value.strip()
+        }
+        # The Golden harness binds the current invocation through its unique
+        # cohort directory and does not print the per-attempt request ID.  If
+        # a request ID is present in stdout, still require an exact match; an
+        # absent ID is not evidence of a second/stale cohort because the
+        # printed cohort path was already required to be current and unique.
+        if stdout_request_ids and stdout_request_ids != {request_id}:
+            raise ProvenanceError(
+                f"Golden stdout request ID does not bind the current attempt: "
+                f"expected {request_id!r}, observed {sorted(stdout_request_ids)}"
+            )
+
+        return ArtifactSet(
+            output_dir=cohort_dir,
+            run_artifact=attempt,
+            summary_artifact=cohort_dir / "summary.json",
+            campaign_manifest=manifest,
+            run_artifacts=[attempt],
+            v2ctl_invocation_id=invocation_id,
+            request_id=request_id,
+            request_ids=[request_id],
+            profile=expected_profile or "golden_p1",
+            profile_config_fingerprint=expected_profile_config_fingerprint,
+            provenance_validation_status="validated",
         )

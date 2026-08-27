@@ -17,6 +17,8 @@ import pytest
 
 from comfymodal_runtime import modal_app
 from comfymodal_runtime import golden_serial
+from comfymodal_runtime import clip_conditioning_cache
+from comfymodal_runtime import snapshot_capture_hygiene
 from comfymodal_runtime.trace import RuntimeTrace
 
 
@@ -41,6 +43,107 @@ def test_startup_source_keeps_non_golden_cpu_snapshot_gate_and_golden_bypass():
     surfaces = source.index("_golden_pre_capture_surfaces = self._golden_snapshot_proof_surfaces()", golden_branch)
     assert source.index("_clear_cpu_snapshot_state_for_golden()", golden_branch) < surfaces
     assert source.index("self._run_golden_snapshot_content_proof(") > cpu_gate
+
+
+def test_golden_snapshot_quiescence_uses_passive_adapter():
+    source = Path(snapshot_capture_hygiene.__file__).read_text(encoding="utf-8")
+    modal_source = Path(modal_app.__file__).read_text(encoding="utf-8")
+    assert "inspect_for_snapshot" in source
+    assert "quiesce_for_snapshot(timeout_s=timeout_s)" in source
+    assert "prove_snapshot_quiescence(passive=True)" in modal_source
+
+
+def test_passive_snapshot_quiescence_does_not_call_mutating_cache_path(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "inspect_for_snapshot",
+        lambda: calls.append("inspect") or {
+            "quiesced": True,
+            "details": [],
+        },
+    )
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "quiesce_for_snapshot",
+        lambda **_kwargs: calls.append("quiesce") or {"quiesced": False},
+    )
+    monkeypatch.setattr(
+        "comfymodal_runtime.snapshot_build_manifest.enumerate_registered_executors",
+        lambda: [],
+    )
+
+    proof = snapshot_capture_hygiene.prove_snapshot_quiescence(passive=True)
+
+    assert proof["proven"] is True
+    assert proof["passive"] is True
+    assert calls == ["inspect"]
+
+
+def test_non_golden_snapshot_proof_default_still_uses_mutating_cache_path(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "inspect_for_snapshot",
+        lambda: calls.append("inspect") or {"quiesced": True},
+    )
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "quiesce_for_snapshot",
+        lambda **_kwargs: calls.append("quiesce") or {
+            "quiesced": True,
+            "details": [],
+        },
+    )
+    monkeypatch.setattr(
+        "comfymodal_runtime.snapshot_build_manifest.enumerate_registered_executors",
+        lambda: [],
+    )
+
+    proof = snapshot_capture_hygiene.prove_snapshot_quiescence()
+
+    assert proof["proven"] is True
+    assert proof["passive"] is False
+    assert calls == ["quiesce"]
+
+
+def test_cache_passive_inspection_is_state_preserving(tmp_path):
+    cache = clip_conditioning_cache.ExactConditioningCache(
+        root_dir=str(tmp_path), max_entries=4, max_bytes=1024, mounted=False
+    )
+    before = {
+        "snapshot_quiescing": cache._snapshot_quiescing,
+        "closing": cache._closing,
+        "lru_closing": cache._lru_closing,
+        "pending": list(cache._pending),
+        "pending_lru": set(cache._pending_lru),
+        "prefetch_events": dict(cache._prefetch_events),
+    }
+
+    result = cache.inspect_for_snapshot()
+
+    assert result["quiesced"] is True
+    assert cache._snapshot_quiescing is before["snapshot_quiescing"]
+    assert cache._closing is before["closing"]
+    assert cache._lru_closing is before["lru_closing"]
+    assert list(cache._pending) == before["pending"]
+    assert cache._pending_lru == before["pending_lru"]
+    assert cache._prefetch_events == before["prefetch_events"]
+
+
+def test_cache_passive_inspection_fails_closed_for_live_worker(tmp_path):
+    cache = clip_conditioning_cache.ExactConditioningCache(
+        root_dir=str(tmp_path), max_entries=4, max_bytes=1024, mounted=False
+    )
+    cast(Any, cache)._worker = SimpleNamespace(is_alive=lambda: True)
+
+    result = cache.inspect_for_snapshot()
+
+    assert result["quiesced"] is False
+    assert "persistence worker is still alive" in result["details"]
+    assert cache._snapshot_quiescing is False
+    assert cache._closing is False
 
 
 def test_golden_state_clear_drops_snapshot_model_references():
@@ -179,6 +282,11 @@ def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypat
     monkeypatch.setitem(sys.modules, "nodes", installed_nodes)
 
     entrypoint = modal_app.ModalRuntimeEntrypoint()
+    # Golden request entry requires the already-restored API's explicit GPU
+    # readiness seam before activation or delegation.
+    entrypoint._legacy_api = SimpleNamespace(
+        _ensure_gpu_ready_for_request=lambda: None,
+    )
     restore_metadata = {
         "remote_python_resume_wall_unix_ns": 100,
         "remote_python_resume_mono_ns": 100,
@@ -256,6 +364,154 @@ def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypat
     assert teardown["end_monotonic_ns"] <= teardown_complete["monotonic_ns"]
     assert [event["name"] for event in telemetry["events"]] == ["TEARDOWN_COMPLETE"]
     assert "adapter_completion" not in telemetry
+
+
+def test_golden_telemetry_log_format_is_complete_bounded_and_redacts_prompt(capsys):
+    telemetry = {
+        "schema": "golden_p1_telemetry_v1",
+        "true_durable_marked": False,
+        "seriality": {"ok": True, "count": 0},
+        "external_restore": {"restore_method_status": "success"},
+        "stages": [
+            {
+                "name": "golden_request_setup",
+                "entry_monotonic_ns": 100,
+                "end_monotonic_ns": 250,
+                "ok": True,
+                "details": {"node_count": 6, "prompt_text": "do not print me"},
+            },
+            {
+                "name": "golden_sampling",
+                "entry_monotonic_ns": 300,
+                "end_monotonic_ns": None,
+                "ok": False,
+                "details": {"error": "RuntimeError: sampler failed"},
+            },
+        ],
+        "events": [{
+            "name": "SAMPLER_FAILED",
+            "fields": {"step": 3, "secret_token": "do not print me either"},
+        }],
+    }
+
+    modal_app._emit_golden_telemetry(telemetry)
+    output = capsys.readouterr().out
+    assert "stage=golden_request_setup duration_ms=0.0 ok=true" in output
+    assert "stage=golden_sampling duration_ms=incomplete ok=false" in output
+    assert "event=SAMPLER_FAILED" in output
+    assert '"step":3' in output
+    assert "do not print me" not in output
+    assert "<redacted>" in output
+
+
+def test_golden_telemetry_log_includes_remote_waterfall_and_boundary_timing(capsys):
+    telemetry = {
+        "external_restore": {"restore_total_ms": 75.0},
+        "stages": [
+            {
+                "name": "golden_request_setup",
+                "entry_monotonic_ns": 100_000_000,
+                "end_monotonic_ns": 250_000_000,
+                "ok": True,
+            },
+            {
+                "name": "golden_sampling",
+                "entry_monotonic_ns": 300_000_000,
+                "end_monotonic_ns": 500_000_000,
+                "ok": False,
+            },
+            {"name": "golden_output", "entry_monotonic_ns": 600_000_000, "ok": None},
+        ],
+    }
+    timing = {
+        "golden_call_wall_ms": 800.0,
+        "golden_stage_span_ms": 400.0,
+        "golden_stage_sum_ms": 350.0,
+        "golden_pre_stage_overhead_ms": 20.0,
+        "golden_post_stage_overhead_ms": 430.0,
+        "golden_telemetry_persist_ms": 1.25,
+    }
+
+    modal_app._emit_golden_telemetry(telemetry, timing=timing)
+    output = capsys.readouterr().out
+    assert "V2 GOLDEN WATERFALL - REMOTE" in output
+    assert "|   # | Stage" in output
+    assert "External restore [ADAPTER BOUNDARY]" in output
+    assert "golden_request_setup [GOLDEN STAGE]" in output
+    assert "150.000 ms" in output
+    assert "350.000 ms" in output
+    assert "FAILED" in output
+    assert "golden_output [GOLDEN STAGE]" in output
+    assert "N/A" in output
+    assert "V2 GOLDEN BOUNDARIES / TIMING" in output
+    assert "Golden call wall [ADAPTER CALL]" in output
+    assert "Golden stage span [GOLDEN STAGES]" in output
+    assert "Pre-stage overhead [ADAPTER]" in output
+    assert "Post-stage overhead [ADAPTER]" in output
+    assert "Telemetry persistence [ADAPTER]" in output
+
+
+def test_adapter_failure_propagates_persisted_telemetry_and_timing(monkeypatch, tmp_path, capsys):
+    volume = object()
+    monkeypatch.setitem(modal_app._MODAL_RESOURCES, "runtime_state_volume", volume)
+    monkeypatch.setattr(modal_app, "RUNTIME_STATE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "comfymodal_runtime.golden_aimdo_activation.activate_golden_dynamic_vram",
+        lambda: {"activated": True, "already_activated": False, "is_dynamic_alias": True},
+    )
+    monkeypatch.setitem(sys.modules, "nodes", SimpleNamespace(NODE_CLASS_MAPPINGS={"X": object()}))
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_api = SimpleNamespace(_ensure_gpu_ready_for_request=lambda: None)
+    entrypoint._restore_timing = {
+        "remote_python_resume_wall_unix_ns": 100,
+        "remote_python_resume_mono_ns": 100,
+        "restore_method_start_wall_unix_ns": 100,
+        "restore_method_start_mono_ns": 100,
+        "restore_method_end_wall_unix_ns": 200,
+        "restore_method_end_mono_ns": 200,
+        "restore_method_status": "success",
+    }
+    persisted = {
+        "schema": "golden_p1_telemetry_v1",
+        "stages": [{
+            "name": "golden_sampling",
+            "entry_monotonic_ns": 1000,
+            "end_monotonic_ns": 2500,
+            "ok": False,
+            "details": {"error": "sampler failed"},
+        }],
+        "events": [{"name": "SAMPLER_FAILED", "fields": {"step": 4}}],
+        "seriality": {"ok": True, "violations": [], "count": 0},
+    }
+
+    async def fail_after_persist(request, *, telemetry_path, **_kwargs):
+        Path(telemetry_path).write_text(json.dumps(persisted), encoding="utf-8")
+        raise RuntimeError("primary-golden-error")
+
+    monkeypatch.setattr(golden_serial, "golden_serial_execute", fail_after_persist)
+
+    async def collect():
+        return [
+            event
+            async for event in entrypoint.run_golden_serial_stream(
+                {"request_id": "failed", "prompt": {"1": {"class_type": "X"}}}
+            )
+        ]
+
+    events = asyncio.run(collect())
+    assert len(events) == 1
+    error = events[0]
+    assert error["type"] == "error"
+    assert "primary-golden-error" in error["message"]
+    assert error["golden_telemetry"] == persisted
+    timing = error["golden_adapter_timing"]
+    assert timing["golden_call_wall_ms"] is not None
+    assert timing["golden_stage_span_ms"] == pytest.approx(0.002)
+    assert timing["golden_stage_sum_ms"] == pytest.approx(0.002)
+    assert timing["golden_telemetry_persist_ms"] is None
+    output = capsys.readouterr().out
+    assert "stage=golden_sampling duration_ms=0.002 ok=false" in output
+    assert "event=SAMPLER_FAILED" in output
 
 
 def test_adapter_rejects_runtime_mount_identity_mismatch(monkeypatch, tmp_path):

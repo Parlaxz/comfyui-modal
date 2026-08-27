@@ -25,6 +25,7 @@ Python 3.11 stdlib only; no network calls; no real BAT execution here.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import inspect
@@ -330,6 +331,16 @@ class StructuralValidator(ValidatorPlugin):
     name = "structural"
 
     def validate(self, record: RunRecord, config: Any) -> list[str]:
+        # Golden has a deliberately separate persisted schema (cohort
+        # manifest + attempt artifact), so the generic run-plan proof fields
+        # such as ``fresh`` and ``v2ctl_config`` are not applicable.  Route it
+        # through the equally fail-closed Golden contract instead of allowing
+        # a generic external run projection to stand in for the cohort.
+        if (
+            str(getattr(config, "profile_name", "") or "") == "golden_p1"
+            and getattr(getattr(record, "artifacts", None), "campaign_manifest", None) is not None
+        ):
+            return GoldenCohortValidator().validate(record, config)
         failures: list[str] = []
 
         # persisted run artifact present
@@ -444,6 +455,152 @@ class ExpectedOutputShaValidator(ValidatorPlugin):
                 f"output SHA mismatch: expected {expected}, observed {record.output_sha}"
             ]
         return []
+
+
+class GoldenCohortValidator(ValidatorPlugin):
+    """Validate the dedicated Golden cohort/attempt artifact contract.
+
+    ``run_golden_serial_stream`` does not emit the generic run-plan artifact.
+    The harness has already performed the detailed event validation; v2ctl
+    verifies that its immutable result is present, internally consistent,
+    hash-intact, and matches the current profile before accepting it.
+    """
+
+    name = "golden_cohort"
+
+    @staticmethod
+    def _load(path: Any) -> dict[str, Any] | None:
+        if path is None:
+            return None
+        try:
+            value = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def validate(self, record: RunRecord, config: Any) -> list[str]:
+        if str(getattr(config, "profile_name", "") or "") != "golden_p1":
+            return []
+
+        failures: list[str] = []
+        artifacts = record.artifacts
+        manifest_path = getattr(artifacts, "campaign_manifest", None)
+        attempt_path = getattr(artifacts, "run_artifact", None)
+        manifest = self._load(manifest_path)
+        attempt = self._load(attempt_path)
+        if manifest is None or manifest_path is None or not Path(manifest_path).is_file():
+            failures.append("Golden cohort manifest missing or unreadable")
+            return failures
+        if attempt is None or attempt_path is None or not Path(attempt_path).is_file():
+            failures.append("Golden attempt artifact missing or unreadable")
+            return failures
+        if not record.backend_ok:
+            failures.append(
+                "Golden backend invocation did not complete successfully"
+                f" (exit code {record.backend_exit_code if record.backend_exit_code is not None else 'unknown'})"
+            )
+        if Path(manifest_path).resolve().parent != Path(attempt_path).resolve().parent:
+            failures.append("Golden manifest and attempt artifacts are from different cohorts")
+
+        target = getattr(config, "target", None)
+        resources = getattr(config, "resources", None)
+        expected_target = {
+            "app_name": str(getattr(target, "app", "") or ""),
+            "class_name": str(getattr(target, "class_name", "") or ""),
+            "gpu": str(getattr(resources, "gpu", "") or ""),
+        }
+        observed_target = manifest.get("target")
+        if manifest.get("mode") != "golden_p1_serial":
+            failures.append("Golden cohort mode is not golden_p1_serial")
+        if manifest.get("method") != "run_golden_serial_stream":
+            failures.append("Golden cohort method is not run_golden_serial_stream")
+        if not isinstance(observed_target, dict) or any(
+            observed_target.get(key) != value for key, value in expected_target.items()
+        ):
+            failures.append("Golden cohort target identity does not match config")
+
+        expected_sha = str(getattr(getattr(config, "workload", None), "expected_output_sha", "") or "").strip()
+        if manifest.get("expected_output_sha") != expected_sha:
+            failures.append("Golden cohort expected output SHA does not match config")
+        workflow = manifest.get("workflow")
+        if not isinstance(workflow, dict) or not all(
+            isinstance(workflow.get(key), str) and workflow[key].strip()
+            for key in ("workflow_hash", "prompt_sha256")
+        ):
+            failures.append("Golden cohort workflow hash proof is missing")
+
+        counts = {
+            "run_count_requested": 1,
+            "attempt_count": 1,
+            "valid_count": 1,
+            "invalid_count": 0,
+            "dnf_count": 0,
+        }
+        for key, expected in counts.items():
+            if manifest.get(key) != expected:
+                failures.append(f"Golden cohort {key}={manifest.get(key)!r}; expected {expected}")
+
+        attempts = manifest.get("attempts")
+        manifest_attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 else None
+        request_id = str(attempt.get("request_id") or "").strip()
+        if not request_id or not isinstance(manifest_attempt, dict) or str(
+            manifest_attempt.get("request_id") or ""
+        ).strip() != request_id:
+            failures.append("Golden cohort attempt request identity is inconsistent")
+        if not record.request_id:
+            failures.append("effective provenance missing request_id")
+        elif record.request_id != request_id:
+            failures.append("Golden attempt request ID does not match v2ctl binding")
+        if attempt.get("mode") != "golden_p1_serial" or attempt.get("method") != "run_golden_serial_stream":
+            failures.append("Golden attempt method/mode proof is missing")
+        if attempt.get("valid") is not True or attempt.get("dnf") is not False:
+            failures.append("Golden attempt did not validate")
+        if attempt.get("failures") != []:
+            failures.append("Golden attempt contains validation failures")
+        validation = attempt.get("validation")
+        observed_shas = validation.get("observed_output_shas") if isinstance(validation, dict) else None
+        if observed_shas != [expected_sha]:
+            failures.append("Golden attempt output SHA proof is missing or mismatched")
+        telemetry = attempt.get("golden_telemetry")
+        if not isinstance(telemetry, dict) or not str(telemetry.get("schema", "")).startswith("golden_"):
+            failures.append("Golden telemetry proof is missing")
+        if isinstance(telemetry, dict):
+            if telemetry.get("true_durable_marked") is not True:
+                failures.append("Golden durable-result proof is missing")
+            if telemetry.get("reopen_verified") is not True:
+                failures.append("Golden durable reopen proof is missing")
+        seriality = attempt.get("seriality") or (telemetry or {}).get("seriality")
+        if not isinstance(seriality, dict) or seriality.get("ok") is not True or seriality.get("count") != 0:
+            failures.append("Golden strict-seriality proof is missing or failed")
+
+        # The Golden writer hashes all immutable sibling artifacts.  Verify
+        # those hashes here so a valid flag in a modified attempt cannot pass.
+        hashes = manifest.get("artifact_file_hashes")
+        if not isinstance(hashes, dict) or not hashes:
+            failures.append("Golden cohort artifact hashes are missing")
+        else:
+            parent = Path(manifest_path).resolve().parent
+            for relative, expected in hashes.items():
+                candidate = (parent / str(relative)).resolve()
+                try:
+                    candidate.relative_to(parent)
+                except ValueError:
+                    failures.append(f"Golden artifact hash path escapes cohort: {relative}")
+                    continue
+                if not candidate.is_file():
+                    failures.append(f"Golden artifact hash file missing: {relative}")
+                    continue
+                observed = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                if str(expected).lower() != observed:
+                    failures.append(f"Golden artifact hash mismatch: {relative}")
+
+        if not str(record.v2ctl_invocation_id or "").strip():
+            failures.append("effective provenance missing v2ctl_invocation_id")
+        if not str(record.profile_config_fingerprint or "").strip():
+            failures.append("effective provenance missing profile_config_fingerprint")
+        if record.provenance_validation_status != "validated":
+            failures.append("effective provenance was not canonically validated")
+        return failures
 
 
 class CanonicalLedgerValidator(ValidatorPlugin):
@@ -1190,6 +1347,21 @@ def build_run_record_from_result(
                             break
                 elif isinstance(desc, dict) and isinstance(desc.get("asset_id"), str):
                     output_sha = desc["asset_id"]
+            if output_sha is None:
+                # Golden attempts keep output identity in the harness
+                # validation projection rather than the generic descriptor
+                # fields.  This is still persisted evidence, not stdout or a
+                # value inferred from the configured expectation.
+                golden_validation = data.get("validation")
+                golden_shas = (
+                    golden_validation.get("observed_output_shas")
+                    if isinstance(golden_validation, dict)
+                    else None
+                )
+                if isinstance(golden_shas, list) and len(golden_shas) == 1:
+                    candidate = golden_shas[0]
+                    if isinstance(candidate, str) and candidate.strip():
+                        output_sha = candidate.strip()
     target = getattr(config, "target", None)
     workload = _config_workload(config)
     return RunRecord(

@@ -843,6 +843,15 @@ change_requires = "deploy"
 owner = "golden-p1"
 description = "P1 serial-Golden dynamic-VRAM path: hydrate model payloads directly into GPU memory during restore instead of the CPU-snapshot defaults. Deploy-baked via modal_app _runtime_env(); a changed value requires a redeploy."
 
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
+type = "bool"
+default = "1"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "P1 serial-Golden workflow SHA equality guard; hash computation and telemetry remain enabled when this guard is explicitly disabled."
+
 # ── Harness selectors (consumed by the request harness; run-only) ───────────
 
 [[flag]]

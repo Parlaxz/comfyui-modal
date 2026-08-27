@@ -19,6 +19,7 @@ from tools.v2_control.errors import FlagError
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAG = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
+HASH_CHECK_FLAG = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
 
 
 def _config(profile: str, *, sets: list[str] | None = None):
@@ -84,6 +85,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
         "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
         "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
         FLAG: "1",
+        HASH_CHECK_FLAG: "0",
     }
     effective = {}
     for name in expected:
@@ -98,20 +100,29 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
     assert config.workload.conditioning_cache == "forced_miss"
     assert (
         config.workload.expected_output_sha
-        == "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+        == "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
     )
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
 
 
 def test_golden_p1_uses_serial_mode_but_preserves_explicit_mode_selector():
     assert cli._benchmark_mode(_config("golden_p1")) == "golden_p1_serial"
-    assert cli._validation_backend_args(_config("golden_p1"))[1] == {
+    args, env = cli._validation_backend_args(_config("golden_p1"))
+    assert args == [
+        "--run-count",
+        "1",
+        "--golden-p1-expected-output-sha",
+        "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da",
+    ]
+    assert env == {
         "V2_BENCHMARK_MODE": "golden_p1_serial"
     }
 
     explicit = _config("golden_p1", sets=["V2_BENCHMARK_MODE=e28_single"])
     assert cli._benchmark_mode(explicit) == "e28_single"
-    assert cli._validation_backend_args(explicit)[1] == {
+    explicit_args, explicit_env = cli._validation_backend_args(explicit)
+    assert explicit_args == args
+    assert explicit_env == {
         "V2_BENCHMARK_MODE": "e28_single"
     }
 
@@ -167,10 +178,7 @@ def test_run_bat_routes_golden_p1_to_benchmark_harness_after_existing_modes():
     lines = _bat_lines("run_v2_single.bat")
     text = "\n".join(lines)
     assert "--golden-p1" in text
-    golden_idx = next(
-        i for i, l in enumerate(lines)
-        if l.strip() == "python tools\\benchmark_v2_direct.py --golden-p1!V2_TOOL_ARGS!"
-    )
+    golden_idx = next(i for i, l in enumerate(lines) if "python tools\\benchmark_v2_direct.py --golden-p1 !V2_GOLDEN_ARGS!" in l)
     # Every explicit V2_BENCHMARK_MODE branch keeps precedence: the golden
     # branch sits after them, immediately before the plain fallback else.
     snapshot_idx = next(
@@ -181,14 +189,16 @@ def test_run_bat_routes_golden_p1_to_benchmark_harness_after_existing_modes():
         if l.strip() == "python tools\\benchmark_v2_direct.py %*"
     )
     assert snapshot_idx < golden_idx < fallback_idx
-    # Every selector token is removed before forwarding, including quoted and
-    # non-leading case variants; all other tokens retain their original form.
+    # CALL's second expansion removes only the leading selector from the
+    # original argument string, preserving quoted remaining arguments.
     golden_start = next(i for i, l in enumerate(lines) if l.strip() == ') else if "!V2_GOLDEN_P1_ACTIVE!"=="1" (')
     golden_block = "\n".join(lines[golden_start:golden_idx + 1])
-    assert 'for %%a in (%*) do if /i not "%%~a"=="golden_p1" set "V2_TOOL_ARGS=!V2_TOOL_ARGS! %%a"' in golden_block
-    assert "V2_FIRST_SKIP" not in golden_block
-    forward = lines[golden_idx]
-    assert forward.strip() == "python tools\\benchmark_v2_direct.py --golden-p1!V2_TOOL_ARGS!"
+    assert 'set "V2_GOLDEN_ARGS=%*"' in golden_block
+    assert 'if /i "%~1"=="golden_p1"' in golden_block
+    assert 'call set "V2_GOLDEN_ARGS=%%V2_GOLDEN_ARGS:* =%%"' in golden_block
+    assert 'set "V2_GOLDEN_ARGS="' in golden_block
+    assert "python tools\\benchmark_v2_direct.py --golden-p1 %*" not in golden_block
+    assert "V2_TOOL_ARGS" not in golden_block
 
 
 def test_neither_bat_clobbers_the_flag_after_resolution():

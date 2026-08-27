@@ -810,6 +810,70 @@ def test_discover_artifacts_nested_output_studio(tmp_path):
     assert result.run_artifact.parent == studio
 
 
+def test_discover_artifacts_binds_current_golden_cohort_not_external_run(tmp_path):
+    """Golden stdout is the invocation binding; generic archive files are ignored."""
+    config = _Config(
+        profile_name="golden_p1",
+        target=_Target(
+            app="stable-modal-comfy-v2-golden-p1",
+            method="run_golden_serial_stream",
+        ),
+        workload=_Workload(
+            expected_output_sha="a" * 64,
+            fresh_required=True,
+            run_count=1,
+        ),
+    )
+    golden_dir = tmp_path / "artifacts" / "phase_p1_serial_golden_v1" / "cohort_current"
+    golden_dir.mkdir(parents=True)
+    request_id = "golden-p1-0-current"
+    (golden_dir / "attempt_0_events.json").write_text("[]", encoding="utf-8")
+    (golden_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (golden_dir / "attempt_0.json").write_text(
+        json.dumps({"request_id": request_id}), encoding="utf-8"
+    )
+    (golden_dir / "manifest.json").write_text(
+        json.dumps({
+            "mode": "golden_p1_serial",
+            "method": "run_golden_serial_stream",
+            "target": {
+                "app_name": config.target.app,
+                "class_name": config.target.class_name,
+                "gpu": config.resources.gpu,
+            },
+            "attempts": [{"request_id": request_id}],
+        }),
+        encoding="utf-8",
+    )
+    # This is the stale shape that previously won by mtime.
+    external = _make_experiments_dir(tmp_path)
+    (external / "run_001_sample.json").write_text(
+        json.dumps({"v2ctl_invocation_id": "stale"}), encoding="utf-8"
+    )
+    fp = FingerprintEngine(config).profile_config_fingerprint()
+    stdout = json.dumps({
+        "output_dir": str(golden_dir),
+        "manifest": str(golden_dir / "manifest.json"),
+        "request_id": request_id,
+    })
+
+    result = BackendRunner(tmp_path, EnvironmentBuilder()).discover_artifacts(
+        config,
+        stdout,
+        invocation_id="current-invocation",
+        strict_canonical=True,
+        expected_profile="golden_p1",
+        expected_profile_config_fingerprint=fp,
+    )
+
+    assert result.output_dir == golden_dir.resolve()
+    assert result.run_artifact == golden_dir / "attempt_0.json"
+    assert result.campaign_manifest == golden_dir / "manifest.json"
+    assert result.request_id == request_id
+    assert result.v2ctl_invocation_id == "current-invocation"
+    assert result.provenance_validation_status == "validated"
+
+
 # ---------------------------------------------------------------------------
 # BackendResult.ok / ArtifactSet defaults
 # ---------------------------------------------------------------------------

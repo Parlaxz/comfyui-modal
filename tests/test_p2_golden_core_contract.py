@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -675,6 +676,18 @@ def test_top_level_persists_once_after_teardown_complete_and_reports_persist_wal
     assert result.telemetry_persist_ms is not None
     assert result.telemetry_persist_ms >= 0
     assert target.exists()
+    persisted = json.loads(target.read_text(encoding="utf-8"))
+    teardown = next(
+        stage for stage in persisted["stages"] if stage["name"] == "golden_teardown"
+    )
+    complete = [
+        event for event in persisted["events"]
+        if event["name"] == gs.EVENT_TEARDOWN_COMPLETE
+    ]
+    assert teardown["end_monotonic_ns"] is not None
+    assert len(complete) == 1
+    assert teardown["end_monotonic_ns"] <= complete[0]["monotonic_ns"]
+    assert persisted["telemetry_persistence"]["telemetry_persisted"] is True
 
 
 def test_true_first_durable_requires_canonical_commit_reopen_hash_proof(tmp_path):

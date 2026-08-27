@@ -299,8 +299,8 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
     confirm, and dry-run reporting so a confirmation cannot silently fall
     back to the restore-only BAT path.
     """
-    # The resolved Golden environment activates the BAT's dedicated harness;
-    # do not forward the profile name as a benchmark positional selector.
+    # The dedicated Golden harness is selected by the canonical positional
+    # selector; keep the resolved environment and expected-output contract.
     if config.profile_name == GOLDEN_P1_PROFILE:
         expected_sha = str(config.workload.expected_output_sha or "").strip()
         args = [
@@ -1215,7 +1215,11 @@ def cmd_gate(args, repo_root: Path) -> int:
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
-        validator.register(val_mod.CanonicalLedgerValidator())
+        # Golden has its own dedicated durability/seriality ledger contract;
+        # the generic E29 run-plan ledger is not emitted by
+        # run_golden_serial_stream.
+        if config.profile_name != GOLDEN_P1_PROFILE:
+            validator.register(val_mod.CanonicalLedgerValidator())
         e31_validator = val_mod.E31ForensicsValidator()
         if e31_validator.applies(config):
             validator.register(e31_validator)
@@ -1283,7 +1287,11 @@ def cmd_confirm(args, repo_root: Path) -> int:
         # Confirm must enforce the same canonical ledger contract as gate;
         # otherwise an E37 gate could pass while confirmation silently drops
         # the first-durable ledger validator.
-        validator.register(val_mod.CanonicalLedgerValidator())
+        # Golden has its own dedicated durability/seriality ledger contract;
+        # the generic E29 run-plan ledger is not emitted by
+        # run_golden_serial_stream.
+        if config.profile_name != GOLDEN_P1_PROFILE:
+            validator.register(val_mod.CanonicalLedgerValidator())
         e31_validator = val_mod.E31ForensicsValidator()
         if e31_validator.applies(config):
             validator.register(e31_validator)

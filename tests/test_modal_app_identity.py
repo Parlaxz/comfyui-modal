@@ -294,6 +294,14 @@ class TestGoldenGateRuntimePropagation(unittest.TestCase):
             os.environ[self._GATE_ENV] = "1"
             self.assertEqual(modal_app._runtime_env()[self._GATE_ENV], "1")
 
+    def test_runtime_env_projects_workflow_hash_check_default_on_and_env_zero(self):
+        env_name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(modal_app._runtime_env()[env_name], "1")
+            os.environ[env_name] = "0"
+            self.assertEqual(modal_app._runtime_env()[env_name], "0")
+
     def test_run_env_probe_reports_golden_gate_without_startup(self):
         with patch.dict(os.environ, {self._GATE_ENV: "1"}, clear=False):
             probe = modal_app.ModalRuntimeEntrypoint().run_env_probe(
