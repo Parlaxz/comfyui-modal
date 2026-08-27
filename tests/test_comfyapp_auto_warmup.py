@@ -1,7 +1,9 @@
 import ast
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1106,6 +1108,49 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("get_total_memory", source)
         self.assertIn("get_torch_device", source)
 
+    def test_restore_gpu_state_skips_device_lookup_without_cuda(self):
+        import comfy.cli_args
+        import comfy.model_management
+        import comfyapp
+        import torch
+
+        instance = object.__new__(comfyapp._ComfyAPIMixin)
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch.object(
+                comfy.model_management,
+                "get_torch_device",
+                side_effect=AssertionError("get_torch_device must not run without CUDA"),
+            ) as get_torch_device,
+            mock.patch("builtins.print") as print_mock,
+        ):
+            result = instance._restore_in_process_gpu_state()
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "cuda_unavailable")
+        get_torch_device.assert_not_called()
+        self.assertIn("cuda_unavailable", str(print_mock.call_args))
+
+    def test_restore_gpu_state_recomputes_total_vram_with_cuda(self):
+        import comfy.model_management
+        import comfyapp
+        import torch
+
+        instance = object.__new__(comfyapp._ComfyAPIMixin)
+        total_memory = 12 * 1024 * 1024 * 1024
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(comfy.model_management, "get_torch_device", return_value="cuda:0") as get_torch_device,
+            mock.patch.object(comfy.model_management, "get_total_memory", return_value=total_memory),
+            mock.patch("comfymodal_runtime.restore_memory_arm.apply_frozen_total_vram_or_none", return_value=None),
+            mock.patch.object(comfyapp, "_opt_diag_enabled", return_value=False),
+            mock.patch("psutil.virtual_memory", return_value=mock.Mock(total=8 * 1024 * 1024 * 1024)),
+        ):
+            instance._restore_in_process_gpu_state()
+
+        self.assertEqual(comfy.model_management.total_vram, 12 * 1024)
+        get_torch_device.assert_called_once_with()
+
     def test_restore_gpu_state_imports_psutil_for_total_ram(self):
         source = self._get_method_source("_restore_in_process_gpu_state")
         self.assertIsNotNone(source)
@@ -1531,6 +1576,105 @@ class FastpathClipPolicyTests(unittest.TestCase):
             "fastpath_load_only must be rejected by eligibility",
         )
         self.assertEqual(eligibility["reason"], "direct_clip_policy_not_compatible")
+
+
+class CudaRestoreCrashLoopTests(unittest.TestCase):
+    """Regression coverage for deferred CUDA reattachment."""
+
+    def _fake_comfy_modules(self):
+        comfy = types.ModuleType("comfy")
+        cli_args = types.ModuleType("comfy.cli_args")
+        model_management = types.ModuleType("comfy.model_management")
+        cli_args.args = SimpleNamespace(cpu=True)
+        model_management.CPUState = SimpleNamespace(CPU="cpu", GPU="gpu")
+        model_management.get_torch_device = mock.Mock(
+            side_effect=AssertionError("device lookup must be deferred")
+        )
+        comfy.cli_args = cli_args
+        comfy.model_management = model_management
+        return {
+            "comfy": comfy,
+            "comfy.cli_args": cli_args,
+            "comfy.model_management": model_management,
+        }
+
+    def test_cpu_snapshot_restore_does_not_lookup_device_without_cuda(self):
+        from comfyapp import _ComfyAPIMixin
+        import torch
+
+        instance = object.__new__(_ComfyAPIMixin)
+        modules = self._fake_comfy_modules()
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            torch.cuda, "is_available", return_value=False
+        ):
+            result = instance._restore_in_process_gpu_state()
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertTrue(result["deferred"])
+        modules["comfy.model_management"].get_torch_device.assert_not_called()
+
+    def test_gpu_snapshot_restore_does_not_lookup_device_without_cuda(self):
+        from comfyapp import _ComfyAPIMixin
+        import torch
+
+        instance = object.__new__(_ComfyAPIMixin)
+        modules = self._fake_comfy_modules()
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            torch.cuda, "is_available", return_value=False
+        ):
+            result = instance._refresh_gpu_snapshot_memory()
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertTrue(result["deferred"])
+        modules["comfy.model_management"].get_torch_device.assert_not_called()
+
+    def test_available_cuda_but_current_device_failure_is_deferred(self):
+        from comfyapp import _ComfyAPIMixin
+        import torch
+
+        instance = object.__new__(_ComfyAPIMixin)
+        with mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+            torch.cuda, "current_device", side_effect=RuntimeError("driver not ready")
+        ):
+            device, diag = instance._initialize_cuda_context()
+
+        self.assertIsNone(device)
+        self.assertEqual(diag["cuda_available"], 0)
+        self.assertEqual(diag["cuda_skip_reason"], "cuda_device_probe_failed")
+
+    def test_first_request_retries_degraded_restore(self):
+        from comfyapp import _ComfyAPIMixin
+
+        instance = object.__new__(_ComfyAPIMixin)
+        instance._gpu_restore_deferred = True
+        instance._select_backend = mock.Mock(return_value="in_process")
+        instance._restore_in_process_gpu_state = mock.Mock(
+            return_value={"status": "ok", "cuda_available": 1}
+        )
+        instance._initialize_cuda_context = mock.Mock(
+            return_value=("cuda:0", {"cuda_available": 1})
+        )
+
+        instance._ensure_gpu_ready_for_request()
+
+        instance._restore_in_process_gpu_state.assert_called_once_with()
+        instance._initialize_cuda_context.assert_called_once_with()
+        self.assertFalse(instance._gpu_restore_deferred)
+
+    def test_first_request_fails_explicitly_when_cuda_stays_unavailable(self):
+        from comfyapp import _ComfyAPIMixin
+
+        instance = object.__new__(_ComfyAPIMixin)
+        instance._gpu_restore_deferred = True
+        instance._select_backend = mock.Mock(return_value="in_process")
+        instance._restore_in_process_gpu_state = mock.Mock(
+            return_value={"status": "skipped", "reason": "cuda_unavailable"}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "CUDA unavailable"):
+            instance._ensure_gpu_ready_for_request()
+
+        instance._restore_in_process_gpu_state.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -18004,25 +18004,68 @@ class _ComfyAPIMixin:
         """
         import torch
         _started_ns = time.perf_counter_ns()
-        if not torch.cuda.is_available():
+        try:
+            _cuda_available = bool(torch.cuda.is_available())
+        except Exception as _available_exc:
+            _cuda_available = False
+            _available_error = repr(_available_exc)
+        else:
+            _available_error = ""
+        if not _cuda_available:
             return None, {
                 "cuda_available": 0,
                 "cuda_device_index": -1,
                 "cuda_device_name": "",
+                "cuda_skip_reason": "cuda_unavailable",
+                "cuda_error": _available_error,
                 "cuda_context_sync_ms": 0.0,
                 "cuda_context_total_ms": round(
                     (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
                 ),
             }
-        _device_index = torch.cuda.current_device()
-        _device = torch.device(_device_index)
-        _sync_started_ns = time.perf_counter_ns()
-        torch.cuda.synchronize(_device)
+        try:
+            _device_index = torch.cuda.current_device()
+            _device = torch.device(_device_index)
+            _sync_started_ns = time.perf_counter_ns()
+            torch.cuda.synchronize(_device)
+        except Exception as _device_exc:
+            # ``is_available()`` can be true while the driver/device query is
+            # still unavailable (for example during CUDA driver reattachment).
+            # Treat that as unavailable rather than allowing restore to crash.
+            print(f"[comfyapp] cuda context probe deferred: {_device_exc!r}")
+            return None, {
+                "cuda_available": 0,
+                "cuda_device_index": -1,
+                "cuda_device_name": "",
+                "cuda_skip_reason": "cuda_device_probe_failed",
+                "cuda_error": str(_device_exc)[:500],
+                "cuda_context_sync_ms": 0.0,
+                "cuda_context_total_ms": round(
+                    (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+                ),
+            }
         _sync_end_ns = time.perf_counter_ns()
+        try:
+            _device_name = torch.cuda.get_device_name(_device)
+        except Exception as _name_exc:
+            print(f"[comfyapp] cuda device name probe deferred: {_name_exc!r}")
+            return None, {
+                "cuda_available": 0,
+                "cuda_device_index": -1,
+                "cuda_device_name": "",
+                "cuda_skip_reason": "cuda_device_probe_failed",
+                "cuda_error": str(_name_exc)[:500],
+                "cuda_context_sync_ms": round(
+                    (_sync_end_ns - _sync_started_ns) / 1_000_000, 3,
+                ),
+                "cuda_context_total_ms": round(
+                    (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+                ),
+            }
         _result = {
             "cuda_available": 1,
             "cuda_device_index": int(_device_index),
-            "cuda_device_name": torch.cuda.get_device_name(_device),
+            "cuda_device_name": _device_name,
             "cuda_context_sync_ms": round(
                 (_sync_end_ns - _sync_started_ns) / 1_000_000, 3,
             ),
@@ -19453,6 +19496,150 @@ class _ComfyAPIMixin:
         except Exception as exc:
             print(f"[comfyapp] clip_cache: patch failed: {exc}")
 
+    def _mark_gpu_restore_deferred(self, reason: str, error: str = "") -> dict:
+        """Keep ComfyUI in CPU mode until CUDA can be reattached safely."""
+        self._gpu_restore_deferred = True
+        result = {
+            # Keep the existing skipped result contract while making the
+            # deferred state explicit for restore/request diagnostics.
+            "status": "skipped",
+            "deferred": True,
+            "reason": reason,
+            "cuda_available": 0,
+        }
+        if error:
+            result["error"] = str(error)[:500]
+        self._gpu_restore_status = result
+        try:
+            import comfy.cli_args
+            comfy.cli_args.args.cpu = True
+        except Exception:
+            pass
+        try:
+            import comfy.model_management
+            _cpu_state = getattr(getattr(comfy.model_management, "CPUState", None), "CPU", None)
+            if _cpu_state is not None:
+                comfy.model_management.cpu_state = _cpu_state
+        except Exception:
+            pass
+        print(
+            f"[comfyapp] gpu_state restore deferred reason={reason}"
+            + (f" error={str(error)[:200]}" if error else "")
+        )
+        return result
+
+    def _refresh_gpu_snapshot_memory(self) -> dict:
+        """Refresh memory totals for a GPU snapshot without probing too early."""
+        import torch
+
+        try:
+            if not torch.cuda.is_available():
+                return self._mark_gpu_restore_deferred("cuda_unavailable")
+        except Exception as _available_exc:
+            return self._mark_gpu_restore_deferred("cuda_probe_failed", repr(_available_exc))
+
+        try:
+            # Validate the driver/device handoff before ComfyUI's helper.  The
+            # latter also calls current_device() on some ComfyUI revisions.
+            _device_index = torch.cuda.current_device()
+            import comfy.model_management
+            import psutil
+            _comfy_device = comfy.model_management.get_torch_device()
+            _device_type = getattr(_comfy_device, "type", str(_comfy_device).split(":", 1)[0])
+            if _device_type != "cuda":
+                return self._mark_gpu_restore_deferred(
+                    "non_cuda_device", str(_comfy_device)
+                )
+            from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
+            _frozen_vram = apply_frozen_total_vram_or_none()
+            if _frozen_vram is not None:
+                comfy.model_management.total_vram = _frozen_vram
+            else:
+                comfy.model_management.total_vram = (
+                    comfy.model_management.get_total_memory(_comfy_device)
+                    / (1024 * 1024)
+                )
+            comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+        except Exception as _restore_exc:
+            return self._mark_gpu_restore_deferred(
+                "cuda_device_probe_failed", repr(_restore_exc)
+            )
+
+        self._gpu_restore_deferred = False
+        result = {"status": "ok", "reason": "gpu_snapshot", "cuda_available": 1}
+        self._gpu_restore_status = result
+        return result
+
+    def _ensure_gpu_ready_for_request(self) -> None:
+        """Retry a deferred in-process GPU restore before touching a prompt."""
+        if self._select_backend() != "in_process":
+            return
+        if not getattr(self, "_gpu_restore_deferred", False):
+            return
+
+        print("[comfyapp] retrying deferred GPU restore at request entry")
+        _restore_result = self._restore_in_process_gpu_state() or {}
+        if _restore_result.get("status") != "ok":
+            raise RuntimeError(
+                "CUDA unavailable after snapshot restore; refusing to execute "
+                "the request in ComfyUI CPU mode "
+                f"(reason={_restore_result.get('reason', 'unknown')})."
+            )
+        _device, _diag = self._initialize_cuda_context()
+        if _device is None:
+            _reason = (_diag or {}).get("cuda_skip_reason", "cuda_unavailable")
+            _error = (_diag or {}).get("cuda_error", "")
+            self._mark_gpu_restore_deferred(_reason, _error)
+            raise RuntimeError(
+                "CUDA unavailable after snapshot restore; refusing to execute "
+                "the request in ComfyUI CPU mode "
+                f"(reason={_reason})."
+            )
+        self._gpu_restore_deferred = False
+        _rt = getattr(self, "_last_restore_timing", None)
+        if isinstance(_rt, dict):
+            _rt["gpu_restore_request_retry"] = 1
+            _rt["gpu_restore_request_retry_status"] = "ok"
+        print("[comfyapp] deferred GPU restore succeeded at request entry")
+
+    def _record_degraded_restore(
+        self,
+        stages: dict,
+        restore_start: float,
+        restore_start_wall_s: float,
+        restore_start_ns: int,
+    ) -> None:
+        """Persist restore timing when GPU reattachment must be deferred."""
+        _restore_end = time.time()
+        stages["restore_degraded"] = 1
+        stages["restore_end_mono_ns"] = time.perf_counter_ns()
+        self._last_restore_timing = {
+            "restore_total_ms": self._profile_ms(restore_start),
+            "restore_start_unix_s": restore_start,
+            "restore_end_unix_s": _restore_end,
+            "restore_method_start_wall_unix_ns": int(restore_start_wall_s * 1_000_000_000),
+            "restore_method_start_mono_ns": restore_start_ns,
+            "restore_method_end_wall_unix_ns": int(_restore_end * 1_000_000_000),
+            "restore_method_end_mono_ns": stages["restore_end_mono_ns"],
+            "restore_method_status": "degraded",
+            "lifecycle_status": "degraded",
+            "lifecycle_method": "restore",
+            **stages,
+        }
+        print(
+            f"[comfyapp] restore degraded; GPU reattachment deferred "
+            f"restore_total_ms={self._last_restore_timing['restore_total_ms']}"
+        )
+        _log_remote_identity(
+            "restore",
+            cls_name=self.__class__.__name__,
+            method_name="restore",
+            restore_session_id=self._last_restore_timing.get("restore_session_id", ""),
+            snapshot_created=0,
+            restored_from_snapshot=1,
+            restored_instance_id=self._restored_instance_id,
+        )
+
     def _restore_in_process_gpu_state(self):
         """Re-enable ComfyUI GPU mode after a CPU-only snapshot import.
 
@@ -19465,37 +19652,61 @@ class _ComfyAPIMixin:
         paths fail with "Input tensors must be on cuda".
         """
         _t0 = time.time()
-        import comfy.cli_args
-        import comfy.model_management
-        import psutil
+        import torch
 
+        # A CPU-only restore must remain a no-op for GPU state.  In
+        # particular, do not let ComfyUI's device helper probe current_device
+        # before _initialize_cuda_context performs its authoritative check.
+        try:
+            if not torch.cuda.is_available():
+                return self._mark_gpu_restore_deferred("cuda_unavailable")
+        except Exception as _available_exc:
+            return self._mark_gpu_restore_deferred("cuda_probe_failed", repr(_available_exc))
+
+        try:
+            import comfy.cli_args
+            import comfy.model_management
+            import psutil
+        except Exception as _module_exc:
+            return self._mark_gpu_restore_deferred(
+                "gpu_restore_import_failed", repr(_module_exc)
+            )
+
+        try:
+            # ── V2 restore_memory experiment (deployment-level, default baseline) ──
+            # When the optimized arm is active and a frozen GPU-capacity snapshot
+            # exists, skip the torch.cuda.mem_get_info round trip entirely — the
+            # frozen value is the SAME physical total VRAM of the deployment GPU.
+            from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
+            _frozen_vram = apply_frozen_total_vram_or_none()
+            if _frozen_vram is not None:
+                comfy.model_management.total_vram = _frozen_vram
+                if _opt_diag_enabled():
+                    print(f"[v2.opt.gpu_state] total_memory_ms=frozen:{_frozen_vram:.0f}")
+                _restore_memory_experiment_log_once()
+            else:
+                # ── V2 Python-restore decomposition (measurement-only, gated) ──
+                _opt_t0 = time.monotonic_ns() if _opt_diag_enabled() else None
+                _device = comfy.model_management.get_torch_device()
+                _device_type = getattr(_device, "type", str(_device).split(":", 1)[0])
+                if _device_type != "cuda":
+                    return self._mark_gpu_restore_deferred("non_cuda_device", str(_device))
+                comfy.model_management.total_vram = (
+                    comfy.model_management.get_total_memory(_device)
+                    / (1024 * 1024)
+                )
+                if _opt_t0 is not None:
+                    _opt_total_memory_ms = round(
+                        (time.monotonic_ns() - _opt_t0) / 1_000_000, 3
+                    )
+                    print(f"[v2.opt.gpu_state] total_memory_ms={_opt_total_memory_ms}")
+            comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+        except Exception as _restore_exc:
+            return self._mark_gpu_restore_deferred(
+                "cuda_device_probe_failed", repr(_restore_exc)
+            )
         comfy.cli_args.args.cpu = False
         comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
-        # ── V2 restore_memory experiment (deployment-level, default baseline) ──
-        # When the optimized arm is active and a frozen GPU-capacity snapshot
-        # exists, skip the torch.cuda.mem_get_info round trip entirely — the
-        # frozen value is the SAME physical total VRAM of the deployment GPU
-        # (nvidia-smi memory.total == mem_get_info()[1] on the same GPU).
-        from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
-        _frozen_vram = apply_frozen_total_vram_or_none()
-        if _frozen_vram is not None:
-            comfy.model_management.total_vram = _frozen_vram
-            if _opt_diag_enabled():
-                print(f"[v2.opt.gpu_state] total_memory_ms=frozen:{_frozen_vram:.0f}")
-            _restore_memory_experiment_log_once()
-        else:
-            # ── V2 Python-restore decomposition (measurement-only, gated) ──
-            _opt_t0 = time.monotonic_ns() if _opt_diag_enabled() else None
-            comfy.model_management.total_vram = (
-                comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
-                / (1024 * 1024)
-            )
-            if _opt_t0 is not None:
-                _opt_total_memory_ms = round(
-                    (time.monotonic_ns() - _opt_t0) / 1_000_000, 3
-                )
-                print(f"[v2.opt.gpu_state] total_memory_ms={_opt_total_memory_ms}")
-        comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
         comfy.model_management.DISABLE_SMART_MEMORY = False
         if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
             comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
@@ -19504,7 +19715,9 @@ class _ComfyAPIMixin:
               f"ram={comfy.model_management.total_ram:.0f}MB "
               f"vram_state={comfy.model_management.vram_state} "
               f"in {(_t1-_t0)*1000:.1f}ms")
-
+        self._gpu_restore_deferred = False
+        self._gpu_restore_status = {"status": "ok", "cuda_available": 1}
+        return self._gpu_restore_status
     def _should_reload_models_volume(self) -> bool:
         """Determine whether the models Volume needs a reload.
 
@@ -19531,6 +19744,10 @@ class _ComfyAPIMixin:
         # ── Post-snapshot restored-instance identity ──
         self._restored_instance_id = uuid.uuid4().hex[:16]
         self._restored_instance_start_unix = time.time()
+        # A new restore gets a fresh GPU handoff decision.  A previous
+        # degraded restore must not force a retry after this one succeeds.
+        self._gpu_restore_deferred = False
+        self._gpu_restore_status = {}
 
         # P1 (corrected): reset the UNET boundary barrier events at
         # the start of every restore. A memory snapshot or a
@@ -19615,6 +19832,7 @@ class _ComfyAPIMixin:
         )
 
         is_in_proc = (self._select_backend() == "in_process")
+        _cu_device = None
 
         # E37 controlled restore path.  Keep this branch before *any* volume,
         # generation, custom-node, profile, prompt-cache, preload, or model
@@ -19666,9 +19884,10 @@ class _ComfyAPIMixin:
                 if self._select_backend() == "in_process":
                     if not ENABLE_GPU_SNAPSHOT and not _backend_deferred:
                         _gpu_started_at = time.time()
-                        self._restore_in_process_gpu_state()
+                        _gpu_result = self._restore_in_process_gpu_state() or {}
                         __stages["gpu_state_ms"] = self._profile_ms(_gpu_started_at)
                     else:
+                        _gpu_result = {"status": "ok", "reason": "gpu_snapshot"}
                         __stages["gpu_state_ms"] = 0.0
                         __stages["gpu_state_skip_reason"] = (
                             "backend_initialized_with_gpu" if _backend_deferred
@@ -19676,6 +19895,13 @@ class _ComfyAPIMixin:
                         )
                     _cuda_started_at = time.time()
                     _cu_device, _cu_diag = self._initialize_cuda_context()
+                    if _cu_device is None and _gpu_result.get("status") == "ok":
+                        _gpu_result = self._mark_gpu_restore_deferred(
+                            (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                            (_cu_diag or {}).get("cuda_error", ""),
+                        )
+                    __stages["gpu_restore_status"] = _gpu_result.get("status", "unknown")
+                    __stages["gpu_restore_reason"] = _gpu_result.get("reason", "")
                     __stages["cuda_warmup_ms"] = self._profile_ms(_cuda_started_at)
                     __stages["cuda_context_ready"] = 1 if _cu_device is not None else 0
                     if _cu_diag:
@@ -19703,13 +19929,13 @@ class _ComfyAPIMixin:
                 "restore_method_start_mono_ns": restore_start_ns,
                 "restore_method_end_wall_unix_ns": int(_minimal_restore_end * 1_000_000_000),
                 "restore_method_end_mono_ns": __stages["restore_end_mono_ns"],
-                "restore_method_status": "success",
+                "restore_method_status": "success" if (not is_in_proc or _cu_device is not None) else "degraded",
                 "restore_session_id": __stages["restore_session_id"],
                 "restored_instance_id": self._restored_instance_id,
                 "container_session_id": CONTAINER_SESSION_ID,
                 "snapshot_import_session_id": CONTAINER_SESSION_ID,
                 "restore_count": _container_restore_count,
-                "lifecycle_status": "ok",
+                "lifecycle_status": "ok" if (not is_in_proc or _cu_device is not None) else "degraded",
                 "lifecycle_method": "restore",
                 "warmup_status": "skipped_minimal_restore",
                 "warmup_profile": {},
@@ -19717,6 +19943,8 @@ class _ComfyAPIMixin:
                 "warmup_profile_token": "",
                 **__stages,
             }
+            if is_in_proc and _cu_device is None:
+                self._last_restore_timing["restore_degraded"] = 1
             self._record_critical_path_restore(
                 "restore_minimal_exit",
                 extra={"minimal_restore_effective": 1},
@@ -20321,24 +20549,9 @@ class _ComfyAPIMixin:
                 print(f"[restore.order] event=gpu_state_start "
                       f"gpu_snapshot={'enabled' if ENABLE_GPU_SNAPSHOT else 'cpu_only'} "
                       f"at_ms_from_restore_start={__stages['gpu_state_start_ms_from_restore_start']}")
-                import comfy.model_management
-                import psutil
-                # ── V2 restore_memory experiment (same frozen-VRAM arm as the
-                #    CPU-only restore path).  Frozen value is semantically equal
-                #    to mem_get_info()[1] on the same deployment GPU. ──
-                from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
-                _frozen_vram = apply_frozen_total_vram_or_none()
-                if _frozen_vram is not None:
-                    comfy.model_management.total_vram = _frozen_vram
-                    if _opt_diag_enabled():
-                        print(f"[v2.opt.gpu_state] total_memory_ms=frozen:{_frozen_vram:.0f}")
-                    _restore_memory_experiment_log_once()
-                else:
-                    comfy.model_management.total_vram = (
-                        comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
-                        / (1024 * 1024)
-                    )
-                comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+                _gpu_result = self._refresh_gpu_snapshot_memory()
+                __stages["gpu_restore_status"] = _gpu_result.get("status", "unknown")
+                __stages["gpu_restore_reason"] = _gpu_result.get("reason", "")
                 __stages["gpu_state_ms"] = self._profile_ms(_s)
                 __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["gpu_state_end_ns"] = time.perf_counter_ns()
@@ -20346,12 +20559,29 @@ class _ComfyAPIMixin:
                 _s = time.time()
                 __stages["cuda_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 _cu_device, _cu_diag = self._initialize_cuda_context()
+                if _cu_device is None and _gpu_result.get("status") == "ok":
+                    _gpu_result = self._mark_gpu_restore_deferred(
+                        (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                        (_cu_diag or {}).get("cuda_error", ""),
+                    )
+                    __stages["gpu_restore_status"] = _gpu_result.get("status", "unknown")
+                    __stages["gpu_restore_reason"] = _gpu_result.get("reason", "")
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
                 __stages["cuda_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["cuda_context_end_ns"] = time.perf_counter_ns()
                 if _cu_diag:
                     __stages["cuda_context_sync_ms"] = _cu_diag.get("cuda_context_sync_ms", 0)
                     __stages["cuda_context_total_ms"] = _cu_diag.get("cuda_context_total_ms", 0)
+                if _cu_device is None:
+                    if not getattr(self, "_gpu_restore_deferred", False):
+                        self._mark_gpu_restore_deferred(
+                            (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                            (_cu_diag or {}).get("cuda_error", ""),
+                        )
+                    self._record_degraded_restore(
+                        __stages, restore_start, restore_start_wall_s, restore_start_ns
+                    )
+                    return
                 print(f"[restore.order] event=cuda_context_ready "
                       f"cuda_warmup_ms={__stages.get('cuda_warmup_ms', 0)} "
                       f"at_ms_from_restore_start={__stages['cuda_end_ms_from_restore_start']}")
@@ -20392,7 +20622,9 @@ class _ComfyAPIMixin:
                     print(f"[restore.order] event=gpu_state_start "
                           f"gpu_snapshot={'enabled' if ENABLE_GPU_SNAPSHOT else 'cpu_only'} "
                           f"at_ms_from_restore_start={__stages['gpu_state_start_ms_from_restore_start']}")
-                    self._restore_in_process_gpu_state()
+                    _gpu_result = self._restore_in_process_gpu_state()
+                    __stages["gpu_restore_status"] = (_gpu_result or {}).get("status", "unknown")
+                    __stages["gpu_restore_reason"] = (_gpu_result or {}).get("reason", "")
                     __stages["gpu_state_ms"] = self._profile_ms(_s)
                     __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                     __stages["gpu_state_end_ns"] = time.perf_counter_ns()
@@ -20411,6 +20643,16 @@ class _ComfyAPIMixin:
                 if _cu_diag:
                     __stages["cuda_context_sync_ms"] = _cu_diag.get("cuda_context_sync_ms", 0)
                     __stages["cuda_context_total_ms"] = _cu_diag.get("cuda_context_total_ms", 0)
+                if _cu_device is None:
+                    if not getattr(self, "_gpu_restore_deferred", False):
+                        self._mark_gpu_restore_deferred(
+                            (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                            (_cu_diag or {}).get("cuda_error", ""),
+                        )
+                    self._record_degraded_restore(
+                        __stages, restore_start, restore_start_wall_s, restore_start_ns
+                    )
+                    return
                 print(f"[restore.order] event=cuda_context_ready "
                       f"cuda_warmup_ms={__stages.get('cuda_warmup_ms', 0)} "
                       f"at_ms_from_restore_start={__stages['cuda_end_ms_from_restore_start']}")
@@ -21477,6 +21719,10 @@ class _ComfyAPIMixin:
             "request_modal_entry",
             extra={"method": "run_prompt"},
         )
+        # A restore that could not see CUDA deliberately leaves ComfyUI in
+        # CPU mode.  Retry that handoff before any request-side sync/preflight
+        # can touch model state, and fail closed if the GPU is still absent.
+        self._ensure_gpu_ready_for_request()
 
         _v4_events: list[dict] = []
         _pd_run = _collect_platform_diagnostics(self.__class__.__name__)
@@ -22543,6 +22789,15 @@ class _ComfyAPIMixin:
 
 
         try:
+            try:
+                # The first request after a degraded restore is the safe point
+                # to retry GPU attachment.  Do this before dependency policy,
+                # preload, or any ComfyUI model operation.
+                self._ensure_gpu_ready_for_request()
+            except RuntimeError as _gpu_err:
+                yield {"type": "error", "message": str(_gpu_err)}
+                return
+
             # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
             # Runs before prompt preload, actual_load, and execution.
             # Dependency failures yield a clear fatal stream event.
