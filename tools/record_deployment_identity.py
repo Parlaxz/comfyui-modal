@@ -72,6 +72,16 @@ def _file_lf_sha256(path: str) -> str:
         return ""
 
 
+def _resolve_app_name() -> str:
+    """Resolve the selected target app, retaining the restore-only fallback."""
+    app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+    if app_name:
+        return app_name
+    return os.environ.get(
+        "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME", _DEFAULT_APP_NAME
+    ).strip() or _DEFAULT_APP_NAME
+
+
 def _git_head(repo_root: str) -> str:
     """Best-effort ``git -C <repo_root> rev-parse HEAD`` (guarded, 10s timeout)."""
     if not repo_root:
@@ -164,9 +174,7 @@ def main() -> int:
         os.environ["MODAL_TOKEN_ID"] = workspace["token_id"]
         os.environ["MODAL_TOKEN_SECRET"] = workspace["token_secret"]
 
-        app_name = os.environ.get(
-            "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME", _DEFAULT_APP_NAME
-        ).strip() or _DEFAULT_APP_NAME
+        app_name = _resolve_app_name()
         gpu = os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000").strip() or "rtx-pro-6000"
 
         print(f"[v2.deploy_identity] app={app_name} class={_CLASS_NAME} method={_METHOD_NAME}")

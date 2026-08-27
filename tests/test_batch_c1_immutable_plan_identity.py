@@ -494,5 +494,61 @@ class TestDeployBatIdentityRecordExitPropagation(unittest.TestCase):
         self.assertIn("container_readback", src)
 
 
+class TestDeploymentIdentityAppSelection(unittest.TestCase):
+    """The identity record must target the selected deployment app."""
+
+    def test_selected_app_precedes_restore_only_compatibility_fallback(self):
+        spec = importlib.util.spec_from_file_location(
+            "record_deployment_identity",
+            REPO_ROOT / "tools" / "record_deployment_identity.py",
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+
+        workspace = {"token_id": "test-id", "token_secret": "test-secret"}
+        remote_result = {
+            "deployment_combined_hash": "deployment",
+            "custom_nodes_generation": "generation",
+            "overall_dependency_hash": "overall",
+        }
+        remote_call = mock.AsyncMock(return_value=remote_result)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COMFYMODAL_V2_APP_NAME": "",
+                "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME": "",
+            },
+            clear=False,
+        ), mock.patch.object(tool, "_load_active_workspace", return_value=workspace), mock.patch.object(
+            tool, "_call_deployment_identity", new=remote_call
+        ), mock.patch.object(tool, "_write_state"), mock.patch.object(
+            tool, "_git_head", return_value=""
+        ), mock.patch.object(tool, "_file_lf_sha256", return_value=""), mock.patch.object(
+            tool.sys, "argv", [str(REPO_ROOT / "tools" / "record_deployment_identity.py")]
+        ):
+            os.environ["COMFYMODAL_V2_APP_NAME"] = "stable-modal-comfy-v2-golden-p1"
+            os.environ["COMFYMODAL_V2_RESTORE_ONLY_APP_NAME"] = "restore-only-app"
+            self.assertEqual(tool.main(), 0)
+
+            os.environ.pop("COMFYMODAL_V2_APP_NAME", None)
+            os.environ["COMFYMODAL_V2_RESTORE_ONLY_APP_NAME"] = "legacy-restore-app"
+            self.assertEqual(tool.main(), 0)
+
+            os.environ.pop("COMFYMODAL_V2_APP_NAME", None)
+            os.environ.pop("COMFYMODAL_V2_RESTORE_ONLY_APP_NAME", None)
+            self.assertEqual(tool.main(), 0)
+
+        self.assertEqual(
+            [call.args[1] for call in remote_call.await_args_list],
+            [
+                "stable-modal-comfy-v2-golden-p1",
+                "legacy-restore-app",
+                "stable-modal-comfy-v2-restore-only-shadow",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
