@@ -1140,6 +1140,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         total_memory = 12 * 1024 * 1024 * 1024
         with (
             mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
             mock.patch.object(comfy.model_management, "get_torch_device", return_value="cuda:0") as get_torch_device,
             mock.patch.object(comfy.model_management, "get_total_memory", return_value=total_memory),
             mock.patch("comfymodal_runtime.restore_memory_arm.apply_frozen_total_vram_or_none", return_value=None),
@@ -1597,6 +1598,75 @@ class CudaRestoreCrashLoopTests(unittest.TestCase):
             "comfy.cli_args": cli_args,
             "comfy.model_management": model_management,
         }
+
+    def test_deferred_retry_flips_cpu_state_before_device_lookup(self):
+        """A restored CPU-state helper must not turn a ready CUDA driver into a retry failure."""
+        from comfyapp import _ComfyAPIMixin
+        import comfyapp
+        import torch
+
+        instance = object.__new__(_ComfyAPIMixin)
+        instance._gpu_restore_deferred = True
+        instance._select_backend = mock.Mock(return_value="in_process")
+        modules = self._fake_comfy_modules()
+        model_management = modules["comfy.model_management"]
+        model_management.DISABLE_SMART_MEMORY = True
+        model_management.VRAMState = SimpleNamespace(HIGH_VRAM="high")
+        model_management.vram_state = "cpu"
+        model_management.get_torch_device.side_effect = lambda: (
+            "cuda:0" if model_management.cpu_state == model_management.CPUState.GPU else "cpu"
+        )
+        model_management.get_total_memory = mock.Mock(return_value=12 * 1024 * 1024 * 1024)
+        instance._initialize_cuda_context = mock.Mock(
+            return_value=("cuda:0", {"cuda_available": 1})
+        )
+
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch("comfymodal_runtime.restore_memory_arm.apply_frozen_total_vram_or_none", return_value=None),
+            mock.patch.object(comfyapp, "_opt_diag_enabled", return_value=False),
+            mock.patch("psutil.virtual_memory", return_value=mock.Mock(total=8 * 1024 * 1024 * 1024)),
+        ):
+            instance._ensure_gpu_ready_for_request()
+
+        self.assertFalse(instance._gpu_restore_deferred)
+        self.assertFalse(modules["comfy.cli_args"].args.cpu)
+        self.assertEqual(model_management.cpu_state, model_management.CPUState.GPU)
+        self.assertNotEqual(instance._gpu_restore_status.get("reason"), "non_cuda_device")
+        model_management.get_torch_device.assert_called_once_with()
+
+    def test_gpu_snapshot_refresh_flips_cpu_state_before_device_lookup(self):
+        """GPU-snapshot memory refresh must also repair a restored CPU mode first."""
+        from comfyapp import _ComfyAPIMixin
+        import torch
+
+        instance = object.__new__(_ComfyAPIMixin)
+        modules = self._fake_comfy_modules()
+        model_management = modules["comfy.model_management"]
+        model_management.DISABLE_SMART_MEMORY = True
+        model_management.VRAMState = SimpleNamespace(HIGH_VRAM="high")
+        model_management.vram_state = "cpu"
+        model_management.get_torch_device.side_effect = lambda: (
+            "cuda:0" if model_management.cpu_state == model_management.CPUState.GPU else "cpu"
+        )
+        model_management.get_total_memory = mock.Mock(return_value=12 * 1024 * 1024 * 1024)
+
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch("comfymodal_runtime.restore_memory_arm.apply_frozen_total_vram_or_none", return_value=None),
+            mock.patch("psutil.virtual_memory", return_value=mock.Mock(total=8 * 1024 * 1024 * 1024)),
+        ):
+            result = instance._refresh_gpu_snapshot_memory()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(modules["comfy.cli_args"].args.cpu)
+        self.assertEqual(model_management.cpu_state, model_management.CPUState.GPU)
+        self.assertNotEqual(result.get("reason"), "non_cuda_device")
+        model_management.get_torch_device.assert_called_once_with()
 
     def test_cpu_snapshot_restore_does_not_lookup_device_without_cuda(self):
         from comfyapp import _ComfyAPIMixin

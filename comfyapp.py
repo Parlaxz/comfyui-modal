@@ -19542,8 +19542,18 @@ class _ComfyAPIMixin:
             # Validate the driver/device handoff before ComfyUI's helper.  The
             # latter also calls current_device() on some ComfyUI revisions.
             _device_index = torch.cuda.current_device()
+            import comfy.cli_args
             import comfy.model_management
             import psutil
+            # The snapshot can restore ComfyUI's import-time CPU state even
+            # though the CUDA driver is ready.  Flip that state before asking
+            # model-management for its device; otherwise it reports CPU and
+            # this path falsely defers the restore.
+            comfy.cli_args.args.cpu = False
+            comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
+            comfy.model_management.DISABLE_SMART_MEMORY = False
+            if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+                comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
             _comfy_device = comfy.model_management.get_torch_device()
             _device_type = getattr(_comfy_device, "type", str(_comfy_device).split(":", 1)[0])
             if _device_type != "cuda":
@@ -19655,13 +19665,23 @@ class _ComfyAPIMixin:
         import torch
 
         # A CPU-only restore must remain a no-op for GPU state.  In
-        # particular, do not let ComfyUI's device helper probe current_device
-        # before _initialize_cuda_context performs its authoritative check.
+        # particular, do not let ComfyUI's device helper probe the driver
+        # before the raw CUDA availability and current-device checks below.
         try:
             if not torch.cuda.is_available():
                 return self._mark_gpu_restore_deferred("cuda_unavailable")
         except Exception as _available_exc:
             return self._mark_gpu_restore_deferred("cuda_probe_failed", repr(_available_exc))
+
+        try:
+            # Probe the raw CUDA driver before changing ComfyUI state.  This
+            # preserves the no-device guard while making the ordering explicit
+            # for snapshot restores where model-management still says CPU.
+            _device_index = torch.cuda.current_device()
+        except Exception as _device_exc:
+            return self._mark_gpu_restore_deferred(
+                "cuda_device_probe_failed", repr(_device_exc)
+            )
 
         try:
             import comfy.cli_args
@@ -19673,6 +19693,19 @@ class _ComfyAPIMixin:
             )
 
         try:
+            # Re-enable GPU mode before get_torch_device(): that helper derives
+            # its answer from the restored CPUState on deferred retries.
+            comfy.cli_args.args.cpu = False
+            comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
+            comfy.model_management.DISABLE_SMART_MEMORY = False
+            if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+                comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+
+            _device = comfy.model_management.get_torch_device()
+            _device_type = getattr(_device, "type", str(_device).split(":", 1)[0])
+            if _device_type != "cuda":
+                return self._mark_gpu_restore_deferred("non_cuda_device", str(_device))
+
             # ── V2 restore_memory experiment (deployment-level, default baseline) ──
             # When the optimized arm is active and a frozen GPU-capacity snapshot
             # exists, skip the torch.cuda.mem_get_info round trip entirely — the
@@ -19687,10 +19720,6 @@ class _ComfyAPIMixin:
             else:
                 # ── V2 Python-restore decomposition (measurement-only, gated) ──
                 _opt_t0 = time.monotonic_ns() if _opt_diag_enabled() else None
-                _device = comfy.model_management.get_torch_device()
-                _device_type = getattr(_device, "type", str(_device).split(":", 1)[0])
-                if _device_type != "cuda":
-                    return self._mark_gpu_restore_deferred("non_cuda_device", str(_device))
                 comfy.model_management.total_vram = (
                     comfy.model_management.get_total_memory(_device)
                     / (1024 * 1024)
@@ -19705,11 +19734,6 @@ class _ComfyAPIMixin:
             return self._mark_gpu_restore_deferred(
                 "cuda_device_probe_failed", repr(_restore_exc)
             )
-        comfy.cli_args.args.cpu = False
-        comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
-        comfy.model_management.DISABLE_SMART_MEMORY = False
-        if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
-            comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
         _t1 = time.time()
         print(f"[comfyapp] gpu_state restored vram={comfy.model_management.total_vram:.0f}MB "
               f"ram={comfy.model_management.total_ram:.0f}MB "
