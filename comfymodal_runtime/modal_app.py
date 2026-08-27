@@ -20485,6 +20485,20 @@ class ModalRuntimeEntrypoint:
                 }
                 return
 
+            # Golden bypasses the normal ComfyUI request entrypoints, so it
+            # must perform the deferred GPU reattachment check itself.  Use
+            # only the API restored for this runtime; silently loading another
+            # API here could execute against an unprepared CPU-mode runtime.
+            legacy_api = getattr(self, "_legacy_api", None)
+            if legacy_api is None:
+                raise RuntimeError("golden_legacy_api_unavailable")
+            ensure_gpu_ready = getattr(
+                legacy_api, "_ensure_gpu_ready_for_request", None
+            )
+            if not callable(ensure_gpu_ready):
+                raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
+            ensure_gpu_ready()
+
             # ── Golden DynamicVRAM activation seam (official-equivalent) ──
             # Exactly one call per request; the callee is idempotent per
             # process (a repeat returns already_activated=True).  When the

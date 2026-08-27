@@ -2968,6 +2968,11 @@ class _GoldenSerialStreamHarness:
             "restore_method_end_mono_ns": 200,
             "restore_method_status": "success",
         }
+        # Golden now performs request-entry GPU readiness through the already
+        # restored legacy API before activation or execution.
+        entrypoint._legacy_api = SimpleNamespace(
+            _ensure_gpu_ready_for_request=lambda: None,
+        )
         return entrypoint
 
     def _inject_volume(self, volume):
@@ -3406,8 +3411,89 @@ class TestGoldenSerialStreamActivation(_GoldenSerialStreamHarness, unittest.Test
         errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
         return results, errors
 
-    # ── Gate unset ────────────────────────────────────────────────────────
+    def test_gpu_readiness_precedes_activation_and_execution(self):
+        """Golden's direct adapter entry must restore GPU state first."""
+        order = []
+        entrypoint = self._entrypoint()
+        entrypoint._legacy_api = SimpleNamespace(
+            _ensure_gpu_ready_for_request=lambda: order.append("readiness"),
+        )
+        self._inject_volume(_TrackingVolume())
+        self._gate_env(present=True)
 
+        activation_calls = []
+        real_activate = self._make_fake_activate(
+            activation_calls,
+            result=_ACTIVATION_OK_DICT,
+        )
+
+        def _activate(*args, **kwargs):
+            order.append("activation")
+            return real_activate(*args, **kwargs)
+
+        self._patch_activation(_activate)
+        delegate_calls = []
+        real_execute = self._make_fake_execute(delegate_calls)
+
+        async def _execute(request, **kwargs):
+            order.append("execution")
+            return await real_execute(request, **kwargs)
+
+        self._patch_golden_execute(_execute)
+
+        async def _run():
+            events = []
+            async for event in entrypoint.run_golden_serial_stream({
+                "request_id": "req-golden-readiness-order",
+                "prompt": {"1": {"class_type": "KSampler"}},
+            }):
+                events.append(event)
+            return events
+
+        events = asyncio.run(_run())
+        results, errors = self._terminal(events)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(order, ["readiness", "activation", "execution"])
+        self.assertEqual(len(activation_calls), 1)
+        self.assertEqual(len(delegate_calls), 1)
+
+    def test_unavailable_cuda_yields_one_explicit_error_before_activation(self):
+        """A failed readiness check must fail closed with one error event."""
+        entrypoint = self._entrypoint()
+
+        def _raise_cuda_unavailable():
+            raise RuntimeError("CUDA unavailable after snapshot restore")
+
+        entrypoint._legacy_api = SimpleNamespace(
+            _ensure_gpu_ready_for_request=_raise_cuda_unavailable,
+        )
+        self._inject_volume(_TrackingVolume())
+        self._gate_env(present=True)
+        activation_calls = []
+        delegate_calls = []
+        self._patch_activation(self._make_fake_activate(activation_calls))
+        self._patch_golden_execute(self._make_fake_execute(delegate_calls))
+
+        async def _run():
+            events = []
+            async for event in entrypoint.run_golden_serial_stream({
+                "request_id": "req-golden-cuda-unavailable",
+                "prompt": {"1": {"class_type": "KSampler"}},
+            }):
+                events.append(event)
+            return events
+
+        events = asyncio.run(_run())
+        results, errors = self._terminal(events)
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1, f"expected one error event: {events}")
+        self.assertIn("CUDA unavailable", str(errors[0].get("message", "")))
+        self.assertEqual(activation_calls, [])
+        self.assertEqual(delegate_calls, [])
+
+    # ── Gate unset ────────────────────────────────────────────────────────
+    
     def test_gate_unset_yields_one_bounded_gate_required_error_no_delegation(self):
         """Gate unset fails closed before Golden delegation or model I/O."""
         calls = []
