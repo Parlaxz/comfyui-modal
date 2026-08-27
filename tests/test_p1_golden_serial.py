@@ -1435,6 +1435,7 @@ def test_request_setup_validates_workflow_hash_not_output_sha(monkeypatch):
     workflow_sha = gs.canonical_workflow_sha256(prompt)
     assert workflow_sha != EXPECTED_OUTPUT_SHA256
     contract = dataclasses.replace(gs.GoldenWorkflowContract(), workflow_sha256=workflow_sha)
+    monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", raising=False)
     monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
     node_map = asyncio.run(gs.golden_request_setup(_setup_session(prompt, contract)))
     assert node_map.clip_loader_id == "1"
@@ -1453,17 +1454,18 @@ def test_request_setup_fails_closed_on_workflow_hash_mismatch(monkeypatch, env_v
         asyncio.run(gs.golden_request_setup(_setup_session(_canonical_prompt(), contract)))
 
 
-def test_request_setup_explicitly_bypasses_workflow_hash_equality_guard(monkeypatch):
+@pytest.mark.parametrize("env_value", ["0", "false"], ids=["zero", "false"])
+def test_request_setup_rejects_disabled_workflow_hash_check(monkeypatch, env_value):
     monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
-    monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "0")
+    monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", env_value)
     prompt = _canonical_prompt()
     actual_sha = gs.canonical_workflow_sha256(prompt)
     contract = dataclasses.replace(gs.GoldenWorkflowContract(), workflow_sha256="0" * 64)
     session = _setup_session(prompt, contract)
 
-    node_map = asyncio.run(gs.golden_request_setup(session))
+    with pytest.raises(RuntimeError, match="workflow_hash_check_disabled"):
+        asyncio.run(gs.golden_request_setup(session))
 
-    assert node_map.clip_loader_id == "1"
     hash_event = next(
         event for event in session.recorder.events
         if event["name"] == "golden_workflow_hash_check"
@@ -1475,8 +1477,7 @@ def test_request_setup_explicitly_bypasses_workflow_hash_equality_guard(monkeypa
         "bypassed": True,
     }
     details = session.recorder.intervals["golden_request_setup"].details
-    assert details["actual_workflow_sha256"] == actual_sha
-    assert details["workflow_hash_check_bypassed"] is True
+    assert details["error"].startswith("RuntimeError: workflow_hash_check_disabled")
 
 
 # ── 10. VAE load/decode stage boundaries ───────────────────────────────────

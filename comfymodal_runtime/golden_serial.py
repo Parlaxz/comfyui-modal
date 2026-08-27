@@ -2247,7 +2247,11 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             enabled=workflow_hash_check_enabled,
             bypassed=not workflow_hash_check_enabled,
         )
-        if workflow_hash_check_enabled and actual_sha != contract.workflow_sha256:
+        if not workflow_hash_check_enabled:
+            raise RuntimeError(
+                "workflow_hash_check_disabled:Golden workflow hash verification is required"
+            )
+        if actual_sha != contract.workflow_sha256:
             raise RuntimeError(f"workflow_sha_mismatch:{actual_sha}!={contract.workflow_sha256}")
         node_map = resolve_golden_node_map(session.request.prompt, contract=contract)
         session.node_map = node_map

@@ -16,6 +16,7 @@ import asyncio
 import concurrent.futures
 import copy
 import json
+import math
 import os
 import re
 import sys
@@ -2205,10 +2206,26 @@ def _identity(result: dict[str, Any]) -> dict[str, Any]:
                 # run after identity extraction.
                 "restore_count": metadata.get("restore_count"),
                 "request_count": metadata.get("request_count"),
+                "post_restore_nonce": metadata.get("post_restore_nonce", ""),
                 "restored_instance_id": metadata.get("restored_instance_id", ""),
                 "restore_session_id": metadata.get("restore_session_id", ""),
                 "container_task_id": metadata.get("container_task_id", ""),
+                "modal_task_id": metadata.get("modal_task_id", ""),
                 "modal_container_id": metadata.get("modal_container_id", ""),
+                "container_id": metadata.get("container_id", ""),
+                "pid": metadata.get("pid"),
+                "process_id": metadata.get("process_id"),
+                "boot_id": metadata.get("boot_id"),
+                "min_containers": metadata.get("min_containers"),
+                "single_use_containers": metadata.get("single_use_containers"),
+                "single_use_enabled": metadata.get("single_use_enabled"),
+                "deployment_identity": metadata.get("deployment_identity", ""),
+                "deployment_combined_hash": metadata.get("deployment_combined_hash", ""),
+                "deployment_fingerprint": metadata.get("deployment_fingerprint", ""),
+                "snapshot_identity": metadata.get("snapshot_identity", ""),
+                "snapshot_target_fingerprint": metadata.get("snapshot_target_fingerprint", ""),
+                "config_identity": metadata.get("config_identity", ""),
+                "profile_config_fingerprint": metadata.get("profile_config_fingerprint", ""),
                 "image_id": metadata.get("image_id", ""),
                 "cloud": metadata.get("cloud", ""),
                 "region": metadata.get("region", ""),
@@ -5292,22 +5309,35 @@ def _check_acceptance(
     # ── Identity checks ──
     identity = result.get("identity", {})
     restored_instance_id = str(identity.get("restored_instance_id", ""))
-    restore_count = int(identity.get("restore_count", -1))
-    request_count = int(identity.get("request_count", -1))
+    def _observed_count(key: str) -> int:
+        raw = identity.get(key)
+        if isinstance(raw, bool):
+            return -1
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return -1
+
+    restore_count = _observed_count("restore_count")
+    request_count = _observed_count("request_count")
+    # Keep the legacy diagnostic spelling for callers that parse failure text;
+    # the separate -1 sentinel still makes missing evidence fail closed.
+    restore_count_text = 0 if restore_count < 0 else restore_count
+    request_count_text = 0 if request_count < 0 else request_count
 
     if not restored_instance_id:
         failures.append(f"{run_label}: restored_instance_id is empty/absent")
     if expected_restore_count is not None and restore_count != expected_restore_count:
         failures.append(
-            f"{run_label}: restore_count={restore_count}, expected={expected_restore_count}"
+            f"{run_label}: restore_count={restore_count_text}, expected={expected_restore_count}"
         )
     if expected_request_count is not None and request_count != expected_request_count:
         failures.append(
-            f"{run_label}: request_count={request_count}, expected={expected_request_count}"
+            f"{run_label}: request_count={request_count_text}, expected={expected_request_count}"
         )
     if expected_request_count_min is not None and request_count < expected_request_count_min:
         failures.append(
-            f"{run_label}: request_count={request_count} < min={expected_request_count_min}"
+            f"{run_label}: request_count={request_count_text} < min={expected_request_count_min}"
         )
     if expected_instance_id and restored_instance_id != expected_instance_id:
         failures.append(
@@ -5648,55 +5678,97 @@ def _trace_events_for_request(result: dict[str, Any], request_id: str) -> list[d
 
 
 def _extract_identity_from_trace(result: dict[str, Any], request_id: str) -> dict[str, Any]:
-    """Extract identity fields from the LAST ``remote_method_entry`` matching
-    ``request_id`` (these DO carry per-event request_id).
+    """Project authoritative request/lifecycle/result identity evidence.
 
-    Reads ``restored_instance_id``, ``restore_count``, ``request_count``.
-    Missing/absent values are reported as empty/0 — checks will fail on absence.
+    Request metadata is preferred over stale lifecycle metadata, while an
+    explicit terminal ``identity``/``golden_identity`` document is allowed to
+    fill (or correct) the request projection.  Counts intentionally remain
+    ``None`` when absent; zero is a real observed count, not a missing-value
+    sentinel.
     """
     trace = result.get("trace", {})
     events = trace.get("events", []) if isinstance(trace, dict) else []
     if not isinstance(events, list):
         events = []
-    instance_id = ""
-    restore_count = 0
-    request_count = 0
-    runtime_fields: dict[str, Any] = {}
-    # Find the LAST matching remote_method_entry (most recent before return)
+    projected: dict[str, Any] = {}
+
+    def merge(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        for key, value in source.items():
+            if value is not None and value != "":
+                projected[str(key)] = value
+
+    # Trace-level metadata is the weakest source, but is useful for older
+    # traces that lack a dedicated lifecycle event.
+    merge(trace.get("metadata") if isinstance(trace, dict) else None)
+
+    # Restore/lifecycle identity is retained for correlation.  Do not use an
+    # arbitrary event's request fields: only the matching request boundary is
+    # authoritative for request_count and request_id.
+    lifecycle_names = {"post_restore_identity", "restore_method_entry"}
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        if ev.get("name") != "remote_method_entry":
+        name = str(ev.get("name", ""))
+        meta = ev.get("metadata")
+        if name in lifecycle_names or (
+            name == "remote_method_entry"
+            and isinstance(meta, dict)
+            and str(meta.get("method_name", "")) == "restore"
+        ):
+            merge(meta)
+
+    # Last matching request boundary wins, matching the stream slicing rule.
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("name") != "remote_method_entry":
             continue
         meta = ev.get("metadata", {})
-        if isinstance(meta, dict) and meta.get("request_id") == request_id:
-            instance_id = str(meta.get("restored_instance_id", "")) or instance_id
-            rc = meta.get("restore_count", 0)
-            if isinstance(rc, (int, float)):
-                restore_count = int(rc)
-            rqc = meta.get("request_count", 0)
-            if isinstance(rqc, (int, float)):
-                request_count = int(rqc)
-            for field in (
-                "app_name",
-                "class_name",
-                "cpu",
-                "memory_mb",
-                "fingerprint",
-                "runtime_shape",
-                "runtime_shape_fingerprint",
-                "runtime_shape_label",
-                "stored_snapshot_model_order",
-            ):
-                if field in meta:
-                    runtime_fields[field] = meta[field]
-    return {
-        "restored_instance_id": instance_id,
-        "restore_count": restore_count,
-        "request_count": request_count,
-        "request_id": request_id,
-        **runtime_fields,
-    }
+        if isinstance(meta, dict) and str(meta.get("request_id", "")) == str(request_id):
+            merge(meta)
+
+    # Direct result identity is the terminal authority for Golden.  Support
+    # both raw remote results and the {type: result, data: ...} stream shape.
+    candidates: list[Any] = [result]
+    data = result.get("data") if isinstance(result, dict) else None
+    if isinstance(data, dict):
+        candidates.append(data)
+    nested_result = result.get("result") if isinstance(result, dict) else None
+    if isinstance(nested_result, dict):
+        candidates.append(nested_result)
+        nested_data = nested_result.get("data")
+        if isinstance(nested_data, dict):
+            candidates.append(nested_data)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        merge(candidate.get("identity"))
+        merge(candidate.get("golden_identity"))
+        merge(candidate.get("request_identity"))
+
+    for key in (
+        "restore_count", "request_count",
+    ):
+        raw = projected.get(key)
+        if raw is None:
+            projected[key] = None
+        elif isinstance(raw, bool):
+            projected[key] = None
+        else:
+            try:
+                projected[key] = int(raw)
+            except (TypeError, ValueError):
+                projected[key] = None
+    for key in (
+        "restored_instance_id", "restore_session_id", "post_restore_nonce",
+        "container_task_id", "modal_task_id", "modal_container_id",
+        "container_id", "container_session_id", "boot_id", "deployment_identity",
+        "deployment_combined_hash", "snapshot_identity", "snapshot_target_fingerprint",
+        "config_identity", "profile_config_fingerprint",
+    ):
+        projected.setdefault(key, "")
+    projected["request_id"] = str(request_id or projected.get("request_id", ""))
+    return projected
 
 
 def _extract_acceptance_timing_scoped(
@@ -10440,7 +10512,9 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
                 "golden_flags_observed",
             } and isinstance(value, dict):
                 scan["flags"].append((idx, path, value))
-            elif key == "identity" and isinstance(value, dict):
+            elif key in {
+                "identity", "golden_identity", "request_identity", "lifecycle_identity",
+            } and isinstance(value, dict):
                 scan["identities"].append((idx, value))
             elif key in {"output_sha", "content_sha256", "sha256", "image_sha256"} and isinstance(value, str) and value.strip():
                 scan["output_shas"].append((idx, path, value.strip()))
@@ -10757,30 +10831,95 @@ def _golden_p1_cold_evidence(identity: dict[str, Any]) -> dict[str, Any]:
             return None
 
     token_keys = (
-        "container_task_id", "modal_container_id",
-        "container_session_id", "restored_instance_id",
+        "container_task_id", "modal_task_id", "modal_container_id",
+        "container_id", "container_session_id", "restored_instance_id",
+        "restore_session_id", "post_restore_nonce", "pid", "boot_id",
     )
     tokens = {k: str(identity.get(k) or "").strip() for k in token_keys}
-    has_token = any(tokens.values())
+    has_token = bool(tokens["restored_instance_id"] and tokens["post_restore_nonce"])
     restore_count = _int("restore_count")
     request_count = _int("request_count")
-    true_cold = bool(has_token and restore_count == 1 and request_count == 1)
+    min_containers = _int("min_containers")
+    single_use_raw = identity.get(
+        "single_use_containers", identity.get("single_use_enabled")
+    )
+    single_use = (
+        single_use_raw is True
+        or str(single_use_raw or "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    frozen = {
+        "deployment": str(
+            identity.get("deployment_identity")
+            or identity.get("deployment_combined_hash")
+            or identity.get("deploy_fingerprint")
+            or identity.get("deployment_fingerprint")
+            or ""
+        ).strip(),
+        "snapshot": str(
+            identity.get("snapshot_identity")
+            or identity.get("snapshot_target_fingerprint")
+            or identity.get("snapshot_fingerprint")
+            or ""
+        ).strip(),
+        "config": str(
+            identity.get("config_identity")
+            or identity.get("config_fingerprint")
+            or identity.get("profile_config_fingerprint")
+            or identity.get("runtime_shape_fingerprint")
+            or ""
+        ).strip(),
+    }
+    requirements = {
+        "restore_count_is_one": restore_count == 1,
+        "request_count_is_one": request_count == 1,
+        "post_restore_nonce_present": bool(tokens["post_restore_nonce"]),
+        "restored_instance_id_present": bool(tokens["restored_instance_id"]),
+        "min_containers_is_zero": min_containers == 0,
+        "single_use_containers_enabled": single_use,
+        "frozen_deployment_identity_present": bool(frozen["deployment"]),
+        "frozen_snapshot_identity_present": bool(frozen["snapshot"]),
+        "frozen_config_identity_present": bool(frozen["config"]),
+    }
+    true_cold = bool(has_token and all(requirements.values()))
+    missing = [name for name, passed in requirements.items() if not passed]
     return {
         "identity_tokens": tokens,
         "identity_tokens_present": has_token,
         "restore_count": restore_count,
         "request_count": request_count,
+        "min_containers": min_containers,
+        "single_use_containers": single_use if single_use_raw is not None else None,
+        "frozen_identities": frozen,
+        "requirements": requirements,
+        "missing_requirements": missing,
         "true_cold": true_cold,
         "basis": (
-            "container/task token present AND restore_count==1 AND request_count==1"
+            "restore_count==1 AND request_count==1 AND post_restore_nonce present "
+            "AND min_containers==0 AND single_use_containers enabled "
+            "AND frozen deployment/snapshot/config identities present"
             if true_cold
             else ""
         ),
         "reason_not_cold": (
-            "" if true_cold
-            else "insufficient remote/container identity evidence; never inferred"
+            "" if true_cold else "missing explicit cold evidence: " + ", ".join(missing)
         ),
     }
+
+
+def _golden_p1_duplicate_identity_fields(
+    identity: Mapping[str, Any],
+    seen_nonces: set[str],
+    seen_instances: set[str],
+) -> list[str]:
+    """Return independently duplicated exposed identity fields."""
+    nonce = str(identity.get("post_restore_nonce") or "").strip()
+    instance_id = str(identity.get("restored_instance_id") or "").strip()
+    duplicates: list[str] = []
+    if nonce and nonce in seen_nonces:
+        duplicates.append("post_restore_nonce")
+    if instance_id and instance_id in seen_instances:
+        duplicates.append("restored_instance_id")
+    return duplicates
 
 
 def _golden_p1_file_hashes(directory: Path) -> dict[str, str]:
@@ -10814,6 +10953,13 @@ async def _run_golden_p1(
     event JSON + telemetry JSON plus summary.json/manifest.json under the
     cohort directory.  Raises when fewer than *run_count* attempts validate.
     """
+    if (
+        isinstance(gap_seconds, bool)
+        or not isinstance(gap_seconds, (int, float))
+        or not math.isfinite(float(gap_seconds))
+        or gap_seconds <= 0
+    ):
+        raise ValueError("golden-p1 gap_seconds must be greater than zero")
     os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
     os.environ["COMFYMODAL_V2_GPU"] = gpu
@@ -10859,9 +11005,15 @@ async def _run_golden_p1(
 
     handle = await asyncio.to_thread(transport._v2_handle, workspace=workspace, gpu=gpu)
     records: list[dict[str, Any]] = []
-    prev_identity_key: tuple[str, ...] = ()
+    gaps: list[dict[str, Any]] = []
+    pending_gap: dict[str, Any] | None = None
+    seen_nonces: set[str] = set()
+    seen_instances: set[str] = set()
 
     for index in range(run_count):
+        # The gap is awaited before constructing the next dispatch payload, so
+        # dispatch timestamps cannot accidentally include an un-awaited sleep.
+        gap_before = pending_gap
         req_id = f"golden-p1-{index}-{uuid.uuid4().hex[:12]}"
         dispatch_unix_ms = int(time.time() * 1000)
         artifact: dict[str, Any] = {
@@ -10887,6 +11039,7 @@ async def _run_golden_p1(
             "dnf": False,
             "error": None,
             "golden_telemetry": None,
+            "gap_before": gap_before,
         }
         attempt_start_ns = time.perf_counter_ns()
         try:
@@ -10918,23 +11071,55 @@ async def _run_golden_p1(
             )
             artifact["validation"] = details
             artifact["failures"] = failures
-            identity: dict[str, Any] = {}
-            for _i, ident in scan["identities"]:
-                identity = ident
+            terminal_event = next(
+                (
+                    event for event in reversed(events)
+                    if isinstance(event, dict)
+                    and str(event.get("type", "")).lower() in {"result", "terminal_result"}
+                ),
+                None,
+            )
+            identity = _extract_identity_from_trace(
+                {"type": "result", "data": terminal_event.get("data", {})}
+                if terminal_event is not None
+                else {},
+                req_id,
+            )
+            if not any(identity.get(key) for key in (
+                "restored_instance_id", "post_restore_nonce", "restore_count", "request_count",
+            )):
+                for _i, ident in scan["identities"]:
+                    identity.update(ident)
             artifact["identity"] = identity
             cold = _golden_p1_cold_evidence(identity)
-            cur_key = tuple(
-                v for v in cold["identity_tokens"].values() if v
+            nonce = cold["identity_tokens"].get("post_restore_nonce", "")
+            instance_id = cold["identity_tokens"].get("restored_instance_id", "")
+            duplicate_fields = _golden_p1_duplicate_identity_fields(
+                identity, seen_nonces, seen_instances,
             )
-            if cold["true_cold"] and prev_identity_key and cur_key == prev_identity_key:
+            if duplicate_fields:
                 cold["true_cold"] = False
                 cold["reason_not_cold"] = (
-                    "container/task identity identical to previous attempt; not fresh"
+                    "duplicate identity across attempts: " + ", ".join(duplicate_fields)
                 )
-            prev_identity_key = cur_key
+                failures.append(cold["reason_not_cold"])
+                valid = False
+            if nonce:
+                seen_nonces.add(nonce)
+            if instance_id:
+                seen_instances.add(instance_id)
+            if gap_before is not None and not gap_before["met"]:
+                failures.append(
+                    f"inter-run gap {gap_before['actual_seconds']:.6f}s < "
+                    f"requested {gap_before['requested_seconds']:.6f}s"
+                )
+                valid = False
             artifact["cold_evidence"] = cold
             artifact["true_cold"] = cold["true_cold"]
-            artifact["valid"] = valid
+            artifact["valid"] = bool(valid and cold["true_cold"])
+            if not cold["true_cold"] and cold["reason_not_cold"] not in failures:
+                failures.append(cold["reason_not_cold"])
+            artifact["failures"] = failures
         except Exception as exc:  # noqa: BLE001 - DNF attempts never count
             artifact["dnf"] = True
             artifact["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
@@ -10963,7 +11148,34 @@ async def _run_golden_p1(
             )
         if index + 1 < run_count:
             print(f"[v2.golden_p1] phase=gap seconds={gap_seconds}", flush=True)
-            await asyncio.sleep(gap_seconds)
+            gap_start_ns = time.perf_counter_ns()
+            gap_start_wall_ns = time.time_ns()
+            gap_start_iso = datetime.now(timezone.utc).isoformat()
+            try:
+                await asyncio.sleep(gap_seconds)
+            finally:
+                gap_end_ns = time.perf_counter_ns()
+                gap_end_wall_ns = time.time_ns()
+            actual_seconds = (gap_end_ns - gap_start_ns) / 1_000_000_000
+            pending_gap = {
+                "requested_seconds": float(gap_seconds),
+                "actual_seconds": actual_seconds,
+                "actual_gap_seconds": actual_seconds,
+                "start_iso": gap_start_iso,
+                "end_iso": datetime.fromtimestamp(
+                    gap_end_wall_ns / 1_000_000_000, tz=timezone.utc
+                ).isoformat(),
+                "gap_start": gap_start_iso,
+                "gap_end": datetime.fromtimestamp(
+                    gap_end_wall_ns / 1_000_000_000, tz=timezone.utc
+                ).isoformat(),
+                "start_wall_unix_ns": gap_start_wall_ns,
+                "end_wall_unix_ns": gap_end_wall_ns,
+                "duration_seconds": actual_seconds,
+                "gap_duration_seconds": actual_seconds,
+                "met": actual_seconds >= float(gap_seconds),
+            }
+            gaps.append(pending_gap)
 
     completed_iso = datetime.now(timezone.utc).isoformat()
     valid_records = [r for r in records if r["valid"]]
@@ -10986,6 +11198,11 @@ async def _run_golden_p1(
         "invalid_count": len(records) - len(valid_records),
         "dnf_count": sum(1 for r in records if r["dnf"]),
         "gap_seconds": gap_seconds,
+        "gaps": gaps,
+        "gap_validation": {
+            "requested_seconds": float(gap_seconds),
+            "all_met": all(gap["met"] for gap in gaps),
+        },
         "strict_serial": True,
         "started_utc": started_iso,
         "completed_utc": completed_iso,
@@ -11005,6 +11222,7 @@ async def _run_golden_p1(
             "identity": r["identity"],
             "cold_evidence": r["cold_evidence"],
             "golden_telemetry": r.get("golden_telemetry"),
+            "gap_before": r.get("gap_before"),
         } for r in records],
     }
     (cohort_dir / "summary.json").write_text(

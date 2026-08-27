@@ -95,8 +95,8 @@ class TestIdentityExtraction(unittest.TestCase):
         result = _make_result_with_events(events)
         identity = _extract_identity_from_trace(result, "req1")
         self.assertEqual(identity["restored_instance_id"], "")
-        self.assertEqual(identity["restore_count"], 0)
-        self.assertEqual(identity["request_count"], 0)
+        self.assertIsNone(identity["restore_count"])
+        self.assertIsNone(identity["request_count"])
 
 
 # ═════════════════════════════════════════════════════════════════════════

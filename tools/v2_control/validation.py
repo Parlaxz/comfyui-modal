@@ -38,6 +38,11 @@ from typing import Any, Protocol
 from .backend import detect_crash_loop
 from .errors import GateError
 
+try:  # Keep direct-script/package imports usable in both test and CLI paths.
+    from tools.golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+except ImportError:  # pragma: no cover - package-relative fallback
+    from ..golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+
 LOG = logging.getLogger("v2ctl.validation")
 
 _GATE_SCHEMA_VERSION = 1
@@ -499,6 +504,27 @@ class GoldenCohortValidator(ValidatorPlugin):
                 "Golden backend invocation did not complete successfully"
                 f" (exit code {record.backend_exit_code if record.backend_exit_code is not None else 'unknown'})"
             )
+
+        # New Golden writers may carry an explicit workflow contract.  It is
+        # mandatory once present, but old P2 artifacts remain readable because
+        # they have no contract metadata at all.
+        contract_sources = [manifest, attempt]
+        metadata_keys = ("workflow_contract", "workflow_identity", "provenance", "workflow",
+                         "identity", "golden_telemetry", "metadata")
+        for artifact in (manifest, attempt):
+            for key in metadata_keys:
+                nested = artifact.get(key)
+                if isinstance(nested, dict):
+                    contract_sources.append(nested)
+                    for child_key in metadata_keys:
+                        child = nested.get(child_key)
+                        if isinstance(child, dict):
+                            contract_sources.append(child)
+        contract_markers = WORKFLOW_CONTRACT_MARKERS
+        for contract in contract_sources:
+            if any(key in contract for key in contract_markers):
+                failures.extend(workflow_contract_failures(contract))
+                break
         if Path(manifest_path).resolve().parent != Path(attempt_path).resolve().parent:
             failures.append("Golden manifest and attempt artifacts are from different cohorts")
 

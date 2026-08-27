@@ -85,7 +85,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
         "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
         "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
         FLAG: "1",
-        HASH_CHECK_FLAG: "0",
+        HASH_CHECK_FLAG: "1",
     }
     effective = {}
     for name in expected:

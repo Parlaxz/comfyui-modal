@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = "golden_observability_p2_v1"
+IDENTITY_MATRIX_SCHEMA_VERSION = "golden_identity_matrix_v1"
 # P1 persisted this order.  It is an input compatibility contract, not the
 # order in which a new report is allowed to display or interpret stages.
 STAGE_ORDER = (
@@ -69,6 +70,44 @@ PRIMARY_FUNCTION_LABELS = {
     "golden_teardown": "golden_teardown()",
 }
 GANTT_BLOCK = "\u2588"
+
+# These are deliberately different hash domains.  In particular, a prompt
+# hash is not proof of the bytes loaded from disk, and the source/compiled
+# hashes are not interchangeable with the workflow accepted by the runner.
+WORKFLOW_IDENTITY_FIELDS = (
+    "workflow_file_bytes_sha256",
+    "parsed_workflow_json_sha256",
+    "source_workflow_sha256",
+    "compiled_workflow_sha256",
+    "request_prompt_sha256",
+    "normalized_golden_request_sha256",
+    "actual_executed_workflow_sha256",
+    "expected_contract_workflow_sha256",
+)
+LEGACY_WORKFLOW_ALIASES = {
+    "workflow_hash": "source_workflow_sha256",
+    "workflow_sha256": "source_workflow_sha256",
+    "workflow_hash_sha256": "source_workflow_sha256",
+    "source_workflow_hash": "source_workflow_sha256",
+    "parsed_workflow_hash": "parsed_workflow_json_sha256",
+    "prompt_sha256": "request_prompt_sha256",
+    "request_hash": "request_prompt_sha256",
+    "expected_workflow_sha256": "expected_contract_workflow_sha256",
+    "expected_workflow_hash": "expected_contract_workflow_sha256",
+    "actual_workflow_sha256": "actual_executed_workflow_sha256",
+    "actual_workflow_hash": "actual_executed_workflow_sha256",
+    "executed_workflow_sha256": "actual_executed_workflow_sha256",
+    "compiled_workflow_hash": "compiled_workflow_sha256",
+    "expected_contract_workflow_hash": "expected_contract_workflow_sha256",
+}
+WORKFLOW_CONTRACT_FIELDS = (
+    "enabled", "bypassed", "actual_executed_workflow_sha256",
+    "expected_contract_workflow_sha256",
+)
+WORKFLOW_CONTRACT_MARKERS = set(WORKFLOW_CONTRACT_FIELDS) | {
+    alias for alias, target in LEGACY_WORKFLOW_ALIASES.items()
+    if target in {"actual_executed_workflow_sha256", "expected_contract_workflow_sha256"}
+}
 
 CANONICAL_CLIP_NAME = "qwen_3_4b.safetensors"
 CANONICAL_UNET_NAME = "z_image_turbo_bf16.safetensors"
@@ -155,6 +194,216 @@ def _zero(value: Any) -> bool:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Return the one JSON byte representation used by request hash domains."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_json(value: Any) -> str:
+    """Text form of the shared canonical JSON representation."""
+    return canonical_json_bytes(value).decode("utf-8")
+
+
+def canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+canonicalize_json = canonical_json_bytes
+
+
+def workflow_file_bytes_sha256(value: bytes | bytearray | memoryview | str | os.PathLike[str]) -> str:
+    return hashlib.sha256(_read_workflow_bytes(value)).hexdigest()
+
+
+def parsed_workflow_json_sha256(value: Any) -> str:
+    return canonical_json_sha256(value)
+
+
+def request_prompt_sha256(value: Any) -> str:
+    return canonical_json_sha256(value)
+
+
+def normalized_golden_request_sha256(value: Any) -> str:
+    return canonical_json_sha256(value)
+
+
+def _hash_domain_value(value: Any) -> str:
+    """Accept a supplied digest, or hash raw structured input without guessing."""
+    if value in (None, ""):
+        return ""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return hashlib.sha256(bytes(value)).hexdigest()
+    if isinstance(value, Mapping) or isinstance(value, (list, tuple)):
+        return canonical_json_sha256(value)
+    return str(value).strip()
+
+
+def _read_workflow_bytes(value: Any) -> bytes:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, Path) or (isinstance(value, str) and Path(value).is_file()):
+        return Path(value).read_bytes()
+    raise TypeError("workflow_file_bytes must be bytes or an existing path")
+
+
+def _identity_sources(value: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Collect explicit metadata containers, without walking arbitrary data."""
+    sources = [value]
+    for key in ("identity", "workflow_identity", "workflow_contract", "provenance",
+                "workflow", "golden_request", "metadata", "telemetry", "golden_telemetry"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+    return sources
+
+
+def build_workflow_identity_matrix(
+    source: Mapping[str, Any] | None = None,
+    *,
+    workflow_file_bytes: bytes | bytearray | memoryview | str | os.PathLike[str] | None = None,
+    parsed_workflow: Any = None,
+    source_workflow: Any = None,
+    compiled_workflow: Any = None,
+    request_prompt: Any = None,
+    normalized_golden_request: Any = None,
+    actual_executed_workflow: Any = None,
+    expected_contract_workflow: Any = None,
+) -> dict[str, Any]:
+    """Build an explicit, lossless workflow identity projection.
+
+    Legacy names are accepted as input only.  They are recorded under
+    ``legacy_aliases`` and never emitted as ambiguous top-level identity
+    fields.  Structured workflow/request inputs use :func:`canonical_json_bytes`;
+    supplied digest strings remain supplied values and are not re-hashed.
+    """
+    root = source if isinstance(source, Mapping) else {}
+    sources = _identity_sources(root)
+    matrix: dict[str, Any] = {
+        "schema": IDENTITY_MATRIX_SCHEMA_VERSION,
+        **{name: "" for name in WORKFLOW_IDENTITY_FIELDS},
+        "legacy_aliases": {},
+    }
+
+    def first(*names: str) -> Any:
+        for container in sources:
+            for name in names:
+                if name in container and container[name] not in (None, ""):
+                    return container[name]
+        return None
+
+    for field_name in WORKFLOW_IDENTITY_FIELDS:
+        value = first(field_name)
+        if value not in (None, ""):
+            matrix[field_name] = _hash_domain_value(value)
+    for alias, target in LEGACY_WORKFLOW_ALIASES.items():
+        value = first(alias)
+        if value in (None, ""):
+            continue
+        entry = {"value": _hash_domain_value(value), "field": target}
+        matrix["legacy_aliases"][alias] = entry
+        if not matrix[target]:
+            matrix[target] = entry["value"]
+
+    if workflow_file_bytes is not None:
+        matrix["workflow_file_bytes_sha256"] = hashlib.sha256(
+            _read_workflow_bytes(workflow_file_bytes)
+        ).hexdigest()
+    parsed = parsed_workflow if parsed_workflow is not None else first(
+        "parsed_workflow", "parsed_workflow_json", "workflow_json", "parsed_prompt"
+    )
+    if parsed is None:
+        workflow_value = first("workflow")
+        if isinstance(workflow_value, (Mapping, list, tuple)) and not any(
+            key in workflow_value for key in ("workflow_hash", "workflow_sha256", "prompt_sha256",
+                                              "enabled", "bypassed")
+        ):
+            parsed = workflow_value
+    if parsed is not None:
+        matrix["parsed_workflow_json_sha256"] = canonical_json_sha256(parsed)
+    supplied = {
+        "source_workflow_sha256": source_workflow if source_workflow is not None else first(
+            "source_workflow"
+        ),
+        "compiled_workflow_sha256": compiled_workflow if compiled_workflow is not None else first(
+            "compiled_workflow"
+        ),
+        "request_prompt_sha256": request_prompt,
+        "normalized_golden_request_sha256": normalized_golden_request,
+        "actual_executed_workflow_sha256": actual_executed_workflow if actual_executed_workflow is not None else first(
+            "actual_executed_workflow"
+        ),
+        "expected_contract_workflow_sha256": expected_contract_workflow if expected_contract_workflow is not None else first(
+            "expected_contract_workflow"
+        ),
+    }
+    structured_request = {
+        "request_prompt_sha256": request_prompt if request_prompt is not None else first(
+            "request_prompt", "prompt", "request"
+        ),
+        "normalized_golden_request_sha256": (
+            normalized_golden_request if normalized_golden_request is not None else
+            first("normalized_golden_request", "normalized_request", "golden_request")
+        ),
+    }
+    for field_name, value in {**supplied, **structured_request}.items():
+        if value is not None:
+            matrix[field_name] = _hash_domain_value(value)
+    return matrix
+
+
+# Short descriptive aliases used by report consumers.
+workflow_identity_matrix = build_workflow_identity_matrix
+build_identity_matrix = build_workflow_identity_matrix
+build_golden_identity_matrix = build_workflow_identity_matrix
+build_identity_provenance = build_workflow_identity_matrix
+
+
+def workflow_contract_failures(value: Mapping[str, Any] | None) -> list[str]:
+    matrix = build_workflow_identity_matrix(value)
+    failures: list[str] = []
+    enabled = value.get("enabled") if isinstance(value, Mapping) else None
+    bypassed = value.get("bypassed") if isinstance(value, Mapping) else None
+    if enabled is None and isinstance(value, Mapping):
+        enabled = next((item.get("enabled") for item in _identity_sources(value)
+                        if "enabled" in item), None)
+    if bypassed is None and isinstance(value, Mapping):
+        bypassed = next((item.get("bypassed") for item in _identity_sources(value)
+                         if "bypassed" in item), None)
+    if not _truth(enabled):
+        failures.append("workflow contract enabled must be true")
+    if bypassed is not False and not (isinstance(bypassed, str) and _norm(bypassed) in {"false", "0", "no", "off"}):
+        failures.append("workflow contract bypassed must be false")
+    actual = matrix["actual_executed_workflow_sha256"]
+    expected = matrix["expected_contract_workflow_sha256"]
+    if not actual:
+        failures.append("workflow contract actual_executed_workflow_sha256 is missing")
+    if not expected:
+        failures.append("workflow contract expected_contract_workflow_sha256 is missing")
+    if actual and expected and actual != expected:
+        failures.append("workflow contract actual and expected workflow hashes differ")
+    return failures
+
+
+def validate_workflow_contract(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    matrix = build_workflow_identity_matrix(value)
+    reasons = workflow_contract_failures(value)
+    return {
+        "valid": not reasons,
+        "reasons": reasons,
+        "identity_matrix": matrix,
+    }
+
+
+def is_workflow_contract_valid(value: Mapping[str, Any] | None) -> bool:
+    return not workflow_contract_failures(value)
+
+
+validate_golden_workflow_contract = validate_workflow_contract
 
 
 def _timestamp(value: Mapping[str, Any]) -> int | None:
@@ -976,7 +1225,22 @@ def validate_attempt(
         reasons.append(str(exc))
     boundaries = extract_boundaries(data)
     identity = _identity(data)
+    identity_matrix = build_workflow_identity_matrix(data)
+    identity.update({key: value for key, value in identity_matrix.items()
+                     if key in WORKFLOW_IDENTITY_FIELDS and value})
+    identity["workflow_identity_matrix"] = identity_matrix
     _identity_failures(identity, expected, reasons)
+    # P2 artifacts did not carry this contract.  Retain their read
+    # compatibility, but once a producer emits any contract field, accepting
+    # it is fail-closed rather than silently falling back to ``workflow_hash``.
+    contract_input = dict(data)
+    contract_input["telemetry"] = telemetry
+    contract_keys = WORKFLOW_CONTRACT_MARKERS
+    if any(key in contract_input for key in contract_keys) or any(
+        isinstance(container, Mapping) and any(key in container for key in contract_keys)
+        for container in _identity_sources(contract_input)
+    ):
+        reasons.extend(workflow_contract_failures(contract_input))
     frozen = _pick(data, "identity_frozen", "frozen_identity", "frozen_identity_proof")
     if frozen is None:
         reasons.append("freshness frozen identity proof missing")
@@ -1220,11 +1484,31 @@ def validate_attempt(
     if "command_start_to_client_receipt_ms" in metrics:
         metrics["command_to_client_receipt_ms"] = metrics["command_start_to_client_receipt_ms"]
         metrics["command_to_result_ms"] = metrics["command_start_to_client_receipt_ms"]
+        metrics["whole_path_ms"] = metrics["command_start_to_client_receipt_ms"]
+        metrics["whole_path_command_start_to_client_receipt_ms"] = metrics[
+            "command_start_to_client_receipt_ms"]
+        metrics["whole_path_command_to_client_receipt_ms"] = metrics[
+            "command_start_to_client_receipt_ms"]
+    if "true_first_durable_result_to_client_receipt_ms" in metrics:
+        metrics["whole_path_durable_to_client_receipt_ms"] = metrics[
+            "true_first_durable_result_to_client_receipt_ms"]
+        metrics["whole_path_durable_to_receipt_ms"] = metrics[
+            "true_first_durable_result_to_client_receipt_ms"]
+    if "python_resume_to_true_first_durable_result_ms" in metrics and "client_receipt" in boundaries:
+        metrics["whole_path_python_resume_to_client_receipt_ms"] = (
+            boundaries["client_receipt"].timestamp_ns - boundaries["python_resume"].timestamp_ns
+        ) / 1_000_000
+    if teardown_wall is not None:
+        metrics["teardown_ms"] = teardown_wall.duration_ms
     return AttemptResult(number, not reasons, reasons, phase, str(exception) if exception else None,
                          raw_refs, raw_logs, identity, walls, teardown_wall, boundaries, metrics, data)
 
 
 validate_golden_attempt = validate_attempt
+
+
+P90_METHOD = "nearest_rank(ceil(0.90*n)); n=5=>rank5"
+STATS_METHOD = P90_METHOD + "; stdev=sample; no trimming"
 
 
 def _percentile_p90(values: Sequence[float]) -> float:
@@ -1241,14 +1525,27 @@ def _percentile_p90(values: Sequence[float]) -> float:
 def compute_stats(values: Sequence[float]) -> dict[str, Any]:
     numbers = [float(v) for v in values]
     if not numbers:
-        return {"n": 0, "method": "p90=nearest_rank(ceil(0.90*n)); n=5=>rank5; stdev=sample; no trimming", "values": []}
+        return {
+            "n": 0, "min": None, "max": None, "median": None, "mean": None,
+            "p90": None, "stdev": None, "cv": None, "range": None,
+            "values": [], "raw_values": [], "raw_observations": [],
+            "observations": [], "raw": [], "sample_stdev": None,
+            "coefficient_of_variation": None, "p90_method": P90_METHOD,
+            "method": STATS_METHOD,
+        }
     mean = statistics.mean(numbers)
     stdev = statistics.stdev(numbers) if len(numbers) > 1 else 0.0
     return {
         "n": len(numbers), "min": min(numbers), "max": max(numbers), "mean": mean,
         "median": statistics.median(numbers), "p90": _percentile_p90(numbers),
         "stdev": stdev, "cv": stdev / mean if mean else None, "range": max(numbers) - min(numbers),
-        "method": "p90=nearest_rank(ceil(0.90*n)); n=5=>rank5; stdev=sample; no trimming",
+        # Preserve every observation.  ``values`` is the P2 compatibility
+        # spelling; the explicit names make it impossible for a renderer to
+        # imply trimming or percentile-only input.
+        "values": numbers, "raw_values": numbers, "raw_observations": numbers,
+        "observations": numbers, "raw": numbers, "sample_stdev": stdev,
+        "coefficient_of_variation": stdev / mean if mean else None,
+        "p90_method": P90_METHOD, "method": STATS_METHOD,
     }
 
 
@@ -1310,6 +1607,31 @@ def _cohort_identity_key(identity: Mapping[str, Any]) -> tuple[str, ...]:
     ))
 
 
+WHOLE_PATH_METRIC_NAMES = (
+    "command_start_to_python_resume_ms",
+    "python_resume_to_true_first_durable_result_ms",
+    "true_first_durable_result_to_result_assembled_ms",
+    "result_assembled_to_teardown_complete_ms",
+    "teardown_complete_to_remote_return_ms",
+    "true_first_durable_result_to_remote_return_ms",
+    "remote_return_to_client_receipt_ms",
+    "command_start_to_client_receipt_ms",
+    "true_first_durable_result_to_client_receipt_ms",
+    "remote_python_resume_to_true_first_durable_result_ms",
+    "command_to_client_receipt_ms",
+    "command_to_result_ms",
+    "whole_path_ms",
+    "whole_path_command_start_to_client_receipt_ms",
+    "whole_path_command_to_client_receipt_ms",
+    "whole_path_durable_to_client_receipt_ms",
+    "whole_path_durable_to_receipt_ms",
+    "whole_path_python_resume_to_client_receipt_ms",
+    "restore_ms",
+    "post_durable_tail_ms",
+    "teardown_ms",
+)
+
+
 @dataclass
 class CohortReport:
     attempts: list[AttemptResult]
@@ -1367,19 +1689,11 @@ def build_five_run_cohort(sources: Iterable[Mapping[str, Any] | str | os.PathLik
         stats["golden_stage_sum_ms"] = compute_stats([attempt.metrics["golden_stage_sum_ms"] for attempt in valid])
         for stage in PRIMARY_STAGE_ORDER:
             stats[stage] = compute_stats([attempt.stage_walls[stage].duration_ms for attempt in valid])
-        metric_names = (
-            "command_start_to_python_resume_ms",
-            "python_resume_to_true_first_durable_result_ms",
-            "true_first_durable_result_to_result_assembled_ms",
-            "result_assembled_to_teardown_complete_ms",
-            "teardown_complete_to_remote_return_ms",
-            "true_first_durable_result_to_remote_return_ms",
-            "remote_return_to_client_receipt_ms",
-            "command_start_to_client_receipt_ms",
-            "true_first_durable_result_to_client_receipt_ms",
-            "remote_python_resume_to_true_first_durable_result_ms",
-            "restore_ms", "post_durable_tail_ms", "command_to_client_receipt_ms", "command_to_result_ms",
-        )
+        stats[TEARDOWN_STAGE] = compute_stats([
+            attempt.teardown_wall.duration_ms for attempt in valid
+            if attempt.teardown_wall is not None
+        ])
+        metric_names = WHOLE_PATH_METRIC_NAMES
         for name in metric_names:
             values = [attempt.metrics.get(name) for attempt in valid]
             if all(value is not None for value in values):
@@ -1402,6 +1716,10 @@ def regenerate_report(sources: Iterable[Mapping[str, Any] | str | os.PathLike[st
          "text": render_primary_function_table(attempt)}
         for attempt in cohort.valid_attempts
     ]
+    report["workflow_identity_matrices"] = [
+        attempt.identity.get("workflow_identity_matrix", {})
+        for attempt in cohort.attempts
+    ]
     report["raw_artifact_refs"] = [ref for attempt in cohort.attempts for ref in attempt.raw_artifact_refs]
     report["raw_log_refs"] = [ref for attempt in cohort.attempts for ref in attempt.raw_log_refs]
     if output_path is not None:
@@ -1410,6 +1728,140 @@ def regenerate_report(sources: Iterable[Mapping[str, Any] | str | os.PathLike[st
 
 
 final_report = regenerate_report
+
+
+def _comparison_input(value: Any) -> tuple[dict[str, Any], bool, int | None]:
+    if isinstance(value, CohortReport):
+        return value.stats, value.valid, len(value.valid_attempts)
+    if isinstance(value, Mapping):
+        stats = value.get("stats")
+        if isinstance(stats, Mapping):
+            valid = value.get("valid") is True
+            count = value.get("valid_count")
+            if count is None:
+                counts: list[int] = []
+                for item in stats.values():
+                    if not isinstance(item, Mapping) or item.get("n") is None:
+                        continue
+                    try:
+                        counts.append(int(item["n"]))
+                    except (TypeError, ValueError):
+                        continue
+                count = min(counts) if counts else None
+            try:
+                count = int(count) if count is not None else None
+            except (TypeError, ValueError):
+                count = None
+            return dict(stats), valid, count
+    return {}, False, None
+
+
+def _delta(candidate: Mapping[str, Any], baseline: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in ("n", "min", "max", "median", "mean", "p90", "stdev", "cv", "range"):
+        left, right = candidate.get(key), baseline.get(key)
+        result[key] = left - right if isinstance(left, (int, float)) and isinstance(right, (int, float)) else None
+    return result
+
+
+def _metric_comparison(name: str, baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+    required = ("n", "median", "p90", "max", "cv", "range")
+    missing = [key for key in required if candidate.get(key) is None or baseline.get(key) is None]
+    if missing:
+        return {"status": "UNVERIFIED", "reason": "missing statistic fields: " + ", ".join(missing),
+                "baseline": dict(baseline), "candidate": dict(candidate), "delta": _delta(candidate, baseline)}
+    try:
+        baseline_n, candidate_n = int(baseline["n"]), int(candidate["n"])
+    except (KeyError, TypeError, ValueError):
+        return {"status": "UNVERIFIED", "reason": "invalid sample count",
+                "baseline": dict(baseline), "candidate": dict(candidate), "delta": _delta(candidate, baseline)}
+    if baseline_n < 2 or candidate_n < 2:
+        return {"status": "UNVERIFIED", "reason": "one-run statistics cannot support a speed claim",
+                "baseline": dict(baseline), "candidate": dict(candidate), "delta": _delta(candidate, baseline)}
+    if baseline_n != candidate_n:
+        return {"status": "UNVERIFIED", "reason": "baseline and candidate sample counts are incomparable",
+                "baseline": dict(baseline), "candidate": dict(candidate), "delta": _delta(candidate, baseline)}
+
+    base_median, cand_median = baseline["median"], candidate["median"]
+    base_p90, cand_p90 = baseline["p90"], candidate["p90"]
+    base_max, cand_max = baseline["max"], candidate["max"]
+    base_cv, cand_cv = baseline["cv"], candidate["cv"]
+    base_range, cand_range = baseline["range"], candidate["range"]
+    is_sub10 = base_median < 10.0 and cand_median < 10.0
+    is_restore_or_commit = name in {"actual_restore", "restore_ms", "golden_durable_commit"}
+    if is_sub10:
+        improved = cand_range < base_range
+        not_worse = cand_range <= base_range
+        rule = "both medians <10ms: compare absolute range"
+    elif is_restore_or_commit:
+        improved = cand_p90 < base_p90 and cand_max <= base_max
+        not_worse = cand_p90 <= base_p90 and cand_max <= base_max
+        rule = "long-tail stage: p90 must improve and max must not worsen"
+    else:
+        improved = (cand_median < base_median and cand_p90 <= base_p90
+                    and cand_max <= base_max
+                    and (base_cv is None or (cand_cv is not None and cand_cv <= base_cv)))
+        not_worse = (cand_p90 <= base_p90 and cand_max <= base_max
+                     and (base_cv is None or (cand_cv is not None and cand_cv <= base_cv)))
+        rule = "median must improve; p90, max, and CV must not worsen"
+    status = "IMPROVED" if improved else ("NOT_IMPROVED" if not_worse else "REGRESSION")
+    deltas = _delta(candidate, baseline)
+    return {
+        "status": status, "rule": rule, "baseline": dict(baseline),
+        "candidate": dict(candidate), "delta": deltas, "deltas": deltas,
+        **{f"{key}_delta": value for key, value in deltas.items()},
+    }
+
+
+def compare_baseline_candidate(baseline: Any, candidate: Any) -> dict[str, Any]:
+    """Compare two structurally valid cohorts without inventing thresholds.
+
+    Structural validity is reported separately from the performance verdict.
+    A missing proof, an invalid cohort, or a one-run/incomplete statistic can
+    never become a positive performance claim.
+    """
+    baseline_stats, baseline_valid, baseline_count = _comparison_input(baseline)
+    candidate_stats, candidate_valid, candidate_count = _comparison_input(candidate)
+    structural = {
+        "baseline_valid": baseline_valid, "candidate_valid": candidate_valid,
+        "baseline_valid_count": baseline_count, "candidate_valid_count": candidate_count,
+        "valid": baseline_valid and candidate_valid,
+    }
+    if not structural["valid"]:
+        return {"verdict": "UNVERIFIED", "performance_verdict": "UNVERIFIED",
+                "structural": structural, "structurally_valid": False,
+                "performance": {"verdict": "UNVERIFIED", "metrics": {}}, "metrics": {},
+                "reasons": ["baseline and candidate must both be structurally valid"]}
+    names = sorted(set(baseline_stats) | set(candidate_stats))
+    metrics: dict[str, Any] = {}
+    reasons: list[str] = []
+    for name in names:
+        base = baseline_stats.get(name)
+        cand = candidate_stats.get(name)
+        if not isinstance(base, Mapping) or not isinstance(cand, Mapping):
+            metrics[name] = {"status": "UNVERIFIED", "reason": "metric absent from baseline or candidate"}
+        else:
+            metrics[name] = _metric_comparison(name, base, cand)
+        if metrics[name].get("status") == "UNVERIFIED":
+            reasons.append(f"{name}: {metrics[name].get('reason', 'incomparable')}")
+    if not metrics or reasons:
+        verdict = "UNVERIFIED"
+    elif any(item["status"] == "REGRESSION" for item in metrics.values()):
+        verdict = "REGRESSION"
+    elif all(item["status"] == "IMPROVED" for item in metrics.values()):
+        verdict = "IMPROVED"
+    else:
+        verdict = "NOT_IMPROVED"
+    return {"verdict": verdict, "performance_verdict": verdict,
+            "structural": structural, "structurally_valid": True,
+            "performance": {"verdict": verdict, "metrics": metrics},
+            "metrics": metrics, "reasons": reasons,
+            "rules": {"no_one_run_claims": True, "thresholds": "none"}}
+
+
+compare_cohorts = compare_baseline_candidate
+compare_golden_cohorts = compare_baseline_candidate
+build_comparison_report = compare_baseline_candidate
 
 
 @dataclass(frozen=True)

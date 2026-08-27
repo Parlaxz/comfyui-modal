@@ -43,7 +43,5 @@ COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
 # ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
 
-# The Golden request contract normally verifies the canonical workflow SHA.
-# P1 explicitly bypasses only that equality guard while retaining hash
-# computation and telemetry recording for auditability.
-COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "0"
+# The Golden request contract requires canonical workflow SHA verification.
+COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "1"
