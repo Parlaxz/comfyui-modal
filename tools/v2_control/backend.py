@@ -589,7 +589,14 @@ class BackendRunner:
                 f"[v2ctl.crash-loop] detected exception={_crash_loop.get('exception_type')!r} "
                 f"count={_crash_loop.get('count')} backend={spec.name}"
             )
-        if capture:
+        # Deploy-only backends intentionally produce no workload artifacts.
+        # Golden discovery is strict even for non-canonical calls, so trying
+        # to discover artifacts here would reject a successful deploy before
+        # the subsequent run-only Golden backend can create its cohort.
+        deploy_only = str(child_env.get("COMFYMODAL_DEPLOY_ONLY", "")).strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        if capture and not deploy_only:
             try:
                 artifacts = self.discover_artifacts(
                     config,

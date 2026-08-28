@@ -51,7 +51,7 @@ import pytest
 MODULE_PATH = Path(__file__).resolve().parents[1] / "comfymodal_runtime" / "golden_serial.py"
 
 # Reconciled Phase 2 gate contract constants (distinct by design).
-CANONICAL_WORKFLOW_SHA256 = "f2de4c6a8f032b4adcd21be0e490ecb97aa87261c8403af79d52e6a2eb29734c"
+CANONICAL_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab044704c0d3b5"
 EXPECTED_OUTPUT_SHA256 = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
 
 

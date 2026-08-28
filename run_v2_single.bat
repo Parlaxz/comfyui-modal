@@ -167,7 +167,11 @@ if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
         echo === ERROR: golden_p1 requires COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-golden-p1 ===
         exit /b 1
     )
-    if /i not "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1" (
+    if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1" (
+        REM v2ctl has already resolved and validated an explicit target app
+        REM override (for example, the isolated P4-N cold app).
+        echo [v2.golden_p1] app_identity_source=v2ctl_resolved_target
+    ) else if /i not "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1" (
         echo === ERROR: golden_p1 app identity mismatch: !COMFYMODAL_V2_APP_NAME! ===
         echo === Expected stable-modal-comfy-v2-golden-p1; refusing before any Modal work. ===
         exit /b 1
@@ -552,6 +556,8 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
         )
     )
     python tools\benchmark_v2_direct.py --golden-p1 !V2_GOLDEN_ARGS!
+    set "BENCHMARK_EXIT_CODE=!errorlevel!"
+    exit /b !BENCHMARK_EXIT_CODE!
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===

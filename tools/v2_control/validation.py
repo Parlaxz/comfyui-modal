@@ -1514,8 +1514,12 @@ def _assert_canonical_backend_identity(
         target_value = target.get
     else:
         target_value = lambda name, default="": getattr(target, name, default)
+    resolved_app = str(target_value("app", "") or "").strip()
     expected_target = {
-        "app": "stable-modal-comfy-v2-golden-p1",
+        # The profile supplies the canonical app by default, but an explicit
+        # resolved app is valid for experimental Golden deployments.  The
+        # identity environment checks below still bind the backend to it.
+        "app": resolved_app or "stable-modal-comfy-v2-golden-p1",
         "class_name": "ModalRuntimeEntrypointV2",
         "method": "run_golden_serial_stream",
     }

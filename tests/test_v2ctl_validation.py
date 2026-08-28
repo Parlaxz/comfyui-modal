@@ -294,14 +294,32 @@ class TestGateRunner:
 
     def test_golden_identity_mismatch_fails_before_backend(self, tmp_path):
         config = FakeConfig(profile_name="golden_p1")
-        config.target.app = "stable-modal-comfy-v2-restore-only-shadow"
+        config.target.app = "p4-n-golden-truecold"
+        config.target.class_name = "WrongEntrypoint"
         config.target.method = "run_golden_serial_stream"
         backend = FakeBackendRunner(stdout=OK_GATE_STDOUT)
         runner = make_gate_runner(tmp_path, backend=backend)
 
-        with pytest.raises(GateError, match="canonical identity|target.app"):
+        with pytest.raises(GateError, match="target.class_name"):
             runner.run_gate(config, FakeSpec())
         assert backend.invocation_count == 0
+
+    def test_golden_identity_allows_explicit_experimental_app(self, tmp_path):
+        config = FakeConfig(profile_name="golden_p1")
+        config.target.app = "p4-n-golden-truecold"
+        config.target.method = "run_golden_serial_stream"
+        artifact = tmp_path / "run_1.json"
+        artifact.write_text("{}", encoding="utf-8")
+        backend = FakeBackendRunner(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        )
+        runner = make_gate_runner(tmp_path, backend=backend)
+
+        result = runner.run_gate(config, FakeSpec())
+
+        assert result.valid is True
+        assert backend.invocations[0]["extra_env"]["COMFYMODAL_V2_APP_NAME"] == "p4-n-golden-truecold"
 
     def test_manifest_persisted_even_when_invalid(self, tmp_path):
         backend = FakeBackendRunner(

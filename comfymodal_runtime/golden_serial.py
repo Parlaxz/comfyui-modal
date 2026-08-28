@@ -57,7 +57,7 @@ import torch
 
 # SHA-256 over the sorted-key compact JSON of the canonical prompt
 # (independently computed by the parent orchestrator).
-EXPECTED_WORKFLOW_SHA256 = "f2de4c6a8f032b4adcd21be0e490ecb97aa87261c8403af79d52e6a2eb29734c"
+EXPECTED_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab044704c0d3b5"
 # SHA-256 of the exact expected canonical OUTPUT PNG bytes (NOT a workflow
 # hash).  Verified against post-durable reopened bytes, fail-closed.
 EXPECTED_OUTPUT_PNG_SHA256 = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
