@@ -77,7 +77,9 @@ class FingerprintEngine:
             deploy_flags[flag.name] = effective_values[flag.name]
         return {
             "git_head": str(git.head),
-            "git_dirty": bool(git.dirty),
+            # ``dirty`` is the overall worktree state used by doctor/reporting;
+            # deployment identity only includes changes that can be published.
+            "git_dirty": bool(dirty_hashes),
             "dirty_hashes": dirty_hashes,
             "target": {
                 "app": str(target.app),

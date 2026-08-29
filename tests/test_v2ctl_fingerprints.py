@@ -234,6 +234,27 @@ def test_dirty_git_state_alters_deploy_fp():
     assert FingerprintEngine(base).run_fingerprint() != FingerprintEngine(dirty).run_fingerprint()
 
 
+def test_excluded_only_git_dirt_does_not_alter_deploy_fp():
+    clean = _base_config()
+    excluded_only = _base_config()
+    excluded_only.git = _Git(dirty=True, dirty_hashes={})
+
+    # Overall worktree dirt remains available for doctor/reporting, but it is
+    # absent from deployment identity when no deploy-relevant paths changed.
+    assert excluded_only.git.dirty is True
+    assert FingerprintEngine(excluded_only).deploy_inputs()["git_dirty"] is False
+    assert FingerprintEngine(clean).deploy_fingerprint() == FingerprintEngine(excluded_only).deploy_fingerprint()
+
+
+def test_deploy_relevant_dirty_hashes_alter_deploy_fp():
+    clean = _base_config()
+    relevant_dirty = _base_config()
+    relevant_dirty.git = _Git(dirty=True, dirty_hashes={"tools/v2_control/fingerprints.py": "abc123"})
+
+    assert FingerprintEngine(relevant_dirty).deploy_inputs()["git_dirty"] is True
+    assert FingerprintEngine(clean).deploy_fingerprint() != FingerprintEngine(relevant_dirty).deploy_fingerprint()
+
+
 def test_dirty_hashes_sorted_in_inputs():
     config = _base_config()
     config.git = _Git(head="h", dirty=True, dirty_hashes={"z.py": "1", "a.py": "2"})
