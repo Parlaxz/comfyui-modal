@@ -56,8 +56,8 @@ if /i "%~1"=="E31_VALIDATION" set "V2_BENCHMARK_RUNS=1"
 if /i "%~1"=="E31_VALIDATION" set "V2_E19_FINAL_COLD_LOADER=1"
 
 REM -- golden_p1 serial-Golden profile selector (atomic opt-in) -------------
-REM Same %~1 mechanism as the validation selectors above.  golden_p1 keeps
-REM the production deploy default (snapshot construction, no probes) and only
+REM Same %~1 mechanism as the validation selectors above.  golden_p1 is the
+REM isolated R0 deploy path (snapshot construction, no probes) and only
 REM establishes the profile's deploy-baked dynamic-VRAM flag.  The flag is
 REM set ONLY when not already defined so a v2ctl-resolved child environment
 REM (profile golden_p1) is never overwritten after resolution.
@@ -65,9 +65,23 @@ set "V2_GOLDEN_P1_ACTIVE=0"
 if /i "%~1"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="1" set "V2_GOLDEN_P1_ACTIVE=1"
 if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
+    if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_serial" (
+        echo === ERROR: golden_p1 requires V2_BENCHMARK_MODE=golden_p1_serial ===
+        exit /b 1
+    )
     set "V2_BENCHMARK_MODE=golden_p1_serial"
     if not defined COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM set "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1"
     echo [v2.golden_p1] selector=ACTIVE golden_enable_dynamic_vram=!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!
+    REM Golden R0 is isolated. Reject missing/protected identity before any
+    REM fallback defaults, workspace loading, or Modal/backend work.
+    if not defined COMFYMODAL_V2_APP_NAME (
+        echo === ERROR: golden_p1 requires an experimental COMFYMODAL_V2_APP_NAME ===
+        exit /b 1
+    )
+    if /i "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1" (
+        echo === ERROR: golden_p1 refuses protected production app stable-modal-comfy-v2-golden-p1 ===
+        exit /b 1
+    )
 )
 
 

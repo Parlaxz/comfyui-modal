@@ -24,6 +24,7 @@ from comfymodal_runtime.contracts import (
     stable_hash,
 )
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime import publication_policy as _publication_policy
 # ── E40 Lane A: single configuration authority ──────────────────────────
 # One resolved-config truth for the runtime. Golden-semantics controls are
 # resolved centrally; the fingerprint binds requested↔deployed↔runtime, and
@@ -3779,36 +3780,13 @@ def _safe_listdir(path: str) -> list[str]:
     return sorted(os.listdir(path))
 
 
-# Shared hash-input filters for the custom-node source generation.  Generated
-# and environment files/directories must never change the persisted
-# generation, so identical baked/runtime canonical content produces an
-# identical generation regardless of mtime or build artifacts.
-#
-# INVARIANT: this set MUST remain a superset of
-# ``__init__._CUSTOM_NODE_SYNC_EXCLUDE_DIRS`` (the deploy-time volume-sync
-# archive filter).  Anything the archive drops on the way to the Volume would
-# otherwise make the extracted Volume tree fingerprint differ from the local
-# tree fingerprint, breaking baked == persisted parity (the V2
-# ``generation_mismatch`` proof failure).  Keep both sets in lockstep.
-_CUSTOM_NODE_GENERATED_DIRS = frozenset({
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    ".ipynb_checkpoints", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".tox", ".eggs", ".cache", "wheelhouse", "wheels", "build", "dist",
-    "tests", "test", "examples", "benchmarks", "benchmark", "traces",
-    "logs", "scripts", ".github",
-    # ── Superset of __init__._CUSTOM_NODE_SYNC_EXCLUDE_DIRS (archive filter) ──
-    # These are dropped from the volume-sync archive, so they must never
-    # participate in the fingerprint either.
-    "output", "test-results", "playwright-report",
-    ".playwright-mcp", ".experiments", ".run_history",
-    "benchmark_runs", "benchmark_logs", "optimization_logs",
-    ".comfymodal_experiments", ".custom_node_requirements", ".baked_custom_node_deps",
-    ".presets", ".preset_blobs",
-})
-_CUSTOM_NODE_GENERATED_FILE_SUFFIXES = (
-    ".log", ".tmp", ".trace", ".jsonl", ".whl",
+# Shared hash-input policy.  Keep this compatibility alias because diagnostics
+# and older callers expose the name, but do not maintain a second filter here.
+_CUSTOM_NODE_GENERATED_DIRS = _publication_policy.EXCLUDED_DIR_NAMES
+_CUSTOM_NODE_GENERATED_FILE_SUFFIXES = tuple(
+    sorted(_publication_policy.EXCLUDED_EXTENSIONS)
 )
-_CUSTOM_NODE_GENERATED_FILE_PREFIXES = ("benchmark_", "trace_")
+_CUSTOM_NODE_GENERATED_FILE_PREFIXES = _publication_policy.EXCLUDED_PREFIXES
 
 
 def custom_node_source_fingerprint(source_root: str) -> dict:
@@ -3831,18 +3809,20 @@ def custom_node_source_fingerprint(source_root: str) -> dict:
         _tracked_exts = {".py", ".txt", ".toml", ".cfg"}
         _tracked_files = {"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"}
         try:
-            for _dirpath, _dirnames, _filenames in os.walk(node_path):
+            for _dirpath, _dirnames, _filenames in os.walk(node_path, followlinks=False):
                 _dirnames[:] = sorted(
-                    d for d in _dirnames if d not in _CUSTOM_NODE_GENERATED_DIRS
+                    d for d in _dirnames
+                    if not _publication_policy.is_excluded_dir_name(d)
+                    and not os.path.islink(os.path.join(_dirpath, d))
                 )
                 for _fn in sorted(_filenames):
                     _ext = os.path.splitext(_fn)[1].lower()
-                    if _ext in _tracked_exts or _fn in _tracked_files:
-                        if _fn.lower().endswith(_CUSTOM_NODE_GENERATED_FILE_SUFFIXES):
-                            continue
-                        if _fn.lower().startswith(_CUSTOM_NODE_GENERATED_FILE_PREFIXES):
+                    if _ext in _publication_policy.GENERATION_SOURCE_EXTENSIONS:
+                        if _publication_policy.is_excluded_name(_fn):
                             continue
                         _fp = os.path.join(_dirpath, _fn)
+                        if os.path.islink(_fp):
+                            continue
                         _rel = os.path.relpath(_fp, node_path).replace("\\", "/")
                         _hasher.update(f"{_rel}:".encode())
                         try:
@@ -6702,55 +6682,17 @@ COMFYUI_PORT = 8188
 
 
 def _looks_like_custom_nodes_source_root(path: str) -> bool:
-    if not path or not os.path.isdir(path):
-        return False
-    real = os.path.realpath(path)
-    if real in ("/", "/root", "/home", "/mnt", "/tmp", "/usr", "/opt"):
-        return False
-    try:
-        entries = sorted(os.listdir(path))
-    except OSError:
-        return False
-    candidate_count = 0
-    for name in entries:
-        p = os.path.join(path, name)
-        if not os.path.isdir(p) or name.startswith("."):
-            continue
-        if os.path.isfile(os.path.join(p, "__init__.py")) or os.path.isfile(os.path.join(p, "requirements.txt")):
-            candidate_count += 1
-    return candidate_count >= 3
+    return _publication_policy._looks_like_custom_nodes_source_root(path)
 
 
 def _resolve_local_custom_nodes_root() -> str:
-    explicit = os.getenv("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-    if explicit:
-        candidates.append(explicit)
-    candidates.extend([
-        os.path.abspath(os.path.join(here, "..")),
-        os.path.abspath(os.path.join(here, "..", "custom_nodes")),
-        os.path.abspath(os.path.join(here, "..", "ComfyUI", "custom_nodes")),
-        "/root/comfy/ComfyUI/custom_nodes",
-        os.path.abspath(os.path.join(here, "comfy", "ComfyUI", "custom_nodes")),
-    ])
-    for candidate in candidates:
-        candidate = os.path.abspath(candidate)
-        if _looks_like_custom_nodes_source_root(candidate):
-            return candidate
-    if env_flag("COMFYMODAL_RUNTIME"):
-        return "/root/comfy/ComfyUI/custom_nodes"
-    if os.path.isdir("/root/comfy/ComfyUI/custom_nodes"):
-        # Runtime fallback: even without COMFYMODAL_RUNTIME, if the ComfyUI
-        # custom-nodes directory exists, use it.  This handles cases where
-        # Modal's .env() vars are not yet available at import time.
-        return "/root/comfy/ComfyUI/custom_nodes"
-    raise RuntimeError(
-        "Could not resolve local custom-node source root. "
-        "Set env COMFYMODAL_LOCAL_CUSTOM_NODES to the local directory "
-        "that contains your custom node folders (the parent directory "
-        "containing 'comfyui-modal' and other custom-node directories). "
-        f"Tried: {candidates}"
+    return _publication_policy.resolve_custom_nodes_root(
+        here,
+        fallback_roots=(
+            "/root/comfy/ComfyUI/custom_nodes",
+            os.path.abspath(os.path.join(here, "comfy", "ComfyUI", "custom_nodes")),
+        ),
     )
 
 
@@ -6796,140 +6738,27 @@ _CACHEDIT_LOCK_SRC = os.path.join(_COMFYUI_MODAL_DIR, _CACHEDIT_LOCK_FILENAME)
 _CACHEDIT_LOCK_DST = "/opt/comfymodal/cachedit_dependency_lock.txt"
 """In-image destination for the lock file (used at build and runtime)."""
 
-_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints"}
-_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
-    r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
-    re.IGNORECASE,
-)
+_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = _publication_policy.EXCLUDED_DIR_NAMES
+_CUSTOM_NODE_LOCAL_CLONE_RE = _publication_policy.LOCAL_CLONE_RE
 _COMFYMODAL_CANONICAL_NODE_NAME = "comfyui-modal"
 _COMFYMODAL_DUPLICATE_TYPO_NAMES = frozenset({"comyui-modal-pagesfile-probe"})
 
 
 def _is_comfymodal_duplicate_dir(node_name: str, node_path: str) -> str | None:
-    """Return a reason string when *node_path* is another copy/worktree of the
-    canonical ComfyModal plugin, else None.
-
-    Verification is repo-specific, never name-only:
-    - git worktree registration pointing at the canonical checkout
-    - the canonical git remote URL
-    - canonical plugin content markers (comfyapp.py + comfymodal_runtime/)
-    """
-    if node_name == _COMFYMODAL_CANONICAL_NODE_NAME:
-        return None
-    if node_name in _COMFYMODAL_DUPLICATE_TYPO_NAMES:
-        return "comfymodal_duplicate_typo"
-    try:
-        git_path = os.path.join(node_path, ".git")
-        if os.path.isfile(git_path):
-            with open(git_path, "r", encoding="utf-8", errors="replace") as _f:
-                _line = (_f.read(512) or "").strip()
-            if _line.lower().startswith("gitdir:"):
-                _gd = _line.split(":", 1)[1].strip()
-                if not os.path.isabs(_gd):
-                    _gd = os.path.join(node_path, _gd)
-                _norm = os.path.normpath(_gd).replace("\\", "/")
-                if ".git/worktrees/" in _norm and "comfyui-modal" in _norm:
-                    return "comfymodal_duplicate_worktree"
-        elif os.path.isdir(git_path):
-            _cfg = os.path.join(git_path, "config")
-            if os.path.isfile(_cfg):
-                with open(_cfg, "r", encoding="utf-8", errors="replace") as _f:
-                    _cfg_text = _f.read(4096)
-                if "comfyui-modal.git" in _cfg_text:
-                    return "comfymodal_duplicate_worktree"
-        if (
-            os.path.isfile(os.path.join(node_path, "comfyapp.py"))
-            and os.path.isdir(os.path.join(node_path, "comfymodal_runtime"))
-            and os.path.isfile(os.path.join(node_path, "comfymodal_runtime", "modal_app.py"))
-        ):
-            return "comfymodal_duplicate_worktree"
-    except Exception:
-        return None
-    return None
-_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
-    ".git/",
-    "__pycache__/",
-    "*.pyc",
-    ".venv/",
-    "venv/",
-    "node_modules/",
-]
-_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
-    ".gitignore",
-    ".slim/",
-    "*.md",
-    ".deploy_log",
-    ".tmp",
-    "*.tmp",
-    ".comfymodal_experiments/",
-    ".custom_node_requirements/",
-    ".hf_token",
-    ".civitai_token",
-    ".deployed_state.json",
-    ".deployed_version",
-    ".modal_settings.json",
-    "latest_benchmark_workflow.json",
-    "modal_logs.txt",
-    "_deploy_output.log",
-    "comfymodal_experiment_presets.json",
-    "comfymodal_experiment_state.json",
-    "apply_experiment_preset.py",
-    "run_experiment_stage.py",
-    "BENCHMARK_WORKFLOW.md",
-]
-_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
-    "*/.git/",
-    "*/__pycache__/",
-    "*/.ipynb_checkpoints/",
-    "*/node_modules/",
-    "*/.venv/",
-    "*/venv/",
-    "*.pyc",
-    "*.pyo",
-    "comfyui-modal/.gitignore",
-    "comfyui-modal/.deploy_log",
-    "comfyui-modal/.tmp",
-    "comfyui-modal/*.tmp",
-    "comfyui-modal/*.log",
-    "comfyui-modal/modal_logs.txt",
-    "comfyui-modal/_deploy_output.log",
-    "comfyui-modal/latest_benchmark_workflow.json",
-    "comfyui-modal/.hf_token",
-    "comfyui-modal/.civitai_token",
-    "comfyui-modal/.deployed_state.json",
-    "comfyui-modal/.deployed_version",
-    "comfyui-modal/.modal_settings.json",
-    "comfyui-modal/.last_v2_dependency_cache_identity.json",
-    "comfyui-modal/.last_custom_node_context_manifest.json",
-    "comfyui-modal/.comfymodal_experiments/",
-    "comfyui-modal/.comfymodal_experiments/*",
-    "comfyui-modal/.playwright-mcp/",
-    "comfyui-modal/.playwright-mcp/*",
-    # ── E40: transient local artifacts must never enter the image ────────
-    # These directories are written by local test/preview activity and are
-    # not application source. Baking them creates software-created image
-    # variance and fails deploys when files mutate mid-upload.
-    "comfyui-modal/output/",
-    "comfyui-modal/output/*",
-    "comfyui-modal/test-results/",
-    "comfyui-modal/test-results/*",
-    "comfyui-modal/playwright-report/",
-    "comfyui-modal/playwright-report/*",
-    "comfyui-modal/.custom_node_requirements/",
-    "comfyui-modal/.baked_custom_node_deps/",
-    "comfyui-modal/.slim/",
-    "comfyui-modal/.slim/*",
-    "comfyui-modal/*.md",
-    "comfyui-modal/comfymodal_experiment_presets.json",
-    "comfyui-modal/comfymodal_experiment_state.json",
-    "comfyui-modal/apply_experiment_preset.py",
-    "comfyui-modal/run_experiment_stage.py",
-    "comfyui-modal/BENCHMARK_WORKFLOW.md",
-    "comfyui-modal-agent*/",
-    "comfyui-modal-worktree*/",
-    "comfyui-modal-wt*/",
-    "comfyui-modal-dc*/",
-]
+    return _publication_policy.comfymodal_duplicate_reason(node_name, node_path)
+_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = _publication_policy.image_ignore_patterns()
+_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = (
+    _publication_policy.image_ignore_patterns()
+    + ["comfymodal_experiment_presets.json", "comfymodal_experiment_state.json"]
+)
+_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = (
+    _publication_policy.image_ignore_patterns()
+    + _publication_policy.image_ignore_patterns("*/")
+    + [
+        "comfyui-modal-agent*/", "comfyui-modal-worktree*/",
+        "comfyui-modal-wt*/", "comfyui-modal-dc*/",
+    ]
+)
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
     "__pycache__",
@@ -6964,20 +6793,7 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
 
 
 def _custom_node_filter_reason(node_name: str, node_path: str) -> str | None:
-    if not os.path.isdir(node_path):
-        return "not_directory"
-    if os.path.islink(node_path):
-        return "symlink"
-    if node_name.startswith("."):
-        return "hidden_directory"
-    if node_name in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
-        return "generated_or_environment_directory"
-    if _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_name):
-        return "local_agent_or_worktree_clone"
-    duplicate_reason = _is_comfymodal_duplicate_dir(node_name, node_path)
-    if duplicate_reason is not None:
-        return duplicate_reason
-    return None
+    return _publication_policy.custom_node_filter_reason(node_name, node_path)
 
 
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
@@ -6989,15 +6805,7 @@ def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
     - must not be in the exclude set (``.git``, ``__pycache__``, GÃ‡Âª)
     - broken symlinks are excluded (``os.path.isdir`` returns ``False``)
     """
-    if not os.path.isdir(cn_root):
-        return []
-    names = []
-    for node_name in sorted(os.listdir(cn_root)):
-        node_path = os.path.join(cn_root, node_name)
-        if _custom_node_filter_reason(node_name, node_path) is not None:
-            continue
-        names.append(node_name)
-    return names
+    return _publication_policy.iter_syncable_custom_node_dirs(cn_root)
 
 
 def _diagnose_custom_node_selection(cn_root: str) -> None:

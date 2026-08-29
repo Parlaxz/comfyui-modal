@@ -924,7 +924,7 @@ default = "e28_single"
 consumed_at = "harness"
 change_requires = "run"
 owner = "v2-core"
-enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
+enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "golden_p1_serial", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
 description = "Benchmark harness mode selector. Default e28_single = ONE full run_plan_stream generation (the tracer/validation path). snapshot_restore_only (the restore-only PROBE that never generates) is an explicit opt-in ONLY; v2ctl gate/run must never silently fall into it."
 
 [[flag]]

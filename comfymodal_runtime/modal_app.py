@@ -49,6 +49,7 @@ from .contracts import (
 )
 from . import contracts as _contracts_mod
 from .deployment_spec import build_deployment_identity
+from .publication_policy import resolve_custom_nodes_root
 from .env import (
     env_flag,
     observability_allows,
@@ -3447,10 +3448,7 @@ class ModalRuntimeSpec:
 
 
 def _local_custom_nodes_root() -> Path:
-    explicit = os.environ.get("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
-    if explicit:
-        return Path(explicit).resolve()
-    return Path(__file__).resolve().parents[1]
+    return Path(resolve_custom_nodes_root(Path(__file__).resolve().parents[1]))
 
 
 def _collect_warmup_env() -> dict[str, str]:

@@ -164,18 +164,19 @@ if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
     REM Golden must never inherit the run-only restore fallback.  Abort before
     REM credentials are loaded or any benchmark/Modal work is attempted.
     if not defined COMFYMODAL_V2_APP_NAME (
-        echo === ERROR: golden_p1 requires COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-golden-p1 ===
+        echo === ERROR: golden_p1 requires an experimental COMFYMODAL_V2_APP_NAME ===
         exit /b 1
     )
-    if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1" (
-        REM v2ctl has already resolved and validated an explicit target app
-        REM override (for example, the isolated P4-N cold app).
-        echo [v2.golden_p1] app_identity_source=v2ctl_resolved_target
-    ) else if /i not "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1" (
-        echo === ERROR: golden_p1 app identity mismatch: !COMFYMODAL_V2_APP_NAME! ===
-        echo === Expected stable-modal-comfy-v2-golden-p1; refusing before any Modal work. ===
+    if /i "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1" (
+        echo === ERROR: golden_p1 refuses protected production app stable-modal-comfy-v2-golden-p1 ===
         exit /b 1
     )
+    if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_serial" (
+        echo === ERROR: golden_p1 requires V2_BENCHMARK_MODE=golden_p1_serial ===
+        exit /b 1
+    )
+    if not defined V2_BENCHMARK_MODE set "V2_BENCHMARK_MODE=golden_p1_serial"
+    echo [v2.golden_p1] app_identity_source=resolved_experimental_target
 )
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"

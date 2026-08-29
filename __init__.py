@@ -22,6 +22,16 @@ if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
 
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.publication_policy import (
+    EXCLUDED_DIR_NAMES as _CUSTOM_NODE_SYNC_EXCLUDE_DIRS,
+    EXCLUDED_EXTENSIONS as _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS,
+    LOCAL_CLONE_RE as _CUSTOM_NODE_LOCAL_CLONE_RE,
+    custom_node_filter_reason as _custom_node_filter_reason_policy,
+    iter_syncable_custom_node_dirs as _iter_syncable_custom_node_dirs_policy,
+    resolve_custom_nodes_root as _resolve_custom_nodes_root_policy,
+    is_excluded_path as _is_excluded_publication_path,
+    is_publishable_top_level_node as _is_publishable_top_level_node,
+)
 
 _local_exact_prefill = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
@@ -903,24 +913,6 @@ def _default_modal_settings() -> dict:
         "gpu": _catalog_default_gpu(),
     }
 
-_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    "output", "test-results", "playwright-report",
-    ".playwright-mcp", ".experiments", ".run_history",
-    "benchmark_runs", "benchmark_logs", "optimization_logs",
-    ".comfymodal_experiments", ".custom_node_requirements", ".baked_custom_node_deps",
-    ".presets", ".preset_blobs",
-}
-# Canonical clone filter — must match comfyapp.py's exact pattern so the
-# local archive sync, the image-baked manifest, and the runtime volume
-# generation all exclude the same agent/worktree clones (including
-# ``comfyui-modal-agent1-full-trace`` variants).
-_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
-    r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
-    re.IGNORECASE,
-)
-_CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS = {".pyc", ".pyo"}
-
 _pip_install_error = ""
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
     " [output]": "output",
@@ -1201,25 +1193,11 @@ def _seed_server_gpu_from_settings() -> str:
         return ""
 
 def _custom_nodes_root() -> str:
-    return os.path.join(os.path.dirname(os.path.dirname(_NODE_DIR)), "custom_nodes")
+    return _resolve_custom_nodes_root_policy(_NODE_DIR)
 
 
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
-    if not os.path.isdir(cn_root):
-        return []
-    names = []
-    for node_dir in os.listdir(cn_root):
-        node_path = os.path.join(cn_root, node_dir)
-        if not os.path.isdir(node_path):
-            continue
-        if (
-            node_dir.startswith(".")
-            or node_dir in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS
-            or _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_dir)
-        ):
-            continue
-        names.append(node_dir)
-    return sorted(names)
+    return _iter_syncable_custom_node_dirs_policy(cn_root)
 
 
 def _build_custom_node_fingerprint(cn_root: str) -> str:
@@ -3126,11 +3104,9 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
     import tarfile
 
     def tar_filter(tarinfo):
-        parts = tarinfo.name.split("/")
-        for part in parts:
-            if part in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
-                return None
-        if any(tarinfo.name.endswith(ext) for ext in _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS):
+        if tarinfo.issym() or tarinfo.islnk():
+            return None
+        if _is_excluded_publication_path(tarinfo.name):
             return None
         return tarinfo
 
@@ -3139,16 +3115,9 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
         allowed = set(_iter_syncable_custom_node_dirs(cn_root))
         for node_dir in (sorted(os.listdir(cn_root)) if os.path.isdir(cn_root) else []):
             node_path = os.path.join(cn_root, node_dir)
-            if not os.path.isdir(node_path):
+            if not os.path.isdir(node_path) or os.path.islink(node_path):
                 continue
-            if node_dir in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
-                reason = "generated_or_environment_directory"
-            elif node_dir.startswith("."):
-                reason = "hidden_directory"
-            elif _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_dir):
-                reason = "local_agent_or_worktree_clone"
-            else:
-                reason = "production_custom_node"
+            reason = _custom_node_filter_reason(node_dir, node_path) or "production_custom_node"
             print(
                 f"[comfyui-modal.custom_node_filter] action={'allow' if node_dir in allowed else 'deny'} "
                 f"name={node_dir} reason={reason}",

@@ -105,7 +105,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
 
 
-def test_golden_p1_uses_serial_mode_but_preserves_explicit_mode_selector():
+def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector():
     assert cli._benchmark_mode(_config("golden_p1")) == "golden_p1_serial"
     args, env = cli._validation_backend_args(_config("golden_p1"))
     assert args == [
@@ -118,15 +118,26 @@ def test_golden_p1_uses_serial_mode_but_preserves_explicit_mode_selector():
         "V2_BENCHMARK_MODE": "golden_p1_serial"
     }
 
-    explicit = _config("golden_p1", sets=["V2_BENCHMARK_MODE=e28_single"])
-    assert cli._benchmark_mode(explicit) == "e28_single"
+    explicit = _config("golden_p1", sets=["V2_BENCHMARK_MODE=golden_p1_serial"])
+    cli._reject_golden_mode_override(explicit, command="v2ctl golden run")
+    assert cli._benchmark_mode(explicit) == "golden_p1_serial"
     explicit_args, explicit_env = cli._validation_backend_args(explicit)
     assert explicit_args == args
     assert explicit_env == {
-        "V2_BENCHMARK_MODE": "e28_single"
+        "V2_BENCHMARK_MODE": "golden_p1_serial"
     }
 
     assert cli._benchmark_mode(_config("production")) == "e28_single"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["acceptance", "variance_cold", "variance_matrix", "volume_read", "snapshot_restore_only"],
+)
+def test_golden_p1_rejects_explicit_generic_mode(mode):
+    config = _config("golden_p1", sets=[f"V2_BENCHMARK_MODE={mode}"])
+    with pytest.raises(cli.GateError, match="only golden_p1_serial is allowed"):
+        cli._reject_golden_mode_override(config, command="v2ctl golden run")
 
 
 # ── Batch wrapper routing (static analysis) ───────────────────────────────
@@ -149,27 +160,53 @@ def test_both_bats_activate_golden_p1_via_existing_selector_mechanisms():
 def test_deploy_golden_selector_uses_golden_mode_and_preserves_target_identity():
     lines = _bat_lines("deploy_and_run_v2_single.bat")
     golden_active = next(i for i, line in enumerate(lines) if 'if "!V2_GOLDEN_P1_ACTIVE!"=="1" (' in line)
+    mode_guard = next(i for i, line in enumerate(lines) if "golden_p1 requires V2_BENCHMARK_MODE=golden_p1_serial" in line)
     golden_mode = next(i for i, line in enumerate(lines) if 'set "V2_BENCHMARK_MODE=golden_p1_serial"' in line)
     default_mode = next(i for i, line in enumerate(lines) if 'set "V2_BENCHMARK_MODE=snapshot_restore_only"' in line)
     restore_only = next(i for i, line in enumerate(lines) if 'if /i "!V2_BENCHMARK_MODE!"=="snapshot_restore_only" set "V2_IS_RESTORE_ONLY=1"' in line)
     app_default = next(i for i, line in enumerate(lines) if 'COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow' in line)
     restore_app = next(i for i, line in enumerate(lines) if 'set "COMFYMODAL_V2_APP_NAME=!COMFYMODAL_V2_RESTORE_ONLY_APP_NAME!"' in line)
 
-    assert golden_mode > golden_active
+    assert golden_active < mode_guard < golden_mode
     assert golden_mode < default_mode < restore_only < restore_app
     assert lines[app_default].strip().startswith(
         "if not defined COMFYMODAL_V2_APP_NAME set "
     )
-    assert _config("golden_p1").target.app == "stable-modal-comfy-v2-golden-p1"
+    assert _config("golden_p1").target.app == "batch-r0-golden-ops"
 
 
 def test_run_bat_rejects_missing_or_wrong_golden_app_before_fallback():
     lines = _bat_lines("run_v2_single.bat")
     text = "\n".join(lines)
     assert 'if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1"' in text
-    assert "golden_p1 requires COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-golden-p1" in text
-    assert 'if /i not "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1"' in text
-    guard = next(i for i, line in enumerate(lines) if "golden_p1 requires COMFYMODAL_V2_APP_NAME" in line)
+    assert "golden_p1 requires an experimental COMFYMODAL_V2_APP_NAME" in text
+    assert 'if /i "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1"' in text
+    guard = next(i for i, line in enumerate(lines) if "golden_p1 requires an experimental" in line)
+    fallback = next(i for i, line in enumerate(lines) if "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow" in line)
+    assert guard < fallback
+
+
+def test_both_bats_reject_non_golden_mode_before_generic_branches():
+    for name in ("deploy_and_run_v2_single.bat", "run_v2_single.bat"):
+        lines = _bat_lines(name)
+        mode_guard = next(
+            i for i, line in enumerate(lines)
+            if "golden_p1 requires V2_BENCHMARK_MODE=golden_p1_serial" in line
+        )
+        generic_branch = next(
+            i for i, line in enumerate(lines)
+            if 'V2_BENCHMARK_MODE!"=="variance_matrix' in line
+        )
+        assert mode_guard < generic_branch
+        assert 'if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_serial" (' in lines[mode_guard - 1]
+
+
+def test_deploy_bat_rejects_missing_or_protected_golden_app_before_fallback():
+    lines = _bat_lines("deploy_and_run_v2_single.bat")
+    text = "\n".join(lines)
+    assert "golden_p1 requires an experimental COMFYMODAL_V2_APP_NAME" in text
+    assert 'if /i "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1"' in text
+    guard = next(i for i, line in enumerate(lines) if "golden_p1 requires an experimental" in line)
     fallback = next(i for i, line in enumerate(lines) if "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow" in line)
     assert guard < fallback
 

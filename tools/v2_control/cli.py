@@ -9,6 +9,7 @@ network, no ambient experiment env leakage.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -58,6 +59,8 @@ GOLDEN_P1_SELECTOR = "golden_p1"
 GOLDEN_P1_METHOD = "run_golden_serial_stream"
 GOLDEN_P1_MODE = "golden_p1_serial"
 FULL_RUN_METHOD = "run_plan_stream"
+PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
+_MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 # E37 deliberately inherits the E29/E28 workload shape, but its late CLIP
 # policy is not compatible with the historical E28 selector.  Keep this path
@@ -170,6 +173,97 @@ def build_components(repo_root: Path, profile_name: str, cli_options: dict[str, 
     env_builder = env_mod.EnvironmentBuilder()
     backend_registry = backend_mod.BackendRegistry(repo_root)
     return registry, profiles, resolver, config, fingerprints, env_builder, backend_registry
+
+
+def _build_components_for_args(repo_root: Path, args):
+    """Resolve one command's complete identity through the same path.
+
+    In particular, public Golden commands must not let doctor/status use the
+    profile target while deploy/run use a separately assembled app override.
+    Keeping this in one helper makes the app, class, method, flags, and
+    fingerprints identical for every command.
+    """
+    return build_components(
+        repo_root,
+        args.profile,
+        cli_options=_cli_target_options(args),
+        sets=getattr(args, "set", []),
+        inherits=getattr(args, "inherit", []),
+    )
+
+
+def _normalize_app_name(value: object) -> str:
+    normalized = str(value).strip().lower()
+    if not _MODAL_APP_NAME_RE.fullmatch(normalized):
+        raise ValueError(
+            f"invalid Golden app name {value!r}; use lowercase letters, digits, "
+            "and internal hyphens (1-63 characters)"
+        )
+    return normalized
+
+
+def _reject_golden_identity_args(args, *, public: bool = False) -> int | None:
+    """Reject protected Golden identity before any backend-side work.
+
+    ``--allow-production`` used to be a bypass.  R0 is intentionally not a
+    production workflow, so the option is accepted only to produce a clear
+    refusal rather than silently changing the target.
+    """
+    profile = str(getattr(args, "profile", "") or "")
+    is_golden = profile == GOLDEN_P1_PROFILE
+    raw_app = getattr(args, "app", None)
+    if raw_app:
+        try:
+            args.app = _normalize_app_name(raw_app)
+        except ValueError as exc:
+            if public or is_golden:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
+    if getattr(args, "app", None) == PROTECTED_GOLDEN_APP:
+        print(
+            f"ERROR: {PROTECTED_GOLDEN_APP!r} is production-protected; "
+            "Golden R0 requires a distinct experimental --app",
+            file=sys.stderr,
+        )
+        return 2
+    if getattr(args, "allow_production", False) and (public or is_golden):
+        print(
+            "ERROR: --allow-production is disabled for the isolated Golden R0 workflow",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
+def _reject_protected_effective_target(
+    config: config_mod.ResolvedConfig, *, command: str
+) -> None:
+    """Reject a protected app after profile/CLI target resolution.
+
+    The raw ``--app`` check runs before dispatch.  This second check closes the
+    equivalent path where a profile or another resolver supplies the protected
+    target, before a command can inspect manifests, versions, or invoke a
+    backend.
+    """
+    app = str(getattr(getattr(config, "target", None), "app", "") or "").strip().lower()
+    if app == PROTECTED_GOLDEN_APP:
+        raise GateError(
+            f"{command} refuses production-protected app {PROTECTED_GOLDEN_APP!r}; "
+            "Golden R0 requires a distinct experimental --app"
+        )
+
+
+def _reject_flat_golden_deploy_run(args) -> int | None:
+    """Keep Golden deploy/run on its explicit public command path."""
+    if getattr(args, "profile", None) != GOLDEN_P1_PROFILE:
+        return None
+    print(
+        "ERROR: flat `v2ctl deploy-run --profile golden_p1` is not supported; "
+        "use `v2ctl golden deploy --app <experimental>` followed by "
+        "`v2ctl golden run --app <experimental>`",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def _redact_env(env: dict[str, str]) -> dict[str, str]:
@@ -314,8 +408,8 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
             args += ["--golden-p1-expected-output-sha", expected_sha]
         # The registry default is e28_single, whose BAT branch invokes the
         # ordinary run_plan_stream path.  Project the effective Golden mode
-        # explicitly so the request reaches the serial-Golden branch.  An
-        # explicit V2_BENCHMARK_MODE remains authoritative.
+        # explicitly so the request reaches the serial-Golden branch.  The
+        # local Golden guard rejects explicit generic modes before this point.
         return args, {"V2_BENCHMARK_MODE": _benchmark_mode(config)}
 
     selector = _backend_selector(config)
@@ -372,8 +466,9 @@ def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
 
     Golden P1 has a dedicated mode because the registry default
     (``e28_single``) routes to the ordinary ``run_plan_stream`` branch.
-    Explicit mode selectors remain authoritative.  Non-Golden profiles keep
-    the registry default and existing explicit-mode behavior.
+    The canonical Golden mode is projected for the inherited registry default;
+    explicit generic selectors are rejected by the command guard.  Non-Golden
+    profiles keep the registry default and existing explicit-mode behavior.
     """
     try:
         env = {f.name: f.value for f in config.flags}
@@ -392,6 +487,38 @@ def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
         return "e28_single"
 
 
+def _reject_golden_mode_override(
+    config: config_mod.ResolvedConfig, *, command: str
+) -> None:
+    """Keep explicit Golden mode selection on the dedicated harness only.
+
+    The Golden profile's registry default is inherited from production for
+    compatibility, so ``_benchmark_mode`` projects that default to the
+    canonical Golden mode.  An explicit override is different: accepting a
+    generic harness mode would let the BAT reach a generic branch before the
+    Golden branch.  Refuse it while the resolved configuration is still local.
+    """
+    profile = str(getattr(config, "profile_name", "") or "")
+    mode_flag = config.flag("V2_BENCHMARK_MODE")
+    effective_mode = _benchmark_mode(config)
+    if profile != GOLDEN_P1_PROFILE and effective_mode == GOLDEN_P1_MODE:
+        raise GateError(
+            f"{command} refuses V2_BENCHMARK_MODE={GOLDEN_P1_MODE} for "
+            f"non-Golden profile {profile or '(missing)'}; only "
+            f"{GOLDEN_P1_PROFILE} may use that mode"
+        )
+    if profile != GOLDEN_P1_PROFILE:
+        return
+    if mode_flag is None or mode_flag.source not in {"cli", "inherit", "set"}:
+        return
+    mode = str(mode_flag.value or "").strip()
+    if mode != GOLDEN_P1_MODE:
+        raise GateError(
+            f"{command} refuses explicit V2_BENCHMARK_MODE={mode or '(empty)'} "
+            f"for {GOLDEN_P1_PROFILE}; only {GOLDEN_P1_MODE} is allowed"
+        )
+
+
 def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -> None:
     """HARD GUARD: gate/run must produce a full generation (run_plan_stream),
     never the snapshot-restore-only PROBE (which calls
@@ -401,6 +528,7 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
     through the gate/run path is a configuration error and is refused before
     any spend.
     """
+    _reject_golden_mode_override(config, command=command)
     mode = _benchmark_mode(config)
     if mode == "snapshot_restore_only":
         raise GateError(
@@ -595,6 +723,21 @@ def latest_deployment_manifest(repo_root: Path) -> dict | None:
         return None
 
 
+def _golden_capture_guard_class(repo_root: Path):
+    """Load the root-level guard when this CLI is launched as a script."""
+    try:
+        from deploy_warmup import GoldenCaptureGuard
+        return GoldenCaptureGuard
+    except ModuleNotFoundError:
+        path = repo_root / "deploy_warmup.py"
+        spec = importlib.util.spec_from_file_location("_v2ctl_deploy_warmup", path)
+        if spec is None or spec.loader is None:
+            raise V2CtlError(f"Golden capture guard module is unavailable: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.GoldenCaptureGuard
+
+
 def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
                        fingerprints: fp_mod.FingerprintEngine,
                        env: dict[str, str],
@@ -700,9 +843,202 @@ def cmd_version(args, repo_root: Path) -> int:
     return 0
 
 
+def cmd_golden_status(args, repo_root: Path) -> int:
+    """Report local Golden readiness without invoking a backend.
+
+    This is deliberately a local status view.  A matching deployment manifest
+    proves only that the requested configuration was deployed; runtime and
+    source identity remain unverified until their explicit checks run.
+    """
+    identity_error = _reject_golden_identity_args(args, public=True)
+    if identity_error is not None:
+        return identity_error
+    try:
+        _, _, _, config, fingerprints, _, _ = _build_components_for_args(
+            repo_root, args
+        )
+        _reject_protected_effective_target(config, command="v2ctl golden status")
+        _reject_golden_mode_override(config, command="v2ctl golden status")
+        manifest = latest_deployment_manifest(repo_root)
+        manifest_path = None
+        manifest_dir = _deployment_manifest_dir(repo_root)
+        if manifest_dir.is_dir():
+            files = sorted(manifest_dir.glob("deploy_*.json"))
+            if files:
+                manifest_path = str(files[-1])
+
+        current_fingerprint = fingerprints.deploy_fingerprint()
+        stored_fingerprint = manifest.get("deploy_fingerprint") if manifest else None
+        manifest_target = manifest.get("target") if manifest else None
+        manifest_target_match = bool(
+            isinstance(manifest_target, dict)
+            and manifest_target.get("app") == config.target.app
+            and manifest_target.get("class") == config.target.class_name
+            and manifest_target.get("method") == config.target.method
+        )
+        manifest_is_golden = bool(
+            manifest
+            and manifest.get("profile") == GOLDEN_P1_PROFILE
+            and manifest_target_match
+        )
+        fingerprint_match = bool(
+            manifest_is_golden and stored_fingerprint == current_fingerprint
+        )
+        # An unrelated/latest production manifest is useful mismatch evidence,
+        # never a source of Golden health state.
+        matching_manifest = manifest if fingerprint_match else None
+        deployed_state_path = repo_root / ".deployed_state.json"
+        deployed_state: dict[str, object] | None = None
+        deployed_state_error = ""
+        if deployed_state_path.is_file():
+            try:
+                raw_state = json.loads(deployed_state_path.read_text(encoding="utf-8"))
+                if isinstance(raw_state, dict):
+                    deployed_state = raw_state
+                else:
+                    deployed_state_error = "deployed state is not an object"
+            except (OSError, json.JSONDecodeError) as exc:
+                deployed_state_error = f"{type(exc).__name__}: {exc}"
+        deployed_target_match = bool(
+            deployed_state
+            and deployed_state.get("app_name") == config.target.app
+            and deployed_state.get("class_name") == config.target.class_name
+        )
+        lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+        lock_status = lock.status()
+        lock_active = bool(lock_status is not None and not lock.is_stale(lock_status))
+        GoldenCaptureGuard = _golden_capture_guard_class(repo_root)
+
+        guard_identity = GoldenCaptureGuard.deployment_identity(
+            app_name=config.target.app,
+            class_name=config.target.class_name,
+            gpu=config.resources.gpu,
+            deployment_info=deployed_state or {},
+            deploy_fingerprint=current_fingerprint,
+        )
+        guard = GoldenCaptureGuard(
+            GoldenCaptureGuard.path_for_deployment(repo_root, guard_identity),
+            deployment_identity=guard_identity,
+        )
+        guard_state = guard.snapshot()
+        overrides = ro_mod.RuntimeOverrideInventory(
+            local_dir=repo_root / ".runtime_state"
+        ).list_local()
+
+        out = {
+            "schema_version": SCHEMA_VERSION,
+            "profile": GOLDEN_P1_PROFILE,
+            "target": {
+                "app": config.target.app,
+                "class": config.target.class_name,
+                "method": config.target.method,
+            },
+            "deployment_manifest": manifest_path,
+            "deployment_fingerprint_current": current_fingerprint,
+            "deployment_fingerprint_stored": stored_fingerprint,
+            "deployment_fingerprint_match": fingerprint_match,
+            "deployment_target_match": manifest_target_match,
+            "deployed_state_present": deployed_state is not None,
+            "deployed_state_target_match": deployed_target_match,
+            "deployed_state_app": (deployed_state or {}).get("app_name"),
+            "deployed_state_class": (deployed_state or {}).get("class_name"),
+            "deployed_state_combined_hash": (deployed_state or {}).get(
+                "deployment_combined_hash"
+            ),
+            "deployed_state_error": deployed_state_error,
+            "runtime_health_status": (matching_manifest or {}).get(
+                "runtime_health_status", "unverified"
+            ),
+            "source_identity_status": (matching_manifest or {}).get(
+                "source_identity_status", "unverified"
+            ),
+            "runtime_overrides_present": len(overrides),
+            "deploy_lock_active": lock_active,
+            "capture_guard": guard_state,
+            "next_request_guarded": bool(guard_state.get("post_capture_guard_pending")),
+            "remote_checks": "not_performed",
+        }
+        out["ready"] = bool(
+            fingerprint_match
+            and deployed_target_match
+            and out["runtime_health_status"] == "verified"
+            and out["source_identity_status"] == "verified"
+            and not out["runtime_overrides_present"]
+            and not lock_active
+            # A pending post-capture guard makes the next request invalid;
+            # readiness therefore remains false until that guard is consumed.
+            and not out["next_request_guarded"]
+        )
+        if args.json:
+            print(json.dumps(out, indent=2, sort_keys=True))
+        else:
+            print("[v2ctl.golden.status]")
+            for key, value in out.items():
+                print(f"{key}={value}")
+        return 0 if out["ready"] else 1
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_golden(args, repo_root: Path) -> int:
+    """Dispatch the public Golden namespace to the canonical handlers."""
+    if args.golden_command not in {"doctor", "status", "deploy", "run"}:
+        print(
+            "ERROR: public Golden commands are doctor, status, deploy, and run",
+            file=sys.stderr,
+        )
+        return 2
+    requested_profile = getattr(args, "profile", "production")
+    if requested_profile not in ("production", GOLDEN_P1_PROFILE):
+        print(
+            f"ERROR: `golden` commands use profile {GOLDEN_P1_PROFILE!r}; "
+            f"received --profile {requested_profile!r}",
+            file=sys.stderr,
+        )
+        return 1
+    identity_error = _reject_golden_identity_args(args, public=True)
+    if identity_error is not None:
+        return identity_error
+    public_run = args.golden_command in {"deploy", "run"}
+    dry_run = bool(getattr(args, "dry_run", False))
+    if public_run and not dry_run:
+        if not getattr(args, "app", None):
+            print(
+                "ERROR: Golden deploy/run requires --app <experimental-app>; "
+                f"{PROTECTED_GOLDEN_APP!r} is protected",
+                file=sys.stderr,
+            )
+            return 2
+    args.profile = GOLDEN_P1_PROFILE
+    args.golden_public = True
+    if args.golden_command == "run":
+        if args.run_count not in (None, 1):
+            print("ERROR: public Golden run always executes exactly one request", file=sys.stderr)
+            return 2
+        args.run_count = 1
+    if args.golden_command == "status":
+        return cmd_golden_status(args, repo_root)
+    handlers = {
+        "doctor": cmd_doctor,
+        "deploy": cmd_deploy,
+        "run": cmd_run,
+    }
+    handler = handlers.get(args.golden_command)
+    if handler is None:
+        print(f"usage: v2ctl golden <command>", file=sys.stderr)
+        return 2
+    return handler(args, repo_root)
+
+
 def cmd_doctor(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     problems: list[str] = []
     out: list[str] = ["[v2ctl.doctor]"]
+    selected_config = None
+    selected_fingerprints = None
     # git state
     git = config_mod.compute_git_state(repo_root)
     out.append(f"git.head={git.head}")
@@ -710,6 +1046,21 @@ def cmd_doctor(args, repo_root: Path) -> int:
     out.append(f"git.dirty={int(git.dirty)}")
     # python
     out.append(f"python={sys.version.split()[0]}")
+    try:
+        _, _, _, selected_config, selected_fingerprints, _, _ = _build_components_for_args(
+            repo_root, args
+        )
+        _reject_protected_effective_target(selected_config, command="v2ctl doctor")
+        _reject_golden_mode_override(selected_config, command="v2ctl doctor")
+        out.append(f"profile={selected_config.profile_name}")
+        out.append(f"target.app={selected_config.target.app}")
+        out.append(f"target.class={selected_config.target.class_name}")
+        out.append(f"target.method={selected_config.target.method}")
+    except GateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except (V2CtlError, OSError) as exc:
+        problems.append(f"config resolution failed: {exc}")
     # backend scripts
     backend_registry = backend_mod.BackendRegistry(repo_root)
     for spec in backend_registry.available():
@@ -758,13 +1109,24 @@ def cmd_doctor(args, repo_root: Path) -> int:
         problems.append("no deployment manifest found; run `v2ctl deploy-run` or `v2ctl deploy` first")
     else:
         try:
-            _, _, _, config, fingerprints, _, _ = build_components(repo_root, args.profile)
+            config = selected_config
+            fingerprints = selected_fingerprints
+            if config is None or fingerprints is None:
+                raise GateError("selected profile could not be resolved")
             current = fingerprints.deploy_fingerprint()
             stored = manifest.get("deploy_fingerprint")
-            match = stored == current
+            manifest_target = manifest.get("target")
+            target_match = bool(
+                isinstance(manifest_target, dict)
+                and manifest_target.get("app") == config.target.app
+                and manifest_target.get("class") == config.target.class_name
+                and manifest_target.get("method") == config.target.method
+            )
+            match = stored == current and target_match
             out.append(f"deployment.fingerprint.stored={stored}")
             out.append(f"deployment.fingerprint.current={current}")
             out.append(f"deployment.fingerprint.match={int(match)}")
+            out.append(f"deployment.target.match={int(target_match)}")
             if not match:
                 problems.append("deployment fingerprint mismatch: deploy-required state changed since last deploy")
         except V2CtlError as exc:
@@ -789,12 +1151,14 @@ def _refuse_protected_explicit(config: config_mod.ResolvedConfig) -> None:
 
 
 def cmd_config(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     try:
-        _, _, _, config, fingerprints, _, _ = build_components(
-            repo_root, args.profile,
-            sets=args.set, inherits=args.inherit,
-        )
+        _, _, _, config, fingerprints, _, _ = _build_components_for_args(repo_root, args)
+        _reject_protected_effective_target(config, command="v2ctl config")
         _refuse_protected_explicit(config)
+        _reject_golden_mode_override(config, command="v2ctl config")
     except V2CtlError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -937,6 +1301,10 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
                     env: dict[str, str], command: str) -> None:
     print("[v2ctl.dry-run] no invocation performed; effective configuration:")
     print(f"profile={config.profile_name} owner={config.owner}")
+    print(
+        f"target.app={config.target.app} target.class={config.target.class_name} "
+        f"target.method={config.target.method}"
+    )
     print(f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
     print(f"run_fingerprint={fingerprints.run_fingerprint()}")
     print(f"selector={_backend_selector(config) or '(none)'}")
@@ -948,15 +1316,25 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
 
 
 def cmd_deploy(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     try:
-        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
-            repo_root, args.profile, cli_options=_cli_target_options(args),
-            sets=args.set, inherits=args.inherit,
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = _build_components_for_args(
+            repo_root, args
         )
+        _reject_protected_effective_target(config, command="v2ctl deploy")
+        _reject_golden_mode_override(config, command="v2ctl deploy")
         invocation_id = _new_invocation_id()
         spec = backend_registry.deploy_only()
+        golden_mode_env = (
+            {"V2_BENCHMARK_MODE": GOLDEN_P1_MODE}
+            if config.profile_name == GOLDEN_P1_PROFILE
+            else {}
+        )
         env = env_builder.build(config, host_env=os.environ,
                                 backend_extra={**spec.deploy_only_env,
+                                               **golden_mode_env,
                                                **_identity_env_for_command("deploy", config),
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
         # Forward the canonical selector (e.g. E28_VALIDATION) as the BAT's
@@ -987,7 +1365,11 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # so a post-deploy comparison can prove a NEW version appeared
             # (a "version deployed recently" check falsely passes when a
             # deploy right after a prior one no-ops).
-            _pre_version = _app_version_number(config.target.app) if config.target.app else 0
+            # Every deploy, including public Golden deploys, must prove that
+            # the target app received a new deployment version.  A successful
+            # backend exit alone can also represent a no-op deploy.
+            verify_version = True
+            _pre_version = _app_version_number(config.target.app)
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id)
@@ -1021,8 +1403,8 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # deployment version ADVANCED during this deploy; if it did not,
             # the deploy must be treated as a failure — never exit 0 on a
             # deploy that left the app unchanged.
-            _post_version = _app_version_number(config.target.app) if config.target.app else 0
-            if _post_version <= _pre_version:
+            _post_version = _app_version_number(config.target.app)
+            if verify_version and _post_version <= _pre_version:
                 try:
                     manifest.unlink(missing_ok=True)
                 except OSError:
@@ -1043,11 +1425,18 @@ def cmd_deploy(args, repo_root: Path) -> int:
 
 
 def cmd_deploy_run(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
+    flat_golden_error = _reject_flat_golden_deploy_run(args)
+    if flat_golden_error is not None:
+        return flat_golden_error
     try:
-        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
-            repo_root, args.profile, cli_options=_cli_target_options(args),
-            sets=args.set, inherits=args.inherit,
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = _build_components_for_args(
+            repo_root, args
         )
+        _reject_protected_effective_target(config, command="v2ctl deploy-run")
+        _reject_golden_mode_override(config, command="v2ctl deploy-run")
         invocation_id = _new_invocation_id()
         spec = backend_registry.canonical()
         env = env_builder.build(config, host_env=os.environ,
@@ -1102,27 +1491,48 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
 
 
 def cmd_run(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     try:
-        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
-            repo_root, args.profile, cli_options=_cli_target_options(args),
-            sets=args.set, inherits=args.inherit,
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = _build_components_for_args(
+            repo_root, args
         )
+        _reject_protected_effective_target(config, command="v2ctl run")
+        _reject_golden_mode_override(config, command="v2ctl run")
         # Run-only: refuse unregistered and deploy-required explicit changes.
         resolver.check_run_safety(config, run_only=True)
         _require_no_deploy_in_flight(repo_root)
         manifest = latest_deployment_manifest(repo_root)
-        if manifest is None:
-            raise GateError("no deployment manifest; run `v2ctl deploy-run` (or `deploy`) first")
-        stored = manifest.get("deploy_fingerprint")
+        golden_dry_run = bool(
+            getattr(args, "golden_public", False) and getattr(args, "dry_run", False)
+        )
+        if not golden_dry_run:
+            if manifest is None:
+                raise GateError("no deployment manifest; run `v2ctl deploy-run` (or `deploy`) first")
+            manifest_target = manifest.get("target")
+            if not (
+                isinstance(manifest_target, dict)
+                and manifest_target.get("app") == config.target.app
+                and manifest_target.get("class") == config.target.class_name
+                and manifest_target.get("method") == config.target.method
+            ):
+                raise GateError(
+                    "deployment target mismatch; the latest deployment does not target "
+                    f"app={config.target.app} class={config.target.class_name} "
+                    f"method={config.target.method}"
+                )
+            stored = manifest.get("deploy_fingerprint")
+            current = fingerprints.deploy_fingerprint()
+            if stored != current:
+                changes = diff_deploy_inputs(manifest.get("deploy_inputs", {}),
+                                             fingerprints.deploy_inputs())
+                raise GateError(
+                    "deployment fingerprint mismatch; deploy-required state changed since last "
+                    f"deploy. stored={stored} current={current}. Changed: "
+                    + ("; ".join(changes) if changes else "(unknown)"),
+                )
         current = fingerprints.deploy_fingerprint()
-        if stored != current:
-            changes = diff_deploy_inputs(manifest.get("deploy_inputs", {}),
-                                         fingerprints.deploy_inputs())
-            raise GateError(
-                "deployment fingerprint mismatch; deploy-required state changed since last "
-                f"deploy. stored={stored} current={current}. Changed: "
-                + ("; ".join(changes) if changes else "(unknown)"),
-            )
         enforce_runtime_overrides(config,
                                   ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
                                   spend=True)
@@ -1176,6 +1586,12 @@ def cmd_run(args, repo_root: Path) -> int:
         print(f"[v2ctl.run] exit={result.exit_code} manifest={run_manifest}")
         if not result.ok():
             return result.exit_code if result.exit_code else 1
+        val_mod.mark_runtime_health_verified(
+            repo_root,
+            config,
+            fingerprints,
+            current,
+        )
         return 0
     except (V2CtlError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1183,17 +1599,36 @@ def cmd_run(args, repo_root: Path) -> int:
 
 
 def cmd_gate(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     try:
-        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
-            repo_root, args.profile, cli_options=_cli_target_options(args),
-            sets=args.set, inherits=args.inherit,
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = _build_components_for_args(
+            repo_root, args
         )
+        _reject_protected_effective_target(config, command="v2ctl gate")
+        _reject_golden_mode_override(config, command="v2ctl gate")
         resolver.check_run_safety(config, run_only=True)
         _require_no_deploy_in_flight(repo_root)
         manifest = latest_deployment_manifest(repo_root)
-        if manifest is None or manifest.get("deploy_fingerprint") != fingerprints.deploy_fingerprint():
+        if manifest is None:
             raise GateError("gate requires a deployment whose fingerprint matches the requested "
                             "configuration; run `v2ctl deploy-run` first")
+        if manifest.get("deploy_fingerprint") != fingerprints.deploy_fingerprint():
+            raise GateError("gate requires a deployment whose fingerprint matches the requested "
+                            "configuration; run `v2ctl deploy-run` first")
+        manifest_target = manifest.get("target")
+        if not (
+            isinstance(manifest_target, dict)
+            and manifest_target.get("app") == config.target.app
+            and manifest_target.get("class") == config.target.class_name
+            and manifest_target.get("method") == config.target.method
+        ):
+            raise GateError(
+                "deployment target mismatch; the latest deployment does not target "
+                f"app={config.target.app} class={config.target.class_name} "
+                f"method={config.target.method}"
+            )
         enforce_runtime_overrides(config,
                                   ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
                                   spend=True)
@@ -1258,11 +1693,15 @@ def cmd_gate(args, repo_root: Path) -> int:
 
 
 def cmd_confirm(args, repo_root: Path) -> int:
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     try:
-        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = build_components(
-            repo_root, args.profile, cli_options=_cli_target_options(args),
-            sets=args.set, inherits=args.inherit,
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = _build_components_for_args(
+            repo_root, args
         )
+        _reject_protected_effective_target(config, command="v2ctl confirm")
+        _reject_golden_mode_override(config, command="v2ctl confirm")
         resolver.check_run_safety(config, run_only=True)
         _require_no_deploy_in_flight(repo_root)
         _require_full_run_mode(config, command="v2ctl confirm")
@@ -1324,27 +1763,24 @@ def cmd_source_probe(args, repo_root: Path) -> int:
     UNEXPECTED_PATH.  Exits nonzero on anything but a full MATCH.  Never
     runs a generation.
     """
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
     try:
         from . import source_probe as sp
 
-        workspace = sp._load_workspace(repo_root)
         # Reuse the profile's target identity (app/class/gpu) so the probe
         # addresses the SAME deployment the gate would.
-        try:
-            registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = (
-                build_components(repo_root, args.profile,
-                                 cli_options=_cli_target_options(args),
-                                 sets=args.set, inherits=args.inherit)
-            )
-            app_name = config.target.app
-            class_name = config.target.class_name
-            gpu = config.resources.gpu
-            deploy_fp = fingerprints.deploy_fingerprint()
-        except Exception:
-            app_name = ""
-            class_name = ""
-            gpu = "rtx-pro-6000"
-            deploy_fp = ""
+        registry, profiles, resolver, config, fingerprints, env_builder, backend_registry = (
+            _build_components_for_args(repo_root, args)
+        )
+        _reject_protected_effective_target(config, command="v2ctl source-probe")
+        _reject_golden_mode_override(config, command="v2ctl source-probe")
+        app_name = config.target.app
+        class_name = config.target.class_name
+        gpu = config.resources.gpu
+        deploy_fp = fingerprints.deploy_fingerprint()
+        workspace = sp._load_workspace(repo_root)
         import os as _os
         if app_name:
             _os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
@@ -1486,7 +1922,9 @@ def cmd_lock(args, repo_root: Path) -> int:
 def _cli_target_options(args) -> dict[str, str]:
     opts: dict[str, str] = {}
     if getattr(args, "app", None):
-        opts["target.app"] = args.app
+        # Modal app names are case-insensitive at the CLI boundary, but the
+        # resolved identity and fingerprints must be stable everywhere.
+        opts["target.app"] = str(args.app).strip().lower()
     if getattr(args, "gpu", None):
         opts["resources.gpu"] = args.gpu
     if getattr(args, "memory_mb", None):
@@ -1516,6 +1954,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-mb", type=int, default=None, help="override resource memory")
     parser.add_argument("--cpu", type=int, default=None, help="override resource CPU")
     parser.add_argument("--run-count", type=int, default=None, help="override run count")
+    parser.add_argument(
+        "--allow-production", action="store_true",
+        help="deprecated; always refused for Golden R0",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("version")
@@ -1555,6 +1997,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", type=int, default=1)
     p.set_defaults(func=cmd_confirm)
 
+    p = sub.add_parser("golden", help="public Golden operations")
+    gsub = p.add_subparsers(dest="golden_command", required=True)
+    gsub.add_parser("status", help="show local Golden readiness without backend calls").set_defaults(
+        func=cmd_golden
+    )
+    for name in ("doctor", "deploy", "run"):
+        gsub.add_parser(name).set_defaults(func=cmd_golden)
+
     p = sub.add_parser("source-probe")
     p.set_defaults(func=cmd_source_probe)
 
@@ -1582,7 +2032,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_GLOBAL_HOIST_WITH_VALUE = ("--profile", "--owner")
+_GLOBAL_HOIST_WITH_VALUE = (
+    "--profile",
+    "--owner",
+    "--app",
+    "--gpu",
+    "--memory-mb",
+    "--cpu",
+    "--run-count",
+)
 
 
 def _hoist_global_options(argv: list[str]) -> list[str]:
@@ -1606,7 +2064,7 @@ def _hoist_global_options(argv: list[str]) -> list[str]:
             rest.append(arg)
             i += 1
             continue
-        if arg in ("--dry-run", "--json"):
+        if arg in ("--dry-run", "--json", "--allow-production"):
             front.append(arg)
             i += 1
             continue
@@ -1621,6 +2079,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(_hoist_global_options(argv))
     repo_root = Path(__file__).resolve().parents[2]
     try:
+        # Apply the flat-command Golden identity guard before dispatch so even
+        # commands that do not reach a backend cannot accept the protected app.
+        if args.command != "golden":
+            identity_error = _reject_golden_identity_args(args)
+            if identity_error is not None:
+                return identity_error
         return args.func(args, repo_root)
     except V2CtlError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -1,8 +1,10 @@
 """Tests for audit round 7: waterfall wiring, topology hash, workspace isolation, active-next bounding."""
 
 import ast
+import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +22,25 @@ def _find_function_source(src, name):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return ast.unparse(node)
     return None
+
+
+def _load_waterfall_function():
+    """Load only the waterfall helper so its arithmetic can be exercised."""
+    src = _read_stripped(REPO_ROOT / "comfyapp.py")
+    tree = ast.parse(src)
+    function = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_log_cold_start_waterfall"
+    )
+    namespace = {
+        "env_flag": lambda _name: False,
+        "_WATERFALL_GLYPH": {"ok": "OK", "miss": "--", "na": "  "},
+        "_PLATFORM_OUTLIER_THRESHOLD_MS": 10000,
+    }
+    module = ast.Module(body=[function], type_ignores=[])
+    exec(compile(module, "<waterfall-test>", "exec"), namespace)
+    return namespace["_log_cold_start_waterfall"]
 
 
 # ── Phase 1: Topology hash ──────────────────────────────────────────────
@@ -132,14 +153,56 @@ class WaterfallCategoryTests(unittest.TestCase):
         self.assertIn("_d(t8b_st, t9)", wf_src)
 
     def test_no_parent_child_double_count(self):
-        """SUM line must exclude items with '_sub' suffix codes."""
-        wf_src = _find_function_source(_read_stripped(REPO_ROOT / "comfyapp.py"),
-                                        "_log_cold_start_waterfall")
-        self.assertIsNotNone(wf_src)
-        # ast.unparse converts `'_sub' not in c` - test for the
-        # pattern without the surrounding code
-        self.assertRegex(wf_src, r"not in c",
-                      "SUM must exclude sub-phase items from critical path")
+        """Old test -> intended invariant -> replacement coverage.
+
+        Old test: match the implementation's ``not in c`` expression.
+        Intended invariant: a parent critical-path span must not be added
+        again through its displayed child spans.
+        Why stale: the implementation's tuple field and arithmetic can change
+        without changing that semantic contract.
+        Replacement coverage: execute the helper with nested child deltas and
+        assert the emitted total contains only the three parent spans.
+        """
+        waterfall = _load_waterfall_function()
+        summary = {
+            "prompt_id": "waterfall-test",
+            "stages": {
+                "t0_client_press": 1000.0,
+                "t2_local_dispatch": 1001.0,
+                "t3_modal_entry": 1002.0,
+                "t3b_validate_done": 1002.5,
+                "t3c_prep_done": 1003.0,
+                "t8b_outputs_collected": 1004.5,
+                "t9_modal_return": 1005.0,
+                "t10_local_materialized": 1006.0,
+            },
+            "deltas_ms": {
+                # These local children total the client-to-entry parent span.
+                "t0_to_t1": 100.0,
+                "t1_to_t2": 900.0,
+                # These execution children are nested in the remote parent.
+                "t3_to_t3b": 500.0,
+                "t3b_to_t3c": 500.0,
+                "clip_load": 250.0,
+                "sampler": 1500.0,
+                "t8b_to_t9": 500.0,
+            },
+            "restore": {"restore_total_ms": 500.0},
+            "derived_ms": {},
+        }
+        with patch("builtins.print") as print_mock:
+            waterfall(summary)
+
+        sum_lines = [
+            str(call.args[0])
+            for call in print_mock.call_args_list
+            if call.args and "known_nonoverlap_total" in str(call.args[0])
+        ]
+        self.assertEqual(len(sum_lines), 1)
+        # 2,000 client->entry + 3,000 remote execution + 1,000 return.
+        match = re.search(r"known_nonoverlap_total\s+([0-9.]+)", sum_lines[0])
+        self.assertIsNotNone(match)
+        self.assertAlmostEqual(float(match.group(1)), 6000.0)
 
     def test_missing_stages_appear(self):
         """The waterfall must include a missing_stages list when

@@ -18,10 +18,11 @@ gate CONDITIONAL GO for Writer A):
   ``golden_output`` -> ``golden_durable_commit`` -> committed-object
   reopen/stat/read/hash verification -> true-durable mark ->
   ``golden_teardown``.
-* No cross-stage overlap, no callbacks/futures/event buses/background
-  prefetch.  Internal QD source workers are allowed but every worker is
-  joined and every CUDA completion event is waited before the load function
-  returns.
+* No cross-stage overlap, no unowned callbacks/futures/event buses/background
+  prefetch.  The opt-in P4-6 diagnostic uses only reversible existing sampler
+  callbacks/model hooks and never participates in workflow execution.  Internal
+  QD source workers are allowed but every worker is joined and every CUDA
+  completion event is waited before the load function returns.
 * Every failure path is fail-closed: no historical pin/alignment fallback,
   no reread, no second H2D, no native loader fallback.
 
@@ -44,6 +45,7 @@ import math
 import ntpath
 import os
 import posixpath
+import sys
 import tempfile
 import threading
 import time
@@ -66,6 +68,11 @@ CANONICAL_CLIP_TYPE = "lumina2"
 CANONICAL_UNET_NAME = "z_image_turbo_bf16.safetensors"
 CANONICAL_VAE_NAME = "ae.safetensors"
 CANONICAL_SAMPLER_CLASS = "ClownsharKSampler_Beta"
+
+# P4-6 is deliberately opt-in. The diagnostic path only observes existing
+# sampler/model callbacks and CacheDiT scalar state; it never changes sampler
+# inputs or performs a CUDA synchronization.
+GOLDEN_SAMPLING_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_SAMPLING_DIAGNOSTICS"
 
 GOLDEN_QD = 4
 GOLDEN_BLOCK_BYTES = 32 * 1024 * 1024
@@ -318,6 +325,7 @@ class GoldenTelemetryRecorder:
         self._reopen_verified = False
         self._reopen_proof: Optional[_DurableReopenProof] = None
         self._external_restore: dict = {}
+        self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
         self.seriality_violations: list[str] = []
 
     def record_external_restore(self, metadata: Optional[dict]) -> None:
@@ -443,7 +451,7 @@ class GoldenTelemetryRecorder:
 
     def to_json_dict(self) -> dict:
         reconcile = self.reconcile_seriality()
-        return {
+        payload = {
             "schema": "golden_p1_telemetry_v1",
             "true_durable_marked": self._true_durable_marked,
             "reopen_verified": self._reopen_verified,
@@ -464,6 +472,10 @@ class GoldenTelemetryRecorder:
             ],
             "events": list(self._events),
         }
+        diagnostics = self.sampling_diagnostics
+        if diagnostics is not None:
+            payload["sampling_diagnostics"] = diagnostics.to_json_dict()
+        return payload
 
     def persist(self, path: str) -> str:
         """Atomically persist the complete JSON telemetry document."""
@@ -492,6 +504,453 @@ class GoldenTelemetryRecorder:
                 pass
             raise
         return path
+
+
+# ── Opt-in bounded sampler diagnostics (P4-6) ──────────────────────────────
+
+
+def _sampling_diagnostics_enabled() -> bool:
+    """Return whether the low-overhead sampler timeline was explicitly enabled."""
+    raw = os.environ.get(GOLDEN_SAMPLING_DIAGNOSTICS_ENV)
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allocator_state() -> dict[str, Any]:
+    """Read cheap allocator counters without realizing any CUDA work."""
+    state = {
+        "allocated_bytes": None,
+        "reserved_bytes": None,
+        "active_bytes": None,
+        "inactive_split_bytes": None,
+        "max_allocated_bytes": None,
+    }
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None:
+        state["available"] = False
+        return state
+    readers = {
+        "allocated_bytes": "memory_allocated",
+        "reserved_bytes": "memory_reserved",
+        "max_allocated_bytes": "max_memory_allocated",
+    }
+    for key, name in readers.items():
+        try:
+            reader = getattr(cuda, name, None)
+            if callable(reader):
+                value = reader()
+                if isinstance(value, int) and not isinstance(value, bool):
+                    state[key] = int(value)
+        except Exception:
+            pass
+    # memory_stats is optional and may itself be unavailable on test doubles.
+    try:
+        stats_fn = getattr(cuda, "memory_stats", None)
+        stats = stats_fn() if callable(stats_fn) else None
+        if isinstance(stats, dict):
+            for key, stat_key in (
+                ("active_bytes", "active_bytes.all.current"),
+                ("inactive_split_bytes", "inactive_split_bytes.all.current"),
+            ):
+                value = stats.get(stat_key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    state[key] = int(value)
+    except Exception:
+        pass
+    state["available"] = any(value is not None for value in state.values())
+    return state
+
+
+def _safe_diagnostic_value(value: Any) -> Any:
+    """Keep passive state JSON-safe; never stringify an unknown counter."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, (str, int, float, bool)) or item is None for item in value
+    ):
+        return list(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_diagnostic_value(item)
+            for key, item in value.items()
+            if isinstance(item, (str, int, float, bool, list, tuple, dict)) or item is None
+        }
+    return None
+
+
+def _read_cachedit_state(patcher: Any, diffusion_model: Any) -> dict[str, Any]:
+    """Passively read already-loaded CacheDiT scalar state.
+
+    This deliberately does not import CacheDiT, call a method, inspect a tensor,
+    or derive one counter from another.  Every requested field remains explicit
+    ``None`` when the installed CacheDiT exposes no matching scalar.
+    """
+    fields = {
+        "expected": None,
+        "computed": None,
+        "cached": None,
+        "skipped": None,
+        "hit_rate": None,
+        "recompute_reasons": None,
+    }
+    config = {"warmup_steps": None, "skip_interval": None}
+    candidates: list[tuple[str, Any]] = []
+    seen: set[int] = set()
+    for module in tuple(sys.modules.values()):
+        if module is None or id(module) in seen:
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict):
+            continue
+        filename = namespace.get("__file__")
+        module_name = str(namespace.get("__name__", ""))
+        if not (
+            isinstance(filename, str)
+            and "comfyui-cachedit" in filename.replace("\\", "/").lower()
+        ) and "cachedit" not in module_name.lower():
+            continue
+        state = namespace.get("_lightweight_cache_state")
+        if isinstance(state, dict):
+            candidates.append(("loaded_module", state))
+            seen.add(id(module))
+    for owner_name, owner in (("diffusion_model", diffusion_model), ("patcher", patcher)):
+        if owner is None:
+            continue
+        for attr in (
+            "_lightweight_cache_state",
+            "_cache_dit_state",
+            "_cache_dit_stats",
+            "cache_dit_state",
+        ):
+            try:
+                state = getattr(owner, attr, None)
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                candidates.append((f"{owner_name}.{attr}", state))
+
+    aliases = {
+        "expected": ("expected", "expected_count", "expected_calls"),
+        "computed": ("computed", "computed_count", "compute_count"),
+        "cached": ("cached", "cached_count", "cache_count", "cache_hits", "hit_count"),
+        "skipped": ("skipped", "skipped_count", "skip_count"),
+        "hit_rate": ("hit_rate", "cache_hit_rate"),
+        "recompute_reasons": ("recompute_reasons", "recompute_reason", "reasons"),
+    }
+    source = None
+    for candidate_source, state in candidates:
+        for field_name, names in aliases.items():
+            if fields[field_name] is not None:
+                continue
+            for name in names:
+                if name in state:
+                    value = _safe_diagnostic_value(state.get(name))
+                    if value is not None:
+                        fields[field_name] = value
+                        source = source or candidate_source
+                    break
+        for config_name in config:
+            if config[config_name] is not None:
+                continue
+            for state_name in (config_name, f"user_{config_name}"):
+                if state_name in state:
+                    value = _safe_diagnostic_value(state.get(state_name))
+                    if value is not None:
+                        config[config_name] = value
+                    break
+    try:
+        options = getattr(patcher, "model_options", None) or {}
+        transformer_options = options.get("transformer_options") or {}
+        cache_config = transformer_options.get("cache_dit_turbo")
+        if cache_config is not None:
+            for config_name, attr in (
+                ("warmup_steps", "user_warmup_steps"),
+                ("skip_interval", "user_skip_interval"),
+            ):
+                if config[config_name] is None:
+                    value = getattr(cache_config, attr, None)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        config[config_name] = value
+    except Exception:
+        pass
+    attached = None
+    try:
+        original = getattr(diffusion_model, "_original_forward", None)
+        forward = getattr(diffusion_model, "forward", None)
+        attached = bool(original is not None and forward is not None and forward is not original)
+    except Exception:
+        pass
+    unavailable = [name for name, value in fields.items() if value is None]
+    return {
+        "available": bool(source is not None or attached is True),
+        "source": source,
+        "attached": attached,
+        "config": config,
+        **fields,
+        "unavailable_fields": unavailable,
+    }
+
+
+class GoldenSamplingDiagnostics:
+    """One opt-in, reversible timeline around the canonical sampler node."""
+
+    _CALLBACK_NAMES = frozenset({"callback", "callback_function"})
+
+    def __init__(self, recorder: GoldenTelemetryRecorder, *, sampler_id: str, sampler_class: str):
+        self.recorder = recorder
+        self.sampler_id = str(sampler_id)
+        self.sampler_class = str(sampler_class)
+        self.timeline: list[dict[str, Any]] = []
+        self.callback_count = 0
+        self.callback_available = False
+        self._callbacks: list[dict[str, Any]] = []
+        self.step_timeline: Optional[list[dict[str, Any]]] = None
+        self.step_timeline_unavailable_reason: Optional[str] = None
+        self.model_forward_count = 0
+        self.first_model_forward_wall_ms: Optional[float] = None
+        self.sampler_wall_ms: Optional[float] = None
+        self.cachedit: Optional[dict[str, Any]] = None
+        self.allocator: dict[str, Any] = {}
+        self._model_hooks: list[Any] = []
+        self._forward_starts: list[int] = []
+        self._sampling_start_ns: Optional[int] = None
+        self._cleanup_done = False
+
+    def _event(self, kind: str, **fields: Any) -> None:
+        item = {"kind": kind, **fields}
+        self.timeline.append(item)
+        try:
+            self.recorder.event("golden_sampling_diagnostic", **item)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _duration_ms(start_ns: int, end_ns: int) -> float:
+        return round(max(0, int(end_ns) - int(start_ns)) / 1_000_000, 3)
+
+    def begin(self, session: GoldenSession) -> None:
+        self._sampling_start_ns = time.monotonic_ns()
+        self.allocator["vae_before_sampling"] = _allocator_state()
+        prep = session.recorder.intervals.get("golden_sampler_prepare")
+        prep_ms = None
+        if prep is not None and prep.end_monotonic_ns is not None:
+            prep_ms = self._duration_ms(prep.entry_monotonic_ns, prep.end_monotonic_ns)
+        self._event(
+            "sampler_setup",
+            sampler_id=self.sampler_id,
+            sampler_class=self.sampler_class,
+            wall_ms=prep_ms,
+            source_stage="golden_sampler_prepare",
+            unavailable=prep_ms is None,
+            allocator=self.allocator["vae_before_sampling"],
+        )
+        self._event("sampling_start", allocator=self.allocator["vae_before_sampling"])
+
+    def install_model_hooks(self, patcher: Any) -> None:
+        try:
+            model = getattr(patcher, "model", None) if patcher is not None else None
+            diffusion_model = getattr(model, "diffusion_model", None) if model is not None else None
+            if diffusion_model is None and patcher is not None:
+                diffusion_model = getattr(patcher, "diffusion_model", None)
+        except Exception:
+            diffusion_model = None
+        pre_register = getattr(diffusion_model, "register_forward_pre_hook", None)
+        post_register = getattr(diffusion_model, "register_forward_hook", None)
+        if not callable(pre_register) or not callable(post_register):
+            self._event("model_forward_hooks_unavailable", wall_ms=None)
+            return
+
+        def pre_hook(*_args: Any, **_kwargs: Any) -> None:
+            self._forward_starts.append(time.monotonic_ns())
+
+        def post_hook(*_args: Any, **_kwargs: Any) -> None:
+            end_ns = time.monotonic_ns()
+            start_ns = self._forward_starts.pop() if self._forward_starts else end_ns
+            wall_ms = self._duration_ms(start_ns, end_ns)
+            self.model_forward_count += 1
+            if self.first_model_forward_wall_ms is None:
+                self.first_model_forward_wall_ms = wall_ms
+                self._event("first_model_forward", index=0, wall_ms=wall_ms)
+            self._event(
+                "model_forward",
+                index=self.model_forward_count - 1,
+                wall_ms=wall_ms,
+                hook_wall_ms=wall_ms,
+            )
+
+        try:
+            try:
+                self._model_hooks.append(pre_register(pre_hook, with_kwargs=True))
+            except TypeError:
+                self._model_hooks.append(pre_register(pre_hook))
+            self._model_hooks.append(post_register(post_hook))
+            self._diffusion_model = diffusion_model
+        except Exception as exc:
+            self._event("model_forward_hooks_unavailable", wall_ms=None, error=type(exc).__name__)
+            self._remove_model_hooks()
+
+    def wrap_sampler_inputs(self, inputs: dict) -> dict:
+        """Wrap only an already-present callback; absent callbacks stay absent."""
+        wrapped = dict(inputs)
+        for key, value in list(wrapped.items()):
+            if str(key).lower() in self._CALLBACK_NAMES and callable(value):
+                wrapped[key] = self._wrap_callback(value)
+            elif str(key).lower() in self._CALLBACK_NAMES and isinstance(value, list):
+                if len(value) == 1 and callable(value[0]):
+                    wrapped[key] = [self._wrap_callback(value[0])]
+        options = wrapped.get("model_options")
+        if isinstance(options, dict):
+            options_copy = dict(options)
+            for key, value in list(options_copy.items()):
+                if str(key).lower() in self._CALLBACK_NAMES and callable(value):
+                    options_copy[key] = self._wrap_callback(value)
+            wrapped["model_options"] = options_copy
+        return wrapped
+
+    def _wrap_callback(self, callback: Callable) -> Callable:
+        self.callback_available = True
+
+        def timed_callback(*args: Any, **kwargs: Any) -> Any:
+            start_ns = time.monotonic_ns()
+            try:
+                return callback(*args, **kwargs)
+            finally:
+                end_ns = time.monotonic_ns()
+                index = args[0] if args else kwargs.get("i", kwargs.get("step", None))
+                self.callback_count += 1
+                step_index = index if isinstance(index, int) and not isinstance(index, bool) else None
+                total_steps = (
+                    args[3]
+                    if len(args) > 3 and isinstance(args[3], int) and not isinstance(args[3], bool)
+                    else kwargs.get("total_steps")
+                )
+                self._callbacks.append({
+                    "step_index": step_index,
+                    "total_steps": total_steps if isinstance(total_steps, int) else None,
+                    "start_ns": start_ns,
+                    "end_ns": end_ns,
+                })
+                self._event(
+                    "callback",
+                    step_index=step_index,
+                    index=index if isinstance(index, (int, str, type(None))) else None,
+                    wall_ms=self._duration_ms(start_ns, end_ns),
+                    callback_wall_ms=self._duration_ms(start_ns, end_ns),
+                )
+
+        return timed_callback
+
+    def finish_sampling(self, patcher: Any, *, ok: bool) -> None:
+        end_ns = time.monotonic_ns()
+        if self._sampling_start_ns is not None:
+            self.sampler_wall_ms = self._duration_ms(self._sampling_start_ns, end_ns)
+        self.allocator["sampling_after"] = _allocator_state()
+        callback_total = next(
+            (item["total_steps"] for item in self._callbacks if item["total_steps"] is not None),
+            None,
+        )
+        step_callbacks = [
+            item for item in self._callbacks
+            if item["step_index"] is not None
+            and (callback_total is None or item["step_index"] < callback_total)
+        ]
+        if step_callbacks and all(item["step_index"] is not None for item in step_callbacks):
+            steps: list[dict[str, Any]] = []
+            previous_ns = self._sampling_start_ns
+            for item in step_callbacks:
+                boundary_ns = int(item["start_ns"])
+                duration_ms = (
+                    self._duration_ms(previous_ns, boundary_ns)
+                    if previous_ns is not None
+                    else None
+                )
+                steps.append({
+                    "step_index": item["step_index"],
+                    "wall_ms": duration_ms,
+                    "callback_wall_ms": self._duration_ms(item["start_ns"], item["end_ns"]),
+                })
+                previous_ns = boundary_ns
+            self.step_timeline = steps
+            self.step_timeline_unavailable_reason = None
+        else:
+            self.step_timeline = None
+            self.step_timeline_unavailable_reason = (
+                "callback_not_observed"
+                if not self._callbacks
+                else "callback_step_index_unavailable"
+            )
+        diffusion_model = getattr(self, "_diffusion_model", None)
+        if diffusion_model is None:
+            try:
+                model = getattr(patcher, "model", None) if patcher is not None else None
+                diffusion_model = getattr(model, "diffusion_model", None)
+            except Exception:
+                diffusion_model = None
+        self.cachedit = _read_cachedit_state(patcher, diffusion_model)
+        self._event(
+            "sampling_end",
+            ok=bool(ok),
+            wall_ms=self.sampler_wall_ms,
+            allocator=self.allocator["sampling_after"],
+            cachedit=self.cachedit,
+        )
+
+    def _remove_model_hooks(self) -> None:
+        for handle in self._model_hooks:
+            try:
+                remove = getattr(handle, "remove", None)
+                if callable(remove):
+                    remove()
+            except Exception:
+                pass
+        self._model_hooks = []
+
+    def cleanup(self) -> None:
+        if self._cleanup_done:
+            return
+        started_ns = time.monotonic_ns()
+        self._remove_model_hooks()
+        self._cleanup_done = True
+        self._event("final_cleanup", wall_ms=self._duration_ms(started_ns, time.monotonic_ns()))
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "sampler": {
+                "node_id": self.sampler_id,
+                "class_type": self.sampler_class,
+                "wall_ms": self.sampler_wall_ms,
+            },
+            "allocator": dict(self.allocator),
+            "model_forward": {
+                "count": self.model_forward_count,
+                "first_wall_ms": self.first_model_forward_wall_ms,
+            },
+            "callback": {
+                "available": self.callback_available,
+                "count": self.callback_count,
+            },
+            "steps": self.step_timeline,
+            "steps_unavailable": self.step_timeline is None,
+            "steps_unavailable_reason": self.step_timeline_unavailable_reason,
+            "cachedit": self.cachedit or {
+                "available": False,
+                "source": None,
+                "attached": None,
+                "config": {"warmup_steps": None, "skip_interval": None},
+                "expected": None,
+                "computed": None,
+                "cached": None,
+                "skipped": None,
+                "hit_rate": None,
+                "recompute_reasons": None,
+                "unavailable_fields": [
+                    "expected", "computed", "cached", "skipped",
+                    "hit_rate", "recompute_reasons",
+                ],
+            },
+            "timeline": list(self.timeline),
+            "cleanup_complete": self._cleanup_done,
+        }
 
 
 # ── SafeTensors header / planning (exact semantics, fail-closed) ──────────
@@ -1579,6 +2038,9 @@ class GoldenSession:
             raise RuntimeError("restore_metadata_invalid_shape")
         self.restore_metadata = dict(supplied_restore or {})
         self.recorder = GoldenTelemetryRecorder()
+        # P4-6 is completely absent from the default path: no hooks, callback
+        # wrappers, CacheDiT inspection, or extra telemetry events are created.
+        self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
         requested_output_root = output_root or self.contract.output_root
         if self.volume_mount_root and not os.path.isabs(str(requested_output_root)):
             requested_output_root = os.path.join(self.volume_mount_root, str(requested_output_root))
@@ -1701,6 +2163,7 @@ class GoldenSerialRunner:
             self._golden_task_baseline = set()
             self._golden_task_baseline_ready = False
         self._golden_tasks: set[asyncio.Task] = set()
+        self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
 
     def _observe_tasks(self) -> None:
         """Record tasks not present when this runner was constructed."""
@@ -2015,6 +2478,13 @@ class GoldenSerialRunner:
 
     async def _call_node(self, unique_id: str, obj: Any, inputs: dict) -> Any:
         func = getattr(obj, obj.FUNCTION)
+        diagnostics = self.sampling_diagnostics
+        if (
+            diagnostics is not None
+            and unique_id == diagnostics.sampler_id
+            and str(self.prompt[unique_id].get("class_type")) == diagnostics.sampler_class
+        ):
+            inputs = diagnostics.wrap_sampler_inputs(inputs)
         if inspect.iscoroutinefunction(func):
             # Await inline: a task is never left pending across nodes.
             return await func(**inputs)
@@ -3169,9 +3639,24 @@ async def golden_sampling(session: GoldenSession) -> Any:
     steps/seed) and deterministic math.  Await complete return; no VAE work."""
     rec = session.recorder
     rec.begin_stage("golden_sampling")
+    diagnostics = (
+        GoldenSamplingDiagnostics(
+            rec,
+            sampler_id=session.node_map.sampler_id,
+            sampler_class=session.contract.sampler_class_type,
+        )
+        if _sampling_diagnostics_enabled()
+        else None
+    )
+    session.sampling_diagnostics = diagnostics
+    rec.sampling_diagnostics = diagnostics
     try:
         runner = session.runner
         node_map = session.node_map
+        if diagnostics is not None:
+            diagnostics.begin(session)
+            diagnostics.install_model_hooks(session.patcher)
+            runner.sampling_diagnostics = diagnostics
         runner.begin_scope({"sampling"})
         try:
             executed = await runner.run_closure(node_map.sampler_id, include_target=True)
@@ -3186,9 +3671,23 @@ async def golden_sampling(session: GoldenSession) -> Any:
             raise RuntimeError("sampler_output_missing")
         sampled = entry.outputs
         session.images_pending_latent = sampled
+        if diagnostics is not None:
+            try:
+                diagnostics.finish_sampling(session.patcher, ok=True)
+            except Exception as diag_exc:
+                diagnostics._event("diagnostics_read_failed", error=type(diag_exc).__name__)
+            finally:
+                diagnostics.cleanup()
         rec.end_stage("golden_sampling", ready=True, sampling_nodes=len(sampler_classes))
         return sampled
     except BaseException as exc:
+        if diagnostics is not None:
+            try:
+                diagnostics.finish_sampling(session.patcher, ok=False)
+            except Exception as diag_exc:
+                diagnostics._event("diagnostics_read_failed", error=type(diag_exc).__name__)
+            finally:
+                diagnostics.cleanup()
         rec.fail_stage("golden_sampling", exc)
         raise
 
@@ -3919,6 +4418,7 @@ __all__ = [
     "EXPECTED_UNET_TENSOR_COUNT",
     "GOLDEN_BLOCK_BYTES",
     "GOLDEN_QD",
+    "GOLDEN_SAMPLING_DIAGNOSTICS_ENV",
     "STAGE_ORDER",
     "ClipLoadSpec",
     "GoldenWorkflowContract",
@@ -3927,6 +4427,7 @@ __all__ = [
     "GoldenQDOwner",
     "GoldenRequest",
     "GoldenSerialRunner",
+    "GoldenSamplingDiagnostics",
     "GoldenSession",
     "GoldenTelemetryRecorder",
     "GoldenVolumeHandle",

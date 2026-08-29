@@ -72,6 +72,7 @@ from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.runtime_shape import runtime_shape_config
 from comfymodal_runtime.trace import RuntimeTrace, _build_local_submission_breakdown
+from deploy_warmup import GoldenCaptureGuard
 from production_workflow import normalize_production_options
 from tools.v2_waterfall import (
     build_waterfall,
@@ -10351,6 +10352,22 @@ def _golden_p1_deployed_identity() -> dict[str, Any]:
     return {k: data[k] for k in keep if data.get(k) not in (None, "")}
 
 
+def _golden_p1_capture_guard_context(
+    *, app_name: str, class_name: str, gpu: str, deployed: dict[str, Any]
+) -> tuple[Path, str]:
+    """Return deployment-keyed persistent state for the request guard."""
+    from deploy_warmup import GoldenCaptureGuard
+
+    identity = GoldenCaptureGuard.deployment_identity(
+        app_name=app_name,
+        class_name=class_name,
+        gpu=gpu,
+        deployment_info=deployed,
+        deploy_fingerprint=os.environ.get("COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT", ""),
+    )
+    return GoldenCaptureGuard.path_for_deployment(ROOT, identity), identity
+
+
 async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> list[Any]:
     """Call the remote ``run_golden_serial_stream`` method via the existing
     app/class handle and consume the event stream to exhaustion.  Mirrors the
@@ -10387,6 +10404,41 @@ async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> lis
     else:
         events.append(stream)
     return events
+
+
+def _golden_p1_request_capture_info(events: list[Any]) -> tuple[bool, str, str]:
+    """Extract explicit request-time capture evidence from a response stream.
+
+    Deployment ``startup``/``snapshot`` lifecycle metadata is intentionally
+    ignored. The guard only arms when the request response itself identifies a
+    build/capture phase (or an explicit request-time capture marker).
+    """
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        candidates = [event]
+        data = event.get("data")
+        if isinstance(data, dict):
+            candidates.append(data)
+        for candidate in candidates:
+            phase = str(
+                candidate.get("request_phase")
+                or candidate.get("phase")
+                or candidate.get("lifecycle_phase")
+                or ""
+            ).strip().lower()
+            explicit = candidate.get("request_time_capture") is True
+            if not explicit and phase not in {"build", "snapshot_capture"}:
+                continue
+            capture_identity = str(
+                candidate.get("capture_identity")
+                or candidate.get("capture_id")
+                or candidate.get("snapshot_id")
+                or candidate.get("snapshot_identity")
+                or "unknown"
+            ).strip()
+            return True, phase or "snapshot_capture", capture_identity or "unknown"
+    return False, "", ""
 
 
 def _golden_p1_extract_telemetry(events: list[Any]) -> dict[str, Any] | None:
@@ -11002,6 +11054,16 @@ async def _run_golden_p1(
                 flush=True,
             )
     cohort_dir.mkdir(parents=True, exist_ok=True)
+    guard_path, deployment_identity = _golden_p1_capture_guard_context(
+        app_name=app_name,
+        class_name=class_name,
+        gpu=gpu,
+        deployed=deployed,
+    )
+    capture_guard = GoldenCaptureGuard(
+        guard_path,
+        deployment_identity=deployment_identity,
+    )
 
     handle = await asyncio.to_thread(transport._v2_handle, workspace=workspace, gpu=gpu)
     records: list[dict[str, Any]] = []
@@ -11042,6 +11104,7 @@ async def _run_golden_p1(
             "gap_before": gap_before,
         }
         attempt_start_ns = time.perf_counter_ns()
+        events: list[Any] = []
         try:
             payload = {
                 "request_id": req_id,
@@ -11125,6 +11188,23 @@ async def _run_golden_p1(
             artifact["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
             artifact["failures"] = [artifact["error"]]
 
+        request_capture, request_phase, capture_identity = (
+            _golden_p1_request_capture_info(events)
+        )
+        guard_result = capture_guard.observe_request(
+            request_id=req_id,
+            request_time_capture=request_capture,
+            capture_identity=capture_identity,
+            deployment_identity=deployment_identity,
+        )
+        artifact["request_phase"] = request_phase or "experiment"
+        artifact["capture_guard"] = guard_result
+        if not guard_result["valid"]:
+            artifact["valid"] = False
+            reason = guard_result["classification"]
+            if reason not in artifact["failures"]:
+                artifact["failures"].append(reason)
+
         artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
         artifact["duration_ms"] = round(
             (time.perf_counter_ns() - attempt_start_ns) / 1_000_000, 3
@@ -11183,7 +11263,14 @@ async def _run_golden_p1(
         "mode": GOLDEN_P1_MODE,
         "method": GOLDEN_P1_REMOTE_METHOD,
         "target": {"app_name": app_name, "class_name": class_name, "gpu": gpu},
+        "profile": os.environ.get("COMFYMODAL_V2CTL_PROFILE", ""),
+        "profile_config_fingerprint": os.environ.get(
+            "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT", ""
+        ),
+        "v2ctl_invocation_id": os.environ.get("COMFYMODAL_V2CTL_INVOCATION_ID", ""),
         "deployment_identity": deployed,
+        "capture_guard_path": str(guard_path),
+        "capture_guard": capture_guard.snapshot(),
         "workflow": {
             "source_path": str(WORKFLOW_PATH),
             "workflow_hash": source["workflow_hash"],
@@ -11222,6 +11309,8 @@ async def _run_golden_p1(
             "identity": r["identity"],
             "cold_evidence": r["cold_evidence"],
             "golden_telemetry": r.get("golden_telemetry"),
+            "request_phase": r.get("request_phase", "experiment"),
+            "capture_guard": r.get("capture_guard"),
             "gap_before": r.get("gap_before"),
         } for r in records],
     }

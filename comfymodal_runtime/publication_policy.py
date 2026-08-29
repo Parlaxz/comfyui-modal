@@ -1,0 +1,345 @@
+"""Pure publication policy shared by archive, image, and identity builders.
+
+This module deliberately imports only the Python standard library.  It is the
+single source of truth for names which are local control-plane state,
+credentials, caches, or generated output and must not be published.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from pathlib import Path
+from typing import Iterator
+
+
+# Directory names are matched at every depth.  Keep this set intentionally
+# conservative: these are either local state/build products or directories
+# which have never been part of the published custom-node source tree.
+EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
+    ".git", ".slim", ".commandcode", ".opencode", ".runtime_state",
+    "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".eggs",
+    ".cache", "wheelhouse", "wheels", "build", "dist", "artifacts",
+    "output", "test-results", "playwright-report", "playwright/.cache",
+    ".playwright-mcp", ".experiments", ".run_history", "benchmark_runs",
+    "benchmark_logs", "optimization_logs", ".comfymodal_experiments",
+    ".custom_node_requirements", ".baked_custom_node_deps", ".presets",
+    ".preset_blobs", ".v2ctl", "tests", "test", "examples", "benchmarks",
+    "benchmark", "traces", "logs", "scripts", ".github", "MagicMock",
+    "reference", "docs",
+})
+
+# Compatibility spelling used by existing callers/tests.
+EXCLUDED_DIRS = EXCLUDED_DIR_NAMES
+
+EXCLUDED_FILENAMES: frozenset[str] = frozenset({
+    ".gitignore", ".env", ".civitai_token", ".hf_token",
+    ".modal_workspaces.json", ".deployed_state.json", ".modal_settings.json",
+    ".deployed_version", ".deploy_log", "modal_logs.txt", "_deploy_output.log",
+    ".custom_nodes.json", "custom_nodes_generation.json",
+    ".last_v2_dependency_cache_identity.json", ".last_custom_node_context_manifest.json",
+    "comfymodal_experiment_presets.json", "comfymodal_experiment_state.json",
+    ".studio_presets.json", ".studio_snapshots.json", ".studio_backends.json",
+    ".studio_workflows.json", ".studio_workflow_versions.json",
+    ".studio_workflow_mappings.json", ".studio_workflow_presets.json",
+    ".studio_model_library.json", ".studio_custom_nodes.json",
+    ".studio_workflow_compatibility.json", ".deploy_warmup_state.json",
+    "latest_benchmark_workflow.json", "apply_experiment_preset.py",
+    "run_experiment_stage.py", "BENCHMARK_WORKFLOW.md",
+    "i2i-check.json", "stack-input-values.json", "current-auto-preview.json",
+})
+
+EXCLUDED_EXTENSIONS: frozenset[str] = frozenset({
+    ".pyc", ".pyo", ".md", ".tmp", ".ref", ".log", ".trace", ".jsonl",
+    ".whl", ".patch", ".diff", ".gz", ".zip", ".tar", ".bundle",
+})
+
+EXCLUDED_PREFIXES: tuple[str, ...] = (
+    "before_v2_", "before_", "benchmark_", "trace_", "AUDIT_",
+)
+EXCLUDED_INFIXES: tuple[str, ...] = (".v21610_backup",)
+GENERATED_JSON_PREFIXES: tuple[str, ...] = (
+    "temp_", "_last_", "studio-", "clean_", "latest_benchmark_",
+    ".modal_", ".model_", ".last_", ".profile_",
+)
+IMAGE_EXTENSIONS: frozenset[str] = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
+})
+EXCLUDED_GLOBS: tuple[str, ...] = (
+    ".env.*", ".experiment_leases.db*", "*_runtime.json", ".studio_*.tmp",
+    "audit-*.png", "comfyui-home.png", "*-current.png", "*-grid.png",
+    "workflow-cards.png", "workflow-oriented-results.png",
+    "results-page-current.png", "setup-page-current.png", "modal-body-*.json",
+    "status-after-*.json", "summary-status-*.json", "setup-body-debug.json",
+    "setup-eval.json", "setup-console-errors*.txt", "setup-console-warnings*.txt",
+    "playwright-*.md",
+)
+
+# The identity builder hashes source code only.  The generation fingerprint
+# retains the existing dependency/build metadata inputs and adds both JS
+# extensions used by custom-node frontends.
+IDENTITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".mjs"})
+GENERATION_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".js", ".mjs", ".txt", ".toml", ".cfg",
+})
+ALLOWED_SOURCE_EXTENSIONS = IDENTITY_SOURCE_EXTENSIONS
+
+LOCAL_CLONE_RE = re.compile(
+    r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
+    re.IGNORECASE,
+)
+
+COMFYMODAL_CANONICAL_NODE_NAME = "comfyui-modal"
+COMFYMODAL_DUPLICATE_TYPO_NAMES = frozenset({"comyui-modal-pagesfile-probe"})
+COMFYMODAL_LOCAL_CUSTOM_NODES_ENV = "COMFYMODAL_LOCAL_CUSTOM_NODES"
+
+
+def is_local_clone_name(name: str) -> bool:
+    """Return whether *name* is a known local agent/worktree clone."""
+    return bool(LOCAL_CLONE_RE.fullmatch(str(name)))
+
+
+def comfymodal_duplicate_reason(node_name: str, node_path: str | os.PathLike[str]) -> str | None:
+    """Return the safety reason for a second ComfyModal checkout.
+
+    Names alone are intentionally insufficient: a valid node called
+    ``comfyui-modal`` remains publishable, while renamed copies are rejected
+    when their git metadata or source markers identify them as this plugin.
+    """
+    if str(node_name).casefold() == COMFYMODAL_CANONICAL_NODE_NAME.casefold():
+        return None
+    if str(node_name).casefold() in {
+        name.casefold() for name in COMFYMODAL_DUPLICATE_TYPO_NAMES
+    }:
+        return "comfymodal_duplicate_typo"
+    path = os.fspath(node_path)
+    try:
+        git_path = os.path.join(path, ".git")
+        if os.path.isfile(git_path):
+            with open(git_path, "r", encoding="utf-8", errors="replace") as handle:
+                git_line = (handle.read(512) or "").strip()
+            if git_line.lower().startswith("gitdir:"):
+                git_dir = git_line.split(":", 1)[1].strip()
+                if not os.path.isabs(git_dir):
+                    git_dir = os.path.join(path, git_dir)
+                normalized = os.path.normpath(git_dir).replace("\\", "/")
+                if ".git/worktrees/" in normalized and "comfyui-modal" in normalized.casefold():
+                    return "comfymodal_duplicate_worktree"
+        elif os.path.isdir(git_path):
+            config_path = os.path.join(git_path, "config")
+            if os.path.isfile(config_path):
+                with open(config_path, "r", encoding="utf-8", errors="replace") as handle:
+                    if "comfyui-modal.git" in handle.read(4096).casefold():
+                        return "comfymodal_duplicate_worktree"
+        if (
+            os.path.isfile(os.path.join(path, "comfyapp.py"))
+            and os.path.isdir(os.path.join(path, "comfymodal_runtime"))
+            and os.path.isfile(os.path.join(path, "comfymodal_runtime", "modal_app.py"))
+        ):
+            return "comfymodal_duplicate_worktree"
+    except (OSError, UnicodeError):
+        # A failed safety probe must not make an otherwise valid node
+        # disappear.  The archive/image callers still apply all other rules.
+        return None
+    return None
+
+
+# Descriptive compatibility spelling for callers that need the old predicate
+# name without carrying the implementation outside the shared policy.
+is_comfymodal_duplicate_dir = comfymodal_duplicate_reason
+
+
+def is_excluded_dir_name(name: str) -> bool:
+    """Return whether a bare directory name is excluded at any depth."""
+    value = str(name)
+    lowered = value.casefold()
+    return (
+        lowered in {item.casefold() for item in EXCLUDED_DIR_NAMES}
+        or lowered.startswith(tuple(prefix.casefold() for prefix in EXCLUDED_PREFIXES))
+        or any(infix.casefold() in lowered for infix in EXCLUDED_INFIXES)
+        or is_local_clone_name(value)
+    )
+
+
+def custom_node_filter_reason(node_name: str, node_path: str | os.PathLike[str]) -> str | None:
+    """Return the canonical top-level custom-node publication decision."""
+    path = os.fspath(node_path)
+    if not os.path.isdir(path):
+        return "not_directory"
+    if os.path.islink(path):
+        return "symlink"
+    if str(node_name).startswith("."):
+        return "hidden_directory"
+    if is_excluded_dir_name(node_name):
+        return "generated_or_environment_directory"
+    if is_local_clone_name(node_name):
+        return "local_agent_or_worktree_clone"
+    return comfymodal_duplicate_reason(node_name, path)
+
+
+def iter_syncable_custom_node_dirs(root: str | Path) -> list[str]:
+    """Return the one canonical list used by archive, image, volume and hash."""
+    root_path = os.fspath(root)
+    if not os.path.isdir(root_path):
+        return []
+    return sorted(
+        name for name in os.listdir(root_path)
+        if custom_node_filter_reason(name, os.path.join(root_path, name)) is None
+    )
+
+
+def _looks_like_custom_nodes_source_root(path: str | os.PathLike[str]) -> bool:
+    root = os.fspath(path)
+    if not root or not os.path.isdir(root):
+        return False
+    if os.path.realpath(root) in {"/", "/root", "/home", "/mnt", "/tmp", "/usr", "/opt"}:
+        return False
+    try:
+        node_like = sum(
+            1
+            for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+            and not name.startswith(".")
+            and (
+                os.path.isfile(os.path.join(root, name, "__init__.py"))
+                or os.path.isfile(os.path.join(root, name, "requirements.txt"))
+            )
+        )
+    except OSError:
+        return False
+    return node_like >= 3
+
+
+def resolve_custom_nodes_root(
+    anchor: str | Path,
+    *,
+    explicit: str | Path | None = None,
+    fallback_roots: tuple[str | Path, ...] = (),
+) -> str:
+    """Resolve one effective custom-node root for every publication path.
+
+    ``anchor`` is the plugin directory; its parent is the default source
+    root.  An explicit ``COMFYMODAL_LOCAL_CUSTOM_NODES`` override wins and is
+    never mixed with fallbacks.  Multiple valid fallback candidates are an
+    error rather than an arbitrary choice, preventing image and identity
+    callers from silently selecting different trees.
+    """
+    override = explicit
+    if override is None:
+        override = os.environ.get(COMFYMODAL_LOCAL_CUSTOM_NODES_ENV, "").strip()
+    if override:
+        candidate = Path(override).expanduser().resolve()
+        if not _looks_like_custom_nodes_source_root(candidate):
+            raise RuntimeError(
+                f"COMFYMODAL_LOCAL_CUSTOM_NODES does not look like a custom-nodes "
+                f"root (need at least 3 node-like directories): {candidate}"
+            )
+        return str(candidate)
+
+    candidates = [Path(anchor).expanduser().resolve().parent]
+    candidates.extend(Path(root).expanduser().resolve() for root in fallback_roots)
+    valid: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.realpath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if _looks_like_custom_nodes_source_root(candidate):
+            valid.append(candidate)
+    if len(valid) > 1:
+        raise RuntimeError(
+            "ambiguous custom-nodes source root; valid candidates: "
+            + ", ".join(str(path) for path in valid)
+            + ". Set COMFYMODAL_LOCAL_CUSTOM_NODES explicitly."
+        )
+    if valid:
+        return str(valid[0])
+    raise RuntimeError(
+        "could not resolve custom-nodes source root from anchor "
+        f"{Path(anchor).resolve()}; set COMFYMODAL_LOCAL_CUSTOM_NODES explicitly"
+    )
+
+
+def is_excluded_name(name: str) -> bool:
+    """Return whether a bare file name is local, generated, or sensitive."""
+    value = str(name)
+    lowered = value.casefold()
+    if lowered in {item.casefold() for item in EXCLUDED_FILENAMES}:
+        return True
+    if lowered.startswith(tuple(prefix.casefold() for prefix in EXCLUDED_PREFIXES)):
+        return True
+    if any(infix.casefold() in lowered for infix in EXCLUDED_INFIXES):
+        return True
+    if any(fnmatch.fnmatchcase(lowered, pattern.casefold()) for pattern in EXCLUDED_GLOBS):
+        return True
+    if lowered.endswith(".json") and lowered.startswith(
+        tuple(prefix.casefold() for prefix in GENERATED_JSON_PREFIXES)
+    ):
+        return True
+    if Path(value).suffix.casefold() in IMAGE_EXTENSIONS and (
+        "screenshot" in lowered or "validation" in lowered
+    ):
+        return True
+    return Path(value).suffix.casefold() in EXCLUDED_EXTENSIONS
+
+
+def is_excluded_path(relative_path: str | os.PathLike[str]) -> bool:
+    """Apply directory rules to parents and file rules to the final part."""
+    parts = [part for part in str(relative_path).replace("\\", "/").split("/") if part]
+    if not parts:
+        return False
+    if any(is_excluded_dir_name(part) for part in parts):
+        return True
+    return is_excluded_name(parts[-1])
+
+
+def is_publishable_top_level_node(name: str, *, is_directory: bool, is_symlink: bool = False) -> bool:
+    """Pure top-level node decision; callers provide filesystem facts."""
+    return bool(
+        is_directory
+        and not is_symlink
+        and not str(name).startswith(".")
+        and not is_excluded_dir_name(name)
+        and not is_local_clone_name(name)
+    )
+
+
+def iter_source_files(
+    root: str | Path,
+    *,
+    extensions: frozenset[str] = IDENTITY_SOURCE_EXTENSIONS,
+) -> Iterator[Path]:
+    """Yield deterministic, regular source files without following symlinks."""
+    root_path = Path(root).resolve()
+    normalized_extensions = {ext.casefold() for ext in extensions}
+    for dirpath_str, dirnames, filenames in os.walk(str(root_path), followlinks=False):
+        dirpath = Path(dirpath_str)
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not is_excluded_dir_name(name)
+            and not (dirpath / name).is_symlink()
+            and not (
+                dirpath == root_path
+                and custom_node_filter_reason(name, dirpath / name) is not None
+            )
+        )
+        for filename in sorted(filenames):
+            path = dirpath / filename
+            if path.is_symlink() or Path(filename).suffix.casefold() not in normalized_extensions:
+                continue
+            if not is_excluded_name(filename):
+                yield path
+
+
+def image_ignore_patterns(prefix: str = "") -> list[str]:
+    """Return deterministic glob patterns suitable for ``add_local_dir``."""
+    patterns = [f"{prefix}{name}/" for name in sorted(EXCLUDED_DIR_NAMES)]
+    patterns.extend(f"{prefix}{name}" for name in sorted(EXCLUDED_FILENAMES))
+    patterns.extend(f"{prefix}*{ext}" for ext in sorted(EXCLUDED_EXTENSIONS))
+    patterns.extend(f"{prefix}{glob}" for glob in EXCLUDED_GLOBS)
+    patterns.extend(f"{prefix}{prefix_name}*" for prefix_name in EXCLUDED_PREFIXES)
+    patterns.extend(f"{prefix}*{infix}*" for infix in EXCLUDED_INFIXES)
+    return patterns

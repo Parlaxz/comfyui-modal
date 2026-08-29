@@ -307,8 +307,9 @@ class ConfigResolver:
     # -- structural resolution --------------------------------------------
 
     def _resolve_target(self, profile_target: dict, cli_options: dict) -> Target:
+        app = str(cli_options.get("target.app", profile_target.get("app", ""))).strip().lower()
         return Target(
-            app=str(cli_options.get("target.app", profile_target.get("app", ""))),
+            app=app,
             class_name=str(
                 cli_options.get("target.class", profile_target.get("class", ""))
             ),

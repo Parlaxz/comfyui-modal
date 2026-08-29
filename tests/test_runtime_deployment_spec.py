@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import io
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,8 +21,10 @@ from comfymodal_runtime.deployment_spec import (
     compute_aggregate_hash,
     compute_file_hashes,
     compute_source_bytes,
+    is_excluded_path,
     is_excluded_name,
 )
+from comfymodal_runtime import publication_policy
 
 
 class TestExclusionPredicate(unittest.TestCase):
@@ -86,6 +90,20 @@ class TestExclusionPredicate(unittest.TestCase):
         self.assertTrue(is_excluded_name(".model_manifest.json"))
         self.assertTrue(is_excluded_name(".profile_config.json"))
 
+    def test_publication_excludes_artifacts_and_bundles_but_keeps_source(self):
+        excluded_paths = (
+            "artifacts/phase_p1/manifest.json",
+            "legitimate-node/artifacts/manifest.json",
+            "comfyui-modal-P4-all.bundle",
+            "legitimate-node/comfyui-modal-P4-all.bundle",
+        )
+        for path in excluded_paths:
+            self.assertTrue(is_excluded_path(path), path)
+            self.assertTrue(publication_policy.is_excluded_path(path), path)
+
+        self.assertFalse(is_excluded_path("legitimate-node/source.py"))
+        self.assertFalse(publication_policy.is_excluded_path("legitimate-node/source.py"))
+
     def test_excluded_screenshot_png(self):
         self.assertTrue(is_excluded_name("studio-validation-desktop.png"))
         self.assertTrue(is_excluded_name("screenshot-result.png"))
@@ -107,6 +125,34 @@ class TestExclusionPredicate(unittest.TestCase):
         # Extension matching should be case-insensitive
         self.assertTrue(is_excluded_name("README.MD"))
         self.assertTrue(is_excluded_name("readme.Md"))
+
+    def test_deployment_identity_and_publication_share_file_policy(self):
+        names = (
+            ".commandcode/settings.json",
+            ".v2ctl/runs/run.json",
+            "before_v2_16_20.patch",
+            "studio-validation-desktop.png",
+            "runtime_state.json",
+            "module.MJS",
+        )
+        for name in names:
+            self.assertEqual(
+                is_excluded_path(name),
+                publication_policy.is_excluded_path(name),
+                name,
+            )
+
+    def test_source_walkers_both_reject_symlinked_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "real.py").write_text("value = 1", encoding="utf-8")
+            link = root / "linked.py"
+            try:
+                link.symlink_to(root / "real.py")
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable on this host")
+            self.assertNotIn("linked.py", compute_file_hashes(root))
+            self.assertNotIn(link, set(publication_policy.iter_source_files(root)))
 
 
 class TestBuildDeploymentIdentity(unittest.TestCase):
@@ -265,6 +311,28 @@ class TestBuildDeploymentIdentity(unittest.TestCase):
         )
         self.assertNotEqual(id1.combined_hash, id2.combined_hash)
 
+    def test_multiple_custom_node_roots_keep_same_relative_paths_distinct(self):
+        self._write("runtime.py", "runtime code")
+        first = self.tmp_path / "custom-one"
+        second = self.tmp_path / "custom-two"
+        first.mkdir()
+        second.mkdir()
+        (first / "node.py").write_text("node one", encoding="utf-8")
+        (second / "node.py").write_text("node two", encoding="utf-8")
+
+        identity = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[first, second]
+        )
+
+        self.assertEqual(
+            identity.file_hashes["custom_node_root_0/node.py"],
+            compute_file_hashes(first)["node.py"],
+        )
+        self.assertEqual(
+            identity.file_hashes["custom_node_root_1/node.py"],
+            compute_file_hashes(second)["node.py"],
+        )
+
     # ── Dependency-only change ───────────────────────────────────────
 
     def test_dependency_hash_is_carried_through(self):
@@ -327,6 +395,35 @@ class TestComputeHelpers(unittest.TestCase):
         # SHA-256 of empty input (no paths fed into the hasher)
         empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         self.assertEqual(compute_aggregate_hash({}), empty_hash)
+
+
+class TestPublisherArchiveFilter(unittest.TestCase):
+    """The deploy-time publisher must apply the shared source policy."""
+
+    def test_archive_excludes_artifacts_and_bundles_but_keeps_source(self):
+        from tools.publish_custom_nodes_volume import _build_custom_nodes_archive
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "legitimate-node"
+            node.mkdir()
+            (node / "source.py").write_text("value = 1", encoding="utf-8")
+            (node / "artifacts").mkdir()
+            (node / "artifacts" / "manifest.json").write_text("{}", encoding="utf-8")
+            (node / "comfyui-modal-P4-all.bundle").write_bytes(b"bundle")
+            (root / "artifacts").mkdir()
+            (root / "artifacts" / "manifest.json").write_text("{}", encoding="utf-8")
+
+            archive = _build_custom_nodes_archive(str(root))
+
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            names = set(tar.getnames())
+
+        self.assertIn("legitimate-node/source.py", names)
+        self.assertNotIn("legitimate-node/artifacts", names)
+        self.assertNotIn("legitimate-node/artifacts/manifest.json", names)
+        self.assertNotIn("legitimate-node/comfyui-modal-P4-all.bundle", names)
+        self.assertFalse(any(name == "artifacts" or name.startswith("artifacts/") for name in names))
 
 
 if __name__ == "__main__":

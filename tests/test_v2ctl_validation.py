@@ -29,6 +29,7 @@ from tools.v2_control.validation import (
     Validator,
     build_run_record_from_result,
     extract_output_sha,
+    mark_runtime_health_verified,
     parse_telemetry,
 )
 
@@ -220,6 +221,123 @@ class TestValidators:
 
 
 class TestGateRunner:
+    @staticmethod
+    def _deployment_manifest(tmp_path, config, fingerprints, **overrides):
+        path = tmp_path / ".v2ctl" / "deployments" / "deploy_0001.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+            "target": {
+                "app": config.target.app,
+                "class": config.target.class_name,
+                "method": config.target.method,
+            },
+            "runtime_health_status": "unverified",
+            **overrides,
+        }
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_successful_validated_gate_marks_matching_deployment_healthy(self, tmp_path):
+        config = FakeConfig()
+        artifact = tmp_path / "run.json"
+        artifact.write_text("{}", encoding="utf-8")
+        runner = make_gate_runner(
+            tmp_path,
+            backend=FakeBackendRunner(
+                stdout=OK_GATE_STDOUT,
+                artifacts=FakeArtifactSet(run_artifact=artifact),
+            ),
+        )
+        manifest = self._deployment_manifest(tmp_path, config, runner._fingerprints)
+
+        result = runner.run_gate(config, FakeSpec())
+
+        assert result.valid is True
+        assert json.loads(manifest.read_text(encoding="utf-8"))["runtime_health_status"] == "verified"
+
+    def test_failed_gate_does_not_mark_deployment_healthy(self, tmp_path):
+        config = FakeConfig()
+        backend = FakeBackendRunner(mode="fail", exit_code=1)
+        runner = make_gate_runner(tmp_path, backend=backend)
+        manifest = self._deployment_manifest(tmp_path, config, runner._fingerprints)
+
+        result = runner.run_gate(config, FakeSpec())
+
+        assert result.valid is False
+        assert json.loads(manifest.read_text(encoding="utf-8"))["runtime_health_status"] == "unverified"
+
+    @pytest.mark.parametrize("overrides", [
+        {"target": {"app": "wrong-app", "class": "ModalRuntimeEntrypointV2", "method": "run_plan_stream"}},
+        {"deploy_fingerprint": "stale-fingerprint"},
+    ])
+    def test_gate_health_transition_requires_matching_target_and_fingerprint(
+        self, tmp_path, overrides
+    ):
+        config = FakeConfig()
+        artifact = tmp_path / "run.json"
+        artifact.write_text("{}", encoding="utf-8")
+        runner = make_gate_runner(
+            tmp_path,
+            backend=FakeBackendRunner(
+                stdout=OK_GATE_STDOUT,
+                artifacts=FakeArtifactSet(run_artifact=artifact),
+            ),
+        )
+        manifest = self._deployment_manifest(
+            tmp_path, config, runner._fingerprints, **overrides
+        )
+
+        result = runner.run_gate(config, FakeSpec())
+
+        assert result.valid is True
+        assert json.loads(manifest.read_text(encoding="utf-8"))["runtime_health_status"] == "unverified"
+
+    def test_health_helper_preserves_source_identity_status(self, tmp_path):
+        config = FakeConfig()
+        runner = make_gate_runner(tmp_path)
+        manifest = self._deployment_manifest(
+            tmp_path, config, runner._fingerprints, source_identity_status="verified"
+        )
+
+        assert mark_runtime_health_verified(
+            tmp_path,
+            config,
+            runner._fingerprints,
+            runner._fingerprints.deploy_fingerprint(),
+        ) == manifest
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        assert data["runtime_health_status"] == "verified"
+        assert data["source_identity_status"] == "verified"
+
+    def test_fingerprint_change_during_backend_does_not_promote_health(self, tmp_path):
+        config = FakeConfig()
+        fingerprints = FakeFingerprints()
+        artifact = tmp_path / "run.json"
+        artifact.write_text("{}", encoding="utf-8")
+
+        class RedeployingBackend(FakeBackendRunner):
+            def run(self, *args, **kwargs):
+                result = super().run(*args, **kwargs)
+                fingerprints.deploy_salt = "redeployed"
+                return result
+
+        backend = RedeployingBackend(
+            stdout=OK_GATE_STDOUT,
+            artifacts=FakeArtifactSet(run_artifact=artifact),
+        )
+        runner = make_gate_runner(
+            tmp_path,
+            fingerprints=fingerprints,
+            backend=backend,
+        )
+        manifest = self._deployment_manifest(tmp_path, config, fingerprints)
+
+        result = runner.run_gate(config, FakeSpec())
+
+        assert result.valid is True
+        assert json.loads(manifest.read_text(encoding="utf-8"))["runtime_health_status"] == "unverified"
+
     def test_arbitrary_target_method_is_rejected_before_backend(self, tmp_path):
         config = FakeConfig()
         config.target.method = "arbitrary_method"

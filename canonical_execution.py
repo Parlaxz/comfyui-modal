@@ -1020,13 +1020,13 @@ def _compute_host_deployment_combined_hash() -> str:
         from comfymodal_runtime.deployment_spec import build_deployment_identity
         from comfymodal_runtime.runtime_shape import runtime_shape_config
         from comfymodal_runtime.contracts import stable_hash as _stable_hash
-        # Mirror build_modal_resources: runtime_root = the comfymodal_runtime
-        # dir, custom_root = env COMFYMODAL_LOCAL_CUSTOM_NODES or the repo
-        # root (this file lives at the repo root).
+        from comfymodal_runtime.publication_policy import resolve_custom_nodes_root
+        # Mirror build_modal_resources: runtime_root is the runtime package,
+        # while custom_root is the same published custom-nodes tree used by
+        # image/archive/volume publication.
         _repo_root = os.path.dirname(os.path.abspath(__file__))
         _runtime_root = os.path.join(_repo_root, "comfymodal_runtime")
-        _explicit = os.environ.get("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
-        _custom_root = _explicit if _explicit else _repo_root
+        _custom_root = resolve_custom_nodes_root(_repo_root)
         # The container call passes no dependency_hash (defaults to "").
         _identity = build_deployment_identity(
             runtime_root=_runtime_root,

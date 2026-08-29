@@ -8,7 +8,7 @@ extends = "production"
 owner = "golden-p1"
 
 [target]
-app = "stable-modal-comfy-v2-golden-p1"
+app = "batch-r0-golden-ops"
 class = "ModalRuntimeEntrypointV2"
 method = "run_golden_serial_stream"
 

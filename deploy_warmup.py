@@ -45,6 +45,224 @@ class WarmupRequiredError(WarmupError):
 STATE_SCHEMA_VERSION = 1
 STATE_FILENAME = ".deploy_warmup_state.json"
 
+# Golden capture guard state is kept separate from deployment warmup state.
+GOLDEN_CAPTURE_GUARD_SCHEMA_VERSION = 2
+
+
+class GoldenCaptureGuardError(WarmupError):
+    """Raised when persisted Golden capture state is malformed."""
+
+
+class GoldenCaptureGuard:
+    """Persist the one-request invalidation after a request-time capture.
+
+    Deployment lifecycle snapshots are not observed by this object. Callers
+    explicitly identify request-time captures, which prevents a deployment
+    ``startup``/``snapshot=True`` event from arming the experiment guard.
+    """
+
+    _STATES = {"idle", "armed"}
+
+    def __init__(self, path: Path, deployment_identity: str = "") -> None:
+        self._path = Path(path)
+        self._deployment_identity = str(deployment_identity).strip()
+        self._data = self._load()
+        if self._deployment_identity and not self._data.get("deployment_identity"):
+            self._data["deployment_identity"] = self._deployment_identity
+
+    @staticmethod
+    def _default(deployment_identity: str = "") -> dict[str, Any]:
+        return {
+            "schema_version": GOLDEN_CAPTURE_GUARD_SCHEMA_VERSION,
+            "state": "idle",
+            "post_capture_guard_pending": False,
+            "last_snapshot_capture_request_id": "",
+            "last_snapshot_capture_at": "",
+            "guard_armed_by_request_id": "",
+            "last_guard_consumed_by_request_id": "",
+            "last_guard_consumed_at": "",
+            "capture_identity": "",
+            "capture_request_id": "",
+            "capture_at": "",
+            "deployment_identity": deployment_identity,
+            "last_transition_reason": "initial",
+        }
+
+    def _load(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return self._default(self._deployment_identity)
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise GoldenCaptureGuardError(
+                f"cannot load Golden capture guard state: {self._path}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise GoldenCaptureGuardError("Golden capture guard state is not an object")
+        if data.get("schema_version") == 1:
+            data = {
+                **self._default(str(data.get("deployment_identity") or "").strip()),
+                "state": data.get("state", "idle"),
+                "capture_identity": data.get("capture_identity", ""),
+                "capture_request_id": data.get("capture_request_id", ""),
+                "capture_at": data.get("capture_at", ""),
+                "deployment_identity": data.get("deployment_identity", ""),
+                "last_transition_reason": data.get("last_transition_reason", "migrated"),
+            }
+            if data["state"] == "armed":
+                data["post_capture_guard_pending"] = True
+                data["last_snapshot_capture_request_id"] = data["capture_request_id"]
+                data["last_snapshot_capture_at"] = data["capture_at"]
+                data["guard_armed_by_request_id"] = data["capture_request_id"]
+            data["schema_version"] = GOLDEN_CAPTURE_GUARD_SCHEMA_VERSION
+        if data.get("schema_version") != GOLDEN_CAPTURE_GUARD_SCHEMA_VERSION:
+            raise GoldenCaptureGuardError("unsupported Golden capture guard schema")
+        if data.get("state") not in self._STATES:
+            raise GoldenCaptureGuardError("invalid Golden capture guard state")
+        for key in (
+            "capture_identity", "capture_request_id", "capture_at", "deployment_identity",
+            "last_transition_reason", "last_snapshot_capture_request_id",
+            "last_snapshot_capture_at", "guard_armed_by_request_id",
+            "last_guard_consumed_by_request_id", "last_guard_consumed_at",
+        ):
+            if not isinstance(data.get(key), str):
+                raise GoldenCaptureGuardError(
+                    f"Golden capture guard field {key!r} must be a string"
+                )
+        if not isinstance(data.get("post_capture_guard_pending"), bool):
+            raise GoldenCaptureGuardError(
+                "Golden capture guard field 'post_capture_guard_pending' must be a bool"
+            )
+        if data["state"] == "armed" and not data["capture_request_id"]:
+            raise GoldenCaptureGuardError("armed Golden capture guard has no request id")
+        if data["state"] == "armed" and not data["post_capture_guard_pending"]:
+            raise GoldenCaptureGuardError("armed Golden capture guard must be pending")
+        if data["state"] == "idle" and data["post_capture_guard_pending"]:
+            raise GoldenCaptureGuardError("idle Golden capture guard cannot be pending")
+        if (
+            self._deployment_identity
+            and data.get("deployment_identity")
+            and data["deployment_identity"] != self._deployment_identity
+        ):
+            return self._default(self._deployment_identity)
+        return data
+
+    @staticmethod
+    def deployment_identity(
+        *,
+        app_name: str,
+        class_name: str,
+        gpu: str,
+        deployment_info: dict[str, Any] | None = None,
+        deploy_fingerprint: str = "",
+    ) -> str:
+        """Return a stable, non-secret key for one deployed Golden target."""
+        info = deployment_info if isinstance(deployment_info, dict) else {}
+        identity = {
+            "app_name": str(app_name).strip(),
+            "class_name": str(class_name).strip(),
+            "gpu": str(gpu).strip(),
+            "deployment_combined_hash": str(
+                info.get("deployment_combined_hash") or ""
+            ).strip(),
+            "deploy_fingerprint": str(
+                info.get("deploy_fingerprint") or deploy_fingerprint or ""
+            ).strip(),
+        }
+        return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def path_for_deployment(repo_root: Path, deployment_identity: str) -> Path:
+        key = hashlib.sha256(str(deployment_identity).encode("utf-8")).hexdigest()
+        return Path(repo_root) / ".v2ctl" / "golden_capture_guards" / f"{key}.json"
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return the persisted guard state for artifact/report inspection."""
+        return dict(self._data)
+
+    def _flush(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, ensure_ascii=False, sort_keys=True, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._path)
+
+    def observe_request(
+        self,
+        *,
+        request_id: str,
+        request_time_capture: bool,
+        capture_identity: str = "",
+        deployment_identity: str = "",
+    ) -> dict[str, Any]:
+        """Classify one Golden request and persist any state transition.
+
+        A capture is always invalid and arms/re-arms the guard. The next
+        non-capture request is invalid and consumes the guard. Later requests
+        are eligible without a redeploy.
+        """
+        request_id = str(request_id).strip()
+        if not request_id:
+            raise ValueError("Golden capture guard request_id is required")
+        deployment_identity = str(deployment_identity).strip()
+        if (
+            deployment_identity
+            and self._data.get("deployment_identity")
+            and self._data["deployment_identity"] != deployment_identity
+        ):
+            self._data = self._default(deployment_identity)
+        elif deployment_identity and not self._data.get("deployment_identity"):
+            self._data["deployment_identity"] = deployment_identity
+        if request_time_capture:
+            self._data.update({
+                "state": "armed",
+                "post_capture_guard_pending": True,
+                "last_snapshot_capture_request_id": request_id,
+                "last_snapshot_capture_at": datetime.now(tz=timezone.utc).isoformat(),
+                "guard_armed_by_request_id": request_id,
+                "capture_identity": str(capture_identity).strip(),
+                "capture_request_id": request_id,
+                "capture_at": datetime.now(tz=timezone.utc).isoformat(),
+                "deployment_identity": deployment_identity,
+                "last_transition_reason": "request_time_capture",
+            })
+            self._flush()
+            return {
+                "classification": "SNAPSHOT_CAPTURE",
+                "valid": False,
+                "counted": False,
+                "transition": "armed",
+                "state": self.snapshot(),
+            }
+        if self._data["state"] == "armed":
+            capture_request_id = self._data["capture_request_id"]
+            self._data.update({
+                "state": "idle",
+                "post_capture_guard_pending": False,
+                "last_guard_consumed_by_request_id": request_id,
+                "last_guard_consumed_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_transition_reason": "capture_follow_up_consumed",
+            })
+            self._flush()
+            return {
+                "classification": "INVALID_DIRECTLY_AFTER_SNAPSHOT_CAPTURE",
+                "valid": False,
+                "counted": False,
+                "transition": "consumed",
+                "capture_request_id": capture_request_id,
+                "state": self.snapshot(),
+            }
+        return {
+            "classification": "ELIGIBLE",
+            "valid": True,
+            "counted": True,
+            "transition": "none",
+            "state": self.snapshot(),
+        }
+
 
 # Generation token
 

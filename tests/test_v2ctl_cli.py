@@ -70,7 +70,7 @@ class TestConfig:
         data = json.loads(r.stdout)
         assert data["profile"] == "golden_p1"
         assert data["target"] == {
-            "app": "stable-modal-comfy-v2-golden-p1",
+            "app": "batch-r0-golden-ops",
             "class": "ModalRuntimeEntrypointV2",
             "method": "run_golden_serial_stream",
         }
@@ -131,6 +131,382 @@ class TestConfig:
         vals = {f["name"]: f["value"] for f in data["flags"]}
         assert vals["COMFYMODAL_V2_UNET_FASTSAFETENSORS"] == "0"
         assert vals["V2_BENCHMARK_RUNS"] == "10"
+
+
+class TestGate1FlatSafety:
+    @pytest.mark.parametrize("command", ["config", "doctor", "deploy", "deploy-run", "run"])
+    @pytest.mark.parametrize("allow_production", [False, True])
+    def test_flat_commands_refuse_protected_app_before_backend(
+        self, command: str, allow_production: bool, monkeypatch, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        class UnexpectedBackend:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("protected app refusal must not invoke a backend")
+
+        monkeypatch.setattr(cli.backend_mod, "BackendRunner", UnexpectedBackend)
+        argv = [command, "--app", "stable-modal-comfy-v2-golden-p1", "--dry-run"]
+        if allow_production:
+            argv.append("--allow-production")
+
+        assert cli.main(argv) == 2
+        captured = capsys.readouterr()
+        assert "production-protected" in captured.err
+        assert "no invocation performed" not in captured.out
+
+    @pytest.mark.parametrize("command", ["config", "doctor", "deploy", "deploy-run", "run"])
+    def test_non_golden_profile_refuses_golden_mode_before_backend(
+        self, command: str, monkeypatch, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        class UnexpectedBackend:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("Golden mode refusal must not invoke a backend")
+
+        monkeypatch.setattr(cli.backend_mod, "BackendRunner", UnexpectedBackend)
+        assert cli.main([
+            command,
+            "--profile", "production",
+            "--app", "gate1-experimental",
+            "--set", "V2_BENCHMARK_MODE=golden_p1_serial",
+            "--dry-run",
+        ]) == 1
+        captured = capsys.readouterr()
+        assert "golden_p1_serial" in captured.err
+        assert "non-Golden profile" in captured.err
+        assert "no invocation performed" not in captured.out
+
+
+class TestGoldenNamespace:
+    def test_golden_doctor_uses_dedicated_profile_namespace(self) -> None:
+        r = run_v2ctl("golden", "doctor")
+        assert r.returncode in (0, 1)
+        assert "[v2ctl.doctor]" in r.stdout
+        assert "git.head=" in r.stdout
+
+    def test_golden_namespace_rejects_internal_config_command(self) -> None:
+        r = run_v2ctl("golden", "config", "--json")
+        assert r.returncode == 2
+        assert "{status,doctor,deploy,run}" in r.stderr
+
+    def test_golden_namespace_rejects_other_profile(self) -> None:
+        r = run_v2ctl("golden", "doctor", "--profile", "e29-tracer")
+        assert r.returncode == 1
+        assert "golden_p1" in r.stderr
+
+    def test_golden_run_rejects_more_than_one_request(self) -> None:
+        r = run_v2ctl("golden", "run", "--run-count", "2", "--dry-run")
+        assert r.returncode == 2
+        assert "exactly one request" in r.stderr
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["acceptance", "variance_cold", "variance_matrix", "volume_read", "snapshot_restore_only"],
+    )
+    def test_golden_run_rejects_explicit_generic_mode(self, mode: str) -> None:
+        r = run_v2ctl(
+            "golden", "run", "--dry-run", "--app", "golden-review-experimental",
+            "--set", f"V2_BENCHMARK_MODE={mode}",
+        )
+        assert r.returncode == 1
+        assert "V2_BENCHMARK_MODE" in r.stderr
+        assert mode in r.stderr
+        assert "only golden_p1_serial is allowed" in r.stderr
+        assert "no invocation performed" not in r.stdout
+
+    def test_golden_run_accepts_only_canonical_mode(self) -> None:
+        r = run_v2ctl(
+            "golden", "run", "--dry-run", "--app", "golden-review-experimental",
+            "--set", "V2_BENCHMARK_MODE=golden_p1_serial",
+        )
+        assert r.returncode == 0, r.stderr
+        assert "no invocation performed" in r.stdout
+        assert "V2_BENCHMARK_MODE=golden_p1_serial" in r.stdout
+
+    def test_golden_deploy_dry_run_uses_golden_selector(self) -> None:
+        r = run_v2ctl("golden", "deploy", "--dry-run")
+        assert r.returncode == 0, r.stderr
+        assert "profile=golden_p1" in r.stdout
+        assert "golden_p1" in r.stdout
+        assert "deploy_and_run_v2_single.bat" in r.stdout
+        assert "V2_BENCHMARK_MODE=golden_p1_serial" in r.stdout
+        assert "no invocation performed" in r.stdout
+
+    def test_golden_namespace_accepts_global_options_after_command(self) -> None:
+        r = run_v2ctl(
+            "golden", "deploy", "--dry-run",
+            "--app", "Batch-R0-Golden-Ops",
+            "--gpu", "rtx-pro-6000",
+        )
+        assert r.returncode == 0, r.stderr
+        assert "COMFYMODAL_V2_APP_NAME=batch-r0-golden-ops" in r.stdout
+        assert "COMFYMODAL_V2_GPU=rtx-pro-6000" in r.stdout
+
+    def test_golden_status_honors_explicit_experimental_app(self) -> None:
+        r = run_v2ctl("golden", "status", "--json", "--app", "Batch-R0-golden-ops")
+        assert r.returncode in (0, 1)
+        assert r.stderr == ""
+        data = json.loads(r.stdout)
+        assert data["target"]["app"] == "batch-r0-golden-ops"
+
+    def test_golden_rejects_production_target_without_explicit_override(self) -> None:
+        r = run_v2ctl(
+            "golden", "deploy", "--app", "stable-modal-comfy-v2-golden-p1"
+        )
+        assert r.returncode == 2
+        assert "production-protected" in r.stderr
+
+    def test_golden_rejects_invalid_experimental_app_name(self) -> None:
+        r = run_v2ctl("golden", "deploy", "--dry-run", "--app", "Batch_R0")
+        assert r.returncode == 2
+        assert "invalid Golden app name" in r.stderr
+
+    @pytest.mark.parametrize("command", ["status", "doctor", "deploy", "run"])
+    def test_golden_hard_denies_protected_app_even_read_only_dry_run(self, command) -> None:
+        argv = ["golden", command, "--app", "STABLE-MODAL-COMFY-V2-GOLDEN-P1"]
+        if command in {"deploy", "run"}:
+            argv.append("--dry-run")
+        r = run_v2ctl(*argv)
+        assert r.returncode == 2
+        assert "production-protected" in r.stderr
+
+    @pytest.mark.parametrize("command", ["status", "doctor", "deploy", "run"])
+    def test_golden_allow_production_is_not_a_bypass(self, command) -> None:
+        r = run_v2ctl("golden", command, "--allow-production", "--dry-run")
+        assert r.returncode == 2
+        assert "allow-production" in r.stderr
+
+    @pytest.mark.parametrize("command", ["deploy", "deploy-run", "run"])
+    def test_flat_golden_command_hard_denies_protected_app(self, command) -> None:
+        r = run_v2ctl(
+            command, "--profile", "golden_p1", "--app",
+            "STABLE-MODAL-COMFY-V2-GOLDEN-P1", "--dry-run",
+        )
+        assert r.returncode == 2
+        assert "production-protected" in r.stderr
+
+    def test_golden_commands_share_resolved_identity(self) -> None:
+        outputs = {}
+        for command in ("status", "doctor", "deploy", "run"):
+            argv = ["golden", command, "--app", "Batch-R0-Golden-Ops"]
+            if command == "status":
+                argv.append("--json")
+            if command in {"deploy", "run"}:
+                argv.append("--dry-run")
+            r = run_v2ctl(*argv)
+            assert r.returncode in (0, 1), r.stderr
+            outputs[command] = r.stdout
+        assert (
+            '"app": "batch-r0-golden-ops"' in outputs["status"]
+            or "target={'app': 'batch-r0-golden-ops'" in outputs["status"]
+        )
+        assert "target.app=batch-r0-golden-ops" in outputs["doctor"]
+        for command in ("deploy", "run"):
+            assert "COMFYMODAL_V2_APP_NAME=batch-r0-golden-ops" in outputs[command]
+            assert "profile=golden_p1" in outputs[command]
+
+    def test_golden_status_is_read_only_and_reports_remote_boundary(self) -> None:
+        r = run_v2ctl("golden", "status", "--json")
+        assert r.returncode in (0, 1)
+        assert r.stderr == ""
+        data = json.loads(r.stdout)
+        assert data["profile"] == "golden_p1"
+        assert data["target"]["method"] == "run_golden_serial_stream"
+        assert data["remote_checks"] == "not_performed"
+        assert isinstance(data["deployed_state_present"], bool)
+        assert isinstance(data["deployed_state_target_match"], bool)
+
+    def test_golden_status_does_not_adopt_unrelated_manifest_health(self, monkeypatch, tmp_path, capsys) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        monkeypatch.setattr(
+            cli,
+            "latest_deployment_manifest",
+            lambda _root: {
+                "profile": "golden_p1",
+                "deploy_fingerprint": "stale",
+                "target": {
+                    "app": "stable-modal-comfy-v2-golden-p1",
+                    "class": "ModalRuntimeEntrypointV2",
+                    "method": "run_golden_serial_stream",
+                },
+                "runtime_health_status": "verified",
+                "source_identity_status": "verified",
+            },
+        )
+        monkeypatch.setattr(cli, "_deployment_manifest_dir", lambda _root: tmp_path)
+        args = SimpleNamespace(
+            profile="golden_p1", app=None, gpu=None, memory_mb=None, cpu=None,
+            owner=None, set=[], inherit=[], json=True,
+        )
+        assert cli.cmd_golden_status(args, REPO_ROOT) == 1
+        data = json.loads(capsys.readouterr().out)
+        assert data["target"]["app"] == "batch-r0-golden-ops"
+        assert data["deployment_target_match"] is False
+        assert data["deployment_fingerprint_match"] is False
+        assert data["runtime_health_status"] == "unverified"
+        assert data["source_identity_status"] == "unverified"
+
+    def test_golden_status_is_not_ready_while_next_request_guarded(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        args = SimpleNamespace(
+            profile="golden_p1", app="golden-experimental", gpu=None,
+            memory_mb=None, cpu=None, owner=None, set=[], inherit=[], json=True,
+        )
+        components = cli._build_components_for_args(REPO_ROOT, args)
+        config, fingerprints = components[3], components[4]
+        target = {
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        }
+        (tmp_path / ".deployed_state.json").write_text(
+            json.dumps({"app_name": config.target.app, "class_name": config.target.class_name}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli, "_build_components_for_args", lambda _root, _args: components)
+        monkeypatch.setattr(
+            cli,
+            "latest_deployment_manifest",
+            lambda _root: {
+                "profile": "golden_p1",
+                "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+                "target": target,
+                "runtime_health_status": "verified",
+                "source_identity_status": "verified",
+            },
+        )
+        monkeypatch.setattr(cli, "_deployment_manifest_dir", lambda _root: tmp_path / "deployments")
+
+        class PendingGuard:
+            @staticmethod
+            def deployment_identity(**kwargs):
+                return "test-deployment"
+
+            @staticmethod
+            def path_for_deployment(root, identity):
+                return tmp_path / "guard.json"
+
+            def __init__(self, path, deployment_identity=None):
+                pass
+
+            def snapshot(self):
+                return {"post_capture_guard_pending": True}
+
+        class NoopLock:
+            def __init__(self, path):
+                pass
+
+            def status(self):
+                return None
+
+        class NoOverrides:
+            def __init__(self, **kwargs):
+                pass
+
+            def list_local(self):
+                return []
+
+        monkeypatch.setattr(cli, "_golden_capture_guard_class", lambda _root: PendingGuard)
+        monkeypatch.setattr(cli.locking_mod, "DeployLock", NoopLock)
+        monkeypatch.setattr(cli.ro_mod, "RuntimeOverrideInventory", NoOverrides)
+
+        assert cli.cmd_golden_status(args, tmp_path) == 1
+        data = json.loads(capsys.readouterr().out)
+        assert data["next_request_guarded"] is True
+        assert data["ready"] is False
+
+    def test_flat_golden_deploy_run_refuses_before_backend(self, monkeypatch, capsys) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        class UnexpectedBackend:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("flat Golden deploy-run must not construct a backend")
+
+        monkeypatch.setattr(cli.backend_mod, "BackendRunner", UnexpectedBackend)
+        args = SimpleNamespace(
+            profile="golden_p1", app="golden-experimental", set=[], inherit=[],
+            owner=None, dry_run=False, gpu=None, memory_mb=None, cpu=None,
+        )
+
+        assert cli.cmd_deploy_run(args, REPO_ROOT) == 2
+        error = capsys.readouterr().err
+        assert "flat `v2ctl deploy-run" in error
+        assert "v2ctl golden deploy" in error
+
+
+class TestGoldenDeployVersionVerification:
+    def test_public_golden_deploy_requires_real_version_advance(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+        from tools.v2_control.backend import BackendResult
+
+        backend_calls = []
+        lock_instances = []
+        manifest = tmp_path / "deploy.json"
+
+        class FakeRunner:
+            def __init__(self, repo_root, env_builder):
+                pass
+
+            @staticmethod
+            def build_command_line(spec, extra_args):
+                return "fake-backend"
+
+            def run(self, *args, **kwargs):
+                backend_calls.append(kwargs)
+                return BackendResult(
+                    exit_code=0, stdout="", stderr="", command="fake-backend",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    ended_at="2026-01-01T00:00:01+00:00", elapsed_seconds=1.0,
+                )
+
+        class FakeLock:
+            def __init__(self, path):
+                lock_instances.append(self)
+
+            def acquire(self, **kwargs):
+                pass
+
+            def release(self):
+                pass
+
+        def fake_manifest(*args, **kwargs):
+            manifest.write_text("{}", encoding="utf-8")
+            return manifest
+
+        monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
+        monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
+        monkeypatch.setattr(cli, "write_deployment_manifest", fake_manifest)
+        args = SimpleNamespace(
+            profile="golden_p1", app="golden-experimental", set=[], inherit=[],
+            owner=None, dry_run=False, gpu=None, memory_mb=None, cpu=None,
+            golden_public=True,
+        )
+
+        versions = iter((7, 8, 8, 8))
+        monkeypatch.setattr(cli, "_app_version_number", lambda app: next(versions))
+        assert cli.cmd_deploy(args, REPO_ROOT) == 0
+        assert manifest.exists()
+
+        # A second backend exit 0 with no version advance is not a valid deploy.
+        assert cli.cmd_deploy(args, REPO_ROOT) == 1
+        assert not manifest.exists()
+        assert len(backend_calls) == 2
+        assert lock_instances
+        assert "version did NOT advance" in capsys.readouterr().err
 
 
 class TestFlags:
@@ -266,6 +642,18 @@ class TestDryRun:
         with pytest.raises(GateError, match="non-Golden profiles"):
             _require_full_run_mode(config_non_golden, command="v2ctl gate")
 
+    @pytest.mark.parametrize(
+        "mode",
+        ["acceptance", "variance_cold", "variance_matrix", "volume_read", "snapshot_restore_only"],
+    )
+    def test_flat_golden_run_rejects_explicit_generic_mode(self, mode: str) -> None:
+        r = run_v2ctl(
+            "run", "--profile", "golden_p1", "--dry-run", "--app",
+            "golden-review-experimental", "--set", f"V2_BENCHMARK_MODE={mode}",
+        )
+        assert r.returncode == 1
+        assert "only golden_p1_serial is allowed" in r.stderr
+
     def test_e29_tracer_profile_forces_full_run_mode(self) -> None:
         # The e29-tracer profile must resolve to a FULL generation mode
         # (e28_single), never the snapshot-restore-only probe default.
@@ -376,7 +764,6 @@ class TestBackendSelectorForwarding:
             ("deploy", "e31-clip-fp32-qd4-arm-b", "E31_VALIDATION"),
             ("deploy-run", "e31-clip-fp32-qd4-arm-b", "E31_VALIDATION"),
             ("deploy-run", "e29-tracer", "E28_VALIDATION"),
-            ("deploy-run", "golden_p1", "golden_p1"),
         ],
     )
     def test_selector_reaches_backend_and_matches_printed_command(
@@ -532,6 +919,45 @@ class TestGateConfirm:
             assert "gate requires a deployment" in r.stderr
         else:
             pytest.skip("a real deployment manifest exists; gate refusal path covered elsewhere")
+
+    def test_gate_requires_manifest_target_match_alongside_fingerprint(
+        self, monkeypatch, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        _, _, _, config, fingerprints, _, _ = cli.build_components(REPO_ROOT, "production")
+
+        class NoopLock:
+            def __init__(self, path):
+                pass
+
+            def status(self):
+                return None
+
+            def is_stale(self, status):
+                return False
+
+        monkeypatch.setattr(cli.locking_mod, "DeployLock", NoopLock)
+        monkeypatch.setattr(
+            cli,
+            "latest_deployment_manifest",
+            lambda _root: {
+                "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+                "target": {
+                    "app": "wrong-target",
+                    "class": config.target.class_name,
+                    "method": config.target.method,
+                },
+            },
+        )
+        args = SimpleNamespace(
+            profile="production", app=None, gpu=None, memory_mb=None, cpu=None,
+            owner=None, set=[], inherit=[], dry_run=True,
+        )
+
+        assert cli.cmd_gate(args, REPO_ROOT) == 1
+        assert "deployment target mismatch" in capsys.readouterr().err
 
     def test_confirm_requires_from(self) -> None:
         r = run_v2ctl("confirm")

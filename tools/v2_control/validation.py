@@ -128,6 +128,60 @@ class GateResult:
     run: RunRecord | None = None
 
 
+def mark_runtime_health_verified(
+    repo_root: Path,
+    config: Any,
+    fingerprints: Any,
+    captured_deploy_fingerprint: str,
+) -> Path | None:
+    """Mark the exact deployment proved by a successful validated run.
+
+    Runtime health is deliberately independent from source identity.  Only the
+    newest deployment manifest is eligible, and it must match all three target
+    identity fields and the deployment fingerprint captured before execution.
+    The fingerprint is checked again immediately before writing so an old
+    successful result cannot promote a deployment created during the run.
+    """
+    deployments = Path(repo_root) / ".v2ctl" / "deployments"
+    if not deployments.is_dir():
+        return None
+    manifests = sorted(deployments.glob("deploy_*.json"))
+    if not manifests:
+        return None
+    path = manifests[-1]
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    target = getattr(config, "target", None)
+    expected_target = {
+        "app": str(getattr(target, "app", "") or ""),
+        "class": str(getattr(target, "class_name", "") or ""),
+        "method": str(getattr(target, "method", "") or ""),
+    }
+    if manifest.get("target") != expected_target:
+        return None
+    if manifest.get("deploy_fingerprint") != captured_deploy_fingerprint:
+        return None
+
+    try:
+        current_deploy_fingerprint = str(fingerprints.deploy_fingerprint())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if current_deploy_fingerprint != captured_deploy_fingerprint:
+        return None
+
+    manifest["runtime_health_status"] = "verified"
+    try:
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
 # --------------------------------------------------------------------------
 # Validator seam
 # --------------------------------------------------------------------------
@@ -1677,6 +1731,13 @@ class GateRunner:
         deploy_inputs = _safe_deploy_inputs(self._fingerprints)
         manifest = _build_manifest(record, config, valid, reasons, deploy_fp, run_fp, deploy_inputs)
         path = self._persist_manifest(config, run_fp, manifest)
+        if valid:
+            mark_runtime_health_verified(
+                self._repo_root,
+                config,
+                self._fingerprints,
+                deploy_fp,
+            )
 
         LOG.info("gate manifest written: %s (valid=%s)", path, valid)
         return GateResult(valid=valid, reasons=reasons, manifest_path=path, run=record)

@@ -98,6 +98,114 @@ class WarmupStateTests(unittest.TestCase):
             self.assertFalse(state.is_warmed())
 
 
+class GoldenCaptureGuardTests(unittest.TestCase):
+    def test_deployment_snapshot_does_not_arm_guard(self):
+        m = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            guard = m.GoldenCaptureGuard(Path(tmp) / "capture_guard.json")
+            result = guard.observe_request(
+                request_id="deployment-startup",
+                request_time_capture=False,
+                deployment_identity="deploy-1",
+            )
+            self.assertEqual(result["classification"], "ELIGIBLE")
+            self.assertEqual(guard.snapshot()["state"], "idle")
+
+    def test_capture_persists_and_next_request_is_consumed(self):
+        m = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture_guard.json"
+            guard = m.GoldenCaptureGuard(path)
+            capture = guard.observe_request(
+                request_id="capture-1",
+                request_time_capture=True,
+                capture_identity="snapshot-1",
+            )
+            self.assertEqual(capture["classification"], "SNAPSHOT_CAPTURE")
+            self.assertFalse(capture["counted"])
+            reloaded = m.GoldenCaptureGuard(path)
+            follow_up = reloaded.observe_request(
+                request_id="run-1",
+                request_time_capture=False,
+            )
+            self.assertEqual(
+                follow_up["classification"],
+                "INVALID_DIRECTLY_AFTER_SNAPSHOT_CAPTURE",
+            )
+            self.assertFalse(follow_up["counted"])
+            self.assertEqual(reloaded.snapshot()["state"], "idle")
+
+    def test_capture_rearms_and_later_request_is_eligible(self):
+        m = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            guard = m.GoldenCaptureGuard(Path(tmp) / "capture_guard.json")
+            guard.observe_request(request_id="capture-1", request_time_capture=True,
+                                  capture_identity="snapshot-1")
+            guard.observe_request(request_id="capture-2", request_time_capture=True,
+                                  capture_identity="snapshot-2")
+            consumed = guard.observe_request(request_id="run-1", request_time_capture=False)
+            eligible = guard.observe_request(request_id="run-2", request_time_capture=False)
+            self.assertEqual(consumed["transition"], "consumed")
+            self.assertEqual(eligible["classification"], "ELIGIBLE")
+            self.assertEqual(guard.snapshot()["capture_identity"], "snapshot-2")
+
+    def test_state_contains_persisted_one_shot_fields(self):
+        m = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture_guard.json"
+            guard = m.GoldenCaptureGuard(path, deployment_identity="deploy-1")
+            guard.observe_request(
+                request_id="capture-1",
+                request_time_capture=True,
+                deployment_identity="deploy-1",
+            )
+            state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(state["post_capture_guard_pending"])
+            self.assertEqual(state["last_snapshot_capture_request_id"], "capture-1")
+            self.assertEqual(state["guard_armed_by_request_id"], "capture-1")
+            self.assertEqual(state["deployment_identity"], "deploy-1")
+            guard.observe_request(
+                request_id="run-1",
+                request_time_capture=False,
+                deployment_identity="deploy-1",
+            )
+            state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertFalse(state["post_capture_guard_pending"])
+            self.assertEqual(state["last_guard_consumed_by_request_id"], "run-1")
+
+    def test_new_deployment_identity_starts_idle_without_redeploy_taint(self):
+        m = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture_guard.json"
+            old = m.GoldenCaptureGuard(path, deployment_identity="deploy-1")
+            old.observe_request(
+                request_id="capture-1",
+                request_time_capture=True,
+                deployment_identity="deploy-1",
+            )
+            fresh = m.GoldenCaptureGuard(path, deployment_identity="deploy-2")
+            state = fresh.snapshot()
+            self.assertEqual(state["deployment_identity"], "deploy-2")
+            self.assertFalse(state["post_capture_guard_pending"])
+            self.assertEqual(
+                fresh.observe_request(
+                    request_id="run-1",
+                    request_time_capture=False,
+                    deployment_identity="deploy-2",
+                )["classification"],
+                "ELIGIBLE",
+            )
+
+    def test_malformed_state_fails_closed(self):
+        m = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture_guard.json"
+            path.write_text("{\"schema_version\": 1, \"state\": \"armed\"}",
+                            encoding="utf-8")
+            with self.assertRaises(m.GoldenCaptureGuardError):
+                m.GoldenCaptureGuard(path)
+
+
 class EnsureWarmupTests(unittest.TestCase):
     def test_ensure_warmup_returns_already_warmed(self):
         m = load_module()

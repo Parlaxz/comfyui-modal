@@ -1410,8 +1410,12 @@ class RunPromptStreamLocalInstrumentationTests(unittest.TestCase):
 
 
 class RunPromptStreamRemoteInstrumentationTests(unittest.TestCase):
-    """comfyapp.run_prompt_stream must yield an early entry status event
-    and log around the two suspected pre-yield blockers."""
+    """Protect the surviving request-entry and preflight boundaries.
+
+    The former cold-UNET instrumentation was intentionally retired by E39;
+    these tests cover the current stream path instead of resurrecting that
+    removed generic-path behavior.
+    """
 
     def setUp(self):
         src = _read(REPO_ROOT / "comfyapp.py")
@@ -1419,33 +1423,77 @@ class RunPromptStreamRemoteInstrumentationTests(unittest.TestCase):
         self.assertIsNotNone(self.src, "run_prompt_stream must be found in comfyapp.py")
 
     def test_has_early_entry_yield(self):
-        """must yield status with phase=entry before _cold_unet_early_actual_load."""
+        """Old test -> intended invariant -> replacement coverage.
+
+        Old test: require the entry yield before the removed cold-UNET call.
+        Intended invariant: a client receives stream entry before any request
+        readiness or dependency/model gate can block it.
+        Why stale: E39 removed speculative cold-UNET loading from this path.
+        Replacement coverage: require entry before the surviving GPU-readiness
+        and dependency-policy gates.
+        """
         entry_idx = self.src.find("'entry'")
-        cold_unet_idx = self.src.find("_cold_unet_early_actual_load")
+        gpu_idx = self.src.find("_ensure_gpu_ready_for_request")
+        dep_idx = self.src.find("_handle_custom_node_sync_and_dependency_policy")
         self.assertGreaterEqual(entry_idx, 0,
                                 "Must have 'entry' phase marker in run_prompt_stream")
-        self.assertGreaterEqual(cold_unet_idx, 0,
-                                "Must have _cold_unet_early_actual_load call")
-        self.assertLess(entry_idx, cold_unet_idx,
-                        "'entry' status yield must appear before _cold_unet_early_actual_load")
+        self.assertGreaterEqual(gpu_idx, 0,
+                                "Must have the surviving request GPU-readiness gate")
+        self.assertGreaterEqual(dep_idx, 0,
+                                "Must have the surviving dependency-policy gate")
+        self.assertLess(entry_idx, gpu_idx,
+                        "'entry' status yield must precede request GPU readiness")
+        self.assertLess(entry_idx, dep_idx,
+                        "'entry' status yield must precede dependency policy")
 
     def test_has_log_before_cold_unet(self):
-        """must have a log before _cold_unet_early_actual_load to mark entry."""
-        pre_idx = self.src.find("cold_unet_before")
-        cold_unet_idx = self.src.find("_cold_unet_early_actual_load")
+        """Old test -> intended invariant -> replacement coverage.
+
+        Old test: require a marker before the removed cold-UNET call.
+        Intended invariant: dependency policy is the request's pre-model-work
+        boundary and must begin before prompt-time loaders.
+        Why stale: E39 removed the speculative loader and its markers.
+        Replacement coverage: require the surviving before-policy marker to
+        precede prompt-time preload and actual-load scheduling.
+        """
+        pre_idx = self.src.find("dependency_policy_before")
+        preload_idx = self.src.find("_prompt_async_preload(workflow)")
+        actual_load_idx = self.src.find("_prompt_async_actual_load(workflow)")
         self.assertGreaterEqual(pre_idx, 0,
-                                "Must have 'cold_unet_before' marker in run_prompt_stream")
-        self.assertLess(pre_idx, cold_unet_idx,
-                        "'cold_unet_before' marker must appear before _cold_unet_early_actual_load")
+                                "Must have the surviving dependency-policy entry marker")
+        self.assertGreaterEqual(preload_idx, 0,
+                                "Must have the surviving prompt preload path")
+        self.assertGreaterEqual(actual_load_idx, 0,
+                                "Must have the surviving actual-load path")
+        self.assertLess(pre_idx, preload_idx,
+                        "dependency policy must precede prompt preload")
+        self.assertLess(pre_idx, actual_load_idx,
+                        "dependency policy must precede actual-load scheduling")
 
     def test_has_log_after_cold_unet(self):
-        """must have a log after _cold_unet_early_actual_load to mark completion."""
-        cold_unet_idx = self.src.find("_cold_unet_early_actual_load")
-        post_idx = self.src.find("cold_unet_after")
+        """Old test -> intended invariant -> replacement coverage.
+
+        Old test: require a marker after the removed cold-UNET call.
+        Intended invariant: model-load scheduling must complete the dependency
+        gate before execution is submitted.
+        Why stale: E39 removed the speculative loader and moved the surviving
+        model setup after shared dependency policy.
+        Replacement coverage: require the after-policy boundary, actual-load
+        scheduling, and execution submission in that order.
+        """
+        post_idx = self.src.find("dependency_policy_after")
+        actual_load_idx = self.src.find("_prompt_async_actual_load(workflow)")
+        execute_idx = self.src.find("self._execute_in_process(workflow")
         self.assertGreaterEqual(post_idx, 0,
-                                "Must have 'cold_unet_after' marker in run_prompt_stream")
-        self.assertGreater(post_idx, cold_unet_idx,
-                           "'cold_unet_after' marker must appear after _cold_unet_early_actual_load")
+                                "Must have the surviving dependency-policy completion marker")
+        self.assertGreaterEqual(actual_load_idx, 0,
+                                "Must have the surviving actual-load path")
+        self.assertGreaterEqual(execute_idx, 0,
+                                "Must submit the surviving in-process execution path")
+        self.assertLess(post_idx, actual_load_idx,
+                        "dependency policy must complete before actual-load scheduling")
+        self.assertLess(actual_load_idx, execute_idx,
+                        "actual-load scheduling must precede execution submission")
 
     def test_has_log_before_dependency_policy(self):
         """must have a log before _handle_custom_node_sync_and_dependency_policy."""

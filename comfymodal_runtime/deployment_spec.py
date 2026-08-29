@@ -11,143 +11,37 @@ Pure functions — suitable for unit tests without Modal or volume access.
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 from typing import Iterator, Sequence
 
 from comfymodal_runtime.contracts import DeploymentIdentity
-
-
-# ── Allowed source extensions for custom-node code ───────────────────────
-
-ALLOWED_SOURCE_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".mjs"})
-
-# ── Excluded directory names (matched at any depth) ──────────────────────
-
-EXCLUDED_DIRS: frozenset[str] = frozenset({
-    ".git",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "node_modules",
-    ".opencode",
-    ".slim",
-    ".comfymodal_experiments",
-    ".custom_node_requirements",
-    ".baked_custom_node_deps",
-    ".presets",
-    ".preset_blobs",
-    "MagicMock",
-    "reference",
-    "docs",
-    "tests",
-    "benchmark_runs",
-    "benchmark_logs",
-    "optimization_logs",
-    "output",
-    "test-results",
-    "playwright-report",
-    ".playwright-mcp",
-    ".experiments",
-    ".run_history",
-})
-
-# ── Excluded file extensions (case-insensitive) ──────────────────────────
-
-EXCLUDED_EXTENSIONS: frozenset[str] = frozenset({
-    ".pyc",
-    ".pyo",
-    ".md",
-    ".tmp",
-    ".ref",
-    ".log",
-})
-
-# ── Excluded filename prefixes ───────────────────────────────────────────
-
-EXCLUDED_PREFIXES: tuple[str, ...] = ("before_v2_",)
-
-# ── Excluded filename infixes ────────────────────────────────────────────
-
-EXCLUDED_INFIXES: tuple[str, ...] = (".v21610_backup",)
-
-# ── Excluded exact filenames ─────────────────────────────────────────────
-
-EXCLUDED_FILENAMES: frozenset[str] = frozenset({
-    ".gitignore",
-    ".deploy_log",
-    "modal_logs.txt",
-})
-
-# ── Generated-state JSON prefixes ────────────────────────────────────────
-
-GENERATED_JSON_PREFIXES: tuple[str, ...] = (
-    "temp_",
-    "_last_",
-    "studio-",
-    "clean_",
-    "latest_benchmark_",
-    ".modal_",
-    ".model_",
-    ".last_",
-    ".profile_",
+from .publication_policy import (
+    ALLOWED_SOURCE_EXTENSIONS,
+    EXCLUDED_DIR_NAMES as EXCLUDED_DIRS,
+    EXCLUDED_EXTENSIONS,
+    EXCLUDED_FILENAMES,
+    EXCLUDED_INFIXES,
+    EXCLUDED_PREFIXES,
+    GENERATED_JSON_PREFIXES,
+    is_excluded_dir_name as _policy_excluded_dir_name,
+    is_excluded_name,
+    iter_source_files,
 )
 
-# ── Image / screenshot extensions ────────────────────────────────────────
 
-_IMAGE_EXTENSIONS: frozenset[str] = frozenset({
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".bmp",
-    ".svg",
-})
+def is_excluded_path(relative_path: str | Path) -> bool:
+    """Apply the shared publication policy to a repository-relative path."""
+    from .publication_policy import is_excluded_path as _is_excluded_path
+
+    return _is_excluded_path(relative_path)
 
 
 # ── Public pure predicates ───────────────────────────────────────────────
 
 
-def is_excluded_name(name: str) -> bool:
-    """Return ``True`` when *name* (bare filename) matches an exclusion rule.
-
-    Pure function — no filesystem access.  Designed for direct unit testing.
-    """
-    # Exact match
-    if name in EXCLUDED_FILENAMES:
-        return True
-    # Prefix match
-    if name.startswith(EXCLUDED_PREFIXES):
-        return True
-    # Infix match
-    if any(infix in name for infix in EXCLUDED_INFIXES):
-        return True
-    # Extension match
-    dot = name.rfind(".")
-    if dot >= 0:
-        ext = name[dot:].lower()
-        if ext in EXCLUDED_EXTENSIONS:
-            return True
-        # Screenshot images
-        if ext in _IMAGE_EXTENSIONS and (
-            "screenshot" in name.lower() or "validation" in name.lower()
-        ):
-            return True
-        # Generated-state JSON
-        if ext == ".json":
-            if name.startswith(GENERATED_JSON_PREFIXES):
-                return True
-    return False
-
-
 def _is_excluded_dir(name: str) -> bool:
     """Return ``True`` when *name* matches an excluded directory rule."""
-    return (
-        name in EXCLUDED_DIRS
-        or name.startswith(EXCLUDED_PREFIXES)
-        or any(infix in name for infix in EXCLUDED_INFIXES)
-    )
+    return _policy_excluded_dir_name(name)
 
 
 # ── Source-file walking ──────────────────────────────────────────────────
@@ -159,16 +53,7 @@ def _iter_source_files(root: Path) -> Iterator[Path]:
     Prunes excluded directories in-place (mutates ``dirnames`` so that
     ``os.walk`` does not descend into them).
     """
-    root = root.resolve()
-    for dirpath_str, dirnames, filenames in os.walk(str(root), followlinks=False):
-        dirnames[:] = [d for d in dirnames if not _is_excluded_dir(d)]
-        dirpath = Path(dirpath_str)
-        for fn in filenames:
-            ext = Path(fn).suffix.lower()
-            if ext not in ALLOWED_SOURCE_EXTENSIONS:
-                continue
-            if not is_excluded_name(fn):
-                yield dirpath / fn
+    yield from iter_source_files(root, extensions=ALLOWED_SOURCE_EXTENSIONS)
 
 
 # ── Hashing helpers ──────────────────────────────────────────────────────
@@ -195,7 +80,7 @@ def compute_file_hashes(root: str | Path) -> dict[str, str]:
     root_path = Path(root).resolve()
     result: dict[str, str] = {}
     for abspath in _iter_source_files(root_path):
-        rel = str(abspath.relative_to(root_path))
+        rel = str(abspath.relative_to(root_path)).replace("\\", "/")
         result[rel] = _sha256_file(abspath)
     return result
 
@@ -262,11 +147,17 @@ def build_deployment_identity(
     custom_hashes: dict[str, str] = {}
     custom_bytes = 0
     if custom_node_paths:
-        for cnp in custom_node_paths:
+        for root_index, cnp in enumerate(custom_node_paths):
             cnp_path = Path(cnp)
             if cnp_path.is_dir():
                 ch = compute_file_hashes(cnp_path)
-                custom_hashes.update(ch)
+                # Relative paths are only unique within one custom-node root.
+                # Namespace them before merging so two roots containing the
+                # same filename cannot silently overwrite one another.
+                custom_hashes.update({
+                    f"custom_node_root_{root_index}/{rel}": sha
+                    for rel, sha in ch.items()
+                })
                 custom_bytes += compute_source_bytes(cnp_path)
 
     custom_node_hash = compute_aggregate_hash(custom_hashes) if custom_hashes else ""
