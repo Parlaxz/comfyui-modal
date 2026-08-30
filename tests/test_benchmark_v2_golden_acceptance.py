@@ -3,18 +3,41 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
+from comfymodal_runtime.contracts import DEPLOYMENT_HASH_NAMESPACE
+import tools.benchmark_v2_direct as benchmark
 from tools.benchmark_v2_direct import (
     GOLDEN_P1_REQUIRED_FLAGS,
     _golden_p1_extract_telemetry,
+    _golden_p1_deployed_identity,
     _golden_p1_scan_events,
     _golden_p1_validate_attempt,
 )
 
 
 SHA = "a" * 64
+MISMATCH_SHA = "b" * 64
+
+
+def _deployment_manifest(*, app: str, profile: str, fingerprint: str) -> dict:
+    return {
+        "schema_version": 2,
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "fingerprint_algorithm": "canonical-boundary-identity-v2",
+        "deployment_hash": fingerprint,
+        "created_at": "2026-08-30T12:00:00+00:00",
+        "profile": profile,
+        "target": {
+            "app": app,
+            "class": "ModalRuntimeEntrypointV2",
+            "method": "run_golden_serial_stream",
+        },
+        "resources": {"gpu": "rtx-pro-6000"},
+        "deploy_fingerprint": fingerprint,
+    }
 
 
 def _proof() -> dict:
@@ -77,6 +100,63 @@ def _validate(scan: dict, *, expected_flags: dict | None = None):
     )
 
 
+def test_golden_identity_uses_matching_manifest_not_stale_deployed_state(
+    tmp_path, monkeypatch
+):
+    app = "batch-s1-cache-e1"
+    profile = "golden_p1"
+    fingerprint = "b" * 64
+    deployments = tmp_path / ".v2ctl" / "deployments"
+    deployments.mkdir(parents=True)
+    (tmp_path / ".deployed_state.json").write_text(
+        json.dumps({
+            "app_name": "batch-ra2-active-patcher",
+            "class_name": "StaleClass",
+            "deployment_combined_hash": "stale",
+            "profile": profile,
+        }),
+        encoding="utf-8",
+    )
+    (deployments / "deploy_20260830-120000-bbbbbbbb.json").write_text(
+        json.dumps(_deployment_manifest(app=app, profile=profile, fingerprint=fingerprint)),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(benchmark, "ROOT", tmp_path)
+
+    identity = _golden_p1_deployed_identity(
+        app_name=app, profile=profile, deploy_fingerprint=fingerprint
+    )
+
+    assert identity["app_name"] == app
+    assert identity["class_name"] == "ModalRuntimeEntrypointV2"
+    assert identity["deploy_fingerprint"] == fingerprint
+    assert identity["deployment_combined_hash"] == fingerprint
+    assert "batch-ra2-active-patcher" not in json.dumps(identity)
+
+
+def test_golden_identity_fails_closed_without_current_matching_manifest(tmp_path, monkeypatch):
+    app = "batch-s1-cache-e1"
+    profile = "golden_p1"
+    current_fingerprint = "b" * 64
+    deployments = tmp_path / ".v2ctl" / "deployments"
+    deployments.mkdir(parents=True)
+    (tmp_path / ".deployed_state.json").write_text(
+        json.dumps({"app_name": "batch-ra2-active-patcher", "deploy_fingerprint": "a" * 64}),
+        encoding="utf-8",
+    )
+    (deployments / "deploy_20260830-110000-aaaaaaaa.json").write_text(
+        json.dumps(_deployment_manifest(
+            app="batch-ra2-active-patcher", profile=profile, fingerprint="a" * 64
+        )),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(benchmark, "ROOT", tmp_path)
+
+    assert _golden_p1_deployed_identity(
+        app_name=app, profile=profile, deploy_fingerprint=current_fingerprint
+    ) == {}
+
+
 def test_terminal_golden_flags_are_scanned_and_optional_extra_expectations_match():
     events = [{
         "type": "result",
@@ -90,6 +170,45 @@ def test_terminal_golden_flags_are_scanned_and_optional_extra_expectations_match
         expected_flags={"custom_gate": "1"},
     )
     assert valid, failures
+
+
+def test_golden_output_sha_mismatch_is_valid_only_with_explicit_warning():
+    scan = _scan()
+    scan["output_shas"] = [(0, "result.output_sha", MISMATCH_SHA)]
+    scan["output_sha_warnings"] = [(
+        0,
+        "result.golden_telemetry.stages[0].details.output_sha_warning",
+        {"expected": SHA, "observed": MISMATCH_SHA},
+    )]
+
+    valid, failures, details = _validate(scan)
+
+    assert valid, failures
+    assert failures == []
+    assert details["output_sha_match"] is False
+    assert details["output_sha_warning"] == {
+        "expected": SHA,
+        "observed": MISMATCH_SHA,
+    }
+
+    scan["output_sha_warnings"] = []
+    valid, failures, _details = _validate(scan)
+    assert not valid
+    assert any("without explicit warning evidence" in failure for failure in failures)
+
+
+def test_golden_output_sha_malformed_or_missing_remains_invalid():
+    missing = _scan()
+    missing["output_shas"] = []
+    valid, failures, _details = _validate(missing)
+    assert not valid
+    assert any("observed output SHA absent" in failure for failure in failures)
+
+    malformed = _scan()
+    malformed["output_shas"] = [(0, "result.output_sha", "not-a-sha")]
+    valid, failures, _details = _validate(malformed)
+    assert not valid
+    assert any("malformed" in failure for failure in failures)
 
 
 def test_nested_telemetry_uses_seriality_proof_and_earliest_commit_event():

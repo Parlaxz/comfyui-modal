@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -30,6 +30,13 @@ METADATA_MEMORY_MB = "memory_mb"
 METADATA_SNAPSHOT_ENABLED = "snapshot_enabled"
 METADATA_GPU_SNAPSHOT_ENABLED = "gpu_snapshot_enabled"
 METADATA_RESTORE_PLAN_GENERATION = "restore_plan_generation"
+
+# All current deployment fingerprints use this namespace.  The explicit
+# namespace keeps the source-identity compatibility spelling from being
+# confused with the canonical image-plan deployment hash.
+DEPLOYMENT_HASH_NAMESPACE = "comfy-modal/deployment/v2"
+SOURCE_IDENTITY_HASH_NAMESPACE = "comfy-modal/source/v2"
+DEPLOYMENT_IDENTITY_SCHEMA_VERSION = 2
 
 VAE_POLICY_VERSION = 1
 VAE_POLICY_ENV_KEY = "COMFYMODAL_V2_VAE_POLICY"
@@ -1394,19 +1401,28 @@ class SnapshotExecutionSeed:
 
 @dataclass(frozen=True)
 class DeploymentIdentity:
-    schema_version: int = 1
+    schema_version: int = DEPLOYMENT_IDENTITY_SCHEMA_VERSION
     runtime_hash: str = ""
     dependency_hash: str = ""
     custom_node_hash: str = ""
     source_bytes: int = 0
     file_hashes: Mapping[str, str] = field(default_factory=dict)
+    # Compatibility records may carry the canonical image-plan deployment
+    # hash.  When present it is authoritative; ``combined_hash`` is only its
+    # compatibility alias.  An absent value retains the source-only hash for
+    # standalone legacy callers and is explicitly marked by the namespace.
+    deployment_hash: str = ""
+    hash_namespace: str = SOURCE_IDENTITY_HASH_NAMESPACE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "file_hashes", _freeze(self.file_hashes or {}))
 
     @property
     def combined_hash(self) -> str:
+        if self.deployment_hash:
+            return self.deployment_hash
         return stable_hash({
+            "hash_namespace": self.hash_namespace,
             "schema_version": self.schema_version,
             "runtime_hash": self.runtime_hash,
             "dependency_hash": self.dependency_hash,
@@ -1422,8 +1438,18 @@ class DeploymentIdentity:
             "custom_node_hash": self.custom_node_hash,
             "source_bytes": self.source_bytes,
             "file_hashes": _thaw(self.file_hashes),
+            "deployment_hash": self.deployment_hash,
+            "hash_namespace": self.hash_namespace,
             "combined_hash": self.combined_hash,
         }
+
+    def with_deployment_hash(self, deployment_hash: str) -> "DeploymentIdentity":
+        """Attach the canonical image-plan hash without changing source data."""
+        return replace(
+            self,
+            deployment_hash=str(deployment_hash or ""),
+            hash_namespace=DEPLOYMENT_HASH_NAMESPACE,
+        )
 
 
 @dataclass(frozen=True)

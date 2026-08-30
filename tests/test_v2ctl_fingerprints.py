@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.v2_control.fingerprints import FingerprintEngine  # noqa: E402
+from comfymodal_runtime.deployment_spec import build_v2_late_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -377,3 +378,46 @@ def test_selector_projection_does_not_change_unrelated_production_profile():
     assert inputs["COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS"] == "0"
     assert inputs["COMFYMODAL_V2_FAST_COLD_ORCHESTRATION"] == "0"
     assert inputs["COMFYMODAL_V2_UNET_FASTSAFETENSORS"] == "0"
+
+
+def test_shared_late_config_is_nonempty_and_complete():
+    late = build_v2_late_config(
+        resolved_values={
+            "COMFYMODAL_V2_PREFILL_LANES": "full",
+            "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": "1",
+            "COMFYMODAL_SAMPLING_DEEP_PROFILE": "on",
+        },
+        cpu_request=12,
+        memory_request=32768,
+    )
+    assert late
+    assert all(isinstance(key, str) and isinstance(value, str) for key, value in late.items())
+    assert late["COMFYMODAL_V2_PREFILL_LANES"] == "full"
+    assert late["COMFYMODAL_V2_NATIVE_FAST_DISK_UNET"] == "1"
+    assert late["COMFYMODAL_SAMPLING_DEEP_PROFILE"] == "on"
+    assert late["COMFYMODAL_V2_CPU_REQUEST"] == "12"
+    assert late["COMFYMODAL_V2_MEMORY_MB"] == "32768"
+    assert late["COMFYMODAL_V2_RUNTIME_REVISION"]
+    assert late["COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT"]
+
+
+def test_shared_late_config_is_deterministic():
+    kwargs = {
+        "resolved_values": {"COMFYMODAL_V2_THREAD_POLICY": "T1"},
+        "cpu_request": 12,
+        "memory_request": 32768,
+    }
+    assert build_v2_late_config(**kwargs) == build_v2_late_config(**kwargs)
+
+
+def test_v2ctl_canonical_identity_includes_late_config():
+    identity = FingerprintEngine(_base_config()).canonical_identity()
+    assert identity.late_config
+
+
+def test_v2ctl_late_config_does_not_use_ambient_environment(monkeypatch):
+    baseline = FingerprintEngine(_base_config()).deploy_fingerprint()
+    monkeypatch.setenv("COMFYMODAL_V2_PREFILL_LANES", "full")
+    monkeypatch.setenv("COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "1")
+    monkeypatch.setenv("COMFYMODAL_SAMPLING_DEEP_PROFILE", "on")
+    assert FingerprintEngine(_base_config()).deploy_fingerprint() == baseline

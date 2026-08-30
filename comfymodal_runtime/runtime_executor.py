@@ -4381,7 +4381,10 @@ def _build_sampling_wrapper() -> Callable:
     Does NOT copy ``CFGGuider.inner_sample`` or any other sampler internals.
     Preserves all model options, wrapper chains, and per-step callbacks.
     """
-    from comfymodal_runtime.model_preload import _ACTIVE_REQUEST_TRACE
+    from comfymodal_runtime.model_preload import (
+        _ACTIVE_LANE_TRACE,
+        _ACTIVE_REQUEST_TRACE,
+    )
 
     def _sampler_node_context(guider: Any) -> tuple[str, str]:
         """Resolve the authoritative sampler node context ``(node_id, node_class)``.
@@ -4482,6 +4485,9 @@ def _build_sampling_wrapper() -> Callable:
 
     def _wrapper(executor: Any, *args: Any, **kwargs: Any) -> Any:
         trace = _ACTIVE_REQUEST_TRACE.get()
+        if trace is None:
+            lane = _ACTIVE_LANE_TRACE.get()
+            trace = getattr(lane, "_trace", None)
         if trace is None:
             return executor(*args, **kwargs)
 
@@ -4763,8 +4769,16 @@ def _build_sampling_wrapper() -> Callable:
                 sampling_start_wall_unix_ns=_sampling_start_event.wall_unix_ns,
                 patcher=_patch,
             )
-        except Exception:
+        except Exception as exc:
             _deep_profile = None
+            try:
+                print(
+                    "[v2.sampling_deep_profile] event=begin_failed "
+                    f"error={type(exc).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         # ── V2 VAE CPU page prefetch (sampling_start hook) ──────────────
         # CPU-only, bounded readiness work submitted through the bridge's
         # coordinator pool (never the mutation lane).  Disabled mode is a
@@ -4832,8 +4846,15 @@ def _build_sampling_wrapper() -> Callable:
                     # Feed every callback index (including the final teardown
                     # callback index) to the deep profile for step classification.
                     _deep_profile.on_callback_index(cb_args[0] if cb_args else None)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    try:
+                        print(
+                            "[v2.sampling_deep_profile] event=callback_failed "
+                            f"error={type(exc).__name__}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
             if not _first_step_fired:
                 _first_step_fired = True
                 try:
@@ -4889,8 +4910,15 @@ def _build_sampling_wrapper() -> Callable:
                             sampler_node_class=node_class,
                             first_step_mono_ns=time.monotonic_ns(),
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    try:
+                        print(
+                            "[v2.sampling_deep_profile] event=finalize_failed "
+                            f"error={type(exc).__name__}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
             if _orig_callback is not None:
                 return _orig_callback(*cb_args, **cb_kwargs)
             return None
@@ -5037,8 +5065,15 @@ def _build_sampling_wrapper() -> Callable:
                         sampling_end_wall_unix_ns=_end_wall,
                         sampling_end_emission_failed=(_sampling_end_event is None),
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    try:
+                        print(
+                            "[v2.sampling_deep_profile] event=finalize_failed "
+                            f"error={type(exc).__name__}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
             # ── Sampler wait-on-activation variance (diagnostic-only) ──
             # Emits a dedicated event separating the sampler wait on
             # activation from sampling duration, using the existing

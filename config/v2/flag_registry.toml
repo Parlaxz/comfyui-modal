@@ -234,6 +234,16 @@ owner = "e31"
 description = "Bounded per-call E31 cast-evidence ring size (and per-cast deferred-event queue cap). Default 1024."
 
 [[flag]]
+name = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
+type = "enum"
+default = "off"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "ra1"
+enum_values = ["off", "steps", "blocks"]
+description = "RA1 gated sampler decomposition level. Default OFF; blocks adds reversible NextDiT category and attention-backend diagnostics."
+
+[[flag]]
 name = "COMFYMODAL_V2_ENV_PROFILE"
 type = "enum"
 default = "production"
@@ -379,6 +389,24 @@ consumed_at = "restore"
 change_requires = "deploy"
 owner = "e29"
 description = "Construct the snapshot at deploy time."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_MANIFEST"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29/ra2b"
+description = "Capture diagnostic snapshot manifests at startup and first restored line."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29/ra2b"
+description = "Run the diagnostic allocator-hygiene pass at the snapshot capture boundary."
 
 [[flag]]
 name = "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"
@@ -853,6 +881,16 @@ owner = "golden-p1"
 description = "P1 serial-Golden workflow SHA equality guard; hash computation and telemetry remain enabled when this guard is explicitly disabled."
 
 # ── Harness selectors (consumed by the request harness; run-only) ───────────
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
+type = "enum"
+default = "pytorch"
+consumed_at = "harness"
+change_requires = "run"
+owner = "golden-p1"
+enum_values = ["pytorch", "sage", "comfy_kitchen"]
+description = "Optional public Golden request attention backend selector; omitted requests retain the existing PyTorch default."
 
 [[flag]]
 name = "V2_BENCHMARK_RUNS"

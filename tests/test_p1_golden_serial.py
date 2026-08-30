@@ -52,7 +52,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "comfymodal_runtime" / "gold
 
 # Reconciled Phase 2 gate contract constants (distinct by design).
 CANONICAL_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab044704c0d3b5"
-EXPECTED_OUTPUT_SHA256 = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
+EXPECTED_OUTPUT_SHA256 = "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
 
 
 def _load_module():
@@ -1473,6 +1473,7 @@ def test_request_setup_rejects_disabled_workflow_hash_check(monkeypatch, env_val
     assert hash_event["fields"] == {
         "actual_sha256": actual_sha,
         "expected_sha256": "0" * 64,
+        "attention_backend": None,
         "enabled": False,
         "bypassed": True,
     }
@@ -1754,6 +1755,24 @@ def test_commit_reopen_verification_precedes_true_durable_result(tmp_path):
     )
 
 
+def test_commit_reopen_accepts_output_expectation_warning(tmp_path):
+    pending = _write_pending(tmp_path)
+    recorder = gs.GoldenTelemetryRecorder()
+
+    asyncio.run(
+        gs.golden_durable_commit(
+            FakeAsyncVolume(),
+            pending,
+            recorder,
+            expected_sha256="f" * 64,
+        )
+    )
+
+    assert pending.committed is True
+    assert recorder.events[-1]["name"] == "durable_reopen_verified"
+    recorder.mark_true_durable()
+
+
 def test_commit_reopen_sha_mismatch_blocks_true_durable(tmp_path):
     """The commit stage itself only commits; the reopened-object proof lives
     in verify_committed_object (top-level integration owns its ordering).
@@ -1858,12 +1877,12 @@ def test_io_bytes_png_matches_pil_compress_level_1_bytes():
     assert ours.startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_golden_output_writes_asset_matching_pending_hash(tmp_path):
+def test_golden_output_writes_asset_matching_pending_hash(tmp_path, caplog):
     """golden_output requires an initialized runner/node_map and the exact
     canonical output branch (VAEDecode -> Any Switch (rgthree) -> SaveImage).
-    The contract's expected OUTPUT PNG SHA is overridden to the actual
-    synthetic PNG bytes so the test verifies ENFORCEMENT (encode -> hash ->
-    write -> pending descriptor) rather than requiring production pixels."""
+    The configured expected SHA deliberately differs from the synthetic PNG:
+    the output must still be written and the mismatch must be persisted as an
+    explicit warning while the observed content hash remains authoritative."""
     import numpy as np
     import torch
     from PIL import Image
@@ -1911,7 +1930,7 @@ def test_golden_output_writes_asset_matching_pending_hash(tmp_path):
     png_bytes = gs.io_bytes_png(Image, first)
     contract = dataclasses.replace(
         gs.GoldenWorkflowContract(),
-        expected_output_png_sha256=hashlib.sha256(png_bytes).hexdigest(),
+        expected_output_png_sha256="f" * 64,
     )
 
     session = object.__new__(gs.GoldenSession)
@@ -1929,7 +1948,8 @@ def test_golden_output_writes_asset_matching_pending_hash(tmp_path):
 
     data = Path(pending.asset_abs_path).read_bytes()
     assert data == png_bytes
-    assert hashlib.sha256(data).hexdigest() == pending.sha256 == contract.expected_output_png_sha256
+    observed_sha = hashlib.sha256(data).hexdigest()
+    assert observed_sha == pending.sha256 != contract.expected_output_png_sha256
     assert len(data) == pending.byte_count
     assert pending.committed is False
     assert Path(pending.sidecar_path).exists()
@@ -1938,6 +1958,22 @@ def test_golden_output_writes_asset_matching_pending_hash(tmp_path):
     assert [nid for nid, _cls, _stage in runner.executed_summary()] == ["7"]
     assert save_executed["called"] is False
     names = [e["name"] for e in session.recorder.events]
+    warning = next(e for e in session.recorder.events if e["name"] == "OUTPUT_SHA_MISMATCH_WARNING")
+    assert warning["fields"] == {
+        "expected_sha": contract.expected_output_png_sha256,
+        "observed_sha": observed_sha,
+        "output_sha_match": False,
+        "output_sha_warning": {
+            "expected": contract.expected_output_png_sha256,
+            "observed": observed_sha,
+            "reason": "configured_output_sha_mismatch",
+        },
+    }
+    assert any("Golden output SHA mismatch is warning-only" in record.message for record in caplog.records)
+    stage = session.recorder.to_json_dict()["stages"][-1]
+    assert stage["name"] == "golden_output"
+    assert stage["details"]["output_sha_match"] is False
+    assert stage["details"]["output_sha_warning"]["observed"] == observed_sha
     assert gs.EVENT_OUTPUT_ENCODE_DONE in names
     assert gs.EVENT_ASSET_WRITE_DONE in names
 
@@ -2055,6 +2091,34 @@ def test_snapshot_proof_does_not_mutate_roots():
         )
     assert str(root) == str(before)
     assert root["nested"]["list"] == [1, 2, 3]
+
+
+def test_snapshot_proof_fails_closed_on_bounded_nested_tensor_and_patcher_refs():
+    class ModelPatcherLike:
+        pass
+
+    root = {"nested": {"tensor": _torch.zeros(2), "patcher": ModelPatcherLike()}}
+    with pytest.raises(RuntimeError, match="snapshot_proof_nonzero") as error:
+        gs.golden_snapshot_content_proof(roots=[root], snapshot_size_bytes=1)
+    assert "tensor_count" in str(error.value)
+    assert "model_patcher_count" in str(error.value)
+
+
+def test_snapshot_proof_hostile_properties_are_not_invoked():
+    class Hostile:
+        def __init__(self):
+            self.child = {"safe": {"value": 1}}
+
+        @property
+        def closed(self):
+            raise AssertionError("arbitrary property was invoked")
+
+        @property
+        def read(self):
+            raise AssertionError("arbitrary property was invoked")
+
+    proof = gs.golden_snapshot_content_proof(roots=[Hostile()], snapshot_size_bytes=1)
+    assert proof["tensor_count"] == 0
 
 
 # ── 13. Contract constants ─────────────────────────────────────────────────

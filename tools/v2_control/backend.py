@@ -1,11 +1,13 @@
 """Canonical backend registry/runner for the v2ctl control plane (E32).
 
-Backends are the existing known-good BAT entry points:
+Backends include the historical BAT entry points and the native Golden deploy:
 
 * ``deploy_and_run_v2_single.bat`` — combined deploy+run (``kind="combined"``);
   the same BAT invoked with ``COMFYMODAL_DEPLOY_ONLY=1`` performs a
   deploy-only run (``kind="deploy_only_via_env"``);
 * ``run_v2_single.bat`` — run-only backend (``kind="run"``).
+* ``modal deploy -m comfymodal_runtime.modal_app`` — native Golden deploy
+  (``kind="deploy"``); it deliberately does not enter the benchmark harness.
 
 ``BackendRunner.run`` invokes the backend through ``subprocess`` with the
 sanitized child environment and the repo root as cwd.  On win32 the command
@@ -289,6 +291,36 @@ class BackendRegistry:
             deploy_only_env={"COMFYMODAL_DEPLOY_ONLY": "1"},
         )
 
+    def native_deploy(self) -> BackendSpec:
+        """Native Modal deploy for Golden; no BAT or benchmark machinery."""
+        return BackendSpec(
+            name="modal_native_golden_deploy",
+            executable=["modal", "deploy", "-m", "comfymodal_runtime.modal_app"],
+            kind="deploy",
+            description="Native Golden deploy through Modal's module deploy command.",
+        )
+
+    # Descriptive spelling for callers that want to make the Golden binding
+    # explicit without maintaining a second spec.
+    def native_golden_deploy(self) -> BackendSpec:
+        return self.native_deploy()
+
+    def publisher_bootstrap(self) -> BackendSpec:
+        """Native Modal deploy for the shared custom-node publisher app."""
+        return BackendSpec(
+            name="modal_native_publisher_bootstrap",
+            executable=["modal", "deploy", "-m", "comfyapp"],
+            kind="deploy",
+            description=(
+                "Native publisher bootstrap through comfyapp's Modal module; "
+                "the caller supplies the stable shared app name."
+            ),
+        )
+
+    def native_publisher_bootstrap(self) -> BackendSpec:
+        """Descriptive alias for the shared publisher bootstrap spec."""
+        return self.publisher_bootstrap()
+
     def run_only(self) -> BackendSpec:
         """Run-only backend (run_v2_single.bat)."""
         return BackendSpec(
@@ -300,7 +332,10 @@ class BackendRegistry:
 
     def by_name(self, name: str) -> BackendSpec:
         """Look up a backend by its BAT stem name (independent of file existence)."""
-        for spec in (self.canonical(), self.deploy_only(), self.run_only()):
+        for spec in (
+            self.canonical(), self.deploy_only(), self.run_only(),
+            self.native_deploy(), self.publisher_bootstrap()
+        ):
             if spec.name == name:
                 return spec
         raise KeyError(f"unknown backend {name!r}")
@@ -596,7 +631,10 @@ class BackendRunner:
         deploy_only = str(child_env.get("COMFYMODAL_DEPLOY_ONLY", "")).strip().lower() in (
             "1", "true", "yes", "on"
         )
-        if capture and not deploy_only:
+        # Native deploys are transport-only too.  Golden deploy must not enter
+        # generic run-artifact discovery: there is no request artifact to
+        # discover during deployment.
+        if capture and not deploy_only and spec.kind != "deploy":
             try:
                 artifacts = self.discover_artifacts(
                     config,

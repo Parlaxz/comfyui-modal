@@ -128,6 +128,14 @@ class RuntimeStateReloadGuardTest(unittest.TestCase):
         self.assertIn("reason=exact_match", line)
         self.assertIn("callback_called=0", line)
         self.assertIn("runtime_state_reload_invoked=0", line)
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications["reload_runtime_state"],
+            "skipped",
+        )
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions["reload_runtime_state"]["reason"],
+            "exact_match",
+        )
 
     def test_match_but_expected_file_missing_reloads(self) -> None:
         _write_prescan(self.root_dir)
@@ -305,6 +313,14 @@ class RuntimeStateReloadGuardTest(unittest.TestCase):
         self.assertIn("decision=reloaded_generation_mismatch", line)
         self.assertIn("reason=generation_mismatch", line)
         self.assertIn("runtime_state_reload_invoked=1", line)
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications["reload_runtime_state"],
+            "reloaded",
+        )
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions["reload_runtime_state"]["decision"],
+            "reloaded_generation_mismatch",
+        )
 
     def test_missing_marker_reloads(self) -> None:
         manifest = {"prescan_custom_nodes.json": {"present": True, "sha256": "0" * 64}}

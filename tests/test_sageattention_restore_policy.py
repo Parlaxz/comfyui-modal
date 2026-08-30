@@ -3,9 +3,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from comfyapp import (
+    build_sage_runtime_identity,
     choose_sage_runtime_mode,
     list_sageattention_extension_files,
     patch_kjnodes_get_sage_func,
+    sage_runtime_cache_usable,
+    sage_runtime_identity_matches,
+    select_public_sageattention_callable,
 )
 
 
@@ -17,6 +21,73 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
             (root / "_fused.cpython-311-x86_64-linux-gnu.so").write_bytes(b"x")
             files = list_sageattention_extension_files(str(Path(tmp)))
             self.assertEqual([p.name for p in files], ["_fused.cpython-311-x86_64-linux-gnu.so"])
+
+    def test_list_accepts_v22_sm89_native_family_without_sm120_name(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sageattention"
+            root.mkdir(parents=True)
+            (root / "_fused.cpython-311-x86_64-linux-gnu.so").write_bytes(b"fused")
+            (root / "_qattn_sm89.cpython-311-x86_64-linux-gnu.so").write_bytes(b"sm89")
+            self.assertEqual(
+                [p.name for p in list_sageattention_extension_files(tmp)],
+                ["_fused.cpython-311-x86_64-linux-gnu.so", "_qattn_sm89.cpython-311-x86_64-linux-gnu.so"],
+            )
+
+    def test_public_dispatcher_is_selected_over_private_symbols(self):
+        calls = []
+
+        class FakeSage:
+            sageattn_qk_int8_pv_fp16_cuda = object()
+
+            @staticmethod
+            def sageattn(*args, **kwargs):
+                calls.append((args, kwargs))
+
+        name, callable_, kwargs = select_public_sageattention_callable(FakeSage)
+        self.assertEqual(name, "sageattn")
+        self.assertIs(callable_, FakeSage.sageattn)
+        self.assertEqual(kwargs, {"tensor_layout": "HND", "is_causal": False})
+
+    def test_runtime_identity_changes_when_artifact_changes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sageattention"
+            root.mkdir(parents=True)
+            extension = root / "_qattn_sm89.so"
+            extension.write_bytes(b"build-a")
+            first = build_sage_runtime_identity(
+                site_packages_root=tmp,
+                gpu_name="RTX PRO 6000",
+                capability=(12, 0),
+                sage_version="2.2.0",
+                torch_version="2.13.0+cu130",
+                torch_cuda="13.0",
+            )
+            extension.write_bytes(b"build-b")
+            second = build_sage_runtime_identity(
+                site_packages_root=tmp,
+                gpu_name="RTX PRO 6000",
+                capability=(12, 0),
+                sage_version="2.2.0",
+                torch_version="2.13.0+cu130",
+                torch_cuda="13.0",
+            )
+            self.assertFalse(sage_runtime_identity_matches(first, second))
+
+    def test_runtime_identity_changes_when_policy_or_gpu_changes(self):
+        base = build_sage_runtime_identity(gpu_name="A", capability=(8, 0))
+        other_gpu = build_sage_runtime_identity(gpu_name="B", capability=(8, 0))
+        other_policy = dict(base, policy_version="different-policy")
+        other_policy["identity_digest"] = ""
+        self.assertFalse(sage_runtime_identity_matches(base, other_gpu))
+        self.assertFalse(sage_runtime_identity_matches(base, other_policy))
+
+    def test_strict_mode_never_reuses_negative_cache(self):
+        identity = build_sage_runtime_identity(gpu_name="A", capability=(12, 0))
+        negative = dict(identity, mode="triton_fallback")
+        positive = dict(identity, mode="baked_cuda")
+        self.assertTrue(sage_runtime_cache_usable(negative, identity))
+        self.assertFalse(sage_runtime_cache_usable(negative, identity, strict=True))
+        self.assertTrue(sage_runtime_cache_usable(positive, identity, strict=True))
 
     def test_choose_sage_runtime_mode_uses_fallback_when_extensions_missing(self):
         mode, reason = choose_sage_runtime_mode(enabled=True, extension_files=[], import_ok=False, smoke_ok=False)
@@ -65,6 +136,15 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
         v = {"dummy": "v"}
         result = module.get_sage_func("sageattn_qk_int8_pv_fp16_cuda")(q, k, v, heads=8)
         self.assertEqual(result, "pytorch")
+
+    def test_patch_kjnodes_rejects_fallback_in_strict_mode(self):
+        class FakeModule:
+            attention_pytorch = lambda *args, **kwargs: "pytorch"
+            wrap_attn = staticmethod(lambda fn: fn)
+            get_sage_func = lambda *args, **kwargs: "sage"
+
+        with self.assertRaisesRegex(RuntimeError, "rejected"):
+            patch_kjnodes_get_sage_func(FakeModule(), baked_cuda_available=False, strict=True)
 
 
 class SageAttentionImportBlockerPatternTests(unittest.TestCase):

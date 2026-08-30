@@ -2,13 +2,15 @@
 
 Thin CLI over the v2_control modules.  Local-only: every deploy/run/gate
 command builds a sanitized child environment and invokes the canonical
-backend (the known-good BATs) via subprocess.  No Modal SDK calls, no
-network, no ambient experiment env leakage.
+backend via subprocess.  Golden deploy uses the native Modal module deploy;
+request execution retains the established backend.  No Modal SDK calls, no
+network, no ambient experiment env leakage in dry-run mode.
 """
 
 from __future__ import annotations
 
 import argparse
+import inspect
 import importlib.util
 import json
 import os
@@ -16,8 +18,18 @@ import re
 import sys
 import time
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+
+from comfymodal_runtime.contracts import DEPLOYMENT_HASH_NAMESPACE
+from comfymodal_runtime.publication_policy import (
+    CUSTOM_NODES_PUBLISHER_APP_NAME,
+    CUSTOM_NODES_VOLUME_NAME,
+)
 
 from . import environment as env_mod
 from . import registry as registry_mod
@@ -42,8 +54,9 @@ from .errors import (
     V2CtlError,
 )
 
-SCHEMA_VERSION = 1
-VERSION = "0.1.0"
+SCHEMA_VERSION = 2
+VERSION = "0.2.0"
+FINGERPRINT_ALGORITHM = "canonical-boundary-identity-v2"
 
 # E31 QD4 cast-once is a distinct validation path.  The profile inherits the
 # E29/E28 workload flags, so selector construction must key off the explicit
@@ -58,6 +71,7 @@ GOLDEN_P1_PROFILE = "golden_p1"
 GOLDEN_P1_SELECTOR = "golden_p1"
 GOLDEN_P1_METHOD = "run_golden_serial_stream"
 GOLDEN_P1_MODE = "golden_p1_serial"
+GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
 _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -151,7 +165,9 @@ def _canonical_metadata_env(
         "COMFYMODAL_V2CTL_PROFILE": str(config.profile_name),
         "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT": fingerprints.profile_config_fingerprint(),
         "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": fingerprints.deploy_fingerprint(),
+        "COMFYMODAL_V2CTL_DEPLOYMENT_HASH": fingerprints.deploy_fingerprint(),
         "COMFYMODAL_V2CTL_RUN_FINGERPRINT": fingerprints.run_fingerprint(),
+        "COMFYMODAL_V2CTL_DEPLOYMENT_HASH_NAMESPACE": DEPLOYMENT_HASH_NAMESPACE,
     }
 
 
@@ -200,6 +216,16 @@ def _normalize_app_name(value: object) -> str:
             "and internal hyphens (1-63 characters)"
         )
     return normalized
+
+
+def derive_publisher_app_name(experimental_app: object) -> str:
+    """Compatibility spelling for the single shared publisher authority.
+
+    The argument is intentionally ignored.  Custom-node ownership belongs to
+    the shared Volume publisher, not to a consuming Golden app.
+    """
+    _ = experimental_app
+    return CUSTOM_NODES_PUBLISHER_APP_NAME
 
 
 def _reject_golden_identity_args(args, *, public: bool = False) -> int | None:
@@ -406,6 +432,19 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
         # therefore still forwards the strict expected-output contract.
         if expected_sha:
             args += ["--golden-p1-expected-output-sha", expected_sha]
+        flag_lookup = getattr(config, "flag", None)
+        attention_flag = (
+            flag_lookup(GOLDEN_ATTENTION_BACKEND_FLAG)
+            if callable(flag_lookup)
+            else None
+        )
+        # Keep the historical request shape byte-compatible when the selector
+        # is omitted: Golden's remote adapter already defaults to PyTorch.
+        if (
+            attention_flag is not None
+            and getattr(attention_flag, "source", "default") != "default"
+        ):
+            args += ["--attention-backend", str(getattr(attention_flag, "value", ""))]
         # The registry default is e28_single, whose BAT branch invokes the
         # ordinary run_plan_stream path.  Project the effective Golden mode
         # explicitly so the request reaches the serial-Golden branch.  The
@@ -487,6 +526,17 @@ def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
         return "e28_single"
 
 
+def _native_golden_deploy_env(env: dict[str, str]) -> dict[str, str]:
+    """Remove the legacy generic benchmark control plane from native deploys.
+
+    ``V2_*`` controls belong to BAT/request compatibility paths.  Native
+    Golden deployment only needs the ``COMFYMODAL_V2_*`` runtime configuration
+    and v2ctl's canonical metadata; in particular it must not carry
+    ``V2_BENCHMARK_MODE`` or any generic validation selector state.
+    """
+    return {name: value for name, value in env.items() if not name.startswith("V2_")}
+
+
 def _reject_golden_mode_override(
     config: config_mod.ResolvedConfig, *, command: str
 ) -> None:
@@ -554,10 +604,10 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
         )
 
 
-def _app_version_number(app_name: str) -> int:
+def _app_version_number(app_name: str) -> int | None:
     """Highest ``v<N>`` version number from ``modal app history`` (0 if none).
 
-    Returns 0 on any uncertainty — never raises.  The history table rows look
+    Returns ``None`` on lookup uncertainty.  The history table rows look
     like ``| v9 | 2026-08-19 17:42 Central Daylight | ...``; the header row
     (``| Version | ...``) contains no ``v<num>`` and is ignored by the regex.
 
@@ -573,6 +623,19 @@ def _app_version_number(app_name: str) -> int:
     import re
     import subprocess
 
+    def explicitly_has_no_app_or_deployments(text: str) -> bool:
+        lowered = text.casefold()
+        return any(
+            re.search(pattern, lowered)
+            for pattern in (
+                r"\bapp(?:lication)?\b[^\n]*\b(?:not found|does not exist)\b",
+                r"\bno such app(?:lication)?\b",
+                r"\bno app(?:lication)?\b[^\n]*\bfound\b",
+                r"\bcould not find (?:the )?app(?:lication)?\b",
+                r"\bno deployments? found\b",
+            )
+        )
+
     try:
         # Resolve the ACTIVE workspace credentials from .modal_workspaces.json.
         ws_file = Path(__file__).resolve().parents[2] / ".modal_workspaces.json"
@@ -583,7 +646,7 @@ def _app_version_number(app_name: str) -> int:
             None,
         )
         if not ws or not ws.get("token_id") or not ws.get("token_secret"):
-            return 0
+            return None
         env = dict(os.environ)
         env["MODAL_TOKEN_ID"] = str(ws["token_id"])
         env["MODAL_TOKEN_SECRET"] = str(ws["token_secret"])
@@ -598,19 +661,53 @@ def _app_version_number(app_name: str) -> int:
             timeout=60,
             env=env,
         )
+        output = f"{r.stdout or ''}\n{r.stderr or ''}"
         if r.returncode != 0:
-            return 0
+            return 0 if explicitly_has_no_app_or_deployments(output) else None
         highest = 0
-        for line in r.stdout.splitlines():
+        for line in (r.stdout or "").splitlines():
             m = re.search(r"\bv(\d+)\b", line, re.IGNORECASE)
             if m:
                 try:
                     highest = max(highest, int(m.group(1)))
                 except ValueError:
                     continue
-        return highest
+        if highest or explicitly_has_no_app_or_deployments(output):
+            return highest
+        return None
     except Exception:
-        return 0
+        return None
+
+
+def _active_workspace_credentials(repo_root: Path) -> dict[str, str]:
+    """Return active workspace credentials for a native Modal child process."""
+    workspace = _active_workspace(repo_root)
+    return {
+        "MODAL_TOKEN_ID": str(workspace["token_id"]),
+        "MODAL_TOKEN_SECRET": str(workspace["token_secret"]),
+    }
+
+
+def _active_workspace(repo_root: Path) -> dict[str, object]:
+    """Return the complete active workspace record without exposing secrets."""
+    path = repo_root / ".modal_workspaces.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"active Modal workspace file is unreadable: {path}") from exc
+    if not isinstance(data, dict):
+        raise GateError(f"active Modal workspace file is not an object: {path}")
+    active_id = data.get("active_workspace_id")
+    workspaces = data.get("workspaces", [])
+    if not isinstance(workspaces, list):
+        raise GateError("active Modal workspace file has malformed workspaces")
+    workspace = next(
+        (item for item in workspaces if isinstance(item, dict) and item.get("id") == active_id),
+        None,
+    )
+    if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
+        raise GateError("active Modal workspace is missing credentials")
+    return workspace
 
 
 # ── Manifests ──────────────────────────────────────────────────────────
@@ -635,15 +732,83 @@ def _profile_config_fingerprint(fingerprints: object) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class DeployIdentitySnapshot:
+    """The deploy identity captured before any publication/backend work."""
+
+    deploy_fingerprint: str
+    deploy_inputs: Mapping[str, Any]
+    profile_config_fingerprint: str
+
+
+def _freeze_deploy_identity(value: Any) -> Any:
+    """Freeze nested deploy inputs so later config mutation cannot alter them."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_deploy_identity(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_deploy_identity(item) for item in value)
+    return value
+
+
+def _thaw_deploy_identity(value: Any) -> Any:
+    """Return JSON-compatible ordinary containers from a frozen snapshot."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_deploy_identity(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_deploy_identity(item) for item in value]
+    return value
+
+
+def capture_deploy_identity(fingerprints: object) -> DeployIdentitySnapshot:
+    """Capture all persisted deploy identity values exactly once."""
+    deploy_fingerprint = getattr(fingerprints, "deploy_fingerprint")
+    deploy_inputs = getattr(fingerprints, "deploy_inputs")
+    return DeployIdentitySnapshot(
+        deploy_fingerprint=str(deploy_fingerprint()),
+        deploy_inputs=_freeze_deploy_identity(deploy_inputs()),
+        profile_config_fingerprint=_profile_config_fingerprint(fingerprints),
+    )
+
+
+def _apply_deploy_identity_to_env(
+    env: dict[str, str], identity: DeployIdentitySnapshot
+) -> None:
+    """Keep child deployment metadata aligned with the captured identity."""
+    env["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = (
+        identity.profile_config_fingerprint
+    )
+    env["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] = identity.deploy_fingerprint
+    env["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] = identity.deploy_fingerprint
+
+
 def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
                               fingerprints: fp_mod.FingerprintEngine,
                               env: dict[str, str],
-                              result: backend_mod.BackendResult | None) -> Path:
+                              result: backend_mod.BackendResult | None,
+                              *, publication: object | None = None,
+                              deploy_identity: DeployIdentitySnapshot | None = None) -> Path:
     d = _deployment_manifest_dir(repo_root)
     d.mkdir(parents=True, exist_ok=True)
-    deploy_fp = fingerprints.deploy_fingerprint()
+    # Direct callers from older tests/tools retain the old convenience
+    # behavior.  Deploy commands always pass their pre-publication snapshot.
+    if deploy_identity is None:
+        deploy_fp = getattr(fingerprints, "deploy_fingerprint")()
+        deploy_inputs_method = getattr(fingerprints, "deploy_inputs", None)
+        deploy_inputs = (
+            deploy_inputs_method() if callable(deploy_inputs_method) else {}
+        )
+        profile_config_fp = _profile_config_fingerprint(fingerprints)
+    else:
+        deploy_fp = deploy_identity.deploy_fingerprint
+        deploy_inputs = _thaw_deploy_identity(deploy_identity.deploy_inputs)
+        profile_config_fp = deploy_identity.profile_config_fingerprint
     manifest = {
         "schema_version": SCHEMA_VERSION,
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
+        "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
         "owner": config.owner,
@@ -654,8 +819,8 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
                       "min_containers": config.resources.min_containers,
                       "scaledown_window": config.resources.scaledown_window},
         "deploy_fingerprint": deploy_fp,
-        "profile_config_fingerprint": _profile_config_fingerprint(fingerprints),
-        "deploy_inputs": fingerprints.deploy_inputs(),
+        "profile_config_fingerprint": profile_config_fp,
+        "deploy_inputs": deploy_inputs,
         "effective_environment": _redact_env(env),
         "runtime_override_policy": config.runtime_override_policy,
         # ── Truthful deploy-health state (E29 gate lesson) ─────────────────
@@ -705,22 +870,160 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
             "profile_config_fingerprint": result.artifacts.profile_config_fingerprint,
             "provenance_validation_status": result.artifacts.provenance_validation_status,
         }
+    if publication is not None:
+        identity = getattr(publication, "identity", None)
+        manifest["custom_nodes_publication"] = {
+            "action": str(getattr(publication, "action", "")),
+            "reason": str(getattr(publication, "reason", "")),
+            "generation": str(getattr(identity, "generation", "")),
+            "identity_schema": getattr(identity, "identity_schema", None),
+            "packaging_policy_version": getattr(
+                identity, "packaging_policy_version", None
+            ),
+            "file_count": getattr(identity, "file_count", None),
+            "total_bytes": getattr(identity, "total_bytes", None),
+            "manifest_digest": getattr(identity, "manifest_digest", None),
+        }
     path = d / f"deploy_{time.strftime('%Y%m%d-%H%M%S')}_{deploy_fp[:8]}.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     return path
 
 
-def latest_deployment_manifest(repo_root: Path) -> dict | None:
+def _validate_deployment_manifest(manifest: object) -> dict | None:
+    """Return a trustworthy current deployment manifest, otherwise ``None``.
+
+    Schema 2 has two spellings for the same deployment identity because the
+    latter is the compatibility field used by the control plane.  Treat both
+    as required and equal: accepting either one independently would allow a
+    persisted manifest to claim a different deployment from the one v2ctl
+    compares before a run.  Older schema-1 records remain stale and are not
+    promoted to current state.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        return None
+    if manifest.get("deployment_hash_namespace") != DEPLOYMENT_HASH_NAMESPACE:
+        return None
+    if manifest.get("fingerprint_algorithm") != FINGERPRINT_ALGORITHM:
+        return None
+
+    deployment_hash = manifest.get("deployment_hash")
+    deploy_fingerprint = manifest.get("deploy_fingerprint")
+    if not (
+        isinstance(deployment_hash, str)
+        and deployment_hash.strip()
+        and isinstance(deploy_fingerprint, str)
+        and deploy_fingerprint.strip()
+        and deployment_hash == deploy_fingerprint
+    ):
+        return None
+    return manifest
+
+
+def _manifest_target_identity(value: object) -> tuple[str, str, str] | None:
+    """Extract a complete target identity from either manifest spelling."""
+    if not isinstance(value, Mapping):
+        return None
+    app = value.get("app")
+    class_name = value.get("class", value.get("class_name"))
+    method = value.get("method")
+    if not all(isinstance(item, str) and item.strip() for item in (app, class_name, method)):
+        return None
+    return str(app), str(class_name), str(method)
+
+
+def _deployment_manifest_target(manifest: Mapping[str, object]) -> tuple[str, str, str] | None:
+    """Return a target only when all persisted target spellings agree.
+
+    Deployment manifests written by different control-plane generations put
+    the target at either ``target`` or ``deploy_inputs.target`` and use
+    ``class`` versus ``class_name``.  A disagreement is not a usable target:
+    target checks must fail closed rather than selecting whichever spelling is
+    convenient.
+    """
+    identities: list[tuple[str, str, str]] = []
+    top_level = _manifest_target_identity(manifest.get("target"))
+    if manifest.get("target") is not None:
+        if top_level is None:
+            return None
+        identities.append(top_level)
+    deploy_inputs = manifest.get("deploy_inputs")
+    if isinstance(deploy_inputs, Mapping) and "target" in deploy_inputs:
+        deploy_target = _manifest_target_identity(deploy_inputs.get("target"))
+        if deploy_target is None:
+            return None
+        identities.append(deploy_target)
+    if not identities or any(identity != identities[0] for identity in identities[1:]):
+        return None
+    return identities[0]
+
+
+def _requested_target_identity(target: object) -> tuple[str, str, str] | None:
+    """Normalize a config target or target mapping for manifest selection."""
+    if isinstance(target, Mapping):
+        return _manifest_target_identity(target)
+    app = getattr(target, "app", None)
+    class_name = getattr(target, "class_name", getattr(target, "class", None))
+    method = getattr(target, "method", None)
+    return _manifest_target_identity(
+        {"app": app, "class_name": class_name, "method": method}
+    )
+
+
+def _manifest_matches_request(
+    manifest: Mapping[str, object], *, profile: str | None, target: object | None
+) -> bool:
+    if profile is not None and manifest.get("profile") != profile:
+        return False
+    if target is None:
+        return True
+    requested = _requested_target_identity(target)
+    return requested is not None and _deployment_manifest_target(manifest) == requested
+
+
+def _read_valid_deployment_manifest(path: Path) -> dict | None:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    validated = _validate_deployment_manifest(manifest)
+    return validated
+
+
+def latest_deployment_manifest_path(
+    repo_root: Path, *, profile: str | None = None, target: object | None = None
+) -> Path | None:
+    """Return the newest valid manifest matching the optional request identity.
+
+    With no filters this retains the historical global ``latest`` behavior.
+    Filtered callers scan backwards through the ledger so an unrelated newer
+    deployment cannot shadow the requested app/profile.
+    """
     d = _deployment_manifest_dir(repo_root)
     if not d.is_dir():
         return None
     files = sorted(d.glob("deploy_*.json"))
     if not files:
         return None
-    try:
-        return json.loads(files[-1].read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    candidates = files[-1:] if profile is None and target is None else reversed(files)
+    for path in candidates:
+        manifest = _read_valid_deployment_manifest(path)
+        if manifest is not None and _manifest_matches_request(
+            manifest, profile=profile, target=target
+        ):
+            return path
+    return None
+
+
+def latest_deployment_manifest(
+    repo_root: Path, *, profile: str | None = None, target: object | None = None
+) -> dict | None:
+    """Return the newest valid deployment manifest for an optional identity."""
+    path = latest_deployment_manifest_path(repo_root, profile=profile, target=target)
+    if path is None:
         return None
+    return _read_valid_deployment_manifest(path)
 
 
 def _golden_capture_guard_class(repo_root: Path):
@@ -748,6 +1051,9 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
     run_fp = fingerprints.run_fingerprint()
     manifest = {
         "schema_version": SCHEMA_VERSION,
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
+        "deployment_hash": fingerprints.deploy_fingerprint(),
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
         "owner": config.owner,
@@ -859,26 +1165,29 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl golden status")
         _reject_golden_mode_override(config, command="v2ctl golden status")
-        manifest = latest_deployment_manifest(repo_root)
-        manifest_path = None
-        manifest_dir = _deployment_manifest_dir(repo_root)
-        if manifest_dir.is_dir():
-            files = sorted(manifest_dir.glob("deploy_*.json"))
-            if files:
-                manifest_path = str(files[-1])
+        requested_target = {
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        }
+        manifest = latest_deployment_manifest(
+            repo_root, profile=config.profile_name, target=requested_target
+        )
+        manifest_path_obj = latest_deployment_manifest_path(
+            repo_root, profile=config.profile_name, target=requested_target
+        )
+        manifest_path = str(manifest_path_obj) if manifest_path_obj else None
 
         current_fingerprint = fingerprints.deploy_fingerprint()
         stored_fingerprint = manifest.get("deploy_fingerprint") if manifest else None
-        manifest_target = manifest.get("target") if manifest else None
         manifest_target_match = bool(
-            isinstance(manifest_target, dict)
-            and manifest_target.get("app") == config.target.app
-            and manifest_target.get("class") == config.target.class_name
-            and manifest_target.get("method") == config.target.method
+            manifest
+            and _deployment_manifest_target(manifest)
+            == _requested_target_identity(requested_target)
         )
         manifest_is_golden = bool(
             manifest
-            and manifest.get("profile") == GOLDEN_P1_PROFILE
+            and manifest.get("profile") == config.profile_name
             and manifest_target_match
         )
         fingerprint_match = bool(
@@ -909,11 +1218,25 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         lock_active = bool(lock_status is not None and not lock.is_stale(lock_status))
         GoldenCaptureGuard = _golden_capture_guard_class(repo_root)
 
+        # The legacy state file may describe another app.  Once the selected
+        # manifest matches the requested fingerprint, derive guard identity
+        # from that manifest instead of allowing stale state to choose the
+        # capture-guard namespace.
+        guard_deployment_info = {}
+        if matching_manifest is not None:
+            guard_deployment_info = {
+                "deployment_combined_hash": matching_manifest.get(
+                    "deployment_hash", ""
+                ),
+                "deploy_fingerprint": matching_manifest.get(
+                    "deploy_fingerprint", ""
+                ),
+            }
         guard_identity = GoldenCaptureGuard.deployment_identity(
             app_name=config.target.app,
             class_name=config.target.class_name,
             gpu=config.resources.gpu,
-            deployment_info=deployed_state or {},
+            deployment_info=guard_deployment_info,
             deploy_fingerprint=current_fingerprint,
         )
         guard = GoldenCaptureGuard(
@@ -960,7 +1283,6 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         }
         out["ready"] = bool(
             fingerprint_match
-            and deployed_target_match
             and out["runtime_health_status"] == "verified"
             and out["source_identity_status"] == "verified"
             and not out["runtime_overrides_present"]
@@ -983,9 +1305,10 @@ def cmd_golden_status(args, repo_root: Path) -> int:
 
 def cmd_golden(args, repo_root: Path) -> int:
     """Dispatch the public Golden namespace to the canonical handlers."""
-    if args.golden_command not in {"doctor", "status", "deploy", "run"}:
+    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap"}:
         print(
-            "ERROR: public Golden commands are doctor, status, deploy, and run",
+            "ERROR: public Golden commands are doctor, status, deploy, run, "
+            "and publisher-bootstrap",
             file=sys.stderr,
         )
         return 2
@@ -1023,6 +1346,7 @@ def cmd_golden(args, repo_root: Path) -> int:
         "doctor": cmd_doctor,
         "deploy": cmd_deploy,
         "run": cmd_run,
+        "publisher-bootstrap": cmd_publisher_bootstrap,
     }
     handler = handlers.get(args.golden_command)
     if handler is None:
@@ -1103,7 +1427,18 @@ def cmd_doctor(args, repo_root: Path) -> int:
             problems.append(f"deploy lock is stale (owner {status.get('owner')}); "
                             "release with `lock force-release` after confirming ownership")
     # deployment fingerprint match
-    manifest = latest_deployment_manifest(repo_root)
+    manifest = None
+    if selected_config is not None:
+        requested_target = {
+            "app": selected_config.target.app,
+            "class": selected_config.target.class_name,
+            "method": selected_config.target.method,
+        }
+        manifest = latest_deployment_manifest(
+            repo_root,
+            profile=selected_config.profile_name,
+            target=requested_target,
+        )
     if manifest is None:
         out.append("deployment.manifest=none")
         problems.append("no deployment manifest found; run `v2ctl deploy-run` or `v2ctl deploy` first")
@@ -1115,12 +1450,14 @@ def cmd_doctor(args, repo_root: Path) -> int:
                 raise GateError("selected profile could not be resolved")
             current = fingerprints.deploy_fingerprint()
             stored = manifest.get("deploy_fingerprint")
-            manifest_target = manifest.get("target")
-            target_match = bool(
-                isinstance(manifest_target, dict)
-                and manifest_target.get("app") == config.target.app
-                and manifest_target.get("class") == config.target.class_name
-                and manifest_target.get("method") == config.target.method
+            requested_target = {
+                "app": config.target.app,
+                "class": config.target.class_name,
+                "method": config.target.method,
+            }
+            target_match = (
+                _deployment_manifest_target(manifest)
+                == _requested_target_identity(requested_target)
             )
             match = stored == current and target_match
             out.append(f"deployment.fingerprint.stored={stored}")
@@ -1315,6 +1652,237 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
         print(f"  {k}={redacted[k]}")
 
 
+def _publish_golden_custom_nodes(
+    repo_root: Path, publisher_app_name: str | None = None
+):
+    """Mirror the canonical custom-node source before a native Golden deploy.
+
+    Imports of ``modal`` and ``modal_client`` stay below the non-dry-run
+    boundary: dry-run must remain a local command with no Volume access.  The
+    compatibility publisher receives the shared publisher app and active
+    workspace explicitly rather than consulting the user's ambient Modal
+    profile.
+    """
+    from . import custom_nodes as custom_nodes_mod
+
+    # Keep the optional parameter as a compatibility surface for older hooks,
+    # but never allow a consumer name to select the authority.
+    publisher_app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
+
+    source_root = custom_nodes_mod.resolve_custom_nodes_root(repo_root)
+    workspace = _active_workspace(repo_root)
+
+    def identity_provider(_root: str | Path) -> dict[str, str]:
+        from comfymodal_runtime.deployment_spec import build_deployment_identity
+
+        identity = build_deployment_identity(
+            repo_root / "comfymodal_runtime",
+            custom_node_paths=[source_root],
+        )
+        return {"generation": identity.custom_node_hash}
+
+    async def publisher(archive: bytes):
+        # Import the legacy compatibility client only after receipt evaluation
+        # has determined that publication is required.
+        from modal_client import sync_custom_nodes
+
+        return await sync_custom_nodes(
+            archive, workspace=workspace, app_name=publisher_app_name
+        )
+
+    try:
+        decision = custom_nodes_mod.run_publish_or_skip(
+            source_root,
+            volume_name=CUSTOM_NODES_VOLUME_NAME,
+            publisher=publisher,
+            workspace=workspace,
+            identity_provider=identity_provider,
+        )
+    except Exception as exc:  # noqa: BLE001 - publication is a deploy gate
+        raise GateError(f"custom-node publication failed: {type(exc).__name__}: {exc}") from exc
+    if decision.skip:
+        print(
+            "[custom_nodes.publish] decision=skip_exact "
+            f"reason={decision.reason} "
+            f"generation={decision.identity.generation[:12]} "
+            f"schema={custom_nodes_mod.RECEIPT_SCHEMA_VERSION} "
+            f"policy={custom_nodes_mod.PACKAGING_POLICY_VERSION}"
+        )
+        return decision
+    if decision.action not in {"published", "recovered"} or (
+        decision.action == "published" and decision.reason != "published_verified"
+    ):
+        result = getattr(decision, "result", None)
+        if isinstance(result, dict):
+            identity = getattr(decision, "identity", None)
+            expected_generation = str(getattr(identity, "generation", "") or "")
+            result_generation = str(result.get("generation") or "")
+            # The publisher result is intentionally bounded to scalar proof
+            # values.  ``readback_generation`` is optional for older publisher
+            # responses; null makes a host readback gap visible without
+            # dumping the response (or any credentials it might contain).
+            diagnostic = json.dumps(
+                {
+                    "status": result.get("status"),
+                    "comfyapp_version": result.get("comfyapp_version"),
+                    "reason": result.get("reason"),
+                    "error": result.get("error"),
+                    "expected_generation": expected_generation[:16] or None,
+                    "result_generation": result_generation[:16] or None,
+                    "readback_generation": str(
+                        result.get("readback_generation") or ""
+                    )[:16] or None,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        else:
+            diagnostic = json.dumps(
+                {
+                    "expected_generation": str(
+                        getattr(getattr(decision, "identity", None), "generation", "")
+                        or ""
+                    )[:16] or None,
+                    "result_generation": None,
+                    "readback_generation": None,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        raise GateError(
+            "Golden deploy requires verified custom-node publication: "
+            f"{decision.reason} result={diagnostic}"
+        )
+    print(
+        f"[custom_nodes.publish] decision={decision.action} reason={decision.reason} "
+        f"generation={decision.identity.generation[:12]} "
+        f"schema={custom_nodes_mod.RECEIPT_SCHEMA_VERSION} "
+        f"policy={custom_nodes_mod.PACKAGING_POLICY_VERSION}"
+    )
+    return decision
+
+
+def _invoke_golden_publisher(
+    repo_root: Path, publisher_app_name: str
+):
+    """Pass the isolated app to the current hook without breaking old hooks."""
+    hook = _publish_golden_custom_nodes
+    try:
+        parameters = inspect.signature(hook).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "publisher_app_name" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in parameters.values()
+    ):
+        return hook(repo_root, CUSTOM_NODES_PUBLISHER_APP_NAME)
+    return hook(repo_root)
+
+
+def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
+    """Deploy the shared custom-node ``comfyapp`` publisher."""
+    identity_error = _reject_golden_identity_args(args, public=True)
+    if identity_error is not None:
+        return identity_error
+    dry_run = bool(getattr(args, "dry_run", False))
+    # Bootstrap owns the shared publication resource, so its effective target
+    # is stable and does not inherit a consumer's app identity.  Keep accepting
+    # the old --app option at the parser boundary for compatibility.
+    args.app = CUSTOM_NODES_PUBLISHER_APP_NAME
+
+    try:
+        (
+            _registry,
+            _profiles,
+            _resolver,
+            config,
+            fingerprints,
+            env_builder,
+            backend_registry,
+        ) = _build_components_for_args(repo_root, args)
+        _reject_protected_effective_target(config, command="v2ctl golden publisher-bootstrap")
+        publisher_app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
+        invocation_id = _new_invocation_id()
+        spec = backend_registry.publisher_bootstrap()
+        env = env_builder.build(
+            config,
+            host_env=os.environ,
+            backend_extra={
+                **_identity_env_for_command("deploy", config),
+                **_canonical_metadata_env(config, fingerprints, invocation_id),
+            },
+        )
+        env = _native_golden_deploy_env(env)
+        if not dry_run:
+            env.update(_active_workspace_credentials(repo_root))
+        extra_args = ["--name", publisher_app_name]
+        command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
+        if dry_run:
+            _dry_run_report(config, fingerprints, env, command)
+            print(f"publisher_app={publisher_app_name}")
+            print("deployment_manifest=none")
+            return 0
+
+        lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
+        lock.acquire(
+            owner=config.owner or args.owner or "v2ctl",
+            target=publisher_app_name,
+            profile=config.profile_name,
+        )
+        try:
+            print(
+                f"[v2ctl.publisher-bootstrap] app={publisher_app_name} "
+                f"command={command}"
+            )
+            pre_version = _app_version_number(publisher_app_name)
+            if pre_version is None:
+                print(
+                    "ERROR: unable to establish the publisher app's pre-deploy "
+                    "version; refusing to invoke the backend",
+                    file=sys.stderr,
+                )
+                return 1
+
+            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+                spec,
+                config=config,
+                extra_args=extra_args,
+                extra_env=env,
+                capture=True,
+                invocation_id=invocation_id,
+            )
+            post_version = _app_version_number(publisher_app_name)
+            if post_version is None:
+                print(
+                    "ERROR: unable to establish the publisher app's post-deploy "
+                    "version; refusing to treat this bootstrap as valid",
+                    file=sys.stderr,
+                )
+                return 1
+            if post_version <= pre_version:
+                _print_backend_diagnostic(result, env)
+                print(
+                    "ERROR: publisher bootstrap reported success but the app's "
+                    "deployment version did NOT advance; refusing to treat it "
+                    "as valid",
+                    file=sys.stderr,
+                )
+                return 1
+            if not result.ok():
+                _print_backend_diagnostic(result, env)
+                return result.exit_code if result.exit_code else 1
+            print(
+                f"[v2ctl.publisher-bootstrap] exit={result.exit_code} "
+                f"version={pre_version}->{post_version}"
+            )
+            return 0
+        finally:
+            lock.release()
+    except (V2CtlError, OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_deploy(args, repo_root: Path) -> int:
     identity_error = _reject_golden_identity_args(args)
     if identity_error is not None:
@@ -1326,22 +1894,32 @@ def cmd_deploy(args, repo_root: Path) -> int:
         _reject_protected_effective_target(config, command="v2ctl deploy")
         _reject_golden_mode_override(config, command="v2ctl deploy")
         invocation_id = _new_invocation_id()
-        spec = backend_registry.deploy_only()
-        golden_mode_env = (
-            {"V2_BENCHMARK_MODE": GOLDEN_P1_MODE}
-            if config.profile_name == GOLDEN_P1_PROFILE
-            else {}
+        native_golden = config.profile_name == GOLDEN_P1_PROFILE
+        spec = (
+            backend_registry.native_deploy()
+            if native_golden else backend_registry.deploy_only()
+        )
+        publisher_app_name: str | None = (
+            CUSTOM_NODES_PUBLISHER_APP_NAME if native_golden else None
         )
         env = env_builder.build(config, host_env=os.environ,
                                 backend_extra={**spec.deploy_only_env,
-                                               **golden_mode_env,
                                                **_identity_env_for_command("deploy", config),
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
-        # Forward the canonical selector (e.g. E28_VALIDATION) as the BAT's
-        # first positional arg: the deploy BAT reads %~1 to activate its
-        # validation branch (env alone is not sufficient in all paths).
+        if native_golden:
+            env = _native_golden_deploy_env(env)
+        if native_golden and not args.dry_run:
+            # The active workspace, not the user's ambient Modal profile, owns
+            # this deploy.  Values are redacted by the normal dry-run report.
+            env.update(_active_workspace_credentials(repo_root))
+        # Historical deploy branches receive their selector as the first BAT
+        # argument. Native Golden deploy has one explicit Modal app argument
+        # and must not be routed through a harness selector.
         selector = _backend_selector(config)
-        extra_args = [selector] if selector else []
+        extra_args = (
+            ["--name", config.target.app]
+            if native_golden else ([selector] if selector else [])
+        )
         command = backend_mod.BackendRunner.build_command_line(
             spec, extra_args)
         if args.dry_run:
@@ -1357,9 +1935,19 @@ def cmd_deploy(args, repo_root: Path) -> int:
         lock.acquire(owner=config.owner or args.owner or "v2ctl",
                      target=config.target.app, profile=config.profile_name)
         try:
+            deploy_identity = capture_deploy_identity(fingerprints)
+            _apply_deploy_identity_to_env(env, deploy_identity)
             print(f"[v2ctl.deploy] profile={config.profile_name} "
-                  f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
+                  f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
             print(f"[v2ctl.deploy] command={command}")
+            publication = None
+            if native_golden:
+                assert publisher_app_name is not None
+                # This is deliberately inside the deploy lock and before both
+                # version capture and native Modal deployment.  A publication
+                # failure exits through the lock's finally block and prevents
+                # the backend from running.
+                publication = _invoke_golden_publisher(repo_root, publisher_app_name)
             # ── Deploy-version-advance verification (E29 root-cause fix) ──
             # Capture the app's highest deployment version BEFORE the deploy
             # so a post-deploy comparison can prove a NEW version appeared
@@ -1370,6 +1958,13 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # backend exit alone can also represent a no-op deploy.
             verify_version = True
             _pre_version = _app_version_number(config.target.app)
+            if _pre_version is None:
+                print(
+                    "ERROR: unable to establish the app's pre-deploy version; "
+                    "refusing to invoke the backend",
+                    file=sys.stderr,
+                )
+                return 1
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id)
@@ -1386,7 +1981,11 @@ def cmd_deploy(args, repo_root: Path) -> int:
                     exception_type=crash["exception_type"],
                     count=int(crash["count"]),
                 )
-            manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
+            manifest = write_deployment_manifest(
+                repo_root, config, fingerprints, env, result,
+                publication=publication,
+                deploy_identity=deploy_identity,
+            )
             print(f"[v2ctl.deploy] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
                 _print_backend_diagnostic(result, env)
@@ -1404,6 +2003,17 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # the deploy must be treated as a failure — never exit 0 on a
             # deploy that left the app unchanged.
             _post_version = _app_version_number(config.target.app)
+            if _post_version is None:
+                try:
+                    manifest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                print(
+                    "ERROR: unable to establish the app's post-deploy version; "
+                    "refusing to treat this deploy as valid.",
+                    file=sys.stderr,
+                )
+                return 1
             if verify_version and _post_version <= _pre_version:
                 try:
                     manifest.unlink(missing_ok=True)
@@ -1419,7 +2029,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
             return 0
         finally:
             lock.release()
-    except (V2CtlError, OSError) as exc:
+    except (V2CtlError, OSError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -1458,13 +2068,18 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
         lock.acquire(owner=config.owner or args.owner or "v2ctl",
                      target=config.target.app, profile=config.profile_name)
         try:
+            deploy_identity = capture_deploy_identity(fingerprints)
+            _apply_deploy_identity_to_env(env, deploy_identity)
             print(f"[v2ctl.deploy-run] profile={config.profile_name} "
-                  f"deploy_fingerprint={fingerprints.deploy_fingerprint()}")
+                  f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
             print(f"[v2ctl.deploy-run] command={command}")
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id, strict_canonical_discovery=True)
-            manifest = write_deployment_manifest(repo_root, config, fingerprints, env, result)
+            manifest = write_deployment_manifest(
+                repo_root, config, fingerprints, env, result,
+                deploy_identity=deploy_identity,
+            )
             print(f"[v2ctl.deploy-run] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
                 # ── E40: crash-loop accounting ────────────────────────────
@@ -1503,22 +2118,25 @@ def cmd_run(args, repo_root: Path) -> int:
         # Run-only: refuse unregistered and deploy-required explicit changes.
         resolver.check_run_safety(config, run_only=True)
         _require_no_deploy_in_flight(repo_root)
-        manifest = latest_deployment_manifest(repo_root)
+        requested_target = {
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        }
+        manifest = latest_deployment_manifest(
+            repo_root, profile=config.profile_name, target=requested_target
+        )
         golden_dry_run = bool(
             getattr(args, "golden_public", False) and getattr(args, "dry_run", False)
         )
         if not golden_dry_run:
             if manifest is None:
                 raise GateError("no deployment manifest; run `v2ctl deploy-run` (or `deploy`) first")
-            manifest_target = manifest.get("target")
-            if not (
-                isinstance(manifest_target, dict)
-                and manifest_target.get("app") == config.target.app
-                and manifest_target.get("class") == config.target.class_name
-                and manifest_target.get("method") == config.target.method
+            if _deployment_manifest_target(manifest) != _requested_target_identity(
+                requested_target
             ):
                 raise GateError(
-                    "deployment target mismatch; the latest deployment does not target "
+                    "deployment target mismatch; no matching deployment targets "
                     f"app={config.target.app} class={config.target.class_name} "
                     f"method={config.target.method}"
                 )
@@ -1610,22 +2228,25 @@ def cmd_gate(args, repo_root: Path) -> int:
         _reject_golden_mode_override(config, command="v2ctl gate")
         resolver.check_run_safety(config, run_only=True)
         _require_no_deploy_in_flight(repo_root)
-        manifest = latest_deployment_manifest(repo_root)
+        requested_target = {
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        }
+        manifest = latest_deployment_manifest(
+            repo_root, profile=config.profile_name, target=requested_target
+        )
         if manifest is None:
             raise GateError("gate requires a deployment whose fingerprint matches the requested "
                             "configuration; run `v2ctl deploy-run` first")
         if manifest.get("deploy_fingerprint") != fingerprints.deploy_fingerprint():
             raise GateError("gate requires a deployment whose fingerprint matches the requested "
                             "configuration; run `v2ctl deploy-run` first")
-        manifest_target = manifest.get("target")
-        if not (
-            isinstance(manifest_target, dict)
-            and manifest_target.get("app") == config.target.app
-            and manifest_target.get("class") == config.target.class_name
-            and manifest_target.get("method") == config.target.method
+        if _deployment_manifest_target(manifest) != _requested_target_identity(
+            requested_target
         ):
             raise GateError(
-                "deployment target mismatch; the latest deployment does not target "
+                "deployment target mismatch; no matching deployment targets "
                 f"app={config.target.app} class={config.target.class_name} "
                 f"method={config.target.method}"
             )
@@ -1825,7 +2446,16 @@ def cmd_source_probe(args, repo_root: Path) -> int:
                 mdir = _deployment_manifest_dir(repo_root)
                 files = sorted(mdir.glob("deploy_*.json")) if mdir.is_dir() else []
                 for manifest_path in reversed(files):
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    try:
+                        manifest = _json.loads(
+                            manifest_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, _json.JSONDecodeError):
+                        # An unrelated/corrupt record must not hide a valid
+                        # current deployment record farther down the ledger.
+                        continue
+                    if not isinstance(manifest, dict):
+                        continue
                     if manifest.get("deploy_fingerprint") == deploy_fp:
                         manifest["source_identity_status"] = "verified"
                         manifest_path.write_text(
@@ -2002,8 +2632,17 @@ def build_parser() -> argparse.ArgumentParser:
     gsub.add_parser("status", help="show local Golden readiness without backend calls").set_defaults(
         func=cmd_golden
     )
-    for name in ("doctor", "deploy", "run"):
-        gsub.add_parser(name).set_defaults(func=cmd_golden)
+    for name in ("doctor", "deploy", "run", "publisher-bootstrap"):
+        child = gsub.add_parser(name)
+        if name in {"deploy", "run", "publisher-bootstrap"}:
+            # Visible on ``golden <command> --help`` while the existing
+            # pre-parser continues to support root-option hoisting.
+            # SUPPRESS is important: _hoist_global_options may already have
+            # populated the root option before argparse reaches this child.
+            child.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
+            child.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
+                               help="resolve and print, invoke nothing")
+        child.set_defaults(func=cmd_golden)
 
     p = sub.add_parser("source-probe")
     p.set_defaults(func=cmd_source_probe)

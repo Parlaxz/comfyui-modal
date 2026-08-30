@@ -2,10 +2,9 @@
 
 Guards the bounded invariants introduced by the V2 cache-snapshot work:
 
-- The clone filter (``_CUSTOM_NODE_LOCAL_CLONE_RE``) is canonical and
-  identical in ``comfyapp.py`` (baked manifest + runtime) and
-  ``__init__.py`` (local archive sync), so ``comfyui-modal-agent1-full-trace``
-  variants agree everywhere.
+- The clone filter is canonical in the shared publication policy used by
+  ``comfyapp.py`` and ``__init__.py`` (local archive sync), so
+  ``comfyui-modal-agent1-full-trace`` variants agree everywhere.
 - ``custom_node_source_generation`` is deterministic: identical baked/runtime
   canonical content produces an identical generation, generated files/mtime
   do not affect it, CRLF/LF line endings are normalized, and real content
@@ -92,23 +91,10 @@ def _write_generated_artifacts(root: Path) -> None:
 
 
 def test_clone_filter_is_canonical_and_agent1_full_trace_variants_agree():
-    """comfyapp and __init__ must use the exact same clone-regex so the
-    baked manifest, runtime volume, and local archive sync agree."""
-    comfyapp_src = (ROOT / "comfyapp.py").read_text(encoding="utf-8-sig")
-    init_src = (ROOT / "__init__.py").read_text(encoding="utf-8-sig")
-    # Extract the two regex literals and assert they are byte-identical.
-    def _extract(src: str, marker: str) -> str:
-        idx = src.index(marker)
-        start = src.index("r\"", idx) + 2
-        end = src.index("\"", start)
-        return src[start:end]
-    app_re = _extract(comfyapp_src, "_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(")
-    init_re = _extract(init_src, "_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(")
-    assert app_re == init_re, (
-        f"clone regex diverged:\n comfyapp={app_re!r}\n __init__={init_re!r}"
-    )
-    import re
-    canonical = re.compile(app_re, re.IGNORECASE)
+    """Both consumers use the same shared clone-filter policy."""
+    from comfymodal_runtime.publication_policy import LOCAL_CLONE_RE
+
+    canonical = LOCAL_CLONE_RE
     for variant in (
         "comfyui-modal-agent1-full-trace",
         "comfyui-modal-agent2",
@@ -123,11 +109,16 @@ def test_clone_filter_is_canonical_and_agent1_full_trace_variants_agree():
 
 
 def test_archive_filter_excludes_agent_clones_via_canonical_regex():
-    """The local archive-sync filter must deny agent/worktree clones just
-    like the baked manifest filter (agent1-full-trace variants included)."""
-    init_src = (ROOT / "__init__.py").read_text(encoding="utf-8-sig")
-    assert "_CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_dir)" in init_src
-    assert "local_agent_or_worktree_clone" in init_src
+    """The local archive-sync filter uses the shared publication policy."""
+    from comfymodal_runtime.publication_policy import iter_syncable_custom_node_dirs
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name in ("comfyui-modal", "comfyui-modal-agent1-full-trace", "ComfyUI-KJNodes"):
+            node = root / name
+            node.mkdir()
+            (node / "__init__.py").write_text("NODE = True\n", encoding="utf-8")
+        assert iter_syncable_custom_node_dirs(root) == ["ComfyUI-KJNodes", "comfyui-modal"]
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +136,22 @@ def test_generation_is_path_independent_for_identical_content():
         g_baked = module.custom_node_source_generation(str(baked))
         g_runtime = module.custom_node_source_generation(str(runtime))
     assert g_baked == g_runtime
+
+
+def test_ordinary_runtime_edit_does_not_change_custom_node_identity(tmp_path):
+    from comfymodal_runtime.deployment_spec import build_deployment_identity
+
+    runtime = tmp_path / "runtime"
+    custom = tmp_path / "custom_nodes"
+    runtime.mkdir()
+    custom.mkdir()
+    (runtime / "runtime.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (custom / "node.py").write_text("VERSION = 1\n", encoding="utf-8")
+    first = build_deployment_identity(runtime, custom_node_paths=[custom])
+    (runtime / "runtime.py").write_text("VERSION = 2\n", encoding="utf-8")
+    second = build_deployment_identity(runtime, custom_node_paths=[custom])
+    assert first.custom_node_hash == second.custom_node_hash
+    assert first.runtime_hash != second.runtime_hash
 
 
 def test_generation_ignores_generated_files_and_mtime():
@@ -183,7 +190,7 @@ def test_generation_normalizes_line_endings():
     assert g1 == g2
 
 
-def test_generation_preserves_real_mismatches():
+def test_generation_preserves_source_mismatches_but_not_dependency_metadata():
     module = _load_comfyapp()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "custom_nodes"
@@ -194,7 +201,7 @@ def test_generation_preserves_real_mismatches():
         (root / "ComfyUI-KJNodes" / "requirements.txt").write_text("numpy==1.26.4\n", encoding="utf-8")
         g3 = module.custom_node_source_generation(str(root))
     assert g1 != g2
-    assert g2 != g3
+    assert g2 == g3
 
 
 def test_fingerprint_walk_is_sorted_and_excludes_generated_dirs():
@@ -235,7 +242,7 @@ def test_archive_sync_generation_is_content_derived_not_uuid():
     assert "custom_node_source_generation(CUSTOM_NODES_PATH)" in src
     assert "generation=_cn_gen_value or None" in src
     # The deterministic value must not be a UUID.
-    assert len(expected) == 32, "content-derived generation must be a 32-hex md5"
+    assert len(expected) == 64, "content-derived generation must be the canonical SHA-256"
 
 
 def test_startup_init_generation_is_content_derived():

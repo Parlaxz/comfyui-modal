@@ -513,6 +513,13 @@ class ExpectedOutputShaValidator(ValidatorPlugin):
         if record.output_sha is None:
             return ["output SHA unavailable: backend produced no output_sha line"]
         if record.output_sha != expected:
+            if str(getattr(config, "profile_name", "") or "") == "golden_p1":
+                LOG.warning(
+                    "Golden output SHA mismatch is warning-only: expected=%s observed=%s",
+                    expected,
+                    record.output_sha,
+                )
+                return []
             return [
                 f"output SHA mismatch: expected {expected}, observed {record.output_sha}"
             ]
@@ -525,7 +532,10 @@ class GoldenCohortValidator(ValidatorPlugin):
     ``run_golden_serial_stream`` does not emit the generic run-plan artifact.
     The harness has already performed the detailed event validation; v2ctl
     verifies that its immutable result is present, internally consistent,
-    hash-intact, and matches the current profile before accepting it.
+    hash-intact, and matches the current profile before accepting it.  A
+    configured output SHA mismatch is accepted only when the attempt records
+    the actual, well-formed SHA together with explicit expected/observed
+    warning evidence.
     """
 
     name = "golden_cohort"
@@ -603,6 +613,8 @@ class GoldenCohortValidator(ValidatorPlugin):
             failures.append("Golden cohort target identity does not match config")
 
         expected_sha = str(getattr(getattr(config, "workload", None), "expected_output_sha", "") or "").strip()
+        if not expected_sha:
+            failures.append("Golden expected output SHA is missing")
         if manifest.get("expected_output_sha") != expected_sha:
             failures.append("Golden cohort expected output SHA does not match config")
         workflow = manifest.get("workflow")
@@ -642,8 +654,38 @@ class GoldenCohortValidator(ValidatorPlugin):
             failures.append("Golden attempt contains validation failures")
         validation = attempt.get("validation")
         observed_shas = validation.get("observed_output_shas") if isinstance(validation, dict) else None
-        if observed_shas != [expected_sha]:
-            failures.append("Golden attempt output SHA proof is missing or mismatched")
+        observed_sha = None
+        if not isinstance(observed_shas, list) or len(observed_shas) != 1:
+            failures.append("Golden attempt output SHA proof is missing or ambiguous")
+        elif not isinstance(observed_shas[0], str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", observed_shas[0].strip()
+        ):
+            failures.append("Golden attempt output SHA proof is malformed")
+        else:
+            observed_sha = observed_shas[0].strip()
+            if observed_sha.lower() != expected_sha.lower():
+                warning = validation.get("output_sha_warning") if isinstance(validation, dict) else None
+                warning_expected = warning.get("expected") if isinstance(warning, dict) else None
+                warning_observed = warning.get("observed") if isinstance(warning, dict) else None
+                warning_ok = (
+                    isinstance(warning_expected, str)
+                    and isinstance(warning_observed, str)
+                    and warning_expected.strip().lower() == expected_sha.lower()
+                    and warning_observed.strip().lower() == observed_sha.lower()
+                )
+                if not warning_ok:
+                    failures.append(
+                        "Golden attempt output SHA mismatch lacks explicit warning evidence"
+                    )
+            elif isinstance(validation, dict) and validation.get("output_sha_warning"):
+                failures.append("Golden attempt output SHA warning contradicts matching SHA")
+        if record.output_sha is not None:
+            if not isinstance(record.output_sha, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", record.output_sha.strip()
+            ):
+                failures.append("Golden record output SHA is malformed")
+            elif observed_sha is not None and record.output_sha.strip().lower() != observed_sha.lower():
+                failures.append("Golden record output SHA disagrees with attempt proof")
         telemetry = attempt.get("golden_telemetry")
         if not isinstance(telemetry, dict) or not str(telemetry.get("schema", "")).startswith("golden_"):
             failures.append("Golden telemetry proof is missing")

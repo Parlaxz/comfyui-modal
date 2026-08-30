@@ -24,6 +24,12 @@ import hashlib
 import json
 from typing import Any
 
+from comfymodal_runtime.deployment_spec import (
+    DEPLOYMENT_HASH_NAMESPACE,
+    build_canonical_boundary_identity,
+    build_v2_late_config,
+)
+
 
 # ``V2_E19_FINAL_COLD_LOADER`` is a harness selector, not a runtime flag.
 # The deploy/run BAT applies these values after v2ctl has resolved the
@@ -152,12 +158,82 @@ class FingerprintEngine:
         """Stable fingerprint of the resolved profile/configuration."""
         return self._sha256_hex(self.config_inputs())
 
+    def canonical_identity(self):
+        """Return the shared typed boundary identity for this control-plane config.
+
+        Source, dependency, accelerator, deployment, and request identities
+        remain independently addressable.  The legacy ``deploy_inputs`` and
+        ``run_inputs`` projections remain available for persisted manifests.
+        """
+        config = self._config
+        git = config.git
+        target = config.target
+        resources = config.resources
+        effective_values = self.effective_flag_values()
+        deploy_flags = {
+            str(flag.name): effective_values[str(flag.name)]
+            for flag in list(config.flags or ())
+            if flag.change_requires in ("build", "deploy")
+        }
+        deploy_flags.update({
+            str(flag.name): effective_values[str(flag.name)]
+            for flag in list(config.unregistered or ())
+        })
+        source_hashes = {
+            str(path): str(sha)
+            for path, sha in sorted((git.dirty_hashes or {}).items())
+        }
+        return build_canonical_boundary_identity(
+            foundation_inputs={
+                "target": str(target.class_name),
+                "python": "3.11",
+            },
+            dependency_inputs={
+                "deploy_flags": deploy_flags,
+                "profile": str(config.profile_name),
+            },
+            accelerator_inputs={
+                "gpu": str(resources.gpu),
+                "cpu": int(resources.cpu),
+                "memory_mb": int(resources.memory_mb),
+            },
+            late_config_inputs=build_v2_late_config(
+                resolved_values=effective_values,
+                cpu_request=int(resources.cpu),
+                memory_request=int(resources.memory_mb),
+            ),
+            source_inputs={
+                "dirty_hashes": source_hashes,
+                "git_head": str(git.head),
+            },
+            deployment_inputs=self.deploy_inputs(),
+            request_inputs={
+                "workload": {
+                    "fresh_required": bool(config.workload.fresh_required),
+                    "conditioning_cache": str(config.workload.conditioning_cache),
+                    "expected_output_sha": str(config.workload.expected_output_sha),
+                    "run_count": int(config.workload.run_count),
+                    "gap_seconds": _fmt(config.workload.gap_seconds),
+                    "nonce": str(config.workload.nonce),
+                },
+                "run_flags": {
+                    str(flag.name): effective_values[str(flag.name)]
+                    for flag in list(config.flags or ())
+                    if flag.change_requires in ("run", "none")
+                },
+            },
+        )
+
     # Explicit name used by the reserved env/schema field.
     def profile_config_fingerprint(self) -> str:
         return self.config_fingerprint()
 
     def profile_fingerprint(self) -> str:
         return self.config_fingerprint()
+
+    def deployment_hash_namespace(self) -> str:
+        """Name the hash domain shared with the runtime image plan."""
+        return DEPLOYMENT_HASH_NAMESPACE
 
     def effective_flag_values(self) -> dict[str, str]:
         """Return flag values after the canonical deploy-selector projection.
@@ -192,10 +268,10 @@ class FingerprintEngine:
         return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     def deploy_fingerprint(self) -> str:
-        return self._sha256_hex(self.deploy_inputs())
+        return self.canonical_identity().deployment
 
     def run_fingerprint(self) -> str:
-        return self._sha256_hex(self.run_inputs())
+        return self.canonical_identity().request
 
     def _sha256_hex(self, data: dict) -> str:
         return hashlib.sha256(self.canonical_json(data).encode("utf-8")).hexdigest()

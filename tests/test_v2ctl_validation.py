@@ -13,6 +13,7 @@ Agent B's backend/fingerprints/environment modules.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from tools.v2_control.validation import (
     ConfirmRunner,
     E31ForensicsValidator,
     ExpectedOutputShaValidator,
+    GoldenCohortValidator,
     GateRunner,
     RunRecord,
     StructuralValidator,
@@ -44,6 +46,8 @@ from tests.v2ctl_fakes import (
 )
 
 SHA_20B1 = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+GOLDEN_EXPECTED_SHA = "c" * 64
+GOLDEN_OBSERVED_SHA = "d" * 64
 
 
 def make_validator() -> Validator:
@@ -93,6 +97,100 @@ def make_confirm_runner(tmp_path, fingerprints=None, backend=None, validator=Non
         backend_runner=backend,
         env_builder=object(),
     )
+
+
+def _golden_cohort_record(tmp_path: Path, *, include_warning: bool = True,
+                          include_sha: bool = True) -> RunRecord:
+    """Build the smallest immutable Golden cohort accepted by the validator."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    attempt_path = tmp_path / "attempt_0.json"
+    manifest_path = tmp_path / "manifest.json"
+    request_id = "golden-request-1"
+    validation = {
+        "observed_output_shas": [GOLDEN_OBSERVED_SHA] if include_sha else [],
+        "observed_flags": {},
+    }
+    if include_warning:
+        validation["output_sha_warning"] = {
+            "expected": GOLDEN_EXPECTED_SHA,
+            "observed": GOLDEN_OBSERVED_SHA,
+        }
+    attempt = {
+        "request_id": request_id,
+        "mode": "golden_p1_serial",
+        "method": "run_golden_serial_stream",
+        "valid": True,
+        "dnf": False,
+        "failures": [],
+        "validation": validation,
+        "golden_telemetry": {
+            "schema": "golden_p1_telemetry_v1",
+            "true_durable_marked": True,
+            "reopen_verified": True,
+        },
+        "seriality": {"ok": True, "count": 0},
+    }
+    attempt_path.write_text(json.dumps(attempt), encoding="utf-8")
+    target = {
+        "app_name": "golden-test-app",
+        "class_name": "ModalRuntimeEntrypointV2",
+        "method": "run_golden_serial_stream",
+        "gpu": "rtx-pro-6000",
+    }
+    manifest = {
+        "mode": "golden_p1_serial",
+        "method": "run_golden_serial_stream",
+        "target": target,
+        "expected_output_sha": GOLDEN_EXPECTED_SHA,
+        "workflow": {"workflow_hash": "workflow", "prompt_sha256": "prompt"},
+        "run_count_requested": 1,
+        "attempt_count": 1,
+        "valid_count": 1,
+        "invalid_count": 0,
+        "dnf_count": 0,
+        "attempts": [{"request_id": request_id}],
+        "artifact_file_hashes": {
+            attempt_path.name: hashlib.sha256(attempt_path.read_bytes()).hexdigest(),
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config = FakeConfig(profile_name="golden_p1")
+    config.target.app = target["app_name"]
+    config.target.class_name = target["class_name"]
+    config.target.method = target["method"]
+    config.workload.expected_output_sha = GOLDEN_EXPECTED_SHA
+    artifacts = FakeArtifactSet(
+        run_artifact=attempt_path,
+        campaign_manifest=manifest_path,
+        request_id=request_id,
+    )
+    return RunRecord(
+        run_fingerprint="a" * 64,
+        deploy_fingerprint="b" * 64,
+        profile="golden_p1",
+        target_app=target["app_name"],
+        target_class=target["class_name"],
+        fresh_required=True,
+        expected_output_sha=GOLDEN_EXPECTED_SHA,
+        artifacts=artifacts,
+        backend_ok=True,
+        telemetry={},
+        output_sha=GOLDEN_OBSERVED_SHA if include_sha else None,
+        request_id=request_id,
+        v2ctl_invocation_id="invocation",
+        profile_config_fingerprint="profile-fingerprint",
+        provenance_validation_status="validated",
+    )
+
+
+def _golden_config(record: RunRecord) -> FakeConfig:
+    config = FakeConfig(profile_name="golden_p1")
+    config.target.app = record.target_app
+    config.target.class_name = record.target_class
+    config.target.method = "run_golden_serial_stream"
+    config.resources.gpu = "rtx-pro-6000"
+    config.workload.expected_output_sha = GOLDEN_EXPECTED_SHA
+    return config
 
 
 class TestParsing:
@@ -218,6 +316,26 @@ class TestValidators:
             output_sha=None,
         )
         assert ExpectedOutputShaValidator().validate(record, config) == []
+
+    def test_golden_cohort_accepts_explicit_output_sha_mismatch_warning(self, tmp_path):
+        record = _golden_cohort_record(tmp_path)
+
+        assert GoldenCohortValidator().validate(record, _golden_config(record)) == []
+
+    def test_golden_cohort_rejects_missing_sha_or_warning(self, tmp_path):
+        missing_sha = _golden_cohort_record(tmp_path / "missing_sha", include_sha=False)
+        failures = GoldenCohortValidator().validate(
+            missing_sha, _golden_config(missing_sha)
+        )
+        assert any("output SHA proof is missing" in failure for failure in failures)
+
+        missing_warning = _golden_cohort_record(
+            tmp_path / "missing_warning", include_warning=False
+        )
+        failures = GoldenCohortValidator().validate(
+            missing_warning, _golden_config(missing_warning)
+        )
+        assert any("lacks explicit warning evidence" in failure for failure in failures)
 
 
 class TestGateRunner:

@@ -215,6 +215,16 @@ class _FakeTrace:
         return ev
 
 
+class _CallableWithBrokenMetadata:
+    def __getattribute__(self, name):
+        if name in {"__module__", "__qualname__", "__name__", "__closure__"}:
+            raise RuntimeError("broken callable metadata")
+        return object.__getattribute__(self, name)
+
+    def __call__(self, *args, **kwargs):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Flag resolution
 # ---------------------------------------------------------------------------
@@ -556,6 +566,7 @@ class CacheDiTDiscoveryTests(unittest.TestCase):
         self.assertEqual(out["skip_count"], 7)
         self.assertEqual(fresh_calls, [], "fresh import must not be attempted when a loaded module exists")
 
+
     def test_loaded_module_with_windows_style_path_wins(self):
         self._pop_real_cachedit()
         loaded = self._make_fake_module(
@@ -605,6 +616,104 @@ class CacheDiTDiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["cachedit"]["compute_count"], 10)
         self.assertEqual(payload["cachedit"]["skip_count"], 7)
         self.assertFalse(any("cachedit_counter_mismatch" in e for e in art["errors"]), art["errors"])
+
+
+class BackendObservationTests(unittest.TestCase):
+    def setUp(self):
+        sdp.reset_for_tests()
+        self.addCleanup(sdp.reset_for_tests)
+        self._p = patch.object(sdp, "_resolve_ksampler_x0_inpaint", lambda: _FakeKSamplerX0Inpaint)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_attention_override_closure_identifies_pytorch_fallback(self):
+        trace = _FakeTrace()
+        prof = _begin(trace, level="blocks", steps=8, patcher=None)
+
+        def attention_pytorch(*args, **kwargs):
+            return None
+
+        def attention_fallback(*args, **kwargs):
+            return attention_pytorch(*args, **kwargs)
+
+        options = {"optimized_attention_override": attention_fallback}
+        prof._begin_eval()
+        hook = sdp._make_pre_hook(prof, "block:0:attention", "attention")
+        hook(object(), (SimpleNamespace(shape=(1, 2, 3), dtype="bf16", device="cuda:0"),), {
+            "transformer_options": options,
+        })
+        self.assertEqual(prof.evals[-1]["backend"]["dispatch"]["pytorch_override"], 1)
+        self.assertTrue(any("attention_fallback" in item for item in prof._backend_signatures["pytorch_override"][0]))
+        prof._end_eval()
+
+    def test_backend_observation_is_metadata_only_and_bounded(self):
+        trace = _FakeTrace()
+        prof = _begin(trace, level="blocks", steps=8, patcher=None)
+        prof._begin_eval()
+        hook = sdp._make_pre_hook(prof, "block:0:attention", "attention")
+        hook(object(), (SimpleNamespace(shape=(1, 2), dtype="bf16", device="cuda:0"),), {})
+        self.assertEqual(prof._backend_observations[0]["input"]["shape"], [1, 2])
+        self.assertEqual(prof._backend_observations[0]["input"]["device"], "cuda:0")
+        prof._end_eval()
+
+    def test_broken_callable_metadata_cannot_escape_attention_hook(self):
+        trace = _FakeTrace()
+        prof = _begin(trace, level="blocks", steps=8, patcher=None)
+        prof._begin_eval()
+        hook = sdp._make_pre_hook(prof, "block:0:attention", "attention")
+
+        # The hook must still record its span and return normally even when a
+        # selected callable refuses all diagnostic metadata access.
+        hook(object(), (), {"transformer_options": {
+            "optimized_attention_override": _CallableWithBrokenMetadata(),
+        }})
+        prof._span_end("block:0:attention", "attention")
+        self.assertEqual(
+            prof.evals[-1]["backend"]["dispatch"],
+            {"unknown_attention_dispatch": 1},
+        )
+        self.assertTrue(
+            any(item.startswith("attention_callable_metadata_failed:") for item in prof.warnings)
+        )
+        prof._end_eval()
+
+    def test_sdpa_seam_is_counted_per_eval_and_restored(self):
+        fake_ops = types.ModuleType("comfy.ops")
+        import comfy
+
+        def original_sdpa(*args, **kwargs):
+            return "original"
+
+        setattr(fake_ops, "scaled_dot_product_attention", original_sdpa)
+        with patch.dict(sys.modules, {"comfy.ops": fake_ops}), \
+             patch.object(comfy, "ops", fake_ops), \
+             patch.object(sdp, "_resolve_cuda_module", lambda: None):
+            trace = _FakeTrace()
+            prof = _begin(trace, level="blocks", steps=8, patcher=None)
+
+            def attention_sage(*args, **kwargs):
+                return None
+
+            prof._begin_eval()
+            hook = sdp._make_pre_hook(prof, "block:0:attention", "attention")
+            hook(object(), (), {"transformer_options": {
+                "optimized_attention_override": attention_sage,
+            }})
+            self.assertEqual(fake_ops.scaled_dot_product_attention(), "original")
+            prof._span_end("block:0:attention", "attention")
+            prof._end_eval()
+            art = _finalize(prof, trace)
+
+        per_eval = art["evals"]["per_eval"][0]["attention_backend"]
+        self.assertEqual(per_eval["calls"], {"pytorch_sdpa": 1})
+        self.assertIsNone(art["attention_backend"]["correlated_fallback_evals"])
+        self.assertEqual(art["attention_backend"]["observed_sage_sdpa_evals"], 1)
+        self.assertEqual(
+            art["attention_backend"]["actual_backend"],
+            "sage_override_and_pytorch_sdpa_observed_non_correlated",
+        )
+        self.assertIn("not correlated per call", art["semantics"]["attention_backend"])
+        self.assertIs(fake_ops.scaled_dot_product_attention, original_sdpa)
 
 
 class BlockAggregationTests(unittest.TestCase):

@@ -8,6 +8,8 @@ credentials, caches, or generated output and must not be published.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -94,6 +96,11 @@ LOCAL_CLONE_RE = re.compile(
 COMFYMODAL_CANONICAL_NODE_NAME = "comfyui-modal"
 COMFYMODAL_DUPLICATE_TYPO_NAMES = frozenset({"comyui-modal-pagesfile-probe"})
 COMFYMODAL_LOCAL_CUSTOM_NODES_ENV = "COMFYMODAL_LOCAL_CUSTOM_NODES"
+
+# The custom-node source is a shared resource.  Keep its Volume and the one
+# app allowed to mutate it independent of whichever Golden app consumes it.
+CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
+CUSTOM_NODES_PUBLISHER_APP_NAME = "comfyui-custom-nodes-publisher"
 
 
 def is_local_clone_name(name: str) -> bool:
@@ -343,3 +350,31 @@ def image_ignore_patterns(prefix: str = "") -> list[str]:
     patterns.extend(f"{prefix}{prefix_name}*" for prefix_name in EXCLUDED_PREFIXES)
     patterns.extend(f"{prefix}*{infix}*" for infix in EXCLUDED_INFIXES)
     return patterns
+
+
+# Dependency context is deliberately narrower than source publication.  In
+# particular, ordinary Python implementation files must not become inputs to a
+# third-party dependency layer merely because they live beside requirements.
+DEPENDENCY_FILENAMES: frozenset[str] = frozenset({
+    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "install.py",
+})
+DEPENDENCY_EXTENSIONS: frozenset[str] = frozenset({".txt", ".pip", ".in", ".cfg", ".toml"})
+
+
+def normalize_dependency_text(value: str | bytes) -> str:
+    """Normalize dependency declarations without including filesystem noise."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="strict")
+    lines = [line.rstrip() for line in str(value).replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def dependency_context_identity(context: dict[str, str] | None) -> str:
+    """Return a stable digest for a normalized dependency-only file map."""
+    payload = {
+        str(path).replace("\\", "/"): str(digest)
+        for path, digest in sorted((context or {}).items())
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()

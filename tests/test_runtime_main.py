@@ -261,6 +261,38 @@ class TestBootstrap(unittest.TestCase):
         self.assertEqual(state.sage_mode, "triton_fallback")
         self.assertEqual(state.sage_reason, "not-patched-or-not-found")
 
+    def test_restore_callback_exceptions_record_unknown_before_reraise(self):
+        """Each restore callback stage records unknown before propagating errors."""
+        callback_stages = (
+            ("reload_runtime_state", "reload_runtime_state"),
+            ("reload_models", "reload_models"),
+            ("sync_custom_nodes", "sync_custom_nodes"),
+            ("sage_policy", "apply_sage_policy"),
+        )
+        for stage, callback_name in callback_stages:
+            with self.subTest(stage=stage):
+                def _boom():
+                    raise RuntimeError(f"{stage} failed")
+
+                bootstrap = RuntimeBootstrap()
+                setattr(bootstrap, callback_name, _boom)
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    bootstrap.restore()
+                self.assertEqual(
+                    bootstrap.state.restore_stage_classifications.get(stage),
+                    "unknown",
+                )
+
+    def test_restore_absent_sage_callback_is_skipped(self):
+        bootstrap = RuntimeBootstrap()
+
+        bootstrap.restore()
+
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications.get("sage_policy"),
+            "skipped",
+        )
+
     def test_restore_captures_stage_durations_in_state(self):
         model_path = Path(tempfile.gettempdir()) / "models"
         model_path.mkdir(exist_ok=True)

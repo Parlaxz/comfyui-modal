@@ -27,29 +27,31 @@ def _positive_int(name: str, raw: str) -> int:
     return int(raw)
 
 
-def _env_positive(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+def _env_positive(name: str, default: int, environment: Mapping[str, Any]) -> int:
+    raw = environment.get(name)
+    if raw is None or not str(raw).strip():
         return default
-    return _positive_int(name, raw.strip())
+    return _positive_int(name, str(raw).strip())
 
 
-def _env_shape_int(names: tuple[str, ...], default: int) -> int:
+def _env_shape_int(
+    names: tuple[str, ...], default: int, environment: Mapping[str, Any]
+) -> int:
     for name in names:
-        raw = os.environ.get(name)
-        if raw is not None and raw.strip():
-            return _positive_int(name, raw.strip())
+        raw = environment.get(name)
+        if raw is not None and str(raw).strip():
+            return _positive_int(name, str(raw).strip())
     return default
 
 
-def _memory_request() -> int:
-    request_raw = os.environ.get("COMFYMODAL_V2_MEMORY_REQUEST")
-    mb_raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
-    request_present = request_raw is not None and bool(request_raw.strip())
-    mb_present = mb_raw is not None and bool(mb_raw.strip())
+def _memory_request(environment: Mapping[str, Any]) -> int:
+    request_raw = environment.get("COMFYMODAL_V2_MEMORY_REQUEST")
+    mb_raw = environment.get("COMFYMODAL_V2_MEMORY_MB")
+    request_present = request_raw is not None and bool(str(request_raw).strip())
+    mb_present = mb_raw is not None and bool(str(mb_raw).strip())
     if request_present and mb_present:
-        request = _positive_int("COMFYMODAL_V2_MEMORY_REQUEST", request_raw.strip())
-        mb = _positive_int("COMFYMODAL_V2_MEMORY_MB", mb_raw.strip())
+        request = _positive_int("COMFYMODAL_V2_MEMORY_REQUEST", str(request_raw).strip())
+        mb = _positive_int("COMFYMODAL_V2_MEMORY_MB", str(mb_raw).strip())
         if request != mb:
             raise RuntimeError(
                 "COMFYMODAL_V2_MEMORY_REQUEST and COMFYMODAL_V2_MEMORY_MB "
@@ -57,14 +59,14 @@ def _memory_request() -> int:
             )
         return request
     if request_present:
-        return _positive_int("COMFYMODAL_V2_MEMORY_REQUEST", request_raw.strip())
+        return _positive_int("COMFYMODAL_V2_MEMORY_REQUEST", str(request_raw).strip())
     if mb_present:
-        return _positive_int("COMFYMODAL_V2_MEMORY_MB", mb_raw.strip())
+        return _positive_int("COMFYMODAL_V2_MEMORY_MB", str(mb_raw).strip())
     return 49152
 
 
-def _shape_label() -> str | None:
-    raw = os.environ.get("COMFYMODAL_V2_RUNTIME_SHAPE_LABEL", "").strip()
+def _shape_label(environment: Mapping[str, Any]) -> str | None:
+    raw = str(environment.get("COMFYMODAL_V2_RUNTIME_SHAPE_LABEL", "")).strip()
     if not raw:
         return None
     if len(raw) > 80 or any(char not in _SHAPE_LABEL_ALLOWED for char in raw):
@@ -150,22 +152,25 @@ def runtime_shape_config(
     *,
     cpu_request: int | None = None,
     memory_request: int | None = None,
+    environment: Mapping[str, Any] | None = None,
 ) -> RuntimeShapeConfig:
-    legacy_id = os.environ.get("COMFYMODAL_V2_RUNTIME_SHAPE_ID", "").strip()
+    # An explicit mapping is used by identity builders so resolving a shape
+    # never accidentally observes the caller's shell.  ``None`` retains the
+    # runtime behavior for existing callers.
+    env: Mapping[str, Any] = os.environ if environment is None else environment
+    legacy_id = str(env.get("COMFYMODAL_V2_RUNTIME_SHAPE_ID", "")).strip()
     if legacy_id:
         raise RuntimeError(
             "COMFYMODAL_V2_RUNTIME_SHAPE_ID is not accepted; use "
             "COMFYMODAL_V2_RUNTIME_SHAPE_LABEL for a human label"
         )
-    legacy_thread_limit = os.environ.get(
-        "COMFYMODAL_V2_RESTORE_TORCH_THREADS", ""
-    ).strip()
+    legacy_thread_limit = str(env.get("COMFYMODAL_V2_RESTORE_TORCH_THREADS", "")).strip()
     if legacy_thread_limit:
         raise RuntimeError(
             "COMFYMODAL_V2_RESTORE_TORCH_THREADS is incompatible with "
             "C8 runtime-shape policies; use COMFYMODAL_V2_THREAD_POLICY"
         )
-    policy = os.environ.get("COMFYMODAL_V2_THREAD_POLICY", "TBASE").strip().upper() or "TBASE"
+    policy = str(env.get("COMFYMODAL_V2_THREAD_POLICY", "TBASE")).strip().upper() or "TBASE"
     if policy == "T0":
         policy = "TBASE"
     if policy not in _THREAD_POLICY_DEFAULTS:
@@ -179,19 +184,19 @@ def runtime_shape_config(
         omp = mkl = openblas = numexpr = malloc_arena = None
     else:
         intraop = _env_positive(
-            "COMFYMODAL_V2_TORCH_INTRAOP_THREADS", int(defaults["intraop"])
+            "COMFYMODAL_V2_TORCH_INTRAOP_THREADS", int(defaults["intraop"]), env
         )
         interop = _env_positive(
-            "COMFYMODAL_V2_TORCH_INTEROP_THREADS", int(defaults["interop"])
+            "COMFYMODAL_V2_TORCH_INTEROP_THREADS", int(defaults["interop"]), env
         )
-        native = _env_positive("COMFYMODAL_V2_NATIVE_THREADS", int(defaults["native"]))
-        omp = _env_shape_int(("OMP_NUM_THREADS",), native)
-        mkl = _env_shape_int(("MKL_NUM_THREADS",), native)
-        openblas = _env_shape_int(("OPENBLAS_NUM_THREADS",), native)
-        numexpr = _env_shape_int(("NUMEXPR_NUM_THREADS",), native)
-        malloc_arena = _env_shape_int(("MALLOC_ARENA_MAX",), 2)
+        native = _env_positive("COMFYMODAL_V2_NATIVE_THREADS", int(defaults["native"]), env)
+        omp = _env_shape_int(("OMP_NUM_THREADS",), native, env)
+        mkl = _env_shape_int(("MKL_NUM_THREADS",), native, env)
+        openblas = _env_shape_int(("OPENBLAS_NUM_THREADS",), native, env)
+        numexpr = _env_shape_int(("NUMEXPR_NUM_THREADS",), native, env)
+        malloc_arena = _env_shape_int(("MALLOC_ARENA_MAX",), 2, env)
     snapshot_order = (
-        os.environ.get("COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER", "O0").strip().upper()
+        str(env.get("COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER", "O0")).strip().upper()
         or "O0"
     )
     if snapshot_order not in _SNAPSHOT_MODEL_ORDERS:
@@ -199,8 +204,8 @@ def runtime_shape_config(
             f"COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER={snapshot_order!r} is invalid; "
             "expected O0, O1, O2, or O3"
         )
-    env_cpu_request = _env_shape_int(("COMFYMODAL_V2_CPU_REQUEST",), 16)
-    env_memory_request = _memory_request()
+    env_cpu_request = _env_shape_int(("COMFYMODAL_V2_CPU_REQUEST",), 16, env)
+    env_memory_request = _memory_request(env)
     if cpu_request is not None:
         if isinstance(cpu_request, bool) or not isinstance(cpu_request, int) or cpu_request <= 0:
             raise RuntimeError("cpu_request must be a positive integer")
@@ -235,7 +240,7 @@ def runtime_shape_config(
         cpu_request=env_cpu_request,
         memory_request=env_memory_request,
         runtime_shape_fingerprint=_runtime_shape_fingerprint(payload),
-        runtime_shape_label=_shape_label(),
+        runtime_shape_label=_shape_label(env),
     )
 
 

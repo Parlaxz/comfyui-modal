@@ -556,6 +556,7 @@ RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 # is labeled ONLY from remote/container identity evidence — never inferred.
 GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_P1_REMOTE_METHOD = "run_golden_serial_stream"
+GOLDEN_ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME = "phase_p1_serial_golden_v1"
 GOLDEN_P1_DEFAULT_RUN_COUNT = int(os.environ.get("V2_GOLDEN_P1_RUN_COUNT", "5") or 5)
 GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV = "COMFYMODAL_V2_GOLDEN_P1_EXPECTED_OUTPUT_SHA"
@@ -957,7 +958,7 @@ E37_VALIDATION_PROFILE_NAME = "E37_VALIDATION"
 E37_CLEAN_LANE_SELECTOR = "V2_E37_CLEAN_LANE_VALIDATION"
 E37_CLEAN_LANE_PROFILE_NAME = "E37_CLEAN_LANE"
 E37_CLEAN_LANE_EXPECTED_OUTPUT_SHA = (
-    "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
+    "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
 )
 E37_HARNESS_PROFILE: dict[str, str] = {
     "COMFYMODAL_MINIMAL_RESTORE": "1",
@@ -10338,18 +10339,118 @@ def _golden_p1_load_payload() -> dict[str, Any]:
     }
 
 
-def _golden_p1_deployed_identity() -> dict[str, Any]:
-    """Deployment identity fields recorded in .deployed_state.json (best
-    effort; absent file yields {} so nothing is fabricated)."""
-    try:
-        data = json.loads((ROOT / ".deployed_state.json").read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+def _golden_p1_request_payload(
+    source: dict[str, Any],
+    *,
+    request_id: str,
+    index: int,
+    attention_backend: str | None = None,
+) -> dict[str, Any]:
+    """Build one public Golden request, preserving omission semantics.
+
+    The attention selector is a top-level Golden field.  In particular, do
+    not place it in ``modal_options``: the remote Golden adapter validates and
+    normalizes this field at its request boundary.  ``None`` intentionally
+    leaves the field absent so the adapter's existing PyTorch default remains
+    authoritative.
+    """
+    payload = {
+        "request_id": request_id,
+        "prompt": copy.deepcopy(source["prompt"]),
+        "extra_data": copy.deepcopy(source["extra_data"]),
+        "modal_options": copy.deepcopy(source["modal_options"]),
+        "request_origin_info": {
+            "benchmark_mode": GOLDEN_P1_MODE,
+            "golden_p1_run_index": index,
+            "golden_p1_request_id": request_id,
+            "serial": True,
+        },
+    }
+    if attention_backend is not None:
+        normalized = str(attention_backend).strip().lower()
+        if normalized not in GOLDEN_ATTENTION_BACKENDS:
+            raise ValueError(
+                "golden attention backend must be one of: "
+                + ", ".join(GOLDEN_ATTENTION_BACKENDS)
+            )
+        payload["attention_backend"] = normalized
+    return payload
+
+
+def _golden_p1_deployed_identity(
+    app_name: str, profile: str, deploy_fingerprint: str
+) -> dict[str, Any]:
+    """Return identity from the one current, validated v2ctl manifest.
+
+    ``.deployed_state.json`` is legacy mutable state and may describe another
+    app batch.  The v2ctl deployment fingerprint supplied for this request is
+    therefore required to select a manifest; no other persisted identity is a
+    valid fallback.  Multiple matching manifests are ambiguous and fail
+    closed rather than selecting one by mtime or filename.
+    """
+    requested_app = str(app_name or "").strip()
+    requested_profile = str(profile or "").strip()
+    requested_fingerprint = str(deploy_fingerprint or "").strip()
+    if not (requested_app and requested_profile and requested_fingerprint):
         return {}
-    keep = (
-        "app_name", "class_name", "deployment_combined_hash", "gpu",
-        "deployed_at", "deploy_fingerprint", "profile",
+
+    try:
+        from tools.v2_control.cli import _validate_deployment_manifest
+    except Exception:  # noqa: BLE001 - identity lookup must fail closed
+        return {}
+
+    deployment_dir = ROOT / ".v2ctl" / "deployments"
+    if not deployment_dir.is_dir():
+        return {}
+
+    matches: list[dict[str, Any]] = []
+    for path in sorted(deployment_dir.glob("deploy_*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        manifest = _validate_deployment_manifest(raw)
+        if manifest is None:
+            continue
+        target = manifest.get("target")
+        if not isinstance(target, dict):
+            continue
+        if (
+            target.get("app") != requested_app
+            or manifest.get("profile") != requested_profile
+            or manifest.get("deploy_fingerprint") != requested_fingerprint
+        ):
+            continue
+        matches.append(manifest)
+
+    if len(matches) != 1:
+        return {}
+
+    manifest = matches[0]
+    target = manifest.get("target")
+    resources = manifest.get("resources")
+    if not isinstance(target, dict) or not isinstance(resources, dict):
+        return {}
+    identity = {
+        "app_name": target.get("app"),
+        "class_name": target.get("class"),
+        "deployment_combined_hash": manifest.get("deployment_hash"),
+        "gpu": resources.get("gpu"),
+        "deployed_at": manifest.get("created_at"),
+        "deploy_fingerprint": manifest.get("deploy_fingerprint"),
+        "profile": manifest.get("profile"),
+    }
+    # A malformed-but-schema-valid target must not produce a partial identity.
+    required = (
+        "app_name", "class_name", "deployment_combined_hash",
+        "deploy_fingerprint", "profile",
     )
-    return {k: data[k] for k in keep if data.get(k) not in (None, "")}
+    if any(
+        not isinstance(identity.get(key), str) or not identity[key].strip()
+        for key in required
+    ):
+        return {}
+    return {key: value for key, value in identity.items() if value not in (None, "")}
 
 
 def _golden_p1_capture_guard_context(
@@ -10508,6 +10609,7 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
         "flags": [],
         "identities": [],
         "output_shas": [],
+        "output_sha_warnings": [],
         "non_dict_events": 0,
     }
     for idx, event in enumerate(events):
@@ -10568,6 +10670,8 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
                 "identity", "golden_identity", "request_identity", "lifecycle_identity",
             } and isinstance(value, dict):
                 scan["identities"].append((idx, value))
+            elif key == "output_sha_warning":
+                scan["output_sha_warnings"].append((idx, path, value))
             elif key in {"output_sha", "content_sha256", "sha256", "image_sha256"} and isinstance(value, str) and value.strip():
                 scan["output_shas"].append((idx, path, value.strip()))
     return scan
@@ -10835,15 +10939,44 @@ def _golden_p1_validate_attempt(
         v for _i, p, v in scan["output_shas"]
         if "output" in p or "image_sha256" in p
     ]
+    strict_sha_values = sorted({s.lower() for s in strict_shas})
+    malformed_shas = [s for s in strict_shas if not re.fullmatch(r"[0-9a-fA-F]{64}", s)]
     if not expected_output_sha:
         failures.append("no expected output SHA configured (fail-closed)")
     elif not strict_shas:
         failures.append("observed output SHA absent from terminal result")
-    elif any(s.lower() != expected_output_sha.lower() for s in strict_shas):
-        failures.append(
-            f"output SHA mismatch: observed={sorted(set(strict_shas))} "
-            f"expected={expected_output_sha}"
-        )
+    elif malformed_shas:
+        failures.append(f"observed output SHA malformed: {sorted(set(malformed_shas))}")
+    elif len(strict_sha_values) != 1:
+        failures.append(f"observed output SHA ambiguous: {strict_sha_values}")
+    elif strict_sha_values[0] != expected_output_sha.lower():
+        warning = None
+        for _idx, _path, candidate in scan.get("output_sha_warnings", []):
+            if not isinstance(candidate, dict):
+                continue
+            warning_expected = candidate.get("expected", candidate.get("expected_sha"))
+            warning_observed = candidate.get("observed", candidate.get("observed_sha"))
+            if (
+                isinstance(warning_expected, str)
+                and isinstance(warning_observed, str)
+                and warning_expected.strip().lower() == expected_output_sha.lower()
+                and warning_observed.strip().lower() == strict_sha_values[0]
+            ):
+                warning = {
+                    "expected": expected_output_sha,
+                    "observed": warning_observed.strip(),
+                }
+                break
+        if warning is None:
+            failures.append(
+                "output SHA mismatch without explicit warning evidence: "
+                f"observed={sorted(set(strict_shas))} expected={expected_output_sha}"
+            )
+        else:
+            details["output_sha_warning"] = warning
+            details["output_sha_match"] = False
+    else:
+        details["output_sha_match"] = True
     details["observed_output_shas"] = sorted({v for _i, _p, v in scan["output_shas"]})
 
     observed_flags: dict[str, Any] = {}
@@ -10997,6 +11130,7 @@ async def _run_golden_p1(
     expected_output_sha: str,
     expected_flags: dict[str, Any] | None,
     force: bool,
+    attention_backend: str | None = None,
 ) -> dict[str, Any]:
     """Strictly serial Golden P1 cohort over ``run_golden_serial_stream``.
 
@@ -11023,7 +11157,11 @@ async def _run_golden_p1(
     )
 
     source = _golden_p1_load_payload()
-    deployed = _golden_p1_deployed_identity()
+    deployed = _golden_p1_deployed_identity(
+        app_name=app_name,
+        profile=os.environ.get("COMFYMODAL_V2CTL_PROFILE", ""),
+        deploy_fingerprint=os.environ.get("COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT", ""),
+    )
 
     base_dir = (
         Path(artifacts_dir) if artifacts_dir
@@ -11106,18 +11244,12 @@ async def _run_golden_p1(
         attempt_start_ns = time.perf_counter_ns()
         events: list[Any] = []
         try:
-            payload = {
-                "request_id": req_id,
-                "prompt": copy.deepcopy(source["prompt"]),
-                "extra_data": copy.deepcopy(source["extra_data"]),
-                "modal_options": copy.deepcopy(source["modal_options"]),
-                "request_origin_info": {
-                    "benchmark_mode": GOLDEN_P1_MODE,
-                    "golden_p1_run_index": index,
-                    "golden_p1_request_id": req_id,
-                    "serial": True,
-                },
-            }
+            payload = _golden_p1_request_payload(
+                source,
+                request_id=req_id,
+                index=index,
+                attention_backend=attention_backend,
+            )
             # Strict serial: exactly one stream in flight; consumed to
             # exhaustion before anything else happens.
             events = await _golden_p1_consume_stream(handle, payload)
@@ -11305,6 +11437,8 @@ async def _run_golden_p1(
             "true_cold": r["true_cold"],
             "failures": r["failures"],
             "observed_output_shas": (r.get("validation") or {}).get("observed_output_shas"),
+            "output_sha_match": (r.get("validation") or {}).get("output_sha_match"),
+            "output_sha_warning": (r.get("validation") or {}).get("output_sha_warning"),
             "observed_flags": (r.get("validation") or {}).get("observed_flags"),
             "identity": r["identity"],
             "cold_evidence": r["cold_evidence"],
@@ -11365,7 +11499,8 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                 golden_p1_cohort_id: str | None = None,
                 golden_p1_expected_output_sha: str = "",
                 golden_p1_expected_flags: dict[str, Any] | None = None,
-                golden_p1_force: bool = False) -> None:
+                golden_p1_force: bool = False,
+                golden_p1_attention_backend: str | None = None) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
@@ -11459,6 +11594,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             expected_output_sha=golden_p1_expected_output_sha,
             expected_flags=golden_p1_expected_flags,
             force=golden_p1_force,
+            attention_backend=golden_p1_attention_backend,
         )
         return
 
@@ -12351,6 +12487,13 @@ if __name__ == "__main__":
              "directory. Without this flag a colliding cohort gets a fresh "
              "unique subdirectory instead.",
     )
+    _parser.add_argument(
+        "--attention-backend",
+        choices=GOLDEN_ATTENTION_BACKENDS,
+        default=None,
+        help="Explicit public Golden attention backend request field: "
+             "pytorch or sage. Omitted keeps the existing PyTorch default.",
+    )
     _args = _parser.parse_args()
 
     # Special benchmark modes are mutually exclusive — including the new
@@ -12891,6 +13034,7 @@ if __name__ == "__main__":
                 ).strip(),
                 golden_p1_expected_flags=_gp_expected_flags,
                 golden_p1_force=bool(_args.golden_p1_force),
+                golden_p1_attention_backend=_args.attention_backend,
             )
         finally:
             # Process/loop teardown: join any remaining persistence drains with

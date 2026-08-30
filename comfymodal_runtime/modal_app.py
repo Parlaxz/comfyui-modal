@@ -48,7 +48,12 @@ from .contracts import (
     stable_hash,
 )
 from . import contracts as _contracts_mod
-from .deployment_spec import build_deployment_identity
+from .deployment_spec import (
+    DEPLOYMENT_HASH_NAMESPACE,
+    build_deployment_identity,  # compatibility export for legacy test doubles
+    validate_persisted_identity_pair,
+    validate_canonical_boundary_identity,
+)
 from .publication_policy import resolve_custom_nodes_root
 from .env import (
     env_flag,
@@ -279,7 +284,11 @@ except Exception:
 
 APP_NAME = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow").strip() or "stable-modal-comfy-v2-shadow"
 MODELS_VOLUME_NAME = os.environ.get("COMFYMODAL_MODELS_VOLUME", "comfyui-models")
-CUSTOM_NODES_VOLUME_NAME = os.environ.get("COMFYMODAL_CUSTOM_NODES_VOLUME", "comfyui-custom-nodes")
+from comfymodal_runtime.publication_policy import CUSTOM_NODES_VOLUME_NAME as _DEFAULT_CUSTOM_NODES_VOLUME_NAME
+
+CUSTOM_NODES_VOLUME_NAME = os.environ.get(
+    "COMFYMODAL_CUSTOM_NODES_VOLUME", _DEFAULT_CUSTOM_NODES_VOLUME_NAME
+)
 RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "comfymodal-runtime-config")
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
@@ -530,11 +539,9 @@ _RESIDENCY_DIAGNOSTICS_ENABLED: bool = observability_gate(
 _V2_FULL_TRACE_ENABLED: bool = observability_gate(
     "COMFYMODAL_V2_FULL_TRACE", "full_trace",
 )
-# C9 queue-depth shadow image extras (Batch C9, default OFF).  When set to
-# '1' at deploy time the V2 image additionally installs the external loader
-# packages benchmarked by the C9 queue-depth probe (runai-model-streamer,
-# fastsafetensors).  Unset => the production image is unchanged.
-_V2_C9QD_EXTRAS_ENABLED: bool = env_flag("COMFYMODAL_V2_C9QD_EXTRAS", default=False)
+# Image dependencies are owned by comfyapp's canonical image plan.  Keep this
+# module free of package-install policy; optional diagnostics belong in that
+# explicitly gated builder and never in runtime construction.
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
@@ -3132,6 +3139,7 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         cpu_request=actual.cpu,
         memory_request=actual.memory,
     )
+    canonical_identity = _MODAL_RESOURCES.get("canonical_identity")
     return {
         # â”€â”€ App / class identity (from remote-observed values) â”€â”€â”€â”€â”€â”€â”€â”€
         "app_name": actual.app_name,
@@ -3165,6 +3173,16 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         },
         # ── Snapshot target fingerprint ──
         "fingerprint": _snapshot_target_fingerprint(actual),
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "deployment_hash": (
+            canonical_identity.deployment if canonical_identity is not None else ""
+        ),
+        "canonical_identity": (
+            canonical_identity.to_dict()
+            if canonical_identity is not None
+            and callable(getattr(canonical_identity, "to_dict", None))
+            else None
+        ),
     }
 
 
@@ -3252,8 +3270,7 @@ def _snapshot_target_fingerprint(
     startup/restore/request boundaries.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
-    _source_id = _MODAL_RESOURCES.get("source_identity")
-    _combined = _source_id.combined_hash if _source_id is not None else ""
+    _canonical = _MODAL_RESOURCES.get("canonical_identity")
 
     # Registered remote class name (decorated V2 subclass or base fallback)
     _registered_cls = globals().get("ModalRuntimeEntrypointV2", ModalRuntimeEntrypoint)
@@ -3305,15 +3322,16 @@ def _snapshot_target_fingerprint(
         "profile_volume_name": actual.profile_volume_name,
         "volume_mount_paths": _vol_mount_paths,
         # ── Source / env (static deployment config only) ─────────────────
-        "source_combined_hash": _combined,
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "deployment_hash": (
+            _canonical.deployment if _canonical is not None else ""
+        ),
         "runtime_env": _env,
         "runtime_shape": runtime_shape_config(
             cpu_request=actual.cpu,
             memory_request=actual.memory,
         ).identity_payload(),
-        "effective_deployment_combined_hash": globals().get(
-            "_V2_DEPLOYMENT_COMBINED_HASH", ""
-        ),
+        "effective_deployment_hash": globals().get("_V2_DEPLOYMENT_COMBINED_HASH", ""),
         "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
         "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
     }
@@ -3556,6 +3574,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # reach the deployed runtime.
         "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+        ),
+        # RA1 sampler decomposition diagnostics must cross Modal's class-env
+        # boundary; otherwise the profile can be correct at deploy time while
+        # the request container silently resolves the deep profile to off.
+        "COMFYMODAL_SAMPLING_DEEP_PROFILE": os.environ.get(
+            "COMFYMODAL_SAMPLING_DEEP_PROFILE", "off"
         ),
         # Preserve the v2ctl profile selector beside the Golden gate so the
         # container can make the same profile decision as the deploy process.
@@ -4202,62 +4226,24 @@ def _load_cpu_snapshot_vae(
 
 
 def _reference_image() -> Any:
-    """Build the V2 shadow deployment image from the production base.
+    """Return the finished image from the canonical image-plan owner.
 
-    Uses ``_image_base`` (pre-local-sources) so that the V2 source modules
-    can be appended legally — Modal requires that all build steps
-    (``.pip_install``, ``.run_commands``, ``.env()``, ``.add_local_dir``)
-    precede ``.add_local_python_source()``, and ``_image_base`` already
-    satisfies that constraint.
-
-    When ``COMFYMODAL_V2_FULL_TRACE=1`` is set in the deploy-time environment,
-    installs ``viztracer==1.1.1`` via ``image.pip_install()`` **before** any
-    ``add_local_python_source`` calls.  Disabled (default) does not install it.
-
-    Environment variables (snapshot flags, full-trace, warmup profile, memory)
-    are **not** set here via ``image.env()`` — they are propagated at deploy
-    time via the class-level ``env=`` parameter in
-    ``_register_remote_entrypoint`` using ``_runtime_env()``.  This avoids
-    adding build steps to an image whose base may already contain
-    ``add_local_dir``/``add_local_file`` operations.
+    This compatibility name remains because the shadow deployment imports it;
+    it deliberately performs no package installation and no source mutation.
     """
     try:
         legacy = importlib.import_module("comfyapp")
-        # Use _image_base (pre-local-sources).  comfyapp.image already has
-        # add_local_python_source applied and cannot be further modified with
-        # build-step commands.
-        base = getattr(legacy, "_image_base", None)
-        if base is None:
-            # Fallback: attempt the fully-built image (risks build-order
-            # rejection, but avoids hard crash when _image_base is absent)
-            base = getattr(legacy, "image", None)
-            if base is None:
-                raise RuntimeError("comfyapp._image_base and .image are unavailable")
-        image = base
-        # Install viztracer before add_local_python_source when full-trace is enabled
-        if _V2_FULL_TRACE_ENABLED:
-            image = image.pip_install("viztracer==1.1.1")
-        # fastsafetensors is required by the D-phase UNET/CLIP fastsafetensors
-        # runtime paths (runtime-gated by COMFYMODAL_V2_UNET_FASTSAFETENSORS /
-        # COMFYMODAL_V2_CLIP_FAST_HYDRATION), so image content changes do NOT
-        # change runtime behavior when those flags are off.
-        image = image.pip_install("fastsafetensors==0.3.3")
-        # Batch C9 queue-depth shadow extras (default off; production image
-        # unchanged when COMFYMODAL_V2_C9QD_EXTRAS is unset).
-        if _V2_C9QD_EXTRAS_ENABLED:
-            image = image.pip_install(
-                "runai-model-streamer==0.16.1",
-            )
-        for module_name in V2_SOURCE_MODULES:
-            # ── E29 source-identity fix: bake sources into the image ─────
-            # copy=False (the default) attaches a STARTUP MOUNT resolved by
-            # importlib.find_spec at container start — which can silently
-            # resolve a stale/different path and serve OLD Python bytes even
-            # after a fresh deploy (observed: deployed class lacked
-            # source_identity_probe while the local file had it).  copy=True
-            # snapshots the CURRENT local bytes into the image layer at build
-            # time, so the deployed class provably runs THIS source tree.
-            image = image.add_local_python_source(module_name, copy=True)
+        # Reuse the already-constructed plan; rebuilding equivalent descendants
+        # here would create a second image DAG and defeat cache locality.
+        plan = getattr(legacy, "CANONICAL_IMAGE_PLAN", None)
+        if plan is None:
+            plan_builder = getattr(legacy, "build_canonical_image_plan", None)
+            plan = plan_builder() if callable(plan_builder) else None
+        if plan is None:
+            raise RuntimeError("comfyapp canonical image plan is unavailable")
+        image = getattr(plan, "final_image", None) or getattr(plan, "source", None)
+        if image is None:
+            raise RuntimeError("comfyapp canonical image plan has no finished image")
         return image
     except Exception as exc:
         raise RuntimeError("unable to build v2 image from the working ComfyUI image") from exc
@@ -4270,9 +4256,41 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         cpu_request=runtime_spec.cpu,
         memory_request=runtime_spec.memory,
     )
-    runtime_root = Path(__file__).resolve().parent
-    custom_root = _local_custom_nodes_root()
-    identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
+    legacy = importlib.import_module("comfyapp")
+    plan = getattr(legacy, "CANONICAL_IMAGE_PLAN", None)
+    if plan is None:
+        plan_builder = getattr(legacy, "build_canonical_image_plan", None)
+        plan = plan_builder() if callable(plan_builder) else None
+    if plan is None:
+        raise RuntimeError("canonical image plan is unavailable")
+    # Preserve the legacy DeploymentIdentity field for existing callers; the
+    # canonical typed boundary identity is carried alongside it below.  Both
+    # must be present and the compatibility hash must alias the canonical
+    # deployment namespace before resources can be constructed.
+    identity = getattr(plan, "source_identity", None)
+    canonical_identity = getattr(plan, "identity", None)
+    if identity is None:
+        raise RuntimeError("canonical source identity is missing")
+    if canonical_identity is None:
+        raise RuntimeError("canonical deployment identity is missing")
+    validate_canonical_boundary_identity(canonical_identity)
+    if (
+        identity.source_bytes <= 0
+        or not identity.runtime_hash
+        or not identity.dependency_hash
+        or not identity.custom_node_hash
+    ):
+        raise RuntimeError("canonical source identity is incomplete")
+    if identity.hash_namespace != DEPLOYMENT_HASH_NAMESPACE:
+        raise RuntimeError("canonical source identity hash namespace is unsupported")
+    if identity.combined_hash != canonical_identity.deployment:
+        raise RuntimeError(
+            "canonical source/deployment identity hash mismatch"
+        )
+    try:
+        validate_persisted_identity_pair(identity, canonical_identity)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     if _modal is None:
         return {
             "app": None,
@@ -4283,11 +4301,12 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "profile_volume": None,
             "prompt_cache_volume": None,
             "source_identity": identity,
+            "canonical_identity": canonical_identity,
             "spec": runtime_spec,
             "runtime_shape": runtime_shape.identity_payload(),
         }
 
-    image = _reference_image()
+    image = getattr(plan, "final_image", None) or _reference_image()
     models_volume = _modal.Volume.from_name(runtime_spec.models_volume_name, create_if_missing=True)
     custom_nodes_volume = _modal.Volume.from_name(runtime_spec.custom_nodes_volume_name, create_if_missing=True)
     runtime_state_volume = _modal.Volume.from_name(runtime_spec.runtime_state_volume_name, create_if_missing=True)
@@ -4318,6 +4337,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "profile_volume": profile_volume,
         "prompt_cache_volume": prompt_cache_volume,
         "source_identity": identity,
+        "canonical_identity": canonical_identity,
         "spec": runtime_spec,
         "runtime_shape": runtime_shape.identity_payload(),
     }
@@ -6176,6 +6196,12 @@ class ModalRuntimeEntrypoint:
         self._legacy_module: Any | None = None
         self._legacy_api: Any | None = None
         self._runtime_configured = False
+        # Restore-only handoff between the authoritative custom-node identity
+        # read and its possible fallback sync.  These markers are deliberately
+        # not useful during construction or ordinary request execution.
+        self._restore_custom_node_identity_scope_active = False
+        self._restore_custom_node_identity_epoch = 0
+        self._restore_custom_node_identity_cache: dict[str, Any] | None = None
         self._restore_plan: RestorePlan | None = None
         self._preload_bridge = V2LoaderBridge()
         self._lifecycle_trace: RuntimeTrace | None = None
@@ -9004,9 +9030,8 @@ class ModalRuntimeEntrypoint:
         api = self._load_legacy_runtime()
         module = self._legacy_module
 
-        # Make the canonical deployment combined hash available to the loaded
-        # comfyapp module so that ``_resolve_deployment_combined_hash()``
-        # returns the builder-computed value on first priority.
+        # Make the canonical image-plan deployment hash available to the
+        # loaded comfyapp module for its compatibility resolver.
         module._CANONICAL_DEPLOYMENT_COMBINED_HASH = _V2_DEPLOYMENT_COMBINED_HASH
 
         # ── Restore-accounting timer wrappers ──
@@ -9037,6 +9062,55 @@ class ModalRuntimeEntrypoint:
             global _RUNTIME_STATE_VOLUME_RELOADED_MONO
             _RUNTIME_STATE_VOLUME_RELOADED_MONO = time.monotonic()
 
+        def _valid_restore_custom_node_identity(identity: Any) -> bool:
+            """Accept only a complete identity produced by the mounted read."""
+            if type(identity) is not dict:
+                return False
+            if not isinstance(identity.get("custom_node_generation"), str):
+                return False
+            if not identity["custom_node_generation"]:
+                return False
+            if identity.get("generation_source") not in {
+                "persisted_record",
+                "mounted_volume_record",
+                "volume_record",
+            }:
+                return False
+            if identity.get("identity_read_reason") != "mounted_volume_record":
+                return False
+            return all(
+                isinstance(identity.get(key), str)
+                for key in (
+                    "generation_source",
+                    "identity_read_reason",
+                    "schema_version",
+                    "deployment_combined_hash",
+                    "token",
+                )
+            )
+
+        def _peek_restore_custom_node_identity() -> dict[str, str] | None:
+            """Return a valid same-restore identity, otherwise fail closed."""
+            if not getattr(self, "_restore_custom_node_identity_scope_active", False):
+                return None
+            cache = getattr(self, "_restore_custom_node_identity_cache", None)
+            if type(cache) is not dict:
+                return None
+            if cache.get("epoch") != getattr(
+                self, "_restore_custom_node_identity_epoch", None
+            ):
+                return None
+            identity = cache.get("identity")
+            if not _valid_restore_custom_node_identity(identity):
+                return None
+            return dict(identity)
+
+        def _consume_restore_custom_node_identity() -> dict[str, str] | None:
+            """Consume the one-shot read result, or force the old reload path."""
+            identity = _peek_restore_custom_node_identity()
+            self._restore_custom_node_identity_cache = None
+            return identity
+
         def sync_custom_nodes() -> Any:
             # The image already contains the production custom nodes.  Avoid
             # copying the volume over them when the persisted generation is an
@@ -9062,31 +9136,46 @@ class ModalRuntimeEntrypoint:
                     )
                     or ""
                 )
-                _custom_nodes_volume = getattr(module, "custom_nodes_vol", None)
-                if _custom_nodes_volume is not None:
-                    _reload = getattr(_custom_nodes_volume, "reload", None)
-                    if callable(_reload):
-                        _reload()
-                try:
-                    _cn_diag_root = getattr(module, "CUSTOM_NODES_PATH", "")
-                    if _cn_diag_root and os.path.isdir(_cn_diag_root):
-                        _cn_diag = module.custom_node_filter_diagnostics(_cn_diag_root)
-                        print(
-                            "[v2.custom_node_filter] "
-                            f"total_source_dirs={_cn_diag['total_source_dirs']} "
-                            f"accepted_dirs={_cn_diag['accepted_dirs']} "
-                            f"duplicate_comfymodal_dirs={_cn_diag['duplicate_comfymodal_dirs']} "
-                            f"duplicate_names={_cn_diag['duplicate_names_bounded']}",
-                            flush=True,
-                        )
-                except Exception:
-                    pass
-                _current_generation, _current_source = (
-                    module._resolve_custom_nodes_generation(
-                        api=api, authoritative_only=True
-                    )
+                _cached_identity = (
+                    None if _construction else _consume_restore_custom_node_identity()
                 )
-                _current_generation = str(_current_generation or "")
+                if _cached_identity is not None:
+                    # read_current_custom_node_identity already reloaded the
+                    # authoritative mount immediately before this callback.
+                    # Reuse that exact result for this restore decision.
+                    _current_generation = str(
+                        _cached_identity.get("custom_node_generation", "") or ""
+                    )
+                    _current_source = str(
+                        _cached_identity.get("generation_source", "unavailable")
+                        or "unavailable"
+                    )
+                else:
+                    _custom_nodes_volume = getattr(module, "custom_nodes_vol", None)
+                    if _custom_nodes_volume is not None:
+                        _reload = getattr(_custom_nodes_volume, "reload", None)
+                        if callable(_reload):
+                            _reload()
+                    try:
+                        _cn_diag_root = getattr(module, "CUSTOM_NODES_PATH", "")
+                        if _cn_diag_root and os.path.isdir(_cn_diag_root):
+                            _cn_diag = module.custom_node_filter_diagnostics(_cn_diag_root)
+                            print(
+                                "[v2.custom_node_filter] "
+                                f"total_source_dirs={_cn_diag['total_source_dirs']} "
+                                f"accepted_dirs={_cn_diag['accepted_dirs']} "
+                                f"duplicate_comfymodal_dirs={_cn_diag['duplicate_comfymodal_dirs']} "
+                                f"duplicate_names={_cn_diag['duplicate_names_bounded']}",
+                                flush=True,
+                            )
+                    except Exception:
+                        pass
+                    _current_generation, _current_source = (
+                        module._resolve_custom_nodes_generation(
+                            api=api, authoritative_only=True
+                        )
+                    )
+                    _current_generation = str(_current_generation or "")
                 if _baked_generation and _current_generation:
                     if _baked_generation == _current_generation:
                         print(
@@ -9267,7 +9356,38 @@ class ModalRuntimeEntrypoint:
         restore_gpu_state = _wrap_restore_stage("restore_gpu_state", restore_gpu_state)
         initialize_cuda = _wrap_restore_stage("initialize_cuda", initialize_cuda)
 
+        def select_sage_runtime_mode() -> dict[str, Any]:
+            """Use the normal permissive Sage selector after CUDA restore.
+
+            Strict/native-only Sage validation belongs to the explicit Golden
+            request scope in ``golden_serial.py``; it must not become a
+            restore-wide policy for ordinary V2 requests.
+            """
+            mode, reason = api._select_sage_runtime_mode()
+            identity = getattr(api, "_sage_probe_identity", None)
+            if not isinstance(identity, dict):
+                identity = {}
+            return {
+                "mode": str(mode),
+                "reason": str(reason),
+                "identity": dict(identity),
+                "selection": "normal_restore",
+            }
+
+        def select_golden_sage_runtime_mode() -> dict[str, Any]:
+            """Select Golden's baked mode without probing after CUDA restore."""
+            # A Golden snapshot can carry the CPU-snapshot fallback in the API
+            # instance.  Clear only that sticky value at this callback boundary
+            # so the existing env-override path selects the baked runtime
+            # without entering the native smoke probe.
+            api._sage_runtime_mode = None
+            api._sage_runtime_reason = ""
+            return select_sage_runtime_mode()
+
         def apply_sage_policy() -> Any:
+            # Keep the historical permissive policy.  Explicit Golden Sage
+            # strictness is installed only around that request's active UNET
+            # in golden_serial.py.
             return api._apply_sage_attention_policy()
 
         def observe_generations() -> dict[str, str]:
@@ -9279,17 +9399,39 @@ class ModalRuntimeEntrypoint:
             }
 
         def read_current_custom_node_identity() -> dict[str, str]:
-            """Authoritative-only current identity read via API token API."""
+            """Read current identity from a freshly reloaded custom-node Volume.
+
+            The API instance field may have been restored with the memory
+            snapshot, so it is never consulted for this restore decision.
+            Reloading the mounted Volume is intentional: the generation
+            record is the authoritative source and may not be replaced by a
+            network-free in-memory guess.
+            """
+            # A restore may perform this same authoritative read once for the
+            # Sage verifier before the custom-node guard.  Reuse the valid
+            # mounted result rather than reloading the same Volume; the sync
+            # callback remains the one-shot consumer below.
+            cached_identity = _peek_restore_custom_node_identity()
+            if cached_identity is not None:
+                return cached_identity
             result: dict[str, str] = {
                 "custom_node_generation": "",
                 "generation_source": "unavailable",
+                "identity_read_reason": "unavailable",
                 "schema_version": "0",
                 "deployment_combined_hash": "",
                 "token": "",
             }
             try:
-                # Use the module's _resolve_custom_nodes_generation with
-                # API token only — no directory scan, no hash.
+                volume = getattr(module, "custom_nodes_vol", None)
+                reload_volume = getattr(volume, "reload", None)
+                if not callable(reload_volume):
+                    result["identity_read_reason"] = "volume_reload_unavailable"
+                    return result
+                reload_volume()
+                result["identity_read_reason"] = "mounted_volume_reloaded"
+                # authoritative_only excludes the snapshot-restored API field;
+                # this remains an O(1) generation-record read after reload.
                 cn_gen, cn_src = module._resolve_custom_nodes_generation(
                     api=api,
                     authoritative_only=True,
@@ -9299,12 +9441,23 @@ class ModalRuntimeEntrypoint:
                     result["generation_source"] = str(cn_src)
                     result["schema_version"] = "1"
                     result["deployment_combined_hash"] = _V2_DEPLOYMENT_COMBINED_HASH
+                    result["identity_read_reason"] = "mounted_volume_record"
+                else:
+                    result["identity_read_reason"] = "mounted_volume_record_missing"
                 # Capture API token
                 token = getattr(api, "_runtime_generation_seen", "")
                 if token:
                     result["token"] = str(token)
-            except Exception:
-                pass
+            except Exception as exc:
+                result["identity_read_reason"] = f"volume_identity_read_error:{type(exc).__name__}"
+            if (
+                getattr(self, "_restore_custom_node_identity_scope_active", False)
+                and _valid_restore_custom_node_identity(result)
+            ):
+                self._restore_custom_node_identity_cache = {
+                    "epoch": getattr(self, "_restore_custom_node_identity_epoch", None),
+                    "identity": dict(result),
+                }
             return result
 
         config = self._config or BootstrapConfig(
@@ -9316,6 +9469,7 @@ class ModalRuntimeEntrypoint:
             min_containers=MIN_CONTAINERS,
             scaledown_window=SCALEDOWN_WINDOW,
         )
+        restore_wide_sage_policy = not _golden_serial_profile_active()
         self.bootstrap = RuntimeBootstrap(
             config,
             reload_models=reload_models,
@@ -9325,7 +9479,18 @@ class ModalRuntimeEntrypoint:
             start_backend=start_backend,
             restore_gpu_state=restore_gpu_state,
             initialize_cuda=initialize_cuda,
+            # Ordinary restores retain the normal wide Sage policy.  Golden
+            # uses its stale-mode-clearing selector instead; the selector's
+            # presence forces Golden selection without enabling the ordinary
+            # restore-wide force flag.  This is lifecycle policy, not sampler
+            # or request attention_backend routing.
+            select_sage_runtime_mode=(
+                select_sage_runtime_mode
+                if restore_wide_sage_policy
+                else select_golden_sage_runtime_mode
+            ),
             apply_sage_policy=apply_sage_policy,
+            force_sage_selection_after_restore=restore_wide_sage_policy,
             observe_generations=observe_generations,
             read_current_custom_node_identity=read_current_custom_node_identity,
             deployment_combined_hash=_V2_DEPLOYMENT_COMBINED_HASH,
@@ -10659,6 +10824,7 @@ class ModalRuntimeEntrypoint:
                     model_ctx=getattr(self, "_cpu_snapshot_models", None),
                     extra={"lifecycle": "startup", "snap": "True"},
                     quiescence=_snapshot_quiescence,
+                    selected_roots=_golden_pre_capture_surfaces,
                 )
                 if isinstance(_manifest_record, dict):
                     _restore_timing["snapshot_manifest"] = _manifest_record
@@ -11090,14 +11256,24 @@ class ModalRuntimeEntrypoint:
         # (diagnostic only; default off — never enabled on measured runs).
         # Same capture as startup's ``before_capture`` so the two manifests
         # can be diffed to see exactly what the restore changed.
+        _restore_snapshot_manifest: dict[str, Any] | None = None
         try:
             if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
                 from .snapshot_build_manifest import capture_snapshot_manifest
-                capture_snapshot_manifest(
+                _restore_manifest_surfaces: dict[str, list[Any]] | None = None
+                if _golden_serial_profile_active():
+                    try:
+                        _restore_manifest_surfaces = self._golden_snapshot_proof_surfaces()
+                    except Exception:
+                        _restore_manifest_surfaces = None
+                _restore_snapshot_manifest = capture_snapshot_manifest(
                     "first_restored_line",
                     model_ctx=getattr(self, "_cpu_snapshot_models", None),
                     extra={"lifecycle": "restore", "snap": "False"},
+                    selected_roots=_restore_manifest_surfaces,
                 )
+                if isinstance(self._restore_timing, dict):
+                    self._restore_timing["snapshot_manifest_restore"] = _restore_snapshot_manifest
         except Exception:
             pass
         _restore_stage_started = _v2_startup_stage("post_snapshot_restore", "start")
@@ -11318,6 +11494,17 @@ class ModalRuntimeEntrypoint:
         # restore finalization creates the new value after all restore work.
         self._post_restore_nonce = ""
         self._restore_session_id = ""
+        # Start a fresh, restore-only handoff window.  The identity callback
+        # may populate this cache and the fallback sync consumes it once;
+        # construction and ordinary requests never enter this scope.
+        try:
+            self._restore_custom_node_identity_epoch = int(
+                getattr(self, "_restore_custom_node_identity_epoch", 0)
+            ) + 1
+        except Exception:
+            self._restore_custom_node_identity_epoch = 1
+        self._restore_custom_node_identity_cache = None
+        self._restore_custom_node_identity_scope_active = True
         # Reset process-global restore-stage timers at entry to prevent
         # stale accumulation across restores.  Each restore gets its own
         # timing state.
@@ -11643,6 +11830,28 @@ class ModalRuntimeEntrypoint:
                     "restore_method_end_mono_ns": _restore_end_mono_ns,
                     "restore_method_status": "error",
                 }
+                # Bootstrap records these maps as it reaches each existing
+                # restore boundary. Keep partial results when a later
+                # callback raises so error timing remains authoritative.
+                _bootstrap_state = getattr(self.bootstrap, "state", None)
+                _stage_classifications = getattr(
+                    _bootstrap_state, "restore_stage_classifications", {}
+                )
+                _guard_decisions = getattr(
+                    _bootstrap_state, "restore_generation_guard_decisions", {}
+                )
+                err_timing["restore_stage_classifications"] = (
+                    dict(_stage_classifications)
+                    if isinstance(_stage_classifications, dict) else {}
+                )
+                err_timing["restore_generation_guard_decisions"] = (
+                    {
+                        str(key): dict(value)
+                        for key, value in _guard_decisions.items()
+                        if isinstance(value, Mapping)
+                    }
+                    if isinstance(_guard_decisions, dict) else {}
+                )
                 self._restore_timing = err_timing
                 _LATEST_LIFECYCLE_TIMING = err_timing
                 print(
@@ -12220,7 +12429,15 @@ class ModalRuntimeEntrypoint:
                     # This redundancy ensures the wrapper is installed regardless
                     # of which code path activates the UNET.
                     from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
-                    ensure_sampling_timing_wrapper(models.unet)
+                    _sampling_wrapper_installed = ensure_sampling_timing_wrapper(models.unet)
+                    trace.emit(
+                        "sampling_wrapper_install",
+                        phase="diagnostics",
+                        metadata={
+                            "installed": bool(_sampling_wrapper_installed),
+                            "source": "snapshot_unet",
+                        },
+                    )
                     install_registered_unet_forward_hooks()
                     # ── 10. cachedit_restore_prepare ──
                     _cd_restore_node_ids: list[str] = []
@@ -12259,7 +12476,15 @@ class ModalRuntimeEntrypoint:
                                         )
                                         register_unet_forward_probe(_patched_model, source="cachedit_restore")
                                         from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
-                                        ensure_sampling_timing_wrapper(_patched_model)
+                                        _sampling_wrapper_installed = ensure_sampling_timing_wrapper(_patched_model)
+                                        trace.emit(
+                                            "sampling_wrapper_install",
+                                            phase="diagnostics",
+                                            metadata={
+                                                "installed": bool(_sampling_wrapper_installed),
+                                                "source": "cachedit_patched_unet",
+                                            },
+                                        )
                                     _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
                                         "unet_id": id(_patched_model) if _patched_model is not None else id(models.unet),
                                         "workflow_hash": str(getattr(plan, "workflow_hash", "")),
@@ -12771,6 +12996,16 @@ class ModalRuntimeEntrypoint:
                 )
                 trace_local.emit("v2_restore_finalize_start", phase="restore")
                 trace_local.emit(
+                    "restore_stage_classification",
+                    phase="restore",
+                    metadata={
+                        "stage": "restore_finalization",
+                        "classification": "restored",
+                        "decision": "lifecycle_complete",
+                        "reason": "restore_work_completed",
+                    },
+                )
+                trace_local.emit(
                     "remote_lifecycle_end",
                     phase="restore",
                     metadata={"status": "restored"},
@@ -12812,6 +13047,19 @@ class ModalRuntimeEntrypoint:
                     for _stage, _dur_ms in state.stage_durations.items():
                         if _dur_ms is not None and _dur_ms > 0:
                             restore_timing_local[f"{_stage}_ms"] = round(float(_dur_ms), 3)
+                # Bootstrap owns these existing restore boundaries.  Preserve
+                # their classifications beside the timing record so a later
+                # report can distinguish carried, validated, reloaded, and
+                # reconstructed state without inferring from duration.
+                if getattr(state, "restore_stage_classifications", None):
+                    restore_timing_local["restore_stage_classifications"] = dict(
+                        state.restore_stage_classifications
+                    )
+                if getattr(state, "restore_generation_guard_decisions", None):
+                    restore_timing_local["restore_generation_guard_decisions"] = {
+                        str(key): dict(value)
+                        for key, value in state.restore_generation_guard_decisions.items()
+                    }
                 _REQUIRED_RESTORE_STAGES = (
                     "reload_runtime_state", "reload_models", "restore_gpu_state",
                     "initialize_cuda", "snapshot_identity_checks", "cpu_snapshot_retargeting",
@@ -13103,6 +13351,10 @@ class ModalRuntimeEntrypoint:
             # accumulation on the next restore.  This finally runs regardless
             # of success or cancellation.
             _RESTORE_STAGE_TIMERS.clear()
+            # The identity handoff is valid only until this restore exits;
+            # never let a later request or callback reuse it.
+            self._restore_custom_node_identity_cache = None
+            self._restore_custom_node_identity_scope_active = False
             if _restore_end_wall_ns is None:
                 _restore_end_wall_ns = int(time.time() * 1_000_000_000)
                 _restore_end_mono_ns = time.monotonic_ns()
@@ -17325,6 +17577,7 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_RESOURCE_TELEMETRY",
             "COMFYMODAL_V2_ENV_PROFILE",
             "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM",
+            "COMFYMODAL_SAMPLING_DEEP_PROFILE",
             "COMFYMODAL_V2_ATOMIC_PROFILE",
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
             "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
@@ -17795,6 +18048,7 @@ class ModalRuntimeEntrypoint:
                     _file_sha256_lf(os.path.join(_diag_cfr, _name)) if _diag_cfr else ""
                 )
             return {
+                "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
                 "deployment_combined_hash": _deployment_combined_hash,
                 "custom_nodes_generation": custom_nodes_generation,
                 "overall_dependency_hash": overall_dependency_hash,
@@ -17814,6 +18068,7 @@ class ModalRuntimeEntrypoint:
             }
         except Exception as exc:  # noqa: BLE001
             return {
+                "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
                 "deployment_combined_hash": "",
                 "custom_nodes_generation": "",
                 "overall_dependency_hash": "",
@@ -20870,6 +21125,7 @@ class ModalRuntimeEntrypoint:
         from .golden_serial import (
             GoldenRequest,
             golden_serial_execute,
+            normalize_attention_backend,
         )
 
         # Golden is a direct adapter and does not pass through
@@ -20889,6 +21145,11 @@ class ModalRuntimeEntrypoint:
             request_id_raw = request.get("request_id")
             if not isinstance(request_id_raw, str) or not request_id_raw.strip():
                 raise ValueError("golden_request_id_required_nonempty_string")
+            attention_backend = (
+                normalize_attention_backend(request["attention_backend"])
+                if "attention_backend" in request
+                else None
+            )
             prompt = request.get("prompt")
             if not isinstance(prompt, Mapping) or not prompt:
                 raise ValueError("golden_prompt_mapping_required")
@@ -20906,6 +21167,7 @@ class ModalRuntimeEntrypoint:
                 remote_identity=_capture_remote_identity(),
                 host_info=_capture_host_info(),
             )
+            identity_telemetry["attention_backend"] = attention_backend
 
             # Sanitized request id for the local telemetry path: keep only
             # path-safe characters and refuse traversal outside the golden dir.
@@ -20926,6 +21188,17 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_contract_override_not_allowed")
 
             volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
+            if volume is None:
+                # The volume is mounted via the function's ``volumes={...}``
+                # declaration, but the module-level resource fallback may not
+                # carry the live handle in the remote container.
+                try:
+                    import modal as _modal_fallback
+                    volume = _modal_fallback.Volume.from_name(
+                        RUNTIME_STATE_VOLUME_NAME, create_if_missing=False,
+                    )
+                except Exception:
+                    volume = None
             if volume is None:
                 raise RuntimeError("golden_runtime_state_volume_unavailable")
             volume_mount_root = _validate_golden_runtime_mount_root(volume)
@@ -21018,6 +21291,7 @@ class ModalRuntimeEntrypoint:
                 request_id=normalized_request_id,
                 prompt=dict(prompt),
                 extra_data=dict(extra_data_raw),
+                attention_backend=attention_backend,
             )
             self._golden_execution_active = True
             golden_call_start_wall_ns = time.time_ns()
@@ -21736,34 +22010,12 @@ globals()["ModalRuntimeEntrypointV2"] = (
     _v2_decorated_class if _v2_decorated_class is not None else ModalRuntimeEntrypoint
 )
 
-try:
-    _MODAL_RESOURCES = build_modal_resources()
-except Exception:
-    _MODAL_RESOURCES = {
-        "app": None,
-        "image": None,
-        "models_volume": None,
-        "custom_nodes_volume": None,
-        "runtime_state_volume": None,
-        "profile_volume": None,
-        "source_identity": None,
-        "spec": ModalRuntimeSpec(),
-        "runtime_shape": runtime_shape_config().identity_payload(),
-    }
-# Phase 1: Pre-compute deployment combined hash from the canonical
-# DeploymentIdentity / source_identity used by V2 resources.  This
-# stable nonempty value is what startup/restore/request consumers and
-# certificate / manifest expected identity paths all reference — never
-# an ad-hoc env hash or Modal image ID.
-_V2_DEPLOYMENT_COMBINED_HASH = (
-    _MODAL_RESOURCES.get("source_identity").combined_hash
-    if _MODAL_RESOURCES.get("source_identity") is not None
-    else ""
-)
-_V2_DEPLOYMENT_COMBINED_HASH = stable_hash({
-    "source_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
-    "runtime_shape": runtime_shape_config().identity_payload(),
-})
+_MODAL_RESOURCES = build_modal_resources()
+# ``deployment`` is the sole current deployment-hash authority.  The longer
+# compatibility name remains because existing request/manifest contracts use
+# it, but it is an alias—not a second hash over source identity/runtime shape.
+_V2_DEPLOYMENT_HASH_NAMESPACE = DEPLOYMENT_HASH_NAMESPACE
+_V2_DEPLOYMENT_COMBINED_HASH = _MODAL_RESOURCES["canonical_identity"].deployment
 # Modal CLI discovers the application through a module-level ``app`` object.
 # Keep the resource construction above as the single source of truth while
 # exposing the registered shadow app for ``modal deploy -m``.

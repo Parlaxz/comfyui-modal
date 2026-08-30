@@ -101,3 +101,8 @@ playwright-*.md
 
 # v2ctl local control-plane state (deploy/run manifests, locks, gates)
 .v2ctl/
+
+# Generated audit/deployment artifacts and temporary workspace bundles
+artifacts/
+.slim/
+*.bundle

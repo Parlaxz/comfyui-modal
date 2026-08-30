@@ -287,6 +287,14 @@ class TestGoldenGateRuntimePropagation(unittest.TestCase):
 
     _GATE_ENV = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
 
+    def test_runtime_env_projects_sampling_deep_profile(self):
+        env_name = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(modal_app._runtime_env()[env_name], "off")
+            os.environ[env_name] = "blocks"
+            self.assertEqual(modal_app._runtime_env()[env_name], "blocks")
+
     def test_runtime_env_projects_golden_gate_default_off(self):
         with patch.dict(os.environ, clear=False):
             os.environ.pop(self._GATE_ENV, None)
@@ -998,6 +1006,29 @@ class TestV2LifecycleFailureAndTimingExport(unittest.TestCase):
             self.assertIn("restore_total_ms", rt)
             self.assertIn("container_session_id", rt)
 
+    def test_restore_failure_preserves_bootstrap_restore_maps(self):
+        """Bootstrap classifications and guard decisions survive restore errors."""
+        def _boom():
+            raise RuntimeError("runtime state failed")
+
+        failing_bootstrap = modal_app.RuntimeBootstrap(
+            restore_gpu_state=lambda: None,
+            initialize_cuda=lambda: {"cuda_available": 1},
+            reload_runtime_state=_boom,
+        )
+        ep = modal_app.ModalRuntimeEntrypoint(bootstrap=failing_bootstrap)
+        with self.assertRaisesRegex(RuntimeError, "runtime state failed"):
+            ep.restore()
+
+        rt = modal_app._LATEST_LIFECYCLE_TIMING
+        self.assertIsNotNone(rt)
+        if rt is not None:
+            self.assertEqual(
+                rt["restore_stage_classifications"]["reload_runtime_state"],
+                "unknown",
+            )
+            self.assertIn("reload_runtime_state", rt["restore_generation_guard_decisions"])
+
     def test_startup_timing_contains_lifecycle_status_ok(self):
         tmp = tempfile.mkdtemp()
         ep = modal_app.ModalRuntimeEntrypoint(
@@ -1621,6 +1652,18 @@ class TestResolveCustomNodesGeneration(unittest.TestCase):
         self.assertEqual(val, "gen_from_record")
         self.assertEqual(src, "persisted_record")
 
+    def test_authoritative_only_ignores_snapshot_restored_api_field(self):
+        """Restore identity must come from the mounted generation record."""
+        api = SimpleNamespace(_custom_nodes_generation_seen="stale-from-snapshot")
+        with patch(
+            "comfyapp._read_custom_nodes_generation_record",
+            return_value={"generation": "mounted-generation"},
+        ):
+            val, src = _resolve_custom_nodes_generation(
+                api=api, authoritative_only=True
+            )
+        self.assertEqual((val, src), ("mounted-generation", "persisted_record"))
+
     def test_returns_empty_when_both_unavailable(self):
         """When both api field and persisted record are absent, returns missing."""
         api = SimpleNamespace(_custom_nodes_generation_seen="")
@@ -1676,6 +1719,146 @@ class TestResolveCustomNodesGeneration(unittest.TestCase):
         val, src = _resolve_custom_nodes_generation(api=None)
         self.assertIsInstance(val, str)
         self.assertIsInstance(src, str)
+
+
+class TestCustomNodeRestoreExactSkipAuthority(unittest.TestCase):
+    """The restore skip is authorized only by an explicit mounted-record source."""
+
+    @staticmethod
+    def _bootstrap(current: dict[str, str]):
+        calls: list[str] = []
+        bootstrap = RuntimeBootstrap(
+            sync_custom_nodes=lambda: calls.append("sync"),
+            read_current_custom_node_identity=lambda: dict(current),
+        )
+        bootstrap.state.snapshot_custom_node_generation = "mounted-generation"
+        bootstrap.state.snapshot_custom_node_schema = "1"
+        return bootstrap, calls
+
+    def test_snapshot_stale_instance_cannot_skip(self):
+        bootstrap, calls = self._bootstrap(
+            {
+                "custom_node_generation": "mounted-generation",
+                "generation_source": "instance",
+                "schema_version": "1",
+            }
+        )
+        bootstrap.restore()
+        self.assertEqual(calls, ["sync"])
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions["sync_custom_nodes"]["reason"],
+            "untrusted_source",
+        )
+
+    def test_exact_mounted_record_skips(self):
+        bootstrap, calls = self._bootstrap(
+            {
+                "custom_node_generation": "mounted-generation",
+                "generation_source": "persisted_record",
+                "schema_version": "1",
+            }
+        )
+        bootstrap.restore()
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications["sync_custom_nodes"],
+            "skipped",
+        )
+
+    def test_mounted_generation_mismatch_reloads(self):
+        bootstrap, calls = self._bootstrap(
+            {
+                "custom_node_generation": "different-generation",
+                "generation_source": "persisted_record",
+                "schema_version": "1",
+            }
+        )
+        bootstrap.restore()
+        self.assertEqual(calls, ["sync"])
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions["sync_custom_nodes"]["reason"],
+            "generation_mismatch",
+        )
+
+
+class TestModalCustomNodeRestoreReloadHandoff(unittest.TestCase):
+    """The restore identity read is reused by exactly one fallback sync."""
+
+    @staticmethod
+    def _configured_entry(current_generation: str):
+        reloads = []
+        syncs = []
+
+        class Volume:
+            def reload(self):
+                reloads.append("reload")
+
+        class API:
+            _custom_nodes_state = ()
+
+            def _sync_custom_nodes_from_volume(self):
+                syncs.append("sync")
+                return {"synced": True}
+
+        api = API()
+        module = SimpleNamespace(
+            custom_nodes_vol=Volume(),
+            load_baked_custom_node_dependency_manifest=lambda: {
+                "production_custom_node_generation": "baked-generation",
+            },
+            _resolve_custom_nodes_generation=lambda **_kwargs: (
+                current_generation,
+                "persisted_record",
+            ),
+        )
+        entry = modal_app.ModalRuntimeEntrypoint.__new__(
+            modal_app.ModalRuntimeEntrypoint
+        )
+        entry._config = None
+        entry._bootstrap_injected = False
+        entry._runtime_configured = False
+        entry._legacy_module = module
+        entry._legacy_api = api
+        entry._load_legacy_runtime = lambda: api
+        entry._restore_custom_node_identity_scope_active = True
+        entry._restore_custom_node_identity_epoch = 1
+        entry._restore_custom_node_identity_cache = None
+        entry._configure_runtime()
+        return entry, reloads, syncs
+
+    def test_exact_match_reuses_read_and_skips_sync(self):
+        entry, reloads, syncs = self._configured_entry("baked-generation")
+
+        identity = entry.bootstrap.read_current_custom_node_identity()
+        result = entry.bootstrap.sync_custom_nodes()
+
+        self.assertEqual(identity["custom_node_generation"], "baked-generation")
+        self.assertEqual(reloads, ["reload"])
+        self.assertEqual(syncs, [])
+        self.assertTrue(result[0]["skipped"])
+
+    def test_mismatch_fallback_does_one_reload(self):
+        entry, reloads, syncs = self._configured_entry("mounted-generation")
+
+        entry.bootstrap.read_current_custom_node_identity()
+        result = entry.bootstrap.sync_custom_nodes()
+
+        self.assertEqual(reloads, ["reload"])
+        self.assertEqual(syncs, ["sync"])
+        self.assertEqual(result, {"synced": True})
+
+    def test_cache_resets_between_restore_epochs(self):
+        entry, reloads, syncs = self._configured_entry("mounted-generation")
+
+        entry.bootstrap.read_current_custom_node_identity()
+        entry.bootstrap.sync_custom_nodes()
+        entry._restore_custom_node_identity_epoch = 2
+        entry._restore_custom_node_identity_cache = None
+        entry.bootstrap.read_current_custom_node_identity()
+        entry.bootstrap.sync_custom_nodes()
+
+        self.assertEqual(reloads, ["reload", "reload"])
+        self.assertEqual(syncs, ["sync", "sync"])
 
 
 # ── Sync actual-sync generation record creation ──────────────────────
@@ -2717,6 +2900,7 @@ import inspect
 import json
 
 _GOLDEN_METHOD_NAME = "run_golden_serial_stream"
+_GOLDEN_ATTENTION_UNSET = object()
 
 # Identifiers that must NEVER appear (as Name/attribute) inside the adapter
 # method body: generic stream/executor routing and teardown ownership.
@@ -3030,6 +3214,7 @@ class _GoldenSerialStreamHarness:
                 "request_id": getattr(request, "request_id", None),
                 "prompt": getattr(request, "prompt", None),
                 "extra_data": getattr(request, "extra_data", None),
+                "attention_backend": getattr(request, "attention_backend", None),
                 "volume": volume,
                 "output_root": output_root,
                 "telemetry_path": telemetry_path,
@@ -3059,7 +3244,8 @@ class _GoldenSerialStreamHarness:
         return _fake
 
     def _build_kwargs(self, *, request_id, prompt, extra_data=None,
-                      contract=None) -> dict:
+                      contract=None,
+                      attention_backend=_GOLDEN_ATTENTION_UNSET) -> dict:
         """Map intent kwargs onto the adapter's actual parameter shape so the
         behavioral tests stay robust to incidental naming while still
         requiring the contract-critical single ``request`` mapping.
@@ -3098,6 +3284,8 @@ class _GoldenSerialStreamHarness:
             payload["extra_data"] = extra_data
         if contract is not None:
             payload["contract"] = contract
+        if attention_backend is not _GOLDEN_ATTENTION_UNSET:
+            payload["attention_backend"] = attention_backend
         return {request_param: payload}
 
     def _collect_stream(self, **kwargs):
@@ -3217,6 +3405,29 @@ class TestGoldenSerialStreamBehavior(_GoldenSerialStreamHarness, unittest.TestCa
             [a for a in accessed if "teardown" in a.lower()], [],
             f"adapter must never invoke mutating teardown helpers; accessed={accessed}",
         )
+
+    def test_attention_backend_omission_is_distinct_from_explicit_pytorch(self):
+        volume = _TrackingVolume()
+        self._inject_volume(volume)
+
+        omitted_calls = []
+        self._patch_golden_execute(self._make_fake_execute(omitted_calls))
+        self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-attention-omitted",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+        self.assertEqual(len(omitted_calls), 1)
+        self.assertIsNone(omitted_calls[0]["attention_backend"])
+
+        explicit_calls = []
+        self._patch_golden_execute(self._make_fake_execute(explicit_calls))
+        self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-attention-pytorch",
+            prompt={"1": {"class_type": "KSampler"}},
+            attention_backend="pytorch",
+        ))
+        self.assertEqual(len(explicit_calls), 1)
+        self.assertEqual(explicit_calls[0]["attention_backend"], "pytorch")
 
     # ── Failure path ──────────────────────────────────────────────────────
 

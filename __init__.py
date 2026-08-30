@@ -946,27 +946,18 @@ def _resolve_local_workflow_image_candidates(filename: str) -> list[str]:
     return [os.path.join(_COMFYUI_ROOT, directory, *parts) for directory in search_dirs]
 
 def _ensure_modal():
+    """Validate the control-plane dependency without mutating the runtime.
+
+    Package installation belongs to the canonical image builder.  A missing
+    local Modal SDK is a setup error; startup must not repair it implicitly.
+    """
     global _pip_install_error
     try:
         import modal  # noqa: F401
         return
     except ImportError:
-        pass
-    if os.environ.get("COMFYMODAL_ALLOW_RUNTIME_PIP_INSTALL") != "1":
-        _pip_install_error = "modal package not installed. Run: pip install modal"
-        print("[comfyui-modal] ERROR: 'modal' package not found. Run: pip install modal")
-        print("[comfyui-modal] Set COMFYMODAL_ALLOW_RUNTIME_PIP_INSTALL=1 to auto-install (not recommended for production)")
-        return
-    print("[comfyui-modal] 'modal' package not found — installing...")
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "modal"], check=True, capture_output=True, text=True)
-        print("[comfyui-modal] 'modal' installed successfully.")
-    except subprocess.CalledProcessError as e:
-        _pip_install_error = e.stderr or str(e)
-        print(f"[comfyui-modal] ERROR: Failed to install 'modal' package: {e.stderr}")
-    except Exception as e:
-        _pip_install_error = str(e)
-        print(f"[comfyui-modal] ERROR: Unexpected error installing 'modal': {e}")
+        _pip_install_error = "modal package not installed; install it before starting ComfyUI"
+        print(f"[comfyui-modal] ERROR: {_pip_install_error}")
 
 _ensure_modal()
 

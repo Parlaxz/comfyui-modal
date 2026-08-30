@@ -22,13 +22,15 @@ is always stubbed so no real CUDA API is touched.
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import time
 import unittest
 from types import MappingProxyType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
+from comfymodal_runtime import golden_serial as gs
 from comfymodal_runtime import sampling_deep_profile as sdp
 from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER
 from comfymodal_runtime.trace import RuntimeTrace
@@ -358,6 +360,20 @@ class BlocksWrapperTests(_WrapperHarnessMixin):
         self.assertEqual(self.dm.pre_hook_count, 0)
         self.assertEqual(self.dm.layers[0].pre_hook_count, 0)
 
+    def test_lane_trace_context_profiles_when_request_context_is_absent(self):
+        self._set_fakes()
+        request_trace = self.trace
+        self.mp._ACTIVE_REQUEST_TRACE.reset(self._token)
+        lane = self.mp.ModelLaneTrace(request_trace, "UNET")
+        lane_token = self.mp._ACTIVE_LANE_TRACE.set(lane)
+        try:
+            self._run_wrapper(callback=lambda *a: None)
+        finally:
+            self.mp._ACTIVE_LANE_TRACE.reset(lane_token)
+            self._token = self.mp._ACTIVE_REQUEST_TRACE.set(request_trace)
+        self.assertEqual(len(self._profile_events()), 1)
+        self.assertEqual(self._profile_events()[0].metadata["status"], "ok")
+
     def test_no_cuda_sync_within_sampling_window(self):
         self._set_fakes()
         sync_inside = {"v": 0}
@@ -515,6 +531,132 @@ class StepsWrapperTests(_WrapperHarnessMixin):
         self.assertEqual(dict(art.get("categories_ms") or {}), {})
         # Hooks removed after finalize.
         self.assertEqual(self.dm.pre_hook_count, 0)
+
+
+class GoldenRunnerProfileTests(_WrapperHarnessMixin):
+    """The canonical Golden runner bypasses ComfyUI's wrapper executor."""
+
+    _level = "blocks"
+
+    def _run_golden(self, *, failing=False):
+        class _Runner:
+            def __init__(self, fail):
+                self.fail = fail
+                self.cache = {}
+                self.executed = []
+
+            def begin_scope(self, _allowed):
+                pass
+
+            def end_scope(self):
+                pass
+
+            async def run_closure(self, target_id, *, include_target):
+                assert include_target is True
+                if self.fail:
+                    raise RuntimeError("golden sampler boom")
+                self.executed.append({
+                    "node_id": target_id,
+                    "class_type": "ClownsharKSampler_Beta",
+                    "stage_class": "sampling",
+                })
+                self.cache[target_id] = gs._CacheEntry(outputs=[["latent"]])
+                return self.executed_summary()
+
+            def executed_summary(self):
+                return [
+                    (item["node_id"], item["class_type"], item["stage_class"])
+                    for item in self.executed
+                ]
+
+        runner = _Runner(failing)
+        session = SimpleNamespace(
+            recorder=gs.GoldenTelemetryRecorder(),
+            request=SimpleNamespace(
+                prompt={"1242": {"inputs": {"steps": 8}}},
+            ),
+            contract=SimpleNamespace(sampler_class_type="ClownsharKSampler_Beta"),
+            node_map=SimpleNamespace(sampler_id="1242"),
+            runner=runner,
+            patcher=self.patcher,
+        )
+        return session, runner
+
+    def _execute_golden(self, session):
+        runtime_executor = __import__(
+            "comfymodal_runtime.runtime_executor",
+            fromlist=["ensure_sampling_timing_wrapper"],
+        )
+        with patch.object(sdp, "_resolve_cuda_module", lambda: None), \
+             patch.object(runtime_executor, "ensure_sampling_timing_wrapper", return_value=True):
+            return asyncio.run(gs.golden_sampling(session))  # type: ignore[arg-type]
+
+    def test_canonical_runner_emits_profile_to_trace_and_recorder(self):
+        session, _runner = self._run_golden()
+        result = self._execute_golden(session)
+
+        self.assertEqual(result, [["latent"]])
+        names = [event.name for event in self.trace.events]
+        self.assertLess(names.index("sampling_start"), names.index("sampling_end"))
+        self.assertLess(names.index("sampling_end"), names.index("sampling_deep_profile"))
+        recorder_events = [
+            event for event in session.recorder.events
+            if event["name"] == "sampling_deep_profile"
+        ]
+        self.assertEqual(len(recorder_events), 1)
+        artifact = recorder_events[0]["fields"]["metadata"]
+        self.assertEqual(artifact["level"], "blocks")
+        self.assertLess(len(json.dumps(artifact)), 512 * 1024)
+
+    def test_canonical_runner_finalizes_profile_on_exception(self):
+        session, _runner = self._run_golden(failing=True)
+        with self.assertRaisesRegex(RuntimeError, "golden sampler boom"):
+            self._execute_golden(session)
+
+        names = [event.name for event in self.trace.events]
+        self.assertIn("sampling_start", names)
+        self.assertIn("sampling_end", names)
+        self.assertIn("sampling_deep_profile", names)
+        recorder_events = [
+            event for event in session.recorder.events
+            if event["name"] == "sampling_deep_profile"
+        ]
+        self.assertEqual(len(recorder_events), 1)
+
+    def test_profile_setup_failure_does_not_escape_golden_sampler(self):
+        session, _runner = self._run_golden()
+        with patch.object(
+            sdp,
+            "begin_sampling_profile",
+            side_effect=RuntimeError("profile setup boom"),
+        ):
+            result = self._execute_golden(session)
+
+        self.assertEqual(result, [["latent"]])
+        names = [event.name for event in self.trace.events]
+        self.assertEqual(names.count("sampling_start"), 1)
+        self.assertEqual(names.count("sampling_end"), 1)
+        self.assertLess(names.index("sampling_start"), names.index("sampling_end"))
+        self.assertFalse(hasattr(_FakeKSamplerX0Inpaint, sdp._PATCH_MARKER))
+        markers = [
+            event for event in session.recorder.events
+            if event["name"] == "sampling_deep_profile_setup_failed"
+        ]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0]["fields"]["error"], "RuntimeError")
+        self.assertTrue(markers[0]["fields"]["profiling_disabled"])
+        self.assertTrue(markers[0]["fields"]["measurement_only"])
+
+    def test_existing_profile_owner_is_not_duplicated(self):
+        session, _runner = self._run_golden()
+        token = sdp._CURRENT_PROFILE.set(cast(Any, object()))
+        try:
+            self._execute_golden(session)
+        finally:
+            sdp._CURRENT_PROFILE.reset(token)
+        names = [event.name for event in self.trace.events]
+        self.assertNotIn("sampling_start", names)
+        self.assertNotIn("sampling_deep_profile", names)
 
 
 if __name__ == "__main__":

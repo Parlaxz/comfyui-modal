@@ -442,7 +442,7 @@ class TestRoundTripAndPurity(unittest.TestCase):
 
             g1 = comfyapp.custom_node_source_generation(fixture_root)
             self.assertIsInstance(g1, str)
-            self.assertRegex(g1, r"^[0-9a-f]{32}$")
+            self.assertRegex(g1, r"^[0-9a-f]{64}$")
             # The fixture tree is actually tracked by the fingerprint walk.
             fp = comfyapp.custom_node_source_fingerprint(fixture_root)
             self.assertEqual(len(fp.get("nodes") or []), 3)
@@ -479,7 +479,7 @@ class TestRoundTripAndPurity(unittest.TestCase):
         except Exception as exc:  # pragma: no cover - environment guard
             pytest.skip(f"custom_nodes root walk unavailable: {exc!r}")
         self.assertTrue(g_real)
-        self.assertRegex(g_real, r"^[0-9a-f]{32}$")
+        self.assertRegex(g_real, r"^[0-9a-f]{64}$")
 
     def test_do_not_weaken_existing_step3(self):
         """No side effects on import; report helpers are pure.
@@ -601,7 +601,7 @@ class TestRoundTripAndPurity(unittest.TestCase):
         except Exception as exc:  # pragma: no cover - environment guard
             pytest.skip(f"custom_nodes root walk unavailable: {exc!r}")
         self.assertTrue(g_local)
-        self.assertRegex(g_local, r"^[0-9a-f]{32}$")
+        self.assertRegex(g_local, r"^[0-9a-f]{64}$")
 
         try:
             archive = _build_custom_nodes_archive(str(REAL_CUSTOM_NODES_ROOT))

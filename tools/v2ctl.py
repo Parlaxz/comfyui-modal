@@ -7,6 +7,13 @@ BAT invocations, or PowerShell set chains.
 """
 
 import sys
+from pathlib import Path
+
+# ``python tools/v2ctl.py`` puts ``tools/`` on sys.path, not the repository
+# root.  Make the package import deterministic without relying on PYTHONPATH.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from v2_control.cli import main
 

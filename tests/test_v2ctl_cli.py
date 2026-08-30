@@ -182,6 +182,85 @@ class TestGate1FlatSafety:
 
 
 class TestGoldenNamespace:
+    def test_filtered_manifest_lookup_ignores_newer_unrelated_deployment(self, tmp_path) -> None:
+        from tools.v2_control import cli
+
+        manifest_dir = tmp_path / ".v2ctl" / "deployments"
+        manifest_dir.mkdir(parents=True)
+
+        def write(name: str, manifest: dict) -> None:
+            (manifest_dir / name).write_text(json.dumps(manifest), encoding="utf-8")
+
+        base = {
+            "schema_version": cli.SCHEMA_VERSION,
+            "deployment_hash_namespace": cli.DEPLOYMENT_HASH_NAMESPACE,
+            "fingerprint_algorithm": cli.FINGERPRINT_ALGORITHM,
+        }
+        write(
+            "deploy_20260830-090243_s1.json",
+            {
+                **base,
+                "profile": "golden_p1",
+                "deploy_fingerprint": "s1-fingerprint",
+                "deployment_hash": "s1-fingerprint",
+                "deploy_inputs": {
+                    "target": {
+                        "app": "batch-s1-cache-e1",
+                        "class_name": "ModalRuntimeEntrypointV2",
+                        "method": "run_golden_serial_stream",
+                    }
+                },
+            },
+        )
+        write(
+            "deploy_20260830-090427_ra5.json",
+            {
+                **base,
+                "profile": "golden_p1",
+                "deploy_fingerprint": "ra5-fingerprint",
+                "deployment_hash": "ra5-fingerprint",
+                "target": {
+                    "app": "batch-ra5-attention-shootout",
+                    "class": "ModalRuntimeEntrypointV2",
+                    "method": "run_golden_serial_stream",
+                },
+            },
+        )
+
+        target = {
+            "app": "batch-s1-cache-e1",
+            "class": "ModalRuntimeEntrypointV2",
+            "method": "run_golden_serial_stream",
+        }
+        selected = cli.latest_deployment_manifest(
+            tmp_path, profile="golden_p1", target=target
+        )
+        assert selected is not None
+        assert selected["deploy_fingerprint"] == "s1-fingerprint"
+        selected_path = cli.latest_deployment_manifest_path(
+            tmp_path, profile="golden_p1", target=target
+        )
+        assert selected_path is not None
+        assert selected_path.name == "deploy_20260830-090243_s1.json"
+
+    def test_filtered_manifest_lookup_returns_none_without_valid_match(self, tmp_path) -> None:
+        from tools.v2_control import cli
+
+        manifest_dir = tmp_path / ".v2ctl" / "deployments"
+        manifest_dir.mkdir(parents=True)
+        (manifest_dir / "deploy_20260830-090243_invalid.json").write_text(
+            json.dumps({"schema_version": 1}), encoding="utf-8"
+        )
+        assert cli.latest_deployment_manifest(
+            tmp_path,
+            profile="golden_p1",
+            target={
+                "app": "batch-s1-cache-e1",
+                "class": "ModalRuntimeEntrypointV2",
+                "method": "run_golden_serial_stream",
+            },
+        ) is None
+
     def test_golden_doctor_uses_dedicated_profile_namespace(self) -> None:
         r = run_v2ctl("golden", "doctor")
         assert r.returncode in (0, 1)
@@ -191,7 +270,7 @@ class TestGoldenNamespace:
     def test_golden_namespace_rejects_internal_config_command(self) -> None:
         r = run_v2ctl("golden", "config", "--json")
         assert r.returncode == 2
-        assert "{status,doctor,deploy,run}" in r.stderr
+        assert "publisher-bootstrap" in r.stderr
 
     def test_golden_namespace_rejects_other_profile(self) -> None:
         r = run_v2ctl("golden", "doctor", "--profile", "e29-tracer")
@@ -227,13 +306,14 @@ class TestGoldenNamespace:
         assert "no invocation performed" in r.stdout
         assert "V2_BENCHMARK_MODE=golden_p1_serial" in r.stdout
 
-    def test_golden_deploy_dry_run_uses_golden_selector(self) -> None:
+    def test_golden_deploy_dry_run_uses_native_modal_deploy(self) -> None:
         r = run_v2ctl("golden", "deploy", "--dry-run")
         assert r.returncode == 0, r.stderr
         assert "profile=golden_p1" in r.stdout
         assert "golden_p1" in r.stdout
-        assert "deploy_and_run_v2_single.bat" in r.stdout
-        assert "V2_BENCHMARK_MODE=golden_p1_serial" in r.stdout
+        assert "modal deploy -m comfymodal_runtime.modal_app" in r.stdout
+        assert "--name" in r.stdout
+        assert "deploy_and_run_v2_single.bat" not in r.stdout
         assert "no invocation performed" in r.stdout
 
     def test_golden_namespace_accepts_global_options_after_command(self) -> None:
@@ -327,7 +407,7 @@ class TestGoldenNamespace:
         monkeypatch.setattr(
             cli,
             "latest_deployment_manifest",
-            lambda _root: {
+            lambda _root, **_kwargs: {
                 "profile": "golden_p1",
                 "deploy_fingerprint": "stale",
                 "target": {
@@ -377,7 +457,7 @@ class TestGoldenNamespace:
         monkeypatch.setattr(
             cli,
             "latest_deployment_manifest",
-            lambda _root: {
+            lambda _root, **_kwargs: {
                 "profile": "golden_p1",
                 "deploy_fingerprint": fingerprints.deploy_fingerprint(),
                 "target": target,
@@ -446,6 +526,43 @@ class TestGoldenNamespace:
 
 
 class TestGoldenDeployVersionVerification:
+    def test_app_version_lookup_distinguishes_absent_from_uncertain(
+        self, monkeypatch
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        class Result:
+            def __init__(self, returncode, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        outputs = iter([
+            Result(1, stderr="App 'new-app' not found"),
+            Result(1, stderr="permission denied while listing app history"),
+            Result(0, stdout="header only\n"),
+            Result(0, stdout="| v7 | deployment |\n"),
+        ])
+        monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: next(outputs))
+        assert cli._app_version_number("new-app") == 0
+        assert cli._app_version_number("uncertain-app") is None
+        assert cli._app_version_number("empty-history") is None
+        assert cli._app_version_number("deployed-app") == 7
+
+    def test_native_golden_deploy_env_has_no_generic_benchmark_controls(self):
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        env = cli._native_golden_deploy_env({
+            "V2_BENCHMARK_MODE": "golden_p1_serial",
+            "V2_BENCHMARK_RUNS": "1",
+            "V2_E28_VALIDATION": "1",
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": "1",
+        })
+        assert not any(name.startswith("V2_") for name in env)
+        assert env["COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"] == "1"
+
     def test_public_golden_deploy_requires_real_version_advance(
         self, monkeypatch, tmp_path, capsys
     ) -> None:
@@ -490,6 +607,23 @@ class TestGoldenDeployVersionVerification:
         monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
         monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
         monkeypatch.setattr(cli, "write_deployment_manifest", fake_manifest)
+        # Native Golden deploys gate Modal deployment on verified custom-node
+        # publication.  Keep this version-advance test focused on its existing
+        # contract by supplying that verified publication explicitly.
+        monkeypatch.setattr(
+            cli,
+            "_publish_golden_custom_nodes",
+            lambda _root: SimpleNamespace(
+                action="published", reason="published_verified", identity=SimpleNamespace(
+                    generation="test-generation",
+                    identity_schema=1,
+                    packaging_policy_version=1,
+                    file_count=0,
+                    total_bytes=0,
+                    manifest_digest="test-manifest",
+                )
+            ),
+        )
         args = SimpleNamespace(
             profile="golden_p1", app="golden-experimental", set=[], inherit=[],
             owner=None, dry_run=False, gpu=None, memory_mb=None, cpu=None,
@@ -724,6 +858,11 @@ class TestDryRun:
         monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
         monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
         monkeypatch.setattr(cli, "write_deployment_manifest", fake_manifest)
+        # Version lookup is a required deploy preflight.  The failed backend
+        # consumes the first pre-version; the later successful deploy consumes
+        # the remaining pre/post pair.
+        versions = iter((0, 0, 1))
+        monkeypatch.setattr(cli, "_app_version_number", lambda app: next(versions))
         args = SimpleNamespace(
             profile="production", set=[], inherit=[], owner=None, dry_run=False,
             app=None, gpu=None, memory_mb=None, cpu=None,
@@ -942,7 +1081,7 @@ class TestGateConfirm:
         monkeypatch.setattr(
             cli,
             "latest_deployment_manifest",
-            lambda _root: {
+            lambda _root, **_kwargs: {
                 "deploy_fingerprint": fingerprints.deploy_fingerprint(),
                 "target": {
                     "app": "wrong-target",

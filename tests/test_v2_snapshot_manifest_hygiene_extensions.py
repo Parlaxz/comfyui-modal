@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import builtins
 import io
+import sys
+from types import SimpleNamespace
+
+import torch
 
 from comfymodal_runtime import snapshot_build_manifest as sbm
 
@@ -147,3 +151,173 @@ def test_compact_print_line_carries_anon_and_file_kb(monkeypatch, capsys):
     assert len(lines) == 1
     assert "rss_anon_kb=8000" in lines[0]
     assert "rss_file_kb=4000" in lines[0]
+
+
+def test_mapping_composition_is_bounded_and_separates_kernel_sources():
+    composition = sbm._capture_mapping_composition(
+        {"rss": 100, "pss": 80, "anonymous": 60, "private_dirty": 40},
+        {
+            "available": True,
+            "mapped_bytes": 4096,
+            "anonymous_bytes": 3072,
+            "file_backed_bytes": 1024,
+        },
+    )
+    assert composition["smaps_available"] is True
+    assert composition["mappings_available"] is True
+    assert composition["smaps_anonymous_kb"] == 60
+    assert composition["mapping_virtual_bytes"] == 4096
+    assert composition["note"] != "serialized snapshot size"
+
+
+def test_capture_generation_continuity_and_selected_root_census(monkeypatch):
+    _install_capture_stubs(
+        monkeypatch,
+        status={"vmrss": 1},
+        cgroup={"available": False, "memory_current_bytes": None},
+    )
+    monkeypatch.setattr(sbm, "_capture_smaps_rollup", lambda: {"rss": 10, "anonymous": 8})
+    monkeypatch.setattr(
+        sbm,
+        "_capture_mappings",
+        lambda: {
+            "available": True,
+            "mapped_bytes": 20,
+            "anonymous_bytes": 12,
+            "file_backed_bytes": 8,
+        },
+    )
+    root = SimpleNamespace(child={"items": list(range(1000))})
+    before = sbm.capture_snapshot_manifest(
+        "before_capture", selected_roots={"roots": [root]}
+    )
+    restored = sbm.capture_snapshot_manifest(
+        "first_restored_line", selected_roots={"roots": [root]}
+    )
+
+    assert before["capture_generation_continuity"] == "origin"
+    assert restored["capture_generation_continuity"] == "continued"
+    assert restored["capture_generation_nonce"] == before["capture_generation_nonce"]
+    assert restored["capture_generation_fingerprint"] == before["capture_generation_fingerprint"]
+    census = before["selected_root_census"]
+    assert census["available"] is True
+    assert census["visited_count"] <= census["node_limit"]
+    assert census["depth_limit"] == 2
+    assert census["child_limit"] == 32
+
+
+def test_selected_root_census_is_fail_closed_for_hostile_list_like_input():
+    iterator_called = False
+
+    class HostileList(list):
+        def __getitem__(self, _key):
+            raise RuntimeError("hostile slice")
+
+        def __iter__(self):
+            nonlocal iterator_called
+            iterator_called = True
+            raise RuntimeError("hostile iterator")
+
+    census = sbm._capture_selected_root_census({"roots": HostileList([object()])})
+
+    assert census == {"available": False, "reason": "no_selected_roots"}
+    assert iterator_called is False
+
+
+def test_selected_root_census_skips_hostile_dict_descriptor():
+    class HostileDict:
+        @property
+        def __dict__(self):
+            raise AssertionError("custom __dict__ must not be invoked")
+
+    census = sbm._capture_selected_root_census({"roots": [HostileDict()]})
+
+    assert census["available"] is True
+    assert census["fail_closed_reasons"]["custom_dict_descriptor"] == 1
+
+
+def test_selected_root_census_processes_all_bounded_root_kinds():
+    surfaces = {
+        "roots": [object() for _ in range(sbm._MAX_CENSUS_CHILDREN)],
+        "registries": [object() for _ in range(sbm._MAX_CENSUS_CHILDREN)],
+        "coordinators": [object() for _ in range(sbm._MAX_CENSUS_CHILDREN)],
+    }
+
+    census = sbm._capture_selected_root_census(surfaces)
+
+    assert census["selected_root_count"] == sbm._MAX_CENSUS_CHILDREN * 3
+    assert census["visited_count"] == census["selected_root_count"]
+    assert census["selected_root_truncated"] is False
+    assert census["truncated"] is False
+
+
+def test_selected_root_census_reports_per_kind_input_truncation():
+    census = sbm._capture_selected_root_census(
+        {"roots": [object() for _ in range(sbm._MAX_CENSUS_CHILDREN + 1)]}
+    )
+
+    assert census["selected_root_count"] == sbm._MAX_CENSUS_CHILDREN
+    assert census["selected_root_truncated"] is True
+
+
+def test_selected_root_census_detects_nested_tensor_and_model_patcher_like_refs():
+    ModelPatcherLike = type("ModelPatcherLike", (), {})
+    tensor = torch.zeros(2, dtype=torch.float32)
+    root = SimpleNamespace(child={"tensor": tensor, "patcher": ModelPatcherLike()})
+
+    census = sbm._capture_selected_root_census({"roots": [root]})
+
+    assert census["available"] is True
+    assert census["tensor_like_count"] >= 1
+    assert census["model_patcher_like_count"] >= 1
+    assert census["tensor_records"][0]["path"].startswith("roots[0]")
+    assert census["tensor_storage_bytes"] >= tensor.numel() * tensor.element_size()
+
+
+def test_selected_root_census_does_not_invoke_hostile_properties_or_iterators():
+    class Hostile:
+        def __init__(self):
+            self.child = {"safe": object()}
+
+        @property
+        def dangerous(self):
+            raise AssertionError("arbitrary property was invoked")
+
+        def __iter__(self):
+            raise AssertionError("arbitrary iterator was invoked")
+
+    census = sbm._capture_selected_root_census({"roots": [Hostile()]})
+
+    assert census["available"] is True
+    assert census["visited_count"] <= census["node_limit"]
+
+
+def test_manifest_capture_is_cpu_only_and_never_touches_torch_cuda(monkeypatch):
+    capture_torch_threads = sbm._capture_torch_threads
+
+    class CpuOnlyTorch:
+        __version__ = "test"
+
+        @staticmethod
+        def get_num_threads():
+            return 1
+
+        @staticmethod
+        def get_num_interop_threads():
+            return 1
+
+        def __getattr__(self, name):
+            if name == "cuda":
+                raise AssertionError("CUDA must not be queried during capture")
+            raise AttributeError(name)
+
+    _install_capture_stubs(
+        monkeypatch,
+        status={"vmrss": 1},
+        cgroup={"available": False, "memory_current_bytes": None},
+    )
+    monkeypatch.setattr(sbm, "_capture_torch_threads", capture_torch_threads)
+    monkeypatch.setitem(sys.modules, "torch", CpuOnlyTorch())
+    manifest = sbm.capture_snapshot_manifest("before_capture", selected_roots={"roots": []})
+    assert manifest["torch_threads"]["torch_importable"] is True
+    assert manifest["selected_root_census"]["available"] is False

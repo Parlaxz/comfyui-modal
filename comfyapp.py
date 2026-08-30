@@ -1,5 +1,6 @@
 ﻿import contextlib
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import modal
@@ -24,6 +26,10 @@ from comfymodal_runtime.contracts import (
     stable_hash,
 )
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.deployment_spec import (
+    build_v2_late_config,
+    compute_custom_node_hash,
+)
 from comfymodal_runtime import publication_policy as _publication_policy
 # ── E40 Lane A: single configuration authority ──────────────────────────
 # One resolved-config truth for the runtime. Golden-semantics controls are
@@ -2039,7 +2045,7 @@ def _resolve_custom_nodes_generation(
 ) -> tuple[str, str]:
     """Authoritative request-time custom-node generation resolution.
 
-    Priority (first non-empty value wins):
+    Priority (first non-empty value wins) for ordinary request diagnostics:
     1. ``api._custom_nodes_generation_seen`` (hydrated API field — fast path)
     2. ``_read_custom_nodes_generation_record()`` (persisted record fallback)
 
@@ -2047,11 +2053,13 @@ def _resolve_custom_nodes_generation(
     ``"persisted_record"``, or ``"missing"``.  Never raises: both paths are
     wrapped in try/except.  The returned *value* is always a ``str``,
     possibly empty when neither source is available.  ``authoritative_only``
-    restricts the resolver to the in-memory API token and the small deployed
-    generation record; it never fingerprints source directories.
+    ignores the hydrated API field and restricts the resolver to the mounted
+    generation record; it never fingerprints source directories.  A field
+    restored in the memory snapshot is not evidence that the current Volume
+    has the same generation.
     """
     # First: hydrated API field (fast path, set by _sync_custom_nodes_from_volume)
-    if api is not None:
+    if not authoritative_only and api is not None:
         try:
             val = str(getattr(api, "_custom_nodes_generation_seen", "") or "").strip()
             if val:
@@ -2425,43 +2433,23 @@ def _build_immutable_dependency_manifest_identity(
 
 
 # Canonical deployment combined hash, set by modal_app._configure_runtime()
-# from ``_MODAL_RESOURCES['source_identity'].combined_hash``.  When nonempty
-# ``_resolve_deployment_combined_hash()`` returns this value first, falling
-# back to the legacy derivation only as a backward-compatible safety net.
+# from the canonical image-plan identity.  There is deliberately no runtime
+# derivation from mounted manifests: incomplete source coverage must fail
+# closed rather than become a plausible deployment identity.
 _CANONICAL_DEPLOYMENT_COMBINED_HASH: str = ""
 
 
 def _resolve_deployment_combined_hash() -> str:
     """Build a deterministic combined hash representing deployment identity.
 
-    Priority:
-    1. ``_CANONICAL_DEPLOYMENT_COMBINED_HASH`` (set by modal_app's
-       ``_configure_runtime`` from deployment builder's combined hash).
-    2. Legacy derivation from COMFYAPP_VERSION, runtime revision, baked
-       dependency hash, and custom-nodes generation (fail-closed fallback).
-
-    Returns empty string when no identity component is available.
+    Returns the canonical image-plan deployment hash, or empty when the plan
+    was not constructed.  Runtime manifests are not an identity fallback.
     """
     # Canonical source: deployment builder combined hash
     if _CANONICAL_DEPLOYMENT_COMBINED_HASH:
         return _CANONICAL_DEPLOYMENT_COMBINED_HASH
 
-    # Legacy fail-closed fallback
-    _baked = load_baked_custom_node_dependency_manifest()
-    _baked_hash = _baked.get("overall_dependency_hash", "") if _baked else ""
-    if not _baked_hash:
-        return ""
-    _cn_gen_rec = _read_custom_nodes_generation_record()
-    _cn_gen = _cn_gen_rec.get("generation", "") if _cn_gen_rec else ""
-    if not _cn_gen:
-        return ""
-    import hashlib
-    _h = hashlib.sha256()
-    _h.update(f"comfyapp_version={COMFYAPP_VERSION}\n".encode())
-    _h.update(f"runtime_revision={_V2_RUNTIME_REVISION}\n".encode())
-    _h.update(f"baked_hash={_baked_hash}\n".encode())
-    _h.update(f"custom_nodes_generation={_cn_gen}\n".encode())
-    return _h.hexdigest()
+    return ""
 
 
 def _build_and_persist_dependency_manifest(
@@ -3806,8 +3794,7 @@ def custom_node_source_fingerprint(source_root: str) -> dict:
         if os.path.islink(node_path):
             entry["realpath_if_symlink"] = os.path.realpath(node_path)
         _hasher = hashlib.sha256()
-        _tracked_exts = {".py", ".txt", ".toml", ".cfg"}
-        _tracked_files = {"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"}
+        _source_files = []
         try:
             for _dirpath, _dirnames, _filenames in os.walk(node_path, followlinks=False):
                 _dirnames[:] = sorted(
@@ -3824,11 +3811,13 @@ def custom_node_source_fingerprint(source_root: str) -> dict:
                         if os.path.islink(_fp):
                             continue
                         _rel = os.path.relpath(_fp, node_path).replace("\\", "/")
-                        _hasher.update(f"{_rel}:".encode())
-                        try:
-                            _hasher.update(_canonical_dependency_bytes(_fp))
-                        except OSError:
-                            pass
+                        _source_files.append((_rel, _fp))
+            for _rel, _fp in sorted(_source_files, key=lambda item: item[0]):
+                _hasher.update(f"{_rel}:".encode())
+                try:
+                    _hasher.update(_canonical_dependency_bytes(_fp))
+                except OSError:
+                    pass
         except Exception:
             pass
         entry["content_hash"] = _hasher.hexdigest()[:16]
@@ -3851,13 +3840,12 @@ def custom_node_source_generation(
     and same-process comparisons.  The persisted generation must not include
     that path because the build context and Modal volume use different roots.
     """
-    fingerprint = fingerprint or custom_node_source_fingerprint(source_root)
-    stable_fingerprint = {
-        key: value for key, value in fingerprint.items() if key != "source_root"
-    }
-    return hashlib.md5(
-        json.dumps(stable_fingerprint, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    # ``fingerprint`` remains accepted for compatibility with older callers,
+    # but generation is owned by the S1 deployment identity helper.  The host
+    # archive publisher and this remote post-extract readback therefore hash
+    # the same source set with the same namespace and algorithm.
+    _ = fingerprint
+    return compute_custom_node_hash([source_root])
 
 
 # Alias for backward compatibility
@@ -3992,7 +3980,7 @@ def requirements_file_hash(path: str) -> str | None:
 
 
 _DEPENDENCY_TEXT_SUFFIXES = frozenset({
-    ".cfg", ".in", ".pip", ".py", ".toml", ".txt", ".yaml", ".yml",
+    ".cfg", ".in", ".js", ".mjs", ".pip", ".py", ".toml", ".txt", ".yaml", ".yml",
 })
 
 
@@ -6478,7 +6466,195 @@ def list_sageattention_extension_files(site_packages_root: str) -> list[Path]:
     root = Path(site_packages_root) / "sageattention"
     if not root.is_dir():
         return []
-    return sorted(root.glob("*.so"))
+    # SageAttention 2.2.0 uses the public dispatcher for SM120.  Its native
+    # implementation is commonly named ``_qattn_sm89*.so`` (SM120 is routed
+    # through that family), so do not require an ``_qattn_sm120`` artifact.
+    native_suffixes = {".so", ".pyd", ".dll", ".dylib"}
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and (
+            path.suffix.lower() in native_suffixes or ".so." in path.name.lower()
+        )
+    )
+
+
+SAGE_RUNTIME_CACHE_SCHEMA_VERSION = 2
+SAGE_RUNTIME_POLICY_VERSION = "ra5-phase-a-v1"
+SAGEATTENTION_SOURCE_REPOSITORY = "https://github.com/thu-ml/SageAttention.git"
+SAGEATTENTION_GIT_REF = "v2.2.0"
+SAGEATTENTION_EXPECTED_NATIVE_FAMILY = "_qattn_sm89"
+SAGEATTENTION_SOURCE_POLICY = (
+    f"{SAGEATTENTION_SOURCE_REPOSITORY}@{SAGEATTENTION_GIT_REF}"
+)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (OSError, IOError):
+        return ""
+
+
+def sageattention_artifact_identity(site_packages_root: str) -> dict[str, Any]:
+    """Describe the installed SageAttention package without importing it.
+
+    In particular, the manifest treats ``_fused`` and ``_qattn_sm89`` as
+    separate artifacts.  The latter is the expected native family for the
+    v2.2.0 public dispatcher on SM120; an ``_qattn_sm120`` file is not needed.
+    """
+    package_root = Path(site_packages_root) / "sageattention"
+    files = list_sageattention_extension_files(site_packages_root)
+    manifest = []
+    for path in files:
+        try:
+            relative = path.relative_to(package_root).as_posix()
+            size = path.stat().st_size
+        except OSError:
+            continue
+        manifest.append({"path": relative, "size": size, "sha256": _sha256_file(path)})
+    manifest.sort(key=lambda item: item["path"])
+
+    metadata_files = []
+    site_root = Path(site_packages_root)
+    for metadata_root in sorted(site_root.glob("sageattention*.dist-info")):
+        for name in ("METADATA", "RECORD", "direct_url.json"):
+            path = metadata_root / name
+            if path.is_file():
+                metadata_files.append({
+                    "path": path.relative_to(site_root).as_posix(),
+                    "sha256": _sha256_file(path),
+                })
+    source_files = []
+    if package_root.is_dir():
+        for path in sorted(package_root.rglob("*.py")):
+            if path.is_file():
+                source_files.append({
+                    "path": path.relative_to(package_root).as_posix(),
+                    "sha256": _sha256_file(path),
+                })
+
+    canonical = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "package_root": str(package_root),
+        "extension_manifest": manifest,
+        "extension_manifest_hash": hashlib.sha256(canonical).hexdigest(),
+        "native_kernel_families": sorted({
+            "_fused" if "_fused" in item["path"] else SAGEATTENTION_EXPECTED_NATIVE_FAMILY
+            for item in manifest
+            if "_fused" in item["path"] or SAGEATTENTION_EXPECTED_NATIVE_FAMILY in item["path"]
+        }),
+        "source_manifest_hash": hashlib.sha256(
+            json.dumps(source_files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "metadata_manifest_hash": hashlib.sha256(
+            json.dumps(metadata_files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _sage_identity_digest(identity: dict) -> str:
+    comparable = {
+        key: value
+        for key, value in identity.items()
+        if key not in {"identity_digest", "created_at", "mode", "reason"}
+    }
+    return hashlib.sha256(json.dumps(comparable, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def sage_runtime_identity_matches(cached: dict, current: dict) -> bool:
+    """Return whether two complete Sage runtime identities are interchangeable."""
+    if not isinstance(cached, dict) or not isinstance(current, dict):
+        return False
+    if (
+        cached.get("schema_version") != SAGE_RUNTIME_CACHE_SCHEMA_VERSION
+        or current.get("schema_version") != SAGE_RUNTIME_CACHE_SCHEMA_VERSION
+    ):
+        return False
+    # Recompute rather than trusting a stored digest.  A partially edited or
+    # corrupt cache must not match by retaining its old digest field.
+    return _sage_identity_digest(cached) == _sage_identity_digest(current)
+
+
+def sage_runtime_cache_usable(cached: dict, current: dict, *, strict: bool = False) -> bool:
+    """Apply identity and policy checks before reusing a runtime decision."""
+    if not sage_runtime_identity_matches(cached, current):
+        return False
+    if cached.get("mode") not in {"baked_cuda", "triton_fallback", "disabled"}:
+        return False
+    # A negative result is never authoritative for the explicit Golden arm.
+    return not strict or cached.get("mode") == "baked_cuda"
+
+
+def build_sage_runtime_identity(
+    *,
+    site_packages_root: str = "",
+    selected_symbol: str = "sageattn",
+    kernel_family: str = "sage2++_public_dispatch",
+    gpu_name: str = "",
+    capability: tuple[int, int] | None = None,
+    sage_version: str = "",
+    torch_version: str = "",
+    torch_cuda: str = "",
+    driver_version: str = "",
+    image_identity: str = "",
+    deployment_identity: str = "",
+) -> dict[str, Any]:
+    """Build the cache identity used by Sage restore policy.
+
+    Imports and CUDA queries are intentionally opt-in through the omitted
+    values.  Snapshot startup can therefore use the helpers without causing a
+    CUDA or Sage import; restore probing supplies the runtime values.
+    """
+    artifact = sageattention_artifact_identity(site_packages_root) if site_packages_root else {
+        "extension_manifest": [], "extension_manifest_hash": "", "native_kernel_families": [],
+        "source_manifest_hash": "", "metadata_manifest_hash": "",
+    }
+    identity: dict[str, Any] = {
+        "schema_version": SAGE_RUNTIME_CACHE_SCHEMA_VERSION,
+        "policy_version": SAGE_RUNTIME_POLICY_VERSION,
+        "gpu_name": gpu_name or "unknown",
+        "gpu_capability": list(capability) if capability is not None else [],
+        "sage_version": sage_version,
+        "sage_source_identity": artifact.get("source_manifest_hash", ""),
+        "sage_build_identity": artifact.get("metadata_manifest_hash", ""),
+        # These policy fields remain populated even when a legacy install has
+        # no source metadata, keeping the cache tied to the pinned build.
+        "sage_source_repository": SAGEATTENTION_SOURCE_REPOSITORY,
+        "sage_source_ref": SAGEATTENTION_GIT_REF,
+        "sage_source_policy": SAGEATTENTION_SOURCE_POLICY,
+        "sage_expected_native_family": SAGEATTENTION_EXPECTED_NATIVE_FAMILY,
+        "extension_manifest_hash": artifact.get("extension_manifest_hash", ""),
+        "torch_version": torch_version,
+        "torch_cuda": torch_cuda,
+        "driver_version": driver_version,
+        "image_identity": image_identity,
+        "deployment_identity": deployment_identity,
+        "selected_symbol": selected_symbol,
+        "kernel_family": kernel_family,
+    }
+    identity["artifact_identity"] = artifact
+    identity["identity_digest"] = _sage_identity_digest(identity)
+    return identity
+
+
+def select_public_sageattention_callable(module) -> tuple[str | None, Callable | None, dict[str, Any]]:
+    """Select only SageAttention's supported public dispatcher.
+
+    Private extension modules and private kernel symbols are deliberately not
+    bound here.  SageAttention v2.2.0 owns the SM120 -> SM89 native dispatch.
+    """
+    candidate = getattr(module, "sageattn", None)
+    if callable(candidate):
+        return "sageattn", candidate, {"tensor_layout": "HND", "is_causal": False}
+    return None, None, {}
 
 
 def choose_sage_runtime_mode(enabled: bool, extension_files: list[Path], import_ok: bool, smoke_ok: bool) -> tuple[str, str]:
@@ -6493,20 +6669,119 @@ def choose_sage_runtime_mode(enabled: bool, extension_files: list[Path], import_
     return "baked_cuda", "compiled-extensions-usable"
 
 
-def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool) -> bool:
+def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool, *, strict: bool = False) -> bool:
     original = getattr(module, "get_sage_func", None)
     fallback = getattr(module, "attention_pytorch", None)
     wrap_attn_fn = getattr(module, "wrap_attn", None)
     if original is None or fallback is None or wrap_attn_fn is None:
+        if strict:
+            raise RuntimeError("Strict SageAttention policy could not locate KJNodes integration")
         return False
 
+    if strict and not baked_cuda_available:
+        raise RuntimeError(
+            "Strict SageAttention policy rejected KJNodes PyTorch fallback"
+        )
+
     module._comfy_modal_baked_cuda_available = baked_cuda_available
+    module._comfy_modal_strict_sage = strict
     if getattr(module, "_comfy_modal_get_sage_func_patched", False):
         return True
 
+    def _validate_strict_attention_inputs(
+        q, k, v, heads, mask, attn_precision, skip_reshape, kwargs
+    ) -> None:
+        if mask is not None or kwargs.get("attn_mask") is not None:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected unsupported attention mask"
+            )
+        if kwargs.get("enable_gqa", False):
+            raise RuntimeError("Strict SageAttention policy rejected GQA")
+        if kwargs.get("is_causal", False):
+            raise RuntimeError("Strict SageAttention policy rejected causal attention")
+        if attn_precision is not None:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected unsupported attention precision"
+            )
+        if kwargs.get("low_precision_attention", True) is False:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected KJNodes PyTorch fallback"
+            )
+        try:
+            shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+        except Exception as exc:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected invalid attention shape"
+            ) from exc
+        if skip_reshape:
+            if not all(len(shape) == 4 for shape in shapes):
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected non-HND attention"
+                )
+            head_counts = tuple(shape[1] for shape in shapes)
+            if head_counts != (heads, heads, heads):
+                raise RuntimeError("Strict SageAttention policy rejected GQA")
+        else:
+            if not all(len(shape) == 3 for shape in shapes):
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected non-NHD attention"
+                )
+            if shapes[0][-1] != shapes[1][-1] or shapes[0][-1] != shapes[2][-1]:
+                raise RuntimeError("Strict SageAttention policy rejected GQA")
+            if not isinstance(heads, int) or isinstance(heads, bool) or heads <= 0:
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected invalid head count"
+                )
+            if shapes[0][-1] % heads:
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected invalid head dimension"
+                )
+
     def wrapped_get_sage_func(sage_attention, allow_compile=False):
+        strict_sage = bool(getattr(module, "_comfy_modal_strict_sage", False))
+        if strict_sage and getattr(module, "_comfy_modal_baked_cuda_available", False):
+            # Do not call KJNodes' factory first.  Its factory imports/binds a
+            # selector-specific private symbol, even though the RA5 arm must
+            # use SageAttention's public native dispatcher.
+            if sage_attention == "auto" or "sageattn_qk_" in str(sage_attention):
+                return _strict_public_sage_attention(wrap_attn_fn)
+
         if getattr(module, "_comfy_modal_baked_cuda_available", False) or sage_attention == "disabled":
-            return original(sage_attention, allow_compile=allow_compile)
+            selected = original(sage_attention, allow_compile=allow_compile)
+            if not strict_sage or sage_attention == "disabled":
+                return selected
+
+            # Sage3 is a separate KJNodes backend.  Keep its native factory
+            # semantics, but retain the fail-closed guard for any fallback
+            # that it may acquire in a future KJNodes release.
+
+            selected_body = getattr(selected, "__wrapped__", selected)
+
+            @wrap_attn_fn
+            def strict_attention(q, k, v, heads, mask=None, attn_precision=None,
+                                  skip_reshape=False, skip_output_reshape=False, **kwargs):
+                _validate_strict_attention_inputs(
+                    q, k, v, heads, mask, attn_precision, skip_reshape, kwargs
+                )
+
+                def reject_inner_fallback(*_args, **_kwargs):
+                    raise RuntimeError(
+                        "Strict SageAttention policy rejected KJNodes attention_pytorch fallback"
+                    )
+
+                previous_fallback = module.attention_pytorch
+                module.attention_pytorch = reject_inner_fallback
+                try:
+                    return selected_body(
+                        q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                        skip_reshape=skip_reshape,
+                        skip_output_reshape=skip_output_reshape,
+                        **kwargs,
+                    )
+                finally:
+                    module.attention_pytorch = previous_fallback
+
+            return strict_attention
         if sage_attention != "auto" and "sageattn" not in str(sage_attention):
             return original(sage_attention, allow_compile=allow_compile)
 
@@ -6529,6 +6804,129 @@ def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool) -> bool:
     module.get_sage_func = wrapped_get_sage_func
     module._comfy_modal_get_sage_func_patched = True
     return True
+
+
+def _strict_public_sage_attention(wrap_attn_fn):
+    """Build the strict KJNodes adapter around Sage's public native callable.
+
+    KJNodes normally binds a selector-specific closure and its wrapper can
+    intentionally choose ``attention_pytorch``.  The RA5 production arm must
+    instead bind ``sageattention.sageattn`` itself, while retaining KJNodes'
+    tensor-layout/output-shape convention.
+    """
+    try:
+        import torch
+        import sageattention
+    except Exception as exc:
+        raise RuntimeError(
+            f"Strict SageAttention native callable unavailable:{type(exc).__name__}"
+        ) from exc
+
+    native = getattr(sageattention, "sageattn", None)
+    if not callable(native):
+        raise RuntimeError("Strict SageAttention native callable unavailable:sageattn")
+
+    def supports_sm_scale() -> bool:
+        try:
+            parameter = inspect.signature(native).parameters.get("sm_scale")
+        except (TypeError, ValueError):
+            return False
+        return parameter is not None and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+
+    @wrap_attn_fn
+    def strict_attention(q, k, v, heads, mask=None, attn_precision=None,
+                         skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if mask is not None or kwargs.get("attn_mask") is not None:
+            raise RuntimeError("Strict SageAttention policy rejected unsupported attention mask")
+        if kwargs.get("enable_gqa", False):
+            raise RuntimeError("Strict SageAttention policy rejected GQA")
+        if kwargs.get("is_causal", False):
+            raise RuntimeError("Strict SageAttention policy rejected causal attention")
+        if attn_precision is not None:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected unsupported attention precision"
+            )
+        if kwargs.get("low_precision_attention", True) is False:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected KJNodes attention_pytorch fallback"
+            )
+        if not isinstance(heads, int) or isinstance(heads, bool) or heads <= 0:
+            raise RuntimeError("Strict SageAttention policy rejected invalid head count")
+
+        in_dtype = getattr(v, "dtype", None)
+        # Match KJNodes' established conversion contract: Sage2 accepts fp16
+        # and bf16, while the model path may present fp32 activations.
+        if any(getattr(t, "dtype", None) is torch.float32 for t in (q, k, v)):
+            q, k, v = (t.to(torch.float16) for t in (q, k, v))
+        if any(getattr(t, "dtype", None) not in (torch.float16, torch.bfloat16)
+               for t in (q, k, v)):
+            raise RuntimeError("Strict SageAttention policy rejected unsupported attention dtype")
+
+        try:
+            shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+        except Exception as exc:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected invalid attention shape"
+            ) from exc
+        if skip_reshape:
+            if not all(len(shape) == 4 for shape in shapes):
+                raise RuntimeError("Strict SageAttention policy rejected non-HND attention")
+            if tuple(shape[1] for shape in shapes) != (heads, heads, heads):
+                raise RuntimeError("Strict SageAttention policy rejected GQA")
+            if len({shape[0] for shape in shapes}) != 1 or len({shape[-1] for shape in shapes}) != 1:
+                raise RuntimeError("Strict SageAttention policy rejected incompatible attention shapes")
+            batch, dim_head = shapes[0][0], shapes[0][-1]
+            q_native, k_native, v_native = q, k, v
+            tensor_layout = "HND"
+        else:
+            if not all(len(shape) == 3 for shape in shapes):
+                raise RuntimeError("Strict SageAttention policy rejected non-NHD attention")
+            if len({shape[0] for shape in shapes}) != 1 or len({shape[-1] for shape in shapes}) != 1:
+                raise RuntimeError("Strict SageAttention policy rejected incompatible attention shapes")
+            if shapes[0][-1] % heads:
+                raise RuntimeError("Strict SageAttention policy rejected invalid head dimension")
+            batch = shapes[0][0]
+            dim_head = shapes[0][-1] // heads
+            q_native, k_native, v_native = (
+                tensor.view(batch, -1, heads, dim_head) for tensor in (q, k, v)
+            )
+            tensor_layout = "NHD"
+
+        sage_kwargs = {
+            "attn_mask": None,
+            "is_causal": False,
+            "tensor_layout": tensor_layout,
+        }
+        requested_scale = kwargs.get("scale", None)
+        if "scale" in kwargs:
+            if requested_scale is not None and (
+                isinstance(requested_scale, bool)
+                or not isinstance(requested_scale, (int, float))
+            ):
+                raise RuntimeError("Strict SageAttention policy rejected invalid attention scale")
+            if not supports_sm_scale():
+                raise RuntimeError("Strict SageAttention policy rejected unsupported sm_scale")
+            sage_kwargs["sm_scale"] = requested_scale
+
+        try:
+            out = native(q_native, k_native, v_native, **sage_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Strict SageAttention native call failed:{type(exc).__name__}"
+            ) from exc
+        if in_dtype is not None and getattr(out, "dtype", in_dtype) != in_dtype:
+            out = out.to(in_dtype)
+        if tensor_layout == "HND":
+            if not skip_output_reshape:
+                out = out.transpose(1, 2).reshape(batch, -1, heads * dim_head)
+        elif skip_output_reshape:
+            out = out.transpose(1, 2)
+        else:
+            out = out.reshape(batch, -1, heads * dim_head)
+        return out
+
+    strict_attention._comfy_modal_selected_callable = "sageattention.sageattn"
+    return strict_attention
 
 
 def build_replay_warmup_workflow(workflow: dict) -> dict:
@@ -6659,7 +7057,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.30"
+COMFYAPP_VERSION = "2.16.31"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -6668,7 +7066,7 @@ APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
 RUNTIME_CONFIG_VOLUME_NAME = "comfymodal-runtime-config"
 RUNTIME_CONFIG_PATH = "/root/comfymodal_runtime_state"
-CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
+CUSTOM_NODES_VOLUME_NAME = _publication_policy.CUSTOM_NODES_VOLUME_NAME
 # P2: dedicated prompt-encoding cache volume. NEVER written to the
 # models or custom-nodes volumes. The volume is mounted only by the
 # persist + lookup functions below; the GPU class does not need to
@@ -7058,6 +7456,9 @@ def _normalize_requirements_context_metadata(root: str) -> None:
     and modes even when every dependency file is byte-for-byte unchanged.
     Normalize files and directories so metadata-only changes cannot invalidate
     the custom-node dependency image layer.
+
+    The staged copy path is intentionally content-based (the equivalent of
+    ``shutil.copyfile(src, dst)``), never metadata-based.
     """
     if not os.path.isdir(root):
         return
@@ -7588,16 +7989,19 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"[comfyapp] comfyui_modal_excluded_baked_custom_node_deps={'yes' if combined_excluded_ok else 'check_logs'}")
     print(f"[comfyapp] build_order:")
     print(f"  1. base CUDA image (nvidia/cuda:13.0.0-devel-ubuntu24.04)")
-    print(f"  2. comfy-cli install")
-    print(f"  3. PyTorch CUDA reinstall (cu130)")
-    print(f"  4. triton install")
-    print(f"  5. SageAttention build")
-    print(f"  6. env vars")
+    print(f"  2. install comfy-cli build utility")
+    print(f"  3. fetch/checkout pinned ComfyUI v0.34.2")
+    print(f"  4. install pinned ComfyUI requirements")
+    print(f"  5. PyTorch CUDA reinstall (cu130)")
+    print(f"  6. triton install")
     print(f"  7. add .custom_node_requirements (as local_dir)")
     print(f"  8. run custom-node prereq pip loop")
-    print(f"  9. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
-    print(f"  10. generate/add baked dependency manifest")
-    print(f"  11. add helper Python sources")
+    print(f"  9. install/verify comfy-kitchen==0.2.31")
+    print(f"  10. install/verify fastsafetensors and SageAttention")
+    print(f"  11. apply late runtime env vars")
+    print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
+    print(f"  13. generate/add baked dependency manifest")
+    print(f"  14. add helper Python sources")
     print(f"[comfyapp] ===========================================")
 
     _save_last_context_manifest(current)
@@ -7813,20 +8217,47 @@ GPU_PROFILES = {
 }
 
 # Authoritative ComfyUI core for Step-3 host<->image parity: the upstream
-# v0.24.0 tag commit the local validation checkout is pinned to
-# (Comfy-Org/ComfyUI, lightweight tag v0.24.0).  comfy-cli 1.3.7's default
+# v0.34.2 tag commit the image checkout is pinned to
+# (Comfy-Org/ComfyUI, lightweight tag v0.34.2).  comfy-cli 1.3.7's default
 # "nightly" install clones master WITHOUT a tag checkout, so the image must
 # be re-pinned explicitly; the string change also busts the image layer hash
 # so a new pin always triggers a rebuild of the affected layers.
-_COMFYUI_PINNED_COMMIT = "f49bdb655707b97952dcef40e12e5af1f08d2007"
+_COMFYUI_PINNED_COMMIT = "169fcf35a2fc163fec31338b816503ddac0d3fcf"
 
-SAGEATTENTION_GIT_REF = "v2.2.0"
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
+
+def _compute_v2_runtime_revision(runtime_root: Path) -> str:
+    """Return the stable content revision for packaged runtime sources.
+
+    Keep this small standalone spelling for source-level tooling that loads
+    this function without importing comfyapp; the implementation mirrors the
+    shared deployment-spec algorithm.
+    """
+    root = Path(runtime_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"runtime package is not a directory: {root}")
+    source_files = []
+    for path in root.rglob("*.py"):
+        resolved_path = path.resolve()
+        if not resolved_path.is_relative_to(root):
+            raise ValueError(f"runtime source escapes package: {path}")
+        if not resolved_path.is_file():
+            raise OSError(f"runtime source is not a file: {path}")
+        source_files.append((path.relative_to(root).as_posix(), resolved_path))
+    digest = hashlib.sha256()
+    for relative_path, path in sorted(source_files, key=lambda item: item[0]):
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
 try:
-    _V2_RUNTIME_REVISION = hashlib.sha256(
-        (Path(__file__).resolve().parent / "comfymodal_runtime" / "modal_app.py").read_bytes()
-    ).hexdigest()[:16]
+    _V2_RUNTIME_REVISION = _compute_v2_runtime_revision(
+        Path(__file__).resolve().parent / "comfymodal_runtime"
+    )
 except Exception:
     _V2_RUNTIME_REVISION = "0000000000000000"
 
@@ -7853,16 +8284,23 @@ _image_base = (
         "clang",
     )
     .pip_install("comfy-cli==1.3.7", "httpx>=0.27.0")
+    # Fetch only the pinned ComfyUI source.  Do not use ``comfy install`` here:
+    # that command installs requirements from an implicit moving checkout and
+    # makes ordinary source changes ancestors of heavyweight dependency work.
     .run_commands(
-        "comfy --skip-prompt install --nvidia",
-        gpu="a10g",
-    )
-    # Pin ComfyUI to the exact authoritative commit (comfy-cli's default
-    # nightly install leaves the checkout on an unpinned master snapshot).
-    .run_commands(
+        "rm -rf /root/comfy/ComfyUI && "
+        "git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /root/comfy/ComfyUI && "
         "git -C /root/comfy/ComfyUI fetch --depth=1 origin " + _COMFYUI_PINNED_COMMIT + " && "
         "git -C /root/comfy/ComfyUI checkout --force " + _COMFYUI_PINNED_COMMIT + " && "
         "git -C /root/comfy/ComfyUI log -1 --format='pinned=%H'",
+        gpu="a10g",
+    )
+    # Install the requirements belonging to the pinned checkout in a distinct
+    # dependency step.  Torch is re-pinned immediately below because upstream
+    # requirements may declare a different CUDA wheel.
+    .run_commands(
+        "python -m pip install --disable-pip-version-check --no-input "
+        "-r /root/comfy/ComfyUI/requirements.txt",
         gpu="a10g",
     )
     # Force CUDA 13.0 PyTorch after comfy install (which may install older CUDA build)
@@ -7876,82 +8314,20 @@ _image_base = (
     .run_commands(
         "python -m pip install --upgrade 'triton>=3.0.0'",
     )
-    .run_commands(
-        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=1 "
-        "python -m pip install --upgrade --force-reinstall "
-        "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
-        "--no-build-isolation --no-deps",
-        gpu="a10g",
-    )
-    .run_commands(
-        "python -X utf8 -c \"import pathlib, site; "
-        "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
-        "files = list(pathlib.Path(site_root).joinpath('sageattention').glob('*.so')); "
-        "print([f.name for f in files]); "
-        "assert files, 'no sageattention shared objects built'\"",
-        gpu="a10g",
-    )
-    .run_commands(
-        "python -X utf8 -c \"import sageattention._fused; print('sageattention._fused ok')\"",
-        gpu="a10g",
-    )
 )
+
+# Stable OS/CUDA/Python plus the pinned ComfyUI core ABI (Torch/Triton) stop
+# here.  Later custom-node dependency and accelerator layers are children of
+# this boundary, never parents of it.
+_FOUNDATION_IMAGE = _image_base
 
 # Runtime/source-only environment belongs to the child image, after the
 # stable dependency boundary.  It must not be an ancestor of the pip layer.
-_V2_RUNTIME_ENV = {
-    "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime_state/.inductor-cache",
-    "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
-    "TRITON_CACHE_DIR": "/tmp/triton_cache",
-    "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
-    "TORCHINDUCTOR_COMPILE_THREADS": "1",
-    "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
-    "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
-    "COMFYMODAL_WARMUP_TEXT": "warmup",
-    "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
-    "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-    "COMFYMODAL_PRELOAD_MODE": "clip_only",
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
-    "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
-    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
-    "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
-    "COMFYMODAL_RUNTIME": "1",
-    "PROMPT_ASYNC_PRELOAD": "0",
-    "PROMPT_PRELOAD_WORKERS": "2",
-    "PROMPT_ASYNC_ACTUAL_LOAD": "1",
-    "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1",
-    "ACTUAL_LOAD_MODE": "unet_vae_only",
-    "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
-    "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "0",
-    "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
-    "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
-    "COMFYMODAL_PRELOAD_MAX_TOTAL_GB": "12",
-    "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
-    "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
-    "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
-    "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
-    "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
-    "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
-    "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
-    "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
-    # Native fast-disk UNET (opt-in, default OFF).  Baked into the V2
-    # container image from the caller's environment at deploy time so that
-    # $env:COMFYMODAL_V2_NATIVE_FAST_DISK_UNET='1' before
-    # deploy_and_run_v2_single.bat activates it in the deployed container.
-    "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": os.environ.get(
-        "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "0"
-    ),
-    # Sampling deep profile level (opt-in, default off).  Baked into the V2
-    # container image from the caller's environment at deploy time the same
-    # way the native-fast-disk flag is baked; the profiler itself is
-    # untouched and still resolves its own env/file flag at runtime.
-    "COMFYMODAL_SAMPLING_DEEP_PROFILE": os.environ.get(
-        "COMFYMODAL_SAMPLING_DEEP_PROFILE", "off"
-    ),
-}
-_V2_RUNTIME_ENV.update(runtime_shape_config().environment())
+_V2_RUNTIME_ENV = build_v2_late_config(
+    environment=dict(os.environ),
+    runtime_root=Path(__file__).resolve().parent / "comfymodal_runtime",
+    runtime_revision=_V2_RUNTIME_REVISION,
+)
 
 # Combined requirements layer: one COPY + one pip loop (single cache unit).
 # When no requirements.txt changes, the layer is cached (~5s deploy).
@@ -8048,8 +8424,79 @@ if not _INSIDE_MODAL_CONTAINER:
         'PYEOF\n'
     )
 
-_STABLE_DEPENDENCY_IMAGE = _image_base
-_image_base = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
+# Canonical accelerator/native boundary.  These installs intentionally happen
+# after the complete third-party environment: SageAttention's build imports
+# torch/triton and fastsafetensors is required by the later direct-GPU loader.
+# There is no runtime/image descendant that is allowed to add these packages.
+_THIRD_PARTY_DEPENDENCY_IMAGE = _image_base.run_commands(
+    "python -m pip install --disable-pip-version-check --no-input "
+    "--upgrade --force-reinstall --no-deps 'comfy-kitchen==0.2.31'",
+    gpu="a10g",
+).run_commands(
+    "python -X utf8 -c \"import importlib, importlib.metadata; "
+    "version = importlib.metadata.version('comfy-kitchen'); "
+    "assert version == '0.2.31', f'expected comfy-kitchen==0.2.31, got {version}'; "
+    "kitchen = importlib.import_module('comfy_kitchen'); "
+    "assert callable(getattr(kitchen, 'int8_attention', None)), "
+    "'comfy_kitchen.int8_attention is unavailable'; "
+    "available = getattr(kitchen, 'int8_attention_is_available', None); "
+    "assert callable(available), "
+    "'comfy_kitchen.int8_attention_is_available is unavailable'; "
+    "assert available(), 'comfy_kitchen INT8 attention is unavailable'; "
+    "print(f'comfy-kitchen {version}: int8_attention available')\"",
+    gpu="a10g",
+)
+_ACCELERATOR_NATIVE_IMAGE = _THIRD_PARTY_DEPENDENCY_IMAGE.pip_install(
+    "fastsafetensors==0.3.3",
+)
+if env_flag("COMFYMODAL_V2_C9QD_EXTRAS"):
+    # Explicit diagnostic/benchmark opt-in; never part of the normal image.
+    _ACCELERATOR_NATIVE_IMAGE = _ACCELERATOR_NATIVE_IMAGE.pip_install(
+        "runai-model-streamer==0.16.1",
+    )
+_ACCELERATOR_NATIVE_IMAGE = _ACCELERATOR_NATIVE_IMAGE.run_commands(
+    "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=1 "
+    "python -m pip install --upgrade --force-reinstall "
+    "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
+    "--no-build-isolation --no-deps",
+    gpu="a10g",
+).run_commands(
+    "python -X utf8 -c \"import pathlib, site; "
+    "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
+    "files = list(pathlib.Path(site_root).joinpath('sageattention').rglob('*.so')); "
+    "print([f.name for f in files]); "
+    "assert any('_fused' in f.name for f in files), 'sageattention._fused was not built'; "
+    "assert any('_qattn_sm89' in f.name for f in files), "
+    "'SageAttention v2.2.0 native _qattn_sm89 family was not built'\"",
+    gpu="a10g",
+).run_commands(
+    "python -X utf8 -c \"import sageattention._fused; "
+    "from sageattention import sageattn; "
+    "assert callable(sageattn), 'public sageattn dispatcher is not callable'; "
+    "print('sageattention._fused and sageattention.sageattn ok')\"",
+    gpu="a10g",
+)
+# Compatibility marker retained for source-level build diagnostics:
+# print('sageattention._fused ok')
+
+
+def _add_explicit_diagnostic_dependencies(img: Any) -> Any:
+    """Add diagnostics only when explicitly requested at image build time."""
+    if env_flag("COMFYMODAL_V2_FULL_TRACE"):
+        return img.pip_install("viztracer==1.1.1")
+    return img
+
+
+_ACCELERATOR_NATIVE_IMAGE = _add_explicit_diagnostic_dependencies(
+    _ACCELERATOR_NATIVE_IMAGE
+)
+
+# Build-time configuration is isolated from both dependency and source
+# identities.  Modal requires env/build operations before local Python source;
+# this is the final config boundary and is consumed as a finished image.
+_STABLE_DEPENDENCY_IMAGE = _ACCELERATOR_NATIVE_IMAGE
+_LATE_CONFIG_IMAGE = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
+_image_base = _LATE_CONFIG_IMAGE
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
 # Only runs during local deploy/image build.  Skipped inside remote Modal containers.
@@ -8213,7 +8660,7 @@ _APP_SOURCE_BYTES = os.path.getsize(__file__)
 def _add_gpu_python_sources(img):
     img = img.add_local_python_source("comfyapp", copy=True)
     img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _GPU_COMFYMODAL_PYTHON_SOURCES:
+    for _module_name in _CANONICAL_GPU_SOURCE_MODULES:
         img = img.add_local_python_source(_module_name, copy=True)
     return img
 
@@ -8234,7 +8681,195 @@ def _add_comfymodal_local_python_sources(img):
     return img
 
 
-image = _add_gpu_python_sources(_image_base).add_local_python_source("comfymodal_runtime", copy=True)
+_CANONICAL_GPU_SOURCE_MODULES = tuple(dict.fromkeys(
+    _GPU_COMFYMODAL_PYTHON_SOURCES + (
+        "canonical_execution", "modal_client", "run_prompt_options",
+        "warmup_profile", "workflow_metadata", "model_manifest",
+    )
+))
+
+
+@dataclass(frozen=True)
+class CanonicalImagePlan:
+    """The sole owner of the deploy image DAG and its identity boundaries."""
+
+    foundation: Any
+    third_party_dependency_environment: Any
+    accelerator_native_packages: Any
+    late_config: Any
+    source: Any
+    source_identity: Any
+    identity: Any
+
+    @property
+    def final_image(self) -> Any:
+        return self.source
+
+
+_CANONICAL_PLAN_METADATA_ENV = "COMFYMODAL_CANONICAL_IMAGE_PLAN"
+_CANONICAL_PLAN_METADATA_PATH_ENV = "COMFYMODAL_CANONICAL_IMAGE_PLAN_PATH"
+_CANONICAL_PLAN_METADATA_IMAGE_PATH = "/opt/comfymodal/canonical_image_plan.json"
+# Keep the generated handoff outside the Modal source tree.  Modal snapshots
+# local-file sources before/while importing this module; rewriting a file under
+# ``.baked_custom_node_deps`` during that lifecycle makes the deploy fail even
+# when the serialized identities are unchanged.  The destination inside the
+# image remains the stable runtime metadata path below.
+_CANONICAL_PLAN_METADATA_HOST_PATH = os.path.join(
+    tempfile.gettempdir(),
+    f"comfymodal-canonical-image-plan-{os.getpid()}.json",
+)
+
+
+def _persist_canonical_plan_metadata(source_identity: Any, identity: Any) -> None:
+    """Persist the typed image-plan identities for the local image build."""
+    if _INSIDE_MODAL_CONTAINER:
+        return
+    metadata_path = Path(_CANONICAL_PLAN_METADATA_HOST_PATH)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = json.dumps(
+        {
+            "source_identity": source_identity.to_dict(),
+            "canonical_identity": identity.to_dict(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if not metadata_path.is_file() or metadata_path.read_text(encoding="utf-8") != metadata:
+        metadata_path.write_text(metadata, encoding="utf-8")
+
+
+def _load_persisted_canonical_plan_metadata() -> tuple[Any, Any] | None:
+    """Read the typed plan record baked into the runtime image."""
+    raw = os.environ.get(_CANONICAL_PLAN_METADATA_ENV, "").strip()
+    if not raw:
+        metadata_path = os.environ.get(_CANONICAL_PLAN_METADATA_PATH_ENV, "").strip()
+        if not metadata_path:
+            return None
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                raw = metadata_file.read().strip()
+        except OSError as exc:
+            raise RuntimeError(
+                f"invalid persisted canonical image-plan metadata: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not raw:
+            raise RuntimeError(
+                "invalid persisted canonical image-plan metadata: metadata file is empty"
+            )
+    from comfymodal_runtime.deployment_spec import (
+        CanonicalBoundaryIdentity,
+        deployment_identity_from_dict,
+    )
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("plan metadata is not an object")
+        return (
+            deployment_identity_from_dict(payload["source_identity"]),
+            CanonicalBoundaryIdentity.from_dict(payload["canonical_identity"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid persisted canonical image-plan metadata: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def build_canonical_image_plan() -> CanonicalImagePlan:
+    """Return the finished image and typed identities for every boundary."""
+    from comfymodal_runtime.deployment_spec import (
+        build_canonical_boundary_identity,
+        build_deployment_identity,
+        validate_canonical_boundary_identity,
+    )
+
+    persisted = _load_persisted_canonical_plan_metadata() if _INSIDE_MODAL_CONTAINER else None
+    if persisted is not None:
+        source_identity, identity = persisted
+    else:
+        dependency_context = _compute_deterministic_context_hash(
+            _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+        )
+        if not dependency_context.get("context_hash"):
+            raise RuntimeError("canonical dependency identity unavailable")
+        source_identity = build_deployment_identity(
+            runtime_root=Path(__file__).resolve().parent / "comfymodal_runtime",
+            custom_node_paths=[_LOCAL_CUSTOM_NODES],
+            dependency_hash=_build_v2_dependency_cache_identity(
+                dependency_context["context_hash"]
+            ).get("dependency_key", ""),
+        )
+        if (
+            source_identity.source_bytes <= 0
+            or not source_identity.custom_node_hash
+            or not source_identity.dependency_hash
+        ):
+            raise RuntimeError(
+                "canonical source identity incomplete: runtime/custom-node/dependency source is missing"
+            )
+
+        identity = build_canonical_boundary_identity(
+            source_identity=source_identity,
+            foundation_inputs={
+                "image": "nvidia/cuda:13.0.0-devel-ubuntu24.04",
+                "python": "3.11",
+                "comfyui_commit": _COMFYUI_PINNED_COMMIT,
+            },
+            dependency_inputs={
+                "context_hash": dependency_context["context_hash"],
+                "cachedit_lock": _sha256_file_canonical(_CACHEDIT_LOCK_SRC),
+                "installer": _V2_DEPENDENCY_INSTALLER_VERSION,
+            },
+            accelerator_inputs={
+                "fastsafetensors": "0.3.3",
+                "sageattention": "v2.2.0",
+                "triton": "3.x",
+                "c9_extras": env_flag("COMFYMODAL_V2_C9QD_EXTRAS"),
+            },
+            late_config_inputs=dict(_V2_RUNTIME_ENV),
+        )
+        validate_canonical_boundary_identity(identity)
+        source_identity = source_identity.with_deployment_hash(identity.deployment)
+
+    validate_canonical_boundary_identity(identity)
+    _persist_canonical_plan_metadata(source_identity, identity)
+    # ``_image_base`` is now the post-custom-node-source boundary.  Start the
+    # final source additions there so the canonical plan does not accidentally
+    # drop the published custom-node tree.
+    source = _add_gpu_python_sources(_image_base).add_local_python_source(
+        "comfymodal_runtime", copy=True,
+    )
+    if not _INSIDE_MODAL_CONTAINER:
+        source = source.add_local_file(
+            _CANONICAL_PLAN_METADATA_HOST_PATH,
+            _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+            copy=True,
+        ).env({
+            _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+        })
+    return CanonicalImagePlan(
+        foundation=_FOUNDATION_IMAGE,
+        third_party_dependency_environment=_THIRD_PARTY_DEPENDENCY_IMAGE,
+        accelerator_native_packages=_ACCELERATOR_NATIVE_IMAGE,
+        late_config=_LATE_CONFIG_IMAGE,
+        source=source,
+        source_identity=source_identity,
+        identity=identity,
+    )
+
+
+CANONICAL_IMAGE_PLAN = build_canonical_image_plan()
+image = CANONICAL_IMAGE_PLAN.final_image
+
+publisher_image = _add_comfymodal_local_python_sources(
+    modal.Image.debian_slim(python_version="3.11")
+).add_local_file(
+    _CANONICAL_PLAN_METADATA_HOST_PATH,
+    _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+    copy=True,
+).env({
+    _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+})
 
 download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")
@@ -8470,9 +9105,7 @@ def _validate_safe_tar_member(member, staging_dir: str) -> None:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
-        modal.Image.debian_slim(python_version="3.11")
-    ),
+    image=publisher_image,
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -8574,7 +9207,17 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d))
     ) if os.path.isdir(CUSTOM_NODES_PATH) else []
     print(f"[comfyapp] sync_custom_nodes_to_volume extracted syncable_nodes={len(nodes)} raw_dirs={len(raw_dirs)}")
-    return {"status": "ok", "nodes": nodes, "raw_dirs": raw_dirs}
+    return {
+        "status": "ok",
+        "comfyapp_version": COMFYAPP_VERSION,
+        "nodes": nodes,
+        "raw_dirs": raw_dirs,
+        # This is the value written before the commit, not a host-derived
+        # guess.  The publisher uses it to distinguish a successful remote
+        # write from a host-side generation-record readback failure.
+        "generation": _cn_gen.get("generation", ""),
+        "generation_record_path": CUSTOM_NODES_GENERATION_CONTROL_PATH,
+    }
 
 
 @app.function(
@@ -14408,15 +15051,75 @@ class _ComfyAPIMixin:
 
     def _preferred_sage_backend(self):
         import sageattention
+        return select_public_sageattention_callable(sageattention)
 
-        for name, kwargs in (
-            ("sageattn_qk_int8_pv_fp16_cuda", {"pv_accum_dtype": "fp32"}),
-            ("sageattn_qk_int8_pv_fp8_cuda", {"pv_accum_dtype": "fp32+fp32"}),
-        ):
-            candidate = getattr(sageattention, name, None)
-            if callable(candidate):
-                return name, candidate, kwargs
-        return None, None, {}
+    def _sage_runtime_identity(self, *, selected_symbol: str = "", kernel_family: str = "") -> dict[str, Any]:
+        """Collect restore-time identity; never called during snapshot startup."""
+        import torch
+
+        gpu_name = "unknown"
+        capability = None
+        if torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+            try:
+                capability = tuple(torch.cuda.get_device_capability(0))
+            except Exception:
+                pass
+        driver_version = ""
+        try:
+            driver = getattr(getattr(torch, "_C", None), "_cuda_getDriverVersion", None)
+            if callable(driver):
+                driver_version = str(driver())
+        except Exception:
+            pass
+        sage_version = ""
+        selected = selected_symbol
+        try:
+            import sageattention
+            sage_version = str(getattr(sageattention, "__version__", "") or "")
+            if not selected:
+                selected, _, _ = select_public_sageattention_callable(sageattention)
+        except Exception:
+            pass
+        if not sage_version:
+            try:
+                from importlib.metadata import version
+                sage_version = version("sageattention")
+            except Exception:
+                pass
+        artifact = sageattention_artifact_identity(SAGEATTENTION_SITE_PACKAGES)
+        if not kernel_family:
+            kernel_family = (
+                "sage2++_sm89_dispatch"
+                if SAGEATTENTION_EXPECTED_NATIVE_FAMILY in " ".join(
+                    item["path"] for item in artifact["extension_manifest"]
+                )
+                else "sage2++_public_dispatch"
+            )
+        image_identity = "|".join(
+            os.environ.get(name, "")
+            for name in ("COMFYMODAL_IMAGE_ID", "MODAL_IMAGE_ID", "MODAL_IMAGE_VERSION")
+        )
+        deployment_identity = "|".join(
+            os.environ.get(name, "")
+            for name in ("COMFYMODAL_DEPLOYMENT_ID", "MODAL_APP_ID", "MODAL_FUNCTION_ID")
+        )
+        return build_sage_runtime_identity(
+            site_packages_root=SAGEATTENTION_SITE_PACKAGES,
+            selected_symbol=selected or "none",
+            kernel_family=kernel_family,
+            gpu_name=gpu_name,
+            capability=capability,
+            sage_version=sage_version,
+            torch_version=str(getattr(torch, "__version__", "") or ""),
+            torch_cuda=str(getattr(getattr(torch, "version", None), "cuda", "") or ""),
+            driver_version=driver_version,
+            image_identity=image_identity,
+            deployment_identity=deployment_identity,
+        )
 
     def _verify_baked_sageattention_runtime(self) -> tuple[bool, list[str]]:
         import importlib
@@ -14425,36 +15128,67 @@ class _ComfyAPIMixin:
         extension_files = list_sageattention_extension_files(SAGEATTENTION_SITE_PACKAGES)
         if not extension_files:
             return False, ["compiled-extensions-missing"]
+        if not any(
+            SAGEATTENTION_EXPECTED_NATIVE_FAMILY in path.name
+            for path in extension_files
+        ):
+            return False, [
+                f"expected-native-family-missing:{SAGEATTENTION_EXPECTED_NATIVE_FAMILY}"
+            ]
 
         try:
-            import sageattention._fused  # noqa: F401
             importlib.invalidate_caches()
-            import sageattention  # noqa: F401
+            import sageattention._fused  # noqa: F401
+            import sageattention
         except Exception as exc:
             return False, [f"_fused-import-failed:{type(exc).__name__}"]
 
         try:
             backend_name, backend, backend_kwargs = self._preferred_sage_backend()
             if backend is None:
-                return False, ["no-supported-kjnodes-backend-symbol"]
-            q = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
-            k = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
-            v = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
-            _ = backend(q, k, v, is_causal=False, attn_mask=None, tensor_layout="NHD", **backend_kwargs)
+                return False, ["public-sageattn-callable-missing"]
+            # HND is the layout used by KJNodes when skip_reshape=True.  The
+            # public dispatcher, rather than a private extension symbol,
+            # chooses the v2.2.0 Sage2++ native family for SM120.
+            q = torch.randn(1, 8, 16, 64, device="cuda", dtype=torch.float16)
+            k = torch.randn(1, 8, 16, 64, device="cuda", dtype=torch.float16)
+            v = torch.randn(1, 8, 16, 64, device="cuda", dtype=torch.float16)
+            _ = backend(q, k, v, attn_mask=None, **backend_kwargs)
             torch.cuda.synchronize()
-            return True, [str(backend_name or "unknown-backend"), *[p.name for p in extension_files]]
+            self._sage_probe_identity = self._sage_runtime_identity(
+                selected_symbol=str(backend_name),
+            )
+            return True, [
+                str(backend_name or "unknown-backend"),
+                self._sage_probe_identity.get("kernel_family", ""),
+                *[p.name for p in extension_files],
+            ]
         except Exception as exc:
-            return False, [f"cuda-smoke-test-failed:{type(exc).__name__}"]
+            return False, [f"public-dispatch-smoke-test-failed:{type(exc).__name__}"]
 
-    def _select_sage_runtime_mode(self) -> tuple[str, str]:
+    def _select_sage_runtime_mode(
+        self, *, force_probe: bool = False, strict: bool = False
+    ) -> tuple[str, str]:
+        """Select Sage mode, optionally requiring a request-local fresh probe.
+
+        ``force_probe``/``strict`` are used only by the dedicated V2 Golden
+        restore callback, after CUDA has been reattached.  Ordinary ComfyUI
+        restores retain their existing override/cache behavior.
+        """
+        force_probe = bool(force_probe)
+        strict = bool(strict)
         # Sticky GÃ‡Ã¶ already selected earlier in this restore
-        if getattr(self, "_sage_runtime_mode", None) is not None:
+        if not force_probe and not strict and getattr(self, "_sage_runtime_mode", None) is not None:
             return self._sage_runtime_mode, getattr(self, "_sage_runtime_reason", "sticky")
 
         # P2 GÃ‡Ã¶ runtime-configurable env override (file GÃ¥Ã† env GÃ¥Ã† module)
         _rt_sage_mode = _resolve_sage_runtime_env_override()
         _rt_sage_probe = _resolve_sage_probe_on_restore()
-        if _rt_sage_mode in ("baked_cuda", "triton_fallback"):
+        if (
+            not force_probe
+            and not strict
+            and _rt_sage_mode in ("baked_cuda", "triton_fallback")
+        ):
             self._sage_runtime_mode = _rt_sage_mode
             self._sage_runtime_reason = f"runtime_override"
             print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason} "
@@ -14462,11 +15196,12 @@ class _ComfyAPIMixin:
             return self._sage_runtime_mode, self._sage_runtime_reason
 
         # P2 GÃ‡Ã¶ skip probe on restore: prefer cached value, else env default
-        if not _rt_sage_probe:
+        if not force_probe and not _rt_sage_probe and not strict:
             cached = self._load_sage_runtime_cache()
             if cached:
                 print(f"[comfyapp] sage_runtime_cache hit mode={cached['mode']} reason={cached['reason']} "
                       f"gpu={cached['gpu_name']} sage_v={cached['sage_version']} (probe skipped)")
+                self._sage_probe_identity = cached
                 self._sage_runtime_mode = cached["mode"]
                 self._sage_runtime_reason = cached["reason"]
                 return self._sage_runtime_mode, self._sage_runtime_reason
@@ -14482,10 +15217,11 @@ class _ComfyAPIMixin:
 
         # Normal path: check persistent cache, probe if needed
         import json, os
-        cached = self._load_sage_runtime_cache()
+        cached = None if force_probe or strict else self._load_sage_runtime_cache()
         if cached:
             print(f"[comfyapp] sage_runtime_cache hit mode={cached['mode']} reason={cached['reason']} "
                   f"gpu={cached['gpu_name']} sage_v={cached['sage_version']}")
+            self._sage_probe_identity = cached
             self._sage_runtime_mode = cached["mode"]
             self._sage_runtime_reason = cached["reason"]
             return self._sage_runtime_mode, self._sage_runtime_reason
@@ -14503,12 +15239,17 @@ class _ComfyAPIMixin:
         self._sage_runtime_reason = details[0] if details else reason
         print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason}")
         # Persist to volume for future restores
-        self._save_sage_runtime_cache(mode, self._sage_runtime_reason)
+        if not force_probe and not strict:
+            self._save_sage_runtime_cache(mode, self._sage_runtime_reason)
+        if strict and mode != "baked_cuda":
+            raise RuntimeError(
+                f"Strict SageAttention probe failed: {self._sage_runtime_reason}"
+            )
         return self._sage_runtime_mode, self._sage_runtime_reason
 
     def _load_sage_runtime_cache(self) -> dict | None:
         """Read cached sage runtime mode from volume. Returns None if stale or missing."""
-        import json, os, torch
+        import json, os
         try:
             if not os.path.isfile(SAGE_RUNTIME_CACHE_PATH):
                 return None
@@ -14516,38 +15257,24 @@ class _ComfyAPIMixin:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return None
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
-            sage_version = ""
-            try:
-                import sageattention
-                sage_version = getattr(sageattention, "__version__", "") or ""
-            except ImportError:
-                pass
-            # Cache is valid if GPU and sage version match
-            if data.get("gpu_name") == gpu_name and data.get("sage_version") == sage_version:
+            current = self._sage_runtime_identity()
+            if sage_runtime_cache_usable(data, current):
                 return data
-            print(f"[comfyapp] sage_runtime_cache stale: gpu {data.get('gpu_name')}->{gpu_name} "
-                  f"sage {data.get('sage_version')}->{sage_version}")
+            print(f"[comfyapp] sage_runtime_cache stale: identity {data.get('identity_digest', '')[:16]}->"
+                  f"{current.get('identity_digest', '')[:16]}")
         except Exception as exc:
             print(f"[comfyapp] sage_runtime_cache error: {exc}")
         return None
 
     def _save_sage_runtime_cache(self, mode: str, reason: str) -> None:
         """Persist sage runtime mode to volume for faster future restores."""
-        import json, os, torch, time
+        import json, os, time
         try:
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
-            sage_version = ""
-            try:
-                import sageattention
-                sage_version = getattr(sageattention, "__version__", "") or ""
-            except ImportError:
-                pass
+            identity = getattr(self, "_sage_probe_identity", None) or self._sage_runtime_identity()
             data = {
+                **identity,
                 "mode": mode,
                 "reason": reason,
-                "gpu_name": gpu_name,
-                "sage_version": sage_version,
                 "created_at": time.time(),
             }
             os.makedirs(os.path.dirname(SAGE_RUNTIME_CACHE_PATH), exist_ok=True)
@@ -14556,11 +15283,11 @@ class _ComfyAPIMixin:
                 json.dump(data, f, indent=2, sort_keys=True)
             os.replace(tmp, SAGE_RUNTIME_CACHE_PATH)
             _commit_runtime_config_vol_async("sage_runtime_cache", runtime_config_vol)
-            print(f"[comfyapp] sage_runtime_cache saved mode={mode} gpu={gpu_name} sage_v={sage_version}")
+            print(f"[comfyapp] sage_runtime_cache saved mode={mode} identity={identity['identity_digest'][:16]}")
         except Exception as exc:
             print(f"[comfyapp] sage_runtime_cache save error: {exc}")
 
-    def _apply_sage_attention_policy(self):
+    def _apply_sage_attention_policy(self, *, strict: bool = False):
         _t0 = time.time()
         baked_cuda_available = getattr(self, "_sage_runtime_mode", "triton_fallback") == "baked_cuda"
         found = False
@@ -14569,7 +15296,11 @@ class _ComfyAPIMixin:
             file_name = getattr(mod, "__file__", "") or ""
             if file_name.endswith("model_optimization_nodes.py"):
                 found = True
-                patched = patch_kjnodes_get_sage_func(mod, baked_cuda_available=baked_cuda_available)
+                patched = patch_kjnodes_get_sage_func(
+                    mod,
+                    baked_cuda_available=baked_cuda_available,
+                    strict=bool(strict),
+                )
                 _dur = round((time.time() - _t0) * 1000, 1)
                 print(f"[comfyapp] sage_policy module=model_optimization_nodes.py "
                       f"found=True patched={patched} "
@@ -14578,8 +15309,10 @@ class _ComfyAPIMixin:
                 return patched
         _dur = round((time.time() - _t0) * 1000, 1)
         print(f"[comfyapp] sage_policy module=model_optimization_nodes.py "
-              f"found=False baked_cuda_available={baked_cuda_available} "
-              f"duration={_dur}ms")
+               f"found=False baked_cuda_available={baked_cuda_available} "
+               f"duration={_dur}ms")
+        if strict:
+            raise RuntimeError("Strict SageAttention policy could not locate KJNodes integration")
         return False
 
     # GÃ¶Ã‡GÃ¶Ã‡ Backend scaffold (warmup + execution backend selection) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
@@ -20439,6 +21172,10 @@ class _ComfyAPIMixin:
                 __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
+                _sage_identity = getattr(self, "_sage_probe_identity", {}) or {}
+                __stages["sage_identity_digest"] = _sage_identity.get("identity_digest", "")
+                __stages["sage_selected_symbol"] = _sage_identity.get("selected_symbol", "")
+                __stages["sage_kernel_family"] = _sage_identity.get("kernel_family", "")
                 __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
                 __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
                 self._log_profile(
@@ -20539,6 +21276,10 @@ class _ComfyAPIMixin:
                 __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
+                _sage_identity = getattr(self, "_sage_probe_identity", {}) or {}
+                __stages["sage_identity_digest"] = _sage_identity.get("identity_digest", "")
+                __stages["sage_selected_symbol"] = _sage_identity.get("selected_symbol", "")
+                __stages["sage_kernel_family"] = _sage_identity.get("kernel_family", "")
                 __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
                 __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
                 self._log_profile(

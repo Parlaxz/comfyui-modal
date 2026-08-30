@@ -16,10 +16,12 @@ import pytest
 from tools.v2_control import cli
 from tools.v2_control.environment import EnvironmentBuilder
 from tools.v2_control.errors import FlagError
+from tools.benchmark_v2_direct import _golden_p1_request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAG = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
 HASH_CHECK_FLAG = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
+ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 
 
 def _config(profile: str, *, sets: list[str] | None = None):
@@ -100,7 +102,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
     assert config.workload.conditioning_cache == "forced_miss"
     assert (
         config.workload.expected_output_sha
-        == "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
+        == "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
     )
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
 
@@ -112,7 +114,7 @@ def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector
         "--run-count",
         "1",
         "--golden-p1-expected-output-sha",
-        "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da",
+        "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e",
     ]
     assert env == {
         "V2_BENCHMARK_MODE": "golden_p1_serial"
@@ -128,6 +130,61 @@ def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector
     }
 
     assert cli._benchmark_mode(_config("production")) == "e28_single"
+
+
+def test_golden_attention_backend_is_run_only_and_omitted_by_default():
+    config = _config("golden_p1")
+    flag = config.flag(ATTENTION_BACKEND_FLAG)
+    assert flag is not None
+    assert flag.value == "pytorch"
+    assert flag.source == "default"
+    assert flag.change_requires == "run"
+    args, _env = cli._validation_backend_args(config)
+    assert "--attention-backend" not in args
+
+    source = {"prompt": {"1": {}}, "extra_data": {}, "modal_options": {}}
+    payload = _golden_p1_request_payload(
+        source, request_id="r-default", index=0,
+    )
+    assert "attention_backend" not in payload
+
+
+def test_golden_attention_backend_sage_propagates_to_top_level_payload():
+    config = _config("golden_p1", sets=[f"{ATTENTION_BACKEND_FLAG}=sage"])
+    flag = config.flag(ATTENTION_BACKEND_FLAG)
+    assert flag is not None
+    assert flag.value == "sage"
+    assert flag.source == "set"
+    assert flag.change_requires == "run"
+    args, _env = cli._validation_backend_args(config)
+    assert args[-2:] == ["--attention-backend", "sage"]
+
+    source = {
+        "prompt": {"1": {}},
+        "extra_data": {},
+        "modal_options": {"unrelated": True},
+    }
+    payload = _golden_p1_request_payload(
+        source, request_id="r-sage", index=0, attention_backend="sage",
+    )
+    assert payload["attention_backend"] == "sage"
+    assert "attention_backend" not in payload["modal_options"]
+
+
+def test_golden_attention_backend_comfy_kitchen_is_run_only_and_propagates():
+    config = _config("golden_p1", sets=[f"{ATTENTION_BACKEND_FLAG}=comfy_kitchen"])
+    flag = config.flag(ATTENTION_BACKEND_FLAG)
+    assert flag is not None
+    assert flag.value == "comfy_kitchen"
+    assert flag.source == "set"
+    assert flag.change_requires == "run"
+    args, _env = cli._validation_backend_args(config)
+    assert args[-2:] == ["--attention-backend", "comfy_kitchen"]
+
+
+def test_golden_attention_backend_rejects_values_outside_public_selector():
+    with pytest.raises(FlagError):
+        _config("golden_p1", sets=[f"{ATTENTION_BACKEND_FLAG}=flash"])
 
 
 @pytest.mark.parametrize(

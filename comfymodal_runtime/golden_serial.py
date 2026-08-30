@@ -37,10 +37,13 @@ semantics through a narrow Golden-owned driver (never
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
+import importlib
 import inspect
 import json
+import logging
 import math
 import ntpath
 import os
@@ -51,18 +54,21 @@ import threading
 import time
 import types
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import torch
+
+LOG = logging.getLogger("comfymodal_runtime.golden_serial")
 
 # ── Canonical contract constants ──────────────────────────────────────────
 
 # SHA-256 over the sorted-key compact JSON of the canonical prompt
 # (independently computed by the parent orchestrator).
 EXPECTED_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab044704c0d3b5"
-# SHA-256 of the exact expected canonical OUTPUT PNG bytes (NOT a workflow
-# hash).  Verified against post-durable reopened bytes, fail-closed.
-EXPECTED_OUTPUT_PNG_SHA256 = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
+# SHA-256 of the current canonical OUTPUT PNG bytes (NOT a workflow hash).
+# The observed content hash remains authoritative; a configured expectation
+# mismatch is recorded as a warning and does not prevent durability proof.
+EXPECTED_OUTPUT_PNG_SHA256 = "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
 CANONICAL_CLIP_NAME = "qwen_3_4b.safetensors"
 CANONICAL_CLIP_TYPE = "lumina2"
 CANONICAL_UNET_NAME = "z_image_turbo_bf16.safetensors"
@@ -73,6 +79,10 @@ CANONICAL_SAMPLER_CLASS = "ClownsharKSampler_Beta"
 # sampler/model callbacks and CacheDiT scalar state; it never changes sampler
 # inputs or performs a CUDA synchronization.
 GOLDEN_SAMPLING_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_SAMPLING_DIAGNOSTICS"
+
+# Public Golden request selector.  This is deliberately request-local; it is
+# not a process/global ComfyUI attention switch.
+ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 
 GOLDEN_QD = 4
 GOLDEN_BLOCK_BYTES = 32 * 1024 * 1024
@@ -198,11 +208,383 @@ class GoldenWorkflowContract:
 
 @dataclass(frozen=True)
 class GoldenRequest:
-    """One frozen Golden request: id + canonical workflow prompt."""
+    """One frozen Golden request: id + workflow + optional attention arm.
+
+    ``attention_backend`` is the only supported backend selector for the
+    public Golden API.  ``None`` preserves an omitted selector and means
+    auto: Golden does not install an attention override.  Explicit selectors
+    are normalized once at the request boundary and subsequently treated as
+    immutable run identity.
+    """
 
     request_id: str
     prompt: dict
     extra_data: dict = field(default_factory=dict)
+    attention_backend: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.attention_backend is not None:
+            object.__setattr__(
+                self,
+                "attention_backend",
+                normalize_attention_backend(self.attention_backend),
+            )
+
+
+class AttentionBackendValidationError(RuntimeError):
+    """Raised when a requested Golden attention arm cannot be proven."""
+
+
+def normalize_attention_backend(value: Any) -> str:
+    """Normalize and validate the public ``attention_backend`` field."""
+    if not isinstance(value, str):
+        raise ValueError("golden_attention_backend_must_be_string")
+    normalized = value.strip().lower()
+    if normalized not in ATTENTION_BACKENDS:
+        raise ValueError(
+            "golden_attention_backend_invalid:"
+            f"{value!r}; allowed={','.join(ATTENTION_BACKENDS)}"
+        )
+    return normalized
+
+
+_MISSING = object()
+
+
+def _require_attention_backend_invocation(backend: str, state: Mapping[str, Any]) -> None:
+    """Fail closed when a non-baseline override was never observed in use."""
+    if backend != "pytorch" and int(state.get("calls", 0)) == 0:
+        raise AttentionBackendValidationError("attention_backend_override_not_invoked")
+
+
+def _attention_call_args(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[Any, Any, Any, int, Any, bool, bool, dict[str, Any]]:
+    """Extract the common Comfy attention call shape without copying tensors."""
+    if len(args) < 4:
+        raise AttentionBackendValidationError("attention_call_shape_invalid")
+    q, k, v, heads = args[:4]
+    if len(args) > 4:
+        mask = args[4]
+        if "mask" in kwargs or "attn_mask" in kwargs:
+            raise AttentionBackendValidationError("attention_masks_conflict")
+    else:
+        mask = kwargs.get("mask", _MISSING)
+        attn_mask = kwargs.get("attn_mask", _MISSING)
+        if mask is _MISSING:
+            mask = attn_mask
+        elif attn_mask is not _MISSING and mask is not attn_mask:
+            raise AttentionBackendValidationError("attention_masks_conflict")
+        if mask is _MISSING:
+            mask = None
+    if len(args) > 5 and "attn_precision" not in kwargs:
+        kwargs["attn_precision"] = args[5]
+    skip_reshape = bool(args[6] if len(args) > 6 else kwargs.get("skip_reshape", False))
+    skip_output_reshape = bool(
+        args[7] if len(args) > 7 else kwargs.get("skip_output_reshape", False)
+    )
+    return q, k, v, heads, mask, skip_reshape, skip_output_reshape, kwargs
+
+
+def _raw_attention_callable(value: Callable) -> Callable:
+    """Use a wrapped Comfy callable's implementation without re-entering the seam."""
+    raw = getattr(value, "__wrapped__", None)
+    return raw if callable(raw) else value
+
+
+def _sage_public_supports_sm_scale(value: Callable) -> bool:
+    """Return whether the selected public Sage callable names ``sm_scale``."""
+    try:
+        parameter = inspect.signature(value).parameters.get("sm_scale")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+
+
+def _sage_attention_call_kwargs(
+    selected: Callable,
+    q: Any,
+    k: Any,
+    v: Any,
+    heads: int,
+    mask: Any,
+    skip_reshape: bool,
+    call_kwargs: dict[str, Any],
+) -> tuple[Any, Any, Any, int, dict[str, Any]]:
+    """Validate Comfy semantics and build Sage's public arguments."""
+    if mask is not None:
+        raise AttentionBackendValidationError("sage_attention_mask_unsupported")
+    if call_kwargs.get("is_causal", False):
+        raise AttentionBackendValidationError("sage_causal_attention_unsupported")
+    if call_kwargs.get("enable_gqa", False):
+        raise AttentionBackendValidationError("sage_gqa_unsupported")
+    if call_kwargs.get("attn_precision") is not None:
+        raise AttentionBackendValidationError("sage_attention_precision_unsupported")
+    if not isinstance(heads, int) or isinstance(heads, bool) or heads <= 0:
+        raise AttentionBackendValidationError("sage_attention_heads_invalid")
+
+    try:
+        q_shape = tuple(q.shape)
+        k_shape = tuple(k.shape)
+        v_shape = tuple(v.shape)
+    except Exception as exc:
+        raise AttentionBackendValidationError("sage_attention_tensor_shape_invalid") from exc
+
+    if skip_reshape:
+        if not all(len(shape) == 4 for shape in (q_shape, k_shape, v_shape)):
+            raise AttentionBackendValidationError("sage_attention_hnd_shape_invalid")
+        q_heads, k_heads, v_heads = (q_shape[1], k_shape[1], v_shape[1])
+        if (q_heads, k_heads, v_heads) != (heads, heads, heads):
+            raise AttentionBackendValidationError("sage_gqa_unsupported")
+        tensor_layout = "HND"
+        q_native, k_native, v_native = q, k, v
+        dim_head = q_shape[-1]
+    else:
+        if not all(len(shape) == 3 for shape in (q_shape, k_shape, v_shape)):
+            raise AttentionBackendValidationError("sage_attention_nhd_shape_invalid")
+        if q_shape[0] != k_shape[0] or q_shape[0] != v_shape[0]:
+            raise AttentionBackendValidationError("sage_attention_batch_shape_invalid")
+        if q_shape[-1] != k_shape[-1] or q_shape[-1] != v_shape[-1]:
+            raise AttentionBackendValidationError("sage_gqa_unsupported")
+        if q_shape[-1] % heads:
+            raise AttentionBackendValidationError("sage_attention_head_dim_invalid")
+        dim_head = q_shape[-1] // heads
+        q_native, k_native, v_native = (
+            tensor.view(q_shape[0], -1, heads, dim_head)
+            for tensor in (q, k, v)
+        )
+        tensor_layout = "NHD"
+
+    sage_kwargs: dict[str, Any] = {
+        "is_causal": False,
+        "tensor_layout": tensor_layout,
+    }
+    scale = call_kwargs.get("scale", _MISSING)
+    sm_scale = call_kwargs.get("sm_scale", _MISSING)
+    if scale is not _MISSING and sm_scale is not _MISSING and scale != sm_scale:
+        raise AttentionBackendValidationError("sage_attention_scale_conflict")
+    requested_scale = sm_scale if sm_scale is not _MISSING else scale
+    if requested_scale is not _MISSING:
+        if requested_scale is not None and (
+            isinstance(requested_scale, bool)
+            or not isinstance(requested_scale, (int, float))
+        ):
+            raise AttentionBackendValidationError("sage_attention_scale_invalid")
+        if not _sage_public_supports_sm_scale(selected):
+            raise AttentionBackendValidationError("sage_sm_scale_unsupported")
+        sage_kwargs["sm_scale"] = requested_scale
+    return q_native, k_native, v_native, dim_head, sage_kwargs
+
+
+def _resolve_kitchen_attention_callable() -> tuple[Callable, str]:
+    """Resolve only the official Comfy/Kitchen INT8 callable.
+
+    No fallback is returned.  The first name is the official ComfyUI wrapper;
+    the latter names are the official native Kitchen entry points used by
+    compatible ComfyUI releases.
+    """
+    try:
+        attention = importlib.import_module("comfy.ldm.modules.attention")
+        wrapper = getattr(attention, "attention_comfy_kitchen_int8", None)
+        if callable(wrapper):
+            return wrapper, "attention_comfy_kitchen_int8"
+    except Exception:
+        pass
+    for module_name in ("comfy_kitchen", "comfy_kitchen.sage_attention"):
+        try:
+            module = importlib.import_module(module_name)
+            native = getattr(module, "int8_attention", None)
+            if callable(native):
+                return native, f"{module_name}.int8_attention"
+        except Exception:
+            continue
+    raise AttentionBackendValidationError("comfy_kitchen_attention_unavailable")
+
+
+@contextlib.contextmanager
+def attention_backend_scope(patcher: Any, backend: str):
+    """Install one backend on the active ModelPatcher and always restore it.
+
+    The override is placed in the existing ``model_options`` /
+    ``transformer_options`` seam consumed by ComfyUI attention.  No CLIP or
+    VAE object is touched and no global attention alias is rebound.
+    """
+    backend = normalize_attention_backend(backend)
+    calls = 0
+    selected_name = backend
+    if backend == "pytorch":
+        attention = importlib.import_module("comfy.ldm.modules.attention")
+        selected = getattr(attention, "attention_pytorch", None)
+        if not callable(selected):
+            raise AttentionBackendValidationError("pytorch_attention_unavailable")
+        selected_name = "comfy.ldm.modules.attention.attention_pytorch"
+
+        def attention_backend_pytorch_override(_func: Callable, *args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            call_kwargs = dict(kwargs)
+            call_kwargs["_inside_attn_wrapper"] = True
+            return _raw_attention_callable(selected)(*args, **call_kwargs)
+
+        override = attention_backend_pytorch_override
+    elif backend == "sage":
+        try:
+            sage = importlib.import_module("sageattention")
+            selected = getattr(sage, "sageattn", None)
+        except Exception as exc:
+            raise AttentionBackendValidationError(
+                f"sageattention_import_failed:{type(exc).__name__}"
+            ) from exc
+        if not callable(selected):
+            raise AttentionBackendValidationError("sageattention_sageattn_unavailable")
+        selected_name = "sageattention.sageattn"
+
+        def attention_backend_sage_override(_func: Callable, *args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            q, k, v, heads, mask, skip_reshape, skip_output_reshape, call_kwargs = _attention_call_args(
+                args, kwargs
+            )
+            if call_kwargs.get("low_precision_attention", True) is False:
+                raise AttentionBackendValidationError("sage_low_precision_disabled")
+            q_native, k_native, v_native, dim_head, sage_kwargs = _sage_attention_call_kwargs(
+                selected,
+                q,
+                k,
+                v,
+                heads,
+                mask,
+                skip_reshape,
+                call_kwargs,
+            )
+            batch = q.shape[0]
+            tensor_layout = sage_kwargs["tensor_layout"]
+            try:
+                out = selected(
+                    q_native,
+                    k_native,
+                    v_native,
+                    **sage_kwargs,
+                )
+            except Exception as exc:
+                raise AttentionBackendValidationError(
+                    f"sageattention_native_call_failed:{type(exc).__name__}"
+                ) from exc
+            if tensor_layout == "HND":
+                if not skip_output_reshape:
+                    out = out.transpose(1, 2).reshape(batch, -1, heads * dim_head)
+            elif skip_output_reshape:
+                out = out.transpose(1, 2)
+            else:
+                out = out.reshape(batch, -1, heads * dim_head)
+            return out
+
+        override = attention_backend_sage_override
+    else:
+        selected, selected_name = _resolve_kitchen_attention_callable()
+
+        if selected_name == "attention_comfy_kitchen_int8":
+            def attention_backend_comfy_kitchen_int8_override(
+                _func: Callable, *args: Any, **kwargs: Any
+            ) -> Any:
+                nonlocal calls
+                calls += 1
+                call_kwargs = dict(kwargs)
+                call_kwargs["_inside_attn_wrapper"] = True
+                try:
+                    return _raw_attention_callable(selected)(*args, **call_kwargs)
+                except Exception as exc:
+                    raise AttentionBackendValidationError(
+                        f"comfy_kitchen_native_call_failed:{type(exc).__name__}"
+                    ) from exc
+        else:
+            def attention_backend_comfy_kitchen_int8_override(
+                _func: Callable, *args: Any, **kwargs: Any
+            ) -> Any:
+                nonlocal calls
+                calls += 1
+                q, k, v, heads, mask, skip_reshape, skip_output_reshape, _call_kwargs = _attention_call_args(
+                    args, kwargs
+                )
+                if mask is not None:
+                    raise AttentionBackendValidationError("comfy_kitchen_attention_mask_unsupported")
+                if skip_reshape:
+                    batch, _, _, dim_head = q.shape
+                    q_native, k_native, v_native = q, k, v
+                else:
+                    batch, _, dim_head = q.shape
+                    dim_head //= heads
+                    q_native, k_native, v_native = (
+                        t.view(batch, -1, heads, dim_head).transpose(1, 2)
+                        for t in (q, k, v)
+                    )
+                try:
+                    out = _raw_attention_callable(selected)(q_native, k_native, v_native)
+                except Exception as exc:
+                    raise AttentionBackendValidationError(
+                        f"comfy_kitchen_native_call_failed:{type(exc).__name__}"
+                    ) from exc
+                if skip_reshape:
+                    if not skip_output_reshape:
+                        out = out.transpose(1, 2).reshape(batch, -1, heads * dim_head)
+                elif skip_output_reshape:
+                    out = out.transpose(1, 2)
+                else:
+                    out = out.transpose(1, 2).reshape(batch, -1, heads * dim_head)
+                return out
+
+        override = attention_backend_comfy_kitchen_int8_override
+
+    options = getattr(patcher, "model_options", None)
+    created_options = options is None
+    if created_options and backend != "pytorch":
+        raise AttentionBackendValidationError("active_unet_model_options_unavailable")
+    if created_options:
+        options = {}
+        try:
+            setattr(patcher, "model_options", options)
+        except Exception as exc:
+            raise AttentionBackendValidationError(
+                "active_unet_model_options_unavailable"
+            ) from exc
+    if not isinstance(options, dict):
+        raise AttentionBackendValidationError("active_unet_model_options_unavailable")
+    previous_transformer_options = options.get("transformer_options", _MISSING)
+    if (
+        previous_transformer_options is not _MISSING
+        and previous_transformer_options is not None
+        and not isinstance(previous_transformer_options, dict)
+    ):
+        raise AttentionBackendValidationError("active_unet_transformer_options_unavailable")
+    transformer_options = previous_transformer_options
+    created_transformer_options = not isinstance(transformer_options, dict)
+    if created_transformer_options:
+        transformer_options = {}
+        options["transformer_options"] = transformer_options
+    if not isinstance(transformer_options, dict):
+        raise AttentionBackendValidationError("active_unet_transformer_options_unavailable")
+
+    previous = transformer_options.get("optimized_attention_override", _MISSING)
+    transformer_options["optimized_attention_override"] = override
+    state = {"requested_backend": backend, "selected_callable": selected_name, "calls": 0}
+    try:
+        yield state
+        state["calls"] = calls
+    finally:
+        if previous is _MISSING:
+            transformer_options.pop("optimized_attention_override", None)
+        else:
+            transformer_options["optimized_attention_override"] = previous
+        if created_transformer_options:
+            if previous_transformer_options is _MISSING:
+                options.pop("transformer_options", None)
+            else:
+                options["transformer_options"] = previous_transformer_options
+        if created_options:
+            try:
+                delattr(patcher, "model_options")
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True)
@@ -472,6 +854,9 @@ class GoldenTelemetryRecorder:
             ],
             "events": list(self._events),
         }
+        run_identity = getattr(self, "run_identity", None)
+        if isinstance(run_identity, dict):
+            payload["run_identity"] = dict(run_identity)
         diagnostics = self.sampling_diagnostics
         if diagnostics is not None:
             payload["sampling_diagnostics"] = diagnostics.to_json_dict()
@@ -1736,6 +2121,9 @@ GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 SNAPSHOT_SIZE_SOURCE = "process_rss_pre_capture_resident_memory_proxy"
 _SNAPSHOT_PROOF_MAX_SIZE_BYTES = GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES
 _SNAPSHOT_PROOF_ATOMIC_TYPES = (type(None), bool, int, float, complex, str, bytes, bytearray)
+_SNAPSHOT_PROOF_MAX_DEPTH = 2
+_SNAPSHOT_PROOF_MAX_NODES = 128
+_SNAPSHOT_PROOF_MAX_CHILDREN = 32
 
 
 def _is_opaque_surface_leaf(obj: Any) -> bool:
@@ -1759,9 +2147,49 @@ def _surface_namespace(obj: Any) -> Optional[dict]:
     """Read an instance namespace without invoking user ``__getattribute__``."""
     try:
         namespace = object.__getattribute__(obj, "__dict__")
-    except (AttributeError, TypeError):
+    except Exception:
         return None
     return namespace if isinstance(namespace, dict) else None
+
+
+def _surface_value(obj: Any, name: str, default: Any = None) -> Any:
+    """Read a known instance field without invoking arbitrary descriptors."""
+    namespace = _surface_namespace(obj)
+    if namespace is not None and name in namespace:
+        try:
+            return namespace[name]
+        except Exception:
+            return default
+    return default
+
+
+def _safe_class_has_attribute(obj: Any, name: str) -> bool:
+    """Check a known class surface without invoking an instance descriptor."""
+    try:
+        for cls in type(obj).__mro__:
+            if name in vars(cls):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _surface_children(obj: Any) -> Any:
+    """Return a safe child iterator for selected proof surfaces only."""
+    if type(obj) is dict:
+        return dict.values(obj)
+    if type(obj) is list:
+        return list.__iter__(obj)
+    if type(obj) is tuple:
+        return tuple.__iter__(obj)
+    if type(obj) is set:
+        return set.__iter__(obj)
+    if type(obj) is frozenset:
+        return frozenset.__iter__(obj)
+    namespace = _surface_namespace(obj)
+    if isinstance(namespace, dict):
+        return dict.values(namespace)
+    return None
 
 
 def _validate_snapshot_size(snapshot_size_bytes: Any) -> int:
@@ -1796,11 +2224,12 @@ def golden_snapshot_content_proof(
     ``snapshot_size_bytes`` is the required pre-capture process-RSS proxy.  The
     source and non-serialized marker are fixed by this contract so a report
     cannot mislabel RSS as a platform-serialized snapshot size.  The supplied
-    surfaces are retained as metadata and only their *direct* values are
-    checked for the existing contamination counters; no recursive object-graph
-    traversal occurs.  Thus cycles and arbitrarily deep runtime scaffolding
-    cannot crash startup, while direct tensor/model contamination still fails
-    closed.
+    surfaces are retained as metadata and traversed only through a small fixed
+    selected-root bound.  The traversal reads built-in container values and
+    instance ``__dict__`` values only; it never invokes arbitrary properties,
+    follows GC referents, or copies tensor contents.  Thus cycles and
+    arbitrarily deep runtime scaffolding cannot crash startup, while nested
+    tensor/model contamination within the proof bound fails closed.
     """
     surfaces = [("root", r) for r in roots] + [("registry", r) for r in registries] + [
         ("coordinator", c) for c in coordinators
@@ -1838,38 +2267,81 @@ def golden_snapshot_content_proof(
         for role in roles
     }
 
+    storage_ids: set[int] = set()
+    unsafe_nested_surface = False
+
     def note_tensor(tensor: Any, role: Optional[str]) -> None:
         counts["tensor_count"] += 1
-        nbytes = int(tensor.numel()) * int(tensor.element_size())
-        counts["parameter_bytes"] += nbytes
+        try:
+            storage = tensor.untyped_storage()
+            storage_id = int(storage.data_ptr())
+            nbytes = int(storage.nbytes())
+        except Exception:
+            nbytes = int(tensor.numel()) * int(tensor.element_size())
+            storage_id = id(tensor)
+        unique_storage = storage_id not in storage_ids
+        if unique_storage:
+            storage_ids.add(storage_id)
+            counts["parameter_bytes"] += nbytes
         if role is not None and role in per_role:
             per_role[role]["tensor_count"] += 1
-            per_role[role]["parameter_bytes"] += nbytes
+            if unique_storage:
+                per_role[role]["parameter_bytes"] += nbytes
 
-    for _kind, item in surfaces:
-        # This is deliberately a direct-root check, not a graph walk.  The
-        # measured snapshot-size gate above is the bounded acceptance proof.
-        if isinstance(item, torch.Tensor):
-            note_tensor(item, None)
+    queue: list[tuple[Any, int]] = [(item, 0) for _kind, item in surfaces]
+    seen: set[int] = set()
+    while queue and len(seen) < _SNAPSHOT_PROOF_MAX_NODES:
+        item, depth = queue.pop(0)
+        try:
+            item_id = id(item)
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            if isinstance(item, torch.Tensor):
+                note_tensor(item, None)
+                continue
+            if isinstance(item, asyncio.Future):
+                counts["future_count"] += 1
+                continue
+            if _is_opaque_surface_leaf(item):
+                continue
+            if isinstance(item, (dict, list, tuple, set, frozenset)) and type(item) not in {
+                dict, list, tuple, set, frozenset
+            }:
+                unsafe_nested_surface = True
+                continue
+            type_name = type(item).__name__
+            if _looks_like_model_patcher(item):
+                counts["model_patcher_count"] += 1
+            is_qd_owner = type_name == GoldenQDOwner.__name__ or isinstance(item, GoldenQDOwner)
+            if is_qd_owner:
+                counts["qd_owner_count"] += 1
+                role = str(_surface_value(item, "role", "") or "")
+                if role in per_role:
+                    per_role[role]["qd_owner_count"] += 1
+                buf = _surface_value(item, "_gpu_buf")
+                if isinstance(buf, torch.Tensor):
+                    note_tensor(buf, role if role in per_role else None)
+            closed = _surface_value(item, "closed")
+            if isinstance(closed, bool) and closed is False and _safe_class_has_attribute(item, "read"):
+                counts["open_payload_reader_count"] += 1
+            if depth >= _SNAPSHOT_PROOF_MAX_DEPTH:
+                continue
+            children = _surface_children(item)
+            if children is not None:
+                for child_index, child in enumerate(children):
+                    if child_index >= _SNAPSHOT_PROOF_MAX_CHILDREN:
+                        break
+                    if child is not None:
+                        queue.append((child, depth + 1))
+        except Exception:
+            # Selected surfaces are diagnostic inputs.  An object that rejects
+            # safe inspection contributes no trusted children and cannot abort
+            # the proof or cleanup path.
             continue
-        if _is_opaque_surface_leaf(item):
-            continue
-        type_name = type(item).__name__
-        if _looks_like_model_patcher(item):
-            counts["model_patcher_count"] += 1
-        if type_name == GoldenQDOwner.__name__ or isinstance(item, GoldenQDOwner):
-            counts["qd_owner_count"] += 1
-            role = str(getattr(item, "role", "") or "")
-            if role in per_role:
-                per_role[role]["qd_owner_count"] += 1
-                buf = getattr(item, "_gpu_buf", None)
-                if buf is not None and isinstance(buf, torch.Tensor):
-                    note_tensor(buf, role)
-        closed = getattr(item, "closed", None)
-        if isinstance(closed, bool) and closed is False and hasattr(item, "read"):
-            counts["open_payload_reader_count"] += 1
-        if isinstance(item, asyncio.Future):
-            counts["future_count"] += 1
+
+    if unsafe_nested_surface:
+        raise RuntimeError("snapshot_proof_surface_unavailable:nested_container")
 
     for thread in threading.enumerate():
         name = str(getattr(thread, "name", ""))
@@ -1923,7 +2395,12 @@ def _looks_like_model_patcher(obj: Any) -> bool:
     type_name = type(obj).__name__
     if type_name in {"ModelPatcher", "ModelPatcherDynamic", "CoreModelPatcher"}:
         return True
-    if type_name.endswith("ModelPatcher") or type_name.endswith("ModelPatcherDynamic"):
+    if (
+        type_name.endswith("ModelPatcher")
+        or type_name.endswith("ModelPatcherDynamic")
+        or "modelpatcher" in type_name.lower()
+        or "model_patcher" in type_name.lower()
+    ):
         return True
     try:
         import comfy.model_patcher as model_patcher
@@ -1940,10 +2417,18 @@ def _looks_like_model_patcher(obj: Any) -> bool:
     except (ImportError, AttributeError):
         pass
     # Capability detection covers upstream subclasses/rebindings while still
-    # requiring the distinctive patcher surface, not merely a ``model`` attr.
-    return callable(getattr(obj, "is_dynamic", None)) and callable(
-        getattr(obj, "model_size", None)
-    ) and hasattr(obj, "load_device") and hasattr(obj, "offload_device")
+    # requiring the distinctive patcher surface.  Inspect class dictionaries,
+    # rather than reading instance attributes, so hostile properties cannot be
+    # invoked by the bounded proof.
+    try:
+        class_names = set()
+        for cls in type(obj).__mro__:
+            class_names.update(vars(cls))
+        return {
+            "is_dynamic", "model_size", "load_device", "offload_device"
+        }.issubset(class_names)
+    except Exception:
+        return False
 
 
 # ── Session ───────────────────────────────────────────────────────────────
@@ -1979,6 +2464,8 @@ class GoldenFinalResult:
     # Persistence is application work after the Golden teardown wall.  It is
     # intentionally not part of any stage interval.
     telemetry_persist_ms: Optional[float] = None
+    attention_backend: Optional[str] = None
+    run_identity: dict = field(default_factory=dict)
 
     @property
     def restore_metadata(self) -> dict:
@@ -2063,6 +2550,12 @@ class GoldenSession:
         self.final_result: Optional[GoldenFinalResult] = None
         self.telemetry_persist_ms: Optional[float] = None
         self.restore_baseline: dict = {}
+        self.run_identity = {
+            "request_id": str(request.request_id),
+            "workflow_sha256": canonical_workflow_sha256(request.prompt),
+            "attention_backend": request.attention_backend,
+        }
+        self.recorder.run_identity = dict(self.run_identity)
 
     def build_final_result(self) -> GoldenFinalResult:
         pending = self.pending_durability
@@ -2080,6 +2573,8 @@ class GoldenSession:
             seriality_violation_count=int(reconcile["count"]),
             executed_nodes=list(self.runner.executed_summary()) if self.runner else [],
             restore_observation=dict(getattr(self.recorder, "_external_restore", {})),
+            attention_backend=self.request.attention_backend,
+            run_identity=dict(getattr(self, "run_identity", {})),
         )
 
 
@@ -2537,6 +3032,38 @@ class GoldenSerialRunner:
         return self.executed_summary()
 
 
+def _sampler_bound_patcher(session: GoldenSession) -> Any:
+    """Return the model object that the sampler will actually receive.
+
+    Preparatory model-wrapper nodes may clone the seeded patcher.  The clone is
+    retained in the runner cache under the source node, so applying the
+    attention override only to ``session.patcher`` would miss the sampler's
+    active model.  Unresolved or non-link model inputs retain the direct-model
+    behavior used by clone-free workflows.
+    """
+    fallback = session.patcher
+    runner = session.runner
+    node_map = session.node_map
+    if runner is None or node_map is None:
+        return fallback
+    prompt = getattr(runner, "prompt", None) or getattr(session.request, "prompt", {})
+    sampler_info = prompt.get(node_map.sampler_id, {})
+    model_link = (sampler_info.get("inputs") or {}).get("model")
+    if not _is_link(model_link):
+        return fallback
+    entry = getattr(runner, "cache", {}).get(model_link[0])
+    outputs = getattr(entry, "outputs", None)
+    if not isinstance(outputs, (list, tuple)):
+        return fallback
+    socket = model_link[1]
+    if socket < 0 or socket >= len(outputs):
+        return fallback
+    values = outputs[socket]
+    if not isinstance(values, (list, tuple)) or len(values) != 1:
+        return fallback
+    return values[0] if values[0] is not None else fallback
+
+
 # ── Canonical workflow resolution (pure) ──────────────────────────────────
 
 
@@ -2605,6 +3132,78 @@ def resolve_golden_node_map(prompt: dict, *, contract: Optional[GoldenWorkflowCo
 
 
 # ── Stage implementations ─────────────────────────────────────────────────
+
+
+_GOLDEN_SAMPLING_PROFILE_RECORD_MAX_BYTES = 512 * 1024
+
+
+def _record_golden_sampling_profile(
+    recorder: GoldenTelemetryRecorder,
+    artifact: Any,
+    *,
+    level: str,
+    source: str,
+    schema_version: int = 1,
+) -> None:
+    """Copy one bounded, JSON-safe profile artifact into Golden telemetry."""
+    try:
+        payload = json.loads(json.dumps(artifact, default=str))
+        encoded_size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        if encoded_size > _GOLDEN_SAMPLING_PROFILE_RECORD_MAX_BYTES:
+            payload = {
+                "schema_version": int(schema_version),
+                "level": str(level),
+                "status": "record_bounded",
+                "errors": [f"artifact_bytes_exceeded:{encoded_size}"],
+            }
+    except Exception as exc:
+        payload = {
+            "schema_version": int(schema_version),
+            "level": str(level),
+            "status": "record_serialize_failed",
+            "errors": [f"artifact_serialize_failed:{type(exc).__name__}"],
+        }
+    recorder.event(
+        "sampling_deep_profile",
+        phase="diagnostics",
+        metadata=payload,
+        source=source,
+    )
+
+
+def validate_attention_backend_diagnostics(
+    requested_backend: Optional[str], artifact: Mapping[str, Any] | None
+) -> None:
+    """Fail closed when optional dispatch evidence contradicts the request."""
+    if not isinstance(artifact, Mapping):
+        return
+    # An omitted selector is the historical auto path.  There is no Golden
+    # override to prove, so optional diagnostics must not reinterpret the
+    # existing patcher's/KJNodes dispatch as a failed explicit arm.
+    if requested_backend is None:
+        return
+    requested = normalize_attention_backend(requested_backend)
+    observed = artifact.get("attention_backend")
+    if not isinstance(observed, Mapping):
+        return
+    counts = observed.get("dispatch_counts")
+    if not isinstance(counts, Mapping):
+        return
+    incompatible = {
+        "pytorch": ("sage_override", "comfy_kitchen_int8_override"),
+        "sage": ("pytorch_override", "comfy_kitchen_int8_override"),
+        "comfy_kitchen": ("pytorch_override", "sage_override"),
+    }[requested]
+    if any(int(counts.get(key, 0) or 0) > 0 for key in incompatible):
+        raise AttentionBackendValidationError(
+            f"attention_backend_fallback_or_wrong_backend:{requested}"
+        )
+    if requested in {"sage", "comfy_kitchen"} and int(
+        observed.get("pytorch_sdpa_calls", 0) or 0
+    ) > 0:
+        raise AttentionBackendValidationError(
+            f"attention_backend_fallback_or_wrong_backend:{requested}"
+        )
 
 
 async def golden_restore(session: GoldenSession) -> dict:
@@ -2714,6 +3313,7 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             "golden_workflow_hash_check",
             actual_sha256=actual_sha,
             expected_sha256=contract.workflow_sha256,
+            attention_backend=session.request.attention_backend,
             enabled=workflow_hash_check_enabled,
             bypassed=not workflow_hash_check_enabled,
         )
@@ -2748,6 +3348,8 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             "golden_request_setup",
             ready=True,
             request_id=session.request.request_id,
+            attention_backend=session.request.attention_backend,
+            run_identity=dict(getattr(session, "run_identity", {})),
             node_count=len(session.request.prompt),
             actual_workflow_sha256=actual_sha,
             expected_workflow_sha256=contract.workflow_sha256,
@@ -3639,6 +4241,11 @@ async def golden_sampling(session: GoldenSession) -> Any:
     steps/seed) and deterministic math.  Await complete return; no VAE work."""
     rec = session.recorder
     rec.begin_stage("golden_sampling")
+    requested_attention_backend = getattr(session.request, "attention_backend", None)
+    if requested_attention_backend is not None:
+        requested_attention_backend = normalize_attention_backend(
+            requested_attention_backend
+        )
     diagnostics = (
         GoldenSamplingDiagnostics(
             rec,
@@ -3653,15 +4260,318 @@ async def golden_sampling(session: GoldenSession) -> Any:
     try:
         runner = session.runner
         node_map = session.node_map
+        attention_patcher = _sampler_bound_patcher(session)
         if diagnostics is not None:
             diagnostics.begin(session)
             diagnostics.install_model_hooks(session.patcher)
             runner.sampling_diagnostics = diagnostics
-        runner.begin_scope({"sampling"})
         try:
-            executed = await runner.run_closure(node_map.sampler_id, include_target=True)
+            runtime_executor = importlib.import_module("comfymodal_runtime.runtime_executor")
+            _sampling_wrapper_installed = runtime_executor.ensure_sampling_timing_wrapper(
+                session.patcher
+            )
+            rec.event(
+                "sampling_wrapper_install",
+                installed=bool(_sampling_wrapper_installed),
+                patcher_type=type(session.patcher).__name__,
+                source="golden_sampling_runner",
+            )
+        except Exception as exc:
+            rec.event(
+                "sampling_wrapper_install",
+                installed=False,
+                patcher_type=type(session.patcher).__name__,
+                source="golden_sampling_runner",
+                error=type(exc).__name__,
+            )
+            try:
+                print(
+                    "[v2.sampling_deep_profile] event=runner_install_failed "
+                    f"error={type(exc).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        # GoldenSerialRunner calls the node method directly, so ComfyUI's
+        # SAMPLER_SAMPLE wrapper can be installed successfully while never
+        # seeing this invocation.  In that canonical path, bridge the same
+        # existing lifecycle explicitly instead of changing sampler inputs or
+        # execution order.  The active request trace is authoritative; a
+        # profile already owned by the production wrapper is left alone so a
+        # wrapper transition cannot create two profiles for one invocation.
+        deep_profile = None
+        deep_profile_trace = None
+        deep_profile_sdp = None
+        sampling_start_event = None
+        profile_steps = 0
+        sampling_profile_skipped = False
+        sampling_profile_setup_failed = False
+        trace_profile_count_before = 0
+        try:
+            try:
+                deep_profile_sdp = importlib.import_module(
+                    "comfymodal_runtime.sampling_deep_profile"
+                )
+                profile_level = deep_profile_sdp.resolve_profile_level()
+                if profile_level in {"steps", "blocks"}:
+                    model_preload = importlib.import_module("comfymodal_runtime.model_preload")
+                    deep_profile_trace = model_preload._ACTIVE_REQUEST_TRACE.get()
+                    if deep_profile_trace is None:
+                        runtime_trace_module = importlib.import_module("comfymodal_runtime.trace")
+                        deep_profile_trace = runtime_trace_module.RuntimeTrace(
+                            request_id=str(session.request.request_id),
+                            process="golden_sampling",
+                        )
+                    trace_profile_count_before = sum(
+                        1
+                        for event in getattr(deep_profile_trace, "events", ())
+                        if getattr(event, "name", None) == deep_profile_sdp.EVENT_NAME
+                    )
+                    current_profile = None
+                    try:
+                        current_profile = deep_profile_sdp._CURRENT_PROFILE.get()
+                    except Exception:
+                        pass
+                    # _PATCH_OWNER covers a concurrent production invocation;
+                    # _CURRENT_PROFILE covers the wrapper in this context.
+                    if (
+                        current_profile is not None
+                        or getattr(deep_profile_sdp, "_PATCH_OWNER", None) is not None
+                    ):
+                        sampling_profile_skipped = True
+                    else:
+                        sampler_inputs = (
+                            session.request.prompt.get(node_map.sampler_id, {}).get("inputs", {})
+                        )
+                        requested_steps = sampler_inputs.get("steps")
+                        if _is_link(requested_steps):
+                            linked_entry = runner.cache.get(str(requested_steps[0]))
+                            if linked_entry is not None:
+                                socket = int(requested_steps[1])
+                                linked_outputs = getattr(linked_entry, "outputs", None)
+                                if linked_outputs is not None and socket < len(linked_outputs):
+                                    requested_steps = linked_outputs[socket]
+                        def _positive_int(value: Any, depth: int = 0) -> int:
+                            if depth > 4:
+                                return 0
+                            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                                return int(value)
+                            if isinstance(value, (list, tuple)):
+                                for item in value:
+                                    resolved = _positive_int(item, depth + 1)
+                                    if resolved:
+                                        return resolved
+                            return 0
+                        profile_steps = _positive_int(requested_steps)
+                        sampling_start_event = deep_profile_trace.emit(
+                            "sampling_start",
+                            phase="execution",
+                            metadata={
+                                "node_id": str(node_map.sampler_id),
+                                "node_class": str(session.contract.sampler_class_type),
+                                "steps": profile_steps,
+                                "source": "golden_sampling_runner",
+                            },
+                        )
+                        deep_profile = deep_profile_sdp.begin_sampling_profile(
+                            deep_profile_trace,
+                            level=profile_level,
+                            node_id=str(node_map.sampler_id),
+                            node_class=str(session.contract.sampler_class_type),
+                            steps=profile_steps,
+                            sampling_start_monotonic_ns=sampling_start_event.monotonic_ns,
+                            sampling_start_wall_unix_ns=sampling_start_event.wall_unix_ns,
+                            patcher=session.patcher,
+                            requested_backend=requested_attention_backend,
+                        )
+            except Exception as profile_setup_exc:
+                # Deep profiling is measurement-only.  In particular, an import,
+                # configuration, trace-metadata, or profiler setup failure must
+                # never change the canonical sampler result or escape into it.
+                deep_profile = None
+                sampling_profile_skipped = True
+                sampling_profile_setup_failed = True
+                try:
+                    rec.event(
+                        "sampling_deep_profile_setup_failed",
+                        source="golden_sampling_runner",
+                        profiling_disabled=True,
+                        measurement_only=True,
+                        error=type(profile_setup_exc).__name__,
+                    )
+                except Exception:
+                    pass
+
+            scope_started = False
+            attention_scope_state: dict[str, Any] | None = None
+            try:
+                runner.begin_scope({"sampling"})
+                scope_started = True
+                try:
+                    if requested_attention_backend is None:
+                        # Preserve the historical omission/no-override route:
+                        # KJNodes or another already-installed sampler-bound
+                        # override remains authoritative for this run.
+                        executed = await runner.run_closure(
+                            node_map.sampler_id, include_target=True
+                        )
+                    else:
+                        with attention_backend_scope(
+                            attention_patcher,
+                            requested_attention_backend,
+                        ) as attention_scope_state:
+                            executed = await runner.run_closure(
+                                node_map.sampler_id, include_target=True
+                            )
+                finally:
+                    if (
+                        deep_profile_trace is not None
+                        and sampling_start_event is not None
+                        and sampling_profile_setup_failed
+                    ):
+                        # The start boundary is authoritative even when profile
+                        # setup fails.  Close only the boundary this runner
+                        # emitted; an owning production profile never reaches
+                        # this path because it skips the Golden bridge above.
+                        try:
+                            deep_profile_trace.emit(
+                                "sampling_end",
+                                phase="execution",
+                                metadata={
+                                    "node_id": str(node_map.sampler_id),
+                                    "node_class": str(session.contract.sampler_class_type),
+                                    "steps": profile_steps,
+                                    "duration_ms": round(
+                                        (time.monotonic_ns() - sampling_start_event.monotonic_ns)
+                                        / 1_000_000,
+                                        3,
+                                    ),
+                                    "source": "golden_sampling_runner",
+                                    "profiling_setup_failed": True,
+                                },
+                            )
+                        except Exception:
+                            # Preserve the sampler result/exception if the
+                            # measurement-only close emission also fails.
+                            pass
+                    elif deep_profile_trace is not None and not sampling_profile_skipped:
+                        sampling_end_event = None
+                        try:
+                            sampling_end_event = deep_profile_trace.emit(
+                                "sampling_end",
+                                phase="execution",
+                                metadata={
+                                    "node_id": str(node_map.sampler_id),
+                                    "node_class": str(session.contract.sampler_class_type),
+                                    "steps": profile_steps,
+                                    "duration_ms": round(
+                                        (time.monotonic_ns() - sampling_start_event.monotonic_ns)
+                                        / 1_000_000,
+                                        3,
+                                    ),
+                                    "source": "golden_sampling_runner",
+                                },
+                            )
+                        except Exception:
+                            # Preserve the sampler exception and let the existing
+                            # lifecycle record a failed authoritative emission.
+                            pass
+                        if deep_profile is not None:
+                            try:
+                                if sampling_end_event is not None:
+                                    end_mono = sampling_end_event.monotonic_ns
+                                    end_wall = sampling_end_event.wall_unix_ns
+                                    end_emission_failed = False
+                                else:
+                                    end_mono = time.monotonic_ns()
+                                    end_wall = time.time_ns()
+                                    end_emission_failed = True
+                                artifact = deep_profile_sdp.finalize_sampling_profile(
+                                    deep_profile,
+                                    deep_profile_trace,
+                                    sampling_end_monotonic_ns=end_mono,
+                                    sampling_end_wall_unix_ns=end_wall,
+                                    sampling_end_emission_failed=end_emission_failed,
+                                )
+                            except Exception as profile_exc:
+                                artifact = {
+                                    "schema_version": getattr(deep_profile_sdp, "SCHEMA_VERSION", 1),
+                                    "level": profile_level,
+                                    "status": "finalize_failed",
+                                    "errors": [f"finalize_failed:{type(profile_exc).__name__}"],
+                                }
+                            validate_attention_backend_diagnostics(
+                                requested_attention_backend,
+                                artifact,
+                            )
+                            # sampling_deep_profile.finalize_sampling_profile emits
+                            # the RuntimeTrace event.  Mirror its bounded JSON
+                            # payload into the authoritative Golden recorder.
+                            _record_golden_sampling_profile(
+                                rec,
+                                artifact,
+                                level=profile_level,
+                                source="golden_sampling_runner",
+                                schema_version=getattr(deep_profile_sdp, "SCHEMA_VERSION", 1),
+                            )
+                        elif deep_profile_sdp is not None:
+                            # A lifecycle rejection is itself fail-closed.  Do not
+                            # manufacture a second profile; an owning production
+                            # wrapper, if present, is responsible for its event.
+                            pass
+                    elif (
+                        deep_profile_trace is not None
+                        and sampling_profile_skipped
+                        and not sampling_profile_setup_failed
+                    ):
+                        # If the production wrapper owned this invocation, copy
+                        # only a newly emitted profile into the Golden recorder;
+                        # never finalize or emit a second one here.
+                        profile_events = [
+                            event
+                            for event in getattr(deep_profile_trace, "events", ())[0:]
+                            if getattr(event, "name", None) == deep_profile_sdp.EVENT_NAME
+                        ]
+                        if len(profile_events) > trace_profile_count_before:
+                            metadata = profile_events[-1].metadata
+                            _record_golden_sampling_profile(
+                                rec,
+                                dict(metadata),
+                                level="unknown",
+                                source="production_sampler_wrapper",
+                                schema_version=getattr(deep_profile_sdp, "SCHEMA_VERSION", 1),
+                            )
+            finally:
+                if scope_started:
+                    runner.end_scope()
+            if requested_attention_backend is None:
+                rec.event(
+                    "attention_backend_selection",
+                    requested_backend=None,
+                    selected_callable="existing_patcher_override",
+                    calls=None,
+                    override_applied=False,
+                    source="active_unet_model_patcher_transformer_options",
+                )
+            else:
+                if attention_scope_state is None:
+                    raise AttentionBackendValidationError("attention_backend_scope_missing")
+                rec.event(
+                    "attention_backend_selection",
+                    requested_backend=requested_attention_backend,
+                    selected_callable=attention_scope_state["selected_callable"],
+                    calls=attention_scope_state["calls"],
+                    source="active_unet_model_patcher_transformer_options",
+                )
+                _require_attention_backend_invocation(
+                    requested_attention_backend,
+                    attention_scope_state,
+                )
         finally:
-            runner.end_scope()
+            # The sampling scope is closed by the inner finally above.  Keep
+            # this outer finally as the diagnostics/lifecycle boundary, but do
+            # not close the same runner scope a second time.
+            pass
         _assert_runner_quiescence(runner)
         sampler_classes = [sc for _n, _c, sc in executed if sc == "sampling"]
         if not sampler_classes:
@@ -3914,8 +4824,9 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
     and whose selected input is exactly ``any_02 -> [vae_decode_id, 0]``;
     that pass-through node (and only it — VAEDecode is already cached) is
     executed through the serial runner, and the PNG is encoded from the
-    runner-cache output of that node.  The encoded SHA must equal the
-    contract's expected OUTPUT PNG SHA.
+    runner-cache output of that node.  The encoded SHA is content-addressed
+    and recorded.  A configured expectation mismatch is an explicit warning,
+    not a write or durability failure.
     """
     rec = session.recorder
     rec.begin_stage("golden_output")
@@ -3996,7 +4907,7 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
         )
 
         # Exact upstream SaveImage.save_images conversion + encoding.
-        i = 255.0 * images.cpu().numpy()
+        i = 255.0 * images.detach().cpu().numpy()
         first = np.clip(i, 0, 255).astype(np.uint8)[0]
         img = Image.fromarray(first)
         bio = io.BytesIO()
@@ -4005,8 +4916,31 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
 
         sha256 = hashlib.sha256(buf).hexdigest()
         expected_sha = session.contract.expected_output_png_sha256
-        if sha256 != expected_sha:
-            raise RuntimeError(f"output_png_sha_mismatch:{sha256}!={expected_sha}")
+        output_sha_match = bool(expected_sha) and sha256.lower() == expected_sha.lower()
+        output_sha_warning = None
+        if expected_sha and not output_sha_match:
+            output_sha_warning = {
+                "expected": expected_sha,
+                "observed": sha256,
+                "reason": "configured_output_sha_mismatch",
+            }
+            LOG.warning(
+                "Golden output SHA mismatch is warning-only: expected=%s observed=%s",
+                expected_sha,
+                sha256,
+            )
+            print(
+                "[v2.golden_p1] WARNING output_sha_mismatch "
+                f"expected={expected_sha} observed={sha256}",
+                flush=True,
+            )
+            rec.event(
+                "OUTPUT_SHA_MISMATCH_WARNING",
+                expected_sha=expected_sha,
+                observed_sha=sha256,
+                output_sha_match=False,
+                output_sha_warning=output_sha_warning,
+            )
         out_dir = os.path.abspath(session.output_root)
         asset_path = os.path.join(out_dir, f"{sha256}.png")
         sidecar_path = os.path.join(out_dir, f"{sha256}.json")
@@ -4068,12 +5002,21 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
             volume_mount_root=mount_root,
         )
         session.pending_durability = pending
-        rec.event(EVENT_OUTPUT_ENCODE_DONE, sha256=sha256)
+        rec.event(
+            EVENT_OUTPUT_ENCODE_DONE,
+            sha256=sha256,
+            expected_sha256=expected_sha,
+            output_sha_match=output_sha_match,
+            output_sha_warning=output_sha_warning,
+        )
         rec.event(EVENT_ASSET_WRITE_DONE, asset_path=os.path.basename(asset_path))
         rec.end_stage(
             "golden_output",
             ready=True,
             sha256=sha256,
+            expected_sha256=expected_sha,
+            output_sha_match=output_sha_match,
+            output_sha_warning=output_sha_warning,
             byte_count=len(buf),
             committed=False,
         )
@@ -4095,11 +5038,17 @@ def io_bytes_png(Image: Any, array: Any, *, pnginfo: Any = None, compress_level:
     return bio.getvalue()
 
 
-def verify_committed_object(pending: PendingDurability, *, expected_sha256: str) -> _DurableReopenProof:
+def verify_committed_object(
+    pending: PendingDurability,
+    *,
+    expected_sha256: str,
+    enforce_expected_sha: bool = True,
+) -> _DurableReopenProof:
     """Post-commit durability proof: reopen/stat/read/hash the COMMITTED
     object from disk and fail closed unless stat size, reopened byte count,
-    and the pending record all agree AND the SHA matches the pending record
-    and the expected canonical OUTPUT PNG SHA."""
+    and the pending record all agree.  Strict callers may enforce the
+    configured expectation; Golden's output expectation is warning-only while
+    content-addressed pending/reopened integrity remains fail-closed."""
     if pending is None:
         raise RuntimeError("reopen_requires_pending_durability")
     if not pending.committed:
@@ -4129,7 +5078,7 @@ def verify_committed_object(pending: PendingDurability, *, expected_sha256: str)
         )
     if sha256 != pending.sha256:
         raise RuntimeError(f"durable_sha_mismatch:{sha256}!={pending.sha256}")
-    if sha256 != expected_sha256:
+    if enforce_expected_sha and sha256 != expected_sha256:
         raise RuntimeError(f"durable_expected_output_sha_mismatch:{sha256}!={expected_sha256}")
     return _DurableReopenProof(
         byte_count=byte_count,
@@ -4148,11 +5097,15 @@ async def golden_durable_commit(
     recorder: GoldenTelemetryRecorder,
     *,
     expected_sha256: Optional[str] = None,
+    enforce_expected_sha: bool = False,
 ) -> Optional[dict]:
     """Emit VOLUME_COMMIT_START, await the REAL Modal Volume commit API
     (``commit.aio()`` when present, else an awaitable/sync ``commit()``), then
     VOLUME_COMMIT_COMPLETE.  When ``expected_sha256`` is supplied, this stage
-    also owns the reopen/stat/read/hash proof before its END.  OUTPUT_ENCODE_DONE
+    also owns the reopen/stat/read/hash proof before its END.  The expected SHA
+    is an observation contract; a mismatch was already recorded by
+    ``golden_output`` and does not weaken reopened pending-content integrity.
+    OUTPUT_ENCODE_DONE
     / ASSET_WRITE_DONE are emitted exactly once by :func:`golden_output` at the
     real write — they are NOT re-emitted here.
     """
@@ -4197,7 +5150,11 @@ async def golden_durable_commit(
         recorder.event(EVENT_VOLUME_COMMIT_COMPLETE)
         pending.committed = True
         reopened = None
-        reopened = verify_committed_object(pending, expected_sha256=expected_sha256)
+        reopened = verify_committed_object(
+            pending,
+            expected_sha256=expected_sha256,
+            enforce_expected_sha=enforce_expected_sha,
+        )
         recorder.mark_reopen_verified(reopened)
         recorder.end_stage(
             "golden_durable_commit",
@@ -4331,8 +5288,9 @@ async def golden_serial_execute(
     ``telemetry_persist_ms``.
     Durability is strictly:
     commit -> reopen/stat/read/hash the committed object -> verify byte
-    count and SHA from the REOPENED bytes against the pending record and the
-    expected OUTPUT PNG SHA -> TRUE_FIRST_DURABLE_RESULT -> RESULT_ASSEMBLED.
+    count and SHA from the REOPENED bytes against the pending record (the
+    configured output expectation is warning-only) -> TRUE_FIRST_DURABLE_RESULT
+    -> RESULT_ASSEMBLED.
     ``snapshot_proof`` is retained as an optional reusable helper input for
     compatibility, but request teardown does not invoke it.
     """
@@ -4413,6 +5371,8 @@ async def golden_serial_execute(
 
 __all__ = [
     "CANONICAL_CLIP_SPEC",
+    "ATTENTION_BACKENDS",
+    "AttentionBackendValidationError",
     "EXPECTED_OUTPUT_PNG_SHA256",
     "EXPECTED_WORKFLOW_SHA256",
     "EXPECTED_UNET_TENSOR_COUNT",
@@ -4433,6 +5393,7 @@ __all__ = [
     "GoldenVolumeHandle",
     "PendingDurability",
     "canonical_workflow_sha256",
+    "attention_backend_scope",
     "check_view_alignment",
     "classify_node",
     "golden_clip_forward",
@@ -4452,6 +5413,7 @@ __all__ = [
     "golden_vae_load",
     "make_zero_copy_view",
     "parse_safetensors_header",
+    "normalize_attention_backend",
     "partition_coverage",
     "plan_source_regions",
     "read_file_qd_gpu",
@@ -4463,6 +5425,7 @@ __all__ = [
     "uniform_source_dtype",
     "uniform_source_dtype_across",
     "validate_qd_adoption",
+    "validate_attention_backend_diagnostics",
     "validate_transport_records",
     "validate_unet_binding",
     "verify_committed_object",

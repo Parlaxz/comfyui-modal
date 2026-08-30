@@ -27,6 +27,10 @@ from urllib import error as urllib_error, request as urllib_request
 
 from gpu_catalog import DEFAULT_GPU, GPU_BY_VALUE, normalize_gpu_value
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.publication_policy import (
+    iter_syncable_custom_node_dirs,
+    normalize_dependency_text,
+)
 
 BENCHMARK_VERSION = "4.2.0"
 LOCAL_BASE_URL = os.environ.get("COMFYMODAL_BENCHMARK_URL", "http://127.0.0.1:8188")
@@ -339,9 +343,11 @@ def _build_custom_nodes_fingerprint_local(cn_root: Path) -> tuple[str | None, st
     if not cn_root.is_dir():
         return None, "custom_nodes_root_missing"
     manifest = []
-    for node_name in _iter_syncable_custom_node_dirs_local(cn_root):
+    for node_name in iter_syncable_custom_node_dirs(cn_root):
         req_path = cn_root / node_name / "requirements.txt"
-        req_text = req_path.read_text(encoding="utf-8") if req_path.is_file() else ""
+        req_text = normalize_dependency_text(
+            req_path.read_bytes() if req_path.is_file() else b""
+        )
         manifest.append({"node": node_name, "requirements_txt": req_text})
     payload = json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest(), ""

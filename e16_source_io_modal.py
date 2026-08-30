@@ -1,4 +1,9 @@
-"""Dedicated Modal source-only E16 endpoint."""
+"""Dedicated Modal source-only E16 benchmark endpoint.
+
+This module is benchmark-only and non-canonical: it is not a production or
+Golden image owner.  Its separate image is intentional for the E16 source-I/O
+experiment and must not be treated as a second production dependency path.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +37,8 @@ _V2_MODULES = (
 )
 
 try:
+    # E16 owns this benchmark image only; production and Golden use
+    # comfyapp.CANONICAL_IMAGE_PLAN instead.
     import comfyapp as _production_image_source
     _image = _production_image_source._image_base.pip_install("fastsafetensors==0.3.3")
     _image = _image.add_local_file(str(_ROOT / "e16_source_io.py"), "/root/e16_source_io.py", copy=True)
@@ -40,7 +47,7 @@ try:
     for _module in _V2_MODULES:
         _image = _image.add_local_python_source(_module, copy=True)
 except Exception as exc:
-    raise RuntimeError("E16 production image construction failed") from exc
+    raise RuntimeError("E16 benchmark image construction failed") from exc
 
 _models_volume = modal.Volume.from_name(_VOLUME_NAME, create_if_missing=False)
 if not callable(getattr(_models_volume, "with_mount_options", None)):

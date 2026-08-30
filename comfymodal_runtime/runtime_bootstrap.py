@@ -324,6 +324,7 @@ class BootstrapState:
     # SageAttention policy observability
     sage_mode: str = ""
     sage_reason: str = ""
+    sage_runtime_identity: dict[str, Any] = field(default_factory=dict)
     sage_identity_captured: bool = False
     # Lane B — snapshot Sage identity (frozen at CPU-snapshot time, verified at restore)
     snapshot_sage_identity: dict[str, str] = field(default_factory=dict)
@@ -398,6 +399,10 @@ class BootstrapState:
     # Instrumentation only — never consumed by validation/certificate
     # decisions in Step 2.
     snapshot_validation_proof: dict[str, Any] = field(default_factory=dict)
+    # Restore-stage evidence only.  These records describe existing callback
+    # outcomes and generation-guard decisions; they never select a new path.
+    restore_stage_classifications: dict[str, str] = field(default_factory=dict)
+    restore_generation_guard_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def has_prescan_identity(self) -> bool:
         """Backward-compatible diagnostic — checks frozen prescan identity."""
@@ -1251,7 +1256,9 @@ class RuntimeBootstrap:
         start_backend: Callable[[], Any] | None = None,
         restore_gpu_state: Callable[[], Any] | None = None,
         initialize_cuda: Callable[[], Any] | None = None,
+        select_sage_runtime_mode: Callable[[], Any] | None = None,
         apply_sage_policy: Callable[[], Any] | None = None,
+        force_sage_selection_after_restore: bool = False,
         observe_generations: Callable[[], dict[str, str]] | None = None,
         read_current_custom_node_identity: Callable[[], dict[str, str]] | None = None,
         read_models_generation_record: Callable[[], dict[str, Any] | None] | None = None,
@@ -1269,7 +1276,12 @@ class RuntimeBootstrap:
         self.start_backend = start_backend
         self.restore_gpu_state = restore_gpu_state
         self.initialize_cuda = initialize_cuda
+        # Presence of this callback is an explicit Golden restore contract:
+        # snapshot identity may be observed, but it may not suppress the
+        # post-CUDA fresh capability selection.
+        self.select_sage_runtime_mode = select_sage_runtime_mode
         self.apply_sage_policy = apply_sage_policy
+        self.force_sage_selection_after_restore = bool(force_sage_selection_after_restore)
         self.observe_generations = observe_generations
         self.read_current_custom_node_identity = read_current_custom_node_identity
         self.read_models_generation_record = read_models_generation_record
@@ -1939,8 +1951,40 @@ class RuntimeBootstrap:
     # REMOVED: _build_and_store_snapshot_certificate — placeholder superseded
     # by the V2 workflow certificate built in ModalRuntimeEntrypoint.startup().
 
+    def _record_restore_stage(
+        self,
+        stage: str,
+        classification: str,
+        *,
+        trace: RuntimeTrace | None = None,
+        decision: str = "",
+        reason: str = "",
+        callback_called: bool | None = None,
+        guard: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record additive restore evidence at an existing lifecycle boundary."""
+        payload: dict[str, Any] = {
+            "stage": str(stage),
+            "classification": str(classification),
+            "decision": str(decision),
+            "reason": str(reason),
+        }
+        if callback_called is not None:
+            payload["callback_called"] = int(bool(callback_called))
+        if guard is not None:
+            payload["generation_guard"] = dict(guard)
+            self.state.restore_generation_guard_decisions[str(stage)] = dict(guard)
+        self.state.restore_stage_classifications[str(stage)] = str(classification)
+        if trace is not None:
+            try:
+                trace.emit("restore_stage_classification", phase="restore", metadata=payload)
+            except Exception:
+                pass
+
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
+        self.state.restore_stage_classifications = {}
+        self.state.restore_generation_guard_decisions = {}
         # ── E29: canonical ledger restore boundary (measurement only) ────────
         # The remote restore begins at this first executable line; record it on
         # the canonical axis so the ledger can bridge bootstrap -> modal_app
@@ -2023,31 +2067,53 @@ class RuntimeBootstrap:
         try:
             # ── 1. restore_gpu_state ──
             def _do_restore_gpu_state():
+                _called = self.restore_gpu_state is not None
+                _classification = "restored" if _called else "skipped"
                 if trace:
                     trace.emit("restore_gpu_state_start", phase="restore")
-                if self.restore_gpu_state:
-                    self.restore_gpu_state()
-                if trace:
-                    trace.emit("restore_gpu_state_end", phase="restore")
+                try:
+                    if self.restore_gpu_state:
+                        self.restore_gpu_state()
+                except Exception:
+                    _classification = "unknown"
+                    raise
+                finally:
+                    if trace:
+                        trace.emit("restore_gpu_state_end", phase="restore")
+                    self._record_restore_stage(
+                        "restore_gpu_state", _classification, trace=trace,
+                        callback_called=_called,
+                    )
             with variance_stage(trace, stage="restore_gpu_state", phase="restore"):
                 _do_restore_gpu_state()
 
             # ── 2. initialize_cuda_context ──
             def _do_initialize_cuda():
+                _called = self.initialize_cuda is not None
+                _classification = "validated" if _called else "skipped"
                 if trace:
                     trace.emit("cuda_init_start", phase="restore")
-                if self.initialize_cuda:
-                    cuda_result = self.initialize_cuda()
-                    if isinstance(cuda_result, dict):
-                        self.state.cuda = dict(cuda_result)
-                if trace:
-                    trace.emit(
-                        "cuda_init_end",
-                        phase="restore",
-                        metadata={
-                            "device": str(self.state.cuda.get("device", "")),
-                            "cuda_available": str(self.state.cuda.get("cuda_available", "")),
-                        },
+                try:
+                    if self.initialize_cuda:
+                        cuda_result = self.initialize_cuda()
+                        if isinstance(cuda_result, dict):
+                            self.state.cuda = dict(cuda_result)
+                except Exception:
+                    _classification = "unknown"
+                    raise
+                finally:
+                    if trace:
+                        trace.emit(
+                            "cuda_init_end",
+                            phase="restore",
+                            metadata={
+                                "device": str(self.state.cuda.get("device", "")),
+                                "cuda_available": str(self.state.cuda.get("cuda_available", "")),
+                            },
+                        )
+                    self._record_restore_stage(
+                        "initialize_cuda", _classification, trace=trace,
+                        callback_called=_called,
                     )
             with variance_stage(trace, stage="cuda_init", phase="restore"):
                 _do_initialize_cuda()
@@ -2095,7 +2161,11 @@ class RuntimeBootstrap:
                     ),
                 )
                 _sage_verify_ms = round((time.perf_counter() - _sage_t0) * 1000, 3)
-            if _sage_verify_ok:
+            _force_sage_selection = bool(
+                self.select_sage_runtime_mode is not None
+                or self.force_sage_selection_after_restore
+            )
+            if _sage_verify_ok and not _force_sage_selection:
                 _skipped_sage = True
                 print(
                     f"[v2.sage_restore] decision=snapshot_exact_skip "
@@ -2115,29 +2185,82 @@ class RuntimeBootstrap:
                 )
 
             if not _skipped_sage:
-                with variance_stage(trace, stage="sage_policy", phase="restore"):
-                    if trace:
-                        trace.emit("sage_policy_start", phase="restore")
-                    if self.apply_sage_policy:
-                        sage_result = self.apply_sage_policy()
-                        if isinstance(sage_result, bool):
-                            self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
-                            self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
-                        elif isinstance(sage_result, dict):
-                            self.state.sage_mode = str(sage_result.get("mode", ""))
-                            self.state.sage_reason = str(sage_result.get("reason", ""))
-                        # Lane B: capture sage identity after successful application
-                        if self.state.sage_mode:
-                            self.state.sage_identity_captured = True
-                    if trace:
-                        trace.emit(
-                            "sage_policy_end",
-                            phase="restore",
-                            metadata={
-                                "sage_mode": self.state.sage_mode,
-                                "sage_reason": self.state.sage_reason,
-                            },
-                        )
+                _sage_callback_called = self.apply_sage_policy is not None
+                _sage_selector_called = _force_sage_selection
+                _sage_classification = (
+                    "restored"
+                    if (_sage_callback_called or _sage_selector_called)
+                    else "skipped"
+                )
+                try:
+                    with variance_stage(trace, stage="sage_policy", phase="restore"):
+                        if trace:
+                            trace.emit("sage_policy_start", phase="restore")
+                        try:
+                            # This callback is intentionally reached only from
+                            # restore, after restore_gpu_state + initialize_cuda.
+                            # It must run before policy application so a
+                            # snapshot-carried fallback cannot remain sticky.
+                            if self.select_sage_runtime_mode:
+                                selected = self.select_sage_runtime_mode()
+                                if isinstance(selected, dict):
+                                    self.state.sage_mode = str(selected.get("mode", ""))
+                                    self.state.sage_reason = str(selected.get("reason", ""))
+                                    identity = selected.get("identity")
+                                    if isinstance(identity, Mapping):
+                                        self.state.sage_runtime_identity = dict(identity)
+                                elif isinstance(selected, (tuple, list)) and len(selected) >= 2:
+                                    self.state.sage_mode = str(selected[0])
+                                    self.state.sage_reason = str(selected[1])
+                            if self.apply_sage_policy:
+                                sage_result = self.apply_sage_policy()
+                                if isinstance(sage_result, bool):
+                                    self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
+                                    self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
+                                elif isinstance(sage_result, dict):
+                                    self.state.sage_mode = str(sage_result.get("mode", ""))
+                                    self.state.sage_reason = str(sage_result.get("reason", ""))
+                                # Lane B: capture sage identity after successful application
+                                if self.state.sage_mode:
+                                    self.state.sage_identity_captured = True
+                        finally:
+                            if trace:
+                                trace.emit(
+                                    "sage_policy_end",
+                                    phase="restore",
+                                    metadata={
+                                        "sage_mode": self.state.sage_mode,
+                                        "sage_reason": self.state.sage_reason,
+                                        "sage_runtime_identity": dict(
+                                            self.state.sage_runtime_identity
+                                        ),
+                                    },
+                                )
+                except Exception:
+                    _sage_classification = "unknown"
+                    raise
+                finally:
+                    self._record_restore_stage(
+                        "sage_policy",
+                        _sage_classification,
+                        trace=trace,
+                        decision="fallback_full_discovery",
+                        reason=(
+                            "fresh_selection_after_cuda_restore" if _sage_selector_called
+                            else "no_snapshot_sage_identity" if not self.state.snapshot_sage_identity
+                            else "verify_failed"
+                        ),
+                        callback_called=bool(_sage_callback_called or _sage_selector_called),
+                    )
+            else:
+                self._record_restore_stage(
+                    "sage_policy",
+                    "validated",
+                    trace=trace,
+                    decision="snapshot_exact_skip",
+                    reason="identity_match",
+                    callback_called=False,
+                )
 
             # ── 3. reload_runtime_state (Batch B guard) ──
             # Skip the network Volume reload when the mounted
@@ -2153,6 +2276,7 @@ class RuntimeBootstrap:
             _runtime_state_reload_reason = "unconditional"
             _runtime_state_reload_check_ms = 0.0
             _runtime_state_reload_skipped = False
+            _runtime_state_reload: dict[str, Any] = {}
             if self.reload_runtime_state is not None:
                 _runtime_state_reload = self._decide_runtime_state_reload()
                 _runtime_state_reload_decision = _runtime_state_reload["decision"]
@@ -2169,22 +2293,42 @@ class RuntimeBootstrap:
             _runtime_state_reload_invoked = (
                 (not _runtime_state_reload_skipped) and self.reload_runtime_state is not None
             )
+            _runtime_state_classification = (
+                "skipped" if _runtime_state_reload_skipped
+                else ("reloaded" if _runtime_state_reload_invoked else "unknown")
+            )
 
             def _do_reload_runtime_state():
                 if trace:
                     trace.emit("reload_runtime_state_start", phase="restore")
-                if self.reload_runtime_state:
-                    self.reload_runtime_state()
-                if trace:
-                    trace.emit("reload_runtime_state_end", phase="restore")
+                try:
+                    if self.reload_runtime_state:
+                        self.reload_runtime_state()
+                finally:
+                    if trace:
+                        trace.emit("reload_runtime_state_end", phase="restore")
 
-            with variance_stage(trace, stage="runtime_state", phase="restore"):
-                if _runtime_state_reload_skipped:
-                    # The construction-time generation marker already proves
-                    # the restored mount matches the snapshot write set.
-                    pass
-                else:
-                    _do_reload_runtime_state()
+            try:
+                with variance_stage(trace, stage="runtime_state", phase="restore"):
+                    if _runtime_state_reload_skipped:
+                        # The construction-time generation marker already proves
+                        # the restored mount matches the snapshot write set.
+                        pass
+                    else:
+                        _do_reload_runtime_state()
+            except Exception:
+                _runtime_state_classification = "unknown"
+                raise
+            finally:
+                self._record_restore_stage(
+                    "reload_runtime_state",
+                    _runtime_state_classification,
+                    trace=trace,
+                    decision=_runtime_state_reload_decision,
+                    reason=_runtime_state_reload_reason,
+                    callback_called=_runtime_state_reload_invoked,
+                    guard=_runtime_state_reload,
+                )
             print(
                 f"[v2.runtime_state_volume_restore] "
                 f"decision={_runtime_state_reload_decision} "
@@ -2206,7 +2350,6 @@ class RuntimeBootstrap:
                         "check_ms": _runtime_state_reload_check_ms,
                     },
                 )
-
             # ── 4. reload_models (Batch A guard) ──
             # Skip the network Volume reload when the mounted models
             # generation record exactly matches the snapshot construction
@@ -2217,6 +2360,7 @@ class RuntimeBootstrap:
             _models_reload_reason = "unconditional"
             _models_reload_check_ms = 0.0
             _models_reload_skipped = False
+            _models_reload: dict[str, Any] = {}
             if self.reload_models is not None:
                 _models_reload = self._decide_models_reload()
                 _models_reload_decision = _models_reload["decision"]
@@ -2226,22 +2370,42 @@ class RuntimeBootstrap:
             _models_reload_callback_called = (
                 (not _models_reload_skipped) and self.reload_models is not None
             )
+            _models_reload_classification = (
+                "skipped" if _models_reload_skipped
+                else ("reloaded" if _models_reload_callback_called else "unknown")
+            )
 
             def _do_reload_models():
                 if trace:
                     trace.emit("reload_models_start", phase="restore")
-                if self.reload_models:
-                    self.reload_models()
-                if trace:
-                    trace.emit("reload_models_end", phase="restore")
+                try:
+                    if self.reload_models:
+                        self.reload_models()
+                finally:
+                    if trace:
+                        trace.emit("reload_models_end", phase="restore")
 
-            with variance_stage(trace, stage="models", phase="restore"):
-                if _models_reload_skipped:
-                    # The existing generation contract already proves the
-                    # mounted model state matches the snapshot baseline.
-                    pass
-                else:
-                    _do_reload_models()
+            try:
+                with variance_stage(trace, stage="models", phase="restore"):
+                    if _models_reload_skipped:
+                        # The existing generation contract already proves the
+                        # mounted model state matches the snapshot baseline.
+                        pass
+                    else:
+                        _do_reload_models()
+            except Exception:
+                _models_reload_classification = "unknown"
+                raise
+            finally:
+                self._record_restore_stage(
+                    "reload_models",
+                    _models_reload_classification,
+                    trace=trace,
+                    decision=_models_reload_decision,
+                    reason=_models_reload_reason,
+                    callback_called=_models_reload_callback_called,
+                    guard=_models_reload,
+                )
             print(
                 f"[v2.models_volume_restore] "
                 f"decision={_models_reload_decision} "
@@ -2261,7 +2425,6 @@ class RuntimeBootstrap:
                         "check_ms": _models_reload_check_ms,
                     },
                 )
-
             # Lane B: restore prescan identity from persisted record
             # (measurement-only bracket; the function is a no-op fallback
             # when no prescan record exists — it is still timed).
@@ -2287,15 +2450,34 @@ class RuntimeBootstrap:
             _cn_fallback_reason = ""
 
             _current_source = "unavailable"
+            _current_identity_reason = "unavailable"
             if self.read_current_custom_node_identity and self.sync_custom_nodes:
                 current = self.read_current_custom_node_identity()
-                _current_gen = current.get("custom_node_generation", "")
-                _current_schema = current.get("schema_version", "0")
-                _current_dep_hash = current.get("deployment_combined_hash", "")
-                _current_source = current.get("generation_source", "unavailable")
+                if not isinstance(current, Mapping):
+                    current = {}
+                    _current_identity_reason = "invalid_identity_shape"
+                else:
+                    _current_identity_reason = str(
+                        current.get("identity_read_reason", "") or "unavailable"
+                    )
+                _current_gen = str(current.get("custom_node_generation", "") or "")
+                _current_schema = str(current.get("schema_version", "0") or "0")
+                _current_dep_hash = str(current.get("deployment_combined_hash", "") or "")
+                _current_source = str(
+                    current.get("generation_source", "unavailable") or "unavailable"
+                )
 
                 if not _current_gen:
                     _cn_fallback_reason = "missing_current_token"
+                    _cn_decision = "fallback_full_sync"
+                # Only an explicitly mounted-record source can authorize an
+                # exact skip; a snapshot-restored API field cannot.
+                elif _current_source not in {
+                    "persisted_record",
+                    "mounted_volume_record",
+                    "volume_record",
+                }:
+                    _cn_fallback_reason = "untrusted_source"
                     _cn_decision = "fallback_full_sync"
                 elif self.state.snapshot_custom_node_schema and _current_schema != self.state.snapshot_custom_node_schema:
                     _cn_fallback_reason = "schema_mismatch"
@@ -2312,10 +2494,11 @@ class RuntimeBootstrap:
                 else:
                     _skipped_cn_sync = True
             elif self.state.has_prescan_identity() and self.sync_custom_nodes:
-                # Fallback: use legacy prescan identity when read_current_custom_node_identity
-                # is not provided (backward-compatible path for tests and simpler callers).
+                # Legacy prescan identity is snapshot state, not a fresh
+                # mounted-record read.  It cannot authorize an exact skip.
                 _current_source = "prescan_identity"
-                _skipped_cn_sync = True
+                _cn_fallback_reason = "authoritative_reader_unavailable"
+                _cn_decision = "fallback_full_sync"
 
             # Step-2: a fallback full-sync means the snapshot's canonical
             # deployment-static proof no longer describes the current custom
@@ -2337,36 +2520,67 @@ class RuntimeBootstrap:
                     "decision": _cn_decision,
                     "skipped_sync": int(bool(_skipped_cn_sync)),
                     "fallback_reason": _cn_fallback_reason,
+                    "current_source": _current_source,
+                    "identity_read_reason": _current_identity_reason,
                 },
             )
 
-            with variance_stage(trace, stage="custom_node_sync", phase="restore"):
-                if _skipped_cn_sync:
-                    print(
-                        f"[v2.custom_node_restore] "
-                        f"decision={_cn_decision} "
-                        f"callback_called=0 "
-                        f"source={_current_source} "
-                        f"check_ms={_check_ms}",
-                        flush=True,
-                    )
-                else:
-                    if _cn_fallback_reason:
+            _cn_callback_called = not _skipped_cn_sync and self.sync_custom_nodes is not None
+            _cn_classification = (
+                "skipped" if _skipped_cn_sync
+                else ("reloaded" if _cn_callback_called else "unknown")
+            )
+            _cn_guard = {
+                "decision": _cn_decision,
+                "reason": _cn_fallback_reason or ("exact_match" if _skipped_cn_sync else "unconditional"),
+                "current_source": _current_source,
+                "identity_read_reason": _current_identity_reason,
+            }
+            try:
+                with variance_stage(trace, stage="custom_node_sync", phase="restore"):
+                    if _skipped_cn_sync:
                         print(
                             f"[v2.custom_node_restore] "
                             f"decision={_cn_decision} "
-                            f"callback_called=1 "
-                            f"source={_current_source if _current_source else 'unavailable'} "
-                            f"check_ms={_check_ms} "
-                            f"reason={_cn_fallback_reason}",
+                            f"callback_called=0 "
+                            f"source={_current_source} "
+                            f"identity_reason={_current_identity_reason} "
+                            f"check_ms={_check_ms}",
                             flush=True,
                         )
-                    if trace:
-                        trace.emit("sync_custom_nodes_start", phase="restore")
-                    if self.sync_custom_nodes:
-                        self.sync_custom_nodes()
-                    if trace:
-                        trace.emit("sync_custom_nodes_end", phase="restore")
+                    else:
+                        if _cn_fallback_reason:
+                            print(
+                                f"[v2.custom_node_restore] "
+                                f"decision={_cn_decision} "
+                                f"callback_called=1 "
+                                f"source={_current_source if _current_source else 'unavailable'} "
+                                f"identity_reason={_current_identity_reason} "
+                                f"check_ms={_check_ms} "
+                                f"reason={_cn_fallback_reason}",
+                                flush=True,
+                            )
+                        if trace:
+                            trace.emit("sync_custom_nodes_start", phase="restore")
+                        try:
+                            if self.sync_custom_nodes:
+                                self.sync_custom_nodes()
+                        finally:
+                            if trace:
+                                trace.emit("sync_custom_nodes_end", phase="restore")
+            except Exception:
+                _cn_classification = "unknown"
+                raise
+            finally:
+                self._record_restore_stage(
+                    "sync_custom_nodes",
+                    _cn_classification,
+                    trace=trace,
+                    decision=_cn_decision,
+                    reason=_cn_guard["reason"],
+                    callback_called=_cn_callback_called,
+                    guard=_cn_guard,
+                )
             with variance_stage(trace, stage="generation_observe", phase="restore"):
                 if not _skipped_cn_sync:
                     if trace:
@@ -2444,6 +2658,14 @@ class RuntimeBootstrap:
                             },
                         )
             _emit_startup_stage("snapshot_execution_seed", "end", started=_seed_started, trace=trace, phase="restore")
+            self._record_restore_stage(
+                "snapshot_execution_seed",
+                "restored" if _seed_hydrated else "reconstructed",
+                trace=trace,
+                decision="hydrated" if _seed_hydrated else "minimal_fallback",
+                reason="publisher_payload" if _seed_hydrated else "payload_unavailable",
+                callback_called=_seed_hydrated,
+            )
             if trace and self.state.snapshot_seed_built:
                 trace.emit(
                     "snapshot_execution_seed_built",

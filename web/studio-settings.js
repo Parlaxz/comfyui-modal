@@ -567,7 +567,7 @@ export function renderSettings(state, context) {
     // Runtime & Backend group
     const runtimeGroup = el("div", {
       class: "comfymodal-settings-group",
-      "data-search": "runtime backend deploy state snapshots presets workspace workspaces legacy settings edit",
+      "data-search": "runtime backend deploy state snapshots presets workspace workspaces edit",
     });
     runtimeGroup.appendChild(el("h4", { class: "comfymodal-settings-group-title", text: "Runtime & Backend" }));
 
@@ -613,10 +613,8 @@ export function renderSettings(state, context) {
     backendLinkWrap.appendChild(settingsRow("Backend", backendLink));
     runtimeGroup.appendChild(backendLinkWrap);
 
-    // Workspace editing now owns the retired legacy Settings entry point.
-    // Keep both the explicit workspace link and the legacy-compatible label
-    // pointed at the same Backend tab, with a hash deep-link for reloads and
-    // embeds that do not expose the shell's focus API.
+    // Workspace editing lives in the Backend tab, with a hash deep-link for
+    // reloads and embeds that do not expose the shell's focus API.
     function openWorkspaces(e) {
       e.preventDefault();
       if (context && typeof context.setPage === "function") {
@@ -668,24 +666,7 @@ export function renderSettings(state, context) {
     workspacesLinkWrap.appendChild(settingsRow("Workspaces", workspacesLink));
     runtimeGroup.appendChild(workspacesLinkWrap);
 
-    const legacyLinkWrap = el("div", {
-      class: "comfymodal-settings-control",
-      "data-search": "legacy settings workspaces",
-    });
-    const legacyLink = el("a", {
-      class: "comfymodal-settings-link",
-      "data-testid": "settings-open-legacy",
-      text: "Open legacy settings",
-      href: "#",
-      "aria-label": "Open legacy settings",
-    });
-    legacyLink.addEventListener("click", openWorkspaces);
-    legacyLinkWrap.appendChild(settingsRow("Legacy settings", legacyLink));
-    runtimeGroup.appendChild(legacyLinkWrap);
     section.appendChild(runtimeGroup);
-
-    // The retired Legacy entry point is retained as a deep-link to the
-    // Backend-owned workspace editor; no legacy overlay is mounted.
 
     return section;
   }

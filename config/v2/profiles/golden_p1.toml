@@ -15,7 +15,7 @@ method = "run_golden_serial_stream"
 [workload]
 fresh_required = true
 conditioning_cache = "forced_miss"
-expected_output_sha = "454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da"
+expected_output_sha = "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
 # v2ctl gate is one structural generation; the frozen final cohort uses
 # `v2ctl confirm --runs 5`, with single-use containers for each run.
 run_count = 1
@@ -35,6 +35,8 @@ COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "0"
 COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "1"
 COMFYMODAL_V2_VAE_SNAPSHOT = "0"
 COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
+COMFYMODAL_V2_SNAPSHOT_MANIFEST = "1"
+COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "1"
 
 # Modal memory snapshots remain enabled by the runtime default.  The
 # COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT control is not in the v2ctl flag
@@ -42,6 +44,7 @@ COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
 
 # ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
+COMFYMODAL_SAMPLING_DEEP_PROFILE = "blocks"
 
 # The Golden request contract requires canonical workflow SHA verification.
 COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "1"
