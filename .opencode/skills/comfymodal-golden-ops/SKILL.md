@@ -45,6 +45,33 @@ Every experiment gets an explicit isolated app, e.g.:
 
 Use legal Modal app names. Do not add source-code allowlists for new batch names.
 
+## Generated-output durability policy
+
+Read `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for the current output
+contract. `COMFYMODAL_OUTPUT_DURABILITY` accepts only `off` or `strict`;
+missing/`off` resolves to `off`, and an invalid explicit value is a
+configuration error: `configuration error: COMFYMODAL_OUTPUT_DURABILITY must
+be off or strict`. Generated-output durability is **off by default**.
+
+The normal Golden request therefore measures and returns:
+
+```text
+encode -> observed SHA/bytes -> FIRST_RESULT_READY -> return
+```
+
+An experiment that explicitly selects `strict` must instead prove:
+
+```text
+write/fsync -> Volume.commit -> reopen/hash proof
+-> TRUE_FIRST_DURABLE_RESULT -> return
+```
+
+Strict failure rejects the run; it must not downgrade to `off`. Do not add
+persistent output workers, background durability work, deduplication, or
+shortcuts. This generated-output choice never weakens S4/source publication:
+the shared custom-node publication and full-content identity/readback contract
+remain mandatory.
+
 ## Supported public commands
 
 Run from the repository root.
@@ -159,9 +186,10 @@ An accepted Golden observation must structurally prove the current Golden contra
 - `request_count == 1`
 - authoritative true-cold/restored identity
 - expected PNG SHA
-- `true_durable == true`
-- reopen verification
-- commit-before-reopen ordering
+- output mode and its matching endpoint evidence
+- in `off` mode: observed encoded bytes/SHA and `FIRST_RESULT_READY`
+- in `strict` mode: `true_durable == true`, reopen verification, and
+  commit-before-reopen ordering
 - strict seriality / zero seriality violations
 - valid snapshot/quiescence proof
 - completed Golden teardown
@@ -225,7 +253,9 @@ For a new change:
 2. Run one request.
 3. Classify it.
 4. If it is a snapshot capture, discard it and also discard the directly-following request; then continue.
-5. If the first eligible run fails exactness, identity, durability, routing, or the experiment-specific gate, diagnose it before launching confirmation runs.
+5. If the first eligible run fails exactness, identity, its selected output
+   endpoint/durability contract, routing, or the experiment-specific gate,
+   diagnose it before launching confirmation runs.
 6. If it passes, collect the remaining requested observations separately.
 7. Compare only equivalent timing boundaries. Always ask whether a number is a full stage or a partial sub-span.
 8. Preserve complete raw logs; do not rely only on profiler summaries.

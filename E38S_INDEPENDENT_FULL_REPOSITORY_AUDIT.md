@@ -1,5 +1,11 @@
 # E38S Independent Full Repository / Architecture / Performance / Correctness Audit — comfyui-modal
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 **Date:** 2026-08-21
 **Scope:** READ-ONLY. No source/test/deploy/commit/push/reset/clean. Dirty worktree preserved (40 files dirty, branch TESTING2, HEAD `8e49d75` + `a6a755e`/`0ba7000` lineage). `comfyapp.py` 22,614 lines, `__init__.py` 384k bytes, `comfymodal_runtime/` 70+ modules, `config/v2/flag_registry.toml` 950 lines.
 **Method:** 10 parallel specialist lanes, first-principles source read, graph discovery (codebase-memory unavailable — fallback to grep/Read), artifact forensics (E27-E37 reports + raw `comfymodal-data/` where present), git history, flag/profile inventory. Independence requirement honored — every historical claim re-checked against current source and labeled.
@@ -633,4 +639,3 @@ Every finding above includes `how to prove/falsify`. For the next deployment gat
 ---
 
 *End of E38 independent audit. All observations are from current source or raw artifacts; speculative savings explicitly not counted. Dirty worktree and E37 lock preserved.*
-

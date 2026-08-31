@@ -607,6 +607,12 @@ class TestGoldenDeployVersionVerification:
         monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
         monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
         monkeypatch.setattr(cli, "write_deployment_manifest", fake_manifest)
+        # Keep this version-advance unit test isolated from the repository's
+        # persistent Golden receipt ledger.
+        monkeypatch.setattr(
+            cli, "_write_golden_deployment_receipt",
+            lambda *args, **kwargs: tmp_path / "deployment-receipt.json",
+        )
         # Native Golden deploys gate Modal deployment on verified custom-node
         # publication.  Keep this version-advance test focused on its existing
         # contract by supplying that verified publication explicitly.

@@ -37,6 +37,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 from .environment import EnvironmentBuilder
 from .errors import BackendError, ProvenanceError
@@ -498,6 +499,7 @@ class BackendRunner:
         timeout_seconds: float | None = None,
         invocation_id: str | None = None,
         invocation_context: str | None = None,
+        canonical_identity: Mapping[str, str] | None = None,
         strict_canonical_discovery: bool = False,
         allow_multiple_run_artifacts: bool = False,
     ) -> BackendResult:
@@ -541,9 +543,32 @@ class BackendRunner:
             run_fp = fp.run_fingerprint()
         except Exception as exc:  # pragma: no cover - duck-typed test config
             raise BackendError(f"cannot compute canonical fingerprints: {exc}") from exc
+        # Receipt-bound requests use the immutable deployment identity while
+        # retaining this invocation's current request fingerprint.  This is a
+        # narrow channel; arbitrary extra_env values cannot spoof provenance.
+        profile = str(getattr(config, "profile_name", "") or "")
+        if canonical_identity is not None:
+            allowed = {
+                "profile", "profile_config_fingerprint", "deploy_fingerprint",
+                "run_fingerprint",
+            }
+            unknown = set(canonical_identity) - allowed
+            if unknown:
+                raise BackendError(
+                    "canonical identity contains unsupported fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            profile = str(canonical_identity.get("profile", profile) or "")
+            profile_config_fp = str(
+                canonical_identity.get("profile_config_fingerprint", profile_config_fp) or ""
+            )
+            deploy_fp = str(canonical_identity.get("deploy_fingerprint", deploy_fp) or "")
+            run_fp = str(canonical_identity.get("run_fingerprint", run_fp) or "")
+            if not profile or not profile_config_fp or not deploy_fp or not run_fp:
+                raise BackendError("canonical identity override is incomplete")
         child_env.update({
             "COMFYMODAL_V2CTL_INVOCATION_ID": invocation_id,
-            "COMFYMODAL_V2CTL_PROFILE": str(getattr(config, "profile_name", "") or ""),
+            "COMFYMODAL_V2CTL_PROFILE": profile,
             "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT": profile_config_fp,
             "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": deploy_fp,
             "COMFYMODAL_V2CTL_RUN_FINGERPRINT": run_fp,

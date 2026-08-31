@@ -1,5 +1,11 @@
 # E39 — comfyapp.py Golden-Path Reachability, Deconfliction, and Aggressive Phase-G Pruning Report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical E39 report; preserve its
+> pruning and run evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`
+> for current generated-output semantics. Output durability is off by default;
+> strict commit/reopen/hash proof is opt-in. S4 source publication durability
+> remains mandatory.
+
 Batch: E39 · Date: 2026-08-22 · Branch: `TESTING2`
 Baseline checkpoint commit: **`36b895d`** ("e37/e38: checkpoint pre-E39 worktree") — created at batch start so every E39 change is cleanly separable from E31–E37 uncommitted work.
 Post-prune state: uncommitted working-tree changes to `comfyapp.py` + `tests/test_production_plan_fix.py` only.

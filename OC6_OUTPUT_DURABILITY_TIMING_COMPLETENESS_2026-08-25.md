@@ -1,5 +1,11 @@
 # OC6 — Batch Output: Output Durability, Timing-Completeness Forensic Audit (2026-08-25)
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical output-durability audit;
+> preserve its source/artifact observations, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> semantics. Output durability is off by default; strict commit/reopen/hash
+> proof is opt-in. S4 source publication durability remains mandatory.
+
 Mode: READ-ONLY forensic audit. No deploy, no paid run, no source/instrumentation changes.
 Deliverables: this file + `OC6_OUTPUT_TIMING_CLAIMS_2026-08-25.csv`.
 All event/field names below are copied verbatim from code or artifacts. Nothing is renamed; nothing is invented. Where a named boundary does not exist, the report says so.

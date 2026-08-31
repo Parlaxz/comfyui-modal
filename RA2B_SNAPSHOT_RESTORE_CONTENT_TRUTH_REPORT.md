@@ -1,5 +1,11 @@
 # RA2B snapshot/restore content truth report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical Golden snapshot evidence;
+> preserve its observations, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> semantics. Output durability is off by default; strict commit/reopen/hash
+> proof is opt-in. S4 source publication durability remains mandatory.
+
 ## Executive answer
 
 The three supplied serial Golden attempts are all structurally valid,

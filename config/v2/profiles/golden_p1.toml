@@ -45,6 +45,7 @@ COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "0"
 # ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
 COMFYMODAL_SAMPLING_DEEP_PROFILE = "off"
+COMFYMODAL_GOLDEN_QD_TRANSPORT = "legacy"
 
 # The Golden request contract requires canonical workflow SHA verification.
 COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "1"

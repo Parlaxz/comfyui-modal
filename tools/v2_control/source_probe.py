@@ -40,6 +40,9 @@ REQUIRED_MODULES = (
     "comfymodal_runtime/model_preload.py",
     "comfymodal_runtime/clip_fast_hydration_wiring.py",
     "comfymodal_runtime/registry_proof_store.py",
+    "comfymodal_runtime/golden_serial.py",
+    "comfymodal_runtime/golden_qd_transport.py",
+    "comfymodal_runtime/output_durability.py",
 )
 
 # Remote module names (dotted, as imported inside the container).
@@ -52,6 +55,9 @@ REMOTE_MODULE_NAMES = {
     "comfymodal_runtime/model_preload.py": "comfymodal_runtime.model_preload",
     "comfymodal_runtime/clip_fast_hydration_wiring.py": "comfymodal_runtime.clip_fast_hydration_wiring",
     "comfymodal_runtime/registry_proof_store.py": "comfymodal_runtime.registry_proof_store",
+    "comfymodal_runtime/golden_serial.py": "comfymodal_runtime.golden_serial",
+    "comfymodal_runtime/golden_qd_transport.py": "comfymodal_runtime.golden_qd_transport",
+    "comfymodal_runtime/output_durability.py": "comfymodal_runtime.output_durability",
 }
 
 # Expected container-side path prefixes for add_local_python_source mounts.
@@ -284,13 +290,14 @@ def run_source_probe(
     *,
     workspace: dict[str, Any] | None = None,
     gpu: str = "",
+    expected: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute the full source-identity stop-gate.
 
     Returns ``(exit_code, report)`` where exit_code is 0 only when every
     required module MATCHes.
     """
-    expected = compute_expected_local(repo_root)
+    expected = expected if expected is not None else compute_expected_local(repo_root)
     if workspace is None:
         workspace = _load_workspace(repo_root)
     probe = call_remote_source_probe(repo_root, workspace=workspace, gpu=gpu or "rtx-pro-6000")

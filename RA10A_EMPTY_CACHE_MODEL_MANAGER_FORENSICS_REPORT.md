@@ -1,5 +1,11 @@
 # RA10A — `empty_cache` / Model-Manager / Unload Forensics Report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical Golden lifecycle forensics;
+> preserve its evidence, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> semantics. Output durability is off by default; strict commit/reopen/hash
+> proof is opt-in. S4 source publication durability remains mandatory.
+
 ## 1. Scope, method, and evidence limits
 
 This is a read-only forensic report for the current Golden lifecycle.  It

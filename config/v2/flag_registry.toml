@@ -660,6 +660,16 @@ owner = "e30"
 description = "Optional JSON artifact path for per-block E30 CLIP QD stats (empty = no artifact)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
+type = "enum"
+default = "legacy"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+enum_values = ["legacy", "dispatcher"]
+description = "Golden QD4 transport arm for the isolated RA9C comparison."
+
+[[flag]]
 name = "COMFYMODAL_V2_GPU_FAST_RETURN"
 type = "bool"
 default = "1"

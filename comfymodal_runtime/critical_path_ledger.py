@@ -1,10 +1,12 @@
 """Canonical ground-truth critical-path ledger (Batch E29).
 
 This module is the ONE authoritative account of the remote request from
-``remote Python resume`` to ``first durable result``.  It is measurement-only:
-every span/event is a real, code-site-stamped observation on the shared remote
-process monotonic clock (``time.monotonic_ns()``).  Nothing here invents a
-stage name or converts unexplained wall into a plausible bucket.
+``remote Python resume`` to the selected result endpoint.  For generated output,
+the default endpoint is ``FIRST_RESULT_READY``; an explicitly selected strict
+output-durability experiment uses ``TRUE_FIRST_DURABLE_RESULT``.  It is
+measurement-only: every span/event is a real, code-site-stamped observation on
+the shared remote process monotonic clock (``time.monotonic_ns()``).  Nothing
+here invents a stage name or converts unexplained wall into a plausible bucket.
 
 Accounting contract (strict, per the E29 spec):
 
@@ -30,9 +32,11 @@ inappropriate the scope reports ``union_coverage_ms``, ``overlap_coverage_ms``
 and ``exclusive_residual_ms`` explicitly instead.
 
 Zero-gap contract: at request end ``build_serial_ledger`` constructs the serial
-ledger ``remote_python_resume_mono_ns -> first_durable_result_mono_ns``; every
-nanosecond on that serial axis is represented.  Unknown ownership renders as
-``UNATTRIBUTED`` (never blank, never a guessed stage name).
+ledger from ``remote_python_resume_mono_ns`` to the selected result endpoint
+(``FIRST_RESULT_READY`` by default, ``TRUE_FIRST_DURABLE_RESULT`` only for
+explicit strict output durability); every nanosecond on that serial axis is
+represented.  Unknown ownership renders as ``UNATTRIBUTED`` (never blank, never
+a guessed stage name).
 
 Request scoping: every span carries ``request_id``/``trace_id`` plus the full
 identity block (``restored_instance_id``, ``restore_session_id``,
@@ -82,9 +86,12 @@ _RESTORE_RID: str = ""
 
 # ── Authoritative serial-ledger endpoints (E29 acceptance contract) ─────
 # ``request_ledger_report`` MUST bound the serial zero-gap ledger by these
-# explicit endpoints (remote_python_resume -> first_durable_result), never by
-# min/max of whatever spans/events happen to exist.  A truncated ledger must
-# not be able to tile its own truncated interval and still claim zero-gap.
+# explicit endpoints (remote_python_resume -> the selected result endpoint),
+# never by min/max of whatever spans/events happen to exist.  The historical
+# ``first_durable_result_mono_ns`` storage key names that selected end boundary;
+# its meaning is FIRST_RESULT_READY by default and TRUE_FIRST_DURABLE_RESULT
+# only for an explicit strict output-durability experiment.  A truncated ledger
+# must not be able to tile its own truncated interval and still claim zero-gap.
 _AUTHORITATIVE_ENDPOINTS: dict[str, int] = {}
 
 
@@ -94,8 +101,12 @@ def set_authoritative_endpoints(
     first_durable_result_mono_ns: int | None = None,
 ) -> None:
     """Record the explicit canonical boundaries for the serial zero-gap
-    ledger.  Both endpoints are required for the acceptance report; a missing
-    endpoint surfaces as ``endpoint_status="missing"`` with the exact key."""
+    ledger.  ``first_durable_result_mono_ns`` is the historical storage name
+    for the selected result endpoint: use the ``FIRST_RESULT_READY`` boundary
+    by default, and ``TRUE_FIRST_DURABLE_RESULT`` only for explicit strict
+    output durability.  Both endpoints are required for the acceptance report;
+    a missing endpoint surfaces as ``endpoint_status="missing"`` with the
+    exact key."""
     global _AUTHORITATIVE_ENDPOINTS
     if remote_python_resume_mono_ns is not None:
         _AUTHORITATIVE_ENDPOINTS["remote_python_resume_mono_ns"] = int(
@@ -720,19 +731,23 @@ def get_restore_events() -> list[dict[str, Any]]:
 def request_ledger_report() -> dict[str, Any]:
     """JSON-safe snapshot of the current request ledger: identity, spans,
     events, per-span arithmetic reconciliation, and the serial zero-gap
-    ledger from the earliest to the latest recorded boundary.
+    ledger from remote Python resume to the selected result endpoint.
 
-    The serial axis spans restore entry .. first durable result: the
-    restore-session spans/events (same process, same monotonic clock) are
-    included whenever a restore session exists for this container process.
+    The serial axis spans remote Python resume .. the selected result endpoint:
+    ``FIRST_RESULT_READY`` by default, or ``TRUE_FIRST_DURABLE_RESULT`` only
+    for explicit strict output durability.  Restore-session spans/events (same
+    process, same monotonic clock) are included whenever a restore session
+    exists for this container process.
 
     E29 acceptance contract: the serial ledger MUST use the explicit
     authoritative endpoints set via ``set_authoritative_endpoints()``
-    (remote_python_resume_mono_ns -> first_durable_result_mono_ns), NOT
-    min/max(existing spans/events).  A truncated ledger must not be able to
-    tile its own truncated interval and still claim zero-gap: if the
-    authoritative endpoints are missing, the report's ``serial_ledger`` is
-    None and ``endpoint_status`` carries the exact missing boundary.
+    (remote_python_resume_mono_ns -> the selected result endpoint), NOT
+    min/max(existing spans/events).  The compatibility storage key
+    ``first_durable_result_mono_ns`` carries that selected end timestamp.  A
+    truncated ledger must not be able to tile its own truncated interval and
+    still claim zero-gap: if the authoritative endpoints are missing, the
+    report's ``serial_ledger`` is None and ``endpoint_status`` carries the
+    exact missing boundary.
     """
     spans = get_spans()
     events = get_events()

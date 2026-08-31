@@ -1,5 +1,11 @@
 # Golden Suite Gate Report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical gate evidence is preserved
+> as recorded and is not rewritten. For current generated-output requirements,
+> use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`: output durability is off
+> by default; only explicit strict runs require commit/reopen/hash proof. S4
+> source publication durability remains mandatory.
+
 **Evidence date:** 2026-08-27 (UTC)  
 **Evidence set:** `golden-p3-ComfyUI` / `phase_p1_serial_golden_v1`  
 **Report ownership:** this report only; no other repository file is changed by this report.

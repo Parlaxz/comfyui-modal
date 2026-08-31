@@ -23,7 +23,7 @@ CONTENT_B = b"# module B\nvalue = 2\n"
 
 @pytest.fixture()
 def repo_root(tmp_path: Path) -> Path:
-    """A repo tree with the five required modules present (real bytes)."""
+    """A repo tree with all required modules present (real bytes)."""
     root = tmp_path / "repo"
     runtime = root / "comfymodal_runtime"
     runtime.mkdir(parents=True)
@@ -36,6 +36,9 @@ def repo_root(tmp_path: Path) -> Path:
         "model_preload.py": b"# module F\nvalue = 6\n",
         "clip_fast_hydration_wiring.py": b"# module G\nvalue = 7\n",
         "registry_proof_store.py": b"# module H\nvalue = 8\n",
+        "golden_serial.py": b"# module I\nvalue = 9\n",
+        "golden_qd_transport.py": b"# module J\nvalue = 10\n",
+        "output_durability.py": b"# module K\nvalue = 11\n",
     }
     for name, data in payloads.items():
         (runtime / name).write_bytes(data)
@@ -95,6 +98,11 @@ def test_sha256_file_deterministic(repo_root: Path) -> None:
 def test_compute_expected_local(repo_root: Path) -> None:
     expected = sp.compute_expected_local(repo_root)
     assert "comfymodal_runtime/registry_proof_store.py" in sp.REQUIRED_MODULES
+    assert sp.REQUIRED_MODULES[-3:] == (
+        "comfymodal_runtime/golden_serial.py",
+        "comfymodal_runtime/golden_qd_transport.py",
+        "comfymodal_runtime/output_durability.py",
+    )
     assert expected["modules"]["comfymodal_runtime/modal_app.py"]["sha256"] == sp.sha256_file(
         repo_root / "comfymodal_runtime/modal_app.py"
     )

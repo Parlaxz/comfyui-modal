@@ -105,6 +105,7 @@ def test_external_restore_is_observed_verbatim_and_never_timed_as_local_work(mon
 
 
 def test_top_level_order_and_return_are_distinct_from_assembled_event(monkeypatch, tmp_path):
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
     calls = []
     captured = {}
     payload = b"synthetic committed asset"
@@ -611,6 +612,7 @@ def test_teardown_has_no_snapshot_proof_and_does_not_persist(tmp_path):
 
 
 def test_top_level_persists_once_after_teardown_complete_and_reports_persist_wall(monkeypatch, tmp_path):
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
     calls = []
     payload = b"synthetic committed asset"
     asset_path = tmp_path / "asset.png"
@@ -690,7 +692,8 @@ def test_top_level_persists_once_after_teardown_complete_and_reports_persist_wal
     assert persisted["telemetry_persistence"]["telemetry_persisted"] is True
 
 
-def test_true_first_durable_requires_canonical_commit_reopen_hash_proof(tmp_path):
+def test_true_first_durable_requires_canonical_commit_reopen_hash_proof(tmp_path, monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
     payload = b"synthetic committed bytes"
     digest = hashlib.sha256(payload).hexdigest()
     asset = tmp_path / "asset.png"
@@ -700,6 +703,9 @@ def test_true_first_durable_requires_canonical_commit_reopen_hash_proof(tmp_path
         def commit(self):
             return None
 
+    precondition_recorder = gs.GoldenTelemetryRecorder()
+    precondition_recorder.output_durability_mode = "strict"
+    precondition_recorder.durability_requested = True
     pending = gs.PendingDurability(
         asset_abs_path=str(asset),
         volume_rel_path="asset.png",
@@ -710,11 +716,13 @@ def test_true_first_durable_requires_canonical_commit_reopen_hash_proof(tmp_path
         volume_mount_root=str(tmp_path),
     )
     with pytest.raises(RuntimeError, match="mount_reopen_proof"):
-        asyncio.run(gs.golden_durable_commit(Volume(), pending, gs.GoldenTelemetryRecorder()))
+        asyncio.run(gs.golden_durable_commit(Volume(), pending, precondition_recorder))
 
     # The canonical proof API may return a private typed proof rather than a
     # forgeable marker dict; both expose the proof fields for inspection.
     recorder = gs.GoldenTelemetryRecorder()
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
     reopened = asyncio.run(
         gs.golden_durable_commit(Volume(), pending, recorder, expected_sha256=digest)
     )
@@ -811,8 +819,11 @@ def test_teardown_checks_real_runner_quiescence_and_records_failure():
     asyncio.run(exercise())
 
 
-def test_durable_commit_precondition_failure_has_stage_interval():
+def test_durable_commit_precondition_failure_has_stage_interval(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
     recorder = gs.GoldenTelemetryRecorder()
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
     with pytest.raises(RuntimeError, match="pending_durability"):
         asyncio.run(
             gs.golden_durable_commit(
@@ -930,7 +941,8 @@ def test_saveimage_selected_socket_must_be_zero(tmp_path):
         asyncio.run(gs.golden_output(session))
 
 
-def test_output_and_commit_containment_and_reopen_hash_are_fail_closed(tmp_path):
+def test_output_and_commit_containment_and_reopen_hash_are_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
     mount = tmp_path / "mount"
     outside = tmp_path / "outside"
     mount.mkdir()
@@ -961,6 +973,9 @@ def test_output_and_commit_containment_and_reopen_hash_are_fail_closed(tmp_path)
         sidecar_path=str(mount / "asset.json"),
         volume_mount_root=str(mount),
     )
+    recorder = gs.GoldenTelemetryRecorder()
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
 
     class MutatingVolume:
         def commit(self):
@@ -971,7 +986,7 @@ def test_output_and_commit_containment_and_reopen_hash_are_fail_closed(tmp_path)
             gs.golden_durable_commit(
                 MutatingVolume(),
                 pending,
-                gs.GoldenTelemetryRecorder(),
+                recorder,
                 expected_sha256=digest,
             )
         )

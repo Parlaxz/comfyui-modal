@@ -1,0 +1,18 @@
+RA7B retained snapshot-run failure (user-supplied provider log; do not count as a valid Golden cohort attempt)
+classification=platform_dnf
+stage=snapshot_restore_container_create
+observed_at=2026-08-31 11:39:45-11:39:46 local log time
+
+Aug 31  11:39:45.924
+creating container: cannot create gofer process: setting up nvproxy for gofer: nvidia-container-cli configure failed, err: exit status 1
+stdout:
+stderr: nvidia-container-cli: initialization error: driver rpc error: timed out
+Aug 31  11:39:46.408
+Runner failed with exit code: 128
+
+Context from the supplied snapshot log:
+- snap_true entered successfully and snapshot creation completed.
+- Restore from memory snapshot was attempted.
+- Failure occurred while creating the container/gofer process during nvproxy setup.
+- This is a Modal/NVIDIA driver RPC timeout, not an application Golden result.
+- Preserve as a failed platform attempt; exclude from valid_count and do not retry by changing source/config.

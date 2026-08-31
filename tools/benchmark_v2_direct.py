@@ -80,6 +80,13 @@ from tools.v2_waterfall import (
     render_waterfall,
     waterfall_to_dict,
 )
+from tools.v2_control.validation import (
+    _durability_context_is_distinct_publication,
+    _durability_key_kind,
+    _historical_pre_selector_strict,
+    _output_proof_truthy,
+    resolve_output_durability_mode,
+)
 from tools.variance_report import (
     build_summary,
     build_matrix_summary,
@@ -548,11 +555,12 @@ RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 # Strictly serial full-generation cohort driven by the dedicated remote
 # method ``run_golden_serial_stream``.  Each attempt consumes the remote
 # event stream to exhaustion and is validated FAIL-CLOSED: exactly one
-# terminal result, zero error events, true_durable evidence, expected
-# output SHA, zero seriality violations, completed teardown telemetry,
-# snapshot proof, commit→reopen→TRUE_FIRST_DURABLE_RESULT ordering, and
-# canonical runtime-flag agreement.  Invalid/DNF attempts are preserved as
-# artifacts and NEVER counted.  True-cold status
+# terminal result, zero error events, the selected output endpoint (ready by
+# default or true-durable in strict mode), expected output SHA, zero seriality
+# violations, completed teardown telemetry, snapshot proof, and canonical
+# runtime-flag agreement.  Strict mode additionally requires the unchanged
+# commit→reopen→TRUE_FIRST_DURABLE_RESULT ordering.  Invalid/DNF attempts are
+# preserved as artifacts and NEVER counted.  True-cold status
 # is labeled ONLY from remote/container identity evidence — never inferred.
 GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_P1_REMOTE_METHOD = "run_golden_serial_stream"
@@ -10320,6 +10328,108 @@ def _golden_p1_truthy(raw: Any) -> bool:
     return bool(raw)
 
 
+def _golden_p1_durability_value_positive(raw: Any) -> bool:
+    """Return whether one durability field contains performed evidence.
+
+    Durability fields are emitted even when the off-mode operation was not
+    requested.  In particular, ``False``, ``None``, empty values, and the
+    explicit ``NOT RUN`` marker are observations, not evidence that
+    persistence was attempted.  Non-empty structured operation records still
+    count unless they explicitly report a negative/skipped outcome.
+    """
+    if raw is None or isinstance(raw, bool):
+        return raw is True
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    if isinstance(raw, str):
+        normalized = raw.strip().lower().replace("-", "_")
+        if not normalized or normalized in {
+            "false", "off", "none", "null", "empty", "not_run", "skipped", "disabled",
+        }:
+            return False
+        return _golden_p1_truthy(raw)
+    if isinstance(raw, list):
+        return bool(raw) and any(
+            _golden_p1_durability_value_positive(item) for item in raw
+        )
+    if not isinstance(raw, dict) or not raw:
+        return False
+
+    status = str(raw.get("status", "")).strip().lower().replace("-", "_")
+    if status in {"false", "off", "none", "null", "empty", "not_run", "skipped", "disabled"}:
+        return False
+
+    for key in ("ok", "valid", "verified", "complete", "success",
+                "performed", "invoked", "enabled", "committed"):
+        if key in raw:
+            return _golden_p1_durability_value_positive(raw[key])
+    if status:
+        if status in {"true", "on", "ok", "ready", "complete", "completed",
+                      "success", "succeeded", "done", "performed", "committed"}:
+            return True
+
+    # Do not treat a named marker by itself as performed work.  A timestamp,
+    # duration, path, or other non-empty payload makes the structured record
+    # meaningful while preserving fail-closed behavior for empty records.
+    return any(
+        key != "name" and _golden_p1_durability_value_positive(value)
+        for key, value in raw.items()
+    )
+
+
+def _golden_p1_positive_durability_claimed(value: Any) -> bool:
+    """Find positive generated-output durability evidence in one event."""
+    selector_keys = {
+        "output_durability_mode", "request_output_durability_mode",
+        "output_durability", "request_output_durability", "durability_mode",
+        "comfymodal_output_durability", "comfymodal_v2_output_durability_mode",
+        "comfymodal_v2_request_output_durability_mode",
+        "comfymodal_v2_output_durability", "comfymodal_v2_request_output_durability",
+    }
+
+    def visit(current: Any, context: tuple[str, ...] = ()) -> bool:
+        if isinstance(current, dict):
+            name = str(current.get("name", "")).strip().lower().replace("-", "_")
+            if name and not _durability_context_is_distinct_publication(context + (name,)):
+                kind = _durability_key_kind(name)
+                if kind is not None and _golden_p1_durability_value_positive(current):
+                    return True
+                if any(token in name for token in (
+                    "durable_commit", "durable_reopen", "output_persist",
+                    "asset_write", "output_fsync", "sidecar",
+                )) and _golden_p1_durability_value_positive(current):
+                    return True
+            for key, child in current.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                child_context = context + (normalized,)
+                if _durability_context_is_distinct_publication(child_context):
+                    continue
+                if normalized not in selector_keys:
+                    kind = _durability_key_kind(normalized)
+                    if kind is not None and _golden_p1_durability_value_positive(child):
+                        return True
+                if visit(child, child_context):
+                    return True
+        elif isinstance(current, list):
+            return any(visit(item, context) for item in current)
+        return False
+
+    return visit(value)
+
+
+def _golden_p1_positive_durability_entry(entry: Any) -> bool:
+    """Classify a scanned durability entry without changing raw scan output."""
+    if not isinstance(entry, tuple) or len(entry) != 3:
+        return False
+    _index, path, value = entry
+    context = tuple(
+        part for part in re.split(r"[.\[\]]+", str(path).lower()) if part
+    )
+    if _durability_context_is_distinct_publication(context):
+        return False
+    return _golden_p1_durability_value_positive(value)
+
+
 def _golden_p1_load_payload() -> dict[str, Any]:
     """Exact prompt/extra_data/modal_options from the existing workflow
     snapshot payload (latest_benchmark_workflow.json), never rewritten."""
@@ -10606,16 +10716,36 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
         "commit": [],
         "reopen": [],
         "true_first": [],
+        "asset_write": [],
+        "fsync": [],
+        "sidecar": [],
+        "pending_durability": [],
         "flags": [],
         "identities": [],
         "output_shas": [],
+        "output_byte_counts": [],
         "output_sha_warnings": [],
+        "output_durability_mode": [],
+        "result_ready": [],
+        "output_integrity": [],
+        "durability_claims": [],
         "non_dict_events": 0,
     }
+
+    def _path_context(path: str) -> tuple[str, ...]:
+        return tuple(
+            part for part in re.split(r"[.\[\]]+", str(path).lower()) if part
+        )
+
+    def _named_kind(name: str) -> str | None:
+        return _durability_key_kind(name)
+
     for idx, event in enumerate(events):
         if not isinstance(event, dict):
             scan["non_dict_events"] += 1
             continue
+        if _golden_p1_positive_durability_claimed(event):
+            scan["durability_claims"].append((idx, event))
         etype = str(event.get("type") or event.get("event") or "").strip().lower()
         if etype in {"result", "terminal_result"}:
             scan["terminal_results"].append((idx, event))
@@ -10626,20 +10756,65 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
             unit_name = _golden_p1_unit_name(value)
             if unit_name:
                 ul = unit_name.lower()
-                if "teardown" in ul:
+                if _durability_context_is_distinct_publication(
+                    _path_context(path) + (ul.replace("-", "_"),)
+                ):
+                    unit_kind = None
+                else:
+                    unit_kind = _named_kind(ul)
+                if unit_kind in {"asset_write", "fsync", "sidecar", "pending_durability"}:
+                    scan[unit_kind].append((idx, path, value))
+                if unit_kind == "true_durable":
+                    scan["true_durable"].append((idx, path, value))
+                elif unit_kind == "commit":
+                    scan["commit"].append((idx, path, value))
+                elif unit_kind == "reopen":
+                    scan["reopen"].append((idx, path, value))
+                elif unit_kind == "true_first":
+                    scan["true_first"].append((idx, path, value))
+                elif "result_ready" in ul or "result-ready" in ul or ul == "first_result_ready":
+                    scan["result_ready"].append((idx, path, value))
+                elif "output_integrity" in ul or "output_identity" in ul:
+                    scan["output_integrity"].append((idx, path, value))
+                elif "teardown" in ul:
                     scan["teardown"].append((idx, path, value))
                 elif "snapshot_proof" in ul:
                     scan["snapshot_proof"].append((idx, path, value))
-                elif "reopen" in ul:
+                elif "reopen" in ul and unit_kind is None:
                     scan["reopen"].append((idx, path, value))
-                elif "commit" in ul:
+                elif "commit" in ul and unit_kind is None:
                     scan["commit"].append((idx, path, value))
-                elif "true_first_durable_result" in ul:
+                elif "true_first_durable_result" in ul and unit_kind is None:
                     scan["true_first"].append((idx, path, value))
             # ── Key-based evidence ─────────────────────────────────────
             key = _golden_p1_last_key(path)
+            kind = None if _durability_context_is_distinct_publication(
+                _path_context(path)
+            ) else _durability_key_kind(key)
             if key == "true_durable":
                 scan["true_durable"].append((idx, path, value))
+            elif key == "true_durable_marked":
+                scan["true_durable"].append((idx, path, value))
+            elif key in {
+                "output_durability_mode", "request_output_durability_mode",
+                "output_durability", "request_output_durability", "durability_mode",
+            }:
+                scan["output_durability_mode"].append((idx, path, value))
+            elif key in {
+                "result_ready", "result_ready_proof", "result_ready_marked",
+                "first_result_ready", "first_result_ready_marked",
+            }:
+                scan["result_ready"].append((idx, path, value))
+            elif key in {
+                "output_integrity", "output_integrity_proof", "output_identity",
+                "observed_output_identity", "observed_asset_identity",
+            }:
+                scan["output_integrity"].append((idx, path, value))
+            elif kind in {"asset_write", "fsync", "sidecar", "pending_durability"}:
+                if _golden_p1_truthy(value) or isinstance(value, dict):
+                    scan[kind].append((idx, path, value))
+            elif key == "reopen_verified":
+                scan["reopen"].append((idx, path, value))
             elif key in {
                 "seriality", "seriality_proof", "golden_seriality",
                 "golden_seriality_proof",
@@ -10651,15 +10826,15 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
                 t in key for t in ("proof", "manifest", "fingerprint", "evidence")
             ):
                 scan["snapshot_proof"].append((idx, path, value))
-            elif "commit" in key and "count" not in key:
+            elif kind == "commit" or ("commit" in key and "count" not in key):
                 ts = _golden_p1_ts_value(value)
                 if ts is not None:
                     scan["commit"].append((idx, path, ts))
-            elif "reopen" in key:
+            elif kind == "reopen" or "reopen" in key:
                 ts = _golden_p1_ts_value(value)
                 if ts is not None:
                     scan["reopen"].append((idx, path, ts))
-            elif "true_first_durable_result" in key:
+            elif kind == "true_first" or "true_first_durable_result" in key:
                 scan["true_first"].append((idx, path, value))
             elif key in {
                 "runtime_flags", "flags", "effective_flags", "flag_evidence",
@@ -10672,8 +10847,21 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
                 scan["identities"].append((idx, value))
             elif key == "output_sha_warning":
                 scan["output_sha_warnings"].append((idx, path, value))
-            elif key in {"output_sha", "content_sha256", "sha256", "image_sha256"} and isinstance(value, str) and value.strip():
+            elif key in {"output_sha", "content_sha256", "sha256", "image_sha256", "asset_id"} and isinstance(value, str) and value.strip():
+                if key == "asset_id" and not any(
+                    token in path.lower() for token in ("output", "asset", "image", "descriptor")
+                ):
+                    continue
+                if key == "sha256" and not any(
+                    token in path.lower() for token in ("output", "asset", "image", "descriptor", "result")
+                ):
+                    continue
                 scan["output_shas"].append((idx, path, value.strip()))
+            elif key in {"byte_count", "output_byte_count", "bytes"}:
+                if key != "bytes" and "snapshot" not in path.lower():
+                    scan["output_byte_counts"].append((idx, path, value))
+                elif "output" in path.lower() or "asset" in path.lower() or "image" in path.lower() or "descriptor" in path.lower():
+                    scan["output_byte_counts"].append((idx, path, value))
     return scan
 
 
@@ -10819,6 +11007,144 @@ def _golden_p1_validate_attempt(
     failures: list[str] = []
     details: dict[str, Any] = {}
 
+    mode_sources = [
+        {"output_durability_mode": value}
+        for _idx, _path, value in scan.get("output_durability_mode", [])
+    ]
+    if expected_flags:
+        mode_sources.append(expected_flags)
+    configured_mode = os.environ.get("COMFYMODAL_OUTPUT_DURABILITY")
+    if configured_mode is None:
+        configured_mode = os.environ.get("COMFYMODAL_V2_OUTPUT_DURABILITY_MODE")
+    environment_configuration_error = False
+    if configured_mode is not None:
+        try:
+            # Validate the actual process selector even when the result carries
+            # an authoritative mode; runtime would reject this configuration
+            # before producing that result.
+            resolve_output_durability_mode({"output_durability_mode": configured_mode})
+        except ValueError as exc:
+            failures.append(f"output durability configuration error: {exc}")
+            environment_configuration_error = True
+        if not mode_sources and not environment_configuration_error:
+            mode_sources.append({"output_durability_mode": configured_mode})
+    selector_keys = {
+        "output_durability_mode", "request_output_durability_mode",
+        "output_durability", "request_output_durability", "durability_mode",
+        "COMFYMODAL_OUTPUT_DURABILITY", "COMFYMODAL_V2_OUTPUT_DURABILITY_MODE",
+        "COMFYMODAL_V2_REQUEST_OUTPUT_DURABILITY_MODE",
+        "COMFYMODAL_V2_OUTPUT_DURABILITY", "COMFYMODAL_V2_REQUEST_OUTPUT_DURABILITY",
+    }
+    selector_present = any(
+        isinstance(source, dict) and any(key in source for key in selector_keys)
+        for source in mode_sources
+    )
+    try:
+        output_durability_mode = (
+            "off" if environment_configuration_error
+            else resolve_output_durability_mode(*mode_sources)
+        )
+    except ValueError as exc:
+        failures.append(f"output durability configuration error: {exc}")
+        # Keep the projection deterministic after recording the configuration
+        # failure.  This value is never accepted because ``failures`` is
+        # non-empty; importantly, malformed input is not normalized to a pass.
+        output_durability_mode = "off"
+    expected_mode_present = expected_flags is not None and any(
+        key in expected_flags
+        for key in (
+            "output_durability_mode", "request_output_durability_mode",
+            "output_durability", "request_output_durability", "durability_mode",
+            "COMFYMODAL_OUTPUT_DURABILITY", "COMFYMODAL_V2_OUTPUT_DURABILITY_MODE",
+            "COMFYMODAL_V2_REQUEST_OUTPUT_DURABILITY_MODE",
+            "COMFYMODAL_V2_OUTPUT_DURABILITY", "COMFYMODAL_V2_REQUEST_OUTPUT_DURABILITY",
+        )
+    )
+    if (
+        not selector_present
+        and configured_mode is None
+        and not expected_mode_present
+        and not environment_configuration_error
+        and (
+            _historical_pre_selector_strict(scan)
+            or all(scan.get(key) for key in ("true_durable", "commit", "reopen", "true_first"))
+        )
+    ):
+        # Compatibility is restricted to in-memory/persisted artifacts that
+        # visibly carry the old strict evidence.  A selector-less modern
+        # result remains off; absence alone is never a strict request.
+        output_durability_mode = "strict"
+    details["output_durability_mode"] = output_durability_mode
+    details["output_endpoint"] = (
+        "true_durable" if output_durability_mode == "strict" else "result_ready"
+    )
+    if output_durability_mode == "off":
+        # NOT RUN is a semantic state, not a zero-duration measurement.  Keep
+        # the fields explicit so report consumers do not manufacture a 0 ms
+        # commit span from missing evidence.
+        details["durability_status"] = "NOT RUN"
+        details["durability_waterfall"] = {
+            "status": "NOT RUN",
+            "asset_write_ms": None,
+            "fsync_ms": None,
+            "commit_ms": None,
+            "reopen_ms": None,
+            "true_durable_ms": None,
+        }
+        details["durability"] = dict(details["durability_waterfall"])
+        ready = [
+            value for _idx, _path, value in scan.get("result_ready", [])
+            if _output_proof_truthy(value)
+        ]
+        if not ready:
+            failures.append("result-ready evidence missing or false")
+        durability_entries = (
+            scan.get("true_durable", [])
+            + scan.get("commit", [])
+            + scan.get("reopen", [])
+            + scan.get("true_first", [])
+            + scan.get("asset_write", [])
+            + scan.get("fsync", [])
+            + scan.get("sidecar", [])
+            + scan.get("pending_durability", [])
+        )
+        durable_evidence_present = bool(
+            any(_golden_p1_positive_durability_entry(entry) for entry in durability_entries)
+            or any(
+                isinstance(claim, tuple)
+                and len(claim) == 2
+                and _golden_p1_positive_durability_claimed(claim[1])
+                for claim in scan.get("durability_claims", [])
+            )
+        )
+        if durable_evidence_present:
+            failures.append("output durability evidence invoked or claimed in off mode")
+        integrity = scan.get("output_integrity", [])
+        if integrity and not all(_output_proof_truthy(value) for _idx, _path, value in integrity):
+            failures.append("output integrity evidence missing or false")
+    else:
+        details["durability_status"] = "RUN"
+        # Only measured evidence may populate strict durability spans.  A
+        # missing duration is represented as None, never as a fabricated zero.
+        def _measured_duration(entries: list[tuple[int, str, Any]]) -> float | None:
+            for _idx, _path, value in entries:
+                if isinstance(value, dict):
+                    for key in ("duration_ms", "elapsed_ms", "wall_ms"):
+                        raw = value.get(key)
+                        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+                            return round(float(raw), 3)
+            return None
+
+        details["durability_waterfall"] = {
+            "status": "RUN",
+            "asset_write_ms": _measured_duration(scan.get("asset_write", [])),
+            "fsync_ms": _measured_duration(scan.get("fsync", [])),
+            "commit_ms": _measured_duration(scan.get("commit", [])),
+            "reopen_ms": _measured_duration(scan.get("reopen", [])),
+            "true_durable_ms": _measured_duration(scan.get("true_first", [])),
+        }
+        details["durability"] = dict(details["durability_waterfall"])
+
     if len(scan["terminal_results"]) != 1:
         failures.append(
             f"terminal result count={len(scan['terminal_results'])}, expected exactly 1"
@@ -10828,11 +11154,12 @@ def _golden_p1_validate_attempt(
     if scan["non_dict_events"]:
         failures.append(f"non-dict stream events: {scan['non_dict_events']}")
 
-    td_ok = bool(scan["true_durable"]) and all(
-        _golden_p1_truthy(v) for _, _, v in scan["true_durable"]
-    )
-    if not td_ok:
-        failures.append("true_durable evidence missing or false")
+    if output_durability_mode == "strict":
+        td_ok = bool(scan["true_durable"]) and all(
+            _golden_p1_truthy(v) for _, _, v in scan["true_durable"]
+        )
+        if not td_ok:
+            failures.append("true_durable evidence missing or false")
 
     if not scan["seriality"]:
         failures.append("seriality telemetry absent (required; fail-closed)")
@@ -10865,11 +11192,17 @@ def _golden_p1_validate_attempt(
             "snapshot proof absent, unproven, malformed, or contaminated"
         )
 
-    if not scan["commit"]:
+    commit_timestamps = [
+        _golden_p1_entry_ts(entry) for entry in scan.get("commit", [])
+    ]
+    reopen_timestamps = [
+        _golden_p1_entry_ts(entry) for entry in scan.get("reopen", [])
+    ]
+    if output_durability_mode == "strict" and not commit_timestamps:
         failures.append("commit timestamp evidence absent")
-    if not scan["reopen"]:
+    if output_durability_mode == "strict" and not reopen_timestamps:
         failures.append("reopen timestamp evidence absent")
-    if scan["commit"] and scan["reopen"]:
+    if output_durability_mode == "strict" and commit_timestamps and reopen_timestamps:
         def _earliest_evidence(entries: list[tuple[int, str, Any]]) -> tuple[int, str, Any]:
             timestamped = [
                 (entry, _golden_p1_entry_ts(entry))
@@ -10908,9 +11241,9 @@ def _golden_p1_validate_attempt(
                 f"commit_idx={c_entry[0]} reopen_idx={r_entry[0]} "
                 f"commit_ts={c_ts} reopen_ts={r_ts}"
             )
-    if not scan["true_first"]:
+    if output_durability_mode == "strict" and not scan["true_first"]:
         failures.append("TRUE_FIRST_DURABLE_RESULT marker absent")
-    elif scan["commit"]:
+    elif output_durability_mode == "strict" and scan["commit"]:
         tf_entries = [
             t for t in scan["true_first"] if _golden_p1_entry_ts(t) is not None
         ]
@@ -10937,7 +11270,10 @@ def _golden_p1_validate_attempt(
     # output hash (output_sha / image_sha256), not incidental hashes.
     strict_shas = [
         v for _i, p, v in scan["output_shas"]
-        if "output" in p or "image_sha256" in p
+        if any(
+            token in p.lower()
+            for token in ("output_sha", "content_sha256", "image_sha256", "asset_id", "output")
+        )
     ]
     strict_sha_values = sorted({s.lower() for s in strict_shas})
     malformed_shas = [s for s in strict_shas if not re.fullmatch(r"[0-9a-fA-F]{64}", s)]
@@ -10978,6 +11314,23 @@ def _golden_p1_validate_attempt(
     else:
         details["output_sha_match"] = True
     details["observed_output_shas"] = sorted({v for _i, _p, v in scan["output_shas"]})
+
+    # Descriptor surfaces expose byte_count alongside the output SHA.  When
+    # present it is part of the output identity proof and must be a positive
+    # integer; absent byte-count data remains compatible with older surfaces.
+    byte_counts = [value for _i, _p, value in scan.get("output_byte_counts", [])]
+    malformed_byte_counts = [
+        value for value in byte_counts
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ]
+    if malformed_byte_counts:
+        failures.append(
+            f"observed output byte count malformed: {malformed_byte_counts!r}"
+        )
+    elif len(set(byte_counts)) > 1:
+        failures.append(f"observed output byte count ambiguous: {sorted(set(byte_counts))}")
+    if byte_counts:
+        details["observed_output_byte_count"] = byte_counts[0]
 
     observed_flags: dict[str, Any] = {}
     for _i, _p, f in scan["flags"]:

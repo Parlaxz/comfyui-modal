@@ -1,5 +1,11 @@
 # E36 Full Critical-Path Report
 
+> **SUPERSESSION NOTICE (2026-08-30):** This historical timing report remains
+> evidence for its original run. Its generated-output endpoint terminology is
+> superseded by `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`: output is
+> result-ready by default; commit/reopen/hash proof is required only for an
+> explicit strict run. S4 source publication durability remains mandatory.
+
 ## CURRENT AUTHORITATIVE STATUS
 
 **Current decision:** The authoritative current-source result is the valid QD4

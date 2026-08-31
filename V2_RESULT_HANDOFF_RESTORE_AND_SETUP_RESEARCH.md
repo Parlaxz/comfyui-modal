@@ -1,5 +1,12 @@
 # V2 — Result Handoff, Python Restore, and Remote Setup: Remaining-Cost Research
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical result-handoff research;
+> preserve its evidence, but do not use its deferred/background-drain output
+> proposal as current policy. Generated-output durability is off by default;
+> strict commit/reopen/hash proof is opt-in. See
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`. S4 source publication
+> durability remains mandatory.
+
 Date: 2026-08-13 (following `V2_10_COLD_RUNS_35S_COOLDOWN.md`, deployment `b557b2401f293223`, RTX PRO 6000 / 12 CPU / 32768 MB, PNG level 1, 10 cold runs, 35 s gap)
 
 Scope: READ-ONLY investigation. No code changed, no deployment, no generation. Revision 2 corrects the stage-14 boundary accounting, quantifies terminal cleanup from existing evidence, reclassifies frozen-VRAM and the Volume-reload skip, and rebuilds the optimization budget conservatively.

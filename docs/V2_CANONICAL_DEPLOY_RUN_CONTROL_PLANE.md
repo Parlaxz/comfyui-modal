@@ -621,6 +621,34 @@ Batch-specific validators may add conditions such as real CLIP miss/encode, exac
 
 Use a validator plug-in seam rather than hardcoding E29/E30/E31 into core `v2ctl`.
 
+## 18.1 Generated-output durability is an explicit policy
+
+Golden and other V2 guidance must use
+`docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for generated request output.
+`COMFYMODAL_OUTPUT_DURABILITY` accepts `off|strict`; missing/`off` resolves to
+`off`, while an invalid explicit value is a configuration error:
+`configuration error: COMFYMODAL_OUTPUT_DURABILITY must be off or strict`.
+Generated-output durability is off by default.
+
+The default result contract is:
+
+```text
+encode -> observed SHA/bytes -> FIRST_RESULT_READY -> return
+```
+
+Only an explicit strict opt-in requires:
+
+```text
+write/fsync -> Volume.commit -> reopen/hash proof
+-> TRUE_FIRST_DURABLE_RESULT -> return
+```
+
+The validator must match evidence to the selected mode and must not require
+`true_durable` for an output-off result or accept a strict result before its
+commit/reopen/hash proof. Strict failure cannot silently downgrade. This policy
+does not make S4/source publication durability optional; that publication
+contract remains mandatory.
+
 ---
 
 # 19. Artifact Discovery
@@ -932,15 +960,17 @@ the finalization block referenced `_span_durable_result` before assignment
 `except Exception: pass`. Rules for lifecycle instrumentation:
 
 - initialize every span holder to `None` at the TOP of the function;
-- open `request:executor-run` at PLAN RECEIPT, close it at
-  `first_durable_result`;
+- open `request:executor-run` at PLAN RECEIPT, close it at the selected result
+  endpoint (`FIRST_RESULT_READY` by default; `TRUE_FIRST_DURABLE_RESULT` only
+  for explicit strict output durability);
 - NEVER swallow finalization exceptions on a tracer run: attach
   `canonical_ledger_status="ok"|"error"` + `canonical_ledger_error`
   to the result so a broken tracer FAILS the gate, not silently vanishes;
 - the serial ledger MUST use explicit authoritative endpoints
-  (`remote_python_resume_mono_ns` → `first_durable_result_mono_ns`), never
-  min/max of existing events — a truncated ledger must not tile its own
-  truncated interval and claim zero-gap (`endpoint_status="missing"` fails).
+  (`remote_python_resume_mono_ns` → the selected result endpoint; the
+  compatibility storage key is `first_durable_result_mono_ns`), never min/max
+  of existing events — a truncated ledger must not tile its own truncated
+  interval and claim zero-gap (`endpoint_status="missing"` fails).
 
 ## 24.6 Host plan validation can fail on the LOCAL node registry
 

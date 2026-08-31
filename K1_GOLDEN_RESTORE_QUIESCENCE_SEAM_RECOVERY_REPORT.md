@@ -1,5 +1,11 @@
 # K1 Golden Restore Recovery — Snapshot-Quiescence Seam Experiment Report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical Golden experiment report;
+> preserve its restore evidence, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> semantics. Output durability is off by default; strict commit/reopen/hash
+> proof is opt-in. S4 source publication durability remains mandatory.
+
 Date: 2026-08-25
 Batch: K1 (single hypothesis: unconditional `prove_snapshot_quiescence()` at the snapshot capture boundary is responsible for a substantial portion of the restore regression)
 Verdict: **K1_SELECTED = YES** (change left UNCOMMITTED in the deployment lane worktree)

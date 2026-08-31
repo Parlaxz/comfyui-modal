@@ -41,6 +41,7 @@ from . import locking as locking_mod
 from . import runtime_overrides as ro_mod
 from . import validation as val_mod
 from . import provenance as prov_mod
+from . import deployment_receipt as receipt_mod
 from .errors import (
     BackendError,
     DeployCrashLoopError,
@@ -716,6 +717,81 @@ def _deployment_manifest_dir(repo_root: Path) -> Path:
     return repo_root / ".v2ctl" / "deployments"
 
 
+def _receipt_target(config: config_mod.ResolvedConfig) -> dict[str, str]:
+    return {
+        "app": str(config.target.app),
+        "class": str(config.target.class_name),
+        "method": str(config.target.method),
+    }
+
+
+def _bound_deployment_receipt(
+    repo_root: Path, config: config_mod.ResolvedConfig, *, command: str
+) -> tuple[Path, receipt_mod.DeploymentReceipt]:
+    """Load the immutable Golden authority and perform host admission checks."""
+    selected = receipt_mod.latest_deployment_receipt(
+        repo_root, profile=config.profile_name, target=_receipt_target(config)
+    )
+    if selected is None:
+        raise GateError(f"{command} requires an immutable deployment receipt")
+    path, receipt = selected
+    target = _receipt_target(config)
+    if receipt.target != target:
+        raise GateError(f"{command} deployment receipt target mismatch")
+    if receipt.profile != config.profile_name:
+        raise GateError(f"{command} deployment receipt profile mismatch")
+    # A different app version is a different remote deployment, even when the
+    # local source happens to be unchanged.  Unknown lookup is fail-closed.
+    current_version = _app_version_number(receipt.target["app"])
+    if current_version is None or current_version != receipt.deployment_version:
+        raise GateError(
+            f"{command} deployment receipt version mismatch: stored="
+            f"{receipt.deployment_version} current={current_version!r}"
+        )
+    try:
+        current_fp = str(fp_mod.FingerprintEngine(config).deploy_fingerprint())
+    except Exception as exc:  # noqa: BLE001 - receipt admission is fail-closed
+        raise GateError(f"{command} could not resolve local deployment identity: {exc}") from exc
+    if current_fp != receipt.deploy_fingerprint:
+        print(
+            f"[v2ctl.{command}] WARNING: local deploy identity drifted after deployment; "
+            "binding the immutable remote receipt (source drift is warning-only)",
+            file=sys.stderr,
+        )
+    return path, receipt
+
+
+def _receipt_effective_env(
+    env: dict[str, str], receipt: receipt_mod.DeploymentReceipt
+) -> dict[str, str]:
+    """Overlay only the receipt's narrow deployed configuration projection.
+
+    Host/tool variables and request metadata stay owned by this invocation;
+    receipt data is never a general child-environment restore mechanism.
+    """
+    receipt.validate()
+    bound = dict(env)
+    for name, value in receipt.effective_environment.items():
+        bound[name] = str(value)
+    bound["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] = receipt.deploy_fingerprint
+    bound["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] = receipt.deploy_fingerprint
+    bound["COMFYMODAL_V2CTL_PROFILE"] = receipt.profile
+    resources = receipt.deployment_identity.get("resources", {})
+    if isinstance(resources, dict):
+        for env_name, resource_name in (
+            ("COMFYMODAL_V2_GPU", "gpu"),
+            ("COMFYMODAL_V2_CPU_REQUEST", "cpu"),
+            ("COMFYMODAL_V2_MEMORY_MB", "memory_mb"),
+            ("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "cpu"),
+            ("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", "memory_mb"),
+        ):
+            if resource_name in resources:
+                bound[env_name] = str(resources[resource_name])
+    if receipt.profile_config_fingerprint:
+        bound["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = receipt.profile_config_fingerprint
+    return bound
+
+
 def _run_manifest_dir(repo_root: Path) -> Path:
     return repo_root / ".v2ctl" / "runs"
 
@@ -889,6 +965,131 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
     return path
 
 
+def _write_golden_deployment_receipt(
+    repo_root: Path,
+    config: config_mod.ResolvedConfig,
+    env: dict[str, str],
+    deploy_identity: DeployIdentitySnapshot,
+    deployment_version: int,
+    manifest_path: Path,
+    publication: object | None,
+    source_probe_expected: dict[str, Any] | None = None,
+) -> Path:
+    """Write the one-time receipt for a successful native Golden deploy."""
+    from . import source_probe as source_probe_mod
+
+    expected_source = source_probe_expected or source_probe_mod.compute_expected_local(repo_root)
+    # Persist the deployment projection, not the child process environment.
+    # In particular this excludes PATH/TEMP, Modal credentials, request-only
+    # flags, invocation IDs, and arbitrary host variables.
+    deployment_flag_values = {}
+    effective_values = fp_mod.FingerprintEngine(config).effective_flag_values()
+    for flag in list(getattr(config, "flags", ()) or ()) + list(
+        getattr(config, "unregistered", ()) or ()
+    ):
+        if (
+            getattr(flag, "change_requires", "") in {"build", "deploy"}
+            or not getattr(flag, "registered", True)
+        ):
+            name = str(flag.name)
+            if name in env:
+                deployment_flag_values[name] = str(effective_values.get(name, env[name]))
+    safe_env = {
+        name: str(env[name])
+        for name in (
+            "COMFYMODAL_V2_APP_NAME", "COMFYMODAL_V2_CLASS_NAME",
+            "COMFYMODAL_V2_GPU", "COMFYMODAL_V2_MEMORY_MB",
+            "COMFYMODAL_V2_CPU_REQUEST", "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST",
+            "COMFYMODAL_V2_BASELINE_CPU_REQUEST", "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS",
+        )
+        if name in env
+    }
+    safe_env.update(deployment_flag_values)
+    identity = getattr(publication, "identity", None)
+    generation = str(getattr(identity, "generation", "") or "")
+    if not generation:
+        raise GateError("Golden deploy has no verified full-content S4 publication identity")
+    s4_identity = {
+        "generation": generation,
+        "identity_schema": getattr(identity, "identity_schema", None),
+        "packaging_policy_version": getattr(identity, "packaging_policy_version", None),
+        "file_count": getattr(identity, "file_count", None),
+        "total_bytes": getattr(identity, "total_bytes", None),
+        "manifest_digest": getattr(identity, "manifest_digest", None),
+    }
+    planned_path = receipt_mod.receipt_path(
+        repo_root, deploy_identity.deploy_fingerprint, deployment_version
+    )
+    # The mutable ledger points at the immutable receipt before its digest is
+    # captured, so the receipt's manifest digest covers the final ledger.
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["deployment_receipt"] = str(planned_path)
+    manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    receipt = receipt_mod.DeploymentReceipt(
+        profile=str(config.profile_name),
+        target={
+            "app": str(config.target.app),
+            "class": str(config.target.class_name),
+            "method": str(config.target.method),
+        },
+        deploy_fingerprint=deploy_identity.deploy_fingerprint,
+        effective_environment=safe_env,
+        deployment_version=deployment_version,
+        created_at=receipt_mod.now_utc(),
+        modal_app=str(config.target.app),
+        deployment_identity={
+            "app": str(config.target.app),
+            "class": str(config.target.class_name),
+            "method": str(config.target.method),
+            "version": deployment_version,
+            "deploy_fingerprint": deploy_identity.deploy_fingerprint,
+            "resources": {
+                "gpu": str(config.resources.gpu),
+                "cpu": int(config.resources.cpu),
+                "memory_mb": int(config.resources.memory_mb),
+            },
+        },
+        deployed_source={
+            "git_head": str(config.git.head),
+            "dirty_hashes": dict(config.git.dirty_hashes or {}),
+        },
+        source_probe={"expected": expected_source},
+        image_identity={
+            # Deploy output does not provide a runtime image probe.  Keep this
+            # explicit rather than inventing an image ID from local state.
+            "status": "not_observed_at_deploy",
+        },
+        workflow_model_contract={
+            "profile": str(config.profile_name),
+            "expected_output_sha": str(config.workload.expected_output_sha),
+            "conditioning_cache": str(config.workload.conditioning_cache),
+        },
+        s4_generation=generation,
+        profile_config_fingerprint=deploy_identity.profile_config_fingerprint,
+        manifest_path=str(manifest_path),
+        manifest_digest=receipt_mod.manifest_digest(manifest_path),
+        s4_identity=s4_identity,
+        effective_config={
+            "profile": str(config.profile_name),
+            "target": {
+                "app": str(config.target.app),
+                "class": str(config.target.class_name),
+                "method": str(config.target.method),
+            },
+            "resources": {
+                "gpu": str(config.resources.gpu),
+                "cpu": int(config.resources.cpu),
+                "memory_mb": int(config.resources.memory_mb),
+            },
+            "deploy_flags": deployment_flag_values,
+            "deploy_inputs": _thaw_deploy_identity(deploy_identity.deploy_inputs),
+        },
+        receipt_path=str(planned_path),
+    )
+    path = receipt_mod.write_deployment_receipt(repo_root, receipt)
+    return path
+
+
 def _validate_deployment_manifest(manifest: object) -> dict | None:
     """Return a trustworthy current deployment manifest, otherwise ``None``.
 
@@ -1045,22 +1246,32 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
                        fingerprints: fp_mod.FingerprintEngine,
                        env: dict[str, str],
                        result: backend_mod.BackendResult,
-                       provenance: prov_mod.Provenance | None) -> Path:
+                       provenance: prov_mod.Provenance | None,
+                       deployment_receipt: receipt_mod.DeploymentReceipt | None = None) -> Path:
     d = _run_manifest_dir(repo_root)
     d.mkdir(parents=True, exist_ok=True)
-    run_fp = fingerprints.run_fingerprint()
+    run_fp = val_mod._bound_run_fingerprint(fingerprints, deployment_receipt)
+    deploy_fp = (
+        deployment_receipt.deploy_fingerprint
+        if deployment_receipt is not None else fingerprints.deploy_fingerprint()
+    )
+    profile_fp = (
+        deployment_receipt.profile_config_fingerprint
+        if deployment_receipt is not None and deployment_receipt.profile_config_fingerprint
+        else fingerprints.profile_config_fingerprint()
+    )
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
         "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
-        "deployment_hash": fingerprints.deploy_fingerprint(),
+        "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
         "owner": config.owner,
-        "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+        "deploy_fingerprint": deploy_fp,
         "run_fingerprint": run_fp,
         "v2ctl_invocation_id": result.v2ctl_invocation_id,
-        "profile_config_fingerprint": fingerprints.profile_config_fingerprint(),
+        "profile_config_fingerprint": profile_fp,
         "request_id": result.request_id,
         "provenance_validation_status": result.provenance_validation_status,
         "workload": {
@@ -1093,6 +1304,23 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
             "provenance_validation_status": result.artifacts.provenance_validation_status,
         },
     }
+    if deployment_receipt is not None:
+        manifest.update({
+            "deployment_receipt_path": deployment_receipt.receipt_path,
+            "deployment_receipt_integrity_digest": deployment_receipt.to_dict()[
+                "integrity_digest"
+            ],
+            "deployment_version": deployment_receipt.deployment_version,
+            "receipt_profile": deployment_receipt.profile,
+            "receipt_target": dict(deployment_receipt.target),
+            "receipt_deploy_fingerprint": deployment_receipt.deploy_fingerprint,
+            "receipt_source_probe_expected": deployment_receipt.source_probe.get("expected"),
+            "receipt_manifest_path": deployment_receipt.manifest_path,
+            "receipt_manifest_digest": deployment_receipt.manifest_digest,
+            "source_probe_evidence_path": str(receipt_mod.source_probe_evidence_path(
+                repo_root, deployment_receipt
+            )),
+        })
     if provenance is not None:
         manifest["provenance"] = provenance.to_dict()
     path = d / f"run_{time.strftime('%Y%m%d-%H%M%S')}_{run_fp[:8]}.json"
@@ -1893,6 +2121,17 @@ def cmd_deploy(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl deploy")
         _reject_golden_mode_override(config, command="v2ctl deploy")
+        unregistered_explicit = [
+            flag for flag in config.unregistered if flag.source in {"cli", "inherit", "set"}
+        ]
+        if unregistered_explicit:
+            print(
+                "[v2ctl.deploy] WARNING: unregistered explicit flags are not "
+                "admission metadata; they will be recorded but require exact "
+                "receipt proof for later bound requests: "
+                + ", ".join(flag.name for flag in unregistered_explicit),
+                file=sys.stderr,
+            )
         invocation_id = _new_invocation_id()
         native_golden = config.profile_name == GOLDEN_P1_PROFILE
         spec = (
@@ -1941,8 +2180,14 @@ def cmd_deploy(args, repo_root: Path) -> int:
                   f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
             print(f"[v2ctl.deploy] command={command}")
             publication = None
+            source_probe_expected = None
             if native_golden:
                 assert publisher_app_name is not None
+                from . import source_probe as source_probe_mod
+
+                # Capture the exact source expectation alongside the frozen
+                # deploy identity, before publication or backend work starts.
+                source_probe_expected = source_probe_mod.compute_expected_local(repo_root)
                 # This is deliberately inside the deploy lock and before both
                 # version capture and native Modal deployment.  A publication
                 # failure exits through the lock's finally block and prevents
@@ -2026,6 +2271,13 @@ def cmd_deploy(args, repo_root: Path) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if native_golden:
+                receipt = _write_golden_deployment_receipt(
+                    repo_root, config, env, deploy_identity, _post_version,
+                    manifest, publication,
+                    source_probe_expected,
+                )
+                print(f"[v2ctl.deploy] deployment_receipt={receipt}")
             return 0
         finally:
             lock.release()
@@ -2115,8 +2367,14 @@ def cmd_run(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl run")
         _reject_golden_mode_override(config, command="v2ctl run")
+        bound_receipt = None
+        if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
+            _, bound_receipt = _bound_deployment_receipt(repo_root, config, command="run")
         # Run-only: refuse unregistered and deploy-required explicit changes.
-        resolver.check_run_safety(config, run_only=True)
+        resolver.check_run_safety(
+            config, run_only=True,
+            trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
+        )
         _require_no_deploy_in_flight(repo_root)
         requested_target = {
             "app": config.target.app,
@@ -2130,9 +2388,9 @@ def cmd_run(args, repo_root: Path) -> int:
             getattr(args, "golden_public", False) and getattr(args, "dry_run", False)
         )
         if not golden_dry_run:
-            if manifest is None:
+            if manifest is None and bound_receipt is None:
                 raise GateError("no deployment manifest; run `v2ctl deploy-run` (or `deploy`) first")
-            if _deployment_manifest_target(manifest) != _requested_target_identity(
+            if manifest is not None and _deployment_manifest_target(manifest) != _requested_target_identity(
                 requested_target
             ):
                 raise GateError(
@@ -2140,9 +2398,9 @@ def cmd_run(args, repo_root: Path) -> int:
                     f"app={config.target.app} class={config.target.class_name} "
                     f"method={config.target.method}"
                 )
-            stored = manifest.get("deploy_fingerprint")
-            current = fingerprints.deploy_fingerprint()
-            if stored != current:
+            stored = manifest.get("deploy_fingerprint") if manifest is not None else None
+            current = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
+            if bound_receipt is None and manifest is not None and stored != current:
                 changes = diff_deploy_inputs(manifest.get("deploy_inputs", {}),
                                              fingerprints.deploy_inputs())
                 raise GateError(
@@ -2150,13 +2408,15 @@ def cmd_run(args, repo_root: Path) -> int:
                     f"deploy. stored={stored} current={current}. Changed: "
                     + ("; ".join(changes) if changes else "(unknown)"),
                 )
-        current = fingerprints.deploy_fingerprint()
+        current = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
         enforce_runtime_overrides(config,
                                   ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
                                   spend=True)
         # ── Full-run guard: run must generate (run_plan_stream), never the
         # snapshot-restore-only PROBE. ──
         _require_full_run_mode(config, command="v2ctl run")
+        if bound_receipt is not None:
+            receipt_mod.require_source_probe_evidence(repo_root, bound_receipt)
         run_count = args.run_count or config.workload.run_count
         selector = _backend_selector(config)
         if selector:
@@ -2175,6 +2435,11 @@ def cmd_run(args, repo_root: Path) -> int:
                                                **_identity_env_for_command("run", config),
                                                **selector_env,
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
+        if bound_receipt is not None:
+            env = _receipt_effective_env(env, bound_receipt)
+            env["COMFYMODAL_V2CTL_RUN_FINGERPRINT"] = val_mod._bound_run_fingerprint(
+                fingerprints, bound_receipt
+            )
         # Forward the canonical selector as the BAT's first positional arg so
         # the run BAT enters its validation mode (e.g. E28_VALIDATION) instead
         # of falling into the snapshot_restore_only probe branch.
@@ -2183,19 +2448,42 @@ def cmd_run(args, repo_root: Path) -> int:
             _dry_run_report(config, fingerprints, env, command)
             return 0
         print(f"[v2ctl.run] profile={config.profile_name} "
-              f"deploy_fingerprint={current} run_fingerprint={fingerprints.run_fingerprint()}")
+              f"deploy_fingerprint={current} run_fingerprint="
+              f"{val_mod._bound_run_fingerprint(fingerprints, bound_receipt)}")
         print(f"[v2ctl.run] command={command}")
         result = backend_mod.BackendRunner(repo_root, env_builder).run(
             spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
             invocation_id=invocation_id, strict_canonical_discovery=True,
-            allow_multiple_run_artifacts=run_count > 1)
+            allow_multiple_run_artifacts=run_count > 1,
+            canonical_identity=(
+                {
+                    "profile": bound_receipt.profile,
+                    "profile_config_fingerprint": (
+                        bound_receipt.profile_config_fingerprint
+                        or fingerprints.profile_config_fingerprint()
+                    ),
+                    "deploy_fingerprint": current,
+                    "run_fingerprint": val_mod._bound_run_fingerprint(
+                        fingerprints, bound_receipt
+                    ),
+                }
+                if bound_receipt is not None else None
+            ))
         provenance = prov_mod.build_provenance(
-            config, env, current, fingerprints.run_fingerprint(), [],
+            config, env, current,
+            val_mod._bound_run_fingerprint(fingerprints, bound_receipt), [],
             invocation_id=invocation_id,
-            profile_config_fingerprint=fingerprints.profile_config_fingerprint(),
+            profile_config_fingerprint=(
+                bound_receipt.profile_config_fingerprint
+                if bound_receipt is not None and bound_receipt.profile_config_fingerprint
+                else fingerprints.profile_config_fingerprint()
+            ),
             request_id=result.request_id or "",
         )
-        run_manifest = write_run_manifest(repo_root, config, fingerprints, env, result, provenance)
+        run_manifest = write_run_manifest(
+            repo_root, config, fingerprints, env, result, provenance,
+            deployment_receipt=bound_receipt,
+        )
         if result.artifacts.run_artifact is not None:
             try:
                 prov_mod.write_provenance_sibling(result.artifacts.run_artifact, provenance)
@@ -2209,6 +2497,7 @@ def cmd_run(args, repo_root: Path) -> int:
             config,
             fingerprints,
             current,
+            bound_receipt=bound_receipt,
         )
         return 0
     except (V2CtlError, OSError) as exc:
@@ -2226,7 +2515,13 @@ def cmd_gate(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl gate")
         _reject_golden_mode_override(config, command="v2ctl gate")
-        resolver.check_run_safety(config, run_only=True)
+        bound_receipt = None
+        if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
+            _, bound_receipt = _bound_deployment_receipt(repo_root, config, command="gate")
+        resolver.check_run_safety(
+            config, run_only=True,
+            trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
+        )
         _require_no_deploy_in_flight(repo_root)
         requested_target = {
             "app": config.target.app,
@@ -2236,13 +2531,13 @@ def cmd_gate(args, repo_root: Path) -> int:
         manifest = latest_deployment_manifest(
             repo_root, profile=config.profile_name, target=requested_target
         )
-        if manifest is None:
+        if manifest is None and bound_receipt is None:
             raise GateError("gate requires a deployment whose fingerprint matches the requested "
                             "configuration; run `v2ctl deploy-run` first")
-        if manifest.get("deploy_fingerprint") != fingerprints.deploy_fingerprint():
+        if bound_receipt is None and manifest is not None and manifest.get("deploy_fingerprint") != fingerprints.deploy_fingerprint():
             raise GateError("gate requires a deployment whose fingerprint matches the requested "
                             "configuration; run `v2ctl deploy-run` first")
-        if _deployment_manifest_target(manifest) != _requested_target_identity(
+        if manifest is not None and _deployment_manifest_target(manifest) != _requested_target_identity(
             requested_target
         ):
             raise GateError(
@@ -2271,6 +2566,8 @@ def cmd_gate(args, repo_root: Path) -> int:
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
+        if config.profile_name == GOLDEN_P1_PROFILE:
+            validator.register(val_mod.GoldenCohortValidator())
         # Golden has its own dedicated durability/seriality ledger contract;
         # the generic E29 run-plan ledger is not emitted by
         # run_golden_serial_stream.
@@ -2287,20 +2584,31 @@ def cmd_gate(args, repo_root: Path) -> int:
             validator.register(clean_lane_validator)
         runner = backend_mod.BackendRunner(repo_root, env_builder)
         gate = val_mod.GateRunner(repo_root=repo_root, fingerprints=fingerprints,
-                                  validators=validator, backend_runner=runner,
-                                  env_builder=env_builder)
+                                   validators=validator, backend_runner=runner,
+                                   env_builder=env_builder,
+                                   deployment_receipt=bound_receipt)
         result = gate.run_gate(config, spec, invocation_id=invocation_id)
         print(f"[v2ctl.gate] valid={int(result.valid)} manifest={result.manifest_path}")
         for reason in result.reasons:
             print(f"  FAIL {reason}")
         if result.run is not None and result.run.artifacts.run_artifact is not None:
+            provenance_env = env_builder.build(
+                config, host_env=os.environ,
+                backend_extra={"V2_BENCHMARK_RUNS": "1",
+                               **_canonical_metadata_env(config, fingerprints, invocation_id)},
+            )
+            if bound_receipt is not None:
+                provenance_env = _receipt_effective_env(provenance_env, bound_receipt)
             provenance = prov_mod.build_provenance(
-                config, env_builder.build(config, host_env=os.environ,
-                                          backend_extra={"V2_BENCHMARK_RUNS": "1",
-                                                         **_canonical_metadata_env(config, fingerprints, invocation_id)}),
-                fingerprints.deploy_fingerprint(), fingerprints.run_fingerprint(), [],
+                config, provenance_env,
+                bound_receipt.deploy_fingerprint if bound_receipt is not None else fingerprints.deploy_fingerprint(),
+                val_mod._bound_run_fingerprint(fingerprints, bound_receipt), [],
                 invocation_id=invocation_id,
-                profile_config_fingerprint=fingerprints.profile_config_fingerprint(),
+                profile_config_fingerprint=(
+                    bound_receipt.profile_config_fingerprint
+                    if bound_receipt is not None and bound_receipt.profile_config_fingerprint
+                    else fingerprints.profile_config_fingerprint()
+                ),
                 request_id=result.run.request_id if result.run is not None else "",
             )
             try:
@@ -2323,7 +2631,13 @@ def cmd_confirm(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl confirm")
         _reject_golden_mode_override(config, command="v2ctl confirm")
-        resolver.check_run_safety(config, run_only=True)
+        bound_receipt = None
+        if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
+            _, bound_receipt = _bound_deployment_receipt(repo_root, config, command="confirm")
+        resolver.check_run_safety(
+            config, run_only=True,
+            trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
+        )
         _require_no_deploy_in_flight(repo_root)
         _require_full_run_mode(config, command="v2ctl confirm")
         enforce_runtime_overrides(config,
@@ -2344,6 +2658,8 @@ def cmd_confirm(args, repo_root: Path) -> int:
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
+        if config.profile_name == GOLDEN_P1_PROFILE:
+            validator.register(val_mod.GoldenCohortValidator())
         # Confirm must enforce the same canonical ledger contract as gate;
         # otherwise an E37 gate could pass while confirmation silently drops
         # the first-durable ledger validator.
@@ -2362,8 +2678,9 @@ def cmd_confirm(args, repo_root: Path) -> int:
         if clean_lane_validator.applies(config):
             validator.register(clean_lane_validator)
         confirm = val_mod.ConfirmRunner(repo_root=repo_root, fingerprints=fingerprints,
-                                        backend_runner=runner, env_builder=env_builder,
-                                        validators=validator)
+                                         backend_runner=runner, env_builder=env_builder,
+                                         validators=validator,
+                                         deployment_receipt=bound_receipt)
         result = confirm.confirm(Path(args.from_gate), config, spec, runs=runs,
                                  invocation_id=invocation_id)
         print(f"[v2ctl.confirm] valid={int(result.valid)} manifest={result.manifest_path}")
@@ -2400,7 +2717,17 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         app_name = config.target.app
         class_name = config.target.class_name
         gpu = config.resources.gpu
-        deploy_fp = fingerprints.deploy_fingerprint()
+        bound_receipt = None
+        if config.profile_name == GOLDEN_P1_PROFILE:
+            _, bound_receipt = _bound_deployment_receipt(
+                repo_root, config, command="source-probe"
+            )
+        deploy_fp = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
+        expected_source = (
+            bound_receipt.source_probe.get("expected") if bound_receipt is not None else None
+        )
+        if bound_receipt is not None and not isinstance(expected_source, dict):
+            raise GateError("deployment receipt has no source-probe expectation")
         workspace = sp._load_workspace(repo_root)
         import os as _os
         if app_name:
@@ -2410,12 +2737,24 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         if gpu:
             _os.environ["COMFYMODAL_V2_GPU"] = str(gpu)
 
-        exit_code, report = sp.run_source_probe(repo_root, workspace=workspace, gpu=str(gpu))
+        exit_code, report = sp.run_source_probe(
+            repo_root, workspace=workspace, gpu=str(gpu), expected=expected_source
+        )
+        if bound_receipt is not None:
+            receipt_mod.write_source_probe_evidence(repo_root, bound_receipt, report)
         print(f"[v2ctl.source-probe] profile={args.profile}")
         print(f"[v2ctl.source-probe] git_head={report['expected'].get('git_head', '')[:12]}")
         print(f"[v2ctl.source-probe] target app={app_name or '(profile unresolved)'} "
               f"class={class_name or '(profile unresolved)'} gpu={gpu or 'rtx-pro-6000'}")
         summary = report["remote_summary"]
+        expected_remote_hash = str(
+            (bound_receipt.deployment_identity.get("deployment_combined_hash", "")
+             if bound_receipt is not None else "")
+        )
+        if expected_remote_hash and summary.get("deployment_combined_hash") != expected_remote_hash:
+            raise GateError(
+                "source-probe deployment identity mismatch against immutable receipt"
+            )
         print(f"[v2ctl.source-probe] remote class={summary['class_name']} "
               f"image={summary['image_id']} container={summary['container_session_id']}")
         print(f"[v2ctl.source-probe] remote deployment_combined_hash="
@@ -2439,33 +2778,36 @@ def cmd_source_probe(args, repo_root: Path) -> int:
                   file=sys.stderr)
         else:
             print(f"[v2ctl.source-probe] RESULT=PASS source_identity=MATCH")
-            # Flip the deployment manifest's source_identity_status to
-            # verified when it exists (truthful health semantics).
-            try:
-                import json as _json
-                mdir = _deployment_manifest_dir(repo_root)
-                files = sorted(mdir.glob("deploy_*.json")) if mdir.is_dir() else []
-                for manifest_path in reversed(files):
-                    try:
-                        manifest = _json.loads(
-                            manifest_path.read_text(encoding="utf-8")
-                        )
-                    except (OSError, _json.JSONDecodeError):
-                        # An unrelated/corrupt record must not hide a valid
-                        # current deployment record farther down the ledger.
-                        continue
-                    if not isinstance(manifest, dict):
-                        continue
-                    if manifest.get("deploy_fingerprint") == deploy_fp:
-                        manifest["source_identity_status"] = "verified"
-                        manifest_path.write_text(
-                            json.dumps(manifest, indent=2, sort_keys=True),
-                            encoding="utf-8",
-                        )
-                        print(f"[v2ctl.source-probe] manifest source_identity_status=verified")
-                        break
-            except Exception as _exc_manifest:
-                print(f"[v2ctl.source-probe] (manifest status update skipped: {_exc_manifest})")
+            # A receipt seals the deployment manifest.  Bound source-probe
+            # evidence is persisted separately, so do not amend that ledger.
+            if bound_receipt is None:
+                # Flip the deployment manifest's source_identity_status to
+                # verified when it exists (truthful health semantics).
+                try:
+                    import json as _json
+                    mdir = _deployment_manifest_dir(repo_root)
+                    files = sorted(mdir.glob("deploy_*.json")) if mdir.is_dir() else []
+                    for manifest_path in reversed(files):
+                        try:
+                            manifest = _json.loads(
+                                manifest_path.read_text(encoding="utf-8")
+                            )
+                        except (OSError, _json.JSONDecodeError):
+                            # An unrelated/corrupt record must not hide a valid
+                            # current deployment record farther down the ledger.
+                            continue
+                        if not isinstance(manifest, dict):
+                            continue
+                        if manifest.get("deploy_fingerprint") == deploy_fp:
+                            manifest["source_identity_status"] = "verified"
+                            manifest_path.write_text(
+                                json.dumps(manifest, indent=2, sort_keys=True),
+                                encoding="utf-8",
+                            )
+                            print(f"[v2ctl.source-probe] manifest source_identity_status=verified")
+                            break
+                except Exception as _exc_manifest:
+                    print(f"[v2ctl.source-probe] (manifest status update skipped: {_exc_manifest})")
         return exit_code
     except (V2CtlError, OSError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

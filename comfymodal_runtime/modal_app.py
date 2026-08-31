@@ -132,6 +132,7 @@ from .output_delivery import (
     build_default_chain,
     run_strategy_chain,
 )
+from .output_durability import resolve_output_durability
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall, waterfall_to_dict, attach_waterfall, mark_waterfall_non_applicable, is_graph_result, graph_result_from_event
@@ -3574,6 +3575,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # reach the deployed runtime.
         "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+        ),
+        "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
+            "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
         ),
         # RA1 sampler decomposition diagnostics must cross Modal's class-env
         # boundary; otherwise the profile can be correct at deploy time while
@@ -16605,7 +16609,9 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 pass
             _descriptor_start_mono_ns = time.monotonic_ns()
-            selected, _asset_commit_task, _asset_diag = await self._persist_output_assets(selected)
+            selected, _asset_commit_task, _asset_diag = await self._persist_output_assets_for_policy(
+                selected, _output_durability_policy,
+            )
             _stage13_asset_write_end_mono_ns = time.monotonic_ns()
             if selected_index is not None:
                 attempts[selected_index] = selected
@@ -16615,16 +16621,39 @@ class ModalRuntimeEntrypoint:
                 result = attempt_to_descriptor_result(
                     selected,
                     generation=_snapshot_target_fingerprint(),
-                    legacy_data=False,
+                    legacy_data=_output_durability_policy.mode == "off",
                     output_mode=getattr(plan.execution_options, "output_mode", "original"),
                     variant=getattr(plan.execution_options, "output_mode", "original"),
                 )
             _descriptor_end_mono_ns = time.monotonic_ns()
+            if _output_durability_policy.mode == "off":
+                _result_ready = bool(selected.success and selected.items)
+                _result_byte_count = sum(len(item.raw_bytes) for item in selected.items)
+                _result_shas = [
+                    item.content_sha256 or hashlib.sha256(item.raw_bytes).hexdigest()
+                    for item in selected.items
+                    if item.raw_bytes
+                ]
+                result.update({
+                    "output_durability_mode": "off",
+                    "durability_requested": False,
+                    "result_durable": False,
+                    "result_ready": _result_ready,
+                    "result_ready_evidence": {
+                        "status": "ready" if _result_ready else "not_ready",
+                        "event": "FIRST_RESULT_READY" if _result_ready else "",
+                        "inline_bytes": True,
+                        "byte_count": _result_byte_count,
+                        "sha256": _result_shas,
+                    },
+                })
             trace.emit("output_persist_end", phase="output", metadata={
                 "duration_ms": round((_descriptor_end_mono_ns - _descriptor_start_mono_ns) / 1_000_000, 3),
                 "items": selected.total_items,
                 "hashes": selected.output_hash_count,
                 "serialized_bytes": result.get("output_diagnostics", {}).get("serialized_result_bytes", 0),
+                "output_durability_mode": _output_durability_policy.mode,
+                "persistence_status": _asset_diag.get("persistence_status"),
             })
             # Variant A: do NOT await the commit here — the result event must
             # be yielded first.  Stash the commit task + diag per-request; the
@@ -16634,6 +16663,12 @@ class ModalRuntimeEntrypoint:
                 self._deferred_commit_task = _asset_commit_task
                 self._deferred_commit_diag = _asset_diag
                 self._deferred_commit_pending = True
+            elif _output_durability_policy.mode == "off":
+                # Off mode has no persistence operation to finalize.  Do not
+                # manufacture a deferred event for a zero-duration commit.
+                self._deferred_commit_task = None
+                self._deferred_commit_diag = _asset_diag
+                self._deferred_commit_pending = False
             else:
                 self._deferred_commit_task = None
                 self._deferred_commit_diag = _asset_diag
@@ -16641,8 +16676,9 @@ class ModalRuntimeEntrypoint:
             if not getattr(self, "_v2_first_durable_result_seen", False):
                 self._v2_first_durable_result_seen = True
                 _v2_startup_stage(
-                    "first_durable_result", "ready", phase="request",
-                    metadata={"output_persisted": 1},
+                    "first_result_ready" if _output_durability_policy.mode == "off" else "first_durable_result",
+                    "ready", phase="request",
+                    metadata={"output_persisted": int(_output_durability_policy.mode != "off")},
                 )
             # Compute overlap between commit and descriptor build intervals
             _commit_start = _asset_diag.get("commit_start_mono_ns", 0)
@@ -16677,10 +16713,17 @@ class ModalRuntimeEntrypoint:
                 "conversion_fallback": any(
                     meta.conversion_fallback for meta in _codec_meta
                 ),
-                "output_asset_write_ms": _asset_diag.get("write_ms", 0.0),
-                "output_volume_commit_ms": _asset_diag.get("commit_ms", 0.0),
-                "output_commit_overlap_ms": round(_overlap_ns / 1_000_000, 3),
-                "commit_status": "pending" if _asset_commit_task is not None else "skipped",
+                "output_asset_write_ms": _asset_diag.get("write_ms"),
+                "output_volume_commit_ms": _asset_diag.get("commit_ms"),
+                "output_commit_overlap_ms": (
+                    None if _output_durability_policy.mode == "off"
+                    else round(_overlap_ns / 1_000_000, 3)
+                ),
+                "commit_status": _asset_diag.get(
+                    "commit_status",
+                    "pending" if _asset_commit_task is not None else "skipped",
+                ),
+                "persistence_status": _asset_diag.get("persistence_status"),
                 "output_hash_count": selected.output_hash_count,
                 "base64_encode_count": selected.base64_encode_count,
                 "base64_decode_count": selected.base64_decode_count,
@@ -17194,6 +17237,28 @@ class ModalRuntimeEntrypoint:
             else:
                 images.append(entry)
         return {"images": images, "videos": videos, "outputs": outputs}
+
+    async def _persist_output_assets_for_policy(
+        self,
+        attempt: Attempt,
+        policy: Any,
+    ) -> tuple[Attempt, asyncio.Task[Any] | None, dict[str, Any]]:
+        """Persist generated output only for an explicit strict request."""
+        if getattr(policy, "mode", "off") == "off":
+            return attempt, None, {
+                "write_ms": None,
+                "write_end_mono_ns": 0,
+                "commit_start_mono_ns": 0,
+                "commit_end_mono_ns": 0,
+                "commit_ms": None,
+                "overlap_ms": None,
+                "files_written": 0,
+                "thumbnail_files_written": 0,
+                "commit_error": "",
+                "commit_status": "NOT RUN",
+                "persistence_status": "NOT RUN",
+            }
+        return await self._persist_output_assets(attempt)
 
     async def _persist_output_assets(
         self,
@@ -17714,6 +17779,9 @@ class ModalRuntimeEntrypoint:
             "comfymodal_runtime.model_preload",
             "comfymodal_runtime.clip_fast_hydration_wiring",
             "comfymodal_runtime.registry_proof_store",
+            "comfymodal_runtime.golden_serial",
+            "comfymodal_runtime.golden_qd_transport",
+            "comfymodal_runtime.output_durability",
         )
 
         def _sha256_bytes(path: str) -> str:
@@ -19128,6 +19196,10 @@ class ModalRuntimeEntrypoint:
         control_partition: Any = None,
         _remote_cancel_watcher: RemoteCancelWatcher | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # Generated-output durability is request policy, not source-publication
+        # policy. Resolve it before graph execution so an invalid explicit
+        # value fails through the normal request error path.
+        _output_durability_policy = resolve_output_durability()
         # ── E29: durable-result span holder ──────────────────────────────
         # Opened at plan receipt (see below) and closed at the first durable
         # result emit boundary.  MUST be initialized before any branch can
@@ -20945,7 +21017,13 @@ class ModalRuntimeEntrypoint:
                         )
                     except Exception:
                         pass
-                    _ledger_event("first_durable_result", mono_ns=_emit_mono or time.monotonic_ns())
+                    _ledger_event(
+                        "first_result_ready"
+                        if isinstance(data, dict)
+                        and data.get("output_durability_mode") == "off"
+                        else "first_durable_result",
+                        mono_ns=_emit_mono or time.monotonic_ns(),
+                    )
                     # ── E29: close the result-assembly span ───────────────
                     # The span opened at output_persist_start (inside
                     # _execute_v2_prompt_executor) closes at this exact
@@ -21127,6 +21205,7 @@ class ModalRuntimeEntrypoint:
             golden_serial_execute,
             normalize_attention_backend,
         )
+        from .output_durability import resolve_output_durability
 
         # Golden is a direct adapter and does not pass through
         # run_plan_stream's request counter.  Count it at this request entry,
@@ -21145,6 +21224,7 @@ class ModalRuntimeEntrypoint:
             request_id_raw = request.get("request_id")
             if not isinstance(request_id_raw, str) or not request_id_raw.strip():
                 raise ValueError("golden_request_id_required_nonempty_string")
+            output_policy = resolve_output_durability()
             attention_backend = (
                 normalize_attention_backend(request["attention_backend"])
                 if "attention_backend" in request
@@ -21168,6 +21248,8 @@ class ModalRuntimeEntrypoint:
                 host_info=_capture_host_info(),
             )
             identity_telemetry["attention_backend"] = attention_backend
+            identity_telemetry["output_durability_mode"] = output_policy.mode
+            identity_telemetry["durability_requested"] = output_policy.durability_requested
 
             # Sanitized request id for the local telemetry path: keep only
             # path-safe characters and refuse traversal outside the golden dir.
@@ -21357,6 +21439,34 @@ class ModalRuntimeEntrypoint:
         _return_wall_unix_ns = time.time_ns()
         _return_mono_ns = time.monotonic_ns()
         result_data = dataclasses.asdict(result)
+        # Off-mode Golden owns no output file, so project its validated
+        # in-memory bytes through the existing legacy ``images[].data``
+        # transport.  The metadata stays explicit and distinguishes ready from
+        # durable; strict results retain their historical path descriptor.
+        if (
+            result_data.get("output_durability_mode") == "off"
+            and result_data.get("image_data")
+        ):
+            image_sha = str(result_data.get("image_sha256", ""))
+            image_filename = str(result_data.get("filename") or f"{image_sha}.png")
+            image_entry = {
+                "filename": image_filename,
+                "node_id": result_data.get("output_node_id", ""),
+                "output_key": "images",
+                "mime_type": result_data.get("mime_type", "image/png"),
+                "file_ext": ".png",
+                "width": result_data.get("width", 0),
+                "height": result_data.get("height", 0),
+                "byte_count": result_data.get("byte_count", 0),
+                "asset_id": image_sha,
+                "identity": f"sha256:{image_sha}" if image_sha else "",
+                "data": result_data["image_data"],
+                "output_durability_mode": "off",
+                "durability_requested": False,
+                "result_durable": False,
+            }
+            result_data["images"] = [image_entry]
+            result_data["include_base64"] = True
         # The adapter result is the authoritative request-scoped Golden
         # identity surface.  Keep a named copy as well as the conventional
         # result identity key so host projection can consume either terminal

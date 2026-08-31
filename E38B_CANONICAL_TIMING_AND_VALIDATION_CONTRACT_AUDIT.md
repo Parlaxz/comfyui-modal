@@ -1,5 +1,11 @@
 # E38B — Canonical Timing, Reconciliation, and Fail-Closed Validation Contract Audit
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 Date: 2026-08-21 · Scope: current local checkout (dirty, preserved) + raw E37 artifacts · Mode: READ-ONLY forensic audit. No source, test, profile, or deployment changes were made. The only file created is this report.
 
 Authoritative inputs:

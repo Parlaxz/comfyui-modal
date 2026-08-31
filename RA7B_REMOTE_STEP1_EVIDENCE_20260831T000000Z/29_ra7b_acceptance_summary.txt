@@ -1,0 +1,30 @@
+RA7B FUNCTIONAL ACCEPTANCE — 2026-08-31
+
+Decision: PASS for the requested default-off durability semantics.
+
+Frozen deployment:
+- app=ra7b-step1-main-0831
+- deploy_fingerprint=e6a31b700622bc19ec5dd017a29a92ef8bf872f5692a3998ee688a4296106a76
+- profile=golden_p1
+- output_durability_mode=off
+- output_endpoint=result_ready
+- clip=bf16 control; qd_transport=legacy; cast_once=not enabled
+
+Eligible requests: 6/6 valid, true_cold=true, dnf=false, first_result_ready=true,
+durability_status=NOT RUN, reopen_verified=false, seriality count=0, and usable
+encoded output observed. The configured output SHA mismatch remains a warning:
+expected=8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e
+observed=bfb360008914dbacbe594b22dc09fd2b7658fa4d63ed7c25364806ce0b2280ce.
+
+Golden-call wall times (ms), retained slow outliers included:
+11459.278, 14136.007, 16503.562, 26203.608, 23280.430, 13131.917
+Sampling stage times (ms):
+5431.1, 5671.1, 5435.6, 5519.5, 5535.2, 5458.0
+
+Separate retained platform DNF:
+- snapshot restore reached snapshot creation, then failed during container/gofer
+  creation with nvidia-container-cli driver RPC timeout and exit code 128.
+- Evidence: 23_remote_snapshot_platform_dnf_20260831T113747.log
+
+Conclusion: do not alter RA7B for latency. Proceed to the QD4 A/B, explicitly
+comparing good-case load time and tail variance.

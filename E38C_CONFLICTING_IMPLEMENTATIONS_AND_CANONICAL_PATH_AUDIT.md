@@ -1,5 +1,11 @@
 # E38C — Conflicting Implementations, Reachability, and Canonical Runtime Path Audit
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 Batch: E38C · Date: 2026-08-21 · Branch: `TESTING2` (dirty; E31–E37 uncommitted, +11,558/−1,489 across 55 tracked files vs HEAD `8e49d75`)
 Authority rule applied: **current local worktree is authoritative**. Git history used only for origin. Every CONFIRMED claim was re-read in native source. No production source, tests, profiles, or git state were modified. This report is the only file created.
 

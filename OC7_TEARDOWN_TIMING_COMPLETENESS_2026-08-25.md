@@ -1,5 +1,11 @@
 # OC7 — Batch Teardown and Post-Result Timing-Completeness Audit
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical teardown audit; preserve
+> its evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for
+> current generated-output semantics. Output durability is off by default;
+> strict commit/reopen/hash proof is opt-in. S4 source publication durability
+> remains mandatory.
+
 Date: 2026-08-25
 Mode: READ ONLY. No deploy, no paid runs, no source changes.
 Outputs: this file + `OC7_TEARDOWN_TIMING_CLAIMS_2026-08-25.csv`.

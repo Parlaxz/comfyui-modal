@@ -1,5 +1,11 @@
 # E38L Independent Full Repository / Architecture / Performance / Correctness Audit
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 **Date:** 2026-08-21  
 **Auditor:** E38L  
 **Repository:** `comfyui-modal`  

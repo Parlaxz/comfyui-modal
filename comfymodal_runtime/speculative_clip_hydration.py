@@ -63,6 +63,11 @@ from .env import env_flag
 _LOCK = threading.Lock()
 # request_id -> _SpeculativeClipLane
 _LANES: dict[str, "_SpeculativeClipLane"] = {}
+# Scalar tombstones let demand distinguish "no speculative lane was ever
+# started" from "a lane was cancelled and may still be draining" after the
+# lane object has been removed.  They never contain tensors, owners, or lane
+# objects.
+_CANCELLED_LANES: dict[str, str] = {}
 # Release-once guard for the UNET prefetch release callback.  Separate from
 # _LOCK because _drop_lane_locked is called while holding _LOCK (a plain
 # non-reentrant Lock) and _signal_unet_release must not re-enter it.
@@ -95,9 +100,98 @@ class _SpeculativeClipLane:
     # release UNET source prefetch exactly once.
     unet_release_sent: bool = False
     release_callback: Any = None
+    # Cancellation is cooperative: a reader already inside the external
+    # loader cannot be force-killed safely.  The event prevents further work;
+    # publication is still decided atomically under ``_LOCK``.
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    done_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    worker: Optional[threading.Thread] = field(default=None, repr=False)
     # E30: True when the QD reader produced this lane's tensors (vs the
     # fastsafe fallback).  Propagated into the take record as ``qd_used``.
     _qd_used: bool = False
+
+
+class _SpeculativeCancellation(RuntimeError):
+    """The lane was cancelled before its source tensors could be published."""
+
+
+def _cleanup_speculative_resources(
+    lane: "_SpeculativeClipLane",
+    owners: Any,
+    per_file_sds: Any,
+) -> dict[str, Any]:
+    """Release detached resources without ever rooting them in ``_LANES``."""
+    cleanup: dict[str, Any]
+    try:
+        cleanup = _wiring._close_source_owners(owners)
+    except Exception as exc:
+        cleanup = {
+            "ok": False,
+            "closed": 0,
+            "errors": [f"{type(exc).__name__}: {str(exc)[:160]}"],
+        }
+    try:
+        per_file_sds.clear()
+    except Exception:
+        pass
+    if cleanup.get("errors"):
+        lane.record["cleanup_errors"] = list(cleanup["errors"])
+        lane.record["cleanup_failed"] = True
+    return cleanup
+
+
+def _lane_cancel_requested(lane: "_SpeculativeClipLane") -> bool:
+    with _LOCK:
+        return bool(lane.cancelled or lane.cancel_event.is_set())
+
+
+def _cancel_lane_locked(lane: "_SpeculativeClipLane", reason: str) -> list:
+    """Atomically remove a lane and detach only already-published owners."""
+    lane.cancelled = True
+    lane.cancel_event.set()
+    for key, candidate in list(_LANES.items()):
+        if candidate is lane:
+            _CANCELLED_LANES[key] = str(reason)
+            _LANES.pop(key, None)
+            _RESTORE_MANIFEST_DIGESTS.pop(key, None)
+    owners = list(lane.owners)
+    lane.owners = []
+    try:
+        lane.per_file_sds.clear()
+    except Exception:
+        pass
+    lane.per_file_sds = []
+    lane.record.update({
+        "cancelled": True,
+        "cancel_reason": str(reason),
+        "reason": str(reason),
+        "result": {"ok": False, "reason": str(reason), "cancelled": True},
+    })
+    return owners
+
+
+def _record_worker_failure(lane: "_SpeculativeClipLane", exc: BaseException) -> None:
+    """Close the outer worker failure seam without leaving a live lane."""
+    with _LOCK:
+        if lane.done_event.is_set():
+            return
+        owners = list(lane.owners)
+        lane.owners = []
+        try:
+            lane.per_file_sds.clear()
+        except Exception:
+            pass
+        lane.per_file_sds = []
+        lane.record.update({
+            "result": {
+                "ok": False,
+                "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+            },
+            "worker_error": f"{type(exc).__name__}: {str(exc)[:200]}",
+        })
+        lane.finished_mono_ns = time.monotonic_ns()
+    _cleanup_speculative_resources(lane, owners, [])
+    lane.done_event.set()
 
 
 def _clip_names_from_spec(model_spec: Any) -> tuple[str, ...]:
@@ -527,6 +621,7 @@ def _start_speculative_clip_lane(
             started_mono_ns=time.monotonic_ns(),
             release_callback=release_callback,
         )
+        _CANCELLED_LANES.pop(request_id, None)
         _LANES[request_id] = lane
 
     # ── E26: lane-started telemetry (best-effort; never raises) ──
@@ -546,10 +641,10 @@ def _start_speculative_clip_lane(
     def _worker() -> None:
         try:
             _run_speculative_read(lane, trace=trace)
-        except Exception:
+        except Exception as exc:
             # The demand path never observes a half-failed speculative state;
             # it simply re-runs the normal hydrator.
-            pass
+            _record_worker_failure(lane, exc)
         finally:
             _signal_unet_release(lane)
 
@@ -559,10 +654,13 @@ def _start_speculative_clip_lane(
             daemon=True,
             name="comfymodal-speculative-clip-hydration",
         )
+        with _LOCK:
+            lane.worker = t
         t.start()
     except Exception:
         with _LOCK:
-            _LANES.pop(request_id, None)
+            owners = _cancel_lane_locked(lane, "worker_start_failed")
+        _cleanup_speculative_resources(lane, owners, [])
         _signal_unet_release(lane)
         return None
     return lane
@@ -655,7 +753,11 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
         # bound, the lane records a failure and the demand path falls back.
         try:
             _cuda_deadline = time.monotonic() + 5.0
-            while not torch.cuda.is_initialized() and time.monotonic() < _cuda_deadline:
+            while (
+                not _lane_cancel_requested(lane)
+                and not torch.cuda.is_initialized()
+                and time.monotonic() < _cuda_deadline
+            ):
                 time.sleep(0.02)
         except Exception:
             pass
@@ -686,6 +788,8 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
         lane.file_paths = tuple(paths)
         checkpoint_bytes = 0
         for path in paths:
+            if _lane_cancel_requested(lane):
+                raise _SpeculativeCancellation("speculative_lane_cancelled")
             if not os.path.exists(path):
                 raise RuntimeError(f"missing source file: {path}")
             _entry = _manifest_by_path.get(path) or {}
@@ -771,25 +875,16 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
             transformed = _wiring._apply_pipeline(work, pipeline, comfy_utils=None)
             per_file_sds.append(transformed)
             checkpoint_bytes += int(os.path.getsize(path))
-        # ── E28 Target C: compute-ready FP32 cast-once ──
-        # When the flag is on and the manifest is uniformly BF16, cast every
-        # tensor once to FP32 (exact widening) BEFORE the bind so the final
-        # resident representation is compute-ready and the per-forward cast
-        # tax disappears.  Fail-closed: any ineligibility leaves the BF16
-        # tensors untouched (normal demand path).
-        _cast_record: dict[str, Any] = {}
-        try:
-            from .clip_fp32_cast_once import apply_cast_once, cast_once_enabled
-
-            if not clean_lane.enabled() and cast_once_enabled():
-                per_file_sds, _cast_record = apply_cast_once(
-                    per_file_sds, list(lane.manifest_files), trace=trace
-                )
-        except Exception:
-            _cast_record = {}
-        lane.owners = owners
-        lane.per_file_sds = per_file_sds
-        lane.record = {
+        # FP32 ownership transfer is demand-owned.  A speculative worker may
+        # own BF16 source mappings and loader handles, but it must not create
+        # an unowned transformed representation before demand can construct
+        # the request-local ClipFP32OwnershipTransfer.
+        _cast_record: dict[str, Any] = {
+            "requested": bool(env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")),
+            "applied": False,
+            "deferred_to_demand": True,
+        }
+        success_record = {
             "speculative_read_ms": round((time.perf_counter() - t0) * 1000.0, 3),
             "checkpoint_bytes": checkpoint_bytes,
             "files": len(lane.file_paths),
@@ -802,6 +897,21 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
             # safely do ``record.get("cast_once", {}).get("applied", False)``.
             "cast_once": dict(_cast_record),
         }
+        # The worker may finish after cancellation or identity replacement.
+        # Publish both maps and owners as one store transition, otherwise a
+        # late worker can resurrect a lane the demand path already removed.
+        with _LOCK:
+            active = (
+                not lane.cancelled
+                and not lane.cancel_event.is_set()
+                and any(candidate is lane for candidate in _LANES.values())
+            )
+            if active:
+                lane.owners = owners
+                lane.per_file_sds = per_file_sds
+                lane.record = success_record
+            else:
+                raise _SpeculativeCancellation("speculative_lane_cancelled_before_publish")
         result = {
             "ok": True,
             "mode": "QD4" if clean_lane.enabled() else cfh.MODE_FASTSAFE,
@@ -836,17 +946,28 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
         except Exception:
             pass
     except Exception as exc:
+        cancelled = isinstance(exc, _SpeculativeCancellation) or _lane_cancel_requested(lane)
         result = {
             "ok": False,
             "mode": cfh.MODE_FASTSAFE,
-            "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+            "reason": (
+                "speculative_lane_cancelled"
+                if cancelled
+                else f"{type(exc).__name__}: {str(exc)[:200]}"
+            ),
+            "cancelled": cancelled,
             "wall_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
-        for loader, fb in owners:
-            try:
-                loader.close()
-            except Exception:
-                pass
+        # A failed speculative read is never takeable and must not retain a
+        # partial model-sized mapping in the process-global lane store.
+        _cleanup_speculative_resources(lane, owners, per_file_sds)
+        with _LOCK:
+            # If publication never happened, these are normally empty.  The
+            # identity check prevents a cancelled worker from clearing a new
+            # lane that reused the same request id.
+            if any(candidate is lane for candidate in _LANES.values()):
+                lane.per_file_sds = []
+                lane.owners = []
         if not clean_lane.enabled():
             try:
                 torch.cuda.empty_cache()
@@ -858,8 +979,18 @@ def _run_speculative_read(lane: "_SpeculativeClipLane", *, trace: Any = None) ->
             "path_source": lane.path_source,
         })
     finally:
-        lane.record["result"] = result
-        lane.finished_mono_ns = time.monotonic_ns()
+        with _LOCK:
+            if lane.cancelled and result.get("ok"):
+                result = {
+                    "ok": False,
+                    "mode": result.get("mode", cfh.MODE_FASTSAFE),
+                    "reason": "speculative_lane_cancelled_after_read",
+                    "cancelled": True,
+                    "wall_ms": result.get("wall_ms", 0.0),
+                }
+            lane.record["result"] = result
+            lane.finished_mono_ns = time.monotonic_ns()
+        lane.done_event.set()
         # ── E29: canonical ledger speculative-CLIP lane-finished marker ──
         # The source-read completion boundary on the canonical axis, so the
         # serial ledger can prove whether the read finished before or after
@@ -907,6 +1038,15 @@ def active_speculative_request_id() -> str:
         return ""
 
 
+def cancelled_speculative_lane_reason(request_id: str = "") -> str:
+    """Return a scalar cancellation tombstone for demand-side fail-closed."""
+    with _LOCK:
+        reason = _CANCELLED_LANES.get(request_id) if request_id else ""
+        if not reason and request_id != _RESTORE_TIME_KEY:
+            reason = _CANCELLED_LANES.get(_RESTORE_TIME_KEY, "")
+        return str(reason or "")
+
+
 def resolve_speculative_key(request_id: str) -> str:
     """Resolve the lane key for *request_id*: the request id itself when a
     lane exists under it, else the reserved restore-time key (single-flight
@@ -924,19 +1064,40 @@ def resolve_speculative_key(request_id: str) -> str:
 def join_speculative_clip_lane(request_id: str, timeout_s: float = 60.0) -> Optional[dict[str, Any]]:
     """Join the speculative lane (if present) and return its record.
 
-    Returns None when no lane exists or the join fails — the caller then
-    runs its normal hydrator.  Never raises.
+    A timeout cancels and removes the lane.  It returns an explicit failed
+    record so the caller can fail closed; it must not start a second source
+    read while the original worker is still draining.  Never raises.
     """
     lane = get_speculative_clip_lane(request_id)
     if lane is None:
+        with _LOCK:
+            cancelled_reason = _CANCELLED_LANES.get(request_id)
+            if not cancelled_reason and request_id != _RESTORE_TIME_KEY:
+                cancelled_reason = _CANCELLED_LANES.get(_RESTORE_TIME_KEY)
+        if cancelled_reason:
+            return {
+                "ok": False,
+                "cancelled": True,
+                "reason": cancelled_reason,
+            }
         return None
     try:
-        _deadline = time.monotonic() + max(0.0, timeout_s)
-        while lane.finished_mono_ns == 0:
-            if time.monotonic() >= _deadline:
-                break
-            time.sleep(0.002)
-        return dict(lane.record) if lane.record else None
+        if lane.done_event.wait(timeout=max(0.0, timeout_s)):
+            with _LOCK:
+                return dict(lane.record) if lane.record else None
+        with _LOCK:
+            owners = _cancel_lane_locked(lane, "speculative_join_timeout")
+        cleanup = _cleanup_speculative_resources(lane, owners, [])
+        _signal_unet_release(lane)
+        result = {
+            "ok": False,
+            "cancelled": True,
+            "reason": "speculative_join_timeout",
+            "cleanup_errors": list(cleanup.get("errors") or []),
+        }
+        with _LOCK:
+            lane.record["result"] = result
+            return dict(lane.record)
     except Exception:
         return None
 
@@ -952,13 +1113,6 @@ def take_speculative_read(
     lane = get_speculative_clip_lane(request_id)
     if lane is None:
         return None
-    if lane.cancelled or not lane.owners or not lane.per_file_sds:
-        return None
-    try:
-        if not lane.record.get("result", {}).get("ok"):
-            return None
-    except Exception:
-        return None
     # Resolve the actual store key (request id, or the reserved restore-time
     # key when the lane was never re-keyed at plan receipt).
     key = request_id
@@ -970,7 +1124,13 @@ def take_speculative_read(
                 return None
         # Re-fetch under the lock; another thread may have taken it.
         lane = _LANES.get(key)
-        if lane is None or lane.cancelled or not lane.owners or not lane.per_file_sds:
+        if (
+            lane is None
+            or lane.cancelled
+            or not lane.owners
+            or not lane.per_file_sds
+            or not lane.record.get("result", {}).get("ok")
+        ):
             return None
         per_file_sds = lane.per_file_sds
         owners = lane.owners
@@ -990,18 +1150,14 @@ def close_speculative_clip_lane(request_id: str) -> None:
         key = request_id
         if key not in _LANES and _RESTORE_TIME_KEY in _LANES:
             key = _RESTORE_TIME_KEY
-        lane = _LANES.pop(key, None)
-        _RESTORE_MANIFEST_DIGESTS.pop(key, None)
-    if lane is None:
-        return
-    for loader, fb in lane.owners:
-        try:
-            loader.close()
-        except Exception:
-            pass
-    lane.owners = []
-    lane.per_file_sds = []
-    lane.cancelled = True
+        lane = _LANES.get(key)
+        if lane is None:
+            return
+        owners = _cancel_lane_locked(lane, "explicit_close")
+    cleanup = _cleanup_speculative_resources(lane, owners, [])
+    if cleanup.get("errors"):
+        with _LOCK:
+            lane.record["cleanup_errors"] = list(cleanup["errors"])
     try:
         import torch
 
@@ -1019,20 +1175,17 @@ def clear_speculative_lanes_for_test() -> None:
         close_speculative_clip_lane(rid)
     with _LOCK:
         _LANES.clear()
+        _CANCELLED_LANES.clear()
 
 
 def _drop_lane_locked(request_id: str) -> None:
-    lane = _LANES.pop(request_id, None)
-    _RESTORE_MANIFEST_DIGESTS.pop(request_id, None)
+    lane = _LANES.get(request_id)
     if lane is None:
         return
-    for loader, fb in lane.owners:
-        try:
-            loader.close()
-        except Exception:
-            pass
-    lane.owners = []
-    lane.per_file_sds = []
+    owners = _cancel_lane_locked(lane, "identity_replaced")
+    cleanup = _cleanup_speculative_resources(lane, owners, [])
+    if cleanup.get("errors"):
+        lane.record["cleanup_errors"] = list(cleanup["errors"])
     _signal_unet_release(lane)
 
 
@@ -1153,6 +1306,7 @@ def start_restore_time_clip_lane(
             started_mono_ns=time.monotonic_ns(),
             release_callback=release_callback,
         )
+        _CANCELLED_LANES.pop(key, None)
         _LANES[key] = lane
         _RESTORE_MANIFEST_DIGESTS[key] = digest
     # Restore-time lane-started telemetry.
@@ -1200,21 +1354,24 @@ def start_restore_time_clip_lane(
     def _worker() -> None:
         try:
             _run_speculative_read(lane, trace=trace)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_worker_failure(lane, exc)
         finally:
             _signal_unet_release(lane)
 
     try:
-        threading.Thread(
+        t = threading.Thread(
             target=_worker,
             daemon=True,
             name="comfymodal-restore-time-clip-hydration",
-        ).start()
+        )
+        with _LOCK:
+            lane.worker = t
+        t.start()
     except Exception:
         with _LOCK:
-            _LANES.pop(key, None)
-            _RESTORE_MANIFEST_DIGESTS.pop(key, None)
+            owners = _cancel_lane_locked(lane, "worker_start_failed")
+        _cleanup_speculative_resources(lane, owners, [])
         _signal_unet_release(lane)
         return None
     return lane
@@ -1282,13 +1439,8 @@ def reconcile_restore_time_lane(
             # the exact digest).
             if restore_digest and current_digest and restore_digest != current_digest:
                 # Manifest changed since restore: drop the stale lane.
-                for loader, fb in restore_lane.owners:
-                    try:
-                        loader.close()
-                    except Exception:
-                        pass
-                restore_lane.owners = []
-                restore_lane.per_file_sds = []
+                owners = _cancel_lane_locked(restore_lane, "manifest_changed")
+                _cleanup_speculative_resources(restore_lane, owners, [])
                 _signal_unet_release(restore_lane)
                 restore_lane = None
             else:
@@ -1339,13 +1491,8 @@ def reconcile_restore_time_lane(
         elif restore_lane is not None:
             # A non-restore lane under the reserved key: drop it (should not
             # happen; fail closed).
-            for loader, fb in restore_lane.owners:
-                try:
-                    loader.close()
-                except Exception:
-                    pass
-            restore_lane.owners = []
-            restore_lane.per_file_sds = []
+            owners = _cancel_lane_locked(restore_lane, "invalid_restore_lane")
+            _cleanup_speculative_resources(restore_lane, owners, [])
             _signal_unet_release(restore_lane)
     # No lane (or dropped): start a fresh request-time lane via the E25/E26
     # entry point (which handles all the gates + telemetry).

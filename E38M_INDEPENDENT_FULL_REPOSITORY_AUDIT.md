@@ -1,5 +1,11 @@
 # E38M — INDEPENDENT FULL REPOSITORY AUDIT
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 **Date:** 2026-08-21
 **Scope:** Exhaustive read-only independent senior-engineer audit of the `comfyui-modal` repository
 **Codebase-memory snapshot:** 45,721 nodes / 245,576 edges / 596 Python files / 8,304 functions / 1,048 files

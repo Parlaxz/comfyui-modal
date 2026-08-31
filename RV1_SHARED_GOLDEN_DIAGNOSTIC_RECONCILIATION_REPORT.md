@@ -1,5 +1,11 @@
 # RV1 Shared Golden Diagnostic Reconciliation
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical reconciliation report;
+> preserve its evidence and source-publication findings, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> semantics. Output durability is off by default; strict commit/reopen/hash
+> proof is opt-in. S4 source publication durability remains mandatory.
+
 ## Scope
 
 RV1 reconciled the completed S4, RA2B, RA3, RA6, RA7, and RA8 local work into

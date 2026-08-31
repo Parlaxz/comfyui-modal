@@ -385,7 +385,10 @@ class ConfigResolver:
 
     # -- safety -----------------------------------------------------------
 
-    def check_run_safety(self, config: ResolvedConfig, run_only: bool) -> None:
+    def check_run_safety(
+        self, config: ResolvedConfig, run_only: bool,
+        trusted_environment: dict[str, str] | None = None,
+    ) -> None:
         """Refuse run-only execution when explicit flags require a deploy.
 
         ``run_only=True``: any flag explicitly overridden at run time
@@ -397,16 +400,21 @@ class ConfigResolver:
         if not run_only:
             return
         offenders: list[str] = []
+        trusted_environment = trusted_environment or {}
         for flag in config.flags:
             if flag.source not in _EXPLICIT_SOURCES:
                 continue
-            if flag.change_requires in ("build", "deploy"):
+            if flag.change_requires in ("build", "deploy") and str(
+                trusted_environment.get(flag.name, "")
+            ) != str(flag.value):
                 offenders.append(
                     f"{flag.name}={flag.value} "
                     f"(source={flag.source}, change_requires={flag.change_requires})"
                 )
         for flag in config.unregistered:
-            if flag.source in _EXPLICIT_SOURCES:
+            if flag.source in _EXPLICIT_SOURCES and str(
+                trusted_environment.get(flag.name, "")
+            ) != str(flag.value):
                 offenders.append(
                     f"{flag.name}={flag.value} (unregistered, source={flag.source})"
                 )

@@ -1,5 +1,12 @@
 # V2 Batch E29 — Ground-Truth Critical-Path Instrumentation, Restore Map, and Gantt Repair
 
+> **SUPERSESSION NOTICE (2026-08-30):** This is a historical E29 evidence
+> record. Preserve its original findings, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> semantics: output durability is off by default; only explicit `strict`
+> requires commit/reopen/hash proof before `TRUE_FIRST_DURABLE_RESULT`. S4
+> source publication durability remains mandatory.
+
 ## CURRENT AUTHORITATIVE STATUS
 
 **E29_GROUND_TRUTH_CRITICAL_PATH = BLOCKED (evidence corrections applied, awaiting fresh artifact)**

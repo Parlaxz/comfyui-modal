@@ -1,0 +1,5 @@
+RA9C source-probe attempt
+command=python tools/v2ctl.py --profile golden_p1 --app ra9c-control-0831 source-probe
+classification=control_plane_timeout
+result=terminated after 300000 ms with no captured stdout
+note=The preceding dry-run/global-app probe reached ra9c-control-0831 and returned MATCH; this receipt-bound invocation did not complete within the timeout. Retain and do not count as a Golden request or runtime failure.

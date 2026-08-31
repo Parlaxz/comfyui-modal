@@ -926,12 +926,12 @@ class OwnerRetirementTest(unittest.TestCase):
     def test_instrumentation_validation_precedes_generation_and_owner_publish(self):
         source = inspect.getsource(hydration_wiring._try_fast_hydrate)
         hook = source.index("_e31_forward_hook(")
-        mark = source.index("_e31_mark_applied(")
+        retire = source.index("_cast_transfer.retire_owners(")
+        mark = source.index("_cast_transfer.mark_ready(")
         bind_proof = source.index('"clip_fh_cast_once_bind_proof"')
-        retire = source.index("retire_source_owners(")
-        self.assertLess(hook, mark)
+        self.assertLess(hook, retire)
+        self.assertLess(retire, mark)
         self.assertLess(mark, bind_proof)
-        self.assertLess(mark, retire)
 
 
 class RealForwardProofTest(unittest.TestCase):

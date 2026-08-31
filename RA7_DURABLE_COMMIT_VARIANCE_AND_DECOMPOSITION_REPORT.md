@@ -1,5 +1,12 @@
 # RA7 durable commit variance and decomposition report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical RA7 measurement evidence;
+> preserve its commit decomposition, but use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current generated-output
+> policy. Commit/reopen/hash proof is required only for explicit `strict`; the
+> default output endpoint is result-ready. S4 source publication durability
+> remains mandatory.
+
 ## Scope and local evidence
 
 RA7 is a source-and-test change only.  No Modal deployment, remote request, or

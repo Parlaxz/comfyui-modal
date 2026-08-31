@@ -1,5 +1,11 @@
 # R0 Golden Operations Hardening Report
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical R0 evidence is preserved as
+> recorded. Use `.opencode/skills/comfymodal-golden-ops/SKILL.md` and
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current operations:
+> generated-output durability is off by default and strict is opt-in. S4
+> source publication durability remains mandatory.
+
 **Verdict:** PASS — isolated remote Golden closure completed. The final
 deployment was source-verified, health-verified, and followed by a valid gate
 and five valid single-run confirmations on the same deployment identity.

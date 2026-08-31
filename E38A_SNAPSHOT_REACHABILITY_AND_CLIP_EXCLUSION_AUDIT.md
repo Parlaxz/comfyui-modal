@@ -1,5 +1,11 @@
 # E38A — Snapshot Reachability, CLIP Weight Exclusion, and Lean-Snapshot Preflight Audit
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 Date: 2026-08-21
 Scope: current local dirty checkout of `comfyui-modal` (E31–E37 uncommitted state authoritative). Read-only audit; no source, test, profile, or deployment changes were made.
 Method: 6 parallel read-only forensic lanes (reachability, lifecycle, flag chain, QD4 dependencies, duplication/quiescence/artifacts, official Modal docs) + orchestrator spot-verification of every pivotal citation.

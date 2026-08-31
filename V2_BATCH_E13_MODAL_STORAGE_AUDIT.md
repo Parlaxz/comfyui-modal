@@ -1,5 +1,12 @@
 # Batch E13: Modal Storage Topology and Volume v2 Audit
 
+> **SUPERSESSION NOTICE (2026-08-30):** This is a historical storage audit;
+> its observations remain historical truth. Do not use any generated-output
+> durability wording here as current policy. Current output durability is off
+> by default and strict is opt-in; see
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`. S4 source publication
+> durability remains mandatory.
+
 **Date:** 2026-08-16  
 **Scope:** repository audit plus current official Modal documentation research  
 **Constraints:** read-only audit; no loader changes, deploys, Modal resource creation, paid Modal runs, or commit

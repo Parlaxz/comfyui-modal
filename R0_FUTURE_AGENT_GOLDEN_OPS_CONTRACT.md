@@ -1,5 +1,11 @@
 # R0 Future-Agent Golden Operations Contract
 
+> **SUPERSESSION NOTICE (2026-08-30):** This R0 contract is historical
+> guidance for its isolated experiment. Use `.opencode/skills/comfymodal-golden-ops/SKILL.md`
+> and `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current operations:
+> generated-output durability is off by default and strict is opt-in. S4
+> source publication durability remains mandatory.
+
 ## Scope
 
 This contract applies to the isolated R0 experiment app only:

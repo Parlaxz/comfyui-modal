@@ -1,5 +1,11 @@
 # Golden Path Plan — Aug 26, 2026
 
+> **SUPERSESSION NOTICE (2026-08-30):** This plan remains a historical design
+> record, not the current generated-output policy. Use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`: output durability is off by
+> default and strict commit/reopen/hash proof is opt-in. S4 source publication
+> durability remains mandatory.
+
 > **Purpose:** Authoritative scope and engineering contract for the ComfyUI Modal **Serial Golden Path** work.
 >
 > This file is written so a fresh implementation/audit agent can understand the target without access to prior conversation history.

@@ -4,20 +4,21 @@ Scope (binding spec: ``.slim/deepwork/p1-serial-golden-v1.md``, Phase 1 Oracle
 gate CONDITIONAL GO for Writer A):
 
 * This module owns ALL ComfyModal-specific Golden v1 logic.  It imports only
-  stdlib, third-party packages (torch/PIL/numpy/modal), and upstream ComfyUI
-  modules (``nodes``, ``folder_paths``, ``execution``, ``comfy.*``,
-  ``comfy_execution.*``).  It MUST NOT import any ``comfymodal_runtime.*``
-  module (including relative imports), ``comfyapp``, ``modal_app``, or any
-  golden/timing/profiler/residency/preload/speculative helper module.
+  stdlib, third-party packages (torch/PIL/numpy/modal), the narrow canonical
+  output-durability policy module, and upstream ComfyUI modules (``nodes``,
+  ``folder_paths``, ``execution``, ``comfy.*``, ``comfy_execution.*``).  The
+  opt-in QD dispatcher is loaded lazily through the focused transport seam;
+  this module MUST NOT import ``comfyapp``, ``modal_app``, or any broad
+  golden/timing/profiler/residency/preload/speculative helper stack.
 * :func:`golden_serial_execute` is the one obvious explicit top-level entry
   point.  Its body visibly calls the stages in the exact required order:
   REAL RESTORE -> ``golden_request_setup`` -> ``golden_clip_load`` ->
   ``golden_clip_forward`` -> ``golden_unet_load`` ->
   ``golden_sampler_prepare`` -> ``golden_vae_load`` -> ``golden_sampling`` ->
   ``golden_sampler_tail`` -> ``golden_vae_decode`` ->
-  ``golden_output`` -> ``golden_durable_commit`` -> committed-object
-  reopen/stat/read/hash verification -> true-durable mark ->
-  ``golden_teardown``.
+  ``golden_output`` -> (strict-only ``golden_durable_commit``) -> committed-object
+  reopen/stat/read/hash verification -> true-durable mark -> ``golden_teardown``;
+  off mode marks ``FIRST_RESULT_READY`` instead.
 * No cross-stage overlap, no unowned callbacks/futures/event buses/background
   prefetch.  The opt-in P4-6 diagnostic uses only reversible existing sampler
   callbacks/model hooks and never participates in workflow execution.  Internal
@@ -37,8 +38,10 @@ semantics through a narrow Golden-owned driver (never
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import contextlib
+import contextvars
 import dataclasses
 import hashlib
 import importlib
@@ -58,6 +61,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import torch
+
+# Loaded through the stdlib import mechanism so the Golden module remains
+# compatible with its direct file-based loader; this is the one permitted
+# project-local dependency, owning the generic runtime selector.
+_OUTPUT_DURABILITY = importlib.import_module(
+    "comfymodal_runtime.output_durability"
+)
+ConfigurationError = _OUTPUT_DURABILITY.ConfigurationError
+ReadyOutputArtifact = _OUTPUT_DURABILITY.ReadyOutputArtifact
+resolve_output_durability = _OUTPUT_DURABILITY.resolve_output_durability
 
 LOG = logging.getLogger("comfymodal_runtime.golden_serial")
 
@@ -83,6 +96,19 @@ GOLDEN_SAMPLING_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_SAMPLING_DIAGNOSTICS"
 # Cross-stage transport/CLIP/VAE diagnostics are deliberately separate from
 # RA6's sampling selector.  The normal Golden path must not pay for them.
 GOLDEN_STAGE_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"
+# QD transport is an explicit experiment selector, deliberately independent
+# from stage diagnostics.  ``legacy`` remains the byte-for-byte control arm.
+GOLDEN_QD_TRANSPORT_ENV = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
+_GOLDEN_QD_ARM_CONTEXT: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "golden_qd_transport_arm", default=None
+)
+
+# RA9H CLIP residency is a request-local view of the already-registered loader
+# selector.  Do not add a Golden-only alias: the canonical V2 flag is the one
+# source of truth when the request does not supply a test/request override.
+CLIP_FP32_CAST_ONCE_ENV = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
+CLIP_RESIDENCY_MODES = ("bf16", "fp32_cast_once")
+_CLIP_TOKENIZER_KEYS = {"spiece_model", "tekken_model", "tokenizer_json"}
 
 # Public Golden request selector.  This is deliberately request-local; it is
 # not a process/global ComfyUI attention switch.
@@ -90,6 +116,168 @@ ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 
 GOLDEN_QD = 4
 GOLDEN_BLOCK_BYTES = 32 * 1024 * 1024
+
+
+def golden_qd_transport_arm(value: Optional[str] = None) -> str:
+    """Resolve the request's explicit QD transport arm.
+
+    The dispatcher module is imported lazily so the legacy Golden module keeps
+    its existing self-contained import surface and does not make the
+    experiment module part of the control arm's import path.
+    """
+    transport = importlib.import_module("comfymodal_runtime.golden_qd_transport")
+    selected = value
+    if selected is None:
+        selected = _GOLDEN_QD_ARM_CONTEXT.get()
+    if selected is None:
+        selected = os.environ.get(GOLDEN_QD_TRANSPORT_ENV)
+    return str(transport.normalize_transport_arm(selected))
+
+
+@contextlib.contextmanager
+def _golden_qd_transport_arm_scope(arm: str):
+    token = _GOLDEN_QD_ARM_CONTEXT.set(str(arm))
+    try:
+        yield
+    finally:
+        _GOLDEN_QD_ARM_CONTEXT.reset(token)
+
+
+def normalize_clip_residency(value: Any) -> str:
+    """Normalize the frozen CLIP residency selector and fail closed."""
+    if not isinstance(value, str):
+        raise ValueError("golden_clip_residency_must_be_string")
+    selected = value.strip().lower()
+    if selected not in CLIP_RESIDENCY_MODES:
+        raise ValueError(
+            "golden_clip_residency_invalid:"
+            f"{value!r}; allowed={','.join(CLIP_RESIDENCY_MODES)}"
+        )
+    return selected
+
+
+def resolve_clip_residency(value: Optional[str] = None) -> str:
+    """Resolve CLIP residency once at the request boundary.
+
+    An omitted selector uses the canonical environment arm; an absent or
+    invalid environment value follows the established safe BF16 control path.
+    """
+    if value is not None:
+        return normalize_clip_residency(value)
+    # Match the established env_flag contract: absent and explicit false-like
+    # values select the BF16 control, while true-like values opt in.  Unknown
+    # explicit values are safely false under that canonical parser.
+    raw = os.environ.get(CLIP_FP32_CAST_ONCE_ENV)
+    enabled = raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
+    return "fp32_cast_once" if enabled else "bf16"
+
+
+_RA9H_TELEMETRY_FIELDS = (
+    "clip_residency_requested",
+    "clip_residency_effective",
+    "cast_once_attempted",
+    "cast_once_applied",
+    "cast_once_fallback",
+    "fallback_reason",
+    "cast_once_fallback_reason",
+    "source_generation_identity",
+    "selected_tensor_count",
+    "source_dtype",
+    "resident_dtype",
+    "compute_dtype",
+    "expected_device",
+    "cast_destination_bytes",
+    "adopted_parameter_count",
+    "adopted_storage_proven",
+    "source_refs_dropped",
+    "source_owner_retired",
+    "clip_load_total_ms",
+    "cast_once_transform_ms",
+    "cast_once_bind_ms",
+    "cast_once_proof_ms",
+    "clip_forward_total_ms",
+)
+
+
+def _new_ra9h_telemetry(requested: str = "bf16") -> dict[str, Any]:
+    """Return the bounded, flat RA9H request/run telemetry contract."""
+    return {
+        "clip_residency_requested": requested,
+        "clip_residency_effective": requested,
+        "cast_once_attempted": False,
+        "cast_once_applied": False,
+        "cast_once_fallback": False,
+        "fallback_reason": None,
+        "cast_once_fallback_reason": None,
+        "source_generation_identity": None,
+        "selected_tensor_count": None,
+        "source_dtype": None,
+        "resident_dtype": None,
+        "compute_dtype": None,
+        "expected_device": None,
+        "cast_destination_bytes": None,
+        "adopted_parameter_count": None,
+        "adopted_storage_proven": None,
+        "source_refs_dropped": "NOT RUN",
+        "source_owner_retired": "NOT RUN",
+        "clip_load_total_ms": None,
+        "cast_once_transform_ms": None,
+        "cast_once_bind_ms": None,
+        "cast_once_proof_ms": None,
+        "clip_forward_total_ms": None,
+    }
+
+
+def _bounded_telemetry_value(value: Any) -> Any:
+    """Keep the flat request record scalar/metadata-only."""
+    if value is None or isinstance(value, (str, int, bool, float)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _bounded_telemetry_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bounded_telemetry_value(item) for item in value]
+    return f"<{type(value).__module__}.{type(value).__name__}>"
+
+
+def _generation_identity(identity: Any) -> dict[str, Any]:
+    """Keep only the bounded identity portion out of the named flat fields."""
+    metadata = identity.metadata() if callable(getattr(identity, "metadata", None)) else identity
+    if not isinstance(metadata, Mapping):
+        return {}
+    return {
+        str(key): _bounded_telemetry_value(value)
+        for key, value in metadata.items()
+        if str(key) in {
+            "checkpoint_identity", "manifest_generation", "selected_tensor_scope",
+            "target_device", "cast_policy_version", "model_patch_identity", "digest",
+        }
+    }
+
+
+def _set_ra9h_telemetry(session: Any, **updates: Any) -> None:
+    """Update request-local RA9H fields and the recorder's metadata copy."""
+    telemetry = getattr(session, "clip_residency_telemetry", None)
+    if not isinstance(telemetry, dict):
+        telemetry = _new_ra9h_telemetry(str(getattr(session, "clip_residency", "bf16")))
+        session.clip_residency_telemetry = telemetry
+    if "cast_once_fallback_reason" in updates and "fallback_reason" not in updates:
+        updates["fallback_reason"] = updates["cast_once_fallback_reason"]
+    telemetry.update({
+        key: _bounded_telemetry_value(value)
+        for key, value in updates.items()
+        if key in _RA9H_TELEMETRY_FIELDS
+    })
+    run_identity = getattr(session, "run_identity", None)
+    if isinstance(run_identity, dict):
+        run_identity.update({
+            key: telemetry[key]
+            for key in ("clip_residency_requested", "clip_residency_effective")
+        })
+    recorder = getattr(session, "recorder", None)
+    if recorder is not None:
+        recorder.clip_residency_telemetry = copy.deepcopy(telemetry)
+        if isinstance(run_identity, dict):
+            recorder.run_identity = dict(run_identity)
 
 # z_image_turbo_bf16 NextDiT intended parameter/buffer count (R42 evidence).
 EXPECTED_UNET_TENSOR_COUNT = 453
@@ -115,6 +303,7 @@ STAGE_ORDER = (
 )
 
 EVENT_TRUE_FIRST_DURABLE_RESULT = "TRUE_FIRST_DURABLE_RESULT"
+EVENT_FIRST_RESULT_READY = "FIRST_RESULT_READY"
 EVENT_RESULT_ASSEMBLED = "RESULT_ASSEMBLED"
 EVENT_TEARDOWN_COMPLETE = "TEARDOWN_COMPLETE"
 EVENT_REAL_RESTORE = "REAL_RESTORE"
@@ -246,6 +435,9 @@ class GoldenRequest:
     prompt: dict
     extra_data: dict = field(default_factory=dict)
     attention_backend: Optional[str] = None
+    # ``None`` means omitted at the public boundary and is resolved exactly
+    # once from the canonical V2 loader selector.
+    clip_residency: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.attention_backend is not None:
@@ -254,6 +446,12 @@ class GoldenRequest:
                 "attention_backend",
                 normalize_attention_backend(self.attention_backend),
             )
+        object.__setattr__(self, "clip_residency", resolve_clip_residency(self.clip_residency))
+
+    @property
+    def clip_residency_mode(self) -> str:
+        """Compatibility spelling for callers that name the field ``mode``."""
+        return str(self.clip_residency)
 
 
 class AttentionBackendValidationError(RuntimeError):
@@ -729,9 +927,17 @@ class GoldenTelemetryRecorder:
         self._events: list[dict] = []
         self._open_stage: Optional[str] = None
         self._true_durable_marked = False
+        self._first_result_ready_marked = False
         self._reopen_verified = False
         self._reopen_proof: Optional[_DurableReopenProof] = None
         self._external_restore: dict = {}
+        self.output_durability_mode = "off"
+        self.durability_requested = False
+        self.result_durable = False
+        self.clip_residency = "bf16"
+        self.clip_residency_record: dict[str, Any] = {}
+        self.clip_residency_telemetry = _new_ra9h_telemetry()
+        self.clip_forward_conversion: dict[str, Any] = {}
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
         self.seriality_violations: list[str] = []
 
@@ -742,7 +948,23 @@ class GoldenTelemetryRecorder:
         if not isinstance(metadata, dict):
             raise RuntimeError("restore_metadata_invalid_shape")
         self._external_restore = dict(metadata)
+        # The QD selector is session evidence, not a stage boundary.  It is
+        # captured when the session is constructed for compatibility with
+        # callers that inspect a fresh session, but REAL_RESTORE must remain
+        # the first event once the execution timeline begins.
+        selector_event = next(
+            (
+                event
+                for event in self._events
+                if event["name"] == "golden_qd_transport_selector"
+            ),
+            None,
+        )
+        if selector_event is not None:
+            self._events.remove(selector_event)
         self.event(EVENT_REAL_RESTORE, **dict(metadata))
+        if selector_event is not None:
+            self._events.append(selector_event)
 
     # -- stage intervals ---------------------------------------------------
 
@@ -770,6 +992,18 @@ class GoldenTelemetryRecorder:
             interval.ready_monotonic_ns = interval.end_monotonic_ns
         interval.ok = True
         interval.details.update(details)
+        telemetry = getattr(self, "clip_residency_telemetry", None)
+        if isinstance(telemetry, dict):
+            duration_ms = max(
+                0.0,
+                (int(interval.end_monotonic_ns) - int(interval.entry_monotonic_ns)) / 1_000_000.0,
+            )
+            if name == "golden_clip_load":
+                telemetry["clip_load_total_ms"] = duration_ms
+            elif name == "golden_clip_forward":
+                telemetry["clip_forward_total_ms"] = duration_ms
+            if name in {"golden_clip_load", "golden_clip_forward"}:
+                interval.details.update(copy.deepcopy(telemetry))
         self._open_stage = None
 
     def fail_stage(self, name: str, exc: BaseException, **details: Any) -> None:
@@ -779,6 +1013,27 @@ class GoldenTelemetryRecorder:
         interval.ok = False
         interval.details.update(details)
         interval.details["error"] = f"{type(exc).__name__}: {exc}"
+        telemetry = getattr(self, "clip_residency_telemetry", None)
+        if isinstance(telemetry, dict):
+            duration_ms = max(
+                0.0,
+                (int(interval.end_monotonic_ns) - int(interval.entry_monotonic_ns)) / 1_000_000.0,
+            )
+            if name == "golden_clip_load":
+                telemetry["clip_load_total_ms"] = duration_ms
+            elif name == "golden_clip_forward":
+                telemetry["clip_forward_total_ms"] = duration_ms
+            if name in {"golden_clip_load", "golden_clip_forward"}:
+                interval.details.update(copy.deepcopy(telemetry))
+        # Transport adapters may add structured evidence while preserving the
+        # public stage exception type.  Keep that evidence on the failure
+        # interval instead of reducing it to the exception string.
+        transport_telemetry = getattr(exc, "telemetry", None)
+        if isinstance(transport_telemetry, Mapping):
+            interval.details["transport_telemetry"] = copy.deepcopy(dict(transport_telemetry))
+        transport_failure = getattr(exc, "transport_failure", None)
+        if isinstance(transport_failure, Mapping):
+            interval.details["transport_failure"] = copy.deepcopy(dict(transport_failure))
         self._open_stage = None
 
     def _require_open(self, name: str) -> GoldenStageInterval:
@@ -809,6 +1064,8 @@ class GoldenTelemetryRecorder:
         )
 
     def mark_true_durable(self) -> None:
+        if getattr(self, "output_durability_mode", "off") != "strict":
+            raise RuntimeError("true_durable_requires_output_durability_strict")
         if self._true_durable_marked:
             raise RuntimeError("true_first_durable_result_already_marked")
         commit = self._intervals.get("golden_durable_commit")
@@ -818,6 +1075,7 @@ class GoldenTelemetryRecorder:
             raise RuntimeError("true_durable_requires_reopen_verification")
         marker_start_ns = self._monotonic()
         self._true_durable_marked = True
+        self.result_durable = True
         self.event(EVENT_TRUE_FIRST_DURABLE_RESULT)
         marker_end_ns = self._monotonic()
         marker_span = {
@@ -832,6 +1090,18 @@ class GoldenTelemetryRecorder:
             subspan=DURABLE_RESULT_MARKER_SUBSPAN,
             **marker_span,
         )
+
+    def mark_first_result_ready(self) -> None:
+        """Mark encoded output ready before teardown, without claiming durability."""
+        if self._first_result_ready_marked:
+            raise RuntimeError("first_result_ready_already_marked")
+        output = self._intervals.get("golden_output")
+        if output is None or output.ok is not True or output.ready_monotonic_ns is None:
+            raise RuntimeError("first_result_ready_requires_successful_output")
+        if self.output_durability_mode != "off":
+            raise RuntimeError("first_result_ready_requires_output_durability_off")
+        self._first_result_ready_marked = True
+        self.event(EVENT_FIRST_RESULT_READY)
 
     def mark_reopen_verified(self, proof: Any) -> None:
         if (
@@ -879,7 +1149,15 @@ class GoldenTelemetryRecorder:
         payload = {
             "schema": "golden_p1_telemetry_v1",
             "true_durable_marked": self._true_durable_marked,
+            "output_durability_mode": self.output_durability_mode,
+            "durability_requested": self.durability_requested,
+            "result_durable": self.result_durable,
+            "first_result_ready_marked": self._first_result_ready_marked,
             "reopen_verified": self._reopen_verified,
+            "clip_residency": self.clip_residency,
+            "clip_residency_record": dict(self.clip_residency_record),
+            "clip_residency_telemetry": copy.deepcopy(self.clip_residency_telemetry),
+            "clip_forward_conversion": dict(self.clip_forward_conversion),
             "external_restore": dict(self._external_restore),
             "seriality": reconcile,
             "stages": [
@@ -900,6 +1178,8 @@ class GoldenTelemetryRecorder:
         run_identity = getattr(self, "run_identity", None)
         if isinstance(run_identity, dict):
             payload["run_identity"] = dict(run_identity)
+        named_telemetry = copy.deepcopy(self.clip_residency_telemetry)
+        payload.update(named_telemetry)
         diagnostics = self.sampling_diagnostics
         if diagnostics is not None:
             payload["sampling_diagnostics"] = diagnostics.to_json_dict()
@@ -1173,10 +1453,20 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
     h2d_enqueue = dict(stats.get("h2d_enqueue") or {})
     h2d_gpu = dict(stats.get("h2d_gpu_event") or {})
     waits = dict(stats.get("waits_quiescence") or {})
+    experiment = dict(stats.get("dispatcher_telemetry") or {})
     return {
         "schema": "golden_qd_transport_diagnostics_v1",
         "role": stats.get("role"),
+        "execution_arm": stats.get("execution_arm", experiment.get("execution_arm", "legacy")),
         "source_bytes": stats.get("bytes_read"),
+        "source_read_count": stats.get("source_read_count"),
+        "source_open_count": stats.get("source_open_count"),
+        "header_parse_count": stats.get("header_parse_count"),
+        "duplicate_read_count": stats.get("duplicate_read_count"),
+        "owner_count": stats.get("owner_count", experiment.get("owner_count")),
+        "adoption_result": stats.get("adoption_result", experiment.get("adoption_result")),
+        "fallback_count": (stats.get("fallback") or {}).get("fallback_count", 0),
+        "fallback_reason": (stats.get("fallback") or {}).get("fallback_reason"),
         "source_open_header_layout": source,
         "staging": staging,
         "source_reads": source_reads,
@@ -1194,6 +1484,10 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "sum_is_not_wall": True,
             "wall_fields": ["source_reads.wall_ns", "h2d_enqueue.wall_ns"],
         },
+        # Dispatcher counters are already JSON-safe and retain their explicit
+        # TOTAL/PARTIAL timing scopes without promoting nested work to a stage
+        # wall.  Legacy transport has an empty object here.
+        "experiment": experiment,
     }
 
 
@@ -1822,8 +2116,10 @@ class GoldenQDOwner:
         """Release pinned staging slots only (safe while views are live)."""
         self._slots = []
 
-    def release_storage(self) -> None:
-        """Release backing storage.  Idempotent; never purges the allocator."""
+    def release_storage(self, purge_allocator: bool = False) -> None:
+        """Release backing storage; the RA9G seam supplies an explicit no-purge contract."""
+        if purge_allocator:
+            raise RuntimeError("golden_qd_owner_allocator_purge_forbidden")
         if self.closed:
             return
         self.closed = True
@@ -2181,6 +2477,281 @@ def make_zero_copy_view(gpu_buf: Any, dtype: torch.dtype, shape: list, rel_start
     return flat.view(dtype).view(tuple(shape))
 
 
+def _read_file_qd_gpu_dispatcher(
+    path: str,
+    *,
+    role: str,
+    device: Optional[str],
+    qd: int,
+    block_bytes: int,
+    diagnostics: Optional[bool],
+) -> dict:
+    """Run the opt-in dispatcher arm and adapt it to the Golden load contract.
+
+    The legacy implementation below is intentionally left intact.  This arm
+    owns only the source/H2D transport plane: Golden still creates typed views,
+    performs adoption proofs, and retains the returned CUDA backing owner at
+    the same stage boundaries as the control path.
+    """
+    transport_module = importlib.import_module("comfymodal_runtime.golden_qd_transport")
+    selected = transport_module.normalize_transport_arm("dispatcher")
+    if selected != "dispatcher":
+        raise RuntimeError(f"unexpected_dispatcher_arm:{selected}")
+    qd = max(1, min(32, int(qd)))
+    block_bytes = max(1, int(block_bytes))
+    diagnostics_enabled = stage_diagnostics_enabled() if diagnostics is None else bool(diagnostics)
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuda_unavailable")
+    dev = device or f"cuda:{torch.cuda.current_device()}"
+
+    total_start_ns = time.perf_counter_ns()
+    header_start_ns = time.perf_counter_ns()
+    parsed = parse_safetensors_header(path)
+    header_end_ns = time.perf_counter_ns()
+    if parsed.get("status") != "ok":
+        raise RuntimeError(f"header_invalid:{parsed.get('reason')}")
+    header = parsed["header"]
+    data_start = int(parsed["data_start"])
+    total = int(parsed["total_data_bytes"])
+    layout_start_ns = time.perf_counter_ns()
+    tensor_map = build_header_tensor_map(header)
+    regions = plan_source_regions(data_start, total, block_bytes, qd)
+    items = [item for region in regions for item in region]
+    coverage_ok, coverage_reason = partition_coverage(
+        [(off - data_start, off - data_start + ln) for off, ln in items], total
+    )
+    if not coverage_ok:
+        raise RuntimeError(f"coverage:{coverage_reason}")
+    layout_end_ns = time.perf_counter_ns()
+
+    gpu_buf = None
+    owner: Optional[GoldenQDOwner] = None
+    payload_fds: dict[int, int] = {}
+    payload_fd_lock = threading.Lock()
+    dispatcher = None
+    try:
+        gpu_buf = torch.empty(total, dtype=torch.uint8, device=dev)
+        staging_allocation_start_ns = time.perf_counter_ns()
+        backend = transport_module.CudaTransferBackend(gpu_buf)
+        staging_slots = max(2 * qd, 1)
+        config = transport_module.TransportConfig(
+            queue_depth=qd,
+            block_bytes=block_bytes,
+            staging_slots=staging_slots,
+            ready_queue_capacity=staging_slots,
+            producer_workers=qd,
+            capacity_class=f"qd{qd}-{block_bytes}",
+        )
+        dispatcher = transport_module.create_transport(
+            "dispatcher", config=config, backend=backend
+        )
+        staging_allocation_ns = max(0, time.perf_counter_ns() - staging_allocation_start_ns)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
+        def read_range(offset: int, length: int) -> bytes:
+            # Windows' lseek/read fallback is not safe on one shared fd.
+            thread_id = threading.get_ident()
+            with payload_fd_lock:
+                fd = payload_fds.get(thread_id)
+                if fd is None:
+                    fd = os.open(path, flags)
+                    payload_fds[thread_id] = fd
+            target = bytearray(int(length))
+            got = _read_at(fd, memoryview(target), int(offset))
+            return bytes(target[:got])
+
+        source_ranges = [
+            transport_module.SourceRange(
+                int(abs_start), int(length), int(abs_start) - data_start, index
+            )
+            for index, (abs_start, length) in enumerate(items)
+        ]
+        result = dispatcher.execute(
+            source_ranges,
+            read_range,
+            destination_size=total,
+            materialize_output=False,
+            parse_count=1,
+            owner_count=1,
+            adoption_result="transport_backing_pending",
+        )
+        dispatcher.snapshot_quiescence()
+        telemetry = dict(result.telemetry)
+        source_wall_ms = float(telemetry.get("source_wall_ms") or 0.0)
+        source_bytes = int(telemetry.get("source_bytes") or 0)
+        source_open_count = len(payload_fds)
+        source_gbps = (
+            source_bytes / max(source_wall_ms * 1_000_000.0, 1.0)
+            if source_wall_ms > 0 else None
+        )
+        records = []
+        for record in result.records:
+            records.append({
+                "worker_id": None,
+                "off": int(record.source_offset),
+                "planned_len": int(record.nbytes),
+                "read_len": int(record.nbytes),
+                "slot_index": None,
+                "h2d_submitted_bytes": int(record.nbytes),
+                "h2d_completed_bytes": int(record.nbytes),
+                "error": None,
+            })
+        h2d_bytes = int(result.completed_bytes)
+        dispatcher_stats = {
+            **telemetry,
+            "execution_arm": "dispatcher",
+            "total_entry_to_return_wall_ms": telemetry.get("total_entry_to_return_wall_ms"),
+            "source_bytes": source_bytes,
+            "source_read_count": int(telemetry.get("source_read_count") or 0),
+            "source_open_count": source_open_count,
+            "h2d_submitted_bytes": int(result.submitted_bytes),
+            "h2d_completed_bytes": h2d_bytes,
+            "owner_count": 1,
+            "adoption_result": "transport_backing_pending",
+        }
+        stats = {
+            "kind": "golden_qd_read",
+            "role": str(role),
+            "status": "ok",
+            "execution_arm": "dispatcher",
+            "configured_qd": qd,
+            "block_bytes": int(block_bytes),
+            "file_bytes": total,
+            "planned_block_count": len(items),
+            "submitted_block_count": len(records),
+            "completed_block_count": len(records),
+            "bytes_read": source_bytes,
+            "source_read_count": int(telemetry.get("source_read_count") or 0),
+            "source_read_bytes": source_bytes,
+            "h2d_submitted_bytes": int(result.submitted_bytes),
+            "h2d_completed_bytes": h2d_bytes,
+            "qd_source_io_wall_ms": source_wall_ms,
+            "qd_source_gbps": source_gbps,
+            "effective_source_gbps": source_gbps,
+            "effective_h2d_gbps": None,
+            "max_inflight": max(telemetry.get("source_qd_depth_samples") or [0]),
+            "pinned_bytes": int(staging_slots * block_bytes),
+            "gpu_bytes": total,
+            "buffer_pool_wait_ms": float(telemetry.get("producer_capacity_block_wall_ms") or 0.0),
+            "source_open_header_layout": {
+                "header_layout_ns": max(0, header_end_ns - header_start_ns),
+                "header_layout_ms": (header_end_ns - header_start_ns) / 1e6,
+                "source_open_ns": None,
+                "source_open_ms": None,
+                "tensor_layout_ns": max(0, layout_end_ns - layout_start_ns),
+                "tensor_layout_ms": (layout_end_ns - layout_start_ns) / 1e6,
+            },
+            "staging": {
+                "allocation_count": staging_slots,
+                "allocated_bytes": staging_slots * block_bytes,
+                "reuse_count": max(0, len(items) - staging_slots),
+                "retained_bytes": 0,
+                "allocation_ns": staging_allocation_ns,
+                "retained_by": "request_dispatcher_pool_until_quiescence",
+            },
+            "source_reads": {
+                "bytes": source_bytes,
+                "copy_count": int(telemetry.get("source_read_count") or 0),
+                "wall_ns": int(float(telemetry.get("source_wall_ms") or 0.0) * 1e6),
+                "timing_scope": "TOTAL nested source workers; may overlap",
+            },
+            "cpu_to_pinned_staging": {
+                "bytes": source_bytes,
+                "copy_count": int(telemetry.get("source_read_count") or 0),
+                "duration_ns": None,
+                "duration_ms": None,
+                "timing_scope": "UNKNOWN CPU-to-pinned copy duration is not measured",
+            },
+            "h2d_enqueue": {
+                "bytes": int(result.submitted_bytes),
+                "copy_count": int(telemetry.get("h2d_submitted_count") or 0),
+                "timing_scope": "PARTIAL dispatcher issue interval; no device duration inferred",
+            },
+            "h2d_gpu_event": {
+                "duration_ns": None,
+                "duration_ms": None,
+                "copy_count": int(telemetry.get("h2d_completed_count") or 0),
+                "bytes": h2d_bytes,
+                "scope": "event completion latency is reported separately",
+                "non_additive": True,
+            },
+            "waits_quiescence": {
+                "workers_joined": True,
+                "h2d_events_waited": True,
+                "copies_complete": True,
+                "operation_live": False,
+                "dispatcher_reap_count": int(telemetry.get("dispatcher_reap_count") or 0),
+                "final_drain_wall_ms": telemetry.get("final_drain_wall_ms"),
+            },
+            "quiescence": {
+                "workers_joined": True,
+                "h2d_events_waited": True,
+                "copies_complete": True,
+                "operation_live": False,
+            },
+            "coverage": {"ok": True, "reason": "ok"},
+            "record_reconciliation": {"ok": True, "reason": "ok"},
+            "fallback": {
+                "pin_fallback": 0,
+                "alignment_tensor_count": 0,
+                "fallback_count": int(telemetry.get("fallback_count") or 0),
+                "fallback_reason": telemetry.get("fallback_reason"),
+            },
+            "blocks": records,
+            "dispatcher_telemetry": dispatcher_stats,
+            "header_parse_count": 1,
+            "source_open_count": source_open_count,
+            "duplicate_read_count": int(telemetry.get("duplicate_read_count") or 0),
+            "owner_count": 1,
+            "adoption_result": "transport_backing_pending",
+            "transport_entry_ns": total_start_ns,
+        }
+        owner = GoldenQDOwner(gpu_buf, [], dev, role=role)
+        stats["owner_count"] = 1
+        stats["adoption_result"] = "backing_owner_retained_for_adoption"
+        views: dict[str, Any] = {}
+        for key, dtype_str, shape, rel_start, length in tensor_map:
+            dtype = _TORCH_DTYPE.get(dtype_str)
+            if dtype is None:
+                raise RuntimeError(f"unsupported_dtype:{key}:{dtype_str}")
+            views[key] = make_zero_copy_view(
+                gpu_buf, dtype, shape, rel_start, length
+            )
+        return {
+            "status": "ok",
+            "sd": views,
+            "owner": owner,
+            "stats": stats,
+            "tensor_map": tensor_map,
+            "header_metadata": header.get("__metadata__"),
+        }
+    except BaseException as exc:
+        if owner is not None:
+            try:
+                owner.release_storage()
+            except Exception:
+                pass
+        wrapped = RuntimeError(
+            f"golden_qd_transport_failed[{role}]:{type(exc).__name__}:{str(exc)[:200]}"
+        )
+        telemetry = getattr(exc, "telemetry", None)
+        if isinstance(telemetry, Mapping):
+            wrapped.telemetry = copy.deepcopy(dict(telemetry))
+        transport_failure = getattr(exc, "to_dict", None)
+        if callable(transport_failure):
+            try:
+                wrapped.transport_failure = copy.deepcopy(transport_failure())
+            except Exception:
+                pass
+        raise wrapped from exc
+    finally:
+        for fd in tuple(payload_fds.values()):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
 def read_file_qd_gpu(
     path: str,
     *,
@@ -2189,6 +2760,7 @@ def read_file_qd_gpu(
     qd: int = GOLDEN_QD,
     block_bytes: int = GOLDEN_BLOCK_BYTES,
     diagnostics: Optional[bool] = None,
+    transport_arm: Optional[str] = None,
 ) -> dict:
     """Single-source QD physical transport: parse header -> plan -> four source
     workers (one fd each, two pinned slots each) -> positioned reads -> async
@@ -2202,6 +2774,15 @@ def read_file_qd_gpu(
     or any reconciliation error.  There is NO pin fallback, NO alignment-copy
     fallback, and NO reread.
     """
+    if golden_qd_transport_arm(transport_arm) == "dispatcher":
+        return _read_file_qd_gpu_dispatcher(
+            path,
+            role=role,
+            device=device,
+            qd=qd,
+            block_bytes=block_bytes,
+            diagnostics=diagnostics,
+        )
     qd = max(1, min(32, int(qd)))
     block_bytes = max(1, int(block_bytes))
     diagnostics_enabled = (
@@ -2982,6 +3563,22 @@ class GoldenFinalResult:
     telemetry_persist_ms: Optional[float] = None
     attention_backend: Optional[str] = None
     run_identity: dict = field(default_factory=dict)
+    output_durability_mode: str = "off"
+    durability_requested: bool = False
+    result_durable: Optional[bool] = None
+    filename: str = ""
+    mime_type: str = "image/png"
+    byte_count: int = 0
+    width: int = 0
+    height: int = 0
+    output_node_id: str = ""
+    image_data: str = ""
+
+    def __post_init__(self) -> None:
+        # Keep manually constructed historical strict results compatible while
+        # making the serialized field unambiguous for new callers.
+        if self.result_durable is None:
+            self.result_durable = bool(self.true_durable)
 
     @property
     def restore_metadata(self) -> dict:
@@ -3011,6 +3608,16 @@ class GoldenSession:
     ):
         self.request = request
         self.contract = contract or GoldenWorkflowContract()
+        # Capture the transport arm in request evidence.  Missing external
+        # bookkeeping does not gate execution; an invalid runtime selector does.
+        self.qd_transport_arm = golden_qd_transport_arm()
+        self.clip_residency = resolve_clip_residency(request.clip_residency)
+        # Snapshot the authoritative identity at request construction so a
+        # caller cannot mutate extra_data between setup and CLIP load.
+        self.clip_source_identity = _ra9h_authoritative_identity(self)
+        self.output_durability_policy = resolve_output_durability()
+        self.output_durability_mode = self.output_durability_policy.mode
+        self.durability_requested = self.output_durability_policy.durability_requested
         if isinstance(volume, GoldenVolumeHandle):
             self.volume = volume.handle
             self.volume_mount_root = str(volume.volume_mount_root)
@@ -3041,6 +3648,18 @@ class GoldenSession:
             raise RuntimeError("restore_metadata_invalid_shape")
         self.restore_metadata = dict(supplied_restore or {})
         self.recorder = GoldenTelemetryRecorder()
+        self.recorder.output_durability_mode = self.output_durability_mode
+        self.recorder.durability_requested = self.durability_requested
+        self.recorder.clip_residency = self.clip_residency
+        self.clip_residency_telemetry = _new_ra9h_telemetry(self.clip_residency)
+        if self.clip_source_identity:
+            self.clip_residency_telemetry["source_generation_identity"] = _bounded_telemetry_value(
+                self.clip_source_identity
+            )
+            self.clip_residency_telemetry["expected_device"] = self.clip_source_identity.get(
+                "target_device"
+            )
+        self.recorder.clip_residency_telemetry = copy.deepcopy(self.clip_residency_telemetry)
         # P4-6 is completely absent from the default path: no hooks, callback
         # wrappers, CacheDiT inspection, or extra telemetry events are created.
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
@@ -3056,6 +3675,10 @@ class GoldenSession:
         self.clip_owner: Optional[GoldenQDOwner] = None
         # One retained QD owner PER checkpoint (canonical spec has exactly one).
         self.clip_owners: list = []
+        # Transaction visibility begins at transport success, before a later
+        # checkpoint/constructor/adoption can fail.  Teardown consults this
+        # registry rather than waiting for the all-checkpoints assignment.
+        self.qd_transaction_owners: list[GoldenQDOwner] = []
         # CLIP compute-scope proof is deliberately separate from the wrapper
         # root.  Small constructor-owned extras (for example logit_scale) are
         # not part of compute readiness.
@@ -3065,6 +3688,12 @@ class GoldenSession:
         self.clip_forward_timing: dict = {}
         self.clip_load_page_faults: dict = {}
         self.clip_forward_page_faults: dict = {}
+        # RA9H state is request-local.  Only scalar/metadata records survive
+        # the transfer; the transfer object itself is cleared after cleanup.
+        self.clip_ownership_transfer: Any = None
+        self.clip_ownership_transfer_record: dict = {}
+        self.clip_residency_record: dict = {}
+        self.clip_forward_conversion: dict = {}
         self.conditioning: Any = None
         self.patcher: Any = None
         self.unet_owner: Optional[GoldenQDOwner] = None
@@ -3072,6 +3701,7 @@ class GoldenSession:
         self.vae_owner: Optional[GoldenQDOwner] = None
         self.images: Any = None
         self.pending_durability: Optional[PendingDurability] = None
+        self.output_artifact: Optional[ReadyOutputArtifact] = None
         self.final_result: Optional[GoldenFinalResult] = None
         self.telemetry_persist_ms: Optional[float] = None
         self.restore_baseline: dict = {}
@@ -3079,27 +3709,100 @@ class GoldenSession:
             "request_id": str(request.request_id),
             "workflow_sha256": canonical_workflow_sha256(request.prompt),
             "attention_backend": request.attention_backend,
+            "qd_transport_arm": self.qd_transport_arm,
+            "clip_residency": self.clip_residency,
+            "clip_residency_requested": self.clip_residency,
+            "clip_residency_effective": self.clip_residency,
+            "clip_source_identity_supplied": bool(self.clip_source_identity),
         }
+        self.recorder.event("golden_qd_transport_selector", arm=self.qd_transport_arm)
         self.recorder.run_identity = dict(self.run_identity)
 
+    def register_qd_owner(self, owner: GoldenQDOwner) -> None:
+        """Make a successful transport owner cleanup-visible immediately."""
+        if not isinstance(owner, GoldenQDOwner):
+            raise RuntimeError("qd_owner_invalid")
+        owners = getattr(self, "qd_transaction_owners", None)
+        if owners is None:
+            owners = []
+            self.qd_transaction_owners = owners
+        if not any(existing is owner for existing in owners):
+            owners.append(owner)
+
+    def cleanup_clip_ownership_transfer(self) -> None:
+        """Release an incomplete RA9H transfer without masking the primary error."""
+        transfer = getattr(self, "clip_ownership_transfer", None)
+        if transfer is None:
+            return
+        try:
+            state = str(getattr(transfer, "state", ""))
+            if state != "READY":
+                record = transfer.release()
+                self.recorder.event("clip_fp32_cast_once_cleanup", **dict(record))
+        finally:
+            self.clip_ownership_transfer = None
+
     def build_final_result(self) -> GoldenFinalResult:
+        output_mode = getattr(self, "output_durability_mode", "off")
+        durability_requested = bool(
+            getattr(self, "durability_requested", False)
+        )
         pending = self.pending_durability
-        if pending is None or not pending.committed:
-            raise RuntimeError("final_result_requires_committed_pending_durability")
-        if not self.recorder.true_durable_marked:
-            raise RuntimeError("final_result_requires_true_durable_mark")
+        artifact = getattr(self, "output_artifact", None)
+        if output_mode == "strict":
+            if pending is None or not pending.committed:
+                raise RuntimeError("final_result_requires_committed_pending_durability")
+            if not self.recorder.true_durable_marked:
+                raise RuntimeError("final_result_requires_true_durable_mark")
+            image_sha256 = pending.sha256
+            asset_path = pending.asset_abs_path
+            volume_rel_path = pending.volume_rel_path
+            filename = os.path.basename(pending.asset_abs_path)
+            mime_type = "image/png"
+            byte_count = pending.byte_count
+            width = 0
+            height = 0
+            output_node_id = str(getattr(self, "output_node_id", ""))
+            image_data = ""
+            result_durable = True
+        else:
+            if artifact is None:
+                raise RuntimeError("final_result_requires_ready_output_artifact")
+            if not self.recorder._first_result_ready_marked:
+                raise RuntimeError("final_result_requires_first_result_ready")
+            image_sha256 = artifact.sha256
+            asset_path = ""
+            volume_rel_path = ""
+            filename = artifact.filename
+            mime_type = artifact.mime_type
+            byte_count = artifact.byte_count
+            width = artifact.width
+            height = artifact.height
+            output_node_id = str(getattr(self, "output_node_id", ""))
+            image_data = base64.b64encode(artifact.raw_bytes).decode("ascii")
+            result_durable = False
         reconcile = self.recorder.reconcile_seriality()
         return GoldenFinalResult(
             request_id=self.request.request_id,
-            image_sha256=pending.sha256,
-            asset_path=pending.asset_abs_path,
-            volume_rel_path=pending.volume_rel_path,
-            true_durable=True,
+            image_sha256=image_sha256,
+            asset_path=asset_path,
+            volume_rel_path=volume_rel_path,
+            true_durable=result_durable,
             seriality_violation_count=int(reconcile["count"]),
             executed_nodes=list(self.runner.executed_summary()) if self.runner else [],
             restore_observation=dict(getattr(self.recorder, "_external_restore", {})),
             attention_backend=self.request.attention_backend,
             run_identity=dict(getattr(self, "run_identity", {})),
+            output_durability_mode=output_mode,
+            durability_requested=durability_requested,
+            result_durable=result_durable,
+            filename=filename,
+            mime_type=mime_type,
+            byte_count=byte_count,
+            width=width,
+            height=height,
+            output_node_id=output_node_id,
+            image_data=image_data,
         )
 
 
@@ -3874,6 +4577,7 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             ready=True,
             request_id=session.request.request_id,
             attention_backend=session.request.attention_backend,
+            clip_residency=getattr(session, "clip_residency", "bf16"),
             run_identity=dict(getattr(session, "run_identity", {})),
             node_count=len(session.request.prompt),
             actual_workflow_sha256=actual_sha,
@@ -4335,6 +5039,128 @@ def _clip_forward_wrappers(
                 pass
 
 
+def _ra9h_clip_module() -> Any:
+    """Load only the RA9G ownership seam, and only when requested."""
+    return importlib.import_module("comfymodal_runtime.clip_fp32_cast_once")
+
+
+def _ra9h_manifest_for_transport(transport: Mapping[str, Any], file_index: int) -> dict[str, Any]:
+    """Build tensor facts from the already-parsed transport view.
+
+    This is not source identity generation.  Identity fields must come from
+    the authoritative request/model manifest and are added separately.
+    """
+    state_dict = transport.get("sd")
+    if not isinstance(state_dict, Mapping):
+        raise RuntimeError(f"clip_fp32_manifest_state_dict_missing:{file_index}")
+    model_keys = [str(key) for key in state_dict if str(key) not in {"spiece_model", "tekken_model", "tokenizer_json"}]
+    if not model_keys:
+        raise RuntimeError(f"clip_fp32_manifest_empty:{file_index}")
+    dtypes = {str(getattr(state_dict[key], "dtype", "")) for key in state_dict if str(key) in model_keys}
+    if len(dtypes) != 1:
+        raise RuntimeError(f"clip_fp32_manifest_non_uniform_dtype:{file_index}")
+    return {
+        "file_index": int(file_index),
+        "dtype": next(iter(dtypes)),
+        "key_set": model_keys,
+        "key_shapes": {
+            key: [int(dim) for dim in getattr(state_dict[key], "shape", ())]
+            for key in model_keys
+        },
+    }
+
+
+def _ra9h_authoritative_identity(session: GoldenSession) -> dict[str, Any]:
+    """Read identity supplied by the request/model authority, never invent it."""
+    candidates: list[Any] = [getattr(session, "clip_source_identity", None)]
+    extra = getattr(getattr(session, "request", None), "extra_data", {}) or {}
+    if isinstance(extra, Mapping):
+        candidates.extend((extra.get("clip_source_identity"), extra.get("source_identity")))
+    metadata = getattr(session, "clip_source_metadata", None)
+    candidates.append(metadata)
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            return {
+                str(key): value
+                for key, value in candidate.items()
+                if str(key) in {
+                    "checkpoint_identity", "checkpoint_id", "source_identity", "checkpoint_hash",
+                    "stable_hash", "manifest_generation", "content_generation", "manifest_digest",
+                    "generation", "digest", "selected_tensor_scope", "tensor_scope", "selected_scope",
+                    "scope", "model_patch_identity", "patch_identity", "model_identity", "target_device",
+                    "cast_policy_version",
+                }
+            }
+    return {}
+
+
+@contextlib.contextmanager
+def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
+    """Observe actual ``cast_to`` allocations without synchronizing CUDA.
+
+    The wrapper counts only a new tensor returned by the existing Comfy cast
+    seam.  If that seam cannot be installed, the result is NOT RUN rather than
+    a synthetic zero.  Installation is scoped to the real CLIP forward and is
+    restored on every outcome.
+    """
+    record: dict[str, Any] = {
+        "status": "NOT RUN",
+        "reason": "disabled" if not enabled else "unavailable",
+        "conversion_count": None,
+        "destination_bytes": None,
+        "source_bytes": None,
+        "instrumentation_scope": "actual_comfy_cast_to_returned_tensor",
+        "timing_scope": "NOT RUN",
+        "synchronization": "none",
+    }
+    if not enabled:
+        yield record
+        return
+    try:
+        management = importlib.import_module("comfy.model_management")
+        original = getattr(management, "cast_to", None)
+    except Exception as exc:
+        record["reason"] = f"instrumentation_install_failed:{type(exc).__name__}"
+        yield record
+        return
+    if not callable(original):
+        yield record
+        return
+    count = 0
+    source_bytes = 0
+    destination_bytes = 0
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        nonlocal count, source_bytes, destination_bytes
+        result = original(*args, **kwargs)
+        tensor = args[0] if args else None
+        if (
+            isinstance(tensor, torch.Tensor)
+            and isinstance(result, torch.Tensor)
+            and result is not tensor
+            and (tensor.dtype != result.dtype or tensor.device != result.device)
+        ):
+            count += 1
+            source_bytes += int(tensor.numel() * tensor.element_size())
+            destination_bytes += int(result.numel() * result.element_size())
+        return result
+
+    try:
+        setattr(management, "cast_to", wrapped)
+    except Exception as exc:
+        record["reason"] = f"instrumentation_install_failed:{type(exc).__name__}"
+        yield record
+        return
+    record.update({"status": "RUN", "reason": "installed", "conversion_count": 0, "destination_bytes": 0, "source_bytes": 0, "timing_scope": "TOTAL actual forward cast_to observation"})
+    try:
+        yield record
+    finally:
+        try:
+            setattr(management, "cast_to", original)
+        finally:
+            record.update({"conversion_count": count, "destination_bytes": destination_bytes, "source_bytes": source_bytes})
+
+
 async def golden_clip_load(session: GoldenSession) -> Any:
     """Load CLIP via the contract's :class:`ClipLoadSpec` and the real
     upstream constructor.
@@ -4360,7 +5186,10 @@ async def golden_clip_load(session: GoldenSession) -> Any:
     the generic scope selector over the combined cond_stage_model against the
     UNION of all checkpoints' view pointers.  A non-dynamic patcher
     (disable_offload wrapper) is rejected with a clear marker rather than
-    silently accepting copies.  No fallback of any kind is permitted.
+    silently accepting copies.  If the explicitly requested cast-once arm
+    cannot establish its identity or transfer proof, the already-transported
+    source is used for an observable BF16 fallback; no reread or second H2D is
+    permitted.
     """
     rec = session.recorder
     rec.begin_stage("golden_clip_load")
@@ -4368,9 +5197,35 @@ async def golden_clip_load(session: GoldenSession) -> Any:
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
     transports: list[dict] = []
     clip_timing = _ClipTiming(enabled=diagnostics_enabled)
+    clip_transfer: Any = None
+    transformed_state_dicts: Optional[list[dict]] = None
+    residency = getattr(session, "clip_residency", "bf16")
     try:
         contract = session.contract
         spec = contract.clip_spec or CANONICAL_CLIP_SPEC
+        request = getattr(session, "request", None)
+        residency = resolve_clip_residency(
+            getattr(request, "clip_residency", residency)
+        )
+        session.clip_residency = residency
+        session.clip_residency_record = {
+            "requested": residency,
+            "actual": "bf16" if residency == "bf16" else "NOT RUN",
+            "fallback": False,
+            "status": "CONTROL" if residency == "bf16" else "REQUESTED",
+        }
+        session.recorder.clip_residency_record = dict(session.clip_residency_record)
+        _set_ra9h_telemetry(
+            session,
+            clip_residency_requested=residency,
+            clip_residency_effective=residency,
+            cast_once_attempted=residency == "fp32_cast_once",
+            cast_once_applied=False,
+            cast_once_fallback=False,
+            cast_once_fallback_reason=None,
+            source_refs_dropped=("NOT RUN" if residency == "bf16" else False),
+            source_owner_retired=("NOT RUN" if residency == "bf16" else False),
+        )
         if str(spec.dtype_policy) != "uniform":
             raise RuntimeError(f"clip_dtype_policy_unsupported:{spec.dtype_policy}")
         if not session.clip_paths:
@@ -4382,10 +5237,15 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         for index, path in enumerate(session.clip_paths):
             role = "clip" if len(session.clip_paths) == 1 else f"clip{index}"
             with clip_timing.span("source_open_read", boundary_kind="host_observed"):
-                transport = read_file_qd_gpu(
-                    path, role=role, qd=contract.qd, block_bytes=contract.block_bytes
-                )
+                with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
+                    transport = read_file_qd_gpu(
+                        path,
+                        role=role,
+                        qd=contract.qd,
+                        block_bytes=contract.block_bytes,
+                    )
             transports.append(transport)
+            session.register_qd_owner(transport["owner"])
             state_dicts.append(transport["sd"])
             stats = transport.get("stats") or {}
             source_layout = stats.get("source_open_header_layout") or {}
@@ -4437,6 +5297,130 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         owners = [t["owner"] for t in transports]
         session.clip_owners = owners
         session.clip_owner = owners[0]
+        source_state_dict_count = len(state_dicts)
+        source_tensor_count = sum(
+            sum(1 for key in sd if str(key) not in _CLIP_TOKENIZER_KEYS)
+            for sd in state_dicts
+        )
+        authoritative = _ra9h_authoritative_identity(session)
+        if authoritative:
+            _set_ra9h_telemetry(
+                session,
+                source_generation_identity={
+                    str(key): value for key, value in authoritative.items()
+                    if key in {
+                        "checkpoint_identity", "checkpoint_id", "source_identity",
+                        "checkpoint_hash", "stable_hash", "manifest_generation",
+                        "content_generation", "manifest_digest", "generation", "digest",
+                        "selected_tensor_scope", "tensor_scope", "selected_scope", "scope",
+                        "model_patch_identity", "patch_identity", "model_identity", "target_device",
+                    }
+                },
+                selected_tensor_count=source_tensor_count,
+            )
+        source_dtype = uniform_source_dtype_across(state_dicts, tag="clip_source")
+        _set_ra9h_telemetry(session, source_dtype=str(source_dtype))
+
+        if residency == "fp32_cast_once":
+            # RA9G owns the source and transformed mappings from this point
+            # until the actual bind, proof, and source-reference retirement.
+            ra9g = _ra9h_clip_module()
+            try:
+                manifests = [
+                    _ra9h_manifest_for_transport(transport, index)
+                    for index, transport in enumerate(transports)
+                ]
+                authoritative = _ra9h_authoritative_identity(session)
+                identity = ra9g.build_source_manifest_identity(
+                    manifests,
+                    identity=authoritative,
+                    target_device=authoritative.get("target_device"),
+                    cast_policy_version=str(authoritative.get("cast_policy_version", "ra9g-fp32-v1")),
+                )
+                session.run_identity["clip_source_identity_digest"] = identity.digest
+                session.recorder.run_identity = dict(session.run_identity)
+                clip_transfer = ra9g.construct_ownership_transfer(
+                    state_dicts,
+                    owners,
+                    manifests,
+                    identity=identity,
+                    strict=True,
+                )
+                session.clip_ownership_transfer = clip_transfer
+                transform_started_ns = time.perf_counter_ns()
+                transformed_state_dicts, transform_record = clip_transfer.transform_once()
+                transform_record = {
+                    **dict(transform_record),
+                    "timing_scope": "TOTAL transform_once host wall",
+                    "host_wall_ns": max(0, time.perf_counter_ns() - transform_started_ns),
+                    "status": "TOTAL",
+                }
+                session.clip_residency_record.update({
+                    # Transformation alone is not application.  The effective
+                    # arm remains unproven until bind, proof, and retirement
+                    # all reach READY below.
+                    "actual": "NOT RUN",
+                    "status": "TRANSFORMED_UNBOUND",
+                    "identity": identity.metadata(),
+                    "transform": transform_record,
+                })
+                session.recorder.clip_residency_record = dict(session.clip_residency_record)
+                _set_ra9h_telemetry(
+                    session,
+                    source_generation_identity=_generation_identity(identity),
+                    selected_tensor_count=len(identity.expected_keys),
+                    source_dtype=str(next(iter(identity.expected_dtypes))[1]),
+                    expected_device=identity.target_device,
+                    cast_destination_bytes=transform_record.get("destination_bytes"),
+                    cast_once_transform_ms=(
+                        float(transform_record["host_wall_ns"]) / 1_000_000.0
+                        if transform_record.get("host_wall_ns") is not None else None
+                    ),
+                )
+                rec.event("clip_fp32_cast_once_transform", **transform_record)
+            except Exception as exc:
+                # The BF16 source is already in hand.  A missing/invalid
+                # authoritative identity may therefore take the explicit
+                # ordinary path without a reread or second H2D.  The fallback
+                # is surfaced and the requested experimental arm is never
+                # reported as successful.
+                if clip_transfer is not None:
+                    # Do not retire the source owner here: the ordinary BF16
+                    # bind below still consumes these already-transported
+                    # views.  Session teardown remains the cleanup owner.
+                    clip_transfer = None
+                    session.clip_ownership_transfer = None
+                transformed_state_dicts = state_dicts
+                session.clip_residency_record.update({
+                    "actual": "bf16",
+                    "status": "FALLBACK",
+                    "fallback": True,
+                    "fallback_reason": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "timing": {"transform_once": "NOT RUN"},
+                })
+                session.recorder.clip_residency_record = dict(session.clip_residency_record)
+                _set_ra9h_telemetry(
+                    session,
+                    clip_residency_effective="bf16",
+                    cast_once_applied=False,
+                    cast_once_fallback=True,
+                    cast_once_fallback_reason=f"{type(exc).__name__}: {str(exc)[:240]}",
+                    resident_dtype=None,
+                    compute_dtype=None,
+                    cast_destination_bytes=None,
+                    cast_once_transform_ms=None,
+                )
+                rec.event(
+                    "clip_fp32_cast_once_fallback",
+                    requested="fp32_cast_once",
+                    actual="bf16",
+                    fallback=True,
+                    fallback_reason=str(exc)[:240],
+                )
+        else:
+            # Do not touch the existing BF16 state dicts or loader arguments in
+            # the control arm.
+            transformed_state_dicts = state_dicts
 
         import comfy.sd  # upstream ComfyUI module (allowed import)
         import folder_paths
@@ -4451,7 +5435,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         # dict, allowing Comfy to derive dtype and load/offload devices.  The
         # initial-device override is deliberately a scoped seam below rather
         # than a model option (which would change native policy selection).
-        uniform_source_dtype_across(state_dicts, tag="clip")
+        resident_dtype = uniform_source_dtype_across(transformed_state_dicts, tag="clip")
         model_options = {}
         if spec.model_options_overrides:
             model_options.update(dict(spec.model_options_overrides))
@@ -4477,7 +5461,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             # key mutations inside load_text_encoder_state_dicts.
             with clip_timing.span("skeleton_patcher_construction"):
                 clip = comfy.sd.load_text_encoder_state_dicts(
-                    [dict(sd) for sd in state_dicts],
+                    [dict(sd) for sd in transformed_state_dicts],
                     embedding_directory=embedding_directory,
                     clip_type=clip_type_value,
                     model_options=model_options,
@@ -4515,9 +5499,50 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         # every checkpoint's tensors are accounted and any copied/missing/
         # unused view fails closed.
         combined_views: dict[str, Any] = {}
-        for index, sd in enumerate(state_dicts):
+        for index, sd in enumerate(transformed_state_dicts):
             for key, view in sd.items():
                 combined_views[f"[{index}]{key}"] = view
+        bind_started_ns = time.perf_counter_ns() if clip_transfer is not None else None
+        if clip_transfer is not None:
+            # This is the actual post-loader destination, not the transformed
+            # mapping.  The receipt is built before any source owner cleanup.
+            ra9g = _ra9h_clip_module()
+            actual_destination = ra9g.actual_bind_destination_map(
+                clip, clip_transfer.identity.expected_keys
+            )
+            receipt = ra9g.build_actual_bind_receipt(
+                clip, actual_destination, clip_transfer.identity, assign=True
+            )
+            clip_transfer.acknowledge_actual_bind(
+                actual_destination, receipt=receipt, assign=True, clip=clip
+            )
+            bind_end_ns = time.perf_counter_ns()
+            _set_ra9h_telemetry(
+                session,
+                cast_once_bind_ms=(
+                    float(max(0, bind_end_ns - bind_started_ns)) / 1_000_000.0
+                    if bind_started_ns is not None else None
+                ),
+            )
+            proof_started_ns = time.perf_counter_ns()
+            transfer_proof = clip_transfer.prove_storage(
+                expected_device=clip_transfer.identity.target_device
+            )
+            session.clip_residency_record.update({
+                "actual_bind_receipt": receipt,
+                "storage_proof": transfer_proof,
+                "timing": {
+                    "transform_once": "TOTAL",
+                    "actual_bind_receipt": "PARTIAL post-loader destination receipt",
+                    "storage_proof": "TOTAL RA9G prove_storage boundary",
+                },
+            })
+            session.recorder.clip_residency_record = dict(session.clip_residency_record)
+            rec.event(
+                "clip_fp32_cast_once_actual_bind",
+                receipt=receipt,
+                storage_proof=transfer_proof,
+            )
         with clip_timing.span("storage_adoption"):
             adoption = select_and_validate_qd_adoption_scope("clip", cond_model, combined_views)
         selected_scope = next(
@@ -4533,11 +5558,95 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             )
         if not compute_identity["compute_ready"]:
             raise RuntimeError(f"clip_compute_scope_not_ready:{compute_identity}")
+        if clip_transfer is not None:
+            # Keep source mappings and their owner alive through BOTH RA9G's
+            # storage proof and Golden's generic adoption proof.  Only then is
+            # it safe to drop mappings, prove source-free storage, and retire.
+            clip_transfer.drop_source_references(
+                receipt={"source_refs_dropped": True, "identity_digest": clip_transfer.identity.digest}
+            )
+            source_free_proof = clip_transfer.source_free_storage_proof(
+                actual_destination,
+                expected_device=clip_transfer.identity.target_device,
+            )
+            proof_end_ns = time.perf_counter_ns()
+            # The transport result also retains the source view dictionaries.
+            # Remove every caller-owned source mapping before releasing the
+            # backing owner; transformed FP32 maps are independent storage.
+            for transport in transports:
+                transport["sd"] = {}
+            state_dicts.clear()
+            clip_transfer.retire_owners()
+            ready_record = clip_transfer.mark_ready(clip)
+            session.clip_ownership_transfer_record = clip_transfer.snapshot()
+            session.clip_residency_record.update({
+                "source_free_storage_proof": source_free_proof,
+                "owner_cleanup": ready_record,
+                "source_refs_dropped_before_owner_retirement": True,
+                "status": "READY",
+            })
+            session.recorder.clip_residency_record = dict(session.clip_residency_record)
+            _set_ra9h_telemetry(
+                session,
+                clip_residency_effective="fp32_cast_once",
+                cast_once_attempted=True,
+                cast_once_applied=True,
+                cast_once_fallback=False,
+                cast_once_fallback_reason=None,
+                source_generation_identity=_generation_identity(clip_transfer.identity),
+                selected_tensor_count=len(clip_transfer.identity.expected_keys),
+                source_dtype=str(source_dtype),
+                resident_dtype="torch.float32",
+                compute_dtype=str(compute_identity["compute_scope_dtype"]),
+                expected_device=clip_transfer.identity.target_device,
+                cast_destination_bytes=clip_transfer.snapshot().get("destination_bytes"),
+                adopted_parameter_count=len(clip_transfer.identity.expected_keys),
+                adopted_storage_proven=True,
+                source_refs_dropped=True,
+                source_owner_retired=True,
+                cast_once_proof_ms=(
+                    float(max(0, proof_end_ns - proof_started_ns)) / 1_000_000.0
+                    if proof_started_ns is not None else None
+                ),
+            )
+            rec.event(
+                "clip_fp32_cast_once_ready",
+                source_free_storage_proof=source_free_proof,
+                owner_cleanup=ready_record,
+                source_refs_dropped_before_owner_retirement=True,
+            )
+            # The model owns the adopted FP32 storage now.  Drop every
+            # request-local mapping/container that still points at source or
+            # transformed tensors before leaving the load stage.
+            combined_views.clear()
+            state_dicts.clear()
+            if transformed_state_dicts is not None:
+                transformed_state_dicts.clear()
+            for transport in transports:
+                transport["sd"] = {}
+            session.clip_ownership_transfer = None
         session.clip_compute_scope = selected_scope
         session.clip_compute_scope_identity = dict(compute_identity)
+        if clip_transfer is None:
+            _set_ra9h_telemetry(
+                session,
+                clip_residency_effective="bf16",
+                source_dtype=str(source_dtype),
+                resident_dtype=str(compute_identity["compute_scope_dtype"]),
+                compute_dtype=str(compute_identity["compute_scope_dtype"]),
+                expected_device=str(compute_identity["compute_scope_device"]),
+                adopted_parameter_count=adoption.get(
+                    "matched_count", adoption.get("tensor_count")
+                ),
+                adopted_storage_proven=bool(
+                    compute_identity.get("compute_scope_storage_proven")
+                ),
+                source_refs_dropped="NOT RUN",
+                source_owner_retired="NOT RUN",
+            )
         rec.event(
             "clip_adoption_identity",
-            state_dict_count=len(state_dicts),
+            state_dict_count=source_state_dict_count,
             **adoption,
             compute_scope_device=compute_identity["compute_scope_device"],
             compute_scope_dtype=compute_identity["compute_scope_dtype"],
@@ -4545,7 +5654,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         )
         rec.event(
             "clip_published",
-            tensor_count=sum(len(sd) for sd in state_dicts),
+            tensor_count=source_tensor_count,
             compute_scope_device=compute_identity["compute_scope_device"],
             compute_scope_dtype=compute_identity["compute_scope_dtype"],
             compute_scope_storage_proven=compute_identity["compute_scope_storage_proven"],
@@ -4574,7 +5683,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             "golden_clip_load",
             ready=True,
             usable=True,
-            published=sum(len(sd) for sd in state_dicts),
+            published=source_tensor_count,
             compute_scope_device=compute_identity["compute_scope_device"],
             compute_scope_dtype=compute_identity["compute_scope_dtype"],
             compute_scope_storage_proven=compute_identity["compute_scope_storage_proven"],
@@ -4586,7 +5695,10 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             owner_retained=True,
             clip_name=[n for n in spec.checkpoint_names],
             clip_type=spec.clip_type,
-            state_dict_count=len(state_dicts),
+            state_dict_count=source_state_dict_count,
+            clip_residency=getattr(session, "clip_residency", "bf16"),
+            clip_residency_record=dict(getattr(session, "clip_residency_record", {})),
+            ownership_transfer=dict(getattr(session, "clip_ownership_transfer_record", {})),
             selected_scope=adoption["selected_scope"],
             source_read_count=sum(int(t["stats"]["source_read_count"]) for t in transports),
             h2d_completed_bytes=sum(int(t["stats"]["h2d_completed_bytes"]) for t in transports),
@@ -4595,12 +5707,50 @@ async def golden_clip_load(session: GoldenSession) -> Any:
                 {
                     "clip_load_timing": session.clip_load_timing,
                     "clip_page_faults": clip_page_faults,
+                    "transport_stats": [
+                        build_qd_transport_diagnostics(t["stats"]) for t in transports
+                    ],
                 }
-                if diagnostics_enabled else {}
+                if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") == "dispatcher" else {}
             ),
         )
         return clip
     except BaseException as exc:
+        if residency == "fp32_cast_once":
+            session.clip_residency_record = {
+                **dict(getattr(session, "clip_residency_record", {})),
+                "requested": "fp32_cast_once",
+                "actual": "NOT RUN",
+                "status": "FAILED",
+                "fallback": True,
+                "fallback_reason": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+            session.recorder.clip_residency_record = dict(session.clip_residency_record)
+            _set_ra9h_telemetry(
+                session,
+                clip_residency_effective="NOT RUN",
+                cast_once_attempted=True,
+                cast_once_applied=False,
+                cast_once_fallback=True,
+                cast_once_fallback_reason=f"{type(exc).__name__}: {str(exc)[:240]}",
+                resident_dtype=None,
+                compute_dtype=None,
+                expected_device=None,
+                adopted_parameter_count=None,
+                adopted_storage_proven=None,
+                source_refs_dropped=False,
+                source_owner_retired=False,
+                cast_destination_bytes=None,
+                cast_once_bind_ms=None,
+                cast_once_proof_ms=None,
+            )
+            rec.event(
+                "clip_fp32_cast_once_fallback",
+                requested="fp32_cast_once",
+                actual="NOT RUN",
+                fallback=True,
+                reason=str(exc)[:240],
+            )
         clip_page_faults = (
             _clip_page_faults_summary(
                 "golden_clip_load", clip_page_fault_start, _clip_page_fault_snapshot()
@@ -4633,6 +5783,7 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
     diagnostics_enabled = stage_diagnostics_enabled()
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
     clip_timing = _ClipTiming(enabled=diagnostics_enabled)
+    conversion_telemetry: Optional[dict[str, Any]] = None
     try:
         runner = session.runner
         if runner is None:
@@ -4666,25 +5817,33 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
         )
         runner.begin_scope({"clip_forward"})
         try:
-            with _clip_qwen_forward_hooks(
-                scope,
-                clip_timing,
-                lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
-                    "status": "unproven", "reason": "compute_scope_missing"
-                },
-                recorder=rec,
-                enabled=diagnostics_enabled,
-            ):
-                with _clip_forward_wrappers(
-                    session.clip,
+            with _ra9h_forward_conversion_instrumentation(
+                enabled=(
+                    diagnostics_enabled
+                    and
+                    (getattr(session, "clip_residency_record", {}) or {}).get("actual")
+                    in {"bf16", "fp32_cast_once"}
+                )
+            ) as conversion_telemetry:
+                with _clip_qwen_forward_hooks(
+                    scope,
                     clip_timing,
                     lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
                         "status": "unproven", "reason": "compute_scope_missing"
                     },
+                    recorder=rec,
                     enabled=diagnostics_enabled,
                 ):
-                    with clip_timing.span("clip_graph_node_wrapper"):
-                        executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
+                    with _clip_forward_wrappers(
+                        session.clip,
+                        clip_timing,
+                        lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
+                            "status": "unproven", "reason": "compute_scope_missing"
+                        },
+                        enabled=diagnostics_enabled,
+                    ):
+                        with clip_timing.span("clip_graph_node_wrapper"):
+                            executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
         finally:
             runner.end_scope()
         qwen_forwards = list(getattr(clip_timing, "qwen_forwards", []))
@@ -4698,6 +5857,10 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             )
         with clip_timing.span("clip_post_forward_sync_wait"):
             _assert_runner_quiescence(runner)
+        if conversion_telemetry is not None:
+            session.clip_forward_conversion = dict(conversion_telemetry)
+            session.recorder.clip_forward_conversion = dict(conversion_telemetry)
+            rec.event("clip_forward_conversion_instrumentation", **conversion_telemetry)
         encode_classes = [sc for _n, _c, sc in executed if sc == "clip_forward"]
         if not encode_classes:
             raise RuntimeError("clip_encode_node_did_not_execute")
@@ -4756,6 +5919,9 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             clip_forward_nodes=len(encode_classes),
             executed_nodes=[nid for nid, _cls, _sc in runner.executed_summary()],
             cache_status="not_used",
+            conversion_instrumentation=(
+                dict(conversion_telemetry) if conversion_telemetry is not None else "NOT RUN"
+            ),
         )
         rec.end_stage(
             "golden_clip_forward",
@@ -4764,6 +5930,9 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             deferred_forward_materialization=materialization,
             repeated_cast_work="UNPROVEN",
             cache_status="not_used",
+            conversion_instrumentation=(
+                dict(conversion_telemetry) if conversion_telemetry is not None else "NOT RUN"
+            ),
             **(
                 {
                     "clip_forward_timing": session.clip_forward_timing,
@@ -5300,14 +6469,19 @@ async def golden_unet_load(session: GoldenSession) -> Any:
 
         # The single QD physical producer into CUDA (one read, one H2D).
         reset_peak_stats()
-        transport = read_file_qd_gpu(
-            unet_path, role="unet", qd=contract.qd, block_bytes=contract.block_bytes
-        )
+        with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
+            transport = read_file_qd_gpu(
+                unet_path,
+                role="unet",
+                qd=contract.qd,
+                block_bytes=contract.block_bytes,
+            )
         views = {
             k[len(prefix):] if prefix and k.startswith(prefix) else k: v
             for k, v in transport["sd"].items()
         }
         session.unet_owner = transport["owner"]
+        session.register_qd_owner(session.unet_owner)
         after_qd = checkpoint("after_qd_destination")
         rec.event("unet_qd_owner_created", role="unet", gpu_bytes=transport["stats"]["gpu_bytes"])
         skeleton_peak_delta = None
@@ -5364,6 +6538,10 @@ async def golden_unet_load(session: GoldenSession) -> Any:
             skeleton_peak_delta_bytes=skeleton_peak_delta,
             adoption_peak_delta_bytes=adoption_peak_delta,
             peak_measurement_supported=peak_supported,
+            **(
+                {"transport_stats": build_qd_transport_diagnostics(transport["stats"])}
+                if getattr(session, "qd_transport_arm", "legacy") == "dispatcher" else {}
+            ),
         )
         return patcher
     except BaseException as exc:
@@ -5858,9 +7036,13 @@ async def golden_vae_load(session: GoldenSession) -> Any:
 
         contract = session.contract
         transport_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
-        transport = read_file_qd_gpu(
-            session.model_paths["vae"], role="vae", qd=contract.qd, block_bytes=contract.block_bytes
-        )
+        with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
+            transport = read_file_qd_gpu(
+                session.model_paths["vae"],
+                role="vae",
+                qd=contract.qd,
+                block_bytes=contract.block_bytes,
+            )
         transport_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
         if diagnostics_enabled:
             components.append({
@@ -5873,6 +7055,7 @@ async def golden_vae_load(session: GoldenSession) -> Any:
         views = transport["sd"]
         owner = transport["owner"]
         session.vae_owner = owner
+        session.register_qd_owner(owner)
         rec.event("vae_qd_owner_created", role="vae", gpu_bytes=transport["stats"]["gpu_bytes"])
 
         # Fail-closed preflight: the dynamic CoreModelPatcher must be active
@@ -5998,7 +7181,7 @@ async def golden_vae_load(session: GoldenSession) -> Any:
                     "vae_load_decomposition": decomposition,
                     "page_faults": page_faults,
                 }
-                if diagnostics_enabled else {}
+                if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") == "dispatcher" else {}
             ),
         )
         return vae
@@ -6117,7 +7300,7 @@ def _volume_rel_path_for_checked_asset(asset_path: str, mount_root: str) -> str:
     return _normalize_volume_rel_path(relative)
 
 
-async def golden_output(session: GoldenSession) -> PendingDurability:
+async def golden_output(session: GoldenSession) -> PendingDurability | ReadyOutputArtifact:
     """Level-1 PNG from the decoded Comfy IMAGE tensor with EXACT current
     upstream output encoding semantics (255*scale, clip, uint8,
     ``compress_level=1`` and no PNG metadata), atomic local write under a content-addressed
@@ -6137,6 +7320,12 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
     not a write or durability failure.
     """
     rec = session.recorder
+    # Missing mode is the documented default: direct/off fixtures must remain
+    # in-memory and must not acquire an implicit strict write path.
+    output_mode = getattr(session, "output_durability_mode", "off")
+    durability_requested = bool(
+        getattr(session, "durability_requested", False)
+    )
     rec.begin_stage("golden_output")
     try:
         import io  # stdlib
@@ -6161,6 +7350,7 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
         if len(save_nodes) != 1:
             raise RuntimeError(f"saveimage_node_ambiguous:{len(save_nodes)}")
         save_id, save_info = save_nodes[0]
+        session.output_node_id = str(save_id)
         images_link = (save_info.get("inputs") or {}).get("images")
         if not _is_link(images_link):
             raise RuntimeError("saveimage_images_link_mismatch")
@@ -6249,6 +7439,42 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
                 output_sha_match=False,
                 output_sha_warning=output_sha_warning,
             )
+        artifact = ReadyOutputArtifact(
+            raw_bytes=buf,
+            sha256=sha256,
+            byte_count=len(buf),
+            filename=f"{sha256}.png",
+            mime_type="image/png",
+            width=int(first.shape[1]),
+            height=int(first.shape[0]),
+        )
+        session.output_artifact = artifact
+        if output_mode == "off":
+            end_output_stage = rec.end_stage
+            rec.event(
+                EVENT_OUTPUT_ENCODE_DONE,
+                sha256=artifact.sha256,
+                expected_sha256=expected_sha,
+                output_sha_match=output_sha_match,
+                output_sha_warning=output_sha_warning,
+                byte_count=artifact.byte_count,
+                output_durability_mode=output_mode,
+                durability_requested=durability_requested,
+            )
+            end_output_stage(
+                "golden_output",
+                ready=True,
+                sha256=artifact.sha256,
+                expected_sha256=expected_sha,
+                output_sha_match=output_sha_match,
+                output_sha_warning=output_sha_warning,
+                byte_count=artifact.byte_count,
+                output_durability_mode=output_mode,
+                durability_requested=durability_requested,
+                result_durable=False,
+            )
+            rec.mark_first_result_ready()
+            return artifact
         out_dir = os.path.abspath(session.output_root)
         asset_path = os.path.join(out_dir, f"{sha256}.png")
         sidecar_path = os.path.join(out_dir, f"{sha256}.json")
@@ -6316,8 +7542,15 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
             expected_sha256=expected_sha,
             output_sha_match=output_sha_match,
             output_sha_warning=output_sha_warning,
+            byte_count=len(buf),
+            output_durability_mode=output_mode,
+            durability_requested=durability_requested,
         )
-        rec.event(EVENT_ASSET_WRITE_DONE, asset_path=os.path.basename(asset_path))
+        rec.event(
+            EVENT_ASSET_WRITE_DONE,
+            asset_path=os.path.basename(asset_path),
+            output_durability_mode=output_mode,
+        )
         rec.end_stage(
             "golden_output",
             ready=True,
@@ -6327,6 +7560,9 @@ async def golden_output(session: GoldenSession) -> PendingDurability:
             output_sha_warning=output_sha_warning,
             byte_count=len(buf),
             committed=False,
+            output_durability_mode=output_mode,
+            durability_requested=durability_requested,
+            result_durable=False,
         )
         return pending
     except BaseException as exc:
@@ -6557,6 +7793,8 @@ async def golden_durable_commit(
     _start_durable_subspan(timing, "pre_commit_bookkeeping", monotonic=monotonic)
     subspans_event_emitted = False
     try:
+        if getattr(recorder, "output_durability_mode", "off") != "strict":
+            raise RuntimeError("durable_commit_requires_output_durability_strict")
         if pending is None:
             raise RuntimeError("durable_commit_requires_pending_durability")
         if expected_sha256 is None:
@@ -6691,12 +7929,25 @@ async def golden_teardown(session: GoldenSession) -> dict:
     substage_timings: dict = {}
     try:
         t0 = time.monotonic_ns()
+        # RA9H transfer cleanup precedes owner staging release.  A completed
+        # transfer has already retired its source owner and is metadata-only;
+        # incomplete transfers still own source mappings/handles here.
+        session.cleanup_clip_ownership_transfer()
+        owners: list[GoldenQDOwner] = []
         for attr in ("clip_owner", "unet_owner", "vae_owner"):
-            owner = getattr(session, attr)
+            owner = getattr(session, attr, None)
             if owner is not None:
-                owner.release_staging()
+                owners.append(owner)
         # Every per-checkpoint CLIP owner (release_staging is idempotent).
-        for owner in session.clip_owners:
+        owners.extend(getattr(session, "clip_owners", []))
+        # Include owners as soon as transport succeeds, including unpublished
+        # earlier CLIP checkpoints when a later checkpoint or adoption fails.
+        owners.extend(getattr(session, "qd_transaction_owners", []))
+        seen_owner_ids: set[int] = set()
+        for owner in owners:
+            if id(owner) in seen_owner_ids:
+                continue
+            seen_owner_ids.add(id(owner))
             owner.release_staging()
         substage_timings["owner_staging_release_ms"] = (time.monotonic_ns() - t0) / 1e6
 
@@ -6785,11 +8036,12 @@ async def golden_serial_execute(
     ``TEARDOWN_COMPLETE`` is recorded after teardown END, then final telemetry
     is persisted once as separate post-teardown application work measured by
     ``telemetry_persist_ms``.
-    Durability is strictly:
-    commit -> reopen/stat/read/hash the committed object -> verify byte
-    count and SHA from the REOPENED bytes against the pending record (the
-    configured output expectation is warning-only) -> TRUE_FIRST_DURABLE_RESULT
-    -> RESULT_ASSEMBLED.
+    In strict mode durability is:
+    commit -> reopen/stat/read/hash the committed object -> verify byte count
+    and SHA from the REOPENED bytes against the pending record (the configured
+    output expectation is warning-only) -> TRUE_FIRST_DURABLE_RESULT ->
+    RESULT_ASSEMBLED.  In off mode the encoded bytes are validated in memory,
+    FIRST_RESULT_READY is emitted, and the commit stage is absent.
     ``snapshot_proof`` is retained as an optional reusable helper input for
     compatibility, but request teardown does not invoke it.
     """
@@ -6807,6 +8059,10 @@ async def golden_serial_execute(
     )
     primary_error: Optional[BaseException] = None
     teardown_error: Optional[BaseException] = None
+    # The selector is request state, not live process configuration.  Keep the
+    # arm captured by GoldenSession in this task's context for every stage
+    # read, even if the environment changes mid-request.
+    transport_arm_token = _GOLDEN_QD_ARM_CONTEXT.set(session.qd_transport_arm)
     try:
         await golden_restore(session)
         await golden_request_setup(session)
@@ -6819,13 +8075,14 @@ async def golden_serial_execute(
         await golden_sampler_tail(session)
         await golden_vae_decode(session)
         await golden_output(session)
-        await golden_durable_commit(
-            session.volume_contract or session.volume,
-            session.pending_durability,
-            session.recorder,
-            expected_sha256=session.contract.expected_output_png_sha256,
-        )
-        session.recorder.mark_true_durable()
+        if session.output_durability_mode == "strict":
+            await golden_durable_commit(
+                session.volume_contract or session.volume,
+                session.pending_durability,
+                session.recorder,
+                expected_sha256=session.contract.expected_output_png_sha256,
+            )
+            session.recorder.mark_true_durable()
         result = session.build_final_result()
         session.recorder.event(EVENT_RESULT_ASSEMBLED, request_id=request.request_id)
     except BaseException as exc:
@@ -6846,6 +8103,8 @@ async def golden_serial_execute(
             teardown_error = exc
         else:
             session.recorder.event(EVENT_TEARDOWN_COMPLETE, request_id=request.request_id)
+    finally:
+        _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
 
     # This is the sole final telemetry write for either outcome.  On success
     # it necessarily follows TEARDOWN_COMPLETE; on failure it preserves the
@@ -6879,9 +8138,16 @@ __all__ = [
     "GOLDEN_QD",
     "GOLDEN_SAMPLING_DIAGNOSTICS_ENV",
     "GOLDEN_STAGE_DIAGNOSTICS_ENV",
+    "GOLDEN_QD_TRANSPORT_ENV",
+    "CLIP_FP32_CAST_ONCE_ENV",
+    "CLIP_RESIDENCY_MODES",
     "DURABLE_COMMIT_BLOCKING_NOTE",
     "DURABLE_COMMIT_SUBSPAN_NAMES",
     "DURABLE_RESULT_MARKER_SUBSPAN",
+    "EVENT_FIRST_RESULT_READY",
+    "ConfigurationError",
+    "ReadyOutputArtifact",
+    "resolve_output_durability",
     "EVENT_DURABLE_RESULT_MARKER_PUBLICATION",
     "STAGE_ORDER",
     "ClipLoadSpec",
@@ -6897,6 +8163,9 @@ __all__ = [
     "GoldenVolumeHandle",
     "PendingDurability",
     "canonical_workflow_sha256",
+    "golden_qd_transport_arm",
+    "normalize_clip_residency",
+    "resolve_clip_residency",
     "stage_diagnostics_enabled",
     "attention_backend_scope",
     "aggregate_timing_intervals",

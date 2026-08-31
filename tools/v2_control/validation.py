@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import re
 import inspect
 import uuid
@@ -46,9 +47,96 @@ except ImportError:  # pragma: no cover - direct tools-script fallback
     except ImportError:  # pragma: no cover - package-relative fallback
         from ..golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
 
+try:  # Canonical runtime selector; validation remains usable without runtime deps.
+    from comfymodal_runtime.output_durability import (
+        ConfigurationError as _RuntimeOutputDurabilityConfigurationError,
+        resolve_output_durability as _runtime_resolve_output_durability,
+    )
+except Exception:  # pragma: no cover - stdlib-only/control-plane fallback
+    _RuntimeOutputDurabilityConfigurationError = None
+    _runtime_resolve_output_durability = None
+
 LOG = logging.getLogger("v2ctl.validation")
 
 _GATE_SCHEMA_VERSION = 1
+
+
+def _receipt_value(receipt: Any, name: str, default: Any = "") -> Any:
+    if receipt is None:
+        return default
+    if isinstance(receipt, dict):
+        return receipt.get(name, default)
+    return getattr(receipt, name, default)
+
+
+def _bind_receipt_environment(extra_env: dict[str, str], receipt: Any) -> dict[str, str]:
+    if receipt is None:
+        return extra_env
+    validator = getattr(receipt, "validate", None)
+    if callable(validator):
+        validator()
+    values = _receipt_value(receipt, "effective_environment", {})
+    if not isinstance(values, dict):
+        raise GateError("deployment receipt effective environment is malformed")
+    from .deployment_receipt import validate_effective_environment
+
+    effective_config = _receipt_value(receipt, "effective_config", {})
+    deploy_flags = (
+        effective_config.get("deploy_flags", {})
+        if isinstance(effective_config, dict) else {}
+    )
+    validate_effective_environment(
+        values,
+        allowed_names={str(name) for name in deploy_flags}
+        if isinstance(deploy_flags, dict) else None,
+    )
+    bound = dict(extra_env)
+    bound.update({str(k): str(v) for k, v in values.items() if v != "<redacted>"})
+    target = _receipt_value(receipt, "target", {})
+    if isinstance(target, dict):
+        for name, key in (("COMFYMODAL_V2_APP_NAME", "app"),
+                          ("COMFYMODAL_V2_CLASS_NAME", "class")):
+            if target.get(key):
+                bound[name] = str(target[key])
+    resources = _receipt_value(receipt, "deployment_identity", {})
+    resources = resources.get("resources", {}) if isinstance(resources, dict) else {}
+    if isinstance(resources, dict):
+        for env_name, resource_name in (
+            ("COMFYMODAL_V2_GPU", "gpu"),
+            ("COMFYMODAL_V2_CPU_REQUEST", "cpu"),
+            ("COMFYMODAL_V2_MEMORY_MB", "memory_mb"),
+            ("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "cpu"),
+            ("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", "memory_mb"),
+        ):
+            if resource_name in resources:
+                bound[env_name] = str(resources[resource_name])
+    deploy_fp = str(_receipt_value(receipt, "deploy_fingerprint", ""))
+    if not deploy_fp:
+        raise GateError("deployment receipt has no deployment fingerprint")
+    bound["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] = deploy_fp
+    bound["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] = deploy_fp
+    profile = str(_receipt_value(receipt, "profile", ""))
+    if profile:
+        bound["COMFYMODAL_V2CTL_PROFILE"] = profile
+    profile_fp = str(_receipt_value(receipt, "profile_config_fingerprint", ""))
+    if profile_fp:
+        bound["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = profile_fp
+    return bound
+
+
+def _bound_run_fingerprint(fingerprints: Any, receipt: Any) -> str:
+    """Keep request identity deterministic while replacing only deploy state."""
+    if receipt is None:
+        return str(fingerprints.run_fingerprint())
+    deploy_fp = str(_receipt_value(receipt, "deploy_fingerprint", ""))
+    try:
+        inputs = dict(fingerprints.run_inputs())
+        inputs["deploy_fingerprint"] = deploy_fp
+        return hashlib.sha256(
+            json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    except Exception:  # noqa: BLE001 - older test doubles expose only run_fingerprint
+        return str(fingerprints.run_fingerprint())
 
 
 # --------------------------------------------------------------------------
@@ -133,14 +221,18 @@ def mark_runtime_health_verified(
     config: Any,
     fingerprints: Any,
     captured_deploy_fingerprint: str,
+    *,
+    bound_receipt: Any | None = None,
 ) -> Path | None:
     """Mark the exact deployment proved by a successful validated run.
 
     Runtime health is deliberately independent from source identity.  Only the
     newest deployment manifest is eligible, and it must match all three target
     identity fields and the deployment fingerprint captured before execution.
-    The fingerprint is checked again immediately before writing so an old
-    successful result cannot promote a deployment created during the run.
+    For non-receipt paths, the fingerprint is checked again immediately before
+    writing so an old successful result cannot promote a deployment created
+    during the run.  Receipt-bound paths validate the matching manifest and
+    return its path without mutating the sealed ledger.
     """
     deployments = Path(repo_root) / ".v2ctl" / "deployments"
     if not deployments.is_dir():
@@ -171,8 +263,13 @@ def mark_runtime_health_verified(
         current_deploy_fingerprint = str(fingerprints.deploy_fingerprint())
     except (AttributeError, TypeError, ValueError):
         return None
-    if current_deploy_fingerprint != captured_deploy_fingerprint:
+    if bound_receipt is None and current_deploy_fingerprint != captured_deploy_fingerprint:
         return None
+
+    # A bound Golden receipt seals this deployment manifest.  Health evidence
+    # belongs to the run/gate artifacts, not to the immutable ledger.
+    if bound_receipt is not None:
+        return path
 
     manifest["runtime_health_status"] = "verified"
     try:
@@ -526,6 +623,424 @@ class ExpectedOutputShaValidator(ValidatorPlugin):
         return []
 
 
+_OUTPUT_DURABILITY_SELECTOR_KEYS = (
+    "output_durability_mode",
+    "request_output_durability_mode",
+    "output_durability",
+    "request_output_durability",
+    "durability_mode",
+)
+_OUTPUT_DURABILITY_CONFIG_FLAGS = (
+    "COMFYMODAL_OUTPUT_DURABILITY",
+    "COMFYMODAL_V2_OUTPUT_DURABILITY_MODE",
+    "COMFYMODAL_V2_REQUEST_OUTPUT_DURABILITY_MODE",
+    "COMFYMODAL_V2_OUTPUT_DURABILITY",
+    "COMFYMODAL_V2_REQUEST_OUTPUT_DURABILITY",
+)
+_OUTPUT_DURABILITY_CONFIGURATION_ERROR = (
+    "configuration error: COMFYMODAL_OUTPUT_DURABILITY must be off or strict"
+)
+
+
+def _normalize_output_durability_mode(value: Any) -> str:
+    """Apply the runtime selector contract to one explicit value.
+
+    ``off`` and an absent/empty value mean off; ``strict`` means strict.  Any
+    other non-empty value is a configuration error.  In particular, invalid
+    input is not converted to ``off``: doing that would allow a malformed
+    explicit request to pass the validator as if it had never been made.
+    """
+    normalized = str(value or "").strip().lower()
+    if not normalized or normalized == "off":
+        return "off"
+    if normalized == "strict":
+        return "strict"
+    error_type = _RuntimeOutputDurabilityConfigurationError or ValueError
+    raise error_type(_OUTPUT_DURABILITY_CONFIGURATION_ERROR)
+
+
+def _selector_from_source(source: Any) -> tuple[bool, Any]:
+    """Find an explicit selector only on known result/telemetry containers."""
+    if isinstance(source, dict):
+        for key in (*_OUTPUT_DURABILITY_SELECTOR_KEYS, *_OUTPUT_DURABILITY_CONFIG_FLAGS):
+            if key in source:
+                return True, source[key]
+        for key in (
+            "result", "data", "golden_telemetry", "telemetry", "metadata",
+            "request", "workload", "options",
+        ):
+            nested = source.get(key)
+            found, value = _selector_from_source(nested)
+            if found:
+                return True, value
+    return False, None
+
+
+def _resolve_output_durability_mode(*sources: Any, config: Any = None) -> str:
+    """Resolve request-output durability with result evidence taking priority.
+
+    Missing selectors are ``off``.  An invalid explicit selector raises the
+    same configuration error as the runtime resolver.  Config is consulted
+    only when the authoritative result surfaces do not carry a selector.
+    """
+    observed_modes: list[str] = []
+    environment_mode: str | None = None
+    environment_value = os.environ.get("COMFYMODAL_OUTPUT_DURABILITY")
+    if environment_value is not None:
+        # Validate the actual process selector even when result/config
+        # evidence is present.  Runtime would reject an invalid selector
+        # before producing that evidence.
+        environment_mode = _normalize_output_durability_mode(environment_value)
+    for source in sources:
+        found, value = _selector_from_source(source)
+        if found:
+            observed_modes.append(_normalize_output_durability_mode(value))
+    # Validate every explicit resolved-config selector even when a result
+    # surface is present.  The runtime cannot execute with an invalid config
+    # and the validator must not hide that error behind result precedence.
+    if config is not None:
+        for name in _OUTPUT_DURABILITY_CONFIG_FLAGS:
+            try:
+                flag = config.flag(name)
+            except Exception:  # noqa: BLE001 - duck-typed validation config
+                flag = None
+            if flag is not None:
+                _normalize_output_durability_mode(getattr(flag, "value", flag))
+        for flag in getattr(config, "flags", ()) or ():
+            if getattr(flag, "name", "") in _OUTPUT_DURABILITY_CONFIG_FLAGS:
+                _normalize_output_durability_mode(getattr(flag, "value", flag))
+        for name in _OUTPUT_DURABILITY_SELECTOR_KEYS:
+            value = getattr(config, name, None)
+            if value is not None:
+                _normalize_output_durability_mode(value)
+        workload = getattr(config, "workload", None)
+        if isinstance(workload, dict):
+            found, value = _selector_from_source(workload)
+            if found:
+                _normalize_output_durability_mode(value)
+    if observed_modes:
+        # Conflicting evidence fails closed.  Invalid values have already
+        # raised above, rather than being hidden by an explicit off surface.
+        return "strict" if all(mode == "strict" for mode in observed_modes) else "off"
+    if config is not None:
+        for name in _OUTPUT_DURABILITY_CONFIG_FLAGS:
+            try:
+                flag = config.flag(name)
+            except Exception:  # noqa: BLE001 - duck-typed validation config
+                flag = None
+            if flag is not None:
+                return _normalize_output_durability_mode(getattr(flag, "value", flag))
+        for flag in getattr(config, "flags", ()) or ():
+            if getattr(flag, "name", "") in _OUTPUT_DURABILITY_CONFIG_FLAGS:
+                return _normalize_output_durability_mode(getattr(flag, "value", flag))
+        for name in _OUTPUT_DURABILITY_SELECTOR_KEYS:
+            value = getattr(config, name, None)
+            if value is not None:
+                return _normalize_output_durability_mode(value)
+        workload = getattr(config, "workload", None)
+        if isinstance(workload, dict):
+            found, value = _selector_from_source(workload)
+            if found:
+                return _normalize_output_durability_mode(value)
+    if environment_mode is not None:
+        return environment_mode
+    if _runtime_resolve_output_durability is not None:
+        try:
+            return str(_runtime_resolve_output_durability().mode)
+        except Exception as exc:  # noqa: BLE001 - preserve runtime config semantics
+            raw = os.environ.get("COMFYMODAL_OUTPUT_DURABILITY")
+            error_type = _RuntimeOutputDurabilityConfigurationError or ValueError
+            if raw not in (None, ""):
+                raise error_type(_OUTPUT_DURABILITY_CONFIGURATION_ERROR) from exc
+            raise
+    return "off"
+
+
+def _output_durability_selector_present(*sources: Any, config: Any = None) -> bool:
+    for source in sources:
+        if _selector_from_source(source)[0]:
+            return True
+    # An environment selector is explicit even when it selects ``off`` (or
+    # contains an invalid value).  It must prevent selector-less historical
+    # evidence from being upgraded to strict.
+    if os.environ.get("COMFYMODAL_OUTPUT_DURABILITY") is not None:
+        return True
+    if config is not None:
+        for name in _OUTPUT_DURABILITY_CONFIG_FLAGS:
+            try:
+                if config.flag(name) is not None:
+                    return True
+            except Exception:  # noqa: BLE001 - duck-typed validation config
+                pass
+        if any(
+            getattr(flag, "name", "") in _OUTPUT_DURABILITY_CONFIG_FLAGS
+            for flag in (getattr(config, "flags", ()) or ())
+        ):
+            return True
+        if any(getattr(config, name, None) is not None for name in _OUTPUT_DURABILITY_SELECTOR_KEYS):
+            return True
+        workload = getattr(config, "workload", None)
+        if isinstance(workload, dict) and _selector_from_source(workload)[0]:
+            return True
+    return False
+
+
+# Public spelling for callers that want to share the exact parser without
+# importing any runtime/model-loading code.
+resolve_output_durability_mode = _resolve_output_durability_mode
+
+
+def _output_proof_truthy(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key in ("ok", "valid", "verified", "ready", "complete", "success"):
+            if key in value:
+                return _output_proof_truthy(value[key])
+        if any(value.get(key) for key in ("asset_id", "output_sha", "content_sha256", "sha256")):
+            return True
+        status = str(value.get("status", "")).strip().lower()
+        return status in {"ready", "complete", "completed", "ok", "success", "valid"}
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "1", "true", "yes", "on", "ok", "ready", "complete", "completed", "success", "valid",
+        }
+    return value is True
+
+
+def _result_ready_proof(*sources: Any) -> Any:
+    keys = (
+        "result_ready", "result_ready_proof", "result_ready_marked",
+        "first_result_ready", "first_result_ready_marked",
+    )
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            if key in source:
+                return source[key]
+        for key in ("result", "data", "golden_telemetry", "telemetry", "metadata"):
+            value = _result_ready_proof(source.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _durability_context_is_distinct_publication(context: tuple[str, ...]) -> bool:
+    """Keep unrelated S4/publication commits out of the output gate.
+
+    The control plane can carry several ledgers in one artifact.  A commit in
+    an explicitly named S4/publication container is not generated-output
+    durability evidence; an ``output_*`` container remains authoritative even
+    when it also mentions publication.
+    """
+    joined = "_".join(context)
+    publication_index = next(
+        (index for index, token in enumerate(context)
+         if "publication" in token or "published" in token or token == "s4"),
+        None,
+    )
+    if publication_index is None:
+        return False
+    publication = any(token in joined for token in ("publication", "published"))
+    s4 = "s4" in joined
+    # Only the path leading into the named publication branch determines
+    # whether it is distinct.  ``s4_publication.fsync`` is still distinct;
+    # ``output_publication.fsync`` is generated-output persistence.
+    parent = "_".join(context[:publication_index])
+    generated_output = any(
+        token in parent
+        for token in ("output", "asset", "durable", "sidecar", "fsync")
+    )
+    return (publication or s4) and not generated_output
+
+
+def _durability_key_kind(key: Any) -> str | None:
+    normalized = str(key).strip().lower().replace("-", "_")
+    if normalized in {"true_durable", "true_durable_marked", "result_durable"}:
+        return "true_durable"
+    if normalized in {"pending_durability", "pendingdurability", "durability_invoked",
+                      "output_durability_invoked"}:
+        return "pending_durability"
+    if normalized in {"asset_write", "asset_write_done", "output_asset_write",
+                      "output_asset_write_ms", "file_written", "output_file_written"}:
+        return "asset_write"
+    if normalized in {"fsync", "output_fsync", "asset_fsync", "output_fsync_ms"}:
+        return "fsync"
+    if "sidecar" in normalized:
+        return "sidecar"
+    if normalized in {"commit", "volume_commit", "volume_commit_start",
+                      "volume_commit_complete", "output_commit"}:
+        return "commit"
+    if normalized in {"reopen", "reopen_verified", "durable_reopen",
+                      "durable_reopen_verified"}:
+        return "reopen"
+    if normalized in {"true_first_durable_result", "first_durable_result"}:
+        return "true_first"
+    if normalized == "output_durability":
+        return "pending_durability"
+    if "asset_write" in normalized or normalized.endswith("file_written"):
+        return "asset_write"
+    if "fsync" in normalized:
+        return "fsync"
+    if "sidecar" in normalized:
+        return "sidecar"
+    if "pending_durability" in normalized or "durable_commit" in normalized:
+        return "pending_durability" if "pending" in normalized else "commit"
+    if "durable_reopen" in normalized:
+        return "reopen"
+    if "true_first_durable_result" in normalized:
+        return "true_first"
+    return None
+
+
+def _durability_claim_value(value: Any, kind: str) -> bool:
+    """Whether a field is positive persistence evidence (rather than absent)."""
+    if kind in {"commit", "reopen", "true_first"} and value not in (None, False, "", 0):
+        return True
+    if isinstance(value, dict):
+        # A structured operation record is evidence unless it explicitly says
+        # that the operation was skipped/false.
+        for key in ("ok", "success", "completed", "performed", "invoked", "enabled"):
+            if key in value:
+                return _output_proof_truthy(value[key])
+        status = str(value.get("status", "")).strip().lower()
+        if status in {"skipped", "not_run", "disabled", "false", "off"}:
+            return False
+        return True
+    return _output_proof_truthy(value) or (
+        kind in {"asset_write", "fsync", "sidecar", "pending_durability"}
+        and value not in (None, False, "", 0, 0.0)
+    )
+
+
+def _golden_durability_claimed(*sources: Any) -> bool:
+    """Detect generated-output persistence work without treating absent evidence as 0ms."""
+    def visit(value: Any, context: tuple[str, ...] = ()) -> bool:
+        if isinstance(value, dict):
+            name = str(value.get("name", "")).strip().lower().replace("-", "_")
+            if name and not _durability_context_is_distinct_publication(context + (name,)):
+                name_kind = _durability_key_kind(name)
+                if name_kind is not None:
+                    return True
+                if any(token in name for token in (
+                    "durable_commit", "durable_reopen", "output_persist",
+                    "asset_write", "output_fsync", "sidecar",
+                )):
+                    return True
+            for key, child in value.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                child_context = context + (normalized,)
+                if _durability_context_is_distinct_publication(child_context):
+                    continue
+                if normalized not in _OUTPUT_DURABILITY_SELECTOR_KEYS:
+                    kind = _durability_key_kind(normalized)
+                    if kind is not None and _durability_claim_value(child, kind):
+                        return True
+                if visit(child, child_context):
+                    return True
+        elif isinstance(value, list):
+            return any(visit(item, context) for item in value)
+        return False
+
+    for source in sources:
+        if visit(source):
+            return True
+    return False
+
+
+def _historical_pre_selector_strict(*sources: Any) -> bool:
+    """Recognize only the old, explicitly durable ledger shape.
+
+    Before RA7B there was no selector.  Such artifacts remain readable only
+    when their canonical ledger contains the old strict endpoint and positive
+    durability evidence; an arbitrary selector-less result is not upgraded to
+    strict merely because it lacks a field.
+    """
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        ledger = source.get("canonical_ledger")
+        if isinstance(ledger, dict) and str(ledger.get("endpoint_status", "")).lower() == "ok":
+            serial = ledger.get("serial_ledger")
+            if isinstance(serial, dict) or _golden_durability_claimed(source):
+                return True
+        if (
+            (source.get("true_durable") is True or source.get("true_durable_marked") is True)
+            and source.get("reopen_verified") is True
+            and _golden_durability_claimed(source)
+        ):
+            return True
+    return False
+
+
+def _canonical_evidence_timestamp(value: Any) -> float | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("mono_ns", "monotonic_ns", "wall_ns", "wall_unix_ns",
+                "end_wall_ns", "entry_wall_ns", "timestamp", "time"):
+        raw = value.get(key)
+        if isinstance(raw, bool) or raw is None:
+            continue
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def _canonical_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(event)
+    metadata = event.get("metadata")
+    if isinstance(metadata, dict):
+        payload.update(metadata)
+    fields = event.get("fields")
+    if isinstance(fields, dict):
+        payload.update(fields)
+    return payload
+
+
+def _named_proof_value(source: Any, key: str) -> Any:
+    """Read a proof field from the known artifact/telemetry containers."""
+    if not isinstance(source, dict):
+        return None
+    if key in source:
+        return source[key]
+    for nested_key in (
+        "result", "data", "golden_telemetry", "telemetry", "metadata",
+        "canonical_ledger",
+    ):
+        value = _named_proof_value(source.get(nested_key), key)
+        if value is not None:
+            return value
+    return None
+
+
+def _canonical_commit_reopen_order(ledger: dict[str, Any]) -> bool | None:
+    """Return ordering from authoritative ledger events, or ``None`` absent."""
+    events = ledger.get("events")
+    if not isinstance(events, list):
+        return None
+    commits: list[float] = []
+    reopens: list[float] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("name", "")).strip().lower().replace("-", "_")
+        payload = _canonical_event_payload(event)
+        stamp = _canonical_evidence_timestamp(event) or _canonical_evidence_timestamp(payload)
+        if stamp is None:
+            continue
+        if "commit" in name and "result" not in name:
+            commits.append(stamp)
+        if "reopen" in name:
+            reopens.append(stamp)
+    if not commits or not reopens:
+        return None
+    return min(commits) <= min(reopens)
+
+
 class GoldenCohortValidator(ValidatorPlugin):
     """Validate the dedicated Golden cohort/attempt artifact contract.
 
@@ -687,13 +1202,48 @@ class GoldenCohortValidator(ValidatorPlugin):
             elif observed_sha is not None and record.output_sha.strip().lower() != observed_sha.lower():
                 failures.append("Golden record output SHA disagrees with attempt proof")
         telemetry = attempt.get("golden_telemetry")
+        selector_present = _output_durability_selector_present(
+            attempt, telemetry, manifest, config=config
+        )
+        try:
+            output_durability_mode = _resolve_output_durability_mode(
+                attempt, telemetry, manifest, config=config
+            )
+        except ValueError as exc:
+            failures.append(str(exc))
+            output_durability_mode = "off"
+        if not selector_present and _historical_pre_selector_strict(attempt, telemetry, manifest):
+            # Compatibility is limited to genuinely old strict artifacts.  A
+            # selector-less modern artifact remains off, rather than gaining a
+            # durable endpoint from missing metadata.
+            output_durability_mode = "strict"
+        if output_durability_mode == "off":
+            # Request-output durability is deliberately opt-in.  The result
+            # endpoint is still required, but a result-ready artifact must not
+            # be promoted to a durable result by this validator.
+            result_ready = _result_ready_proof(attempt, telemetry)
+            if not _output_proof_truthy(result_ready):
+                failures.append("Golden result-ready proof is missing or false")
+            integrity_values = [
+                source[key]
+                for source in (attempt, telemetry if isinstance(telemetry, dict) else {})
+                for key in ("output_integrity", "output_identity")
+                if key in source
+            ]
+            if integrity_values and not all(_output_proof_truthy(value) for value in integrity_values):
+                failures.append("Golden output integrity proof is false")
+            if _golden_durability_claimed(attempt, telemetry):
+                failures.append(
+                    "Golden output durability evidence is contradictory in off mode"
+                )
         if not isinstance(telemetry, dict) or not str(telemetry.get("schema", "")).startswith("golden_"):
             failures.append("Golden telemetry proof is missing")
         if isinstance(telemetry, dict):
-            if telemetry.get("true_durable_marked") is not True:
-                failures.append("Golden durable-result proof is missing")
-            if telemetry.get("reopen_verified") is not True:
-                failures.append("Golden durable reopen proof is missing")
+            if output_durability_mode == "strict":
+                if telemetry.get("true_durable_marked") is not True:
+                    failures.append("Golden durable-result proof is missing")
+                if telemetry.get("reopen_verified") is not True:
+                    failures.append("Golden durable reopen proof is missing")
         seriality = attempt.get("seriality") or (telemetry or {}).get("seriality")
         if not isinstance(seriality, dict) or seriality.get("ok") is not True or seriality.get("count") != 0:
             failures.append("Golden strict-seriality proof is missing or failed")
@@ -755,25 +1305,97 @@ class CanonicalLedgerValidator(ValidatorPlugin):
             return []
 
         telemetry = record.telemetry or {}
-        status = str(telemetry.get("canonical_ledger_status") or "")
+        artifact = _artifact_data(record)
+        selector_present = _output_durability_selector_present(
+            telemetry, artifact, config=config
+        )
+        failures: list[str] = []
+        try:
+            output_durability_mode = _resolve_output_durability_mode(
+                telemetry, artifact, config=config
+            )
+        except ValueError as exc:
+            return [str(exc)]
+        historical = (
+            not selector_present
+            and isinstance(artifact.get("canonical_ledger"), dict)
+            and _historical_pre_selector_strict(artifact, telemetry)
+        )
+        if historical:
+            # Compatibility is intentionally limited to the recognized
+            # pre-selector canonical ledger shape.
+            output_durability_mode = "strict"
+        if output_durability_mode == "off" and _golden_durability_claimed(telemetry, artifact):
+            return ["canonical ledger contains output durability evidence in off mode"]
+        status = str(
+            telemetry.get("canonical_ledger_status")
+            or artifact.get("canonical_ledger_status")
+            or ""
+        )
         if status == "error":
             return [
                 "canonical ledger finalization errored on the remote "
                 "(canonical_ledger_status=error)"
             ]
         if status == "ok":
+            ledger = artifact.get("canonical_ledger")
+            ledger = ledger if isinstance(ledger, dict) else {}
+            ledger_endpoint = ledger.get("endpoint")
+            if isinstance(ledger_endpoint, dict):
+                ledger_endpoint = ledger_endpoint.get("status") or ledger_endpoint.get("name")
             endpoint_status = str(
-                telemetry.get("canonical_ledger_endpoint_status") or ""
-            )
-            if endpoint_status != "ok":
-                return [
+                ledger.get("endpoint_status")
+                or ledger_endpoint
+                or telemetry.get("canonical_ledger_endpoint_status")
+                or ""
+            ).strip().lower().replace("-", "_")
+            if output_durability_mode == "strict":
+                # Current strict runs must name the durable endpoint.  The
+                # historical ``ok`` endpoint is accepted only above.
+                accepted_endpoint_statuses = {
+                    "true_durable", "true_durable_result", "first_durable_result",
+                }
+                if historical:
+                    accepted_endpoint_statuses.add("ok")
+            else:
+                accepted_endpoint_statuses = {"result_ready", "first_result_ready"}
+            if endpoint_status not in accepted_endpoint_statuses:
+                failures.append(
                     f"canonical ledger endpoint_status={endpoint_status or '(missing)'}: "
                     "explicit authoritative endpoints (remote_python_resume -> "
-                    "first_durable_result) are required"
-                ]
-            if telemetry.get("canonical_ledger_zero_gap") != "True":
-                return ["canonical ledger serial zero-gap did not pass"]
-            return []
+                    f"{'first_durable_result' if output_durability_mode == 'strict' else 'result_ready'}"
+                    ") are required"
+                )
+            serial_zero_gap = telemetry.get("canonical_ledger_zero_gap")
+            if serial_zero_gap is None:
+                serial_zero_gap = ledger.get("serial_ledger", {}).get("zero_gap") \
+                    if isinstance(ledger.get("serial_ledger"), dict) else None
+            if not _runtime_bool(serial_zero_gap):
+                failures.append("canonical ledger serial zero-gap did not pass")
+            if output_durability_mode == "off":
+                ready = _result_ready_proof(telemetry, artifact)
+                if not _output_proof_truthy(ready):
+                    failures.append("canonical ledger result-ready proof missing")
+            elif not historical:
+                durable_marked = any(
+                    _runtime_bool(_named_proof_value(source, key))
+                    for source in (telemetry, artifact)
+                    for key in ("true_durable", "true_durable_marked")
+                )
+                if not durable_marked:
+                    failures.append("canonical ledger true_durable/true_durable_marked proof missing")
+                reopen_verified = any(
+                    _runtime_bool(_named_proof_value(source, "reopen_verified"))
+                    for source in (telemetry, artifact)
+                )
+                if not reopen_verified:
+                    failures.append("canonical ledger reopen_verified proof missing")
+                ordering = _canonical_commit_reopen_order(ledger)
+                if ordering is not True:
+                    failures.append(
+                        "canonical ledger commit-before-reopen ordering proof missing or invalid"
+                    )
+            return failures
         # status absent → canonical ledger missing from the artifact entirely.
         return [
             "canonical ledger missing from the run artifact "
@@ -1592,9 +2214,38 @@ _CANONICAL_IDENTITY_ENV = (
 )
 
 
+def _receipt_identity_environment(receipt: Any) -> dict[str, str] | None:
+    if receipt is None:
+        return None
+    result: dict[str, str] = {}
+    values = _receipt_value(receipt, "effective_environment", {})
+    if isinstance(values, dict):
+        result.update({str(k): str(v) for k, v in values.items()})
+    target = _receipt_value(receipt, "target", {})
+    if isinstance(target, dict):
+        if target.get("app"):
+            result["COMFYMODAL_V2_APP_NAME"] = str(target["app"])
+        if target.get("class"):
+            result["COMFYMODAL_V2_CLASS_NAME"] = str(target["class"])
+    deployment = _receipt_value(receipt, "deployment_identity", {})
+    resources = deployment.get("resources", {}) if isinstance(deployment, dict) else {}
+    if isinstance(resources, dict):
+        for env_name, resource_name in (
+            ("COMFYMODAL_V2_GPU", "gpu"),
+            ("COMFYMODAL_V2_CPU_REQUEST", "cpu"),
+            ("COMFYMODAL_V2_MEMORY_MB", "memory_mb"),
+            ("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "cpu"),
+            ("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", "memory_mb"),
+        ):
+            if resource_name in resources:
+                result[env_name] = str(resources[resource_name])
+    return result
+
+
 def _assert_canonical_backend_identity(
     config: Any,
     extra_env: dict[str, str],
+    identity_source: dict[str, str] | None = None,
 ) -> None:
     """Refuse Golden backend calls unless the complete identity is explicit.
 
@@ -1634,7 +2285,7 @@ def _assert_canonical_backend_identity(
     except Exception as exc:  # noqa: BLE001 - fail closed for duck-typed callers
         raise GateError(f"golden_p1 canonical identity could not be resolved: {exc}") from exc
     for name in _CANONICAL_IDENTITY_ENV:
-        expected = expected_env.get(name, "").strip()
+        expected = str((identity_source or {}).get(name, expected_env.get(name, ""))).strip()
         observed = str(extra_env.get(name, "") or "").strip()
         if not expected or expected.lower() in {"none", "null"}:
             failures.append(f"golden_p1 canonical identity {name} is missing from config")
@@ -1661,6 +2312,7 @@ def _run_backend(
     invocation_id: str,
     strict_canonical: bool,
     allow_multiple_run_artifacts: bool = False,
+    canonical_identity: dict[str, str] | None = None,
 ) -> Any:
     """Call real BackendRunner plus older duck-typed test runners safely."""
     kwargs: dict[str, Any] = {
@@ -1682,6 +2334,8 @@ def _run_backend(
         kwargs["strict_canonical_discovery"] = strict_canonical
     if "allow_multiple_run_artifacts" in parameters:
         kwargs["allow_multiple_run_artifacts"] = allow_multiple_run_artifacts
+    if canonical_identity is not None and "canonical_identity" in parameters:
+        kwargs["canonical_identity"] = canonical_identity
     return runner.run(spec, **kwargs)
 
 
@@ -1697,12 +2351,14 @@ class GateRunner:
         validators: Validator,
         backend_runner: Any,
         env_builder: Any,
+        deployment_receipt: Any | None = None,
     ) -> None:
         self._repo_root = Path(repo_root)
         self._fingerprints = fingerprints
         self._validators = validators
         self._backend_runner = backend_runner
         self._env_builder = env_builder
+        self._deployment_receipt = deployment_receipt
 
     def run_gate(
         self,
@@ -1712,14 +2368,22 @@ class GateRunner:
         invocation_context: str | None = None,
     ) -> GateResult:
         invocation_id = str(invocation_id or invocation_context or uuid.uuid4().hex)
-        deploy_fp = self._fingerprints.deploy_fingerprint()
-        run_fp = self._fingerprints.run_fingerprint()
-        profile_config_fp = _profile_config_fingerprint(self._fingerprints)
+        deploy_fp = str(_receipt_value(
+            self._deployment_receipt, "deploy_fingerprint", ""
+        ) or self._fingerprints.deploy_fingerprint())
+        run_fp = _bound_run_fingerprint(self._fingerprints, self._deployment_receipt)
+        profile_config_fp = str(_receipt_value(
+            self._deployment_receipt, "profile_config_fingerprint", ""
+        ) or _profile_config_fingerprint(self._fingerprints))
         # Keep the full-run mode and target-method policy centralized in the
         # CLI guard so direct GateRunner callers cannot bypass Golden routing.
         from .cli import _require_full_run_mode
 
         _require_full_run_mode(config, command="v2ctl gate")
+        if self._deployment_receipt is not None:
+            from .deployment_receipt import require_source_probe_evidence
+
+            require_source_probe_evidence(self._repo_root, self._deployment_receipt)
         # Keep selector, run count, nonce, and selector env in one canonical
         # construction shared with confirm and CLI dry-run reporting.
         from .cli import _validation_backend_args
@@ -1729,7 +2393,18 @@ class GateRunner:
             config, deploy_fp, run_fp, profile_config_fp, invocation_id,
             {"V2_BENCHMARK_RUNS": "1", **selector_env},
         )
-        _assert_canonical_backend_identity(config, extra_env)
+        extra_env = _bind_receipt_environment(extra_env, self._deployment_receipt)
+        _assert_canonical_backend_identity(
+            config, extra_env,
+            _receipt_identity_environment(self._deployment_receipt),
+        )
+        canonical_identity = {
+            "profile": str(_receipt_value(self._deployment_receipt, "profile", "")
+                            or getattr(config, "profile_name", "") or ""),
+            "profile_config_fingerprint": profile_config_fp,
+            "deploy_fingerprint": deploy_fp,
+            "run_fingerprint": run_fp,
+        }
         try:
             result = _run_backend(
                 self._backend_runner, backend_spec, config=config,
@@ -1737,6 +2412,7 @@ class GateRunner:
                 extra_env=extra_env,
                 timeout_seconds=600.0, invocation_id=invocation_id,
                 strict_canonical=True,
+                canonical_identity=canonical_identity,
             )
         except Exception as exc:  # noqa: BLE001 - backend spawn/timeout failure
             detail = str(exc)
@@ -1760,6 +2436,7 @@ class GateRunner:
                 record, config, valid=False, reasons=reasons,
                 deploy_fp=deploy_fp, run_fp=run_fp,
                 deploy_inputs=_safe_deploy_inputs(self._fingerprints),
+                deployment_receipt=self._deployment_receipt,
             )
             path = self._persist_manifest(config, run_fp, manifest)
             LOG.warning("gate manifest written (crash-loop, invalid): %s", path)
@@ -1771,7 +2448,10 @@ class GateRunner:
 
         # persist manifest even when invalid, so confirm can refuse
         deploy_inputs = _safe_deploy_inputs(self._fingerprints)
-        manifest = _build_manifest(record, config, valid, reasons, deploy_fp, run_fp, deploy_inputs)
+        manifest = _build_manifest(
+            record, config, valid, reasons, deploy_fp, run_fp, deploy_inputs,
+            deployment_receipt=self._deployment_receipt,
+        )
         path = self._persist_manifest(config, run_fp, manifest)
         if valid:
             mark_runtime_health_verified(
@@ -1779,6 +2459,7 @@ class GateRunner:
                 config,
                 self._fingerprints,
                 deploy_fp,
+                bound_receipt=self._deployment_receipt,
             )
 
         LOG.info("gate manifest written: %s (valid=%s)", path, valid)
@@ -1816,12 +2497,14 @@ class ConfirmRunner:
         backend_runner: Any,
         env_builder: Any,
         validators: Validator,
+        deployment_receipt: Any | None = None,
     ) -> None:
         self._repo_root = Path(repo_root)
         self._fingerprints = fingerprints
         self._backend_runner = backend_runner
         self._env_builder = env_builder
         self._validators = validators
+        self._deployment_receipt = deployment_receipt
 
     def confirm(
         self,
@@ -1839,6 +2522,10 @@ class ConfirmRunner:
         from .cli import _require_full_run_mode
 
         _require_full_run_mode(config, command="v2ctl confirm")
+        if self._deployment_receipt is not None:
+            from .deployment_receipt import require_source_probe_evidence
+
+            require_source_probe_evidence(self._repo_root, self._deployment_receipt)
         path = Path(gate_manifest)
         if not path.is_file():
             raise GateError(f"gate manifest not found: {path}")
@@ -1854,21 +2541,83 @@ class ConfirmRunner:
                 f"gate manifest {path} is invalid (gate_valid=False); confirm refuses to run: {reasons}"
             )
 
+        if self._deployment_receipt is not None:
+            receipt = self._deployment_receipt
+            receipt_data = receipt.to_dict() if hasattr(receipt, "to_dict") else {}
+            expected_path = str(getattr(receipt, "receipt_path", "") or "")
+            if not expected_path or data.get("deployment_receipt_path") != expected_path:
+                raise GateError("gate manifest is not bound to the deployment receipt path")
+            if data.get("deployment_receipt_integrity_digest") != receipt_data.get(
+                "integrity_digest"
+            ):
+                raise GateError("gate manifest deployment receipt integrity mismatch")
+            if data.get("deployment_version") != receipt.deployment_version:
+                raise GateError("gate manifest deployment version mismatch")
+            if data.get("receipt_profile") != receipt.profile:
+                raise GateError("gate manifest deployment receipt profile mismatch")
+            if data.get("receipt_target") != receipt.target:
+                raise GateError("gate manifest deployment receipt target mismatch")
+            if data.get("receipt_deploy_fingerprint") != receipt.deploy_fingerprint:
+                raise GateError("gate manifest deployment receipt fingerprint mismatch")
+            if data.get("receipt_source_probe_expected") != receipt.source_probe.get("expected"):
+                raise GateError("gate manifest source-probe expectation mismatch")
+            if data.get("receipt_manifest_path") != receipt.manifest_path:
+                raise GateError("gate manifest deployment manifest path mismatch")
+            if data.get("receipt_manifest_digest") != receipt.manifest_digest:
+                raise GateError("gate manifest deployment manifest digest mismatch")
+            from .deployment_receipt import source_probe_evidence_path
+
+            if data.get("source_probe_evidence_path") != str(
+                source_probe_evidence_path(Path(receipt.receipt_path).parents[2], receipt)
+            ):
+                raise GateError("gate manifest source-probe evidence path mismatch")
+
         # deploy fingerprint must still match the current deployment
         snapshot = data.get("config_snapshot") or {}
         manifest_deploy_fp = snapshot.get("deploy_fingerprint")
-        current_deploy_fp = self._fingerprints.deploy_fingerprint()
+        current_deploy_fp = str(_receipt_value(
+            self._deployment_receipt, "deploy_fingerprint", ""
+        ) or self._fingerprints.deploy_fingerprint())
         if manifest_deploy_fp != current_deploy_fp:
             changed = _changed_deploy_inputs(snapshot, self._fingerprints)
             raise GateError(
                 "deployment fingerprint changed since the gate manifest was written; "
                 f"refusing to confirm. Changed deploy inputs: {', '.join(changed) or 'unknown'}"
             )
+        if self._deployment_receipt is not None:
+            if snapshot.get("profile") != self._deployment_receipt.profile:
+                raise GateError("gate manifest profile is not receipt-bound")
+            if snapshot.get("run_fingerprint") != _bound_run_fingerprint(
+                self._fingerprints, self._deployment_receipt
+            ):
+                raise GateError("gate manifest run identity is not receipt-bound")
+            if snapshot.get("profile_config_fingerprint") != self._deployment_receipt.profile_config_fingerprint:
+                raise GateError("gate manifest profile configuration is not receipt-bound")
+            run_identity = data.get("run")
+            expected_run = _bound_run_fingerprint(
+                self._fingerprints, self._deployment_receipt
+            )
+            if not isinstance(run_identity, dict) or run_identity.get(
+                "deploy_fingerprint"
+            ) != self._deployment_receipt.deploy_fingerprint or run_identity.get(
+                "run_fingerprint"
+            ) != expected_run:
+                raise GateError("gate manifest run record is not receipt-bound")
+            if data.get("profile_config_fingerprint") != self._deployment_receipt.profile_config_fingerprint:
+                raise GateError("gate manifest top-level profile configuration mismatch")
+            if snapshot.get("target") != {
+                "app": self._deployment_receipt.target.get("app", ""),
+                "class_name": self._deployment_receipt.target.get("class", ""),
+                "method": self._deployment_receipt.target.get("method", ""),
+            }:
+                raise GateError("gate manifest target is not receipt-bound")
 
-        # git head comparison (source drift)
+        # A receipt binds the immutable remote version.  Local source drift is
+        # informational after that bind; without a receipt retain the legacy
+        # fail-closed gate-manifest contract.
         manifest_head = snapshot.get("git_head")
         current_head = self._current_git_head()
-        if manifest_head and current_head and manifest_head != current_head:
+        if self._deployment_receipt is None and manifest_head and current_head and manifest_head != current_head:
             raise GateError(
                 f"git HEAD changed since the gate manifest: {manifest_head} -> {current_head}; refusing to confirm"
             )
@@ -1888,9 +2637,11 @@ class ConfirmRunner:
         # Each confirmation is deliberately a separate single-run backend
         # invocation.  In particular, never pass `runs` as --run-count or
         # enable multi-artifact discovery for the confirmation loop.
-        run_fp = self._fingerprints.run_fingerprint()
-        deploy_fp = self._fingerprints.deploy_fingerprint()
-        profile_config_fp = _profile_config_fingerprint(self._fingerprints)
+        run_fp = _bound_run_fingerprint(self._fingerprints, self._deployment_receipt)
+        deploy_fp = current_deploy_fp
+        profile_config_fp = str(_receipt_value(
+            self._deployment_receipt, "profile_config_fingerprint", ""
+        ) or _profile_config_fingerprint(self._fingerprints))
         from .cli import _validation_backend_args
 
         extra_args, selector_env = _validation_backend_args(config)
@@ -1905,7 +2656,18 @@ class ConfirmRunner:
                 config, deploy_fp, run_fp, profile_config_fp, run_invocation_id,
                 {"V2_BENCHMARK_RUNS": "1", **selector_env},
             )
-            _assert_canonical_backend_identity(config, extra_env)
+            extra_env = _bind_receipt_environment(extra_env, self._deployment_receipt)
+            _assert_canonical_backend_identity(
+                config, extra_env,
+                _receipt_identity_environment(self._deployment_receipt),
+            )
+            canonical_identity = {
+                "profile": str(_receipt_value(self._deployment_receipt, "profile", "")
+                                or getattr(config, "profile_name", "") or ""),
+                "profile_config_fingerprint": profile_config_fp,
+                "deploy_fingerprint": deploy_fp,
+                "run_fingerprint": run_fp,
+            }
             try:
                 result = _run_backend(
                     self._backend_runner, backend_spec, config=config,
@@ -1914,6 +2676,7 @@ class ConfirmRunner:
                     timeout_seconds=600.0, invocation_id=run_invocation_id,
                     strict_canonical=True,
                     allow_multiple_run_artifacts=False,
+                    canonical_identity=canonical_identity,
                 )
             except Exception as exc:  # noqa: BLE001 - backend spawn/timeout
                 detail = str(exc)
@@ -1929,7 +2692,10 @@ class ConfirmRunner:
         valid = not all_reasons
         combined = records[-1] if records else None
         deploy_inputs = _safe_deploy_inputs(self._fingerprints)
-        manifest = _build_manifest(combined, config, valid, all_reasons, deploy_fp, run_fp, deploy_inputs)
+        manifest = _build_manifest(
+            combined, config, valid, all_reasons, deploy_fp, run_fp, deploy_inputs,
+            deployment_receipt=self._deployment_receipt,
+        )
         manifest["confirm_runs"] = runs
         manifest["gate_manifest"] = str(path)
         manifest_path = self._persist_manifest(config, run_fp, manifest, kind="confirm")
@@ -2006,6 +2772,7 @@ def _build_manifest(
     deploy_fp: str,
     run_fp: str,
     deploy_inputs: dict | None = None,
+    deployment_receipt: Any | None = None,
 ) -> dict:
     git_head = getattr(config, "git", None)
     if git_head is not None:
@@ -2023,6 +2790,32 @@ def _build_manifest(
     }
     if deploy_inputs:
         snapshot["deploy_inputs"] = deploy_inputs
+    if deployment_receipt is not None:
+        effective_config = getattr(deployment_receipt, "effective_config", {})
+        deployment_identity = getattr(deployment_receipt, "deployment_identity", {})
+        snapshot["profile"] = deployment_receipt.profile
+        snapshot["git_head"] = str(
+            getattr(deployment_receipt, "deployed_source", {}).get("git_head", "")
+        )
+        snapshot["target"] = {
+            "app": deployment_receipt.target.get("app", ""),
+            "class_name": deployment_receipt.target.get("class", ""),
+            "method": deployment_receipt.target.get("method", ""),
+        }
+        receipt_resources = (
+            deployment_identity.get("resources", {})
+            if isinstance(deployment_identity, dict) else {}
+        )
+        if isinstance(effective_config, dict) and isinstance(
+            effective_config.get("resources"), dict
+        ):
+            receipt_resources = effective_config["resources"]
+        snapshot["resources"] = dict(receipt_resources)
+        if isinstance(effective_config, dict) and isinstance(
+            effective_config.get("deploy_inputs"), dict
+        ):
+            snapshot["deploy_inputs"] = effective_config["deploy_inputs"]
+        snapshot["profile_config_fingerprint"] = deployment_receipt.profile_config_fingerprint
     manifest = {
         "schema_version": _GATE_SCHEMA_VERSION,
         "gate_valid": valid,
@@ -2031,6 +2824,32 @@ def _build_manifest(
         "config_snapshot": snapshot,
         "created_at": _now_utc().isoformat(),
     }
+    if deployment_receipt is not None:
+        receipt_data = (
+            deployment_receipt.to_dict()
+            if hasattr(deployment_receipt, "to_dict") else deployment_receipt
+        )
+        manifest["deployment_receipt_path"] = str(
+            receipt_data.get("receipt_path", "") if isinstance(receipt_data, dict) else ""
+        )
+        manifest["deployment_receipt_integrity_digest"] = str(
+            receipt_data.get("integrity_digest", "") if isinstance(receipt_data, dict) else ""
+        )
+        manifest["deployment_version"] = getattr(deployment_receipt, "deployment_version", None)
+        manifest["receipt_deploy_fingerprint"] = deploy_fp
+        manifest["receipt_profile"] = deployment_receipt.profile
+        manifest["receipt_target"] = dict(deployment_receipt.target)
+        manifest["receipt_source_probe_expected"] = deployment_receipt.source_probe.get("expected")
+        manifest["receipt_manifest_path"] = deployment_receipt.manifest_path
+        manifest["receipt_manifest_digest"] = deployment_receipt.manifest_digest
+        from .deployment_receipt import source_probe_evidence_path
+
+        manifest["source_probe_evidence_path"] = str(
+            source_probe_evidence_path(
+                Path(deployment_receipt.receipt_path).parents[2], deployment_receipt
+            )
+            if deployment_receipt.receipt_path else ""
+        )
     if record is not None:
         manifest.update({
             "v2ctl_invocation_id": record.v2ctl_invocation_id,
@@ -2042,6 +2861,11 @@ def _build_manifest(
             "selected_summary_path": str(getattr(record.artifacts, "summary_artifact", "") or ""),
             "run_artifacts": [str(p) for p in (getattr(record.artifacts, "run_artifacts", []) or [])],
         })
+    if deployment_receipt is not None:
+        # Artifact metadata can be produced by a drifted local runtime.  The
+        # top-level admission identity remains the immutable receipt identity.
+        manifest["profile"] = deployment_receipt.profile
+        manifest["profile_config_fingerprint"] = deployment_receipt.profile_config_fingerprint
     return manifest
 
 

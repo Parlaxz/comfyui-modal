@@ -456,7 +456,9 @@ For CUDA profiling, prefer events/stream-aware measurement that does not add syn
 Microbenchmarks are useful capability evidence, not automatically production wins.
 
 Primary performance work should ultimately improve the real requested endpoint, especially:
-- Python resume -> true durable result;
+- Python resume -> `FIRST_RESULT_READY` for the default output mode, or
+  Python resume -> `TRUE_FIRST_DURABLE_RESULT` for an explicit strict output
+  durability experiment;
 - complete semantic stage walls.
 
 Do not "optimize" by:
@@ -489,6 +491,29 @@ Never silently redefine the canonical result because a new backend is faster.
 
 "Generated" and "durable" are different.
 
+The current generated-output policy is
+`docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`. It defines
+`COMFYMODAL_OUTPUT_DURABILITY=off|strict`: missing/`off` means `off`, while an
+invalid explicit value is a configuration error. Generated-output durability
+is off by default. The default endpoint is:
+
+```text
+encode -> observed SHA/bytes -> FIRST_RESULT_READY -> return
+```
+
+The strict opt-in endpoint is:
+
+```text
+write/fsync -> Volume.commit -> reopen/hash proof
+-> TRUE_FIRST_DURABLE_RESULT -> return
+```
+
+Therefore `true_durable`, commit, reopen, and hash proof are not universal
+requirements for an output-off result. They are required for strict output
+durability, and strict failure must not silently fall back to the default.
+There is no persistent output worker, background durability work,
+deduplication shortcut, or shortcut around either sequence.
+
 The durability contract should clearly distinguish:
 - output encoding;
 - asset write;
@@ -504,10 +529,14 @@ The durability contract should clearly distinguish:
 Do not stamp a durable/result event before the operation it claims has actually completed.
 
 When durability uses a Modal Volume:
-- prove the asset path is inside the intended mount;
-- commit successfully;
-- reopen the committed object;
-- verify the bytes/hash required by the contract.
+- in strict generated-output mode, prove the asset path is inside the intended
+  mount;
+- commit successfully, reopen the committed object, and verify the bytes/hash
+  required by the strict contract.
+
+This distinction does **not** weaken S4/source-publication durability. Shared
+custom-node publication, authoritative full-content identity, and its required
+Volume/receipt readback remain mandatory in every mode.
 
 For single-use Golden containers, avoid large post-durable cleanup. Process exit can own final model/CUDA reclamation when that is the selected lifecycle.
 
@@ -524,6 +553,10 @@ For current Golden deployment/run commands and structural acceptance rules, load
 Do not duplicate or bypass its public control plane because an internal script looks easier.
 
 If that public interface is broken, repair the interface.
+
+Never use `@fixer` for any remote Modal deployment or run. The deployment/run
+operator must be the primary agent or another explicitly designated non-fixer
+operator.
 
 ## Deploy-only means deploy-only
 

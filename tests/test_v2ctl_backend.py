@@ -431,6 +431,33 @@ def test_runner_child_env_contains_config_flag(tmp_path):
     assert "FLAG=1" in result.stdout
 
 
+def test_runner_receipt_identity_override_wins_over_local_fingerprints(monkeypatch, tmp_path):
+    """A receipt-bound call must not be rewritten with local deploy identity."""
+    spec = BackendSpec(name="identity", executable=[sys.executable, "-c", "pass"])
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(backend_module.subprocess, "run", fake_run)
+    BackendRunner(tmp_path, EnvironmentBuilder()).run(
+        spec,
+        config=_Config(),
+        canonical_identity={
+            "profile": "golden_p1",
+            "profile_config_fingerprint": "receipt-profile",
+            "deploy_fingerprint": "receipt-deploy",
+            "run_fingerprint": "current-request",
+        },
+    )
+    env = calls[0]["env"]
+    assert env["COMFYMODAL_V2CTL_PROFILE"] == "golden_p1"
+    assert env["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] == "receipt-profile"
+    assert env["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] == "receipt-deploy"
+    assert env["COMFYMODAL_V2CTL_RUN_FINGERPRINT"] == "current-request"
+
+
 # ---------------------------------------------------------------------------
 # Artifact discovery
 # ---------------------------------------------------------------------------

@@ -1,5 +1,11 @@
 # E38O Independent Full Repository Audit — comfyui-modal
 
+> **SUPERSESSION NOTICE (2026-08-30):** Historical audit; preserve its
+> evidence, but use `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md` for current
+> generated-output guidance. Output durability is off by default; strict
+> commit/reopen/hash proof is opt-in. S4 source publication durability remains
+> mandatory.
+
 **Audit type:** READ-ONLY (no source/test/deploy/git mutation; dirty worktree and concurrent E37 clean-lane experiment preserved).
 **Auditor:** E38O (orchestrated subagent lanes A–F + independent raw-artifact forensics + oracle synthesis).
 **Date:** 2026-08-21.

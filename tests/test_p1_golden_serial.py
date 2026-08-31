@@ -340,10 +340,13 @@ def test_telemetry_persists_complete_json_atomically(tmp_path):
     assert leftovers == []
 
 
-def test_true_durable_requires_successful_commit_stage(tmp_path):
+def test_true_durable_requires_successful_commit_stage(tmp_path, monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
     pending = _write_pending(tmp_path)
     pending.committed = True
     rec = gs.GoldenTelemetryRecorder()
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     with pytest.raises(RuntimeError, match="true_durable_requires"):
         rec.mark_true_durable()
     rec.begin_stage("golden_durable_commit")
@@ -1777,13 +1780,16 @@ def _write_pending(tmp_path, payload=b"\x89PNG\r\n\x1a\n golden-bytes", *, sha=N
     )
 
 
-def test_durable_commit_success_event_ordering(tmp_path):
+def test_durable_commit_success_event_ordering(tmp_path, monkeypatch):
     """golden_durable_commit owns the commit and reopen proof events;
     OUTPUT_ENCODE_DONE / ASSET_WRITE_DONE belong to golden_output and the
     true-durable marker belongs to top-level integration."""
     pending = _write_pending(tmp_path)
     volume = FakeAsyncVolume()
     rec = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     asyncio.run(
         gs.golden_durable_commit(
             volume, pending, rec, expected_sha256=pending.sha256
@@ -1800,11 +1806,14 @@ def test_durable_commit_success_event_ordering(tmp_path):
     assert volume.calls == ["commit", "committed"]
 
 
-def test_commit_reopen_verification_precedes_true_durable_result(tmp_path):
+def test_commit_reopen_verification_precedes_true_durable_result(tmp_path, monkeypatch):
     """Commit must be followed by reopened byte-count/SHA verification of the
     persisted asset before TRUE_FIRST_DURABLE_RESULT can be stamped."""
     pending = _write_pending(tmp_path)
     rec = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     asyncio.run(
         gs.golden_durable_commit(
             FakeAsyncVolume(), pending, rec, expected_sha256=pending.sha256
@@ -1819,9 +1828,12 @@ def test_commit_reopen_verification_precedes_true_durable_result(tmp_path):
     )
 
 
-def test_commit_reopen_accepts_output_expectation_warning(tmp_path):
+def test_commit_reopen_accepts_output_expectation_warning(tmp_path, monkeypatch):
     pending = _write_pending(tmp_path)
     recorder = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
 
     asyncio.run(
         gs.golden_durable_commit(
@@ -1837,7 +1849,7 @@ def test_commit_reopen_accepts_output_expectation_warning(tmp_path):
     recorder.mark_true_durable()
 
 
-def test_durable_commit_exposes_full_nonnegative_decomposition_with_injected_clock(tmp_path):
+def test_durable_commit_exposes_full_nonnegative_decomposition_with_injected_clock(tmp_path, monkeypatch):
     class Clock:
         def __init__(self):
             self.value = 100
@@ -1849,6 +1861,9 @@ def test_durable_commit_exposes_full_nonnegative_decomposition_with_injected_clo
     pending = _write_pending(tmp_path, payload=b"decomposition")
     clock = Clock()
     recorder = gs.GoldenTelemetryRecorder(monotonic=clock.tick, wall=clock.tick)
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
     asyncio.run(
         gs.golden_durable_commit(
             FakeAsyncVolume(), pending, recorder, expected_sha256=pending.sha256
@@ -1873,9 +1888,12 @@ def test_durable_commit_exposes_full_nonnegative_decomposition_with_injected_clo
     assert "true_durable_result_marker_publication" not in spans
 
 
-def test_true_durable_marker_is_separate_post_commit_span_and_event_snapshot_isolated(tmp_path):
+def test_true_durable_marker_is_separate_post_commit_span_and_event_snapshot_isolated(tmp_path, monkeypatch):
     pending = _write_pending(tmp_path, payload=b"marker")
     recorder = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
     asyncio.run(
         gs.golden_durable_commit(
             FakeAsyncVolume(), pending, recorder, expected_sha256=pending.sha256
@@ -1899,9 +1917,12 @@ def test_true_durable_marker_is_separate_post_commit_span_and_event_snapshot_iso
     assert marker["fields"]["duration_ns"] >= 0
 
 
-def test_durable_commit_failure_emits_failure_decomposition_payload(tmp_path):
+def test_durable_commit_failure_emits_failure_decomposition_payload(tmp_path, monkeypatch):
     pending = _write_pending(tmp_path, payload=b"failure")
     recorder = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    recorder.output_durability_mode = "strict"
+    recorder.durability_requested = True
     with pytest.raises(RuntimeError, match="volume commit boom"):
         asyncio.run(
             gs.golden_durable_commit(
@@ -1918,13 +1939,16 @@ def test_durable_commit_failure_emits_failure_decomposition_payload(tmp_path):
     assert "true_durable_result_marker_publication" not in event["fields"]["durable_commit_subspans"]
 
 
-def test_commit_reopen_sha_mismatch_blocks_true_durable(tmp_path):
+def test_commit_reopen_sha_mismatch_blocks_true_durable(tmp_path, monkeypatch):
     """The commit stage itself only commits; the reopened-object proof lives
     in verify_committed_object (top-level integration owns its ordering).
     A descriptor SHA != committed file bytes must fail that proof even though
     the volume commit succeeded."""
     pending = _write_pending(tmp_path, sha="ff" * 32)  # descriptor SHA != file bytes
     rec = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     with pytest.raises(RuntimeError, match="durable_sha_mismatch"):
         asyncio.run(
             gs.golden_durable_commit(
@@ -1935,11 +1959,14 @@ def test_commit_reopen_sha_mismatch_blocks_true_durable(tmp_path):
     assert gs.EVENT_TRUE_FIRST_DURABLE_RESULT not in [e["name"] for e in rec.events]
 
 
-def test_commit_reopen_byte_count_mismatch_blocks_true_durable(tmp_path):
+def test_commit_reopen_byte_count_mismatch_blocks_true_durable(tmp_path, monkeypatch):
     """A descriptor size != committed file size must fail the reopened-object
     proof even though the volume commit succeeded."""
     pending = _write_pending(tmp_path, byte_count=999)  # descriptor size != file size
     rec = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     with pytest.raises(RuntimeError, match="durable_byte_count_mismatch"):
         asyncio.run(
             gs.golden_durable_commit(
@@ -1950,10 +1977,13 @@ def test_commit_reopen_byte_count_mismatch_blocks_true_durable(tmp_path):
     assert gs.EVENT_TRUE_FIRST_DURABLE_RESULT not in [e["name"] for e in rec.events]
 
 
-def test_durable_commit_prefers_aio_accessor(tmp_path):
+def test_durable_commit_prefers_aio_accessor(tmp_path, monkeypatch):
     pending = _write_pending(tmp_path, payload=b"a")
     volume = _make_aio_volume()
     rec = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     asyncio.run(
         gs.golden_durable_commit(
             volume, pending, rec, expected_sha256=pending.sha256
@@ -1963,10 +1993,13 @@ def test_durable_commit_prefers_aio_accessor(tmp_path):
     assert pending.committed is True
 
 
-def test_commit_failure_prevents_durable_and_result(tmp_path):
+def test_commit_failure_prevents_durable_and_result(tmp_path, monkeypatch):
     pending = _write_pending(tmp_path, payload=b"a")
     volume = FakeAsyncVolume(fail=True)
     rec = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    rec.output_durability_mode = "strict"
+    rec.durability_requested = True
     with pytest.raises(RuntimeError, match="volume commit boom"):
         asyncio.run(
             gs.golden_durable_commit(
@@ -2022,7 +2055,7 @@ def test_io_bytes_png_matches_pil_compress_level_1_bytes():
     assert ours.startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_golden_output_writes_asset_matching_pending_hash(tmp_path, caplog):
+def test_golden_output_writes_asset_matching_pending_hash(tmp_path, caplog, monkeypatch):
     """golden_output requires an initialized runner/node_map and the exact
     canonical output branch (VAEDecode -> Any Switch (rgthree) -> SaveImage).
     The configured expected SHA deliberately differs from the synthetic PNG:
@@ -2080,6 +2113,11 @@ def test_golden_output_writes_asset_matching_pending_hash(tmp_path, caplog):
 
     session = object.__new__(gs.GoldenSession)
     session.recorder = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    session.output_durability_mode = "strict"
+    session.durability_requested = True
+    session.recorder.output_durability_mode = "strict"
+    session.recorder.durability_requested = True
     session.request = gs.GoldenRequest(request_id="r-out", prompt=prompt)
     session.contract = contract
     mount_root = tmp_path / "volume"
@@ -2123,11 +2161,16 @@ def test_golden_output_writes_asset_matching_pending_hash(tmp_path, caplog):
     assert gs.EVENT_ASSET_WRITE_DONE in names
 
 
-def test_final_result_requires_committed_pending_and_durable_mark(tmp_path):
+def test_final_result_requires_committed_pending_and_durable_mark(tmp_path, monkeypatch):
     session = object.__new__(gs.GoldenSession)
     pending = _write_pending(tmp_path)
     session.pending_durability = pending
     session.recorder = gs.GoldenTelemetryRecorder()
+    monkeypatch.setenv("COMFYMODAL_OUTPUT_DURABILITY", "strict")
+    session.output_durability_mode = "strict"
+    session.durability_requested = True
+    session.recorder.output_durability_mode = "strict"
+    session.recorder.durability_requested = True
     session.runner = None
     session.request = gs.GoldenRequest(request_id="r1", prompt={})
     with pytest.raises(RuntimeError, match="requires_committed_pending_durability"):

@@ -1,5 +1,13 @@
 # V2 Output Delivery Critical-Path Study — Earliest Safe Result Delivery
 
+> **SUPERSESSION NOTICE (2026-08-30):** This is a historical design study,
+> preserved for its evidence and rejected/endorsed alternatives. Its proposed
+> generated-output deferral, background drain, deduplication, and universal
+> commit-before/after semantics are not current policy. Use
+> `docs/COMFYMODAL_OUTPUT_DURABILITY_POLICY.md`: output durability is off by
+> default and strict commit/reopen/hash proof is opt-in. S4 source publication
+> durability remains mandatory.
+
 Status: DESIGN ONLY (read-only study; no code modified, no paid generations run)
 Date: 2026-08-11 (data from runs through 2026-08-12)
 Scope: post-VAE output delivery only. Active-profile logic, CLIP/UNET overlap, conditioning cache, sampling, and snapshot/loader architecture are explicitly out of scope and untouched.

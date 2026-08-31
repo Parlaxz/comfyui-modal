@@ -153,23 +153,55 @@ _ACTIVE_TRACE: Any = None
 _LAST_CLIP: Any = None  # weakref.ref(clip) or None; never a strong reference
 
 
-def _close_source_owners(owners: Any) -> None:
-    """Best-effort failure cleanup for every loader/buffer component."""
+def _close_source_owners(owners: Any) -> dict[str, Any]:
+    """Failure cleanup with explicit destructive-close diagnostics.
+
+    ``release_storage``/``free_storage``/``release_buffer`` are
+    non-destructive ownership APIs and are called only with their explicit
+    no-purge contract.  A ``TypeError`` is not a reason to retry them without
+    that contract: it may be an implementation failure, not a signature
+    mismatch.  ``close()`` is the sole no-argument fallback and is used only
+    for this destructive failure-cleanup path.
+    """
+    errors: list[str] = []
+    closed = 0
     for owner in list(owners or []):
         components = tuple(owner) if isinstance(owner, (tuple, list)) else (owner,)
         for component in components:
-            for name in ("close", "release_storage", "free_storage", "release_buffer"):
+            if component is None:
+                continue
+            released = False
+            for name in ("release_storage", "free_storage", "release_buffer", "release"):
                 method = getattr(component, name, None)
                 if not callable(method):
                     continue
                 try:
-                    try:
-                        method(purge_allocator=False)
-                    except TypeError:
-                        method()
-                except Exception:
-                    pass
+                    method(purge_allocator=False)
+                    released = True
+                except Exception as exc:
+                    errors.append(
+                        f"{type(component).__name__}.{name}: "
+                        f"{type(exc).__name__}: {str(exc)[:120]}"
+                    )
                 break
+            if released:
+                closed += 1
+                continue
+            close = getattr(component, "close", None)
+            if callable(close):
+                try:
+                    # Explicitly destructive failure cleanup; never use this
+                    # no-arg call as a retry for a non-destructive API.
+                    close()
+                    closed += 1
+                except Exception as exc:
+                    errors.append(
+                        f"{type(component).__name__}.close: "
+                        f"{type(exc).__name__}: {str(exc)[:120]}"
+                    )
+            else:
+                errors.append(f"{type(component).__name__}: no cleanup API")
+    return {"ok": not errors, "closed": closed, "errors": errors}
 
 
 def _blob_free(sd: dict) -> dict:
@@ -643,8 +675,50 @@ def _model_structural_destination_keys(
     })
 
 
+def _authoritative_clip_manifest_fields(clip: Any, cpu_models: Any) -> dict[str, Any]:
+    """Copy identity fields already supplied by the snapshot/model provider.
+
+    This function is deliberately not an identity generator: object ids,
+    paths, sizes, mtimes, and locally computed hashes are never promoted to
+    source identity.
+    """
+    result: dict[str, Any] = {}
+    model_key = getattr(cpu_models, "model_key", None)
+    loader_options = getattr(model_key, "optimization_loader_options", {}) or {}
+    candidates = {
+        "checkpoint_identity": (
+            getattr(model_key, "clip_identity", None)
+            or getattr(clip, "checkpoint_identity", None)
+            or getattr(clip, "source_identity", None)
+        ),
+        "manifest_generation": (
+            getattr(model_key, "model_volume_generation", None)
+            or getattr(clip, "manifest_generation", None)
+            or getattr(clip, "content_generation", None)
+        ),
+        "selected_tensor_scope": (
+            getattr(clip, "selected_tensor_scope", None)
+            or getattr(model_key, "clip_type", None)
+        ),
+        "model_patch_identity": (
+            getattr(clip, "model_patch_identity", None)
+            or (loader_options.get("model_patch_identity") if isinstance(loader_options, Mapping) else None)
+        ),
+    }
+    target_gpus = getattr(cpu_models, "target_gpus", ()) or ()
+    candidates["target_device"] = (
+        getattr(clip, "target_device", None)
+        or (target_gpus[0] if target_gpus else None)
+    )
+    for key, value in candidates.items():
+        if isinstance(value, (str, int, bool)) and str(value):
+            result[key] = value
+    return result
+
+
 def _build_manifest(
-    clip: Any, paths: list[str], comfy_utils: Any = None
+    clip: Any, paths: list[str], comfy_utils: Any = None,
+    *, authoritative_fields: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict]:
     import torch
 
@@ -721,7 +795,7 @@ def _build_manifest(
         return {"eligible": False, "reason": f"routing: {routing_detail}"}
     if not assign_ok:
         return {"eligible": False, "reason": f"can_assign_sd: {assign_detail}"}
-    return {
+    result = {
         "schema": 1,
         "eligible": True,
         "reason": "capability gates passed at capture",
@@ -737,6 +811,10 @@ def _build_manifest(
         "capture_ts_ns": time.time_ns(),
         "loader_specs": [],
     }
+    for key, value in (authoritative_fields or {}).items():
+        if key not in result and isinstance(value, (str, int, bool)) and str(value):
+            result[key] = value
+    return result
 
 
 # ── Capture side (startup) ─────────────────────────────────────────────────
@@ -760,7 +838,12 @@ def maybe_prepare_clip_snapshot_exclusion(
     if cfh.clip_weights_excluded(clip):
         return {"status": "already_excluded"}
     try:
-        manifest = _build_manifest(clip, _clip_file_paths(cpu_models), comfy_utils=comfy_utils)
+        manifest = _build_manifest(
+            clip,
+            _clip_file_paths(cpu_models),
+            comfy_utils=comfy_utils,
+            authoritative_fields=_authoritative_clip_manifest_fields(clip, cpu_models),
+        )
     except Exception as exc:
         _emit(trace, "clip_fh_capture", {"status": "error", "reason": f"{type(exc).__name__}: {str(exc)[:160]}"})
         return {"status": "error", "reason": str(exc)[:200]}
@@ -843,8 +926,8 @@ def _fastsafe_load(path: str) -> tuple[dict, Any, Any]:
 
 def _e31_forward_hook(
     clip: Any,
-    per_file_sds: list[dict],
-    files: list[dict],
+    per_file_sds: Optional[list[dict]] = None,
+    files: Optional[list[dict]] = None,
     *,
     expect_device: Optional[str],
     bind_snapshot: dict[str, Any],
@@ -863,6 +946,7 @@ def _e31_forward_hook(
         cast_once_enabled,
         compare_resident_fp32,
         install_real_forward_check,
+        snapshot_adopted_storage,
         snapshot_resident_fp32,
     )
 
@@ -939,6 +1023,13 @@ def _e31_forward_hook(
             "forward_boundary": "outer_clip_encode",
         },
     }
+    # Never let strict transfer callbacks retain source maps.  The tuple is
+    # populated only for the compatibility-only legacy helper path.
+    legacy_source = (
+        (per_file_sds or [], files or [])
+        if not bind_snapshot.get("bind_proof")
+        else (None, None)
+    )
     try:
         bind_fingerprint = cfh.clip_hydration_fingerprint(clip)
     except Exception:
@@ -985,13 +1076,22 @@ def _e31_forward_hook(
             )
             and strict_scope_ok
         )
-        after = snapshot_resident_fp32(
-            clip,
-            per_file_sds,
-            files,
-            expect_device=expect_device,
-            phase="post_real_forward",
-        )
+        if bind_snapshot.get("bind_proof"):
+            after = snapshot_adopted_storage(
+                clip,
+                bind_snapshot["bind_proof"],
+                expect_device=expect_device,
+                phase="post_real_forward",
+            )
+        else:
+            # Compatibility-only path for old offline helper tests.  Strict
+            # ownership-transfer wiring always has a bind_proof and therefore
+            # never captures these source mappings in its callback.
+            after = snapshot_resident_fp32(
+                clip, legacy_source[0] or [], legacy_source[1] or [],
+                expect_device=expect_device,
+                phase="post_real_forward",
+            )
         stable, stability = compare_resident_fp32(bind_snapshot, after)
         try:
             fingerprint_ok = bind_fingerprint is not None and (
@@ -1203,6 +1303,79 @@ def _e31_forward_hook(
     }
 
 
+def _cast_transfer_identity(manifest: Mapping[str, Any], files: list[dict]) -> Any:
+    """Build strict cast identity from the attached frozen manifest only."""
+    from .clip_fp32_cast_once import build_source_manifest_identity
+
+    fields = {
+        name: manifest.get(name)
+        for name in (
+            "checkpoint_identity",
+            "manifest_generation",
+            "content_generation",
+            "selected_tensor_scope",
+            "model_patch_identity",
+            "target_device",
+        )
+        if manifest.get(name) not in (None, "", [], {})
+    }
+    if not str(fields.get("target_device", "")).startswith("cuda:"):
+        raise RuntimeError("missing stable identity field: target_device must be explicit CUDA")
+    return build_source_manifest_identity(
+        files,
+        identity=fields,
+        target_device=None,
+        cast_policy_version=str(manifest.get("cast_policy_version", "ra9g-fp32-v1")),
+    )
+
+
+def _emit_cast_fallback(trace: Any, reason: str) -> None:
+    _emit(trace, "clip_fh_cast_once_fallback", {
+        "requested": True,
+        "applied": False,
+        "fallback": "ordinary_bf16",
+        "fallback_count": 1,
+        "reason": str(reason)[:240],
+    })
+
+
+def _bind_with_ownership_transfer(
+    clip: Any,
+    transfer: Any,
+    transformed: list[dict],
+    *,
+    require_no_meta: bool,
+) -> tuple[dict[str, Any], str]:
+    """The sole strict cast-once bind adapter used by demand and take paths."""
+    from .clip_fp32_cast_once import actual_bind_destination_map, build_actual_bind_receipt
+
+    ok, evidence = cfh.hydrate_clip_bind(
+        clip,
+        transformed,
+        require_no_meta=require_no_meta,
+        expect_device=transfer.identity.target_device,
+    )
+    if not ok:
+        raise RuntimeError(f"bind: {evidence}")
+    allowed_extra_keys = {
+        str(key)
+        for manifest in getattr(transfer, "_manifests", ())
+        for key in (manifest.get("structural_destination_keys") or ())
+    }
+    destination = actual_bind_destination_map(
+        clip,
+        transfer.identity.expected_keys,
+        allowed_extra_keys=allowed_extra_keys,
+    )
+    receipt = build_actual_bind_receipt(
+        clip, destination, transfer.identity, assign=True
+    )
+    transfer.acknowledge_actual_bind(
+        destination, receipt=receipt, assign=True, clip=clip
+    )
+    return transfer.prove_storage(expected_device=transfer.identity.target_device), evidence
+
+
 def _try_fast_hydrate(
     clip: Any, manifest: dict, *, trace: Any = None, comfy_utils: Any = None
 ) -> dict[str, Any]:
@@ -1238,6 +1411,10 @@ def _try_fast_hydrate(
     _scoped_readiness = _gpu_coord.scoped_cuda_readiness_enabled()
     _e31_cast_once_applied = False
     _e31_cast_record: dict[str, Any] = {}
+    _e31_bind_record: dict[str, Any] = {}
+    _cast_transfer: Any = None
+    _cast_fallback_reason = ""
+    _cast_once_requested = bool(env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"))
     # ── E29: canonical ledger CLIP hydration span ───────────────────────
     # The whole fast-hydrate window (source read / speculative take / bind /
     # sync) becomes one ledger span so the serial ledger owns CLIP GPU
@@ -1266,6 +1443,7 @@ def _try_fast_hydrate(
             active_speculative_request_id,
             join_speculative_clip_lane,
             get_speculative_clip_lane,
+            cancelled_speculative_lane_reason,
         )
 
         _rid = str(getattr(trace, "request_id", "") or _request_id())
@@ -1291,12 +1469,20 @@ def _try_fast_hydrate(
             # demand, but the read can outlast request setup).  Join it with a
             # bounded wait so a completed successful speculative read is
             # consumed instead of forcing a second full CLIP file read.  The
-            # join is fail-closed: on timeout or a failed read the normal
-            # demand read loop runs exactly once.
+            # The join is fail-closed: on timeout/cancellation no demand read
+            # is started against a worker that may still be draining.
             _join_rid = _rid or active_speculative_request_id()
             _lane = get_speculative_clip_lane(_join_rid) if _join_rid else None
             if _lane is not None and _lane.finished_mono_ns == 0:
                 _join_ms = join_speculative_clip_lane(_join_rid, timeout_s=20.0)
+                if (_join_ms or {}).get("cancelled"):
+                    # The worker has been cancelled and removed from the lane
+                    # store, but a filesystem/loader call may still be
+                    # draining.  Do not enter either fast read loop: doing so
+                    # would create a duplicate read against live owners.
+                    raise RuntimeError(
+                        f"speculative_join_failed_closed:{(_join_ms or {}).get('reason', 'cancelled')}"
+                    )
                 _speculative_take_reason = (
                     f"joined_lane_ms={round((_join_ms or {}).get('speculative_read_ms', 0) or 0, 1)}"
                 )
@@ -1305,6 +1491,21 @@ def _try_fast_hydrate(
                     _speculative_take_reason += ":join_take_failed"
             elif _lane is not None:
                 _speculative_take_reason = "lane_finished_not_takeable"
+            elif _join_rid:
+                # The lane may already have been removed by cancellation.  A
+                # scalar tombstone is still a fail-closed signal; without
+                # this check the normal fast read would race the old worker.
+                _join_ms = join_speculative_clip_lane(_join_rid, timeout_s=0.0)
+                if (_join_ms or {}).get("cancelled"):
+                    raise RuntimeError(
+                        f"speculative_join_failed_closed:{(_join_ms or {}).get('reason', 'cancelled')}"
+                    )
+            else:
+                _cancelled_reason = cancelled_speculative_lane_reason(_rid)
+                if _cancelled_reason:
+                    raise RuntimeError(
+                        f"speculative_join_failed_closed:{_cancelled_reason}"
+                    )
         _emit(
             trace,
             "clip_fh_speculative_take_result",
@@ -1314,7 +1515,9 @@ def _try_fast_hydrate(
                 "reason": _speculative_take_reason or "primary_hit",
             },
         )
-    except Exception:
+    except Exception as _spec_exc:
+        if "speculative_join_failed_closed" in str(_spec_exc):
+            raise
         _speculative_taken = None
     if clean_lane.enabled() and _speculative_taken is None:
         # CLEAN_LANE deliberately has no restore-time speculative read.  Do
@@ -1623,7 +1826,16 @@ def _try_fast_hydrate(
                 # read loop below (the manifest is authoritative).
                 _e31_cast_once_applied = False
                 _e31_cast_record = {}
-                _close_source_owners(_spec_owners)
+                _spec_cleanup = _close_source_owners(_spec_owners)
+                if _spec_cleanup.get("errors"):
+                    _emit(
+                        trace,
+                        "clip_fh_speculative_cleanup_failed",
+                        {
+                            "errors": list(_spec_cleanup["errors"]),
+                            "primary_error": _detail or "speculative verification failed",
+                        },
+                    )
                 _emit(
                     trace,
                     "clip_fh_speculative_rejected",
@@ -1657,35 +1869,46 @@ def _try_fast_hydrate(
                 ok, detail = _verify_file_against_manifest(file_manifest, transformed)
                 if not ok:
                     raise RuntimeError(detail)
-                try:
-                    from .clip_fp32_cast_once import apply_cast_once, cast_once_enabled
-
-                    if cast_once_enabled():
-                        casted, cast_record = apply_cast_once(
-                            [transformed], [file_manifest], trace=trace
-                        )
-                        if not cast_record.get("applied"):
-                            raise RuntimeError(
-                                f"cast_once_transform_failed:{cast_record.get('reason', '')}"
-                            )
-                        transformed = casted[0]
-                        _e31_cast_once_applied = True
-                        if not _e31_cast_record:
-                            _e31_cast_record = dict(cast_record)
-                        else:
-                            for _field in ("tensor_count", "bytes_in", "bytes_out", "allocated_delta_bytes"):
-                                _e31_cast_record[_field] = int(_e31_cast_record.get(_field, 0) or 0) + int(cast_record.get(_field, 0) or 0)
-                            for _field in ("source_provenance", "per_file"):
-                                _e31_cast_record.setdefault(_field, [])
-                                _e31_cast_record[_field].extend(list(cast_record.get(_field) or []))
-                            _e31_cast_record["source_provenance_files"] = len(
-                                _e31_cast_record.get("source_provenance") or []
-                            )
-                except ImportError:
-                    pass
                 per_file_sds.append(transformed)
                 owners.append((loader, fb))
                 checkpoint_bytes += int(file_manifest.get("size_bytes", 0))
+        # The transfer owns both the BF16 source mappings and the loader
+        # handles.  In particular, speculative reads arrive here still BF16;
+        # no cast-once representation exists before this request-local object.
+        try:
+            from .clip_fp32_cast_once import (
+                cast_once_enabled,
+                construct_ownership_transfer,
+            )
+            if cast_once_enabled():
+                try:
+                    _cast_identity = _cast_transfer_identity(manifest, files)
+                except Exception as _identity_exc:
+                    _cast_fallback_reason = f"{type(_identity_exc).__name__}: {str(_identity_exc)[:160]}"
+                    _cast_transfer = None
+                else:
+                    try:
+                        _cast_transfer = construct_ownership_transfer(
+                            per_file_sds,
+                            owners,
+                            files,
+                            identity=_cast_identity,
+                            strict=True,
+                        )
+                        per_file_sds, _e31_cast_record = _cast_transfer.transform_once(trace=trace)
+                        _e31_cast_once_applied = True
+                    except Exception as _cast_exc:
+                        _cast_fallback_reason = f"{type(_cast_exc).__name__}: {str(_cast_exc)[:160]}"
+                        # The transfer never published a transformed mapping;
+                        # retain the original BF16 maps/owners for the
+                        # ordinary bind below.  Do not run transfer.release()
+                        # here: that would retire the only live source handles
+                        # before the documented BF16 fallback can adopt them.
+                        _cast_transfer = None
+                        _e31_cast_record = {}
+        except ImportError:
+            pass
+
         if _scoped_readiness:
             _copy_event = _gpu_coord.record_copy_event(
                 "clip", trace, stream=torch.cuda.current_stream()
@@ -1696,12 +1919,21 @@ def _try_fast_hydrate(
         # A new bind is a semantic mutation boundary.  Invalidate the old
         # marker/generation and any pending callback before replacing storage.
         cfh.reset_clip_hydration_for_bind(clip)
-        ok, evidence = cfh.hydrate_clip_bind(
-            clip,
-            per_file_sds,
-            require_no_meta=cfh.clip_weights_excluded(clip),
-            expect_device=f"cuda:{torch.cuda.current_device()}",
-        )
+        if _cast_transfer is not None:
+            _e31_bind_record, evidence = _bind_with_ownership_transfer(
+                clip,
+                _cast_transfer,
+                per_file_sds,
+                require_no_meta=cfh.clip_weights_excluded(clip),
+            )
+            ok = True
+        else:
+            ok, evidence = cfh.hydrate_clip_bind(
+                clip,
+                per_file_sds,
+                require_no_meta=cfh.clip_weights_excluded(clip),
+                expect_device=f"cuda:{torch.cuda.current_device()}",
+            )
         if not ok:
             raise RuntimeError(f"bind: {evidence}")
         _bind_wait_started_ns = 0
@@ -1776,36 +2008,19 @@ def _try_fast_hydrate(
         # before either hydration marker or owner publication.  A failed proof
         # therefore takes the existing outer fast-path failure cleanup rather
         # than escaping as a successful hydration.
-        _e31_bind_record: dict[str, Any] = {}
         _e31_forward_install: dict[str, Any] = {}
         _e31_owner_record: dict[str, Any] = {}
         try:
             from .clip_fp32_cast_once import (
                 cast_once_enabled as _e31_enabled,
                 cast_once_generation as _e31_generation,
-                mark_cast_once_applied as _e31_mark_applied,
-                verify_resident_fp32 as _e31_verify_resident,
             )
 
-            if _e31_enabled():
+            if _e31_enabled() and _cast_transfer is not None:
                 if not _e31_cast_once_applied:
                     raise RuntimeError("E31 cast-once expected but no cast-once tensors were produced")
-                _e31_ok, _e31_bind_record = _e31_verify_resident(
-                    clip,
-                    per_file_sds,
-                    files,
-                    expect_device=f"cuda:{torch.cuda.current_device()}",
-                    phase="post_bind",
-                )
-                if not _e31_ok:
-                    _emit(
-                        trace,
-                        "clip_fh_cast_once_residency_failed",
-                        {"reason": str(_e31_bind_record.get("reason", "")), "evidence": _e31_bind_record},
-                    )
-                    raise RuntimeError(
-                        f"E31 cast-once residency proof failed: {_e31_bind_record.get('reason', '')}"
-                    )
+                if _cast_transfer is None or not _e31_cast_once_applied:
+                    raise RuntimeError("E31 cast-once requested without an ownership transfer")
                 fp32_bytes = int(_e31_bind_record.get("fp32_bytes", 0) or 0)
                 # Install and validate the exact real-forward boundary BEFORE
                 # retiring source owners or publishing a cast generation.  If
@@ -1813,9 +2028,7 @@ def _try_fast_hydrate(
                 # fail closed while all source components are still owned.
                 _e31_forward_install = _e31_forward_hook(
                     clip,
-                    per_file_sds,
-                    files,
-                    expect_device=f"cuda:{torch.cuda.current_device()}",
+                    expect_device=_cast_transfer.identity.target_device,
                     bind_snapshot=_e31_bind_record,
                     trace=trace,
                 )
@@ -1823,16 +2036,32 @@ def _try_fast_hydrate(
                     raise RuntimeError("E31 real-forward hook installation failed")
                 if not _e31_forward_install.get("instrumentation_available", False):
                     raise RuntimeError("E31 forward forensics instrumentation unavailable")
+                # Drop every local source/transformed reference before the
+                # transfer retires its handles.  The callback above captures
+                # only immutable proof metadata and the model handle.
+                _cast_transfer.drop_source_references()
+                per_file_sds = []
+                owners = []
+                _e31_owner_record = _cast_transfer.retire_owners()
+                _emit(trace, "clip_fh_cast_once_owner_retired", _e31_owner_record)
+                if not _e31_owner_record.get("ok"):
+                    raise RuntimeError(
+                        "E31 source owner retirement failed: "
+                        f"{_e31_owner_record.get('owners_failed', 0)} owner(s)"
+                    )
+                (_e31_forward_install.get("hook") or {})["owner_transition"] = dict(_e31_owner_record)
                 _e31_generation_before_mark = int(_e31_generation(clip))
-                _e31_mark_applied(clip)
-                _e31_bind_record["generation"] = int(_e31_generation(clip))
+                _e31_ready_record = _cast_transfer.mark_ready(clip)
+                _e31_bind_record.update(_e31_ready_record)
+                _e31_bind_record["generation"] = int(_e31_ready_record.get("generation", 0) or 0)
+                bind_proof = _e31_bind_record.get("bind_proof")
+                if isinstance(bind_proof, dict):
+                    bind_proof["generation"] = _e31_bind_record["generation"]
                 if _e31_bind_record["generation"] <= _e31_generation_before_mark:
                     setattr(clip, cfh.HYDRATED_MARKER, False)
                     raise RuntimeError("E31 cast-once generation mark did not advance")
-                # Publish the bind proof only after the successful generation
-                # mark.  The residency snapshot is taken before the mark, so
-                # emitting it earlier leaves the canonical top-level proof at
-                # generation 0 even though the bound/observed generation is 1.
+                # Publish the bind proof only after both storage proof and
+                # source-owner retirement have succeeded.
                 _emit(trace, "clip_fh_cast_once_bind_proof", _e31_bind_record)
                 try:
                     from . import model_preload as _e31_preload
@@ -1848,20 +2077,10 @@ def _try_fast_hydrate(
                             raise RuntimeError("E31 forward callback generation rebind failed")
                 except ImportError:
                     pass
-                _e31_owner_record = cfh.retire_source_owners(
-                    owners,
-                    bf16_bytes=int(_e31_cast_record.get("bytes_in", 0) or 0),
-                    fp32_bytes=fp32_bytes,
-                    clip=clip,
-                )
-                _emit(trace, "clip_fh_cast_once_owner_retired", _e31_owner_record)
-                if not _e31_owner_record.get("ok"):
-                    raise RuntimeError(
-                        "E31 source owner retirement failed: "
-                        f"{_e31_owner_record.get('owners_failed', 0)} owner(s)"
-                    )
-                (_e31_forward_install.get("hook") or {})["owner_transition"] = dict(_e31_owner_record)
+                cfh.mark_clip_hydrated(clip)
             else:
+                if _e31_enabled() and _cast_fallback_reason:
+                    _emit_cast_fallback(trace, _cast_fallback_reason)
                 for loader, fb in owners:
                     cfh.owner_attach(clip, loader, fb)
                 cfh.mark_clip_hydrated(clip)
@@ -1901,13 +2120,27 @@ def _try_fast_hydrate(
         except Exception:
             pass
         if _e31_bind_record:
+            _fp32_param_count = int(
+                _e31_bind_record.get("fp32_param_count")
+                or (_e31_bind_record.get("count_by_dtype") or {}).get("torch.float32", 0)
+                or _e31_bind_record.get("parameter_count", 0)
+                or 0
+            )
+            _fp32_bytes = int(
+                _e31_bind_record.get("fp32_bytes")
+                or (_e31_bind_record.get("bytes_by_dtype") or {}).get("torch.float32", 0)
+                or _e31_bind_record.get("destination_bytes", 0)
+                or 0
+            )
             _emit(
                 trace,
                 "clip_fh_cast_once_applied",
                 {
                     "generation": int(_e31_bind_record.get("generation", 0)),
-                    "fp32_params": int((_e31_bind_record.get("count_by_dtype") or {}).get("torch.float32", 0)),
-                    "fp32_bytes": int(_e31_bind_record.get("fp32_bytes", 0)),
+                    "fp32_params": _fp32_param_count,
+                    "fp32_param_count": _fp32_param_count,
+                    "fp32_bytes": _fp32_bytes,
+                    "destination_bytes": _fp32_bytes,
                     "post_mark_generation": int(_e31_bind_record.get("generation", 0)),
                     "forward_hook": _e31_forward_install.get("hook", {}),
                 },
@@ -1940,16 +2173,30 @@ def _try_fast_hydrate(
             "cuda_delta_bytes": _cuda_peak_delta(baseline),
             "zero_copy": True,
             "zero_copy_evidence": evidence,
-            "fallback_count": 0,
+            "fallback_count": 1 if _cast_once_requested and not _e31_bind_record else 0,
             "e31_evidence_schema": 1,
-            "cast_once_requested": bool(_e31_bind_record),
+            "cast_once_requested": _cast_once_requested,
             "cast_once_applied": bool(_e31_bind_record),
+            "cast_once_fallback": (
+                _cast_fallback_reason or "ordinary_bf16"
+                if _cast_once_requested and not _e31_bind_record
+                else None
+            ),
             "cast_once_generation": int(_e31_bind_record.get("generation", 0) or 0),
             "owner_transition": _e31_owner_record if _e31_bind_record else None,
             "forward_observed": False,
             "forward_timing": None,
-            "conversion_count": int(_e31_cast_record.get("tensor_count", 0) or 0),
-            "conversion_bytes": int(_e31_cast_record.get("bytes_out", 0) or 0),
+            "conversion_count": int(
+                _e31_cast_record.get("tensor_count", 0)
+                or _e31_bind_record.get("fp32_param_count", 0)
+                or 0
+            ),
+            "conversion_bytes": int(
+                _e31_cast_record.get("bytes_out", 0)
+                or _e31_bind_record.get("fp32_bytes", 0)
+                or _e31_bind_record.get("destination_bytes", 0)
+                or 0
+            ),
             "post_forward_stability": None,
             "canonical": {
                 "phase": "execution",
@@ -1967,6 +2214,17 @@ def _try_fast_hydrate(
             result["e31_forward_evidence"] = _e31_forward_install.get("hook", {})
             result["cast_once_requested"] = True
             result["cast_once_applied"] = True
+            result["fallback_count"] = 0
+            result["fp32_param_count"] = int(
+                _e31_bind_record.get("fp32_param_count")
+                or _e31_bind_record.get("parameter_count", 0)
+                or 0
+            )
+            result["fp32_bytes"] = int(
+                _e31_bind_record.get("fp32_bytes")
+                or _e31_bind_record.get("destination_bytes", 0)
+                or 0
+            )
             result["cast_once_generation"] = int(_e31_bind_record.get("generation", 0) or 0)
             result["conversion"] = {
                 "count": int(_e31_cast_record.get("tensor_count", 0) or 0),
@@ -2002,6 +2260,7 @@ def _try_fast_hydrate(
                 pass
         return result
     except Exception as exc:
+        reason = f"{type(exc).__name__}: {str(exc)[:160]}"
         try:
             cfh.reset_clip_hydration_for_bind(clip)
         except Exception:
@@ -2017,7 +2276,23 @@ def _try_fast_hydrate(
                 )
             except Exception:
                 pass
-        _close_source_owners(owners)
+        if _cast_transfer is not None:
+            try:
+                _cast_transfer.fail(exc)
+                _cast_transfer.release()
+            except Exception as _cleanup_exc:
+                _emit(trace, "clip_fh_cast_once_cleanup_failed", {
+                    "reason": f"{type(_cleanup_exc).__name__}: {str(_cleanup_exc)[:160]}",
+                    "primary_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                })
+            owners = []
+        else:
+            _cleanup = _close_source_owners(owners)
+            if _cleanup.get("errors"):
+                _emit(trace, "clip_fh_source_cleanup_failed", {
+                    "errors": list(_cleanup["errors"]),
+                    "primary_error": reason,
+                })
         try:
             torch.cuda.empty_cache()
         except Exception:
@@ -2028,7 +2303,6 @@ def _try_fast_hydrate(
                 _span_clip_hydration.finish(mono_ns=time.monotonic_ns())
             except Exception:
                 pass
-        reason = f"{type(exc).__name__}: {str(exc)[:160]}"
         state = cfh.clip_hydration_state(clip)["state"]
         _emit_decision(
             trace,
@@ -2044,6 +2318,9 @@ def _try_fast_hydrate(
             "mode": cfh.MODE_NATIVE,
             "reason": reason,
             "fallback_count": 1,
+            "cast_once_requested": _cast_once_requested,
+            "cast_once_applied": False,
+            "cast_once_fallback": "ordinary_bf16" if _cast_once_requested else None,
             "wall_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
 
@@ -2082,6 +2359,13 @@ def _hydrate_cpu_assign(
             "reconstruction": "cpu_assign",
             "zero_copy_evidence": evidence,
             "fallback_count": 1,
+            "cast_once_requested": bool(env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")),
+            "cast_once_applied": False,
+            "cast_once_fallback": (
+                "ordinary_bf16"
+                if env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")
+                else None
+            ),
         }
         _emit(trace, "clip_fh_hydration_end", result)
         _emit_decision(
@@ -2203,6 +2487,13 @@ def _hydrate_native_copy(
             "reconstruction": "native_copy",
             "params_copied": count,
             "fallback_count": 1,
+            "cast_once_requested": bool(env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")),
+            "cast_once_applied": False,
+            "cast_once_fallback": (
+                "ordinary_bf16"
+                if env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")
+                else None
+            ),
         }
         _emit(trace, "clip_fh_hydration_end", result)
         _emit_decision(
@@ -2220,6 +2511,13 @@ def _hydrate_native_copy(
             "mode": cfh.MODE_NATIVE,
             "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
             "fallback_count": 1,
+            "cast_once_requested": bool(env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")),
+            "cast_once_applied": False,
+            "cast_once_fallback": (
+                "ordinary_bf16"
+                if env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE")
+                else None
+            ),
         }
         _emit(trace, "clip_fh_hydration_end", result)
         _emit_decision(
@@ -2232,6 +2530,10 @@ def _hydrate_native_copy(
         return result
 
 
+def _cast_once_requested_for_recording() -> bool:
+    return bool(env_flag("COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"))
+
+
 def _record_mode(
     clip: Any,
     mode: str,
@@ -2240,12 +2542,36 @@ def _record_mode(
     state_before: Optional[str] = None,
     state_after: Optional[str] = None,
 ) -> dict[str, Any]:
+    # A requested cast-once path that cannot establish identity/ownership is
+    # an ordinary BF16 fallback, never an unrequested nominal success.  Apply
+    # this at the recording boundary as well as at the fast-path result so
+    # both ``_RECORD`` and loader execution identity retain the truth.
+    if _cast_once_requested_for_recording() and not bool(info.get("cast_once_applied", False)):
+        info = dict(info)
+        info["cast_once_requested"] = True
+        info["cast_once_applied"] = False
+        info["cast_once_fallback"] = info.get("cast_once_fallback") or "ordinary_bf16"
+        info["fallback_count"] = max(int(info.get("fallback_count", 0) or 0), 1)
     rid = _request_id()
     rec = _RECORD.setdefault(
-        rid, {"mode": None, "fallback_count": 0, "hydrated": False, "last": None}
+        rid,
+        {
+            "mode": None,
+            "fallback_count": 0,
+            "hydrated": False,
+            "last": None,
+            "cast_once_requested": False,
+            "cast_once_applied": False,
+        },
     )
     rec["mode"] = mode
     rec["fallback_count"] += int(info.get("fallback_count", 0) or 0)
+    if "cast_once_requested" in info:
+        rec["cast_once_requested"] = bool(info.get("cast_once_requested"))
+    if "cast_once_applied" in info:
+        rec["cast_once_applied"] = bool(info.get("cast_once_applied"))
+    if info.get("cast_once_fallback"):
+        rec["cast_once_fallback"] = str(info["cast_once_fallback"])
     if info.get("ok") and not info.get("e31_forward_required"):
         rec["hydrated"] = True
     entry = dict(info)
@@ -3037,6 +3363,9 @@ def clip_fh_request_summary(request_id: str = "") -> dict[str, Any]:
         "hydration_source": mode,
         "hydrated": bool(rec.get("hydrated", False)),
         "fallback_count": int(rec.get("fallback_count", 0) or 0),
+        "cast_once_requested": bool(rec.get("cast_once_requested", False)),
+        "cast_once_applied": bool(rec.get("cast_once_applied", False)),
+        "cast_once_fallback": rec.get("cast_once_fallback"),
         "last": rec.get("last"),
     }
     # ``_LAST_CLIP`` is a weakref.ref (stored by ``_note_clip`` so the
