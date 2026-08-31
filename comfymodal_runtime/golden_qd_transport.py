@@ -675,8 +675,13 @@ class TransportDispatcher:
         self._completed_records: list[ReadyRecord] = []
         self._dispatcher_error: BaseException | None = None
         self._cleanup_errors: list[BaseException] = []
+        # Pool bookkeeping and bounded detachment must not race.  Backend
+        # calls deliberately happen outside this lock; only the lease/event
+        # state transition is serialized with cleanup.
+        self._lease_cleanup_lock = threading.RLock()
         self._stop = False
         self._cancelled = False
+        self._cleanup_deadline: float | None = None
         self._thread: threading.Thread | None = None
 
     @property
@@ -705,32 +710,38 @@ class TransportDispatcher:
         blocked = False
         capacity = self.config.ready_queue_capacity
         assert capacity is not None
-        with self._queue_condition:
-            while len(self._queue) >= capacity and not self._cancelled and not self._stop:
-                blocked = True
-                self._queue_condition.wait()
-            if blocked:
-                self.telemetry.ready_queue_block_count += 1
-                self.telemetry.ready_queue_block_wall_ns += time.monotonic_ns() - started
-            if self._cancelled:
-                raise CancellationError("transport was cancelled before publish")
-            if self._stop:
-                raise CancellationError("transport was quiesced before publish")
-            # This call does not call back into the dispatcher condition.
-            self.pool._mark_ready(lease, record, self.destination_size)
-            self._queue.append((lease, record))
-            self.telemetry.ready_depth = len(self._queue)
-            self._queue_condition.notify_all()
+        with self._lease_cleanup_lock:
+            with self._queue_condition:
+                while len(self._queue) >= capacity and not self._cancelled and not self._stop:
+                    blocked = True
+                    self._queue_condition.wait()
+                if blocked:
+                    self.telemetry.ready_queue_block_count += 1
+                    self.telemetry.ready_queue_block_wall_ns += time.monotonic_ns() - started
+                if self._cancelled:
+                    raise CancellationError("transport was cancelled before publish")
+                if self._stop:
+                    raise CancellationError("transport was quiesced before publish")
+                # This call does not call back into the dispatcher condition.
+                self.pool._mark_ready(lease, record, self.destination_size)
+                self._queue.append((lease, record))
+                self.telemetry.ready_depth = len(self._queue)
+                self._queue_condition.notify_all()
 
     def quiesce(self) -> None:
         with self._queue_condition:
             self._stop = True
             self._queue_condition.notify_all()
 
-    def cancel(self) -> None:
+    def cancel(self, *, deadline: float | None = None) -> None:
         with self._queue_condition:
             self._cancelled = True
             self._stop = True
+            if deadline is not None:
+                self._cleanup_deadline = (
+                    deadline if self._cleanup_deadline is None
+                    else min(self._cleanup_deadline, deadline)
+                )
             self._queue_condition.notify_all()
 
     def _note_cleanup(self, error: BaseException) -> None:
@@ -755,45 +766,59 @@ class TransportDispatcher:
                 raw_status = self.backend.poll_event(event)
                 status = EventStatus(raw_status)
             except BaseException as exc:
-                self.pool._poison(lease, "H2D poll was uncertain")
+                with self._lease_cleanup_lock:
+                    with self._queue_condition:
+                        current = self._in_flight.pop(key, None)
+                        self._queue_condition.notify_all()
+                    if current is None or lease._returned:
+                        continue
+                    self.pool._poison(lease, "H2D poll was uncertain")
                 raise TransportError("H2D poll failed; staging pool poisoned") from exc
             if status == EventStatus.PENDING:
                 continue
-            with self._queue_condition:
-                self._in_flight.pop(key, None)
-                self._queue_condition.notify_all()
-            if status == EventStatus.COMPLETE:
-                # The completion event is the proof that the submitted copy
-                # finished.  Count it before pool bookkeeping so a cleanup
-                # race cannot make the telemetry claim that it did not.
-                self.telemetry.h2d_completed_bytes += record.nbytes
-                self.telemetry.h2d_completed_count += 1
-                self.pool._return_completed(lease)
+            with self._lease_cleanup_lock:
+                # Bounded drain may have detached and poisoned this lease
+                # while poll_event was in progress.  It owns that cleanup;
+                # do not turn the expected stale generation into a second
+                # dispatcher failure.
                 with self._queue_condition:
-                    self._completed_records.append(record)
-                self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submit_ns)
-            elif status == EventStatus.UNCERTAIN:
-                self.pool._poison(lease, "uncertain H2D completion")
-                raise TransportError("uncertain H2D completion; staging pool poisoned")
-            else:
-                self.pool._poison(lease, "H2D event failed")
-                raise TransportError("H2D completion event failed; staging pool poisoned")
+                    current = self._in_flight.pop(key, None)
+                    self._queue_condition.notify_all()
+                if current is None or lease._returned:
+                    continue
+                if status == EventStatus.COMPLETE:
+                    # The completion event is the proof that the submitted
+                    # copy finished.  Count it before pool bookkeeping so a
+                    # cleanup race cannot make telemetry claim it did not.
+                    self.telemetry.h2d_completed_bytes += record.nbytes
+                    self.telemetry.h2d_completed_count += 1
+                    self.pool._return_completed(lease)
+                    with self._queue_condition:
+                        self._completed_records.append(record)
+                    self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submit_ns)
+                elif status == EventStatus.UNCERTAIN:
+                    self.pool._poison(lease, "uncertain H2D completion")
+                    raise TransportError("uncertain H2D completion; staging pool poisoned")
+                else:
+                    self.pool._poison(lease, "H2D event failed")
+                    raise TransportError("H2D completion event failed; staging pool poisoned")
         self.telemetry.dispatcher_reap_count += 1
         self.telemetry.dispatcher_reap_wall_ns += time.monotonic_ns() - started
 
     def _return_queued(self) -> None:
-        with self._queue_condition:
-            queued = self._queue[:]
-            self._queue.clear()
-            self.telemetry.ready_depth = 0
-            self._queue_condition.notify_all()
-        for lease, _record in queued:
-            try:
-                self.pool._return_ready(lease)
-            except BaseException as exc:
-                self._note_cleanup(exc)
+        with self._lease_cleanup_lock:
+            with self._queue_condition:
+                queued = self._queue[:]
+                self._queue.clear()
+                self.telemetry.ready_depth = 0
+                self._queue_condition.notify_all()
+            for lease, _record in queued:
+                try:
+                    self.pool._return_ready(lease)
+                except BaseException as exc:
+                    self._note_cleanup(exc)
 
-    def _cancel_in_flight(self) -> None:
+    def _cancel_in_flight(self, deadline: float | None = None) -> None:
         # Snapshot under the condition, then release it before any backend or
         # pool call.  In particular, never reacquire this condition while it
         # is held by _run.
@@ -808,6 +833,8 @@ class TransportDispatcher:
                 self._note_cleanup(exc)
             status: EventStatus | None = None
             for _ in range(self.config.cancellation_poll_limit):
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 try:
                     status = EventStatus(self.backend.poll_event(event))
                 except BaseException as exc:
@@ -817,36 +844,43 @@ class TransportDispatcher:
                 if status != EventStatus.PENDING:
                     break
             proven = cancel_ok and status == EventStatus.COMPLETE
-            if proven:
-                try:
-                    self.telemetry.h2d_completed_bytes += record.nbytes
-                    self.telemetry.h2d_completed_count += 1
-                    self.pool._return_completed(lease)
-                    with self._queue_condition:
-                        self._completed_records.append(record)
-                except BaseException as exc:
-                    self._note_cleanup(exc)
-            else:
-                self.pool._poison(lease, "cancelled H2D completion was not proven")
-                if status == EventStatus.PENDING:
-                    self._note_cleanup(TransportError("cancelled H2D event remained pending"))
-                elif status == EventStatus.UNCERTAIN:
-                    self._note_cleanup(TransportError("cancelled H2D completion was uncertain"))
-                elif status == EventStatus.FAILED:
-                    self._note_cleanup(TransportError("cancelled H2D completion failed"))
-            with self._queue_condition:
-                self._in_flight.pop(key, None)
-                self._queue_condition.notify_all()
+            with self._lease_cleanup_lock:
+                with self._queue_condition:
+                    current = self._in_flight.get(key)
+                if current is None:
+                    # A concurrent bounded drain already detached this event.
+                    continue
+                if proven:
+                    try:
+                        self.telemetry.h2d_completed_bytes += record.nbytes
+                        self.telemetry.h2d_completed_count += 1
+                        self.pool._return_completed(lease)
+                        with self._queue_condition:
+                            self._completed_records.append(record)
+                    except BaseException as exc:
+                        self._note_cleanup(exc)
+                else:
+                    self.pool._poison(lease, "cancelled H2D completion was not proven")
+                    if status == EventStatus.PENDING:
+                        self._note_cleanup(TransportError("cancelled H2D event remained pending"))
+                    elif status == EventStatus.UNCERTAIN:
+                        self._note_cleanup(TransportError("cancelled H2D completion was uncertain"))
+                    elif status == EventStatus.FAILED:
+                        self._note_cleanup(TransportError("cancelled H2D completion failed"))
+                with self._queue_condition:
+                    self._in_flight.pop(key, None)
+                    self._queue_condition.notify_all()
 
-    def _cleanup_cancelled(self) -> None:
+    def _cleanup_cancelled(self, deadline: float | None = None) -> None:
         self._return_queued()
-        with self._queue_condition:
-            handoff = list(self._handoff.values())
-            self._handoff.clear()
-            self._queue_condition.notify_all()
-        for lease, _record in handoff:
-            self.pool._poison(lease, "cancelled dispatcher handoff was not completed")
-        self._cancel_in_flight()
+        with self._lease_cleanup_lock:
+            with self._queue_condition:
+                handoff = list(self._handoff.values())
+                self._handoff.clear()
+                self._queue_condition.notify_all()
+            for lease, _record in handoff:
+                self.pool._poison(lease, "cancelled dispatcher handoff was not completed")
+        self._cancel_in_flight(deadline)
 
     def _run(self) -> None:
         try:
@@ -855,7 +889,7 @@ class TransportDispatcher:
                     self._poll()
                 except BaseException as exc:
                     self._set_dispatcher_error(exc)
-                    self._cleanup_cancelled()
+                    self._cleanup_cancelled(self._cleanup_deadline)
                     return
                 with self._queue_condition:
                     cancelled = self._cancelled
@@ -867,7 +901,7 @@ class TransportDispatcher:
                         self._queue_condition.notify_all()
                     done = self._stop and item is None and not self._queue and not self._in_flight
                 if cancelled:
-                    self._cleanup_cancelled()
+                    self._cleanup_cancelled(self._cleanup_deadline)
                     return
                 if done:
                     return
@@ -878,8 +912,9 @@ class TransportDispatcher:
                 lease, record = item
                 event = None
                 try:
-                    self.pool._mark_in_flight(lease)
-                    source = self.pool._buffer_for_dispatch(lease, record.nbytes)
+                    with self._lease_cleanup_lock:
+                        self.pool._mark_in_flight(lease)
+                        source = self.pool._buffer_for_dispatch(lease, record.nbytes)
                     event = self.backend.submit_h2d(source, record.destination_offset)
                     if event is None:
                         raise TransportError("backend returned no completion event")
@@ -889,64 +924,91 @@ class TransportDispatcher:
                     self.telemetry.h2d_submitted_bytes += record.nbytes
                     self.telemetry.h2d_submitted_count += 1
                 except BaseException as exc:
-                    self.pool._poison(lease, "H2D submission did not produce a completion event")
+                    if self._cancelled:
+                        return
+                    with self._lease_cleanup_lock:
+                        self.pool._poison(lease, "H2D submission did not produce a completion event")
                     self._set_dispatcher_error(exc)
-                    self._cleanup_cancelled()
+                    self._cleanup_cancelled(self._cleanup_deadline)
                     return
-                with self._queue_condition:
-                    handoff = self._handoff.get(lease.slot_index)
-                    if handoff is not item:
-                        registration_error = TransportError(
-                            "dispatcher handoff was cleaned up before event registration"
-                        )
-                    else:
-                        self._handoff.pop(lease.slot_index, None)
-                        self._in_flight[lease.slot_index] = (
-                            lease, record, event, time.monotonic_ns()
-                        )
-                        registration_error = None
-                    self._queue_condition.notify_all()
+                with self._lease_cleanup_lock:
+                    with self._queue_condition:
+                        handoff = self._handoff.get(lease.slot_index)
+                        if handoff is not item:
+                            # A bounded cancellation may have detached this
+                            # handoff while submit_h2d was blocked.  The
+                            # cleanup owner already poisoned it; do not emit
+                            # a stale-lease secondary error.
+                            registration_error = None if self._cancelled else TransportError(
+                                "dispatcher handoff was cleaned up before event registration"
+                            )
+                        else:
+                            self._handoff.pop(lease.slot_index, None)
+                            self._in_flight[lease.slot_index] = (
+                                lease, record, event, time.monotonic_ns()
+                            )
+                            registration_error = None
+                        self._queue_condition.notify_all()
                 if registration_error is not None:
-                    self.pool._poison(lease, str(registration_error))
+                    with self._lease_cleanup_lock:
+                        self.pool._poison(lease, str(registration_error))
                     self._set_dispatcher_error(registration_error)
-                    self._cleanup_cancelled()
+                    self._cleanup_cancelled(self._cleanup_deadline)
+                    return
+                if self._cancelled:
                     return
         finally:
             with self._queue_condition:
                 self._queue_condition.notify_all()
 
-    def drain(self, timeout: float | None = None) -> None:
+    def drain(
+        self,
+        timeout: float | None = None,
+        *,
+        bounded: bool = True,
+        deadline: float | None = None,
+    ) -> None:
         thread = self._thread
         if thread is None:
             return
-        bounded = self.config.cleanup_timeout if timeout is None else max(0.0, timeout)
-        thread.join(bounded)
+        if not bounded:
+            thread.join()
+            return
+        if deadline is None:
+            budget = self.config.cleanup_timeout if timeout is None else max(0.0, timeout)
+            deadline = time.monotonic() + budget
+        thread.join(max(0.0, deadline - time.monotonic()))
         if not thread.is_alive():
             return
         # A backend may never settle.  Detach every event and poison every
         # uncertain lease; do not wait indefinitely for a permanently pending
         # event or hold a dispatcher condition while doing pool cleanup.
-        with self._queue_condition:
-            queued = self._queue[:]
-            active = list(self._in_flight.values())
-            handoff = list(self._handoff.values())
-            self._queue.clear()
-            self._handoff.clear()
-            self._in_flight.clear()
-            self._stop = True
-            self._cancelled = True
-            self.telemetry.ready_depth = 0
-            self._queue_condition.notify_all()
-        for lease, _record in queued:
-            try:
-                self.pool._return_ready(lease)
-            except BaseException as exc:
-                self._note_cleanup(exc)
-        for lease, _record in handoff:
-            self.pool._poison(lease, "bounded drain could not complete dispatcher handoff")
-        for lease, _record, _event, _submit_ns in active:
-            self.pool._poison(lease, "bounded drain could not prove H2D completion")
-        thread.join(min(0.05, bounded))
+        with self._lease_cleanup_lock:
+            with self._queue_condition:
+                queued = self._queue[:]
+                active = list(self._in_flight.values())
+                handoff = list(self._handoff.values())
+                self._queue.clear()
+                self._handoff.clear()
+                self._in_flight.clear()
+                self._stop = True
+                self._cancelled = True
+                self._cleanup_deadline = (
+                    deadline if self._cleanup_deadline is None
+                    else min(self._cleanup_deadline, deadline)
+                )
+                self.telemetry.ready_depth = 0
+                self._queue_condition.notify_all()
+            for lease, _record in queued:
+                try:
+                    self.pool._return_ready(lease)
+                except BaseException as exc:
+                    self._note_cleanup(exc)
+            for lease, _record in handoff:
+                self.pool._poison(lease, "bounded drain could not complete dispatcher handoff")
+            for lease, _record, _event, _submit_ns in active:
+                self.pool._poison(lease, "bounded drain could not prove H2D completion")
+        thread.join(max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
             self._note_cleanup(TransportError("dispatcher thread did not stop within bounded drain"))
 
@@ -976,6 +1038,8 @@ class GoldenQDTransport:
         self._active_lock = threading.Lock()
         self._cancel_requested = False
         self._abort_requested = False
+        self._abort_deadline: float | None = None
+        self._abort_lock = threading.Lock()
 
     def acquire(self, timeout: float | None = None, *, declared_range: SourceRange | None = None) -> StageLease:
         started = time.monotonic_ns()
@@ -1006,26 +1070,42 @@ class GoldenQDTransport:
         if self.dispatcher is not None:
             self.dispatcher.quiesce()
 
-    def drain(self, timeout: float | None = None) -> None:
+    def drain(
+        self,
+        timeout: float | None = None,
+        *,
+        bounded: bool = True,
+        deadline: float | None = None,
+    ) -> None:
         if self.dispatcher is not None:
             self.telemetry.final_drain_start_ns = time.monotonic_ns()
             self.dispatcher.quiesce()
-            self.dispatcher.drain(timeout)
+            self.dispatcher.drain(timeout, bounded=bounded, deadline=deadline)
             self.telemetry.final_drain_end_ns = time.monotonic_ns()
 
     def cancel(self, timeout: float | None = None) -> None:
         self._cancel_requested = True
-        self._abort_requested = True
+        deadline = self._begin_abort()
         self.pool._cancel_waiters()
         if self.dispatcher is not None:
-            self.dispatcher.cancel()
-            self.dispatcher.drain(timeout)
+            self.dispatcher.cancel(deadline=deadline)
+            cancel_deadline = deadline
+            if timeout is not None:
+                cancel_deadline = min(deadline, time.monotonic() + max(0.0, timeout))
+            self.dispatcher.drain(timeout, bounded=True, deadline=cancel_deadline)
 
     def _request_abort(self) -> None:
-        self._abort_requested = True
+        self._begin_abort()
         self.pool._cancel_waiters()
         if self.dispatcher is not None:
-            self.dispatcher.cancel()
+            self.dispatcher.cancel(deadline=self._abort_deadline)
+
+    def _begin_abort(self) -> float:
+        with self._abort_lock:
+            self._abort_requested = True
+            if self._abort_deadline is None:
+                self._abort_deadline = time.monotonic() + self.config.cleanup_timeout
+            return self._abort_deadline
 
     @staticmethod
     def _record_ranges(ranges: Iterable[SourceRange], destination_size: int | None = None) -> list[SourceRange]:
@@ -1162,8 +1242,14 @@ class GoldenQDTransport:
                             try:
                                 self.pool.return_lease(lease)
                             except BaseException as exc:
-                                with errors_lock:
-                                    producer_cleanup_errors.append(exc)
+                                # Abort cleanup may already have detached and
+                                # poisoned this exact lease.  That expected
+                                # handoff must not become a stale-generation
+                                # secondary diagnostic (a real producer
+                                # cleanup error is still retained).
+                                if not (self._abort_requested and lease._returned and isinstance(exc, LeaseError)):
+                                    with errors_lock:
+                                        producer_cleanup_errors.append(exc)
             except BaseException as exc:
                 note_worker_error(exc)
             finally:
@@ -1173,18 +1259,54 @@ class GoldenQDTransport:
         threads = [threading.Thread(target=worker, name=f"golden-qd-source-{i}", daemon=True) for i in range(self.config.producer_workers)]
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join(self.config.cleanup_timeout)
+        # Successful producer completion is ordinary work, not cleanup.  Do
+        # not spend the abort budget once per worker: slow source reads and
+        # backpressure are allowed to finish normally.  Once an abort is
+        # observed, all remaining joins share one absolute deadline with the
+        # dispatcher drain below.
+        abort_deadline = self._abort_deadline
+        while True:
+            live_workers = [thread for thread in threads if thread.is_alive()]
+            if not live_workers:
+                break
+            if self._abort_requested:
+                if abort_deadline is None:
+                    abort_deadline = self._begin_abort()
+                remaining = abort_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                live_workers[0].join(min(0.01, remaining))
+            else:
+                # A short join lets another producer report an abort while a
+                # different producer is blocked on source I/O or backpressure.
+                live_workers[0].join(0.01)
+        if self._abort_requested and abort_deadline is None:
+            abort_deadline = self._begin_abort()
         live_workers = [thread for thread in threads if thread.is_alive()]
         if live_workers:
             errors.append(TransportError("source worker did not stop within bounded cleanup"))
             self._request_abort()
-            self.pool._poison(None, "source worker cleanup was uncertain", all_active=True)
-            for thread in live_workers:
-                thread.join(0.05)
+            if self.dispatcher is not None:
+                with self.dispatcher._lease_cleanup_lock:
+                    self.pool._poison(None, "source worker cleanup was uncertain", all_active=True)
+            else:
+                self.pool._poison(None, "source worker cleanup was uncertain", all_active=True)
+            if abort_deadline is None:
+                abort_deadline = self._begin_abort()
+            while live_workers:
+                remaining = abort_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                live_workers[0].join(min(0.01, remaining))
+                live_workers = [thread for thread in threads if thread.is_alive()]
         self.telemetry.source_end_ns = time.monotonic_ns()
         self.telemetry.final_drain_start_ns = time.monotonic_ns()
-        self.drain(self.config.cleanup_timeout)
+        if abort_deadline is None:
+            # No abort occurred: wait for the dispatcher to quiesce without
+            # applying the cleanup timeout to normal completion.
+            self.drain(None, bounded=False)
+        else:
+            self.drain(deadline=abort_deadline)
         self.telemetry.final_drain_end_ns = time.monotonic_ns()
 
         dispatcher_error = self.dispatcher.dispatcher_error if self.dispatcher else None

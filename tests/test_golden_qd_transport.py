@@ -161,6 +161,21 @@ def test_source_qd_interval_closes_when_reader_raises():
     assert telemetry["source_qd_timeline"][-1]["depth"] == 0
 
 
+def test_normal_producer_completion_is_not_limited_by_cleanup_timeout():
+    transport = GoldenQDTransport(
+        small_config(queue_depth=1, staging_slots=1, producer_workers=1, cleanup_timeout=1.0),
+        FakeBackend(),
+    )
+
+    def slow_reader(offset, length):
+        time.sleep(1.05)
+        return b"data"
+
+    result = transport.execute([SourceRange(0, 4)], slow_reader, output_size=4)
+
+    assert result.output == b"data"
+
+
 def test_ready_queue_is_bounded_and_backpressure_is_counted():
     source = FakeSource(b"a" * 32)
     transport = GoldenQDTransport(
@@ -403,3 +418,38 @@ def test_explicit_cancel_always_returns_typed_cancelled_failure():
     with pytest.raises(TransportFailure) as caught:
         transport.execute([SourceRange(0, 4)], reader)
     assert caught.value.cancelled is True
+
+
+def test_abort_cleanup_has_one_bounded_deadline_without_stale_lease_secondary():
+    started = threading.Event()
+    release = threading.Event()
+    outcome = []
+    transport = GoldenQDTransport(
+        small_config(queue_depth=1, staging_slots=1, producer_workers=1, cleanup_timeout=0.05),
+        FakeBackend(),
+    )
+
+    def blocked_reader(offset, length):
+        started.set()
+        release.wait(timeout=1)
+        return b"data"
+
+    def run():
+        try:
+            transport.execute([SourceRange(0, 4)], blocked_reader)
+        except TransportFailure as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(timeout=1)
+    began = time.monotonic()
+    transport.cancel()
+    elapsed = time.monotonic() - began
+    thread.join(timeout=1)
+
+    assert elapsed < 0.2
+    assert not thread.is_alive()
+    assert outcome and outcome[0].cancelled is True
+    assert all("stale lease generation" not in str(error).lower() for error in outcome[0].secondary_errors)
+    release.set()
