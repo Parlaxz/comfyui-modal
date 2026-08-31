@@ -106,6 +106,19 @@ class RA9GOwnershipTransferTest(unittest.TestCase):
         _, _, changed_identity = _fixture(generation="manifest-2")
         self.assertNotEqual(identity.digest, changed_identity.digest)
 
+    def test_non_bf16_model_tensor_cannot_be_labeled_cast_once(self):
+        source, manifests, identity = _fixture()
+        source["weight"] = source["weight"].to(torch.float32)
+        transfer = ra9g.ClipFP32OwnershipTransfer(
+            [source], [_Owner()], manifests, identity, strict=True
+        )
+        with self.assertRaises(ra9g.OwnershipTransferError) as caught:
+            transfer.transform_once()
+        self.assertIn("must be BF16", str(caught.exception))
+        self.assertEqual(transfer.state, ra9g.FAILED)
+        self.assertIsNone(transfer.transformed_mappings)
+        self.assertEqual(source["weight"].dtype, torch.float32)
+
     def test_identity_and_device_are_explicit(self):
         source, manifests, _ = _fixture()
         with self.assertRaises(ra9g.OwnershipTransferError):
@@ -295,6 +308,22 @@ class RA9GOwnershipTransferTest(unittest.TestCase):
         transfer.retire_owners()
         self.assertTrue(transfer.source_free_storage_proof(actual, expected_device="cpu")["ok"])
         self.assertEqual(owner.released, 1)
+
+    def test_selected_scope_representation_metric_detects_independent_storage(self):
+        transfer, _, transformed, _, identity = _transfer()
+        transfer.bind(transformed, assign=True)
+        proof = transfer.prove_storage()
+        independent = {"weight": torch.empty(4, dtype=torch.float32)}
+        independent_signature = ra9g._tensor_storage_signature(independent)
+        metrics = ra9g._selected_scope_representation_metrics(
+            proof["storage_representation_signatures"] + [independent_signature],
+            destination_bytes=proof["destination_bytes"],
+            selected_scope=identity.selected_tensor_scope,
+        )
+        self.assertEqual(metrics["selected_scope"], "clip.transformer")
+        self.assertEqual(metrics["representation_count"], 2)
+        self.assertEqual(metrics["duplicate_bytes"], proof["destination_bytes"])
+        self.assertFalse(metrics["no_second_representation"])
 
     def test_actual_bind_rejects_fake_transformed_mapping_without_receipt(self):
         transfer, _, transformed, _, _ = _transfer()

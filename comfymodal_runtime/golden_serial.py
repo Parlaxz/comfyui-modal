@@ -202,6 +202,22 @@ _RA9H_TELEMETRY_FIELDS = (
     "cast_once_proof_ms",
     "clip_forward_total_ms",
     "real_forward_count",
+    "all_conversion_count",
+    "all_conversion_bytes",
+    "all_conversion_source_bytes",
+    "all_conversion_destination_bytes",
+    "all_conversion_source_dtypes",
+    "all_conversion_destination_dtypes",
+    "per_forward_conversion_source_dtypes",
+    "per_forward_conversion_destination_dtypes",
+    "selected_parameter_conversion_count",
+    "selected_parameter_conversion_bytes",
+    "selected_parameter_conversion_source_bytes",
+    "selected_parameter_source_dtypes",
+    "selected_parameter_destination_dtypes",
+    "per_forward_selected_parameter_conversion_counts",
+    "per_forward_selected_parameter_conversion_bytes",
+    "parameter_scope_proof_status",
     "per_forward_conversion_counts",
     "per_forward_conversion_bytes",
     "repeated_conversion_count",
@@ -243,6 +259,22 @@ def _new_ra9h_telemetry(requested: str = "bf16") -> dict[str, Any]:
         "cast_once_proof_ms": None,
         "clip_forward_total_ms": None,
         "real_forward_count": None,
+        "all_conversion_count": None,
+        "all_conversion_bytes": None,
+        "all_conversion_source_bytes": None,
+        "all_conversion_destination_bytes": None,
+        "all_conversion_source_dtypes": None,
+        "all_conversion_destination_dtypes": None,
+        "per_forward_conversion_source_dtypes": None,
+        "per_forward_conversion_destination_dtypes": None,
+        "selected_parameter_conversion_count": None,
+        "selected_parameter_conversion_bytes": None,
+        "selected_parameter_conversion_source_bytes": None,
+        "selected_parameter_source_dtypes": None,
+        "selected_parameter_destination_dtypes": None,
+        "per_forward_selected_parameter_conversion_counts": None,
+        "per_forward_selected_parameter_conversion_bytes": None,
+        "parameter_scope_proof_status": "NOT RUN",
         "per_forward_conversion_counts": None,
         "per_forward_conversion_bytes": None,
         "repeated_conversion_count": None,
@@ -2372,6 +2404,35 @@ def _cuda_event_elapsed_ms(start_event: Any, end_event: Any) -> Optional[float]:
     return value if math.isfinite(value) and value >= 0 else None
 
 
+def _writable_bytes_view(target: Any) -> memoryview:
+    """Return a writable byte view without copying CPU torch staging storage."""
+    if isinstance(target, torch.Tensor):
+        if (
+            target.device.type != "cpu"
+            or target.dtype != torch.uint8
+            or target.dim() != 1
+            or not target.is_contiguous()
+        ):
+            raise TypeError("source read target must be a contiguous CPU uint8 tensor")
+        try:
+            view = memoryview(target.detach().numpy())
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise TypeError("CPU uint8 tensor has no writable zero-copy byte view") from exc
+    else:
+        try:
+            view = memoryview(target)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("source read target must be writable byte-addressable storage") from exc
+    try:
+        if view.format != "B" or view.ndim != 1:
+            view = view.cast("B")
+    except (TypeError, ValueError) as exc:
+        raise TypeError("source read target is not contiguous byte-addressable storage") from exc
+    if view.readonly:
+        raise TypeError("source read target is not writable")
+    return view
+
+
 def _read_at(fd: int, mv: Any, offset: int) -> int:
     """Fill ``mv`` fully from absolute file offset (preadv > pread > lseek+read)."""
     total = 0
@@ -2842,7 +2903,13 @@ def _read_file_qd_gpu_dispatcher(
                 worker_id = threading.get_ident() % qd
                 started = source_telemetry.before(worker_id)
                 try:
-                    got = int(_read_at(self._fd_for_thread(), target, int(offset)))
+                    # Keep the dispatcher-facing slot as its original torch
+                    # tensor while giving positioned OS I/O the writable byte
+                    # protocol it requires.  This is a view, never a staging
+                    # allocation or a bytes materialization.
+                    got = int(_read_at(
+                        self._fd_for_thread(), _writable_bytes_view(target), int(offset)
+                    ))
                 except BaseException:
                     raise
                 else:
@@ -5266,7 +5333,7 @@ def _clip_qwen_forward_hooks(
     timing: _ClipTiming,
     snapshot: Callable[[], dict[str, Any]],
     recorder: Optional[GoldenTelemetryRecorder] = None,
-    conversion_observer: Optional[Callable[[str, int], None]] = None,
+    conversion_observer: Optional[Callable[..., Any]] = None,
     *,
     enabled: bool = True,
 ):
@@ -5326,7 +5393,7 @@ def _clip_qwen_forward_hooks(
                 "input_facts_truncated": bool(getattr(input_facts, "truncated", False)),
             })
             if callable(conversion_observer):
-                conversion_observer("start", index)
+                conversion_observer("start", index, starts[-1]["snapshot"])
         except Exception as exc:
             timing.unproven(
                 "clip_qwen_transformer_forward",
@@ -5364,9 +5431,25 @@ def _clip_qwen_forward_hooks(
                 "output_facts": output_facts,
                 "output_facts_truncated": bool(getattr(output_facts, "truncated", False)),
             }
-            forwards.append(record)
+            conversion_record = None
             if callable(conversion_observer):
-                conversion_observer("end", index)
+                conversion_record = conversion_observer("end", index)
+            if isinstance(conversion_record, Mapping):
+                record["conversion_entries"] = list(
+                    conversion_record.get("conversion_entries") or []
+                )
+                for key in (
+                    "conversion_count", "source_bytes", "destination_bytes",
+                    "selected_parameter_conversion_count",
+                    "selected_parameter_conversion_bytes",
+                    "selected_parameter_conversion_source_bytes",
+                    "selected_parameter_source_dtypes",
+                    "selected_parameter_destination_dtypes",
+                    "parameter_scope_proof_status",
+                ):
+                    if key in conversion_record:
+                        record[key] = conversion_record[key]
+            forwards.append(record)
             timing.phases.append({
                 "name": "clip_qwen_transformer_forward",
                 "start_ns": record["start_ns"],
@@ -5444,13 +5527,17 @@ def _clip_scope_snapshot(scope: Any, patcher: Any = None) -> dict[str, Any]:
         entries = []
         for name, tensor in tensors:
             storage = tensor.untyped_storage()
+            data_ptr = int(tensor.data_ptr())
+            storage_ptr = int(storage.data_ptr())
             entries.append({
                 "name": str(name),
                 "device": str(tensor.device),
                 "dtype": str(tensor.dtype),
-                "data_ptr": int(tensor.data_ptr()),
-                "storage_ptr": int(storage.data_ptr()),
+                "data_ptr": data_ptr,
+                "storage_ptr": storage_ptr,
                 "storage_bytes": int(storage.nbytes()),
+                "tensor_bytes": int(tensor.numel() * tensor.element_size()),
+                "storage_offset_bytes": data_ptr - storage_ptr,
                 "shape": [int(x) for x in tensor.shape],
             })
         patcher = patcher if patcher is not None else getattr(scope, "patcher", None)
@@ -5571,27 +5658,27 @@ def _clip_compute_dtype_from_forward_evidence(
     is_compute_dtype = lambda value: str(value).startswith((
         "torch.float", "torch.bfloat", "torch.half"
     ))
+    # The first observed Qwen hook is the selected compute boundary.  Do not
+    # aggregate later forwards or use process-wide conversion traffic as proof.
+    selected_forward = forwards[0] if isinstance(forwards[0], Mapping) else {}
     input_dtypes = sorted({
         str(fact.get("dtype"))
-        for forward in forwards
-        for fact in (forward.get("input_facts") or [])
+        for fact in (selected_forward.get("input_facts") or [])
         if isinstance(fact, Mapping) and fact.get("dtype") and is_compute_dtype(fact.get("dtype"))
     })
     observed_output_dtypes = sorted({
         str(fact.get("dtype"))
-        for forward in forwards
-        for fact in (forward.get("output_facts") or [])
+        for fact in (selected_forward.get("output_facts") or [])
         if isinstance(fact, Mapping) and fact.get("dtype")
     })
     output_dtypes = sorted({
         str(fact.get("dtype"))
-        for forward in forwards
-        for fact in (forward.get("output_facts") or [])
+        for fact in (selected_forward.get("output_facts") or [])
         if isinstance(fact, Mapping) and fact.get("dtype") and is_compute_dtype(fact.get("dtype"))
     })
     cast_dtypes = sorted({
         str(item.get("destination_dtype"))
-        for item in (conversion or {}).get("conversions", [])
+        for item in (selected_forward.get("conversion_entries") or [])
         if isinstance(item, Mapping) and item.get("destination_dtype")
     })
     def facts_truncated(forward: Mapping[str, Any], name: str) -> bool:
@@ -5607,14 +5694,8 @@ def _clip_compute_dtype_from_forward_evidence(
         "output_dtypes": output_dtypes,
         "observed_output_dtypes": observed_output_dtypes,
         "cast_destination_dtypes": cast_dtypes,
-        "input_facts_truncated": any(
-            facts_truncated(forward, "input_facts") for forward in forwards
-            if isinstance(forward, Mapping)
-        ),
-        "output_facts_truncated": any(
-            facts_truncated(forward, "output_facts") for forward in forwards
-            if isinstance(forward, Mapping)
-        ),
+        "input_facts_truncated": facts_truncated(selected_forward, "input_facts"),
+        "output_facts_truncated": facts_truncated(selected_forward, "output_facts"),
     })
     if evidence["input_facts_truncated"] or evidence["output_facts_truncated"]:
         evidence["reason"] = "bounded_forward_facts_truncated"
@@ -5637,6 +5718,7 @@ def _clip_compute_dtype_from_forward_evidence(
         evidence["status"] = "PROVEN"
         evidence["basis"] = "observed_output_and_cast_destination"
         return matching[0], evidence
+    evidence["reason"] = "mixed_or_missing_forward_boundary_dtype"
     return None, evidence
 
 
@@ -5782,7 +5864,9 @@ def _ra9h_authoritative_identity(session: GoldenSession) -> dict[str, Any]:
 
 
 @contextlib.contextmanager
-def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
+def _ra9h_forward_conversion_instrumentation(
+    *, enabled: bool, scope_snapshot: Optional[Callable[[], dict[str, Any]]] = None
+):
     """Observe actual ``cast_to`` allocations without synchronizing CUDA.
 
     The wrapper counts only a new tensor returned by the existing Comfy cast
@@ -5804,6 +5888,22 @@ def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
         "repeated_conversion_count": None,
         "repeated_conversion_bytes": None,
         "forward_diagnostics_status": "NOT RUN",
+        "all_conversion_count": None,
+        "all_conversion_bytes": None,
+        "all_conversion_source_bytes": None,
+        "all_conversion_destination_bytes": None,
+        "all_conversion_source_dtypes": None,
+        "all_conversion_destination_dtypes": None,
+        "per_forward_conversion_source_dtypes": None,
+        "per_forward_conversion_destination_dtypes": None,
+        "selected_parameter_conversion_count": None,
+        "selected_parameter_conversion_bytes": None,
+        "selected_parameter_conversion_source_bytes": None,
+        "selected_parameter_source_dtypes": None,
+        "selected_parameter_destination_dtypes": None,
+        "per_forward_selected_parameter_conversion_counts": None,
+        "per_forward_selected_parameter_conversion_bytes": None,
+        "parameter_scope_proof_status": "NOT RUN",
     }
     if not enabled:
         yield record
@@ -5813,32 +5913,154 @@ def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
         original = getattr(management, "cast_to", None)
     except Exception as exc:
         record["reason"] = f"instrumentation_install_failed:{type(exc).__name__}"
+        record["parameter_scope_proof_status"] = "UNPROVEN"
         record.pop("_observe_forward", None)
         yield record
         return
     if not callable(original):
+        record["parameter_scope_proof_status"] = "UNPROVEN"
         yield record
         return
     count = 0
     source_bytes = 0
     destination_bytes = 0
     conversions: list[dict[str, Any]] = []
-    forward_starts: dict[int, tuple[int, int, int]] = {}
+    forward_starts: dict[int, tuple[int, int, int, int, str, dict[str, dict[str, Any]]]] = {}
     per_forward: list[dict[str, Any]] = []
 
-    def observe_forward(phase: str, index: int) -> None:
+    def scope_identities(snapshot: Any) -> tuple[str, dict[str, dict[str, Any]]]:
+        if not isinstance(snapshot, Mapping) or snapshot.get("status") != "proven":
+            return "UNPROVEN", {}
+        entries = snapshot.get("entries")
+        if not isinstance(entries, list) or not entries or len(entries) > 4096:
+            return "UNPROVEN", {}
+        identities: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                return "UNPROVEN", {}
+            try:
+                storage_ptr = int(entry["storage_ptr"])
+                storage_bytes = int(entry["storage_bytes"])
+                data_ptr = int(entry["data_ptr"])
+                tensor_bytes = int(entry.get("tensor_bytes", 0))
+                storage_offset = int(entry.get("storage_offset_bytes", data_ptr - storage_ptr))
+            except (KeyError, TypeError, ValueError):
+                return "UNPROVEN", {}
+            if storage_ptr <= 0 or storage_bytes < 0 or tensor_bytes < 0:
+                return "UNPROVEN", {}
+            identities.setdefault(str(entry.get("name", "")), {
+                "storage_ptr": storage_ptr,
+                "storage_bytes": storage_bytes,
+                "storage_offset_bytes": storage_offset,
+                "tensor_bytes": tensor_bytes,
+                "data_ptr": data_ptr,
+            })
+        return "PROVEN", identities
+
+    def tensor_facts(tensor: torch.Tensor) -> Optional[dict[str, Any]]:
+        try:
+            storage = tensor.untyped_storage()
+            storage_ptr = int(storage.data_ptr())
+            data_ptr = int(tensor.data_ptr())
+            return {
+                "source_storage_ptr": storage_ptr,
+                "source_storage_bytes": int(storage.nbytes()),
+                "source_data_ptr": data_ptr,
+                "source_storage_offset_bytes": data_ptr - storage_ptr,
+                "source_tensor_bytes": int(tensor.numel() * tensor.element_size()),
+                "source_dtype": str(tensor.dtype),
+            }
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def selected_names(facts: Optional[Mapping[str, Any]], identities: Mapping[str, Mapping[str, Any]]) -> list[str]:
+        if facts is None:
+            return []
+        try:
+            source_storage = int(facts["source_storage_ptr"])
+            source_storage_bytes = int(facts["source_storage_bytes"])
+            source_start = int(facts["source_storage_offset_bytes"])
+            source_end = source_start + int(facts["source_tensor_bytes"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        if source_start < 0 or source_end < source_start or source_end > source_storage_bytes:
+            return []
+        names = []
+        for name, selected in identities.items():
+            if source_storage != int(selected["storage_ptr"]):
+                continue
+            selected_start = int(selected["storage_offset_bytes"])
+            selected_end = selected_start + int(selected["tensor_bytes"])
+            if (
+                selected_start < 0
+                or selected_end < selected_start
+                or selected_end > int(selected["storage_bytes"])
+            ):
+                continue
+            if source_start <= selected_start < source_end or selected_start <= source_start < selected_end:
+                names.append(name)
+        return names
+
+    def observe_forward(
+        phase: str, index: int, selected_snapshot: Optional[dict[str, Any]] = None
+    ) -> Optional[dict[str, Any]]:
         if phase == "start":
-            forward_starts[int(index)] = (count, source_bytes, destination_bytes)
-            return
-        start_count, start_source, start_destination = forward_starts.pop(
-            int(index), (count, source_bytes, destination_bytes)
+            if selected_snapshot is None and callable(scope_snapshot):
+                try:
+                    selected_snapshot = scope_snapshot()
+                except Exception:
+                    selected_snapshot = None
+            proof_status, identities = scope_identities(selected_snapshot)
+            forward_starts[int(index)] = (
+                count, source_bytes, destination_bytes, len(conversions),
+                proof_status, identities,
+            )
+            return None
+        start_count, start_source, start_destination, start_conversion, proof_status, identities = forward_starts.pop(
+            int(index), (count, source_bytes, destination_bytes, len(conversions), "UNPROVEN", {})
         )
-        per_forward.append({
+        forward_conversions = list(conversions[start_conversion:])
+        for item in forward_conversions:
+            item["selected_parameter_names"] = selected_names(item, identities) if proof_status == "PROVEN" else []
+        matched = [item for item in forward_conversions if item.get("selected_parameter_names")]
+        unmatched = [item for item in forward_conversions if not item.get("selected_parameter_names")]
+        # Unmatched conversions are observed activation/output/device work, not
+        # parameter casts.  They remain visible in the all-conversion ledger
+        # without invalidating a valid selected-scope storage proof.
+        selected_proven = proof_status == "PROVEN"
+        selected_count = sum(1 for _item in matched) if selected_proven else None
+        selected_bytes = sum(int(item["destination_bytes"]) for item in matched) if selected_proven else None
+        selected_source_bytes = sum(int(item["source_bytes"]) for item in matched) if selected_proven else None
+        selected_source_dtypes = sorted({
+            str(item["source_dtype"]) for item in matched if item.get("source_dtype")
+        }) if selected_proven else None
+        selected_destination_dtypes = sorted({
+            str(item["destination_dtype"]) for item in matched if item.get("destination_dtype")
+        }) if selected_proven else None
+        entry = {
             "forward_index": int(index),
             "conversion_count": max(0, count - start_count),
             "source_bytes": max(0, source_bytes - start_source),
             "destination_bytes": max(0, destination_bytes - start_destination),
-        })
+            "source_dtypes": sorted({
+                str(item["source_dtype"]) for item in forward_conversions
+                if item.get("source_dtype")
+            }),
+            "destination_dtypes": sorted({
+                str(item["destination_dtype"]) for item in forward_conversions
+                if item.get("destination_dtype")
+            }),
+            "conversion_entries": forward_conversions,
+            "selected_parameter_conversion_count": selected_count,
+            "selected_parameter_conversion_bytes": selected_bytes,
+            "selected_parameter_conversion_source_bytes": selected_source_bytes,
+            "selected_parameter_source_dtypes": selected_source_dtypes,
+            "selected_parameter_destination_dtypes": selected_destination_dtypes,
+            "parameter_scope_proof_status": "PROVEN" if selected_proven else "UNPROVEN",
+            "unmatched_conversion_count": len(unmatched),
+        }
+        per_forward.append(entry)
+        return entry
 
     # Request-local callback only; it is removed before telemetry is emitted.
     record["_observe_forward"] = observe_forward
@@ -5861,6 +6083,7 @@ def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
                 "destination_dtype": str(result.dtype),
                 "source_bytes": int(tensor.numel() * tensor.element_size()),
                 "destination_bytes": int(result.numel() * result.element_size()),
+                **(tensor_facts(tensor) or {}),
             })
         return result
 
@@ -5868,9 +6091,10 @@ def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
         setattr(management, "cast_to", wrapped)
     except Exception as exc:
         record["reason"] = f"instrumentation_install_failed:{type(exc).__name__}"
+        record["parameter_scope_proof_status"] = "UNPROVEN"
         yield record
         return
-    record.update({"status": "RUN", "reason": "installed", "conversion_count": 0, "destination_bytes": 0, "source_bytes": 0, "timing_scope": "TOTAL actual forward cast_to observation", "conversions": conversions, "per_forward": per_forward})
+    record.update({"status": "RUN", "reason": "installed", "conversion_count": 0, "destination_bytes": 0, "source_bytes": 0, "timing_scope": "TOTAL actual forward cast_to observation", "conversions": conversions, "per_forward": per_forward, "parameter_scope_proof_status": "UNPROVEN"})
     try:
         yield record
     finally:
@@ -5889,6 +6113,61 @@ def _ra9h_forward_conversion_instrumentation(*, enabled: bool):
                     "UNPROVEN" if per_forward else "NOT RUN"
                 ),
             })
+            record["all_conversion_count"] = count
+            record["all_conversion_bytes"] = destination_bytes
+            record["all_conversion_source_bytes"] = source_bytes
+            record["all_conversion_destination_bytes"] = destination_bytes
+            record["all_conversion_source_dtypes"] = sorted({
+                str(item["source_dtype"]) for item in conversions
+                if item.get("source_dtype")
+            })
+            record["all_conversion_destination_dtypes"] = sorted({
+                str(item["destination_dtype"]) for item in conversions
+                if item.get("destination_dtype")
+            })
+            proven_forwards = [
+                item for item in per_forward
+                if item.get("parameter_scope_proof_status") == "PROVEN"
+            ]
+            accounted_conversion_count = sum(
+                len(item.get("conversion_entries") or []) for item in per_forward
+            )
+            all_conversions_accounted = (
+                bool(per_forward) and accounted_conversion_count == len(conversions)
+            )
+            if per_forward and len(proven_forwards) == len(per_forward) and all_conversions_accounted:
+                record["parameter_scope_proof_status"] = "PROVEN"
+                record["selected_parameter_conversion_count"] = sum(
+                    int(item["selected_parameter_conversion_count"]) for item in per_forward
+                )
+                record["selected_parameter_conversion_bytes"] = sum(
+                    int(item["selected_parameter_conversion_bytes"]) for item in per_forward
+                )
+                record["selected_parameter_conversion_source_bytes"] = sum(
+                    int(item["selected_parameter_conversion_source_bytes"]) for item in per_forward
+                )
+                record["selected_parameter_source_dtypes"] = sorted({
+                    dtype for item in per_forward
+                    for dtype in (item.get("selected_parameter_source_dtypes") or [])
+                })
+                record["selected_parameter_destination_dtypes"] = sorted({
+                    dtype for item in per_forward
+                    for dtype in (item.get("selected_parameter_destination_dtypes") or [])
+                })
+            elif per_forward:
+                record["parameter_scope_proof_status"] = "UNPROVEN"
+            record["per_forward_selected_parameter_conversion_counts"] = [
+                item.get("selected_parameter_conversion_count") for item in per_forward
+            ] if per_forward else None
+            record["per_forward_selected_parameter_conversion_bytes"] = [
+                item.get("selected_parameter_conversion_bytes") for item in per_forward
+            ] if per_forward else None
+            record["per_forward_conversion_source_dtypes"] = [
+                item.get("source_dtypes", []) for item in per_forward
+            ] if per_forward else None
+            record["per_forward_conversion_destination_dtypes"] = [
+                item.get("destination_dtypes", []) for item in per_forward
+            ] if per_forward else None
             record.pop("_observe_forward", None)
             if len(per_forward) >= 2:
                 record["repeated_conversion_count"] = sum(
@@ -6222,6 +6501,12 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         def golden_initial_device(load_device, offload_device, model_size=0):
             return torch.device("meta")
 
+        # Constructor/load_state_dict(assign=True) is the actual ownership
+        # bind seam.  Enter bind before it, including the dynamic-patcher
+        # postflight immediately following the constructor, so failures there
+        # cannot be misclassified as safe BF16 fallback.
+        if clip_transfer is not None:
+            set_clip_lifecycle_phase("bind")
         model_management.text_encoder_initial_device = golden_initial_device
         try:
             # Shallow dict copies retain the SAME tensor objects (zero-copy
@@ -6270,8 +6555,6 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         for index, sd in enumerate(transformed_state_dicts):
             for key, view in sd.items():
                 combined_views[f"[{index}]{key}"] = view
-        if clip_transfer is not None:
-            set_clip_lifecycle_phase("bind")
         bind_started_ns = time.perf_counter_ns() if clip_transfer is not None else None
         if clip_transfer is not None:
             # This is the actual post-loader destination, not the transformed
@@ -6623,6 +6906,21 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
         )
         runner.begin_scope({"clip_forward"})
         try:
+            def observe_clip_forward(
+                phase: str, index: int, selected_snapshot: Optional[dict[str, Any]] = None
+            ) -> Any:
+                if conversion_telemetry is None:
+                    return None
+                observer = conversion_telemetry.get("_observe_forward")
+                result = (
+                    observer(phase, index, selected_snapshot)
+                    if callable(observer) else None
+                )
+                conversion_telemetry.setdefault("_forward_observer_events", []).append(
+                    {"phase": phase, "index": int(index)}
+                )
+                return result
+
             with _ra9h_forward_conversion_instrumentation(
                 enabled=(
                     diagnostics_enabled
@@ -6638,15 +6936,7 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                         "status": "unproven", "reason": "compute_scope_missing"
                     },
                     recorder=rec,
-                    conversion_observer=(
-                        lambda phase, index: (
-                            conversion_telemetry.get("_observe_forward", lambda *_: None)(phase, index),
-                            conversion_telemetry.setdefault(
-                                "_forward_observer_events", []
-                            ).append({"phase": phase, "index": int(index)})
-                        )
-                        if conversion_telemetry is not None else None
-                    ),
+                    conversion_observer=observe_clip_forward if conversion_telemetry is not None else None,
                     enabled=diagnostics_enabled,
                 ):
                     with _clip_forward_wrappers(
@@ -6720,6 +7010,70 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             repeated_conversion_count=repeated_conversion_count,
             repeated_conversion_bytes=repeated_conversion_bytes,
             forward_diagnostics_status=forward_diag_status,
+            all_conversion_count=(
+                conversion_telemetry.get("all_conversion_count")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            all_conversion_bytes=(
+                conversion_telemetry.get("all_conversion_bytes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            all_conversion_source_bytes=(
+                conversion_telemetry.get("all_conversion_source_bytes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            all_conversion_destination_bytes=(
+                conversion_telemetry.get("all_conversion_destination_bytes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            all_conversion_source_dtypes=(
+                conversion_telemetry.get("all_conversion_source_dtypes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            all_conversion_destination_dtypes=(
+                conversion_telemetry.get("all_conversion_destination_dtypes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            per_forward_conversion_source_dtypes=(
+                conversion_telemetry.get("per_forward_conversion_source_dtypes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            per_forward_conversion_destination_dtypes=(
+                conversion_telemetry.get("per_forward_conversion_destination_dtypes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            selected_parameter_conversion_count=(
+                conversion_telemetry.get("selected_parameter_conversion_count")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            selected_parameter_conversion_bytes=(
+                conversion_telemetry.get("selected_parameter_conversion_bytes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            selected_parameter_conversion_source_bytes=(
+                conversion_telemetry.get("selected_parameter_conversion_source_bytes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            selected_parameter_source_dtypes=(
+                conversion_telemetry.get("selected_parameter_source_dtypes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            selected_parameter_destination_dtypes=(
+                conversion_telemetry.get("selected_parameter_destination_dtypes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            per_forward_selected_parameter_conversion_counts=(
+                conversion_telemetry.get("per_forward_selected_parameter_conversion_counts")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            per_forward_selected_parameter_conversion_bytes=(
+                conversion_telemetry.get("per_forward_selected_parameter_conversion_bytes")
+                if isinstance(conversion_telemetry, Mapping) else None
+            ),
+            parameter_scope_proof_status=(
+                conversion_telemetry.get("parameter_scope_proof_status", "UNPROVEN")
+                if isinstance(conversion_telemetry, Mapping) else "UNPROVEN"
+            ),
         )
         encode_classes = [sc for _n, _c, sc in executed if sc == "clip_forward"]
         if not encode_classes:

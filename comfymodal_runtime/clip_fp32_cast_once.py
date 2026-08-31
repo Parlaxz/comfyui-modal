@@ -26,7 +26,8 @@ Invalidation semantics (fail-closed):
   parameter data in place; a subsequent forward either sees the mutated
   (still-FP32) values (patches applied in FP32 by Comfy's patch machinery)
   or triggers the regular cast path.  A stale compute-ready representation
-  is structurally impossible because there is no second representation.
+  is structurally impossible within the selected/adopted CLIP scope because
+  there is no second representation there.
 * Defensive demand-time check: :func:`assert_compute_ready_no_patches`
   verifies every file-covered parameter is FP32 and no weight/bias function
   is registered on the leaves before the bind is allowed to proceed with
@@ -282,6 +283,47 @@ def _tensor_storage_ptr(tensor: Any) -> Optional[int]:
         return None
 
 
+def _tensor_storage_signature(mapping: Mapping[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    """Return a complete, scalar signature for one selected-scope storage map."""
+    signature: list[tuple[Any, ...]] = []
+    for key in sorted(mapping):
+        tensor = mapping[key]
+        if not isinstance(tensor, torch.Tensor):
+            raise OwnershipTransferError(f"storage signature requires tensor: {key}")
+        storage = tensor.untyped_storage()
+        signature.append((
+            str(key),
+            int(tensor.data_ptr()),
+            int(storage.data_ptr()),
+            tuple(int(dim) for dim in tensor.shape),
+            str(tensor.dtype),
+            str(tensor.device),
+            int(storage.nbytes()),
+        ))
+    return tuple(signature)
+
+
+def _selected_scope_representation_metrics(
+    signatures: Any, *, destination_bytes: int, selected_scope: str
+) -> dict[str, Any]:
+    """Derive representation claims only from complete selected-scope signatures."""
+    normalized = {
+        tuple(tuple(item) for item in signature)
+        for signature in (signatures or [])
+    }
+    representation_count = len(normalized)
+    duplicate_bytes = max(0, representation_count - 1) * max(0, int(destination_bytes))
+    return {
+        "selected_scope": str(selected_scope),
+        "storage_representation_signatures": [
+            [list(item) for item in signature] for signature in sorted(normalized, key=repr)
+        ],
+        "representation_count": representation_count,
+        "duplicate_bytes": duplicate_bytes,
+        "no_second_representation": representation_count == 1,
+    }
+
+
 def _allocator_checkpoint() -> dict[str, Any]:
     """Capture allocator counters without synchronizing or retaining tensors."""
     result: dict[str, Any] = {
@@ -340,8 +382,22 @@ def actual_bind_destination_map(
         wanted = {str(key) for key in expected_keys}
         destination: dict[str, Any] = {}
         all_keys: set[str] = set()
-        for leaf in _cfh._leaf_loaders(csm):
-            for key, tensor in _cfh._leaf_param_map(leaf).items():
+        leaves = _cfh._leaf_loaders(csm)
+        if leaves:
+            for leaf in leaves:
+                for key, tensor in _cfh._leaf_param_map(leaf).items():
+                    key = str(key)
+                    all_keys.add(key)
+                    if key in wanted:
+                        if key in destination and destination[key] is not tensor:
+                            raise OwnershipTransferError(f"duplicate actual destination: {key}")
+                        destination[key] = tensor
+        else:
+            # A plain torch.nn.Module destination has no Comfy load_sd leaf.
+            # Its named parameters/buffers are still the actual post-assign
+            # destination and must be inspected without a test-only seam.
+            named = list(csm.named_parameters()) + list(csm.named_buffers())
+            for key, tensor in named:
                 key = str(key)
                 all_keys.add(key)
                 if key in wanted:
@@ -633,6 +689,10 @@ class ClipFP32OwnershipTransfer:
             manifest_dtype = str(manifest.get("dtype", ""))
             if not manifest_dtype:
                 raise OwnershipTransferError(f"missing manifest dtype: file {file_index}")
+            if manifest_dtype != _SOURCE_DTYPE:
+                raise OwnershipTransferError(
+                    f"source manifest dtype must be BF16: file {file_index}: {manifest_dtype}"
+                )
             for key, tensor in mapping.items():
                 key = str(key)
                 if key in _TOKENIZER_KEYS:
@@ -650,6 +710,10 @@ class ClipFP32OwnershipTransfer:
                 if tuple(tensor.shape) != tuple(expected_shape):
                     raise OwnershipTransferError(
                         f"source key shape mismatch: file {file_index}: {key}"
+                    )
+                if str(tensor.dtype) != _SOURCE_DTYPE:
+                    raise OwnershipTransferError(
+                        f"source key dtype must be BF16: file {file_index}: {key}"
                     )
                 if str(tensor.dtype) != manifest_dtype:
                     raise OwnershipTransferError(
@@ -852,8 +916,8 @@ class ClipFP32OwnershipTransfer:
                 transformed = _flatten_tensor_maps(self._transformed)
                 source = _flatten_tensor_maps(self._source)
                 unique: set[int] = set()
-                transformed_storage_signature: list[Optional[int]] = []
-                destination_storage_signature: list[Optional[int]] = []
+                transformed_storage_signature: Optional[tuple[tuple[Any, ...], ...]] = None
+                destination_storage_signature: Optional[tuple[tuple[Any, ...], ...]] = None
                 source_bytes = 0
                 destination_bytes = 0
                 per_key: list[dict[str, Any]] = []
@@ -876,8 +940,6 @@ class ClipFP32OwnershipTransfer:
                     if src_storage is None or dst_storage is None or src_storage != dst_storage or int(src.data_ptr()) != int(dst.data_ptr()):
                         raise OwnershipTransferError(f"storage proof adoption mismatch: {key}")
                     unique.add(int(dst_storage))
-                    transformed_storage_signature.append(src_storage)
-                    destination_storage_signature.append(dst_storage)
                     source_bytes += int(source[key].numel() * source[key].element_size())
                     destination_bytes += int(dst.numel() * dst.element_size())
                     per_key.append({
@@ -891,16 +953,19 @@ class ClipFP32OwnershipTransfer:
                         "destination_storage_ptr": _tensor_storage_ptr(dst),
                         "file_index": int(file_indices.get(key, 0)),
                     })
-                # A representation is the complete model-sized FP32 storage
-                # signature, not a Python mapping.  Derive these claims from
-                # the actual transformed/destination storage aliases so a
-                # second model-sized allocation cannot be hidden by constants.
-                representation_signatures = {
-                    tuple(transformed_storage_signature),
-                    tuple(destination_storage_signature),
-                }
-                representation_count = len(representation_signatures)
-                duplicate_fp32_bytes = max(0, representation_count - 1) * destination_bytes
+                # A representation is the complete selected-scope FP32
+                # storage signature, not a Python mapping.  The transformed
+                # and destination signatures intentionally collapse when the
+                # actual bind adopted storage by alias.
+                transformed_storage_signature = _tensor_storage_signature(transformed)
+                destination_storage_signature = _tensor_storage_signature(self._destination)
+                representation_metrics = _selected_scope_representation_metrics(
+                    [transformed_storage_signature, destination_storage_signature],
+                    destination_bytes=destination_bytes,
+                    selected_scope=self._identity.selected_tensor_scope,
+                )
+                representation_count = int(representation_metrics["representation_count"])
+                duplicate_fp32_bytes = int(representation_metrics["duplicate_bytes"])
                 source_refs = len(self._source)
                 owner_refs = len(self._owners)
                 self._record.update({
@@ -923,9 +988,15 @@ class ClipFP32OwnershipTransfer:
                         and source_refs > 0
                         and owner_refs > 0
                     ),
+                    "selected_scope": self._identity.selected_tensor_scope,
+                    "storage_representation_signatures": representation_metrics[
+                        "storage_representation_signatures"
+                    ],
                     "fp32_resident_representation_count": representation_count,
                     "duplicate_model_sized_fp32_bytes": duplicate_fp32_bytes,
-                    "no_second_model_sized_copy": representation_count == 1,
+                    "no_second_model_sized_copy": representation_metrics[
+                        "no_second_representation"
+                    ],
                     "source_refs_at_proof": source_refs,
                     "owner_refs_at_proof": owner_refs,
                     "per_key": per_key,

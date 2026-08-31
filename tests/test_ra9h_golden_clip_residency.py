@@ -108,6 +108,7 @@ def test_compute_dtype_uses_real_qwen_boundary_evidence_not_residency():
         [{
             "input_facts": [{"dtype": "torch.bfloat16", "device": "cuda:0"}],
             "output_facts": [{"dtype": "torch.float32", "device": "cuda:0"}],
+            "conversion_entries": [{"destination_dtype": "torch.float32"}],
         }],
         {"conversions": [{"destination_dtype": "torch.float32"}]},
     )
@@ -123,6 +124,7 @@ def test_compute_dtype_mixed_output_evidence_fails_closed():
                 {"dtype": "torch.float32", "device": "cpu"},
                 {"dtype": "torch.bfloat16", "device": "cpu"},
             ],
+            "conversion_entries": [{"destination_dtype": "torch.float32"}],
         }],
         {"conversions": [{"destination_dtype": "torch.float32"}]},
     )
@@ -137,11 +139,34 @@ def test_compute_dtype_truncated_forward_evidence_fails_closed():
             "input_facts": [{"dtype": "torch.bfloat16", "device": "cpu"}],
             "output_facts": [{"dtype": "torch.float32", "device": "cpu"}],
             "output_facts_truncated": True,
+            "conversion_entries": [{"destination_dtype": "torch.float32"}],
         }],
         {"conversions": [{"destination_dtype": "torch.float32"}]},
     )
     assert dtype is None
     assert evidence["reason"] == "bounded_forward_facts_truncated"
+
+
+def test_compute_dtype_ignores_unrelated_conversion_outside_selected_qwen_forward():
+    dtype, evidence = gs._clip_compute_dtype_from_forward_evidence(
+        [
+            {
+                "input_facts": [{"dtype": "torch.bfloat16", "device": "cpu"}],
+                "output_facts": [{"dtype": "torch.float32", "device": "cpu"}],
+                "conversion_entries": [],
+            },
+            {
+                "input_facts": [{"dtype": "torch.bfloat16", "device": "cpu"}],
+                "output_facts": [{"dtype": "torch.float32", "device": "cpu"}],
+                "conversion_entries": [{"destination_dtype": "torch.float32"}],
+            },
+        ],
+        {"conversions": [{"destination_dtype": "torch.float32"}]},
+    )
+    assert dtype is None
+    assert evidence["status"] == "OBSERVED"
+    assert evidence["cast_destination_dtypes"] == []
+    assert evidence["reason"] == "mixed_or_missing_forward_boundary_dtype"
 
 
 def test_forward_fact_collection_signals_bounded_truncation():
@@ -316,8 +341,119 @@ def test_forward_conversion_diagnostics_pair_two_real_boundaries(monkeypatch):
             observe("end", index)
     assert record["real_forward_count"] == 2
     assert [item["conversion_count"] for item in record["per_forward"]] == [1, 1]
+    assert [
+        len(item["conversion_entries"]) for item in record["per_forward"]
+    ] == [1, 1]
     assert record["repeated_conversion_count"] == 1
     assert record["forward_diagnostics_status"] == "PROVEN"
+
+
+def _ra9h_scope_snapshot(tensor, name="weight"):
+    storage = tensor.untyped_storage()
+    storage_ptr = int(storage.data_ptr())
+    data_ptr = int(tensor.data_ptr())
+    return {
+        "status": "proven",
+        "entries": [{
+            "name": name,
+            "storage_ptr": storage_ptr,
+            "storage_bytes": int(storage.nbytes()),
+            "data_ptr": data_ptr,
+            "storage_offset_bytes": data_ptr - storage_ptr,
+            "tensor_bytes": int(tensor.numel() * tensor.element_size()),
+        }],
+    }
+
+
+def test_selected_parameter_conversion_is_proven_in_one_forward(monkeypatch):
+    fake_mm = types.ModuleType("comfy.model_management")
+
+    def cast_to(tensor, dtype=None, device=None, **kwargs):
+        return tensor.to(dtype=dtype, device=device)
+
+    fake_mm.cast_to = cast_to
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+    source = torch.ones(4, dtype=torch.bfloat16)
+    with gs._ra9h_forward_conversion_instrumentation(
+        enabled=True, scope_snapshot=lambda: _ra9h_scope_snapshot(source)
+    ) as record:
+        observe = record["_observe_forward"]
+        observe("start", 0)
+        fake_mm.cast_to(source, dtype=torch.float32)
+        observe("end", 0)
+    assert record["parameter_scope_proof_status"] == "PROVEN"
+    assert record["selected_parameter_conversion_count"] == 1
+    assert record["selected_parameter_conversion_bytes"] == 16
+    assert record["selected_parameter_conversion_source_bytes"] == 8
+    assert record["selected_parameter_source_dtypes"] == ["torch.bfloat16"]
+    assert record["selected_parameter_destination_dtypes"] == ["torch.float32"]
+    assert record["per_forward_selected_parameter_conversion_counts"] == [1]
+
+
+def test_unmatched_activation_conversion_does_not_count_as_selected_parameter(monkeypatch):
+    fake_mm = types.ModuleType("comfy.model_management")
+    fake_mm.cast_to = lambda tensor, dtype=None, device=None, **kwargs: tensor.to(dtype=dtype, device=device)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+    parameter = torch.ones(4, dtype=torch.bfloat16)
+    activation = torch.ones(4, dtype=torch.bfloat16)
+    with gs._ra9h_forward_conversion_instrumentation(
+        enabled=True, scope_snapshot=lambda: _ra9h_scope_snapshot(parameter)
+    ) as record:
+        observe = record["_observe_forward"]
+        observe("start", 0)
+        fake_mm.cast_to(activation, dtype=torch.float32)
+        observe("end", 0)
+    assert record["all_conversion_count"] == 1
+    assert record["parameter_scope_proof_status"] == "PROVEN"
+    assert record["selected_parameter_conversion_count"] == 0
+    assert record["selected_parameter_conversion_bytes"] == 0
+
+
+def test_activation_conversion_stays_separate_from_proven_parameter_conversion(monkeypatch):
+    fake_mm = types.ModuleType("comfy.model_management")
+    fake_mm.cast_to = lambda tensor, dtype=None, device=None, **kwargs: tensor.to(dtype=dtype, device=device)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+    parameter = torch.ones(4, dtype=torch.bfloat16)
+    activation = torch.ones(2, dtype=torch.bfloat16)
+    with gs._ra9h_forward_conversion_instrumentation(
+        enabled=True, scope_snapshot=lambda: _ra9h_scope_snapshot(parameter)
+    ) as record:
+        observe = record["_observe_forward"]
+        observe("start", 0)
+        fake_mm.cast_to(parameter, dtype=torch.float32)
+        fake_mm.cast_to(activation, dtype=torch.float32)
+        observe("end", 0)
+    assert record["all_conversion_count"] == 2
+    assert record["all_conversion_bytes"] == 24
+    assert record["parameter_scope_proof_status"] == "PROVEN"
+    assert record["selected_parameter_conversion_count"] == 1
+    assert record["selected_parameter_conversion_bytes"] == 16
+
+
+def test_fp32_no_conversion_proves_selected_zero_with_one_forward(monkeypatch):
+    fake_mm = types.ModuleType("comfy.model_management")
+    fake_mm.cast_to = lambda tensor, dtype=None, device=None, **kwargs: tensor
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+    parameter = torch.ones(4, dtype=torch.float32)
+    with gs._ra9h_forward_conversion_instrumentation(
+        enabled=True, scope_snapshot=lambda: _ra9h_scope_snapshot(parameter)
+    ) as record:
+        observe = record["_observe_forward"]
+        observe("start", 0)
+        fake_mm.cast_to(parameter, dtype=torch.float32)
+        observe("end", 0)
+    assert record["parameter_scope_proof_status"] == "PROVEN"
+    assert record["selected_parameter_conversion_count"] == 0
+    assert record["selected_parameter_conversion_bytes"] == 0
+    assert record["forward_diagnostics_status"] == "UNPROVEN"
+
+
+def test_missing_cast_seam_leaves_parameter_proof_unproven(monkeypatch):
+    monkeypatch.setitem(sys.modules, "comfy.model_management", types.ModuleType("comfy.model_management"))
+    with gs._ra9h_forward_conversion_instrumentation(enabled=True) as record:
+        pass
+    assert record["parameter_scope_proof_status"] == "UNPROVEN"
+    assert record["selected_parameter_conversion_count"] is None
 
 
 def test_failure_and_cancellation_cleanup_do_not_publish_ready():
@@ -369,17 +505,25 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
 
     class DynamicPatcher:
         def is_dynamic(self):
+            captured["postflight_phase"] = session.clip_residency_record.get(
+                "lifecycle_phase"
+            )
             return True
 
-    class Scope:
-        def named_modules(self):
-            return [("", self)]
+    class Loader(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.empty(4, device="meta", dtype=torch.float32)
+            )
 
     def load_text_encoder_state_dicts(state_dicts, **kwargs):
         captured["calls"] = captured.get("calls", 0) + 1
         captured["state_dicts"] = state_dicts
+        destination = Loader()
+        destination.load_state_dict(state_dicts[0], assign=True)
         clip = types.SimpleNamespace(
-            cond_stage_model=Scope(),
+            cond_stage_model=destination,
             patcher=DynamicPatcher(),
             tokenize=lambda *a, **k: {},
             encode_from_tokens_scheduled=lambda *a, **k: "conditioning",
@@ -467,13 +611,15 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
     # GoldenSession methods are intentionally used directly; this keeps the
     # fake at the adapter boundary without constructing unrelated runtime state.
     session.register_qd_owner = gs.GoldenSession.register_qd_owner.__get__(session, gs.GoldenSession)
-    # Keep the fake narrowly scoped while still exercising RA9G's actual-bind
-    # receipt path after the real loader returns.
-    monkeypatch.setattr(cfh, "_leaf_loaders", lambda _root: [captured["clip"].cond_stage_model])
-    monkeypatch.setattr(cfh, "_leaf_param_map", lambda _leaf: captured["state_dicts"][0])
     clip = asyncio.run(gs.golden_clip_load(session))
     assert captured["calls"] == 1
+    assert captured["postflight_phase"] == "bind"
     assert captured["state_dicts"][0]["weight"].dtype is torch.float32
+    assert clip.cond_stage_model.weight.data_ptr() == captured["state_dicts"][0]["weight"].data_ptr()
+    assert (
+        clip.cond_stage_model.weight.untyped_storage().data_ptr()
+        == captured["state_dicts"][0]["weight"].untyped_storage().data_ptr()
+    )
     assert fake_read_calls["read"] == 1
     assert session.clip_residency_record["status"] == "READY"
     assert session.clip_residency_record["actual"] == "fp32_cast_once"

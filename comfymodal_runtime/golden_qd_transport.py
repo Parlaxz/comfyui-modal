@@ -269,13 +269,17 @@ class StageLease:
             self._producer_identity = threading.get_ident()
 
 
-def _buffer_slice(buffer: Any, nbytes: int) -> Any:
+def _buffer_slice(buffer: Any, nbytes: int, offset: int = 0) -> Any:
     """Slice byte-addressable storage without converting it to Python bytes."""
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise LeaseError("staging buffer slice offset is invalid")
+    if not isinstance(nbytes, int) or isinstance(nbytes, bool) or nbytes < 0:
+        raise LeaseError("staging buffer slice length is invalid")
     try:
-        return memoryview(buffer)[:nbytes]
+        return memoryview(buffer)[offset : offset + nbytes]
     except (TypeError, ValueError):
         try:
-            return buffer[:nbytes]
+            return buffer[offset : offset + nbytes]
         except (TypeError, ValueError, RuntimeError) as exc:
             raise LeaseError("staging buffer is not sliceable as uint8 storage") from exc
 
@@ -291,7 +295,7 @@ def _write_buffer(buffer: Any, data: memoryview) -> None:
     try:
         import torch
         if isinstance(buffer, torch.Tensor) and buffer.dtype == getattr(torch, "uint8"):
-            source = getattr(torch, "frombuffer")(bytearray(data), dtype=getattr(torch, "uint8"))
+            source = getattr(torch, "frombuffer")(memoryview(data), dtype=getattr(torch, "uint8"))
             buffer[: len(data)].copy_(source)
             return
     except (ImportError, TypeError, ValueError, RuntimeError):
@@ -464,6 +468,20 @@ class StagingPool:
             slot = self._validate_locked(lease)
             if slot.state != SlotState.IN_FLIGHT or not lease._producer_retired:
                 raise LeaseError("dispatcher may access only a retired in-flight lease")
+            # Full-block CPU torch staging is submitted as the original slot
+            # object.  The source reader gets a separate bytes-compatible view
+            # of that same storage; the backend must retain the tensor API.
+            try:
+                import torch
+                if (
+                    isinstance(slot.buffer, torch.Tensor)
+                    and slot.buffer.dtype == getattr(torch, "uint8")
+                    and slot.buffer.dim() == 1
+                    and nbytes == slot.buffer.numel()
+                ):
+                    return slot.buffer
+            except (ImportError, TypeError, ValueError, RuntimeError):
+                pass
             return _buffer_slice(slot.buffer, nbytes)
 
     def _return_completed(self, lease: StageLease) -> None:
@@ -1382,7 +1400,7 @@ class GoldenQDTransport:
         while total < item.length:
             if attempts > retries:
                 raise ReconciliationError(f"short read for source range {item.source_offset}:{item.length}")
-            view = _buffer_slice(target, item.length - total)
+            view = _buffer_slice(target, item.length - total, total)
             # Do not catch TypeError here: it may be raised after a reader has
             # already touched the target. Retrying through another API would
             # turn one physical source read into an unaccounted duplicate.

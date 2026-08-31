@@ -1,16 +1,20 @@
 import json
+import os
 import threading
 import time
 
 import pytest
+import torch
 
 from comfymodal_runtime.golden_qd_transport import (
     BackingOwner,
+    CudaTransferBackend,
     DEFAULT_BLOCK_BYTES,
     DEFAULT_QUEUE_DEPTH,
     DEFAULT_STAGING_SLOTS,
     EventStatus,
     FakeBackend,
+    FakeEvent,
     FakeSource,
     GoldenQDTransport,
     LeaseError,
@@ -27,6 +31,7 @@ from comfymodal_runtime.golden_qd_transport import (
     normalize_transport_arm,
     prove_backing_survives_stage_release,
 )
+from comfymodal_runtime import golden_serial as gs
 
 
 def small_config(**kwargs):
@@ -121,6 +126,116 @@ def test_direct_readinto_fills_the_lease_without_returning_a_payload():
     assert result.telemetry["direct_readinto_count"] == 2
     assert result.telemetry["python_payload_materialization"] is False
     assert result.telemetry["source_read_count"] == 2
+
+
+def test_direct_positioned_read_uses_zero_copy_torch_view_and_original_h2d_tensor(tmp_path):
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"abcdefgh")
+    try:
+        staging = torch.empty(8, dtype=torch.uint8, pin_memory=True)
+        assert staging.is_pinned()
+    except RuntimeError:
+        # CPU-only builds and hosts without a pinning allocator still prove the
+        # exact Torch-to-buffer-view storage contract below.
+        staging = torch.empty(8, dtype=torch.uint8)
+    view = gs._writable_bytes_view(staging)
+    assert view.readonly is False
+    assert view.obj.ctypes.data == staging.data_ptr()
+
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        assert gs._read_at(fd, view, 0) == 8
+    finally:
+        os.close(fd)
+    assert bytes(staging.tolist()) == b"abcdefgh"
+
+    class RecordingBackend:
+        @staticmethod
+        def allocate_staging_buffers(slots, block_bytes):
+            assert (slots, block_bytes) == (1, 8)
+            return [staging]
+
+        def __init__(self):
+            self.received = []
+            self.destination = bytearray()
+
+        def submit_h2d(self, source, destination_offset):
+            self.received.append(source)
+            payload = bytes(source.detach().cpu().tolist())
+            end = destination_offset + len(payload)
+            self.destination.extend(b"\0" * (end - len(self.destination)))
+            self.destination[destination_offset:end] = payload
+            return FakeEvent(0)
+
+        def poll_event(self, event):
+            return EventStatus.COMPLETE
+
+        def cancel_event(self, event):
+            return None
+
+    backend = RecordingBackend()
+
+    class PositionedSource:
+        def readinto(self, target, offset):
+            return gs._read_at(source_fd, gs._writable_bytes_view(target), offset)
+
+    source_fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        transport = GoldenQDTransport(
+            small_config(queue_depth=1, staging_slots=1), backend
+        )
+        result = transport.execute(
+            [SourceRange(0, 8)], PositionedSource(), destination_size=8,
+            materialize_output=False,
+        )
+    finally:
+        os.close(source_fd)
+    assert result.telemetry["source_read_mode"] == "direct_readinto"
+    assert len(backend.received) == 1
+    assert backend.received[0] is staging
+    assert bytes(backend.destination) == b"abcdefgh"
+
+
+def test_cuda_staging_allocator_requests_pinned_cpu_uint8(monkeypatch):
+    requests = []
+    original_empty = torch.empty
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def fake_empty(size, **kwargs):
+        requests.append((size, kwargs))
+        return original_empty(size, dtype=kwargs["dtype"])
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    buffers = CudaTransferBackend.allocate_staging_buffers(2, 8)
+    assert len(buffers) == 2
+    assert requests == [
+        (8, {"dtype": torch.uint8, "pin_memory": True}),
+        (8, {"dtype": torch.uint8, "pin_memory": True}),
+    ]
+
+
+def test_direct_short_read_advances_destination_and_source_offsets():
+    class ShortDirectSource:
+        def __init__(self):
+            self.calls = []
+
+        def readinto(self, target, offset):
+            count = 2 if not self.calls else len(target)
+            self.calls.append((offset, len(target)))
+            target[:count] = memoryview(b"abcdefgh")[offset : offset + count]
+            return count
+
+    source = ShortDirectSource()
+    transport = GoldenQDTransport(
+        small_config(queue_depth=1, staging_slots=1), FakeBackend()
+    )
+    result = transport.execute(
+        [SourceRange(0, 8)], source, destination_size=8, materialize_output=True,
+    )
+    assert result.output == b"abcdefgh"
+    assert source.calls == [(0, 8), (2, 6)]
+    assert result.telemetry["source_read_count"] == 2
+    assert result.telemetry["source_bytes"] == 8
 
 
 def test_dispatcher_can_leave_cuda_destination_unmaterialized():
