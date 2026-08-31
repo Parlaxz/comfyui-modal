@@ -80,6 +80,10 @@ class RA9GOwnershipTransferTest(unittest.TestCase):
         self.assertEqual(proof["fp32_param_count"], 1)
         self.assertEqual(proof["fp32_bytes"], 16)
         self.assertEqual(proof["count_by_dtype"]["torch.float32"], 1)
+        self.assertTrue(proof["source_alive_through_proof"])
+        self.assertTrue(proof["no_second_model_sized_copy"])
+        self.assertEqual(proof["duplicate_model_sized_fp32_bytes"], 0)
+        self.assertIn("after_storage_proof_source_alive", proof["ownership_checkpoints"])
         with self.assertRaises(ra9g.OwnershipTransferError):
             transfer.retire_owners()
         transfer.drop_source_refs()
@@ -89,6 +93,7 @@ class RA9GOwnershipTransferTest(unittest.TestCase):
         self.assertEqual(owner.released, 1)
         record = transfer.mark_ready()
         self.assertEqual(record["status"], ra9g.READY)
+        self.assertIn("after_source_owner_retirement", record["ownership_checkpoints"])
         snapshot = transfer.snapshot()
         self.assertTrue(snapshot["metadata_only"])
         self.assertFalse(any(isinstance(value, torch.Tensor) for value in snapshot.values()))
@@ -245,12 +250,51 @@ class RA9GOwnershipTransferTest(unittest.TestCase):
             transfer.acknowledge_actual_bind(actual, receipt=receipt, assign=True)
             transfer.prove_storage()
             transfer.drop_source_refs()
+            before_retirement = transfer.source_free_storage_proof(actual, expected_device="cpu")
+            self.assertFalse(before_retirement["source_free"])
+            self.assertEqual(before_retirement["source_refs"], 0)
+            self.assertEqual(before_retirement["owner_refs"], 1)
             transfer.retire_owners()
             transfer.mark_ready()
             proof = transfer.source_free_storage_proof(actual, expected_device="cpu")
         self.assertTrue(receipt["actual_bind"])
         self.assertEqual(receipt["receipt_marker"], "ra9g.actual_bind.v1")
         self.assertTrue(proof["ok"])
+        self.assertEqual(proof["source_refs"], 0)
+        self.assertEqual(proof["owner_refs"], 0)
+
+    def test_real_torch_assign_replaces_meta_parameter_and_proves_actual_pointer(self):
+        transfer, _source, transformed, owner, identity = _transfer()
+
+        class Loader(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty(4, device="meta", dtype=torch.float32)
+                )
+
+            def load_sd(self, state_dict):
+                self.load_state_dict(state_dict, assign=True)
+
+        class Clip:
+            pass
+
+        clip = Clip()
+        clip.cond_stage_model = Loader()
+        clip.cond_stage_model.load_sd(transformed[0])
+        adopted = clip.cond_stage_model.weight
+        assert adopted.data_ptr() == transformed[0]["weight"].data_ptr()
+        assert adopted.untyped_storage().data_ptr() == transformed[0]["weight"].untyped_storage().data_ptr()
+
+        actual = ra9g.actual_bind_destination_map(clip, identity.expected_keys)
+        receipt = ra9g.build_actual_bind_receipt(clip, actual, identity, assign=True)
+        transfer.acknowledge_actual_bind(actual, receipt=receipt, assign=True, clip=clip)
+        transfer.prove_storage(expected_device="cpu")
+        self.assertEqual(actual["weight"].data_ptr(), transformed[0]["weight"].data_ptr())
+        transfer.drop_source_refs(receipt={"source_refs_dropped": True})
+        transfer.retire_owners()
+        self.assertTrue(transfer.source_free_storage_proof(actual, expected_device="cpu")["ok"])
+        self.assertEqual(owner.released, 1)
 
     def test_actual_bind_rejects_fake_transformed_mapping_without_receipt(self):
         transfer, _, transformed, _, _ = _transfer()

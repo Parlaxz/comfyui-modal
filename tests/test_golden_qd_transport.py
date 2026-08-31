@@ -103,6 +103,26 @@ def test_concurrent_source_reads_and_qd_four_under_slow_h2d():
     assert result.telemetry["h2d_completed_count"] == 8
 
 
+def test_direct_readinto_fills_the_lease_without_returning_a_payload():
+    source = FakeSource(b"abcdefgh")
+    backend = FakeBackend(destination=bytearray())
+    transport = GoldenQDTransport(small_config(queue_depth=1, staging_slots=1), backend)
+
+    result = transport.execute(
+        [SourceRange(0, 4, 0, "a"), SourceRange(4, 4, 4, "b")],
+        source,
+        destination_size=8,
+        materialize_output=False,
+    )
+
+    assert bytes(backend.destination) == b"abcdefgh"
+    assert source.calls == [(0, 4), (4, 4)]
+    assert result.telemetry["source_read_mode"] == "direct_readinto"
+    assert result.telemetry["direct_readinto_count"] == 2
+    assert result.telemetry["python_payload_materialization"] is False
+    assert result.telemetry["source_read_count"] == 2
+
+
 def test_dispatcher_can_leave_cuda_destination_unmaterialized():
     destination = bytearray()
     backend = FakeBackend(destination=destination)
@@ -364,6 +384,37 @@ class _BlockingSubmit(FakeBackend):
         return super().submit_h2d(source, destination_offset)
 
 
+class _LateFailedBackend(_BlockingSubmit):
+    def cancel_event(self, event):
+        # Leave the event's real terminal state observable after cancellation.
+        return None
+
+    def poll_event(self, event):
+        self.poll_count += 1
+        return EventStatus.FAILED
+
+
+class _LatePendingBackend(_BlockingSubmit):
+    def cancel_event(self, event):
+        return None
+
+    def poll_event(self, event):
+        self.poll_count += 1
+        return EventStatus.PENDING
+
+
+class _CloseFailureSource(FakeSource):
+    def __init__(self, data):
+        super().__init__(data)
+        self.close_calls = 0
+        self.fail_close = True
+
+    def close(self):
+        self.close_calls += 1
+        if self.fail_close:
+            raise OSError("source close failed")
+
+
 def test_bounded_drain_accounts_for_ready_to_inflight_handoff():
     backend = _BlockingSubmit()
     transport = GoldenQDTransport(
@@ -386,6 +437,111 @@ def test_bounded_drain_accounts_for_ready_to_inflight_handoff():
         if time.monotonic() >= deadline:
             pytest.fail("dispatcher did not stop after bounded handoff cleanup")
         time.sleep(0.001)
+    with pytest.raises(Exception, match="unpoisoned"):
+        transport.snapshot_quiescence()
+    assert transport.telemetry.h2d_submitted_count == 1
+    assert transport.telemetry.h2d_completed_count == 1
+    assert transport.telemetry.late_submission_count == 1
+    assert transport.telemetry.late_submission_resolved_count == 1
+    assert transport.dispatcher._late_submissions == {}
+
+
+def test_explicit_cancel_timeout_has_one_effective_absolute_deadline():
+    backend = _BlockingSubmit()
+    transport = GoldenQDTransport(
+        small_config(queue_depth=1, staging_slots=1, cleanup_timeout=1.0), backend
+    )
+    transport.start()
+    lease = transport.acquire()
+    lease.fill(b"data")
+    transport.publish(lease, ReadyRecord(0, 0, 4))
+    assert backend.entered.wait(timeout=1)
+
+    began = time.monotonic()
+    transport.cancel(timeout=0.01)
+    effective = transport._abort_deadline
+    assert effective is not None
+    assert transport.dispatcher is not None
+    assert transport.dispatcher._cleanup_deadline == effective
+    assert effective <= began + 0.2
+    backend.release.set()
+
+
+def test_failed_late_event_is_terminally_classified_and_removed():
+    backend = _LateFailedBackend()
+    transport = GoldenQDTransport(
+        small_config(queue_depth=1, staging_slots=1, cleanup_timeout=0.01), backend
+    )
+    transport.start()
+    lease = transport.acquire()
+    lease.fill(b"data")
+    transport.publish(lease, ReadyRecord(0, 0, 4))
+    assert backend.entered.wait(timeout=1)
+
+    transport.cancel(timeout=0.001)
+    backend.release.set()
+    deadline = time.monotonic() + 1
+    dispatcher_thread = transport.dispatcher._thread if transport.dispatcher is not None else None
+    while dispatcher_thread is not None and dispatcher_thread.is_alive():
+        if time.monotonic() >= deadline:
+            pytest.fail("dispatcher did not classify failed late event")
+        time.sleep(0.001)
+
+    assert transport.dispatcher is not None
+    assert transport.dispatcher._late_submissions == {}
+    assert transport.dispatcher.unresolved_late_events == 0
+    assert transport.telemetry.completion_classification == "late_submit_failed"
+    assert transport.telemetry.late_submission_unresolved_count == 0
+
+
+def test_unresolved_late_event_retains_owner_and_blocks_quiescence():
+    backend = _LatePendingBackend()
+    owner = BackingOwner(b"owner")
+    transport = GoldenQDTransport(
+        small_config(queue_depth=1, staging_slots=1, cleanup_timeout=0.01), backend
+    )
+    outcome = []
+
+    def run():
+        try:
+            transport.execute([SourceRange(0, 4)], lambda offset, length: b"data", owner=owner)
+        except TransportFailure as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert backend.entered.wait(timeout=1)
+    transport.cancel(timeout=0.001)
+    backend.release.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert outcome and outcome[0].retained_owner is owner
+    assert outcome[0].retained_transport is transport
+    assert owner.released is False
+    with pytest.raises(Exception):
+        transport.snapshot_quiescence()
+    assert transport.dispatcher is not None
+    deadline = time.monotonic() + 1
+    while transport.dispatcher.unresolved_late_events == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert transport.dispatcher.unresolved_late_events == 1
+
+
+def test_failed_source_close_remains_tracked_and_fails_quiescence():
+    source = _CloseFailureSource(b"data")
+    transport = GoldenQDTransport(small_config(queue_depth=1, staging_slots=1), FakeBackend())
+    with pytest.raises(TransportFailure) as caught:
+        transport.execute([SourceRange(0, 4)], source)
+
+    assert isinstance(caught.value.primary_error, OSError)
+    assert "close failed" in str(caught.value.primary_error)
+    assert source.close_calls == 1
+    with pytest.raises(Exception):
+        transport.snapshot_quiescence()
+
+    source.fail_close = False
+    assert transport._close_source() == []
     assert transport.snapshot_quiescence()
 
 
@@ -405,7 +561,21 @@ def test_cancel_cleanup_is_bounded_and_poisoned_when_event_is_uncertain():
         time.sleep(0.001)
     transport.cancel()
     assert transport.pool.poisoned
-    assert transport.snapshot_quiescence()
+    with pytest.raises(Exception, match="unpoisoned"):
+        transport.snapshot_quiescence()
+
+
+def test_abort_stale_receipt_suppression_does_not_hide_unrelated_lease_error():
+    pool = StagingPool(slots=1, block_bytes=8)
+    lease = pool.acquire()
+    pool._expect_abort_cleanup(lease)
+    assert pool._consume_expected_abort_cleanup(lease, LeaseError("lease was already returned"))
+    pool.return_lease(lease)
+
+    newer = pool.acquire()
+    pool._expect_abort_cleanup(newer)
+    assert not pool._consume_expected_abort_cleanup(newer, LeaseError("staging capacity class mismatch"))
+    pool.return_lease(newer)
 
 
 def test_explicit_cancel_always_returns_typed_cancelled_failure():

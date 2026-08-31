@@ -125,6 +125,161 @@ def test_dispatcher_branch_calls_adapter_with_original_arguments(monkeypatch):
     ]
 
 
+def test_dispatcher_adapter_uses_direct_readinto_transport_seam_without_payload_materialization():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_read_file_qd_gpu_dispatcher"
+    )
+
+    calls = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+    ]
+    assert any(
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create_transport"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "CudaTransferBackend"
+        for node in calls
+    )
+    assert any(
+        isinstance(node, ast.FunctionDef)
+        and node.name == "readinto"
+        for node in ast.walk(fn)
+    )
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "_qd_gpu_worker"
+        for node in ast.walk(fn)
+    )
+    assert not any(
+        isinstance(node.func, ast.Name)
+        and node.func.id in {"bytearray", "bytes"}
+        for node in calls
+    )
+
+
+def test_dispatcher_telemetry_classifies_direct_read_and_queue_planes_truthfully():
+    diagnostics = gs.build_qd_transport_diagnostics({
+        "execution_arm": "dispatcher",
+        "bytes_read": 42,
+        "source_read_count": 1,
+        "source_reads": {
+            "wall_ns": 21,
+            "per_read": {
+                "percentiles_ns": {
+                    "p50_ns": 3,
+                    "p90_ns": 5,
+                    "p99_ns": 7,
+                },
+                "max_ns": 9,
+            },
+        },
+        "cpu_to_pinned_staging": {"bytes": 42, "duration_ns": 0},
+        "staging": {"allocated_bytes": 128, "memory_kind": "pinned"},
+        "lease_wait": {"wait_ns": 11, "wait_count": 1},
+        "ready_backpressure": {"wait_ns": 13, "wait_count": 1},
+        "h2d_submit_wall": {"wall_ns": 17},
+        "h2d_event_poll": {"status": "OBSERVED", "wall_ns": 19, "poll_count": 2},
+        "h2d_event_completion_latency_ms": 2.5,
+        "allocation_pinning": {"status": "OBSERVED", "allocation_ns": 29, "pinned": True},
+        "producer_qd_occupancy": {"max_depth": 4, "fraction_time_at_target": 0.5},
+        "free_ready_depth": {"minimum_free_slots": 1, "ready_queue_depth_at_end": 0},
+        "exact_reconciliation": {"ok": True, "planned_bytes": 42},
+        "final_drain": {"wall_ns": 23},
+    })
+
+    assert diagnostics["cpu_to_pinned_staging"]["status"] == "NOT RUN"
+    assert diagnostics["pinned_slot_wait"]["status"] == "NOT RUN"
+    assert diagnostics["source_reads"]["per_read"]["percentiles_ns"]["p90_ns"] == 5
+    assert diagnostics["source_read_wall_ns"] == 21
+    assert diagnostics["source_bytes"] == 42
+    assert diagnostics["source_read_count"] == 1
+    assert diagnostics["h2d_submit_wall"]["wall_ns"] == 17
+    assert diagnostics["allocation_pinning"] == {
+        "status": "OBSERVED",
+        "allocation_ns": 29,
+        "pinned": True,
+    }
+    assert diagnostics["h2d_event_poll"]["wall_ns"] == 19
+    assert diagnostics["h2d_event_wait"]["status"] == "NOT RUN"
+    assert diagnostics["h2d_event_completion"]["latency_ms"] == 2.5
+    assert diagnostics["producer_qd_occupancy"]["max_depth"] == 4
+    assert diagnostics["free_ready_depth"]["minimum_free_slots"] == 1
+    assert diagnostics["exact_reconciliation"]["planned_bytes"] == 42
+    assert diagnostics["final_drain"]["wall_ns"] == 23
+
+
+def test_legacy_qd_diagnostics_report_positioned_reads_and_bounded_percentiles():
+    telemetry = gs._SourceTelemetry(2)
+    clock = iter((100, 150, 300, 450))
+    original_clock = gs.time.perf_counter_ns
+    gs.time.perf_counter_ns = lambda: next(clock)
+    try:
+        first = telemetry.before(0)
+        telemetry.after(0, first, 10)
+        second = telemetry.before(1)
+        telemetry.after(1, second, 20)
+    finally:
+        gs.time.perf_counter_ns = original_clock
+
+    snapshot = telemetry.snapshot()
+    source = gs._read_duration_summary(snapshot)
+    diagnostics = gs.build_qd_transport_diagnostics({
+        "execution_arm": "legacy",
+        "source_read_count": snapshot["read_count"],
+        "bytes_read": snapshot["read_bytes"],
+        "source_reads": {
+            "wall_ns": snapshot["latest_end_ns"] - snapshot["earliest_start_ns"],
+            "bytes": snapshot["read_bytes"],
+            "read_count": snapshot["read_count"],
+            "per_read": source,
+        },
+        "pinned_slot_wait": {"wait_ns": 7, "wait_count": 1},
+        "h2d_submit_wall": {"wall_ns": 11},
+        "h2d_event_wait": {"wait_ns": 13, "wait_count": 1},
+        "final_drain": {"wall_ns": 17},
+        "allocation_pinning": {"allocation_ns": 19, "pinned": True},
+    })
+
+    assert diagnostics["source_bytes"] == 30
+    assert diagnostics["source_read_count"] == 2
+    assert diagnostics["source_reads"]["wall_ns"] == 350
+    assert diagnostics["source_reads"]["per_read"]["percentiles_ns"] == {
+        "p50_ns": 100,
+        "p90_ns": 140,
+        "p95_ns": 145,
+        "p99_ns": 149,
+    }
+    assert diagnostics["source_reads"]["per_read"]["max_ns"] == 150
+    assert diagnostics["pinned_slot_wait"]["wait_ns"] == 7
+    assert diagnostics["h2d_submit_wall"]["wall_ns"] == 11
+    assert diagnostics["h2d_event_wait"]["wait_ns"] == 13
+    assert diagnostics["final_drain"]["wall_ns"] == 17
+    assert diagnostics["allocation_pinning"]["pinned"] is True
+
+
+def test_dispatcher_direct_read_does_not_report_a_separate_cpu_copy():
+    diagnostics = gs.build_qd_transport_diagnostics({
+        "execution_arm": "dispatcher",
+        "bytes_read": 42,
+        "pinned_bytes": 0,
+        "cpu_to_pinned_staging": {"bytes": 42, "duration_ns": 0},
+        "staging": {"allocated_bytes": 128, "memory_kind": "pinned"},
+        "allocation_pinning": {"status": "OBSERVED", "allocated_bytes": 128, "pinned": True},
+    })
+
+    assert diagnostics["cpu_to_pinned_staging"]["status"] == "NOT RUN"
+    assert diagnostics["allocation_pinning"]["status"] == "OBSERVED"
+    assert diagnostics["pinned_slot_wait"]["status"] == "NOT RUN"
+    assert diagnostics["post_transport_construction_adoption"]["status"] == "NOT RUN"
+
+
 def test_register_qd_owner_is_immediately_visible_and_deduplicated(monkeypatch):
     monkeypatch.delenv(gs.GOLDEN_QD_TRANSPORT_ENV, raising=False)
     session = gs.GoldenSession(_request(), volume=object())

@@ -164,6 +164,19 @@ class TransportBackend(Protocol):
         ...
 
 
+class PinnedRangeReader(Protocol):
+    """The narrow zero-copy source contract used by the dispatcher arm.
+
+    ``target`` is writable lease storage and is valid only for this call.
+    Implementations must fill at most ``len(target)`` bytes starting at the
+    absolute source ``offset`` and return the number written.  The explicit
+    offset avoids a shared seek/read cursor between producer workers.
+    """
+
+    def readinto(self, target: Any, offset: int) -> int:
+        ...
+
+
 def _validate_ready_record(record: ReadyRecord) -> None:
     if not isinstance(record, ReadyRecord):
         raise TypeError("publish requires ReadyRecord")
@@ -236,6 +249,16 @@ class StageLease:
                 raise LeaseError("lease is no longer writable")
             self._filled = nbytes
 
+    def _read_target(self, nbytes: int) -> Any:
+        """Return a bounded, ephemeral writable target for a source reader."""
+        if not isinstance(nbytes, int) or isinstance(nbytes, bool) or not 0 < nbytes <= self._pool.block_bytes:
+            raise LeaseError("invalid read target size")
+        with self._pool._meta:
+            slot = self._pool._validate_locked(self)
+            if slot.state != SlotState.FILLING or self._producer_retired:
+                raise LeaseError("lease is no longer writable")
+            return _buffer_slice(slot.buffer, nbytes)
+
     def retire(self) -> None:
         """Relinquish producer ownership before the dispatcher can return it."""
         with self._pool._meta:
@@ -244,6 +267,17 @@ class StageLease:
                 raise LeaseError("only a filling lease can be retired")
             self._producer_retired = True
             self._producer_identity = threading.get_ident()
+
+
+def _buffer_slice(buffer: Any, nbytes: int) -> Any:
+    """Slice byte-addressable storage without converting it to Python bytes."""
+    try:
+        return memoryview(buffer)[:nbytes]
+    except (TypeError, ValueError):
+        try:
+            return buffer[:nbytes]
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise LeaseError("staging buffer is not sliceable as uint8 storage") from exc
 
 
 def _write_buffer(buffer: Any, data: memoryview) -> None:
@@ -298,6 +332,7 @@ class StagingPool:
         self._poisoned = False
         self._poison_reason: str | None = None
         self._cancelled = False
+        self._expected_abort_cleanup: set[int] = set()
 
     @property
     def capacity(self) -> int:
@@ -377,6 +412,26 @@ class StagingPool:
         lease._returned = True
         self._available.notify_all()
 
+    def _expect_abort_cleanup(self, lease: StageLease) -> None:
+        with self._meta:
+            self._expected_abort_cleanup.add(id(lease))
+
+    def _consume_expected_abort_cleanup(self, lease: StageLease, error: BaseException) -> bool:
+        """Consume only the stale errors caused by our own abort detachment."""
+        if not isinstance(error, LeaseError):
+            return False
+        if str(error) not in {"stale lease generation", "lease was already returned"}:
+            return False
+        with self._meta:
+            marker = id(lease)
+            if marker not in self._expected_abort_cleanup:
+                return False
+            self._expected_abort_cleanup.remove(marker)
+            return True
+
+    def _buffer_for_read(self, lease: StageLease, nbytes: int) -> Any:
+        return lease._read_target(nbytes)
+
     def _mark_ready(self, lease: StageLease, record: ReadyRecord, destination_size: int | None = None) -> None:
         _validate_ready_record(record)
         with self._meta:
@@ -409,7 +464,7 @@ class StagingPool:
             slot = self._validate_locked(lease)
             if slot.state != SlotState.IN_FLIGHT or not lease._producer_retired:
                 raise LeaseError("dispatcher may access only a retired in-flight lease")
-            return slot.buffer[:nbytes]
+            return _buffer_slice(slot.buffer, nbytes)
 
     def _return_completed(self, lease: StageLease) -> None:
         with self._available:
@@ -425,13 +480,22 @@ class StagingPool:
                 raise LeaseError("only a retired unsubmitted ready lease can be drained")
             self._free_locked(slot, lease)
 
-    def _poison(self, lease: StageLease | None, reason: str, *, all_active: bool = False) -> None:
+    def _poison(
+        self,
+        lease: StageLease | None,
+        reason: str,
+        *,
+        all_active: bool = False,
+        expected_abort: bool = False,
+    ) -> None:
         with self._available:
             self._poisoned = True
             self._poison_reason = reason
             for slot in self._slots:
                 if all_active or (lease is not None and slot.lease is lease and slot.generation == lease.generation):
                     if slot.lease is not None:
+                        if expected_abort:
+                            self._expected_abort_cleanup.add(id(slot.lease))
                         slot.state = SlotState.POISONED
                         slot.lease._returned = True
                         slot.lease = None
@@ -482,6 +546,13 @@ class _Telemetry:
     execution_arm: str = DISPATCHER_ARM
     fallback_count: int = 0
     fallback_reason: str | None = None
+    source_read_mode: str = "legacy_bytes"
+    direct_readinto_count: int = 0
+    late_submission_count: int = 0
+    late_submission_resolved_count: int = 0
+    late_submission_unresolved_count: int = 0
+    event_cancel_count: int = 0
+    completion_classification: str = "normal"
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def source_read(self, nbytes: int, *, duplicate: bool = False) -> None:
@@ -609,6 +680,15 @@ class _Telemetry:
                 "fallback_reason": self.fallback_reason,
                 "source_open_count": self.source_open_count,
                 "duplicate_read_count": self.duplicate_read_count,
+                "source_read_mode": self.source_read_mode,
+                "reader_mode": self.source_read_mode,
+                "direct_readinto_count": self.direct_readinto_count,
+                "python_payload_materialization": self.source_read_mode != "direct_readinto",
+                "late_submission_count": self.late_submission_count,
+                "late_submission_resolved_count": self.late_submission_resolved_count,
+                "late_submission_unresolved_count": self.late_submission_unresolved_count,
+                "event_cancel_count": self.event_cancel_count,
+                "completion_classification": self.completion_classification,
             }
 
 
@@ -630,6 +710,8 @@ class TransportFailure(TransportError):
         self.secondary_errors = tuple(secondary_errors)
         self.telemetry = dict(telemetry or {})
         self.cancelled = cancelled
+        self.retained_owner: Any = None
+        self.retained_transport: Any = None
         super().__init__(str(primary_error))
 
     def to_dict(self) -> dict[str, Any]:
@@ -671,6 +753,9 @@ class TransportDispatcher:
         # that handoff visible until the event is registered so bounded drain
         # cannot mistake the gap for quiescence and lose the lease/event.
         self._handoff: dict[int, tuple[StageLease, ReadyRecord]] = {}
+        self._uncertain_handoffs: dict[int, tuple[StageLease, ReadyRecord]] = {}
+        self._late_submissions: dict[int, tuple[StageLease, ReadyRecord, Any, int]] = {}
+        self._unresolved_late_submission_keys: set[int] = set()
         self._in_flight: dict[int, tuple[StageLease, ReadyRecord, Any, int]] = {}
         self._completed_records: list[ReadyRecord] = []
         self._dispatcher_error: BaseException | None = None
@@ -697,6 +782,15 @@ class TransportDispatcher:
     def completed_records(self) -> tuple[ReadyRecord, ...]:
         with self._queue_condition:
             return tuple(self._completed_records)
+
+    @property
+    def unresolved_late_events(self) -> int:
+        """Number of late backend events whose terminal state is not proven."""
+        with self._queue_condition:
+            # A newly registered late event is unresolved until its first
+            # terminal classification; do not create a release window between
+            # registration and the cancellation poll.
+            return len(self._late_submissions)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -798,9 +892,11 @@ class TransportDispatcher:
                     self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submit_ns)
                 elif status == EventStatus.UNCERTAIN:
                     self.pool._poison(lease, "uncertain H2D completion")
+                    self.telemetry.completion_classification = "uncertain"
                     raise TransportError("uncertain H2D completion; staging pool poisoned")
                 else:
                     self.pool._poison(lease, "H2D event failed")
+                    self.telemetry.completion_classification = "failed"
                     raise TransportError("H2D completion event failed; staging pool poisoned")
         self.telemetry.dispatcher_reap_count += 1
         self.telemetry.dispatcher_reap_wall_ns += time.monotonic_ns() - started
@@ -813,6 +909,7 @@ class TransportDispatcher:
                 self.telemetry.ready_depth = 0
                 self._queue_condition.notify_all()
             for lease, _record in queued:
+                self.pool._expect_abort_cleanup(lease)
                 try:
                     self.pool._return_ready(lease)
                 except BaseException as exc:
@@ -823,17 +920,22 @@ class TransportDispatcher:
         # pool call.  In particular, never reacquire this condition while it
         # is held by _run.
         with self._queue_condition:
-            active = list(self._in_flight.items())
+            active = list(self._in_flight.items()) + list(self._late_submissions.items())
         for key, (lease, record, event, _submit_ns) in active:
-            cancel_ok = True
+            with self._queue_condition:
+                is_late_submission = key in self._late_submissions
             try:
+                self.telemetry.event_cancel_count += 1
                 self.backend.cancel_event(event)
             except BaseException as exc:
-                cancel_ok = False
                 self._note_cleanup(exc)
             status: EventStatus | None = None
-            for _ in range(self.config.cancellation_poll_limit):
-                if deadline is not None and time.monotonic() >= deadline:
+            for poll_index in range(self.config.cancellation_poll_limit):
+                # Even an expired abort budget gets one post-cancel query. A
+                # submit_h2d call may return its event after the deadline, and
+                # that event must be explicitly classified rather than
+                # silently abandoned.
+                if poll_index and deadline is not None and time.monotonic() >= deadline:
                     break
                 try:
                     status = EventStatus(self.backend.poll_event(event))
@@ -843,10 +945,13 @@ class TransportDispatcher:
                     break
                 if status != EventStatus.PENDING:
                     break
-            proven = cancel_ok and status == EventStatus.COMPLETE
+            # A successful terminal query is completion proof even for a
+            # backend whose event cancellation operation is unsupported.  The
+            # cancellation attempt is still required and is accounted above.
+            proven = status == EventStatus.COMPLETE
             with self._lease_cleanup_lock:
                 with self._queue_condition:
-                    current = self._in_flight.get(key)
+                    current = self._in_flight.get(key) or self._late_submissions.get(key)
                 if current is None:
                     # A concurrent bounded drain already detached this event.
                     continue
@@ -854,21 +959,50 @@ class TransportDispatcher:
                     try:
                         self.telemetry.h2d_completed_bytes += record.nbytes
                         self.telemetry.h2d_completed_count += 1
-                        self.pool._return_completed(lease)
+                        if not lease._returned:
+                            self.pool._return_completed(lease)
                         with self._queue_condition:
                             self._completed_records.append(record)
+                            self._in_flight.pop(key, None)
+                            if key in self._late_submissions:
+                                self._late_submissions.pop(key, None)
+                                self._unresolved_late_submission_keys.discard(key)
+                                self.telemetry.late_submission_resolved_count += 1
+                                self.telemetry.completion_classification = "late_submit_resolved"
+                            else:
+                                self.telemetry.completion_classification = "cancelled_resolved"
                     except BaseException as exc:
                         self._note_cleanup(exc)
+                elif status == EventStatus.FAILED:
+                    # FAILED is terminal.  It is not completion proof, but it
+                    # is no longer an unresolved event either.  In particular
+                    # do not leave a late submission in the ownership map
+                    # forever merely because its copy failed after abort.
+                    self.pool._poison(lease, "cancelled H2D completion failed", expected_abort=True)
+                    with self._queue_condition:
+                        self._in_flight.pop(key, None)
+                        self._late_submissions.pop(key, None)
+                        self._unresolved_late_submission_keys.discard(key)
+                        self._queue_condition.notify_all()
+                    self.telemetry.completion_classification = (
+                        "late_submit_failed" if is_late_submission else "cancelled_failed"
+                    )
+                    self._note_cleanup(TransportError("cancelled H2D completion failed"))
                 else:
-                    self.pool._poison(lease, "cancelled H2D completion was not proven")
+                    self.pool._poison(lease, "cancelled H2D completion was not proven", expected_abort=True)
+                    if is_late_submission and key not in self._unresolved_late_submission_keys:
+                        self._unresolved_late_submission_keys.add(key)
+                        self.telemetry.late_submission_unresolved_count += 1
+                    self.telemetry.completion_classification = "cancelled_unresolved"
                     if status == EventStatus.PENDING:
                         self._note_cleanup(TransportError("cancelled H2D event remained pending"))
                     elif status == EventStatus.UNCERTAIN:
                         self._note_cleanup(TransportError("cancelled H2D completion was uncertain"))
-                    elif status == EventStatus.FAILED:
-                        self._note_cleanup(TransportError("cancelled H2D completion failed"))
                 with self._queue_condition:
-                    self._in_flight.pop(key, None)
+                    if proven:
+                        self._in_flight.pop(key, None)
+                        self._late_submissions.pop(key, None)
+                        self._unresolved_late_submission_keys.discard(key)
                     self._queue_condition.notify_all()
 
     def _cleanup_cancelled(self, deadline: float | None = None) -> None:
@@ -877,9 +1011,10 @@ class TransportDispatcher:
             with self._queue_condition:
                 handoff = list(self._handoff.values())
                 self._handoff.clear()
+                self._uncertain_handoffs.update({item[0].slot_index: item for item in handoff})
                 self._queue_condition.notify_all()
             for lease, _record in handoff:
-                self.pool._poison(lease, "cancelled dispatcher handoff was not completed")
+                self.pool._poison(lease, "cancelled dispatcher handoff was not completed", expected_abort=True)
         self._cancel_in_flight(deadline)
 
     def _run(self) -> None:
@@ -899,7 +1034,7 @@ class TransportDispatcher:
                         self._handoff[item[0].slot_index] = item
                         self.telemetry.ready_depth = len(self._queue)
                         self._queue_condition.notify_all()
-                    done = self._stop and item is None and not self._queue and not self._in_flight
+                    done = self._stop and item is None and not self._queue and not self._in_flight and not self._late_submissions
                 if cancelled:
                     self._cleanup_cancelled(self._cleanup_deadline)
                     return
@@ -925,6 +1060,7 @@ class TransportDispatcher:
                     self.telemetry.h2d_submitted_count += 1
                 except BaseException as exc:
                     if self._cancelled:
+                        self._cleanup_cancelled(self._cleanup_deadline)
                         return
                     with self._lease_cleanup_lock:
                         self.pool._poison(lease, "H2D submission did not produce a completion event")
@@ -934,20 +1070,29 @@ class TransportDispatcher:
                 with self._lease_cleanup_lock:
                     with self._queue_condition:
                         handoff = self._handoff.get(lease.slot_index)
-                        if handoff is not item:
-                            # A bounded cancellation may have detached this
-                            # handoff while submit_h2d was blocked.  The
-                            # cleanup owner already poisoned it; do not emit
-                            # a stale-lease secondary error.
-                            registration_error = None if self._cancelled else TransportError(
-                                "dispatcher handoff was cleaned up before event registration"
-                            )
-                        else:
+                        uncertain = self._uncertain_handoffs.pop(lease.slot_index, None)
+                        if handoff is item:
                             self._handoff.pop(lease.slot_index, None)
                             self._in_flight[lease.slot_index] = (
                                 lease, record, event, time.monotonic_ns()
                             )
                             registration_error = None
+                        elif uncertain is item and self._cancelled:
+                            # The backend accepted the copy after bounded
+                            # cancellation detached the handoff.  It is now a
+                            # first-class event, not an ignorable late return.
+                            self._late_submissions[lease.slot_index] = (
+                                lease, record, event, time.monotonic_ns()
+                            )
+                            self.telemetry.late_submission_count += 1
+                            registration_error = None
+                        else:
+                            # A bounded cancellation may have detached this
+                            # handoff without a matching event.  Only an
+                            # actual cancellation owns that state.
+                            registration_error = TransportError(
+                                "dispatcher handoff was cleaned up before event registration"
+                            )
                         self._queue_condition.notify_all()
                 if registration_error is not None:
                     with self._lease_cleanup_lock:
@@ -956,6 +1101,7 @@ class TransportDispatcher:
                     self._cleanup_cancelled(self._cleanup_deadline)
                     return
                 if self._cancelled:
+                    self._cleanup_cancelled(self._cleanup_deadline)
                     return
         finally:
             with self._queue_condition:
@@ -986,11 +1132,11 @@ class TransportDispatcher:
         with self._lease_cleanup_lock:
             with self._queue_condition:
                 queued = self._queue[:]
-                active = list(self._in_flight.values())
+                active = list(self._in_flight.values()) + list(self._late_submissions.values())
                 handoff = list(self._handoff.values())
                 self._queue.clear()
                 self._handoff.clear()
-                self._in_flight.clear()
+                self._uncertain_handoffs.update({item[0].slot_index: item for item in handoff})
                 self._stop = True
                 self._cancelled = True
                 self._cleanup_deadline = (
@@ -1000,14 +1146,19 @@ class TransportDispatcher:
                 self.telemetry.ready_depth = 0
                 self._queue_condition.notify_all()
             for lease, _record in queued:
+                self.pool._expect_abort_cleanup(lease)
                 try:
                     self.pool._return_ready(lease)
                 except BaseException as exc:
                     self._note_cleanup(exc)
             for lease, _record in handoff:
-                self.pool._poison(lease, "bounded drain could not complete dispatcher handoff")
+                self.pool._poison(lease, "bounded drain could not complete dispatcher handoff", expected_abort=True)
             for lease, _record, _event, _submit_ns in active:
-                self.pool._poison(lease, "bounded drain could not prove H2D completion")
+                self.pool._poison(lease, "bounded drain could not prove H2D completion", expected_abort=True)
+            for key in self._late_submissions:
+                if key not in self._unresolved_late_submission_keys:
+                    self._unresolved_late_submission_keys.add(key)
+                    self.telemetry.late_submission_unresolved_count += 1
         thread.join(max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
             self._note_cleanup(TransportError("dispatcher thread did not stop within bounded drain"))
@@ -1040,6 +1191,12 @@ class GoldenQDTransport:
         self._abort_requested = False
         self._abort_deadline: float | None = None
         self._abort_lock = threading.Lock()
+        self._reader_handles: dict[int, Any] = {}
+        self._reader_lock = threading.Lock()
+        # Kept only as a lifetime anchor for the fail-closed late-event
+        # contract.  The caller remains responsible for releasing an owner
+        # after successful transport/adoption or a proven terminal failure.
+        self._owner_lifetime: Any = None
 
     def acquire(self, timeout: float | None = None, *, declared_range: SourceRange | None = None) -> StageLease:
         started = time.monotonic_ns()
@@ -1085,14 +1242,14 @@ class GoldenQDTransport:
 
     def cancel(self, timeout: float | None = None) -> None:
         self._cancel_requested = True
-        deadline = self._begin_abort()
+        # Compute the effective deadline once.  Every participant in this
+        # abort (waiters, producers, dispatcher, and drain) must see this same
+        # absolute point rather than independently starting a timeout budget.
+        deadline = self._begin_abort(timeout)
         self.pool._cancel_waiters()
         if self.dispatcher is not None:
             self.dispatcher.cancel(deadline=deadline)
-            cancel_deadline = deadline
-            if timeout is not None:
-                cancel_deadline = min(deadline, time.monotonic() + max(0.0, timeout))
-            self.dispatcher.drain(timeout, bounded=True, deadline=cancel_deadline)
+            self.dispatcher.drain(bounded=True, deadline=deadline)
 
     def _request_abort(self) -> None:
         self._begin_abort()
@@ -1100,12 +1257,54 @@ class GoldenQDTransport:
         if self.dispatcher is not None:
             self.dispatcher.cancel(deadline=self._abort_deadline)
 
-    def _begin_abort(self) -> float:
+    def _begin_abort(self, timeout: float | None = None) -> float:
         with self._abort_lock:
             self._abort_requested = True
+            budget = self.config.cleanup_timeout if timeout is None else max(0.0, timeout)
+            requested_deadline = time.monotonic() + budget
             if self._abort_deadline is None:
-                self._abort_deadline = time.monotonic() + self.config.cleanup_timeout
+                self._abort_deadline = requested_deadline
+            else:
+                self._abort_deadline = min(self._abort_deadline, requested_deadline)
             return self._abort_deadline
+
+    def backend_owner_release_allowed(self) -> bool:
+        """Return whether an adapter may release its CUDA owner.
+
+        An unresolved late submission still has access to the backend's CUDA
+        destination.  Adapters must retain the owner (and this transport) in
+        that case; releasing storage would make the event's ownership lie
+        about the lifetime it actually requires.
+        """
+        if self.dispatcher is None:
+            return True
+        with self.dispatcher._queue_condition:
+            outstanding = bool(
+                self.dispatcher._late_submissions
+                or self.dispatcher._in_flight
+                or self.dispatcher._handoff
+                or self.dispatcher._uncertain_handoffs
+            )
+            dispatcher_live = (
+                self.dispatcher._thread is not None
+                and self.dispatcher._thread.is_alive()
+            )
+            # During cancellation a live dispatcher may still register an
+            # event after the caller's bounded drain has returned.  Retain the
+            # owner across that race; releasing here would be fail-open.
+            return not outstanding and not (self._cancel_requested and dispatcher_live)
+
+    def _retain_failure_lifetime(self, failure: TransportFailure) -> None:
+        with self._reader_lock:
+            reader_live = bool(self._reader_handles)
+        if not self.backend_owner_release_allowed():
+            failure.retained_owner = self._owner_lifetime
+            failure.retained_transport = self
+        elif reader_live:
+            # A failed close is retriable through this transport.  Keep the
+            # source handle and its transport reachable instead of turning an
+            # OS-resource leak into an apparently complete failure path.
+            failure.retained_transport = self
 
     @staticmethod
     def _record_ranges(ranges: Iterable[SourceRange], destination_size: int | None = None) -> list[SourceRange]:
@@ -1167,10 +1366,78 @@ class GoldenQDTransport:
             remaining -= len(data)
         return b"".join(pieces)
 
+    @staticmethod
+    def _read_exact_into(
+        lease: StageLease,
+        reader: PinnedRangeReader,
+        item: SourceRange,
+        retries: int,
+        telemetry: _Telemetry,
+    ) -> None:
+        """Fill one lease directly, retaining no Python payload between reads."""
+        target = lease._read_target(item.length)
+        offset = item.source_offset
+        total = 0
+        attempts = 0
+        while total < item.length:
+            if attempts > retries:
+                raise ReconciliationError(f"short read for source range {item.source_offset}:{item.length}")
+            view = _buffer_slice(target, item.length - total)
+            # Do not catch TypeError here: it may be raised after a reader has
+            # already touched the target. Retrying through another API would
+            # turn one physical source read into an unaccounted duplicate.
+            count = reader.readinto(view, offset)
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise ReconciliationError("source readinto must return an integer byte count")
+            if count < 0 or count > item.length - total:
+                raise ReconciliationError("source readinto returned an invalid byte count")
+            attempts += 1
+            telemetry.source_read(count, duplicate=attempts > 1)
+            total += count
+            offset += count
+        lease.mark_filled(total)
+        with telemetry._lock:
+            telemetry.direct_readinto_count += 1
+
+    def _open_source(self, reader: Any) -> tuple[Any, bool]:
+        """Open and register a source handle until all producers have joined."""
+        opened = reader
+        opener = getattr(reader, "open", None)
+        if callable(opener):
+            opened = opener()
+            if opened is None:
+                opened = reader
+        direct = callable(getattr(opened, "readinto", None))
+        if not direct and not callable(opened) and not callable(getattr(opened, "read", None)):
+            raise TypeError("source reader must provide readinto(target, offset) or read(offset, length)")
+        with self._reader_lock:
+            self._reader_handles[id(opened)] = opened
+        return opened, direct
+
+    def _close_source(self) -> list[BaseException]:
+        with self._reader_lock:
+            handles = list(self._reader_handles.items())
+        errors: list[BaseException] = []
+        for handle_id, handle in handles:
+            close = getattr(handle, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as exc:
+                    errors.append(exc)
+                    # A failed close is still an open reader.  Keep the exact
+                    # handle registered so quiescence cannot pass until a
+                    # later close succeeds.
+                    continue
+            with self._reader_lock:
+                if self._reader_handles.get(handle_id) is handle:
+                    self._reader_handles.pop(handle_id, None)
+        return errors
+
     def execute(
         self,
         ranges: Iterable[SourceRange],
-        reader: Callable[[int, int], bytes],
+        reader: PinnedRangeReader | Callable[[int, int], bytes],
         *,
         output_size: int | None = None,
         destination_size: int | None = None,
@@ -1193,17 +1460,27 @@ class GoldenQDTransport:
         self.telemetry.parse_count = parse_count
         self.telemetry.owner, self.telemetry.adoption = owner, adoption
         self.telemetry.owner_count, self.telemetry.adoption_result = owner_count, adoption_result
+        self._owner_lifetime = owner
         self.telemetry.configure_source_qd(min(self.config.queue_depth, self.config.producer_workers))
         self.telemetry.source_start_ns = time.monotonic_ns()
-        read_fn: Callable[[int, int], bytes] = reader
-        reader_open = getattr(reader, "open", None)
-        if callable(reader_open):
-            opened = reader_open()
-            if opened is None:
-                opened = reader
-            read_fn = cast(Callable[[int, int], bytes], opened if callable(opened) else getattr(opened, "read"))
+        read_source, direct_readinto = self._open_source(reader)
+        read_fn: Callable[[int, int], bytes] | None = None
+        if not direct_readinto:
+            read_fn = cast(
+                Callable[[int, int], bytes],
+                read_source if callable(read_source) else getattr(read_source, "read"),
+            )
+        self.telemetry.source_read_mode = "direct_readinto" if direct_readinto else "legacy_bytes"
         self.telemetry.source_open_count += 1
-        self.start(destination_size=exact_destination_size)
+        try:
+            self.start(destination_size=exact_destination_size)
+        except BaseException as exc:
+            close_errors = self._close_source()
+            if close_errors:
+                failure = TransportFailure(exc, secondary_errors=close_errors)
+                self._retain_failure_lifetime(failure)
+                raise failure from exc
+            raise
         errors: list[BaseException] = []
         producer_cleanup_errors: list[BaseException] = []
         errors_lock = threading.Lock()
@@ -1231,10 +1508,17 @@ class GoldenQDTransport:
                         lease = self.acquire(declared_range=item)
                         self.telemetry.source_read_begin()
                         try:
-                            data = self._read_exact(read_fn, item, self.config.read_retries, self.telemetry)
+                            if direct_readinto:
+                                self._read_exact_into(
+                                    lease, cast(PinnedRangeReader, read_source), item,
+                                    self.config.read_retries, self.telemetry,
+                                )
+                            else:
+                                assert read_fn is not None
+                                data = self._read_exact(read_fn, item, self.config.read_retries, self.telemetry)
+                                lease.fill(data)
                         finally:
                             self.telemetry.source_read_end()
-                        lease.fill(data)
                         self.publish(lease, ReadyRecord(item.source_offset, item.target_offset, item.length, item.record_id))
                         lease = None  # dispatcher now owns the lease
                     finally:
@@ -1247,7 +1531,7 @@ class GoldenQDTransport:
                                 # handoff must not become a stale-generation
                                 # secondary diagnostic (a real producer
                                 # cleanup error is still retained).
-                                if not (self._abort_requested and lease._returned and isinstance(exc, LeaseError)):
+                                if not self.pool._consume_expected_abort_cleanup(lease, exc):
                                     with errors_lock:
                                         producer_cleanup_errors.append(exc)
             except BaseException as exc:
@@ -1288,9 +1572,9 @@ class GoldenQDTransport:
             self._request_abort()
             if self.dispatcher is not None:
                 with self.dispatcher._lease_cleanup_lock:
-                    self.pool._poison(None, "source worker cleanup was uncertain", all_active=True)
+                    self.pool._poison(None, "source worker cleanup was uncertain", all_active=True, expected_abort=True)
             else:
-                self.pool._poison(None, "source worker cleanup was uncertain", all_active=True)
+                self.pool._poison(None, "source worker cleanup was uncertain", all_active=True, expected_abort=True)
             if abort_deadline is None:
                 abort_deadline = self._begin_abort()
             while live_workers:
@@ -1308,9 +1592,12 @@ class GoldenQDTransport:
         else:
             self.drain(deadline=abort_deadline)
         self.telemetry.final_drain_end_ns = time.monotonic_ns()
+        # Never close a source behind a producer that did not retire; the
+        # open handle is part of the uncertainty reported to snapshot hygiene.
+        close_errors = [] if live_workers else self._close_source()
 
         dispatcher_error = self.dispatcher.dispatcher_error if self.dispatcher else None
-        cleanup_errors = list(self.dispatcher.cleanup_errors) if self.dispatcher else []
+        cleanup_errors = (list(self.dispatcher.cleanup_errors) if self.dispatcher else []) + close_errors
         with errors_lock:
             worker_errors = list(errors)
             worker_cleanup_errors = list(producer_cleanup_errors)
@@ -1320,6 +1607,10 @@ class GoldenQDTransport:
             primary = CancellationError("Golden QD transport was explicitly cancelled")
         if primary is None and worker_errors:
             primary = worker_errors[0]
+        if primary is None and close_errors:
+            # A source that could not be closed is not a successful, reusable
+            # transport even when all bytes and completion events reconciled.
+            primary = close_errors[0]
         telemetry = self.telemetry.snapshot(self.config.queue_depth, sum(s == SlotState.FREE for s in self.pool.states()))
         secondary: list[BaseException] = []
         for error in (cleanup_errors + worker_cleanup_errors + worker_errors):
@@ -1338,9 +1629,22 @@ class GoldenQDTransport:
         if self.telemetry.h2d_submitted_bytes != self.telemetry.h2d_completed_bytes:
             secondary.append(ReconciliationError("submitted and completed H2D byte counts differ"))
         if primary is not None:
-            raise TransportFailure(primary, secondary_errors=secondary, telemetry=telemetry, cancelled=self._cancel_requested) from primary
+            failure = TransportFailure(
+                primary,
+                secondary_errors=secondary,
+                telemetry=telemetry,
+                cancelled=self._cancel_requested,
+            )
+            self._retain_failure_lifetime(failure)
+            raise failure from primary
         if actual != expected or len(completed) != len(source_ranges):
-            raise TransportFailure(ReconciliationError("source record coverage is missing or duplicated"), secondary_errors=secondary, telemetry=telemetry) from None
+            failure = TransportFailure(
+                ReconciliationError("source record coverage is missing or duplicated"),
+                secondary_errors=secondary,
+                telemetry=telemetry,
+            )
+            self._retain_failure_lifetime(failure)
+            raise failure from None
         # A caller that supplies a CUDA destination may request only source
         # reads and H2D submission/completion.  In that mode the destination
         # remains the caller-owned backing store and is never copied to CPU.
@@ -1352,13 +1656,25 @@ class GoldenQDTransport:
     def snapshot_quiescence(self) -> bool:
         with self._active_lock:
             producers = self._active_producers
+        with self._reader_lock:
+            open_readers = len(self._reader_handles)
         dispatcher_live = self.dispatcher is not None and self.dispatcher._thread is not None and self.dispatcher._thread.is_alive()
-        queue_live = bool(self.dispatcher and self.dispatcher._queue)
-        handoff_live = bool(self.dispatcher and self.dispatcher._handoff)
-        events_live = bool(self.dispatcher and self.dispatcher._in_flight)
+        if self.dispatcher is None:
+            queue_live = handoff_live = events_live = False
+        else:
+            with self.dispatcher._queue_condition:
+                queue_live = bool(self.dispatcher._queue)
+                handoff_live = bool(self.dispatcher._handoff or self.dispatcher._uncertain_handoffs)
+                events_live = bool(self.dispatcher._in_flight or self.dispatcher._late_submissions)
         slot_live = any(state in (SlotState.FILLING, SlotState.READY, SlotState.IN_FLIGHT) for state in self.pool.states())
-        if producers or dispatcher_live or queue_live or handoff_live or events_live or slot_live:
-            raise TransportError("snapshot requires no live producer, dispatcher, slot, event, or queue state")
+        if (
+            self.pool.poisoned or producers or dispatcher_live or queue_live or handoff_live
+            or events_live or open_readers or slot_live
+        ):
+            raise TransportError(
+                "snapshot requires an unpoisoned pool with no live producer, dispatcher, "
+                "slot, event, reader, queue, or uncertain handoff state"
+            )
         return True
 
 
@@ -1409,12 +1725,12 @@ class FakeBackend:
     def submit_h2d(self, source: Any, destination_offset: int) -> FakeEvent:
         if self.fail_submit is not None:
             raise self.fail_submit
-        data = bytes(source)
-        end = destination_offset + len(data)
+        length = int(source.numel()) if hasattr(source, "numel") else len(source)
+        end = destination_offset + length
         if end > len(self.destination):
             self.destination.extend(b"\0" * (end - len(self.destination)))
-        self.destination[destination_offset:end] = data
-        self.submissions.append((destination_offset, len(data)))
+        self.destination[destination_offset:end] = source[:length]
+        self.submissions.append((destination_offset, length))
         return FakeEvent(self.h2d_delay_polls, self.event_uncertain, self.event_failed)
 
     def poll_event(self, event: FakeEvent) -> EventStatus:
@@ -1502,6 +1818,19 @@ class FakeSource:
             available = min(available, self.short_reads)
         return self.data[offset : offset + max(0, available)]
 
+    def readinto(self, target: Any, offset: int) -> int:
+        """Exercise the production range-reader contract without a payload."""
+        length = len(target)
+        self.calls.append((offset, length))
+        if offset in self.fail_at:
+            raise OSError(f"injected source read failure at {offset}")
+        available = min(length, len(self.data) - offset)
+        if self.short_reads and available > 1:
+            available = min(available, self.short_reads)
+        if available > 0:
+            target[:available] = memoryview(self.data)[offset : offset + available]
+        return max(0, available)
+
 
 class BackingOwner:
     def __init__(self, storage: bytes | bytearray | memoryview, identity: str = "backing") -> None:
@@ -1574,7 +1903,7 @@ __all__ = [
     "DEFAULT_QUEUE_DEPTH", "DEFAULT_STAGING_SLOTS", "DISPATCHER_ARM", "EventStatus", "FakeBackend", "FakeEvent",
     "FakeSource", "GoldenQDTransport", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
     "PoolPoisonedError", "QDTransport", "ReadyRecord", "ReconciliationError", "SlotState", "SourceRange",
-    "StageLease", "StagingPool", "TransportBackend", "TransportConfig", "TransportDispatcher", "TransportError",
+    "StageLease", "StagingPool", "PinnedRangeReader", "TransportBackend", "TransportConfig", "TransportDispatcher", "TransportError",
     "TransportFailure", "TransportResult", "create_transport", "map_output_views", "normalize_transport_arm",
     "prove_backing_survives_stage_release",
 ]

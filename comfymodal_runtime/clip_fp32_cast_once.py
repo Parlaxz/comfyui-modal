@@ -282,6 +282,33 @@ def _tensor_storage_ptr(tensor: Any) -> Optional[int]:
         return None
 
 
+def _allocator_checkpoint() -> dict[str, Any]:
+    """Capture allocator counters without synchronizing or retaining tensors."""
+    result: dict[str, Any] = {
+        "allocated_bytes": None,
+        "reserved_bytes": None,
+        "available": False,
+    }
+    try:
+        cuda = getattr(torch, "cuda", None)
+        if cuda is None or not bool(cuda.is_available()):
+            return result
+        for key, reader_name in (
+            ("allocated_bytes", "memory_allocated"),
+            ("reserved_bytes", "memory_reserved"),
+        ):
+            reader = getattr(cuda, reader_name, None)
+            value = reader() if callable(reader) else None
+            if isinstance(value, int) and not isinstance(value, bool):
+                result[key] = int(value)
+        result["available"] = any(
+            result[key] is not None for key in ("allocated_bytes", "reserved_bytes")
+        )
+    except Exception:
+        pass
+    return result
+
+
 def _flatten_tensor_maps(mappings: Any) -> dict[str, Any]:
     if isinstance(mappings, dict):
         return {
@@ -526,6 +553,19 @@ class ClipFP32OwnershipTransfer:
         self._retirement_failed = False
         self._source_release_failed = False
         self._ever_failed = False
+        self._record["ownership_checkpoints"] = {}
+
+    def _checkpoint(self, name: str) -> None:
+        """Add one bounded lifecycle checkpoint to the request-local record."""
+        checkpoints = self._record.setdefault("ownership_checkpoints", {})
+        if isinstance(checkpoints, dict) and name not in checkpoints:
+            checkpoints[str(name)] = {
+                "state": self._state,
+                "source_refs": len(self._source),
+                "transformed_refs": 0 if self._transformed is None else len(self._transformed),
+                "owner_refs": len(self._owners),
+                "allocator": _allocator_checkpoint(),
+            }
 
     @classmethod
     def build(cls, source_state_dicts: list[dict], owners: list[Any], manifests: list[dict], **kwargs: Any) -> "ClipFP32OwnershipTransfer":
@@ -625,6 +665,7 @@ class ClipFP32OwnershipTransfer:
     def transform_once(self, *, trace: Any = None) -> tuple[list[dict], dict[str, Any]]:
         with self._lock:
             self._require(SOURCE_ACTIVE)
+            self._checkpoint("source_alive_before_transform")
             self._state = FP32_TRANSFORM_IN_PROGRESS
             try:
                 count, source_bytes = self._validate_source()
@@ -657,6 +698,7 @@ class ClipFP32OwnershipTransfer:
                     "generation": 0,
                 })
                 self._state = FP32_BOUND_UNPROVEN
+                self._checkpoint("after_single_transform")
                 return transformed, dict(self._record)
             except BaseException as exc:
                 self._transformed = None
@@ -791,6 +833,7 @@ class ClipFP32OwnershipTransfer:
                     "storage_identity_provided": True,
                     "bind_receipt": _metadata_only(receipt),
                 })
+                self._checkpoint("after_assign_bind")
                 return dict(self._record)
             except BaseException as exc:
                 self._poison(exc)
@@ -809,6 +852,8 @@ class ClipFP32OwnershipTransfer:
                 transformed = _flatten_tensor_maps(self._transformed)
                 source = _flatten_tensor_maps(self._source)
                 unique: set[int] = set()
+                transformed_storage_signature: list[Optional[int]] = []
+                destination_storage_signature: list[Optional[int]] = []
                 source_bytes = 0
                 destination_bytes = 0
                 per_key: list[dict[str, Any]] = []
@@ -826,9 +871,13 @@ class ClipFP32OwnershipTransfer:
                         raise OwnershipTransferError(f"storage proof device mismatch: {key}")
                     if tuple(src.shape) != tuple(dst.shape) or str(src.dtype) != str(dst.dtype) or str(dst.dtype) != _COMPUTE_DTYPE:
                         raise OwnershipTransferError(f"storage proof metadata mismatch: {key}")
-                    if _tensor_storage_ptr(src) is None or _tensor_storage_ptr(src) != _tensor_storage_ptr(dst) or int(src.data_ptr()) != int(dst.data_ptr()):
+                    src_storage = _tensor_storage_ptr(src)
+                    dst_storage = _tensor_storage_ptr(dst)
+                    if src_storage is None or dst_storage is None or src_storage != dst_storage or int(src.data_ptr()) != int(dst.data_ptr()):
                         raise OwnershipTransferError(f"storage proof adoption mismatch: {key}")
-                    unique.add(int(_tensor_storage_ptr(dst)))
+                    unique.add(int(dst_storage))
+                    transformed_storage_signature.append(src_storage)
+                    destination_storage_signature.append(dst_storage)
                     source_bytes += int(source[key].numel() * source[key].element_size())
                     destination_bytes += int(dst.numel() * dst.element_size())
                     per_key.append({
@@ -842,6 +891,18 @@ class ClipFP32OwnershipTransfer:
                         "destination_storage_ptr": _tensor_storage_ptr(dst),
                         "file_index": int(file_indices.get(key, 0)),
                     })
+                # A representation is the complete model-sized FP32 storage
+                # signature, not a Python mapping.  Derive these claims from
+                # the actual transformed/destination storage aliases so a
+                # second model-sized allocation cannot be hidden by constants.
+                representation_signatures = {
+                    tuple(transformed_storage_signature),
+                    tuple(destination_storage_signature),
+                }
+                representation_count = len(representation_signatures)
+                duplicate_fp32_bytes = max(0, representation_count - 1) * destination_bytes
+                source_refs = len(self._source)
+                owner_refs = len(self._owners)
                 self._record.update({
                     "status": FP32_BOUND_PROVEN,
                     "parameter_count": len(self._identity.expected_keys),
@@ -857,6 +918,16 @@ class ClipFP32OwnershipTransfer:
                     "bytes_by_dtype": {_COMPUTE_DTYPE: destination_bytes},
                     "unique_storage_count": len(unique),
                     "storage_proven": True,
+                    "source_alive_through_proof": (
+                        self._state == FP32_BOUND_UNPROVEN
+                        and source_refs > 0
+                        and owner_refs > 0
+                    ),
+                    "fp32_resident_representation_count": representation_count,
+                    "duplicate_model_sized_fp32_bytes": duplicate_fp32_bytes,
+                    "no_second_model_sized_copy": representation_count == 1,
+                    "source_refs_at_proof": source_refs,
+                    "owner_refs_at_proof": owner_refs,
                     "per_key": per_key,
                 })
                 self._bind_proof = {
@@ -884,6 +955,7 @@ class ClipFP32OwnershipTransfer:
                 }
                 self._record["bind_proof"] = _metadata_only(self._bind_proof)
                 self._state = FP32_BOUND_PROVEN
+                self._checkpoint("after_storage_proof_source_alive")
                 return dict(self._record)
             except BaseException as exc:
                 self._poison(exc)
@@ -920,6 +992,7 @@ class ClipFP32OwnershipTransfer:
                 self._destination = None
                 self._record.update({"status": SOURCE_REFS_DROPPED, "source_refs_dropped": True})
                 self._state = SOURCE_REFS_DROPPED
+                self._checkpoint("after_source_reference_drop")
                 return dict(self._record)
             except BaseException as exc:
                 if self._external_release_callback is not None:
@@ -949,6 +1022,7 @@ class ClipFP32OwnershipTransfer:
                 self._callbacks.clear()
                 self._record.update({"status": SOURCE_OWNER_RETIRED, "owner_retired": True, "owner_result": dict(result) if isinstance(result, Mapping) else {"ok": True}})
                 self._state = SOURCE_OWNER_RETIRED
+                self._checkpoint("after_source_owner_retirement")
                 return dict(self._record)
             except BaseException as exc:
                 self._retirement_failed = True
@@ -1075,7 +1149,11 @@ class ClipFP32OwnershipTransfer:
             return result
 
     def source_free_storage_proof(self, destination: Any, *, expected_device: Optional[str] = None) -> dict[str, Any]:
-        """Prove current adopted storage using only the immutable bind proof."""
+        """Prove adopted storage and report whether ownership is fully free.
+
+        Pointer stability may be checked after source-reference drop, but the
+        ``ok``/``source_free`` claims become true only after owner retirement.
+        """
         with self._lock:
             if self._state not in (SOURCE_REFS_DROPPED, SOURCE_OWNER_RETIRED, READY):
                 raise OwnershipTransferError("source-free proof requires a retired source state")
@@ -1097,7 +1175,28 @@ class ClipFP32OwnershipTransfer:
                     raise OwnershipTransferError(f"source-free proof storage pointer mismatch: {key}")
                 if list(tensor.shape) != list(entry["shape"]) or str(tensor.dtype) != entry["dtype"] or str(tensor.device) != entry["device"]:
                     raise OwnershipTransferError(f"source-free proof metadata mismatch: {key}")
-            return {"ok": True, "source_free": True, "per_key": _metadata_only(expected), "target_device": self._bind_proof["target_device"]}
+            source_refs = len(self._source)
+            owner_refs = len(self._owners)
+            source_free = (
+                self._state in (SOURCE_OWNER_RETIRED, READY)
+                and source_refs == 0
+                and owner_refs == 0
+            )
+            result = {
+                "ok": source_free,
+                "source_free": source_free,
+                "storage_pointers_match": True,
+                "state": self._state,
+                "source_refs": source_refs,
+                "owner_refs": owner_refs,
+                "owners": owner_refs,
+                "per_key": _metadata_only(expected),
+                "target_device": self._bind_proof["target_device"],
+            }
+            self._record["source_free_storage_proof"] = _metadata_only(result)
+            if source_free:
+                self._checkpoint("after_source_free_storage_proof")
+            return result
 
     assert_quiescent = snapshot
 
@@ -1192,8 +1291,10 @@ def apply_cast_once(
 
     record: dict[str, Any] = {
         "requested": bool(cast_once_enabled()),
+        "effective": "fp32_cast_once" if cast_once_enabled() else "bf16",
         "applied": False,
-        "fallback_count": 1 if cast_once_enabled() else 0,
+        "fallback": False,
+        "fallback_count": 0,
         "reason": "",
         "tensor_count": 0,
         "bytes_in": 0,
@@ -1210,10 +1311,12 @@ def apply_cast_once(
     try:
         if len(per_file_sds) != len(file_manifests):
             record["reason"] = "file_count_mismatch"
+            record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
             return per_file_sds, record
         for entry in file_manifests:
             if str(entry.get("dtype", "")) != _SOURCE_DTYPE:
                 record["reason"] = f"unsupported_source_dtype:{entry.get('dtype', '')}"
+                record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                 return per_file_sds, record
         _t0 = time.perf_counter()
         _ev_start = None
@@ -1240,10 +1343,12 @@ def apply_cast_once(
                 record["reason"] = (
                     f"manifest_file_index_mismatch:{local_file_index}:{file_index}"
                 )
+                record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                 return per_file_sds, record
             manifest_keys = [str(key) for key in (manifest.get("key_set") or [])]
             if len(manifest_keys) != len(set(manifest_keys)):
                 record["reason"] = f"duplicate_manifest_key_set:{file_index}"
+                record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                 return per_file_sds, record
             expected_keys = {
                 key for key in (manifest_keys or [str(key) for key in sd])
@@ -1258,6 +1363,7 @@ def apply_cast_once(
                     f"unexpected={len(actual_keys - expected_keys)} "
                     f"missing={len(expected_keys - actual_keys)}"
                 )
+                record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                 return per_file_sds, record
             source_dtypes: dict[str, str] = {}
             source_shapes: dict[str, list[int]] = {}
@@ -1265,6 +1371,7 @@ def apply_cast_once(
                 tensor = sd.get(key)
                 if not isinstance(tensor, torch.Tensor):
                     record["reason"] = f"missing_or_non_tensor_source:{file_index}:{key}"
+                    record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                     return per_file_sds, record
                 actual_dtype = str(tensor.dtype)
                 expected_dtype = str(manifest.get("dtype", ""))
@@ -1273,13 +1380,16 @@ def apply_cast_once(
                         f"source_dtype_mismatch:{file_index}:{key}:"
                         f"got {actual_dtype} expected {expected_dtype}"
                     )
+                    record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                     return per_file_sds, record
                 expected_shape = (manifest.get("key_shapes") or {}).get(key)
                 if manifest_keys and expected_shape is None:
                     record["reason"] = f"missing_manifest_shape:{file_index}:{key}"
+                    record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                     return per_file_sds, record
                 if expected_shape is not None and list(tensor.shape) != list(expected_shape):
                     record["reason"] = f"source_shape_mismatch:{file_index}:{key}"
+                    record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
                     return per_file_sds, record
                 source_dtypes[key] = actual_dtype
                 source_shapes[key] = list(tensor.shape)
@@ -1320,6 +1430,8 @@ def apply_cast_once(
         _alloc_after = int(torch.cuda.memory_allocated()) if torch.cuda.is_available() else 0
         record.update({
             "applied": True,
+            "effective": "fp32_cast_once",
+            "fallback": False,
             "fallback_count": 0,
             "reason": "ok",
             "tensor_count": _count,
@@ -1360,6 +1472,7 @@ def apply_cast_once(
         return _cast_sds, record
     except Exception as exc:  # noqa: BLE001 - fail closed
         record["reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        record.update({"effective": "bf16", "fallback": True, "fallback_count": 1})
         # Fail-closed must be diagnosable: report how far the cast got before
         # the failure so a partial conversion can never masquerade as applied.
         record["partial_tensor_count"] = _count if "_count" in dir() else 0

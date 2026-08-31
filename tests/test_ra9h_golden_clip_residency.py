@@ -93,6 +93,77 @@ def test_named_ra9h_telemetry_fields_are_flat_and_unavailable_is_not_zero():
     assert payload["clip_forward_total_ms"] is None
 
 
+def test_compute_dtype_uses_real_qwen_boundary_evidence_not_residency():
+    assert gs._clip_compute_dtype_from_forward_evidence([], {}) == (
+        None,
+        {
+            "status": "UNPROVEN",
+            "forward_count": 0,
+            "input_dtypes": [],
+            "output_dtypes": [],
+            "cast_destination_dtypes": [],
+        },
+    )
+    dtype, evidence = gs._clip_compute_dtype_from_forward_evidence(
+        [{
+            "input_facts": [{"dtype": "torch.bfloat16", "device": "cuda:0"}],
+            "output_facts": [{"dtype": "torch.float32", "device": "cuda:0"}],
+        }],
+        {"conversions": [{"destination_dtype": "torch.float32"}]},
+    )
+    assert dtype == "torch.float32"
+    assert evidence["status"] == "PROVEN"
+
+
+def test_compute_dtype_mixed_output_evidence_fails_closed():
+    dtype, evidence = gs._clip_compute_dtype_from_forward_evidence(
+        [{
+            "input_facts": [{"dtype": "torch.bfloat16", "device": "cpu"}],
+            "output_facts": [
+                {"dtype": "torch.float32", "device": "cpu"},
+                {"dtype": "torch.bfloat16", "device": "cpu"},
+            ],
+        }],
+        {"conversions": [{"destination_dtype": "torch.float32"}]},
+    )
+    assert dtype is None
+    assert evidence["status"] == "OBSERVED"
+    assert evidence["reason"] == "mixed_or_missing_forward_boundary_dtype"
+
+
+def test_compute_dtype_truncated_forward_evidence_fails_closed():
+    dtype, evidence = gs._clip_compute_dtype_from_forward_evidence(
+        [{
+            "input_facts": [{"dtype": "torch.bfloat16", "device": "cpu"}],
+            "output_facts": [{"dtype": "torch.float32", "device": "cpu"}],
+            "output_facts_truncated": True,
+        }],
+        {"conversions": [{"destination_dtype": "torch.float32"}]},
+    )
+    assert dtype is None
+    assert evidence["reason"] == "bounded_forward_facts_truncated"
+
+
+def test_forward_fact_collection_signals_bounded_truncation():
+    facts = gs._clip_forward_tensor_facts(
+        [torch.ones(1), torch.ones(1), torch.ones(1)], limit=2
+    )
+    assert len(facts) == 2
+    assert facts.truncated is True
+
+
+def test_cast_once_failure_classification_uses_lifecycle_phase():
+    assert gs._clip_cast_once_failure_classification("constructor_preflight") == (
+        False, "constructor_preflight_failure"
+    )
+    assert gs._clip_cast_once_failure_classification("bind") == (
+        True, "fatal_bind_or_proof"
+    )
+    assert gs._clip_cast_once_failure_classification("proof") == (
+        True, "fatal_bind_or_proof"
+    )
+
+
 def test_request_freezes_mode_and_run_identity():
     request = gs.GoldenRequest("run-1", {"1": {"class_type": "X"}}, clip_residency="bf16")
     session = gs.GoldenSession.__new__(gs.GoldenSession)
@@ -135,8 +206,15 @@ def test_actual_bind_receipt_storage_proof_and_cleanup_order():
         assert owner.released == 0
         transfer.drop_source_references(receipt={"receipt": "source-dropped"})
         assert transfer.source_mappings is None
-        transfer.source_free_storage_proof(actual, expected_device="cpu")
+        before_retirement = transfer.source_free_storage_proof(actual, expected_device="cpu")
+        assert before_retirement["source_free"] is False
+        assert before_retirement["source_refs"] == 0
+        assert before_retirement["owner_refs"] == 1
         transfer.retire_owners()
+        after_retirement = transfer.source_free_storage_proof(actual, expected_device="cpu")
+        assert after_retirement["source_free"] is True
+        assert after_retirement["source_refs"] == 0
+        assert after_retirement["owner_refs"] == 0
         transfer.mark_ready(clip)
     assert log == ["owner_release"]
     assert transfer.state == ra9g.READY
@@ -220,6 +298,26 @@ def test_forward_conversion_unavailable_is_not_run_not_zero(monkeypatch):
     assert record["status"] == "NOT RUN"
     assert record["conversion_count"] is None
     assert record["destination_bytes"] is None
+
+
+def test_forward_conversion_diagnostics_pair_two_real_boundaries(monkeypatch):
+    fake_mm = types.ModuleType("comfy.model_management")
+
+    def cast_to(tensor, dtype=None, device=None, **kwargs):
+        return tensor.to(dtype=dtype, device=device)
+
+    fake_mm.cast_to = cast_to
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+    with gs._ra9h_forward_conversion_instrumentation(enabled=True) as record:
+        observe = record["_observe_forward"]
+        for index in (0, 1):
+            observe("start", index)
+            fake_mm.cast_to(torch.ones(2, dtype=torch.bfloat16), dtype=torch.float32)
+            observe("end", index)
+    assert record["real_forward_count"] == 2
+    assert [item["conversion_count"] for item in record["per_forward"]] == [1, 1]
+    assert record["repeated_conversion_count"] == 1
+    assert record["forward_diagnostics_status"] == "PROVEN"
 
 
 def test_failure_and_cancellation_cleanup_do_not_publish_ready():
@@ -378,6 +476,8 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
     assert captured["state_dicts"][0]["weight"].dtype is torch.float32
     assert fake_read_calls["read"] == 1
     assert session.clip_residency_record["status"] == "READY"
+    assert session.clip_residency_record["actual"] == "fp32_cast_once"
+    assert session.clip_residency_record["fallback"] is False
     assert session.clip_ownership_transfer is None
     assert owner.closed is True
     assert any(event["name"] == "clip_fp32_cast_once_actual_bind" for event in session.recorder.events)
@@ -391,7 +491,10 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
     assert named["selected_tensor_count"] == 1
     assert named["source_dtype"] == "torch.bfloat16"
     assert named["resident_dtype"] == "torch.float32"
-    assert named["compute_dtype"] == "torch.float32"
+    # Compute dtype is intentionally unavailable until an actual selected
+    # Qwen forward boundary supplies input/output evidence; residency alone is
+    # not a compute claim.
+    assert named["compute_dtype"] is None
     assert named["expected_device"] == "cpu"
     assert named["cast_destination_bytes"] == 16
     assert named["adopted_parameter_count"] == 1
