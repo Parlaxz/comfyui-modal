@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Iterator
 
@@ -28,7 +29,7 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     ".playwright-mcp", ".experiments", ".run_history", "benchmark_runs",
     "benchmark_logs", "optimization_logs", ".comfymodal_experiments",
     ".custom_node_requirements", ".baked_custom_node_deps", ".presets",
-    ".preset_blobs", ".v2ctl", "tests", "test", "examples", "benchmarks",
+    ".preset_blobs", ".v2ctl", ".comfymodal_control", "tests", "test", "examples", "benchmarks",
     "benchmark", "traces", "logs", "scripts", ".github", "MagicMock",
     "reference", "docs",
 })
@@ -79,14 +80,19 @@ EXCLUDED_GLOBS: tuple[str, ...] = (
     "playwright-*.md",
 )
 
-# The identity builder hashes source code only.  The generation fingerprint
-# retains the existing dependency/build metadata inputs and adds both JS
-# extensions used by custom-node frontends.
+# The deployment identity builder hashes source code only.  Publication
+# generation is deliberately broader: it covers every included semantic file,
+# including JSON configuration consumed by custom nodes.
 IDENTITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".mjs"})
 GENERATION_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
-    ".py", ".js", ".mjs", ".txt", ".toml", ".cfg",
+    ".py", ".js", ".mjs", ".txt", ".toml", ".cfg", ".json",
 })
 ALLOWED_SOURCE_EXTENSIONS = IDENTITY_SOURCE_EXTENSIONS
+
+# These are the text formats for which the existing source identity contract
+# treats CRLF and LF as equivalent.  Other included files, including binary
+# assets, are hashed byte-for-byte.
+CANONICAL_TEXT_EXTENSIONS: frozenset[str] = GENERATION_SOURCE_EXTENSIONS
 
 LOCAL_CLONE_RE = re.compile(
     r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
@@ -339,6 +345,124 @@ def iter_source_files(
                 continue
             if not is_excluded_name(filename):
                 yield path
+
+
+def iter_publication_files(root: str | Path) -> Iterator[Path]:
+    """Yield the complete canonical custom-node publication set.
+
+    Unlike ``iter_source_files`` this includes every non-excluded extension.
+    Both the host publisher and the remote consumer use this set for the
+    persisted publication generation.
+    """
+    raw_root = Path(root).expanduser()
+    try:
+        raw_root_stat = raw_root.lstat()
+    except OSError as exc:
+        raise OSError(f"custom-node source root is unreadable: {raw_root}") from exc
+    if stat.S_ISLNK(raw_root_stat.st_mode):
+        raise ValueError(f"symlink is not a publishable source root: {raw_root}")
+    root_path = raw_root.resolve(strict=False)
+    try:
+        root_stat = root_path.lstat()
+    except OSError as exc:
+        raise OSError(f"custom-node source root is unreadable: {root_path}") from exc
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        raise ValueError(f"custom-node source root is not a directory: {root_path}")
+
+    for entry in os.scandir(root_path):
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise OSError(f"custom-node tree entry is unreadable: {entry.path}") from exc
+        if stat.S_ISLNK(entry_stat.st_mode) or not (
+            stat.S_ISDIR(entry_stat.st_mode) or stat.S_ISREG(entry_stat.st_mode)
+        ):
+            raise ValueError(f"special file is not publishable: {entry.path}")
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for node_name in iter_syncable_custom_node_dirs(root_path):
+        node_path = root_path / node_name
+        node_stat = node_path.lstat()
+        if not stat.S_ISDIR(node_stat.st_mode) or stat.S_ISLNK(node_stat.st_mode):
+            raise ValueError(f"syncable custom-node root is not a regular directory: {node_path}")
+        included_count = 0
+        for dirpath_str, dirnames, filenames in os.walk(
+            str(node_path), followlinks=False, onerror=raise_walk_error
+        ):
+            dirpath = Path(dirpath_str)
+            for name in (*dirnames, *filenames):
+                path = dirpath / name
+                try:
+                    entry_stat = path.lstat()
+                except OSError as exc:
+                    raise OSError(f"custom-node tree entry is unreadable: {path}") from exc
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise ValueError(f"symlink is not publishable: {path}")
+                if name in dirnames and not stat.S_ISDIR(entry_stat.st_mode):
+                    raise ValueError(f"non-directory traversal entry is not publishable: {path}")
+                if name in filenames and not stat.S_ISREG(entry_stat.st_mode):
+                    raise ValueError(f"special file is not publishable: {path}")
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not is_excluded_path(
+                    f"{node_name}/{(dirpath / name).relative_to(node_path).as_posix()}"
+                )
+            )
+            for filename in sorted(filenames):
+                path = dirpath / filename
+                relative = path.relative_to(root_path).as_posix()
+                if is_excluded_path(relative):
+                    continue
+                included_count += 1
+                yield path
+        if included_count == 0:
+            raise ValueError(
+                f"syncable custom-node {node_name!r} contains no included semantic files"
+            )
+
+
+def canonical_publication_bytes(path: str | Path, data: bytes) -> bytes:
+    """Return canonical bytes for one included publication file."""
+    if Path(path).suffix.casefold() in CANONICAL_TEXT_EXTENSIONS:
+        return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return data
+
+
+def publication_manifest_digest(
+    entries: Iterator[dict[str, object]] | list[dict[str, object]],
+) -> str:
+    """Hash a canonical ``path``/``size``/``sha256`` publication manifest."""
+    canonical_entries = [
+        {
+            "path": str(entry["path"]),
+            "size": int(str(entry["size"])),
+            "sha256": str(entry["sha256"]),
+        }
+        for entry in entries
+    ]
+    canonical_entries.sort(key=lambda entry: entry["path"])
+    raw = json.dumps(
+        canonical_entries,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def compute_publication_generation(root: str | Path) -> str:
+    """Return the full-content generation for the publication set."""
+    entries: list[dict[str, object]] = []
+    for path in iter_publication_files(root):
+        data = canonical_publication_bytes(path, path.read_bytes())
+        entries.append({
+            "path": path.relative_to(Path(root).resolve()).as_posix(),
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+    return publication_manifest_digest(entries) if entries else ""
 
 
 def image_ignore_patterns(prefix: str = "") -> list[str]:

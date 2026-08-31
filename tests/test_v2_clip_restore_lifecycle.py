@@ -139,7 +139,10 @@ class _FakeCSM(torch.nn.Module):
 class _FakePatcher:
     def __init__(self, model: Any):
         self.model = model
-        self.load_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # This synthetic fixture is deliberately CPU-only. Avoid probing CUDA
+        # here: the real preload-worker guard must continue rejecting worker
+        # calls to torch.cuda.is_available().
+        self.load_device = torch.device("cpu")
         self.offload_device = torch.device("cpu")
         self.is_clip = True
 

@@ -205,7 +205,8 @@ class TestStartupCreatesManifest:
 
         # Simulate startup calling _write_custom_nodes_generation_record_no_commit
         gen_rec = comfyapp._write_custom_nodes_generation_record_no_commit(
-            reason="startup_init_generation_record"
+            reason="startup_init_generation_record",
+            content_generation="startup-content-generation",
         )
         assert gen_rec["generation"]
         assert gen_rec["reason"] == "startup_init_generation_record"
@@ -1137,7 +1138,8 @@ class TestPersistOrdering:
         # Test generation record initialization directly
         import comfyapp
         gen_rec = comfyapp._write_custom_nodes_generation_record_no_commit(
-            reason="startup_init_generation_record"
+            reason="startup_init_generation_record",
+            content_generation="startup-content-generation",
         )
         assert gen_rec["reason"] == "startup_init_generation_record"
 

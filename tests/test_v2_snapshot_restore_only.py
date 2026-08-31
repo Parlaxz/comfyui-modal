@@ -740,7 +740,14 @@ class TestRestoreOnlyProbeMethod(unittest.TestCase):
         os.environ["COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET"] = "1"
         try:
             ep = self._make_entrypoint(unet_present=False)
-            result = ep.run_snapshot_restore_only_probe(request_id="req-2")
+            # Placement is sourced from the process environment.  Keep this
+            # hermetic assertion independent of a host/runner's Modal metadata.
+            with patch.dict(
+                os.environ,
+                {"MODAL_CLOUD_PROVIDER": "", "MODAL_REGION": ""},
+                clear=False,
+            ):
+                result = ep.run_snapshot_restore_only_probe(request_id="req-2")
             timing = result["restore_timing"]
             self.assertEqual(timing["remote_python_resume_wall_unix_ns"], 1_700_000_000_000_000_000)
             self.assertEqual(timing["restore_total_ms"], 1234.5)

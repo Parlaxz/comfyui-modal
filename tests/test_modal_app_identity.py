@@ -1880,15 +1880,25 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
     Uses content-derived deterministic generation so concurrent containers
     syncing identical content converge on the same value."""
 
-    # Shared fingerprint seed drives both the mock return value and the
-    # expected content-derived generation (MD5 of JSON-dumped fingerprint).
+    # The source fingerprint remains a mock for the in-process comparison path;
+    # persisted generation identity is the canonical full-publication SHA-256
+    # manifest digest from publication_policy.
     _FP_SEED = "test_content"
     _EXPECTED_FP = {"nodes": [{"path": "/n/test_content", "hash": "test_contenttest_content"}]}
 
     @classmethod
     def _expected_gen(cls):
-        import hashlib, json
-        return hashlib.md5(json.dumps(cls._EXPECTED_FP, sort_keys=True).encode()).hexdigest()
+        import hashlib
+        from comfymodal_runtime.publication_policy import publication_manifest_digest
+
+        content = b"NODE = True\n"
+        return publication_manifest_digest([
+            {
+                "path": "test_node/__init__.py",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            },
+        ])
 
     def setUp(self):
         from comfyapp import _ComfyAPIMixin
@@ -1920,8 +1930,11 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         self._isdir_patch.start()
         self._sync_patch.start()
         self._env_patch.start()
-        # Stub out hashlib.md5/json.dumps so the real modules work normally
-        # (the test uses the actual md5 of the mock fingerprint).
+        self._generation_patch = patch(
+            "comfyapp.custom_node_source_generation",
+            return_value=self._expected_gen(),
+        )
+        self._generation_patch.start()
 
     def tearDown(self):
         self._env_patch.stop()
@@ -1929,6 +1942,7 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         self._isdir_patch.stop()
         self._state_patch.stop()
         self._fp_patch.stop()
+        self._generation_patch.stop()
 
     def _step3_mocks(self, record_exists, record_value=None):
         """Return a context manager that patches the record helpers and
@@ -1943,13 +1957,17 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
 
     def test_creates_content_derived_generation_when_record_absent(self):
         """When no generation record exists, a content-derived generation is
-        written (MD5 of the synced fingerprint), the volume is committed, and
+        written (canonical full-publication SHA-256), the volume is committed, and
         ``_custom_nodes_generation_seen`` is hydrated to the same value."""
         write_kwargs = {}
 
-        def _capture_write(reason="", generation=None):
-            write_kwargs["generation"] = generation
-            return {"generation": generation or "uuid_fallback", "schema_version": 1}
+        def _capture_write(reason="", content_generation=None):
+            write_kwargs["content_generation"] = content_generation
+            return {
+                "content_generation": content_generation,
+                "generation": content_generation,
+                "schema_version": 2,
+            }
 
         fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
         with fp_patch, rec_patch, \
@@ -1959,9 +1977,9 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
             mock_vol.commit.side_effect = lambda: setattr(mock_vol, '_committed', True)
             self.api._sync_custom_nodes_from_volume()
 
-        self.assertIn("generation", write_kwargs,
-                      "generation kwarg must be passed to write helper")
-        self.assertEqual(write_kwargs["generation"], self._expected_gen(),
+        self.assertIn("content_generation", write_kwargs,
+                      "content_generation kwarg must be passed to write helper")
+        self.assertEqual(write_kwargs["content_generation"], self._expected_gen(),
                          "write helper must receive the content-derived generation")
         self.assertTrue(getattr(mock_vol, '_committed', False),
                         "custom_nodes_vol.commit() must be called after creation")
@@ -1974,13 +1992,20 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         existing_gen = "existing_gen_001"
         called = {"write": False}
 
-        def _fail_if_called(reason="", generation=None):
+        def _fail_if_called(reason="", content_generation=None):
             called["write"] = True
-            return {"generation": "should_not_be_called", "schema_version": 1}
+            return {
+                "content_generation": "should_not_be_called",
+                "schema_version": 2,
+            }
 
         fp_patch, rec_patch = self._step3_mocks(
             record_exists=True,
-            record_value={"generation": existing_gen, "schema_version": 1},
+            record_value={
+                "content_generation": existing_gen,
+                "generation": existing_gen,
+                "schema_version": 2,
+            },
         )
         with fp_patch, rec_patch, \
              patch("comfyapp._write_custom_nodes_generation_record_no_commit",
@@ -1996,7 +2021,7 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
     def test_record_creation_failure_does_not_raise(self):
         """If the write helper raises, the sync does not propagate the
         exception and ``_custom_nodes_generation_seen`` stays empty."""
-        def _raise_on_write(reason="", generation=None):
+        def _raise_on_write(reason="", content_generation=None):
             raise RuntimeError("write failed")
 
         fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
@@ -2014,9 +2039,12 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         content-derived generation (proving concurrent convergence)."""
         write_calls = []
 
-        def _capture(reason="", generation=None):
-            write_calls.append(generation)
-            return {"generation": generation, "schema_version": 1}
+        def _capture(reason="", content_generation=None):
+            write_calls.append(content_generation)
+            return {
+                "content_generation": content_generation,
+                "schema_version": 2,
+            }
 
         fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
         with fp_patch, rec_patch, \
@@ -2066,9 +2094,12 @@ class TestSyncSkipsContentFingerprintWhenRecordExists(unittest.TestCase):
             fp_calls.append(1)
             return {"nodes": []}
 
-        def _fail_write(reason="", generation=None):
-            writes.append(generation)
-            return {"generation": "should_not_be_called", "schema_version": 1}
+        def _fail_write(reason="", content_generation=None):
+            writes.append(content_generation)
+            return {
+                "content_generation": "should_not_be_called",
+                "schema_version": 2,
+            }
 
         with (
             patch("comfyapp.custom_node_source_fingerprint", side_effect=_counting_fp),
@@ -2078,7 +2109,11 @@ class TestSyncSkipsContentFingerprintWhenRecordExists(unittest.TestCase):
                   return_value={"created": [], "removed": [], "kept": [],
                                 "state": {"dummy": 1}}),
             patch("comfyapp._read_custom_nodes_generation_record",
-                  return_value={"generation": "existing_content_gen", "schema_version": 1}),
+                  return_value={
+                      "content_generation": "existing_content_gen",
+                      "generation": "existing_content_gen",
+                      "schema_version": 2,
+                  }),
             patch("comfyapp._write_custom_nodes_generation_record_no_commit",
                   side_effect=_fail_write),
             patch("comfyapp.custom_nodes_vol"),
@@ -2125,11 +2160,15 @@ class TestGenerationWriteTempPathDistinct(unittest.TestCase):
                  patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_DIR", _tmpdir), \
                  patch("builtins.open", _tracking_open):
                 comfyapp._write_custom_nodes_generation_record_no_commit(
-                    reason="test_1", generation="gen_a",
+                    reason="test_1", content_generation="gen_a",
                 )
                 comfyapp._write_custom_nodes_generation_record_no_commit(
-                    reason="test_2", generation="gen_b",
+                    reason="test_2", content_generation="gen_b",
                 )
+                record = comfyapp._read_custom_nodes_generation_record()
+                self.assertIsNotNone(record)
+                self.assertEqual(record["schema_version"], 2)
+                self.assertEqual(record["content_generation"], "gen_b")
             _tmp_paths = [p for p in _paths if ".tmp." in p]
             self.assertGreaterEqual(len(_tmp_paths), 2,
                                     "must open at least two .tmp.* files across two invocations")
@@ -2148,6 +2187,31 @@ class TestGenerationWriteTempPathDistinct(unittest.TestCase):
             try:
                 os.rmdir(_tmpdir)
             except Exception:
+                pass
+
+
+class TestGenerationRecordPublicationContract(unittest.TestCase):
+    """The publication record cannot be minted from a narrow legacy identity."""
+
+    def test_generation_only_call_fails_without_creating_a_record(self):
+        tmpdir = tempfile.mkdtemp()
+        record_path = os.path.join(tmpdir, "custom_nodes_generation.json")
+        try:
+            with patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_PATH", record_path), \
+                 patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_DIR", tmpdir):
+                with self.assertRaises(TypeError):
+                    comfyapp._write_custom_nodes_generation_record_no_commit(
+                        reason="legacy_rv2", generation="narrow-source-id",
+                    )
+            self.assertFalse(os.path.exists(record_path))
+        finally:
+            try:
+                os.unlink(record_path)
+            except FileNotFoundError:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
                 pass
 
 

@@ -291,6 +291,9 @@ _MAX_METADATA_CHARS = 384
 _MAX_BACKEND_CALLS = 1_000_000
 _MAX_PATCHES = 64
 _MAX_NATIVE_LEAF_EVENTS = 64
+_MAX_EVAL_RECORDS = 64
+_MAX_CALLBACK_RECORDS = 64
+_MAX_PROCESS_COMPUTE_RECORDS = 64
 _MISSING = object()
 
 # These are dispatch controls rather than tensor inputs.  Keep this list
@@ -611,6 +614,101 @@ def _attention_call_descriptor(
     return descriptor
 
 
+def _read_process_residency_snapshot() -> dict[str, Any]:
+    """Read cheap process RSS and cumulative page-fault counters.
+
+    This helper is called only after a non-off profile has been created.  It
+    deliberately does not import torch, touch tensor memory, or synchronize a
+    device.  Linux ``/proc/self/statm`` provides current RSS; ``resource``
+    provides cumulative minor/major faults.  Each field fails soft
+    independently so an unsupported host still produces an explicit,
+    JSON-safe unavailable observation.
+    """
+    result: dict[str, Any] = {
+        "rss_bytes": None,
+        "minor_page_faults": None,
+        "major_page_faults": None,
+        "source": {
+            "rss": "/proc/self/statm",
+            "page_faults": "resource.getrusage(RUSAGE_SELF)",
+        },
+        "availability": {
+            "rss_bytes": False,
+            "minor_page_faults": False,
+            "major_page_faults": False,
+        },
+    }
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as statm:
+            fields = statm.read().split()
+        if len(fields) >= 2:
+            resident_pages = int(fields[1])
+            sysconf = getattr(os, "sysconf", None)
+            page_size_raw = sysconf("SC_PAGE_SIZE") if callable(sysconf) else 0
+            page_size = int(page_size_raw) if isinstance(page_size_raw, int) else 0
+            if resident_pages >= 0 and page_size > 0:
+                result["rss_bytes"] = resident_pages * page_size
+                result["availability"]["rss_bytes"] = True
+    except Exception:
+        pass
+    try:
+        import resource
+
+        getrusage = getattr(resource, "getrusage", None)
+        usage_self = getattr(resource, "RUSAGE_SELF", None)
+        if not callable(getrusage) or usage_self is None:
+            raise RuntimeError("resource_usage_unavailable")
+        usage = getrusage(usage_self)
+        for field, usage_name in (
+            ("minor_page_faults", "ru_minflt"),
+            ("major_page_faults", "ru_majflt"),
+        ):
+            value = getattr(usage, usage_name, None)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[field] = int(value)
+                result["availability"][field] = True
+    except Exception:
+        pass
+    return result
+
+
+def _process_residency_delta(
+    before: Optional[dict[str, Any]], after: Optional[dict[str, Any]]
+) -> dict[str, Optional[int]]:
+    """Subtract numeric process counters without inventing unavailable values."""
+    result: dict[str, Optional[int]] = {}
+    for field in ("rss_bytes", "minor_page_faults", "major_page_faults"):
+        prior = before.get(field) if isinstance(before, dict) else None
+        current = after.get(field) if isinstance(after, dict) else None
+        if (
+            isinstance(prior, (int, float))
+            and not isinstance(prior, bool)
+            and isinstance(current, (int, float))
+            and not isinstance(current, bool)
+        ):
+            result[field] = int(current) - int(prior)
+        else:
+            result[field] = None
+    return result
+
+
+def _unavailable_process_residency_snapshot() -> dict[str, Any]:
+    return {
+        "rss_bytes": None,
+        "minor_page_faults": None,
+        "major_page_faults": None,
+        "source": {
+            "rss": "/proc/self/statm",
+            "page_faults": "resource.getrusage(RUSAGE_SELF)",
+        },
+        "availability": {
+            "rss_bytes": False,
+            "minor_page_faults": False,
+            "major_page_faults": False,
+        },
+    }
+
+
 _PROFILER_KEY_MARKERS = (
     "sageattention",
     "comfy_kitchen",
@@ -714,10 +812,12 @@ class SamplingDeepProfile:
         "sampling_end_mono_ns", "sampling_end_wall_ns",
         "patcher", "dm", "rejected",
         "errors", "warnings", "callback_indices", "evals",
+        "_eval_overflow_count", "_callback_overflow_count",
         "_current_eval", "_span_stack", "_hooks", "_ctx_token",
         "_patched_class", "_original_ksampler_call", "_ksampler_owner",
         "_inner_marker_available",
         "_cuda_module", "_cuda_enabled", "_cuda_pairs", "_cuda_timings",
+        "_cuda_pair_count",
         "_cuda_per_eval_forward",
         "_backend_module", "_backend_original", "_backend_observations",
         "_backend_counts", "_backend_signatures",
@@ -732,7 +832,10 @@ class SamplingDeepProfile:
         "_override_chain", "_override_call_count",
         "_override_first_call",
         "_closure_aliases", "_closure_alias_unobservable", "_closure_alias_cells",
-        "_start_perf_ns", "finalize_host_ms", "cuda_sync_ms", "last_artifact",
+        "_process_entry_snapshot", "_process_first_compute", "_process_later_compute",
+        "_process_compute_count", "_process_compute_overflow", "_process_last_snapshot",
+        "_start_perf_ns", "finalize_host_ms", "cuda_sync_ms", "cuda_sync_count",
+        "allocator_before", "allocator_after", "last_artifact",
         "finalized",
     )
 
@@ -749,6 +852,7 @@ class SamplingDeepProfile:
         patcher: Any,
         dm: Any,
         requested_backend: str = "",
+        process_entry_snapshot: Optional[dict[str, Any]] = None,
     ) -> None:
         self.trace = trace
         self.level = level
@@ -767,6 +871,8 @@ class SamplingDeepProfile:
         self.warnings: list[str] = []
         self.callback_indices: list[tuple[Any, int]] = []  # (index, mono_ns)
         self.evals: list[dict[str, Any]] = []
+        self._eval_overflow_count = 0
+        self._callback_overflow_count = 0
         self._current_eval: Optional[dict[str, Any]] = None
         self._span_stack: list[dict[str, Any]] = []
         self._hooks: list[tuple[str, Any]] = []
@@ -778,6 +884,7 @@ class SamplingDeepProfile:
         self._cuda_module: Any = None
         self._cuda_enabled = False
         self._cuda_pairs: list[tuple[Any, Any, str, int]] = []
+        self._cuda_pair_count = 0
         self._cuda_timings: dict[str, float] = {}
         self._cuda_per_eval_forward: dict[int, float] = {}
         self._backend_module: Any = None
@@ -808,9 +915,24 @@ class SamplingDeepProfile:
         self._closure_aliases: list[dict[str, Any]] = []
         self._closure_alias_unobservable: list[str] = []
         self._closure_alias_cells: set[int] = set()
+        if isinstance(process_entry_snapshot, dict):
+            self._process_entry_snapshot = dict(process_entry_snapshot)
+        else:
+            try:
+                self._process_entry_snapshot = _read_process_residency_snapshot()
+            except Exception:
+                self._process_entry_snapshot = _unavailable_process_residency_snapshot()
+        self._process_first_compute: Optional[dict[str, Any]] = None
+        self._process_later_compute: list[dict[str, Any]] = []
+        self._process_compute_count = 0
+        self._process_compute_overflow = 0
+        self._process_last_snapshot: Optional[dict[str, Any]] = None
         self._start_perf_ns = time.perf_counter_ns()
         self.finalize_host_ms = 0.0
         self.cuda_sync_ms = 0.0
+        self.cuda_sync_count = 0
+        self.allocator_before: dict[str, Any] = {}
+        self.allocator_after: dict[str, Any] = {}
         self.last_artifact: Optional[dict[str, Any]] = None
         self.finalized = False
 
@@ -896,8 +1018,16 @@ class SamplingDeepProfile:
             self.errors.append(
                 f"nested_ksampler_call: eval {self._current_eval['index']} still open"
             )
+        index = len(self.evals) + self._eval_overflow_count
+        # Keep evidence bounded even if a malformed sampler loops forever.  The
+        # overflow counter remains visible so truncation cannot masquerade as a
+        # valid 17-evaluation run.
+        if len(self.evals) >= _MAX_EVAL_RECORDS:
+            self._eval_overflow_count += 1
+            self._current_eval = None
+            return
         ev: dict[str, Any] = {
-            "index": len(self.evals),
+            "index": index,
             # Same steady clock as the authoritative sampling_start/sampling_end
             # event timestamps so setup/steps/teardown reconcile exactly.
             "start_ns": time.monotonic_ns(),
@@ -908,6 +1038,7 @@ class SamplingDeepProfile:
             "backend": {"dispatch": {}, "calls": {}},
             "compute_or_skip": "unknown",
             "block_hooks_fired": False,
+            "process_compute_recorded": False,
         }
         self.evals.append(ev)
         self._current_eval = ev
@@ -926,6 +1057,9 @@ class SamplingDeepProfile:
 
     def on_callback_index(self, index: Any) -> None:
         """Record one per-step callback index (int) with its host timestamp."""
+        if len(self.callback_indices) >= _MAX_CALLBACK_RECORDS:
+            self._callback_overflow_count += 1
+            return
         if isinstance(index, bool):
             index = int(index)
         if isinstance(index, int):
@@ -1637,6 +1771,11 @@ class SamplingDeepProfile:
                 pass
         if key.startswith("block:") or key.startswith("refiner:"):
             ev["block_hooks_fired"] = True
+        # Block-total marker hooks fire only after CacheDiT has selected an
+        # actual NextDiT compute.  Capture once per eval here, rather than at
+        # eval index 0, because a leading eval may be a whole-forward skip.
+        if (key.startswith("refiner:") or (key.startswith("block:") and key.count(":") == 1)):
+            self._record_process_compute_snapshot(ev)
         self._span_stack.append(entry)
 
     def _span_end(self, key: str, category: Optional[str]) -> None:
@@ -1656,6 +1795,7 @@ class SamplingDeepProfile:
                 self._cuda_pairs.append(
                     (entry["cuda_start"], e, key, ev["index"] if ev is not None else -1)
                 )
+                self._cuda_pair_count += 1
             except Exception:
                 pass
         if ev is None:
@@ -1702,6 +1842,7 @@ class SamplingDeepProfile:
         try:
             t0 = time.perf_counter_ns()
             self._cuda_module.synchronize()
+            self.cuda_sync_count += 1
             self.cuda_sync_ms = (time.perf_counter_ns() - t0) / 1_000_000
         except Exception as exc:
             self.warnings.append(f"cuda_realization_failed:{type(exc).__name__}")
@@ -1718,6 +1859,87 @@ class SamplingDeepProfile:
             except Exception:
                 pass
         self._cuda_pairs = []
+
+    def _record_process_compute_snapshot(self, ev: dict[str, Any]) -> None:
+        """Record one process snapshot for an actual inner-block compute.
+
+        CacheDiT whole-forward skips never enter this method because they do
+        not fire the block marker hooks.  The bounded record count is separate
+        from the sampler's expected 17/10/7 cadence so malformed runs remain
+        observable without unbounded diagnostic state.
+        """
+        if ev.get("process_compute_recorded"):
+            return
+        ev["process_compute_recorded"] = True
+        self._process_compute_count += 1
+        stored_count = (1 if self._process_first_compute is not None else 0) + len(
+            self._process_later_compute
+        )
+        if stored_count >= _MAX_PROCESS_COMPUTE_RECORDS:
+            self._process_compute_overflow += 1
+            return
+        try:
+            snapshot = _read_process_residency_snapshot()
+        except Exception:
+            snapshot = _unavailable_process_residency_snapshot()
+        if not isinstance(snapshot, dict):
+            snapshot = _unavailable_process_residency_snapshot()
+        previous = self._process_last_snapshot or self._process_entry_snapshot
+        record: dict[str, Any] = {
+            "ordinal": self._process_compute_count,
+            "eval_index": int(ev.get("index", -1)),
+            "snapshot": dict(snapshot),
+            "delta_from_entry": _process_residency_delta(
+                self._process_entry_snapshot, snapshot
+            ),
+        }
+        if self._process_first_compute is None:
+            record["delta_from_previous_compute"] = None
+            self._process_first_compute = record
+        else:
+            record["delta_from_previous_compute"] = _process_residency_delta(
+                previous, snapshot
+            )
+            self._process_later_compute.append(record)
+        self._process_last_snapshot = snapshot
+
+    def _process_residency_artifact(self) -> dict[str, Any]:
+        """Serialize process residency observations separately from allocators."""
+        return {
+            "collection": "cheap_process_counters_no_sync",
+            "entry": {
+                "snapshot": dict(self._process_entry_snapshot),
+                "delta_from_entry": None,
+            },
+            "first_compute": self._process_first_compute,
+            "later_compute": list(self._process_later_compute),
+            "compute_records": {
+                "expected_for_pinned_workflow": EXPECTED_CACHEDIT[1],
+                "observed_count": self._process_compute_count,
+                "stored_count": (1 if self._process_first_compute is not None else 0)
+                + len(self._process_later_compute),
+                "overflow_count": self._process_compute_overflow,
+                "max_records": _MAX_PROCESS_COMPUTE_RECORDS,
+            },
+        }
+
+    def _allocator_snapshot(self) -> dict[str, Any]:
+        """Read allocator counters without adding a synchronization boundary."""
+        if self._cuda_module is None:
+            return {"available": False, "reason": "cuda_probe_not_enabled"}
+        result: dict[str, Any] = {"available": True, "synchronized": False}
+        for output_name, reader_name in (
+            ("allocated_bytes", "memory_allocated"),
+            ("reserved_bytes", "memory_reserved"),
+            ("max_allocated_bytes", "max_memory_allocated"),
+        ):
+            try:
+                value = getattr(self._cuda_module, reader_name)()
+                if isinstance(value, int) and not isinstance(value, bool):
+                    result[output_name] = int(value)
+            except Exception:
+                result[output_name] = None
+        return result
 
     # ── Artifact / reconciliation ─────────────────────────────────────────
 
@@ -1749,7 +1971,13 @@ class SamplingDeepProfile:
                     "placement": "post_sampling_end_cleanup",
                     "finalize_ms": round(self.finalize_host_ms, 3),
                     "cuda_sync_ms": round(self.cuda_sync_ms, 3),
+                    "cuda_sync_count": self.cuda_sync_count,
                 },
+                "allocator": {
+                    "before_sampling": dict(self.allocator_before),
+                    "after_sampling": dict(self.allocator_after),
+                },
+                "process_residency": self._process_residency_artifact(),
             }
         start_ns = self.sampling_start_mono_ns
         end_ns = self.sampling_end_mono_ns
@@ -1770,8 +1998,16 @@ class SamplingDeepProfile:
             expected_cbs = list(range(steps + 1))
         if steps <= 0:
             errors.append("steps_invalid: expected positive step count")
-        if len(evals) != expected_evals:
-            errors.append(f"eval_count_mismatch: expected={expected_evals} observed={len(evals)}")
+        observed_eval_count = len(evals) + self._eval_overflow_count
+        if observed_eval_count != expected_evals:
+            errors.append(
+                f"eval_count_mismatch: expected={expected_evals} observed={observed_eval_count}"
+            )
+        if self._callback_overflow_count:
+            errors.append(
+                f"callback_count_overflow: stored={len(cb_indices)} "
+                f"overflow={self._callback_overflow_count}"
+            )
         if cb_indices != expected_cbs:
             if not cb_indices:
                 warnings.append("callbacks_absent: step boundaries derived from eval indices only")
@@ -1783,10 +2019,21 @@ class SamplingDeepProfile:
         # Per-eval payload (bounded; blocks mode adds per-eval categories).
         per_eval: list[dict[str, Any]] = []
         for ev in evals:
+            index = int(ev["index"])
+            is_final = observed_eval_count == expected_evals and index == expected_evals - 1
+            eval_step = index // 2 if not is_final else None
             d: dict[str, Any] = {
-                "index": ev["index"],
+                "index": index,
+                "phase": "teardown" if is_final else "sampling_step",
+                "step": eval_step,
+                "row": None if is_final else index % 2,
+                "is_first_eval": index == 0,
+                "is_final_post_loop_eval": is_final,
                 "ms": _ms(None if ev["end_ns"] is None else ev["end_ns"] - ev["start_ns"]),
                 "compute_or_skip": ev["compute_or_skip"],
+                "classification_source": (
+                    "inner_block_marker" if self._inner_marker_available else "unavailable"
+                ),
             }
             fwd = ev["spans"].get("forward")
             if fwd:
@@ -1862,6 +2109,11 @@ class SamplingDeepProfile:
                     if isinstance(v, int)
                 ]
                 entry["residual_ms"] = round((total_ns - sum(children_ns)) / 1e6, 3)
+            entry["solver_controller_gaps_ms"] = {
+                "pre_model": entry.get("pre_model_ms"),
+                "row_0_to_row_1": entry.get("gap_ms"),
+                "post_model": entry.get("post_model_ms"),
+            }
             steps_ms.append(entry)
 
         # ── Setup / teardown / final eval (ns-precision) ──
@@ -2041,6 +2293,46 @@ class SamplingDeepProfile:
                     f"attention_backend_fallback_or_wrong_backend:{requested_backend}"
                 )
         semantics = {
+            "authoritative_wall": (
+                "authoritative_sampling_window_ms is the supplied sampling_start "
+                "to sampling_end wall on the same monotonic clock; child spans "
+                "explain it and are never substituted for golden_sampling wall"
+            ),
+            "sampler_invocation": (
+                "setup_ms is sampling_start to first model evaluation; the "
+                "sampler invocation remains the enclosing authoritative wall"
+            ),
+            "solver_controller_gaps": (
+                "pre_model_ms, gap_ms, and post_model_ms are host-wall gaps "
+                "around the two row evaluations. They include solver/controller "
+                "bookkeeping where no narrower hook exists and are not GPU-only"
+            ),
+            "first_vs_later_eval": (
+                "per_eval marks index 0 as first evaluation; all other step rows "
+                "and the distinct final post-loop teardown evaluation are explicit"
+            ),
+            "callback_progress": (
+                "callback timestamps define step boundaries when present; callback "
+                "and progress bookkeeping is owned by the following step pre-model "
+                "gap, not counted again in the preceding step"
+            ),
+            "allocator": (
+                "allocator counters are cheap point observations and do not imply "
+                "a synchronization or a causal allocation attribution"
+            ),
+            "process_residency": (
+                "process_residency.entry is captured at profile entry; first_compute "
+                "and later_compute are captured by actual NextDiT inner-block "
+                "compute markers, which CacheDiT whole-forward skips bypass. RSS "
+                "comes from /proc/self/statm and cumulative page faults from "
+                "resource.getrusage(RUSAGE_SELF). Fields may be unavailable; "
+                "deltas are observational and do not establish residency or "
+                "page-fault causality. Records are bounded and overflow is explicit."
+            ),
+            "non_attention": (
+                "non_attention_ms is derived from compute-forward wall minus the "
+                "directly hooked attention category; it is not a second span"
+            ),
             "norm_category": (
                 "norm_ms is directly measured from attention/ffn RMSNorm and "
                 "adaLN modulation module forward hooks"
@@ -2126,28 +2418,100 @@ class SamplingDeepProfile:
             "request_id": str(getattr(self.trace, "request_id", "")),
             "steps": steps,
             "authoritative_sampling_window_ms": sampling_total_ms,
+            "authoritative_wall": {
+                "source": "golden_sampling",
+                "boundary": "sampling_start_to_sampling_end",
+                "clock": "monotonic_ns",
+                "wall_ms": sampling_total_ms,
+            },
+            "sampler_invocation": {
+                "authoritative_wall_ms": sampling_total_ms,
+                "setup_to_first_eval_ms": setup_ms,
+                "first_eval_index": 0 if evals else None,
+                "later_eval_count": max(0, observed_eval_count - 1),
+                "final_post_loop_eval_distinct": bool(
+                    observed_eval_count == expected_evals and observed_eval_count > 0
+                ),
+            },
             "callbacks": {
                 "observed_indices": cb_indices,
                 "expected": expected_cbs,
+                "count": len(cb_indices) + self._callback_overflow_count,
+                "stored_count": len(cb_indices),
+                "overflow_count": self._callback_overflow_count,
+                "timestamps_monotonic_ns": [ns for _idx, ns in cb_list],
+                "final_index": cb_indices[-1] if cb_indices else None,
             },
             "evals": {
-                "count": len(evals),
+                "count": observed_eval_count,
+                "stored_count": len(evals),
+                "overflow_count": self._eval_overflow_count,
                 "expected": expected_evals,
                 "per_eval": per_eval,
+                "first_eval_index": 0 if evals else None,
+                "final_post_loop_eval_index": (
+                    expected_evals - 1 if observed_eval_count == expected_evals else None
+                ),
             },
             "compute_or_skip": cs,
+            "first_use": {
+                "first_eval_index": 0 if evals else None,
+                "first_compute_eval_index": next(
+                    (int(ev["index"]) for ev in evals if ev["compute_or_skip"] == "compute"),
+                    None,
+                ),
+                "native_leaf_evidence": "attention_backend.profiler.native_leaf_events",
+                "status": (
+                    "observed" if self._native_leaf_events else "unproven"
+                ),
+            },
             "reconciliation": {
                 "sampling_total_ms": sampling_total_ms,
+                "authoritative_wall_ms": sampling_total_ms,
+                "sampler_invocation_ms": sampling_total_ms,
                 "setup_ms": setup_ms,
                 "steps_ms": steps_ms,
                 "teardown_ms": teardown_ms,
                 "teardown_final_eval_ms": final_eval_ms,
                 "teardown_residual_ms": teardown_residual_ms,
+                "post_loop_residual_ms": teardown_residual_ms,
                 "accounted_ms": accounted_ms,
                 "sampling_residual_ms": sampling_residual_ms,
                 "residual_status": residual_status,
             },
             "categories_ms": categories_ms,
+            "nextdit": {
+                "available": self.level == "blocks",
+                "compute_forward_ms": round(
+                    sum(
+                        (ev["spans"]["forward"][1] - ev["spans"]["forward"][0])
+                        for ev in evals
+                        if ev["compute_or_skip"] == "compute" and ev["spans"].get("forward")
+                    ) / 1e6,
+                    3,
+                ),
+                "attention_ms": (
+                    round(categories.get("attention", 0.0) / 1e6, 3)
+                    if self.level == "blocks" else None
+                ),
+                "non_attention_ms": (
+                    round(
+                        (
+                            sum(
+                                (ev["spans"]["forward"][1] - ev["spans"]["forward"][0])
+                                for ev in evals
+                                if ev["compute_or_skip"] == "compute" and ev["spans"].get("forward")
+                            ) - categories.get("attention", 0.0)
+                        ) / 1e6,
+                        3,
+                    )
+                    if self.level == "blocks" else None
+                ),
+                "category_timing": (
+                    "attention_direct_hook_non_attention_derived"
+                    if self.level == "blocks" else "not_collected_steps_mode"
+                ),
+            },
             "blocks": blocks_payload,
             "cuda_timings_ms": cuda_timings_ms,
             "attention_backend": {
@@ -2166,13 +2530,22 @@ class SamplingDeepProfile:
             },
             "semantics": semantics,
             "cachedit": cachedit,
+            "allocator": {
+                "before_sampling": dict(self.allocator_before),
+                "after_sampling": dict(self.allocator_after),
+            },
+            "process_residency": self._process_residency_artifact(),
             "errors": errors[:50],
             "warnings": warnings[:50],
             "instrumentation_overhead": {
                 "placement": "post_sampling_end_cleanup",
                 "finalize_ms": round(self.finalize_host_ms, 3),
                 "cuda_sync_ms": round(self.cuda_sync_ms, 3),
+                "cuda_sync_count": self.cuda_sync_count,
+                "cuda_event_pairs_recorded": self._cuda_pair_count,
+                "synchronization_inside_sampling": False,
             },
+            "cleanup": {"complete": False},
         }
         return artifact
 
@@ -2292,6 +2665,7 @@ class SamplingDeepProfile:
             self._finalize_cuda()
         except Exception as exc:
             self.warnings.append(f"cuda_realization_failed:{type(exc).__name__}")
+        self.allocator_after = self._allocator_snapshot()
         try:
             return self._build_artifact()
         except Exception as exc:
@@ -2350,6 +2724,10 @@ def begin_sampling_profile(
     level = _normalize_level(level)
     if level == "off":
         return None
+    try:
+        process_entry_snapshot = _read_process_residency_snapshot()
+    except Exception:
+        process_entry_snapshot = _unavailable_process_residency_snapshot()
     if _CURRENT_PROFILE.get() is not None:
         prof = SamplingDeepProfile(
             trace, level=level, node_id=node_id, node_class=node_class, steps=steps,
@@ -2357,6 +2735,7 @@ def begin_sampling_profile(
             sampling_start_wall_unix_ns=sampling_start_wall_unix_ns,
             patcher=patcher, dm=None,
             requested_backend=requested_backend,
+            process_entry_snapshot=process_entry_snapshot,
         )
         prof.rejected = True
         prof.warnings.append(
@@ -2378,6 +2757,7 @@ def begin_sampling_profile(
         sampling_start_wall_unix_ns=sampling_start_wall_unix_ns,
         patcher=patcher, dm=dm,
         requested_backend=requested_backend,
+        process_entry_snapshot=process_entry_snapshot,
     )
     profile._ctx_token = _CURRENT_PROFILE.set(profile)
     try:
@@ -2390,6 +2770,7 @@ def begin_sampling_profile(
             profile._install_diffusion_hooks()
             profile._install_cuda_recorder()
             profile._install_backend_probe()
+        profile.allocator_before = profile._allocator_snapshot()
     except Exception as exc:
         profile.errors.append(f"begin_failed:{type(exc).__name__}")
     return profile
@@ -2435,6 +2816,24 @@ def finalize_sampling_profile(
             profile._restore_all()
         finally:
             profile.finalized = True
+    # Restoration is deliberately reported after it has happened.  This keeps
+    # the emitted artifact honest about cleanup without adding another event or
+    # a second diagnostic system.
+    if isinstance(artifact, dict):
+        cleanup_complete = bool(profile.finalized and not profile._hooks and not profile._backend_patches)
+        artifact["cleanup"] = {
+            "complete": cleanup_complete,
+            "ksampler_patch_restored": not profile._ksampler_owner,
+            "hooks_restored": not profile._hooks,
+            "backend_patches_restored": not profile._backend_patches,
+        }
+        artifact["cleanup_complete"] = cleanup_complete
+        if profile.errors:
+            artifact["errors"] = list(dict.fromkeys(
+                list(artifact.get("errors") or []) + profile.errors
+            ))[:50]
+            if artifact.get("status") == "ok":
+                artifact["status"] = "incomplete"
     profile.last_artifact = artifact
     if trace is not None:
         try:

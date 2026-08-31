@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey, RestorePlan
+from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
 from comfymodal_runtime.modal_app import (
     ModalRuntimeEntrypoint,
     _build_v2_critical_path,
@@ -22,9 +23,7 @@ from comfymodal_runtime.modal_app import (
 from comfymodal_runtime.runtime_executor import ExecutionContext
 from comfymodal_runtime.runtime_bootstrap import BootstrapConfig, RuntimeBootstrap, BootstrapState
 from comfymodal_runtime.runtime_executor import RuntimeExecutor
-from comfymodal_runtime.restore_plan import build_restore_model_spec
 from comfymodal_runtime.trace import RuntimeTrace
-from comfymodal_runtime.model_preload import V2LoaderBridge
 
 
 def test_v2_critical_path_uses_passed_sampler_node_to_sampler_start():
@@ -93,8 +92,44 @@ _CM_HOOK = patch("comfymodal_runtime.runtime_bootstrap.configure_manager_offline
 _CM_HOOK.start()
 
 
+def _hermetic_cachedit_preimport(importlib_module: Any) -> dict[str, Any]:
+    """Run the real startup pre-import against dependency-family stubs.
+
+    The startup contract is fail-closed when the image's CacheDiT family is
+    broken.  These tests exercise lifecycle timing, so provide the same
+    shape as the hermetic CacheDiT tests without changing production imports
+    or installing a process-wide fake package.
+    """
+    class _Metadata:
+        @staticmethod
+        def version(package: str) -> str:
+            return {
+                "transformers": "4.55.2",
+                "diffusers": "0.36.0",
+                "cache-dit": "1.2.3",
+            }[package]
+
+    class _Importlib:
+        metadata = _Metadata()
+
+        @staticmethod
+        def import_module(name: str) -> types.ModuleType:
+            module = types.ModuleType(name)
+            module.__file__ = f"/fake/cachedit-family/{name}.py"
+            if name == "cache_dit":
+                setattr(module, "__version__", "1.2.3")
+                setattr(module, "__title__", "cache-dit")
+                setattr(module, "CacheDiT", type("CacheDiT", (), {}))
+            return module
+
+    return importlib_module(
+        _importlib=_Importlib(),
+        _print=lambda *args, **kwargs: None,
+    )
+
+
 @pytest.fixture(autouse=True)
-def _reset_module_level_counters():
+def _reset_module_level_counters(monkeypatch: pytest.MonkeyPatch):
     """Reset module-level counters before each test to prevent cross-test leakage.
 
     Production semantics are preserved at module scope — this fixture only
@@ -104,6 +139,15 @@ def _reset_module_level_counters():
     import comfymodal_runtime.modal_app as _ma
     _ma._v2_container_restore_count = 0
     _ma._LATEST_LIFECYCLE_TIMING = None
+    # Local environments may have an older diffusers/huggingface-hub pair
+    # and no cache_dit package.  Keep startup's real fail-closed implementation
+    # intact while supplying only its dependency seam for these timing tests.
+    _real_cachedit_preimport = _ma.preimport_cachedit_family
+    monkeypatch.setattr(
+        _ma,
+        "preimport_cachedit_family",
+        lambda: _hermetic_cachedit_preimport(_real_cachedit_preimport),
+    )
     # Also reset the restore_count on any cached entrypoint instances
     yield
 
@@ -175,7 +219,7 @@ def test_restore_returns_restore_timing_with_required_keys():
 
 
 def test_restore_timing_stage_timings_included_when_available():
-    """Stage timings from bootstrap state appear in _restore_timing when > 0."""
+    """Authoritative restore phase timings are exported in the result."""
     entrypoint = ModalRuntimeEntrypoint(
         bootstrap=_make_minimal_bootstrap(),
         config=BootstrapConfig(comfyui_root="/tmp/void", models_path="/tmp/void/models"),
@@ -188,15 +232,15 @@ def test_restore_timing_stage_timings_included_when_available():
     entrypoint._get_remote_restore_publisher = lambda: publisher_mock
 
     result = entrypoint.restore()
-    rt = result["_restore_timing"]
+    phase_durations = result["phase_durations_ms"]
 
-    # The bootstrap emits _start/_end pairs that durations_ms() computes;
-    # at least snapshot_restore_ms should be present.
-    stage_keys = [k for k in rt if k.endswith("_ms") and k != "restore_total_ms"]
-    # snapshot_restore covers the full restore span
-    assert any("snapshot_restore" in k for k in stage_keys), (
-        f"No snapshot_restore_ms among stage keys: {stage_keys}"
+    # Typed snapshot_restore_start/end events are the authoritative source for
+    # this duration; _restore_timing is only the bootstrap-stage compatibility map.
+    assert "snapshot_restore" in phase_durations, (
+        "No snapshot_restore in phase_durations_ms: "
+        f"{list(phase_durations.keys())}"
     )
+    assert phase_durations["snapshot_restore"] >= 0
 
 
 def test_restore_count_increments():
@@ -285,7 +329,7 @@ def test_restore_trace_has_container_session_id():
 
 
 def test_restore_plan_read_events():
-    """restore() trace must contain restore_plan_read_start and restore_plan_read_end."""
+    """restore() trace contains the current lifecycle and completion events."""
     entrypoint = ModalRuntimeEntrypoint(
         bootstrap=_make_minimal_bootstrap(),
         config=BootstrapConfig(comfyui_root="/tmp/void", models_path="/tmp/void/models"),
@@ -302,18 +346,21 @@ def test_restore_plan_read_events():
     events = trace_dict.get("events", [])
     event_names = [e.get("name") for e in events]
 
-    assert "restore_plan_read_start" in event_names, (
-        f"Missing restore_plan_read_start in events: {event_names}"
+    assert "snapshot_restore_start" in event_names, (
+        f"Missing snapshot_restore_start in events: {event_names}"
     )
-    assert "restore_plan_read_end" in event_names, (
-        f"Missing restore_plan_read_end in events: {event_names}"
+    assert "snapshot_restore_end" in event_names, (
+        f"Missing snapshot_restore_end in events: {event_names}"
+    )
+    assert "restore_completion_evidence" in event_names, (
+        f"Missing restore_completion_evidence in events: {event_names}"
     )
 
     # Verify ordering
-    idx_start = event_names.index("restore_plan_read_start")
-    idx_end = event_names.index("restore_plan_read_end")
+    idx_start = event_names.index("snapshot_restore_start")
+    idx_end = event_names.index("snapshot_restore_end")
     assert idx_start < idx_end, (
-        f"restore_plan_read_start ({idx_start}) must precede restore_plan_read_end ({idx_end})"
+        f"snapshot_restore_start ({idx_start}) must precede snapshot_restore_end ({idx_end})"
     )
 
 
@@ -415,120 +462,43 @@ def test_execution_phase_durations_exported():
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _restore_plan_with_identity() -> RestorePlan:
-    """Build a RestorePlan with model_key so the preload path is exercised."""
-    model_key = ModelRestoreKey(
-        unet_identity="unet.safetensors",
-        clip_identity="clip.safetensors",
-        clip_type="flux",
-    )
-    # Workflow with CLIPLoader so model_spec includes clip loaders for
-    # _find_request + _load_clip to succeed during clip-only prepare.
-    workflow = {
-        "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
-    }
-    return RestorePlan(
-        generation=1,
-        model_key=model_key,
-        prefill_key=PrefillKey(model_key=model_key),
-        model_spec=build_restore_model_spec(workflow, {"unet": []}),
-        source_workflow_hash="test-hash",
-    )
+def test_restore_is_lifecycle_only_without_request_plan():
+    """Restore no longer owns request-plan preload or handoff fallback.
 
-
-def _fake_comfy_nodes() -> SimpleNamespace:
-    """Fake NODE_CLASS_MAPPINGS module for bridge installation."""
-    class FakeCLIPLoader:
-        def load_clip(self, clip_name, type="stable_diffusion", device="default"):
-            return (SimpleNamespace(),)
-
-    class FakeUNETLoader:
-        def load_unet(self, unet_name, weight_dtype="default"):
-            return (f"unet:{unet_name}:{weight_dtype}",)
-
-    return SimpleNamespace(
-        NODE_CLASS_MAPPINGS={
-            "CLIPLoader": FakeCLIPLoader,
-            "UNETLoader": FakeUNETLoader,
-        }
-    )
-
-
-def _mock_defer_api_handoff_fails() -> SimpleNamespace:
-    """API mock with deferral helpers where the UNET handoff returns submitted=False."""
-    return SimpleNamespace(
-        _patch_unet_loader_cache=lambda: None,
-        _start_production_restore_unet=lambda *a, **kw: {"submitted": False},
-        _executor=SimpleNamespace(success=True, history_result={}, reset=lambda: None),
-        _wait_for_restore_preload_before_request=lambda wf: None,
-        _preflight_before_prompt_execution=lambda wf: None,
-        _preflight_already_ran=False,
-        _repair_missing_workflow_nodes=lambda wf: {"missing_before": [], "missing_after": [], "blocked_by_mode": False},
-        _begin_prompt_profile=lambda *a, **kw: None,
-        _stage_windows=None,
-        _actual_load_futures={},
-    )
-
-
-def test_restore_extends_preparation_when_handoff_fails():
-    """When the UNET handoff returns submitted=False after clip-only prepare,
-    restore() extends the existing preparation with UNET+VAE instead of
-    clearing and doing a full reprepare (which would duplicate CLIP)."""
+    Request-specific preparation is performed from the submitted execution
+    plan.  Restore must therefore leave the plan unset and report the typed
+    completion evidence without emitting the retired fallback-mode event.
+    """
     bootstrap = _make_minimal_bootstrap()
     entrypoint = ModalRuntimeEntrypoint(
         bootstrap=bootstrap,
         config=BootstrapConfig(comfyui_root="/tmp/void", models_path="/tmp/void/models"),
     )
-    # Inject API with deferral helpers that fail
-    entrypoint._legacy_api = _mock_defer_api_handoff_fails()
-    entrypoint._legacy_module = SimpleNamespace(
-        _materialize_input_images=lambda inputs: None,
-    )
 
-    # Publisher returns a plan with model_key
-    plan = _restore_plan_with_identity()
+    reads: list[str] = []
     publisher_mock = SimpleNamespace(
-        read_current_plan=lambda: plan,
+        read_current_plan=lambda: reads.append("read"),
         publish_with_metrics=lambda p: {"changed": False},
     )
     entrypoint._restore_publisher = publisher_mock
     entrypoint._get_remote_restore_publisher = lambda: publisher_mock
 
-    # Patch sys.modules['nodes'] so bridge.prepare() does not import real ComfyUI
-    with patch.dict("sys.modules", {"nodes": _fake_comfy_nodes()}):
-        result = entrypoint.restore()
+    result = entrypoint.restore()
     trace_dict = result.get("trace", {})
     events = trace_dict.get("events", [])
     event_names = [e.get("name") for e in events]
 
-    # Verify we took the extension path
-    assert "preload_fallback_mode" in event_names, (
-        f"Missing preload_fallback_mode in events: {[e for e in event_names if 'preload' in e]}"
-    )
-    fallback_events = [e for e in events if e.get("name") == "preload_fallback_mode"]
-    assert len(fallback_events) >= 1
-    mode = fallback_events[0].get("metadata", {}).get("mode", "")
-    assert mode == "extended_existing_preparation", (
-        f"Expected extended_existing_preparation, got {mode!r}"
-    )
-
-    # CLIP was loaded only once (no duplicate)
-    clip_events = [e for e in events if "clip" in e.get("name", "").lower()]
-    clip_submitted = [e for e in events if e.get("name") == "preload_submitted" and e.get("metadata", {}).get("lane") == "clip"]
-    assert len(clip_submitted) == 1, (
-        f"Expected exactly one clip preload_submitted, got {len(clip_submitted)}"
-    )
-
-    # UNET was submitted via extension
-    unet_submitted = [e for e in events if e.get("name") == "preload_submitted" and e.get("metadata", {}).get("lane") == "unet"]
-    assert len(unet_submitted) >= 1, (
-        f"Expected at least one unet preload_submitted via extension"
-    )
-
-    # preload_extension_submitted event present
-    ext_events = [e for e in events if e.get("name") == "preload_extension_submitted"]
-    assert len(ext_events) >= 1, (
-        f"Missing preload_extension_submitted in events"
+    completion_events = [
+        e for e in events if e.get("name") == "restore_completion_evidence"
+    ]
+    assert len(completion_events) == 1
+    completion_metadata = completion_events[0].get("metadata", {})
+    assert completion_metadata.get("preload_submitted") == "False"
+    assert completion_metadata.get("restore_plan_generation") == ""
+    assert entrypoint._restore_plan is None
+    assert reads == []
+    assert "preload_fallback_mode" not in event_names, (
+        f"Restore must not emit retired fallback event: {event_names}"
     )
 
 
@@ -1114,21 +1084,21 @@ def test_startup_returns_restore_timing():
 
 
 def test_startup_restore_timing_includes_stage_durations():
-    """startup _restore_timing includes stage durations from bootstrap when available."""
+    """startup exports explicit phase durations from typed trace events."""
     entrypoint = ModalRuntimeEntrypoint(
         bootstrap=_make_minimal_bootstrap(),
         config=BootstrapConfig(comfyui_root="/tmp/void", models_path="/tmp/void/models"),
     )
 
     result = entrypoint.startup()
-    rt = result["_restore_timing"]
-
-    # Bootstrap emits _start/_end pairs; at minimum snapshot_restore_ms should be present
-    stage_keys = [k for k in rt if k.endswith("_ms") and k != "restore_total_ms"]
-    # The startup trace emits snapshot_restore_start/snapshot_restore_end events
-    assert any("snapshot_restore" in k for k in stage_keys), (
-        f"No snapshot_restore_ms among stage keys: {stage_keys}"
+    phase_durations = result["phase_durations_ms"]
+    assert isinstance(phase_durations, dict)
+    # The startup trace emits typed snapshot_restore_start/snapshot_restore_end
+    # events; export_phase_durations() uses their monotonic timestamps.
+    assert "snapshot_restore" in phase_durations, (
+        f"No snapshot_restore among phase durations: {list(phase_durations.keys())}"
     )
+    assert phase_durations["snapshot_restore"] >= 0
 
 
 def test_startup_sets_restore_timing_on_instance():
@@ -1223,7 +1193,7 @@ def test_run_stream_uses_process_local_fallback_when_instance_empty():
         "restore_session_id": "fallback-session-001",
         "container_session_id": "fallback-container-001",
         "restore_count": 1,
-        "snapshot_restore_ms": 1000.0,
+        "phase_durations_ms": {"snapshot_restore": 1000.0},
     }
     ma._LATEST_LIFECYCLE_TIMING = fake_timing
 

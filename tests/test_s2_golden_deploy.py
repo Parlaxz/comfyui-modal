@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import asyncio
 import json
 import sys
 import tarfile
@@ -132,8 +134,8 @@ def _root(tmp_path: Path) -> Path:
 
 def _generation_record(volume: FakeVolume, identity) -> None:
     volume.files[GENERATION_RECORD_PATH] = json.dumps({
-        "schema_version": 1,
-        "generation": identity.generation,
+        "schema_version": 2,
+        "content_generation": identity.content_generation,
     }).encode()
 
 
@@ -148,7 +150,7 @@ def test_exact_trusted_skip_does_not_call_compatibility_publisher(tmp_path):
 
     async def publisher(_archive):
         calls.append(True)
-        return {"status": "ok", "generation": identity.generation}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     decision = __import__("asyncio").run(publish_or_skip(
         root, volume_name=volume.name, volume=volume, publisher=publisher
@@ -157,7 +159,7 @@ def test_exact_trusted_skip_does_not_call_compatibility_publisher(tmp_path):
     assert calls == []
 
 
-@pytest.mark.parametrize("receipt_state", ["missing", "stale"])
+@pytest.mark.parametrize("receipt_state", ["missing", "stale", "malformed"])
 def test_generation_match_recovers_receipt_without_republishing(tmp_path, monkeypatch, receipt_state):
     root = _root(tmp_path)
     identity, _archive, _files = prepare_publication(root)
@@ -168,6 +170,8 @@ def test_generation_match_recovers_receipt_without_republishing(tmp_path, monkey
         values = dict(stale.__dict__)
         values["manifest_digest"] = "stale-manifest"
         volume.files[RECEIPT_PATH] = PublicationReceipt(**values).to_bytes()
+    elif receipt_state == "malformed":
+        volume.files[RECEIPT_PATH] = b"not-json"
 
     monkeypatch.setattr(
         "tools.v2_control.custom_nodes.build_archive",
@@ -212,7 +216,7 @@ def test_async_volume_reads_are_used_for_publication(tmp_path):
 
     async def publisher(_archive):
         _generation_record(volume, identity)
-        return {"status": "ok"}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     decision = __import__("asyncio").run(publish_or_skip(
         root, volume_name=volume.name, volume=volume, publisher=publisher,
@@ -227,13 +231,44 @@ def test_async_volume_batch_upload_is_awaited_for_receipt(tmp_path):
 
     async def publisher(_archive):
         _generation_record(volume, identity)
-        return {"status": "ok"}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     decision = __import__("asyncio").run(publish_or_skip(
         root, volume_name=volume.name, volume=volume, publisher=publisher,
     ))
     assert decision.reason == "published_verified"
     assert RECEIPT_PATH in volume.files
+
+
+def test_host_modal_volume_does_not_reload_before_committed_readback(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    identity, _archive, _files = prepare_publication(root)
+    monkeypatch.delenv("MODAL_IS_REMOTE", raising=False)
+
+    class Volume(ModalShapeVolume):
+        __module__ = "modal.volume"
+
+        def __init__(self):
+            super().__init__()
+            self.reload = _AioMethod(
+                lambda: (_ for _ in ()).throw(
+                    AssertionError("host Modal Volume must not reload")
+                ),
+                lambda: (_ for _ in ()).throw(
+                    RuntimeError("reload() can only be called from within a running function")
+                ),
+            )
+
+    volume = Volume()
+
+    async def publisher(_archive):
+        _generation_record(volume, identity)
+        return {"status": "ok", "content_generation": identity.content_generation}
+
+    decision = __import__("asyncio").run(publish_or_skip(
+        root, volume_name=volume.name, volume=volume, publisher=publisher,
+    ))
+    assert decision.reason == "published_verified"
 
 
 def test_modal_143_aio_interfaces_avoid_blocking_volume_wrappers(tmp_path):
@@ -243,7 +278,7 @@ def test_modal_143_aio_interfaces_avoid_blocking_volume_wrappers(tmp_path):
 
     async def publisher(_archive):
         _generation_record(volume, identity)
-        return {"status": "ok"}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     decision = __import__("asyncio").run(publish_or_skip(
         root, volume_name=volume.name, volume=volume, publisher=publisher,
@@ -266,7 +301,7 @@ def test_sync_volume_factory_runs_outside_async_event_loop(tmp_path):
 
     async def publisher(_archive):
         _generation_record(volume, identity)
-        return {"status": "ok"}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     decision = __import__("asyncio").run(publish_or_skip(
         root, volume_name=volume.name, volume_factory=factory, publisher=publisher,
@@ -280,6 +315,15 @@ def test_consumer_name_does_not_change_canonical_custom_node_identity(tmp_path):
     identity_a, _archive, _files = prepare_publication(root)
     identity_b, _archive, _files = prepare_publication(root)
     assert identity_a.to_dict() == identity_b.to_dict()
+
+
+def test_identity_and_receipt_name_full_content_explicitly(tmp_path):
+    identity, _archive, _files = prepare_publication(_root(tmp_path))
+    receipt = PublicationReceipt.create(identity, "test-volume")
+    assert identity.to_dict()["content_generation"] == identity.manifest_digest
+    assert "generation" not in identity.to_dict()
+    assert receipt.to_dict()["content_generation"] == identity.content_generation
+    assert "generation" not in receipt.to_dict()
 
 
 def test_receipt_read_transient_error_is_not_missing_receipt():
@@ -350,9 +394,9 @@ def test_fallback_generation_matches_canonical_remote_hash(tmp_path):
     root = _root(tmp_path)
     files = collect_semantic_files(root)
     identity = build_source_identity(root, semantic_files=files)
-    from comfymodal_runtime.deployment_spec import compute_custom_node_hash
+    from comfymodal_runtime.publication_policy import compute_publication_generation
 
-    assert identity.generation == compute_custom_node_hash([root])
+    assert identity.generation == compute_publication_generation(root)
 
 
 def test_archive_generation_matches_remote_generation_helper(tmp_path):
@@ -362,10 +406,10 @@ def test_archive_generation_matches_remote_generation_helper(tmp_path):
     extracted.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         tar.extractall(extracted, filter="data")
-    from comfymodal_runtime.deployment_spec import compute_custom_node_hash
+    from comfymodal_runtime.publication_policy import compute_publication_generation
 
-    assert compute_custom_node_hash([root]) == compute_custom_node_hash([extracted])
-    assert identity.generation == compute_custom_node_hash([extracted])
+    assert compute_publication_generation(root) == compute_publication_generation(extracted)
+    assert identity.generation == compute_publication_generation(extracted)
 
 
 @pytest.mark.parametrize("reason", [
@@ -407,12 +451,19 @@ def test_publication_finalizes_receipt_only_after_verified_content(tmp_path):
 
     async def publisher(_archive):
         _generation_record(volume, identity)
-        return {"status": "ok"}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     decision = __import__("asyncio").run(publish_or_skip(
         root, volume_name=volume.name, volume=volume, publisher=publisher
     ))
     assert decision.reason == "published_verified"
+    assert decision.result == {
+        "status": "ok",
+        "content_generation": identity.content_generation,
+    }
+    record = json.loads(volume.files[GENERATION_RECORD_PATH].decode())
+    assert record["schema_version"] == 2
+    assert record["content_generation"] == identity.content_generation
     assert RECEIPT_PATH in volume.files
 
 
@@ -432,7 +483,7 @@ def test_failed_publication_and_receipt_write_failure_retry(tmp_path, monkeypatc
 
     async def successful(_archive):
         _generation_record(volume, identity)
-        return {"status": "ok"}
+        return {"status": "ok", "content_generation": identity.content_generation}
 
     import tools.v2_control.custom_nodes as custom_nodes
     monkeypatch.setattr(custom_nodes, "write_receipt", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk")))
@@ -464,8 +515,139 @@ def test_identity_provider_and_semantic_walk_are_single_pass(tmp_path):
 
     files = collect_semantic_files(root)
     identity = build_source_identity(root, semantic_files=files, identity_provider=provider)
-    assert identity.generation == "s1-adapter-generation"
+    assert identity.generation == identity.manifest_digest
+    assert identity.source_generation == "s1-adapter-generation"
     assert len(calls) == 1
+
+
+def test_changed_json_does_not_recover_from_narrow_generation_record(tmp_path):
+    """A narrow source hash must not bless a full-content publication."""
+    from comfymodal_runtime.deployment_spec import compute_custom_node_hash
+
+    root = _root(tmp_path)
+    config = root / "node-a" / "node_config.json"
+    config.write_text('{"mode": "one"}\n', encoding="utf-8")
+    narrow_generation = compute_custom_node_hash([root])
+    config.write_text('{"mode": "two"}\n', encoding="utf-8")
+    identity = build_source_identity(root)
+    assert narrow_generation != identity.generation
+
+    volume = FakeVolume()
+    volume.files[GENERATION_RECORD_PATH] = json.dumps({
+        "schema_version": 2,
+        "generation": narrow_generation,
+    }).encode()
+    calls = []
+
+    async def publisher(archive):
+        calls.append(archive)
+        _generation_record(volume, identity)
+        return {"status": "ok", "content_generation": identity.content_generation}
+
+    decision = __import__("asyncio").run(publish_or_skip(
+        root, volume_name=volume.name, volume=volume, publisher=publisher,
+    ))
+    assert calls
+    assert decision.reason == "published_verified"
+
+
+def test_receipt_is_written_after_generation_readback(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    identity, _archive, _files = prepare_publication(root)
+    volume = FakeVolume()
+    write_observations = []
+
+    async def publisher(_archive):
+        _generation_record(volume, identity)
+        return {"status": "ok", "content_generation": identity.content_generation}
+
+    import tools.v2_control.custom_nodes as custom_nodes
+
+    async def write_receipt_after_readback(volume_arg, receipt):
+        write_observations.append(GENERATION_RECORD_PATH in volume_arg.files)
+        volume_arg.files[RECEIPT_PATH] = receipt.to_bytes()
+
+    monkeypatch.setattr(custom_nodes, "write_receipt_async", write_receipt_after_readback)
+    decision = __import__("asyncio").run(publish_or_skip(
+        root, volume_name=volume.name, volume=volume, publisher=publisher,
+    ))
+    assert decision.reason == "published_verified"
+    assert write_observations == [True]
+
+
+def test_publisher_must_return_explicit_content_generation(tmp_path):
+    root = _root(tmp_path)
+    identity, _archive, _files = prepare_publication(root)
+    volume = FakeVolume()
+
+    async def publisher(_archive):
+        _generation_record(volume, identity)
+        return {"status": "ok", "generation": "narrow-source-id"}
+
+    decision = __import__("asyncio").run(publish_or_skip(
+        root, volume_name=volume.name, volume=volume, publisher=publisher,
+    ))
+    assert decision.action == "publish"
+    assert decision.reason == "publication_incomplete"
+    assert RECEIPT_PATH not in volume.files
+
+
+def test_injected_fake_volume_refreshes_off_loop_before_readback(tmp_path):
+    root = _root(tmp_path)
+    identity, _archive, _files = prepare_publication(root)
+
+    class ReloadingVolume(FakeVolume):
+        def __init__(self):
+            super().__init__()
+            self.reload_count = 0
+            self.reload_off_loop = True
+
+        def reload(self):
+            self.reload_count += 1
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                self.reload_off_loop = False
+
+    volume = ReloadingVolume()
+
+    async def publisher(_archive):
+        _generation_record(volume, identity)
+        return {"status": "ok", "content_generation": identity.content_generation}
+
+    decision = __import__("asyncio").run(publish_or_skip(
+        root, volume_name=volume.name, volume=volume, publisher=publisher,
+    ))
+    assert decision.reason == "published_verified"
+    assert volume.reload_count == 1
+    assert volume.reload_off_loop
+    record = json.loads(volume.files[GENERATION_RECORD_PATH].decode())
+    assert record["schema_version"] == 2
+    assert record["content_generation"] == identity.content_generation
+
+
+def test_archive_transport_metadata_does_not_replace_content_generation(tmp_path):
+    root = _root(tmp_path)
+    identity, archive, _files = prepare_publication(root)
+    volume = FakeVolume()
+
+    async def publisher(published_archive):
+        _generation_record(volume, identity)
+        return {
+            "status": "ok",
+            "content_generation": identity.content_generation,
+            "archive_sha256": hashlib.sha256(published_archive).hexdigest(),
+            "transport_sha256": "narrow-source-or-transport-id",
+        }
+
+    decision = __import__("asyncio").run(publish_or_skip(
+        root, volume_name=volume.name, volume=volume, publisher=publisher,
+    ))
+    assert decision.reason == "published_verified"
+    assert decision.identity.content_generation == identity.manifest_digest
+    assert archive
 
 
 def test_native_golden_backend_is_not_a_bat(tmp_path):

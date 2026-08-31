@@ -8,7 +8,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import comfyapp
 from comfymodal_runtime import modal_app
@@ -21,6 +21,96 @@ from tools.publish_custom_nodes_volume import (
 
 
 class SourceIdentityPublicationTests(unittest.TestCase):
+    @staticmethod
+    def _archive_with_node() -> bytes:
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            payload = b"NODE = True\n"
+            member = tarfile.TarInfo("node-a/__init__.py")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+        return archive.getvalue()
+
+    def test_sync_fails_closed_before_record_write_or_commit_on_generation_failure(self):
+        secret = "custom-node generation failed token=modal-token-secret"
+        credential = "modal-token-secret"
+        with tempfile.TemporaryDirectory() as tmp:
+            record_writer = patch.object(comfyapp, "_write_custom_nodes_generation_record_no_commit")
+            volume = Mock()
+            with patch.object(comfyapp, "CUSTOM_NODES_PATH", tmp), \
+                 patch.object(comfyapp, "custom_nodes_vol", volume), \
+                 patch.object(
+                     comfyapp,
+                     "custom_node_source_generation",
+                     side_effect=RuntimeError(secret),
+                 ), record_writer as mock_writer:
+                result = comfyapp.sync_custom_nodes_to_volume.local(
+                    self._archive_with_node()
+                )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["comfyapp_version"], comfyapp.COMFYAPP_VERSION)
+        self.assertIn("generation_computation_failed", result["error"])
+        self.assertIn("custom_node_source_generation raised RuntimeError:", result["error"])
+        self.assertIn("custom-node generation failed", result["generation_failure_reason"])
+        self.assertIn(result["generation_failure_reason"], result["error"])
+        self.assertNotIn(secret, result["error"])
+        self.assertNotIn(credential, result["error"])
+        self.assertNotIn(credential, result["generation_failure_reason"])
+        self.assertLessEqual(len(result["generation_failure_reason"]), 320)
+        mock_writer.assert_not_called()
+        volume.commit.assert_not_called()
+
+    def test_sync_fails_closed_before_record_write_or_commit_on_empty_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            volume = Mock()
+            with patch.object(comfyapp, "CUSTOM_NODES_PATH", tmp), \
+                 patch.object(comfyapp, "custom_nodes_vol", volume), \
+                 patch.object(comfyapp, "custom_node_source_generation", return_value=""), \
+                 patch.object(
+                     comfyapp,
+                     "_write_custom_nodes_generation_record_no_commit",
+                 ) as mock_writer:
+                result = comfyapp.sync_custom_nodes_to_volume.local(
+                    self._archive_with_node()
+                )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("generation_computation_failed", result["error"])
+        self.assertIn("returned empty content_generation", result["error"])
+        mock_writer.assert_not_called()
+        volume.commit.assert_not_called()
+
+    def test_sync_success_returns_explicit_content_generation_with_one_commit(self):
+        generation = "canonical-content-generation"
+        with tempfile.TemporaryDirectory() as tmp:
+            volume = Mock()
+            with patch.object(comfyapp, "CUSTOM_NODES_PATH", tmp), \
+                 patch.object(comfyapp, "custom_nodes_vol", volume), \
+                 patch.object(
+                     comfyapp,
+                     "custom_node_source_generation",
+                     return_value=generation,
+                 ), patch.object(
+                     comfyapp,
+                     "_write_custom_nodes_generation_record_no_commit",
+                     return_value={
+                         "schema_version": 2,
+                         "content_generation": generation,
+                     },
+                 ) as mock_writer:
+                result = comfyapp.sync_custom_nodes_to_volume.local(
+                    self._archive_with_node()
+                )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["content_generation"], generation)
+        mock_writer.assert_called_once_with(
+            reason="post_sync_custom_nodes_to_volume",
+            content_generation=generation,
+        )
+        volume.commit.assert_called_once_with()
+
     def test_default_root_is_parent_custom_nodes_for_all_publishers(self):
         repo_root = Path(__file__).resolve().parents[1]
         expected = repo_root.parent.resolve()

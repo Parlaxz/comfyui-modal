@@ -33,6 +33,11 @@ consumer identity: exact receipt skips happen before publisher resolution,
 archive creation, and content upload. A missing/stale receipt may be finalized
 from the Volume only when its authoritative generation exactly matches the
 canonical desired generation; otherwise publication fails closed.
+Receipt recovery requires authoritative **full published-content** identity:
+code/deployment identity alone cannot prove the full shared Volume contents.
+Missing receipt != missing content, but matching a narrow source identity !=
+matching full content. Use one canonical full-content generation for desired
+identity, publication, Volume readback, and receipt recovery.
 
 Every experiment gets an explicit isolated app, e.g.:
 

@@ -24,6 +24,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -138,6 +140,53 @@ def test_generation_is_path_independent_for_identical_content():
     assert g_baked == g_runtime
 
 
+def test_generation_resolves_mount_root_but_preserves_symlink_publication_contract(tmp_path):
+    """The Volume mount root may be a symlink; published content may not."""
+    module = _load_comfyapp()
+    from comfymodal_runtime import publication_policy
+
+    real_root = tmp_path / "real_custom_nodes"
+    mount_root = tmp_path / "custom_nodes_vol"
+    _write_canonical_node(real_root)
+    try:
+        mount_root.symlink_to(real_root, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation is unavailable on this host: {exc}")
+
+    direct_generation = module.custom_node_source_generation(str(real_root))
+    assert module.custom_node_source_generation(str(mount_root)) == direct_generation
+
+    # The host/archive path still passes the raw root to the shared walker and
+    # therefore continues to reject a symlinked archive root.
+    with pytest.raises(ValueError, match="symlink is not a publishable source root"):
+        publication_policy.compute_publication_generation(mount_root)
+
+    direct_fingerprint = module.custom_node_source_fingerprint(str(real_root))
+    outside_file = tmp_path / "outside.py"
+    outside_file.write_bytes(b"OUTSIDE = True\n")
+    linked_file = real_root / "ComfyUI-KJNodes" / "linked.py"
+    try:
+        linked_file.symlink_to(outside_file)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"file symlink creation is unavailable on this host: {exc}")
+    with pytest.raises(ValueError, match="symlink is not publishable"):
+        module.custom_node_source_generation(str(mount_root))
+    assert module.custom_node_source_fingerprint(str(real_root)) == direct_fingerprint
+
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "linked.py").write_bytes(b"OUTSIDE_DIR = True\n")
+    linked_dir = real_root / "ComfyUI-KJNodes" / "linked_dir"
+    linked_file.unlink()
+    try:
+        linked_dir.symlink_to(outside_dir, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlink creation is unavailable on this host: {exc}")
+    with pytest.raises(ValueError, match="symlink is not publishable"):
+        module.custom_node_source_generation(str(mount_root))
+    assert module.custom_node_source_fingerprint(str(real_root)) == direct_fingerprint
+
+
 def test_ordinary_runtime_edit_does_not_change_custom_node_identity(tmp_path):
     from comfymodal_runtime.deployment_spec import build_deployment_identity
 
@@ -190,7 +239,7 @@ def test_generation_normalizes_line_endings():
     assert g1 == g2
 
 
-def test_generation_preserves_source_mismatches_but_not_dependency_metadata():
+def test_generation_includes_all_included_publication_metadata():
     module = _load_comfyapp()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "custom_nodes"
@@ -201,7 +250,27 @@ def test_generation_preserves_source_mismatches_but_not_dependency_metadata():
         (root / "ComfyUI-KJNodes" / "requirements.txt").write_text("numpy==1.26.4\n", encoding="utf-8")
         g3 = module.custom_node_source_generation(str(root))
     assert g1 != g2
-    assert g2 == g3
+    assert g2 != g3
+
+
+def test_changed_included_json_changes_full_generation_not_code_identity():
+    """The old source-only hash reproduces the publication identity bug."""
+    module = _load_comfyapp()
+    from comfymodal_runtime.deployment_spec import compute_custom_node_hash
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "custom_nodes"
+        _write_canonical_node(root)
+        config = root / "ComfyUI-KJNodes" / "node_config.json"
+        config.write_text('{"mode": "one"}\n', encoding="utf-8")
+        narrow_before = compute_custom_node_hash([root])
+        full_before = module.custom_node_source_generation(str(root))
+        config.write_text('{"mode": "two"}\n', encoding="utf-8")
+        narrow_after = compute_custom_node_hash([root])
+        full_after = module.custom_node_source_generation(str(root))
+
+    assert narrow_before == narrow_after
+    assert full_before != full_after
 
 
 def test_fingerprint_walk_is_sorted_and_excludes_generated_dirs():
@@ -240,7 +309,7 @@ def test_archive_sync_generation_is_content_derived_not_uuid():
         expected = module.custom_node_source_generation(str(root))
     src = (ROOT / "comfyapp.py").read_text(encoding="utf-8-sig")
     assert "custom_node_source_generation(CUSTOM_NODES_PATH)" in src
-    assert "generation=_cn_gen_value or None" in src
+    assert "content_generation=_cn_gen_value" in src
     # The deterministic value must not be a UUID.
     assert len(expected) == 64, "content-derived generation must be the canonical SHA-256"
 
@@ -250,4 +319,4 @@ def test_startup_init_generation_is_content_derived():
     not a UUID, so baked/runtime generation identity can match."""
     src = (ROOT / "comfyapp.py").read_text(encoding="utf-8-sig")
     assert "reason=\"startup_init_generation_record\"" in src
-    assert "generation=_cn_init_generation or None" in src
+    assert "content_generation=_cn_init_generation or None" in src

@@ -381,6 +381,7 @@ class LevelAClassificationTests(unittest.TestCase):
     def setUp(self):
         sdp.reset_for_tests()
         self.addCleanup(sdp.reset_for_tests)
+        _FakeCuda.sync_count = 0
         self._p = patch.object(sdp, "_resolve_ksampler_x0_inpaint", lambda: _FakeKSamplerX0Inpaint)
         self._p.start()
         self.addCleanup(self._p.stop)
@@ -399,6 +400,14 @@ class LevelAClassificationTests(unittest.TestCase):
         # final teardown eval distinct from the 8 steps
         self.assertIsNotNone(art["reconciliation"]["teardown_final_eval_ms"])
         self.assertIsNotNone(art["reconciliation"]["teardown_ms"])
+        self.assertEqual(art["evals"]["per_eval"][0]["phase"], "sampling_step")
+        self.assertTrue(art["evals"]["per_eval"][0]["is_first_eval"])
+        self.assertEqual(art["evals"]["per_eval"][-1]["phase"], "teardown")
+        self.assertTrue(art["evals"]["per_eval"][-1]["is_final_post_loop_eval"])
+        self.assertTrue(art["sampler_invocation"]["final_post_loop_eval_distinct"])
+        self.assertIn("solver_controller_gaps_ms", art["reconciliation"]["steps_ms"][0])
+        self.assertFalse(art["instrumentation_overhead"]["synchronization_inside_sampling"])
+        self.assertTrue(art["cleanup_complete"])
 
     def test_reconciliation_residuals_exact(self):
         trace = _FakeTrace()
@@ -439,6 +448,20 @@ class LevelAClassificationTests(unittest.TestCase):
         self.assertTrue(any("callbacks_absent" in w for w in art["warnings"]))
         self.assertEqual(art["evals"]["count"], 17)
         self.assertEqual(art["status"], "ok")
+
+    def test_excessive_eval_and_callback_records_remain_bounded(self):
+        trace = _FakeTrace()
+        prof = _begin(trace, level="steps", steps=8, patcher=None)
+        k = _FakeKSamplerX0Inpaint()
+        for index in range(sdp._MAX_EVAL_RECORDS + 32):
+            k(1, 0.4)
+            prof.on_callback_index(index)
+        art = _finalize(prof, trace)
+        self.assertLessEqual(art["evals"]["stored_count"], sdp._MAX_EVAL_RECORDS)
+        self.assertGreater(art["evals"]["overflow_count"], 0)
+        self.assertLessEqual(art["callbacks"]["stored_count"], sdp._MAX_CALLBACK_RECORDS)
+        self.assertGreater(art["callbacks"]["overflow_count"], 0)
+        self.assertEqual(art["status"], "incomplete")
 
     def test_extra_callback_index_reported(self):
         trace = _FakeTrace()
@@ -509,6 +532,88 @@ class ComputeSkipAndCacheDiTTests(unittest.TestCase):
             any("cachedit_counter_mismatch" in e or "cachedit_hook_mismatch" in e for e in art["errors"]),
             art["errors"],
         )
+
+
+class ProcessResidencyTelemetryTests(unittest.TestCase):
+    def setUp(self):
+        sdp.reset_for_tests()
+        self.addCleanup(sdp.reset_for_tests)
+        _FakeCuda.sync_count = 0
+        self._p = patch.object(sdp, "_resolve_ksampler_x0_inpaint", lambda: _FakeKSamplerX0Inpaint)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    @staticmethod
+    def _snapshot(value):
+        return {
+            "rss_bytes": value,
+            "minor_page_faults": value + 10,
+            "major_page_faults": value + 1,
+            "source": {"rss": "fake_statm", "page_faults": "fake_rusage"},
+            "availability": {
+                "rss_bytes": True,
+                "minor_page_faults": True,
+                "major_page_faults": True,
+            },
+        }
+
+    def test_first_compute_is_actual_forward_not_eval_zero_and_no_sync(self):
+        """A skipped first eval must not receive the first-compute snapshot."""
+        dm = _FakeNextDiT(n_layers=2)
+        patcher = SimpleNamespace(model=SimpleNamespace(diffusion_model=dm))
+        trace = _FakeTrace()
+        snapshots = iter((self._snapshot(100), self._snapshot(120), self._snapshot(140)))
+
+        class _SkipThenComputeSampler:
+            def __init__(self, inner_model=None):
+                self.inner_model = inner_model
+                self.calls = 0
+
+            def __call__(self, x, sigma):
+                self.calls += 1
+                dm.skip = self.calls == 1
+                return dm(x, sigma)
+
+        with patch.object(sdp, "_resolve_cuda_module", lambda: None), \
+             patch.object(sdp, "_read_process_residency_snapshot", lambda: next(snapshots)), \
+             patch.object(sdp, "_resolve_ksampler_x0_inpaint", lambda: _SkipThenComputeSampler):
+            prof = _begin(trace, level="steps", steps=8, patcher=patcher)
+            k = _SkipThenComputeSampler(inner_model=dm)
+            k(1, 0.5)  # eval 0: CacheDiT-style whole-forward skip
+            k(1, 0.4)  # eval 1: first actual inner-block compute
+            k(1, 0.3)  # eval 2: later compute
+            art = _finalize(prof, trace)
+
+        residency = art["process_residency"]
+        self.assertEqual(residency["entry"]["snapshot"]["rss_bytes"], 100)
+        self.assertEqual(residency["first_compute"]["eval_index"], 1)
+        self.assertEqual(residency["first_compute"]["snapshot"]["rss_bytes"], 120)
+        self.assertEqual(len(residency["later_compute"]), 1)
+        self.assertEqual(residency["later_compute"][0]["eval_index"], 2)
+        self.assertEqual(residency["later_compute"][0]["delta_from_entry"]["rss_bytes"], 40)
+        self.assertEqual(art["compute_or_skip"], {"compute": 2, "skip": 1, "unknown": 0})
+        self.assertEqual(_FakeCuda.sync_count, 0)
+        json.loads(json.dumps(art))
+
+    def test_process_compute_records_are_bounded_and_overflow_is_explicit(self):
+        trace = _FakeTrace()
+        snapshots = iter(self._snapshot(i) for i in range(sdp._MAX_PROCESS_COMPUTE_RECORDS + 1))
+        with patch.object(sdp, "_resolve_cuda_module", lambda: None), \
+             patch.object(sdp, "_read_process_residency_snapshot", lambda: next(snapshots)):
+            prof = _begin(trace, level="steps", steps=1, patcher=None)
+            for index in range(sdp._MAX_PROCESS_COMPUTE_RECORDS + 5):
+                prof._record_process_compute_snapshot({
+                    "index": index,
+                    "process_compute_recorded": False,
+                })
+            art = _finalize(prof, trace)
+
+        records = art["process_residency"]["compute_records"]
+        self.assertEqual(records["stored_count"], sdp._MAX_PROCESS_COMPUTE_RECORDS)
+        self.assertEqual(records["observed_count"], sdp._MAX_PROCESS_COMPUTE_RECORDS + 5)
+        self.assertEqual(records["overflow_count"], 5)
+        self.assertEqual(len(art["process_residency"]["later_compute"]), sdp._MAX_PROCESS_COMPUTE_RECORDS - 1)
+        json.loads(json.dumps(art))
 
 
 class CacheDiTDiscoveryTests(unittest.TestCase):
@@ -809,6 +914,8 @@ class BlockAggregationTests(unittest.TestCase):
         self.assertIn("norm_gate_residual", sem)
         self.assertIn("step_callback_partition", sem)
         self.assertIn("cuda_realization", sem)
+        self.assertIn("authoritative_wall", sem)
+        self.assertIn("non_attention", sem)
         # Per-block entries separate measured norm from derived norm_gate_residual.
         self.assertTrue(art["blocks"], "blocks mode must produce per-block entries")
         for b in art["blocks"]:
@@ -817,6 +924,8 @@ class BlockAggregationTests(unittest.TestCase):
             self.assertIn("attention_ms", b)
             self.assertIn("mlp_ms", b)
         self.assertIn("norm_gate_residual", art["categories_ms"])
+        self.assertIn("attention_ms", art["nextdit"])
+        self.assertIn("non_attention_ms", art["nextdit"])
         # Derived residual matches the per-block residual semantics.
         self.assertEqual(
             art["categories_ms"]["norm_gate_residual"],

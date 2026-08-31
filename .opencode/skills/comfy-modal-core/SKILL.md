@@ -197,6 +197,13 @@ content upload. If a receipt is missing or stale, receipt-only recovery is
 allowed only when the authoritative Volume generation exactly matches the
 canonical desired generation; ambiguous state fails closed.
 
+Receipt recovery requires authoritative **full published-content** identity.
+Code/deployment identity is not sufficient proof of the full shared Volume
+contents. Missing receipt does not mean missing content, but matching a narrow
+source identity does not mean matching full content. Maintain one canonical
+full-content generation across desired identity, publication, Volume readback,
+and receipt recovery.
+
 ## Prefer deterministic semantic identity
 
 Generation/fingerprint inputs must represent semantic state.

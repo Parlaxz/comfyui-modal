@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FLAG = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
 HASH_CHECK_FLAG = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
 ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
+SAMPLING_DEEP_PROFILE_FLAG = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
 
 
 def _config(profile: str, *, sets: list[str] | None = None):
@@ -105,6 +106,14 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
         == "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
     )
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
+
+
+def test_golden_p1_keeps_sampling_decomposition_opt_in_by_default():
+    config = _config("golden_p1")
+    flag = config.flag(SAMPLING_DEEP_PROFILE_FLAG)
+    assert flag is not None
+    assert flag.value == "off"
+    assert flag.source == "profile:golden_p1"
 
 
 def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector():

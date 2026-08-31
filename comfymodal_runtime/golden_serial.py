@@ -37,6 +37,7 @@ semantics through a narrow Golden-owned driver (never
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import dataclasses
 import hashlib
@@ -79,6 +80,9 @@ CANONICAL_SAMPLER_CLASS = "ClownsharKSampler_Beta"
 # sampler/model callbacks and CacheDiT scalar state; it never changes sampler
 # inputs or performs a CUDA synchronization.
 GOLDEN_SAMPLING_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_SAMPLING_DIAGNOSTICS"
+# Cross-stage transport/CLIP/VAE diagnostics are deliberately separate from
+# RA6's sampling selector.  The normal Golden path must not pay for them.
+GOLDEN_STAGE_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"
 
 # Public Golden request selector.  This is deliberately request-local; it is
 # not a process/global ComfyUI attention switch.
@@ -118,6 +122,27 @@ EVENT_OUTPUT_ENCODE_DONE = "OUTPUT_ENCODE_DONE"
 EVENT_ASSET_WRITE_DONE = "ASSET_WRITE_DONE"
 EVENT_VOLUME_COMMIT_START = "VOLUME_COMMIT_START"
 EVENT_VOLUME_COMMIT_COMPLETE = "VOLUME_COMMIT_COMPLETE"
+EVENT_DURABLE_RESULT_MARKER_PUBLICATION = "DURABLE_RESULT_MARKER_PUBLICATION"
+
+# These are deliberately wall-clock subspans of the one authoritative durable
+# commit stage.  Modal exposes Volume.commit as one blocking operation; there
+# is no lower-level server-side breakdown available to this process.
+DURABLE_COMMIT_SUBSPAN_NAMES = (
+    "pre_commit_bookkeeping",
+    "volume_commit_call_wall",
+    "commit_return_to_reopen_start",
+    "reopen_open",
+    "stat",
+    "readback",
+    "readback_sha256",
+    "byte_count_content_verification",
+    "close_finalize",
+)
+DURABLE_RESULT_MARKER_SUBSPAN = "true_durable_result_marker_publication"
+DURABLE_COMMIT_BLOCKING_NOTE = (
+    "Modal exposes Volume.commit as one blocking call; lower-level commit timing "
+    "inside the service is unavailable and is not inferred here."
+)
 
 _TORCH_DTYPE = {
     "F32": torch.float32,
@@ -747,11 +772,12 @@ class GoldenTelemetryRecorder:
         interval.details.update(details)
         self._open_stage = None
 
-    def fail_stage(self, name: str, exc: BaseException) -> None:
+    def fail_stage(self, name: str, exc: BaseException, **details: Any) -> None:
         interval = self._require_open(name)
         interval.end_monotonic_ns = self._monotonic()
         interval.end_wall_ns = self._wall()
         interval.ok = False
+        interval.details.update(details)
         interval.details["error"] = f"{type(exc).__name__}: {exc}"
         self._open_stage = None
 
@@ -775,7 +801,10 @@ class GoldenTelemetryRecorder:
                 "name": name,
                 "monotonic_ns": self._monotonic(),
                 "wall_ns": self._wall(),
-                "fields": fields,
+                # Raw events are snapshots.  In particular, a later marker or
+                # caller mutation must not rewrite an already-emitted timing
+                # decomposition.
+                "fields": copy.deepcopy(fields),
             }
         )
 
@@ -787,8 +816,22 @@ class GoldenTelemetryRecorder:
             raise RuntimeError("true_durable_requires_successful_commit_stage")
         if not self._reopen_verified or self._reopen_proof is None:
             raise RuntimeError("true_durable_requires_reopen_verification")
+        marker_start_ns = self._monotonic()
         self._true_durable_marked = True
         self.event(EVENT_TRUE_FIRST_DURABLE_RESULT)
+        marker_end_ns = self._monotonic()
+        marker_span = {
+            "start_monotonic_ns": marker_start_ns,
+            "end_monotonic_ns": marker_end_ns,
+            "duration_ns": max(0, marker_end_ns - marker_start_ns),
+            "stage_boundary": "post_commit_result_marker",
+            "outside_durable_commit_stage": True,
+        }
+        self.event(
+            EVENT_DURABLE_RESULT_MARKER_PUBLICATION,
+            subspan=DURABLE_RESULT_MARKER_SUBSPAN,
+            **marker_span,
+        )
 
     def mark_reopen_verified(self, proof: Any) -> None:
         if (
@@ -900,6 +943,17 @@ def _sampling_diagnostics_enabled() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def stage_diagnostics_enabled() -> bool:
+    """Return whether optional CLIP/VAE/QD stage diagnostics are enabled."""
+    raw = os.environ.get(GOLDEN_STAGE_DIAGNOSTICS_ENV)
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _stage_diagnostics_enabled() -> bool:
+    """Test-compatible private adapter for the public stage selector."""
+    return stage_diagnostics_enabled()
+
+
 def _allocator_state() -> dict[str, Any]:
     """Read cheap allocator counters without realizing any CUDA work."""
     state = {
@@ -943,6 +997,239 @@ def _allocator_state() -> dict[str, Any]:
         pass
     state["available"] = any(value is not None for value in state.values())
     return state
+
+
+def _host_memory_visibility() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "rss_bytes": None,
+        "rss_source": None,
+        "max_rss_bytes": None,
+        "memlock_soft_bytes": None,
+        "memlock_hard_bytes": None,
+    }
+    try:
+        psutil = importlib.import_module("psutil")
+        rss = getattr(getattr(psutil, "Process")(), "memory_info")().rss
+        if isinstance(rss, int) and not isinstance(rss, bool):
+            state["rss_bytes"] = int(rss)
+            state["rss_source"] = "psutil"
+    except Exception:
+        try:
+            with open("/proc/self/statm", "r", encoding="ascii") as fh:
+                pages = int(fh.read().split()[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            state["rss_bytes"] = pages * page_size
+            state["rss_source"] = "proc_statm"
+        except Exception:
+            pass
+    try:
+        resource = importlib.import_module("resource")
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        max_rss = int(usage.ru_maxrss)
+        if sys.platform != "darwin" and sys.platform != "win32":
+            max_rss *= 1024
+        state["max_rss_bytes"] = max_rss
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        state["memlock_soft_bytes"] = None if soft < 0 else int(soft)
+        state["memlock_hard_bytes"] = None if hard < 0 else int(hard)
+    except Exception:
+        pass
+    state["available"] = any(value is not None for key, value in state.items() if key != "available")
+    return state
+
+
+def _process_page_faults() -> dict[str, Any]:
+    """Read raw process fault counters without touching or prewarming pages.
+
+    ``resource.getrusage`` is authoritative where available.  Linux procfs is
+    only a fallback for runtimes without usable ``resource`` counters; missing
+    dimensions remain ``None`` rather than being represented as zero.
+    """
+    result = {
+        "available": False,
+        "minor_faults": None,
+        "major_faults": None,
+        # Historical VAE consumers use these explicit aliases; they are
+        # adapters over the same raw counters, not another definition.
+        "minor_page_faults": None,
+        "major_page_faults": None,
+        "source": None,
+    }
+    try:
+        resource = importlib.import_module("resource")
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        minor = getattr(usage, "ru_minflt", None)
+        major = getattr(usage, "ru_majflt", None)
+        if isinstance(minor, int) and not isinstance(minor, bool):
+            result["minor_faults"] = int(minor)
+        if isinstance(major, int) and not isinstance(major, bool):
+            result["major_faults"] = int(major)
+        result["minor_page_faults"] = result["minor_faults"]
+        result["major_page_faults"] = result["major_faults"]
+        result["available"] = result["minor_faults"] is not None or result["major_faults"] is not None
+        if result["available"]:
+            result["source"] = "resource.getrusage(RUSAGE_SELF)"
+            return result
+    except Exception:
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            # /proc/<pid>/stat puts minflt at field 10 and majflt at field 12.
+            # The command name may contain spaces, so split only after ')'.
+            with open("/proc/self/stat", "r", encoding="ascii") as stat_file:
+                fields = stat_file.read().rsplit(")", 1)[1].split()
+            result.update(
+                available=True,
+                source="/proc/self/stat",
+                minor_faults=int(fields[7]),
+                major_faults=int(fields[9]),
+                minor_page_faults=int(fields[7]),
+                major_page_faults=int(fields[9]),
+            )
+        except Exception:
+            pass
+    return result
+
+
+def page_fault_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, Any]:
+    def delta(name: str) -> Optional[int]:
+        alias = name.replace("_faults", "_page_faults")
+        left = before.get(name, before.get(alias))
+        right = after.get(name, after.get(alias))
+        if not isinstance(left, int) or isinstance(left, bool):
+            return None
+        if not isinstance(right, int) or isinstance(right, bool):
+            return None
+        return max(0, int(right) - int(left))
+
+    minor = delta("minor_faults")
+    major = delta("major_faults")
+    return {
+        "available": minor is not None or major is not None,
+        "minor_delta": minor,
+        "major_delta": major,
+        "minor_page_faults_delta": minor,
+        "major_page_faults_delta": major,
+        "supporting_evidence_only": True,
+        "source": after.get("source") or before.get("source"),
+    }
+
+
+def aggregate_timing_intervals(
+    intervals: Iterable[Mapping[str, Any]],
+    *,
+    enclosing_start_ns: Optional[int] = None,
+    enclosing_end_ns: Optional[int] = None,
+) -> dict[str, Any]:
+    spans = []
+    for item in intervals:
+        start = item.get("start_ns")
+        end = item.get("end_ns")
+        if start is None or end is None:
+            continue
+        start, end = int(start), int(end)
+        if end < start:
+            raise ValueError("timing_interval_inverted")
+        spans.append((start, end))
+    spans.sort()
+    union_ns = 0
+    overlap_ns = 0
+    union_end = None
+    for start, end in spans:
+        if union_end is None:
+            union_end = end
+            union_ns = end - start
+        elif start >= union_end:
+            union_ns += end - start
+            union_end = end
+        else:
+            overlap_ns += min(end, union_end) - start
+            if end > union_end:
+                union_ns += end - union_end
+                union_end = end
+    sum_ns = sum(end - start for start, end in spans)
+    wall_ns = None
+    residual_ns = None
+    if enclosing_start_ns is not None and enclosing_end_ns is not None:
+        wall_ns = max(0, int(enclosing_end_ns) - int(enclosing_start_ns))
+        residual_ns = wall_ns - union_ns
+    return {
+        "interval_count": len(spans),
+        "sum_ns": sum_ns,
+        "union_ns": union_ns,
+        "overlap_ns": overlap_ns,
+        "wall_ns": wall_ns,
+        "residual_ns": residual_ns,
+        "non_additive": bool(overlap_ns or (wall_ns is not None and sum_ns != wall_ns)),
+        "aggregation": "union_for_wall_sum_for_nested_durations",
+    }
+
+
+def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(stats.get("source_open_header_layout") or {})
+    staging = dict(stats.get("staging") or {})
+    source_reads = dict(stats.get("source_reads") or {})
+    cpu_to_pinned = dict(stats.get("cpu_to_pinned_staging") or {})
+    h2d_enqueue = dict(stats.get("h2d_enqueue") or {})
+    h2d_gpu = dict(stats.get("h2d_gpu_event") or {})
+    waits = dict(stats.get("waits_quiescence") or {})
+    return {
+        "schema": "golden_qd_transport_diagnostics_v1",
+        "role": stats.get("role"),
+        "source_bytes": stats.get("bytes_read"),
+        "source_open_header_layout": source,
+        "staging": staging,
+        "source_reads": source_reads,
+        "cpu_to_pinned_staging": cpu_to_pinned,
+        "h2d_enqueue": h2d_enqueue,
+        "h2d_gpu_event": h2d_gpu,
+        "waits_quiescence": waits,
+        "throughput": {
+            "source_gbps": stats.get("effective_source_gbps", stats.get("qd_source_gbps")),
+            "h2d_gbps": stats.get("effective_h2d_gbps"),
+            "h2d_scope": "sum_of_copy_event_durations",
+        },
+        "overlap": {
+            "nested_timings_not_additive": True,
+            "sum_is_not_wall": True,
+            "wall_fields": ["source_reads.wall_ns", "h2d_enqueue.wall_ns"],
+        },
+    }
+
+
+def build_vae_load_decomposition(
+    *,
+    stage_start_ns: int,
+    stage_end_ns: int,
+    components: Iterable[Mapping[str, Any]],
+    transport_stats: Mapping[str, Any],
+    memory_before: Optional[Mapping[str, Any]] = None,
+    memory_after: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    component_list = [dict(component) for component in components]
+    aggregate = aggregate_timing_intervals(
+        component_list,
+        enclosing_start_ns=stage_start_ns,
+        enclosing_end_ns=stage_end_ns,
+    )
+    return {
+        "schema": "vae_load_decomposition_v1",
+        "clock": "perf_counter_ns",
+        "stage_wall_ns": max(0, int(stage_end_ns) - int(stage_start_ns)),
+        "stage_wall_ms": round(max(0, int(stage_end_ns) - int(stage_start_ns)) / 1e6, 4),
+        "components": component_list,
+        "aggregation": aggregate,
+        "transport": build_qd_transport_diagnostics(transport_stats),
+        "memory": {
+            "before": dict(memory_before or {}),
+            "after": dict(memory_after or {}),
+        },
+        "overlap": {
+            "nested_timings_not_additive": True,
+            "do_not_sum_components_for_stage_wall": True,
+            "residual_ns": aggregate["residual_ns"],
+        },
+    }
 
 
 def _safe_diagnostic_value(value: Any) -> Any:
@@ -1547,10 +1834,10 @@ class GoldenQDOwner:
         self.release_storage()
 
 
-def _wait_event_host(event: Any) -> float:
+def _wait_event_host_ns(event: Any, *, measure: bool = True) -> int:
     if event is None:
         raise RuntimeError("missing_completion_event")
-    started = time.perf_counter()
+    started = time.perf_counter_ns() if measure else None
     query = getattr(event, "query", None)
     complete = bool(query()) if callable(query) else False
     if not complete:
@@ -1560,7 +1847,22 @@ def _wait_event_host(event: Any) -> float:
         sync()
         if callable(query) and not bool(query()):
             raise RuntimeError("incomplete_completion_event")
-    return (time.perf_counter() - started) * 1000.0
+    return max(0, time.perf_counter_ns() - int(started)) if started is not None else 0
+
+
+def _wait_event_host(event: Any) -> float:
+    return _wait_event_host_ns(event) / 1e6
+
+
+def _cuda_event_elapsed_ms(start_event: Any, end_event: Any) -> Optional[float]:
+    elapsed = getattr(start_event, "elapsed_time", None)
+    if not callable(elapsed):
+        return None
+    try:
+        value = float(elapsed(end_event))
+    except Exception:
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def _read_at(fd: int, mv: Any, offset: int) -> int:
@@ -1595,7 +1897,8 @@ def _read_at(fd: int, mv: Any, offset: int) -> int:
 class _SourceTelemetry:
     """Observed source-read depth/counters (never fabricated from records)."""
 
-    def __init__(self, qd: int):
+    def __init__(self, qd: int, *, enabled: bool = True):
+        self.enabled = bool(enabled)
         self._lock = threading.Lock()
         self.inflight = 0
         self.max_inflight = 0
@@ -1607,6 +1910,8 @@ class _SourceTelemetry:
         }
 
     def before(self, worker_id: int) -> int:
+        if not self.enabled:
+            return 0
         now = time.perf_counter_ns()
         with self._lock:
             self.inflight += 1
@@ -1620,6 +1925,8 @@ class _SourceTelemetry:
         return now
 
     def after(self, worker_id: int, started_ns: int, read_bytes: int) -> int:
+        if not self.enabled:
+            return 0
         now = time.perf_counter_ns()
         with self._lock:
             self.inflight -= 1
@@ -1646,14 +1953,19 @@ class _SourceTelemetry:
 class _QDReaderState:
     """Authoritative completion ledger for one QD transport run."""
 
-    def __init__(self, regions: list[list[tuple[int, int]]]):
+    def __init__(self, regions: list[list[tuple[int, int]]], *, diagnostics_enabled: bool = True):
         self.regions = regions
+        self.diagnostics_enabled = bool(diagnostics_enabled)
         self._lock = threading.Lock()
         self.records: list[dict] = []
         self.errors: list[str] = []
         self.submitted = 0
         self.completed = 0
         self.buffer_pool_wait_ms = 0.0
+        self.buffer_pool_wait_ns = 0
+        self.h2d_wait_ns = 0
+        self.h2d_gpu_event_ns = 0
+        self.h2d_gpu_event_count = 0
         self._worker_counts = {
             wid: {"submitted": 0, "completed": 0, "record_bytes": 0}
             for wid in range(len(regions))
@@ -1689,8 +2001,29 @@ class _QDReaderState:
             self.errors.append(f"worker={worker_id}:{type(exc).__name__}:{str(exc)[:160]}")
 
     def add_buffer_wait(self, ms: float) -> None:
+        if not self.diagnostics_enabled:
+            return
         with self._lock:
             self.buffer_pool_wait_ms += float(ms)
+
+    def add_buffer_wait_ns(self, value: int) -> None:
+        if not self.diagnostics_enabled:
+            return
+        with self._lock:
+            self.buffer_pool_wait_ns += max(0, int(value))
+
+    def add_h2d_wait_ns(self, value: int) -> None:
+        if not self.diagnostics_enabled:
+            return
+        with self._lock:
+            self.h2d_wait_ns += max(0, int(value))
+
+    def add_h2d_gpu_event_ms(self, value: Optional[float]) -> None:
+        if not self.diagnostics_enabled or value is None:
+            return
+        with self._lock:
+            self.h2d_gpu_event_ns += max(0, int(round(float(value) * 1e6)))
+            self.h2d_gpu_event_count += 1
 
     def finalize_worker(self, worker_id: int) -> None:
         with self._lock:
@@ -1711,11 +2044,13 @@ def _qd_gpu_worker(
     state: _QDReaderState,
     slots: list,
     events: list,
+    start_events: list,
     gpu_buf: Any,
     data_start: int,
     fd: int,
     worker_id: int,
     telemetry: _SourceTelemetry,
+    diagnostics_enabled: bool,
 ) -> None:
     """One static source worker: positioned reads into its two pinned slots,
     async non-blocking H2D into the contiguous CUDA buffer, slot reuse gated
@@ -1725,35 +2060,56 @@ def _qd_gpu_worker(
         for index, (abs_start, ln) in enumerate(state.regions[worker_id]):
             slot_index = index % 2
             previous = slot_records[slot_index]
-            wait_ms = 0.0
             if previous is not None:
                 end_event = events[slot_index]
-                wait_ms = _wait_event_host(end_event)
+                wait_ns = _wait_event_host_ns(end_event, measure=diagnostics_enabled)
                 previous["h2d_completed_bytes"] = int(previous["planned_len"])
-                state.add_buffer_wait(wait_ms)
+                if diagnostics_enabled:
+                    previous["h2d_wait_ns"] = wait_ns
+                    state.add_buffer_wait(wait_ns / 1e6)
+                    state.add_buffer_wait_ns(wait_ns)
+                    state.add_h2d_wait_ns(wait_ns)
+                    previous["h2d_gpu_event_ms"] = _cuda_event_elapsed_ms(
+                        start_events[slot_index], end_event
+                    )
+                    state.add_h2d_gpu_event_ms(previous["h2d_gpu_event_ms"])
             rel = int(abs_start) - int(data_start)
             if rel < 0 or rel + int(ln) > int(gpu_buf.numel()):
                 raise RuntimeError(f"destination_slice_out_of_range:{rel}:{ln}")
             state.submit(worker_id)
-            started = telemetry.before(worker_id)
+            started = telemetry.before(worker_id) if diagnostics_enabled else 0
             slot = slots[slot_index]
             if not bool(getattr(slot, "is_pinned", lambda: False)()):
                 raise RuntimeError("pinned_slot_required")
             mv = memoryview(slot.numpy())[:ln]
             got = int(_read_at(fd, mv, abs_start))
-            ended = telemetry.after(worker_id, started, got)
+            ended = telemetry.after(worker_id, started, got) if diagnostics_enabled else 0
             record = {
                 "worker_id": worker_id,
                 "off": int(abs_start),
                 "planned_len": int(ln),
                 "read_len": int(got),
-                "source_start_ns": started,
-                "source_end_ns": ended,
+                "source_start_ns": started if diagnostics_enabled else None,
+                "source_end_ns": ended if diagnostics_enabled else None,
+            }
+            if diagnostics_enabled:
+                record.update({
+                    "cpu_to_pinned_start_ns": started,
+                    "cpu_to_pinned_end_ns": ended,
+                })
+            record.update({
                 "slot_index": slot_index,
                 "h2d_submitted_bytes": 0,
                 "h2d_completed_bytes": 0,
-                "error": None,
-            }
+            })
+            if diagnostics_enabled:
+                record.update({
+                    "h2d_enqueue_start_ns": None,
+                    "h2d_enqueue_end_ns": None,
+                    "h2d_wait_ns": 0,
+                    "h2d_gpu_event_ms": None,
+                })
+            record["error"] = None
             state.record(record)
             if got != ln:
                 record["error"] = f"short_read got={got} want={ln}"
@@ -1763,8 +2119,13 @@ def _qd_gpu_worker(
             if event is None:
                 raise RuntimeError("missing_completion_event")
             try:
+                if diagnostics_enabled:
+                    record["h2d_enqueue_start_ns"] = time.perf_counter_ns()
+                    start_events[slot_index].record()
                 gpu_buf[rel : rel + ln].copy_(slot[:ln], non_blocking=True)
                 event.record()
+                if diagnostics_enabled:
+                    record["h2d_enqueue_end_ns"] = time.perf_counter_ns()
             except BaseException as exc:
                 record["error"] = f"h2d_failed:{type(exc).__name__}"
                 state.error(worker_id, exc)
@@ -1827,6 +2188,7 @@ def read_file_qd_gpu(
     device: Optional[str] = None,
     qd: int = GOLDEN_QD,
     block_bytes: int = GOLDEN_BLOCK_BYTES,
+    diagnostics: Optional[bool] = None,
 ) -> dict:
     """Single-source QD physical transport: parse header -> plan -> four source
     workers (one fd each, two pinned slots each) -> positioned reads -> async
@@ -1842,15 +2204,21 @@ def read_file_qd_gpu(
     """
     qd = max(1, min(32, int(qd)))
     block_bytes = max(1, int(block_bytes))
+    diagnostics_enabled = (
+        stage_diagnostics_enabled() if diagnostics is None else bool(diagnostics)
+    )
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_unavailable")
     dev = device or f"cuda:{torch.cuda.current_device()}"
+    header_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
     parsed = parse_safetensors_header(path)
     if parsed.get("status") != "ok":
         raise RuntimeError(f"header_invalid:{parsed.get('reason')}")
     header = parsed["header"]
     data_start = int(parsed["data_start"])
     total = int(parsed["total_data_bytes"])
+    header_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
+    layout_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
     tensor_map = build_header_tensor_map(header)
     regions = plan_source_regions(data_start, total, block_bytes, qd)
     items = [item for region in regions for item in region]
@@ -1859,6 +2227,7 @@ def read_file_qd_gpu(
     )
     if not cov_ok:
         raise RuntimeError(f"coverage:{cov_reason}")
+    layout_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
 
     stats: dict = {
         "kind": "golden_qd_read",
@@ -1893,7 +2262,42 @@ def read_file_qd_gpu(
             "operation_live": True,
         },
     }
-    cuda_before = int(torch.cuda.memory_allocated())
+    if diagnostics_enabled:
+        stats.update({
+            "effective_source_gbps": None,
+            "effective_h2d_gbps": None,
+            "source_bytes": 0,
+            "staging_allocation_bytes": 0,
+            "staging_reuse_count": sum(max(0, len(region) - 2) for region in regions),
+            "staging_retained_bytes": 0,
+            "buffer_pool_wait_ns": 0,
+            "source_open_header_layout": {
+                "header_layout_ns": None,
+                "header_layout_ms": None,
+                "source_open_ns": None,
+                "source_open_ms": None,
+                "tensor_layout_ns": None,
+                "tensor_layout_ms": None,
+            },
+            "staging": {
+                "allocation_count": 0,
+                "allocated_bytes": 0,
+                "reuse_count": sum(max(0, len(region) - 2) for region in regions),
+                "retained_bytes": 0,
+                "allocation_ns": None,
+                "retained_by": "transport_owner",
+            },
+            "source_reads": {},
+            "cpu_to_pinned_staging": {},
+            "h2d_enqueue": {},
+            "h2d_gpu_event": {},
+            "waits_quiescence": {},
+            "memory_visibility": {
+                "before": _host_memory_visibility(),
+                "after": None,
+            },
+        })
+    cuda_before = int(torch.cuda.memory_allocated()) if diagnostics_enabled else None
     owner: Optional[GoldenQDOwner] = None
     fds: list[int] = []
     threads: list[threading.Thread] = []
@@ -1904,9 +2308,12 @@ def read_file_qd_gpu(
         gpu_buf = torch.empty(total, dtype=torch.uint8, device=dev)
         slots: list[list] = []
         events: list[list] = []
+        start_events: list[list] = []
+        allocation_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
         for _ in range(qd):
             worker_slots: list = []
             worker_events: list = []
+            worker_start_events: list = []
             for _slot in range(2):
                 try:
                     slot = torch.empty(block_bytes, dtype=torch.uint8, pin_memory=True)
@@ -1915,46 +2322,85 @@ def read_file_qd_gpu(
                 if not bool(getattr(slot, "is_pinned", lambda: False)()):
                     raise RuntimeError("pin_allocation_failed:not_pinned")
                 worker_slots.append(slot)
+                # Completion events are correctness machinery.  Start events
+                # are timing-only and do not exist on the normal path.
                 worker_events.append(torch.cuda.Event(enable_timing=False))
+                if diagnostics_enabled:
+                    worker_start_events.append(torch.cuda.Event(enable_timing=True))
             slots.append(worker_slots)
             events.append(worker_events)
+            start_events.append(worker_start_events)
         stats["pinned_bytes"] = sum(block_bytes for worker in slots for _ in worker)
+        if diagnostics_enabled:
+            stats["staging"] = {
+                **stats["staging"],
+                "allocation_count": qd * 2,
+                "allocated_bytes": stats["pinned_bytes"],
+                "retained_bytes": stats["pinned_bytes"],
+                "allocation_ns": time.perf_counter_ns() - int(allocation_start_ns),
+            }
+            stats["staging_allocation_bytes"] = stats["staging"]["allocated_bytes"]
+            stats["staging_retained_bytes"] = stats["staging"]["retained_bytes"]
 
-        state = _QDReaderState(regions)
-        telemetry = _SourceTelemetry(qd)
+        state = _QDReaderState(regions, diagnostics_enabled=diagnostics_enabled)
+        telemetry = _SourceTelemetry(qd, enabled=diagnostics_enabled)
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        open_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
         fds = [os.open(path, flags) for _ in range(qd)]
+        if diagnostics_enabled:
+            stats["source_open_header_layout"]["source_open_ns"] = (
+                time.perf_counter_ns() - int(open_start_ns)
+            )
+            stats["source_open_header_layout"]["source_open_ms"] = round(
+                stats["source_open_header_layout"]["source_open_ns"] / 1e6, 4
+            )
         for i in range(qd):
             t = threading.Thread(
                 target=_qd_gpu_worker,
-                args=(state, slots[i], events[i], gpu_buf, data_start, fds[i], i, telemetry),
+                args=(
+                    state, slots[i], events[i], start_events[i], gpu_buf,
+                    data_start, fds[i], i, telemetry, diagnostics_enabled,
+                ),
                 daemon=True,
                 name=f"golden-qd-{role}-{i}",
             )
             threads.append(t)
         with _GOLDEN_THREAD_LOCK:
             _GOLDEN_THREADS.update(threads)
-        t_wall0 = time.perf_counter()
+        t_wall0 = time.perf_counter_ns() if diagnostics_enabled else None
         for t in threads:
             t.start()
         for t in threads:
             t.join()
         state.workers_joined = True
-        source_wall_ms = (time.perf_counter() - t_wall0) * 1000.0
+        source_wall_ns = (
+            max(0, time.perf_counter_ns() - int(t_wall0))
+            if diagnostics_enabled else None
+        )
 
         # Wait every outstanding CUDA completion event before declaring the
         # buffer contents final; mark the protected records complete.
         for record in state.records:
             if record.get("h2d_submitted_bytes") and not record.get("h2d_completed_bytes"):
                 event = events[int(record["worker_id"])][int(record["slot_index"])]
-                _wait_event_host(event)
+                wait_ns = _wait_event_host_ns(event, measure=diagnostics_enabled)
                 record["h2d_completed_bytes"] = int(record["planned_len"])
+                if diagnostics_enabled:
+                    record["h2d_wait_ns"] = wait_ns
+                    state.add_h2d_wait_ns(wait_ns)
+                    record["h2d_gpu_event_ms"] = _cuda_event_elapsed_ms(
+                        start_events[int(record["worker_id"])][int(record["slot_index"])], event
+                    )
+                    state.add_h2d_gpu_event_ms(record["h2d_gpu_event_ms"])
         state.events_waited = True
 
-        source = telemetry.snapshot()
+        source = (
+            telemetry.snapshot()
+            if diagnostics_enabled
+            else {"max_inflight": 0, "earliest_start_ns": None, "latest_end_ns": None}
+        )
         stats["max_inflight"] = source["max_inflight"]
-        stats["source_read_count"] = sum(w["read_count"] for w in source["per_worker"].values())
-        stats["source_read_bytes"] = sum(w["read_bytes"] for w in source["per_worker"].values())
+        stats["source_read_count"] = len(state.records)
         # NOTE: qd_source_io_wall_ms / qd_source_gbps are computed BELOW, after
         # the reconciled record bytes are populated into stats["bytes_read"].
 
@@ -1963,9 +2409,13 @@ def read_file_qd_gpu(
         stats["submitted_block_count"] = int(state.submitted)
         stats["completed_block_count"] = len(state.records)
         stats["bytes_read"] = sum(int(r.get("read_len", 0)) for r in state.records)
+        stats["source_read_bytes"] = stats["bytes_read"]
         stats["h2d_submitted_bytes"] = sum(int(r.get("h2d_submitted_bytes", 0)) for r in state.records)
         stats["h2d_completed_bytes"] = sum(int(r.get("h2d_completed_bytes", 0)) for r in state.records)
         stats["buffer_pool_wait_ms"] = round(state.buffer_pool_wait_ms, 4)
+        if diagnostics_enabled:
+            stats["source_bytes"] = stats["bytes_read"]
+            stats["buffer_pool_wait_ns"] = state.buffer_pool_wait_ns
         stats["blocks"] = list(state.records)
 
         # Throughput is computed from the RECONCILED byte totals above.  The
@@ -1977,6 +2427,62 @@ def read_file_qd_gpu(
             elapsed_ns = max(int(end_ns) - int(start_ns), 1)
             stats["qd_source_io_wall_ms"] = round(elapsed_ns / 1_000_000, 4)
             stats["qd_source_gbps"] = round(stats["bytes_read"] / elapsed_ns, 4)
+            if diagnostics_enabled:
+                stats["effective_source_gbps"] = stats["qd_source_gbps"]
+
+        if diagnostics_enabled:
+            source_layout = stats["source_open_header_layout"]
+            source_layout["header_layout_ns"] = max(0, int(header_end_ns) - int(header_start_ns))
+            source_layout["header_layout_ms"] = round(source_layout["header_layout_ns"] / 1e6, 4)
+            source_layout["tensor_layout_ns"] = max(0, int(layout_end_ns) - int(layout_start_ns))
+            source_layout["tensor_layout_ms"] = round(source_layout["tensor_layout_ns"] / 1e6, 4)
+
+        source_records = list(state.records)
+        if diagnostics_enabled:
+            cpu_intervals = [
+                {"start_ns": r.get("cpu_to_pinned_start_ns"), "end_ns": r.get("cpu_to_pinned_end_ns")}
+                for r in source_records
+            ]
+            enqueue_intervals = [
+                {"start_ns": r.get("h2d_enqueue_start_ns"), "end_ns": r.get("h2d_enqueue_end_ns")}
+                for r in source_records
+            ]
+            stats["source_reads"] = {
+                **aggregate_timing_intervals(
+                    [{"start_ns": r.get("source_start_ns"), "end_ns": r.get("source_end_ns")} for r in source_records]
+                ),
+                "bytes": stats["bytes_read"],
+                "wall_ns": source_wall_ns,
+            }
+            stats["cpu_to_pinned_staging"] = {
+                **aggregate_timing_intervals(cpu_intervals),
+                "bytes": stats["bytes_read"],
+                "copy_count": len(source_records),
+            }
+            stats["h2d_enqueue"] = {
+                **aggregate_timing_intervals(enqueue_intervals),
+                "bytes": stats["h2d_submitted_bytes"],
+            }
+            h2d_event_ns = state.h2d_gpu_event_ns
+            stats["h2d_gpu_event"] = {
+                "duration_ns": h2d_event_ns if state.h2d_gpu_event_count else None,
+                "duration_ms": round(h2d_event_ns / 1e6, 4) if state.h2d_gpu_event_count else None,
+                "copy_count": state.h2d_gpu_event_count,
+                "bytes": stats["h2d_completed_bytes"],
+                "scope": "sum_of_copy_event_durations",
+                "non_additive": True,
+            }
+            if h2d_event_ns > 0:
+                stats["effective_h2d_gbps"] = round(stats["h2d_completed_bytes"] / h2d_event_ns, 4)
+        if diagnostics_enabled:
+            stats["waits_quiescence"] = {
+                "buffer_pool_wait_ns": state.buffer_pool_wait_ns,
+                "h2d_wait_ns": state.h2d_wait_ns,
+                "h2d_event_wait_count": sum(1 for r in source_records if r.get("h2d_wait_ns")),
+                "workers_joined": state.workers_joined,
+                "h2d_events_waited": state.events_waited,
+                "copies_complete": False,
+            }
 
         finalization = state.worker_finalization_snapshot()
         recon_ok = True
@@ -2016,6 +2522,13 @@ def read_file_qd_gpu(
             "copies_complete": True,
             "operation_live": False,
         }
+        if diagnostics_enabled:
+            stats["waits_quiescence"].update(stats["quiescence"])
+        if diagnostics_enabled:
+            stats["memory_visibility"]["after"] = {
+                "host": _host_memory_visibility(),
+                "cuda": _allocator_state(),
+            }
 
         sd: dict[str, Any] = {}
         for key, dtype_str, shape, rel_start, length in tensor_map:
@@ -2026,7 +2539,10 @@ def read_file_qd_gpu(
 
         owner = GoldenQDOwner(gpu_buf, [slot for worker in slots for slot in worker], dev, role=role)
         stats["status"] = "ok"
-        stats["cuda_alloc_delta_bytes"] = max(int(torch.cuda.memory_allocated()) - cuda_before, 0)
+        if diagnostics_enabled:
+            stats["cuda_alloc_delta_bytes"] = max(
+                int(torch.cuda.memory_allocated()) - int(cuda_before), 0
+            )
         # Retain the parsed safetensors metadata from the INITIAL transport so
         # consumers (e.g. VAE) never reread the header/payload after transport.
         return {
@@ -2540,6 +3056,15 @@ class GoldenSession:
         self.clip_owner: Optional[GoldenQDOwner] = None
         # One retained QD owner PER checkpoint (canonical spec has exactly one).
         self.clip_owners: list = []
+        # CLIP compute-scope proof is deliberately separate from the wrapper
+        # root.  Small constructor-owned extras (for example logit_scale) are
+        # not part of compute readiness.
+        self.clip_compute_scope: Any = None
+        self.clip_compute_scope_identity: dict = {}
+        self.clip_load_timing: dict = {}
+        self.clip_forward_timing: dict = {}
+        self.clip_load_page_faults: dict = {}
+        self.clip_forward_page_faults: dict = {}
         self.conditioning: Any = None
         self.patcher: Any = None
         self.unet_owner: Optional[GoldenQDOwner] = None
@@ -3367,6 +3892,449 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
         raise
 
 
+_CLIP_LOAD_TIMING_PHASES = (
+    "source_open_read",
+    "header_layout_parse",
+    "qd_staging_allocation",
+    "h2d_transport",
+    "skeleton_patcher_construction",
+    "storage_adoption",
+    "owner_publish_handoff",
+    "compute_ready_proof",
+)
+
+
+class _ClipTiming:
+    """Small, JSON-safe host timing ledger owned by the CLIP stages.
+
+    The ledger never synchronizes CUDA.  A phase may be ``unproven`` when an
+    upstream helper exposes a duration but not an absolute boundary; that is
+    preferable to manufacturing a boundary from a stage total.
+    """
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = bool(enabled)
+        self.started_ns = time.perf_counter_ns() if self.enabled else None
+        self.phases: list[dict[str, Any]] = []
+        self.qwen_forwards: list[dict[str, Any]] = []
+        self.qwen_hook_status = "UNPROVEN"
+
+    @contextlib.contextmanager
+    def span(self, name: str, *, boundary_kind: str = "host_observed", level: str = "parent"):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            end = time.perf_counter_ns()
+            self.phases.append({
+                "name": str(name),
+                "start_ns": start,
+                "end_ns": end,
+                "duration_ns": max(0, end - start),
+                "boundary_kind": boundary_kind,
+                "level": level,
+            })
+
+    def unproven(self, name: str, *, duration_ns: Optional[int] = None, detail: Any = None,
+                 parent: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        self.phases.append({
+            "name": str(name),
+            "start_ns": None,
+            "end_ns": None,
+            "duration_ns": int(duration_ns) if duration_ns is not None else None,
+            "boundary_kind": "unproven",
+            "level": "nested" if parent else "parent",
+            "parent_phase": parent,
+            "detail": detail,
+        })
+
+    def finish(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False}
+        observed = [
+            p for p in self.phases
+            if p.get("level") == "parent" and p.get("start_ns") is not None
+        ]
+        observed.sort(key=lambda p: int(p["start_ns"]))
+        overlap_ns = 0
+        previous_end: Optional[int] = None
+        union_ns = 0
+        for phase in observed:
+            start, end = int(phase["start_ns"]), int(phase["end_ns"])
+            if previous_end is not None and start < previous_end:
+                overlap_ns += min(previous_end, end) - start
+            if previous_end is None or start >= previous_end:
+                union_ns += end - start
+            elif end > previous_end:
+                union_ns += end - previous_end
+            previous_end = max(previous_end or end, end)
+        wall_ns = max(0, time.perf_counter_ns() - int(self.started_ns))
+        return {
+            "schema": "golden_clip_timing_v1",
+            "clock": "perf_counter_ns",
+            "phases": list(self.phases),
+            "required_phases": list(_CLIP_LOAD_TIMING_PHASES),
+            "parent_reconciliation": {
+                "wall_ns": wall_ns,
+                "observed_union_ns": union_ns,
+                "residual_ns": wall_ns - union_ns,
+                "overlap_ns": overlap_ns,
+                "non_additive": bool(overlap_ns),
+            },
+        }
+
+
+def _clip_page_fault_snapshot() -> dict[str, Any]:
+    """Compatibility adapter for the canonical raw process-counter reader."""
+    raw = _process_page_faults()
+    return {
+        "available": raw.get("available", False),
+        "source": raw.get("source"),
+        "minor_faults": raw.get("minor_faults"),
+        "major_faults": raw.get("major_faults"),
+    }
+
+
+def _clip_page_fault_delta(
+    start: Mapping[str, Any], end: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Compatibility adapter retaining the historical CLIP summary keys."""
+    delta = page_fault_delta(start, end)
+    return {
+        "available": delta["available"],
+        "source": delta["source"],
+        "minor_fault_delta": delta["minor_delta"],
+        "major_fault_delta": delta["major_delta"],
+    }
+
+
+def _clip_page_faults_summary(
+    stage: str, start: Mapping[str, Any], end: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build the JSON-safe event/end-stage shape for one CLIP interval."""
+    delta = _clip_page_fault_delta(start, end)
+    return {
+        "stage": str(stage),
+        "start": {
+            "minor_faults": start.get("minor_faults"),
+            "major_faults": start.get("major_faults"),
+        },
+        "end": {
+            "minor_faults": end.get("minor_faults"),
+            "major_faults": end.get("major_faults"),
+        },
+        "start_counters": {
+            "minor_faults": start.get("minor_faults"),
+            "major_faults": start.get("major_faults"),
+        },
+        "end_counters": {
+            "minor_faults": end.get("minor_faults"),
+            "major_faults": end.get("major_faults"),
+        },
+        **delta,
+        "diagnostic_only": True,
+    }
+
+
+@contextlib.contextmanager
+def _clip_qwen_forward_hooks(
+    scope: Any,
+    timing: _ClipTiming,
+    snapshot: Callable[[], dict[str, Any]],
+    recorder: Optional[GoldenTelemetryRecorder] = None,
+    *,
+    enabled: bool = True,
+):
+    """Observe selected-scope forwards, restoring hooks in all outcomes.
+
+    Hooks return ``None`` and never synchronize or alter arguments/results.
+    Every callback is best effort: an instrumentation failure is retained as
+    ``UNPROVEN`` data and cannot replace a real CLIP result or exception.
+    """
+    if not enabled:
+        yield
+        return
+    forwards: list[dict[str, Any]] = []
+    handles: list[Any] = []
+    starts: list[dict[str, Any]] = []
+    timing.qwen_forwards = forwards
+    timing.qwen_hook_status = "UNPROVEN"
+
+    def safe_snapshot() -> dict[str, Any]:
+        try:
+            value = snapshot()
+            return value if isinstance(value, dict) else {
+                "status": "unproven", "reason": "snapshot_invalid_shape"
+            }
+        except Exception as exc:
+            return {"status": "unproven", "reason": f"snapshot_failed:{type(exc).__name__}"}
+
+    def safe_faults() -> dict[str, Any]:
+        try:
+            return _clip_page_fault_snapshot()
+        except Exception as exc:
+            return {
+                "available": False,
+                "source": None,
+                "minor_faults": None,
+                "major_faults": None,
+                "reason": f"page_fault_snapshot_failed:{type(exc).__name__}",
+            }
+
+    def pre_hook(*_args: Any, **_kwargs: Any) -> None:
+        # A stack handles nested forwards without making assumptions about the
+        # selected module's implementation.
+        try:
+            starts.append({
+                "start_ns": time.perf_counter_ns(),
+                "snapshot": safe_snapshot(),
+                "faults": safe_faults(),
+            })
+        except Exception as exc:
+            timing.unproven(
+                "clip_qwen_transformer_forward",
+                detail={"status": "UNPROVEN", "reason": f"pre_hook_failed:{type(exc).__name__}"},
+            )
+
+    def post_hook(*_args: Any, **_kwargs: Any) -> None:
+        try:
+            end_ns = time.perf_counter_ns()
+            start = starts.pop() if starts else {
+                "start_ns": end_ns,
+                "snapshot": {"status": "unproven", "reason": "pre_hook_not_observed"},
+                "faults": safe_faults(),
+            }
+            after_snapshot = safe_snapshot()
+            after_faults = safe_faults()
+            index = len(forwards)
+            fault_summary = _clip_page_faults_summary(
+                "clip_qwen_transformer_forward", start["faults"], after_faults
+            )
+            record = {
+                "index": index,
+                "phase": "first_qwen_compute" if index == 0 else "later_forward_work",
+                "start_ns": int(start["start_ns"]),
+                "end_ns": int(end_ns),
+                "duration_ns": max(0, int(end_ns) - int(start["start_ns"])),
+                "boundary_kind": "host_observed",
+                "before_snapshot": start["snapshot"],
+                "after_snapshot": after_snapshot,
+                "page_faults": fault_summary,
+            }
+            forwards.append(record)
+            timing.phases.append({
+                "name": "clip_qwen_transformer_forward",
+                "start_ns": record["start_ns"],
+                "end_ns": record["end_ns"],
+                "duration_ns": record["duration_ns"],
+                "boundary_kind": "host_observed_nested",
+                "level": "nested",
+                "detail": {
+                    "index": index,
+                    "phase": record["phase"],
+                    "page_faults": fault_summary,
+                },
+            })
+            timing.qwen_hook_status = "host_observed"
+            if recorder is not None:
+                try:
+                    recorder.event("clip_qwen_transformer_forward", **record)
+                    recorder.event("clip_page_faults", **fault_summary)
+                except Exception:
+                    pass
+        except Exception as exc:
+            timing.unproven(
+                "clip_qwen_transformer_forward",
+                detail={"status": "UNPROVEN", "reason": f"post_hook_failed:{type(exc).__name__}"},
+            )
+
+    try:
+        pre_register = getattr(scope, "register_forward_pre_hook", None)
+        post_register = getattr(scope, "register_forward_hook", None)
+        if not callable(pre_register) or not callable(post_register):
+            timing.unproven(
+                "clip_qwen_transformer_forward",
+                detail={"status": "UNPROVEN", "reason": "scope_hooks_unavailable"},
+            )
+            yield
+            return
+        try:
+            try:
+                handles.append(pre_register(pre_hook, with_kwargs=True))
+            except TypeError:
+                handles.append(pre_register(pre_hook))
+            handles.append(post_register(post_hook))
+            timing.qwen_hook_status = "installed"
+        except Exception as exc:
+            timing.unproven(
+                "clip_qwen_transformer_forward",
+                detail={"status": "UNPROVEN", "reason": f"hook_install_failed:{type(exc).__name__}"},
+            )
+            for handle in reversed(handles):
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+            handles.clear()
+        yield
+    finally:
+        for handle in reversed(handles):
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        if not forwards and timing.qwen_hook_status in {"installed", "host_observed"}:
+            timing.unproven(
+                "clip_qwen_transformer_forward",
+                detail={"status": "UNPROVEN", "reason": "no_scope_forward_observed"},
+            )
+
+
+def _clip_scope_snapshot(scope: Any, patcher: Any = None) -> dict[str, Any]:
+    """Capture only scalar device/dtype/storage identity for a compute scope."""
+    try:
+        tensors = list(scope.named_parameters()) + list(scope.named_buffers())
+        if not tensors:
+            return {"status": "unproven", "reason": "scope_has_no_tensors"}
+        entries = []
+        for name, tensor in tensors:
+            storage = tensor.untyped_storage()
+            entries.append({
+                "name": str(name),
+                "device": str(tensor.device),
+                "dtype": str(tensor.dtype),
+                "data_ptr": int(tensor.data_ptr()),
+                "storage_ptr": int(storage.data_ptr()),
+                "storage_bytes": int(storage.nbytes()),
+                "shape": [int(x) for x in tensor.shape],
+            })
+        patcher = patcher if patcher is not None else getattr(scope, "patcher", None)
+        patcher_state = {}
+        if patcher is not None:
+            for key in ("is_dynamic", "load_device", "offload_device", "model_size"):
+                try:
+                    value = getattr(patcher, key)
+                    patcher_state[key] = str(value) if key != "is_dynamic" else bool(value)
+                except Exception:
+                    patcher_state[key] = None
+        return {
+            "status": "proven",
+            "tensor_count": len(entries),
+            "entries": entries,
+            "patcher": patcher_state,
+        }
+    except Exception as exc:
+        return {"status": "unproven", "reason": f"{type(exc).__name__}"}
+
+
+def _clip_compute_identity(scope: Any, adoption: Mapping[str, Any], patcher: Any = None) -> dict[str, Any]:
+    snap = _clip_scope_snapshot(scope, patcher)
+    entries = snap.get("entries", []) if snap.get("status") == "proven" else []
+    devices = sorted({str(item["device"]) for item in entries})
+    dtypes = sorted({str(item["dtype"]) for item in entries})
+    storage_proven = bool(
+        snap.get("status") == "proven"
+        and int(adoption.get("matched_count", 0)) == int(adoption.get("same_storage_count", 0))
+        and int(adoption.get("copied_storage_count", 1)) == 0
+    )
+    ready = bool(storage_proven and len(devices) == 1 and len(dtypes) == 1)
+    return {
+        "compute_scope_device": devices[0] if len(devices) == 1 else devices,
+        "compute_scope_dtype": dtypes[0] if len(dtypes) == 1 else dtypes,
+        "compute_scope_storage_proven": storage_proven,
+        "compute_ready": ready,
+        "compute_scope_tensor_count": len(entries),
+        "compute_scope_snapshot": snap,
+    }
+
+
+def _clip_materialization_status(before: Mapping[str, Any], after: Mapping[str, Any]) -> str:
+    if before.get("status") != "proven" or after.get("status") != "proven":
+        return "UNPROVEN"
+    before_entries = before.get("entries") or []
+    after_entries = after.get("entries") or []
+    if len(before_entries) != len(after_entries):
+        return "YES"
+    before_map = {item.get("name"): item for item in before_entries}
+    for item in after_entries:
+        old = before_map.get(item.get("name"))
+        if old is None:
+            return "YES"
+        if any(old.get(key) != item.get(key) for key in ("device", "dtype", "data_ptr", "storage_ptr")):
+            return "YES"
+    return "NO"
+
+
+@contextlib.contextmanager
+def _clip_forward_wrappers(
+    clip: Any,
+    timing: _ClipTiming,
+    snapshot: Callable[[], dict[str, Any]],
+    *,
+    enabled: bool = True,
+):
+    """Temporarily classify CLIP tokenization and encode, then restore exactly."""
+    if not enabled:
+        yield
+        return
+    names = (
+        ("tokenize", "clip_tokenization_input_prep"),
+        ("encode_from_tokens_scheduled", "clip_qwen_transformer_encode"),
+    )
+    originals: list[tuple[str, bool, Any]] = []
+    installed: list[str] = []
+    snapshots = getattr(timing, "snapshots", {})
+    timing.snapshots = snapshots
+    try:
+        for attr, phase in names:
+            original = getattr(clip, attr)
+            had_local = attr in getattr(clip, "__dict__", {})
+            local_dict = getattr(clip, "__dict__", {})
+            originals.append((attr, had_local, local_dict.get(attr) if had_local else None))
+
+            def wrapped(*args: Any, _original=original, _phase=phase, **kwargs: Any) -> Any:
+                with timing.span(
+                    _phase,
+                    boundary_kind="host_observed_nested",
+                    level="nested",
+                ):
+                    result = _original(*args, **kwargs)
+                key = "after_tokenization" if _phase == "clip_tokenization_input_prep" else "after_encode"
+                try:
+                    snapshots[key] = snapshot()
+                except Exception:
+                    snapshots[key] = {"status": "unproven", "reason": "snapshot_failed"}
+                return result
+
+            try:
+                setattr(clip, attr, wrapped)
+            except Exception as exc:
+                timing.unproven(
+                    phase,
+                    detail=f"wrapper_install_failed:{type(exc).__name__}",
+                )
+                originals.pop()
+                continue
+            installed.append(attr)
+        yield
+    finally:
+        for attr, had_local, old in reversed(originals):
+            try:
+                if had_local:
+                    setattr(clip, attr, old)
+                else:
+                    delattr(clip, attr)
+            except Exception:
+                # Restoration is diagnostic-only; never replace a real CLIP
+                # result or exception with an instrumentation exception.
+                pass
+
+
 async def golden_clip_load(session: GoldenSession) -> Any:
     """Load CLIP via the contract's :class:`ClipLoadSpec` and the real
     upstream constructor.
@@ -3396,7 +4364,10 @@ async def golden_clip_load(session: GoldenSession) -> Any:
     """
     rec = session.recorder
     rec.begin_stage("golden_clip_load")
+    diagnostics_enabled = stage_diagnostics_enabled()
+    clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
     transports: list[dict] = []
+    clip_timing = _ClipTiming(enabled=diagnostics_enabled)
     try:
         contract = session.contract
         spec = contract.clip_spec or CANONICAL_CLIP_SPEC
@@ -3410,17 +4381,59 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         state_dicts: list[dict] = []
         for index, path in enumerate(session.clip_paths):
             role = "clip" if len(session.clip_paths) == 1 else f"clip{index}"
-            transport = read_file_qd_gpu(
-                path, role=role, qd=contract.qd, block_bytes=contract.block_bytes
-            )
+            with clip_timing.span("source_open_read", boundary_kind="host_observed"):
+                transport = read_file_qd_gpu(
+                    path, role=role, qd=contract.qd, block_bytes=contract.block_bytes
+                )
             transports.append(transport)
             state_dicts.append(transport["sd"])
-            rec.event(
-                "clip_qd_owner_created",
-                role=role,
-                gpu_bytes=transport["stats"]["gpu_bytes"],
-                clip_index=index,
-            )
+            stats = transport.get("stats") or {}
+            source_layout = stats.get("source_open_header_layout") or {}
+            staging = stats.get("staging") or {}
+            if diagnostics_enabled:
+                clip_timing.unproven(
+                    "header_layout_parse",
+                    duration_ns=source_layout.get("header_layout_ns"),
+                    detail="transport exposes duration but not an absolute parse boundary",
+                    parent="source_open_read",
+                )
+                clip_timing.unproven(
+                    "qd_staging_allocation",
+                    duration_ns=staging.get("allocation_ns"),
+                    detail="pinned allocation duration is reported by transport",
+                    parent="source_open_read",
+                )
+                h2d_intervals = [
+                    (item.get("h2d_enqueue_start_ns"), item.get("h2d_enqueue_end_ns"))
+                    for item in stats.get("blocks", [])
+                    if item.get("h2d_enqueue_start_ns") is not None
+                    and item.get("h2d_enqueue_end_ns") is not None
+                ]
+                if h2d_intervals:
+                    h2d_start = min(int(item[0]) for item in h2d_intervals)
+                    h2d_end = max(int(item[1]) for item in h2d_intervals)
+                    clip_timing.phases.append({
+                        "name": "h2d_transport",
+                        "start_ns": h2d_start,
+                        "end_ns": h2d_end,
+                        "duration_ns": max(0, h2d_end - h2d_start),
+                        "boundary_kind": "host_observed_transport_overlap",
+                        "level": "nested",
+                        "parent_phase": "source_open_read",
+                    })
+                else:
+                    clip_timing.unproven(
+                        "h2d_transport", parent="source_open_read",
+                        detail="no absolute H2D enqueue boundaries available",
+                    )
+            owner_fields = {
+                "role": role,
+                "gpu_bytes": transport["stats"]["gpu_bytes"],
+                "clip_index": index,
+            }
+            if diagnostics_enabled:
+                owner_fields["transport_timing"] = build_qd_transport_diagnostics(stats)
+            rec.event("clip_qd_owner_created", **owner_fields)
         owners = [t["owner"] for t in transports]
         session.clip_owners = owners
         session.clip_owner = owners[0]
@@ -3462,12 +4475,13 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             # Shallow dict copies retain the SAME tensor objects (zero-copy
             # preserved) while shielding our retained view dicts from upstream
             # key mutations inside load_text_encoder_state_dicts.
-            clip = comfy.sd.load_text_encoder_state_dicts(
-                [dict(sd) for sd in state_dicts],
-                embedding_directory=embedding_directory,
-                clip_type=clip_type_value,
-                model_options=model_options,
-            )
+            with clip_timing.span("skeleton_patcher_construction"):
+                clip = comfy.sd.load_text_encoder_state_dicts(
+                    [dict(sd) for sd in state_dicts],
+                    embedding_directory=embedding_directory,
+                    clip_type=clip_type_value,
+                    model_options=model_options,
+                )
         finally:
             model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
@@ -3479,11 +4493,12 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             "clip_patcher_identity",
             **require_dynamic_patcher_instance(tag="clip", patcher=getattr(clip, "patcher", None)),
         )
-        try:
-            setattr(clip, "_golden_qd_owner", owners[0])
-        except Exception:
-            pass  # owner lifetime is additionally held by the session
-        session.clip = clip
+        with clip_timing.span("owner_publish_handoff"):
+            try:
+                setattr(clip, "_golden_qd_owner", owners[0])
+            except Exception:
+                pass  # owner lifetime is additionally held by the session
+            session.clip = clip
 
         usable = callable(getattr(clip, "encode_from_tokens_scheduled", None)) and callable(
             getattr(clip, "tokenize", None)
@@ -3503,32 +4518,71 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         for index, sd in enumerate(state_dicts):
             for key, view in sd.items():
                 combined_views[f"[{index}]{key}"] = view
-        adoption = select_and_validate_qd_adoption_scope("clip", cond_model, combined_views)
+        with clip_timing.span("storage_adoption"):
+            adoption = select_and_validate_qd_adoption_scope("clip", cond_model, combined_views)
+        selected_scope = next(
+            (module for path, module in cond_model.named_modules()
+             if str(path) == str(adoption["selected_scope"])),
+            cond_model if adoption["selected_scope"] == "" else None,
+        )
+        if selected_scope is None:
+            raise RuntimeError("clip_compute_scope_not_found")
+        with clip_timing.span("compute_ready_proof"):
+            compute_identity = _clip_compute_identity(
+                selected_scope, adoption, getattr(clip, "patcher", None)
+            )
+        if not compute_identity["compute_ready"]:
+            raise RuntimeError(f"clip_compute_scope_not_ready:{compute_identity}")
+        session.clip_compute_scope = selected_scope
+        session.clip_compute_scope_identity = dict(compute_identity)
         rec.event(
             "clip_adoption_identity",
             state_dict_count=len(state_dicts),
             **adoption,
+            compute_scope_device=compute_identity["compute_scope_device"],
+            compute_scope_dtype=compute_identity["compute_scope_dtype"],
+            compute_scope_storage_proven=compute_identity["compute_scope_storage_proven"],
         )
-        device_sample = None
-        params = list(cond_model.parameters()) if cond_model is not None else []
-        if params:
-            device_sample = str(params[0].device)
         rec.event(
             "clip_published",
             tensor_count=sum(len(sd) for sd in state_dicts),
-            device_ready=device_sample,
+            compute_scope_device=compute_identity["compute_scope_device"],
+            compute_scope_dtype=compute_identity["compute_scope_dtype"],
+            compute_scope_storage_proven=compute_identity["compute_scope_storage_proven"],
+            compute_ready=compute_identity["compute_ready"],
+            outer_extra_count=adoption["outer_extra_count"],
+            outer_extra_bytes=adoption["outer_extra_bytes"],
+            outer_extra_devices=adoption["outer_extra_devices"],
+            outer_extra_names=adoption["outer_extra_names"],
             owner_retained=session.clip_owner is owners[0],
         )
         qd_quiescence = [
             _require_transport_quiescence(transport, tag=f"clip{index}")
             for index, transport in enumerate(transports)
         ]
+        clip_page_faults = (
+            _clip_page_faults_summary(
+                "golden_clip_load", clip_page_fault_start, _clip_page_fault_snapshot()
+            ) if diagnostics_enabled else {}
+        )
+        session.clip_load_page_faults = clip_page_faults
+        session.clip_load_timing = clip_timing.finish() if diagnostics_enabled else {}
+        if diagnostics_enabled:
+            rec.event("clip_load_timing", **session.clip_load_timing)
+            rec.event("clip_page_faults", **clip_page_faults)
         rec.end_stage(
             "golden_clip_load",
             ready=True,
             usable=True,
             published=sum(len(sd) for sd in state_dicts),
-            device_ready=str(device_sample),
+            compute_scope_device=compute_identity["compute_scope_device"],
+            compute_scope_dtype=compute_identity["compute_scope_dtype"],
+            compute_scope_storage_proven=compute_identity["compute_scope_storage_proven"],
+            compute_ready=compute_identity["compute_ready"],
+            outer_extra_count=adoption["outer_extra_count"],
+            outer_extra_bytes=adoption["outer_extra_bytes"],
+            outer_extra_devices=adoption["outer_extra_devices"],
+            outer_extra_names=adoption["outer_extra_names"],
             owner_retained=True,
             clip_name=[n for n in spec.checkpoint_names],
             clip_type=spec.clip_type,
@@ -3537,10 +4591,31 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             source_read_count=sum(int(t["stats"]["source_read_count"]) for t in transports),
             h2d_completed_bytes=sum(int(t["stats"]["h2d_completed_bytes"]) for t in transports),
             qd_quiescence=qd_quiescence,
+            **(
+                {
+                    "clip_load_timing": session.clip_load_timing,
+                    "clip_page_faults": clip_page_faults,
+                }
+                if diagnostics_enabled else {}
+            ),
         )
         return clip
     except BaseException as exc:
-        rec.fail_stage("golden_clip_load", exc)
+        clip_page_faults = (
+            _clip_page_faults_summary(
+                "golden_clip_load", clip_page_fault_start, _clip_page_fault_snapshot()
+            ) if diagnostics_enabled else {}
+        )
+        session.clip_load_page_faults = clip_page_faults
+        if diagnostics_enabled:
+            try:
+                rec.event("clip_page_faults", **clip_page_faults)
+            except Exception:
+                pass
+        rec.fail_stage(
+            "golden_clip_load", exc,
+            **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
+        )
         raise
 
 
@@ -3555,6 +4630,9 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
     prefetch, and no UNET/VAE source activity may begin here."""
     rec = session.recorder
     rec.begin_stage("golden_clip_forward")
+    diagnostics_enabled = stage_diagnostics_enabled()
+    clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
+    clip_timing = _ClipTiming(enabled=diagnostics_enabled)
     try:
         runner = session.runner
         if runner is None:
@@ -3562,29 +4640,155 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
         node_map = session.node_map
         # Native socket-major cache shape: one output socket carrying one item.
         runner.seed(node_map.clip_loader_id, [[session.clip]])
+        scope = session.clip_compute_scope
+        patcher = getattr(session.clip, "patcher", None)
+        before = _clip_scope_snapshot(scope, patcher) if scope is not None else {
+            "status": "unproven", "reason": "compute_scope_missing"
+        }
+        clip_timing.snapshots = {"before": before}
+        rec.event(
+            "clip_cache_status",
+            status="not_used",
+            cache_owner="golden_serial_runner",
+            explanation="runner cache is node execution bookkeeping, not a CLIP conditioning cache",
+        )
+        clip_timing.unproven(
+            "clip_model_patcher_device_cast_preparation",
+            detail="no separate cast/materialization boundary is directly observable in Golden Serial",
+        )
+        clip_timing.unproven(
+            "clip_projection_final_layers",
+            detail="upstream encode call is the proven aggregate boundary; inner projection split unavailable",
+        )
+        clip_timing.unproven(
+            "clip_cache_interaction",
+            detail="no conditioning cache bridge exists in Golden Serial",
+        )
         runner.begin_scope({"clip_forward"})
         try:
-            executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
+            with _clip_qwen_forward_hooks(
+                scope,
+                clip_timing,
+                lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
+                    "status": "unproven", "reason": "compute_scope_missing"
+                },
+                recorder=rec,
+                enabled=diagnostics_enabled,
+            ):
+                with _clip_forward_wrappers(
+                    session.clip,
+                    clip_timing,
+                    lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
+                        "status": "unproven", "reason": "compute_scope_missing"
+                    },
+                    enabled=diagnostics_enabled,
+                ):
+                    with clip_timing.span("clip_graph_node_wrapper"):
+                        executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
         finally:
             runner.end_scope()
-        _assert_runner_quiescence(runner)
+        qwen_forwards = list(getattr(clip_timing, "qwen_forwards", []))
+        if diagnostics_enabled:
+            rec.event(
+                "clip_qwen_transformer_hooks",
+                status=getattr(clip_timing, "qwen_hook_status", "UNPROVEN"),
+                forward_count=len(qwen_forwards),
+                first_qwen_compute=(qwen_forwards[0] if qwen_forwards else None),
+                later_forward_work=qwen_forwards[1:],
+            )
+        with clip_timing.span("clip_post_forward_sync_wait"):
+            _assert_runner_quiescence(runner)
         encode_classes = [sc for _n, _c, sc in executed if sc == "clip_forward"]
         if not encode_classes:
             raise RuntimeError("clip_encode_node_did_not_execute")
         entry = runner.cache.get(node_map.clip_encode_id)
         if entry is None or not entry.outputs:
             raise RuntimeError("clip_encode_output_missing")
-        conditioning = entry.outputs[0][0] if isinstance(entry.outputs[0], list) else entry.outputs[0]
+        with clip_timing.span("clip_conditioning_packaging"):
+            conditioning = entry.outputs[0][0] if isinstance(entry.outputs[0], list) else entry.outputs[0]
         session.conditioning = conditioning
+        after = clip_timing.snapshots.get("after_encode", {
+            "status": "unproven", "reason": "encode_not_observed"
+        })
+        materialization = _clip_materialization_status(before, after)
+        session.clip_compute_scope_identity = {
+            **dict(session.clip_compute_scope_identity),
+            "before_forward": before,
+            "after_tokenization": clip_timing.snapshots.get("after_tokenization", {
+                "status": "unproven", "reason": "tokenization_not_observed"
+            }),
+            "after_encode": after,
+            "deferred_forward_materialization": materialization,
+        }
+        clip_timing_payload = clip_timing.finish() if diagnostics_enabled else {}
+        if diagnostics_enabled:
+            clip_timing_payload["deferred_forward_materialization"] = materialization
+            clip_timing_payload["repeated_cast_work"] = "UNPROVEN"
+            clip_timing_payload["cache_status"] = "not_used"
+            clip_timing_payload["first_qwen_compute"] = (
+                qwen_forwards[0] if qwen_forwards else "UNPROVEN"
+            )
+            clip_timing_payload["later_forward_work"] = {
+                "qwen_forwards": qwen_forwards[1:],
+                "packaging_phase": "clip_conditioning_packaging",
+                "residual_boundary": "UNPROVEN",
+            }
+        clip_page_faults = (
+            _clip_page_faults_summary(
+                "golden_clip_forward", clip_page_fault_start, _clip_page_fault_snapshot()
+            ) if diagnostics_enabled else {}
+        )
+        session.clip_forward_page_faults = clip_page_faults
+        session.clip_forward_timing = clip_timing_payload
+        if diagnostics_enabled:
+            rec.event("clip_forward_timing", **session.clip_forward_timing)
+            rec.event("clip_page_faults", **clip_page_faults)
+            rec.event(
+                "clip_forward_readiness_recheck",
+                before_forward=before,
+                after_tokenization=clip_timing.snapshots.get("after_tokenization"),
+                after_encode=after,
+                deferred_forward_materialization=materialization,
+                repeated_cast_work="UNPROVEN",
+            )
         rec.event(
             "clip_forward_complete",
             clip_forward_nodes=len(encode_classes),
             executed_nodes=[nid for nid, _cls, _sc in runner.executed_summary()],
+            cache_status="not_used",
         )
-        rec.end_stage("golden_clip_forward", ready=True, encoded=True)
+        rec.end_stage(
+            "golden_clip_forward",
+            ready=True,
+            encoded=True,
+            deferred_forward_materialization=materialization,
+            repeated_cast_work="UNPROVEN",
+            cache_status="not_used",
+            **(
+                {
+                    "clip_forward_timing": session.clip_forward_timing,
+                    "clip_page_faults": clip_page_faults,
+                }
+                if diagnostics_enabled else {}
+            ),
+        )
         return conditioning
     except BaseException as exc:
-        rec.fail_stage("golden_clip_forward", exc)
+        clip_page_faults = (
+            _clip_page_faults_summary(
+                "golden_clip_forward", clip_page_fault_start, _clip_page_fault_snapshot()
+            ) if diagnostics_enabled else {}
+        )
+        session.clip_forward_page_faults = clip_page_faults
+        if diagnostics_enabled:
+            try:
+                rec.event("clip_page_faults", **clip_page_faults)
+            except Exception:
+                pass
+        rec.fail_stage(
+            "golden_clip_forward", exc,
+            **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
+        )
         raise
 
 
@@ -4641,13 +5845,31 @@ async def golden_vae_load(session: GoldenSession) -> Any:
     second read; all loader work joined before READY."""
     rec = session.recorder
     rec.begin_stage("golden_vae_load")
+    diagnostics_enabled = stage_diagnostics_enabled()
+    stage_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
+    page_faults_before = _process_page_faults() if diagnostics_enabled else None
+    memory_before = (
+        {"host": _host_memory_visibility(), "cuda": _allocator_state()}
+        if diagnostics_enabled else None
+    )
+    components: list[dict[str, Any]] = []
     try:
         import comfy.sd  # upstream
 
         contract = session.contract
+        transport_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
         transport = read_file_qd_gpu(
             session.model_paths["vae"], role="vae", qd=contract.qd, block_bytes=contract.block_bytes
         )
+        transport_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
+        if diagnostics_enabled:
+            components.append({
+                "name": "qd_transport",
+                "start_ns": transport_start_ns,
+                "end_ns": transport_end_ns,
+                "scope": "enclosing_transport_wall",
+                "non_additive": True,
+            })
         views = transport["sd"]
         owner = transport["owner"]
         session.vae_owner = owner
@@ -4657,6 +5879,7 @@ async def golden_vae_load(session: GoldenSession) -> Any:
         # BEFORE construction — upstream VAE builds its patcher from
         # CoreModelPatcher and derives load_state_dict(assign=) from
         # patcher.is_dynamic(), which is what makes weight adoption zero-copy.
+        construction_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
         require_dynamic_core_model_patcher(tag="vae")
         source_dtype = uniform_source_dtype(views, tag="vae")
 
@@ -4669,6 +5892,15 @@ async def golden_vae_load(session: GoldenSession) -> Any:
         # strict pointer proof below fails if anything moved or copied.
         vae = comfy.sd.VAE(sd=views, device=device, dtype=source_dtype, metadata=metadata)
         vae.throw_exception_if_invalid()
+        construction_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
+        if diagnostics_enabled:
+            components.append({
+                "name": "skeleton_patcher_construction",
+                "start_ns": construction_start_ns,
+                "end_ns": construction_end_ns,
+                "scope": "constructor_and_dynamic_patcher_preflight",
+                "non_additive": True,
+            })
         rec.event(
             "vae_patcher_identity",
             **require_dynamic_patcher_instance(tag="vae", patcher=getattr(vae, "patcher", None)),
@@ -4684,10 +5916,28 @@ async def golden_vae_load(session: GoldenSession) -> Any:
         working = {str(dt) for dt in getattr(vae, "working_dtypes", [])}
         if working and str(params[0].dtype) not in working:
             raise RuntimeError(f"vae_param_dtype:{params[0].dtype} not in {working}")
+        if diagnostics_enabled:
+            components.append({
+                "name": "dtype_device_finalization",
+                "start_ns": construction_start_ns,
+                "end_ns": time.perf_counter_ns(),
+                "scope": "source_dtype_device_and_final_parameter_checks",
+                "non_additive": True,
+            })
         # Fail-closed adoption proof: every first-stage parameter/buffer must
         # be CUDA-resident, BF16 (the transported source requires BF16), and
         # storage-identical to a QD view.  No model.to / loader fallback.
+        adoption_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
         adoption = validate_qd_adoption("vae", [first_stage], views)
+        adoption_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
+        if diagnostics_enabled:
+            components.append({
+                "name": "storage_adoption",
+                "start_ns": adoption_start_ns,
+                "end_ns": adoption_end_ns,
+                "scope": "pointer_identity_validation",
+                "non_additive": True,
+            })
         rec.event("vae_adoption_identity", **adoption)
         try:
             setattr(vae, "_golden_qd_owner", owner)
@@ -4695,6 +5945,41 @@ async def golden_vae_load(session: GoldenSession) -> Any:
             pass
         session.vae = vae
         qd_quiescence = _require_transport_quiescence(transport, tag="vae")
+        decomposition = None
+        page_faults = None
+        if diagnostics_enabled:
+            compute_ready_ns = time.perf_counter_ns()
+            components.append({
+                "name": "compute_ready_return",
+                "start_ns": compute_ready_ns,
+                "end_ns": compute_ready_ns,
+                "scope": "ready_point",
+                "non_additive": True,
+            })
+            stage_end_ns = time.perf_counter_ns()
+            page_faults_after = _process_page_faults()
+            page_faults = {
+                "before": page_faults_before,
+                "after": page_faults_after,
+                "delta": page_fault_delta(page_faults_before, page_faults_after),
+            }
+            memory_after = {"host": _host_memory_visibility(), "cuda": _allocator_state()}
+            decomposition = build_vae_load_decomposition(
+                stage_start_ns=int(stage_start_ns),
+                stage_end_ns=stage_end_ns,
+                components=components,
+                transport_stats=transport["stats"],
+                memory_before=memory_before,
+                memory_after={**memory_after, "page_faults": page_faults},
+            )
+            rec.event(
+                "vae_load_decomposition",
+                decomposition=decomposition,
+                source_bytes=transport["stats"].get("bytes_read"),
+                effective_source_gbps=transport["stats"].get("effective_source_gbps"),
+                effective_h2d_gbps=transport["stats"].get("effective_h2d_gbps"),
+                page_faults=page_faults,
+            )
         rec.end_stage(
             "golden_vae_load",
             ready=True,
@@ -4704,10 +5989,33 @@ async def golden_vae_load(session: GoldenSession) -> Any:
             source_read_count=int(transport["stats"]["source_read_count"]),
             h2d_completed_bytes=int(transport["stats"]["h2d_completed_bytes"]),
             qd_quiescence=qd_quiescence,
+            source_bytes=transport["stats"].get("bytes_read"),
+            effective_source_gbps=transport["stats"].get("effective_source_gbps"),
+            effective_h2d_gbps=transport["stats"].get("effective_h2d_gbps"),
+            **(
+                {
+                    "transport_stats": build_qd_transport_diagnostics(transport["stats"]),
+                    "vae_load_decomposition": decomposition,
+                    "page_faults": page_faults,
+                }
+                if diagnostics_enabled else {}
+            ),
         )
         return vae
     except BaseException as exc:
-        rec.fail_stage("golden_vae_load", exc)
+        if diagnostics_enabled:
+            page_faults_after = _process_page_faults()
+            rec.fail_stage(
+                "golden_vae_load",
+                exc,
+                page_faults={
+                    "before": page_faults_before,
+                    "after": page_faults_after,
+                    "delta": page_fault_delta(page_faults_before, page_faults_after),
+                },
+            )
+        else:
+            rec.fail_stage("golden_vae_load", exc)
         raise
 
 
@@ -5038,11 +6346,67 @@ def io_bytes_png(Image: Any, array: Any, *, pnginfo: Any = None, compress_level:
     return bio.getvalue()
 
 
+def _new_durable_commit_timing(*, clock_name: str = "monotonic_ns") -> dict[str, Any]:
+    """Create raw, monotonic-ns evidence for the durable commit decomposition."""
+    return {
+        "clock": clock_name,
+        "blocking_commit_note": DURABLE_COMMIT_BLOCKING_NOTE,
+        "durable_commit_subspans": {
+            name: {
+                "start_monotonic_ns": None,
+                "end_monotonic_ns": None,
+                "duration_ns": None,
+            }
+            for name in DURABLE_COMMIT_SUBSPAN_NAMES
+        },
+    }
+
+
+def _start_durable_subspan(
+    timing: dict[str, Any],
+    name: str,
+    *,
+    monotonic: Callable[[], int] = time.monotonic_ns,
+    started_ns: Optional[int] = None,
+) -> int:
+    started_ns = monotonic() if started_ns is None else int(started_ns)
+    timing["durable_commit_subspans"][name]["start_monotonic_ns"] = started_ns
+    return started_ns
+
+
+def _finish_durable_subspan(
+    timing: dict[str, Any],
+    name: str,
+    *,
+    end_ns: Optional[int] = None,
+    monotonic: Callable[[], int] = time.monotonic_ns,
+) -> int:
+    ended_ns = monotonic() if end_ns is None else int(end_ns)
+    span = timing["durable_commit_subspans"][name]
+    started_ns = span["start_monotonic_ns"]
+    if started_ns is not None:
+        span["end_monotonic_ns"] = ended_ns
+        span["duration_ns"] = max(0, ended_ns - int(started_ns))
+    return ended_ns
+
+
+def _finish_open_durable_subspans(
+    timing: dict[str, Any], *, monotonic: Callable[[], int] = time.monotonic_ns
+) -> None:
+    """Close only spans that started before a failure; leave later work null."""
+    for name in DURABLE_COMMIT_SUBSPAN_NAMES:
+        span = timing["durable_commit_subspans"][name]
+        if span["start_monotonic_ns"] is not None and span["end_monotonic_ns"] is None:
+            _finish_durable_subspan(timing, name, monotonic=monotonic)
+
+
 def verify_committed_object(
     pending: PendingDurability,
     *,
     expected_sha256: str,
     enforce_expected_sha: bool = True,
+    timing: Optional[dict[str, Any]] = None,
+    monotonic: Callable[[], int] = time.monotonic_ns,
 ) -> _DurableReopenProof:
     """Post-commit durability proof: reopen/stat/read/hash the COMMITTED
     object from disk and fail closed unless stat size, reopened byte count,
@@ -5066,20 +6430,98 @@ def verify_committed_object(
     _sidecar_path, _ = _require_path_in_volume(
         pending.sidecar_path, mount_root
     )
-    stat = os.stat(asset_path)
-    with open(asset_path, "rb") as fh:
-        data = fh.read()
-    byte_count = len(data)
-    sha256 = hashlib.sha256(data).hexdigest()
-    if int(stat.st_size) != byte_count or byte_count != int(pending.byte_count):
-        raise RuntimeError(
-            f"durable_byte_count_mismatch:stat={int(stat.st_size)}:"
-            f"read={byte_count}:pending={int(pending.byte_count)}"
-        )
-    if sha256 != pending.sha256:
-        raise RuntimeError(f"durable_sha_mismatch:{sha256}!={pending.sha256}")
-    if enforce_expected_sha and sha256 != expected_sha256:
-        raise RuntimeError(f"durable_expected_output_sha_mismatch:{sha256}!={expected_sha256}")
+    fh = None
+    try:
+        if timing is not None:
+            _start_durable_subspan(timing, "reopen_open", monotonic=monotonic)
+        try:
+            fh = open(asset_path, "rb")
+        finally:
+            if timing is not None:
+                open_start = timing["durable_commit_subspans"]["reopen_open"][
+                    "start_monotonic_ns"
+                ]
+                open_end = _finish_durable_subspan(
+                    timing, "reopen_open", monotonic=monotonic
+                )
+                handoff = timing["durable_commit_subspans"][
+                    "commit_return_to_reopen_start"
+                ]
+                if handoff["start_monotonic_ns"] is not None and handoff["end_monotonic_ns"] is None:
+                    _finish_durable_subspan(
+                        timing,
+                        "commit_return_to_reopen_start",
+                        end_ns=open_start or open_end,
+                        monotonic=monotonic,
+                    )
+
+        if timing is not None:
+            _start_durable_subspan(timing, "stat", monotonic=monotonic)
+        try:
+            stat = os.stat(asset_path)
+        finally:
+            if timing is not None:
+                _finish_durable_subspan(timing, "stat", monotonic=monotonic)
+
+        if timing is not None:
+            _start_durable_subspan(timing, "readback", monotonic=monotonic)
+        try:
+            data = fh.read()
+        finally:
+            if timing is not None:
+                _finish_durable_subspan(timing, "readback", monotonic=monotonic)
+
+        if timing is not None:
+            _start_durable_subspan(
+                timing, "readback_sha256", monotonic=monotonic
+            )
+        try:
+            byte_count = len(data)
+            sha256 = hashlib.sha256(data).hexdigest()
+        finally:
+            if timing is not None:
+                _finish_durable_subspan(
+                    timing, "readback_sha256", monotonic=monotonic
+                )
+
+        if timing is not None:
+            _start_durable_subspan(
+                timing,
+                "byte_count_content_verification",
+                monotonic=monotonic,
+            )
+        try:
+            if int(stat.st_size) != byte_count or byte_count != int(pending.byte_count):
+                raise RuntimeError(
+                    f"durable_byte_count_mismatch:stat={int(stat.st_size)}:"
+                    f"read={byte_count}:pending={int(pending.byte_count)}"
+                )
+            if sha256 != pending.sha256:
+                raise RuntimeError(f"durable_sha_mismatch:{sha256}!={pending.sha256}")
+            if enforce_expected_sha and sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"durable_expected_output_sha_mismatch:{sha256}!={expected_sha256}"
+                )
+        finally:
+            if timing is not None:
+                _finish_durable_subspan(
+                    timing,
+                    "byte_count_content_verification",
+                    monotonic=monotonic,
+                )
+    finally:
+        if fh is not None:
+            if timing is not None:
+                _start_durable_subspan(
+                    timing, "close_finalize", monotonic=monotonic
+                )
+            try:
+                fh.close()
+            finally:
+                if timing is not None:
+                    _finish_durable_subspan(
+                        timing, "close_finalize", monotonic=monotonic
+                    )
     return _DurableReopenProof(
         byte_count=byte_count,
         sha256=sha256,
@@ -5098,7 +6540,7 @@ async def golden_durable_commit(
     *,
     expected_sha256: Optional[str] = None,
     enforce_expected_sha: bool = False,
-) -> Optional[dict]:
+) -> _DurableReopenProof:
     """Emit VOLUME_COMMIT_START, await the REAL Modal Volume commit API
     (``commit.aio()`` when present, else an awaitable/sync ``commit()``), then
     VOLUME_COMMIT_COMPLETE.  When ``expected_sha256`` is supplied, this stage
@@ -5110,6 +6552,10 @@ async def golden_durable_commit(
     real write — they are NOT re-emitted here.
     """
     recorder.begin_stage("golden_durable_commit")
+    monotonic = recorder._monotonic
+    timing = _new_durable_commit_timing(clock_name="recorder.monotonic_ns")
+    _start_durable_subspan(timing, "pre_commit_bookkeeping", monotonic=monotonic)
+    subspans_event_emitted = False
     try:
         if pending is None:
             raise RuntimeError("durable_commit_requires_pending_durability")
@@ -5131,11 +6577,18 @@ async def golden_durable_commit(
             volume = handle
         elif pending_mount_root is None:
             raise RuntimeError("pending_volume_mount_root_required")
+
+        _finish_durable_subspan(
+            timing, "pre_commit_bookkeeping", monotonic=monotonic
+        )
         recorder.event(EVENT_VOLUME_COMMIT_START, label=str(getattr(volume, "label", "")))
         commit_fn = getattr(volume, "commit", None)
         if not callable(commit_fn):
             raise RuntimeError("volume_commit_api_unavailable")
         aio_fn = getattr(commit_fn, "aio", None)
+        _start_durable_subspan(
+            timing, "volume_commit_call_wall", monotonic=monotonic
+        )
         try:
             if callable(aio_fn):
                 await aio_fn()
@@ -5144,9 +6597,27 @@ async def golden_durable_commit(
                 if inspect.isawaitable(result):
                     await result
         except BaseException as exc:
+            _finish_durable_subspan(
+                timing, "volume_commit_call_wall", monotonic=monotonic
+            )
             recorder.event("VOLUME_COMMIT_FAILED", error=f"{type(exc).__name__}: {exc}")
             pending.committed = False
             raise
+        commit_return_ns = monotonic()
+        _finish_durable_subspan(
+            timing,
+            "volume_commit_call_wall",
+            end_ns=commit_return_ns,
+            monotonic=monotonic,
+        )
+        # This boundary starts at return from the single blocking Modal API,
+        # before completion bookkeeping and before the reopen call.
+        _start_durable_subspan(
+            timing,
+            "commit_return_to_reopen_start",
+            monotonic=monotonic,
+            started_ns=commit_return_ns,
+        )
         recorder.event(EVENT_VOLUME_COMMIT_COMPLETE)
         pending.committed = True
         reopened = None
@@ -5154,20 +6625,48 @@ async def golden_durable_commit(
             pending,
             expected_sha256=expected_sha256,
             enforce_expected_sha=enforce_expected_sha,
+            timing=timing,
+            monotonic=monotonic,
         )
         recorder.mark_reopen_verified(reopened)
+        recorder.event(
+            "DURABLE_COMMIT_SUBSPANS",
+            outcome="success",
+            clock=timing["clock"],
+            blocking_commit_note=timing["blocking_commit_note"],
+            durable_commit_subspans=copy.deepcopy(timing["durable_commit_subspans"]),
+        )
+        subspans_event_emitted = True
         recorder.end_stage(
             "golden_durable_commit",
             ready=True,
             sha256=pending.sha256,
             volume_rel_path=pending.volume_rel_path,
             reopened_verified=reopened is not None,
+            clock=timing["clock"],
+            blocking_commit_note=timing["blocking_commit_note"],
+            durable_commit_subspans=copy.deepcopy(timing["durable_commit_subspans"]),
         )
         return reopened
     except BaseException as exc:
+        _finish_open_durable_subspans(timing, monotonic=monotonic)
         if pending is not None:
             pending.committed = False
-        recorder.fail_stage("golden_durable_commit", exc)
+        if not subspans_event_emitted:
+            recorder.event(
+                "DURABLE_COMMIT_SUBSPANS",
+                outcome="failure",
+                clock=timing["clock"],
+                blocking_commit_note=timing["blocking_commit_note"],
+                durable_commit_subspans=copy.deepcopy(timing["durable_commit_subspans"]),
+            )
+        recorder.fail_stage(
+            "golden_durable_commit",
+            exc,
+            clock=timing["clock"],
+            blocking_commit_note=timing["blocking_commit_note"],
+            durable_commit_subspans=copy.deepcopy(timing["durable_commit_subspans"]),
+        )
         raise
 
 
@@ -5379,6 +6878,11 @@ __all__ = [
     "GOLDEN_BLOCK_BYTES",
     "GOLDEN_QD",
     "GOLDEN_SAMPLING_DIAGNOSTICS_ENV",
+    "GOLDEN_STAGE_DIAGNOSTICS_ENV",
+    "DURABLE_COMMIT_BLOCKING_NOTE",
+    "DURABLE_COMMIT_SUBSPAN_NAMES",
+    "DURABLE_RESULT_MARKER_SUBSPAN",
+    "EVENT_DURABLE_RESULT_MARKER_PUBLICATION",
     "STAGE_ORDER",
     "ClipLoadSpec",
     "GoldenWorkflowContract",
@@ -5393,7 +6897,11 @@ __all__ = [
     "GoldenVolumeHandle",
     "PendingDurability",
     "canonical_workflow_sha256",
+    "stage_diagnostics_enabled",
     "attention_backend_scope",
+    "aggregate_timing_intervals",
+    "build_qd_transport_diagnostics",
+    "build_vae_load_decomposition",
     "check_view_alignment",
     "classify_node",
     "golden_clip_forward",
@@ -5413,6 +6921,7 @@ __all__ = [
     "golden_vae_load",
     "make_zero_copy_view",
     "parse_safetensors_header",
+    "page_fault_delta",
     "normalize_attention_backend",
     "partition_coverage",
     "plan_source_regions",

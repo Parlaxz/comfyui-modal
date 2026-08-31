@@ -160,7 +160,7 @@ def test_sync_result_exposes_persisted_generation_for_host_readback_gate():
     end = source.find("\ndef ", start + 10)
     body = source[start:end]
 
-    assert '"generation": _cn_gen.get("generation", "")' in body
+    assert '"content_generation": _cn_gen.get("content_generation", "")' in body
     assert '"generation_record_path": CUSTOM_NODES_GENERATION_CONTROL_PATH' in body
 
 

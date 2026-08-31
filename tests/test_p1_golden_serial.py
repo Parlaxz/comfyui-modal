@@ -262,6 +262,67 @@ def test_telemetry_rejects_overlapping_open_stage_and_duplicate_entry():
         rec.begin_stage("golden_restore")
 
 
+def test_ra8_timing_aggregation_marks_overlap_and_keeps_stage_wall_separate():
+    result = gs.aggregate_timing_intervals(
+        [{"start_ns": 0, "end_ns": 10}, {"start_ns": 5, "end_ns": 20}],
+        enclosing_start_ns=0,
+        enclosing_end_ns=30,
+    )
+    assert result["sum_ns"] == 25
+    assert result["union_ns"] == 20
+    assert result["overlap_ns"] == 5
+    assert result["wall_ns"] == 30
+    assert result["residual_ns"] == 10
+    assert result["non_additive"] is True
+
+
+def test_ra8_vae_decomposition_and_page_fault_schema_are_offline():
+    stats = {
+        "role": "vae",
+        "bytes_read": 128,
+        "effective_source_gbps": 1.25,
+        "effective_h2d_gbps": 2.5,
+        "source_open_header_layout": {"header_layout_ns": 3},
+        "staging": {"allocated_bytes": 64, "reuse_count": 2, "retained_bytes": 64},
+        "source_reads": {"bytes": 128},
+        "cpu_to_pinned_staging": {"bytes": 128},
+        "h2d_enqueue": {"bytes": 128},
+        "h2d_gpu_event": {"duration_ns": 51},
+        "waits_quiescence": {"workers_joined": True},
+    }
+    faults = gs.page_fault_delta(
+        {"minor_faults": 10, "major_faults": 2, "source": "test"},
+        {"minor_faults": 17, "major_faults": 3, "source": "test"},
+    )
+    assert faults == {
+        "available": True,
+        "minor_delta": 7,
+        "major_delta": 1,
+        "minor_page_faults_delta": 7,
+        "major_page_faults_delta": 1,
+        "supporting_evidence_only": True,
+        "source": "test",
+    }
+    result = gs.build_vae_load_decomposition(
+        stage_start_ns=0,
+        stage_end_ns=100,
+        components=[{"name": "qd_transport", "start_ns": 0, "end_ns": 80}],
+        transport_stats=stats,
+        memory_before={"host": {"available": False}},
+    )
+    assert result["schema"] == "vae_load_decomposition_v1"
+    assert result["clock"] == "perf_counter_ns"
+    assert result["stage_wall_ns"] == 100
+    assert result["transport"]["schema"] == "golden_qd_transport_diagnostics_v1"
+    assert result["transport"]["source_bytes"] == 128
+    assert result["transport"]["throughput"] == {
+        "source_gbps": 1.25,
+        "h2d_gbps": 2.5,
+        "h2d_scope": "sum_of_copy_event_durations",
+    }
+    assert result["overlap"]["do_not_sum_components_for_stage_wall"] is True
+
+
 def test_telemetry_persists_complete_json_atomically(tmp_path):
     rec = gs.GoldenTelemetryRecorder()
     rec.begin_stage("golden_restore")
@@ -449,7 +510,9 @@ def test_real_qd_transport_roundtrip_synthetic_file():
     path = Path(__import__("tempfile").gettempdir()) / "golden_qd_roundtrip.safetensors"
     path.write_bytes(struct.pack("<Q", len(hb)) + hb + payload)
 
-    result = gs.read_file_qd_gpu(str(path), role="test", qd=2, block_bytes=1024 * 1024)
+    result = gs.read_file_qd_gpu(
+        str(path), role="test", qd=2, block_bytes=1024 * 1024, diagnostics=True
+    )
     try:
         sd = result["sd"]
         # Compare transport bytes, not float equality: the synthetic bit
@@ -1715,9 +1778,9 @@ def _write_pending(tmp_path, payload=b"\x89PNG\r\n\x1a\n golden-bytes", *, sha=N
 
 
 def test_durable_commit_success_event_ordering(tmp_path):
-    """golden_durable_commit intentionally owns ONLY the volume commit events;
+    """golden_durable_commit owns the commit and reopen proof events;
     OUTPUT_ENCODE_DONE / ASSET_WRITE_DONE belong to golden_output and the
-    reopen/true-durable ordering belongs to top-level integration."""
+    true-durable marker belongs to top-level integration."""
     pending = _write_pending(tmp_path)
     volume = FakeAsyncVolume()
     rec = gs.GoldenTelemetryRecorder()
@@ -1731,6 +1794,7 @@ def test_durable_commit_success_event_ordering(tmp_path):
         "VOLUME_COMMIT_START",
         "VOLUME_COMMIT_COMPLETE",
         "durable_reopen_verified",
+        "DURABLE_COMMIT_SUBSPANS",
     ]
     assert pending.committed is True
     assert volume.calls == ["commit", "committed"]
@@ -1769,8 +1833,89 @@ def test_commit_reopen_accepts_output_expectation_warning(tmp_path):
     )
 
     assert pending.committed is True
-    assert recorder.events[-1]["name"] == "durable_reopen_verified"
+    assert recorder.events[-1]["name"] == "DURABLE_COMMIT_SUBSPANS"
     recorder.mark_true_durable()
+
+
+def test_durable_commit_exposes_full_nonnegative_decomposition_with_injected_clock(tmp_path):
+    class Clock:
+        def __init__(self):
+            self.value = 100
+
+        def tick(self):
+            self.value += 1
+            return self.value
+
+    pending = _write_pending(tmp_path, payload=b"decomposition")
+    clock = Clock()
+    recorder = gs.GoldenTelemetryRecorder(monotonic=clock.tick, wall=clock.tick)
+    asyncio.run(
+        gs.golden_durable_commit(
+            FakeAsyncVolume(), pending, recorder, expected_sha256=pending.sha256
+        )
+    )
+
+    event = next(e for e in recorder.events if e["name"] == "DURABLE_COMMIT_SUBSPANS")
+    fields = event["fields"]
+    assert fields["clock"] == "recorder.monotonic_ns"
+    assert "Volume.commit as one blocking call" in fields["blocking_commit_note"]
+    spans = fields["durable_commit_subspans"]
+    assert tuple(spans) == gs.DURABLE_COMMIT_SUBSPAN_NAMES
+    assert all(span["duration_ns"] >= 0 for span in spans.values())
+    starts = [span["start_monotonic_ns"] for span in spans.values()]
+    ends = [span["end_monotonic_ns"] for span in spans.values()]
+    assert all(start is not None and end is not None for start, end in zip(starts, ends))
+    assert all(start <= end for start, end in zip(starts, ends))
+    assert (
+        spans["volume_commit_call_wall"]["end_monotonic_ns"]
+        == spans["commit_return_to_reopen_start"]["start_monotonic_ns"]
+    )
+    assert "true_durable_result_marker_publication" not in spans
+
+
+def test_true_durable_marker_is_separate_post_commit_span_and_event_snapshot_isolated(tmp_path):
+    pending = _write_pending(tmp_path, payload=b"marker")
+    recorder = gs.GoldenTelemetryRecorder()
+    asyncio.run(
+        gs.golden_durable_commit(
+            FakeAsyncVolume(), pending, recorder, expected_sha256=pending.sha256
+        )
+    )
+    subspans_event = next(
+        e for e in recorder.events if e["name"] == "DURABLE_COMMIT_SUBSPANS"
+    )
+    before = json.loads(json.dumps(subspans_event["fields"]["durable_commit_subspans"]))
+
+    recorder.mark_true_durable()
+
+    assert subspans_event["fields"]["durable_commit_subspans"] == before
+    assert "true_durable_result_marker_publication" not in before
+    marker = next(
+        e for e in recorder.events if e["name"] == "DURABLE_RESULT_MARKER_PUBLICATION"
+    )
+    assert marker["fields"]["subspan"] == "true_durable_result_marker_publication"
+    assert marker["fields"]["outside_durable_commit_stage"] is True
+    assert marker["fields"]["stage_boundary"] == "post_commit_result_marker"
+    assert marker["fields"]["duration_ns"] >= 0
+
+
+def test_durable_commit_failure_emits_failure_decomposition_payload(tmp_path):
+    pending = _write_pending(tmp_path, payload=b"failure")
+    recorder = gs.GoldenTelemetryRecorder()
+    with pytest.raises(RuntimeError, match="volume commit boom"):
+        asyncio.run(
+            gs.golden_durable_commit(
+                FakeAsyncVolume(fail=True),
+                pending,
+                recorder,
+                expected_sha256=pending.sha256,
+            )
+        )
+    event = next(e for e in recorder.events if e["name"] == "DURABLE_COMMIT_SUBSPANS")
+    assert event["fields"]["outcome"] == "failure"
+    assert "Volume.commit as one blocking call" in event["fields"]["blocking_commit_note"]
+    assert event["fields"]["durable_commit_subspans"]["volume_commit_call_wall"]["duration_ns"] >= 0
+    assert "true_durable_result_marker_publication" not in event["fields"]["durable_commit_subspans"]
 
 
 def test_commit_reopen_sha_mismatch_blocks_true_durable(tmp_path):

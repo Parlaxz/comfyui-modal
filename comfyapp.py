@@ -28,7 +28,6 @@ from comfymodal_runtime.contracts import (
 from comfymodal_runtime.env import env_flag
 from comfymodal_runtime.deployment_spec import (
     build_v2_late_config,
-    compute_custom_node_hash,
 )
 from comfymodal_runtime import publication_policy as _publication_policy
 # ── E40 Lane A: single configuration authority ──────────────────────────
@@ -1877,7 +1876,7 @@ MODELS_GENERATION_CONTROL_PATH = os.path.join(MODELS_GENERATION_CONTROL_DIR, "mo
 # contents.  It must NEVER be used as a proxy for the models
 # generation; a model-only change does not advance it and a
 # custom-node-only change does advance it.
-CUSTOM_NODES_GENERATION_SCHEMA_VERSION = 1
+CUSTOM_NODES_GENERATION_SCHEMA_VERSION = 2
 CUSTOM_NODES_GENERATION_CONTROL_DIR = MODELS_GENERATION_CONTROL_DIR
 CUSTOM_NODES_GENERATION_CONTROL_PATH = os.path.join(
     CUSTOM_NODES_GENERATION_CONTROL_DIR, "custom_nodes_generation.json"
@@ -1951,8 +1950,9 @@ def _current_models_generation_id() -> str:
 def _read_custom_nodes_generation_record() -> dict | None:
     """Read the authoritative custom-nodes generation record.
 
-    Returns a dict with ``generation``, ``updated_at_unix``, ``reason``,
-    and ``schema_version``, or ``None`` when missing/invalid.
+    Returns a dict with ``content_generation``, ``updated_at_unix``, ``reason``,
+    and ``schema_version``, or ``None`` when missing/invalid.  A matching
+    ``generation`` echo is retained only for older runtime diagnostics.
     Distinct from the models generation: a model-only change does
     NOT advance this record.
     """
@@ -1967,23 +1967,35 @@ def _read_custom_nodes_generation_record() -> dict | None:
         return None
     if _data.get("schema_version") != CUSTOM_NODES_GENERATION_SCHEMA_VERSION:
         return None
-    _gen = _data.get("generation")
-    if not _gen or not isinstance(_gen, str):
+    _content_generation = _data.get("content_generation")
+    if (
+        not isinstance(_content_generation, str)
+        or not _content_generation.strip()
+        or _content_generation != _content_generation.strip()
+    ):
+        return None
+    # Keep a read-only compatibility echo for older runtime diagnostics, but
+    # never accept a disagreement with the canonical content identity.
+    if "generation" in _data and _data["generation"] != _content_generation:
         return None
     return _data
 
 
-def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str | None = None) -> dict:
+def _write_custom_nodes_generation_record_no_commit(
+    reason: str,
+    content_generation: str,
+) -> dict:
     """Create a new custom-nodes generation record and atomically
     persist it (without committing the volume). The caller is
     responsible for calling ``custom_nodes_vol.commit()`` after
     this returns. Raises on failure.
 
-    When *generation* is provided it is used as-is (caller-chosen
-    deterministic value).  When omitted a UUID is generated.  Using
-    a content-derived deterministic generation ensures concurrent
-    containers syncing identical custom-node content converge on the
-    same persisted value — the atomic ``os.replace`` still resolves
+    ``content_generation`` is the required canonical full-content identity.
+    A legacy ``generation``-only call is intentionally rejected rather than
+    being treated as a content identity.  Using a content-derived
+    deterministic generation ensures concurrent containers syncing identical
+    custom-node content converge on the same persisted value — the atomic
+    ``os.replace`` still resolves
     races, but the identical value makes last-writer-wins harmless.
 
     **Temp-path uniqueness**: each invocation uses a distinct per-process
@@ -1993,9 +2005,14 @@ def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str
     in-flight writer, causing a ``FileNotFoundError``.  On failure the
     temp file is cleaned up before re-raising.
     """
+    if not isinstance(content_generation, str) or not content_generation.strip():
+        raise ValueError("content_generation is required for a publication record")
     _record = {
         "schema_version": CUSTOM_NODES_GENERATION_SCHEMA_VERSION,
-        "generation": generation if generation is not None else uuid.uuid4().hex,
+        "content_generation": content_generation.strip(),
+        # Compatibility for runtime diagnostics that still read this field;
+        # all trust decisions use content_generation and validate the echo.
+        "generation": content_generation.strip(),
         "updated_at_unix": time.time(),
         "reason": reason,
     }
@@ -2018,15 +2035,20 @@ def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str
         except Exception:
             pass
         raise
-    print(f"[comfyapp.custom_nodes_gen] wrote generation={_record['generation'][:12]}... reason={reason}")
+    print(
+        f"[comfyapp.custom_nodes_gen] wrote content_generation="
+        f"{_record['content_generation'][:12]}... reason={reason}"
+    )
     return _record
 
 
-def _write_custom_nodes_generation_record(reason: str) -> dict:
-    """Legacy wrapper that writes the generation record and commits.
-    Kept for backward-compatibility with external callers.
-    """
-    _record = _write_custom_nodes_generation_record_no_commit(reason)
+def _write_custom_nodes_generation_record(
+    reason: str, content_generation: str
+) -> dict:
+    """Write the generation record and commit the custom-nodes volume."""
+    _record = _write_custom_nodes_generation_record_no_commit(
+        reason, content_generation=content_generation
+    )
     custom_nodes_vol.commit()
     return _record
 
@@ -2035,7 +2057,7 @@ def _current_custom_nodes_generation_id() -> str:
     _rec = _read_custom_nodes_generation_record()
     if _rec is None:
         return ""
-    return _rec["generation"]
+    return _rec["content_generation"]
 
 
 def _resolve_custom_nodes_generation(
@@ -2070,7 +2092,7 @@ def _resolve_custom_nodes_generation(
     # Fallback: persisted generation record on the custom-nodes volume
     try:
         rec = _read_custom_nodes_generation_record()
-        gen = str((rec or {}).get("generation", "") or "").strip()
+        gen = str((rec or {}).get("content_generation", "") or "").strip()
         if gen:
             return gen, "persisted_record"
     except Exception:
@@ -3841,11 +3863,16 @@ def custom_node_source_generation(
     that path because the build context and Modal volume use different roots.
     """
     # ``fingerprint`` remains accepted for compatibility with older callers,
-    # but generation is owned by the S1 deployment identity helper.  The host
+    # but generation is owned by the shared full publication policy.  The host
     # archive publisher and this remote post-extract readback therefore hash
-    # the same source set with the same namespace and algorithm.
+    # the same semantic file set and manifest projection.
     _ = fingerprint
-    return compute_custom_node_hash([source_root])
+    # Modal exposes a mounted Volume root through a symlink.  Resolve only the
+    # adapter's expected root; the shared walker still rejects symlinks within
+    # the publication tree (and direct host archive roots) as before.
+    return _publication_policy.compute_publication_generation(
+        os.path.realpath(source_root)
+    )
 
 
 # Alias for backward compatibility
@@ -9176,17 +9203,71 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         # random UUID here would break that identity after every local
         # archive sync even when nothing changed.
         _cn_gen_value = ""
+        _gen_failure_reason = ""
         try:
             _cn_gen_value = custom_node_source_generation(CUSTOM_NODES_PATH)
         except Exception as _gen_exc:
-            print(f"[comfyapp.sync_custom_nodes_to_volume] generation compute failed: {_gen_exc!r}")
+            # Surface enough detail to diagnose the failure, while keeping the
+            # returned diagnostic bounded and redacting credential-shaped
+            # values that may appear in filesystem/configuration errors.
+            try:
+                _gen_exc_detail = str(_gen_exc)
+            except Exception:
+                _gen_exc_detail = "<unavailable>"
+            _gen_exc_detail = re.sub(
+                r"(?i)(\b(?:authorization|bearer|password|passwd|token|secret|"
+                r"api[-_ ]?key|credential)\b\s*[:=]\s*)[^\s,;]+",
+                r"\1<redacted>",
+                _gen_exc_detail,
+            )
+            _gen_exc_detail = re.sub(
+                r"(?i)\b(?:modal[-_ ]?(?:token|secret)|"
+                r"(?:api|access|session)[-_ ]?(?:key|token|secret)|"
+                r"(?:token|secret|password|credential))[-_:][^\s,;]+",
+                "<redacted>",
+                _gen_exc_detail,
+            )[:256]
+            _gen_failure_reason = (
+                "custom_node_source_generation raised "
+                f"{type(_gen_exc).__name__}: {_gen_exc_detail}"
+            )
+        else:
+            if not isinstance(_cn_gen_value, str):
+                _gen_failure_reason = (
+                    "custom_node_source_generation returned invalid "
+                    f"{type(_cn_gen_value).__name__} content_generation"
+                )
+            elif not _cn_gen_value.strip():
+                _gen_failure_reason = (
+                    "custom_node_source_generation returned empty content_generation"
+                )
+
+        if _gen_failure_reason:
+            _gen_error = (
+                "generation_computation_failed: "
+                f"comfyapp_version={COMFYAPP_VERSION}; "
+                f"reason={_gen_failure_reason}"
+            )
+            print(
+                "[comfyapp.sync_custom_nodes_to_volume] "
+                f"{_gen_error}"
+            )
+            # The extracted tree is intentionally left uncommitted.  Without
+            # a canonical content generation there is no safe publication
+            # record to commit alongside it.
+            return {
+                "status": "error",
+                "comfyapp_version": COMFYAPP_VERSION,
+                "error": _gen_error,
+                "generation_failure_reason": _gen_failure_reason,
+            }
         _cn_gen = _write_custom_nodes_generation_record_no_commit(
             reason="post_sync_custom_nodes_to_volume",
-            generation=_cn_gen_value or None,
+            content_generation=_cn_gen_value,
         )
         print(
             f"[comfyapp.sync_custom_nodes_to_volume] advanced custom_nodes_generation="
-            f"{( _cn_gen.get('generation', '') or '')[:12]}"
+            f"{( _cn_gen.get('content_generation', '') or '')[:12]}"
         )
     except Exception as _cn_gen_exc:
         print(f"[comfyapp.sync_custom_nodes_to_volume] generation record write failed: {_cn_gen_exc!r}")
@@ -9215,7 +9296,7 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         # This is the value written before the commit, not a host-derived
         # guess.  The publisher uses it to distinguish a successful remote
         # write from a host-side generation-record readback failure.
-        "generation": _cn_gen.get("generation", ""),
+        "content_generation": _cn_gen.get("content_generation", ""),
         "generation_record_path": CUSTOM_NODES_GENERATION_CONTROL_PATH,
     }
 
@@ -10951,7 +11032,7 @@ class _ComfyAPIMixin:
             _baked_mft_pre = load_baked_custom_node_dependency_manifest()
             _cn_fp_pre = _baked_mft_pre if _baked_mft_pre else None
             _cn_gen_rec_pre = _read_custom_nodes_generation_record()
-            _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
+            _cn_gen_pre = _cn_gen_rec_pre.get("content_generation", "") if _cn_gen_rec_pre else ""
             _manifest_snapshot = _load_dependency_manifest()
             _manifest_load_ms = round((time.time() - _dep_t0) * 1000, 2)
             _chk_t0 = time.time()
@@ -11153,7 +11234,7 @@ class _ComfyAPIMixin:
             _cn_gen_rec_pre = _read_custom_nodes_generation_record()
             _custom_node_generation_read_ms = round((time.time() - _cngr_t0) * 1000, 2)
 
-            _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
+            _cn_gen_pre = _cn_gen_rec_pre.get("content_generation", "") if _cn_gen_rec_pre else ""
 
             # 2a. Load persisted manifest (timed)
             _ml_t0 = time.time()
@@ -11683,7 +11764,7 @@ class _ComfyAPIMixin:
             try:
                 _cn_gen_rec = _read_custom_nodes_generation_record()
                 _cn_gen_now = (
-                    (_cn_gen_rec or {}).get("generation", "")
+                    (_cn_gen_rec or {}).get("content_generation", "")
                     if _cn_gen_rec else ""
                 )
                 if (
@@ -11719,7 +11800,7 @@ class _ComfyAPIMixin:
                 # the current value even on memoized-hit paths.
                 try:
                     _gen_rec_memo = _read_custom_nodes_generation_record()
-                    _gen_now_memo = (_gen_rec_memo or {}).get("generation", "") if _gen_rec_memo else ""
+                    _gen_now_memo = (_gen_rec_memo or {}).get("content_generation", "") if _gen_rec_memo else ""
                     if _gen_now_memo:
                         self._custom_nodes_generation_seen = _gen_now_memo
                 except Exception:
@@ -11773,7 +11854,7 @@ class _ComfyAPIMixin:
                 # source fingerprint is unchanged across lifecycle boundaries.
                 try:
                     _gen_rec_skip = _read_custom_nodes_generation_record()
-                    _gen_now_skip = (_gen_rec_skip or {}).get("generation", "") if _gen_rec_skip else ""
+                    _gen_now_skip = (_gen_rec_skip or {}).get("content_generation", "") if _gen_rec_skip else ""
                     if _gen_now_skip:
                         self._custom_nodes_generation_seen = _gen_now_skip
                 except Exception:
@@ -11805,12 +11886,12 @@ class _ComfyAPIMixin:
         # same generation.
         try:
             _gen_rec = _read_custom_nodes_generation_record()
-            _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
+            _gen_now = (_gen_rec or {}).get("content_generation", "") if _gen_rec else ""
             if not _gen_now:
                 _gen_now = custom_node_source_generation(CUSTOM_NODES_PATH)
                 _write_custom_nodes_generation_record_no_commit(
                     reason="actual_sync_created",
-                    generation=_gen_now,
+                    content_generation=_gen_now,
                 )
                 custom_nodes_vol.commit()
             if _gen_now:
@@ -18422,16 +18503,16 @@ class _ComfyAPIMixin:
                 print(f"[dep_manifest] generation compute failed during init: {_cn_init_gen_exc!r}")
             _cn_gen_rec_su = _write_custom_nodes_generation_record_no_commit(
                 reason="startup_init_generation_record",
-                generation=_cn_init_generation or None,
+                content_generation=_cn_init_generation or None,
             )
             # Commit the generation record so the manifest persists it atomically.
             # The manifest write below will be in a separate commit cycle.
             custom_nodes_vol.commit()
             print(
                 f"[dep_manifest] initialized generation="
-                f"{_cn_gen_rec_su['generation'][:12]} reason=startup_init_generation_record"
+                f"{_cn_gen_rec_su['content_generation'][:12]} reason=startup_init_generation_record"
             )
-        _cn_gen_str_su = _cn_gen_rec_su.get("generation", "")
+        _cn_gen_str_su = _cn_gen_rec_su.get("content_generation", "")
 
         # In production modes, missing baked hash must fail closed.
         if not _baked_mft_ok and _repair_mode_s in ("off", "fail_fast"):

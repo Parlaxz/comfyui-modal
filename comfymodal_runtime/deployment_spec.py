@@ -588,10 +588,10 @@ def compute_custom_node_hash(custom_node_paths: Sequence[str | Path]) -> str:
     """Return the canonical S1 hash for one or more custom-node roots.
 
     Custom-node paths are namespaced before aggregation so equal relative
-    paths from separate roots cannot overwrite one another.  This is the same
-    source identity used by deployment manifests; the runtime publisher calls
-    this helper too, keeping the archive's host generation and the remote
-    generation on one algorithm.
+    paths from separate roots cannot overwrite one another.  This remains the
+    narrower source/code identity used by deployment manifests.  Publication
+    generation is intentionally separate and is owned by
+    ``publication_policy.compute_publication_generation``.
     """
     custom_hashes = _custom_node_file_hashes(custom_node_paths)
     return compute_aggregate_hash(custom_hashes) if custom_hashes else ""

@@ -5650,8 +5650,8 @@ def _persist_v2_dependency_manifest(
     if not _cn_gen:
         try:
             _rec = legacy_module._read_custom_nodes_generation_record()
-            if _rec and _rec.get("generation"):
-                _cn_gen = str(_rec["generation"])
+            if _rec and _rec.get("content_generation"):
+                _cn_gen = str(_rec["content_generation"])
         except Exception:
             pass
 
@@ -9280,12 +9280,12 @@ class ModalRuntimeEntrypoint:
                     try:
                         _rec = module._read_custom_nodes_generation_record() or {}
                         if (
-                            str(_rec.get("generation", "") or "")
+                            str(_rec.get("content_generation", "") or "")
                             != _parity_post_sync_actual
                         ):
                             module._write_custom_nodes_generation_record_no_commit(
                                 reason="v2_construction_reconcile",
-                                generation=_parity_post_sync_actual,
+                                content_generation=_parity_post_sync_actual,
                             )
                             _vol = getattr(module, "custom_nodes_vol", None)
                             if _vol is not None and callable(

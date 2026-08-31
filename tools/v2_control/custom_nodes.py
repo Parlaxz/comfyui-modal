@@ -25,16 +25,20 @@ from typing import Any, Callable, Iterable, Mapping
 from comfymodal_runtime.publication_policy import (
     CUSTOM_NODES_PUBLISHER_APP_NAME,
     CUSTOM_NODES_VOLUME_NAME,
+    canonical_publication_bytes,
+    publication_manifest_digest,
     is_excluded_path,
+    iter_publication_files,
     iter_syncable_custom_node_dirs,
     resolve_custom_nodes_root,
 )
 
 
-IDENTITY_SCHEMA_VERSION = 1
-RECEIPT_SCHEMA_VERSION = 1
+IDENTITY_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 2
 PACKAGING_POLICY_VERSION = 1
-PUBLICATION_PROTOCOL_VERSION = 1
+PUBLICATION_PROTOCOL_VERSION = 2
+GENERATION_RECORD_SCHEMA_VERSION = 2
 PUBLISHER_MARKER = "comfyui-modal-golden"
 RECEIPT_PATH = ".comfymodal_control/custom_nodes_publication_receipt.json"
 GENERATION_RECORD_PATH = ".comfymodal_control/custom_nodes_generation.json"
@@ -54,13 +58,19 @@ class SemanticFile:
 
 @dataclass(frozen=True)
 class CustomNodeSourceIdentity:
-    generation: str
+    content_generation: str
     identity_schema: int
     packaging_policy_version: int
     file_count: int
     total_bytes: int
     manifest_digest: str
     files: tuple[tuple[str, int, str], ...] = ()
+    source_generation: str = ""
+
+    @property
+    def generation(self) -> str:
+        """Compatibility view; publication code uses content_generation."""
+        return self.content_generation
 
     @property
     def manifest(self) -> tuple[dict[str, Any], ...]:
@@ -72,19 +82,20 @@ class CustomNodeSourceIdentity:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "generation": self.generation,
+            "content_generation": self.content_generation,
             "identity_schema": self.identity_schema,
             "packaging_policy_version": self.packaging_policy_version,
             "file_count": self.file_count,
             "total_bytes": self.total_bytes,
             "manifest_digest": self.manifest_digest,
+            "source_generation": self.source_generation,
         }
 
 
 @dataclass(frozen=True)
 class PublicationReceipt:
     schema_version: int
-    generation: str
+    content_generation: str
     identity_schema: int
     packaging_policy_version: int
     publication_protocol_version: int
@@ -99,6 +110,11 @@ class PublicationReceipt:
     created_at: str = ""
 
     @property
+    def generation(self) -> str:
+        """Compatibility view; receipt identity is content_generation."""
+        return self.content_generation
+
+    @property
     def bytes(self) -> int:
         return self.total_bytes
 
@@ -106,7 +122,7 @@ class PublicationReceipt:
         """Canonical receipt payload covered by ``integrity_digest``."""
         return {
             "schema_version": self.schema_version,
-            "generation": self.generation,
+            "content_generation": self.content_generation,
             "identity_schema": self.identity_schema,
             "packaging_policy_version": self.packaging_policy_version,
             "publication_protocol_version": self.publication_protocol_version,
@@ -133,7 +149,7 @@ class PublicationReceipt:
     def create(cls, identity: CustomNodeSourceIdentity, volume_name: str) -> "PublicationReceipt":
         receipt = cls(
             schema_version=RECEIPT_SCHEMA_VERSION,
-            generation=identity.generation,
+            content_generation=identity.content_generation,
             identity_schema=identity.identity_schema,
             packaging_policy_version=identity.packaging_policy_version,
             publication_protocol_version=PUBLICATION_PROTOCOL_VERSION,
@@ -158,7 +174,7 @@ class PublicationReceipt:
         if not isinstance(raw, dict):
             raise ReceiptError("malformed_receipt")
         required = {
-            "schema_version", "generation", "identity_schema",
+            "schema_version", "content_generation", "identity_schema",
             "packaging_policy_version", "publication_protocol_version", "state",
             "volume_name", "file_count", "bytes", "total_bytes", "manifest_digest",
             "publisher", "ownership_marker", "integrity_digest", "created_at",
@@ -167,7 +183,8 @@ class PublicationReceipt:
             raise ReceiptError("malformed_receipt")
         try:
             receipt = cls(
-                schema_version=raw["schema_version"], generation=raw["generation"],
+                schema_version=raw["schema_version"],
+                content_generation=raw["content_generation"],
                 identity_schema=raw["identity_schema"],
                 packaging_policy_version=raw["packaging_policy_version"],
                 publication_protocol_version=raw["publication_protocol_version"],
@@ -194,8 +211,10 @@ class PublicationReceipt:
             raise ReceiptError("schema_mismatch")
         if receipt.state != "verified":
             raise ReceiptError("publication_incomplete")
+        if "generation" in raw and raw["generation"] != receipt.content_generation:
+            raise ReceiptError("schema_mismatch")
         if not all(isinstance(getattr(receipt, name), str) and getattr(receipt, name)
-                   for name in ("generation", "volume_name", "manifest_digest", "publisher",
+                   for name in ("content_generation", "volume_name", "manifest_digest", "publisher",
                                 "ownership_marker", "integrity_digest")):
             raise ReceiptError("malformed_receipt")
         if type(receipt.file_count) is not int or type(receipt.total_bytes) is not int:
@@ -271,62 +290,17 @@ def collect_semantic_files(root: str | Path) -> tuple[SemanticFile, ...]:
         if not stat.S_ISDIR(entry_stat.st_mode) and not stat.S_ISREG(entry_stat.st_mode):
             raise ValueError(f"special file is not publishable: {entry.path}")
 
-    def raise_walk_error(error: OSError) -> None:
-        raise error
-
     files: list[SemanticFile] = []
-    node_names = iter_syncable_custom_node_dirs(root_path)
-    for node_name in node_names:
-        node_path = root_path / node_name
-        node_stat = node_path.lstat()
-        if not stat.S_ISDIR(node_stat.st_mode) or stat.S_ISLNK(node_stat.st_mode):
-            raise ValueError(f"syncable custom-node root is not a regular directory: {node_path}")
-        node_file_count = 0
-        for directory, dirnames, filenames in os.walk(
-            node_path, followlinks=False, onerror=raise_walk_error
-        ):
-            directory_path = Path(directory)
-            # os.walk lists symlinked directories in ``dirnames`` even with
-            # followlinks=False.  Inspect every entry before applying policy;
-            # silently dropping a link or special file would make the identity
-            # describe an incomplete tree.
-            for name in (*dirnames, *filenames):
-                path = directory_path / name
-                try:
-                    entry_stat = path.lstat()
-                except OSError as exc:
-                    raise OSError(f"custom-node tree entry is unreadable: {path}") from exc
-                if stat.S_ISLNK(entry_stat.st_mode):
-                    raise ValueError(f"symlink is not publishable: {path}")
-                if name in dirnames and not stat.S_ISDIR(entry_stat.st_mode):
-                    raise ValueError(f"non-directory traversal entry is not publishable: {path}")
-                if name in filenames and not stat.S_ISREG(entry_stat.st_mode):
-                    raise ValueError(f"special file is not publishable: {path}")
-            dirnames[:] = sorted(
-                name for name in dirnames
-                if not is_excluded_path(
-                    f"{node_name}/{(directory_path / name).relative_to(node_path).as_posix()}"
-                )
-            )
-            for filename in sorted(filenames):
-                path = directory_path / filename
-                relative = path.relative_to(root_path).as_posix()
-                if _is_control_metadata(relative) or is_excluded_path(relative):
-                    continue
-                data = path.read_bytes()
-                files.append(SemanticFile(relative, len(data), hashlib.sha256(data).hexdigest(), data))
-                node_file_count += 1
-        if node_file_count == 0:
-            raise ValueError(
-                f"syncable custom-node {node_name!r} contains no included semantic files"
-            )
+    for path in iter_publication_files(root_path):
+        relative = path.relative_to(root_path).as_posix()
+        data = canonical_publication_bytes(relative, path.read_bytes())
+        files.append(SemanticFile(relative, len(data), hashlib.sha256(data).hexdigest(), data))
     return tuple(sorted(files, key=lambda item: item.path))
 
 
 def _manifest(files: Iterable[SemanticFile]) -> tuple[list[dict[str, Any]], str, int]:
     entries = [{"path": item.path, "size": item.size, "sha256": item.sha256} for item in files]
-    raw = _canonical_json(entries)
-    return entries, hashlib.sha256(raw).hexdigest(), sum(item.size for item in files)
+    return entries, publication_manifest_digest(entries), sum(item.size for item in files)
 
 
 def build_source_identity(
@@ -360,20 +334,21 @@ def build_source_identity(
             provided = identity_provider(root, files)
         else:
             provided = identity_provider(root)
-    generation = str(provided.get("generation") if isinstance(provided, Mapping) else provided or "").strip()
-    if not generation:
-        # Keep the local fallback on the same S1 provider used by the Golden
-        # CLI.  There must not be a second host-only generation algorithm.
-        from comfymodal_runtime.deployment_spec import compute_custom_node_hash
-
-        generation = compute_custom_node_hash([root])
+    source_generation = str(
+        provided.get("generation") if isinstance(provided, Mapping) else provided or ""
+    ).strip()
+    # Publication generation is the manifest digest, not the narrower S1 code
+    # hash supplied by the optional adapter.  Keep that adapter value separate
+    # for diagnostics/consumers that still need a source-only identity.
+    content_generation = manifest_digest
     return CustomNodeSourceIdentity(
-        generation=generation,
+        content_generation=content_generation,
         identity_schema=IDENTITY_SCHEMA_VERSION,
         packaging_policy_version=PACKAGING_POLICY_VERSION,
         file_count=len(entries), total_bytes=total_bytes,
         manifest_digest=manifest_digest,
         files=tuple((item.path, item.size, item.sha256) for item in files),
+        source_generation=source_generation,
     )
 
 
@@ -510,7 +485,7 @@ def evaluate_receipt(
             return fail("ownership_unproven", receipt)
         if _receipt_integrity(receipt) != receipt.integrity_digest:
             return fail("integrity_mismatch", receipt)
-        if (receipt.generation != desired.generation or receipt.file_count != desired.file_count
+        if (receipt.content_generation != desired.content_generation or receipt.file_count != desired.file_count
                 or receipt.total_bytes != desired.total_bytes
                 or receipt.manifest_digest != desired.manifest_digest):
             return fail("generation_mismatch", receipt)
@@ -521,30 +496,81 @@ def evaluate_receipt(
         return fail("malformed_receipt")
 
 
-def _generation_readback(volume: Any) -> str | None:
+def _content_generation_from_record(data: bytes) -> str | None:
     try:
-        raw = json.loads(_read_volume_file(volume, GENERATION_RECORD_PATH).decode("utf-8"))
-        value = (
-            raw.get("generation")
-            if isinstance(raw, dict) and raw.get("schema_version", 1) == 1
-            else None
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("schema_version") != GENERATION_RECORD_SCHEMA_VERSION:
+        return None
+    value = raw.get("content_generation")
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        return None
+    # A compatibility echo is harmless only when it cannot disagree with the
+    # canonical field.  Schema-1 generation-only records are rejected above.
+    if "generation" in raw and raw.get("generation") != value:
+        return None
+    return value.strip()
+
+
+def _content_generation_readback(volume: Any) -> str | None:
+    try:
+        return _content_generation_from_record(
+            _read_volume_file(volume, GENERATION_RECORD_PATH)
         )
-        return str(value).strip() if value else None
     except Exception:
         return None
 
 
-async def _generation_readback_async(volume: Any) -> str | None:
+async def _content_generation_readback_async(volume: Any) -> str | None:
     try:
-        raw = json.loads((await _read_volume_file_async(volume, GENERATION_RECORD_PATH)).decode("utf-8"))
-        value = (
-            raw.get("generation")
-            if isinstance(raw, dict) and raw.get("schema_version", 1) == 1
-            else None
+        return _content_generation_from_record(
+            await _read_volume_file_async(volume, GENERATION_RECORD_PATH)
         )
-        return str(value).strip() if value else None
     except Exception:
         return None
+
+
+def _is_host_modal_volume(volume: Any) -> bool:
+    """Identify a real host-side Modal Volume without importing Modal eagerly."""
+    volume_type = type(volume)
+    return (
+        volume_type.__module__ == "modal.volume"
+        and volume_type.__name__ == "Volume"
+        and os.environ.get("MODAL_IS_REMOTE") != "1"
+    )
+
+
+async def _refresh_volume_async(volume: Any) -> Any:
+    """Optionally refresh an injected/container-side Volume handle.
+
+    ``Volume.reload`` is a container-only operation.  On the host control
+    plane, direct ``Volume.read_file`` calls already read committed state and
+    ``reload().aio()`` raises because there is no running Modal function.
+    Small local fakes and container-compatible handles may still provide a
+    reload/reopen operation, so retain that compatibility path when the
+    handle is not a real host-side Modal Volume.
+    """
+    if _is_host_modal_volume(volume):
+        return volume
+    method = getattr(volume, "reload", None)
+    if not callable(method):
+        method = getattr(volume, "reopen", None)
+    if not callable(method):
+        return volume
+    aio_method = getattr(method, "aio", None)
+    if callable(aio_method):
+        refreshed = aio_method()
+    else:
+        # Modal's plain reload/reopen wrappers are synchronous.  Never invoke
+        # them on the event-loop thread, even when a local/injected Volume
+        # exposes only that compatibility interface.
+        refreshed = await asyncio.to_thread(method)
+    if inspect.isawaitable(refreshed):
+        refreshed = await refreshed
+    return refreshed if refreshed is not None else volume
 
 
 def write_receipt(volume: Any, receipt: PublicationReceipt, *, path: str = RECEIPT_PATH) -> None:
@@ -604,27 +630,35 @@ async def publish_or_skip(
             volume = await asyncio.to_thread(factory, volume_name)
             if inspect.isawaitable(volume):
                 volume = await volume
+    volume_refresh_ok = True
     try:
+        volume = await _refresh_volume_async(volume)
         existing = await read_receipt_async(volume, volume_name=volume_name)
         decision = evaluate_receipt(existing, identity, volume_name=volume_name,
                                     repair_requested=repair_requested)
     except ReceiptError as exc:
         decision = PublicationDecision("publish", str(exc), identity)
+    except Exception:
+        # A refresh/read failure must never become an exact skip.
+        volume_refresh_ok = False
+        decision = PublicationDecision("publish", "volume_readback_failed", identity)
     if decision.skip:
         return decision
 
     # A content publication can succeed while its receipt write is lost (or a
-    # previous receipt can become stale).  The generation record is written by
+    # previous receipt can become stale).  The content-generation record is
+    # written by
     # the remote publisher before its content commit and is therefore the
     # authoritative, tiny proof that the Volume already contains this exact
-    # source generation.  Recovering only the receipt avoids rebuilding and
+    # source content generation.  Recovering only the receipt avoids rebuilding and
     # re-uploading content.  Any read/parse ambiguity returns None and remains
     # on the normal fail-closed publication path.
-    generation_matches = (
-        not repair_requested
-        and await _generation_readback_async(volume) == identity.generation
+    content_generation_matches = (
+        volume_refresh_ok
+        and not repair_requested
+        and await _content_generation_readback_async(volume) == identity.content_generation
     )
-    if generation_matches:
+    if content_generation_matches:
         recovered = PublicationReceipt.create(identity, volume_name)
         try:
             await write_receipt_async(volume, recovered)
@@ -649,11 +683,24 @@ async def publish_or_skip(
         result = await result
     if not isinstance(result, Mapping) or str(result.get("status", "")).lower() not in {"ok", "success", "verified"}:
         return PublicationDecision("publish", "publication_incomplete", identity, result=result)
-    result_generation = str(result.get("generation") or "").strip() if isinstance(result, Mapping) else ""
-    readback_generation = await _generation_readback_async(volume)
-    # A publisher's return value is advisory.  The persisted generation record
-    # is the post-publication proof required before a receipt can be finalized.
-    if (result_generation and result_generation != identity.generation) or readback_generation != identity.generation:
+    result_value = result.get("content_generation") if isinstance(result, Mapping) else None
+    result_content_generation = (
+        result_value
+        if isinstance(result_value, str)
+        and result_value
+        and result_value == result_value.strip()
+        and ("generation" not in result or result.get("generation") == result_value)
+        else ""
+    )
+    # Read the committed record directly.  Host-side Modal Volume.read_file is
+    # the authoritative readback; reloading here is container-only and can
+    # raise before the generation proof is available.
+    readback_content_generation = await _content_generation_readback_async(volume)
+    # Both the explicit publisher result and persisted record are required.
+    if (
+        result_content_generation != identity.content_generation
+        or readback_content_generation != identity.content_generation
+    ):
         return PublicationDecision("publish", "publication_incomplete", identity, result=result)
     receipt = PublicationReceipt.create(identity, volume_name)
     try:
@@ -681,7 +728,8 @@ __all__ = [
     "CustomNodeSourceIdentity", "PublicationReceipt", "PublicationDecision",
     "SemanticFile", "ReceiptError", "IDENTITY_SCHEMA_VERSION",
     "RECEIPT_SCHEMA_VERSION", "PACKAGING_POLICY_VERSION",
-    "PUBLICATION_PROTOCOL_VERSION", "RECEIPT_PATH", "GENERATION_RECORD_PATH",
+    "PUBLICATION_PROTOCOL_VERSION", "GENERATION_RECORD_SCHEMA_VERSION",
+    "RECEIPT_PATH", "GENERATION_RECORD_PATH",
     "CUSTOM_NODES_VOLUME_NAME", "CUSTOM_NODES_PUBLISHER_APP_NAME",
     "collect_semantic_files", "build_source_identity", "build_archive",
     "prepare_publication", "evaluate_receipt", "read_receipt", "read_receipt_async",
