@@ -9,6 +9,7 @@ network, no ambient experiment env leakage in dry-run mode.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import argparse
 import inspect
 import importlib.util
@@ -29,6 +30,7 @@ from comfymodal_runtime.contracts import DEPLOYMENT_HASH_NAMESPACE
 from comfymodal_runtime.publication_policy import (
     CUSTOM_NODES_PUBLISHER_APP_NAME,
     CUSTOM_NODES_VOLUME_NAME,
+import modal_workspaces
 )
 
 from . import environment as env_mod
@@ -75,6 +77,68 @@ GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
+DEFAULT_MODAL_ENVIRONMENT = "(default)"
+PUBLISHER_FUNCTION_NAME = "sync_custom_nodes_to_volume"
+PUBLISHER_PREFLIGHT_FIELDS = (
+    "WORKSPACE", "ENVIRONMENT", "PUBLISHER_APP", "PUBLISHER_EXISTS",
+    "PUBLISHER_FUNCTION_EXISTS", "PUBLISHER_VERSION_BEFORE",
+    "LOCAL_CONTENT_GENERATION", "REMOTE_CONTENT_GENERATION",
+    "PUBLICATION_DECISION", "BOOTSTRAP_REQUIRED", "READY_FOR_CONSUMER_DEPLOY",
+)
+
+
+@dataclass(frozen=True)
+class WorkspaceBinding:
+    """Frozen, credential-bearing workspace selection for one operation.
+
+    Credentials are deliberately absent from all public/provenance projections.
+    ``environment`` is ``(default)`` when Modal's default environment is being
+    used; this makes the selection explicit without changing Modal's default
+    lookup semantics.
+    """
+
+    workspace_id: str
+    label: str
+    environment: str
+    token_id: str
+    token_secret: str
+
+    def __repr__(self) -> str:
+        return (
+            "WorkspaceBinding(workspace_id={!r}, label={!r}, environment={!r})"
+        ).format(self.workspace_id, self.label, self.environment)
+
+    @property
+    def public(self) -> dict[str, str]:
+        return {
+            "workspace": self.workspace_id,
+            "environment": self.environment,
+        }
+
+    @property
+    def credentials(self) -> dict[str, str]:
+        return {
+            "MODAL_TOKEN_ID": self.token_id,
+            "MODAL_TOKEN_SECRET": self.token_secret,
+        }
+
+    @property
+    def workspace(self) -> dict[str, str]:
+        """Compatibility projection for the existing custom-node publisher API.
+
+        Keep construction private so new control-plane code does not pass a
+        mutable credential-bearing record around accidentally.
+        """
+        return self._workspace_payload()
+
+    def _workspace_payload(self) -> dict[str, str]:
+        return {
+            "id": self.workspace_id,
+            "label": self.label,
+            "token_id": self.token_id,
+            "token_secret": self.token_secret,
+            "environment": self.environment,
+        }
 _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 # E37 deliberately inherits the E29/E28 workload shape, but its late CLIP
@@ -314,7 +378,7 @@ _DIAGNOSTIC_QUOTED_SECRET_RE = re.compile(
 )
 
 
-def _redact_backend_diagnostic(text: str, env: dict[str, str]) -> str:
+def _redact_backend_diagnostic(text: str, env: Mapping[str, str]) -> str:
     """Redact credential-shaped values from backend output."""
     output = text or ""
     # Replace values actually supplied to the backend first, including values
@@ -327,11 +391,20 @@ def _redact_backend_diagnostic(text: str, env: dict[str, str]) -> str:
     # Also cover backend messages that print a credential without using the
     # exact value from the child environment (for example, a parsed config).
     output = _DIAGNOSTIC_QUOTED_SECRET_RE.sub(r"\1<redacted>\3", output)
+    # Cover token-shaped values emitted without a field name (for example by
+    # an SDK exception's repr).  This is deliberately conservative and is in
+    # addition to replacement of the exact credentials supplied to the child.
+    output = re.sub(
+        r"(?i)\b(?:ak|as|mk|ms|wk|ws)[-_][a-z0-9_-]{8,}\b",
+        "<redacted>",
+        output,
+    )
+    output = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer <redacted>", output)
     output = _DIAGNOSTIC_SECRET_RE.sub(r"\1<redacted>", output)
     return output
 
 
-def _safe_backend_diagnostic(text: str, env: dict[str, str]) -> str:
+def _safe_backend_diagnostic(text: str, env: Mapping[str, str]) -> str:
     """Return bounded backend output with credential-shaped values redacted."""
     output = _redact_backend_diagnostic(text, env)
     if len(output) > _BACKEND_DIAGNOSTIC_MAX_CHARS:
@@ -605,7 +678,11 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
         )
 
 
-def _app_version_number(app_name: str) -> int | None:
+def _app_version_number(
+    app_name: str,
+    workspace: Mapping[str, object] | WorkspaceBinding | None = None,
+    environment: str | None = None,
+) -> int | None:
     """Highest ``v<N>`` version number from ``modal app history`` (0 if none).
 
     Returns ``None`` on lookup uncertainty.  The history table rows look
@@ -638,18 +715,29 @@ def _app_version_number(app_name: str) -> int | None:
         )
 
     try:
-        # Resolve the ACTIVE workspace credentials from .modal_workspaces.json.
-        ws_file = Path(__file__).resolve().parents[2] / ".modal_workspaces.json"
-        data = json.loads(ws_file.read_text(encoding="utf-8"))
-        active_id = data.get("active_workspace_id")
-        ws = next(
-            (w for w in data.get("workspaces", []) if w.get("id") == active_id),
-            None,
-        )
+        # Resolve credentials from the frozen binding, not the ambient Modal
+        # profile.  The one-argument compatibility path retains the historical
+        # active-workspace behavior for older callers and test doubles.
+        if isinstance(workspace, WorkspaceBinding):
+            ws = workspace._workspace_payload()
+        elif isinstance(workspace, Mapping):
+            ws = workspace
+        else:
+            ws_file = Path(__file__).resolve().parents[2] / ".modal_workspaces.json"
+            data = json.loads(ws_file.read_text(encoding="utf-8"))
+            active = modal_workspaces.get_active_workspace(data)
+            ws = active
         if not ws or not ws.get("token_id") or not ws.get("token_secret"):
             return None
         env = dict(os.environ)
         env["MODAL_TOKEN_ID"] = str(ws["token_id"])
+        selected_environment = environment
+        if selected_environment is None and isinstance(workspace, (WorkspaceBinding, Mapping)):
+            selected_environment = str(ws.get("environment") or "").strip()
+        if selected_environment and selected_environment != DEFAULT_MODAL_ENVIRONMENT:
+            env["MODAL_ENVIRONMENT"] = selected_environment
+        else:
+            env.pop("MODAL_ENVIRONMENT", None)
         env["MODAL_TOKEN_SECRET"] = str(ws["token_secret"])
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
@@ -710,6 +798,443 @@ def _active_workspace(repo_root: Path) -> dict[str, object]:
         raise GateError("active Modal workspace is missing credentials")
     return workspace
 
+def resolve_workspace_binding(
+    repo_root: Path,
+    *,
+    workspace_id: str | None = None,
+    environment: str | None = None,
+) -> WorkspaceBinding:
+    """Resolve and freeze the selected workspace before any remote operation.
+
+    The registry is the only authority.  In particular, this function never
+    asks the Modal CLI which profile is active.  An explicit workspace is
+    required to be the registry's active workspace so a later child process
+    cannot accidentally use a different global selection.
+    """
+    path = Path(repo_root) / ".modal_workspaces.json"
+    registry = modal_workspaces.load_workspace_registry(path)
+    active = modal_workspaces.get_active_workspace(registry)
+    requested = None
+    if workspace_id:
+        requested = modal_workspaces.get_workspace(registry, str(workspace_id).strip())
+        if requested is None:
+            raise GateError(f"Modal workspace {workspace_id!r} is not registered")
+    selected = requested or active
+    if not isinstance(selected, dict):
+        raise GateError("Modal workspace cannot be resolved from .modal_workspaces.json")
+    if not isinstance(active, dict) or selected.get("id") != active.get("id"):
+        raise GateError(
+            "active Modal workspace does not match frozen workspace "
+            f"{selected.get('id')!r}"
+        )
+    token_id = str(selected.get("token_id") or "").strip()
+    token_secret = str(selected.get("token_secret") or "").strip()
+    if not token_id or not token_secret:
+        raise GateError("frozen Modal workspace is missing credentials")
+    chosen_environment = str(
+        environment or selected.get("environment") or DEFAULT_MODAL_ENVIRONMENT
+    ).strip()
+    if not chosen_environment:
+        chosen_environment = DEFAULT_MODAL_ENVIRONMENT
+    return WorkspaceBinding(
+        workspace_id=str(selected.get("id") or "").strip(),
+        label=str(selected.get("label") or ""),
+        environment=chosen_environment,
+        token_id=token_id,
+        token_secret=token_secret,
+    )
+
+
+def assert_workspace_binding_current(repo_root: Path, binding: WorkspaceBinding) -> None:
+    """Fail closed if the registry changed after the operation was frozen."""
+    registry = modal_workspaces.load_workspace_registry(
+        Path(repo_root) / ".modal_workspaces.json"
+    )
+    active = modal_workspaces.get_active_workspace(registry)
+    if isinstance(active, dict):
+        registry_environment = str(active.get("environment") or "").strip()
+        if registry_environment and registry_environment != binding.environment:
+            raise GateError("Modal environment changed after preflight")
+    current = resolve_workspace_binding(
+        repo_root,
+        workspace_id=binding.workspace_id,
+        environment=binding.environment,
+    )
+    if current.workspace_id != binding.workspace_id:
+        raise GateError("active Modal workspace changed after preflight")
+    if current.environment != binding.environment:
+        raise GateError("Modal environment changed after preflight")
+
+
+def _workspace_binding_for_args(args, repo_root: Path) -> WorkspaceBinding | None:
+    """Use the new explicit binding surface while keeping old unit doubles valid."""
+    if not any(hasattr(args, name) for name in ("workspace_id", "workspace", "environment")):
+        return None
+    workspace_id = getattr(args, "workspace_id", None) or getattr(args, "workspace", None)
+    return resolve_workspace_binding(
+        repo_root,
+        workspace_id=workspace_id,
+        environment=getattr(args, "environment", None),
+    )
+
+
+def _apply_workspace_binding_to_env(env: dict[str, str], binding: WorkspaceBinding) -> None:
+    """Replace ambient Modal selection with the frozen selection."""
+    for name in env_mod.AUTH_INTERNAL_VARS:
+        env.pop(name, None)
+    env.update(binding.credentials)
+    if binding.environment != DEFAULT_MODAL_ENVIRONMENT:
+        env["MODAL_ENVIRONMENT"] = binding.environment
+
+
+def _apply_workspace_binding_to_process(binding: WorkspaceBinding) -> None:
+    """Set process-local Modal selection for source-probe transport."""
+    for name in env_mod.AUTH_INTERNAL_VARS:
+        os.environ.pop(name, None)
+    os.environ.pop("COMFYMODAL_ENVIRONMENT", None)
+    os.environ.update(binding.credentials)
+    if binding.environment == DEFAULT_MODAL_ENVIRONMENT:
+        os.environ.pop("MODAL_ENVIRONMENT", None)
+        os.environ.pop("COMFYMODAL_ENVIRONMENT", None)
+    else:
+        os.environ["MODAL_ENVIRONMENT"] = binding.environment
+        os.environ["COMFYMODAL_ENVIRONMENT"] = binding.environment
+
+
+@contextmanager
+def _workspace_process_environment(
+    binding: WorkspaceBinding | None, extra: Mapping[str, str] | None = None
+):
+    """Temporarily bind process-based Modal clients, restoring the parent env."""
+    original = dict(os.environ)
+    try:
+        if binding is not None:
+            _apply_workspace_binding_to_process(binding)
+        if extra:
+            os.environ.update({str(name): str(value) for name, value in extra.items()})
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(original)
+
+
+def _call_version_probe(app_name: str, binding: WorkspaceBinding) -> int | None:
+    """Call the version probe without breaking one-argument test fakes."""
+    try:
+        parameters = inspect.signature(_app_version_number).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if len(parameters) >= 3:
+        return _app_version_number(app_name, binding, binding.environment)
+    if len(parameters) >= 2:
+        return _app_version_number(app_name, binding)
+    return _app_version_number(app_name)
+
+
+class _FrozenWorkspaceBackendRunner:
+    """Inject a frozen workspace into every GateRunner/ConfirmRunner call.
+
+    GateRunner and ConfirmRunner own the execution loop and intentionally have
+    no workspace parameter.  Wrapping their existing backend API is narrower
+    than changing the shared validator: the wrapper rechecks the registry for
+    each actual invocation and puts the frozen credentials last in the child
+    environment, overriding any ambient Modal selection without mutating it.
+    """
+
+    def __init__(self, runner: Any, repo_root: Path, binding: WorkspaceBinding) -> None:
+        self._runner = runner
+        self._repo_root = Path(repo_root)
+        self._binding = binding
+
+    def run(self, spec, *, config, extra_args=(), extra_env=None, capture=True,
+            timeout_seconds=None, invocation_id=None, invocation_context=None,
+            canonical_identity=None, strict_canonical_discovery=False,
+            allow_multiple_run_artifacts=False):
+        assert_workspace_binding_current(self._repo_root, self._binding)
+        bound_env = dict(extra_env or {})
+        _apply_workspace_binding_to_env(bound_env, self._binding)
+        kwargs: dict[str, Any] = {
+            "config": config,
+            "extra_args": list(extra_args),
+            "extra_env": bound_env,
+            "capture": capture,
+            "timeout_seconds": timeout_seconds,
+            "invocation_id": invocation_id,
+            "invocation_context": invocation_context,
+            "canonical_identity": canonical_identity,
+            "strict_canonical_discovery": strict_canonical_discovery,
+            "allow_multiple_run_artifacts": allow_multiple_run_artifacts,
+        }
+        try:
+            parameters = inspect.signature(self._runner.run).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if not accepts_kwargs:
+            kwargs = {name: value for name, value in kwargs.items() if name in parameters}
+        return self._runner.run(spec, **kwargs)
+
+
+def _publisher_function_exists(
+    binding: WorkspaceBinding,
+    app_name: str = CUSTOM_NODES_PUBLISHER_APP_NAME,
+    function_name: str = PUBLISHER_FUNCTION_NAME,
+) -> bool | None:
+    """Probe the publisher Function using the frozen client/workspace."""
+    try:
+        import modal
+
+        client = modal.Client.from_credentials(binding.token_id, binding.token_secret)
+        modal.Function.from_name(
+            app_name,
+            function_name,
+            client=client,
+            environment_name=(
+                None if binding.environment == DEFAULT_MODAL_ENVIRONMENT
+                else binding.environment
+            ),
+        )
+        return True
+    except Exception as exc:
+        # A not-found response is absence.  Authentication, transport, and
+        # malformed-response failures are uncertainty and must fail closed.
+        text = str(exc).casefold()
+        if any(
+            re.search(pattern, text)
+            for pattern in (
+                r"\bfunction\b[^\n]*\b(?:not found|does not exist)\b",
+                r"\bno such function\b",
+                r"\bcould not find (?:the )?function\b",
+                r"\bapp(?:lication)?\b[^\n]*\b(?:not found|does not exist)\b",
+                r"\bno such app(?:lication)?\b",
+            )
+        ):
+            return False
+        return None
+
+
+def _publisher_probe(
+    repo_root: Path,
+    binding: WorkspaceBinding,
+    *,
+    publisher_app: str = CUSTOM_NODES_PUBLISHER_APP_NAME,
+    function_name: str = PUBLISHER_FUNCTION_NAME,
+) -> dict[str, object]:
+    """Default, credential-scoped publisher probes; all calls are lazy."""
+    from . import custom_nodes as custom_nodes_mod
+
+    version = _call_version_probe(publisher_app, binding)
+    function_exists = (
+        _publisher_function_exists(binding, publisher_app, function_name)
+        if version is not None else None
+    )
+    # ``_app_version_number`` uses zero for a known missing/no-deployments
+    # response.  A successful Function lookup disambiguates an existing app
+    # whose history is empty; otherwise zero is treated as missing.
+    if version is None:
+        app_exists: bool | None = None
+    else:
+        app_exists = version > 0 or function_exists is True
+    remote_generation: str | None = None
+    try:
+        volume = custom_nodes_mod.get_volume(
+            CUSTOM_NODES_VOLUME_NAME, workspace=binding._workspace_payload()
+        )
+        remote_generation = custom_nodes_mod._content_generation_readback(volume)
+    except Exception:
+        # A missing/unreadable volume is not an exact match and cannot become a
+        # skip by accident.
+        remote_generation = None
+    return {
+        "publisher_exists": app_exists,
+        "publisher_function_exists": function_exists,
+        "publisher_version": version,
+        "remote_generation": remote_generation,
+    }
+
+
+def _local_content_generation(repo_root: Path) -> str:
+    from . import custom_nodes as custom_nodes_mod
+
+    source_root = custom_nodes_mod.resolve_custom_nodes_root(repo_root)
+    identity = custom_nodes_mod.build_source_identity(source_root)
+    return str(identity.content_generation)
+
+
+def _write_publisher_preflight(repo_root: Path, data: Mapping[str, object]) -> Path:
+    directory = Path(repo_root) / ".v2ctl" / "publisher_preflight"
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_workspace = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(data["WORKSPACE"]))
+    path = directory / f"publisher_{safe_workspace}.json"
+    path.write_text(
+        json.dumps(
+            {field: data.get(field) for field in PUBLISHER_PREFLIGHT_FIELDS},
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def run_publisher_preflight(
+    repo_root: Path,
+    binding: WorkspaceBinding,
+    *,
+    local_content_generation: str | None = None,
+    probe: Any | None = None,
+    publisher_app: str = CUSTOM_NODES_PUBLISHER_APP_NAME,
+    function_name: str = PUBLISHER_FUNCTION_NAME,
+    require_ready: bool = False,
+) -> dict[str, object]:
+    """Resolve the publisher decision and persist its control-plane record.
+
+    ``probe`` is injectable so tests can prove ordering without Modal/GPU
+    calls.  It receives ``(repo_root, binding)`` or just ``binding``.
+    """
+    assert_workspace_binding_current(repo_root, binding)
+    local = local_content_generation or _local_content_generation(repo_root)
+    if probe is None:
+        observed = _publisher_probe(
+            repo_root, binding, publisher_app=publisher_app, function_name=function_name
+        )
+    elif isinstance(probe, Mapping):
+        observed = probe
+    else:
+        try:
+            count = len(inspect.signature(probe).parameters)
+        except (TypeError, ValueError):
+            count = 2
+        observed = probe(repo_root, binding) if count >= 2 else probe(binding)
+    if not isinstance(observed, Mapping):
+        raise GateError("publisher preflight probe returned malformed state")
+    def presence(*names: str) -> bool | None:
+        for name in names:
+            if name in observed:
+                value = observed[name]
+                if value is None:
+                    return None
+                if isinstance(value, bool):
+                    return value
+                normalized = str(value).strip().casefold()
+                if normalized in {"1", "true", "yes", "on", "exists"}:
+                    return True
+                if normalized in {"0", "false", "no", "off", "absent", "missing"}:
+                    return False
+                return None
+        return None
+
+    app_exists = presence("publisher_exists", "app_exists")
+    function_exists = presence("publisher_function_exists", "function_exists")
+    version = observed.get("publisher_version", observed.get("version"))
+    if isinstance(version, str) and version.strip().isdigit():
+        version = int(version.strip())
+    remote = observed.get("remote_generation", observed.get("content_generation"))
+    remote = str(remote).strip() if remote is not None and str(remote).strip() else None
+    version_known = type(version) is int and version >= 0
+    if not local or not version_known or app_exists is None or function_exists is None:
+        decision = "invalid"
+    elif not app_exists or not function_exists:
+        decision = "bootstrap_required"
+    elif remote is None:
+        decision = "invalid"
+    elif remote == local:
+        decision = "skip_exact"
+    else:
+        decision = "publish_required"
+    bootstrap_required = bool(
+        version_known and (app_exists is False or function_exists is False)
+    )
+    # Consumer readiness is an exact full-content proof, not merely permission
+    # to attempt publication.  The deploy path explicitly admits
+    # publish_required once, then performs this exact final preflight.
+    ready = bool(
+        app_exists is True
+        and function_exists is True
+        and version_known
+        and local
+        and remote == local
+    )
+    data: dict[str, object] = {
+        "WORKSPACE": binding.workspace_id,
+        "ENVIRONMENT": binding.environment,
+        "PUBLISHER_APP": publisher_app,
+        "PUBLISHER_EXISTS": app_exists,
+        "PUBLISHER_FUNCTION_EXISTS": function_exists,
+        "PUBLISHER_VERSION_BEFORE": version,
+        "LOCAL_CONTENT_GENERATION": local,
+        "REMOTE_CONTENT_GENERATION": remote,
+        "PUBLICATION_DECISION": decision,
+        "BOOTSTRAP_REQUIRED": bootstrap_required,
+        "READY_FOR_CONSUMER_DEPLOY": ready,
+    }
+    path = _write_publisher_preflight(repo_root, data)
+    data["artifact_path"] = str(path)
+    if require_ready and not ready:
+        raise GateError(
+            "publisher preflight is not ready for consumer deploy: "
+            f"decision={decision} bootstrap_required={bootstrap_required}"
+        )
+    return data
+
+
+def _verify_publisher_after_bootstrap(
+    repo_root: Path,
+    binding: WorkspaceBinding,
+    before: Mapping[str, object],
+    *,
+    probe: Any | None = None,
+) -> dict[str, object]:
+    """Require app/Function presence and a version advance after bootstrap."""
+    assert_workspace_binding_current(repo_root, binding)
+    after = run_publisher_preflight(
+        repo_root,
+        binding,
+        local_content_generation=(
+            str(before.get("LOCAL_CONTENT_GENERATION") or "") or None
+        ),
+        probe=probe,
+    )
+    before_version = before.get("PUBLISHER_VERSION_BEFORE")
+    after_version = after.get("PUBLISHER_VERSION_BEFORE")
+    if not isinstance(before_version, int) or not isinstance(after_version, int):
+        raise GateError("publisher bootstrap version proof is unavailable")
+    if after_version <= before_version:
+        raise GateError("publisher bootstrap did not advance deployment version")
+    if not after["PUBLISHER_EXISTS"] or not after["PUBLISHER_FUNCTION_EXISTS"]:
+        raise GateError("publisher bootstrap did not verify app and Function")
+    return after
+
+
+def _print_golden_predeploy_card(
+    invocation_id: str, preflight: Mapping[str, object], *, lock_state: str = "CLEAR"
+) -> None:
+    """Print the compact RX9P-A admission card, without credentials."""
+    yes_no = lambda value: "YES" if value else "NO"
+    print("[v2ctl.golden.pre-deploy]")
+    print(f"EXPERIMENT_ID={invocation_id}")
+    print(f"MODAL_WORKSPACE={preflight.get('WORKSPACE', '')}")
+    print(f"MODAL_ENVIRONMENT={preflight.get('ENVIRONMENT', '')}")
+    print(f"PUBLISHER_APP={preflight.get('PUBLISHER_APP', '')}")
+    print(f"PUBLISHER_EXISTS={yes_no(preflight.get('PUBLISHER_EXISTS'))}")
+    print(
+        "PUBLISHER_FUNCTION_EXISTS="
+        f"{yes_no(preflight.get('PUBLISHER_FUNCTION_EXISTS'))}"
+    )
+    print(f"PUBLISHER_VERSION={preflight.get('PUBLISHER_VERSION_BEFORE')}")
+    print(f"LOCAL_CONTENT_GENERATION={preflight.get('LOCAL_CONTENT_GENERATION', '')}")
+    print(f"REMOTE_CONTENT_GENERATION={preflight.get('REMOTE_CONTENT_GENERATION') or '(none)'}")
+    print(f"PUBLICATION_DECISION={preflight.get('PUBLICATION_DECISION', 'invalid')}")
+    print(f"DEPLOY_LOCK={lock_state}")
+    print(
+        "READY_FOR_CONSUMER_DEPLOY="
+        f"{yes_no(preflight.get('READY_FOR_CONSUMER_DEPLOY'))}"
+    )
+
+
 
 # ── Manifests ──────────────────────────────────────────────────────────
 
@@ -726,7 +1251,11 @@ def _receipt_target(config: config_mod.ResolvedConfig) -> dict[str, str]:
 
 
 def _bound_deployment_receipt(
-    repo_root: Path, config: config_mod.ResolvedConfig, *, command: str
+    repo_root: Path,
+    config: config_mod.ResolvedConfig,
+    *,
+    command: str,
+    workspace_binding: WorkspaceBinding | None = None,
 ) -> tuple[Path, receipt_mod.DeploymentReceipt]:
     """Load the immutable Golden authority and perform host admission checks."""
     selected = receipt_mod.latest_deployment_receipt(
@@ -742,7 +1271,11 @@ def _bound_deployment_receipt(
         raise GateError(f"{command} deployment receipt profile mismatch")
     # A different app version is a different remote deployment, even when the
     # local source happens to be unchanged.  Unknown lookup is fail-closed.
-    current_version = _app_version_number(receipt.target["app"])
+    current_version = (
+        _call_version_probe(receipt.target["app"], workspace_binding)
+        if workspace_binding is not None
+        else _app_version_number(receipt.target["app"])
+    )
     if current_version is None or current_version != receipt.deployment_version:
         raise GateError(
             f"{command} deployment receipt version mismatch: stored="
@@ -791,6 +1324,19 @@ def _receipt_effective_env(
         bound["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = receipt.profile_config_fingerprint
     return bound
 
+def _require_receipt_workspace(
+    receipt: receipt_mod.DeploymentReceipt, binding: WorkspaceBinding, *, command: str
+) -> None:
+    identity = receipt.deployment_identity
+    workspace = str(identity.get("modal_workspace", ""))
+    environment = str(identity.get("modal_environment", ""))
+    if workspace != binding.workspace_id or environment != binding.environment:
+        raise GateError(
+            f"{command} deployment receipt workspace/environment mismatch: "
+            f"stored={workspace}/{environment} current={binding.workspace_id}/{binding.environment}"
+        )
+
+
 
 def _run_manifest_dir(repo_root: Path) -> Path:
     return repo_root / ".v2ctl" / "runs"
@@ -814,6 +1360,8 @@ class DeployIdentitySnapshot:
 
     deploy_fingerprint: str
     deploy_inputs: Mapping[str, Any]
+    workspace_id: str = ""
+    environment: str = ""
     profile_config_fingerprint: str
 
 
@@ -837,13 +1385,17 @@ def _thaw_deploy_identity(value: Any) -> Any:
     return value
 
 
-def capture_deploy_identity(fingerprints: object) -> DeployIdentitySnapshot:
+def capture_deploy_identity(
+    fingerprints: object, binding: WorkspaceBinding | None = None
+) -> DeployIdentitySnapshot:
     """Capture all persisted deploy identity values exactly once."""
     deploy_fingerprint = getattr(fingerprints, "deploy_fingerprint")
     deploy_inputs = getattr(fingerprints, "deploy_inputs")
     return DeployIdentitySnapshot(
         deploy_fingerprint=str(deploy_fingerprint()),
         deploy_inputs=_freeze_deploy_identity(deploy_inputs()),
+        workspace_id=binding.workspace_id if binding is not None else "",
+        environment=binding.environment if binding is not None else "",
         profile_config_fingerprint=_profile_config_fingerprint(fingerprints),
     )
 
@@ -887,6 +1439,8 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
+        "modal_workspace": deploy_identity.workspace_id if deploy_identity else "",
+        "modal_environment": deploy_identity.environment if deploy_identity else "",
         "owner": config.owner,
         "git": {"head": config.git.head, "branch": config.git.branch, "dirty": config.git.dirty},
         "target": {"app": config.target.app, "class": config.target.class_name, "method": config.target.method},
@@ -1042,6 +1596,8 @@ def _write_golden_deployment_receipt(
             "class": str(config.target.class_name),
             "method": str(config.target.method),
             "version": deployment_version,
+            "modal_workspace": deploy_identity.workspace_id,
+            "modal_environment": deploy_identity.environment,
             "deploy_fingerprint": deploy_identity.deploy_fingerprint,
             "resources": {
                 "gpu": str(config.resources.gpu),
@@ -1082,6 +1638,8 @@ def _write_golden_deployment_receipt(
                 "memory_mb": int(config.resources.memory_mb),
             },
             "deploy_flags": deployment_flag_values,
+            "modal_workspace": deploy_identity.workspace_id,
+            "modal_environment": deploy_identity.environment,
             "deploy_inputs": _thaw_deploy_identity(deploy_identity.deploy_inputs),
         },
         receipt_path=str(planned_path),
@@ -1267,6 +1825,14 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
+        "modal_workspace": (
+            deployment_receipt.deployment_identity.get("modal_workspace", "")
+            if deployment_receipt is not None else ""
+        ),
+        "modal_environment": (
+            deployment_receipt.deployment_identity.get("modal_environment", "")
+            if deployment_receipt is not None else ""
+        ),
         "owner": config.owner,
         "deploy_fingerprint": deploy_fp,
         "run_fingerprint": run_fp,
@@ -1881,7 +2447,10 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
 
 
 def _publish_golden_custom_nodes(
-    repo_root: Path, publisher_app_name: str | None = None
+    repo_root: Path,
+    publisher_app_name: str | None = None,
+    workspace_binding: WorkspaceBinding | None = None,
+    local_content_generation: str | None = None,
 ):
     """Mirror the canonical custom-node source before a native Golden deploy.
 
@@ -1892,13 +2461,23 @@ def _publish_golden_custom_nodes(
     profile.
     """
     from . import custom_nodes as custom_nodes_mod
+    if workspace_binding is not None:
+        assert_workspace_binding_current(repo_root, workspace_binding)
+
 
     # Keep the optional parameter as a compatibility surface for older hooks,
     # but never allow a consumer name to select the authority.
     publisher_app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
 
     source_root = custom_nodes_mod.resolve_custom_nodes_root(repo_root)
-    workspace = _active_workspace(repo_root)
+    workspace = (
+        workspace_binding._workspace_payload()
+        if workspace_binding is not None else _active_workspace(repo_root)
+    )
+    secrets = (
+        {str(name): str(value) for name, value in workspace.items()}
+        if isinstance(workspace, Mapping) else {}
+    )
 
     def identity_provider(_root: str | Path) -> dict[str, str]:
         from comfymodal_runtime.deployment_spec import build_deployment_identity
@@ -1917,17 +2496,37 @@ def _publish_golden_custom_nodes(
         return await sync_custom_nodes(
             archive, workspace=workspace, app_name=publisher_app_name
         )
+    process_extra = {
+        "COMFYMODAL_V2_APP_NAME": publisher_app_name,
+    }
+    process_scope = (
+        _workspace_process_environment(workspace_binding, process_extra)
+        if workspace_binding is not None else None
+    )
 
     try:
-        decision = custom_nodes_mod.run_publish_or_skip(
-            source_root,
-            volume_name=CUSTOM_NODES_VOLUME_NAME,
-            publisher=publisher,
-            workspace=workspace,
-            identity_provider=identity_provider,
-        )
+        if process_scope is None:
+            decision = custom_nodes_mod.run_publish_or_skip(
+                source_root,
+                volume_name=CUSTOM_NODES_VOLUME_NAME,
+                publisher=publisher,
+                workspace=workspace,
+                identity_provider=identity_provider,
+            )
+        else:
+            with process_scope:
+                decision = custom_nodes_mod.run_publish_or_skip(
+                    source_root,
+                    volume_name=CUSTOM_NODES_VOLUME_NAME,
+                    publisher=publisher,
+                    workspace=workspace,
+                    identity_provider=identity_provider,
+                )
     except Exception as exc:  # noqa: BLE001 - publication is a deploy gate
-        raise GateError(f"custom-node publication failed: {type(exc).__name__}: {exc}") from exc
+        raise GateError(
+            "custom-node publication failed: "
+            + _safe_exception_diagnostic(exc, secrets=secrets)
+        ) from exc
     if decision.skip:
         print(
             "[custom_nodes.publish] decision=skip_exact "
@@ -1951,15 +2550,19 @@ def _publish_golden_custom_nodes(
             # dumping the response (or any credentials it might contain).
             diagnostic = json.dumps(
                 {
-                    "status": result.get("status"),
-                    "comfyapp_version": result.get("comfyapp_version"),
-                    "reason": result.get("reason"),
-                    "error": result.get("error"),
+                    "status": _safe_public_value(result.get("status"), secrets),
+                    "comfyapp_version": _safe_public_value(
+                        result.get("comfyapp_version"), secrets
+                    ),
+                    "reason": _safe_public_value(result.get("reason"), secrets),
+                    "error": _safe_public_value(result.get("error"), secrets),
                     "expected_generation": expected_generation[:16] or None,
-                    "result_generation": result_generation[:16] or None,
-                    "readback_generation": str(
-                        result.get("readback_generation") or ""
-                    )[:16] or None,
+                    "result_generation": _safe_public_value(
+                        result_generation[:16], secrets
+                    ),
+                    "readback_generation": _safe_public_value(
+                        result.get("readback_generation"), secrets
+                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -1979,10 +2582,11 @@ def _publish_golden_custom_nodes(
             )
         raise GateError(
             "Golden deploy requires verified custom-node publication: "
-            f"{decision.reason} result={diagnostic}"
+            f"{_safe_public_value(decision.reason, secrets) or 'unknown'} result={diagnostic}"
         )
     print(
-        f"[custom_nodes.publish] decision={decision.action} reason={decision.reason} "
+        f"[custom_nodes.publish] decision={decision.action} "
+        f"reason={_safe_public_value(decision.reason, secrets) or 'unknown'} "
         f"generation={decision.identity.generation[:12]} "
         f"schema={custom_nodes_mod.RECEIPT_SCHEMA_VERSION} "
         f"policy={custom_nodes_mod.PACKAGING_POLICY_VERSION}"
@@ -1991,20 +2595,38 @@ def _publish_golden_custom_nodes(
 
 
 def _invoke_golden_publisher(
-    repo_root: Path, publisher_app_name: str
+    repo_root: Path,
+    publisher_app_name: str,
+    workspace_binding: WorkspaceBinding | None = None,
+    local_content_generation: str | None = None,
 ):
     """Pass the isolated app to the current hook without breaking old hooks."""
     hook = _publish_golden_custom_nodes
     try:
         parameters = inspect.signature(hook).parameters
     except (TypeError, ValueError):
+    kwargs = {}
+    if "workspace_binding" in parameters:
+        kwargs["workspace_binding"] = workspace_binding
+    if "local_content_generation" in parameters:
+        kwargs["local_content_generation"] = local_content_generation
         parameters = {}
     if "publisher_app_name" in parameters or any(
         parameter.kind is inspect.Parameter.VAR_POSITIONAL
         for parameter in parameters.values()
     ):
-        return hook(repo_root, CUSTOM_NODES_PUBLISHER_APP_NAME)
-    return hook(repo_root)
+        return hook(repo_root, CUSTOM_NODES_PUBLISHER_APP_NAME, **kwargs)
+    return hook(repo_root, **kwargs)
+
+
+def _assert_publication_generation(publication: object, expected: str) -> None:
+    """Keep the preflight and publisher on one full-content generation."""
+    actual = str(getattr(getattr(publication, "identity", None), "generation", "") or "")
+    if not expected or actual != expected:
+        raise GateError(
+            "custom-node publication generation mismatch: "
+            f"expected={expected[:16] or '(none)'} actual={actual[:16] or '(none)'}"
+        )
 
 
 def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
@@ -2028,6 +2650,7 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             env_builder,
             backend_registry,
         ) = _build_components_for_args(repo_root, args)
+        workspace_binding = _workspace_binding_for_args(args, repo_root)
         _reject_protected_effective_target(config, command="v2ctl golden publisher-bootstrap")
         publisher_app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
         invocation_id = _new_invocation_id()
@@ -2041,7 +2664,9 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             },
         )
         env = _native_golden_deploy_env(env)
-        if not dry_run:
+        if workspace_binding is not None:
+            _apply_workspace_binding_to_env(env, workspace_binding)
+        elif not dry_run:
             env.update(_active_workspace_credentials(repo_root))
         extra_args = ["--name", publisher_app_name]
         command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
@@ -2055,6 +2680,7 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
         lock.acquire(
             owner=config.owner or args.owner or "v2ctl",
             target=publisher_app_name,
+            auto_recover=True,
             profile=config.profile_name,
         )
         try:
@@ -2062,14 +2688,26 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                 f"[v2ctl.publisher-bootstrap] app={publisher_app_name} "
                 f"command={command}"
             )
-            pre_version = _app_version_number(publisher_app_name)
-            if pre_version is None:
+            preflight = None
+            if workspace_binding is not None:
+                preflight = run_publisher_preflight(repo_root, workspace_binding)
+                pre_version = preflight.get("PUBLISHER_VERSION_BEFORE")
+                if preflight.get("PUBLICATION_DECISION") == "invalid":
+                    raise GateError(
+                        "publisher bootstrap preflight is unknown/invalid; "
+                        "refusing to bootstrap on uncertain lookup state"
+                    )
+            else:
+                pre_version = _app_version_number(publisher_app_name)
+            if not isinstance(pre_version, int):
                 print(
                     "ERROR: unable to establish the publisher app's pre-deploy "
                     "version; refusing to invoke the backend",
                     file=sys.stderr,
                 )
                 return 1
+            if workspace_binding is not None:
+                assert_workspace_binding_current(repo_root, workspace_binding)
 
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec,
@@ -2079,7 +2717,11 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                 capture=True,
                 invocation_id=invocation_id,
             )
-            post_version = _app_version_number(publisher_app_name)
+            post_version = (
+                _call_version_probe(publisher_app_name, workspace_binding)
+                if workspace_binding is not None
+                else _app_version_number(publisher_app_name)
+            )
             if post_version is None:
                 print(
                     "ERROR: unable to establish the publisher app's post-deploy "
@@ -2095,6 +2737,12 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                     "as valid",
                     file=sys.stderr,
                 )
+            if workspace_binding is not None:
+                postflight = run_publisher_preflight(repo_root, workspace_binding)
+                if not postflight["PUBLISHER_EXISTS"] or not postflight["PUBLISHER_FUNCTION_EXISTS"]:
+                    raise GateError(
+                        "publisher bootstrap did not verify app and required Function"
+                    )
                 return 1
             if not result.ok():
                 _print_backend_diagnostic(result, env)
@@ -2120,6 +2768,10 @@ def cmd_deploy(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl deploy")
+        workspace_binding = (
+            _workspace_binding_for_args(args, repo_root)
+            if config.profile_name == GOLDEN_P1_PROFILE else None
+        )
         _reject_golden_mode_override(config, command="v2ctl deploy")
         unregistered_explicit = [
             flag for flag in config.unregistered if flag.source in {"cli", "inherit", "set"}
@@ -2147,10 +2799,13 @@ def cmd_deploy(args, repo_root: Path) -> int:
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
         if native_golden:
             env = _native_golden_deploy_env(env)
-        if native_golden and not args.dry_run:
+        if native_golden:
             # The active workspace, not the user's ambient Modal profile, owns
             # this deploy.  Values are redacted by the normal dry-run report.
-            env.update(_active_workspace_credentials(repo_root))
+            if workspace_binding is not None:
+                _apply_workspace_binding_to_env(env, workspace_binding)
+            elif not args.dry_run:
+                env.update(_active_workspace_credentials(repo_root))
         # Historical deploy branches receive their selector as the first BAT
         # argument. Native Golden deploy has one explicit Modal app argument
         # and must not be routed through a harness selector.
@@ -2172,14 +2827,16 @@ def cmd_deploy(args, repo_root: Path) -> int:
                   "they will be enforced at gate/run time", file=sys.stderr)
         lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
         lock.acquire(owner=config.owner or args.owner or "v2ctl",
-                     target=config.target.app, profile=config.profile_name)
+                     target=config.target.app, profile=config.profile_name,
+                     auto_recover=True)
         try:
-            deploy_identity = capture_deploy_identity(fingerprints)
+            deploy_identity = capture_deploy_identity(fingerprints, workspace_binding)
             _apply_deploy_identity_to_env(env, deploy_identity)
             print(f"[v2ctl.deploy] profile={config.profile_name} "
                   f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
             print(f"[v2ctl.deploy] command={command}")
             publication = None
+            final_publisher_preflight = None
             source_probe_expected = None
             if native_golden:
                 assert publisher_app_name is not None
@@ -2187,12 +2844,52 @@ def cmd_deploy(args, repo_root: Path) -> int:
 
                 # Capture the exact source expectation alongside the frozen
                 # deploy identity, before publication or backend work starts.
+                publisher_preflight = None
+                publication_generation = (
+                    _local_content_generation(repo_root)
+                    if workspace_binding is not None else ""
+                )
+                if workspace_binding is not None:
+                    publisher_preflight = run_publisher_preflight(
+                        repo_root,
+                        workspace_binding,
+                        local_content_generation=publication_generation,
+                        require_ready=False,
+                    )
+                    if publisher_preflight["PUBLICATION_DECISION"] == "bootstrap_required":
+                        raise GateError(
+                            "consumer deploy is gated: publisher bootstrap is required"
+                        )
+                    if publisher_preflight["PUBLICATION_DECISION"] not in {
+                        "skip_exact", "publish_required"
+                    }:
+                        raise GateError(
+                            "consumer deploy is gated: publisher generation preflight is invalid"
+                        )
                 source_probe_expected = source_probe_mod.compute_expected_local(repo_root)
                 # This is deliberately inside the deploy lock and before both
                 # version capture and native Modal deployment.  A publication
                 # failure exits through the lock's finally block and prevents
                 # the backend from running.
-                publication = _invoke_golden_publisher(repo_root, publisher_app_name)
+                publication = _invoke_golden_publisher(
+                    repo_root,
+                    publisher_app_name,
+                    workspace_binding,
+                    publication_generation,
+                )
+                if workspace_binding is not None:
+                    _assert_publication_generation(publication, publication_generation)
+                    final_publisher_preflight = run_publisher_preflight(
+                        repo_root,
+                        workspace_binding,
+                        local_content_generation=publication_generation,
+                        require_ready=True,
+                    )
+                    _print_golden_predeploy_card(
+                        invocation_id,
+                        final_publisher_preflight,
+                        lock_state="RECOVERED" if lock.last_recovery else "CLEAR",
+                    )
             # ── Deploy-version-advance verification (E29 root-cause fix) ──
             # Capture the app's highest deployment version BEFORE the deploy
             # so a post-deploy comparison can prove a NEW version appeared
@@ -2202,7 +2899,11 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # the target app received a new deployment version.  A successful
             # backend exit alone can also represent a no-op deploy.
             verify_version = True
-            _pre_version = _app_version_number(config.target.app)
+            _pre_version = (
+                _call_version_probe(config.target.app, workspace_binding)
+                if workspace_binding is not None
+                else _app_version_number(config.target.app)
+            )
             if _pre_version is None:
                 print(
                     "ERROR: unable to establish the app's pre-deploy version; "
@@ -2318,7 +3019,8 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
                                   spend=True)
         lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
         lock.acquire(owner=config.owner or args.owner or "v2ctl",
-                     target=config.target.app, profile=config.profile_name)
+                     target=config.target.app, profile=config.profile_name,
+                     auto_recover=True)
         try:
             deploy_identity = capture_deploy_identity(fingerprints)
             _apply_deploy_identity_to_env(env, deploy_identity)
@@ -2366,10 +3068,22 @@ def cmd_run(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl run")
+        workspace_binding = (
+            _workspace_binding_for_args(args, repo_root)
+            if config.profile_name == GOLDEN_P1_PROFILE else None
+        )
         _reject_golden_mode_override(config, command="v2ctl run")
         bound_receipt = None
         if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
-            _, bound_receipt = _bound_deployment_receipt(repo_root, config, command="run")
+            receipt_kwargs = ({"workspace_binding": workspace_binding}
+                              if workspace_binding is not None else {})
+            _, bound_receipt = _bound_deployment_receipt(
+                repo_root, config, command="run", **receipt_kwargs
+            )
+            if workspace_binding is not None:
+                _require_receipt_workspace(bound_receipt, workspace_binding, command="run")
+                assert_workspace_binding_current(repo_root, workspace_binding)
+                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
         # Run-only: refuse unregistered and deploy-required explicit changes.
         resolver.check_run_safety(
             config, run_only=True,
@@ -2434,6 +3148,8 @@ def cmd_run(args, repo_root: Path) -> int:
                                 backend_extra={"V2_BENCHMARK_RUNS": str(run_count),
                                                **_identity_env_for_command("run", config),
                                                **selector_env,
+        if workspace_binding is not None:
+            _apply_workspace_binding_to_env(env, workspace_binding)
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
         if bound_receipt is not None:
             env = _receipt_effective_env(env, bound_receipt)
@@ -2514,10 +3230,22 @@ def cmd_gate(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl gate")
+        workspace_binding = (
+            _workspace_binding_for_args(args, repo_root)
+            if config.profile_name == GOLDEN_P1_PROFILE else None
+        )
         _reject_golden_mode_override(config, command="v2ctl gate")
         bound_receipt = None
         if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
-            _, bound_receipt = _bound_deployment_receipt(repo_root, config, command="gate")
+            receipt_kwargs = ({"workspace_binding": workspace_binding}
+                              if workspace_binding is not None else {})
+            _, bound_receipt = _bound_deployment_receipt(
+                repo_root, config, command="gate", **receipt_kwargs
+            )
+            if workspace_binding is not None:
+                _require_receipt_workspace(bound_receipt, workspace_binding, command="gate")
+                assert_workspace_binding_current(repo_root, workspace_binding)
+                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
         resolver.check_run_safety(
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
@@ -2559,6 +3287,8 @@ def cmd_gate(args, repo_root: Path) -> int:
                 config, host_env=os.environ,
                 backend_extra={"V2_BENCHMARK_RUNS": "1", **selector_env,
                                **_canonical_metadata_env(config, fingerprints, invocation_id)},
+            if workspace_binding is not None:
+                _apply_workspace_binding_to_env(env, workspace_binding)
             )
             command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
@@ -2582,6 +3312,10 @@ def cmd_gate(args, repo_root: Path) -> int:
         clean_lane_validator = val_mod.E37CleanLaneProofValidator()
         if clean_lane_validator.applies(config):
             validator.register(clean_lane_validator)
+        if workspace_binding is not None:
+            runner = _FrozenWorkspaceBackendRunner(
+                runner, repo_root, workspace_binding
+            )
         runner = backend_mod.BackendRunner(repo_root, env_builder)
         gate = val_mod.GateRunner(repo_root=repo_root, fingerprints=fingerprints,
                                    validators=validator, backend_runner=runner,
@@ -2630,10 +3364,22 @@ def cmd_confirm(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl confirm")
+        workspace_binding = (
+            _workspace_binding_for_args(args, repo_root)
+            if config.profile_name == GOLDEN_P1_PROFILE else None
+        )
         _reject_golden_mode_override(config, command="v2ctl confirm")
         bound_receipt = None
         if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
-            _, bound_receipt = _bound_deployment_receipt(repo_root, config, command="confirm")
+            receipt_kwargs = ({"workspace_binding": workspace_binding}
+                              if workspace_binding is not None else {})
+            _, bound_receipt = _bound_deployment_receipt(
+                repo_root, config, command="confirm", **receipt_kwargs
+            )
+            if workspace_binding is not None:
+                _require_receipt_workspace(bound_receipt, workspace_binding, command="confirm")
+                assert_workspace_binding_current(repo_root, workspace_binding)
+                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
         resolver.check_run_safety(
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
@@ -2650,10 +3396,16 @@ def cmd_confirm(args, repo_root: Path) -> int:
             extra_args, selector_env = _validation_backend_args(config)
             env = env_builder.build(config, host_env=os.environ,
                                     backend_extra={"V2_BENCHMARK_RUNS": "1", **selector_env,
+            if workspace_binding is not None:
+                _apply_workspace_binding_to_env(env, workspace_binding)
                                                    **_canonical_metadata_env(config, fingerprints, invocation_id)})
             command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
             return 0
+        if workspace_binding is not None:
+            runner = _FrozenWorkspaceBackendRunner(
+                runner, repo_root, workspace_binding
+            )
         runner = backend_mod.BackendRunner(repo_root, env_builder)
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
@@ -2713,14 +3465,31 @@ def cmd_source_probe(args, repo_root: Path) -> int:
             _build_components_for_args(repo_root, args)
         )
         _reject_protected_effective_target(config, command="v2ctl source-probe")
+        workspace_binding = (
+            _workspace_binding_for_args(args, repo_root)
+            if config.profile_name == GOLDEN_P1_PROFILE else None
+        )
+        if getattr(args, "dry_run", False):
+            print("[v2ctl.dry-run] no invocation performed; source probe skipped")
+            print(
+                f"target.app={config.target.app} target.class={config.target.class_name} "
+                f"target.gpu={config.resources.gpu}"
+            )
+            return 0
         _reject_golden_mode_override(config, command="v2ctl source-probe")
         app_name = config.target.app
         class_name = config.target.class_name
         gpu = config.resources.gpu
         bound_receipt = None
+            receipt_kwargs = ({"workspace_binding": workspace_binding}
+                              if workspace_binding is not None else {})
         if config.profile_name == GOLDEN_P1_PROFILE:
             _, bound_receipt = _bound_deployment_receipt(
-                repo_root, config, command="source-probe"
+                repo_root, config, command="source-probe", **receipt_kwargs
+            if workspace_binding is not None:
+                _require_receipt_workspace(bound_receipt, workspace_binding, command="source-probe")
+                assert_workspace_binding_current(repo_root, workspace_binding)
+                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
             )
         deploy_fp = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
         expected_source = (
@@ -2728,17 +3497,22 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         )
         if bound_receipt is not None and not isinstance(expected_source, dict):
             raise GateError("deployment receipt has no source-probe expectation")
-        workspace = sp._load_workspace(repo_root)
-        import os as _os
-        if app_name:
-            _os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
-        if class_name:
-            _os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
-        if gpu:
-            _os.environ["COMFYMODAL_V2_GPU"] = str(gpu)
-
-        exit_code, report = sp.run_source_probe(
-            repo_root, workspace=workspace, gpu=str(gpu), expected=expected_source
+        workspace = (
+            workspace_binding._workspace_payload()
+            if workspace_binding is not None else sp._load_workspace(repo_root)
+        probe_env = {
+            name: str(value)
+            for name, value in {
+                "COMFYMODAL_V2_APP_NAME": app_name,
+                "COMFYMODAL_V2_CLASS_NAME": class_name,
+                "COMFYMODAL_V2_GPU": gpu,
+            }.items()
+            if value
+        }
+        with _workspace_process_environment(workspace_binding, probe_env):
+            exit_code, report = sp.run_source_probe(
+                repo_root, workspace=workspace, gpu=str(gpu), expected=expected_source
+            )
         )
         if bound_receipt is not None:
             receipt_mod.write_source_probe_evidence(repo_root, bound_receipt, report)
@@ -2921,6 +3695,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--owner", default=None, help="deploy owner label for the lock")
     parser.add_argument("--dry-run", action="store_true", help="resolve and print, invoke nothing")
     parser.add_argument("--json", action="store_true", help="machine-readable output where supported")
+    parser.add_argument(
+        "--workspace", "--workspace-id", dest="workspace_id", default=None,
+        help="explicit Modal workspace id from .modal_workspaces.json",
+    )
+    parser.add_argument(
+        "--environment", dest="environment", default=None,
+        help="explicit Modal environment (default: registry/default environment)",
+    )
     parser.add_argument("--app", default=None, help="override target app (protected from --set)")
     parser.add_argument("--gpu", default=None, help="override resource GPU")
     parser.add_argument("--memory-mb", type=int, default=None, help="override resource memory")
@@ -3016,6 +3798,9 @@ def build_parser() -> argparse.ArgumentParser:
 _GLOBAL_HOIST_WITH_VALUE = (
     "--profile",
     "--owner",
+    "--workspace",
+    "--workspace-id",
+    "--environment",
     "--app",
     "--gpu",
     "--memory-mb",
