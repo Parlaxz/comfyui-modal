@@ -456,6 +456,21 @@ def test_validate_transport_records_accepts_exact_run():
     assert ok, reason
 
 
+def test_validate_transport_records_uses_independent_static_plan_identity():
+    planned = [(0, 0, 4, "a"), (4, 4, 4, "b")]
+    records = [
+        {"off": 0, "destination_offset": 0, "planned_len": 4, "record_id": "a",
+         "read_len": 4, "h2d_submitted_bytes": 4, "h2d_completed_bytes": 4},
+        {"off": 4, "destination_offset": 4, "planned_len": 4, "record_id": "b",
+         "read_len": 4, "h2d_submitted_bytes": 4, "h2d_completed_bytes": 4},
+    ]
+    ok, reason = gs.validate_transport_records(records, planned, 0, 8)
+    assert ok, reason
+    records[0]["destination_offset"] = 4
+    ok, reason = gs.validate_transport_records(records, planned, 0, 8)
+    assert not ok and reason.startswith("block_count_or_identity")
+
+
 def test_short_read_fails_closed():
     records = _good_records()
     records[1]["read_len"] = 2

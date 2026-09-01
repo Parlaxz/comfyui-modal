@@ -1597,7 +1597,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         source_reads.setdefault("wall_ms", source_wall_ms)
     if "per_read" not in source_reads and experiment.get("source_reads_per_read") is not None:
         source_reads["per_read"] = copy.deepcopy(experiment["source_reads_per_read"])
-    if execution_arm == "dispatcher":
+    if execution_arm in {"dispatcher", "static_e27"}:
         # The dispatcher performs the positioned read directly into the lease.
         # There is no separate CPU-to-pinned copy or legacy pinned-slot reuse,
         # but CudaTransferBackend still allocates real pinned staging storage.
@@ -1664,7 +1664,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
                 "timing_scope": "PARTIAL H2D submit-to-event completion latency",
             }
     lease_wait = dict(stats.get("lease_wait") or {})
-    if not lease_wait and execution_arm == "dispatcher":
+    if not lease_wait and execution_arm in {"dispatcher", "static_e27"}:
         lease_wait = {
             "wait_ns": (
                 int(float(experiment["producer_capacity_block_wall_ms"]) * 1e6)
@@ -1681,7 +1681,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "timing_scope": "TOTAL waits to acquire a reusable dispatcher lease",
         }
     ready_backpressure = dict(stats.get("ready_backpressure") or {})
-    if not ready_backpressure and execution_arm == "dispatcher":
+    if not ready_backpressure and execution_arm in {"dispatcher", "static_e27"}:
         ready_backpressure = {
             "wait_ns": (
                 int(float(experiment["ready_queue_block_wall_ms"]) * 1e6)
@@ -1699,7 +1699,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "timing_scope": "TOTAL producer waits for dispatcher ready-queue capacity",
         }
     qd_occupancy = dict(stats.get("producer_qd_occupancy") or {})
-    if not qd_occupancy and execution_arm == "dispatcher":
+    if not qd_occupancy and execution_arm in {"dispatcher", "static_e27"}:
         qd_occupancy = {
             "target": experiment.get("source_qd_target"),
             "max_depth": (
@@ -1710,13 +1710,13 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "timeline": experiment.get("source_qd_timeline"),
         }
     free_ready_depth = dict(stats.get("free_ready_depth") or {})
-    if not free_ready_depth and execution_arm == "dispatcher":
+    if not free_ready_depth and execution_arm in {"dispatcher", "static_e27"}:
         free_ready_depth = {
             "minimum_free_slots": experiment.get("minimum_free_slots"),
             "ready_queue_depth_at_end": experiment.get("ready_queue_depth"),
         }
     fallback = dict(stats.get("fallback") or {})
-    if not fallback and execution_arm == "dispatcher":
+    if not fallback and execution_arm in {"dispatcher", "static_e27"}:
         fallback = {
             "count": int(experiment.get("fallback_count") or 0),
             "reason": experiment.get("fallback_reason"),
@@ -1727,10 +1727,38 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         or stats.get("record_reconciliation")
         or {}
     )
+    producer_balance = dict(
+        stats.get("producer_balance")
+        or {
+            "read_bytes": stats.get("producer_read_bytes", experiment.get("producer_read_bytes")),
+            "read_counts": stats.get("producer_read_counts", experiment.get("producer_read_counts")),
+        }
+    )
     return {
         "schema": "golden_qd_transport_diagnostics_v1",
         "role": stats.get("role"),
         "execution_arm": execution_arm,
+        "static_regions": copy.deepcopy(
+            stats.get("static_regions", experiment.get("static_regions"))
+        ),
+        "producer_ids": copy.deepcopy(
+            stats.get("producer_ids", experiment.get("producer_ids"))
+        ),
+        "producer_balance": producer_balance,
+        "producer_offset_monotonic": stats.get(
+            "producer_offset_monotonic", experiment.get("producer_offset_monotonic")
+        ),
+        "producer_destination_offset_monotonic": stats.get(
+            "producer_destination_offset_monotonic",
+            experiment.get("producer_destination_offset_monotonic"),
+        ),
+        "blocks": copy.deepcopy(stats.get("blocks", experiment.get("blocks"))),
+        "coverage": copy.deepcopy(stats.get("coverage", experiment.get("coverage"))),
+        "h2d_reconciliation": copy.deepcopy(
+            stats.get("h2d_reconciliation", experiment.get("h2d_reconciliation"))
+        ),
+        "poisoned": stats.get("poisoned", experiment.get("poisoned")),
+        "poison_reason": stats.get("poison_reason", experiment.get("poison_reason")),
         "source_bytes": source_bytes,
         "source_read_count": source_read_count,
         "source_open_count": stats.get("source_open_count"),
@@ -2904,16 +2932,67 @@ def _qd_gpu_worker(
 
 def validate_transport_records(
     records: list[dict],
-    planned_items: list[tuple[int, int]],
+    planned_items: list[tuple[int, ...]],
     data_start: int,
     total: int,
 ) -> tuple[bool, str]:
     """Exact planned/read/H2D reconciliation (pure; fail-closed)."""
-    expected = sorted((int(off), int(ln)) for off, ln in planned_items)
-    actual = sorted((int(r.get("off", -1)), int(r.get("planned_len", -1))) for r in records)
+    try:
+        strict_identity = any(len(item) >= 3 for item in planned_items)
+    except TypeError:
+        return False, "invalid_planned_record_shape"
+
+    def exact_int(value: Any) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("record field must be an integer")
+        return int(value)
+
+    expected: list[tuple[int, ...]] = []
+    try:
+        for item in planned_items:
+            if len(item) == 2:
+                off, ln = item
+                expected.append((int(off), int(ln)))
+            elif len(item) == 4:
+                off, destination, ln, record_id = item
+                if record_id is not None and not isinstance(record_id, (str, int)):
+                    return False, "invalid_planned_record_id"
+                expected.append((exact_int(off), exact_int(destination), exact_int(ln), record_id))
+            else:
+                return False, "invalid_planned_record_shape"
+    except (TypeError, ValueError, OverflowError):
+        return False, "invalid_planned_record_shape"
+    try:
+        if strict_identity:
+            actual_rows = []
+            for record in records:
+                record_id = record["record_id"]
+                if record_id is not None and not isinstance(record_id, (str, int)):
+                    return False, "invalid_actual_record_id"
+                actual_rows.append(
+                    (
+                        exact_int(record["off"]),
+                        exact_int(record["destination_offset"]),
+                        exact_int(record["planned_len"]),
+                        record_id,
+                    )
+                )
+            actual = sorted(actual_rows)
+        else:
+            actual = sorted(
+                (int(record.get("off", -1)), int(record.get("planned_len", -1)))
+                for record in records
+            )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, "invalid_actual_record_shape"
     if len(records) != len(planned_items) or actual != expected:
         return False, f"block_count_or_identity:{len(records)}:{len(planned_items)}"
-    rel = [(off - int(data_start), off - int(data_start) + ln) for off, ln in expected]
+    source_items = (
+        [(off, ln) for off, _destination, ln, _record_id in expected]
+        if strict_identity
+        else [(off, ln) for off, ln in expected]
+    )
+    rel = [(off - int(data_start), off - int(data_start) + ln) for off, ln in source_items]
     ok, reason = partition_coverage(rel, int(total))
     if not ok:
         return False, reason
@@ -2953,8 +3032,9 @@ def _read_file_qd_gpu_dispatcher(
     qd: int,
     block_bytes: int,
     diagnostics: Optional[bool],
+    transport_arm: str = "dispatcher",
 ) -> dict:
-    """Run the opt-in dispatcher arm and adapt it to the Golden load contract.
+    """Run the opt-in dispatcher/static-E27 arm and adapt it to Golden.
 
     The legacy implementation below is intentionally left intact.  This arm
     owns only the source/H2D transport plane: Golden still creates typed views,
@@ -2962,11 +3042,13 @@ def _read_file_qd_gpu_dispatcher(
     the same stage boundaries as the control path.
     """
     transport_module = importlib.import_module("comfymodal_runtime.golden_qd_transport")
-    selected = transport_module.normalize_transport_arm("dispatcher")
-    if selected != "dispatcher":
-        raise RuntimeError(f"unexpected_dispatcher_arm:{selected}")
+    selected = transport_module.normalize_transport_arm(transport_arm)
+    if selected not in ("dispatcher", "static_e27"):
+        raise RuntimeError(f"unexpected_qd_transport_arm:{selected}")
     qd = max(1, min(32, int(qd)))
     block_bytes = max(1, int(block_bytes))
+    if selected == "static_e27" and (qd != 4 or block_bytes != 32 * 1024 * 1024):
+        raise RuntimeError("static_e27_requires_qd4_32m")
     diagnostics_enabled = stage_diagnostics_enabled() if diagnostics is None else bool(diagnostics)
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_unavailable")
@@ -3051,7 +3133,7 @@ def _read_file_qd_gpu_dispatcher(
             capacity_class=f"qd{qd}-{block_bytes}",
         )
         dispatcher = transport_module.create_transport(
-            "dispatcher", config=config, backend=backend,
+            selected, config=config, backend=backend,
             diagnostics=diagnostics_enabled,
         )
         staging_allocation_ns = (
@@ -3060,7 +3142,10 @@ def _read_file_qd_gpu_dispatcher(
         )
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
 
-        source_telemetry = _SourceTelemetry(qd, enabled=diagnostics_enabled)
+        source_telemetry = _SourceTelemetry(
+            4 if selected == "static_e27" else qd,
+            enabled=diagnostics_enabled,
+        )
 
         class _PositionedSource:
             """One positioned source object with one descriptor per producer."""
@@ -3071,7 +3156,8 @@ def _read_file_qd_gpu_dispatcher(
                 self.open_count = 0
 
             def _fd_for_producer(self, producer_id: int) -> int:
-                if not isinstance(producer_id, int) or not 0 <= producer_id < qd:
+                producer_limit = 4 if selected == "static_e27" else qd
+                if not isinstance(producer_id, int) or not 0 <= producer_id < producer_limit:
                     raise RuntimeError(f"invalid_producer_id:{producer_id!r}")
                 with self._lock:
                     fd = self._fds.get(producer_id)
@@ -3129,6 +3215,21 @@ def _read_file_qd_gpu_dispatcher(
             )
             for index, (abs_start, length) in enumerate(items)
         ]
+        expected_static_plan = None
+        if selected == "static_e27":
+            _planned_regions, planned_work = dispatcher.plan_static_work(
+                source_ranges, destination_size=total
+            )
+            expected_static_plan = tuple(
+                (
+                    int(item.source_offset),
+                    int(item.target_offset),
+                    int(item.length),
+                    item.record_id,
+                )
+                for producer_items in planned_work
+                for item in producer_items
+            )
         result = dispatcher.execute(
             source_ranges,
             source,
@@ -3172,16 +3273,26 @@ def _read_file_qd_gpu_dispatcher(
             records.append({
                 "worker_id": record.producer_id,
                 "off": int(record.source_offset),
+                "destination_offset": int(record.destination_offset),
                 "planned_len": int(record.nbytes),
                 "read_len": int(record.nbytes),
+                "record_id": record.record_id,
                 "slot_index": None,
                 "h2d_submitted_bytes": int(record.nbytes),
                 "h2d_completed_bytes": int(record.nbytes),
                 "error": None,
             })
-        record_ok, record_reason = validate_transport_records(records, items, data_start, total)
+        validation_items = (
+            list(expected_static_plan)
+            if expected_static_plan is not None
+            else items
+        )
+        record_ok, record_reason = validate_transport_records(
+            records, validation_items, data_start, total
+        )
         if not record_ok:
             raise RuntimeError(f"record_reconciliation:{record_reason}")
+        planned_count = len(validation_items)
         if int(result.submitted_bytes) != total or int(result.completed_bytes) != total:
             raise RuntimeError(
                 f"h2d_reconciliation:{result.submitted_bytes}:{result.completed_bytes}:{total}"
@@ -3241,7 +3352,7 @@ def _read_file_qd_gpu_dispatcher(
         exact_reconciliation = {
             "ok": True,
             "reason": "ok",
-            "planned_ranges": len(items),
+            "planned_ranges": planned_count,
             "completed_ranges": len(records),
             "planned_bytes": total,
             "source_read_bytes": source_bytes,
@@ -3250,7 +3361,7 @@ def _read_file_qd_gpu_dispatcher(
         }
         dispatcher_stats = {
             **telemetry,
-            "execution_arm": "dispatcher",
+            "execution_arm": selected,
             "total_entry_to_return_wall_ms": telemetry.get("total_entry_to_return_wall_ms"),
             "source_bytes": source_bytes,
             "source_read_count": source_read_count,
@@ -3291,11 +3402,11 @@ def _read_file_qd_gpu_dispatcher(
             "kind": "golden_qd_read",
             "role": str(role),
             "status": "ok",
-            "execution_arm": "dispatcher",
+            "execution_arm": selected,
             "configured_qd": qd,
             "block_bytes": int(block_bytes),
             "file_bytes": total,
-            "planned_block_count": len(items),
+            "planned_block_count": planned_count,
             "submitted_block_count": len(records),
             "completed_block_count": len(records),
             "bytes_read": source_bytes,
@@ -3328,7 +3439,7 @@ def _read_file_qd_gpu_dispatcher(
             "staging": {
                 "allocation_count": staging_slots,
                 "allocated_bytes": staging_slots * block_bytes,
-                "reuse_count": max(0, len(items) - staging_slots),
+                "reuse_count": max(0, planned_count - staging_slots),
                 "retained_bytes": 0,
                 "allocation_ns": staging_allocation_ns,
                 "memory_kind": "pinned",
@@ -3426,6 +3537,16 @@ def _read_file_qd_gpu_dispatcher(
                 "operation_live": False,
             },
             "coverage": {"ok": True, "reason": "ok"},
+            "static_regions": telemetry.get("static_regions"),
+            "producer_ids": telemetry.get("producer_ids"),
+            "producer_balance": {
+                "read_bytes": telemetry.get("producer_read_bytes"),
+                "read_counts": telemetry.get("producer_read_counts"),
+            },
+            "producer_offset_monotonic": telemetry.get("producer_offset_monotonic"),
+            "producer_destination_offset_monotonic": telemetry.get(
+                "producer_destination_offset_monotonic"
+            ),
             "record_reconciliation": exact_reconciliation,
             "fallback": {
                 "pin_fallback": 0,
@@ -3520,14 +3641,20 @@ def read_file_qd_gpu(
     or any reconciliation error.  There is NO pin fallback, NO alignment-copy
     fallback, and NO reread.
     """
-    if golden_qd_transport_arm(transport_arm) == "dispatcher":
-        return _read_file_qd_gpu_dispatcher(
-            path,
+    selected_transport_arm = golden_qd_transport_arm(transport_arm)
+    if selected_transport_arm in ("dispatcher", "static_e27"):
+        adapter_kwargs = dict(
             role=role,
             device=device,
             qd=qd,
             block_bytes=block_bytes,
             diagnostics=diagnostics,
+        )
+        if selected_transport_arm != "dispatcher":
+            adapter_kwargs["transport_arm"] = selected_transport_arm
+        return _read_file_qd_gpu_dispatcher(
+            path,
+            **adapter_kwargs,
         )
     qd = max(1, min(32, int(qd)))
     block_bytes = max(1, int(block_bytes))
@@ -7453,7 +7580,9 @@ async def golden_clip_load(session: GoldenSession) -> Any:
                 "gpu_bytes": transport["stats"]["gpu_bytes"],
                 "clip_index": index,
             }
-            if diagnostics_enabled:
+            if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") in {
+                "dispatcher", "static_e27"
+            }:
                 owner_fields["transport_timing"] = build_qd_transport_diagnostics(stats)
             rec.event("clip_qd_owner_created", **owner_fields)
         owners = [t["owner"] for t in transports]
@@ -7931,7 +8060,9 @@ async def golden_clip_load(session: GoldenSession) -> Any:
                         build_qd_transport_diagnostics(t["stats"]) for t in transports
                     ],
                 }
-                if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") == "dispatcher" else {}
+                if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") in {
+                    "dispatcher", "static_e27"
+                } else {}
             ),
         )
         return clip
@@ -9621,7 +9752,9 @@ async def golden_vae_load(session: GoldenSession) -> Any:
                     "vae_load_decomposition": decomposition,
                     "page_faults": page_faults,
                 }
-                if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") == "dispatcher" else {}
+                if diagnostics_enabled or getattr(session, "qd_transport_arm", "legacy") in {
+                    "dispatcher", "static_e27"
+                } else {}
             ),
         )
         return vae

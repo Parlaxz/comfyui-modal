@@ -220,6 +220,20 @@ def test_enum_validation_at_resolve(resolver):
         )
 
 
+def test_qd_transport_accepts_static_e27_and_rejects_unrelated_value(resolver):
+    config = resolver.resolve(
+        profile_name="production",
+        sets=[("COMFYMODAL_GOLDEN_QD_TRANSPORT", "static_e27")],
+    )
+    assert _flag(config, "COMFYMODAL_GOLDEN_QD_TRANSPORT").value == "static_e27"
+
+    with pytest.raises(FlagError, match="enum"):
+        resolver.resolve(
+            profile_name="production",
+            sets=[("COMFYMODAL_GOLDEN_QD_TRANSPORT", "unrelated")],
+        )
+
+
 def test_nonce_regex_at_resolve(resolver):
     with pytest.raises(FlagError, match="does not match"):
         resolver.resolve(

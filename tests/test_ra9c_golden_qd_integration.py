@@ -233,6 +233,30 @@ def test_dispatcher_partial_reap_telemetry_does_not_fabricate_wall_time():
     }
 
 
+def test_static_e27_diagnostics_are_promoted_without_claiming_unobserved_order():
+    diagnostics = gs.build_qd_transport_diagnostics({
+        "execution_arm": "static_e27",
+        "static_regions": [{"producer_id": 0, "start": 0, "end": 8}],
+        "producer_ids": [0, 1, 2, 3],
+        "producer_read_bytes": {"0": 8},
+        "producer_read_counts": {"0": 1},
+        "producer_offset_monotonic": True,
+        "producer_destination_offset_monotonic": None,
+        "duplicate_read_count": 0,
+        "poisoned": False,
+        "h2d_reconciliation": {"ok": True},
+    })
+
+    assert diagnostics["execution_arm"] == "static_e27"
+    assert diagnostics["static_regions"][0]["producer_id"] == 0
+    assert diagnostics["producer_ids"] == [0, 1, 2, 3]
+    assert diagnostics["producer_balance"]["read_bytes"] == {"0": 8}
+    assert diagnostics["producer_offset_monotonic"] is True
+    assert diagnostics["producer_destination_offset_monotonic"] is None
+    assert diagnostics["poisoned"] is False
+    assert diagnostics["h2d_reconciliation"] == {"ok": True}
+
+
 def test_legacy_qd_diagnostics_report_positioned_reads_and_bounded_percentiles():
     telemetry = gs._SourceTelemetry(2)
     clock = iter((100, 150, 300, 450))

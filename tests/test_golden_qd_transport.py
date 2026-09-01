@@ -49,6 +49,7 @@ from golden_qd_transport_under_test import (
     create_transport,
     map_output_views,
     normalize_transport_arm,
+    static_e27_regions,
     prove_backing_survives_stage_release,
 )
 
@@ -79,8 +80,140 @@ def test_selector_is_explicit_and_independent_of_diagnostics(monkeypatch):
     monkeypatch.setenv("COMFYMODAL_GOLDEN_QD_TRANSPORT", "dispatcher")
     assert normalize_transport_arm() == "dispatcher"
     assert create_transport("legacy", config=small_config()).arm == "legacy"
+    assert create_transport("test", config=small_config(), backend=FakeBackend()).arm == "static_e27"
     with pytest.raises(ValueError):
         normalize_transport_arm("r41")
+
+
+def test_static_e27_regions_are_four_fixed_contiguous_regions_for_odd_lengths():
+    regions = static_e27_regions(37)
+    assert regions == ((0, 10), (10, 20), (20, 30), (30, 37))
+    assert sum(end - start for start, end in regions) == 37
+    assert all(left[1] == right[0] for left, right in zip(regions, regions[1:]))
+    assert static_e27_regions(3) == ((0, 1), (1, 2), (2, 3), (3, 3))
+
+
+def test_static_e27_arm_uses_fixed_ids_and_preserves_output_identity():
+    class RecordingSource(FakeSource):
+        def __init__(self, data):
+            super().__init__(data)
+            self.producer_calls = []
+
+        def readinto(self, target, offset, producer_id=None):
+            self.producer_calls.append((producer_id, offset, len(target)))
+            return super().readinto(target, offset, producer_id)
+
+    data = bytes(range(37))
+    source = RecordingSource(data)
+    transport = GoldenQDTransport(
+        small_config(block_bytes=8), FakeBackend(), arm="static_e27"
+    )
+    result = transport.execute([SourceRange(0, len(data), 0)], source, output_size=len(data))
+
+    assert result.output == data
+    assert {producer for producer, _offset, _length in source.producer_calls} == set(range(4))
+    assert result.telemetry["execution_arm"] == "static_e27"
+    assert result.telemetry["producer_ids"] == [0, 1, 2, 3]
+    assert result.telemetry["static_regions"] == [
+        {"producer_id": 0, "start": 0, "end": 10, "relative_start": 0, "relative_end": 10},
+        {"producer_id": 1, "start": 10, "end": 20, "relative_start": 10, "relative_end": 20},
+        {"producer_id": 2, "start": 20, "end": 30, "relative_start": 20, "relative_end": 30},
+        {"producer_id": 3, "start": 30, "end": 37, "relative_start": 30, "relative_end": 37},
+    ]
+    assert result.telemetry["producer_offset_monotonic"] is True
+    assert result.telemetry["source_bytes"] == 37
+    assert result.telemetry["h2d_submitted_bytes"] == result.telemetry["h2d_completed_bytes"] == 37
+    assert result.telemetry["duplicate_read_count"] == 0
+
+
+def test_static_e27_short_read_retry_advances_source_and_destination_offsets():
+    source = FakeSource(bytes(range(19)), short_reads=3)
+    transport = GoldenQDTransport(
+        small_config(block_bytes=8, read_retries=4), FakeBackend(), arm="static_e27"
+    )
+    result = transport.execute([SourceRange(0, 19, 0)], source, output_size=19)
+
+    assert result.output == bytes(range(19))
+    assert result.telemetry["source_bytes"] == 19
+    assert result.telemetry["duplicate_read_count"] > 0
+    assert result.telemetry["producer_offset_monotonic"] is True
+    assert all(
+        offsets == sorted(offsets)
+        for offsets in result.telemetry["producer_destination_offsets"].values()
+    )
+
+
+def test_static_e27_rejects_permuted_destination_mapping_during_planning():
+    transport = GoldenQDTransport(
+        small_config(block_bytes=8), FakeBackend(), arm="static_e27"
+    )
+    with pytest.raises(qd.ReconciliationError, match="canonical forward layout"):
+        transport.plan_static_work(
+            [SourceRange(0, 4, 4, "a"), SourceRange(4, 4, 0, "b")],
+            destination_size=8,
+        )
+
+
+def test_static_e27_split_chunks_have_unique_ids_and_unsplit_id_is_preserved():
+    transport = GoldenQDTransport(
+        small_config(block_bytes=8), FakeBackend(), arm="static_e27"
+    )
+    _regions, work = transport.plan_static_work(
+        [SourceRange(0, 4, 0, "unsplit"), SourceRange(4, 20, 4, "split")],
+        destination_size=24,
+    )
+    planned = [item for producer_items in work for item in producer_items]
+    ids = [item.record_id for item in planned]
+    assert ids[0] == "unsplit"
+    assert len(ids) == len(set(ids))
+    assert "split" in ids
+    assert all(isinstance(record_id, (str, int)) for record_id in ids)
+
+
+def test_static_e27_diagnostics_off_marks_destination_order_unobserved():
+    transport = GoldenQDTransport(
+        small_config(block_bytes=8), FakeBackend(), arm="static_e27", diagnostics=False
+    )
+    result = transport.execute(
+        [SourceRange(0, 19, 0, "payload")], FakeSource(bytes(range(19))), output_size=19
+    )
+    assert result.telemetry["producer_destination_offset_monotonic"] is None
+    assert result.telemetry["producer_ids"] == [0, 1, 2, 3]
+    assert result.telemetry["producer_read_bytes"]
+
+
+def test_static_e27_uncertain_completion_poison_is_fail_closed():
+    transport = GoldenQDTransport(
+        small_config(block_bytes=8), FakeBackend(event_uncertain=True), arm="static_e27"
+    )
+    with pytest.raises(TransportFailure) as caught:
+        transport.execute([SourceRange(0, 19, 0)], FakeSource(bytes(range(19))), output_size=19)
+    assert "uncertain" in str(caught.value.primary_error).lower()
+    assert transport.pool.poisoned
+    assert caught.value.telemetry["poisoned"] is True
+
+
+def test_golden_reader_forwards_static_arm_without_changing_control_arguments(monkeypatch):
+    calls = []
+    sentinel = {"status": "static-sentinel"}
+    monkeypatch.setattr(gs, "golden_qd_transport_arm", lambda value=None: "static_e27")
+
+    def adapter(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(gs, "_read_file_qd_gpu_dispatcher", adapter)
+    assert gs.read_file_qd_gpu("checkpoint.safetensors", role="unet", diagnostics=False) is sentinel
+    assert calls == [
+        (("checkpoint.safetensors",), {
+            "role": "unet",
+            "device": None,
+            "qd": gs.GOLDEN_QD,
+            "block_bytes": gs.GOLDEN_BLOCK_BYTES,
+            "diagnostics": False,
+            "transport_arm": "static_e27",
+        })
+    ]
 
 
 def test_generation_identity_wrong_pool_double_return_and_capacity_class():

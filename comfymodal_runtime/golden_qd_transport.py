@@ -18,6 +18,10 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
 TRANSPORT_ENV = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
 LEGACY_ARM = "legacy"
 DISPATCHER_ARM = "dispatcher"
+CONTROL_ARM = DISPATCHER_ARM
+STATIC_E27_ARM = "static_e27"
+TEST_ARM = STATIC_E27_ARM
+STATIC_E27_PRODUCERS = 4
 DEFAULT_QUEUE_DEPTH = 4
 DEFAULT_BLOCK_BYTES = 32 * 1024 * 1024
 DEFAULT_STAGING_SLOTS = 8
@@ -61,9 +65,50 @@ class SlotState(str, Enum):
 def normalize_transport_arm(value: str | None = None) -> str:
     selected = os.environ.get(TRANSPORT_ENV) if value is None else value
     selected = LEGACY_ARM if selected is None or selected == "" else str(selected).strip().lower()
-    if selected not in (LEGACY_ARM, DISPATCHER_ARM):
-        raise ValueError(f"unknown Golden QD transport arm {selected!r}; expected legacy or dispatcher")
+    if selected == "control":
+        selected = CONTROL_ARM
+    elif selected == "test":
+        selected = TEST_ARM
+    if selected not in (LEGACY_ARM, DISPATCHER_ARM, STATIC_E27_ARM):
+        raise ValueError(
+            f"unknown Golden QD transport arm {selected!r}; "
+            "expected legacy, dispatcher, or static_e27"
+        )
     return selected
+
+
+def static_e27_regions(total: int, producer_count: int = STATIC_E27_PRODUCERS) -> tuple[tuple[int, int], ...]:
+    """Return fixed E27 regions as relative ``[start, end)`` byte ranges.
+
+    Regions are planned once per transport.  Empty trailing regions are kept
+    so the static arm always has the four explicit producer identities used by
+    the E27 probe, including for very short test inputs.
+    """
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise ValueError("total must be a non-negative integer")
+    if producer_count != STATIC_E27_PRODUCERS:
+        raise ValueError("static E27 transport requires exactly four producers")
+    width = (total + producer_count - 1) // producer_count if total else 0
+    return tuple(
+        (min(i * width, total), min((i + 1) * width, total))
+        for i in range(producer_count)
+    )
+
+
+def static_segments(total: int, qd: int) -> tuple[tuple[int, int], ...]:
+    """E27-compatible non-empty static segmentation helper."""
+    if isinstance(total, bool) or not isinstance(total, int):
+        raise ValueError("total must be an integer")
+    if isinstance(qd, bool) or not isinstance(qd, int) or qd <= 0 or total < 0:
+        raise ValueError("invalid total or qd")
+    if total == 0:
+        return ()
+    width = (total + qd - 1) // qd
+    return tuple(
+        (start, min(start + width, total))
+        for start in (i * width for i in range(qd))
+        if start < total
+    )
 
 
 @dataclass(frozen=True)
@@ -597,6 +642,18 @@ class _Telemetry:
     fallback_reason: str | None = None
     source_read_mode: str = "legacy_bytes"
     direct_readinto_count: int = 0
+    static_regions: list[dict[str, int]] | None = None
+    producer_read_bytes: dict[int, int] | None = None
+    producer_read_counts: dict[int, int] | None = None
+    producer_last_source_offset: dict[int, int] | None = None
+    producer_offset_monotonic: bool = True
+    producer_destination_offsets: dict[int, list[int]] | None = None
+    producer_destination_offset_monotonic: bool | None = True
+    producer_ids: tuple[int, ...] = ()
+    poisoned: bool = False
+    poison_reason: str | None = None
+    coverage_ok: bool | None = None
+    h2d_reconciled: bool | None = None
     late_submission_count: int | None = None
     late_submission_resolved_count: int | None = None
     late_submission_unresolved_count: int | None = None
@@ -623,14 +680,41 @@ class _Telemetry:
             self.qd_samples = []
             self.source_qd_depth_samples = []
             self.source_qd_timeline = []
+            self.producer_destination_offsets = {}
+            self.producer_destination_offset_monotonic = True
+        else:
+            # Destination order is an optional observation, not a correctness
+            # counter.  Diagnostics-off must not report that it was observed.
+            self.producer_destination_offset_monotonic = None
         self.source_qd_depth = 0 if self.diagnostics_enabled else None
+        self.producer_read_bytes = {}
+        self.producer_read_counts = {}
+        self.producer_last_source_offset = {}
 
-    def source_read(self, nbytes: int, *, duplicate: bool = False) -> None:
+    def source_read(
+        self,
+        nbytes: int,
+        *,
+        duplicate: bool = False,
+        producer_id: int | None = None,
+        source_offset: int | None = None,
+    ) -> None:
         with self._correctness_lock:
             self.source_read_count += 1
             self.source_bytes += nbytes
             if duplicate:
                 self.duplicate_read_count += 1
+            if producer_id is not None:
+                assert self.producer_read_bytes is not None
+                assert self.producer_read_counts is not None
+                self.producer_read_bytes[producer_id] = self.producer_read_bytes.get(producer_id, 0) + nbytes
+                self.producer_read_counts[producer_id] = self.producer_read_counts.get(producer_id, 0) + 1
+                if source_offset is not None:
+                    assert self.producer_last_source_offset is not None
+                    previous = self.producer_last_source_offset.get(producer_id)
+                    if previous is not None and source_offset < previous:
+                        self.producer_offset_monotonic = False
+                    self.producer_last_source_offset[producer_id] = source_offset
 
     def configure_source_qd(self, target: int) -> None:
         if not self.diagnostics_enabled:
@@ -644,6 +728,16 @@ class _Telemetry:
 
     def source_read_end(self) -> None:
         self._source_qd_transition(-1)
+
+    def note_record(self, record: ReadyRecord) -> None:
+        if not self.diagnostics_enabled or record.producer_id is None:
+            return
+        assert self.producer_destination_offsets is not None
+        with self._correctness_lock:
+            offsets = self.producer_destination_offsets.setdefault(record.producer_id, [])
+            if offsets and record.destination_offset < offsets[-1]:
+                self.producer_destination_offset_monotonic = False
+            offsets.append(record.destination_offset)
 
     def _source_qd_transition(self, delta: int) -> None:
         if not self.diagnostics_enabled:
@@ -804,6 +898,29 @@ class _Telemetry:
                 "source_read_mode": self.source_read_mode,
                 "reader_mode": self.source_read_mode,
                 "direct_readinto_count": self.direct_readinto_count,
+                "static_regions": list(self.static_regions) if self.static_regions is not None else None,
+                "producer_ids": list(self.producer_ids),
+                "producer_read_bytes": dict(self.producer_read_bytes or {}),
+                "producer_read_counts": dict(self.producer_read_counts or {}),
+                "producer_offset_monotonic": self.producer_offset_monotonic,
+                "producer_destination_offset_monotonic": self.producer_destination_offset_monotonic,
+                "producer_destination_offsets": (
+                    {str(k): list(v) for k, v in self.producer_destination_offsets.items()}
+                    if self.producer_destination_offsets is not None else None
+                ),
+                "poisoned": self.poisoned,
+                "poison_reason": self.poison_reason,
+                "coverage": {
+                    "ok": self.coverage_ok,
+                    "source_bytes": self.source_bytes,
+                    "h2d_submitted_bytes": self.h2d_submitted_bytes,
+                    "h2d_completed_bytes": self.h2d_completed_bytes,
+                },
+                "h2d_reconciliation": {
+                    "ok": self.h2d_reconciled,
+                    "submitted_bytes": self.h2d_submitted_bytes,
+                    "completed_bytes": self.h2d_completed_bytes,
+                },
                 "python_payload_materialization": self.source_read_mode != "direct_readinto",
                 "late_submission_count": self.late_submission_count,
                 "late_submission_resolved_count": self.late_submission_resolved_count,
@@ -1356,6 +1473,8 @@ class GoldenQDTransport:
         # contract.  The caller remains responsible for releasing an owner
         # after successful transport/adoption or a proven terminal failure.
         self._owner_lifetime: Any = None
+        self._static_regions: tuple[tuple[int, int], ...] | None = None
+        self._static_work: tuple[tuple[SourceRange, ...], ...] | None = None
 
     def acquire(
         self,
@@ -1520,6 +1639,104 @@ class GoldenQDTransport:
         return result
 
     @staticmethod
+    def _static_e27_work(
+        ranges: Sequence[SourceRange], block_bytes: int
+    ) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[SourceRange, ...], ...]]:
+        """Plan four fixed source regions and their block-clamped work.
+
+        The input ranges describe the logical destination layout.  Static E27
+        deliberately ignores their scheduling order, partitions the contiguous
+        source span once, and lets each producer walk only its own region.
+        Intersections preserve destination mapping and record identity.
+        """
+        if not ranges:
+            regions = static_e27_regions(0)
+            return regions, tuple(() for _ in range(STATIC_E27_PRODUCERS))
+        ordered = sorted(ranges, key=lambda item: item.source_offset)
+        source_start = ordered[0].source_offset
+        cursor = source_start
+        destination_cursor = 0
+        for item in ordered:
+            if item.source_offset != cursor:
+                raise ReconciliationError("static E27 source ranges must be contiguous")
+            if item.target_offset != destination_cursor:
+                raise ReconciliationError(
+                    "static E27 destination ranges must preserve canonical forward layout"
+                )
+            cursor += item.length
+            destination_cursor += item.length
+        total = cursor - source_start
+        regions = static_e27_regions(total)
+        work_specs: list[list[tuple[int, SourceRange, int, int]]] = [
+            [] for _ in range(STATIC_E27_PRODUCERS)
+        ]
+        item_index = 0
+        for producer_id, (relative_start, relative_end) in enumerate(regions):
+            absolute = source_start + relative_start
+            region_end = source_start + relative_end
+            while absolute < region_end:
+                while item_index < len(ordered) and absolute >= ordered[item_index].source_offset + ordered[item_index].length:
+                    item_index += 1
+                if item_index >= len(ordered):
+                    raise ReconciliationError("static E27 region exceeds source ranges")
+                item = ordered[item_index]
+                item_end = item.source_offset + item.length
+                chunk_end = min(region_end, item_end, absolute + block_bytes)
+                if chunk_end <= absolute:
+                    raise ReconciliationError("static E27 planner did not advance")
+                work_specs[producer_id].append((item_index, item, absolute, chunk_end))
+                absolute = chunk_end
+
+        chunk_counts: dict[int, int] = {}
+        for producer_items in work_specs:
+            for original_index, _item, _start, _end in producer_items:
+                chunk_counts[original_index] = chunk_counts.get(original_index, 0) + 1
+        used_ids = {item.record_id for item in ordered if item.record_id is not None}
+        generated_ids: set[str | int] = set()
+        work: list[list[SourceRange]] = [[] for _ in range(STATIC_E27_PRODUCERS)]
+        chunk_indices: dict[int, int] = {}
+        for producer_id, producer_items in enumerate(work_specs):
+            for original_index, item, absolute, chunk_end in producer_items:
+                chunk_index = chunk_indices.get(original_index, 0)
+                chunk_indices[original_index] = chunk_index + 1
+                if chunk_counts[original_index] == 1:
+                    record_id = item.record_id
+                elif chunk_index == 0 and item.record_id is not None:
+                    # Preserve the caller's identity once, but never duplicate
+                    # it across the chunks of a split source range.
+                    record_id = item.record_id
+                else:
+                    stem = (
+                        f"{item.record_id}:static_e27:{chunk_index}"
+                        if item.record_id is not None
+                        else f"static_e27:{original_index}:{chunk_index}"
+                    )
+                    record_id = stem
+                    suffix = 1
+                    while record_id in used_ids or record_id in generated_ids:
+                        record_id = f"{stem}:{suffix}"
+                        suffix += 1
+                    generated_ids.add(record_id)
+                work[producer_id].append(
+                    SourceRange(
+                        absolute,
+                        chunk_end - absolute,
+                        item.target_offset + (absolute - item.source_offset),
+                        record_id,
+                    )
+                )
+        return regions, tuple(tuple(items) for items in work)
+
+    def plan_static_work(
+        self, ranges: Iterable[SourceRange], destination_size: int | None = None
+    ) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[SourceRange, ...], ...]]:
+        """Return the transport-owned static plan before execution begins."""
+        if self.arm != STATIC_E27_ARM:
+            raise ReconciliationError("static E27 plan requested for non-static arm")
+        source_ranges = self._record_ranges(ranges, destination_size)
+        return self._static_e27_work(source_ranges, self.config.block_bytes)
+
+    @staticmethod
     def _read_exact(reader: Callable[[int, int], bytes], item: SourceRange, retries: int, telemetry: _Telemetry) -> bytes:
         pieces: list[bytes] = []
         offset = item.source_offset
@@ -1571,7 +1788,12 @@ class GoldenQDTransport:
             if count < 0 or count > item.length - total:
                 raise ReconciliationError("source readinto returned an invalid byte count")
             attempts += 1
-            telemetry.source_read(count, duplicate=attempts > 1)
+            telemetry.source_read(
+                count,
+                duplicate=attempts > 1,
+                producer_id=producer_id,
+                source_offset=offset,
+            )
             total += count
             offset += count
         lease.mark_filled(total)
@@ -1640,16 +1862,44 @@ class GoldenQDTransport:
             raise ValueError("output_size and destination_size disagree")
         exact_destination_size = destination_size if destination_size is not None else output_size
         source_ranges = self._record_ranges(ranges, exact_destination_size)
+        planned_ranges = source_ranges
+        self.telemetry.producer_ids = tuple(
+            range(STATIC_E27_PRODUCERS if self.arm == STATIC_E27_ARM else self.config.producer_workers)
+        )
+        if self.arm == STATIC_E27_ARM:
+            self._static_regions, self._static_work = self._static_e27_work(
+                source_ranges, self.config.block_bytes
+            )
+            planned_ranges = [item for producer_items in self._static_work for item in producer_items]
+            self.telemetry.static_regions = [
+                {
+                    "producer_id": producer_id,
+                    "start": source_ranges[0].source_offset + start if source_ranges else start,
+                    "end": source_ranges[0].source_offset + end if source_ranges else end,
+                    "relative_start": start,
+                    "relative_end": end,
+                }
+                for producer_id, (start, end) in enumerate(self._static_regions)
+            ]
         if parse_count < 0:
             raise ValueError("parse_count must be non-negative")
         self.telemetry.parse_count = parse_count
         self.telemetry.owner, self.telemetry.adoption = owner, adoption
         self.telemetry.owner_count, self.telemetry.adoption_result = owner_count, adoption_result
         self._owner_lifetime = owner
-        self.telemetry.configure_source_qd(min(self.config.queue_depth, self.config.producer_workers))
+        source_qd = STATIC_E27_PRODUCERS if self.arm == STATIC_E27_ARM else min(
+            self.config.queue_depth, self.config.producer_workers
+        )
+        self.telemetry.configure_source_qd(source_qd)
         if self.telemetry.diagnostics_enabled:
             self.telemetry.source_start_ns = time.monotonic_ns()
         read_source, direct_readinto = self._open_source(reader)
+        if self.arm == STATIC_E27_ARM and not direct_readinto:
+            close_errors = self._close_source()
+            error = ReconciliationError("static E27 arm requires direct readinto source")
+            if close_errors:
+                raise TransportFailure(error, secondary_errors=close_errors) from error
+            raise error
         read_fn: Callable[[int, int], bytes] | None = None
         if not direct_readinto:
             read_fn = cast(
@@ -1683,12 +1933,24 @@ class GoldenQDTransport:
             with self._active_lock:
                 self._active_producers += 1
             try:
+                static_items = (
+                    self._static_work[producer_id]
+                    if self.arm == STATIC_E27_ARM and self._static_work is not None
+                    else None
+                )
+                local_index = 0
                 while not self._abort_requested:
-                    with index_lock:
-                        if index >= len(source_ranges):
+                    if static_items is not None:
+                        if local_index >= len(static_items):
                             return
-                        item = source_ranges[index]
-                        index += 1
+                        item = static_items[local_index]
+                        local_index += 1
+                    else:
+                        with index_lock:
+                            if index >= len(source_ranges):
+                                return
+                            item = source_ranges[index]
+                            index += 1
                     lease: StageLease | None = None
                     try:
                         lease = self.acquire(declared_range=item, producer_id=producer_id)
@@ -1717,6 +1979,15 @@ class GoldenQDTransport:
                                 producer_id,
                             ),
                         )
+                        self.telemetry.note_record(
+                            ReadyRecord(
+                                item.source_offset,
+                                item.target_offset,
+                                item.length,
+                                item.record_id,
+                                producer_id,
+                            )
+                        )
                         lease = None  # dispatcher now owns the lease
                     finally:
                         if lease is not None:
@@ -1737,6 +2008,7 @@ class GoldenQDTransport:
                 with self._active_lock:
                     self._active_producers -= 1
 
+        producer_count = STATIC_E27_PRODUCERS if self.arm == STATIC_E27_ARM else self.config.producer_workers
         threads = [
             threading.Thread(
                 target=worker,
@@ -1744,7 +2016,7 @@ class GoldenQDTransport:
                 name=f"golden-qd-source-{producer_id}",
                 daemon=True,
             )
-            for producer_id in range(self.config.producer_workers)
+            for producer_id in range(producer_count)
         ]
         for thread in threads:
             thread.start()
@@ -1818,6 +2090,15 @@ class GoldenQDTransport:
             # A source that could not be closed is not a successful, reusable
             # transport even when all bytes and completion events reconciled.
             primary = close_errors[0]
+        self.telemetry.poisoned = self.pool.poisoned
+        self.telemetry.poison_reason = getattr(self.pool, "_poison_reason", None)
+        completed = self.dispatcher.completed_records if self.dispatcher else ()
+        expected = {(r.source_offset, r.target_offset, r.length, r.record_id) for r in planned_ranges}
+        actual = {(r.source_offset, r.destination_offset, r.nbytes, r.record_id) for r in completed}
+        self.telemetry.coverage_ok = actual == expected and len(completed) == len(planned_ranges)
+        self.telemetry.h2d_reconciled = (
+            self.telemetry.h2d_submitted_bytes == self.telemetry.h2d_completed_bytes
+        )
         telemetry = self.telemetry.snapshot(self.config.queue_depth, sum(s == SlotState.FREE for s in self.pool.states()))
         secondary: list[BaseException] = []
         for error in (cleanup_errors + worker_cleanup_errors + worker_errors):
@@ -1828,9 +2109,6 @@ class GoldenQDTransport:
         # Cancellation is never a successful result, but completed records are
         # still reconciled for accounting and queued records are intentionally
         # absent from this set.
-        completed = self.dispatcher.completed_records if self.dispatcher else ()
-        expected = {(r.source_offset, r.target_offset, r.length, r.record_id) for r in source_ranges}
-        actual = {(r.source_offset, r.destination_offset, r.nbytes, r.record_id) for r in completed}
         if len(completed) != len(actual):
             secondary.append(ReconciliationError("completed records were duplicated"))
         if self.telemetry.h2d_submitted_bytes != self.telemetry.h2d_completed_bytes:
@@ -1844,7 +2122,7 @@ class GoldenQDTransport:
             )
             self._retain_failure_lifetime(failure)
             raise failure from primary
-        if actual != expected or len(completed) != len(source_ranges):
+        if actual != expected or len(completed) != len(planned_ranges):
             failure = TransportFailure(
                 ReconciliationError("source record coverage is missing or duplicated"),
                 secondary_errors=secondary,
@@ -2119,10 +2397,10 @@ def _read_destination(destination: Any, size: int) -> bytes:
 
 __all__ = [
     "BackingAdoption", "BackingOwner", "CancellationError", "CudaTransferBackend", "DEFAULT_BLOCK_BYTES",
-    "DEFAULT_QUEUE_DEPTH", "DEFAULT_STAGING_SLOTS", "DISPATCHER_ARM", "EventStatus", "FakeBackend", "FakeEvent",
-    "FakeSource", "GoldenQDTransport", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
+    "DEFAULT_QUEUE_DEPTH", "DEFAULT_STAGING_SLOTS", "DISPATCHER_ARM", "CONTROL_ARM", "STATIC_E27_ARM", "TEST_ARM",
+    "STATIC_E27_PRODUCERS", "EventStatus", "FakeBackend", "FakeEvent", "FakeSource", "GoldenQDTransport", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
     "PoolPoisonedError", "QDTransport", "ReadyRecord", "ReconciliationError", "SlotState", "SourceRange",
     "StageLease", "StagingPool", "PinnedRangeReader", "TransportBackend", "TransportConfig", "TransportDispatcher", "TransportError",
-    "TransportFailure", "TransportResult", "create_transport", "map_output_views", "normalize_transport_arm",
+    "TransportFailure", "TransportResult", "create_transport", "map_output_views", "normalize_transport_arm", "static_e27_regions", "static_segments",
     "prove_backing_survives_stage_release",
 ]

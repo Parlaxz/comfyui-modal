@@ -666,7 +666,7 @@ default = "legacy"
 consumed_at = "restore"
 change_requires = "deploy"
 owner = "golden-p1"
-enum_values = ["legacy", "dispatcher"]
+enum_values = ["legacy", "dispatcher", "static_e27"]
 description = "Golden QD4 transport arm for the isolated RA9C comparison."
 
 [[flag]]
