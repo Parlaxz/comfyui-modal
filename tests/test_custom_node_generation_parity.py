@@ -39,6 +39,7 @@ Scenario coverage (16 mandated + extras):
 All tests are local (no Modal, no paid anything).
 """
 
+import ast
 import io
 import os
 import re
@@ -554,7 +555,7 @@ class TestRoundTripAndPurity(unittest.TestCase):
         the volume-sync archive drops.
 
         The V2 ``generation_mismatch`` proof failure was caused by the archive
-        filter (``__init__._CUSTOM_NODE_SYNC_EXCLUDE_DIRS``) excluding
+        filter excluding
         directories that ``comfyapp._CUSTOM_NODE_GENERATED_DIRS`` still walked
         (e.g. ``.comfymodal_experiments``, ``.custom_node_requirements``,
         ``.baked_custom_node_deps``, ``benchmark_runs``).  Archive->extract then
@@ -562,17 +563,36 @@ class TestRoundTripAndPurity(unittest.TestCase):
         Volume generation even after a fresh publish.  This test pins the
         unification.
         """
-        try:
-            import comfyapp
-        except Exception as exc:  # pragma: no cover - environment guard
-            pytest.skip(f"comfyapp is not importable on this machine: {exc!r}")
-        try:
-            from tools.publish_custom_nodes_volume import _CUSTOM_NODE_SYNC_EXCLUDE_DIRS
-        except Exception as exc:  # pragma: no cover - environment guard
-            pytest.skip(f"tools.publish_custom_nodes_volume not importable: {exc!r}")
+        from comfymodal_runtime import publication_policy
 
-        archive_excludes = set(_CUSTOM_NODE_SYNC_EXCLUDE_DIRS)
-        fingerprint_excludes = set(comfyapp._CUSTOM_NODE_GENERATED_DIRS)
+        # This is a source-contract test.  Importing comfyapp would execute
+        # the full local image/build setup and is unnecessary for proving that
+        # its compatibility alias points at the canonical policy.
+        source = (Path(__file__).resolve().parents[1] / "comfyapp.py").read_text(
+            encoding="utf-8-sig"
+        )
+        tree = ast.parse(source)
+        generated_assignment = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "_CUSTOM_NODE_GENERATED_DIRS"
+                    for target in node.targets
+                )
+            ),
+            None,
+        )
+        if generated_assignment is None:
+            self.fail("comfyapp.py must define _CUSTOM_NODE_GENERATED_DIRS")
+        if not isinstance(generated_assignment.value, ast.Attribute):
+            self.fail("_CUSTOM_NODE_GENERATED_DIRS must reference the policy module")
+        self.assertEqual(generated_assignment.value.attr, "EXCLUDED_DIR_NAMES")
+
+        archive_excludes = set(publication_policy.EXCLUDED_DIR_NAMES)
+        fingerprint_excludes = set(publication_policy.EXCLUDED_DIR_NAMES)
         missing = sorted(archive_excludes - fingerprint_excludes)
         self.assertEqual(
             missing,

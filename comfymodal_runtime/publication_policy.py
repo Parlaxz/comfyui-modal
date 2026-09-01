@@ -205,25 +205,12 @@ def iter_syncable_custom_node_dirs(root: str | Path) -> list[str]:
 
 
 def _looks_like_custom_nodes_source_root(path: str | os.PathLike[str]) -> bool:
-    root = os.fspath(path)
-    if not root or not os.path.isdir(root):
-        return False
-    if os.path.realpath(root) in {"/", "/root", "/home", "/mnt", "/tmp", "/usr", "/opt"}:
-        return False
-    try:
-        node_like = sum(
-            1
-            for name in os.listdir(root)
-            if os.path.isdir(os.path.join(root, name))
-            and not name.startswith(".")
-            and (
-                os.path.isfile(os.path.join(root, name, "__init__.py"))
-                or os.path.isfile(os.path.join(root, name, "requirements.txt"))
-            )
-        )
-    except OSError:
-        return False
-    return node_like >= 3
+    # Keep this private historical spelling as a compatibility wrapper.  Root
+    # selection itself lives in custom_node_root so every caller gets the same
+    # worktree/explicit-root policy.
+    from .custom_node_root import looks_like_custom_nodes_root
+
+    return looks_like_custom_nodes_root(path)
 
 
 def resolve_custom_nodes_root(
@@ -232,49 +219,14 @@ def resolve_custom_nodes_root(
     explicit: str | Path | None = None,
     fallback_roots: tuple[str | Path, ...] = (),
 ) -> str:
-    """Resolve one effective custom-node root for every publication path.
+    """Compatibility wrapper for the canonical custom-node root resolver."""
+    from .custom_node_root import resolve_custom_nodes_root_details
 
-    ``anchor`` is the plugin directory; its parent is the default source
-    root.  An explicit ``COMFYMODAL_LOCAL_CUSTOM_NODES`` override wins and is
-    never mixed with fallbacks.  Multiple valid fallback candidates are an
-    error rather than an arbitrary choice, preventing image and identity
-    callers from silently selecting different trees.
-    """
-    override = explicit
-    if override is None:
-        override = os.environ.get(COMFYMODAL_LOCAL_CUSTOM_NODES_ENV, "").strip()
-    if override:
-        candidate = Path(override).expanduser().resolve()
-        if not _looks_like_custom_nodes_source_root(candidate):
-            raise RuntimeError(
-                f"COMFYMODAL_LOCAL_CUSTOM_NODES does not look like a custom-nodes "
-                f"root (need at least 3 node-like directories): {candidate}"
-            )
-        return str(candidate)
-
-    candidates = [Path(anchor).expanduser().resolve().parent]
-    candidates.extend(Path(root).expanduser().resolve() for root in fallback_roots)
-    valid: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = os.path.normcase(os.path.realpath(candidate))
-        if key in seen:
-            continue
-        seen.add(key)
-        if _looks_like_custom_nodes_source_root(candidate):
-            valid.append(candidate)
-    if len(valid) > 1:
-        raise RuntimeError(
-            "ambiguous custom-nodes source root; valid candidates: "
-            + ", ".join(str(path) for path in valid)
-            + ". Set COMFYMODAL_LOCAL_CUSTOM_NODES explicitly."
-        )
-    if valid:
-        return str(valid[0])
-    raise RuntimeError(
-        "could not resolve custom-nodes source root from anchor "
-        f"{Path(anchor).resolve()}; set COMFYMODAL_LOCAL_CUSTOM_NODES explicitly"
-    )
+    return resolve_custom_nodes_root_details(
+        anchor,
+        explicit=explicit,
+        fallback_roots=fallback_roots,
+    ).root
 
 
 def is_excluded_name(name: str) -> bool:
@@ -469,6 +421,15 @@ def compute_publication_generation(root: str | Path) -> str:
 def image_ignore_patterns(prefix: str = "") -> list[str]:
     """Return deterministic glob patterns suitable for ``add_local_dir``."""
 
+    def case_insensitive_glob(value: str) -> str:
+        """Encode both cases without expanding into an exponential list."""
+        return "".join(
+            f"[{character.lower()}{character.upper()}]"
+            if character.isalpha()
+            else character
+            for character in value
+        )
+
     def case_variants(value: str) -> tuple[str, ...]:
         variants = [""]
         for character in value:
@@ -483,10 +444,18 @@ def image_ignore_patterns(prefix: str = "") -> list[str]:
         return tuple(variants)
 
     patterns = [f"{prefix}{name}/" for name in sorted(EXCLUDED_DIR_NAMES)]
+    patterns.extend(
+        f"{prefix}{case_insensitive_glob(name)}/"
+        for name in sorted(EXCLUDED_DIR_NAMES)
+    )
     patterns.extend(f"{prefix}{name}" for name in sorted(EXCLUDED_FILENAMES))
     patterns.extend(f"{prefix}*{ext}" for ext in sorted(EXCLUDED_EXTENSIONS))
     patterns.extend(f"{prefix}{glob}" for glob in EXCLUDED_GLOBS)
     patterns.extend(f"{prefix}{prefix_name}*" for prefix_name in EXCLUDED_PREFIXES)
+    patterns.extend(
+        f"{prefix}{case_insensitive_glob(prefix_name)}*"
+        for prefix_name in EXCLUDED_PREFIXES
+    )
     patterns.extend(f"{prefix}*{infix}*" for infix in EXCLUDED_INFIXES)
     patterns.extend(
         f"{prefix}{json_prefix}*{extension}"

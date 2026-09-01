@@ -177,6 +177,14 @@ class TestExclusionPredicate(unittest.TestCase):
         ):
             self.assertTrue(ignored(path), path)
 
+        for path in (
+            "REPORTS/",
+            "nested/Workflows/",
+            "BEFORE_deploy.patch",
+            "nested/BEFORE_v2_manifest.diff",
+        ):
+            self.assertTrue(ignored(path), path)
+
         for path in ("runtime.py", "nested/runtime.py", "runtime_asset.png"):
             self.assertFalse(ignored(path), path)
 

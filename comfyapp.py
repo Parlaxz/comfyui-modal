@@ -30,6 +30,10 @@ from comfymodal_runtime.deployment_spec import (
     build_v2_late_config,
 )
 from comfymodal_runtime import publication_policy as _publication_policy
+from comfymodal_runtime.custom_node_root import (
+    CustomNodesRootResolution as _CustomNodesRootResolution,
+    resolve_custom_nodes_root_details as _resolve_custom_nodes_root_details,
+)
 # ── E40 Lane A: single configuration authority ──────────────────────────
 # One resolved-config truth for the runtime. Golden-semantics controls are
 # resolved centrally; the fingerprint binds requested↔deployed↔runtime, and
@@ -7110,15 +7114,20 @@ def _looks_like_custom_nodes_source_root(path: str) -> bool:
     return _publication_policy._looks_like_custom_nodes_source_root(path)
 
 
-def _resolve_local_custom_nodes_root() -> str:
+def _resolve_local_custom_nodes_root_details() -> _CustomNodesRootResolution:
     here = os.path.dirname(os.path.abspath(__file__))
-    return _publication_policy.resolve_custom_nodes_root(
+    return _resolve_custom_nodes_root_details(
         here,
         fallback_roots=(
             "/root/comfy/ComfyUI/custom_nodes",
             os.path.abspath(os.path.join(here, "comfy", "ComfyUI", "custom_nodes")),
         ),
     )
+
+
+def _resolve_local_custom_nodes_root() -> str:
+    """Return the canonical local root while retaining the old API."""
+    return _resolve_local_custom_nodes_root_details().root
 
 
 def _assert_valid_local_custom_nodes_root(path: str) -> None:
@@ -7147,11 +7156,23 @@ _INSIDE_MODAL_CONTAINER = bool(os.environ.get("MODAL_IMAGE_ID")) or os.path.isdi
 # Resolved at deploy time to copy local custom nodes into the image.
 _COMFYUI_MODAL_DIR = os.path.dirname(os.path.abspath(__file__))
 if not _INSIDE_MODAL_CONTAINER:
-    _LOCAL_CUSTOM_NODES = _resolve_local_custom_nodes_root()
+    _LOCAL_CUSTOM_NODES_RESOLUTION = _resolve_local_custom_nodes_root_details()
+    _LOCAL_CUSTOM_NODES = _LOCAL_CUSTOM_NODES_RESOLUTION.root
 else:
     # Remote runtime GÃ‡Ã¶ skip local source resolution.  The custom nodes will
     # be synced from the Modal volume at restore() time.
     _LOCAL_CUSTOM_NODES = "/root/comfy/ComfyUI/custom_nodes"
+    _LOCAL_CUSTOM_NODES_RESOLUTION = _CustomNodesRootResolution(
+        _LOCAL_CUSTOM_NODES,
+        "remote_runtime_mount",
+        (_LOCAL_CUSTOM_NODES,),
+    )
+
+
+def _local_custom_nodes_root_diagnostics() -> dict[str, object]:
+    """Return the selected root and its auditable resolution details."""
+    return _LOCAL_CUSTOM_NODES_RESOLUTION.as_dict()
+
 
 # Requirements-only build context so pip-install layers cache independently of
 # non-requirements custom node source changes.
@@ -7906,6 +7927,15 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print("[comfyapp] === Requirements Context Diagnostics ===")
     print(f"[comfyapp] COMFYAPP_VERSION={COMFYAPP_VERSION}")
     print(f"[comfyapp] source_root={source_root}")
+    _root_resolution_diag = _local_custom_nodes_root_diagnostics()
+    print(
+        "[comfyapp] custom_nodes_root_resolution_method="
+        f"{_root_resolution_diag['custom_nodes_root_resolution_method']}"
+    )
+    print(
+        "[comfyapp] custom_nodes_root_candidates="
+        f"{_root_resolution_diag['custom_nodes_root_candidates']}"
+    )
     print(f"[comfyapp] requirements_dir={requirements_dir}")
 
     # Task 7: Cache killer flags
@@ -8610,6 +8640,15 @@ if not _INSIDE_MODAL_CONTAINER:
         _staged_count = len(os.listdir(_staged_reqs)) if os.path.isdir(_staged_reqs) else 0
         print(f"[comfyapp] build-context: comfyapp_dir={_COMFYUI_MODAL_DIR}")
         print(f"[comfyapp] build-context: local_source={_LOCAL_CUSTOM_NODES}")
+        _root_resolution_diag = _local_custom_nodes_root_diagnostics()
+        print(
+            "[comfyapp] build-context: custom_nodes_root_resolution_method="
+            f"{_root_resolution_diag['custom_nodes_root_resolution_method']}"
+        )
+        print(
+            "[comfyapp] build-context: custom_nodes_root_candidates="
+            f"{_root_resolution_diag['custom_nodes_root_candidates']}"
+        )
         print(f"[comfyapp] build-context: local_syncable_nodes={_baked_node_count} "
               f"nodes_with_dep_files={_baked_with_deps}")
         if _baked_node_names:
