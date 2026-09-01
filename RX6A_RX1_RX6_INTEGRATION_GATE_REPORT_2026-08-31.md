@@ -18,7 +18,7 @@ resulting canonical commit IDs are listed beside each source commit.
 ### Runtime implementation
 
 - RX1 `749b6cc89e35e2896dfeef5f13502440c0021ef2` → `21d56c7eed0a395bc616a0b693671563c3ba972d`
-- RX2 `97cb9cbfb6e5ed80df447b685d861fe88d6ecbebd` → `caaa945416a5469cb9a84c4cfb92c548654091d1`
+- RX2 `97cb9cbfb6e5ed80df447685d861fe88d6ecbebd` → `caaa945416a5469cb9a84c4cfb92c548654091d1`
 - RX3 `85dc140bb5c839b919f92bf87c7ecc3e9daa4436` → `d8e78649e4add9ef98a2037506276d49e8e34ebb`
 - RX6 `fdcb1be0cc339489fb74e534ede8030add1ee885` → `8f7db36445fb1020f84dae6e459d5881c126f47f`
 
