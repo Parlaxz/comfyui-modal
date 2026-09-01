@@ -43,9 +43,10 @@ and reproduction. No missing field is fabricated here.
 | `RX7A_STATIC_E27_INTEGRATION_REPORT_2026-09-01.md:3-8,10-18,22-45` | Present accepted integration result, focused verification, and explicit mechanism-unproven status. |
 | `RX7A_RX6B_AND_STATIC_E27_CANONICAL_INTEGRATION_REPORT_2026-09-01.md:30-35,46-68,70-84` | Present canonical wiring/contract and the statement that no RX8 behavior was introduced. |
 | `E36_FULL_CRITICAL_PATH_REPORT.md:182-210` | Present valid QD4 source evidence and a variance-based historical interpretation; not an RX7 per-run artifact. |
+| `RV4_SEQUENTIAL_REMOTE_RAW_LOG.md:27-34,36-105` | Present surviving resource-matched QD evidence: the reduced-resource redeploy explicitly records `cpu=4,memory_mb=16384`, and its source-probe reports RTX PRO 6000; this is RV4 comparison evidence, not an RX7 artifact. |
 | `OC2_CLIP_LOAD_TIMING_COMPLETENESS_2026-08-25.md:145-151` | Present correction that approximately 1385.929 ms was retained-model CLIPTextEncode/conditioning, not cold CLIP weight load. |
 | `COMFYUI_MODAL_V2_AUG9_RESOURCE_GPU_OPTIMIZATION_REPORT.md:140-160` | Present historical restore/resource comparison; its approximately 1.381 s figure is restore median, not equivalent cold CLIP/UNET load. |
-| `C8_BENCHMARK_REPORT.md:25-40` | Present documented clean production baseline of CPU 16 and memory 49152 MiB. |
+| `C8_BENCHMARK_REPORT.md:25-40` | Present an unrelated old C8/August resource shape of CPU 16 and memory 49152 MiB; it is not the QD control baseline and is not RX7 actual-resource evidence. |
 | `config/v2/flag_registry.toml:196-214,672-679,882-900` | Present registry defaults: stage diagnostics 0, cast-once 0, legacy transport, and static E27 registered as opt-in. |
 
 ### Absent evidence
@@ -181,6 +182,21 @@ exact-output, zero-DNF, zero-fallback, and zero-seriality-violation at
 `RX7_E27_CONTIGUOUS_QD4_SOURCE_SCHEDULING_AB_REPORT_2026-09-01.md:42-45`.
 That remains a report-level claim only.
 
+### Resource-matched QD control
+
+The current serial QD campaign control is explicitly RTX PRO 6000, CPU=4,
+RAM=16384 MiB, `min_containers=0`, and `scaledown_window=4`. The surviving RV4
+record is valid resource-matched QD comparison evidence: its reduced-resource
+redeploy explicitly says `cpu=4,memory_mb=16384` at
+`RV4_SEQUENTIAL_REMOTE_RAW_LOG.md:27-34`, and the corresponding source-probe
+reports `gpu=rtx-pro-6000` at `RV4_SEQUENTIAL_REMOTE_RAW_LOG.md:36-105`.
+This establishes the control/comparison resource shape, not RX7's actual
+resources; the RX7 deployment receipts and raw run artifacts remain missing.
+
+CPU16/RAM49152 came from an unrelated old C8/August snapshot/resource shape.
+It was incorrectly promoted as the clean QD control baseline and is corrected
+here; it must not be used as the QD control baseline.
+
 ## 4. Direct answers
 
 1. **What was the intended arm distinction?** Intended distinction was
@@ -195,9 +211,14 @@ That remains a report-level claim only.
 2. **What resources did RX7 actually use?** UNKNOWN. The contaminated profile
    that was present before this freeze (`gpu=rtx-pro-6000`, `cpu=8`,
    `memory_mb=8192`, `min_containers=0`, `scaledown_window=4`) is not proof of
-   actual RX7 resources. The clean inherited production baseline documented by
-   `C8_BENCHMARK_REPORT.md:25-40` is GPU RTX-PRO-6000, CPU 16, RAM 49152 MB,
-   but that baseline must not be claimed as RX7's actual allocation.
+   actual RX7 resources. The current serial QD control is explicitly GPU
+   RTX-PRO-6000, CPU4, RAM16384 MiB, `min_containers=0`, and
+   `scaledown_window=4`; RV4 independently supplies the surviving
+   resource-matched QD comparison at `RV4_SEQUENTIAL_REMOTE_RAW_LOG.md:27-34`
+   and `:36-105`. The CPU16/RAM49152 values in
+   `C8_BENCHMARK_REPORT.md:25-40` are an unrelated old C8/August
+   snapshot/resource shape and must not be treated as RX7 or QD-control
+   allocation.
 
 3. **Can the intended clean serial control be proven?** No. The intended
    control semantics are clear from the profile and Golden Serial design, but
@@ -205,16 +226,25 @@ That remains a report-level claim only.
    receipts/manifests are absent. The aggregate claim is insufficient for
    independent proof.
 
-4. **Why was control slow?** Only observed variance, non-equivalent historical
-   comparisons, and unknown RX7 configuration/environment can be attributed.
+4. **Why was control slow?** RX7 control slowness was not explained by
+   comparing it to the old retained-model conditioning value. The approximately
+   1385.929 ms value in `OC2_CLIP_LOAD_TIMING_COMPLETENESS_2026-08-25.md:151`
+   is a retained-model CLIPTextEncode/conditioning measurement, not a cold
+   CLIP weight load. Separately, the documented good Golden dispatcher run
+   records complete Golden stage boundaries of `golden_clip_load` approximately
+   1378 ms, `golden_unet_load` approximately 1380 ms, and Golden wall
+   approximately 9845 ms. That is complete Golden load-stage/wall evidence,
+   not a partial conditioning measurement; its own run identity and context
+   must be preserved, and it does not prove RX7. The exact readable repository
+   artifact/report for those named values was not found among the searched
+   candidates (`RV2B_REMOTE_GOLDEN_BASELINE_RAW_LOG.md`,
+   `RV2B_REMOTE_GOLDEN_BASELINE_TRUTH_REPORT.md`, `final_obs_container_full.log`,
+   and related reports), so they are cited as **known-good dispatcher evidence
+   (path unresolved)** rather than assigned to an invented filename or line.
    `E36_FULL_CRITICAL_PATH_REPORT.md:189-210` supports variance in lifecycle,
-   source, H2D-host, and pre-sampler portions. It is not valid to call this
-   “Modal variance” as a proven singular cause. `OC2_CLIP_LOAD_TIMING_COMPLETENESS_2026-08-25.md:151`
-   corrects the approximately 1385.929 ms value as retained-model
-   CLIPTextEncode/conditioning rather than cold CLIP weight load, while
-   `COMFYUI_MODAL_V2_AUG9_RESOURCE_GPU_OPTIMIZATION_REPORT.md:140-156`
-   reports approximately 1.381 s restore median, not equivalent cold CLIP or
-   UNET load. No single cause can be proved from the missing RX7 artifacts.
+   source, H2D-host, and pre-sampler portions. Because RX7 raw artifacts are
+   missing, no singular cause is claimed; resource/configuration/context
+   mismatch remains unresolved.
 
 5. **Can the raw six control plus six static runs be reproduced?** No. The
    raw confirmations, all twelve listed cohort directories, and RX7-specific
@@ -235,33 +265,27 @@ That remains a report-level claim only.
    `RX7A_RX6B_AND_STATIC_E27_CANONICAL_INTEGRATION_REPORT_2026-09-01.md:46-68`.
    It is not default and is not mechanism-proven.
 
-8. **What is the exact clean `golden_p1` profile?** Inherited production
-   resources: GPU `rtx-pro-6000`, CPU 16, RAM 49152 MB; `min_containers` and
-   `scaledown_window` inherited; transport `legacy`; stage diagnostics 0;
-   cast-once 0; deep profile `off`; dynamic VRAM 1; workflow hash check 1;
-   runtime overrides forbidden; no CLI overrides. The profile now expresses
-   the two clean zero values explicitly so resolution is unambiguous, while
-   leaving registry and runtime source unchanged.
+8. **What is the exact clean `golden_p1` profile?** RTX-PRO-6000, CPU4,
+   RAM16384 MiB, `min_containers=0`, `scaledown_window=4`; transport `legacy`;
+   stage diagnostics 0; cast-once 0; output durability `off`; deep profile
+   `off`; dynamic VRAM 1; workflow check 1; runtime overrides forbidden; no CLI
+   overrides. Static E27 remains opt-in only and is not set in this profile.
 
 ## 5. Contamination, restoration, and no-rerun decision
 
-`git blame` on the pre-freeze profile showed the `[resources]` block at lines
-15–20 and diagnostics/cast-once values at lines 56–57 as introduced by
-`afe4d30`. `afe4d30^:config/v2/profiles/golden_p1.toml` had no resources block,
-used legacy transport, and had no diagnostics/cast-once keys. The registry
-defaults in `config/v2/flag_registry.toml:196-214,672-679` are diagnostics 0,
-cast-once 0, and legacy transport.
-
-The minimal clean-control restoration made in this lane is limited to
+The prior freeze incorrectly removed explicit resource values and promoted the
+old C8/August CPU16/RAM49152 shape as the clean QD control. The corrective
+profile change in this lane is limited to
 `config/v2/profiles/golden_p1.toml`:
 
-- removed the contaminated explicit `[resources]` block, restoring inherited
-  production resource resolution;
-- retained `COMFYMODAL_GOLDEN_QD_TRANSPORT = "legacy"`;
-- changed only the two contaminated explicit diagnostics/cast-once values to
-  their clean registry defaults, `"0"` and `"0"`;
-- preserved all unrelated profile fields, static E27 registration, and runtime
-  source.
+- restored explicit `[resources]` for RTX PRO 6000, CPU4, RAM16384 MiB,
+  `min_containers=0`, and `scaledown_window=4`;
+- retained `COMFYMODAL_GOLDEN_QD_TRANSPORT = "legacy"`, diagnostics `"0"`,
+  cast-once `"0"`, and deep profile `"off"`;
+- added explicit `COMFYMODAL_OUTPUT_DURABILITY = "off"`;
+- preserved all other profile fields, static E27 registration, runtime override
+  policy, and runtime source. Static E27 remains opt-in only and is not set in
+  this profile.
 
 This change establishes the next control configuration; it does not
 retroactively prove RX7's resources or execution. No Modal deployment or rerun
@@ -276,14 +300,16 @@ The surviving RX7 report is useful as a bounded aggregate observation, but it
 cannot support independent per-run validation or reproduction. RX7 A/B is
 therefore inconclusive, and the static E27 winner is unproven. The static
 implementation itself is suitable to retain as an opt-in, fail-closed path.
-The canonical control profile has been restored to inherited production
-resources, legacy transport, explicit diagnostics/cast-once zero, deep profile
-off, dynamic VRAM enabled, and workflow hash checking enabled.
+The exact clean control profile is RTX-PRO-6000, CPU4, RAM16384 MiB,
+`min_containers=0`, `scaledown_window=4`, legacy transport, diagnostics 0,
+cast-once 0, output durability off, deep profile off, dynamic VRAM 1, workflow
+check 1, runtime overrides forbidden, and no CLI overrides. Static E27 remains
+opt-in only and is not set in this profile.
 
 RX7_AB_VALID=INCONCLUSIVE
 RX7_STATIC_IMPLEMENTATION_VALID=YES
 STATIC_E27_CANONICAL_WINNER=UNPROVEN
-RX7_ACTUAL_CPU=UNKNOWN (not present in surviving RX7 artifacts)
-RX7_ACTUAL_RAM_MB=UNKNOWN (not present in surviving RX7 artifacts)
-NEXT_QD_CONTROL=golden_p1: inherited production resources (RTX-PRO-6000, CPU 16, RAM 49152 MB), COMFYMODAL_GOLDEN_QD_TRANSPORT=legacy, COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=0, COMFYMODAL_V2_CLIP_FP32_CAST_ONCE=0, COMFYMODAL_SAMPLING_DEEP_PROFILE=off, COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1, COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK=1, runtime overrides forbidden
+RX7_ACTUAL_CPU=UNKNOWN
+RX7_ACTUAL_RAM_MB=UNKNOWN
+NEXT_QD_CONTROL=golden_p1 / legacy / 4 CPU / 16384 MiB / diagnostics off / cast-once off
 REMOTE_RERUN_REQUIRED=YES
