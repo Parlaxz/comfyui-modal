@@ -1,7 +1,7 @@
 # RX4 — Final Parallelization Architecture Audit
 
-**Date:** 2026-08-31  
-**Status:** PARKED — design only; no runtime implementation was made.  
+**Date:** 2026-08-31
+**Status:** PARKED — design only; no runtime implementation was made.
 **Runtime code:** unchanged by this report.
 
 > **GOLDEN SERIAL REMAINS SERIAL.** No parallelization implementation should
