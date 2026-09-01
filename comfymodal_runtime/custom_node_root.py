@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .publication_policy import iter_syncable_custom_node_dirs
+
 
 CUSTOM_NODES_ENV = "COMFYMODAL_LOCAL_CUSTOM_NODES"
 _WORKTREE_MARKERS = (".slim", "worktrees")
@@ -37,29 +39,29 @@ def _normalise(path: str | os.PathLike[str]) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def _is_worktree_collection(path: str | os.PathLike[str]) -> bool:
+    resolved = Path(os.path.realpath(os.fspath(path)))
+    return (
+        resolved.name.casefold() == "worktrees"
+        and resolved.parent.name.casefold() == ".slim"
+    )
+
+
 def looks_like_custom_nodes_root(path: str | os.PathLike[str]) -> bool:
-    """Return whether *path* contains a plausible custom-node set."""
+    """Return whether *path* contains at least one syncable custom node."""
     candidate = os.fspath(path)
     if not candidate or not os.path.isdir(candidate):
+        return False
+    if _is_worktree_collection(candidate):
         return False
     if os.path.realpath(candidate).casefold() in {
         value.casefold() for value in _UNSAFE_ROOTS
     }:
         return False
     try:
-        node_like = sum(
-            1
-            for name in os.listdir(candidate)
-            if os.path.isdir(os.path.join(candidate, name))
-            and not name.startswith(".")
-            and (
-                os.path.isfile(os.path.join(candidate, name, "__init__.py"))
-                or os.path.isfile(os.path.join(candidate, name, "requirements.txt"))
-            )
-        )
+        return bool(iter_syncable_custom_node_dirs(candidate))
     except OSError:
         return False
-    return node_like >= 3
 
 
 def _worktree_context(anchor: Path) -> tuple[Path, str, Path] | None:
@@ -104,7 +106,7 @@ def resolve_custom_nodes_root_details(
         if not looks_like_custom_nodes_root(candidate):
             raise RuntimeError(
                 f"{CUSTOM_NODES_ENV} does not look like a custom-nodes root "
-                f"(need at least 3 node-like directories): {candidate}"
+                f"(expected at least one syncable custom-node directory): {candidate}"
             )
         return CustomNodesRootResolution(
             str(candidate),
@@ -140,7 +142,7 @@ def resolve_custom_nodes_root_details(
         seen.add(key)
         # In particular, never accept <repo>/.slim/worktrees itself if it was
         # supplied as a fallback or encountered through a legacy caller.
-        if candidate.name.casefold() == "worktrees" and candidate.parent.name.casefold() == ".slim":
+        if _is_worktree_collection(candidate):
             continue
         if looks_like_custom_nodes_root(candidate):
             valid.append((candidate, method))

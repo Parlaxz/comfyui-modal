@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from comfymodal_runtime.custom_node_root import (
     CustomNodesRootResolution,
+    looks_like_custom_nodes_root,
     resolve_custom_nodes_root_details,
 )
 
@@ -52,15 +53,22 @@ def _load_resolver_functions():
     return module
 
 
-def _node_root(path: Path) -> Path:
-    for name in ("node-a", "node-b", "node-c"):
+def _node_root(path: Path, *, node_count: int = 3) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    for index in range(node_count):
+        name = f"node-{index + 1}"
         node = path / name
         node.mkdir(parents=True, exist_ok=True)
         (node / "__init__.py").write_text("", encoding="utf-8")
     return path
 
 
-def _fixture(base: Path, *, staged: bool) -> tuple[Path, Path, Path]:
+def _fixture(
+    base: Path,
+    *,
+    staged: bool,
+    node_count: int = 3,
+) -> tuple[Path, Path, Path]:
     canonical = base / "ComfyUI" / "custom_nodes"
     plugin = canonical / "comfyui-modal"
     worktrees = plugin / ".slim" / "worktrees"
@@ -73,7 +81,15 @@ def _fixture(base: Path, *, staged: bool) -> tuple[Path, Path, Path]:
         (worktrees / lane / "__init__.py").write_text("", encoding="utf-8")
     _node_root(canonical)
     if staged:
-        _node_root(worktree / ".slim" / "rx7-custom-nodes")
+        staged_root = _node_root(
+            worktree / ".slim" / "rx7-custom-nodes",
+            node_count=node_count,
+        )
+        # These are real directories/files in the checkout but are excluded by
+        # the publication policy and must not make an empty root look valid.
+        for name in (".slim", "reports", "docs", ".cache"):
+            (staged_root / name).mkdir()
+        (staged_root / "README.md").write_text("not a node", encoding="utf-8")
     return plugin, worktree, canonical
 
 
@@ -107,6 +123,29 @@ class RX8ACustomNodeRootTests(unittest.TestCase):
         self.assertEqual(resolution.method, "worktree_staged_root")
         self.assertTrue(resolution.root.endswith(os.path.join(".slim", "rx7-custom-nodes")))
 
+    def test_staged_worktree_accepts_any_nonzero_syncable_node_count(self):
+        for node_count in (1, 2, 3, 8):
+            with self.subTest(node_count=node_count), tempfile.TemporaryDirectory() as tmp:
+                _plugin, worktree, _canonical = _fixture(
+                    Path(tmp), staged=True, node_count=node_count
+                )
+                resolution = self._resolve(self.comfyapp, worktree)
+            self.assertEqual(resolution.method, "worktree_staged_root")
+
+    def test_zero_syncable_staged_root_falls_back_and_explicit_zero_root_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _plugin, worktree, canonical = _fixture(
+                Path(tmp), staged=True, node_count=0
+            )
+            staged = worktree / ".slim" / "rx7-custom-nodes"
+            self.assertFalse(looks_like_custom_nodes_root(staged))
+            resolution = self._resolve(self.comfyapp, worktree)
+            self.assertEqual(Path(resolution.root), canonical.resolve())
+            with self.assertRaisesRegex(
+                RuntimeError, "expected at least one syncable custom-node directory"
+            ):
+                self._resolve(self.comfyapp, worktree, configured_env=str(staged))
+
     def test_unstaged_worktree_falls_back_to_canonical_not_worktrees(self):
         with tempfile.TemporaryDirectory() as tmp:
             _plugin, worktree, canonical = _fixture(Path(tmp), staged=False)
@@ -114,6 +153,14 @@ class RX8ACustomNodeRootTests(unittest.TestCase):
         self.assertEqual(Path(resolution.root), canonical.resolve())
         self.assertEqual(resolution.method, "canonical_root_from_worktree")
         self.assertNotIn(os.path.join(".slim", "worktrees"), resolution.root)
+
+    def test_worktrees_collection_is_rejected_even_when_populated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _plugin, worktree, _canonical = _fixture(Path(tmp), staged=False)
+            collection = worktree.parent
+            self.assertFalse(looks_like_custom_nodes_root(collection))
+            with self.assertRaisesRegex(RuntimeError, "does not look like a custom-nodes root"):
+                self._resolve(self.comfyapp, worktree, configured_env=str(collection))
 
     def test_explicit_root_precedes_staged_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -153,8 +153,10 @@ Resolution order:
 1. Non-empty `COMFYMODAL_LOCAL_CUSTOM_NODES` configuration wins. An explicit
    empty value and an invalid configured root fail clearly.
 2. For `<repo>/.slim/worktrees/<lane>`,
-   `<worktree>/.slim/<lane>-custom-nodes` wins when it contains at least three
-   node-like directories.
+   `<worktree>/.slim/<lane>-custom-nodes` wins when it contains one or more
+   syncable custom-node directories under the canonical publication policy.
+   The structural check uses the same syncable-node list as archive, image,
+   Volume, and hash generation; unrelated/excluded entries do not qualify.
 3. Without a staged root, canonical `ComfyUI/custom_nodes` wins. The
    `.slim/worktrees` collection is explicitly rejected.
 4. More than one valid inferred/fallback root fails with an ambiguity error;
@@ -177,10 +179,12 @@ ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx8
 ComfyUI/custom_nodes/comfyui-modal/.slim/rx7-custom-nodes/
 ```
 
-It covers canonical checkout, staged worktree, unstaged worktree, explicit
-root, empty root, ambiguous fallback candidates, and diagnostics. Seven tests
-pass while extracting the actual resolver functions from `comfyapp.py` with
-source-path fidelity, without executing unrelated import-time build work.
+It covers canonical checkout, staged worktree roots containing zero, one, two,
+three, and many syncable nodes, misleading excluded entries, unstaged worktree,
+explicit root, empty root, ambiguous fallback candidates, collection
+rejection, and diagnostics. The tests extract the actual resolver functions
+from `comfyapp.py` with source-path fidelity, without executing unrelated
+import-time build work.
 
 ## Remaining RX8 suite problems
 
@@ -200,7 +204,7 @@ Focused checks passed:
 
 ```text
 python -m unittest tests.test_rx8a_custom_node_root
-Ran 7 tests — OK
+Ran 10 tests — OK
 
 python -m unittest tests.test_runtime_deployment_spec
 Ran 52 tests in 0.546s — OK (skipped=1)
@@ -212,8 +216,8 @@ python -m unittest tests.test_custom_node_generation_parity.TestRoundTripAndPuri
 Ran 2 tests — OK
 ```
 
-With a temporary three-node configured root to avoid scanning the concurrent
-shared worktree during ComfyApp import, the complete relevant set passed:
+With a temporary configured root to avoid scanning the concurrent shared
+worktree during ComfyApp import, the complete relevant set passed:
 
 ```text
 tests.test_rx8a_custom_node_root
