@@ -304,12 +304,34 @@ def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypat
         Path(kwargs["telemetry_path"]).write_text(
             json.dumps({
                 "schema": "golden_p1_telemetry_v1",
-                "stages": [{
-                    "name": "golden_teardown",
-                    "end_monotonic_ns": 10,
-                    "end_wall_ns": 10,
-                    "ok": True,
-                }],
+                "external_restore": {"restore_total_ms": 12.5},
+                "stages": [
+                    {
+                        "name": "golden_request_setup",
+                        "entry_monotonic_ns": 1,
+                        "end_monotonic_ns": 2,
+                        "ok": True,
+                    },
+                    {
+                        "name": "golden_clip_forward",
+                        "entry_monotonic_ns": 2,
+                        "end_monotonic_ns": 4,
+                        "ok": True,
+                    },
+                    {
+                        "name": "golden_sampling",
+                        "entry_monotonic_ns": 4,
+                        "end_monotonic_ns": 7,
+                        "ok": True,
+                    },
+                    {
+                        "name": "golden_teardown",
+                        "entry_monotonic_ns": 8,
+                        "end_monotonic_ns": 10,
+                        "end_wall_ns": 10,
+                        "ok": True,
+                    },
+                ],
                 "events": [{
                     "name": "TEARDOWN_COMPLETE",
                     "monotonic_ns": 11,
@@ -362,14 +384,24 @@ def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypat
         assert isinstance(terminal[key], int)
     assert terminal["return_mono_ns"] <= terminal["yield_mono_ns"]
     telemetry = next(event["data"]["golden_telemetry"] for event in events if event["type"] == "result")
+    assert (tmp_path / "golden" / "p2.json").is_file()
+    assert json.loads((tmp_path / "golden" / "p2.json").read_text()) == telemetry
     teardown = next(stage for stage in telemetry["stages"] if stage["name"] == "golden_teardown")
     teardown_complete = next(
         event for event in telemetry["events"] if event["name"] == "TEARDOWN_COMPLETE"
     )
     assert teardown["end_monotonic_ns"] <= teardown_complete["monotonic_ns"]
+    output = capsys.readouterr().out
+    assert "V2 GOLDEN WATERFALL - REMOTE" in output
+    assert output.count("V2 GOLDEN WATERFALL - REMOTE") == 1
+    assert "golden_request_setup [GOLDEN STAGE]" in output
+    assert "golden_clip_forward [GOLDEN STAGE]" in output
+    assert "golden_sampling [GOLDEN STAGE]" in output
+    assert "V2 COLD WATERFALL - REMOTE" not in output
+    assert "V2 COLD WATERFALL - REMOTE/PARTIAL" not in output
+    assert "[v2.golden_telemetry]" not in output
     assert [event["name"] for event in telemetry["events"]] == ["TEARDOWN_COMPLETE"]
     assert "adapter_completion" not in telemetry
-    assert "[v2.golden_telemetry]" not in capsys.readouterr().out
 
 
 def test_golden_telemetry_log_format_is_complete_bounded_and_redacts_prompt(capsys):
@@ -462,6 +494,7 @@ def test_golden_adapter_terminal_paths_do_not_emit_telemetry_block():
     start = source.index("    async def run_golden_serial_stream(")
     end = source.index("    async def run_prompt_stream(", start)
     assert "_emit_golden_telemetry(" not in source[start:end]
+    assert "_emit_golden_waterfall(" in source[start:end]
 
 
 def test_adapter_failure_propagates_persisted_telemetry_and_timing(monkeypatch, tmp_path, capsys):
@@ -528,6 +561,9 @@ def test_adapter_failure_propagates_persisted_telemetry_and_timing(monkeypatch, 
     assert timing["golden_stage_sum_ms"] == pytest.approx(0.002)
     assert timing["golden_telemetry_persist_ms"] is None
     output = capsys.readouterr().out
+    assert "V2 GOLDEN WATERFALL - REMOTE" in output
+    assert "golden_sampling [GOLDEN STAGE]" in output
+    assert "V2 COLD WATERFALL - REMOTE" not in output
     assert "[v2.golden_telemetry]" not in output
 
 

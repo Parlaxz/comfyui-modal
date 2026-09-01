@@ -1581,6 +1581,14 @@ def _emit_golden_telemetry(
         )
 
 
+def _emit_golden_waterfall(
+    telemetry: Any, *, timing: Mapping[str, Any] | None = None
+) -> None:
+    """Print only the bounded Golden waterfall, never the raw telemetry dump."""
+    if isinstance(telemetry, Mapping):
+        print(_format_golden_waterfall(telemetry, timing=timing), flush=True)
+
+
 def _read_golden_telemetry(
     path: Path | None,
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -21416,6 +21424,7 @@ class ModalRuntimeEntrypoint:
             error_event["golden_adapter_timing"] = timing
             if telemetry is not None:
                 error_event["golden_telemetry"] = telemetry
+                _emit_golden_waterfall(telemetry, timing=timing)
             elif telemetry_error:
                 error_event["golden_telemetry_error"] = telemetry_error
             yield error_event
@@ -21485,7 +21494,7 @@ class ModalRuntimeEntrypoint:
         }
         # Evidence, never fabrication: attach the telemetry document Golden
         # actually persisted at the known local path.  Host artifacts retain
-        # the canonical breakdown without duplicating it in container logs.
+        # the raw canonical document without duplicating it in container logs.
         telemetry, telemetry_error = _read_golden_telemetry(telemetry_path)
         timing = _golden_adapter_timing(
             telemetry,
@@ -21498,6 +21507,7 @@ class ModalRuntimeEntrypoint:
         result_data["golden_adapter_timing"] = timing
         if telemetry is not None:
             result_data["golden_telemetry"] = telemetry
+            _emit_golden_waterfall(telemetry, timing=timing)
         elif telemetry_error:
             result_data["golden_telemetry_error"] = telemetry_error
         _yield_wall_unix_ns = time.time_ns()
