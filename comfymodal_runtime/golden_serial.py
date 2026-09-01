@@ -1564,6 +1564,48 @@ def _read_duration_summary(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _actual_source_report_fields(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose one physical-source report at the transport result boundary."""
+    return {
+        "actual_source": report,
+        "actual_source_telemetry": copy.deepcopy(report),
+        "actual_source_events": copy.deepcopy(report.get("actual_source_events")),
+        "actual_source_transitions": copy.deepcopy(report.get("actual_source_transitions")),
+        "SOURCE_TOTAL_WALL_MS": report.get("SOURCE_TOTAL_WALL_MS"),
+        "SOURCE_SYSCALL_UNION_BUSY_MS": report.get("SOURCE_SYSCALL_UNION_BUSY_MS"),
+        "H2D_TOTAL_WALL_MS": report.get("H2D_TOTAL_WALL_MS"),
+        "SOURCE_TO_GPU_READY_MS": report.get("SOURCE_TO_GPU_READY_MS"),
+        "SOURCE_H2D_OVERLAP_MS": report.get("SOURCE_H2D_OVERLAP_MS"),
+        "POST_SOURCE_H2D_TAIL_MS": report.get("POST_SOURCE_H2D_TAIL_MS"),
+        "quiescence_evidence": copy.deepcopy(report.get("quiescence_evidence")),
+    }
+
+
+def _reconcile_actual_source_h2d(
+    report: dict[str, Any], transport_report: Any
+) -> dict[str, Any]:
+    """Retain core-owned H2D lifecycle data without importing its read events.
+
+    Until the dispatcher binds the adapter's context, its existing H2D hooks
+    land on a separate compatibility report.  H2D fields can be reconciled
+    from that report; its broad ``readinto`` events must never replace the
+    adapter's physical syscall events.
+    """
+    if report.get("h2d_events") or not isinstance(transport_report, Mapping):
+        return report
+    for key in (
+        "h2d_events", "h2d_submitted_bytes", "h2d_completed_bytes",
+        "first_h2d_submit_ns", "last_h2d_submit_ns", "first_h2d_completion_ns",
+        "final_required_event_completion_ns", "h2d_reconciliation_complete",
+        "H2D_TOTAL_WALL_MS", "SOURCE_H2D_OVERLAP_MS", "SOURCE_TO_GPU_READY_MS",
+        "POST_SOURCE_H2D_TAIL_MS", "source_finished_to_gpu_ready_tail_ms",
+        "dispatcher_control", "quiescence_evidence", "quiescence",
+    ):
+        if key in transport_report:
+            report[key] = copy.deepcopy(transport_report[key])
+    return report
+
+
 def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(stats.get("source_open_header_layout") or {})
     staging = dict(stats.get("staging") or {})
@@ -1727,6 +1769,9 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         or stats.get("record_reconciliation")
         or {}
     )
+    actual_source = stats.get("actual_source") or stats.get("actual_source_telemetry")
+    actual_source = copy.deepcopy(actual_source) if isinstance(actual_source, Mapping) else None
+    e27_source_mechanism_evaluation = stats.get("e27_source_mechanism_evaluation")
     producer_balance = dict(
         stats.get("producer_balance")
         or {
@@ -1791,6 +1836,50 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         "exact_reconciliation": exact_reconciliation,
         "waits_quiescence": waits,
         "final_drain": dict(stats.get("final_drain") or {}),
+        # Physical syscall/H2D evidence is owned by ActualSourceTelemetry.
+        # Preserve the raw report here rather than replacing it with the
+        # broader dispatcher readinto interval.
+        "actual_source": actual_source,
+        "actual_source_telemetry": copy.deepcopy(actual_source),
+        "actual_source_events": (
+            copy.deepcopy(actual_source.get("actual_source_events"))
+            if actual_source is not None else None
+        ),
+        "actual_source_transitions": (
+            copy.deepcopy(actual_source.get("actual_source_transitions"))
+            if actual_source is not None else None
+        ),
+        "e27_source_mechanism_evaluation": copy.deepcopy(
+            e27_source_mechanism_evaluation
+        ),
+        "E27_SOURCE_MECHANISM_PROVEN": stats.get("E27_SOURCE_MECHANISM_PROVEN"),
+        "e27_source_mechanism_line": stats.get("e27_source_mechanism_line"),
+        "e27_source_mechanism_failed_predicates": copy.deepcopy(
+            stats.get("e27_source_mechanism_failed_predicates")
+        ),
+        "SOURCE_TOTAL_WALL_MS": (
+            actual_source.get("SOURCE_TOTAL_WALL_MS") if actual_source is not None else None
+        ),
+        "SOURCE_SYSCALL_UNION_BUSY_MS": (
+            actual_source.get("SOURCE_SYSCALL_UNION_BUSY_MS")
+            if actual_source is not None else None
+        ),
+        "H2D_TOTAL_WALL_MS": (
+            actual_source.get("H2D_TOTAL_WALL_MS") if actual_source is not None else None
+        ),
+        "SOURCE_TO_GPU_READY_MS": (
+            actual_source.get("SOURCE_TO_GPU_READY_MS") if actual_source is not None else None
+        ),
+        "SOURCE_H2D_OVERLAP_MS": (
+            actual_source.get("SOURCE_H2D_OVERLAP_MS") if actual_source is not None else None
+        ),
+        "POST_SOURCE_H2D_TAIL_MS": (
+            actual_source.get("POST_SOURCE_H2D_TAIL_MS") if actual_source is not None else None
+        ),
+        "quiescence_evidence": (
+            copy.deepcopy(actual_source.get("quiescence_evidence"))
+            if actual_source is not None else None
+        ),
         "post_transport_construction_adoption": dict(
             stats.get("post_transport_construction_adoption") or {
                 "status": "NOT RUN",
@@ -2612,32 +2701,144 @@ def _writable_bytes_view(target: Any) -> memoryview:
     return view
 
 
-def _read_at(fd: int, mv: Any, offset: int) -> int:
-    """Fill ``mv`` fully from absolute file offset (preadv > pread > lseek+read)."""
+def _read_at(
+    fd: int,
+    mv: Any,
+    offset: int,
+    *,
+    actual_source: Any = None,
+    producer_id: int = 0,
+    region_id: Optional[int] = None,
+    destination_offset: Optional[int] = None,
+) -> int:
+    """Fill ``mv`` from an absolute offset and optionally trace each read syscall.
+
+    ``actual_source`` is deliberately a syscall-level seam.  The transition is
+    opened immediately before, and closed immediately after, one physical
+    ``preadv``/``pread``/``read`` call.  It is not a timer around this helper or
+    around a worker's positioned-read operation.
+    """
+
+    # Keep the legacy control arm as direct syscall code.  In particular, do
+    # not construct the instrumented closure (or a per-syscall callback) when
+    # no evaluator was explicitly supplied.
+    if actual_source is None:
+        total = 0
+        if hasattr(os, "preadv"):
+            while total < len(mv):
+                n = int(os.preadv(fd, [mv[total:]], int(offset) + total))
+                if n <= 0:
+                    break
+                total += n
+        elif hasattr(os, "pread"):
+            while total < len(mv):
+                data = os.pread(fd, len(mv) - total, int(offset) + total)
+                n = len(data)
+                if n <= 0:
+                    break
+                mv[total : total + n] = data
+                total += n
+        else:
+            while total < len(mv):
+                os.lseek(fd, int(offset) + total, os.SEEK_SET)
+                data = os.read(fd, len(mv) - total)
+                n = len(data)
+                if n <= 0:
+                    break
+                mv[total : total + n] = data
+                total += n
+        return total
+
+    actual_source.mark_physical_syscall_provenance("golden_serial._read_at")
+
+    def physical_read(
+        requested_bytes: int,
+        source_offset: int,
+        destination: Optional[int],
+        retry_number: int,
+        syscall: Callable[[], Any],
+    ) -> Any:
+        call = None
+        closed = False
+        if actual_source is not None:
+            call = actual_source.syscall_enter(
+                producer_id,
+                source_offset,
+                requested_bytes,
+                retry_number=retry_number,
+                region_id=region_id,
+                destination_offset=destination,
+            )
+        try:
+            result = syscall()
+            if isinstance(result, int):
+                returned_bytes = int(result)
+            else:
+                returned_bytes = len(result)
+            if actual_source is not None:
+                actual_source.syscall_exit(call, returned_bytes)
+                closed = True
+            return result
+        except BaseException as exc:
+            if actual_source is not None and not closed:
+                # Preserve the original syscall/validation exception while
+                # still closing the evidence transition on every failure path.
+                try:
+                    actual_source.syscall_exit(call, 0, error=exc)
+                except BaseException:
+                    pass
+            raise
+
+    retry_number = 0
     total = 0
     if hasattr(os, "preadv"):
         while total < len(mv):
-            n = int(os.preadv(fd, [mv[total:]], int(offset) + total))
+            requested = len(mv) - total
+            result = physical_read(
+                requested,
+                int(offset) + total,
+                None if destination_offset is None else int(destination_offset) + total,
+                retry_number,
+                lambda: os.preadv(fd, [mv[total:]], int(offset) + total),
+            )
+            n = int(result)
             if n <= 0:
                 break
             total += n
+            retry_number += 1
     elif hasattr(os, "pread"):
         while total < len(mv):
-            data = os.pread(fd, len(mv) - total, int(offset) + total)
+            requested = len(mv) - total
+            data = physical_read(
+                requested,
+                int(offset) + total,
+                None if destination_offset is None else int(destination_offset) + total,
+                retry_number,
+                lambda: os.pread(fd, requested, int(offset) + total),
+            )
             n = len(data)
             if n <= 0:
                 break
             mv[total : total + n] = data
             total += n
+            retry_number += 1
     else:
         while total < len(mv):
             os.lseek(fd, int(offset) + total, os.SEEK_SET)
-            data = os.read(fd, len(mv) - total)
+            requested = len(mv) - total
+            data = physical_read(
+                requested,
+                int(offset) + total,
+                None if destination_offset is None else int(destination_offset) + total,
+                retry_number,
+                lambda: os.read(fd, requested),
+            )
             n = len(data)
             if n <= 0:
                 break
             mv[total : total + n] = data
             total += n
+            retry_number += 1
     return total
 
 
@@ -3146,14 +3347,21 @@ def _read_file_qd_gpu_dispatcher(
             4 if selected == "static_e27" else qd,
             enabled=diagnostics_enabled,
         )
+        actual_source_telemetry = None
 
         class _PositionedSource:
             """One positioned source object with one descriptor per producer."""
+
+            # The dispatcher binds this context instead of wrapping
+            # ``readinto`` with a second, broader synthetic source event.  The
+            # adapter remains the owner of the physical syscall boundary.
+            handles_actual_source_telemetry = True
 
             def __init__(self) -> None:
                 self._fds: dict[int, int] = {}
                 self._lock = threading.Lock()
                 self.open_count = 0
+                self.actual_source_telemetry = None
 
             def _fd_for_producer(self, producer_id: int) -> int:
                 producer_limit = 4 if selected == "static_e27" else qd
@@ -3177,7 +3385,12 @@ def _read_file_qd_gpu_dispatcher(
                     # protocol it requires.  This is a view, never a staging
                     # allocation or a bytes materialization.
                     got = int(_read_at(
-                        self._fd_for_producer(producer_id), _writable_bytes_view(target), int(offset)
+                        self._fd_for_producer(producer_id),
+                        _writable_bytes_view(target),
+                        int(offset),
+                        actual_source=self.actual_source_telemetry,
+                        producer_id=producer_id,
+                        destination_offset=int(offset) - data_start,
                     ))
                 except BaseException:
                     raise
@@ -3230,6 +3443,27 @@ def _read_file_qd_gpu_dispatcher(
                 for producer_items in planned_work
                 for item in producer_items
             )
+            source_start = source_ranges[0].source_offset if source_ranges else 0
+            actual_source_telemetry = transport_module.ActualSourceTelemetry(
+                arm=selected,
+                producer_count=4,
+                regions=tuple(
+                    {
+                        "producer_id": producer_id,
+                        "region_id": producer_id,
+                        "start": source_start + int(region_start),
+                        "end": source_start + int(region_end),
+                    }
+                    for producer_id, (region_start, region_end) in enumerate(_planned_regions)
+                ),
+                expected_ranges=((source_start, source_start + total),) if total else (),
+                expected_destination_ranges=tuple(
+                    (item.target_offset, item.target_offset + item.length)
+                    for item in source_ranges
+                ),
+                expected_h2d_bytes=total,
+            )
+            source.actual_source_telemetry = actual_source_telemetry
         result = dispatcher.execute(
             source_ranges,
             source,
@@ -3398,6 +3632,41 @@ def _read_file_qd_gpu_dispatcher(
             "owner_count": 1,
             "adoption_result": "transport_backing_pending",
         }
+        actual_source_report = (
+            actual_source_telemetry.to_dict()
+            if actual_source_telemetry is not None else None
+        )
+        if actual_source_report is not None:
+            actual_source_report = _reconcile_actual_source_h2d(
+                actual_source_report, telemetry.get("actual_source")
+            )
+        # Evaluate only the authoritative physical-source report after its H2D
+        # fields have been reconciled. Missing or malformed evidence remains
+        # an explicit NO; it is never promoted from a performance observation.
+        e27_source_mechanism_evaluation = transport_module.evaluate_e27_source_mechanism(
+            actual_source_report
+        )
+        e27_source_mechanism_line = e27_source_mechanism_evaluation["emitted_line"]
+        e27_source_mechanism_proven = e27_source_mechanism_evaluation[
+            "E27_SOURCE_MECHANISM_PROVEN"
+        ]
+        e27_source_mechanism_failed_predicates = copy.deepcopy(
+            e27_source_mechanism_evaluation["failed_predicates"]
+        )
+        dispatcher_stats.update({
+            "e27_source_mechanism_evaluation": copy.deepcopy(
+                e27_source_mechanism_evaluation
+            ),
+            "E27_SOURCE_MECHANISM_PROVEN": e27_source_mechanism_proven,
+            "e27_source_mechanism_line": e27_source_mechanism_line,
+            "e27_source_mechanism_failed_predicates": e27_source_mechanism_failed_predicates,
+        })
+        if actual_source_report is not None:
+            # This report is the authoritative physical source/H2D evidence.
+            # Keep it at the dispatcher boundary as well as under its
+            # structured namespace so existing Golden result consumers retain
+            # their schema while new consumers can use the raw events.
+            dispatcher_stats.update(_actual_source_report_fields(actual_source_report))
         stats = {
             "kind": "golden_qd_read",
             "role": str(role),
@@ -3414,6 +3683,14 @@ def _read_file_qd_gpu_dispatcher(
             "source_read_bytes": source_bytes,
             "h2d_submitted_bytes": int(result.submitted_bytes),
             "h2d_completed_bytes": h2d_bytes,
+            "e27_source_mechanism_evaluation": copy.deepcopy(
+                e27_source_mechanism_evaluation
+            ),
+            "E27_SOURCE_MECHANISM_PROVEN": e27_source_mechanism_proven,
+            "e27_source_mechanism_line": e27_source_mechanism_line,
+            "e27_source_mechanism_failed_predicates": copy.deepcopy(
+                e27_source_mechanism_failed_predicates
+            ),
             "qd_source_io_wall_ms": source_wall_ms,
             "qd_source_gbps": source_gbps,
             "effective_source_gbps": source_gbps,
@@ -3570,6 +3847,8 @@ def _read_file_qd_gpu_dispatcher(
                 "reason": "outside the dispatcher transport/read boundary",
             },
         }
+        if actual_source_report is not None:
+            stats.update(_actual_source_report_fields(actual_source_report))
         stats["owner_count"] = 1
         stats["adoption_result"] = "backing_owner_retained_for_adoption"
         views: dict[str, Any] = {}
