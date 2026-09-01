@@ -7171,14 +7171,16 @@ _COMFYMODAL_DUPLICATE_TYPO_NAMES = frozenset({"comyui-modal-pagesfile-probe"})
 
 def _is_comfymodal_duplicate_dir(node_name: str, node_path: str) -> str | None:
     return _publication_policy.comfymodal_duplicate_reason(node_name, node_path)
-_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = _publication_policy.image_ignore_patterns()
-_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = (
+_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = (
     _publication_policy.image_ignore_patterns()
+    + _publication_policy.image_ignore_patterns("**/")
+)
+_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = (
+    _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS
     + ["comfymodal_experiment_presets.json", "comfymodal_experiment_state.json"]
 )
 _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = (
-    _publication_policy.image_ignore_patterns()
-    + _publication_policy.image_ignore_patterns("*/")
+    _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS
     + [
         "comfyui-modal-agent*/", "comfyui-modal-worktree*/",
         "comfyui-modal-wt*/", "comfyui-modal-dc*/",
@@ -7284,10 +7286,9 @@ def custom_node_filter_diagnostics(cn_root: str) -> dict:
 
 
 def _custom_node_image_ignore_patterns(node_name: str) -> list[str]:
-    patterns = list(_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS)
     if node_name == os.path.basename(_COMFYUI_MODAL_DIR):
-        patterns.extend(_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS)
-    return patterns
+        return list(_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS)
+    return list(_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS)
 
 
 def _custom_node_requirements_context_dir(node_name: str) -> str:

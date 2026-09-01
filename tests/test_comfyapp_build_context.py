@@ -51,6 +51,20 @@ def load_module():
 
 
 class ComfyAppBuildContextTests(unittest.TestCase):
+    def test_image_ignore_patterns_share_recursive_publication_base(self):
+        module = load_module()
+
+        recursive_pattern = "**/__pycache__/"
+        for patterns in (
+            module._CUSTOM_NODE_IMAGE_IGNORE_PATTERNS,
+            module._COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS,
+            module._COMBINED_CUSTOM_NODE_IGNORE_PATTERNS,
+        ):
+            self.assertIn(recursive_pattern, patterns)
+            self.assertNotIn("*/__pycache__/", patterns)
+
+        self.assertIn("__pycache__/", module._CUSTOM_NODE_IMAGE_IGNORE_PATTERNS)
+
     def test_comfyui_modal_node_ignores_generated_deploy_artifacts(self):
         module = load_module()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import io
+import fnmatch
 import tarfile
 import tempfile
 import unittest
@@ -103,6 +104,81 @@ class TestExclusionPredicate(unittest.TestCase):
 
         self.assertFalse(is_excluded_path("legitimate-node/source.py"))
         self.assertFalse(publication_policy.is_excluded_path("legitimate-node/source.py"))
+
+    def test_publication_excludes_known_non_runtime_directories_recursively(self):
+        excluded_dirs = (".repowise", "ra11f", "reports", "example_workflows", "workflows")
+        for directory in excluded_dirs:
+            for path in (
+                f"{directory}/state.json",
+                f"legitimate-node/{directory}/nested/runtime.py",
+            ):
+                self.assertTrue(is_excluded_path(path), path)
+                self.assertTrue(publication_policy.is_excluded_path(path), path)
+
+        self.assertFalse(is_excluded_path("legitimate-node/runtime.py"))
+        self.assertFalse(publication_policy.is_excluded_path("legitimate-node/runtime.py"))
+
+    def test_publication_walk_skips_known_non_runtime_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "node-a"
+            node.mkdir()
+            (node / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+            for directory in (".repowise", "ra11f", "reports", "example_workflows", "workflows"):
+                excluded = node / "nested" / directory
+                excluded.mkdir(parents=True)
+                (excluded / "ignored.py").write_text("ignored = True\n", encoding="utf-8")
+
+            published = {
+                path.relative_to(root).as_posix()
+                for path in publication_policy.iter_publication_files(root)
+            }
+
+        self.assertEqual(published, {"node-a/runtime.py"})
+
+    def test_image_ignore_patterns_cover_known_non_runtime_directories_recursively(self):
+        excluded_dirs = (".repowise", "ra11f", "reports", "example_workflows", "workflows")
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        for directory in excluded_dirs:
+            self.assertIn(f"{directory}/", patterns)
+            self.assertIn(f"**/{directory}/", patterns)
+
+    def test_image_ignore_patterns_cover_generated_json_and_generated_images(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        for prefix in GENERATED_JSON_PREFIXES:
+            self.assertIn(f"{prefix}*.json", patterns)
+            self.assertIn(f"**/{prefix}*.json", patterns)
+        for extension in (".png", ".jpg", ".webp"):
+            self.assertIn(f"*screenshot*{extension}", patterns)
+            self.assertIn(f"**/*validation*{extension}", patterns)
+
+    def test_image_ignore_patterns_match_exclusions_without_hiding_runtime_files(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+
+        def ignored(path):
+            return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+        for path in (
+            "temp_result.json",
+            "nested/_last_trace_result.json",
+            "nested/screenshot-result.PNG",
+            "nested/studio-validation-desktop.webp",
+            "README.md",
+            "nested/README.MD",
+        ):
+            self.assertTrue(ignored(path), path)
+
+        for path in ("runtime.py", "nested/runtime.py", "runtime_asset.png"):
+            self.assertFalse(ignored(path), path)
 
     def test_excluded_screenshot_png(self):
         self.assertTrue(is_excluded_name("studio-validation-desktop.png"))

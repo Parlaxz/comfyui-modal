@@ -24,7 +24,8 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     ".git", ".slim", ".commandcode", ".opencode", ".runtime_state",
     "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".eggs",
-    ".cache", "wheelhouse", "wheels", "build", "dist", "artifacts",
+    ".cache", ".repowise", "ra11f", "reports", "example_workflows",
+    "workflows", "wheelhouse", "wheels", "build", "dist", "artifacts",
     "output", "test-results", "playwright-report", "playwright/.cache",
     ".playwright-mcp", ".experiments", ".run_history", "benchmark_runs",
     "benchmark_logs", "optimization_logs", ".comfymodal_experiments",
@@ -467,12 +468,40 @@ def compute_publication_generation(root: str | Path) -> str:
 
 def image_ignore_patterns(prefix: str = "") -> list[str]:
     """Return deterministic glob patterns suitable for ``add_local_dir``."""
+
+    def case_variants(value: str) -> tuple[str, ...]:
+        variants = [""]
+        for character in value:
+            if character.isalpha():
+                variants = [
+                    f"{variant}{case}"
+                    for variant in variants
+                    for case in (character.lower(), character.upper())
+                ]
+            else:
+                variants = [f"{variant}{character}" for variant in variants]
+        return tuple(variants)
+
     patterns = [f"{prefix}{name}/" for name in sorted(EXCLUDED_DIR_NAMES)]
     patterns.extend(f"{prefix}{name}" for name in sorted(EXCLUDED_FILENAMES))
     patterns.extend(f"{prefix}*{ext}" for ext in sorted(EXCLUDED_EXTENSIONS))
     patterns.extend(f"{prefix}{glob}" for glob in EXCLUDED_GLOBS)
     patterns.extend(f"{prefix}{prefix_name}*" for prefix_name in EXCLUDED_PREFIXES)
     patterns.extend(f"{prefix}*{infix}*" for infix in EXCLUDED_INFIXES)
+    patterns.extend(
+        f"{prefix}{json_prefix}*{extension}"
+        for json_prefix in GENERATED_JSON_PREFIXES
+        for extension in case_variants(".json")
+    )
+    patterns.extend(
+        f"{prefix}*{kind}*{extension_variant}"
+        for kind in ("screenshot", "validation")
+        for extension in sorted(IMAGE_EXTENSIONS)
+        for extension_variant in case_variants(extension)
+    )
+    # Modal's image matcher is case-sensitive, while ``is_excluded_name``
+    # treats the Markdown extension case-insensitively.
+    patterns.extend(f"{prefix}*.{extension}" for extension in ("mD", "Md", "MD"))
     return patterns
 
 
