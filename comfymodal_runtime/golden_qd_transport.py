@@ -80,9 +80,9 @@ def normalize_transport_arm(value: str | None = None) -> str:
 def static_e27_regions(total: int, producer_count: int = STATIC_E27_PRODUCERS) -> tuple[tuple[int, int], ...]:
     """Return fixed E27 regions as relative ``[start, end)`` byte ranges.
 
-    Regions are planned once per transport.  Empty trailing regions are kept
-    so the static arm always has the four explicit producer identities used by
-    the E27 probe, including for very short test inputs.
+    Regions are planned once per transport. Empty trailing regions are kept
+    so the static arm always has the four explicit producer identities used
+    by the E27 probe, including for very short test inputs.
     """
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
         raise ValueError("total must be a non-negative integer")
@@ -684,7 +684,7 @@ class _Telemetry:
             self.producer_destination_offset_monotonic = True
         else:
             # Destination order is an optional observation, not a correctness
-            # counter.  Diagnostics-off must not report that it was observed.
+            # counter. Diagnostics-off must not report that it was observed.
             self.producer_destination_offset_monotonic = None
         self.source_qd_depth = 0 if self.diagnostics_enabled else None
         self.producer_read_bytes = {}
@@ -1644,7 +1644,7 @@ class GoldenQDTransport:
     ) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[SourceRange, ...], ...]]:
         """Plan four fixed source regions and their block-clamped work.
 
-        The input ranges describe the logical destination layout.  Static E27
+        The input ranges describe the logical destination layout. Static E27
         deliberately ignores their scheduling order, partitions the contiguous
         source span once, and lets each producer walk only its own region.
         Intersections preserve destination mapping and record identity.

@@ -516,12 +516,17 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
             self.weight = torch.nn.Parameter(
                 torch.empty(4, device="meta", dtype=torch.float32)
             )
+            # Constructor-owned structural state is not supplied by the
+            # checkpoint and must be declared by the live Golden path.
+            self.constructor_scale = torch.nn.Parameter(
+                torch.ones(1, dtype=torch.float32)
+            )
 
     def load_text_encoder_state_dicts(state_dicts, **kwargs):
         captured["calls"] = captured.get("calls", 0) + 1
         captured["state_dicts"] = state_dicts
         destination = Loader()
-        destination.load_state_dict(state_dicts[0], assign=True)
+        destination.load_state_dict(state_dicts[0], strict=False, assign=True)
         clip = types.SimpleNamespace(
             cond_stage_model=destination,
             patcher=DynamicPatcher(),
@@ -625,6 +630,9 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
     assert session.clip_residency_record["actual"] == "fp32_cast_once"
     assert session.clip_residency_record["fallback"] is False
     assert session.clip_ownership_transfer is None
+    assert session.clip_ownership_transfer_record["bind_proof"][
+        "structural_destination_keys"
+    ] == ["constructor_scale"]
     assert owner.closed is True
     assert any(event["name"] == "clip_fp32_cast_once_actual_bind" for event in session.recorder.events)
     assert clip.patcher.is_dynamic()
@@ -652,3 +660,26 @@ def test_golden_fp32_loader_uses_one_actual_assign_bind_seam(monkeypatch):
     assert named["cast_once_bind_ms"] is not None
     assert named["cast_once_proof_ms"] is not None
     assert named["clip_forward_total_ms"] is None
+
+
+def test_golden_bind_seam_rejects_unrelated_extra_after_structural_discovery():
+    class ConstructorModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+            self.constructor_scale = torch.nn.Parameter(
+                torch.ones(1, dtype=torch.float32)
+            )
+
+    model = ConstructorModel()
+    clip = types.SimpleNamespace(cond_stage_model=model)
+    structural = ra9g.discover_structural_destination_keys(clip, {"weight"})
+    assert structural == ["constructor_scale"]
+
+    model.register_parameter(
+        "unrelated_extra", torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+    )
+    with pytest.raises(ra9g.OwnershipTransferError, match="actual destination extra keys"):
+        ra9g.actual_bind_destination_map(
+            clip, {"weight"}, declared_structural_keys=structural
+        )

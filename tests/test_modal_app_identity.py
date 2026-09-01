@@ -281,6 +281,91 @@ class TestE31RuntimePropagation(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_stage_diagnostics_passthrough_preserves_absence(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS", None)
+            self.assertNotIn(
+                "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS", modal_app._runtime_env()
+            )
+            os.environ["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"] = "1"
+            self.assertEqual(
+                modal_app._runtime_env()["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"],
+                "1",
+            )
+
+
+class TestGoldenRA9GIdentityHandoff(unittest.TestCase):
+    """The direct Golden adapter supplies only canonical RA9G identity."""
+
+    _PROMPT = {
+        "1": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": "qwen3_4b.safetensors", "type": "stable_diffusion"},
+        },
+    }
+
+    def _identity(self, extra_data=None):
+        with patch.object(
+            comfyapp,
+            "_read_models_generation_record",
+            return_value={"generation": "models-generation-7"},
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            return modal_app._golden_ra9g_identity(
+                self._PROMPT, extra_data or {},
+            )
+
+    def test_builds_all_required_fields_from_canonical_sources(self):
+        identity = self._identity()
+        self.assertEqual(identity["checkpoint_identity"], "qwen3_4b.safetensors")
+        self.assertEqual(identity["manifest_generation"], "models-generation-7")
+        self.assertEqual(
+            identity["selected_tensor_scope"], "qwen3_4b.transformer.model",
+        )
+        self.assertEqual(identity["target_device"], "cuda:0")
+        self.assertEqual(
+            identity["model_patch_identity"], "golden-native-model-options-v1",
+        )
+
+    def test_caller_identity_must_agree_with_runtime_authority(self):
+        with self.assertRaisesRegex(RuntimeError, "golden_identity_conflict:checkpoint_identity"):
+            self._identity({
+                "clip_source_identity": {"checkpoint_identity": "other.safetensors"},
+            })
+
+    def test_dual_clip_identity_uses_the_canonical_unchanged_pair(self):
+        prompt = {
+            "1": {
+                "class_type": "DualCLIPLoader",
+                "inputs": {
+                    "clip_name1": "clip-a.safetensors",
+                    "clip_name2": "clip-b.safetensors",
+                    "type": "stable_diffusion",
+                },
+            },
+        }
+        with patch.object(
+            comfyapp,
+            "_read_models_generation_record",
+            return_value={"generation": "models-generation-7"},
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            identity = modal_app._golden_ra9g_identity(prompt, {})
+        self.assertEqual(identity["checkpoint_identity"], "clip-a.safetensors||clip-b.safetensors")
+
+    def test_missing_models_generation_fails_closed(self):
+        with patch.object(
+            comfyapp, "_read_models_generation_record", return_value=None,
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "missing stable identity field: manifest_generation",
+            ):
+                modal_app._golden_ra9g_identity(self._PROMPT, {})
+
 
 class TestGoldenGateRuntimePropagation(unittest.TestCase):
     """The Golden DynamicVRAM gate crosses both runtime observation boundaries."""
@@ -406,6 +491,92 @@ class TestStartupIdentityCapture(unittest.TestCase):
         self.assertEqual(result["backend"], "in_process")
         self.assertIn("trace", result)
         self.assertIn("events", result["trace"])
+
+
+class TestGoldenModelsGenerationStartup(unittest.TestCase):
+    """Golden establishes the canonical model identity before snapshot work."""
+
+    @staticmethod
+    def _entrypoint(reader, writer):
+        entrypoint = modal_app.ModalRuntimeEntrypoint(
+            bootstrap=RuntimeBootstrap(),
+        )
+        entrypoint._legacy_module = SimpleNamespace(
+            _read_models_generation_record=reader,
+            _write_models_generation_record=writer,
+        )
+        return entrypoint
+
+    def test_existing_record_is_not_rewritten(self):
+        reader = MagicMock(return_value={"generation": "stable-models-generation"})
+        writer = MagicMock()
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=True):
+            record = entrypoint._maybe_initialize_golden_models_generation()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["generation"], "stable-models-generation")
+        reader.assert_called_once_with()
+        writer.assert_not_called()
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "existing"
+        )
+
+    def test_missing_record_calls_writer_once_with_clear_reason(self):
+        reader = MagicMock(return_value=None)
+        writer = MagicMock(
+            return_value={"generation": "new-models-generation"},
+        )
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=True):
+            record = entrypoint._maybe_initialize_golden_models_generation()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["generation"], "new-models-generation")
+        writer.assert_called_once()
+        reason = writer.call_args.args[0]
+        self.assertIn("golden_serial_startup", reason)
+        self.assertIn("models_generation", reason)
+        self.assertIn("missing_or_invalid", reason)
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "initialized"
+        )
+
+    def test_non_golden_profile_does_not_initialize_record(self):
+        reader = MagicMock(return_value=None)
+        writer = MagicMock()
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=False):
+            record = entrypoint._maybe_initialize_golden_models_generation()
+
+        self.assertIsNone(record)
+        reader.assert_not_called()
+        writer.assert_not_called()
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "not_run"
+        )
+
+    def test_writer_failure_is_visible_and_fails_closed(self):
+        reader = MagicMock(return_value=None)
+        writer = MagicMock(side_effect=OSError("volume unavailable"))
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "golden_serial_models_generation_initialization_failed",
+            ):
+                entrypoint._maybe_initialize_golden_models_generation()
+
+        writer.assert_called_once()
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "failed"
+        )
 
 
 class TestRestoreIdentityCapture(unittest.TestCase):
@@ -3500,6 +3671,45 @@ class TestGoldenSerialStreamBehavior(_GoldenSerialStreamHarness, unittest.TestCa
         ))
         self.assertEqual(len(explicit_calls), 1)
         self.assertEqual(explicit_calls[0]["attention_backend"], "pytorch")
+
+    def test_cast_once_handoff_contains_request_bound_ra9g_identity(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+        prompt = {
+            "1": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": "qwen3_4b.safetensors",
+                    "type": "stable_diffusion",
+                },
+            },
+        }
+        with patch.dict(
+            os.environ, {"COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "1"},
+        ), patch.object(
+            comfyapp,
+            "_read_models_generation_record",
+            return_value={"generation": "models-generation-7"},
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            events = self._collect_stream(**self._build_kwargs(
+                request_id="req-golden-ra9g-identity",
+                prompt=prompt,
+            ))
+
+        self.assertEqual(
+            [event for event in events if event.get("type") == "error"], [],
+        )
+        self.assertEqual(len(calls), 1)
+        identity = calls[0]["extra_data"]["clip_source_identity"]
+        self.assertEqual(
+            set(identity), {
+                "checkpoint_identity", "manifest_generation",
+                "selected_tensor_scope", "target_device", "model_patch_identity",
+            },
+        )
 
     # ── Failure path ──────────────────────────────────────────────────────
 

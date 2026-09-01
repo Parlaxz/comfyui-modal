@@ -430,6 +430,49 @@ class RA9GOwnershipTransferTest(unittest.TestCase):
         self.assertTrue(record["storage_proven"])
         self.assertEqual(record["bind_receipt"]["receipt_marker"], "ra9g.actual_bind.v1")
 
+    def test_wiring_accepts_same_object_alias_and_declared_structural_key(self):
+        transfer, _, transformed, _, _ = _transfer()
+        transfer._manifests[0]["structural_destination_keys"] = ["logit_scale"]
+
+        clip = type("Clip", (), {})()
+        clip.cond_stage_model = object()
+        expected_tensor = transformed[0]["weight"]
+        destination = {
+            "weight": expected_tensor,
+            "transformer.model.weight": expected_tensor,
+            "logit_scale": torch.ones(1, dtype=torch.float32),
+        }
+        with mock.patch.object(cfh, "hydrate_clip_bind", return_value=(True, "actual-bind")), \
+             mock.patch.object(cfh, "_leaf_loaders", return_value=[clip.cond_stage_model]), \
+             mock.patch.object(cfh, "_leaf_param_map", return_value=destination):
+            record, evidence = wiring._bind_with_ownership_transfer(
+                clip, transfer, transformed, require_no_meta=False
+            )
+
+        self.assertEqual(evidence, "actual-bind")
+        self.assertTrue(record["storage_proven"])
+        self.assertEqual(record["bind_receipt"]["receipt_marker"], "ra9g.actual_bind.v1")
+
+    def test_unrelated_post_bind_tensor_is_not_an_ignored_extra(self):
+        transfer, _, transformed, _, identity = _transfer()
+        clip = type("Clip", (), {})()
+        clip.cond_stage_model = object()
+        expected_tensor = transformed[0]["weight"]
+        destination = {
+            "weight": expected_tensor,
+            "transformer.model.weight": expected_tensor,
+            "logit_scale": torch.ones(1, dtype=torch.float32),
+            "unrelated": expected_tensor.clone(),
+        }
+        with mock.patch.object(cfh, "_leaf_loaders", return_value=[clip.cond_stage_model]), \
+             mock.patch.object(cfh, "_leaf_param_map", return_value=destination):
+            with self.assertRaisesRegex(ra9g.OwnershipTransferError, "actual destination extra keys"):
+                ra9g.actual_bind_destination_map(
+                    clip,
+                    identity.expected_keys,
+                    declared_structural_keys=("logit_scale",),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

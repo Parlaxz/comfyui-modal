@@ -370,10 +370,64 @@ def _flatten_tensor_maps(mappings: Any) -> dict[str, Any]:
     return flattened
 
 
+def discover_structural_destination_keys(clip: Any, expected_keys: Any) -> list[str]:
+    """Discover constructor-owned destination names on a live CLIP.
+
+    The leaf maps are the authoritative Comfy load/bind surface.  Named
+    parameters and buffers supplement that surface for parameters owned by the
+    enclosing model rather than a dispatch leaf.  A name is structural only
+    when it is not an expected checkpoint name and its tensor object is not
+    one of the expected destination objects; aliases are therefore filtered by
+    exact object identity, never by a name heuristic or storage coincidence.
+    """
+    try:
+        from . import clip_fast_hydration as _cfh
+
+        csm = getattr(clip, "cond_stage_model", None)
+        if csm is None:
+            return []
+        wanted = {str(key) for key in (expected_keys or ())}
+        entries: list[tuple[str, Any]] = []
+        leaves = _cfh._leaf_loaders(csm)
+        for leaf in leaves or ():
+            for key, tensor in _cfh._leaf_param_map(leaf).items():
+                entries.append((str(key), tensor))
+        # Leaf maps cover the names accepted by load_sd, but constructor-owned
+        # parameters/buffers can live on the enclosing cond-stage model.
+        for accessor_name in ("named_parameters", "named_buffers"):
+            accessor = getattr(csm, accessor_name, None)
+            if not callable(accessor):
+                continue
+            try:
+                named = accessor(remove_duplicate=False)
+            except TypeError:
+                named = accessor()
+            entries.extend((str(key), tensor) for key, tensor in named)
+
+        expected_destination_ids = {
+            id(tensor) for key, tensor in entries if key in wanted
+        }
+        return sorted({
+            key for key, tensor in entries
+            if key not in wanted and id(tensor) not in expected_destination_ids
+        })
+    except OwnershipTransferError:
+        raise
+    except Exception as exc:
+        raise OwnershipTransferError(
+            f"structural destination discovery failed: {exc}"
+        ) from exc
+
+
 def actual_bind_destination_map(
-    clip: Any, expected_keys: Any, *, allowed_extra_keys: Any = ()
+    clip: Any, expected_keys: Any, *, declared_structural_keys: Any = ()
 ) -> dict[str, Any]:
-    """Collect the destination tensors after ``hydrate_clip_bind`` returns."""
+    """Collect the destination tensors after ``hydrate_clip_bind`` returns.
+
+    ``declared_structural_keys`` is the frozen model-structure declaration,
+    not a general extra-key allowlist.  All other non-expected names must be
+    aliases of an expected tensor by object identity or the bind fails.
+    """
     try:
         from . import clip_fast_hydration as _cfh
         csm = getattr(clip, "cond_stage_model", None)
@@ -381,13 +435,13 @@ def actual_bind_destination_map(
             raise OwnershipTransferError("clip has no destination model")
         wanted = {str(key) for key in expected_keys}
         destination: dict[str, Any] = {}
-        all_keys: set[str] = set()
+        destination_entries: list[tuple[str, Any]] = []
         leaves = _cfh._leaf_loaders(csm)
         if leaves:
             for leaf in leaves:
                 for key, tensor in _cfh._leaf_param_map(leaf).items():
                     key = str(key)
-                    all_keys.add(key)
+                    destination_entries.append((key, tensor))
                     if key in wanted:
                         if key in destination and destination[key] is not tensor:
                             raise OwnershipTransferError(f"duplicate actual destination: {key}")
@@ -399,12 +453,25 @@ def actual_bind_destination_map(
             named = list(csm.named_parameters()) + list(csm.named_buffers())
             for key, tensor in named:
                 key = str(key)
-                all_keys.add(key)
+                destination_entries.append((key, tensor))
                 if key in wanted:
                     if key in destination and destination[key] is not tensor:
                         raise OwnershipTransferError(f"duplicate actual destination: {key}")
                     destination[key] = tensor
-        unexpected = all_keys - wanted - {str(key) for key in (allowed_extra_keys or ())}
+        # Comfy's leaf map exposes both the fully-qualified state-dict name
+        # and its load_sd spelling.  Only an alias of an expected destination
+        # tensor may be omitted from the exact key set; matching names or
+        # storage pointers are not sufficient proof.
+        expected_destination_ids = {id(tensor) for tensor in destination.values()}
+        structural = {str(key) for key in (declared_structural_keys or ())}
+        unexpected = {
+            key for key, tensor in destination_entries
+            if (
+                key not in wanted
+                and key not in structural
+                and id(tensor) not in expected_destination_ids
+            )
+        }
         if unexpected:
             raise OwnershipTransferError(f"actual destination extra keys: {sorted(unexpected)}")
         if set(destination) != wanted:
@@ -492,7 +559,9 @@ def snapshot_adopted_storage(
             return record
         target = str(expect_device or bind_proof.get("target_device") or "")
         destination = actual_bind_destination_map(
-            clip, expected, allowed_extra_keys=bind_proof.get("allowed_extra_keys", ())
+            clip,
+            expected,
+            declared_structural_keys=bind_proof.get("structural_destination_keys", ()),
         )
         record["expected_count"] = len(expected)
         for key in sorted(expected):
@@ -1006,7 +1075,7 @@ class ClipFP32OwnershipTransfer:
                     "identity_digest": self._identity.digest,
                     "target_device": self._identity.target_device,
                     "expected_keys": list(self._identity.expected_keys),
-                    "allowed_extra_keys": sorted({
+                    "structural_destination_keys": sorted({
                         str(key)
                         for manifest in self._manifests
                         for key in (manifest.get("structural_destination_keys") or ())

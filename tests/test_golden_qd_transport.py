@@ -105,9 +105,7 @@ def test_static_e27_arm_uses_fixed_ids_and_preserves_output_identity():
 
     data = bytes(range(37))
     source = RecordingSource(data)
-    transport = GoldenQDTransport(
-        small_config(block_bytes=8), FakeBackend(), arm="static_e27"
-    )
+    transport = GoldenQDTransport(small_config(block_bytes=8), FakeBackend(), arm="static_e27")
     result = transport.execute([SourceRange(0, len(data), 0)], source, output_size=len(data))
 
     assert result.output == data
@@ -144,9 +142,7 @@ def test_static_e27_short_read_retry_advances_source_and_destination_offsets():
 
 
 def test_static_e27_rejects_permuted_destination_mapping_during_planning():
-    transport = GoldenQDTransport(
-        small_config(block_bytes=8), FakeBackend(), arm="static_e27"
-    )
+    transport = GoldenQDTransport(small_config(block_bytes=8), FakeBackend(), arm="static_e27")
     with pytest.raises(qd.ReconciliationError, match="canonical forward layout"):
         transport.plan_static_work(
             [SourceRange(0, 4, 4, "a"), SourceRange(4, 4, 0, "b")],
@@ -155,9 +151,7 @@ def test_static_e27_rejects_permuted_destination_mapping_during_planning():
 
 
 def test_static_e27_split_chunks_have_unique_ids_and_unsplit_id_is_preserved():
-    transport = GoldenQDTransport(
-        small_config(block_bytes=8), FakeBackend(), arm="static_e27"
-    )
+    transport = GoldenQDTransport(small_config(block_bytes=8), FakeBackend(), arm="static_e27")
     _regions, work = transport.plan_static_work(
         [SourceRange(0, 4, 0, "unsplit"), SourceRange(4, 20, 4, "split")],
         destination_size=24,

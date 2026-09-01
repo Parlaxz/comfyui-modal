@@ -12,6 +12,13 @@ app = "batch-r0-golden-ops"
 class = "ModalRuntimeEntrypointV2"
 method = "run_golden_serial_stream"
 
+[resources]
+gpu = "rtx-pro-6000"
+cpu = 8
+memory_mb = 8192
+min_containers = 0
+scaledown_window = 4
+
 [workload]
 fresh_required = true
 conditioning_cache = "forced_miss"
@@ -46,6 +53,8 @@ COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "0"
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
 COMFYMODAL_SAMPLING_DEEP_PROFILE = "off"
 COMFYMODAL_GOLDEN_QD_TRANSPORT = "legacy"
+COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS = "1"
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "1"
 
 # The Golden request contract requires canonical workflow SHA verification.
 COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "1"

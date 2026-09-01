@@ -698,6 +698,51 @@ class CastOnceIdentityTest(unittest.TestCase):
 class ExactResidencyProofTest(unittest.TestCase):
     """The cast-once claim is an exact checkpoint-to-parameter proof."""
 
+    def test_model_structural_discovery_uses_parameters_and_buffers(self):
+        source = {
+            "a": torch.ones(2, dtype=torch.float32),
+            "b": torch.ones(3, dtype=torch.float32),
+        }
+        clip, _, _ = _mapping_fixture(source=source)
+        csm = clip.cond_stage_model
+        csm.logit_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+        csm.register_buffer("structural_buffer", torch.ones(1, dtype=torch.float32))
+        csm.register_parameter("checkpoint_alias", csm.leaf.a)
+
+        structural = hydration_wiring._model_structural_destination_keys(
+            clip, set(source)
+        )
+
+        self.assertEqual(structural, ["logit_scale", "structural_buffer"])
+
+    def test_discovered_structural_destination_does_not_allow_unrelated_extra(self):
+        source = {
+            "a": torch.ones(2, dtype=torch.float32),
+            "b": torch.ones(3, dtype=torch.float32),
+        }
+        clip, _, _ = _mapping_fixture(source=source)
+        clip.cond_stage_model.logit_scale = torch.nn.Parameter(
+            torch.ones(1, dtype=torch.float32)
+        )
+        structural = hydration_wiring._model_structural_destination_keys(
+            clip, set(source)
+        )
+        destination = {
+            "a": source["a"],
+            "b": source["b"],
+            "logit_scale": clip.cond_stage_model.logit_scale,
+            "unrelated": torch.ones(1, dtype=torch.float32),
+        }
+
+        with patch.object(cfh, "_leaf_loaders", return_value=[clip.cond_stage_model.leaf]), \
+             patch.object(cfh, "_leaf_param_map", return_value=destination):
+            with self.assertRaisesRegex(
+                cast_once.OwnershipTransferError, "actual destination extra keys"
+            ):
+                cast_once.actual_bind_destination_map(
+                    clip, set(source), declared_structural_keys=structural
+                )
+
     def test_successful_fp32_cast_and_exact_mapping(self):
         original = {
             "a": torch.arange(4, dtype=torch.bfloat16),

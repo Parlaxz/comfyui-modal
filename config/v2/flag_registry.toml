@@ -196,6 +196,15 @@ description = "FastSafeTensor bounce-buffer size in KiB for UNET reads (request-
 # ── Deploy-baked (captured by the deployed runtime; a change needs a deploy) ──
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-ops"
+description = "Optional Golden CLIP/VAE/QD stage diagnostics, including E31 forward evidence. Default OFF; deploy-baked for structurally classified experiment requests."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
 type = "bool"
 default = "0"

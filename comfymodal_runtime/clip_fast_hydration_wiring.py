@@ -653,26 +653,10 @@ def _verify_file_against_manifest(
 def _model_structural_destination_keys(
     clip: Any, expected_keys: set[str]
 ) -> list[str]:
-    """Freeze model-created destination keys not supplied by the checkpoint.
+    """Compatibility wrapper for the RA9G-owned structural-key helper."""
+    from comfymodal_runtime import clip_fp32_cast_once as ra9g
 
-    The proof still rejects any destination not in this frozen declaration at
-    demand time.  Aliased state-dict names for checkpoint parameters are
-    excluded by identity, matching the residency proof's destination map.
-    """
-    csm = getattr(clip, "cond_stage_model", None)
-    if csm is None:
-        return []
-    destination_all: list[tuple[str, Any]] = []
-    for leaf in cfh._leaf_loaders(csm):
-        for key, tensor in cfh._leaf_param_map(leaf).items():
-            destination_all.append((str(key), tensor))
-    expected_destination_ids = {
-        id(tensor) for key, tensor in destination_all if key in expected_keys
-    }
-    return sorted({
-        key for key, tensor in destination_all
-        if key not in expected_keys and id(tensor) not in expected_destination_ids
-    })
+    return ra9g.discover_structural_destination_keys(clip, expected_keys)
 
 
 def _authoritative_clip_manifest_fields(clip: Any, cpu_models: Any) -> dict[str, Any]:
@@ -1357,7 +1341,7 @@ def _bind_with_ownership_transfer(
     )
     if not ok:
         raise RuntimeError(f"bind: {evidence}")
-    allowed_extra_keys = {
+    declared_structural_keys = {
         str(key)
         for manifest in getattr(transfer, "_manifests", ())
         for key in (manifest.get("structural_destination_keys") or ())
@@ -1365,7 +1349,7 @@ def _bind_with_ownership_transfer(
     destination = actual_bind_destination_map(
         clip,
         transfer.identity.expected_keys,
-        allowed_extra_keys=allowed_extra_keys,
+        declared_structural_keys=declared_structural_keys,
     )
     receipt = build_actual_bind_receipt(
         clip, destination, transfer.identity, assign=True

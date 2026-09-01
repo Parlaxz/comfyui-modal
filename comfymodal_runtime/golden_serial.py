@@ -3548,6 +3548,9 @@ def _read_file_qd_gpu_dispatcher(
                 "producer_destination_offset_monotonic"
             ),
             "record_reconciliation": exact_reconciliation,
+            "h2d_reconciliation": telemetry.get("h2d_reconciliation"),
+            "poisoned": telemetry.get("poisoned"),
+            "poison_reason": telemetry.get("poison_reason"),
             "fallback": {
                 "pin_fallback": 0,
                 "alignment_tensor_count": 0,
@@ -7796,6 +7799,15 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
             raise RuntimeError("clip_construct_failed")
+        if clip_transfer is not None:
+            # Golden bypasses the legacy snapshot manifest wiring.  Freeze the
+            # live constructor-owned names now, before the actual bind, so the
+            # same declaration is retained by RA9G's later storage proof.
+            structural_destination_keys = ra9g.discover_structural_destination_keys(
+                clip, clip_transfer.identity.expected_keys
+            )
+            for manifest in clip_transfer._manifests:
+                manifest["structural_destination_keys"] = list(structural_destination_keys)
         # Postflight: a non-dynamic patcher (e.g. a disable_offload wrapper)
         # would silently accept weight COPIES — always rejected, regardless of
         # the spec preflight gate.
@@ -7834,7 +7846,9 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             # mapping.  The receipt is built before any source owner cleanup.
             ra9g = _ra9h_clip_module()
             actual_destination = ra9g.actual_bind_destination_map(
-                clip, clip_transfer.identity.expected_keys
+                clip,
+                clip_transfer.identity.expected_keys,
+                declared_structural_keys=structural_destination_keys,
             )
             receipt = ra9g.build_actual_bind_receipt(
                 clip, actual_destination, clip_transfer.identity, assign=True

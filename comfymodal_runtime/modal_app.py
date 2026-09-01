@@ -2408,6 +2408,103 @@ def _capture_remote_identity() -> dict[str, Any]:
     return identity
 
 
+# Direct Golden does not pass through the restore/model-plan path, so the
+# request adapter must carry the stable fields needed by RA9G.  These values
+# are intentionally limited to canonical model/runtime sources; in
+# particular, no filesystem metadata, object identity, or tensor data is used.
+_GOLDEN_RA9G_SELECTED_TENSOR_SCOPE = "qwen3_4b.transformer.model"
+_GOLDEN_RA9G_MODEL_PATCH_IDENTITY = "golden-native-model-options-v1"
+_GOLDEN_RA9G_IDENTITY_ALIASES = {
+    "checkpoint_identity": (
+        "checkpoint_identity", "checkpoint_id", "source_identity",
+        "checkpoint_hash", "stable_hash",
+    ),
+    "manifest_generation": (
+        "manifest_generation", "content_generation", "manifest_digest",
+        "generation", "digest",
+    ),
+    "selected_tensor_scope": (
+        "selected_tensor_scope", "tensor_scope", "selected_scope", "scope",
+    ),
+    "target_device": ("target_device", "device"),
+    "model_patch_identity": (
+        "model_patch_identity", "patch_identity", "model_identity",
+    ),
+}
+
+
+def _golden_runtime_target_device() -> str:
+    """Return the explicit CUDA device selected for this request."""
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("missing stable identity field: target_device")
+    try:
+        device = str(torch.device("cuda", int(torch.cuda.current_device())))
+    except Exception as exc:
+        raise RuntimeError("missing stable identity field: target_device") from exc
+    if not device.startswith("cuda:"):
+        raise RuntimeError("missing stable identity field: target_device")
+    return device
+
+
+def _golden_ra9g_identity(
+    prompt: Mapping[str, Any], extra_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the request-bound RA9G identity from authoritative sources.
+
+    The fixed Golden contract supplies the selected scope and native
+    model-options identity.  The workflow supplies checkpoint identity,
+    ``comfyapp`` supplies the authoritative models generation, and CUDA
+    supplies the explicit target device.  Any identity supplied by the caller
+    is only accepted when it agrees with every value derived here.
+    """
+    model_key = derive_model_key(dict(prompt))
+    checkpoint_identity = str(getattr(model_key, "clip_identity", "") or "")
+    if not checkpoint_identity:
+        raise RuntimeError("missing stable identity field: checkpoint_identity")
+
+    try:
+        comfyapp = sys.modules.get("comfyapp")
+        reader = getattr(comfyapp, "_read_models_generation_record", None)
+        record = reader() if callable(reader) else None
+    except Exception:
+        record = None
+    manifest_generation = (
+        record.get("generation", "")
+        if isinstance(record, Mapping) else ""
+    )
+    if not isinstance(manifest_generation, str):
+        manifest_generation = ""
+    if not manifest_generation:
+        raise RuntimeError("missing stable identity field: manifest_generation")
+
+    authoritative = {
+        "checkpoint_identity": checkpoint_identity,
+        "manifest_generation": manifest_generation,
+        "selected_tensor_scope": _GOLDEN_RA9G_SELECTED_TENSOR_SCOPE,
+        "target_device": _golden_runtime_target_device(),
+        "model_patch_identity": _GOLDEN_RA9G_MODEL_PATCH_IDENTITY,
+    }
+
+    # Existing Golden accepts these two request-bound identity containers.
+    # Validate all recognized aliases before replacing the boundary value so a
+    # caller cannot smuggle a conflicting alias past the canonical fields.
+    supplied: list[Mapping[str, Any]] = []
+    for name in ("clip_source_identity", "source_identity"):
+        candidate = extra_data.get(name)
+        if isinstance(candidate, Mapping):
+            supplied.append(candidate)
+    for candidate in supplied:
+        for field, aliases in _GOLDEN_RA9G_IDENTITY_ALIASES.items():
+            values = [candidate[key] for key in aliases if key in candidate]
+            if any(value not in (None, "", [], {}) and str(value) != authoritative[field]
+                   for value in values):
+                raise RuntimeError(f"golden_identity_conflict:{field}")
+
+    return authoritative
+
+
 def _post_restore_identity_telemetry(
     runtime: Any,
     *,
@@ -4100,6 +4197,10 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
             env[_ev_key] = os.environ[_ev_key]
     if "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS" in os.environ:
         env["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"]
+    # Optional Golden stage diagnostics preserve their absent-by-default
+    # contract: an unset host flag remains unset in the container.
+    if "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS" in os.environ:
+        env["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"] = os.environ["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -6251,6 +6352,10 @@ class ModalRuntimeEntrypoint:
         # Lifecycle startup remains compatible with the legacy runtime, but a
         # Golden stage can never silently fall back into it.
         self._golden_execution_active = False
+        # Startup-only status for the Golden models-generation control record.
+        # The record is established before snapshot construction and is never
+        # synthesized at request time.
+        self._golden_models_generation_startup_status = "not_run"
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
@@ -9521,6 +9626,126 @@ class ModalRuntimeEntrypoint:
         )
         self._runtime_configured = True
 
+    def _ensure_golden_models_generation_record(self) -> dict[str, Any]:
+        """Establish the canonical models-generation record for Golden.
+
+        Direct Golden bypasses the legacy ``ComfyAPI.startup`` path, which is
+        normally responsible for creating this control record.  Reuse the
+        canonical reader and writer from the configured runtime module instead
+        of deriving identity from custom nodes or model filesystem metadata.
+
+        The canonical reader already treats missing, malformed, and
+        unsupported records as invalid.  A successful writer result is
+        validated before startup continues; there is no retry or request-time
+        fallback because RA9G identity must fail closed.
+        """
+        module = self._legacy_module
+        if module is None:
+            self._golden_models_generation_startup_status = "failed"
+            raise RuntimeError("golden_serial_models_generation_module_unavailable")
+
+        reader = getattr(module, "_read_models_generation_record", None)
+        writer = getattr(module, "_write_models_generation_record", None)
+        if not callable(reader):
+            self._golden_models_generation_startup_status = "failed"
+            raise RuntimeError("golden_serial_models_generation_reader_unavailable")
+
+        try:
+            record = reader()
+        except Exception as exc:
+            # The canonical reader normally converts read/parse failures to
+            # None.  Treat a legacy/test double that raises the same way: the
+            # record is invalid and the canonical writer gets one chance to
+            # repair it at startup.
+            record = None
+            read_error = type(exc).__name__
+        else:
+            read_error = ""
+
+        if (
+            isinstance(record, Mapping)
+            and isinstance(record.get("generation"), str)
+            and bool(record.get("generation", "").strip())
+        ):
+            self._golden_models_generation_startup_status = "existing"
+            print(
+                "[v2.models_generation] profile=golden_serial "
+                "status=existing source=canonical_record",
+                flush=True,
+            )
+            return dict(record)
+
+        reason = "golden_serial_startup_models_generation_missing_or_invalid"
+        if read_error:
+            reason += f":reader_error={read_error}"
+        if not callable(writer):
+            self._golden_models_generation_startup_status = "failed"
+            raise RuntimeError("golden_serial_models_generation_writer_unavailable")
+        try:
+            written = writer(reason)
+        except Exception as exc:
+            self._golden_models_generation_startup_status = "failed"
+            print(
+                "[v2.models_generation] profile=golden_serial "
+                f"status=failed reason={reason} "
+                f"error_type={type(exc).__name__}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "golden_serial_models_generation_initialization_failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not (
+            isinstance(written, Mapping)
+            and isinstance(written.get("generation"), str)
+            and bool(written.get("generation", "").strip())
+        ):
+            self._golden_models_generation_startup_status = "failed"
+            print(
+                "[v2.models_generation] profile=golden_serial "
+                "status=failed reason=writer_returned_invalid_record",
+                flush=True,
+            )
+            raise RuntimeError(
+                "golden_serial_models_generation_writer_returned_invalid_record"
+            )
+
+        self._golden_models_generation_startup_status = "initialized"
+        print(
+            "[v2.models_generation] profile=golden_serial "
+            f"status=initialized reason={reason}",
+            flush=True,
+        )
+        return dict(written)
+
+    def _maybe_initialize_golden_models_generation(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        profile_active: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """Initialize the model identity record only for Golden Serial."""
+        active = (
+            _golden_serial_profile_active()
+            if profile_active is None
+            else bool(profile_active)
+        )
+        if not active:
+            return None
+        record = self._ensure_golden_models_generation_record()
+        if trace is not None:
+            trace.emit(
+                "golden_models_generation_ready",
+                phase="lifecycle",
+                metadata={
+                    "status": self._golden_models_generation_startup_status,
+                    "source": "canonical_record",
+                    "generation": str(record["generation"])[:16],
+                },
+            )
+        return record
+
     def _capture_coordinator_state(self) -> dict[str, Any]:
         """Capture coordinator state from the bridge's coordinator (best-effort)."""
         state: dict[str, Any] = {}
@@ -9860,6 +10085,11 @@ class ModalRuntimeEntrypoint:
         self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
         identity = _capture_remote_identity()
         self._configure_runtime()
+        # Direct Golden bypasses ComfyAPI.startup, so establish the canonical
+        # models-generation control record before bootstrap/snapshot work can
+        # complete.  The profile gate keeps every non-Golden lifecycle path
+        # unchanged.
+        _golden_serial_active = _golden_serial_profile_active()
         trace.set_metadata(**identity)
         trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         startup_session_id = uuid.uuid4().hex
@@ -9912,6 +10142,10 @@ class ModalRuntimeEntrypoint:
         )
         _lifecycle_error: str | None = None
         try:
+            self._maybe_initialize_golden_models_generation(
+                trace=trace,
+                profile_active=_golden_serial_active,
+            )
             state = self.bootstrap.startup(snapshot=True, trace=trace)
 
             # [v2.generation_identity] bootstrap diagnostic
@@ -10232,7 +10466,6 @@ class ModalRuntimeEntrypoint:
             # Plan C: CPU model snapshot construction.  Golden is a separate
             # serial profile: it must not even evaluate the legacy CPU-snapshot
             # gate, since that gate can require the production snapshot setup.
-            _golden_serial_active = _golden_serial_profile_active()
             _golden_pre_capture_surfaces: dict[str, list[Any]] | None = None
             if _golden_serial_active:
                 self._clear_cpu_snapshot_state_for_golden()
@@ -21221,6 +21454,7 @@ class ModalRuntimeEntrypoint:
             GoldenRequest,
             golden_serial_execute,
             normalize_attention_backend,
+            resolve_clip_residency,
         )
         from .output_durability import resolve_output_durability
 
@@ -21353,6 +21587,12 @@ class ModalRuntimeEntrypoint:
                 raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
             ensure_gpu_ready()
 
+            golden_extra_data = dict(extra_data_raw)
+            if resolve_clip_residency() == "fp32_cast_once":
+                golden_extra_data["clip_source_identity"] = _golden_ra9g_identity(
+                    prompt, extra_data_raw,
+                )
+
             # ── Golden DynamicVRAM activation seam (official-equivalent) ──
             # Exactly one call per request; the callee is idempotent per
             # process (a repeat returns already_activated=True).  When the
@@ -21389,7 +21629,7 @@ class ModalRuntimeEntrypoint:
             golden_request = GoldenRequest(
                 request_id=normalized_request_id,
                 prompt=dict(prompt),
-                extra_data=dict(extra_data_raw),
+                extra_data=golden_extra_data,
                 attention_backend=attention_backend,
             )
             self._golden_execution_active = True

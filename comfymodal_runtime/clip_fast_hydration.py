@@ -1388,9 +1388,16 @@ def _leaf_param_map(leaf: Any) -> dict[str, Any]:
     Comfy leaves forward the file state dict directly to an inner module
     (e.g. SDClipModel.load_sd -> transformer.load_state_dict), so the file
     keys are the inner module's names while ``leaf.state_dict()`` prefixes
-    them with the leaf attribute path.  Both the exact names and the
-    first-component-stripped names are mapped (exact wins)."""
-    sd = leaf.state_dict()
+    them with the leaf attribute path.  Keep the actual parameter/buffer
+    objects when the upstream Module API supports it; ownership proofs use
+    object identity to distinguish aliases from constructor-owned state.
+    Both the exact names and the first-component-stripped names are mapped
+    (exact wins)."""
+    try:
+        sd = leaf.state_dict(keep_vars=True)
+    except TypeError:
+        # Small Comfy-compatible leaves may expose the older no-argument form.
+        sd = leaf.state_dict()
     mapping: dict[str, Any] = {}
     for key, tensor in sd.items():
         mapping[key] = tensor
