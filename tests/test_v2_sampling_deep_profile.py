@@ -18,6 +18,7 @@ torch.cuda.  Covers:
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
@@ -32,6 +33,7 @@ from typing import Any
 from unittest.mock import patch
 
 from comfymodal_runtime import sampling_deep_profile as sdp
+from comfymodal_runtime import golden_serial as golden
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +199,27 @@ class _FakeCuda:
     @classmethod
     def synchronize(cls):
         cls.sync_count += 1
+
+
+class _FakeStream:
+    def __init__(self, query_results, device="cuda:0"):
+        self._query_results = iter(query_results)
+        self.query_count = 0
+        self.device = device
+
+    def query(self):
+        self.query_count += 1
+        return next(self._query_results)
+
+
+class _FakeCudaWithStream(_FakeCuda):
+    stream: Any = None
+    current_stream_count = 0
+
+    @classmethod
+    def current_stream(cls):
+        cls.current_stream_count += 1
+        return cls.stream
 
 
 class _FakeTrace:
@@ -614,6 +637,55 @@ class ProcessResidencyTelemetryTests(unittest.TestCase):
         self.assertEqual(records["overflow_count"], 5)
         self.assertEqual(len(art["process_residency"]["later_compute"]), sdp._MAX_PROCESS_COMPUTE_RECORDS - 1)
         json.loads(json.dumps(art))
+
+    def test_host_cpu_thread_and_wall_evidence_is_serialized(self):
+        trace = _FakeTrace()
+        snapshots = iter((
+            {
+                **self._snapshot(100),
+                "process_cpu_time_ns": 1_000,
+                "thread_cpu_time_ns": 700,
+                "wall_monotonic_ns": 10_000,
+                "wall_unix_ns": 20_000,
+            },
+            {
+                **self._snapshot(120),
+                "process_cpu_time_ns": 1_250,
+                "thread_cpu_time_ns": 850,
+                "wall_monotonic_ns": 13_000,
+                "wall_unix_ns": 23_000,
+            },
+        ))
+        with patch.object(sdp, "_resolve_cuda_module", lambda: None), \
+             patch.object(sdp, "_read_process_residency_snapshot", lambda: next(snapshots)):
+            prof = _begin(trace, level="steps", steps=1, patcher=None)
+            art = _finalize(prof, trace)
+        host = art["host_cpu_wall"]
+        self.assertEqual(host["delta"]["process_cpu_time_ns"], 250)
+        self.assertEqual(host["delta"]["thread_cpu_time_ns"], 150)
+        self.assertEqual(host["delta"]["wall_monotonic_ns"], 3_000)
+        self.assertEqual(art["process_residency"]["sampling_end"]["boundary"],
+                         "after_sampling_end_before_cuda_realization")
+        json.loads(json.dumps(art))
+
+    def test_host_evidence_is_unavailable_without_numeric_delta(self):
+        trace = _FakeTrace()
+        unavailable = sdp._unavailable_process_residency_snapshot()
+        with patch.object(sdp, "_resolve_cuda_module", lambda: None), \
+             patch.object(sdp, "_read_process_residency_snapshot", return_value=unavailable):
+            prof = _begin(trace, level="steps", steps=1, patcher=None)
+            art = _finalize(prof, trace)
+        host = art["host_cpu_wall"]
+        self.assertEqual(host["status"], "unavailable")
+        self.assertEqual(host["available_fields"], [])
+        self.assertEqual(host["scope"], "deep_profile_entry_to_after_sampling_end")
+        self.assertEqual(
+            host["limits"],
+            [
+                "process_cpu_time_ns", "thread_cpu_time_ns", "rss_bytes",
+                "minor_page_faults", "major_page_faults",
+            ],
+        )
 
 
 class CacheDiTDiscoveryTests(unittest.TestCase):
@@ -1104,6 +1176,14 @@ class CudaOrderingTests(unittest.TestCase):
             art = _finalize(prof, trace)
         self.assertEqual(_FakeCuda.sync_count, 1, "exactly one post-boundary sync")
         self.assertTrue(art["clocks"]["cuda_events"])
+        self.assertEqual(art["cuda_boundary"]["status"], "observed")
+        self.assertEqual(
+            art["cuda_boundary"]["stream_readiness"]["profile_start"]["status"],
+            "unavailable",
+        )
+        self.assertTrue(art["cuda_boundary"]["start_recorded"])
+        self.assertTrue(art["cuda_boundary"]["end_recorded"])
+        self.assertEqual(art["cuda_boundary"]["realization"], "post_sampling_end_only")
         self.assertGreaterEqual(art["instrumentation_overhead"]["cuda_sync_ms"], 0.0)
         self.assertEqual(art["instrumentation_overhead"]["placement"], "post_sampling_end_cleanup")
         # ── P0-3: bounded CUDA timing results serialized in the artifact ──
@@ -1119,6 +1199,49 @@ class CudaOrderingTests(unittest.TestCase):
         for v in payload["cuda_timings_ms"].values():
             self.assertIsInstance(v, (int, float))
 
+    def test_stream_query_is_non_synchronizing_supporting_boundary_evidence(self):
+        dm = _FakeNextDiT(n_layers=4)
+        patcher = SimpleNamespace(model=SimpleNamespace(diffusion_model=dm))
+        trace = _FakeTrace()
+        stream = _FakeStream((True, False), device="cuda:3")
+        _FakeCudaWithStream.stream = stream
+        _FakeCudaWithStream.current_stream_count = 0
+        _FakeCudaWithStream.sync_count = 0
+        with patch.object(sdp, "_resolve_cuda_module", lambda: _FakeCudaWithStream), \
+             patch.object(sdp, "_read_cachedit_counters", lambda d, p: {"discoverable": False}):
+            prof = _begin(trace, level="blocks", steps=8, patcher=patcher)
+            self.assertEqual(stream.query_count, 1)
+            self.assertEqual(_FakeCudaWithStream.sync_count, 0)
+            _run_standard_sampling(prof)
+            self.assertEqual(stream.query_count, 1, "no query inside sampling window")
+            art = _finalize(prof, trace)
+
+        boundary = art["cuda_boundary"]
+        self.assertEqual(stream.query_count, 2)
+        self.assertEqual(_FakeCudaWithStream.sync_count, 1)
+        self.assertEqual(boundary["status"], "observed")
+        self.assertTrue(boundary["stream_readiness"]["query_observed"])
+        self.assertEqual(
+            boundary["stream_readiness"]["profile_start"]["status"], "ready"
+        )
+        self.assertEqual(
+            boundary["stream_readiness"]["post_sampling_end"]["status"],
+            "not_ready",
+        )
+        self.assertEqual(
+            boundary["stream_readiness"]["profile_start"]["stream"]["device"],
+            "cuda:3",
+        )
+        self.assertTrue(
+            boundary["stream_readiness"]["profile_start"]["non_synchronizing"]
+        )
+        self.assertIn(
+            "visible on that stream only",
+            boundary["stream_readiness"]["semantics"],
+        )
+        self.assertIn("causal proof", boundary["semantics"])
+        json.loads(json.dumps(art))
+
     def test_cuda_unavailable_warning_and_no_events(self):
         dm = _FakeNextDiT(n_layers=4)
         patcher = SimpleNamespace(model=SimpleNamespace(diffusion_model=dm))
@@ -1131,6 +1254,20 @@ class CudaOrderingTests(unittest.TestCase):
         self.assertFalse(art["clocks"]["cuda_events"])
         self.assertTrue(any("cuda_events_unavailable" in w for w in art["warnings"]))
 
+    def test_cuda_boundary_pair_is_cleared_when_realization_sync_fails(self):
+        dm = _FakeNextDiT(n_layers=2)
+        patcher = SimpleNamespace(model=SimpleNamespace(diffusion_model=dm))
+        trace = _FakeTrace()
+        with patch.object(sdp, "_resolve_cuda_module", lambda: _FakeCuda), \
+             patch.object(sdp, "_read_cachedit_counters", lambda d, p: {"discoverable": False}), \
+             patch.object(_FakeCuda, "synchronize", side_effect=RuntimeError("sync")):
+            prof = _begin(trace, level="blocks", steps=8, patcher=patcher)
+            _run_standard_sampling(prof)
+            art = _finalize(prof, trace)
+        self.assertFalse(art["cuda_boundary"]["end_recorded"])
+        self.assertIsNone(art["cuda_boundary"]["elapsed_ms"])
+        self.assertTrue(any("cuda_realization_failed" in w for w in art["warnings"]))
+
     def test_steps_mode_never_enables_cuda(self):
         trace = _FakeTrace()
         with patch.object(sdp, "_resolve_cuda_module", lambda: _FakeCuda):
@@ -1141,6 +1278,124 @@ class CudaOrderingTests(unittest.TestCase):
             art = _finalize(prof, trace)
         self.assertFalse(art["clocks"]["cuda_events"])
         self.assertEqual(_FakeCuda.sync_count, 0)
+
+
+class GoldenSamplingDecompositionTests(unittest.TestCase):
+    def test_complete_stage_is_total_children_are_partial_and_residual_is_explicit(self):
+        stage = SimpleNamespace(entry_monotonic_ns=100, end_monotonic_ns=900)
+        out = golden._build_golden_sampling_decomposition(
+            stage,
+            sampling_start_event=SimpleNamespace(monotonic_ns=200),
+            sampling_end_event=SimpleNamespace(monotonic_ns=700),
+            sampling_start_ns=250,
+            sampling_end_ns=650,
+            ok=True,
+        )
+        self.assertEqual(out["total"]["scope"], "TOTAL")
+        self.assertFalse(out["total"]["non_additive"])
+        self.assertEqual(out["children"]["actual_sampler_invocation"]["scope"], "PARTIAL")
+        self.assertTrue(out["children"]["actual_sampler_invocation"]["non_additive"])
+        self.assertEqual(out["children"]["actual_sampler_invocation"]["start_monotonic_ns"], 250)
+        self.assertEqual(out["residual"]["scope"], "RESIDUAL")
+        self.assertEqual(out["residual"]["duration_ns"], 0)
+        self.assertEqual(out["partition"]["status"], "verified")
+        self.assertEqual(
+            out["children"]["actual_sampler_invocation"]["semantics"],
+            "actual_sampler_node_function_entry_to_return_or_await_completion",
+        )
+        self.assertIn("historical_complete_boundary_distinction", out["semantics"])
+        json.loads(json.dumps(out))
+
+    def test_invalid_or_overlapping_children_are_not_subtracted_as_verified(self):
+        stage = SimpleNamespace(entry_monotonic_ns=100, end_monotonic_ns=900)
+        out = golden._build_golden_sampling_decomposition(
+            stage,
+            sampling_start_ns=50,
+            sampling_end_ns=950,
+            ok=True,
+        )
+        actual = out["children"]["actual_sampler_invocation"]
+        self.assertEqual(actual["status"], "overlap")
+        self.assertEqual(actual["relative_to_total"], "overlaps_authoritative_total")
+        self.assertFalse(actual["partition_verified"])
+        self.assertEqual(out["residual"]["duration_ns"], 800)
+        self.assertEqual(out["residual"]["status"], "observed")
+        self.assertGreaterEqual(out["residual"]["duration_ns"], 0)
+
+        invalid = golden._build_golden_sampling_decomposition(
+            SimpleNamespace(entry_monotonic_ns=900, end_monotonic_ns=100),
+            sampling_start_ns=200,
+            sampling_end_ns=300,
+            ok=False,
+        )
+        self.assertEqual(invalid["total"]["status"], "error")
+        self.assertEqual(invalid["residual"]["status"], "error")
+        self.assertIsNone(invalid["residual"]["duration_ns"])
+
+    def test_unseparable_optional_sampler_work_is_explicitly_unavailable(self):
+        stage = SimpleNamespace(entry_monotonic_ns=100, end_monotonic_ns=900)
+        out = golden._build_golden_sampling_decomposition(
+            stage,
+            sampling_start_ns=200,
+            sampling_end_ns=700,
+            ok=True,
+        )
+        components = out["components"]
+        self.assertEqual(components["feature_inj_latent"]["status"], "unavailable")
+        self.assertEqual(components["res4lyf_sampler_work"]["status"], "unavailable")
+        self.assertEqual(components["scheduler_sigma_preparation"]["status"], "unavailable")
+        for name in ("feature_inj_latent", "res4lyf_sampler_work"):
+            self.assertTrue(components[name]["unavailable_reason"])
+
+    def test_decomposition_is_attached_to_closed_recorder_stage_and_event(self):
+        monotonic_values = iter((100, 900))
+        wall_values = iter((1_000, 9_000))
+        recorder = golden.GoldenTelemetryRecorder(
+            monotonic=lambda: next(monotonic_values, 900),
+            wall=lambda: next(wall_values, 9_000),
+        )
+        recorder.begin_stage("golden_sampling")
+        recorder.end_stage("golden_sampling", ready=True)
+        golden._attach_golden_sampling_decomposition(
+            recorder,
+            sampling_start_ns=200,
+            sampling_end_ns=700,
+            ok=True,
+        )
+        details = recorder.intervals["golden_sampling"].details
+        self.assertEqual(details["golden_sampling_decomposition"]["total"]["scope"], "TOTAL")
+        self.assertTrue(any(
+            event["name"] == "golden_sampling_decomposition"
+            for event in recorder.events
+        ))
+
+
+class GoldenSerialRunnerSamplerBoundaryTests(unittest.TestCase):
+    def test_async_sampler_boundary_includes_await_and_excludes_closure(self):
+        class AsyncSampler:
+            FUNCTION = "go"
+
+            @classmethod
+            def INPUT_TYPES(cls):
+                return {"required": {}, "optional": {}}
+
+            async def go(self):
+                await asyncio.sleep(0.001)
+                return ("sample",)
+
+        runner = golden.GoldenSerialRunner(
+            {"sampler": {"class_type": "AsyncSampler", "inputs": {}}},
+            node_classes={"AsyncSampler": AsyncSampler},
+        )
+        runner.set_sampler_target("sampler", "AsyncSampler")
+        runner.begin_scope({"sampling"})
+        try:
+            asyncio.run(runner.run_closure("sampler", include_target=True))
+        finally:
+            runner.end_scope()
+        self.assertIsInstance(runner.sampler_call_start, int)
+        self.assertIsInstance(runner.sampler_call_end, int)
+        self.assertLessEqual(runner.sampler_call_start, runner.sampler_call_end)
 
 
 if __name__ == "__main__":

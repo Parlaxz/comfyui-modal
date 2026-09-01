@@ -85,6 +85,50 @@ class GoldenSamplingDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["cachedit"]["hit_rate"], 0.4)
         self.assertTrue(payload["cleanup_complete"])
         self.assertEqual(model.hooks, [])
+        self.assertEqual(payload["sampler"]["boundary_status"], "fallback")
+        self.assertEqual(
+            payload["sampler"]["boundary"],
+            "diagnostic_sampling_start->diagnostic_sampling_end",
+        )
+        self.assertTrue(payload["sampler"]["non_additive"])
+
+    def test_actual_sampler_boundaries_drive_wall_and_step_partition(self):
+        recorder = gs.GoldenTelemetryRecorder()
+        diagnostics = gs.GoldenSamplingDiagnostics(
+            recorder, sampler_id="137", sampler_class=gs.CANONICAL_SAMPLER_CLASS
+        )
+        patcher = SimpleNamespace(model=SimpleNamespace(diffusion_model=None))
+        diagnostics.begin(SimpleNamespace(recorder=recorder))
+
+        wrapped = diagnostics.wrap_sampler_inputs({"callback": lambda *_args: None})["callback"]
+        wrapped(2, None, None, 8)
+        callback_start_ns = diagnostics._callbacks[0]["start_ns"]
+        sampler_start_ns = callback_start_ns - 5_000_000
+        sampler_end_ns = callback_start_ns + 5_000_000
+
+        diagnostics.finish_sampling(
+            patcher,
+            ok=True,
+            sampler_start_ns=sampler_start_ns,
+            sampler_end_ns=sampler_end_ns,
+        )
+        payload = diagnostics.to_json_dict()
+
+        self.assertEqual(diagnostics.sampler_wall_ms, 10.0)
+        self.assertEqual(payload["sampler"]["boundary_status"], "observed")
+        self.assertEqual(
+            payload["sampler"]["boundary"],
+            "actual_sampler_function_entry->actual_sampler_function_return",
+        )
+        self.assertEqual(payload["sampler"]["boundary_start_monotonic_ns"], sampler_start_ns)
+        self.assertEqual(payload["sampler"]["boundary_end_monotonic_ns"], sampler_end_ns)
+        self.assertEqual(payload["step_partition"]["start_monotonic_ns"], sampler_start_ns)
+        self.assertEqual(
+            payload["steps"][0]["wall_ms"],
+            diagnostics._duration_ms(sampler_start_ns, callback_start_ns),
+        )
+        self.assertEqual(payload["step_partition"]["scope"], "PARTIAL")
+        self.assertTrue(payload["step_partition"]["non_additive"])
 
 
 if __name__ == "__main__":

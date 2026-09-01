@@ -1048,6 +1048,16 @@ class GoldenTelemetryRecorder:
             interval.ready_monotonic_ns = interval.end_monotonic_ns
         interval.ok = True
         interval.details.update(details)
+        if name == "golden_sampling":
+            interval.details.setdefault(
+                "authority", "GoldenTelemetryRecorder.begin_stage->end_stage"
+            )
+            interval.details.setdefault(
+                "semantics",
+                "golden_sampling stage TOTAL: recorder stage entry through this END mark; "
+                "decomposition attachment and event emission occur afterward",
+            )
+            interval.details.setdefault("attachment_and_event_inside_total", False)
         telemetry = getattr(self, "clip_residency_telemetry", None)
         if isinstance(telemetry, dict):
             duration_ms = max(
@@ -1964,6 +1974,12 @@ class GoldenSamplingDiagnostics:
         self._model_hooks: list[Any] = []
         self._forward_starts: list[int] = []
         self._sampling_start_ns: Optional[int] = None
+        self._sampling_end_ns: Optional[int] = None
+        self._sampler_boundary_start_ns: Optional[int] = None
+        self._sampler_boundary_end_ns: Optional[int] = None
+        self._sampler_boundary_source = "diagnostic_sampling_fallback"
+        self._sampler_boundary_status = "fallback"
+        self._sampler_boundary_reason: Optional[str] = "actual_sampler_function_boundary_unavailable"
         self._cleanup_done = False
 
     def _event(self, kind: str, **fields: Any) -> None:
@@ -2090,10 +2106,43 @@ class GoldenSamplingDiagnostics:
 
         return timed_callback
 
-    def finish_sampling(self, patcher: Any, *, ok: bool) -> None:
+    def finish_sampling(
+        self,
+        patcher: Any,
+        *,
+        ok: bool,
+        sampler_start_ns: Optional[int] = None,
+        sampler_end_ns: Optional[int] = None,
+    ) -> None:
         end_ns = time.monotonic_ns()
-        if self._sampling_start_ns is not None:
-            self.sampler_wall_ms = self._duration_ms(self._sampling_start_ns, end_ns)
+        self._sampling_end_ns = end_ns
+        actual_boundary = (
+            isinstance(sampler_start_ns, int)
+            and not isinstance(sampler_start_ns, bool)
+            and isinstance(sampler_end_ns, int)
+            and not isinstance(sampler_end_ns, bool)
+            and sampler_end_ns >= sampler_start_ns
+        )
+        if actual_boundary:
+            boundary_start_ns = int(sampler_start_ns)
+            boundary_end_ns = int(sampler_end_ns)
+            self._sampler_boundary_source = "actual_sampler_function"
+            self._sampler_boundary_status = "observed"
+            self._sampler_boundary_reason = None
+        else:
+            boundary_start_ns = self._sampling_start_ns
+            boundary_end_ns = end_ns
+            self._sampler_boundary_source = "diagnostic_sampling_fallback"
+            self._sampler_boundary_status = "fallback"
+            self._sampler_boundary_reason = (
+                "actual_sampler_function_boundary_invalid"
+                if sampler_start_ns is not None or sampler_end_ns is not None
+                else "actual_sampler_function_boundary_unavailable"
+            )
+        self._sampler_boundary_start_ns = boundary_start_ns
+        self._sampler_boundary_end_ns = boundary_end_ns
+        if boundary_start_ns is not None:
+            self.sampler_wall_ms = self._duration_ms(boundary_start_ns, boundary_end_ns)
         self.allocator["sampling_after"] = _allocator_state()
         callback_total = next(
             (item["total_steps"] for item in self._callbacks if item["total_steps"] is not None),
@@ -2106,7 +2155,7 @@ class GoldenSamplingDiagnostics:
         ]
         if step_callbacks and all(item["step_index"] is not None for item in step_callbacks):
             steps: list[dict[str, Any]] = []
-            previous_ns = self._sampling_start_ns
+            previous_ns = boundary_start_ns
             for item in step_callbacks:
                 boundary_ns = int(item["start_ns"])
                 duration_ms = (
@@ -2167,9 +2216,68 @@ class GoldenSamplingDiagnostics:
         return {
             "enabled": True,
             "sampler": {
+                "name": "golden_sampling_diagnostic_boundary",
                 "node_id": self.sampler_id,
                 "class_type": self.sampler_class,
                 "wall_ms": self.sampler_wall_ms,
+                "scope": "PARTIAL",
+                "non_additive": True,
+                "overlap_semantics": (
+                    "actual_sampler_function_child_not_additive"
+                    if self._sampler_boundary_status == "observed"
+                    else "diagnostic_child_not_actual_function_boundary"
+                ),
+                "boundary": (
+                    "actual_sampler_function_entry->actual_sampler_function_return"
+                    if self._sampler_boundary_status == "observed"
+                    else "diagnostic_sampling_start->diagnostic_sampling_end"
+                ),
+                "boundary_source": self._sampler_boundary_source,
+                "boundary_status": self._sampler_boundary_status,
+                "fallback": self._sampler_boundary_status == "fallback",
+                "boundary_start_monotonic_ns": self._sampler_boundary_start_ns,
+                "boundary_end_monotonic_ns": self._sampler_boundary_end_ns,
+                "boundary_reason": self._sampler_boundary_reason,
+                "authority": (
+                    "GoldenSerialRunner.sampler_call"
+                    if self._sampler_boundary_status == "observed"
+                    else "GoldenSamplingDiagnostics.begin->finish_sampling"
+                ),
+                "semantics": (
+                    "This is the actual sampler node function entry-to-return "
+                    "boundary, but remains a PARTIAL child of the authoritative "
+                    "golden_sampling TOTAL."
+                    if self._sampler_boundary_status == "observed"
+                    else "The actual sampler node function boundary was unavailable; "
+                    "this fallback interval is only a PARTIAL diagnostic child. The "
+                    "authoritative complete stage is the recorder golden_sampling TOTAL."
+                ),
+            },
+            "step_partition": {
+                "boundary": (
+                    "actual_sampler_function_entry->actual_sampler_function_return"
+                    if self._sampler_boundary_status == "observed"
+                    else "diagnostic_sampling_start->diagnostic_sampling_end"
+                ),
+                "boundary_source": self._sampler_boundary_source,
+                "boundary_status": self._sampler_boundary_status,
+                "fallback": self._sampler_boundary_status == "fallback",
+                "boundary_reason": self._sampler_boundary_reason,
+                "start_monotonic_ns": self._sampler_boundary_start_ns,
+                "end_monotonic_ns": self._sampler_boundary_end_ns,
+                "scope": "PARTIAL",
+                "non_additive": True,
+                "overlap_semantics": "step_evidence_not_additive",
+            },
+            "golden_sampling_stage": {
+                "name": "golden_sampling",
+                "scope": "TOTAL",
+                "non_additive": False,
+                "authority": "GoldenTelemetryRecorder.begin_stage->end_stage",
+                "semantics": (
+                    "Recorder stage entry through END mark; attachment and event "
+                    "emission are post-stage and outside TOTAL."
+                ),
             },
             "allocator": dict(self.allocator),
             "model_forward": {
@@ -4599,6 +4707,13 @@ class GoldenSerialRunner:
             self._golden_task_baseline_ready = False
         self._golden_tasks: set[asyncio.Task] = set()
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
+        # Narrow, request-local boundary for the sampler node's actual
+        # FUNCTION call.  These fields intentionally exclude dependency
+        # resolution, input assembly, cache insertion, and other closure work.
+        self.sampler_target_id: Optional[str] = None
+        self.sampler_target_class: Optional[str] = None
+        self.sampler_call_start: Optional[int] = None
+        self.sampler_call_end: Optional[int] = None
 
     def _observe_tasks(self) -> None:
         """Record tasks not present when this runner was constructed."""
@@ -4636,6 +4751,13 @@ class GoldenSerialRunner:
 
     def end_scope(self) -> None:
         self.scope_allowed = None
+
+    def set_sampler_target(self, node_id: str, class_type: str) -> None:
+        """Reset the bounded actual sampler-function boundary before a run."""
+        self.sampler_target_id = str(node_id)
+        self.sampler_target_class = str(class_type)
+        self.sampler_call_start = None
+        self.sampler_call_end = None
 
     def executed_summary(self) -> list:
         return [(item["node_id"], item["class_type"], item["stage_class"]) for item in self.executed]
@@ -4920,11 +5042,37 @@ class GoldenSerialRunner:
             and str(self.prompt[unique_id].get("class_type")) == diagnostics.sampler_class
         ):
             inputs = diagnostics.wrap_sampler_inputs(inputs)
-        if inspect.iscoroutinefunction(func):
-            # Await inline: a task is never left pending across nodes.
-            return await func(**inputs)
-        result = func(**inputs)
-        return await self._resolve(result)
+        sampler_call = (
+            self.sampler_target_id is not None
+            and str(unique_id) == self.sampler_target_id
+            and (
+                self.sampler_target_class is None
+                or str(self.prompt[unique_id].get("class_type"))
+                == self.sampler_target_class
+            )
+        )
+        if not sampler_call and diagnostics is not None:
+            sampler_call = (
+                str(unique_id) == diagnostics.sampler_id
+                and str(self.prompt[unique_id].get("class_type"))
+                == diagnostics.sampler_class
+            )
+        if sampler_call:
+            self.sampler_call_start = time.monotonic_ns()
+        try:
+            if inspect.iscoroutinefunction(func):
+                # Await inline: a task is never left pending across nodes.  The
+                # boundary stays open through the await, not just coroutine
+                # creation.
+                return await func(**inputs)
+            result = func(**inputs)
+            # A synchronous entry point may still return a coroutine/future;
+            # preserve the existing resolver while keeping the target boundary
+            # around its complete asynchronous result.
+            return await self._resolve(result)
+        finally:
+            if sampler_call:
+                self.sampler_call_end = time.monotonic_ns()
 
     # -- closure execution ------------------------------------------------------
 
@@ -5075,6 +5223,512 @@ def resolve_golden_node_map(prompt: dict, *, contract: Optional[GoldenWorkflowCo
 
 
 _GOLDEN_SAMPLING_PROFILE_RECORD_MAX_BYTES = 512 * 1024
+_GOLDEN_SAMPLING_DECOMPOSITION_MAX_BYTES = 128 * 1024
+
+
+def _sampling_decomposition_span(
+    name: str,
+    start_ns: Optional[int],
+    end_ns: Optional[int],
+    *,
+    scope: str,
+    non_additive: bool = True,
+    overlap_semantics: str = "explanatory_child_not_additive",
+    authority: Optional[str] = None,
+    status: str = "observed",
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build one bounded, machine-readable sampling decomposition span."""
+    numeric = (
+        isinstance(start_ns, int) and not isinstance(start_ns, bool)
+        and isinstance(end_ns, int) and not isinstance(end_ns, bool)
+    )
+    valid = numeric and end_ns >= start_ns
+    if not valid:
+        if reason is None:
+            reason = "inverted_interval" if numeric else "interval_boundary_unavailable"
+        status = "error" if numeric else "unavailable"
+    item: dict[str, Any] = {
+        "name": str(name),
+        "scope": str(scope),
+        "status": str(status),
+        "non_additive": bool(non_additive),
+        "overlap_semantics": str(overlap_semantics),
+        "start_monotonic_ns": int(start_ns) if valid else None,
+        "end_monotonic_ns": int(end_ns) if valid else None,
+        "duration_ns": int(end_ns - start_ns) if valid else None,
+        "wall_ms": round((end_ns - start_ns) / 1_000_000, 3) if valid else None,
+        "interval_valid": valid,
+    }
+    if authority is not None:
+        item["authority"] = str(authority)
+    if reason is not None:
+        item["unavailable_reason"] = str(reason)
+    return item
+
+
+def _sampling_event_ns(event: Any) -> Optional[int]:
+    try:
+        value = getattr(event, "monotonic_ns", None)
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+    except Exception:
+        return None
+
+
+def _sampling_decomposition_observation(
+    name: str,
+    *,
+    status: str,
+    scope: str = "DERIVED",
+    value: Any = None,
+    reason: Optional[str] = None,
+    parent: Optional[str] = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "name": str(name),
+        "status": str(status),
+        "scope": str(scope),
+        "non_additive": True,
+        "overlap_semantics": "evidence_only_not_additive",
+    }
+    if value is not None:
+        item["value"] = _bounded_sampling_value(value)
+    if reason is not None:
+        item["unavailable_reason"] = str(reason)
+    if parent is not None:
+        item["parent"] = str(parent)
+    return item
+
+
+def _bounded_sampling_value(value: Any, max_bytes: int = 16 * 1024) -> Any:
+    """Keep nested diagnostic evidence bounded without dropping its label."""
+    safe = _safe_diagnostic_value(value)
+    try:
+        encoded = json.dumps(safe, separators=(",", ":"), default=str).encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return safe
+        return {
+            "bounded": True,
+            "original_bytes": len(encoded),
+            "unavailable_reason": "nested_evidence_bytes_exceeded",
+        }
+    except Exception:
+        return {"bounded": True, "unavailable_reason": "nested_evidence_unserializable"}
+
+
+def _build_golden_sampling_decomposition(
+    stage: Any,
+    *,
+    sampling_start_event: Any = None,
+    sampling_end_event: Any = None,
+    sampling_start_ns: Optional[int] = None,
+    sampling_end_ns: Optional[int] = None,
+    diagnostics: Any = None,
+    profile_artifact: Any = None,
+    sampler_boundary_source: Optional[str] = None,
+    ok: bool,
+) -> dict[str, Any]:
+    """Reconcile the complete Golden stage without relabeling child walls.
+
+    The recorder stage is the only TOTAL.  The sampler pair is a PARTIAL child
+    only when the runner captured the actual sampler ``func(**inputs)`` call;
+    sampling/deep-profile events are not substituted for that boundary.
+    """
+    total_start = getattr(stage, "entry_monotonic_ns", None)
+    total_end = getattr(stage, "end_monotonic_ns", None)
+    # The event pair is a deep-profile lifecycle boundary, not the actual node
+    # function boundary.  Only the runner's narrow scalar hook is authoritative
+    # for ``actual_sampler_invocation``.
+    start_ns = sampling_start_ns
+    end_ns = sampling_end_ns
+    boundary_source = sampler_boundary_source or (
+        "golden_serial_runner_sampler_call"
+        if start_ns is not None or end_ns is not None else None
+    )
+
+    total = _sampling_decomposition_span(
+        "golden_sampling",
+        total_start,
+        total_end,
+        scope="TOTAL",
+        non_additive=False,
+        overlap_semantics="authoritative_enclosing_stage",
+        authority="GoldenTelemetryRecorder.begin_stage->end_stage",
+        status="ok" if ok and total_end is not None else "partial",
+    )
+    total["semantics"] = (
+        "authoritative golden_sampling TOTAL from recorder stage entry through "
+        "the recorder END mark; decomposition attachment and event emission are "
+        "post-stage and outside TOTAL"
+    )
+    total["attachment_and_event_inside_total"] = False
+    children = {
+        "pre_sampler_wrapper_setup": _sampling_decomposition_span(
+            "pre_sampler_wrapper_setup",
+            total_start,
+            start_ns,
+            scope="PARTIAL",
+            authority="golden_sampling stage entry -> sampling_start",
+            status="observed" if start_ns is not None else "unavailable",
+            reason=None if start_ns is not None else "sampling_start_not_observed",
+        ),
+        "actual_sampler_invocation": _sampling_decomposition_span(
+            "actual_sampler_invocation",
+            start_ns,
+            end_ns,
+            scope="PARTIAL",
+            authority=boundary_source or "actual_sampler_function_boundary_unavailable",
+            status="observed" if start_ns is not None and end_ns is not None else "unavailable",
+            reason=None if start_ns is not None and end_ns is not None else "actual_sampler_function_boundary_not_observed",
+        ),
+        "post_sampler_return_materialization": _sampling_decomposition_span(
+            "post_sampler_return_materialization",
+            end_ns,
+            total_end,
+            scope="PARTIAL",
+            authority="sampling_end -> golden_sampling stage end",
+            status="observed" if end_ns is not None and total_end is not None else "unavailable",
+            reason=None if end_ns is not None and total_end is not None else "post_sampler_boundary_not_observed",
+        ),
+    }
+    total_valid = (
+        isinstance(total_start, int) and not isinstance(total_start, bool)
+        and isinstance(total_end, int) and not isinstance(total_end, bool)
+        and total_end >= total_start
+    )
+    for child in children.values():
+        child_start = child.get("start_monotonic_ns")
+        child_end = child.get("end_monotonic_ns")
+        child_valid = bool(child.get("interval_valid"))
+        child["partition_verified"] = False
+        if not child_valid:
+            child["relative_to_total"] = "unverified"
+            child["overlaps_total"] = None
+            continue
+        if not total_valid:
+            child["relative_to_total"] = "unverified"
+            child["overlaps_total"] = None
+            child["status"] = "unverified"
+            child["unavailable_reason"] = "authoritative_total_interval_invalid"
+            continue
+        inside = total_start <= child_start <= child_end <= total_end
+        if inside:
+            child["relative_to_total"] = "inside_authoritative_total"
+            child["overlaps_total"] = False
+            child["status"] = "verified"
+            child["partition_verified"] = True
+        elif child_end <= total_start or child_start >= total_end:
+            child["relative_to_total"] = "outside_authoritative_total"
+            child["overlaps_total"] = False
+            child["status"] = "outside"
+        else:
+            child["relative_to_total"] = "overlaps_authoritative_total"
+            child["overlaps_total"] = True
+            child["status"] = "overlap"
+
+    known_children_ns = sum(
+        int(item["duration_ns"])
+        for item in children.values()
+        if item.get("partition_verified") is True
+        and isinstance(item.get("duration_ns"), int)
+    )
+    total_ns = total.get("duration_ns")
+    residual_ns = int(total_ns) - known_children_ns if total_valid and isinstance(total_ns, int) else None
+    residual_valid = residual_ns is not None and residual_ns >= 0
+    residual_status = (
+        "observed" if residual_valid else
+        ("error" if total_valid and residual_ns is not None else
+         ("error" if isinstance(total_start, int) and isinstance(total_end, int) else "unavailable"))
+    )
+    residual = _sampling_decomposition_span(
+        "unexplained_residual",
+        None,
+        None,
+        scope="RESIDUAL",
+        authority="golden_sampling TOTAL minus known child boundaries",
+        status=residual_status,
+        reason=(
+            None if residual_valid else
+            ("negative_residual_from_invalid_child_intervals" if residual_ns is not None else
+             "authoritative_total_interval_invalid_or_unavailable")
+        ),
+    )
+    residual["status"] = residual_status
+    # Never serialize a negative residual as an observation.  Retain it only
+    # as invalid diagnostic arithmetic so the failure is auditable.
+    residual["duration_ns"] = residual_ns if residual_valid else None
+    residual["wall_ms"] = round(residual_ns / 1_000_000, 3) if residual_valid else None
+    if residual_ns is not None and residual_ns < 0:
+        residual["invalid_duration_ns"] = residual_ns
+    residual["interval_valid"] = residual_valid
+    residual["unexplained"] = True
+    residual["against_total"] = "golden_sampling"
+    residual["known_child_duration_ns"] = known_children_ns
+
+    partition_valid = bool(
+        total_valid
+        and all(item.get("partition_verified") is True for item in children.values())
+        and isinstance(total_ns, int)
+        and known_children_ns == total_ns
+    )
+    partition_roles = {
+        "pre_sampler_wrapper_setup": "prefix",
+        "actual_sampler_invocation": "sampler_call",
+        "post_sampler_return_materialization": "suffix",
+    }
+    for name, role in partition_roles.items():
+        children[name]["partition_role"] = role
+        children[name]["partition_semantics"] = (
+            "disjoint_partition_of_authoritative_total_when_all_three_verified"
+        )
+    if boundary_source is not None:
+        children["actual_sampler_invocation"]["authority"] = boundary_source
+        children["actual_sampler_invocation"]["semantics"] = (
+            "actual_sampler_node_function_entry_to_return_or_await_completion"
+        )
+
+    profile = profile_artifact if isinstance(profile_artifact, Mapping) else {}
+    cachedit = profile.get("cachedit")
+    if cachedit is None and diagnostics is not None:
+        cachedit = getattr(diagnostics, "cachedit", None)
+    first_use = profile.get("first_use")
+    first_use_observed = bool(
+        isinstance(first_use, Mapping)
+        and (
+            first_use.get("first_eval_index") is not None
+            or first_use.get("first_compute_eval_index") is not None
+        )
+    ) or getattr(diagnostics, "first_model_forward_wall_ms", None) is not None
+    per_step = getattr(diagnostics, "step_timeline", None)
+    blocks_observed = bool(profile.get("level") == "blocks" and profile.get("blocks"))
+    cuda_boundary = profile.get("cuda_boundary")
+    cuda_observed = bool(
+        isinstance(cuda_boundary, Mapping)
+        and isinstance(cuda_boundary.get("elapsed_ms"), (int, float))
+        and not isinstance(cuda_boundary.get("elapsed_ms"), bool)
+    )
+    components: dict[str, Any] = {
+        "wrapper_setup": _sampling_decomposition_observation(
+            "wrapper_setup", status="observed" if start_ns is not None else "unavailable",
+            scope="PARTIAL", value=children["pre_sampler_wrapper_setup"],
+            reason=None if start_ns is not None else "sampling_start_not_observed",
+            parent="pre_sampler_wrapper_setup",
+        ),
+        "scheduler_sigma_preparation": _sampling_decomposition_observation(
+            "scheduler_sigma_preparation", status="unavailable", scope="PARTIAL",
+            reason="no narrow scheduler/sigma seam; included in actual_sampler_invocation",
+            parent="actual_sampler_invocation",
+        ),
+        "model_patcher_preparation": _sampling_decomposition_observation(
+            "model_patcher_preparation", status="not_separable", scope="PARTIAL",
+            reason="patcher/model preparation has no safe boundary inside the sampler node",
+            parent="pre_sampler_wrapper_setup",
+        ),
+        "first_step_first_use": _sampling_decomposition_observation(
+            "first_step_first_use",
+            status="observed" if first_use_observed else "unavailable",
+            value=first_use or {
+                "first_model_forward_wall_ms": getattr(diagnostics, "first_model_forward_wall_ms", None),
+            },
+            reason=None if first_use_observed else "model_forward_first_use_not_observed",
+            parent="actual_sampler_invocation",
+        ),
+        "per_step_wall": _sampling_decomposition_observation(
+            "per_step_wall",
+            status="observed" if per_step else "unavailable",
+            value=per_step,
+            reason=None if per_step else "callback_step_timeline_unavailable",
+            parent="actual_sampler_invocation",
+        ),
+        "repeated_block_work": _sampling_decomposition_observation(
+            "repeated_block_work", status="observed" if blocks_observed else "unavailable",
+            value=profile.get("blocks"),
+            reason=None if blocks_observed else "block_hooks_not_observed_or_blocks_mode_disabled",
+            parent="actual_sampler_invocation",
+        ),
+        "attention_backend": _sampling_decomposition_observation(
+            "attention_backend", status="observed" if profile.get("attention_backend") is not None else "unavailable",
+            value=profile.get("attention_backend"),
+            reason=None if profile.get("attention_backend") is not None else "attention_backend_not_separable",
+            parent="actual_sampler_invocation",
+        ),
+        "cachedit": _sampling_decomposition_observation(
+            "cachedit", status="observed" if isinstance(cachedit, Mapping) and cachedit.get("available", cachedit.get("discoverable", False)) else "unavailable",
+            value=cachedit,
+            reason=None if isinstance(cachedit, Mapping) and cachedit.get("available", cachedit.get("discoverable", False)) else "CacheDiT scalar counters unavailable",
+            parent="actual_sampler_invocation",
+        ),
+        "feature_inj_latent": _sampling_decomposition_observation(
+            "feature_inj_latent", status="unavailable", scope="PARTIAL",
+            reason="no safe FeatureInjLatent attribution seam in the Golden sampler boundary",
+            parent="actual_sampler_invocation",
+        ),
+        "res4lyf_sampler_work": _sampling_decomposition_observation(
+            "res4lyf_sampler_work", status="unavailable", scope="PARTIAL",
+            reason="no safe RES4LYF attribution seam; retained inside sampler invocation",
+            parent="actual_sampler_invocation",
+        ),
+        "cuda_waits_synchronization": _sampling_decomposition_observation(
+            "cuda_waits_synchronization",
+            status="observed" if cuda_observed else "unavailable",
+            value=cuda_boundary or profile.get("instrumentation_overhead"),
+            reason=None if cuda_observed else "CUDA marker elapsed evidence unavailable",
+            parent="golden_sampling",
+        ),
+        "final_sampling_return_materialization": _sampling_decomposition_observation(
+            "final_sampling_return_materialization",
+            status="not_separable" if children["post_sampler_return_materialization"].get("duration_ns") is not None else "unavailable",
+            value=children["post_sampler_return_materialization"],
+            reason=(
+                "return/materialization has no narrower safe seam; post boundary is "
+                "only the stage tail after sampling_end"
+                if children["post_sampler_return_materialization"].get("duration_ns") is not None
+                else "post_sampler_boundary_not_observed"
+            ),
+            parent="post_sampler_return_materialization",
+        ),
+    }
+    residency = profile.get("process_residency")
+    end_delta = (
+        residency.get("sampling_end", {}).get("delta_from_entry")
+        if isinstance(residency, Mapping)
+        and isinstance(residency.get("sampling_end"), Mapping)
+        else None
+    )
+    host_limits = (
+        "process_cpu_time_ns", "thread_cpu_time_ns", "rss_bytes",
+        "minor_page_faults", "major_page_faults",
+    )
+    host_available_fields = [
+        name for name in host_limits
+        if isinstance(end_delta, Mapping)
+        and isinstance(end_delta.get(name), (int, float))
+        and not isinstance(end_delta.get(name), bool)
+    ]
+    host_evidence = {
+        "status": "observed" if host_available_fields else "unavailable",
+        "boundary_scope": "deep_profile_entry_to_after_sampling_end",
+        "boundaries": {
+            "start": "deep_profile_entry",
+            "end": "after_sampling_end_before_cuda_realization",
+        },
+        "limits": list(host_limits),
+        "available_fields": host_available_fields,
+        "scope": "DERIVED",
+        "non_additive": True,
+        "overlap_semantics": "snapshot_evidence_not_additive",
+        "value": _bounded_sampling_value(residency),
+        "reason": None if host_available_fields else "deep_profile_host_numeric_snapshots_unavailable",
+    }
+    result = {
+        "schema": "golden_sampling_decomposition_v1",
+        "authority": "golden_sampling.begin_stage->end_stage",
+        "clock": "monotonic_ns",
+        "ok": bool(ok),
+        "total": total,
+        "children": children,
+        "partition": {
+            "status": "verified" if partition_valid else "unverified",
+            "semantics": "three_children_are_disjoint_partition_of_total_when_valid",
+            "verified_child_duration_ns": known_children_ns,
+            "total_duration_ns": total_ns,
+        },
+        "components": components,
+        "host_evidence": host_evidence,
+        "residual": residual,
+        "semantics": {
+            "scope_classifications": {
+                "TOTAL": "Only the enclosing recorder stage is authoritative for complete sampling wall.",
+                "PARTIAL": "A measured child interval explains only its named boundary and may not replace TOTAL.",
+                "DERIVED": "Computed or snapshot evidence; not a separately additive span.",
+                "RESIDUAL": "Explicit unexplained remainder against TOTAL after known child boundary durations.",
+            },
+            "non_additive": True,
+            "overlap": "Nested model/block/attention/backend evidence overlaps parent sampler wall; never sum it with siblings.",
+            "three_stage_partition": (
+                "pre_sampler_wrapper_setup, actual_sampler_invocation, and "
+                "post_sampler_return_materialization are a disjoint partition "
+                "of the authoritative golden_sampling TOTAL only when all three "
+                "intervals validate inside TOTAL; nested profile evidence remains "
+                "non-additive."
+            ),
+            "total_boundary": (
+                "golden_sampling TOTAL is exactly GoldenTelemetryRecorder "
+                "begin_stage entry through end_stage mark. Decomposition attachment "
+                "and its event emission occur after that mark and are outside TOTAL."
+            ),
+            "historical_complete_boundary_distinction": (
+                "Historical observations include complete-boundary sampling walls in the ~4.9-5.6 s range; "
+                "that context does not impose a threshold or relabel any partial interval."
+            ),
+        },
+    }
+    try:
+        payload = json.loads(json.dumps(result, default=str))
+        if len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) > _GOLDEN_SAMPLING_DECOMPOSITION_MAX_BYTES:
+            return {
+                "schema": "golden_sampling_decomposition_v1",
+                "authority": "golden_sampling.begin_stage->end_stage",
+                "clock": "monotonic_ns",
+                "bounded": True,
+                "total": total,
+                "residual": residual,
+                "semantics": result["semantics"],
+                "error": "decomposition_bytes_exceeded",
+            }
+        return payload
+    except Exception:
+        return {
+            "schema": "golden_sampling_decomposition_v1",
+            "authority": "golden_sampling.begin_stage->end_stage",
+            "clock": "monotonic_ns",
+            "total": total,
+            "residual": residual,
+            "error": "decomposition_serialize_failed",
+        }
+
+
+def _attach_golden_sampling_decomposition(
+    recorder: GoldenTelemetryRecorder,
+    *,
+    sampling_start_event: Any = None,
+    sampling_end_event: Any = None,
+    sampling_start_ns: Optional[int] = None,
+    sampling_end_ns: Optional[int] = None,
+    sampler_boundary_source: Optional[str] = None,
+    diagnostics: Any = None,
+    profile_artifact: Any = None,
+    ok: bool,
+) -> dict[str, Any]:
+    """Attach one bounded decomposition to the closed stage and event log."""
+    stage = recorder.intervals.get("golden_sampling")
+    decomposition = _build_golden_sampling_decomposition(
+        stage,
+        sampling_start_event=sampling_start_event,
+        sampling_end_event=sampling_end_event,
+        sampling_start_ns=sampling_start_ns,
+        sampling_end_ns=sampling_end_ns,
+        diagnostics=diagnostics,
+        profile_artifact=profile_artifact,
+        sampler_boundary_source=sampler_boundary_source,
+        ok=ok,
+    ) if stage is not None else {
+        "schema": "golden_sampling_decomposition_v1",
+        "authority": "golden_sampling.begin_stage->end_stage",
+        "error": "stage_interval_unavailable",
+    }
+    if stage is not None:
+        stage.details["golden_sampling_decomposition"] = decomposition
+    try:
+        recorder.event(
+            "golden_sampling_decomposition",
+            decomposition=decomposition,
+            source="golden_sampling_stage",
+            inside_golden_sampling_total=False,
+        )
+    except Exception:
+        pass
+    return decomposition
 
 
 def _record_golden_sampling_profile(
@@ -7983,6 +8637,12 @@ async def golden_sampling(session: GoldenSession) -> Any:
     try:
         runner = session.runner
         node_map = session.node_map
+        set_sampler_target = getattr(runner, "set_sampler_target", None)
+        if callable(set_sampler_target):
+            set_sampler_target(
+                node_map.sampler_id,
+                session.contract.sampler_class_type,
+            )
         attention_patcher = _sampler_bound_patcher(session)
         if diagnostics is not None:
             diagnostics.begin(session)
@@ -8026,6 +8686,11 @@ async def golden_sampling(session: GoldenSession) -> Any:
         deep_profile_trace = None
         deep_profile_sdp = None
         sampling_start_event = None
+        sampling_end_event = None
+        sampling_profile_artifact = None
+        sampler_invocation_start_ns = None
+        sampler_invocation_end_ns = None
+        sampler_boundary_source = None
         profile_steps = 0
         sampling_profile_skipped = False
         sampling_profile_setup_failed = False
@@ -8147,6 +8812,20 @@ async def golden_sampling(session: GoldenSession) -> Any:
                                 node_map.sampler_id, include_target=True
                             )
                 finally:
+                    # The runner timestamps only the target node's actual
+                    # FUNCTION call, including an async await.  Never use the
+                    # surrounding closure wall as actual_sampler_invocation.
+                    sampler_invocation_start_ns = getattr(
+                        runner, "sampler_call_start", None
+                    )
+                    sampler_invocation_end_ns = getattr(
+                        runner, "sampler_call_end", None
+                    )
+                    if (
+                        sampler_invocation_start_ns is not None
+                        or sampler_invocation_end_ns is not None
+                    ):
+                        sampler_boundary_source = "GoldenSerialRunner.sampler_call"
                     if (
                         deep_profile_trace is not None
                         and sampling_start_event is not None
@@ -8157,7 +8836,7 @@ async def golden_sampling(session: GoldenSession) -> Any:
                         # emitted; an owning production profile never reaches
                         # this path because it skips the Golden bridge above.
                         try:
-                            deep_profile_trace.emit(
+                            sampling_end_event = deep_profile_trace.emit(
                                 "sampling_end",
                                 phase="execution",
                                 metadata={
@@ -8216,6 +8895,7 @@ async def golden_sampling(session: GoldenSession) -> Any:
                                     sampling_end_wall_unix_ns=end_wall,
                                     sampling_end_emission_failed=end_emission_failed,
                                 )
+                                sampling_profile_artifact = artifact
                             except Exception as profile_exc:
                                 artifact = {
                                     "schema_version": getattr(deep_profile_sdp, "SCHEMA_VERSION", 1),
@@ -8257,6 +8937,7 @@ async def golden_sampling(session: GoldenSession) -> Any:
                         ]
                         if len(profile_events) > trace_profile_count_before:
                             metadata = profile_events[-1].metadata
+                            sampling_profile_artifact = dict(metadata)
                             _record_golden_sampling_profile(
                                 rec,
                                 dict(metadata),
@@ -8306,22 +8987,54 @@ async def golden_sampling(session: GoldenSession) -> Any:
         session.images_pending_latent = sampled
         if diagnostics is not None:
             try:
-                diagnostics.finish_sampling(session.patcher, ok=True)
+                diagnostics.finish_sampling(
+                    session.patcher,
+                    ok=True,
+                    sampler_start_ns=sampler_invocation_start_ns,
+                    sampler_end_ns=sampler_invocation_end_ns,
+                )
             except Exception as diag_exc:
                 diagnostics._event("diagnostics_read_failed", error=type(diag_exc).__name__)
             finally:
                 diagnostics.cleanup()
         rec.end_stage("golden_sampling", ready=True, sampling_nodes=len(sampler_classes))
+        _attach_golden_sampling_decomposition(
+            rec,
+            sampling_start_event=sampling_start_event,
+            sampling_end_event=sampling_end_event,
+            sampling_start_ns=sampler_invocation_start_ns,
+            sampling_end_ns=sampler_invocation_end_ns,
+            sampler_boundary_source=sampler_boundary_source,
+            diagnostics=diagnostics,
+            profile_artifact=sampling_profile_artifact,
+            ok=True,
+        )
         return sampled
     except BaseException as exc:
         if diagnostics is not None:
             try:
-                diagnostics.finish_sampling(session.patcher, ok=False)
+                diagnostics.finish_sampling(
+                    session.patcher,
+                    ok=False,
+                    sampler_start_ns=sampler_invocation_start_ns,
+                    sampler_end_ns=sampler_invocation_end_ns,
+                )
             except Exception as diag_exc:
                 diagnostics._event("diagnostics_read_failed", error=type(diag_exc).__name__)
             finally:
                 diagnostics.cleanup()
         rec.fail_stage("golden_sampling", exc)
+        _attach_golden_sampling_decomposition(
+            rec,
+            sampling_start_event=sampling_start_event,
+            sampling_end_event=sampling_end_event,
+            sampling_start_ns=sampler_invocation_start_ns,
+            sampling_end_ns=sampler_invocation_end_ns,
+            sampler_boundary_source=sampler_boundary_source,
+            diagnostics=diagnostics,
+            profile_artifact=sampling_profile_artifact,
+            ok=False,
+        )
         raise
 
 

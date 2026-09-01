@@ -368,6 +368,27 @@ def _safe_metadata_text(value: Any) -> Optional[str]:
         return None
 
 
+def _cuda_stream_metadata(stream: Any) -> Optional[dict[str, Any]]:
+    """Describe a CUDA stream without synchronizing or inspecting its work."""
+    if stream is None:
+        return None
+    try:
+        stream_type = f"{type(stream).__module__}.{type(stream).__qualname__}"
+    except Exception:
+        stream_type = "<stream_type_unavailable>"
+    result: dict[str, Any] = {
+        "identity": id(stream),
+        "type": stream_type,
+    }
+    try:
+        device = getattr(stream, "device", None)
+        if device is not None:
+            result["device"] = _safe_metadata_text(device)
+    except Exception:
+        result["device"] = None
+    return result
+
+
 def _callable_metadata(value: Any) -> Optional[dict[str, Any]]:
     """Serialize callable identity and a small closure sample, without calling it."""
     if not callable(value):
@@ -615,7 +636,7 @@ def _attention_call_descriptor(
 
 
 def _read_process_residency_snapshot() -> dict[str, Any]:
-    """Read cheap process RSS and cumulative page-fault counters.
+    """Read cheap process RSS, CPU-time, wall, and page-fault counters.
 
     This helper is called only after a non-off profile has been created.  It
     deliberately does not import torch, touch tensor memory, or synchronize a
@@ -628,16 +649,40 @@ def _read_process_residency_snapshot() -> dict[str, Any]:
         "rss_bytes": None,
         "minor_page_faults": None,
         "major_page_faults": None,
+        "process_cpu_time_ns": None,
+        "thread_cpu_time_ns": None,
+        "wall_monotonic_ns": None,
+        "wall_unix_ns": None,
         "source": {
             "rss": "/proc/self/statm",
             "page_faults": "resource.getrusage(RUSAGE_SELF)",
+            "process_cpu": "time.process_time_ns",
+            "thread_cpu": "time.thread_time_ns",
+            "wall": "time.monotonic_ns/time.time_ns",
         },
         "availability": {
             "rss_bytes": False,
             "minor_page_faults": False,
             "major_page_faults": False,
+            "process_cpu_time_ns": False,
+            "thread_cpu_time_ns": False,
+            "wall_monotonic_ns": False,
+            "wall_unix_ns": False,
         },
     }
+    for field, reader in (
+        ("process_cpu_time_ns", getattr(time, "process_time_ns", None)),
+        ("thread_cpu_time_ns", getattr(time, "thread_time_ns", None)),
+        ("wall_monotonic_ns", getattr(time, "monotonic_ns", None)),
+        ("wall_unix_ns", getattr(time, "time_ns", None)),
+    ):
+        try:
+            value = reader() if callable(reader) else None
+            if isinstance(value, int) and not isinstance(value, bool):
+                result[field] = int(value)
+                result["availability"][field] = True
+        except Exception:
+            pass
     try:
         with open("/proc/self/statm", "r", encoding="ascii") as statm:
             fields = statm.read().split()
@@ -677,7 +722,11 @@ def _process_residency_delta(
 ) -> dict[str, Optional[int]]:
     """Subtract numeric process counters without inventing unavailable values."""
     result: dict[str, Optional[int]] = {}
-    for field in ("rss_bytes", "minor_page_faults", "major_page_faults"):
+    for field in (
+        "rss_bytes", "minor_page_faults", "major_page_faults",
+        "process_cpu_time_ns", "thread_cpu_time_ns",
+        "wall_monotonic_ns", "wall_unix_ns",
+    ):
         prior = before.get(field) if isinstance(before, dict) else None
         current = after.get(field) if isinstance(after, dict) else None
         if (
@@ -697,14 +746,25 @@ def _unavailable_process_residency_snapshot() -> dict[str, Any]:
         "rss_bytes": None,
         "minor_page_faults": None,
         "major_page_faults": None,
+        "process_cpu_time_ns": None,
+        "thread_cpu_time_ns": None,
+        "wall_monotonic_ns": None,
+        "wall_unix_ns": None,
         "source": {
             "rss": "/proc/self/statm",
             "page_faults": "resource.getrusage(RUSAGE_SELF)",
+            "process_cpu": "time.process_time_ns",
+            "thread_cpu": "time.thread_time_ns",
+            "wall": "time.monotonic_ns/time.time_ns",
         },
         "availability": {
             "rss_bytes": False,
             "minor_page_faults": False,
             "major_page_faults": False,
+            "process_cpu_time_ns": False,
+            "thread_cpu_time_ns": False,
+            "wall_monotonic_ns": False,
+            "wall_unix_ns": False,
         },
     }
 
@@ -834,6 +894,9 @@ class SamplingDeepProfile:
         "_closure_aliases", "_closure_alias_unobservable", "_closure_alias_cells",
         "_process_entry_snapshot", "_process_first_compute", "_process_later_compute",
         "_process_compute_count", "_process_compute_overflow", "_process_last_snapshot",
+        "_process_sampling_end_snapshot",
+        "_cuda_boundary_start", "_cuda_boundary_pair", "_cuda_boundary_elapsed_ms",
+        "_cuda_boundary_start_readiness", "_cuda_boundary_post_end_readiness",
         "_start_perf_ns", "finalize_host_ms", "cuda_sync_ms", "cuda_sync_count",
         "allocator_before", "allocator_after", "last_artifact",
         "finalized",
@@ -927,6 +990,12 @@ class SamplingDeepProfile:
         self._process_compute_count = 0
         self._process_compute_overflow = 0
         self._process_last_snapshot: Optional[dict[str, Any]] = None
+        self._process_sampling_end_snapshot: Optional[dict[str, Any]] = None
+        self._cuda_boundary_start: Any = None
+        self._cuda_boundary_pair: Optional[tuple[Any, Any]] = None
+        self._cuda_boundary_elapsed_ms: Optional[float] = None
+        self._cuda_boundary_start_readiness: Optional[dict[str, Any]] = None
+        self._cuda_boundary_post_end_readiness: Optional[dict[str, Any]] = None
         self._start_perf_ns = time.perf_counter_ns()
         self.finalize_host_ms = 0.0
         self.cuda_sync_ms = 0.0
@@ -1173,6 +1242,9 @@ class SamplingDeepProfile:
             return
         cu = _resolve_cuda_module()
         if cu is None:
+            self._cuda_boundary_start_readiness = self._observe_cuda_stream(
+                "profile_start"
+            )
             self.warnings.append("cuda_events_unavailable: CUDA not available")
             if self.requested_backend in {"sage", "comfy_kitchen"}:
                 self._attention_profiler_status = "unavailable"
@@ -1180,6 +1252,89 @@ class SamplingDeepProfile:
             return
         self._cuda_module = cu
         self._cuda_enabled = True
+        # Stream.query() is a non-synchronizing observation.  It reports only
+        # work visible on this stream, not a complete device/multi-stream
+        # backlog and not a causal explanation for the sampling wall.
+        self._cuda_boundary_start_readiness = self._observe_cuda_stream(
+            "profile_start"
+        )
+        # Event recording is enqueue-only and does not realize CUDA work.  The
+        # terminal event is deliberately recorded during post-boundary
+        # finalization; its elapsed value is device elapsed time between these
+        # markers / queue observation only, not proof of inherited GPU backlog
+        # and not a replacement for the host sampling wall.
+        try:
+            boundary_start = cu.Event(enable_timing=True)
+            boundary_start.record()
+            self._cuda_boundary_start = boundary_start
+        except Exception as exc:
+            self.warnings.append(
+                f"cuda_boundary_start_unavailable:{type(exc).__name__}"
+            )
+
+    def _observe_cuda_stream(self, phase: str) -> dict[str, Any]:
+        """Best-effort, nonblocking readiness observation for the current stream."""
+        observation: dict[str, Any] = {
+            "phase": phase,
+            "status": "unavailable",
+            "observed": False,
+            "non_synchronizing": True,
+            "scope": "work_visible_on_current_cuda_stream_only",
+            "stream": None,
+            "reason": None,
+        }
+        cu = self._cuda_module
+        if cu is None:
+            observation["reason"] = "cuda_unavailable"
+            return observation
+        current_stream = getattr(cu, "current_stream", None)
+        if not callable(current_stream):
+            observation["reason"] = "current_stream_unavailable"
+            return observation
+        try:
+            stream = current_stream()
+            observation["stream"] = _cuda_stream_metadata(stream)
+        except Exception as exc:
+            observation["reason"] = f"current_stream_failed:{type(exc).__name__}"
+            return observation
+        query = getattr(stream, "query", None)
+        if not callable(query):
+            observation["reason"] = "stream_query_unavailable"
+            return observation
+        try:
+            ready = query()
+        except Exception as exc:
+            observation["reason"] = f"stream_query_failed:{type(exc).__name__}"
+            return observation
+        if not isinstance(ready, bool):
+            observation["reason"] = "stream_query_non_boolean"
+            return observation
+        observation["status"] = "ready" if ready else "not_ready"
+        observation["observed"] = True
+        return observation
+
+    def _record_cuda_boundary_end(self) -> None:
+        """Record the terminal CUDA marker without synchronizing.
+
+        ``finalize`` invokes this only after the authoritative sampling_end
+        event has been emitted.  The pair is realized by the existing single
+        post-boundary synchronization pass.
+        """
+        if self._cuda_module is None:
+            return
+        self._cuda_boundary_post_end_readiness = self._observe_cuda_stream(
+            "post_sampling_end"
+        )
+        if self._cuda_boundary_start is None:
+            return
+        try:
+            boundary_end = self._cuda_module.Event(enable_timing=True)
+            boundary_end.record()
+            self._cuda_boundary_pair = (self._cuda_boundary_start, boundary_end)
+        except Exception as exc:
+            self.warnings.append(
+                f"cuda_boundary_end_unavailable:{type(exc).__name__}"
+            )
 
     def _install_backend_probe(self) -> None:
         """Install observation-only wrappers around reachable attention seams.
@@ -1837,7 +1992,9 @@ class SamplingDeepProfile:
         has been emitted by the wrapper.  Never called inside
         ``sampling_start``→``sampling_end``.
         """
-        if not self._cuda_enabled or not self._cuda_pairs:
+        if not self._cuda_enabled or (
+            not self._cuda_pairs and self._cuda_boundary_pair is None
+        ):
             return
         try:
             t0 = time.perf_counter_ns()
@@ -1847,6 +2004,9 @@ class SamplingDeepProfile:
         except Exception as exc:
             self.warnings.append(f"cuda_realization_failed:{type(exc).__name__}")
             self._cuda_pairs = []
+            # An unrealized pair is not evidence; do not leave it looking
+            # available after synchronization failure.
+            self._cuda_boundary_pair = None
             return
         for ev_start, ev_end, key, eval_idx in self._cuda_pairs:
             try:
@@ -1859,6 +2019,15 @@ class SamplingDeepProfile:
             except Exception:
                 pass
         self._cuda_pairs = []
+        boundary_pair = self._cuda_boundary_pair
+        self._cuda_boundary_pair = None
+        if boundary_pair is not None:
+            try:
+                self._cuda_boundary_elapsed_ms = round(
+                    float(boundary_pair[0].elapsed_time(boundary_pair[1])), 3
+                )
+            except Exception:
+                self._cuda_boundary_elapsed_ms = None
 
     def _record_process_compute_snapshot(self, ev: dict[str, Any]) -> None:
         """Record one process snapshot for an actual inner-block compute.
@@ -1911,6 +2080,14 @@ class SamplingDeepProfile:
                 "snapshot": dict(self._process_entry_snapshot),
                 "delta_from_entry": None,
             },
+            "sampling_end": {
+                "snapshot": self._process_sampling_end_snapshot,
+                "delta_from_entry": _process_residency_delta(
+                    self._process_entry_snapshot,
+                    self._process_sampling_end_snapshot,
+                ) if self._process_sampling_end_snapshot is not None else None,
+                "boundary": "after_sampling_end_before_cuda_realization",
+            },
             "first_compute": self._process_first_compute,
             "later_compute": list(self._process_later_compute),
             "compute_records": {
@@ -1921,6 +2098,101 @@ class SamplingDeepProfile:
                 "overflow_count": self._process_compute_overflow,
                 "max_records": _MAX_PROCESS_COMPUTE_RECORDS,
             },
+        }
+
+    def _host_cpu_wall_artifact(self) -> dict[str, Any]:
+        """Expose numeric host evidence for the deep-profile sampling window."""
+        delta = (
+            _process_residency_delta(
+                self._process_entry_snapshot,
+                self._process_sampling_end_snapshot,
+            )
+            if self._process_sampling_end_snapshot is not None else None
+        )
+        numeric_fields = (
+            "process_cpu_time_ns", "thread_cpu_time_ns", "rss_bytes",
+            "minor_page_faults", "major_page_faults",
+        )
+        available_fields = [
+            field for field in numeric_fields
+            if isinstance(delta, dict)
+            and isinstance(delta.get(field), (int, float))
+            and not isinstance(delta.get(field), bool)
+        ]
+        return {
+            "collection": "cheap_process_thread_cpu_and_wall_no_sync",
+            "status": "observed" if available_fields else "unavailable",
+            "scope": "deep_profile_entry_to_after_sampling_end",
+            "boundaries": {
+                "start": "deep_profile_entry",
+                "end": "after_sampling_end_before_cuda_realization",
+            },
+            "limits": list(numeric_fields),
+            "available_fields": available_fields,
+            "entry": dict(self._process_entry_snapshot),
+            "sampling_end": (
+                dict(self._process_sampling_end_snapshot)
+                if self._process_sampling_end_snapshot is not None else None
+            ),
+            "delta": delta,
+            "comparison": "host_wall_vs_process_cpu_vs_thread_cpu_vs_cuda_marker_elapsed",
+            "interpretation": "observational_only_no_causal_attribution",
+        }
+
+    def _cuda_boundary_artifact(self) -> dict[str, Any]:
+        """Serialize boundary events and supporting current-stream evidence."""
+        start_readiness = self._cuda_boundary_start_readiness or {
+            "phase": "profile_start",
+            "status": "unavailable",
+            "observed": False,
+            "non_synchronizing": True,
+            "scope": "work_visible_on_current_cuda_stream_only",
+            "stream": None,
+            "reason": "not_collected",
+        }
+        post_readiness = self._cuda_boundary_post_end_readiness or {
+            "phase": "post_sampling_end",
+            "status": "unavailable",
+            "observed": False,
+            "non_synchronizing": True,
+            "scope": "work_visible_on_current_cuda_stream_only",
+            "stream": None,
+            "reason": "not_collected",
+        }
+        query_observed = bool(
+            start_readiness.get("observed") or post_readiness.get("observed")
+        )
+        elapsed_observed = self._cuda_boundary_elapsed_ms is not None
+        evidence_status = "observed" if (elapsed_observed or query_observed) else "unavailable"
+        return {
+            "available": bool(self._cuda_enabled),
+            "status": evidence_status,
+            "evidence_status": evidence_status,
+            "start_recorded": self._cuda_boundary_start is not None,
+            "end_recorded": elapsed_observed,
+            "elapsed_ms": self._cuda_boundary_elapsed_ms,
+            "event_elapsed_observed": elapsed_observed,
+            "stream_readiness": {
+                "profile_start": start_readiness,
+                "post_sampling_end": post_readiness,
+                "query_observed": query_observed,
+                "semantics": (
+                    "stream.query() is a non-synchronizing observation of work "
+                    "visible on that stream only; it is supporting evidence, not "
+                    "causal proof or a full multi-stream backlog measurement"
+                ),
+            },
+            "scope": "DERIVED",
+            "authority": "torch.cuda.Event.elapsed_time(boundary_start,boundary_end) or nonblocking stream.query observation",
+            "semantics": (
+                "supporting device/stream evidence only; event elapsed time is "
+                "between markers, and stream readiness observes only work visible "
+                "on that stream; neither is causal proof or a full multi-stream "
+                "backlog measurement"
+            ),
+            "non_additive": True,
+            "overlap_semantics": "device_elapsed_between_markers_or_stream_readiness_supporting_observation_not_stage_total",
+            "realization": "post_sampling_end_only",
         }
 
     def _allocator_snapshot(self) -> dict[str, Any]:
@@ -1977,7 +2249,9 @@ class SamplingDeepProfile:
                     "before_sampling": dict(self.allocator_before),
                     "after_sampling": dict(self.allocator_after),
                 },
+                "cuda_boundary": self._cuda_boundary_artifact(),
                 "process_residency": self._process_residency_artifact(),
+                "host_cpu_wall": self._host_cpu_wall_artifact(),
             }
         start_ns = self.sampling_start_mono_ns
         end_ns = self.sampling_end_mono_ns
@@ -2329,6 +2603,12 @@ class SamplingDeepProfile:
                 "deltas are observational and do not establish residency or "
                 "page-fault causality. Records are bounded and overflow is explicit."
             ),
+            "host_cpu_wall": (
+                "process/thread CPU time and host wall snapshots are cheap, "
+                "non-synchronizing observations. Comparing CPU deltas with the "
+                "host wall and CUDA boundary evidence can identify host/off-CPU "
+                "or queue behavior, but cannot establish inherited GPU backlog or causality."
+            ),
             "non_attention": (
                 "non_attention_ms is derived from compute-forward wall minus the "
                 "directly hooked attention category; it is not a second span"
@@ -2351,6 +2631,13 @@ class SamplingDeepProfile:
                 "CUDA events recorded around GPU-bearing spans only; one "
                 "synchronize + elapsed_time realization happens after the "
                 "authoritative sampling_end event, outside the sampling window"
+            ),
+            "cuda_boundary": (
+                "CUDA boundary events are recorded without synchronization. The "
+                "terminal marker is recorded after sampling_end and realized by "
+                "the one post-boundary synchronization, so its elapsed value is "
+                "DERIVED device elapsed between markers / queue observation only; "
+                "it is not proof of inherited GPU backlog and not an authoritative wall."
             ),
             "attention_backend": (
                 "dispatch is identified from the actual transformer_options "
@@ -2514,6 +2801,7 @@ class SamplingDeepProfile:
             },
             "blocks": blocks_payload,
             "cuda_timings_ms": cuda_timings_ms,
+            "cuda_boundary": self._cuda_boundary_artifact(),
             "attention_backend": {
                 "requested_backend": requested_backend,
                 "actual_backend": actual_backend,
@@ -2535,6 +2823,7 @@ class SamplingDeepProfile:
                 "after_sampling": dict(self.allocator_after),
             },
             "process_residency": self._process_residency_artifact(),
+            "host_cpu_wall": self._host_cpu_wall_artifact(),
             "errors": errors[:50],
             "warnings": warnings[:50],
             "instrumentation_overhead": {
@@ -2661,6 +2950,14 @@ class SamplingDeepProfile:
             self.errors.append("sampling_end_timestamp_missing")
         if self.sampling_start_mono_ns <= 0:
             self.errors.append("sampling_start_timestamp_missing")
+        try:
+            self._process_sampling_end_snapshot = _read_process_residency_snapshot()
+        except Exception:
+            self._process_sampling_end_snapshot = _unavailable_process_residency_snapshot()
+        # This method is entered only after the caller has emitted
+        # sampling_end.  Recording the marker is safe; realization remains in
+        # _finalize_cuda's single post-boundary synchronization.
+        self._record_cuda_boundary_end()
         try:
             self._finalize_cuda()
         except Exception as exc:
