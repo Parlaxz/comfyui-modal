@@ -13,6 +13,7 @@ import subprocess
 import time
 import sqlite3
 from collections import namedtuple
+from collections.abc import Mapping
 from pathlib import Path
 import traceback as _traceback
 from typing import Any
@@ -5756,9 +5757,16 @@ if _server:
                             # client bypassed the wrapper, finalize graph-like
                             # result_data so history retains a waterfall.
                             if is_graph_result(result_data):
+                                # Golden already carries the adapter marker;
+                                # suppress only its duplicate console render.
+                                _is_golden_result = (
+                                    isinstance(result_data.get("golden_telemetry"), Mapping)
+                                    or isinstance(result_data.get("golden_identity"), Mapping)
+                                )
                                 attach_waterfall(
                                     result_data,
                                     run_label="experiment cell materialize",
+                                    print_render=not _is_golden_result,
                                 )
                             # Carry the graph result's waterfall (a small
                             # structured report dict) into the durable payload

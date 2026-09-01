@@ -142,6 +142,15 @@ class LocalMetaPersistenceTests(unittest.TestCase):
         )
         self.assertIn('run_label="experiment cell materialize"', self.src)
 
+    def test_golden_cell_fallback_suppresses_only_duplicate_render(self):
+        self.assertIn('result_data.get("golden_telemetry")', self.src)
+        self.assertIn('result_data.get("golden_identity")', self.src)
+        self.assertIn("print_render=not _is_golden_result", self.src)
+
+    def test_generic_cell_fallback_remains_print_enabled(self):
+        self.assertIn("_is_golden_result = (", self.src)
+        self.assertIn("print_render=not _is_golden_result", self.src)
+
 
 class InvokerTimingPayloadTests(unittest.TestCase):
     """V2 experiment invoker carries the returned waterfall in timing_payload."""

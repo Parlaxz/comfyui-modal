@@ -270,7 +270,7 @@ def test_pre_capture_proof_fails_closed_at_snapshot_size_limit(monkeypatch):
     ]["error"]
 
 
-def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypatch, tmp_path):
+def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypatch, tmp_path, capsys):
     volume = object()
     monkeypatch.setitem(modal_app._MODAL_RESOURCES, "runtime_state_volume", volume)
     monkeypatch.setattr(modal_app, "RUNTIME_STATE_PATH", str(tmp_path))
@@ -330,6 +330,11 @@ def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypat
         )
 
     monkeypatch.setattr(golden_serial, "golden_serial_execute", fake_execute)
+    monkeypatch.setattr(
+        modal_app,
+        "_emit_golden_telemetry",
+        lambda *_args, **_kwargs: pytest.fail("Golden adapter must not emit telemetry"),
+    )
 
     async def collect():
         return [
@@ -364,6 +369,7 @@ def test_adapter_passes_mount_restore_metadata_and_terminal_timestamps(monkeypat
     assert teardown["end_monotonic_ns"] <= teardown_complete["monotonic_ns"]
     assert [event["name"] for event in telemetry["events"]] == ["TEARDOWN_COMPLETE"]
     assert "adapter_completion" not in telemetry
+    assert "[v2.golden_telemetry]" not in capsys.readouterr().out
 
 
 def test_golden_telemetry_log_format_is_complete_bounded_and_redacts_prompt(capsys):
@@ -451,6 +457,13 @@ def test_golden_telemetry_log_includes_remote_waterfall_and_boundary_timing(caps
     assert "Telemetry persistence [ADAPTER]" in output
 
 
+def test_golden_adapter_terminal_paths_do_not_emit_telemetry_block():
+    source = Path(modal_app.__file__).read_text(encoding="utf-8")
+    start = source.index("    async def run_golden_serial_stream(")
+    end = source.index("    async def run_prompt_stream(", start)
+    assert "_emit_golden_telemetry(" not in source[start:end]
+
+
 def test_adapter_failure_propagates_persisted_telemetry_and_timing(monkeypatch, tmp_path, capsys):
     volume = object()
     monkeypatch.setitem(modal_app._MODAL_RESOURCES, "runtime_state_volume", volume)
@@ -489,6 +502,11 @@ def test_adapter_failure_propagates_persisted_telemetry_and_timing(monkeypatch, 
         raise RuntimeError("primary-golden-error")
 
     monkeypatch.setattr(golden_serial, "golden_serial_execute", fail_after_persist)
+    monkeypatch.setattr(
+        modal_app,
+        "_emit_golden_telemetry",
+        lambda *_args, **_kwargs: pytest.fail("Golden adapter must not emit telemetry"),
+    )
 
     async def collect():
         return [
@@ -510,8 +528,67 @@ def test_adapter_failure_propagates_persisted_telemetry_and_timing(monkeypatch, 
     assert timing["golden_stage_sum_ms"] == pytest.approx(0.002)
     assert timing["golden_telemetry_persist_ms"] is None
     output = capsys.readouterr().out
-    assert "stage=golden_sampling duration_ms=0.002 ok=false" in output
-    assert "event=SAMPLER_FAILED" in output
+    assert "[v2.golden_telemetry]" not in output
+
+
+def test_cache_peek_does_not_initialize_or_log(monkeypatch):
+    monkeypatch.setattr(clip_conditioning_cache, "_SINGLETON", None)
+    monkeypatch.setattr(clip_conditioning_cache, "_SINGLETON_RESOLVED", False)
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "ExactConditioningCache",
+        lambda **_kwargs: pytest.fail("peek must not construct the cache"),
+    )
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "_log_once",
+        lambda *_args, **_kwargs: pytest.fail("peek must not log"),
+    )
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "env_flag",
+        lambda *_args, **_kwargs: pytest.fail("peek must not resolve the environment"),
+    )
+
+    assert clip_conditioning_cache.peek_exact_conditioning_cache() is None
+
+
+def test_cache_peek_returns_an_existing_resolved_service(monkeypatch):
+    cache = object()
+    monkeypatch.setattr(clip_conditioning_cache, "_SINGLETON", cache)
+    monkeypatch.setattr(clip_conditioning_cache, "_SINGLETON_RESOLVED", True)
+
+    assert clip_conditioning_cache.peek_exact_conditioning_cache() is cache
+
+
+def test_exit_flushes_only_an_already_resolved_cache(monkeypatch):
+    flush_calls = []
+
+    class ExistingCache:
+        def flush(self, *, timeout):
+            flush_calls.append(timeout)
+
+    cache = ExistingCache()
+    monkeypatch.setattr(clip_conditioning_cache, "_SINGLETON", cache)
+    monkeypatch.setattr(clip_conditioning_cache, "_SINGLETON_RESOLVED", True)
+    monkeypatch.setattr(
+        clip_conditioning_cache,
+        "get_exact_conditioning_cache",
+        lambda: pytest.fail("exit must not initialize the cache"),
+    )
+
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    cast(Any, entrypoint)._teardown_diagnostics = None
+    monkeypatch.setattr(entrypoint, "_lazy_init_snapshot_state", lambda: None)
+
+    def run_stage(name, callback):
+        if name == "conditioning_cache_flush":
+            callback()
+
+    monkeypatch.setattr(entrypoint, "_run_teardown_stage", run_stage)
+    entrypoint.exit()
+
+    assert flush_calls == [modal_app._PRELOAD_WORKER_JOIN_BUDGET_S]
 
 
 def test_adapter_rejects_runtime_mount_identity_mismatch(monkeypatch, tmp_path):

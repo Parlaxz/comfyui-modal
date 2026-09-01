@@ -2850,6 +2850,14 @@ _SINGLETON_LOCK = threading.Lock()
 _SINGLETON_RESOLVED = False
 
 
+def peek_exact_conditioning_cache() -> ExactConditioningCache | None:
+    """Return the already-resolved cache service without initializing it."""
+    with _SINGLETON_LOCK:
+        if not _SINGLETON_RESOLVED:
+            return None
+        return _SINGLETON
+
+
 def quiesce_for_snapshot(timeout_s: float = 10.0) -> dict[str, Any]:
     """Quiesce the initialized exact-conditioning cache without initializing it."""
     with _SINGLETON_LOCK:

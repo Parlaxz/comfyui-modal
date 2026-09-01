@@ -6467,8 +6467,8 @@ class ModalRuntimeEntrypoint:
             # commit remains the durability backstop.
             def flush_conditioning_cache() -> None:
                 try:
-                    from .clip_conditioning_cache import get_exact_conditioning_cache as _get_ccc
-                    _svc = _get_ccc()
+                    from .clip_conditioning_cache import peek_exact_conditioning_cache
+                    _svc = peek_exact_conditioning_cache()
                     if _svc is not None and hasattr(_svc, "flush"):
                         _svc.flush(timeout=_PRELOAD_WORKER_JOIN_BUDGET_S)
                 except Exception:
@@ -21416,19 +21416,8 @@ class ModalRuntimeEntrypoint:
             error_event["golden_adapter_timing"] = timing
             if telemetry is not None:
                 error_event["golden_telemetry"] = telemetry
-                try:
-                    _emit_golden_telemetry(telemetry, timing=timing)
-                except Exception as log_exc:
-                    # Logging must never replace the primary Golden failure.
-                    error_event["golden_telemetry_log_error"] = (
-                        f"{type(log_exc).__name__}: {log_exc}"[:300]
-                    )
             elif telemetry_error:
                 error_event["golden_telemetry_error"] = telemetry_error
-                try:
-                    _emit_golden_telemetry(None)
-                except Exception:
-                    pass
             yield error_event
             return
 
@@ -21495,9 +21484,8 @@ class ModalRuntimeEntrypoint:
             ),
         }
         # Evidence, never fabrication: attach the telemetry document Golden
-        # actually persisted at the known local path.  The same document is
-        # printed on success and failure, so container logs and host artifacts
-        # have one canonical breakdown.
+        # actually persisted at the known local path.  Host artifacts retain
+        # the canonical breakdown without duplicating it in container logs.
         telemetry, telemetry_error = _read_golden_telemetry(telemetry_path)
         timing = _golden_adapter_timing(
             telemetry,
@@ -21510,18 +21498,8 @@ class ModalRuntimeEntrypoint:
         result_data["golden_adapter_timing"] = timing
         if telemetry is not None:
             result_data["golden_telemetry"] = telemetry
-            try:
-                _emit_golden_telemetry(telemetry, timing=timing)
-            except Exception as log_exc:
-                result_data["golden_telemetry_log_error"] = (
-                    f"{type(log_exc).__name__}: {log_exc}"[:300]
-                )
         elif telemetry_error:
             result_data["golden_telemetry_error"] = telemetry_error
-            try:
-                _emit_golden_telemetry(None)
-            except Exception:
-                pass
         _yield_wall_unix_ns = time.time_ns()
         _yield_mono_ns = time.monotonic_ns()
         _terminal_timing.update({
