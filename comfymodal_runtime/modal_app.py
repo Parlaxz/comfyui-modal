@@ -1381,6 +1381,15 @@ def _golden_log_json(value: Any) -> str:
     )
 
 
+def _is_golden_result(value: Any) -> bool:
+    """Recognize transported Golden results without depending on their class."""
+    if not isinstance(value, Mapping):
+        return False
+    return isinstance(value.get("golden_identity"), Mapping) or isinstance(
+        value.get("golden_telemetry"), Mapping
+    )
+
+
 def _golden_telemetry_stage_duration_ms(stage: Mapping[str, Any]) -> float | None:
     started = stage.get("entry_monotonic_ns")
     ended = stage.get("end_monotonic_ns")
@@ -21706,6 +21715,7 @@ def _build_decorated_v2_class() -> type:
                                     attach_waterfall(
                                         _gres,
                                         run_label=f"modal {orig_method.__name__} stream",
+                                        print_render=not _is_golden_result(_gres),
                                     )
                             yield item
                     finally:

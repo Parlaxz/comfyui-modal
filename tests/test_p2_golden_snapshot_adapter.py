@@ -35,6 +35,29 @@ def test_golden_gate_uses_dynamic_flag_or_profile(monkeypatch):
     assert modal_app._golden_serial_profile_active() is True
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ({"golden_identity": {}}, True),
+        ({"golden_telemetry": {}}, True),
+        ({"golden_identity": None}, False),
+        ({"golden_telemetry": "not telemetry"}, False),
+        ({"trace": {"events": []}}, False),
+        (None, False),
+    ],
+)
+def test_is_golden_result_uses_only_transport_markers(value, expected):
+    assert modal_app._is_golden_result(value) is expected
+
+
+def test_async_stream_wrapper_disables_only_generic_golden_render():
+    source = Path(modal_app.__file__).read_text(encoding="utf-8")
+    start = source.index("if inspect.isasyncgenfunction(orig_method):")
+    end = source.index("elif inspect.isgeneratorfunction(orig_method):", start)
+    wrapper = source[start:end]
+    assert "print_render=not _is_golden_result(_gres)" in wrapper
+
+
 def test_startup_source_keeps_non_golden_cpu_snapshot_gate_and_golden_bypass():
     source = Path(modal_app.__file__).read_text(encoding="utf-8")
     golden_branch = source.index("if _golden_serial_active:")
