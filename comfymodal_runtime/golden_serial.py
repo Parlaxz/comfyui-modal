@@ -52,6 +52,7 @@ import math
 import ntpath
 import os
 import posixpath
+import re
 import sys
 import tempfile
 import threading
@@ -6059,6 +6060,365 @@ class _ClipTiming:
         }
 
 
+_CLIP_DECOMPOSITION_RECORD_LIMIT = 256
+_CLIP_DECOMPOSITION_MODULE_LIMIT = 256
+_CLIP_LAYER_RE = re.compile(r"(?:^|[._])(?:layers?|blocks?|h)(?:[._])(\d+)(?:$|[._])", re.IGNORECASE)
+
+
+def _clip_classify_module(module_name: Any, module: Any) -> dict[str, Any]:
+    """Classify a real Qwen module using names exposed by that module.
+
+    The result is deliberately descriptive rather than prescriptive: model
+    revisions and CPU fakes can use different nesting while still exposing
+    stable ``named_modules`` paths or class names.  No module is selected by
+    parameter count, tensor shape, or a cast-once assumption.
+    """
+    name = str(module_name or "")
+    try:
+        class_name = type(module).__name__
+    except Exception:
+        class_name = "unknown"
+    try:
+        module_path = str(getattr(module, "module_path", "") or "")
+    except Exception:
+        module_path = ""
+    qualified_name = name or module_path or f"<root>:{class_name}"
+    text = f"{name} {module_path} {class_name}".lower()
+    match = _CLIP_LAYER_RE.search(name) or _CLIP_LAYER_RE.search(module_path) or _CLIP_LAYER_RE.search(text)
+    layer_index = int(match.group(1)) if match else None
+    layer_container = bool(re.search(r"(?:^|[._])\d+$", name or module_path))
+
+    if not name and ("transformer" in text or "qwen" in text):
+        category = "qwen_transformer"
+    elif any(token in text for token in ("self_attn", "attention", ".attn", "_attn")):
+        category = "attention"
+    elif any(token in text for token in ("mlp", "feed_forward", "feedforward", "ffn")):
+        category = "mlp"
+    elif any(token in text for token in ("layernorm", "rmsnorm", ".norm", "_norm", "norm1", "norm2")):
+        category = "normalization"
+    elif any(token in text for token in ("embed", "embedding", "word_embeddings")):
+        category = "embedding"
+    elif any(token in text for token in ("projection", "proj", "lm_head", "output")):
+        category = "projection"
+    elif layer_index is not None and layer_container:
+        category = "transformer_layer"
+    elif layer_index is not None:
+        category = "other_repeated_block"
+    else:
+        category = None
+
+    layer_group = None
+    if layer_index is not None:
+        layer_group = "first_layer" if layer_index == 0 else "steady_state_layers"
+    return {
+        "qualified_name": qualified_name[:192],
+        "module_name": name[:192],
+        "class_name": class_name[:96],
+        "category": category,
+        "layer_index": layer_index,
+        "layer_group": layer_group,
+    }
+
+
+def _clip_decomposition_modules(scope: Any) -> tuple[list[tuple[Any, dict[str, Any]]], bool]:
+    """Return bounded, structurally classified module objects for hook setup."""
+    try:
+        named_modules = getattr(scope, "named_modules", None)
+        if not callable(named_modules):
+            return [], False
+        items = named_modules()
+    except Exception:
+        return [], False
+    selected: list[tuple[Any, dict[str, Any]]] = []
+    truncated = False
+    try:
+        for name, module in items:
+            facts = _clip_classify_module(name, module)
+            if facts["category"] is None:
+                continue
+            if len(selected) >= _CLIP_DECOMPOSITION_MODULE_LIMIT:
+                truncated = True
+                break
+            selected.append((module, facts))
+    except Exception:
+        return selected, True
+    return selected, truncated
+
+
+class _ClipForwardDecomposition:
+    """Request-local host-only hooks for a bounded CLIP forward breakdown."""
+
+    def __init__(self, timing: _ClipTiming, scope: Any, *, enabled: bool) -> None:
+        self.timing = timing
+        self.scope = scope
+        self.enabled = bool(enabled)
+        self.hook_status = "NOT RUN" if not self.enabled else "UNPROVEN"
+        self.module_catalog: list[dict[str, Any]] = []
+        self.module_records: list[dict[str, Any]] = []
+        self.errors: list[str] = []
+        self.catalog_truncated = False
+        self.records_truncated = False
+        self._handles: list[Any] = []
+        self._starts: dict[int, list[int]] = {}
+
+    def _error(self, reason: str) -> None:
+        if len(self.errors) < 16:
+            self.errors.append(str(reason)[:192])
+
+    def install(self) -> None:
+        if not self.enabled:
+            return
+        selected, self.catalog_truncated = _clip_decomposition_modules(self.scope)
+        self.module_catalog = [dict(facts) for _module, facts in selected]
+        if not selected:
+            self.hook_status = "UNPROVEN"
+            self._error("no_structurally_classified_modules")
+            return
+        for module, facts in selected:
+            module_id = id(module)
+
+            def pre_hook(*_args: Any, _module_id=module_id) -> None:
+                try:
+                    self._starts.setdefault(_module_id, []).append(time.perf_counter_ns())
+                except Exception as exc:
+                    self._error(f"pre_hook_failed:{type(exc).__name__}")
+
+            def post_hook(*_args: Any, _facts=facts, _module_id=module_id) -> None:
+                try:
+                    end_ns = time.perf_counter_ns()
+                    starts = self._starts.get(_module_id) or []
+                    start_ns = starts.pop() if starts else end_ns
+                    if len(self.module_records) >= _CLIP_DECOMPOSITION_RECORD_LIMIT:
+                        self.records_truncated = True
+                        return
+                    record = {
+                        **dict(_facts),
+                        "start_ns": int(start_ns),
+                        "end_ns": int(end_ns),
+                        "duration_ns": max(0, int(end_ns) - int(start_ns)),
+                        "boundary_kind": "host_observed_inclusive",
+                    }
+                    self.module_records.append(record)
+                except Exception as exc:
+                    self._error(f"post_hook_failed:{type(exc).__name__}")
+
+            try:
+                register_pre = getattr(module, "register_forward_pre_hook", None)
+                register_post = getattr(module, "register_forward_hook", None)
+                if not callable(register_pre) or not callable(register_post):
+                    self._error(f"hooks_unavailable:{facts['qualified_name']}")
+                    continue
+                try:
+                    self._handles.append(register_pre(pre_hook, with_kwargs=True))
+                except TypeError:
+                    self._handles.append(register_pre(pre_hook))
+                self._handles.append(register_post(post_hook))
+            except Exception as exc:
+                self._error(f"hook_install_failed:{facts['qualified_name']}:{type(exc).__name__}")
+        self.hook_status = "installed" if self._handles else "UNPROVEN"
+
+    def remove(self) -> None:
+        for handle in reversed(self._handles):
+            try:
+                handle.remove()
+            except Exception as exc:
+                self._error(f"hook_remove_failed:{type(exc).__name__}")
+        self._handles.clear()
+        if self.hook_status == "installed" and not self.module_records:
+            self._error("no_classified_module_forward_observed")
+
+    def payload(self, *, authoritative_total_wall_ns: Optional[int] = None,
+                conversion: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        phase_names = {
+            # Keep the source phase names here.  These are inclusive host
+            # spans, not exclusive totals for the work named by a bucket.
+            "clip_forward_entry_setup": "clip_forward_entry_setup",
+            "clip_tokenization_input_prep": "clip_tokenization_input_prep",
+            "clip_qwen_transformer_encode": "clip_qwen_transformer_encode",
+            "clip_qwen_transformer_forward": "clip_qwen_transformer_forward",
+            "clip_post_forward_sync_wait": "clip_post_forward_sync_wait",
+            "clip_conditioning_packaging": "clip_conditioning_packaging",
+            "clip_graph_node_wrapper": "clip_graph_node_wrapper",
+        }
+        phase_host: dict[str, int] = {}
+        for phase in self.timing.phases:
+            if phase.get("start_ns") is None or phase.get("end_ns") is None:
+                continue
+            dimension = phase_names.get(str(phase.get("name")))
+            if dimension is None:
+                continue
+            phase_host[dimension] = phase_host.get(dimension, 0) + max(
+                0, int(phase["end_ns"]) - int(phase["start_ns"])
+            )
+        module_host: dict[str, int] = {}
+        first_steady: dict[str, dict[str, Any]] = {
+            "first_layer": {"record_count": 0, "host_duration_ns": 0},
+            "steady_state_layers": {"record_count": 0, "host_duration_ns": 0},
+            "unclassified": {"record_count": 0, "host_duration_ns": 0},
+        }
+        for record in self.module_records:
+            category = str(record.get("category") or "other_repeated_block")
+            module_host[category] = module_host.get(category, 0) + int(record.get("duration_ns", 0) or 0)
+            group = record.get("layer_group") or "unclassified"
+            bucket = first_steady.setdefault(group, {"record_count": 0, "host_duration_ns": 0})
+            bucket["record_count"] += 1
+            bucket["host_duration_ns"] += int(record.get("duration_ns", 0) or 0)
+        qwen = list(getattr(self.timing, "qwen_forwards", []) or [])
+        parent_spans = [
+            phase for phase in self.timing.phases
+            if phase.get("level") == "parent"
+            and phase.get("start_ns") is not None and phase.get("end_ns") is not None
+        ]
+        parent_spans.sort(key=lambda item: int(item["start_ns"]))
+        parent_union_ns = 0
+        previous_end: Optional[int] = None
+        for phase in parent_spans:
+            start, end = int(phase["start_ns"]), int(phase["end_ns"])
+            if previous_end is None or start >= previous_end:
+                parent_union_ns += max(0, end - start)
+            elif end > previous_end:
+                parent_union_ns += end - previous_end
+            previous_end = max(previous_end or end, end)
+        total = None if authoritative_total_wall_ns is None else max(0, int(authoritative_total_wall_ns))
+        reconciliation_status = "PARTIAL" if total is not None else "UNPROVEN"
+        return {
+            "schema": "golden_clip_forward_decomposition_v2",
+            "enabled": True,
+            "boundary": "golden_clip_forward",
+            "authoritative_total": {
+                "status": "TOTAL" if total is not None else "UNPROVEN",
+                "duration_ns": total,
+                "source": "GoldenTelemetryRecorder stage interval" if total is not None else "not finalized",
+            },
+            "phase_host_inclusive_durations_ns": phase_host,
+            "phase_host_duration_semantics": {
+                "boundary_kind": "host_observed_inclusive",
+                "additive": False,
+                "note": (
+                    "Each value retains its original phase name and includes "
+                    "nested work; it is not an exclusive transformer or "
+                    "token-preparation total."
+                ),
+            },
+            "module_host_durations_ns": module_host,
+            "module_records": list(self.module_records),
+            "module_record_limit": _CLIP_DECOMPOSITION_RECORD_LIMIT,
+            "module_records_truncated": bool(self.records_truncated),
+            "module_catalog": list(self.module_catalog),
+            "module_catalog_limit": _CLIP_DECOMPOSITION_MODULE_LIMIT,
+            "module_catalog_truncated": bool(self.catalog_truncated),
+            "first_vs_steady_layers": first_steady,
+            "actual_qwen_transformer_forward": {
+                "status": "PROVEN" if qwen else "UNPROVEN",
+                "forward_count": len(qwen),
+                "host_duration_ns": sum(int(item.get("duration_ns", 0) or 0) for item in qwen),
+                "completion": "host_observed_only",
+            },
+            "model_manager_patcher_activity": {
+                "status": "UNPROVEN",
+                "reason": "no dedicated non-invasive manager/patcher activity boundary",
+            },
+            "parameter_materialization_conversion": {
+                "status": (
+                    "PARTIAL" if isinstance(conversion, Mapping) and conversion.get("status") == "RUN"
+                    else "NOT RUN"
+                ),
+                "source": "existing forward conversion instrumentation" if isinstance(conversion, Mapping) else "existing conversion seam not active",
+                "conversion_count": conversion.get("conversion_count") if isinstance(conversion, Mapping) else None,
+            },
+            "cuda_completion": {
+                "status": "UNPROVEN",
+                "measurement": "no per-module CUDA events or synchronization",
+                "sync_budget": "existing required post-forward completion/quiescence only",
+            },
+            "readiness_storage_rechecks": {
+                "status": "PARTIAL",
+                "observed": ["before_forward", "after_tokenization", "after_encode"],
+                "storage_materialization": "UNPROVEN until the existing before/after snapshots prove it",
+            },
+            "reconciliation": {
+                "status": reconciliation_status,
+                "authoritative_total_wall_ns": total,
+                "observed_parent_union_ns": parent_union_ns,
+                "unaccounted_after_parent_spans_ns": (
+                    None if total is None else total - parent_union_ns
+                ),
+                "inner_spans_additive": False,
+                "inner_spans_status": "PARTIAL",
+                "note": (
+                    "Parent-span union is a partial timing reconciliation; it "
+                    "does not establish complete causal accounting of nested work."
+                ),
+                "residual_note": (
+                    "This value is only authoritative wall time minus the union "
+                    "of observed level=parent spans. It is not a complete or "
+                    "causal residual for all nested work."
+                ),
+            },
+            "hook_status": self.hook_status,
+            "errors": list(self.errors),
+        }
+
+
+@contextlib.contextmanager
+def _clip_forward_decomposition_hooks(
+    scope: Any,
+    timing: _ClipTiming,
+    *,
+    enabled: bool = True,
+):
+    """Install bounded structural module hooks only for one diagnostic forward."""
+    if not enabled:
+        yield None
+        return
+    decomposition = _ClipForwardDecomposition(timing, scope, enabled=True)
+    timing.forward_decomposition = decomposition
+    try:
+        decomposition.install()
+        yield decomposition
+    finally:
+        decomposition.remove()
+
+
+def _clip_attach_forward_decomposition(
+    recorder: Any,
+    session: Any,
+    timing: _ClipTiming,
+    conversion: Optional[Mapping[str, Any]],
+    *,
+    outcome: str,
+) -> Optional[dict[str, Any]]:
+    """Attach the exact recorder interval wall after the stage is closed."""
+    try:
+        # This is diagnostic-only and runs after the stage has been closed.
+        # Treat every read, payload build, mutation, copy, and event as
+        # best-effort so malformed diagnostic state cannot mask the result.
+        decomposition = getattr(timing, "forward_decomposition", None)
+        if decomposition is None or not getattr(timing, "enabled", False):
+            return None
+        interval = getattr(recorder, "_intervals", {}).get("golden_clip_forward")
+        total = None
+        if interval is not None and interval.end_monotonic_ns is not None:
+            total = int(interval.end_monotonic_ns) - int(interval.entry_monotonic_ns)
+        payload = decomposition.payload(
+            authoritative_total_wall_ns=total,
+            conversion=conversion,
+        )
+        payload["stage_outcome"] = str(outcome)
+        existing = dict(getattr(session, "clip_forward_timing", {}) or {})
+        existing["decomposition"] = payload
+        session.clip_forward_timing = existing
+        recorder.clip_forward_timing = copy.deepcopy(existing)
+        if interval is not None:
+            interval.details["clip_forward_timing"] = copy.deepcopy(existing)
+            interval.details["clip_forward_decomposition"] = copy.deepcopy(payload)
+        recorder.event("clip_forward_decomposition", **payload)
+    except BaseException:
+        # Diagnostics must never replace a successful or original failure path.
+        return None
+    return payload
+
+
 def _clip_page_fault_snapshot() -> dict[str, Any]:
     """Compatibility adapter for the canonical raw process-counter reader."""
     raw = _process_page_faults()
@@ -7656,19 +8016,26 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
     diagnostics_enabled = stage_diagnostics_enabled()
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
     clip_timing = _ClipTiming(enabled=diagnostics_enabled)
+    if diagnostics_enabled:
+        # Keep a diagnostic envelope even when setup fails before a compute
+        # scope exists; no hooks are installed by this placeholder.
+        clip_timing.forward_decomposition = _ClipForwardDecomposition(
+            clip_timing, None, enabled=True
+        )
     conversion_telemetry: Optional[dict[str, Any]] = None
     try:
         runner = session.runner
         if runner is None:
             raise RuntimeError("clip_forward_requires_runner")
         node_map = session.node_map
-        # Native socket-major cache shape: one output socket carrying one item.
-        runner.seed(node_map.clip_loader_id, [[session.clip]])
-        scope = session.clip_compute_scope
-        patcher = getattr(session.clip, "patcher", None)
-        before = _clip_scope_snapshot(scope, patcher) if scope is not None else {
-            "status": "unproven", "reason": "compute_scope_missing"
-        }
+        with clip_timing.span("clip_forward_entry_setup", level="nested"):
+            # Native socket-major cache shape: one output socket carrying one item.
+            runner.seed(node_map.clip_loader_id, [[session.clip]])
+            scope = session.clip_compute_scope
+            patcher = getattr(session.clip, "patcher", None)
+            before = _clip_scope_snapshot(scope, patcher) if scope is not None else {
+                "status": "unproven", "reason": "compute_scope_missing"
+            }
         clip_timing.snapshots = {"before": before}
         rec.event(
             "clip_cache_status",
@@ -7687,6 +8054,14 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
         clip_timing.unproven(
             "clip_cache_interaction",
             detail="no conditioning cache bridge exists in Golden Serial",
+        )
+        clip_timing.unproven(
+            "clip_model_manager_patcher_activity",
+            detail="no dedicated non-invasive model-manager/patcher activity boundary",
+        )
+        clip_timing.unproven(
+            "clip_first_use_cuda_library_initialization",
+            detail="CUDA/library initialization is not separately observable without adding synchronization",
         )
         runner.begin_scope({"clip_forward"})
         try:
@@ -7713,26 +8088,29 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                     in {"bf16", "fp32_cast_once"}
                 )
             ) as conversion_telemetry:
-                with _clip_qwen_forward_hooks(
-                    scope,
-                    clip_timing,
-                    lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
-                        "status": "unproven", "reason": "compute_scope_missing"
-                    },
-                    recorder=rec,
-                    conversion_observer=observe_clip_forward if conversion_telemetry is not None else None,
-                    enabled=diagnostics_enabled,
+                with _clip_forward_decomposition_hooks(
+                    scope, clip_timing, enabled=diagnostics_enabled
                 ):
-                    with _clip_forward_wrappers(
-                        session.clip,
+                    with _clip_qwen_forward_hooks(
+                        scope,
                         clip_timing,
                         lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
                             "status": "unproven", "reason": "compute_scope_missing"
                         },
+                        recorder=rec,
+                        conversion_observer=observe_clip_forward if conversion_telemetry is not None else None,
                         enabled=diagnostics_enabled,
                     ):
-                        with clip_timing.span("clip_graph_node_wrapper"):
-                            executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
+                        with _clip_forward_wrappers(
+                            session.clip,
+                            clip_timing,
+                            lambda: _clip_scope_snapshot(scope, patcher) if scope is not None else {
+                                "status": "unproven", "reason": "compute_scope_missing"
+                            },
+                            enabled=diagnostics_enabled,
+                        ):
+                            with clip_timing.span("clip_graph_node_wrapper"):
+                                executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
         finally:
             runner.end_scope()
         qwen_forwards = list(getattr(clip_timing, "qwen_forwards", []))
@@ -7939,6 +8317,10 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                 if diagnostics_enabled else {}
             ),
         )
+        if diagnostics_enabled:
+            _clip_attach_forward_decomposition(
+                rec, session, clip_timing, conversion_telemetry, outcome="success"
+            )
         return conditioning
     except BaseException as exc:
         clip_page_faults = (
@@ -7956,6 +8338,10 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             "golden_clip_forward", exc,
             **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
         )
+        if diagnostics_enabled:
+            _clip_attach_forward_decomposition(
+                rec, session, clip_timing, conversion_telemetry, outcome="failure"
+            )
         raise
 
 
