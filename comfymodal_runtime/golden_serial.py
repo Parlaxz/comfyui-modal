@@ -1516,9 +1516,11 @@ def _percentile(values: Iterable[int], fraction: float) -> Optional[int]:
 
 def _read_duration_summary(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Describe the bounded observed per-read sample without inventing data."""
-    samples = [int(value) for value in snapshot.get("read_duration_samples_ns", ())]
-    observed_count = int(snapshot.get("read_count", 0))
-    sample_limit = int(snapshot.get("read_duration_sample_limit", 0))
+    samples = [int(value) for value in (snapshot.get("read_duration_samples_ns") or ())]
+    observed_count_raw = snapshot.get("read_count")
+    sample_limit_raw = snapshot.get("read_duration_sample_limit")
+    observed_count = int(observed_count_raw) if observed_count_raw is not None else None
+    sample_limit = int(sample_limit_raw) if sample_limit_raw is not None else None
     percentiles = {
         "p50_ns": _percentile(samples, 0.50),
         "p90_ns": _percentile(samples, 0.90),
@@ -1529,8 +1531,15 @@ def _read_duration_summary(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "observed_count": observed_count,
         "sample_count": len(samples),
         "sample_limit": sample_limit,
-        "sample_truncated": observed_count > len(samples),
-        "sampling": "first_reads_bounded" if observed_count > len(samples) else "all_observed_reads",
+        "sample_truncated": (
+            observed_count is not None and observed_count > len(samples)
+        ),
+        "sampling": (
+            "unavailable"
+            if observed_count is None
+            else "first_reads_bounded" if observed_count > len(samples)
+            else "all_observed_reads"
+        ),
         "percentiles_ns": percentiles,
         "percentiles_ms": {
             key[:-3] + "ms": (value / 1e6 if value is not None else None)
@@ -1592,13 +1601,25 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         allocation_pinning = dict(stats.get("allocation_pinning") or {})
         h2d_event_poll = dict(stats.get("h2d_event_poll") or {})
         if not h2d_event_poll:
-            h2d_event_poll = {
-                "status": "OBSERVED",
-                "wall_ns": int(float(experiment.get("dispatcher_reap_wall_ms") or 0.0) * 1e6),
-                "wall_ms": float(experiment.get("dispatcher_reap_wall_ms") or 0.0),
-                "poll_count": int(experiment.get("dispatcher_reap_count") or 0),
-                "timing_scope": "TOTAL dispatcher event polling/reap",
-            }
+            reap_wall_ms = experiment.get("dispatcher_reap_wall_ms")
+            reap_count = experiment.get("dispatcher_reap_count")
+            h2d_event_poll = (
+                {
+                    "status": "OBSERVED",
+                    "wall_ns": (
+                        int(float(reap_wall_ms) * 1e6)
+                        if reap_wall_ms is not None else None
+                    ),
+                    "wall_ms": reap_wall_ms,
+                    "poll_count": reap_count,
+                    "timing_scope": "TOTAL dispatcher event polling/reap",
+                }
+                if reap_wall_ms is not None or reap_count is not None
+                else {
+                    "status": "NOT RUN",
+                    "reason": "dispatcher event polling diagnostics were disabled",
+                }
+            )
         h2d_event_wait = {
             "status": "NOT RUN",
             "reason": "dispatcher polling/reap wall is not a host event wait",
@@ -1634,17 +1655,35 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
     lease_wait = dict(stats.get("lease_wait") or {})
     if not lease_wait and execution_arm == "dispatcher":
         lease_wait = {
-            "wait_ns": int(float(experiment.get("producer_capacity_block_wall_ms") or 0.0) * 1e6),
-            "wait_ms": float(experiment.get("producer_capacity_block_wall_ms") or 0.0),
-            "wait_count": int(experiment.get("producer_capacity_block_count") or 0),
+            "wait_ns": (
+                int(float(experiment["producer_capacity_block_wall_ms"]) * 1e6)
+                if experiment.get("producer_capacity_block_wall_ms") is not None else None
+            ),
+            "wait_ms": experiment.get("producer_capacity_block_wall_ms"),
+            "wait_count": experiment.get("producer_capacity_block_count"),
+            "status": (
+                "OBSERVED"
+                if experiment.get("producer_capacity_block_wall_ms") is not None
+                or experiment.get("producer_capacity_block_count") is not None
+                else "NOT RUN"
+            ),
             "timing_scope": "TOTAL waits to acquire a reusable dispatcher lease",
         }
     ready_backpressure = dict(stats.get("ready_backpressure") or {})
     if not ready_backpressure and execution_arm == "dispatcher":
         ready_backpressure = {
-            "wait_ns": int(float(experiment.get("ready_queue_block_wall_ms") or 0.0) * 1e6),
-            "wait_ms": float(experiment.get("ready_queue_block_wall_ms") or 0.0),
-            "wait_count": int(experiment.get("ready_queue_block_count") or 0),
+            "wait_ns": (
+                int(float(experiment["ready_queue_block_wall_ms"]) * 1e6)
+                if experiment.get("ready_queue_block_wall_ms") is not None else None
+            ),
+            "wait_ms": experiment.get("ready_queue_block_wall_ms"),
+            "wait_count": experiment.get("ready_queue_block_count"),
+            "status": (
+                "OBSERVED"
+                if experiment.get("ready_queue_block_wall_ms") is not None
+                or experiment.get("ready_queue_block_count") is not None
+                else "NOT RUN"
+            ),
             "ready_depth_at_end": experiment.get("ready_queue_depth"),
             "timing_scope": "TOTAL producer waits for dispatcher ready-queue capacity",
         }
@@ -1652,9 +1691,12 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
     if not qd_occupancy and execution_arm == "dispatcher":
         qd_occupancy = {
             "target": experiment.get("source_qd_target"),
-            "max_depth": max(experiment.get("source_qd_depth_samples") or [0]),
+            "max_depth": (
+                max(experiment["source_qd_depth_samples"])
+                if experiment.get("source_qd_depth_samples") else None
+            ),
             "fraction_time_at_target": experiment.get("fraction_time_at_target_source_qd"),
-            "timeline": experiment.get("source_qd_timeline") or [],
+            "timeline": experiment.get("source_qd_timeline"),
         }
     free_ready_depth = dict(stats.get("free_ready_depth") or {})
     if not free_ready_depth and execution_arm == "dispatcher":
@@ -2469,24 +2511,25 @@ class _SourceTelemetry:
 
     def __init__(self, qd: int, *, enabled: bool = True):
         self.enabled = bool(enabled)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock() if self.enabled else None
         self.inflight = 0
         self.max_inflight = 0
         self.earliest_start_ns: Optional[int] = None
         self.latest_end_ns: Optional[int] = None
         self.read_count = 0
         self.read_bytes = 0
-        self.read_duration_samples_ns: list[int] = []
+        self.read_duration_samples_ns: Optional[list[int]] = [] if self.enabled else None
         self.read_duration_max_ns: Optional[int] = None
         self.per_worker = {
             i: {"read_count": 0, "read_bytes": 0, "first_start_ns": None, "last_end_ns": None}
             for i in range(int(qd))
-        }
+        } if self.enabled else {}
 
-    def before(self, worker_id: int) -> int:
+    def before(self, worker_id: int) -> Optional[int]:
         if not self.enabled:
-            return 0
+            return None
         now = time.perf_counter_ns()
+        assert self._lock is not None
         with self._lock:
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
@@ -2498,10 +2541,11 @@ class _SourceTelemetry:
                 worker["first_start_ns"] = now
         return now
 
-    def after(self, worker_id: int, started_ns: int, read_bytes: int) -> int:
+    def after(self, worker_id: int, started_ns: Optional[int], read_bytes: int) -> Optional[int]:
         if not self.enabled:
-            return 0
+            return None
         now = time.perf_counter_ns()
+        assert self._lock is not None and started_ns is not None
         with self._lock:
             self.inflight -= 1
             self.latest_end_ns = (
@@ -2511,6 +2555,7 @@ class _SourceTelemetry:
             duration_ns = max(0, now - int(started_ns))
             self.read_count += 1
             self.read_bytes += int(read_bytes)
+            assert self.read_duration_samples_ns is not None
             if len(self.read_duration_samples_ns) < self.READ_DURATION_SAMPLE_LIMIT:
                 self.read_duration_samples_ns.append(duration_ns)
             self.read_duration_max_ns = (
@@ -2523,6 +2568,20 @@ class _SourceTelemetry:
         return now
 
     def snapshot(self) -> dict:
+        if not self.enabled:
+            return {
+                "inflight": None,
+                "max_inflight": None,
+                "earliest_start_ns": None,
+                "latest_end_ns": None,
+                "read_count": None,
+                "read_bytes": None,
+                "read_duration_samples_ns": None,
+                "read_duration_sample_limit": None,
+                "read_duration_max_ns": None,
+                "per_worker": None,
+            }
+        assert self._lock is not None and self.read_duration_samples_ns is not None
         with self._lock:
             return {
                 "inflight": self.inflight,
@@ -2549,13 +2608,13 @@ class _QDReaderState:
         self.errors: list[str] = []
         self.submitted = 0
         self.completed = 0
-        self.buffer_pool_wait_ms = 0.0
-        self.buffer_pool_wait_ns = 0
-        self.buffer_pool_wait_count = 0
-        self.h2d_wait_ns = 0
-        self.h2d_wait_count = 0
-        self.h2d_gpu_event_ns = 0
-        self.h2d_gpu_event_count = 0
+        self.buffer_pool_wait_ms = 0.0 if self.diagnostics_enabled else None
+        self.buffer_pool_wait_ns = 0 if self.diagnostics_enabled else None
+        self.buffer_pool_wait_count = 0 if self.diagnostics_enabled else None
+        self.h2d_wait_ns = 0 if self.diagnostics_enabled else None
+        self.h2d_wait_count = 0 if self.diagnostics_enabled else None
+        self.h2d_gpu_event_ns = 0 if self.diagnostics_enabled else None
+        self.h2d_gpu_event_count = 0 if self.diagnostics_enabled else None
         self._worker_counts = {
             wid: {"submitted": 0, "completed": 0, "record_bytes": 0}
             for wid in range(len(regions))
@@ -2593,6 +2652,7 @@ class _QDReaderState:
     def add_buffer_wait(self, ms: float) -> None:
         if not self.diagnostics_enabled:
             return
+        assert self.buffer_pool_wait_ms is not None and self.buffer_pool_wait_count is not None
         with self._lock:
             self.buffer_pool_wait_ms += float(ms)
             self.buffer_pool_wait_count += 1
@@ -2600,12 +2660,14 @@ class _QDReaderState:
     def add_buffer_wait_ns(self, value: int) -> None:
         if not self.diagnostics_enabled:
             return
+        assert self.buffer_pool_wait_ns is not None
         with self._lock:
             self.buffer_pool_wait_ns += max(0, int(value))
 
     def add_h2d_wait_ns(self, value: int) -> None:
         if not self.diagnostics_enabled:
             return
+        assert self.h2d_wait_ns is not None and self.h2d_wait_count is not None
         with self._lock:
             self.h2d_wait_ns += max(0, int(value))
             self.h2d_wait_count += 1
@@ -2613,6 +2675,7 @@ class _QDReaderState:
     def add_h2d_gpu_event_ms(self, value: Optional[float]) -> None:
         if not self.diagnostics_enabled or value is None:
             return
+        assert self.h2d_gpu_event_ns is not None and self.h2d_gpu_event_count is not None
         with self._lock:
             self.h2d_gpu_event_ns += max(0, int(round(float(value) * 1e6)))
             self.h2d_gpu_event_count += 1
@@ -2681,11 +2744,11 @@ def _qd_gpu_worker(
                 "off": int(abs_start),
                 "planned_len": int(ln),
                 "read_len": int(got),
-                "source_start_ns": started if diagnostics_enabled else None,
-                "source_end_ns": ended if diagnostics_enabled else None,
             }
             if diagnostics_enabled:
                 record.update({
+                    "source_start_ns": started,
+                    "source_end_ns": ended,
                     "cpu_to_pinned_start_ns": started,
                     "cpu_to_pinned_end_ns": ended,
                 })
@@ -2800,16 +2863,16 @@ def _read_file_qd_gpu_dispatcher(
         raise RuntimeError("cuda_unavailable")
     dev = device or f"cuda:{torch.cuda.current_device()}"
 
-    total_start_ns = time.perf_counter_ns()
-    header_start_ns = time.perf_counter_ns()
+    total_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
+    header_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
     parsed = parse_safetensors_header(path)
-    header_end_ns = time.perf_counter_ns()
+    header_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
     if parsed.get("status") != "ok":
         raise RuntimeError(f"header_invalid:{parsed.get('reason')}")
     header = parsed["header"]
     data_start = int(parsed["data_start"])
     total = int(parsed["total_data_bytes"])
-    layout_start_ns = time.perf_counter_ns()
+    layout_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
     tensor_map = build_header_tensor_map(header)
     regions = plan_source_regions(data_start, total, block_bytes, qd)
     items = [item for region in regions for item in region]
@@ -2818,7 +2881,7 @@ def _read_file_qd_gpu_dispatcher(
     )
     if not coverage_ok:
         raise RuntimeError(f"coverage:{coverage_reason}")
-    layout_end_ns = time.perf_counter_ns()
+    layout_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
 
     gpu_buf = None
     owner: Optional[GoldenQDOwner] = None
@@ -2833,15 +2896,18 @@ def _read_file_qd_gpu_dispatcher(
 
             def __init__(self, backend: Any):
                 self.backend = backend
-                self.staging_allocation_ns = 0
-                self.submit_wall_ns = 0
+                self.staging_allocation_ns = 0 if diagnostics_enabled else None
+                self.submit_wall_ns = 0 if diagnostics_enabled else None
                 self.submit_count = 0
 
             def allocate_staging_buffers(self, slots: int, block_size: int) -> Any:
+                if not diagnostics_enabled:
+                    return self.backend.allocate_staging_buffers(slots, block_size)
                 started = time.perf_counter_ns()
                 try:
                     return self.backend.allocate_staging_buffers(slots, block_size)
                 finally:
+                    assert self.staging_allocation_ns is not None
                     self.staging_allocation_ns += max(0, time.perf_counter_ns() - started)
 
             def submit_h2d(self, source: Any, destination_offset: int) -> Any:
@@ -2850,11 +2916,13 @@ def _read_file_qd_gpu_dispatcher(
                 # Python payload, before handing it to CudaTransferBackend.
                 if not isinstance(source, torch.Tensor):
                     source = torch.frombuffer(source, dtype=torch.uint8)
-                started = time.perf_counter_ns()
+                started = time.perf_counter_ns() if diagnostics_enabled else None
                 try:
                     return self.backend.submit_h2d(source, destination_offset)
                 finally:
-                    self.submit_wall_ns += max(0, time.perf_counter_ns() - started)
+                    if diagnostics_enabled:
+                        assert started is not None and self.submit_wall_ns is not None
+                        self.submit_wall_ns += max(0, time.perf_counter_ns() - started)
                     self.submit_count += 1
 
             def poll_event(self, event: Any) -> Any:
@@ -2874,12 +2942,16 @@ def _read_file_qd_gpu_dispatcher(
             capacity_class=f"qd{qd}-{block_bytes}",
         )
         dispatcher = transport_module.create_transport(
-            "dispatcher", config=config, backend=backend
+            "dispatcher", config=config, backend=backend,
+            diagnostics=diagnostics_enabled,
         )
-        staging_allocation_ns = int(backend.staging_allocation_ns)
+        staging_allocation_ns = (
+            int(backend.staging_allocation_ns)
+            if diagnostics_enabled else None
+        )
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
 
-        source_telemetry = _SourceTelemetry(qd, enabled=True)
+        source_telemetry = _SourceTelemetry(qd, enabled=diagnostics_enabled)
 
         class _PositionedSource:
             """One positioned source object with one descriptor per producer."""
@@ -2889,31 +2961,33 @@ def _read_file_qd_gpu_dispatcher(
                 self._lock = threading.Lock()
                 self.open_count = 0
 
-            def _fd_for_thread(self) -> int:
-                thread_id = threading.get_ident()
+            def _fd_for_producer(self, producer_id: int) -> int:
+                if not isinstance(producer_id, int) or not 0 <= producer_id < qd:
+                    raise RuntimeError(f"invalid_producer_id:{producer_id!r}")
                 with self._lock:
-                    fd = self._fds.get(thread_id)
+                    fd = self._fds.get(producer_id)
                     if fd is None:
                         fd = os.open(path, flags)
-                        self._fds[thread_id] = fd
+                        self._fds[producer_id] = fd
                         self.open_count += 1
                     return fd
 
-            def readinto(self, target: Any, offset: int) -> int:
-                worker_id = threading.get_ident() % qd
-                started = source_telemetry.before(worker_id)
+            def readinto(self, target: Any, offset: int, producer_id: int | None = None) -> int:
+                if producer_id is None:
+                    raise RuntimeError("producer_id_required")
+                started = source_telemetry.before(producer_id)
                 try:
                     # Keep the dispatcher-facing slot as its original torch
                     # tensor while giving positioned OS I/O the writable byte
                     # protocol it requires.  This is a view, never a staging
                     # allocation or a bytes materialization.
                     got = int(_read_at(
-                        self._fd_for_thread(), _writable_bytes_view(target), int(offset)
+                        self._fd_for_producer(producer_id), _writable_bytes_view(target), int(offset)
                     ))
                 except BaseException:
                     raise
                 else:
-                    source_telemetry.after(worker_id, started, got)
+                    source_telemetry.after(producer_id, started, got)
                     return got
 
             def close(self) -> None:
@@ -2921,17 +2995,17 @@ def _read_file_qd_gpu_dispatcher(
                     fds = tuple(self._fds.items())
                 closed: list[tuple[int, int]] = []
                 errors: list[OSError] = []
-                for thread_id, fd in fds:
+                for producer_id, fd in fds:
                     try:
                         os.close(fd)
                     except OSError as exc:
                         errors.append(exc)
                     else:
-                        closed.append((thread_id, fd))
+                        closed.append((producer_id, fd))
                 with self._lock:
-                    for thread_id, fd in closed:
-                        if self._fds.get(thread_id) == fd:
-                            self._fds.pop(thread_id, None)
+                    for producer_id, fd in closed:
+                        if self._fds.get(producer_id) == fd:
+                            self._fds.pop(producer_id, None)
                 if errors:
                     primary = errors[0]
                     for secondary in errors[1:]:
@@ -2961,13 +3035,20 @@ def _read_file_qd_gpu_dispatcher(
         source_snapshot = source_telemetry.snapshot()
         source_wall_ns = (
             max(0, int(source_snapshot["latest_end_ns"]) - int(source_snapshot["earliest_start_ns"]))
-            if source_snapshot["earliest_start_ns"] is not None
+            if diagnostics_enabled
+            and source_snapshot["earliest_start_ns"] is not None
             and source_snapshot["latest_end_ns"] is not None
-            else 0
+            else None
         )
-        source_wall_ms = source_wall_ns / 1e6
-        source_bytes = int(source_snapshot["read_bytes"])
-        source_read_count = int(source_snapshot["read_count"])
+        source_wall_ms = source_wall_ns / 1e6 if source_wall_ns is not None else None
+        source_bytes = (
+            int(source_snapshot["read_bytes"])
+            if diagnostics_enabled else int(telemetry.get("source_bytes") or 0)
+        )
+        source_read_count = (
+            int(source_snapshot["read_count"])
+            if diagnostics_enabled else int(telemetry.get("source_read_count") or 0)
+        )
         if source_bytes != total or source_bytes != int(telemetry.get("source_bytes") or 0):
             raise RuntimeError(
                 f"source_read_reconciliation:{source_bytes}:{telemetry.get('source_bytes')}:{total}"
@@ -2975,12 +3056,12 @@ def _read_file_qd_gpu_dispatcher(
         source_open_count = int(source.open_count)
         source_gbps = (
             source_bytes / max(source_wall_ms * 1_000_000.0, 1.0)
-            if source_wall_ms > 0 else None
+            if source_wall_ms is not None and source_wall_ms > 0 else None
         )
         records = []
         for record in result.records:
             records.append({
-                "worker_id": None,
+                "worker_id": record.producer_id,
                 "off": int(record.source_offset),
                 "planned_len": int(record.nbytes),
                 "read_len": int(record.nbytes),
@@ -2997,33 +3078,57 @@ def _read_file_qd_gpu_dispatcher(
                 f"h2d_reconciliation:{result.submitted_bytes}:{result.completed_bytes}:{total}"
             )
         h2d_bytes = int(result.completed_bytes)
-        h2d_submit_wall = {
-            "wall_ns": int(backend.submit_wall_ns),
-            "wall_ms": backend.submit_wall_ns / 1e6,
-            "submit_count": int(backend.submit_count),
-            "bytes": int(result.submitted_bytes),
-            "timing_scope": "TOTAL host CudaTransferBackend.submit_h2d intervals",
-        }
-        h2d_event_poll = {
-            "status": "OBSERVED",
-            "wall_ns": int(float(telemetry.get("dispatcher_reap_wall_ms") or 0.0) * 1e6),
-            "wall_ms": float(telemetry.get("dispatcher_reap_wall_ms") or 0.0),
-            "poll_count": int(telemetry.get("dispatcher_reap_count") or 0),
-            "timing_scope": "TOTAL dispatcher event polling/reap",
-        }
-        h2d_event_completion = {
-            "status": "OBSERVED",
-            "latency_ms": telemetry.get("h2d_event_completion_latency_ms"),
-            "sample_count": int(telemetry.get("h2d_completed_count") or 0),
-            "timing_scope": "PARTIAL H2D submit-to-event completion latency",
-        }
-        h2d_event_wait = {
-            "status": "NOT RUN",
-            "reason": "dispatcher polling/reap does not measure host event wait",
-        }
-        per_read = _read_duration_summary(source_snapshot)
-        ready_wait_ns = int(float(telemetry.get("ready_queue_block_wall_ms") or 0.0) * 1e6)
-        lease_wait_ns = int(float(telemetry.get("producer_capacity_block_wall_ms") or 0.0) * 1e6)
+        if diagnostics_enabled:
+            assert backend.submit_wall_ns is not None
+            reap_wall_ms = telemetry.get("dispatcher_reap_wall_ms")
+            reap_count = telemetry.get("dispatcher_reap_count")
+            ready_wait_ms = telemetry.get("ready_queue_block_wall_ms")
+            lease_wait_ms = telemetry.get("producer_capacity_block_wall_ms")
+            final_drain_wall_ms = telemetry.get("final_drain_wall_ms")
+            h2d_submit_wall = {
+                "wall_ns": int(backend.submit_wall_ns),
+                "wall_ms": backend.submit_wall_ns / 1e6,
+                "submit_count": int(backend.submit_count),
+                "bytes": int(result.submitted_bytes),
+                "timing_scope": "TOTAL host CudaTransferBackend.submit_h2d intervals",
+            }
+            h2d_event_poll = {
+                "status": "OBSERVED",
+                "wall_ns": (
+                    int(float(reap_wall_ms) * 1e6)
+                    if reap_wall_ms is not None else None
+                ),
+                "wall_ms": reap_wall_ms,
+                "poll_count": reap_count,
+                "timing_scope": "TOTAL dispatcher event polling/reap",
+            }
+            h2d_event_completion = {
+                "status": "OBSERVED",
+                "latency_ms": telemetry.get("h2d_event_completion_latency_ms"),
+                "sample_count": int(telemetry.get("h2d_completed_count") or 0),
+                "timing_scope": "PARTIAL H2D submit-to-event completion latency",
+            }
+            h2d_event_wait = {
+                "status": "NOT RUN",
+                "reason": "dispatcher polling/reap does not measure host event wait",
+            }
+            per_read = _read_duration_summary(source_snapshot)
+            ready_wait_ns = (
+                int(float(ready_wait_ms) * 1e6)
+                if ready_wait_ms is not None else None
+            )
+            lease_wait_ns = (
+                int(float(lease_wait_ms) * 1e6)
+                if lease_wait_ms is not None else None
+            )
+        else:
+            h2d_submit_wall = {}
+            h2d_event_poll = {}
+            h2d_event_completion = {}
+            h2d_event_wait = {}
+            per_read = None
+            ready_wait_ns = None
+            lease_wait_ns = None
         exact_reconciliation = {
             "ok": True,
             "reason": "ok",
@@ -3054,9 +3159,12 @@ def _read_file_qd_gpu_dispatcher(
             "ready_backpressure_wait_ns": ready_wait_ns,
             "producer_qd_occupancy": {
                 "target": telemetry.get("source_qd_target"),
-                "max_depth": max(telemetry.get("source_qd_depth_samples") or [0]),
+                "max_depth": (
+                    max(telemetry.get("source_qd_depth_samples"))
+                    if diagnostics_enabled and telemetry.get("source_qd_depth_samples") else None
+                ),
                 "fraction_time_at_target": telemetry.get("fraction_time_at_target_source_qd"),
-                "timeline": telemetry.get("source_qd_timeline") or [],
+                "timeline": telemetry.get("source_qd_timeline") if diagnostics_enabled else None,
             },
             "free_ready_depth": {
                 "minimum_free_slots": telemetry.get("minimum_free_slots"),
@@ -3090,18 +3198,24 @@ def _read_file_qd_gpu_dispatcher(
             "qd_source_gbps": source_gbps,
             "effective_source_gbps": source_gbps,
             "effective_h2d_gbps": None,
-            "max_inflight": max(telemetry.get("source_qd_depth_samples") or [0]),
+            "max_inflight": (
+                max(telemetry.get("source_qd_depth_samples"))
+                if diagnostics_enabled and telemetry.get("source_qd_depth_samples") else None
+            ),
             "pinned_bytes": staging_slots * block_bytes,
             "gpu_bytes": total,
-            "buffer_pool_wait_ms": float(telemetry.get("producer_capacity_block_wall_ms") or 0.0),
-            "source_open_header_layout": {
-                "header_layout_ns": max(0, header_end_ns - header_start_ns),
-                "header_layout_ms": (header_end_ns - header_start_ns) / 1e6,
-                "source_open_ns": None,
-                "source_open_ms": None,
-                "tensor_layout_ns": max(0, layout_end_ns - layout_start_ns),
-                "tensor_layout_ms": (layout_end_ns - layout_start_ns) / 1e6,
-            },
+            "buffer_pool_wait_ms": telemetry.get("producer_capacity_block_wall_ms"),
+            "source_open_header_layout": (
+                {
+                    "header_layout_ns": max(0, header_end_ns - header_start_ns),
+                    "header_layout_ms": (header_end_ns - header_start_ns) / 1e6,
+                    "source_open_ns": None,
+                    "source_open_ms": None,
+                    "tensor_layout_ns": max(0, layout_end_ns - layout_start_ns),
+                    "tensor_layout_ms": (layout_end_ns - layout_start_ns) / 1e6,
+                }
+                if diagnostics_enabled else {}
+            ),
             "staging": {
                 "allocation_count": staging_slots,
                 "allocated_bytes": staging_slots * block_bytes,
@@ -3112,15 +3226,19 @@ def _read_file_qd_gpu_dispatcher(
                 "pinned": True,
                 "retained_by": "request_dispatcher_pool_until_quiescence",
             },
-            "source_reads": {
-                "bytes": source_bytes,
-                "copy_count": source_read_count,
-                "read_count": source_read_count,
-                "wall_ns": source_wall_ns,
-                "wall_ms": source_wall_ms,
-                "per_read": per_read,
-                "timing_scope": "TOTAL positioned readinto intervals; may overlap",
-            },
+            "source_reads": (
+                {
+                    "bytes": source_bytes,
+                    "copy_count": source_read_count,
+                    "read_count": source_read_count,
+                    "wall_ns": source_wall_ns,
+                    "wall_ms": source_wall_ms,
+                    "per_read": per_read,
+                    "per_worker": source_snapshot.get("per_worker"),
+                    "timing_scope": "TOTAL positioned readinto intervals; may overlap",
+                }
+                if diagnostics_enabled else {}
+            ),
             "cpu_to_pinned_staging": {
                 "status": "NOT RUN",
                 "reason": "positioned readinto fills the acquired staging lease directly",
@@ -3133,25 +3251,25 @@ def _read_file_qd_gpu_dispatcher(
                 "pinned_bytes": staging_slots * block_bytes,
                 "pinned": True,
                 "timing_scope": "TOTAL CudaTransferBackend pinned staging allocation",
-            },
+            } if diagnostics_enabled else {},
             "pinned_slot_wait": {
                 "status": "NOT RUN",
                 "reason": "dispatcher has no legacy pinned slots",
             },
             "lease_wait": {
                 "wait_ns": lease_wait_ns,
-                "wait_ms": lease_wait_ns / 1e6,
+                "wait_ms": lease_wait_ns / 1e6 if lease_wait_ns is not None else None,
                 "wait_count": int(telemetry.get("producer_capacity_block_count") or 0),
                 "timing_scope": "TOTAL waits to acquire a reusable dispatcher lease",
-            },
+            } if diagnostics_enabled else {},
             "ready_backpressure": {
                 "wait_ns": ready_wait_ns,
-                "wait_ms": ready_wait_ns / 1e6,
+                "wait_ms": ready_wait_ns / 1e6 if ready_wait_ns is not None else None,
                 "wait_count": int(telemetry.get("ready_queue_block_count") or 0),
                 "ready_capacity": config.ready_queue_capacity,
                 "ready_depth_at_end": telemetry.get("ready_queue_depth"),
                 "timing_scope": "TOTAL producer waits for dispatcher ready-queue capacity",
-            },
+            } if diagnostics_enabled else {},
             "producer_qd_occupancy": dispatcher_stats["producer_qd_occupancy"],
             "free_ready_depth": dispatcher_stats["free_ready_depth"],
             "h2d_enqueue": {
@@ -3161,7 +3279,7 @@ def _read_file_qd_gpu_dispatcher(
                 "wall_ms": h2d_submit_wall["wall_ms"],
                 "submit_count": h2d_submit_wall["submit_count"],
                 "timing_scope": "TOTAL host CudaTransferBackend.submit_h2d intervals",
-            },
+            } if diagnostics_enabled else {},
             "h2d_gpu_event": {
                 "duration_ns": None,
                 "duration_ms": None,
@@ -3169,16 +3287,19 @@ def _read_file_qd_gpu_dispatcher(
                 "bytes": h2d_bytes,
                 "scope": "event completion latency is reported separately",
                 "non_additive": True,
-            },
+            } if diagnostics_enabled else {},
             "h2d_submit_wall": h2d_submit_wall,
             "h2d_event_poll": h2d_event_poll,
             "h2d_event_completion": h2d_event_completion,
             "h2d_event_wait": h2d_event_wait,
             "final_drain": {
-                "wall_ns": int(float(telemetry.get("final_drain_wall_ms") or 0.0) * 1e6),
-                "wall_ms": telemetry.get("final_drain_wall_ms"),
+                "wall_ns": (
+                    int(float(final_drain_wall_ms) * 1e6)
+                    if final_drain_wall_ms is not None else None
+                ),
+                "wall_ms": final_drain_wall_ms,
                 "timing_scope": "TOTAL dispatcher final drain interval",
-            },
+            } if diagnostics_enabled else {},
             "waits_quiescence": {
                 "workers_joined": True,
                 "h2d_events_waited": True,
@@ -3186,7 +3307,7 @@ def _read_file_qd_gpu_dispatcher(
                 "operation_live": False,
                 "lease_wait_ns": lease_wait_ns,
                 "ready_backpressure_wait_ns": ready_wait_ns,
-                "dispatcher_reap_count": int(telemetry.get("dispatcher_reap_count") or 0),
+                "dispatcher_reap_count": telemetry.get("dispatcher_reap_count"),
                 "final_drain_wall_ms": telemetry.get("final_drain_wall_ms"),
             },
             "quiescence": {
@@ -3346,7 +3467,7 @@ def read_file_qd_gpu(
         "max_inflight": 0,
         "pinned_bytes": 0,
         "gpu_bytes": total,
-        "buffer_pool_wait_ms": 0.0,
+        "buffer_pool_wait_ms": None,
         "coverage": {"ok": False, "reason": "not_validated"},
         "record_reconciliation": {"ok": False, "reason": "not_finalized"},
         # Fail-closed transport: these counters are structurally always zero.
@@ -3465,15 +3586,15 @@ def read_file_qd_gpu(
             stats["source_open_header_layout"]["source_open_ms"] = round(
                 stats["source_open_header_layout"]["source_open_ns"] / 1e6, 4
             )
-        for i in range(qd):
+        for producer_id, _region in enumerate(regions):
             t = threading.Thread(
                 target=_qd_gpu_worker,
                 args=(
-                    state, slots[i], events[i], start_events[i], gpu_buf,
-                    data_start, fds[i], i, telemetry, diagnostics_enabled,
+                    state, slots[producer_id], events[producer_id], start_events[producer_id], gpu_buf,
+                    data_start, fds[producer_id], producer_id, telemetry, diagnostics_enabled,
                 ),
                 daemon=True,
-                name=f"golden-qd-{role}-{i}",
+                name=f"golden-qd-{role}-{producer_id}",
             )
             threads.append(t)
         with _GOLDEN_THREAD_LOCK:
@@ -3512,7 +3633,13 @@ def read_file_qd_gpu(
         source = (
             telemetry.snapshot()
             if diagnostics_enabled
-            else {"max_inflight": 0, "earliest_start_ns": None, "latest_end_ns": None}
+            else {
+                "max_inflight": None,
+                "earliest_start_ns": None,
+                "latest_end_ns": None,
+                "read_count": len(state.records),
+                "read_bytes": sum(int(r.get("read_len", 0)) for r in state.records),
+            }
         )
         stats["max_inflight"] = source["max_inflight"]
         stats["source_read_count"] = source.get("read_count", len(state.records))
@@ -3527,11 +3654,14 @@ def read_file_qd_gpu(
         stats["source_read_bytes"] = source.get("read_bytes", stats["bytes_read"])
         stats["h2d_submitted_bytes"] = sum(int(r.get("h2d_submitted_bytes", 0)) for r in state.records)
         stats["h2d_completed_bytes"] = sum(int(r.get("h2d_completed_bytes", 0)) for r in state.records)
-        stats["buffer_pool_wait_ms"] = round(state.buffer_pool_wait_ms, 4)
+        stats["buffer_pool_wait_ms"] = (
+            round(state.buffer_pool_wait_ms, 4)
+            if diagnostics_enabled and state.buffer_pool_wait_ms is not None else None
+        )
         if diagnostics_enabled:
             stats["source_bytes"] = stats["source_read_bytes"]
             stats["buffer_pool_wait_ns"] = state.buffer_pool_wait_ns
-        stats["blocks"] = list(state.records)
+        stats["blocks"] = list(state.records) if diagnostics_enabled else None
 
         # Actual positioned-read wall is the observed earliest read start to
         # latest read end.  It is intentionally narrower than worker launch

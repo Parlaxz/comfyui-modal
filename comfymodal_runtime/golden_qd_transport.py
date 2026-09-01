@@ -133,6 +133,7 @@ class ReadyRecord:
     destination_offset: int
     nbytes: int
     record_id: str | int | None = None
+    producer_id: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_offset, int) or isinstance(self.source_offset, bool) or self.source_offset < 0:
@@ -143,6 +144,12 @@ class ReadyRecord:
             raise ValueError("nbytes must be positive")
         if self.record_id is not None and not isinstance(self.record_id, (str, int)):
             raise ValueError("record_id must be a string, integer, or None")
+        if self.producer_id is not None and (
+            not isinstance(self.producer_id, int)
+            or isinstance(self.producer_id, bool)
+            or self.producer_id < 0
+        ):
+            raise ValueError("producer_id must be a non-negative integer or None")
 
 
 @dataclass(frozen=True)
@@ -173,7 +180,7 @@ class PinnedRangeReader(Protocol):
     offset avoids a shared seek/read cursor between producer workers.
     """
 
-    def readinto(self, target: Any, offset: int) -> int:
+    def readinto(self, target: Any, offset: int, producer_id: int | None = None) -> int:
         ...
 
 
@@ -188,6 +195,12 @@ def _validate_ready_record(record: ReadyRecord) -> None:
         raise ReconciliationError("record nbytes must be positive")
     if record.record_id is not None and not isinstance(record.record_id, (str, int)):
         raise ReconciliationError("invalid record id")
+    if record.producer_id is not None and (
+        not isinstance(record.producer_id, int)
+        or isinstance(record.producer_id, bool)
+        or record.producer_id < 0
+    ):
+        raise ReconciliationError("invalid producer id")
 
 
 class _Slot:
@@ -203,7 +216,14 @@ class _Slot:
 class StageLease:
     """A generation-tagged producer lease with no public raw-buffer escape."""
 
-    def __init__(self, pool: "StagingPool", slot: _Slot, generation: int, declared_range: SourceRange | None) -> None:
+    def __init__(
+        self,
+        pool: "StagingPool",
+        slot: _Slot,
+        generation: int,
+        declared_range: SourceRange | None,
+        producer_id: int | None = None,
+    ) -> None:
         self._pool = pool
         self.slot_index = slot.index
         self.generation = generation
@@ -212,7 +232,8 @@ class StageLease:
         self._filled = 0
         self._returned = False
         self._producer_retired = False
-        self._producer_identity: int | None = None
+        self.producer_id = producer_id
+        self._producer_identity: int | None = producer_id
 
     @property
     def state(self) -> SlotState:
@@ -266,7 +287,7 @@ class StageLease:
             if slot.state != SlotState.FILLING:
                 raise LeaseError("only a filling lease can be retired")
             self._producer_retired = True
-            self._producer_identity = threading.get_ident()
+            self._producer_identity = self.producer_id
 
 
 def _buffer_slice(buffer: Any, nbytes: int, offset: int = 0) -> Any:
@@ -367,10 +388,17 @@ class StagingPool:
         timeout: float | None = None,
         *,
         declared_range: SourceRange | None = None,
+        producer_id: int | None = None,
     ) -> StageLease:
         requested = self.capacity_class if capacity_class is None else capacity_class
         if requested != self.capacity_class:
             raise LeaseError("staging capacity class mismatch")
+        if producer_id is not None and (
+            not isinstance(producer_id, int)
+            or isinstance(producer_id, bool)
+            or producer_id < 0
+        ):
+            raise LeaseError("producer_id must be a non-negative integer")
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._available:
             while True:
@@ -382,7 +410,9 @@ class StagingPool:
                     if slot.state == SlotState.FREE:
                         slot.generation += 1
                         slot.state = SlotState.FILLING
-                        lease = StageLease(self, slot, slot.generation, declared_range)
+                        lease = StageLease(
+                            self, slot, slot.generation, declared_range, producer_id
+                        )
                         slot.lease = lease
                         return lease
                 if timeout is not None:
@@ -405,7 +435,7 @@ class StagingPool:
                 raise LeaseError(f"cannot return slot in {slot.state.value} state before completion proof")
             # A direct producer return is itself the retirement handshake.
             lease._producer_retired = True
-            lease._producer_identity = threading.get_ident()
+            lease._producer_identity = lease.producer_id
             self._free_locked(slot, lease)
 
     release = return_lease
@@ -453,7 +483,7 @@ class StagingPool:
             if destination_size is not None and record.destination_offset + record.nbytes > destination_size:
                 raise ReconciliationError("record exceeds destination bounds")
             lease._producer_retired = True
-            lease._producer_identity = threading.get_ident()
+            lease._producer_identity = lease.producer_id
             slot.state = SlotState.READY
 
     def _mark_in_flight(self, lease: StageLease) -> None:
@@ -526,7 +556,8 @@ class StagingPool:
 
 @dataclass
 class _Telemetry:
-    entry_ns: int = field(default_factory=time.monotonic_ns)
+    diagnostics_enabled: bool = True
+    entry_ns: int | None = None
     source_start_ns: int | None = None
     source_end_ns: int | None = None
     final_drain_start_ns: int | None = None
@@ -540,22 +571,22 @@ class _Telemetry:
     parse_count: int = 0
     source_open_count: int = 0
     duplicate_read_count: int = 0
-    producer_capacity_block_wall_ns: int = 0
-    producer_capacity_block_count: int = 0
-    ready_queue_block_wall_ns: int = 0
-    ready_queue_block_count: int = 0
-    dispatcher_reap_wall_ns: int = 0
-    dispatcher_reap_count: int = 0
-    h2d_latencies_ns: list[int] = field(default_factory=list)
-    qd_samples: list[int] = field(default_factory=list)
+    producer_capacity_block_wall_ns: int | None = None
+    producer_capacity_block_count: int | None = None
+    ready_queue_block_wall_ns: int | None = None
+    ready_queue_block_count: int | None = None
+    dispatcher_reap_wall_ns: int | None = None
+    dispatcher_reap_count: int | None = None
+    h2d_latencies_ns: list[int] | None = None
+    qd_samples: list[int] | None = None
     source_qd_target: int | None = None
-    source_qd_depth: int = 0
-    source_qd_depth_samples: list[int] = field(default_factory=list)
-    source_qd_timeline: list[dict[str, int]] = field(default_factory=list)
+    source_qd_depth: int | None = None
+    source_qd_depth_samples: list[int] | None = None
+    source_qd_timeline: list[dict[str, int]] | None = None
     _source_qd_start_ns: int | None = field(default=None, repr=False)
     _source_qd_last_transition_ns: int | None = field(default=None, repr=False)
     _source_qd_target_time_ns: int = field(default=0, repr=False)
-    ready_depth: int = 0
+    ready_depth: int | None = None
     min_free_slots: int | None = None
     owner: Any = None
     adoption: Any = None
@@ -566,22 +597,46 @@ class _Telemetry:
     fallback_reason: str | None = None
     source_read_mode: str = "legacy_bytes"
     direct_readinto_count: int = 0
-    late_submission_count: int = 0
-    late_submission_resolved_count: int = 0
-    late_submission_unresolved_count: int = 0
-    event_cancel_count: int = 0
+    late_submission_count: int | None = None
+    late_submission_resolved_count: int | None = None
+    late_submission_unresolved_count: int | None = None
+    event_cancel_count: int | None = None
     completion_classification: str = "normal"
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _lock: threading.Lock | None = field(default=None, repr=False)
+    _correctness_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.diagnostics_enabled:
+            self._lock = threading.Lock()
+            self.entry_ns = time.monotonic_ns()
+            self.producer_capacity_block_wall_ns = 0
+            self.producer_capacity_block_count = 0
+            self.ready_queue_block_wall_ns = 0
+            self.ready_queue_block_count = 0
+            self.dispatcher_reap_wall_ns = 0
+            self.dispatcher_reap_count = 0
+            self.late_submission_count = 0
+            self.late_submission_resolved_count = 0
+            self.late_submission_unresolved_count = 0
+            self.event_cancel_count = 0
+            self.h2d_latencies_ns = []
+            self.qd_samples = []
+            self.source_qd_depth_samples = []
+            self.source_qd_timeline = []
+        self.source_qd_depth = 0 if self.diagnostics_enabled else None
 
     def source_read(self, nbytes: int, *, duplicate: bool = False) -> None:
-        with self._lock:
+        with self._correctness_lock:
             self.source_read_count += 1
             self.source_bytes += nbytes
             if duplicate:
                 self.duplicate_read_count += 1
 
     def configure_source_qd(self, target: int) -> None:
-        with self._lock:
+        if not self.diagnostics_enabled:
+            self.source_qd_target = target
+            return
+        with self._correctness_lock:
             self.source_qd_target = target
 
     def source_read_begin(self) -> None:
@@ -591,6 +646,9 @@ class _Telemetry:
         self._source_qd_transition(-1)
 
     def _source_qd_transition(self, delta: int) -> None:
+        if not self.diagnostics_enabled:
+            return
+        assert self._lock is not None
         with self._lock:
             now = time.monotonic_ns()
             previous = self._source_qd_last_transition_ns
@@ -604,22 +662,46 @@ class _Telemetry:
                 elapsed = now - previous
                 if self.source_qd_target is not None and self.source_qd_depth == self.source_qd_target:
                     self._source_qd_target_time_ns += elapsed
-            next_depth = self.source_qd_depth + delta
+            next_depth = int(self.source_qd_depth or 0) + delta
             if next_depth < 0:
                 raise RuntimeError("source-read QD became negative")
             self.source_qd_depth = next_depth
             self._source_qd_last_transition_ns = now
+            assert self.source_qd_depth_samples is not None
+            assert self.source_qd_timeline is not None
             self.source_qd_depth_samples.append(next_depth)
             self.source_qd_timeline.append({"timestamp_ns": now, "depth": next_depth})
 
     def snapshot(self, queue_depth: int, free_slots: int, total_end_ns: int | None = None) -> dict[str, Any]:
-        with self._lock:
-            end = time.monotonic_ns() if total_end_ns is None else total_end_ns
-            source_wall = 0 if self.source_start_ns is None else (self.source_end_ns or end) - self.source_start_ns
-            drain_wall = 0 if self.final_drain_start_ns is None else (self.final_drain_end_ns or end) - self.final_drain_start_ns
-            qd = list(self.qd_samples)
-            source_qd = list(self.source_qd_depth_samples)
-            source_qd_timeline = list(self.source_qd_timeline)
+        if self.diagnostics_enabled:
+            assert self._lock is not None
+            with self._lock:
+                return self._snapshot_locked(queue_depth, free_slots, total_end_ns)
+        with self._correctness_lock:
+            return self._snapshot_locked(queue_depth, free_slots, total_end_ns)
+
+    def _snapshot_locked(self, queue_depth: int, free_slots: int, total_end_ns: int | None) -> dict[str, Any]:
+            end = (
+                time.monotonic_ns() if self.diagnostics_enabled and total_end_ns is None
+                else total_end_ns
+            )
+            source_wall = (
+                None if not self.diagnostics_enabled or self.source_start_ns is None
+                else (self.source_end_ns or end or self.source_start_ns) - self.source_start_ns
+            )
+            drain_wall = (
+                None if not self.diagnostics_enabled or self.final_drain_start_ns is None
+                else (self.final_drain_end_ns or end or self.final_drain_start_ns) - self.final_drain_start_ns
+            )
+            qd = list(self.qd_samples) if self.qd_samples is not None else None
+            source_qd = (
+                list(self.source_qd_depth_samples)
+                if self.source_qd_depth_samples is not None else None
+            )
+            source_qd_timeline = (
+                list(self.source_qd_timeline)
+                if self.source_qd_timeline is not None else None
+            )
             source_qd_target = self.source_qd_target if self.source_qd_target is not None else queue_depth
             last_source_transition = self._source_qd_last_transition_ns
             # Once all reads have ended, H2D drain time is outside the source
@@ -627,22 +709,28 @@ class _Telemetry:
             # bounded-failure snapshot), account through the snapshot boundary.
             source_qd_end = (
                 max(end, last_source_transition or end)
-                if self.source_qd_depth
-                else (last_source_transition or end)
+                if self.diagnostics_enabled and end is not None and self.source_qd_depth
+                else (last_source_transition or end or 0)
             )
             source_qd_wall = (
-                0
-                if self._source_qd_start_ns is None
+                None
+                if not self.diagnostics_enabled or self._source_qd_start_ns is None
                 else source_qd_end - self._source_qd_start_ns
             )
             target_time = self._source_qd_target_time_ns
-            if (
+            if self.diagnostics_enabled and (
                 self._source_qd_last_transition_ns is not None
                 and self.source_qd_depth == source_qd_target
             ):
                 target_time += source_qd_end - self._source_qd_last_transition_ns
-            target_fraction = target_time / source_qd_wall if source_qd_wall else 0.0
-            latency = (sum(self.h2d_latencies_ns) / len(self.h2d_latencies_ns)) if self.h2d_latencies_ns else 0.0
+            target_fraction = (
+                target_time / source_qd_wall
+                if source_qd_wall is not None and source_qd_wall else None
+            )
+            latency = (
+                sum(self.h2d_latencies_ns) / len(self.h2d_latencies_ns)
+                if self.h2d_latencies_ns else None
+            )
             return {
                 "timing_scope": {
                     "total_entry_to_return_wall_ms": "TOTAL",
@@ -653,10 +741,16 @@ class _Telemetry:
                     "target_qd_occupancy_fraction": "TOTAL weighted source-read interval at target source QD",
                     "h2d_inflight_depth_samples": "PARTIAL dispatcher in-flight H2D depth samples",
                 },
-                "total_entry_to_return_wall_ms": (end - self.entry_ns) / 1e6,
-                "source_aggregate_wall_ms": source_wall / 1e6,
-                "source_wall_ms": source_wall / 1e6,
-                "source_throughput_bytes_s": self.source_bytes / (source_wall / 1e9) if source_wall else 0.0,
+                "total_entry_to_return_wall_ms": (
+                    (end - self.entry_ns) / 1e6
+                    if self.diagnostics_enabled and end is not None and self.entry_ns is not None else None
+                ),
+                "source_aggregate_wall_ms": source_wall / 1e6 if source_wall is not None else None,
+                "source_wall_ms": source_wall / 1e6 if source_wall is not None else None,
+                "source_throughput_bytes_s": (
+                    self.source_bytes / (source_wall / 1e9)
+                    if source_wall else None
+                ),
                 "source_bytes": self.source_bytes,
                 "source_read_count": self.source_read_count,
                 "h2d_submitted_bytes": self.h2d_submitted_bytes,
@@ -678,16 +772,25 @@ class _Telemetry:
                 "target_qd_depth_samples": qd,
                 "h2d_inflight_depth_samples": qd,
                 "ready_queue_depth": self.ready_depth,
-                "minimum_free_slots": self.min_free_slots if self.min_free_slots is not None else free_slots,
-                "min_free_slots": self.min_free_slots if self.min_free_slots is not None else free_slots,
-                "producer_capacity_block_wall_ms": self.producer_capacity_block_wall_ns / 1e6,
+                "minimum_free_slots": self.min_free_slots if self.diagnostics_enabled else None,
+                "min_free_slots": self.min_free_slots if self.diagnostics_enabled else None,
+                "producer_capacity_block_wall_ms": (
+                    self.producer_capacity_block_wall_ns / 1e6
+                    if self.producer_capacity_block_wall_ns is not None else None
+                ),
                 "producer_capacity_block_count": self.producer_capacity_block_count,
-                "ready_queue_block_wall_ms": self.ready_queue_block_wall_ns / 1e6,
+                "ready_queue_block_wall_ms": (
+                    self.ready_queue_block_wall_ns / 1e6
+                    if self.ready_queue_block_wall_ns is not None else None
+                ),
                 "ready_queue_block_count": self.ready_queue_block_count,
-                "dispatcher_reap_wall_ms": self.dispatcher_reap_wall_ns / 1e6,
+                "dispatcher_reap_wall_ms": (
+                    self.dispatcher_reap_wall_ns / 1e6
+                    if self.dispatcher_reap_wall_ns is not None else None
+                ),
                 "dispatcher_reap_count": self.dispatcher_reap_count,
                 "h2d_event_completion_latency_ms": latency,
-                "final_drain_wall_ms": drain_wall / 1e6,
+                "final_drain_wall_ms": drain_wall / 1e6 if drain_wall is not None else None,
                 "parse_count": self.parse_count,
                 "owner": _json_safe(self.owner),
                 "adoption": _json_safe(self.adoption),
@@ -772,9 +875,9 @@ class TransportDispatcher:
         # cannot mistake the gap for quiescence and lose the lease/event.
         self._handoff: dict[int, tuple[StageLease, ReadyRecord]] = {}
         self._uncertain_handoffs: dict[int, tuple[StageLease, ReadyRecord]] = {}
-        self._late_submissions: dict[int, tuple[StageLease, ReadyRecord, Any, int]] = {}
+        self._late_submissions: dict[int, tuple[StageLease, ReadyRecord, Any, int | None]] = {}
         self._unresolved_late_submission_keys: set[int] = set()
-        self._in_flight: dict[int, tuple[StageLease, ReadyRecord, Any, int]] = {}
+        self._in_flight: dict[int, tuple[StageLease, ReadyRecord, Any, int | None]] = {}
         self._completed_records: list[ReadyRecord] = []
         self._dispatcher_error: BaseException | None = None
         self._cleanup_errors: list[BaseException] = []
@@ -818,7 +921,7 @@ class TransportDispatcher:
 
     def publish(self, lease: StageLease, record: ReadyRecord) -> None:
         _validate_ready_record(record)
-        started = time.monotonic_ns()
+        started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         blocked = False
         capacity = self.config.ready_queue_capacity
         assert capacity is not None
@@ -827,7 +930,10 @@ class TransportDispatcher:
                 while len(self._queue) >= capacity and not self._cancelled and not self._stop:
                     blocked = True
                     self._queue_condition.wait()
-                if blocked:
+                if blocked and self.telemetry.diagnostics_enabled:
+                    assert started is not None
+                    assert self.telemetry.ready_queue_block_count is not None
+                    assert self.telemetry.ready_queue_block_wall_ns is not None
                     self.telemetry.ready_queue_block_count += 1
                     self.telemetry.ready_queue_block_wall_ns += time.monotonic_ns() - started
                 if self._cancelled:
@@ -837,7 +943,8 @@ class TransportDispatcher:
                 # This call does not call back into the dispatcher condition.
                 self.pool._mark_ready(lease, record, self.destination_size)
                 self._queue.append((lease, record))
-                self.telemetry.ready_depth = len(self._queue)
+                if self.telemetry.diagnostics_enabled:
+                    self.telemetry.ready_depth = len(self._queue)
                 self._queue_condition.notify_all()
 
     def quiesce(self) -> None:
@@ -869,10 +976,12 @@ class TransportDispatcher:
             self._queue_condition.notify_all()
 
     def _poll(self) -> None:
-        started = time.monotonic_ns()
+        started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         with self._queue_condition:
             active = list(self._in_flight.items())
-            self.telemetry.qd_samples.append(len(active))
+            if self.telemetry.diagnostics_enabled:
+                assert self.telemetry.qd_samples is not None
+                self.telemetry.qd_samples.append(len(active))
         for key, (lease, record, event, submit_ns) in active:
             try:
                 raw_status = self.backend.poll_event(event)
@@ -907,7 +1016,10 @@ class TransportDispatcher:
                     self.pool._return_completed(lease)
                     with self._queue_condition:
                         self._completed_records.append(record)
-                    self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submit_ns)
+                    if self.telemetry.diagnostics_enabled:
+                        assert submit_ns is not None
+                        assert self.telemetry.h2d_latencies_ns is not None
+                        self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submit_ns)
                 elif status == EventStatus.UNCERTAIN:
                     self.pool._poison(lease, "uncertain H2D completion")
                     self.telemetry.completion_classification = "uncertain"
@@ -916,15 +1028,20 @@ class TransportDispatcher:
                     self.pool._poison(lease, "H2D event failed")
                     self.telemetry.completion_classification = "failed"
                     raise TransportError("H2D completion event failed; staging pool poisoned")
-        self.telemetry.dispatcher_reap_count += 1
-        self.telemetry.dispatcher_reap_wall_ns += time.monotonic_ns() - started
+        if self.telemetry.diagnostics_enabled:
+            assert started is not None
+            assert self.telemetry.dispatcher_reap_count is not None
+            assert self.telemetry.dispatcher_reap_wall_ns is not None
+            self.telemetry.dispatcher_reap_count += 1
+            self.telemetry.dispatcher_reap_wall_ns += time.monotonic_ns() - started
 
     def _return_queued(self) -> None:
         with self._lease_cleanup_lock:
             with self._queue_condition:
                 queued = self._queue[:]
                 self._queue.clear()
-                self.telemetry.ready_depth = 0
+                if self.telemetry.diagnostics_enabled:
+                    self.telemetry.ready_depth = 0
                 self._queue_condition.notify_all()
             for lease, _record in queued:
                 self.pool._expect_abort_cleanup(lease)
@@ -943,7 +1060,9 @@ class TransportDispatcher:
             with self._queue_condition:
                 is_late_submission = key in self._late_submissions
             try:
-                self.telemetry.event_cancel_count += 1
+                if self.telemetry.diagnostics_enabled:
+                    assert self.telemetry.event_cancel_count is not None
+                    self.telemetry.event_cancel_count += 1
                 self.backend.cancel_event(event)
             except BaseException as exc:
                 self._note_cleanup(exc)
@@ -985,7 +1104,9 @@ class TransportDispatcher:
                             if key in self._late_submissions:
                                 self._late_submissions.pop(key, None)
                                 self._unresolved_late_submission_keys.discard(key)
-                                self.telemetry.late_submission_resolved_count += 1
+                                if self.telemetry.diagnostics_enabled:
+                                    assert self.telemetry.late_submission_resolved_count is not None
+                                    self.telemetry.late_submission_resolved_count += 1
                                 self.telemetry.completion_classification = "late_submit_resolved"
                             else:
                                 self.telemetry.completion_classification = "cancelled_resolved"
@@ -1010,7 +1131,9 @@ class TransportDispatcher:
                     self.pool._poison(lease, "cancelled H2D completion was not proven", expected_abort=True)
                     if is_late_submission and key not in self._unresolved_late_submission_keys:
                         self._unresolved_late_submission_keys.add(key)
-                        self.telemetry.late_submission_unresolved_count += 1
+                        if self.telemetry.diagnostics_enabled:
+                            assert self.telemetry.late_submission_unresolved_count is not None
+                            self.telemetry.late_submission_unresolved_count += 1
                     self.telemetry.completion_classification = "cancelled_unresolved"
                     if status == EventStatus.PENDING:
                         self._note_cleanup(TransportError("cancelled H2D event remained pending"))
@@ -1050,7 +1173,8 @@ class TransportDispatcher:
                     if not cancelled and self._queue and len(self._in_flight) < self.config.queue_depth:
                         item = self._queue.pop(0)
                         self._handoff[item[0].slot_index] = item
-                        self.telemetry.ready_depth = len(self._queue)
+                        if self.telemetry.diagnostics_enabled:
+                            self.telemetry.ready_depth = len(self._queue)
                         self._queue_condition.notify_all()
                     done = self._stop and item is None and not self._queue and not self._in_flight and not self._late_submissions
                 if cancelled:
@@ -1092,7 +1216,8 @@ class TransportDispatcher:
                         if handoff is item:
                             self._handoff.pop(lease.slot_index, None)
                             self._in_flight[lease.slot_index] = (
-                                lease, record, event, time.monotonic_ns()
+                                lease, record, event,
+                                time.monotonic_ns() if self.telemetry.diagnostics_enabled else None,
                             )
                             registration_error = None
                         elif uncertain is item and self._cancelled:
@@ -1100,9 +1225,12 @@ class TransportDispatcher:
                             # cancellation detached the handoff.  It is now a
                             # first-class event, not an ignorable late return.
                             self._late_submissions[lease.slot_index] = (
-                                lease, record, event, time.monotonic_ns()
+                                lease, record, event,
+                                time.monotonic_ns() if self.telemetry.diagnostics_enabled else None,
                             )
-                            self.telemetry.late_submission_count += 1
+                            if self.telemetry.diagnostics_enabled:
+                                assert self.telemetry.late_submission_count is not None
+                                self.telemetry.late_submission_count += 1
                             registration_error = None
                         else:
                             # A bounded cancellation may have detached this
@@ -1161,7 +1289,8 @@ class TransportDispatcher:
                     deadline if self._cleanup_deadline is None
                     else min(self._cleanup_deadline, deadline)
                 )
-                self.telemetry.ready_depth = 0
+                if self.telemetry.diagnostics_enabled:
+                    self.telemetry.ready_depth = 0
                 self._queue_condition.notify_all()
             for lease, _record in queued:
                 self.pool._expect_abort_cleanup(lease)
@@ -1176,7 +1305,9 @@ class TransportDispatcher:
             for key in self._late_submissions:
                 if key not in self._unresolved_late_submission_keys:
                     self._unresolved_late_submission_keys.add(key)
-                    self.telemetry.late_submission_unresolved_count += 1
+                    if self.telemetry.diagnostics_enabled:
+                        assert self.telemetry.late_submission_unresolved_count is not None
+                        self.telemetry.late_submission_unresolved_count += 1
         thread.join(max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
             self._note_cleanup(TransportError("dispatcher thread did not stop within bounded drain"))
@@ -1185,7 +1316,15 @@ class TransportDispatcher:
 class GoldenQDTransport:
     """Explicit integration seam for a dispatcher-backed Golden stage."""
 
-    def __init__(self, config: TransportConfig | None = None, backend: TransportBackend | None = None, *, arm: str | None = None, pool: StagingPool | None = None) -> None:
+    def __init__(
+        self,
+        config: TransportConfig | None = None,
+        backend: TransportBackend | None = None,
+        *,
+        arm: str | None = None,
+        pool: StagingPool | None = None,
+        diagnostics: bool = True,
+    ) -> None:
         self.config = config or TransportConfig()
         # This class is the dispatcher implementation.  The legacy default is
         # exposed only by create_transport()/LegacyTransport, so supplying a
@@ -1201,7 +1340,9 @@ class GoldenQDTransport:
                 buffers = cast(Sequence[Any], allocator(self.config.staging_slots, self.config.block_bytes))
             pool = StagingPool(self.config.staging_slots, self.config.block_bytes, self.config.capacity_class, buffers=buffers)
         self.pool = pool
-        self.telemetry = _Telemetry(execution_arm=self.arm)
+        self.telemetry = _Telemetry(
+            execution_arm=self.arm, diagnostics_enabled=bool(diagnostics)
+        )
         self.dispatcher: TransportDispatcher | None = None
         self._active_producers = 0
         self._active_lock = threading.Lock()
@@ -1216,17 +1357,34 @@ class GoldenQDTransport:
         # after successful transport/adoption or a proven terminal failure.
         self._owner_lifetime: Any = None
 
-    def acquire(self, timeout: float | None = None, *, declared_range: SourceRange | None = None) -> StageLease:
-        started = time.monotonic_ns()
+    def acquire(
+        self,
+        timeout: float | None = None,
+        *,
+        declared_range: SourceRange | None = None,
+        producer_id: int | None = None,
+    ) -> StageLease:
+        started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         try:
-            return self.pool.acquire(timeout=timeout, declared_range=declared_range)
+            return self.pool.acquire(
+                timeout=timeout, declared_range=declared_range, producer_id=producer_id
+            )
         finally:
-            waited = time.monotonic_ns() - started
-            if waited > 100_000:
+            waited = (
+                time.monotonic_ns() - started
+                if self.telemetry.diagnostics_enabled and started is not None else None
+            )
+            if waited is not None and waited > 100_000:
+                assert self.telemetry.producer_capacity_block_count is not None
+                assert self.telemetry.producer_capacity_block_wall_ns is not None
                 self.telemetry.producer_capacity_block_count += 1
                 self.telemetry.producer_capacity_block_wall_ns += waited
-            free = sum(state == SlotState.FREE for state in self.pool.states())
-            self.telemetry.min_free_slots = free if self.telemetry.min_free_slots is None else min(self.telemetry.min_free_slots, free)
+            if self.telemetry.diagnostics_enabled:
+                free = sum(state == SlotState.FREE for state in self.pool.states())
+                self.telemetry.min_free_slots = (
+                    free if self.telemetry.min_free_slots is None
+                    else min(self.telemetry.min_free_slots, free)
+                )
 
     def start(self, *, destination_size: int | None = None) -> None:
         if self.backend is None:
@@ -1253,10 +1411,12 @@ class GoldenQDTransport:
         deadline: float | None = None,
     ) -> None:
         if self.dispatcher is not None:
-            self.telemetry.final_drain_start_ns = time.monotonic_ns()
+            if self.telemetry.diagnostics_enabled:
+                self.telemetry.final_drain_start_ns = time.monotonic_ns()
             self.dispatcher.quiesce()
             self.dispatcher.drain(timeout, bounded=bounded, deadline=deadline)
-            self.telemetry.final_drain_end_ns = time.monotonic_ns()
+            if self.telemetry.diagnostics_enabled:
+                self.telemetry.final_drain_end_ns = time.monotonic_ns()
 
     def cancel(self, timeout: float | None = None) -> None:
         self._cancel_requested = True
@@ -1391,6 +1551,7 @@ class GoldenQDTransport:
         item: SourceRange,
         retries: int,
         telemetry: _Telemetry,
+        producer_id: int,
     ) -> None:
         """Fill one lease directly, retaining no Python payload between reads."""
         target = lease._read_target(item.length)
@@ -1404,7 +1565,7 @@ class GoldenQDTransport:
             # Do not catch TypeError here: it may be raised after a reader has
             # already touched the target. Retrying through another API would
             # turn one physical source read into an unaccounted duplicate.
-            count = reader.readinto(view, offset)
+            count = reader.readinto(view, offset, producer_id)
             if not isinstance(count, int) or isinstance(count, bool):
                 raise ReconciliationError("source readinto must return an integer byte count")
             if count < 0 or count > item.length - total:
@@ -1414,7 +1575,7 @@ class GoldenQDTransport:
             total += count
             offset += count
         lease.mark_filled(total)
-        with telemetry._lock:
+        with telemetry._correctness_lock:
             telemetry.direct_readinto_count += 1
 
     def _open_source(self, reader: Any) -> tuple[Any, bool]:
@@ -1465,8 +1626,14 @@ class GoldenQDTransport:
         adoption: Any = None,
         owner_count: Any = None,
         adoption_result: Any = None,
+        diagnostics: bool | None = None,
     ) -> TransportResult:
-        self.telemetry.entry_ns = time.monotonic_ns()
+        if diagnostics is not None and bool(diagnostics) != self.telemetry.diagnostics_enabled:
+            self.telemetry = _Telemetry(
+                execution_arm=self.arm, diagnostics_enabled=bool(diagnostics)
+            )
+        if self.telemetry.diagnostics_enabled:
+            self.telemetry.entry_ns = time.monotonic_ns()
         if not isinstance(materialize_output, bool):
             raise ValueError("materialize_output must be a bool")
         if output_size is not None and destination_size is not None and output_size != destination_size:
@@ -1480,7 +1647,8 @@ class GoldenQDTransport:
         self.telemetry.owner_count, self.telemetry.adoption_result = owner_count, adoption_result
         self._owner_lifetime = owner
         self.telemetry.configure_source_qd(min(self.config.queue_depth, self.config.producer_workers))
-        self.telemetry.source_start_ns = time.monotonic_ns()
+        if self.telemetry.diagnostics_enabled:
+            self.telemetry.source_start_ns = time.monotonic_ns()
         read_source, direct_readinto = self._open_source(reader)
         read_fn: Callable[[int, int], bytes] | None = None
         if not direct_readinto:
@@ -1510,7 +1678,7 @@ class GoldenQDTransport:
                 errors.append(exc)
             self._request_abort()
 
-        def worker() -> None:
+        def worker(producer_id: int) -> None:
             nonlocal index
             with self._active_lock:
                 self._active_producers += 1
@@ -1523,21 +1691,32 @@ class GoldenQDTransport:
                         index += 1
                     lease: StageLease | None = None
                     try:
-                        lease = self.acquire(declared_range=item)
-                        self.telemetry.source_read_begin()
+                        lease = self.acquire(declared_range=item, producer_id=producer_id)
+                        if self.telemetry.diagnostics_enabled:
+                            self.telemetry.source_read_begin()
                         try:
                             if direct_readinto:
                                 self._read_exact_into(
                                     lease, cast(PinnedRangeReader, read_source), item,
-                                    self.config.read_retries, self.telemetry,
+                                    self.config.read_retries, self.telemetry, producer_id,
                                 )
                             else:
                                 assert read_fn is not None
                                 data = self._read_exact(read_fn, item, self.config.read_retries, self.telemetry)
                                 lease.fill(data)
                         finally:
-                            self.telemetry.source_read_end()
-                        self.publish(lease, ReadyRecord(item.source_offset, item.target_offset, item.length, item.record_id))
+                            if self.telemetry.diagnostics_enabled:
+                                self.telemetry.source_read_end()
+                        self.publish(
+                            lease,
+                            ReadyRecord(
+                                item.source_offset,
+                                item.target_offset,
+                                item.length,
+                                item.record_id,
+                                producer_id,
+                            ),
+                        )
                         lease = None  # dispatcher now owns the lease
                     finally:
                         if lease is not None:
@@ -1558,7 +1737,15 @@ class GoldenQDTransport:
                 with self._active_lock:
                     self._active_producers -= 1
 
-        threads = [threading.Thread(target=worker, name=f"golden-qd-source-{i}", daemon=True) for i in range(self.config.producer_workers)]
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(producer_id,),
+                name=f"golden-qd-source-{producer_id}",
+                daemon=True,
+            )
+            for producer_id in range(self.config.producer_workers)
+        ]
         for thread in threads:
             thread.start()
         # Successful producer completion is ordinary work, not cleanup.  Do
@@ -1601,15 +1788,17 @@ class GoldenQDTransport:
                     break
                 live_workers[0].join(min(0.01, remaining))
                 live_workers = [thread for thread in threads if thread.is_alive()]
-        self.telemetry.source_end_ns = time.monotonic_ns()
-        self.telemetry.final_drain_start_ns = time.monotonic_ns()
+        if self.telemetry.diagnostics_enabled:
+            self.telemetry.source_end_ns = time.monotonic_ns()
+            self.telemetry.final_drain_start_ns = time.monotonic_ns()
         if abort_deadline is None:
             # No abort occurred: wait for the dispatcher to quiesce without
             # applying the cleanup timeout to normal completion.
             self.drain(None, bounded=False)
         else:
             self.drain(deadline=abort_deadline)
-        self.telemetry.final_drain_end_ns = time.monotonic_ns()
+        if self.telemetry.diagnostics_enabled:
+            self.telemetry.final_drain_end_ns = time.monotonic_ns()
         # Never close a source behind a producer that did not retire; the
         # open handle is part of the uncertainty reported to snapshot hygiene.
         close_errors = [] if live_workers else self._close_source()
@@ -1713,9 +1902,21 @@ class LegacyTransport:
         raise TransportError("legacy execution is owned by the Golden legacy loader")
 
 
-def create_transport(arm: str | None = None, *, config: TransportConfig | None = None, backend: TransportBackend | None = None) -> GoldenQDTransport | LegacyTransport:
+def create_transport(
+    arm: str | None = None,
+    *,
+    config: TransportConfig | None = None,
+    backend: TransportBackend | None = None,
+    diagnostics: bool = True,
+) -> GoldenQDTransport | LegacyTransport:
     selected = normalize_transport_arm(arm)
-    return LegacyTransport(config, backend) if selected == LEGACY_ARM else GoldenQDTransport(config, backend, arm=selected)
+    return (
+        LegacyTransport(config, backend)
+        if selected == LEGACY_ARM
+        else GoldenQDTransport(
+            config, backend, arm=selected, diagnostics=diagnostics
+        )
+    )
 
 
 class FakeEvent:
@@ -1836,7 +2037,7 @@ class FakeSource:
             available = min(available, self.short_reads)
         return self.data[offset : offset + max(0, available)]
 
-    def readinto(self, target: Any, offset: int) -> int:
+    def readinto(self, target: Any, offset: int, producer_id: int | None = None) -> int:
         """Exercise the production range-reader contract without a payload."""
         length = len(target)
         self.calls.append((offset, length))

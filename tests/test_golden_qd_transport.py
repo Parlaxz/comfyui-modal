@@ -1,12 +1,32 @@
+import ast
 import json
+import importlib.util
 import os
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import torch
 
-from comfymodal_runtime.golden_qd_transport import (
+WORKTREE_RUNTIME = Path(__file__).resolve().parents[1] / "comfymodal_runtime"
+WORKTREE_ROOT = WORKTREE_RUNTIME.parent
+if str(WORKTREE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKTREE_ROOT))
+
+
+def _load_local_module(filename: str, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, WORKTREE_RUNTIME / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+qd = _load_local_module("golden_qd_transport.py", "golden_qd_transport_under_test")
+from golden_qd_transport_under_test import (
     BackingOwner,
     CudaTransferBackend,
     DEFAULT_BLOCK_BYTES,
@@ -31,7 +51,8 @@ from comfymodal_runtime.golden_qd_transport import (
     normalize_transport_arm,
     prove_backing_survives_stage_release,
 )
-from comfymodal_runtime import golden_serial as gs
+
+gs = _load_local_module("golden_serial.py", "golden_serial_transport_test")
 
 
 def small_config(**kwargs):
@@ -108,6 +129,111 @@ def test_concurrent_source_reads_and_qd_four_under_slow_h2d():
     assert result.telemetry["h2d_completed_count"] == 8
 
 
+def test_producer_attribution_uses_explicit_enumerated_ids():
+    class RecordingSource(FakeSource):
+        def __init__(self, data):
+            super().__init__(data)
+            self.producer_ids = []
+            self.barrier = threading.Barrier(4)
+
+        def readinto(self, target, offset, producer_id=None):
+            self.producer_ids.append(producer_id)
+            self.barrier.wait(timeout=1)
+            return super().readinto(target, offset)
+
+    source = RecordingSource(bytes(range(32)))
+    transport = GoldenQDTransport(
+        small_config(queue_depth=4, producer_workers=4), FakeBackend()
+    )
+    result = transport.execute(
+        [SourceRange(i * 8, 8, i * 8, i) for i in range(4)],
+        source,
+        output_size=32,
+    )
+
+    assert set(source.producer_ids) == set(range(4))
+    assert {record.producer_id for record in result.records} == set(range(4))
+
+
+def test_golden_reader_uses_explicit_worker_ids_not_thread_identity():
+    source = (WORKTREE_RUNTIME / "golden_serial.py").read_text(encoding="utf-8")
+    assert "threading.get_ident" not in source
+    tree = ast.parse(source)
+    reader = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "read_file_qd_gpu"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "enumerate"
+        for node in ast.walk(reader)
+    )
+
+
+def test_diagnostics_off_does_not_allocate_or_sample_deep_telemetry(monkeypatch):
+    def forbidden_perf_clock():
+        raise AssertionError("diagnostic perf clock used while diagnostics are off")
+
+    monkeypatch.setattr(gs.time, "perf_counter_ns", forbidden_perf_clock)
+    source_telemetry = gs._SourceTelemetry(4, enabled=False)
+    assert source_telemetry._lock is None
+    assert source_telemetry.read_duration_samples_ns is None
+    assert source_telemetry.per_worker == {}
+    disabled_snapshot = source_telemetry.snapshot()
+    assert disabled_snapshot["inflight"] is None
+    assert disabled_snapshot["read_count"] is None
+    assert disabled_snapshot["read_bytes"] is None
+    assert source_telemetry.before(0) is None
+    assert source_telemetry.after(0, None, 4) is None
+
+    transport = GoldenQDTransport(
+        small_config(queue_depth=2, producer_workers=2), FakeBackend(), diagnostics=False
+    )
+    result = transport.execute([SourceRange(0, 4, 0)], lambda offset, length: b"data", output_size=4)
+    assert transport.telemetry._lock is None
+    assert transport.telemetry.h2d_latencies_ns is None
+    assert transport.telemetry.qd_samples is None
+    assert transport.telemetry.source_qd_timeline is None
+    assert transport.telemetry.source_qd_depth is None
+    assert result.telemetry["h2d_event_completion_latency_ms"] is None
+    assert result.telemetry["source_qd_timeline"] is None
+    assert result.telemetry["source_qd_depth"] is None
+
+
+def test_diagnostics_on_retains_forensic_samples_and_off_preserves_bytes_and_proofs():
+    ranges = [SourceRange(i * 8, 8, i * 8, i) for i in range(4)]
+    on = GoldenQDTransport(
+        small_config(queue_depth=2, producer_workers=2), FakeBackend(), diagnostics=True
+    )
+    off = GoldenQDTransport(
+        small_config(queue_depth=2, producer_workers=2), FakeBackend(), diagnostics=False
+    )
+    on_result = on.execute(ranges, FakeSource(bytes(range(32))), output_size=32)
+    off_result = off.execute(ranges, FakeSource(bytes(range(32))), output_size=32)
+
+    assert on_result.output == off_result.output == bytes(range(32))
+    for key in (
+        "source_bytes",
+        "source_read_count",
+        "h2d_submitted_bytes",
+        "h2d_completed_bytes",
+        "h2d_submitted_count",
+        "h2d_completed_count",
+    ):
+        assert on_result.telemetry[key] == off_result.telemetry[key]
+    assert [(r.source_offset, r.destination_offset, r.nbytes) for r in on_result.records] == [
+        (r.source_offset, r.destination_offset, r.nbytes) for r in off_result.records
+    ]
+    assert isinstance(on_result.telemetry["target_qd_depth_samples"], list)
+    assert isinstance(on_result.telemetry["source_qd_timeline"], list)
+    assert off_result.telemetry["target_qd_depth_samples"] is None
+    assert off_result.telemetry["source_qd_timeline"] is None
+    assert on.snapshot_quiescence() is True
+    assert off.snapshot_quiescence() is True
+
+
 def test_direct_readinto_fills_the_lease_without_returning_a_payload():
     source = FakeSource(b"abcdefgh")
     backend = FakeBackend(destination=bytearray())
@@ -176,7 +302,7 @@ def test_direct_positioned_read_uses_zero_copy_torch_view_and_original_h2d_tenso
     backend = RecordingBackend()
 
     class PositionedSource:
-        def readinto(self, target, offset):
+        def readinto(self, target, offset, producer_id=None):
             return gs._read_at(source_fd, gs._writable_bytes_view(target), offset)
 
     source_fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
@@ -219,7 +345,7 @@ def test_direct_short_read_advances_destination_and_source_offsets():
         def __init__(self):
             self.calls = []
 
-        def readinto(self, target, offset):
+        def readinto(self, target, offset, producer_id=None):
             count = 2 if not self.calls else len(target)
             self.calls.append((offset, len(target)))
             target[:count] = memoryview(b"abcdefgh")[offset : offset + count]

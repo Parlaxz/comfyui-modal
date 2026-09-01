@@ -12,6 +12,9 @@ import pytest
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "comfymodal_runtime" / "golden_serial.py"
+WORKTREE_ROOT = MODULE_PATH.parents[1]
+if str(WORKTREE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKTREE_ROOT))
 
 
 def _load_module():
@@ -213,6 +216,21 @@ def test_dispatcher_telemetry_classifies_direct_read_and_queue_planes_truthfully
     assert diagnostics["free_ready_depth"]["minimum_free_slots"] == 1
     assert diagnostics["exact_reconciliation"]["planned_bytes"] == 42
     assert diagnostics["final_drain"]["wall_ns"] == 23
+
+
+def test_dispatcher_partial_reap_telemetry_does_not_fabricate_wall_time():
+    diagnostics = gs.build_qd_transport_diagnostics({
+        "execution_arm": "dispatcher",
+        "dispatcher_telemetry": {"dispatcher_reap_count": 2},
+    })
+
+    assert diagnostics["h2d_event_poll"] == {
+        "status": "OBSERVED",
+        "wall_ns": None,
+        "wall_ms": None,
+        "poll_count": 2,
+        "timing_scope": "TOTAL dispatcher event polling/reap",
+    }
 
 
 def test_legacy_qd_diagnostics_report_positioned_reads_and_bounded_percentiles():
