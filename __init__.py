@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from pathlib import Path
 import traceback as _traceback
 from typing import Any
+import importlib
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
@@ -39,7 +40,32 @@ print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
 
 _log = logging.getLogger(__name__)
 
-from aiohttp import web
+class _LazyImport:
+    """Resolve an optional/heavy symbol only when the runtime uses it."""
+
+    def __init__(self, module_name: str, attribute: str | None = None) -> None:
+        self._module_name = module_name
+        self._attribute = attribute
+        self._resolved: Any = None
+
+    def _resolve(self) -> Any:
+        if self._resolved is None:
+            module = importlib.import_module(self._module_name)
+            self._resolved = (
+                getattr(module, self._attribute)
+                if self._attribute is not None
+                else module
+            )
+        return self._resolved
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._resolve()(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+
+web = _LazyImport("aiohttp", "web")
 from local_placeholders import (
     create_local_placeholder,
     get_local_model_file_info,
@@ -117,16 +143,19 @@ from run_prompt_options import (
 )
 import experiment_setup_adapter as _experiment_setup_adapter
 from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
-from canonical_execution import (
-    RunTrace,
-    build_execution_plan,
-    execute_plan,
-    _reset_profile_prep_cache,
+# These modules pull in Modal/Torch and are used only on an actual request.
+# Keep their historical names as lazy symbols so the public API is unchanged.
+RunTrace = _LazyImport("canonical_execution", "RunTrace")
+build_execution_plan = _LazyImport("canonical_execution", "build_execution_plan")
+execute_plan = _LazyImport("canonical_execution", "execute_plan")
+_reset_profile_prep_cache = _LazyImport("canonical_execution", "_reset_profile_prep_cache")
+ModalTransport = _LazyImport("comfymodal_runtime.modal_transport", "ModalTransport")
+_materialize_v2_result = _LazyImport(
+    "comfymodal_runtime.result_delivery", "materialize_modal_result"
 )
-from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.result_delivery import materialize_modal_result as _materialize_v2_result
-from comfymodal_runtime.trace import RuntimeTrace
-from comfymodal_runtime.v2_waterfall import attach_waterfall, is_graph_result
+RuntimeTrace = _LazyImport("comfymodal_runtime.trace", "RuntimeTrace")
+attach_waterfall = _LazyImport("comfymodal_runtime.v2_waterfall", "attach_waterfall")
+is_graph_result = _LazyImport("comfymodal_runtime.v2_waterfall", "is_graph_result")
 # H19 Wave G: retired Comparison writer/executor imports removed with their
 # zero-caller residue; COMPAT_READ surface (list/get/validate/detect/config/
 # workflow/gallery readers) is unchanged.
@@ -960,7 +989,8 @@ def _ensure_modal():
         _pip_install_error = "modal package not installed; install it before starting ComfyUI"
         print(f"[comfyui-modal] ERROR: {_pip_install_error}")
 
-_ensure_modal()
+if os.environ.get("COMFYUI_MODAL_LIGHTWEIGHT_TEST") != "1":
+    _ensure_modal()
 
 
 _deploy_status = {"state": "idle", "message": ""}
@@ -1794,83 +1824,227 @@ def _maybe_auto_deploy():
         _deploy_status["warning"] = False
         print("[comfyui-modal] deploy state already current - skipping deploy")
 
-try:
-    from server import PromptServer
-    import execution
-    _server = PromptServer.instance
-except Exception as e:
-    print(f"[comfyui-modal] Could not get PromptServer: {e}")
+if os.environ.get("COMFYUI_MODAL_LIGHTWEIGHT_TEST") == "1":
     _server = None
     execution = None
+else:
+    try:
+        from server import PromptServer
+        import execution
+        _server = PromptServer.instance
+    except Exception as e:
+        print(f"[comfyui-modal] Could not get PromptServer: {e}")
+        _server = None
+        execution = None
 
 sys.path.insert(0, _NODE_DIR)
 
-try:
-    import modal as _modal_pkg
-    from modal_client import run_prompt, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, check_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target, persist_validation_certificate
+_modal_available = True
+_modal_runtime_initialized = False
+_modal_runtime_import_error: Exception | None = None
+_modal_client_module: Any = None
+_modal_pkg: Any = None
+_runtime_flag_funcs: dict = {}
 
-    # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
-    _runtime_flag_funcs: dict = {}
 
-    def _get_preload_mode_fn():
-        if "set_preload_mode" not in _runtime_flag_funcs:
-            _runtime_flag_funcs["set_preload_mode"] = _modal_pkg.Function.from_name("comfyui", "set_preload_mode")
-        return _runtime_flag_funcs["set_preload_mode"]
+def _ensure_modal_runtime() -> Any:
+    """Load Modal and initialize its workspace seam on first real use."""
+    global _modal_runtime_initialized, _modal_runtime_import_error
+    global _modal_client_module, _modal_pkg, _modal_available
+    if _modal_runtime_initialized:
+        return _modal_client_module
+    if _modal_runtime_import_error is not None:
+        raise RuntimeError("modal not installed") from _modal_runtime_import_error
+    try:
+        _modal_pkg = importlib.import_module("modal")
+        _modal_client_module = importlib.import_module("modal_client")
+    except ImportError as exc:
+        _modal_runtime_import_error = exc
+        _modal_available = False
+        _deploy_msg = "modal package not installed. Run: pip install modal"
+        _deploy_status.update({"state": "error", "message": _deploy_msg})
+        raise RuntimeError("modal not installed") from exc
 
-    def _get_runtime_flag_fn():
-        if "set_runtime_flag" not in _runtime_flag_funcs:
-            _runtime_flag_funcs["set_runtime_flag"] = _modal_pkg.Function.from_name("comfyui", "set_runtime_flag")
-        return _runtime_flag_funcs["set_runtime_flag"]
-
-    async def _call_set_preload_mode(mode: str) -> str:
-        import asyncio
-        fn = _get_preload_mode_fn()
-        return await asyncio.to_thread(lambda: fn.remote(mode))
-
-    async def _call_set_runtime_flag(name: str, value: str) -> str:
-        import asyncio
-        fn = _get_runtime_flag_fn()
-        return await asyncio.to_thread(lambda: fn.remote(name, value))
-
-    _modal_available = True
-    set_workspace_resolver(_active_workspace)
-    # F8: seed the server's current-GPU authority from the persisted
-    # canonical settings so the selection survives ComfyUI restarts.
+    _modal_runtime_initialized = True
+    set_resolver = getattr(_modal_client_module, "set_workspace_resolver", None)
+    if set_resolver is not None:
+        set_resolver(_active_workspace)
     _seed_server_gpu_from_settings()
     _maybe_auto_deploy()
-except ImportError:
-    _err_detail = f" (install error: {_pip_install_error})" if _pip_install_error else ""
-    print(f"[comfyui-modal] WARNING: 'modal' package not installed.{_err_detail} Run: pip install modal")
-    _modal_available = False
-    _deploy_msg = "modal package not installed. Run: pip install modal"
-    if _pip_install_error:
-        _deploy_msg += f" (pip error: {_pip_install_error})"
-    _deploy_status = {"state": "error", "message": _deploy_msg}
-    def run_prompt(*a, **kw): raise RuntimeError("modal not installed")
-    def get_object_info(*a, **kw): raise RuntimeError("modal not installed")
-    def health_check(*a, **kw): raise RuntimeError("modal not installed")
-    def download_model(*a, **kw): raise RuntimeError("modal not installed")
-    async def download_model_stream(*a, **kw): raise RuntimeError("modal not installed")  # noqa: E704
-    def batch_download_models(*a, **kw): raise RuntimeError("modal not installed")
-    def list_models(*a, **kw): raise RuntimeError("modal not installed")
-    def delete_model(*a, **kw): raise RuntimeError("modal not installed")
-    def sync_custom_nodes(*a, **kw): raise RuntimeError("modal not installed")
-    def refresh_custom_nodes(*a, **kw): raise RuntimeError("modal not installed")
-    def get_sync_status(*a, **kw): raise RuntimeError("modal not installed")
-    def upload_model_to_volume(*a, **kw): raise RuntimeError("modal not installed")
-    def upload_model_chunk(*a, **kw): raise RuntimeError("modal not installed")
-    def resync_runtime(*a, **kw): raise RuntimeError("modal not installed")
-    def get_runtime_state(*a, **kw): raise RuntimeError("modal not installed")
-    def set_active_warmup_profile(*a, **kw): raise RuntimeError("modal not installed")
-    async def check_active_warmup_profile(*a, **kw): raise RuntimeError("modal not installed")  # noqa: E704
-    def get_default_gpu(): return "rtx-pro-6000"
-    def get_available_gpus(): return [{"value": "rtx-pro-6000", "label": "RTX PRO 6000"}]
-    def get_handle_cache_stats(): return {"hits": 0, "misses": 0}
-    def set_gpu(gpu): pass
-    def get_gpu(): return "rtx-pro-6000"
-    def get_modal_app_name(): return "comfyui"
-    def get_modal_class_name(gpu=None): return ""
-    def get_modal_lookup_target(gpu=None, method_name="run_prompt"): return "unknown"
+    return _modal_client_module
+
+
+def _modal_call(name: str, *args: Any, **kwargs: Any) -> Any:
+    return getattr(_ensure_modal_runtime(), name)(*args, **kwargs)
+
+
+def run_prompt(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("run_prompt", *args, **kwargs)
+
+
+def get_object_info(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("get_object_info", *args, **kwargs)
+
+
+def health_check(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("health_check", *args, **kwargs)
+
+
+def download_model(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("download_model", *args, **kwargs)
+
+
+async def download_model_stream(*args: Any, **kwargs: Any) -> Any:
+    stream = _modal_call("download_model_stream", *args, **kwargs)
+    async for item in stream:
+        yield item
+
+
+def batch_download_models(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("batch_download_models", *args, **kwargs)
+
+
+def list_models(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("list_models", *args, **kwargs)
+
+
+def delete_model(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("delete_model", *args, **kwargs)
+
+
+def sync_custom_nodes(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("sync_custom_nodes", *args, **kwargs)
+
+
+def refresh_custom_nodes(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("refresh_custom_nodes", *args, **kwargs)
+
+
+def get_sync_status(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("get_sync_status", *args, **kwargs)
+
+
+def upload_model_to_volume(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("upload_model_to_volume", *args, **kwargs)
+
+
+def upload_model_chunk(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("upload_model_chunk", *args, **kwargs)
+
+
+def clear_cache(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("clear_cache", *args, **kwargs)
+
+
+def resync_runtime(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("resync_runtime", *args, **kwargs)
+
+
+def get_runtime_state(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("get_runtime_state", *args, **kwargs)
+
+
+def set_active_warmup_profile(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("set_active_warmup_profile", *args, **kwargs)
+
+
+async def check_active_warmup_profile(*args: Any, **kwargs: Any) -> Any:
+    return await _modal_call("check_active_warmup_profile", *args, **kwargs)
+
+
+def set_workspace_resolver(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("set_workspace_resolver", *args, **kwargs)
+
+
+def get_handle_cache_stats(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_handle_cache_stats", *args, **kwargs)
+    except RuntimeError:
+        return {"hits": 0, "misses": 0}
+
+
+def get_modal_app_name(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_modal_app_name", *args, **kwargs)
+    except RuntimeError:
+        return "comfyui"
+
+
+def get_modal_class_name(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_modal_class_name", *args, **kwargs)
+    except RuntimeError:
+        return ""
+
+
+def get_modal_lookup_target(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_modal_lookup_target", *args, **kwargs)
+    except RuntimeError:
+        return "unknown"
+
+
+def persist_validation_certificate(*args: Any, **kwargs: Any) -> Any:
+    return _modal_call("persist_validation_certificate", *args, **kwargs)
+
+
+def set_gpu(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("set_gpu", *args, **kwargs)
+    except RuntimeError:
+        return None
+
+
+def get_gpu(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_gpu", *args, **kwargs)
+    except RuntimeError:
+        return "rtx-pro-6000"
+
+
+def get_default_gpu(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_default_gpu", *args, **kwargs)
+    except RuntimeError:
+        return "rtx-pro-6000"
+
+
+def get_available_gpus(*args: Any, **kwargs: Any) -> Any:
+    try:
+        return _modal_call("get_available_gpus", *args, **kwargs)
+    except RuntimeError:
+        return [{"value": "rtx-pro-6000", "label": "RTX PRO 6000"}]
+
+
+def _get_preload_mode_fn():
+    _ensure_modal_runtime()
+    if "set_preload_mode" not in _runtime_flag_funcs:
+        _runtime_flag_funcs["set_preload_mode"] = _modal_pkg.Function.from_name("comfyui", "set_preload_mode")
+    return _runtime_flag_funcs["set_preload_mode"]
+
+
+def _get_runtime_flag_fn():
+    _ensure_modal_runtime()
+    if "set_runtime_flag" not in _runtime_flag_funcs:
+        _runtime_flag_funcs["set_runtime_flag"] = _modal_pkg.Function.from_name("comfyui", "set_runtime_flag")
+    return _runtime_flag_funcs["set_runtime_flag"]
+
+
+async def _call_set_preload_mode(mode: str) -> str:
+    fn = _get_preload_mode_fn()
+    return await asyncio.to_thread(lambda: fn.remote(mode))
+
+
+async def _call_set_runtime_flag(name: str, value: str) -> str:
+    fn = _get_runtime_flag_fn()
+    return await asyncio.to_thread(lambda: fn.remote(name, value))
+
+
+if os.environ.get("COMFYUI_MODAL_LIGHTWEIGHT_TEST") != "1":
+    try:
+        _ensure_modal_runtime()
+    except RuntimeError as exc:
+        print(f"[comfyui-modal] WARNING: modal runtime unavailable: {exc}")
 
 _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 

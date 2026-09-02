@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from .baseline_resolvers import production_baseline_value
+
 
 SAGE_MODES = {"auto", "baked_cuda", "triton_fallback"}
 SAGE_RESOLVED_MODES = {"baked_cuda", "triton_fallback"}
@@ -21,25 +23,6 @@ SAGE_RESOLVED_MODES = {"baked_cuda", "triton_fallback"}
 SAGE_RUNTIME_BASELINE = "baked_cuda"
 PRODUCTION_BASELINE_SAGE_MODE = SAGE_RUNTIME_BASELINE
 PRODUCTION_BASELINE_PROBE = False
-
-
-# Keep the production values here rather than importing comfyapp.  The helper
-# is also used by deployment_spec, which must remain safe to import locally.
-_PRODUCTION_BASELINE_VALUES: dict[str, str] = {
-    "COMFYMODAL_SAGE_RUNTIME_MODE": SAGE_RUNTIME_BASELINE,
-    "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-    "COMFYMODAL_PRELOAD_MODE": "clip_only",
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
-    "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
-    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
-}
-
-
-def production_baseline_value(name: str) -> str | None:
-    """Return the immutable production value for *name*, if one exists."""
-    return _PRODUCTION_BASELINE_VALUES.get(str(name).strip().upper())
 
 
 def normalize_sage_mode(value: str | None) -> str:

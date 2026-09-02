@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import sys
 import tempfile
@@ -51,6 +52,76 @@ def load_module():
 
 
 class ComfyAppBuildContextTests(unittest.TestCase):
+    def test_build_context_diagnostics_are_opt_in(self):
+        """The recursive build diagnostic must not run during normal import."""
+        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8-sig"))
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[id(child)] = parent
+
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_custom_node_build_diagnostics"
+        ]
+        self.assertEqual(len(calls), 1, "build diagnostics should have one guarded import-time call")
+
+        ancestor = parents.get(id(calls[0]))
+        while ancestor is not None and not isinstance(ancestor, ast.If):
+            ancestor = parents.get(id(ancestor))
+        self.assertIsNotNone(ancestor, "build diagnostics must be behind an explicit gate")
+        gate = ancestor.test
+        self.assertIsInstance(gate, ast.Call)
+        self.assertIsInstance(gate.func, ast.Name)
+        self.assertEqual(gate.func.id, "env_flag")
+        self.assertEqual(gate.args[0].value, "COMFYMODAL_BUILD_CONTEXT_DIAGNOSTICS")
+        self.assertFalse(
+            any(
+                keyword.arg == "default"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in gate.keywords
+            ),
+            "build diagnostics must remain disabled when the opt-in flag is absent",
+        )
+
+    def test_explicit_build_diagnostic_entry_point_remains_callable(self):
+        """The production/build diagnostic path remains directly invocable."""
+        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8-sig"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_custom_node_build_diagnostics"
+        )
+        node_diag = MagicMock()
+        harness_diag = MagicMock()
+        namespace = {
+            "_LOCAL_CUSTOM_NODES": "/default/source",
+            "_LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR": "/default/requirements",
+            "_diagnose_custom_node_requirements_context": node_diag,
+            "_diagnose_experiment_harness_context": harness_diag,
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(COMFYAPP_PATH), "exec"), namespace)
+        diagnostic_runner = namespace["run_custom_node_build_diagnostics"]
+
+        self.assertTrue(callable(diagnostic_runner))
+        diagnostic_runner(
+            "/explicit/source",
+            "/explicit/requirements",
+            {"overall_dependency_hash": "test"},
+        )
+
+        node_diag.assert_called_once_with(
+            "/explicit/source",
+            "/explicit/requirements",
+            {"overall_dependency_hash": "test"},
+        )
+        harness_diag.assert_called_once_with()
+
     def test_image_ignore_patterns_share_recursive_publication_base(self):
         module = load_module()
 

@@ -26,17 +26,37 @@ from comfymodal_runtime.contracts import (
     stable_hash,
 )
 from comfymodal_runtime.env import env_flag
+import comfymodal_runtime.baseline_resolvers as _baseline_resolvers
+from comfymodal_runtime.baseline_resolvers import (
+    production_baseline_value,
+    _resolve_production_baseline_flag,
+    _resolve_runtime_flag,
+    _resolve_runtime_string,
+    _resolve_sage_runtime_env_override,
+    _resolve_sage_probe_on_restore,
+    _resolve_preload_mode,
+)
+
+# Compatibility handle for older tests/callers; the mapping remains owned by
+# baseline_resolvers and is not copied here.
+_PRODUCTION_BASELINE_OVERRIDES = _baseline_resolvers._PRODUCTION_BASELINE_OVERRIDES
 from comfymodal_runtime.sage_policy import (
     SAGE_RUNTIME_BASELINE,
+    SAGE_RUNTIME_CACHE_SCHEMA_VERSION,
+    SAGE_RUNTIME_POLICY_VERSION,
+    SAGEATTENTION_SOURCE_REPOSITORY,
+    SAGEATTENTION_GIT_REF,
+    SAGEATTENTION_EXPECTED_NATIVE_FAMILY,
+    SAGEATTENTION_SOURCE_POLICY,
     build_sage_runtime_identity as _sage_policy_build_identity,
     choose_sage_runtime_mode as _sage_policy_choose_mode,
     list_sageattention_extension_files as _sage_policy_list_extensions,
-    production_baseline_value,
     resolve_sage_probe_on_restore,
     resolve_sage_runtime_mode,
     sage_runtime_cache_usable as _sage_policy_cache_usable,
     sage_runtime_identity_matches as _sage_policy_identity_matches,
     select_public_sageattention_callable as _sage_policy_select_callable,
+    sageattention_artifact_identity as _sage_policy_artifact_identity,
 )
 from comfymodal_runtime.deployment_spec import (
     build_v2_late_config,
@@ -3614,56 +3634,28 @@ def _apply_return_mode(result: dict, return_mode: str, payload_image_count: int,
 
 
 def _resolve_runtime_flag(name: str, default: str) -> bool:
-    """Read a runtime ``0``/``1`` flag from file or env var.
-
-    Priority:
-    1. File on the model volume at ``runtime_config/{name}.txt``.
-    2. Env var ``COMFYMODAL_{name}``.
-    3. ``default`` string (``"0"`` or ``"1"``).
-    """
-    baseline = production_baseline_value(f"COMFYMODAL_{name}")
-    if baseline is not None:
-        return baseline == "1"
-    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
-    try:
-        if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v in ("0", "1"):
-                return v == "1"
-    except Exception:
-        pass
-    env = os.environ.get(f"COMFYMODAL_{name}", default)
-    return env == "1"
+    return _baseline_resolvers._resolve_runtime_flag(
+        name,
+        default,
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_production_baseline_flag(name: str) -> str | None:
-    """Return the immutable deployment baseline for a named control."""
-    return production_baseline_value(name)
+    return _baseline_resolvers.production_baseline_value(name)
 
 
 def _resolve_runtime_string(name: str, default: str, allowed: set[str] | tuple[str, ...] | None = None) -> str:
-    """Read a runtime string flag from file or env var.
-
-    Priority:
-    1. File on the model volume at ``runtime_config/{name}.txt``.
-    2. Env var ``COMFYMODAL_{name}``.
-    3. ``default`` string.
-
-    When *allowed* is provided, the value is validated against the set.
-    Returns *default* if an invalid value is encountered.
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
-    try:
-        if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v and (allowed is None or v in allowed):
-                return v
-    except Exception:
-        pass
-    env = os.environ.get(f"COMFYMODAL_{name}", default).strip().lower()
-    if allowed is not None and env not in allowed:
-        return default
-    return env
+    return _baseline_resolvers._resolve_runtime_string(
+        name,
+        default,
+        allowed=allowed,
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_restore_direct_clip_policy_name() -> str:
@@ -3682,81 +3674,31 @@ def _resolve_restore_direct_clip_policy_name() -> str:
 
 
 def _resolve_sage_runtime_env_override() -> str:
-    """Return the effective SAGE_RUNTIME_MODE from file, env, or module default.
-
-    Priority:
-    1. File ``runtime_config/sage_runtime_mode.txt``.
-    2. Module-level ``SAGE_RUNTIME_MODE`` (from env var ``COMFYMODAL_SAGE_RUNTIME_MODE``).
-
-    The production baseline is authoritative over stale runtime-config files.
-    Golden deployments deliberately protect their ``auto`` policy from the
-    production image default and from a stale baked_cuda runtime file; the
-    stale file remains visible in provenance through the warning below.
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_mode.txt")
-    env_mode = os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", _SAGE_RUNTIME_MODE_CONFIGURED)
-    golden_deployment = _golden_sage_runtime_enabled()
-    file_mode = None
-    try:
-        if os.path.isfile(path):
-            file_mode = open(path).read().strip().lower()
-    except Exception:
-        pass
-    resolved, reason, effective_input, resolution_source = resolve_sage_runtime_mode(
-        file_value=file_mode,
-        env_value=env_mode,
-        baseline_value=None if golden_deployment else SAGE_RUNTIME_BASELINE,
-        golden_flag=golden_deployment,
+    return _baseline_resolvers._resolve_sage_runtime_env_override(
+        is_golden=_golden_sage_runtime_enabled(),
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
     )
-    if resolution_source == "golden_env" and file_mode:
-        print(
-            "[comfyapp] stale_file_override_detected "
-            f"path={path} file={file_mode} env={env_mode} effective={effective_input}"
-        )
-    return resolved
 
 
 def _resolve_sage_probe_on_restore() -> bool:
-    """Return whether to probe Sage runtime during restore.
-
-    Priority:
-    1. File ``runtime_config/sage_runtime_probe.txt``.
-    2. Module-level ``SAGE_RUNTIME_PROBE_ON_RESTORE``.
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_probe.txt")
-    file_value = None
-    try:
-        if os.path.isfile(path):
-            file_value = open(path).read().strip().lower()
-    except Exception:
-        pass
-    resolved, _, _, _ = resolve_sage_probe_on_restore(
-        file_value=file_value,
-        env_value="1" if SAGE_RUNTIME_PROBE_ON_RESTORE else "0",
-        baseline_value="0",
-        golden_flag=_golden_sage_runtime_enabled(),
+    return _baseline_resolvers._resolve_sage_probe_on_restore(
+        is_golden=_golden_sage_runtime_enabled(),
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
     )
-    return resolved
 
 
 def _resolve_preload_mode() -> str:
-    """Return the effective preload mode.
-
-    Priority:
-    1. File on the model volume (set by ``set_preload_mode``).
-    2. Module-level env-var default (``PRELOAD_MODE``).
-    """
-    baseline = production_baseline_value("COMFYMODAL_PRELOAD_MODE")
-    if baseline is not None:
-        return baseline
-    try:
-        if os.path.isfile(PRELOAD_MODE_PATH):
-            _v = open(PRELOAD_MODE_PATH).read().strip().lower()
-            if _v:
-                return _v
-    except Exception:
-        pass
-    return PRELOAD_MODE
+    return _baseline_resolvers._resolve_preload_mode(
+        is_golden=_golden_sage_runtime_enabled(),
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        preload_mode_path=PRELOAD_MODE_PATH,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_return_mode() -> str:
@@ -6561,216 +6503,10 @@ def normalize_flux_clip_pair(clip1: str, clip2: str) -> tuple[str, str]:
     return clip1, clip2
 
 
-def list_sageattention_extension_files(site_packages_root: str) -> list[Path]:
-    root = Path(site_packages_root) / "sageattention"
-    if not root.is_dir():
-        return []
-    # SageAttention 2.2.0 uses the public dispatcher for SM120.  Its native
-    # implementation is commonly named ``_qattn_sm89*.so`` (SM120 is routed
-    # through that family), so do not require an ``_qattn_sm120`` artifact.
-    native_suffixes = {".so", ".pyd", ".dll", ".dylib"}
-    return sorted(
-        path for path in root.rglob("*")
-        if path.is_file() and (
-            path.suffix.lower() in native_suffixes or ".so." in path.name.lower()
-        )
-    )
-
-
-SAGE_RUNTIME_CACHE_SCHEMA_VERSION = 2
-SAGE_RUNTIME_POLICY_VERSION = "ra5-phase-a-v1"
-SAGEATTENTION_SOURCE_REPOSITORY = "https://github.com/thu-ml/SageAttention.git"
-SAGEATTENTION_GIT_REF = "v2.2.0"
-SAGEATTENTION_EXPECTED_NATIVE_FAMILY = "_qattn_sm89"
-SAGEATTENTION_SOURCE_POLICY = (
-    f"{SAGEATTENTION_SOURCE_REPOSITORY}@{SAGEATTENTION_GIT_REF}"
-)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except (OSError, IOError):
-        return ""
-
-
-def sageattention_artifact_identity(site_packages_root: str) -> dict[str, Any]:
-    """Describe the installed SageAttention package without importing it.
-
-    In particular, the manifest treats ``_fused`` and ``_qattn_sm89`` as
-    separate artifacts.  The latter is the expected native family for the
-    v2.2.0 public dispatcher on SM120; an ``_qattn_sm120`` file is not needed.
-    """
-    package_root = Path(site_packages_root) / "sageattention"
-    files = list_sageattention_extension_files(site_packages_root)
-    manifest = []
-    for path in files:
-        try:
-            relative = path.relative_to(package_root).as_posix()
-            size = path.stat().st_size
-        except OSError:
-            continue
-        manifest.append({"path": relative, "size": size, "sha256": _sha256_file(path)})
-    manifest.sort(key=lambda item: item["path"])
-
-    metadata_files = []
-    site_root = Path(site_packages_root)
-    for metadata_root in sorted(site_root.glob("sageattention*.dist-info")):
-        for name in ("METADATA", "RECORD", "direct_url.json"):
-            path = metadata_root / name
-            if path.is_file():
-                metadata_files.append({
-                    "path": path.relative_to(site_root).as_posix(),
-                    "sha256": _sha256_file(path),
-                })
-    source_files = []
-    if package_root.is_dir():
-        for path in sorted(package_root.rglob("*.py")):
-            if path.is_file():
-                source_files.append({
-                    "path": path.relative_to(package_root).as_posix(),
-                    "sha256": _sha256_file(path),
-                })
-
-    canonical = json.dumps(
-        manifest,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return {
-        "package_root": str(package_root),
-        "extension_manifest": manifest,
-        "extension_manifest_hash": hashlib.sha256(canonical).hexdigest(),
-        "native_kernel_families": sorted({
-            "_fused" if "_fused" in item["path"] else SAGEATTENTION_EXPECTED_NATIVE_FAMILY
-            for item in manifest
-            if "_fused" in item["path"] or SAGEATTENTION_EXPECTED_NATIVE_FAMILY in item["path"]
-        }),
-        "source_manifest_hash": hashlib.sha256(
-            json.dumps(source_files, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
-        "metadata_manifest_hash": hashlib.sha256(
-            json.dumps(metadata_files, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
-    }
-
-
-def _sage_identity_digest(identity: dict) -> str:
-    comparable = {
-        key: value
-        for key, value in identity.items()
-        if key not in {"identity_digest", "created_at", "mode", "reason"}
-    }
-    return hashlib.sha256(json.dumps(comparable, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
-def sage_runtime_identity_matches(cached: dict, current: dict) -> bool:
-    """Return whether two complete Sage runtime identities are interchangeable."""
-    if not isinstance(cached, dict) or not isinstance(current, dict):
-        return False
-    if (
-        cached.get("schema_version") != SAGE_RUNTIME_CACHE_SCHEMA_VERSION
-        or current.get("schema_version") != SAGE_RUNTIME_CACHE_SCHEMA_VERSION
-    ):
-        return False
-    # Recompute rather than trusting a stored digest.  A partially edited or
-    # corrupt cache must not match by retaining its old digest field.
-    return _sage_identity_digest(cached) == _sage_identity_digest(current)
-
-
-def sage_runtime_cache_usable(cached: dict, current: dict, *, strict: bool = False) -> bool:
-    """Apply identity and policy checks before reusing a runtime decision."""
-    if not sage_runtime_identity_matches(cached, current):
-        return False
-    if cached.get("mode") not in {"baked_cuda", "triton_fallback", "disabled"}:
-        return False
-    # A negative result is never authoritative for the explicit Golden arm.
-    return not strict or cached.get("mode") == "baked_cuda"
-
-
-def build_sage_runtime_identity(
-    *,
-    site_packages_root: str = "",
-    selected_symbol: str = "sageattn",
-    kernel_family: str = "sage2++_public_dispatch",
-    gpu_name: str = "",
-    capability: tuple[int, int] | None = None,
-    sage_version: str = "",
-    torch_version: str = "",
-    torch_cuda: str = "",
-    driver_version: str = "",
-    image_identity: str = "",
-    deployment_identity: str = "",
-) -> dict[str, Any]:
-    """Build the cache identity used by Sage restore policy.
-
-    Imports and CUDA queries are intentionally opt-in through the omitted
-    values.  Snapshot startup can therefore use the helpers without causing a
-    CUDA or Sage import; restore probing supplies the runtime values.
-    """
-    artifact = sageattention_artifact_identity(site_packages_root) if site_packages_root else {
-        "extension_manifest": [], "extension_manifest_hash": "", "native_kernel_families": [],
-        "source_manifest_hash": "", "metadata_manifest_hash": "",
-    }
-    identity: dict[str, Any] = {
-        "schema_version": SAGE_RUNTIME_CACHE_SCHEMA_VERSION,
-        "policy_version": SAGE_RUNTIME_POLICY_VERSION,
-        "gpu_name": gpu_name or "unknown",
-        "gpu_capability": list(capability) if capability is not None else [],
-        "sage_version": sage_version,
-        "sage_source_identity": artifact.get("source_manifest_hash", ""),
-        "sage_build_identity": artifact.get("metadata_manifest_hash", ""),
-        # These policy fields remain populated even when a legacy install has
-        # no source metadata, keeping the cache tied to the pinned build.
-        "sage_source_repository": SAGEATTENTION_SOURCE_REPOSITORY,
-        "sage_source_ref": SAGEATTENTION_GIT_REF,
-        "sage_source_policy": SAGEATTENTION_SOURCE_POLICY,
-        "sage_expected_native_family": SAGEATTENTION_EXPECTED_NATIVE_FAMILY,
-        "extension_manifest_hash": artifact.get("extension_manifest_hash", ""),
-        "torch_version": torch_version,
-        "torch_cuda": torch_cuda,
-        "driver_version": driver_version,
-        "image_identity": image_identity,
-        "deployment_identity": deployment_identity,
-        "selected_symbol": selected_symbol,
-        "kernel_family": kernel_family,
-    }
-    identity["artifact_identity"] = artifact
-    identity["identity_digest"] = _sage_identity_digest(identity)
-    return identity
-
-
-def select_public_sageattention_callable(module) -> tuple[str | None, Callable | None, dict[str, Any]]:
-    """Select only SageAttention's supported public dispatcher.
-
-    Private extension modules and private kernel symbols are deliberately not
-    bound here.  SageAttention v2.2.0 owns the SM120 -> SM89 native dispatch.
-    """
-    candidate = getattr(module, "sageattn", None)
-    if callable(candidate):
-        return "sageattn", candidate, {"tensor_layout": "HND", "is_causal": False}
-    return None, None, {}
-
-
-def choose_sage_runtime_mode(enabled: bool, extension_files: list[Path], import_ok: bool, smoke_ok: bool) -> tuple[str, str]:
-    if not enabled:
-        return "disabled", "explicitly-disabled"
-    if not extension_files:
-        return "triton_fallback", "compiled-extensions-missing"
-    if not import_ok:
-        return "triton_fallback", "compiled-extensions-unusable"
-    if not smoke_ok:
-        return "triton_fallback", "smoke-test-failed"
-    return "baked_cuda", "compiled-extensions-usable"
-
-
 # Compatibility exports remain available to the runtime and older callers,
 # but the dependency-free module above is the canonical implementation.
 list_sageattention_extension_files = _sage_policy_list_extensions
+sageattention_artifact_identity = _sage_policy_artifact_identity
 build_sage_runtime_identity = _sage_policy_build_identity
 sage_runtime_identity_matches = _sage_policy_identity_matches
 sage_runtime_cache_usable = _sage_policy_cache_usable
@@ -8185,6 +7921,42 @@ def _diagnose_experiment_harness_context() -> None:
     print(f"[comfyapp] experiment_harness_diag: state_inside_ignored_dir={'1' if _state_inside_ignored else '0'}")
 
 
+def run_custom_node_build_diagnostics(
+    source_root: str | None = None,
+    requirements_dir: str | None = None,
+    dep_manifest: dict | None = None,
+) -> None:
+    """Run the opt-in diagnostics for a local custom-node build context.
+
+    These diagnostics intentionally include recursive source-size inspection,
+    so they are kept out of ordinary module import and runtime paths.  Callers
+    performing an explicit production/build investigation may invoke this
+    entry point directly; omitted arguments use the module's resolved build
+    context.
+    """
+    resolved_source_root = source_root or _LOCAL_CUSTOM_NODES
+    resolved_requirements_dir = requirements_dir or _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+    resolved_manifest = dep_manifest
+    if resolved_manifest is None:
+        resolved_manifest = {}
+        manifest_path = globals().get("_BAKED_MANIFEST_TEMP")
+        if manifest_path and os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+                    loaded_manifest = json.load(manifest_file)
+                if isinstance(loaded_manifest, dict):
+                    resolved_manifest = loaded_manifest
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+
+    _diagnose_custom_node_requirements_context(
+        resolved_source_root,
+        resolved_requirements_dir,
+        resolved_manifest,
+    )
+    _diagnose_experiment_harness_context()
+
+
 def _safe_dependency_relpath(filepath: str, node_root: str) -> str:
     """Return a POSIX-style relative path from *node_root* to *filepath*.
 
@@ -8759,10 +8531,12 @@ if not _INSIDE_MODAL_CONTAINER:
                     _baked_manifest_for_diag = json.load(_f)
         except Exception:
             pass
-    _diagnose_custom_node_requirements_context(
-        _LOCAL_CUSTOM_NODES, _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR, _baked_manifest_for_diag
-    )
-    _diagnose_experiment_harness_context()
+    if env_flag("COMFYMODAL_BUILD_CONTEXT_DIAGNOSTICS"):
+        run_custom_node_build_diagnostics(
+            _LOCAL_CUSTOM_NODES,
+            _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
+            _baked_manifest_for_diag,
+        )
 
     _image_base = _image_base.add_local_file(
         _BAKED_MANIFEST_TEMP,

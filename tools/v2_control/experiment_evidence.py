@@ -32,6 +32,159 @@ _SECRET_RE = re.compile(
 )
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _OMIT_EVENTS_BYTES = 256 * 1024
+_GOLDEN_P1_BACKENDS = frozenset({"pytorch", "sage", "comfy_kitchen"})
+
+
+def _golden_p1_observed_value(
+    sources: tuple[Any, ...], keys: frozenset[str], allowed: frozenset[str]
+) -> str:
+    """Project one runtime value, returning ``mixed`` on contradiction.
+
+    Control-plane selectors are intentionally not included in *keys*.  They
+    are request inputs, not proof that the selected runtime was actually used.
+    """
+    values: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key).strip().lower()
+                if normalized in keys and item not in (None, ""):
+                    candidate = str(item).strip().lower()
+                    if candidate in allowed and candidate not in values:
+                        values.append(candidate)
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for source in sources:
+        visit(source)
+    if not values:
+        return "missing"
+    return values[0] if len(values) == 1 else "mixed"
+
+
+def _golden_p1_runtime_provenance(
+    golden_telemetry: Mapping[str, Any] | None,
+    terminal_identity: Mapping[str, Any] | None,
+    *,
+    sage_effective_input: str,
+    sage_resolution_source: str,
+) -> dict[str, str]:
+    """Extract backend identity from returned runtime evidence only.
+
+    Request selectors are never accepted as resolved evidence, so an
+    error/DNF without telemetry remains ``missing``.
+    """
+    telemetry = golden_telemetry if isinstance(golden_telemetry, Mapping) else {}
+    identity = terminal_identity if isinstance(terminal_identity, Mapping) else {}
+    sources = (telemetry, identity)
+
+    attention = _golden_p1_observed_value(
+        sources,
+        frozenset({
+            "attention_backend_resolved",
+            "resolved_attention_backend",
+            "attention_backend_observed",
+        }),
+        _GOLDEN_P1_BACKENDS,
+    )
+    selected_callables: list[str] = []
+
+    def collect_selection(value: Any, in_selection: bool = False) -> None:
+        if isinstance(value, Mapping):
+            selection = in_selection or str(value.get("name", "")).strip().lower() == "attention_backend_selection"
+            if selection:
+                selected = str(value.get("selected_callable", "")).strip().lower()
+                if selected:
+                    selected_callables.append(selected)
+            for item in value.values():
+                collect_selection(item, selection)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_selection(item, in_selection)
+
+    for source in sources:
+        collect_selection(source)
+    mapped: list[str] = []
+    for selected in selected_callables:
+        if "sageattention.sageattn" in selected or selected.endswith(".sageattn"):
+            backend = "sage"
+        elif "attention_pytorch" in selected:
+            backend = "pytorch"
+        elif "comfy_kitchen" in selected or "kitchen" in selected:
+            backend = "comfy_kitchen"
+        else:
+            continue
+        if backend not in mapped:
+            mapped.append(backend)
+    attention_values = set(mapped)
+    if attention == "mixed":
+        attention_values.clear()
+        attention_values.add("mixed")
+    elif attention != "missing":
+        attention_values.add(attention)
+    attention = (
+        next(iter(attention_values)) if len(attention_values) == 1
+        else ("mixed" if attention_values else "missing")
+    )
+
+    effective_values: list[str] = []
+    source_values: list[str] = []
+
+    def collect_sage_inputs(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key).strip().lower()
+                if normalized in {
+                    "sage_runtime_mode_effective_input",
+                    "sage_effective_input",
+                    "effective_sage_runtime_mode",
+                }:
+                    candidate = str(item).strip().lower()
+                    if candidate in {"auto", "baked_cuda", "triton_fallback"} and candidate not in effective_values:
+                        effective_values.append(candidate)
+                if normalized in {
+                    "sage_runtime_mode_resolution_source",
+                    "sage_resolution_source",
+                    "sage_runtime_reason",
+                    "sage_reason",
+                    "resolution_source",
+                } and item not in (None, ""):
+                    candidate = str(item).strip().lower()
+                    if candidate and candidate not in source_values:
+                        source_values.append(candidate)
+                collect_sage_inputs(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_sage_inputs(item)
+
+    for source in sources:
+        collect_sage_inputs(source)
+    effective = effective_values[0] if len(effective_values) == 1 else (
+        "mixed" if effective_values else sage_effective_input
+    )
+    resolution_source = source_values[0] if len(source_values) == 1 else (
+        "mixed" if source_values else sage_resolution_source
+    )
+    return {
+        "attention_backend_resolved": attention,
+        "sage_runtime_mode_effective_input": effective or "missing",
+        "sage_runtime_mode_resolution_source": resolution_source or "missing",
+        "sage_runtime_mode_resolved": resolved_sage_runtime_mode(*sources) or "missing",
+    }
+
+
+def _golden_p1_consensus(records: list[dict[str, Any]], field: str, default: str) -> str:
+    """Return one record-level provenance value, or ``mixed`` fail-closed."""
+    values = {
+        str(record.get(field, "") or "").strip().lower() or default
+        for record in records
+    }
+    if not values:
+        return default
+    return next(iter(values)) if len(values) == 1 else "mixed"
 
 
 @dataclass(frozen=True)
@@ -106,15 +259,19 @@ def resolved_sage_runtime_mode(*sources: Any) -> str:
     """
     _RESOLVED_OBSERVED_MODES = {"baked_cuda", "triton_fallback"}
     values: list[str] = []
+    saw_auto = False
 
     def visit(value: Any) -> None:
+        nonlocal saw_auto
         if isinstance(value, Mapping):
             for key, item in value.items():
                 if str(key).lower() in {
                     "resolved_sage_runtime_mode", "sage_mode", "sage_runtime_mode_resolved",
                 } and item not in (None, ""):
                     text = str(item).strip().lower()
-                    if text in _RESOLVED_OBSERVED_MODES and text not in values:
+                    if text == "auto":
+                        saw_auto = True
+                    elif text in _RESOLVED_OBSERVED_MODES and text not in values:
                         values.append(text)
                 visit(item)
         elif isinstance(value, (list, tuple)):
@@ -123,6 +280,8 @@ def resolved_sage_runtime_mode(*sources: Any) -> str:
 
     for source in sources:
         visit(source)
+    if saw_auto and values:
+        return "mixed"
     if not values:
         return ""
     return values[0] if len(values) == 1 else "mixed"

@@ -87,6 +87,10 @@ from tools.v2_control.validation import (
     _output_proof_truthy,
     resolve_output_durability_mode,
 )
+from tools.v2_control.experiment_evidence import (
+    _golden_p1_consensus,
+    _golden_p1_runtime_provenance,
+)
 from tools.variance_report import (
     build_summary,
     build_matrix_summary,
@@ -10455,36 +10459,17 @@ def _golden_p1_request_payload(
     request_id: str,
     index: int,
     attention_backend: str | None = None,
+    invocation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build one public Golden request, preserving omission semantics.
-
-    The attention selector is a top-level Golden field.  In particular, do
-    not place it in ``modal_options``: the remote Golden adapter validates and
-    normalizes this field at its request boundary.  ``None`` intentionally
-    leaves the field absent so the adapter's existing PyTorch default remains
-    authoritative.
-    """
-    payload = {
-        "request_id": request_id,
-        "prompt": copy.deepcopy(source["prompt"]),
-        "extra_data": copy.deepcopy(source["extra_data"]),
-        "modal_options": copy.deepcopy(source["modal_options"]),
-        "request_origin_info": {
-            "benchmark_mode": GOLDEN_P1_MODE,
-            "golden_p1_run_index": index,
-            "golden_p1_request_id": request_id,
-            "serial": True,
-        },
-    }
-    if attention_backend is not None:
-        normalized = str(attention_backend).strip().lower()
-        if normalized not in GOLDEN_ATTENTION_BACKENDS:
-            raise ValueError(
-                "golden attention backend must be one of: "
-                + ", ".join(GOLDEN_ATTENTION_BACKENDS)
-            )
-        payload["attention_backend"] = normalized
-    return payload
+    """Compatibility wrapper for the dependency-free payload builder."""
+    from tools.v2_control.golden_payload import _golden_p1_request_payload as build
+    return build(
+        source,
+        request_id=request_id,
+        index=index,
+        attention_backend=attention_backend,
+        invocation_id=invocation_id,
+    )
 
 
 def _golden_p1_deployed_identity(
@@ -10672,174 +10657,6 @@ def _golden_p1_extract_telemetry(events: list[Any]) -> dict[str, Any] | None:
             if isinstance(telemetry, dict):
                 return telemetry
     return None
-
-
-_GOLDEN_P1_BACKENDS = frozenset(GOLDEN_ATTENTION_BACKENDS)
-_GOLDEN_P1_SAGE_MODES = frozenset({"baked_cuda", "triton_fallback"})
-
-
-def _golden_p1_observed_value(
-    sources: tuple[Any, ...], keys: frozenset[str], allowed: frozenset[str]
-) -> str:
-    """Project one runtime value, returning ``mixed`` on contradiction.
-
-    Control-plane selectors are intentionally not included in *keys*.  In
-    particular, ``attention_backend`` and ``sage_runtime_mode`` are request
-    inputs, not proof that the selected runtime was actually used.
-    """
-    values: list[str] = []
-
-    def visit(value: Any) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                normalized = str(key).strip().lower()
-                if normalized in keys and item not in (None, ""):
-                    candidate = str(item).strip().lower()
-                    if candidate in allowed and candidate not in values:
-                        values.append(candidate)
-                visit(item)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                visit(item)
-
-    for source in sources:
-        visit(source)
-    if not values:
-        return "missing"
-    return values[0] if len(values) == 1 else "mixed"
-
-
-def _golden_p1_runtime_provenance(
-    golden_telemetry: Mapping[str, Any] | None,
-    terminal_identity: Mapping[str, Any] | None,
-    *,
-    sage_effective_input: str,
-    sage_resolution_source: str,
-) -> dict[str, str]:
-    """Extract backend identity from returned runtime evidence only.
-
-    ``attention_backend_selection.selected_callable`` is a runtime selection
-    record emitted after the requested override was invoked.  Explicit
-    resolved fields remain the preferred evidence surface.  No request field
-    is accepted as resolved evidence, so an error/DNF without telemetry stays
-    ``missing``.
-    """
-    telemetry = golden_telemetry if isinstance(golden_telemetry, Mapping) else {}
-    identity = terminal_identity if isinstance(terminal_identity, Mapping) else {}
-    sources = (telemetry, identity)
-
-    attention = _golden_p1_observed_value(
-        sources,
-        frozenset({
-            "attention_backend_resolved",
-            "resolved_attention_backend",
-            "attention_backend_observed",
-        }),
-        _GOLDEN_P1_BACKENDS,
-    )
-    selected_callables: list[str] = []
-
-    def collect_selection(value: Any, in_selection: bool = False) -> None:
-        if isinstance(value, Mapping):
-            selection = in_selection or str(value.get("name", "")).strip().lower() == "attention_backend_selection"
-            if selection:
-                selected = str(value.get("selected_callable", "")).strip().lower()
-                if selected:
-                    selected_callables.append(selected)
-            for item in value.values():
-                collect_selection(item, selection)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect_selection(item, in_selection)
-
-    for source in sources:
-        collect_selection(source)
-    mapped = []
-    for selected in selected_callables:
-        if "sageattention.sageattn" in selected or selected.endswith(".sageattn"):
-            backend = "sage"
-        elif "attention_pytorch" in selected:
-            backend = "pytorch"
-        elif "comfy_kitchen" in selected or "kitchen" in selected:
-            backend = "comfy_kitchen"
-        else:
-            continue
-        if backend not in mapped:
-            mapped.append(backend)
-    attention_values = set(mapped)
-    if attention == "mixed":
-        attention_values.clear()
-        attention_values.update({"mixed"})
-    elif attention != "missing":
-        attention_values.add(attention)
-    attention = (
-        next(iter(attention_values)) if len(attention_values) == 1
-        else ("mixed" if attention_values else "missing")
-    )
-
-    effective_values: list[str] = []
-    source_values: list[str] = []
-
-    def collect_sage_inputs(value: Any) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                normalized = str(key).strip().lower()
-                if normalized in {
-                    "sage_runtime_mode_effective_input",
-                    "sage_effective_input",
-                    "effective_sage_runtime_mode",
-                }:
-                    candidate = str(item).strip().lower()
-                    if candidate in {"auto", "baked_cuda", "triton_fallback"} and candidate not in effective_values:
-                        effective_values.append(candidate)
-                if normalized in {
-                    "sage_runtime_mode_resolution_source",
-                    "sage_resolution_source",
-                    "sage_runtime_reason",
-                    "sage_reason",
-                    "resolution_source",
-                } and item not in (None, ""):
-                    candidate = str(item).strip().lower()
-                    if candidate and candidate not in source_values:
-                        source_values.append(candidate)
-                collect_sage_inputs(item)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect_sage_inputs(item)
-
-    for source in sources:
-        collect_sage_inputs(source)
-    effective = effective_values[0] if len(effective_values) == 1 else (
-        "mixed" if effective_values else sage_effective_input
-    )
-    resolution_source = source_values[0] if len(source_values) == 1 else (
-        "mixed" if source_values else sage_resolution_source
-    )
-    return {
-        "attention_backend_resolved": attention,
-        "sage_runtime_mode_effective_input": effective or "missing",
-        "sage_runtime_mode_resolution_source": resolution_source or "missing",
-        "sage_runtime_mode_resolved": _golden_p1_observed_value(
-            sources,
-            frozenset({
-                "resolved_sage_runtime_mode",
-                "sage_runtime_mode_resolved",
-                "sage_mode",
-            }),
-            _GOLDEN_P1_SAGE_MODES,
-        ),
-    }
-
-
-def _golden_p1_consensus(records: list[dict[str, Any]], field: str, default: str) -> str:
-    """Return one record-level provenance value, or ``mixed`` fail-closed."""
-    values = {
-        str(record.get(field, "") or "").strip().lower() or default
-        for record in records
-    }
-    if not values:
-        return default
-    return next(iter(values)) if len(values) == 1 else "mixed"
 
 
 def _golden_p1_unit_name(value: Any) -> str:
@@ -11637,6 +11454,41 @@ def _golden_p1_file_hashes(directory: Path) -> dict[str, str]:
     return out
 
 
+def _golden_p1_request_pairing(
+    events: list[Any], expected_request_id: str, expected_invocation_id: str
+) -> tuple[bool, str, dict[str, list[str]]]:
+    """Verify returned identity evidence belongs to the dispatched request."""
+    observed: dict[str, list[str]] = {"request_id": [], "invocation_id": []}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key).strip().lower()
+                if normalized in {"request_id", "golden_p1_request_id"}:
+                    text = str(item or "").strip()
+                    if text and text not in observed["request_id"]:
+                        observed["request_id"].append(text)
+                elif normalized == "v2ctl_invocation_id":
+                    text = str(item or "").strip()
+                    if text and text not in observed["invocation_id"]:
+                        observed["invocation_id"].append(text)
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    visit(events)
+    request_ids = observed["request_id"]
+    if not request_ids:
+        return False, "request_identity_missing", observed
+    if any(value != expected_request_id for value in request_ids):
+        return False, "request_identity_mismatch", observed
+    invocation_ids = observed["invocation_id"]
+    if invocation_ids and any(value != expected_invocation_id for value in invocation_ids):
+        return False, "invocation_identity_mismatch", observed
+    return True, "paired", observed
+
+
 async def _run_golden_p1(
     workspace: dict[str, Any],
     transport: ModalTransport,
@@ -11804,6 +11656,11 @@ async def _run_golden_p1(
             "error": None,
             "golden_telemetry": None,
             "gap_before": gap_before,
+            "request_pairing": {
+                "status": "missing",
+                "valid": False,
+                "evidence": {},
+            },
         }
         attempt_start_ns = time.perf_counter_ns()
         events: list[Any] = []
@@ -11813,12 +11670,21 @@ async def _run_golden_p1(
                 request_id=req_id,
                 index=index,
                 attention_backend=attention_backend,
+                invocation_id=invocation_id,
             )
             # Strict serial: exactly one stream in flight; consumed to
             # exhaustion before anything else happens.
             events = await _golden_p1_consume_stream(handle, payload)
             artifact["event_count"] = len(events)
             artifact["golden_telemetry"] = _golden_p1_extract_telemetry(events)
+            paired, pairing_status, pairing_evidence = _golden_p1_request_pairing(
+                events, req_id, invocation_id
+            )
+            artifact["request_pairing"] = {
+                "status": pairing_status,
+                "valid": paired,
+                "evidence": pairing_evidence,
+            }
             (cohort_dir / artifact["events_file"]).write_text(
                 json.dumps(events, default=str, indent=2), encoding="utf-8"
             )
@@ -11830,6 +11696,9 @@ async def _run_golden_p1(
             )
             artifact["validation"] = details
             artifact["failures"] = failures
+            if not paired:
+                failures.append(pairing_status)
+                valid = False
             terminal_event = next(
                 (
                     event for event in reversed(events)
@@ -12129,6 +11998,7 @@ async def _run_golden_p1(
             "identity": r["identity"],
             "cold_evidence": r["cold_evidence"],
             "golden_telemetry": r.get("golden_telemetry"),
+            "request_pairing": r.get("request_pairing"),
             "request_phase": r.get("request_phase", "experiment"),
             "capture_guard": r.get("capture_guard"),
             "gap_before": r.get("gap_before"),

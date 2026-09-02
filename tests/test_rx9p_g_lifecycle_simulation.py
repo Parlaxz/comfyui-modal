@@ -19,6 +19,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from comfymodal_runtime import full_execution_trace as ft
 from comfymodal_runtime import modal_app
 from comfymodal_runtime.full_execution_trace import FullExecutionTraceSession
@@ -31,6 +33,8 @@ from tools.v2_control.experiment_evidence import finalize_experiment_evidence
 REQUEST_ID = "rx9p-g-request"
 INVOCATION_ID = "rx9p-g-invocation"
 E27_RAW_RELATIVE_PATH = "raw/e27_source_mechanism.json"
+
+pytestmark = pytest.mark.heavy_local
 
 
 def _synthetic_trace() -> dict:

@@ -17,7 +17,7 @@ from tools.v2_control import cli
 from tools.v2_control import backend as backend_mod
 from tools.v2_control.environment import EnvironmentBuilder
 from tools.v2_control.errors import FlagError
-from tools.benchmark_v2_direct import _golden_p1_request_payload
+from tools.v2_control.golden_payload import _golden_p1_request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAG = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"

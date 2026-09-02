@@ -6,15 +6,24 @@ All assertions are pure logic against tools.v2_control.experiment_evidence.
 from __future__ import annotations
 
 import json
-import inspect
+import ast
 from pathlib import Path
 
+import pytest
+
 from tools.v2_control import experiment_evidence
-from tools.benchmark_v2_direct import (
+from tools.v2_control.experiment_evidence import (
     _golden_p1_consensus,
     _golden_p1_runtime_provenance,
-    _run_golden_p1,
 )
+
+pytestmark = pytest.mark.fast_unit
+
+
+def _benchmark_source() -> str:
+    return (
+        Path(__file__).resolve().parents[1] / "tools" / "benchmark_v2_direct.py"
+    ).read_text(encoding="utf-8-sig")
 
 
 def _cohort(tmp_path: Path, *, invocation_id: str, request_id: str, extra: dict | None = None):
@@ -234,6 +243,62 @@ def test_dnf_without_telemetry_cannot_be_projected_as_resolved_success():
     assert provenance["sage_runtime_mode_resolved"] == "missing"
 
 
+def test_auto_and_nested_observed_sage_evidence_is_mixed():
+    assert experiment_evidence.resolved_sage_runtime_mode(
+        {"sage_runtime_mode_resolved": "auto"},
+        {"full_trace_artifact": {"golden_telemetry": {"sage_runtime_mode_resolved": "baked_cuda"}}},
+    ) == "mixed"
+
+
+def test_provenance_auto_only_preserves_missing_sentinel():
+    provenance = _golden_p1_runtime_provenance(
+        {"sage_runtime_mode_resolved": "auto"},
+        {},
+        sage_effective_input="auto",
+        sage_resolution_source="auto_resolution",
+    )
+    assert provenance["sage_runtime_mode_resolved"] == "missing"
+
+
+def test_provenance_auto_and_nested_observed_sage_evidence_is_mixed():
+    provenance = _golden_p1_runtime_provenance(
+        {"sage_runtime_mode_resolved": "auto"},
+        {"full_trace_artifact": {"golden_telemetry": {"sage_mode": "baked_cuda"}}},
+        sage_effective_input="auto",
+        sage_resolution_source="auto_resolution",
+    )
+    assert provenance["sage_runtime_mode_resolved"] == "mixed"
+
+
+def test_provenance_policy_auto_does_not_conflict_with_observed_sage_mode():
+    provenance = _golden_p1_runtime_provenance(
+        {"sage_runtime_mode": "auto"},
+        {"full_trace_artifact": {"golden_telemetry": {"sage_mode": "baked_cuda"}}},
+        sage_effective_input="auto",
+        sage_resolution_source="auto_resolution",
+    )
+    assert provenance["sage_runtime_mode_resolved"] == "baked_cuda"
+
+
+def test_compact_nested_sage_observation_is_mismatch(tmp_path: Path):
+    inv = "a" * 32
+    req = "golden-p1-0-abc123"
+    cohort = _cohort(
+        tmp_path,
+        invocation_id=inv,
+        request_id=req,
+        extra={
+            "sage_runtime_mode_resolved": "auto",
+            "full_trace_artifact": {
+                "golden_telemetry": {"sage_mode": "baked_cuda"},
+            },
+        },
+    )
+    compact = experiment_evidence._compact_cohort(cohort, _identity(inv, req))
+    assert compact["sage_runtime_mode_resolved"] == "mixed"
+    assert compact["exact"] == "MISMATCH"
+
+
 def test_contradictory_runtime_records_fail_closed():
     records = [
         {"attention_backend_resolved": "pytorch"},
@@ -243,6 +308,53 @@ def test_contradictory_runtime_records_fail_closed():
 
 
 def test_golden_invocation_id_is_captured_once_and_summary_uses_local_value():
-    source = inspect.getsource(_run_golden_p1)
+    benchmark_path = Path(__file__).resolve().parents[1] / "tools" / "benchmark_v2_direct.py"
+    source = _benchmark_source()
+    tree = ast.parse(source, filename=str(benchmark_path))
+    run_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_golden_p1"
+    )
+    source = ast.get_source_segment(source, run_node) or ""
     assert source.count('os.environ.get("COMFYMODAL_V2CTL_INVOCATION_ID"') == 1
     assert '"v2ctl_invocation_id": invocation_id' in source
+
+
+def test_fast_identity_tests_do_not_import_benchmark_runtime():
+    source = Path(__file__).read_text(encoding="utf-8-sig")
+    tree = ast.parse(source)
+    modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    modules.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert "tools.benchmark_v2_direct" not in modules
+
+
+def test_benchmark_reexports_canonical_pure_identity_helpers():
+    tree = ast.parse(_benchmark_source())
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "tools.v2_control.experiment_evidence"
+        for alias in node.names
+    }
+    assert {
+        "_golden_p1_consensus",
+        "_golden_p1_runtime_provenance",
+    } <= imported
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {
+            "_golden_p1_consensus",
+            "_golden_p1_runtime_provenance",
+        }
+        for node in tree.body
+    )
