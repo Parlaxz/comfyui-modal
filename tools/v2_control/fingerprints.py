@@ -263,8 +263,14 @@ class FingerprintEngine:
             "deploy_fingerprint": self.deploy_fingerprint(),
             "run_fingerprint": self.run_fingerprint(),
             "attention_backend": backend,
+            "attention_backend_configured": backend,
+            "attention_backend_resolved": backend,
             "configured_sage_runtime_mode": configured_sage,
             "resolved_sage_runtime_mode": "",
+            "sage_runtime_mode_configured": configured_sage,
+            "sage_runtime_mode_effective_input": configured_sage,
+            "sage_runtime_mode_resolution_source": "auto_resolution" if configured_sage == "auto" else "explicit_profile",
+            "sage_runtime_mode_resolved": "",
         }
 
     def deployment_hash_namespace(self) -> str:

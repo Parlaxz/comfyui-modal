@@ -95,11 +95,11 @@ Compliance:
   - `REMOTE_GOLDEN_REQUEST_COUNT=1`, `GOLDEN_RETRY_ISSUED=0` (from `remote_profile_smoke_status.txt`)
   - `v2ctl run` log: `run_count=1 gap=35.0s app=rx9p-f-remote-profile-smoke method=run_golden_serial_stream` and `[v2.golden_p1] attempt=0 status=VALID valid_total=1/1 events=1 duration_ms=229407.617 true_cold=True`
   - No second paid Golden request was issued; revalidation was explicitly skipped ("would violate one-request smoke constraint").
-- **Output exactness:** `valid_total=1/1` and bounded stdout indicates run completed; canonical exactness gate via reference SHA not yet independently re-validated in this lane, but run status is `VALID`. Treated as `OUTPUT_EXACT=YES` for smoke (with note that profiler instrumentation must not change final result — downstream exactness re-check pending on bundle).
+- **Output exactness:** `valid_total=1/1` and bounded stdout indicates run completed; output exactness was not independently proven via the canonical SHA mechanism in this lane. Run status `VALID` does not prove exact output. `OUTPUT_EXACT=UNKNOWN` (downstream exactness re-check remains pending on the absent bundle).
 - **Configured/Resolved Sage mode:**
   - `configured_sage_runtime_mode=auto` (from `config/v2/profiles/golden_p1.toml` and `integration_identity.json`)
-  - `resolved_sage_runtime_mode=baked_cuda` (observed in Modal restore logs: `[comfyapp] sage_runtime_mode=baked_cuda reason=runtime_override (SAGE_RUNTIME_MODE=baked_cuda)`) — not `auto`, not inferred from config; no conflicting modes, so not `mixed`.
-- **Attention backend:** configured `unknown` (no explicit selector; GoldenRequest runtime default is `None`), frozen accepted Golden PyTorch backend remains unchanged (no manual override). Actual resolved backend is the canonical PyTorch attention path (recorded as `unknown` in identity probe).
+  - `resolved_sage_runtime_mode=baked_cuda` (observed in Modal restore logs: `[comfyapp] sage_runtime_mode=baked_cuda reason=runtime_override (SAGE_RUNTIME_MODE=baked_cuda)`) — not `auto`, not inferred from config; no conflicting modes, so not `mixed`. Sage configured-vs-resolved identity was not proven as `auto_resolution` (`reason=runtime_override`); `SAGE_CONFIGURED_RESOLVED_IDENTITY_PROVEN=NO`.
+- **Attention backend:** configured `unknown` (no explicit selector; GoldenRequest runtime default is `None`). Attention backend provenance was absent: the configured selector was not proven, so `ATTENTION_BACKEND_PROVEN=NO`.
 
 ---
 
@@ -148,8 +148,8 @@ Local code repairs for this (persist `v2ctl_invocation_id` on every Golden attem
 ## Exactness Gate
 
 - Run status `VALID valid_total=1/1` with `duration_ms=229407.617` indicates output was produced via true Golden path.
-- Canonical exactness mechanism against accepted reference not re-run as a separate exactness suite in this smoke lane (would require second invocation). Profiler instrumentation is not expected to change final result; output SHA reference not yet cross-checked via `derived/report.md` (absent).
-- Recorded as `OUTPUT_EXACT=YES` (status VALID) with note that bundle-level `report.md` exactness is pending until trace descriptor is available.
+- Canonical exactness mechanism against the accepted reference was not re-run as a separate exactness suite in this smoke lane (would require second invocation); output exactness was therefore not independently proven via the canonical SHA mechanism. Profiler instrumentation is not expected to change final result; output SHA reference was not cross-checked via `derived/report.md` (absent).
+- Recorded as `OUTPUT_EXACT=UNKNOWN`; status `VALID` does not establish exactness, and bundle-level `report.md` exactness remains unproven until a trace descriptor is available.
 
 ---
 
@@ -208,10 +208,12 @@ INTEGRATED_TESTING2_HEAD=369d60c7a8f47db743defca570c176eb55bdcf35
 DEPLOYED_SOURCE_MATCH=YES
 REMOTE_DEPLOYS=1
 REMOTE_GOLDEN_REQUEST_COUNT=1
-OUTPUT_EXACT=YES
+OUTPUT_EXACT=UNKNOWN
 ATTENTION_BACKEND=unknown
+ATTENTION_BACKEND_PROVEN=NO
 SAGE_RUNTIME_MODE_CONFIGURED=auto
 SAGE_RUNTIME_MODE_RESOLVED=baked_cuda
+SAGE_CONFIGURED_RESOLVED_IDENTITY_PROVEN=NO
 VIZTRACER_RAW_PRESENT=NO
 TORCH_TRACE_PRESENT=NO
 GOLDEN_PROFILE_COMPLETE=NO
@@ -251,4 +253,3 @@ Do not automatically repair and rerun. Smallest next repair (already applied loc
 3. Redeploy **once** via direct orchestrator lane (not fixer, per owner guidance) and run **one** new diagnostic Golden `golden_p1` with deep profiling + E27 evidence enabled to prove the block/bundle appear and the Gantt matches.
 
 No additional `GOLDEN_REQUESTS` beyond the single smoke have been issued; revalidation was explicitly skipped to respect the one-request constraint.
-

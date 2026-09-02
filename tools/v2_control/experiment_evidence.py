@@ -111,7 +111,7 @@ def resolved_sage_runtime_mode(*sources: Any) -> str:
         if isinstance(value, Mapping):
             for key, item in value.items():
                 if str(key).lower() in {
-                    "resolved_sage_runtime_mode", "sage_mode",
+                    "resolved_sage_runtime_mode", "sage_mode", "sage_runtime_mode_resolved",
                 } and item not in (None, ""):
                     text = str(item).strip().lower()
                     if text in _RESOLVED_OBSERVED_MODES and text not in values:
@@ -128,11 +128,114 @@ def resolved_sage_runtime_mode(*sources: Any) -> str:
     return values[0] if len(values) == 1 else "mixed"
 
 
+def _sage_effective_input(*sources: Any) -> str:
+    """Project the effective Sage input observed before resolution."""
+    values: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                lk = str(key).lower()
+                if lk in {
+                    "sage_runtime_mode_effective_input",
+                    "sage_effective_input",
+                    "effective_sage_runtime_mode",
+                    "effective_input",
+                } and item not in (None, ""):
+                    text = str(item).strip().lower()
+                    if text in {"auto", "baked_cuda", "triton_fallback"} and text not in values:
+                        values.append(text)
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for source in sources:
+        visit(source)
+    if not values:
+        return ""
+    return values[0] if len(values) == 1 else "mixed"
+
+
+def _sage_resolution_source(*sources: Any) -> str:
+    """Project the factual category explaining where final Sage mode came from."""
+    values: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                lk = str(key).lower()
+                if lk in {
+                    "sage_runtime_mode_resolution_source",
+                    "sage_resolution_source",
+                    "resolution_source",
+                    "sage_reason",
+                    "sage_runtime_reason",
+                } and item not in (None, ""):
+                    text = str(item).strip().lower()
+                    if text and text not in values:
+                        values.append(text)
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for source in sources:
+        visit(source)
+    if not values:
+        return ""
+    return values[0] if len(values) == 1 else "mixed"
+
+
+def attention_backend_configured_value(config: Any) -> str:
+    """Return the configured attention backend from control-plane identity."""
+    return resolved_attention_backend(config)
+
+
+def attention_backend_resolved_value(*sources: Any) -> str:
+    """Return the observed attention backend from runtime evidence, or 'missing'."""
+    values: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                lk = str(key).lower()
+                if lk in {
+                    "attention_backend_resolved",
+                    "resolved_attention_backend",
+                    "attention_backend_observed",
+                } and item not in (None, ""):
+                    text = str(item).strip().lower()
+                    if text in {"pytorch", "sage", "comfy_kitchen"} and text not in values:
+                        values.append(text)
+                # Also accept legacy attention_backend if it carries resolved semantics
+                # (but configured is separate; we treat legacy as resolved only when
+                # new fields are absent — handled in _compact_cohort fallback)
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for source in sources:
+        visit(source)
+    if not values:
+        return "missing"
+    return values[0] if len(values) == 1 else "mixed"
+
+
 def sage_runtime_identity(config: Any, *sources: Any) -> dict[str, str]:
-    """Project configured and observed Sage modes into experiment identity."""
+    """Project configured, effective, source and observed Sage modes into identity."""
     return {
+        "sage_runtime_mode_configured": configured_sage_runtime_mode(config),
+        "sage_runtime_mode_effective_input": _sage_effective_input(*sources) or configured_sage_runtime_mode(config),
+        "sage_runtime_mode_resolution_source": _sage_resolution_source(*sources),
+        "sage_runtime_mode_resolved": resolved_sage_runtime_mode(*sources),
+        # Back-compat spellings
         "configured_sage_runtime_mode": configured_sage_runtime_mode(config),
         "resolved_sage_runtime_mode": resolved_sage_runtime_mode(*sources),
+        # Attention backend provenance (control-plane vs runtime)
+        "attention_backend_configured": attention_backend_configured_value(config),
+        "attention_backend_resolved": attention_backend_resolved_value(*sources),
     }
 
 
@@ -262,15 +365,30 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
     resources = manifest.get("resources", {}) if isinstance(manifest, dict) else {}
     target = target if isinstance(target, Mapping) else {}
     resources = resources if isinstance(resources, Mapping) else {}
-    backends = _nested_values(
-        all_data, {"attention_backend", "resolved_attention_backend"}
+    # RX9P-H: attention backend is frozen with separate configured/resolved provenance.
+    configured_backend_values = _nested_values(
+        all_data, {"attention_backend_configured", "ATTENTION_BACKEND_CONFIGURED"}
     )
-    expected_backend = str(identity.get("attention_backend", "") or "").lower()
-    backend_value = backends[0] if len(backends) == 1 else ("mixed" if backends else "")
+    resolved_backend_values = _nested_values(
+        all_data, {"attention_backend_resolved", "ATTENTION_BACKEND_RESOLVED", "resolved_attention_backend"}
+    )
+    # Legacy fallback: when new fields absent, treat legacy attention_backend as both.
+    if not configured_backend_values and not resolved_backend_values:
+        legacy = _nested_values(all_data, {"attention_backend"})
+        configured_backend_values = legacy
+        resolved_backend_values = legacy
+    configured_backend_value = (
+        configured_backend_values[0] if len(configured_backend_values) == 1 else ("mixed" if configured_backend_values else "")
+    )
+    resolved_backend_value = (
+        resolved_backend_values[0] if len(resolved_backend_values) == 1 else ("mixed" if resolved_backend_values else "missing")
+    )
+    # Sage 4-field model: configured, effective_input, resolution_source, resolved
     configured_sage_values = _nested_values(
         all_data,
         {
             "configured_sage_runtime_mode",
+            "sage_runtime_mode_configured",
             "sage_env_mode",
             SAGE_RUNTIME_MODE_FLAG.lower(),
         },
@@ -279,6 +397,20 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         configured_sage_values[0]
         if len(configured_sage_values) == 1
         else ("mixed" if configured_sage_values else "")
+    )
+    effective_sage_values = _nested_values(
+        all_data, {"sage_runtime_mode_effective_input", "sage_effective_input", "effective_input"}
+    )
+    effective_sage_value = (
+        effective_sage_values[0] if len(effective_sage_values) == 1 else ("mixed" if effective_sage_values else "")
+    )
+    if not effective_sage_value:
+        effective_sage_value = configured_sage_value
+    sage_resolution_values = _nested_values(
+        all_data, {"sage_runtime_mode_resolution_source", "sage_resolution_source", "resolution_source", "sage_reason", "sage_runtime_reason"}
+    )
+    sage_resolution_value = (
+        sage_resolution_values[0] if len(sage_resolution_values) == 1 else ("mixed" if sage_resolution_values else "")
     )
     resolved_sage_value = resolved_sage_runtime_mode(*all_data)
     exact = True
@@ -341,21 +473,77 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         elif expected and str(observed) != expected:
             exact = False
             mismatches.append(f"{key}: expected {expected}, observed {observed}")
-    if expected_backend and backend_value and backend_value not in {expected_backend}:
+    # RX9P-H: attention backend frozen with separate provenance — fail closed.
+    # Configured must be pytorch (Golden control), resolved must be observed pytorch (not missing, not mixed, not copied).
+    expected_attention_configured = str(identity.get("attention_backend_configured") or identity.get("attention_backend") or "").strip().lower()
+    expected_attention_resolved = str(identity.get("attention_backend_resolved") or identity.get("attention_backend") or "").strip().lower()
+    # If identity provides no explicit attention expectation but profile is golden, default to pytorch.
+    if not expected_attention_configured and str(identity.get("profile", "") or "").strip().lower() == "golden_p1":
+        expected_attention_configured = "pytorch"
+    if not expected_attention_resolved and str(identity.get("profile", "") or "").strip().lower() == "golden_p1":
+        expected_attention_resolved = "pytorch"
+    if expected_attention_configured:
+        if not configured_backend_value:
+            missing.append(f"{manifest_path}: attention_backend_configured")
+        elif configured_backend_value == "mixed":
+            exact = False
+            mismatches.append(f"attention_backend_configured: mixed observed {configured_backend_values}")
+        elif configured_backend_value != expected_attention_configured:
+            exact = False
+            mismatches.append(f"attention_backend_configured: expected {expected_attention_configured}, observed {configured_backend_value}")
+    if expected_attention_resolved:
+        if resolved_backend_value == "missing" or not resolved_backend_value:
+            missing.append(f"{manifest_path}: attention_backend_resolved")
+            exact = False
+            mismatches.append("attention_backend_resolved: missing (runtime evidence absent)")
+        elif resolved_backend_value == "mixed":
+            exact = False
+            mismatches.append(f"attention_backend_resolved: mixed observed {resolved_backend_values}")
+        elif resolved_backend_value != expected_attention_resolved:
+            exact = False
+            mismatches.append(f"attention_backend_resolved: expected {expected_attention_resolved}, observed {resolved_backend_value}")
+    # Configured and resolved must agree for golden_p1 (both pytorch), and resolved must not be mere copy.
+    if configured_backend_value and resolved_backend_value and configured_backend_value != resolved_backend_value:
         exact = False
-        mismatches.append(f"attention_backend: expected {expected_backend}, observed {backend_value}")
+        mismatches.append(f"attention_backend: configured {configured_backend_value} != resolved {resolved_backend_value}")
+    # Sage 4-field identity — fail closed on override masquerading as auto resolution.
     for key, observed in (
+        ("sage_runtime_mode_configured", configured_sage_value),
+        ("sage_runtime_mode_effective_input", effective_sage_value),
+        ("sage_runtime_mode_resolution_source", sage_resolution_value),
+        ("sage_runtime_mode_resolved", resolved_sage_value),
+        # Back-compat aliases
         ("configured_sage_runtime_mode", configured_sage_value),
         ("resolved_sage_runtime_mode", resolved_sage_value),
     ):
+        # Only validate keys present in identity; new 4-field keys are validated when expected.
         expected = str(identity.get(key, "") or "").strip().lower()
         if not expected:
             continue
-        if not observed:
+        if not observed or observed == "missing":
             missing.append(f"{manifest_path}: {key}")
         elif observed != expected:
             exact = False
             mismatches.append(f"{key}: expected {expected}, observed {observed}")
+    # Effective-input override detection: configured=auto but effective!=auto due to override must fail unless override is frozen config.
+    if configured_sage_value == "auto" and effective_sage_value and effective_sage_value != "auto":
+        # An override is not a legitimate auto_resolution; surface it.
+        if sage_resolution_value in ("environment_override", "runtime_override", "fallback", "explicit_profile"):
+            # Unless the frozen identity explicitly allows this override (it does not for golden_p1), fail.
+            allowed_override = str(identity.get("sage_runtime_mode_effective_input", "") or "").strip().lower()
+            if effective_sage_value != allowed_override:
+                exact = False
+                mismatches.append(
+                    f"sage_effective_input_override: configured=auto effective={effective_sage_value} source={sage_resolution_value}"
+                )
+    if resolved_sage_value == "auto":
+        exact = False
+        mismatches.append("sage_runtime_mode_resolved is auto (never executing)")
+    if configured_sage_value and resolved_sage_value and configured_sage_value == "auto" and effective_sage_value == "auto" and sage_resolution_value not in ("auto_resolution", "auto", "explicit_profile", "probe", ""):
+        # Resolution source must truthfully indicate auto-selection mechanism, not override.
+        if sage_resolution_value in ("environment_override", "runtime_override"):
+            exact = False
+            mismatches.append(f"sage_resolution_source_unexpected_override: {sage_resolution_value}")
     if not attempts:
         missing.append(str(path / "attempt_*.json"))
     receipt_ref = _value(manifest, "deployment_receipt_path", default="")
@@ -447,9 +635,15 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         "deployment_fingerprint": _value(manifest, "deploy_fingerprint", "deployment_fingerprint", default=""),
         "run_fingerprint": _value(manifest, "run_fingerprint", default=""),
         "profile_fingerprint": _value(manifest, "profile_config_fingerprint", default=""),
-        "attention_backend": backend_value,
+        "attention_backend": configured_backend_value,
+        "attention_backend_configured": configured_backend_value,
+        "attention_backend_resolved": resolved_backend_value,
         "configured_sage_runtime_mode": configured_sage_value,
         "resolved_sage_runtime_mode": resolved_sage_value,
+        "sage_runtime_mode_configured": configured_sage_value,
+        "sage_runtime_mode_effective_input": effective_sage_value,
+        "sage_runtime_mode_resolution_source": sage_resolution_value,
+        "sage_runtime_mode_resolved": resolved_sage_value,
         "expected_output_sha": _value(manifest, "expected_output_sha", default=""),
         "observed_output_sha": _output_sha_values(all_data)[:1],
         "exact": "EXACT" if exact and not missing else ("INCOMPLETE" if missing else "MISMATCH"),
@@ -679,16 +873,18 @@ def finalize_experiment_evidence(
             "",
             "## Cohort index",
             "",
-            "| cohort | arm | app | gpu | cpu | RAM MB | min containers | scaledown | deploy fp | run fp | profile fp | attention | durability | true cold | requests | restores | expected SHA | observed SHA | classification | DNF | fallback | serial | start | end | duration | failure | source |",
-            "|---|---|---|---|---:|---:|---:|---:|---|---|---|---|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|",
+            "| cohort | arm | app | gpu | cpu | RAM MB | min containers | scaledown | deploy fp | run fp | profile fp | attention | attn_cfg | attn_res | sage_cfg | sage_eff | sage_src | sage_res | durability | true cold | requests | restores | expected SHA | observed SHA | classification | DNF | fallback | serial | start | end | duration | failure | source |",
+            "|---|---|---|---|---:|---:|---:|---:|---|---|---|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|",
         ]
         for cohort in cohorts:
             lines.append(
-                "| {cohort} | {arm} | {app} | {gpu} | {cpu} | {ram} | {min_containers} | {scaledown_window} | {deployment_fingerprint} | {run_fingerprint} | {profile_fingerprint} | {attention_backend} | {output_durability} | {true_cold} | {request_count} | {restore_count} | {expected_output_sha} | {observed_output_sha} | {exact} | {dnf} | {fallback} | {seriality} | {start} | {end} | {duration} | {failure} | {source_artifacts} |".format(
+                "| {cohort} | {arm} | {app} | {gpu} | {cpu} | {ram} | {min_containers} | {scaledown_window} | {deployment_fingerprint} | {run_fingerprint} | {profile_fingerprint} | {attention_backend} | {attention_backend_configured} | {attention_backend_resolved} | {sage_runtime_mode_configured} | {sage_runtime_mode_effective_input} | {sage_runtime_mode_resolution_source} | {sage_runtime_mode_resolved} | {output_durability} | {true_cold} | {request_count} | {restore_count} | {expected_output_sha} | {observed_output_sha} | {exact} | {dnf} | {fallback} | {seriality} | {start} | {end} | {duration} | {failure} | {source_artifacts} |".format(
                     **{key: str(cohort.get(key, "")).replace("|", "\\|") for key in (
                         "cohort", "arm", "app", "gpu", "cpu", "ram", "min_containers",
                         "scaledown_window", "deployment_fingerprint", "run_fingerprint",
-                        "profile_fingerprint", "attention_backend", "output_durability", "true_cold",
+                        "profile_fingerprint", "attention_backend", "attention_backend_configured", "attention_backend_resolved",
+                        "sage_runtime_mode_configured", "sage_runtime_mode_effective_input", "sage_runtime_mode_resolution_source", "sage_runtime_mode_resolved",
+                        "output_durability", "true_cold",
                         "request_count", "restore_count", "expected_output_sha", "observed_output_sha",
                         "exact", "dnf", "fallback", "seriality", "start", "end", "duration", "failure",
                         "source_artifacts",

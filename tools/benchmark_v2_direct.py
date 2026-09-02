@@ -10674,6 +10674,174 @@ def _golden_p1_extract_telemetry(events: list[Any]) -> dict[str, Any] | None:
     return None
 
 
+_GOLDEN_P1_BACKENDS = frozenset(GOLDEN_ATTENTION_BACKENDS)
+_GOLDEN_P1_SAGE_MODES = frozenset({"baked_cuda", "triton_fallback"})
+
+
+def _golden_p1_observed_value(
+    sources: tuple[Any, ...], keys: frozenset[str], allowed: frozenset[str]
+) -> str:
+    """Project one runtime value, returning ``mixed`` on contradiction.
+
+    Control-plane selectors are intentionally not included in *keys*.  In
+    particular, ``attention_backend`` and ``sage_runtime_mode`` are request
+    inputs, not proof that the selected runtime was actually used.
+    """
+    values: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key).strip().lower()
+                if normalized in keys and item not in (None, ""):
+                    candidate = str(item).strip().lower()
+                    if candidate in allowed and candidate not in values:
+                        values.append(candidate)
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for source in sources:
+        visit(source)
+    if not values:
+        return "missing"
+    return values[0] if len(values) == 1 else "mixed"
+
+
+def _golden_p1_runtime_provenance(
+    golden_telemetry: Mapping[str, Any] | None,
+    terminal_identity: Mapping[str, Any] | None,
+    *,
+    sage_effective_input: str,
+    sage_resolution_source: str,
+) -> dict[str, str]:
+    """Extract backend identity from returned runtime evidence only.
+
+    ``attention_backend_selection.selected_callable`` is a runtime selection
+    record emitted after the requested override was invoked.  Explicit
+    resolved fields remain the preferred evidence surface.  No request field
+    is accepted as resolved evidence, so an error/DNF without telemetry stays
+    ``missing``.
+    """
+    telemetry = golden_telemetry if isinstance(golden_telemetry, Mapping) else {}
+    identity = terminal_identity if isinstance(terminal_identity, Mapping) else {}
+    sources = (telemetry, identity)
+
+    attention = _golden_p1_observed_value(
+        sources,
+        frozenset({
+            "attention_backend_resolved",
+            "resolved_attention_backend",
+            "attention_backend_observed",
+        }),
+        _GOLDEN_P1_BACKENDS,
+    )
+    selected_callables: list[str] = []
+
+    def collect_selection(value: Any, in_selection: bool = False) -> None:
+        if isinstance(value, Mapping):
+            selection = in_selection or str(value.get("name", "")).strip().lower() == "attention_backend_selection"
+            if selection:
+                selected = str(value.get("selected_callable", "")).strip().lower()
+                if selected:
+                    selected_callables.append(selected)
+            for item in value.values():
+                collect_selection(item, selection)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_selection(item, in_selection)
+
+    for source in sources:
+        collect_selection(source)
+    mapped = []
+    for selected in selected_callables:
+        if "sageattention.sageattn" in selected or selected.endswith(".sageattn"):
+            backend = "sage"
+        elif "attention_pytorch" in selected:
+            backend = "pytorch"
+        elif "comfy_kitchen" in selected or "kitchen" in selected:
+            backend = "comfy_kitchen"
+        else:
+            continue
+        if backend not in mapped:
+            mapped.append(backend)
+    attention_values = set(mapped)
+    if attention == "mixed":
+        attention_values.clear()
+        attention_values.update({"mixed"})
+    elif attention != "missing":
+        attention_values.add(attention)
+    attention = (
+        next(iter(attention_values)) if len(attention_values) == 1
+        else ("mixed" if attention_values else "missing")
+    )
+
+    effective_values: list[str] = []
+    source_values: list[str] = []
+
+    def collect_sage_inputs(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key).strip().lower()
+                if normalized in {
+                    "sage_runtime_mode_effective_input",
+                    "sage_effective_input",
+                    "effective_sage_runtime_mode",
+                }:
+                    candidate = str(item).strip().lower()
+                    if candidate in {"auto", "baked_cuda", "triton_fallback"} and candidate not in effective_values:
+                        effective_values.append(candidate)
+                if normalized in {
+                    "sage_runtime_mode_resolution_source",
+                    "sage_resolution_source",
+                    "sage_runtime_reason",
+                    "sage_reason",
+                    "resolution_source",
+                } and item not in (None, ""):
+                    candidate = str(item).strip().lower()
+                    if candidate and candidate not in source_values:
+                        source_values.append(candidate)
+                collect_sage_inputs(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_sage_inputs(item)
+
+    for source in sources:
+        collect_sage_inputs(source)
+    effective = effective_values[0] if len(effective_values) == 1 else (
+        "mixed" if effective_values else sage_effective_input
+    )
+    resolution_source = source_values[0] if len(source_values) == 1 else (
+        "mixed" if source_values else sage_resolution_source
+    )
+    return {
+        "attention_backend_resolved": attention,
+        "sage_runtime_mode_effective_input": effective or "missing",
+        "sage_runtime_mode_resolution_source": resolution_source or "missing",
+        "sage_runtime_mode_resolved": _golden_p1_observed_value(
+            sources,
+            frozenset({
+                "resolved_sage_runtime_mode",
+                "sage_runtime_mode_resolved",
+                "sage_mode",
+            }),
+            _GOLDEN_P1_SAGE_MODES,
+        ),
+    }
+
+
+def _golden_p1_consensus(records: list[dict[str, Any]], field: str, default: str) -> str:
+    """Return one record-level provenance value, or ``mixed`` fail-closed."""
+    values = {
+        str(record.get(field, "") or "").strip().lower() or default
+        for record in records
+    }
+    if not values:
+        return default
+    return next(iter(values)) if len(values) == 1 else "mixed"
+
+
 def _golden_p1_unit_name(value: Any) -> str:
     """Name of a telemetry unit (stage/event dict with a ``name`` field)."""
     if isinstance(value, dict):
@@ -11502,9 +11670,41 @@ async def _run_golden_p1(
     os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
     os.environ["COMFYMODAL_V2_GPU"] = gpu
+    # RX9P-H: capture invocation ID exactly once — sole authority for the
+    # entire Golden run.  Never re-read the environment after this point.
     invocation_id = str(
         os.environ.get("COMFYMODAL_V2CTL_INVOCATION_ID", "") or ""
     ).strip()
+    # Fail closed before any remote execution.
+    if not invocation_id:
+        raise RuntimeError(
+            "COMFYMODAL_V2CTL_INVOCATION_ID is empty: refusing Golden execution"
+        )
+    # Format contract: v2ctl generates uuid4 hex (32 hex chars).  Reject
+    # malformed IDs before remote execution.
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", invocation_id):
+        raise RuntimeError(
+            f"COMFYMODAL_V2CTL_INVOCATION_ID malformed: {invocation_id!r}"
+        )
+    # Golden control: attention backend is explicit pytorch, not default-implied.
+    # Do not rely on omission (None) — freeze configured to pytorch.
+    if attention_backend is None:
+        attention_backend = "pytorch"
+    else:
+        attention_backend = str(attention_backend).strip().lower()
+        if attention_backend not in GOLDEN_ATTENTION_BACKENDS:
+            raise ValueError(
+                "golden attention backend must be one of: "
+                + ", ".join(GOLDEN_ATTENTION_BACKENDS)
+            )
+    # Sage effective-input provenance: the runtime policy observed before
+    # resolution.  For a clean Golden auto run this remains auto; an env
+    # override that flips it to baked_cuda must be surfaced.
+    _sage_effective_input = str(
+        os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", "auto") or "auto"
+    ).strip().lower()
+    if _sage_effective_input not in {"auto", "baked_cuda", "triton_fallback"}:
+        _sage_effective_input = "auto"
     started_iso = datetime.now(timezone.utc).isoformat()
     print(
         f"[v2.golden_p1] mode=start run_count={run_count} gap={gap_seconds}s "
@@ -11578,6 +11778,13 @@ async def _run_golden_p1(
             "request_id": req_id,
             "mode": GOLDEN_P1_MODE,
             "method": GOLDEN_P1_REMOTE_METHOD,
+            # RX9P-H: immutable invocation+request binding + frozen provenance
+            "attention_backend_configured": attention_backend,
+            "attention_backend_resolved": "missing",
+            "sage_runtime_mode_configured": "auto",
+            "sage_runtime_mode_effective_input": _sage_effective_input,
+            "sage_runtime_mode_resolution_source": "auto_resolution" if _sage_effective_input == "auto" else "environment_override",
+            "sage_runtime_mode_resolved": "missing",
             "dispatch_unix_ms": dispatch_unix_ms,
             "dispatch_iso": datetime.fromtimestamp(
                 dispatch_unix_ms / 1000.0, tz=timezone.utc
@@ -11643,6 +11850,29 @@ async def _run_golden_p1(
                 for _i, ident in scan["identities"]:
                     identity.update(ident)
             artifact["identity"] = identity
+            terminal_identity: dict[str, Any] = {}
+            if terminal_event is not None:
+                terminal_data = terminal_event.get("data")
+                if isinstance(terminal_data, dict):
+                    # Keep the terminal document as a runtime evidence source;
+                    # its ordinary ``attention_backend`` remains a request
+                    # selector and is deliberately ignored by the projector.
+                    terminal_identity.update(terminal_data)
+                    for identity_key in ("identity", "golden_identity", "request_identity"):
+                        candidate = terminal_data.get(identity_key)
+                        if isinstance(candidate, dict):
+                            terminal_identity.update(candidate)
+            runtime_identity = dict(identity)
+            runtime_identity.update(terminal_identity)
+            artifact.update(_golden_p1_runtime_provenance(
+                artifact.get("golden_telemetry"),
+                runtime_identity,
+                sage_effective_input=_sage_effective_input,
+                sage_resolution_source=(
+                    "auto_resolution" if _sage_effective_input == "auto"
+                    else "environment_override"
+                ),
+            ))
             cold = _golden_p1_cold_evidence(identity)
             nonce = cold["identity_tokens"].get("post_restore_nonce", "")
             instance_id = cold["identity_tokens"].get("restored_instance_id", "")
@@ -11747,7 +11977,87 @@ async def _run_golden_p1(
             gaps.append(pending_gap)
 
     completed_iso = datetime.now(timezone.utc).isoformat()
+    # RX9P-H: fail closed if any persisted invocation identity mismatches captured.
+    for rec in records:
+        observed_inv = str(rec.get("v2ctl_invocation_id", "") or "").strip()
+        if observed_inv and observed_inv != invocation_id:
+            rec["valid"] = False
+            msg = f"invocation_id_mismatch: captured={invocation_id} observed={observed_inv}"
+            if msg not in rec.get("failures", []):
+                rec.setdefault("failures", []).append(msg)
+        if not observed_inv or not str(rec.get("request_id", "") or "").strip():
+            rec["valid"] = False
+            msg2 = "missing invocation or request identity"
+            if msg2 not in rec.get("failures", []):
+                rec.setdefault("failures", []).append(msg2)
+        if rec.get("attention_backend_resolved") in {"missing", "mixed"} or not rec.get("attention_backend_resolved"):
+            rec["valid"] = False
+            if "attention_backend_resolved_missing" not in rec.get("failures", []):
+                rec.setdefault("failures", []).append("attention_backend_resolved_missing")
+        if rec.get("attention_backend_configured") != rec.get("attention_backend_resolved"):
+            if rec.get("attention_backend_configured") and rec.get("attention_backend_resolved"):
+                rec["valid"] = False
+                msg3 = f"attention_backend_mismatch: configured={rec.get('attention_backend_configured')} resolved={rec.get('attention_backend_resolved')}"
+                if msg3 not in rec.get("failures", []):
+                    rec.setdefault("failures", []).append(msg3)
+        if rec.get("sage_runtime_mode_configured") == "auto" and rec.get("sage_runtime_mode_effective_input") != "auto":
+            if rec.get("sage_runtime_mode_resolution_source") in ("environment_override", "runtime_override"):
+                rec["valid"] = False
+                msg4 = f"sage_effective_input_override: configured=auto effective={rec.get('sage_runtime_mode_effective_input')} source={rec.get('sage_runtime_mode_resolution_source')}"
+                if msg4 not in rec.get("failures", []):
+                    rec.setdefault("failures", []).append(msg4)
+        if rec.get("sage_runtime_mode_resolved") in {"missing", "mixed", "auto"}:
+            rec["valid"] = False
+            sage_failure = (
+                "sage_resolved_is_auto_invalid"
+                if rec.get("sage_runtime_mode_resolved") == "auto"
+                else "sage_runtime_mode_resolved_missing"
+            )
+            if sage_failure not in rec.get("failures", []):
+                rec.setdefault("failures", []).append(sage_failure)
+        if rec.get("sage_runtime_mode_effective_input") == "mixed":
+            rec["valid"] = False
+            if "sage_effective_input_mixed" not in rec.get("failures", []):
+                rec.setdefault("failures", []).append("sage_effective_input_mixed")
+        if rec.get("sage_runtime_mode_resolution_source") == "mixed":
+            rec["valid"] = False
+            if "sage_resolution_source_mixed" not in rec.get("failures", []):
+                rec.setdefault("failures", []).append("sage_resolution_source_mixed")
+
+    provenance_fields = (
+        "attention_backend_configured",
+        "attention_backend_resolved",
+        "sage_runtime_mode_configured",
+        "sage_runtime_mode_effective_input",
+        "sage_runtime_mode_resolution_source",
+        "sage_runtime_mode_resolved",
+    )
+    provenance = {
+        field: _golden_p1_consensus(records, field, "missing")
+        for field in provenance_fields
+    }
+    provenance_failures = [
+        f"{field}_mixed_across_attempts"
+        for field, value in provenance.items()
+        if value == "mixed"
+    ]
+    if provenance_failures:
+        for rec in records:
+            rec["valid"] = False
+            for failure in provenance_failures:
+                if failure not in rec.setdefault("failures", []):
+                    rec["failures"].append(failure)
+
+    # Persist final validity/provenance decisions.  The first attempt write is
+    # intentionally early for crash visibility; this second write prevents a
+    # later fail-closed identity/provenance decision from existing only in RAM.
+    for rec in records:
+        (cohort_dir / f"attempt_{rec['run_index']}.json").write_text(
+            json.dumps(rec, default=str, indent=2), encoding="utf-8"
+        )
     valid_records = [r for r in records if r["valid"]]
+    # RX9P-H: immutable pair — never re-read env, never rewrite observed.
+    # Summary and manifest use the single captured invocation_id authority.
     summary: dict[str, Any] = {
         "mode": GOLDEN_P1_MODE,
         "method": GOLDEN_P1_REMOTE_METHOD,
@@ -11756,7 +12066,18 @@ async def _run_golden_p1(
         "profile_config_fingerprint": os.environ.get(
             "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT", ""
         ),
-        "v2ctl_invocation_id": os.environ.get("COMFYMODAL_V2CTL_INVOCATION_ID", ""),
+        "v2ctl_invocation_id": invocation_id,
+        # RX9P-H attention backend provenance — configured from control-plane,
+        # resolved from runtime evidence (never copied).
+        "attention_backend_configured": provenance["attention_backend_configured"],
+        "attention_backend_resolved": provenance["attention_backend_resolved"],
+        # RX9P-H Sage 4-field identity — truthful instrumentation.
+        "sage_runtime_mode_configured": provenance["sage_runtime_mode_configured"],
+        "sage_runtime_mode_effective_input": provenance["sage_runtime_mode_effective_input"],
+        "sage_runtime_mode_resolution_source": provenance["sage_runtime_mode_resolution_source"],
+        "sage_runtime_mode_resolved": provenance["sage_runtime_mode_resolved"],
+        "provenance_consistent": not provenance_failures,
+        "provenance_failures": provenance_failures,
         "deployment_identity": deployed,
         "capture_guard_path": str(guard_path),
         "capture_guard": capture_guard.snapshot(),
@@ -11785,8 +12106,15 @@ async def _run_golden_p1(
         "cohort_dir": str(cohort_dir),
         "attempts": [{
             "run_index": r["run_index"],
-            "v2ctl_invocation_id": r.get("v2ctl_invocation_id", invocation_id),
+            "v2ctl_invocation_id": invocation_id,
             "request_id": r["request_id"],
+            # RX9P-H: immutable pair + provenance propagated to summary index
+            "attention_backend_configured": r.get("attention_backend_configured", "missing"),
+            "attention_backend_resolved": r.get("attention_backend_resolved", "missing"),
+            "sage_runtime_mode_configured": r.get("sage_runtime_mode_configured", "missing"),
+            "sage_runtime_mode_effective_input": r.get("sage_runtime_mode_effective_input", "missing"),
+            "sage_runtime_mode_resolution_source": r.get("sage_runtime_mode_resolution_source", "missing"),
+            "sage_runtime_mode_resolved": r.get("sage_runtime_mode_resolved", "missing"),
             "dispatch_unix_ms": r["dispatch_unix_ms"],
             "duration_ms": r["duration_ms"],
             "event_count": r["event_count"],

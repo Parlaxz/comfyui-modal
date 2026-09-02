@@ -239,17 +239,28 @@ def _experiment_identity(
     run_fp: str,
     result: Any | None = None,
 ) -> dict[str, Any]:
+    from .experiment_evidence import sage_runtime_identity as _sage_id
     identity = dict(record.experiment_identity if record is not None else {})
+    # RX9P-H: include full Sage 4-field and attention provenance in frozen identity.
+    sage_id = _sage_id(config, identity)
+    attention_configured = resolved_attention_backend(config)
+    attention_resolved = attention_configured  # control-plane expectation; runtime must prove same
     identity.update({
         "profile": str(getattr(config, "profile_name", "") or ""),
         "deploy_fingerprint": deploy_fp,
         "run_fingerprint": run_fp,
         "configured_sage_runtime_mode": configured_sage_runtime_mode(config),
         "resolved_sage_runtime_mode": resolved_sage_runtime_mode(identity),
+        "sage_runtime_mode_configured": sage_id.get("sage_runtime_mode_configured", ""),
+        "sage_runtime_mode_effective_input": sage_id.get("sage_runtime_mode_effective_input", ""),
+        "sage_runtime_mode_resolution_source": sage_id.get("sage_runtime_mode_resolution_source", ""),
+        "sage_runtime_mode_resolved": sage_id.get("sage_runtime_mode_resolved", ""),
         "attention_backend": str(
             (record.attention_backend if record is not None else "")
             or resolved_attention_backend(config)
         ),
+        "attention_backend_configured": attention_configured,
+        "attention_backend_resolved": attention_resolved,
     })
     if record is not None:
         identity.setdefault("v2ctl_invocation_id", record.v2ctl_invocation_id)

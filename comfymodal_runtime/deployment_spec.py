@@ -34,6 +34,7 @@ from .publication_policy import (
     iter_syncable_custom_node_dirs,
     iter_source_files,
 )
+from .sage_policy import SAGE_RUNTIME_BASELINE
 
 
 # This is the final, source/runtime-only environment boundary.  Keep the
@@ -48,7 +49,7 @@ _V2_STATIC_RUNTIME_ENV: dict[str, str] = {
     "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
     "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
     "COMFYMODAL_WARMUP_TEXT": "warmup",
-    "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+    "COMFYMODAL_SAGE_RUNTIME_MODE": SAGE_RUNTIME_BASELINE,
     "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
     "COMFYMODAL_PRELOAD_MODE": "clip_only",
     "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",

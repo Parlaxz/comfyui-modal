@@ -26,6 +26,18 @@ from comfymodal_runtime.contracts import (
     stable_hash,
 )
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.sage_policy import (
+    SAGE_RUNTIME_BASELINE,
+    build_sage_runtime_identity as _sage_policy_build_identity,
+    choose_sage_runtime_mode as _sage_policy_choose_mode,
+    list_sageattention_extension_files as _sage_policy_list_extensions,
+    production_baseline_value,
+    resolve_sage_probe_on_restore,
+    resolve_sage_runtime_mode,
+    sage_runtime_cache_usable as _sage_policy_cache_usable,
+    sage_runtime_identity_matches as _sage_policy_identity_matches,
+    select_public_sageattention_callable as _sage_policy_select_callable,
+)
 from comfymodal_runtime.deployment_spec import (
     build_v2_late_config,
 )
@@ -1484,7 +1496,30 @@ DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_DIRECT_WARMUP_REQUIRE
 #   auto           GÃ‡Ã¶ (default) probe and select automatically
 #   baked_cuda     GÃ‡Ã¶ skip probing, assume Blackwell baked CUDA path
 #   triton_fallback GÃ‡Ã¶ skip probing, force Triton fallback
-SAGE_RUNTIME_MODE = os.getenv("COMFYMODAL_SAGE_RUNTIME_MODE", "auto").strip().lower()
+_SAGE_RUNTIME_MODE_CONFIGURED = os.getenv(
+    "COMFYMODAL_SAGE_RUNTIME_MODE", "auto"
+).strip().lower()
+
+
+def _golden_sage_runtime_enabled() -> bool:
+    return (
+        os.getenv("COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+        or os.getenv("COMFYMODAL_V2CTL_PROFILE", "").strip().lower() == "golden_p1"
+    )
+
+
+_SAGE_GOLDEN_DEPLOYMENT = _golden_sage_runtime_enabled()
+# The image's baked_cuda default is retained for production, but must not win
+# over golden_p1's auto policy when the module is imported before late_config
+# can replace the image environment.
+SAGE_RUNTIME_MODE = (
+    "auto"
+    if _SAGE_GOLDEN_DEPLOYMENT and _SAGE_RUNTIME_MODE_CONFIGURED == "baked_cuda"
+    else _SAGE_RUNTIME_MODE_CONFIGURED
+)
 
 # P3 GÃ‡Ã¶ Restore direct CLIP policy.
 #   auto           GÃ‡Ã¶ (default) load_and_encode unless CLIP already cached or no CLIP in profile
@@ -3586,6 +3621,9 @@ def _resolve_runtime_flag(name: str, default: str) -> bool:
     2. Env var ``COMFYMODAL_{name}``.
     3. ``default`` string (``"0"`` or ``"1"``).
     """
+    baseline = production_baseline_value(f"COMFYMODAL_{name}")
+    if baseline is not None:
+        return baseline == "1"
     path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
     try:
         if os.path.isfile(path):
@@ -3596,6 +3634,11 @@ def _resolve_runtime_flag(name: str, default: str) -> bool:
         pass
     env = os.environ.get(f"COMFYMODAL_{name}", default)
     return env == "1"
+
+
+def _resolve_production_baseline_flag(name: str) -> str | None:
+    """Return the immutable deployment baseline for a named control."""
+    return production_baseline_value(name)
 
 
 def _resolve_runtime_string(name: str, default: str, allowed: set[str] | tuple[str, ...] | None = None) -> str:
@@ -3644,16 +3687,33 @@ def _resolve_sage_runtime_env_override() -> str:
     Priority:
     1. File ``runtime_config/sage_runtime_mode.txt``.
     2. Module-level ``SAGE_RUNTIME_MODE`` (from env var ``COMFYMODAL_SAGE_RUNTIME_MODE``).
+
+    The production baseline is authoritative over stale runtime-config files.
+    Golden deployments deliberately protect their ``auto`` policy from the
+    production image default and from a stale baked_cuda runtime file; the
+    stale file remains visible in provenance through the warning below.
     """
     path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_mode.txt")
+    env_mode = os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", _SAGE_RUNTIME_MODE_CONFIGURED)
+    golden_deployment = _golden_sage_runtime_enabled()
+    file_mode = None
     try:
         if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v in ("auto", "baked_cuda", "triton_fallback"):
-                return v
+            file_mode = open(path).read().strip().lower()
     except Exception:
         pass
-    return SAGE_RUNTIME_MODE
+    resolved, reason, effective_input, resolution_source = resolve_sage_runtime_mode(
+        file_value=file_mode,
+        env_value=env_mode,
+        baseline_value=None if golden_deployment else SAGE_RUNTIME_BASELINE,
+        golden_flag=golden_deployment,
+    )
+    if resolution_source == "golden_env" and file_mode:
+        print(
+            "[comfyapp] stale_file_override_detected "
+            f"path={path} file={file_mode} env={env_mode} effective={effective_input}"
+        )
+    return resolved
 
 
 def _resolve_sage_probe_on_restore() -> bool:
@@ -3664,14 +3724,19 @@ def _resolve_sage_probe_on_restore() -> bool:
     2. Module-level ``SAGE_RUNTIME_PROBE_ON_RESTORE``.
     """
     path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_probe.txt")
+    file_value = None
     try:
         if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v in ("0", "1"):
-                return v == "1"
+            file_value = open(path).read().strip().lower()
     except Exception:
         pass
-    return SAGE_RUNTIME_PROBE_ON_RESTORE
+    resolved, _, _, _ = resolve_sage_probe_on_restore(
+        file_value=file_value,
+        env_value="1" if SAGE_RUNTIME_PROBE_ON_RESTORE else "0",
+        baseline_value="0",
+        golden_flag=_golden_sage_runtime_enabled(),
+    )
+    return resolved
 
 
 def _resolve_preload_mode() -> str:
@@ -3681,6 +3746,9 @@ def _resolve_preload_mode() -> str:
     1. File on the model volume (set by ``set_preload_mode``).
     2. Module-level env-var default (``PRELOAD_MODE``).
     """
+    baseline = production_baseline_value("COMFYMODAL_PRELOAD_MODE")
+    if baseline is not None:
+        return baseline
     try:
         if os.path.isfile(PRELOAD_MODE_PATH):
             _v = open(PRELOAD_MODE_PATH).read().strip().lower()
@@ -6698,6 +6766,16 @@ def choose_sage_runtime_mode(enabled: bool, extension_files: list[Path], import_
     if not smoke_ok:
         return "triton_fallback", "smoke-test-failed"
     return "baked_cuda", "compiled-extensions-usable"
+
+
+# Compatibility exports remain available to the runtime and older callers,
+# but the dependency-free module above is the canonical implementation.
+list_sageattention_extension_files = _sage_policy_list_extensions
+build_sage_runtime_identity = _sage_policy_build_identity
+sage_runtime_identity_matches = _sage_policy_identity_matches
+sage_runtime_cache_usable = _sage_policy_cache_usable
+select_public_sageattention_callable = _sage_policy_select_callable
+choose_sage_runtime_mode = _sage_policy_choose_mode
 
 
 def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool, *, strict: bool = False) -> bool:

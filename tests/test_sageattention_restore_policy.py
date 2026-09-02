@@ -1,12 +1,12 @@
 import unittest
+import pytest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from comfyapp import (
+from comfymodal_runtime.sage_policy import (
     build_sage_runtime_identity,
     choose_sage_runtime_mode,
     list_sageattention_extension_files,
-    patch_kjnodes_get_sage_func,
     sage_runtime_cache_usable,
     sage_runtime_identity_matches,
     select_public_sageattention_callable,
@@ -114,7 +114,9 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
         self.assertEqual(mode, "baked_cuda")
         self.assertEqual(reason, "compiled-extensions-usable")
 
+    @pytest.mark.heavy_local
     def test_patch_kjnodes_get_sage_func_uses_attention_pytorch_when_baked_cuda_unavailable(self):
+        from comfyapp import patch_kjnodes_get_sage_func
         class FakeModule:
             def __init__(self):
                 self.attention_pytorch = lambda q, k, v, heads, **kwargs: "pytorch"
@@ -137,7 +139,9 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
         result = module.get_sage_func("sageattn_qk_int8_pv_fp16_cuda")(q, k, v, heads=8)
         self.assertEqual(result, "pytorch")
 
+    @pytest.mark.heavy_local
     def test_patch_kjnodes_get_sage_func_preserves_explicit_pytorch_selection(self):
+        from comfyapp import patch_kjnodes_get_sage_func
         calls = []
 
         class FakeModule:
@@ -156,7 +160,9 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
         self.assertEqual(selected(None, None, None, heads=8), "explicit-pytorch")
         self.assertEqual(calls, [("pytorch", False)])
 
+    @pytest.mark.heavy_local
     def test_patch_kjnodes_rejects_fallback_in_strict_mode(self):
+        from comfyapp import patch_kjnodes_get_sage_func
         class FakeModule:
             attention_pytorch = lambda *args, **kwargs: "pytorch"
             wrap_attn = staticmethod(lambda fn: fn)
