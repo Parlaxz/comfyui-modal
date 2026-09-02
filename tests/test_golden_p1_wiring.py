@@ -58,6 +58,7 @@ def test_golden_and_production_sage_runtime_modes_are_explicit_and_distinct():
 
 def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path):
     config = _config("golden_p1")
+    # configured is auto (policy), resolved must be observed (not auto); use triton_fallback as valid execution
     result = backend_mod.BackendResult(
         exit_code=0,
         stdout="",
@@ -68,7 +69,7 @@ def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path)
         elapsed_seconds=0.0,
         artifacts=backend_mod.ArtifactSet(
             experiment_identity={
-                "resolved_sage_runtime_mode": "auto",
+                "sage_mode": "triton_fallback",
             },
         ),
     )
@@ -77,9 +78,31 @@ def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path)
     )
     manifest = json.loads(path.read_text(encoding="utf-8"))
     assert manifest["configured_sage_runtime_mode"] == "auto"
-    assert manifest["resolved_sage_runtime_mode"] == "auto"
+    assert manifest["resolved_sage_runtime_mode"] == "triton_fallback"
     assert manifest["experiment_identity"]["configured_sage_runtime_mode"] == "auto"
-    assert manifest["experiment_identity"]["resolved_sage_runtime_mode"] == "auto"
+    assert manifest["experiment_identity"]["resolved_sage_runtime_mode"] == "triton_fallback"
+    # resolved must never be auto for completed execution
+    assert manifest["resolved_sage_runtime_mode"] != "auto"
+
+    # when no runtime observation is present, resolved is missing/unknown (not auto)
+    empty_result = backend_mod.BackendResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        command="golden",
+        started_at="",
+        ended_at="",
+        elapsed_seconds=0.0,
+        artifacts=backend_mod.ArtifactSet(
+            experiment_identity={},
+        ),
+    )
+    empty_path = cli.write_run_manifest(
+        tmp_path, config, cli.build_components(ROOT, "golden_p1")[4], {}, empty_result, None,
+    )
+    empty_manifest = json.loads(empty_path.read_text(encoding="utf-8"))
+    assert empty_manifest["configured_sage_runtime_mode"] == "auto"
+    assert empty_manifest["resolved_sage_runtime_mode"] == ""
 
 
 def test_set_resolution_normalizes_bool_and_carries_provenance():

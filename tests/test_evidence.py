@@ -74,23 +74,42 @@ def test_evidence_indexes_every_cohort_and_declares_incomplete(tmp_path: Path):
 
 
 def test_evidence_identity_records_configured_and_resolved_sage_modes(tmp_path: Path):
+    # 1. configured auto, no runtime observation -> resolved missing/unknown, NOT auto
+    assert resolved_sage_runtime_mode({"sage_env_mode": "auto"}) == ""
+    assert resolved_sage_runtime_mode({"configured_sage_runtime_mode": "auto"}) == ""
+    assert resolved_sage_runtime_mode({"sage_runtime_mode": "auto"}) == ""
+    assert resolved_sage_runtime_mode({"COMFYMODAL_SAGE_RUNTIME_MODE": "auto"}) == ""
+    # 2-3. configured auto + observed
     assert resolved_sage_runtime_mode({"sage_env_mode": "auto", "sage_mode": "triton_fallback"}) == "triton_fallback"
+    assert resolved_sage_runtime_mode({"sage_mode": "baked_cuda"}) == "baked_cuda"
+    # 4. two observations both triton_fallback -> triton_fallback
+    assert resolved_sage_runtime_mode({"sage_mode": "triton_fallback"}, {"resolved_sage_runtime_mode": "triton_fallback"}) == "triton_fallback"
+    # 5. observed triton_fallback + observed baked_cuda -> mixed
+    assert resolved_sage_runtime_mode({"sage_mode": "triton_fallback"}, {"sage_mode": "baked_cuda"}) == "mixed"
+    # 6. policy auto + observed triton_fallback -> NOT mixed
+    assert resolved_sage_runtime_mode({"sage_runtime_mode": "auto", "sage_env_mode": "auto", "sage_mode": "triton_fallback"}) == "triton_fallback"
+    assert resolved_sage_runtime_mode({"configured_sage_runtime_mode": "auto"}, {"sage_mode": "triton_fallback"}) == "triton_fallback"
+
+    # Persisted identity should store configured auto but resolved as observed (triton_fallback), not auto
     result = finalize_experiment_evidence(
         tmp_path,
         identity={
             "profile": "golden_p1",
             "v2ctl_invocation_id": "inv-sage",
             "configured_sage_runtime_mode": "auto",
-            "resolved_sage_runtime_mode": "auto",
+            "resolved_sage_runtime_mode": "triton_fallback",
         },
         verdict="ACCEPT",
     )
     index = json.loads((result.bundle_dir / "evidence_index.json").read_text(encoding="utf-8"))
     assert index["identity"]["configured_sage_runtime_mode"] == "auto"
-    assert index["identity"]["resolved_sage_runtime_mode"] == "auto"
+    assert index["identity"]["resolved_sage_runtime_mode"] == "triton_fallback"
     text = result.markdown_path.read_text(encoding="utf-8")
     assert "configured_sage_runtime_mode" in text
     assert "resolved_sage_runtime_mode" in text
+
+    # completed real execution must not have resolved == auto
+    assert resolved_sage_runtime_mode({"resolved_sage_runtime_mode": "auto"}) == ""
 
 
 def test_large_attempt_events_keep_integrity_metadata_without_embedding(tmp_path: Path):

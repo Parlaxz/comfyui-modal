@@ -97,20 +97,24 @@ def configured_sage_runtime_mode(config: Any) -> str:
 def resolved_sage_runtime_mode(*sources: Any) -> str:
     """Read the actual Sage mode from existing runtime evidence.
 
-    ``sage_mode`` is the runtime selector's result; ``sage_env_mode`` is the
-    configured input and is intentionally not treated as the resolved mode.
+    ``sage_mode`` and ``resolved_sage_runtime_mode`` are observed results;
+    ``sage_env_mode``, ``configured_sage_runtime_mode``, ``sage_runtime_mode``
+    when carrying ``auto``, and ``COMFYMODAL_SAGE_RUNTIME_MODE`` are configured
+    policy and must not be treated as observed execution. ``auto`` is never an
+    executed backend — it is treated as missing/unknown.
     This helper only projects existing evidence and does not choose a policy.
     """
+    _RESOLVED_OBSERVED_MODES = {"baked_cuda", "triton_fallback"}
     values: list[str] = []
 
     def visit(value: Any) -> None:
         if isinstance(value, Mapping):
             for key, item in value.items():
                 if str(key).lower() in {
-                    "resolved_sage_runtime_mode", "sage_runtime_mode", "sage_mode",
+                    "resolved_sage_runtime_mode", "sage_mode",
                 } and item not in (None, ""):
                     text = str(item).strip().lower()
-                    if text in _SAGE_RUNTIME_MODES and text not in values:
+                    if text in _RESOLVED_OBSERVED_MODES and text not in values:
                         values.append(text)
                 visit(item)
         elif isinstance(value, (list, tuple)):
