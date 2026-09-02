@@ -375,9 +375,9 @@ class TestMountCollisionRegression(unittest.TestCase):
         )
 
     def test_COMFYAPP_VERSION_bumped(self):
-        """COMFYAPP_VERSION must be 2.16.27."""
+        """COMFYAPP_VERSION must match the current comfyapp source."""
         self.assertIn(
-            'COMFYAPP_VERSION = "2.16.27"',
+            'COMFYAPP_VERSION = "2.16.31"',
             self.source,
         )
 

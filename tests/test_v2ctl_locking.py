@@ -181,6 +181,101 @@ class TestStaleDetection:
         assert make_lock(lock_path, now).is_stale() is False
 
 
+class TestAutomaticRecovery:
+    def test_same_owner_dead_pid_recovers_and_records_proof(self, lock_path, now, caplog, monkeypatch):
+        write_lock(lock_path, owner="e29", pid=424242, timestamp=now.isoformat(), target="old-target")
+        lock = make_lock(lock_path, now)
+        monkeypatch.setattr(lock, "_pid_alive", lambda pid: False)
+
+        with caplog.at_level("WARNING", logger="v2ctl.locking"):
+            payload = lock.acquire(owner="e29", target="new-target", profile="p", auto_recover=True)
+
+        assert payload["owner"] == "e29"
+        assert payload["target"] == "new-target"
+        assert lock.status() == payload
+        recovery = lock.last_recovery
+        assert recovery is not None
+        assert recovery.owner == "e29"
+        assert recovery.pid == 424242
+        assert recovery.host == DeployLock.host_id()
+        assert recovery.target == "old-target"
+        assert recovery.acquisition_timestamp == now.isoformat()
+        assert recovery.proof_pid_dead is True
+        assert recovery.action == "replace_stale_lock"
+        assert "automatic deploy lock recovery" in caplog.text
+        assert "proof_pid_dead=True" in caplog.text
+
+    @pytest.mark.parametrize("mutation", ["change", "delete"])
+    def test_auto_recovery_does_not_overwrite_or_resurrect_after_validation(
+        self, lock_path, now, monkeypatch, mutation
+    ):
+        write_lock(lock_path, owner="e29", pid=424242, timestamp=now.isoformat(), target="old-target")
+        lock = make_lock(lock_path, now)
+        monkeypatch.setattr(lock, "_pid_alive", lambda pid: False)
+        original_replace = lock._atomic_replace
+
+        def mutate_then_replace(body, *, expected):
+            if mutation == "change":
+                write_lock(
+                    lock_path,
+                    owner="new-owner",
+                    pid=os.getpid(),
+                    timestamp=now.isoformat(),
+                    target="new-owner-target",
+                )
+            else:
+                lock_path.unlink()
+            return original_replace(body, expected=expected)
+
+        monkeypatch.setattr(lock, "_atomic_replace", mutate_then_replace)
+
+        with pytest.raises((LockHeldError, LockStaleError)):
+            lock.acquire(owner="e29", target="replacement", profile="p", auto_recover=True)
+
+        if mutation == "change":
+            status = lock.status()
+            assert status is not None
+            assert status["owner"] == "new-owner"
+        else:
+            assert not lock_path.exists()
+        assert lock.last_recovery is None
+
+    @pytest.mark.parametrize(
+        "overrides, probe_alive",
+        [
+            ({"owner": "other"}, False),
+            ({"pid": os.getpid()}, True),
+            ({"host": "other-host"}, False),
+            ({"timestamp": "not-a-timestamp"}, False),
+        ],
+        ids=["foreign-owner", "live-pid", "different-host", "ambiguous-timestamp"],
+    )
+    def test_auto_recovery_rejects_unproven_lock(self, lock_path, now, monkeypatch, overrides, probe_alive):
+        values = {"owner": "e29", "pid": 424242, "timestamp": now.isoformat()}
+        values.update(overrides)
+        write_lock(lock_path, target="target", **values)
+        before = lock_path.read_text(encoding="utf-8")
+        lock = make_lock(lock_path, now)
+        monkeypatch.setattr(lock, "_pid_alive", lambda pid: probe_alive)
+
+        with pytest.raises((LockHeldError, LockStaleError)):
+            lock.acquire(owner="e29", target="new-target", profile="p", auto_recover=True)
+
+        assert lock_path.read_text(encoding="utf-8") == before
+        assert lock.last_recovery is None
+
+    def test_auto_recovery_rejects_malformed_lock(self, lock_path, now):
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({"schema_version": 1, "owner": "e29"}), encoding="utf-8")
+        lock = make_lock(lock_path, now)
+
+        with pytest.raises(LockHeldError):
+            lock.acquire(owner="e29", target="t", profile="p", auto_recover=True)
+
+        assert lock.status() == {"schema_version": 1, "owner": "e29"}
+        assert lock.last_recovery is None
+
+
 class TestIdentity:
     def test_host_id_nonempty(self):
         assert DeployLock.host_id()

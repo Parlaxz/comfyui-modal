@@ -14,6 +14,11 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
 
+try:
+    from .e27_source_mechanism import ActualSourceTelemetry
+except ImportError:  # The existing focused tests load this file directly.
+    from comfymodal_runtime.e27_source_mechanism import ActualSourceTelemetry
+
 
 TRANSPORT_ENV = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
 LEGACY_ARM = "legacy"
@@ -659,6 +664,7 @@ class _Telemetry:
     late_submission_unresolved_count: int | None = None
     event_cancel_count: int | None = None
     completion_classification: str = "normal"
+    actual_source: ActualSourceTelemetry | None = None
     _lock: threading.Lock | None = field(default=None, repr=False)
     _correctness_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -825,6 +831,9 @@ class _Telemetry:
                 sum(self.h2d_latencies_ns) / len(self.h2d_latencies_ns)
                 if self.h2d_latencies_ns else None
             )
+            actual_source_report = (
+                self.actual_source.to_dict() if self.actual_source is not None else None
+            )
             return {
                 "timing_scope": {
                     "total_entry_to_return_wall_ms": "TOTAL",
@@ -927,6 +936,44 @@ class _Telemetry:
                 "late_submission_unresolved_count": self.late_submission_unresolved_count,
                 "event_cancel_count": self.event_cancel_count,
                 "completion_classification": self.completion_classification,
+                "actual_source": actual_source_report,
+                "actual_source_telemetry": actual_source_report,
+                "source_syscall_events": (
+                    actual_source_report.get("actual_source_events")
+                    if actual_source_report is not None else None
+                ),
+                "source_actual_transitions": (
+                    actual_source_report.get("actual_source_transitions")
+                    if actual_source_report is not None else None
+                ),
+                "SOURCE_TOTAL_WALL_MS": (
+                    actual_source_report.get("SOURCE_TOTAL_WALL_MS")
+                    if actual_source_report is not None else None
+                ),
+                "SOURCE_SYSCALL_UNION_BUSY_MS": (
+                    actual_source_report.get("SOURCE_SYSCALL_UNION_BUSY_MS")
+                    if actual_source_report is not None else None
+                ),
+                "H2D_TOTAL_WALL_MS": (
+                    actual_source_report.get("H2D_TOTAL_WALL_MS")
+                    if actual_source_report is not None else None
+                ),
+                "SOURCE_TO_GPU_READY_MS": (
+                    actual_source_report.get("SOURCE_TO_GPU_READY_MS")
+                    if actual_source_report is not None else None
+                ),
+                "SOURCE_H2D_OVERLAP_MS": (
+                    actual_source_report.get("SOURCE_H2D_OVERLAP_MS")
+                    if actual_source_report is not None else None
+                ),
+                "POST_SOURCE_H2D_TAIL_MS": (
+                    actual_source_report.get("POST_SOURCE_H2D_TAIL_MS")
+                    if actual_source_report is not None else None
+                ),
+                "quiescence_evidence": (
+                    actual_source_report.get("quiescence_evidence")
+                    if actual_source_report is not None else None
+                ),
             }
 
 
@@ -995,6 +1042,7 @@ class TransportDispatcher:
         self._late_submissions: dict[int, tuple[StageLease, ReadyRecord, Any, int | None]] = {}
         self._unresolved_late_submission_keys: set[int] = set()
         self._in_flight: dict[int, tuple[StageLease, ReadyRecord, Any, int | None]] = {}
+        self._actual_h2d_tokens: dict[int, int] = {}
         self._completed_records: list[ReadyRecord] = []
         self._dispatcher_error: BaseException | None = None
         self._cleanup_errors: list[BaseException] = []
@@ -1092,6 +1140,11 @@ class TransportDispatcher:
             self._stop = True
             self._queue_condition.notify_all()
 
+    def _record_h2d_complete(self, key: int) -> None:
+        token = self._actual_h2d_tokens.pop(key, None)
+        if token is not None and self.telemetry.actual_source is not None:
+            self.telemetry.actual_source.record_h2d_complete(token)
+
     def _poll(self) -> None:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         with self._queue_condition:
@@ -1130,6 +1183,7 @@ class TransportDispatcher:
                     # cleanup race cannot make telemetry claim it did not.
                     self.telemetry.h2d_completed_bytes += record.nbytes
                     self.telemetry.h2d_completed_count += 1
+                    self._record_h2d_complete(key)
                     self.pool._return_completed(lease)
                     with self._queue_condition:
                         self._completed_records.append(record)
@@ -1213,6 +1267,7 @@ class TransportDispatcher:
                     try:
                         self.telemetry.h2d_completed_bytes += record.nbytes
                         self.telemetry.h2d_completed_count += 1
+                        self._record_h2d_complete(key)
                         if not lease._returned:
                             self.pool._return_completed(lease)
                         with self._queue_condition:
@@ -1309,6 +1364,15 @@ class TransportDispatcher:
                     with self._lease_cleanup_lock:
                         self.pool._mark_in_flight(lease)
                         source = self.pool._buffer_for_dispatch(lease, record.nbytes)
+                    submit_ns = time.monotonic_ns()
+                    actual_h2d_token = None
+                    if self.telemetry.actual_source is not None:
+                        # This is deliberately before submit_h2d: the core
+                        # telemetry timestamp represents entry to the backend
+                        # operation, not the point at which it returns.
+                        actual_h2d_token = self.telemetry.actual_source.record_h2d_submit(
+                            record.nbytes, timestamp_ns=submit_ns
+                        )
                     event = self.backend.submit_h2d(source, record.destination_offset)
                     if event is None:
                         raise TransportError("backend returned no completion event")
@@ -1317,6 +1381,12 @@ class TransportDispatcher:
                     # under-report a real submission.
                     self.telemetry.h2d_submitted_bytes += record.nbytes
                     self.telemetry.h2d_submitted_count += 1
+                    if actual_h2d_token is not None:
+                        # Do not associate the token until a completion event
+                        # exists.  A failed/no-event submit remains incomplete
+                        # in the core telemetry and can never be reported as a
+                        # completed H2D.
+                        self._actual_h2d_tokens[lease.slot_index] = actual_h2d_token
                 except BaseException as exc:
                     if self._cancelled:
                         self._cleanup_cancelled(self._cleanup_deadline)
@@ -1334,7 +1404,7 @@ class TransportDispatcher:
                             self._handoff.pop(lease.slot_index, None)
                             self._in_flight[lease.slot_index] = (
                                 lease, record, event,
-                                time.monotonic_ns() if self.telemetry.diagnostics_enabled else None,
+                                submit_ns if self.telemetry.diagnostics_enabled else None,
                             )
                             registration_error = None
                         elif uncertain is item and self._cancelled:
@@ -1343,7 +1413,7 @@ class TransportDispatcher:
                             # first-class event, not an ignorable late return.
                             self._late_submissions[lease.slot_index] = (
                                 lease, record, event,
-                                time.monotonic_ns() if self.telemetry.diagnostics_enabled else None,
+                                submit_ns if self.telemetry.diagnostics_enabled else None,
                             )
                             if self.telemetry.diagnostics_enabled:
                                 assert self.telemetry.late_submission_count is not None
@@ -1737,7 +1807,7 @@ class GoldenQDTransport:
         return self._static_e27_work(source_ranges, self.config.block_bytes)
 
     @staticmethod
-    def _read_exact(reader: Callable[[int, int], bytes], item: SourceRange, retries: int, telemetry: _Telemetry) -> bytes:
+    def _read_exact(reader: Callable[[int, int], bytes], item: SourceRange, retries: int, telemetry: _Telemetry, producer_id: int = 0) -> bytes:
         pieces: list[bytes] = []
         offset = item.source_offset
         remaining = item.length
@@ -1745,7 +1815,13 @@ class GoldenQDTransport:
         while remaining:
             if attempts > retries:
                 raise ReconciliationError(f"short read for source range {item.source_offset}:{item.length}")
-            chunk = reader(offset, remaining)
+            if telemetry.actual_source is not None:
+                chunk = telemetry.actual_source.read(
+                    reader, offset, remaining, producer_id=producer_id,
+                    retry_number=attempts, destination_offset=item.target_offset + (offset - item.source_offset),
+                )
+            else:
+                chunk = reader(offset, remaining)
             duplicate = attempts > 0
             attempts += 1
             if not isinstance(chunk, (bytes, bytearray, memoryview)):
@@ -1782,7 +1858,18 @@ class GoldenQDTransport:
             # Do not catch TypeError here: it may be raised after a reader has
             # already touched the target. Retrying through another API would
             # turn one physical source read into an unaccounted duplicate.
-            count = reader.readinto(view, offset, producer_id)
+            bound_actual_source = getattr(reader, "actual_source_telemetry", None)
+            handles_actual_source = getattr(reader, "handles_actual_source_telemetry", False) is True
+            if handles_actual_source and bound_actual_source is not None:
+                count = reader.readinto(view, offset, producer_id)
+            elif telemetry.actual_source is not None:
+                count = telemetry.actual_source.readinto(
+                    reader, view, offset, item.length - total, producer_id=producer_id,
+                    retry_number=attempts,
+                    destination_offset=item.target_offset + total,
+                )
+            else:
+                count = reader.readinto(view, offset, producer_id)
             if not isinstance(count, int) or isinstance(count, bool):
                 raise ReconciliationError("source readinto must return an integer byte count")
             if count < 0 or count > item.length - total:
@@ -1834,6 +1921,94 @@ class GoldenQDTransport:
                 if self._reader_handles.get(handle_id) is handle:
                     self._reader_handles.pop(handle_id, None)
         return errors
+
+    def _persist_actual_source_quiescence(self, phase: str) -> dict[str, Any] | None:
+        """Persist one honest lifecycle checkpoint in the core telemetry."""
+        actual_source = self.telemetry.actual_source
+        if actual_source is None:
+            return None
+
+        with self._active_lock:
+            live_workers = self._active_producers
+        with self._reader_lock:
+            open_readers = len(self._reader_handles)
+
+        queue_blocks = handoff_blocks = event_count = 0
+        dispatcher_live = False
+        unresolved_late = False
+        if self.dispatcher is not None:
+            dispatcher_live = bool(
+                self.dispatcher._thread is not None and self.dispatcher._thread.is_alive()
+            )
+            with self.dispatcher._queue_condition:
+                queue_blocks = len(self.dispatcher._queue)
+                handoff_blocks = len(self.dispatcher._handoff) + len(self.dispatcher._uncertain_handoffs)
+                event_count = len(self.dispatcher._in_flight) + len(self.dispatcher._late_submissions)
+                unresolved_late = bool(self.dispatcher._unresolved_late_submission_keys)
+
+        actual_h2d_inflight = 0
+        raw_h2d = getattr(actual_source, "_h2d", None)
+        if isinstance(raw_h2d, Mapping):
+            actual_h2d_inflight = sum(
+                getattr(item, "complete_ns", None) is None for item in raw_h2d.values()
+            )
+        h2d_inflight = max(event_count, actual_h2d_inflight)
+        slot_states = self.pool.states()
+        ownership_quiescent = not (
+            open_readers or dispatcher_live or queue_blocks or handoff_blocks or h2d_inflight
+            or unresolved_late
+            or any(state in (SlotState.FILLING, SlotState.READY, SlotState.IN_FLIGHT) for state in slot_states)
+        )
+        source_fallback = getattr(actual_source, "fallback", 0)
+        fallback = max(
+            self.telemetry.fallback_count,
+            source_fallback if isinstance(source_fallback, int) and not isinstance(source_fallback, bool) else 0,
+        )
+        source_poison = getattr(actual_source, "poison", 0)
+        poison = max(
+            1 if self.pool.poisoned else 0,
+            source_poison if isinstance(source_poison, int) and not isinstance(source_poison, bool) else 0,
+        )
+        actual_source.fallback = fallback
+        actual_source.poison = poison
+        evidence = {
+            "checkpoint": phase,
+            "phase": phase,
+            "live_source_workers": live_workers,
+            "live_source_readers": open_readers,
+            "live_dispatcher": int(dispatcher_live),
+            "live_slots": sum(state in (SlotState.FILLING, SlotState.READY, SlotState.IN_FLIGHT) for state in slot_states),
+            "actual_syscalls_in_flight": actual_source.actual_inflight,
+            "queued_ready_blocks": queue_blocks + handoff_blocks,
+            "free_buffers": sum(state == SlotState.FREE for state in slot_states),
+            "h2ds_in_flight": h2d_inflight,
+            "unreaped_events": h2d_inflight,
+            "outstanding_futures": 0,
+            "fallback": fallback,
+            "poison": poison,
+            "reconciliation_state": bool(self.telemetry.coverage_ok and self.telemetry.h2d_reconciled),
+            "ownership_quiescent": ownership_quiescent,
+        }
+
+        # Newer core telemetry may retain every checkpoint under either name;
+        # the current core exposes set_quiescence as its compatible API.
+        for method_name in (
+            "record_quiescence_checkpoint",
+            "checkpoint",
+            "set_quiescence",
+        ):
+            method = getattr(actual_source, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(evidence)
+            except TypeError:
+                try:
+                    method(**evidence)
+                except TypeError:
+                    method(phase, evidence)
+            break
+        return evidence
 
     def execute(
         self,
@@ -1900,6 +2075,35 @@ class GoldenQDTransport:
             if close_errors:
                 raise TransportFailure(error, secondary_errors=close_errors) from error
             raise error
+        handles_actual_source = getattr(read_source, "handles_actual_source_telemetry", False) is True
+        bound_actual_source = getattr(read_source, "actual_source_telemetry", None)
+        if handles_actual_source:
+            if not isinstance(bound_actual_source, ActualSourceTelemetry):
+                close_errors = self._close_source()
+                error = ReconciliationError(
+                    "source marked handles_actual_source_telemetry=True must provide "
+                    "an ActualSourceTelemetry instance"
+                )
+                if close_errors:
+                    failure = TransportFailure(error, secondary_errors=close_errors)
+                    self._retain_failure_lifetime(failure)
+                    raise failure from error
+                raise error
+            self.telemetry.actual_source = bound_actual_source
+        elif self.arm == STATIC_E27_ARM:
+            source_start = source_ranges[0].source_offset if source_ranges else 0
+            source_end = max((item.source_offset + item.length for item in source_ranges), default=source_start)
+            self.telemetry.actual_source = ActualSourceTelemetry(
+                arm=self.arm,
+                producer_count=STATIC_E27_PRODUCERS,
+                regions=self.telemetry.static_regions or (),
+                expected_ranges=((source_start, source_end),) if source_end > source_start else (),
+                expected_destination_ranges=tuple(
+                    (item.target_offset, item.target_offset + item.length) for item in source_ranges
+                ),
+                expected_h2d_bytes=exact_destination_size,
+            )
+        self._persist_actual_source_quiescence("bind")
         read_fn: Callable[[int, int], bytes] | None = None
         if not direct_readinto:
             read_fn = cast(
@@ -1964,7 +2168,9 @@ class GoldenQDTransport:
                                 )
                             else:
                                 assert read_fn is not None
-                                data = self._read_exact(read_fn, item, self.config.read_retries, self.telemetry)
+                                data = self._read_exact(
+                                    read_fn, item, self.config.read_retries, self.telemetry, producer_id
+                                )
                                 lease.fill(data)
                         finally:
                             if self.telemetry.diagnostics_enabled:
@@ -2062,6 +2268,8 @@ class GoldenQDTransport:
                 live_workers = [thread for thread in threads if thread.is_alive()]
         if self.telemetry.diagnostics_enabled:
             self.telemetry.source_end_ns = time.monotonic_ns()
+        self._persist_actual_source_quiescence("source_completion")
+        if self.telemetry.diagnostics_enabled:
             self.telemetry.final_drain_start_ns = time.monotonic_ns()
         if abort_deadline is None:
             # No abort occurred: wait for the dispatcher to quiesce without
@@ -2099,6 +2307,7 @@ class GoldenQDTransport:
         self.telemetry.h2d_reconciled = (
             self.telemetry.h2d_submitted_bytes == self.telemetry.h2d_completed_bytes
         )
+        self._persist_actual_source_quiescence("final_completion")
         telemetry = self.telemetry.snapshot(self.config.queue_depth, sum(s == SlotState.FREE for s in self.pool.states()))
         secondary: list[BaseException] = []
         for error in (cleanup_errors + worker_cleanup_errors + worker_errors):
@@ -2130,6 +2339,40 @@ class GoldenQDTransport:
             )
             self._retain_failure_lifetime(failure)
             raise failure from None
+        if self.telemetry.actual_source is not None:
+            actual_report = telemetry.get("actual_source")
+            evidence = actual_report.get("quiescence_evidence") if isinstance(actual_report, Mapping) else None
+            failed_proofs: list[str] = []
+            if self.telemetry.actual_source.actual_inflight != 0:
+                failed_proofs.append("actual source syscalls remain in flight")
+            if not isinstance(actual_report, Mapping) or actual_report.get("quiescence") is not True:
+                failed_proofs.append("final raw quiescence proof is not true")
+            if not isinstance(actual_report, Mapping) or actual_report.get("h2d_reconciliation_complete") is not True:
+                failed_proofs.append("required H2D events were not reconciled")
+            if not isinstance(evidence, Mapping):
+                failed_proofs.append("final quiescence evidence is missing")
+            else:
+                for field in (
+                    "live_source_workers", "live_source_readers", "live_dispatcher",
+                    "live_slots", "queued_ready_blocks", "h2ds_in_flight",
+                    "unreaped_events", "outstanding_futures", "fallback", "poison",
+                ):
+                    if evidence.get(field) != 0:
+                        failed_proofs.append(f"final quiescence field {field} is not zero")
+                if evidence.get("actual_syscalls_in_flight") != 0:
+                    failed_proofs.append("final actual syscall count is not zero")
+                if evidence.get("reconciliation_state") is not True:
+                    failed_proofs.append("final reconciliation state is not true")
+                if evidence.get("ownership_quiescent") is not True:
+                    failed_proofs.append("ownership is not quiescent")
+            if failed_proofs:
+                failure = TransportFailure(
+                    ReconciliationError("actual source telemetry did not prove completion: " + "; ".join(failed_proofs)),
+                    secondary_errors=secondary,
+                    telemetry=telemetry,
+                )
+                self._retain_failure_lifetime(failure)
+                raise failure from None
         # A caller that supplies a CUDA destination may request only source
         # reads and H2D submission/completion.  In that mode the destination
         # remains the caller-owned backing store and is never copied to CPU.
@@ -2152,9 +2395,28 @@ class GoldenQDTransport:
                 handoff_live = bool(self.dispatcher._handoff or self.dispatcher._uncertain_handoffs)
                 events_live = bool(self.dispatcher._in_flight or self.dispatcher._late_submissions)
         slot_live = any(state in (SlotState.FILLING, SlotState.READY, SlotState.IN_FLIGHT) for state in self.pool.states())
+        actual_source = self.telemetry.actual_source
+        actual_source_inflight = actual_source.actual_inflight if actual_source is not None else 0
+        actual_h2d_inflight = 0
+        if actual_source is not None:
+            raw_h2d = getattr(actual_source, "_h2d", None)
+            if isinstance(raw_h2d, Mapping):
+                actual_h2d_inflight = sum(
+                    getattr(item, "complete_ns", None) is None for item in raw_h2d.values()
+                )
+        final_evidence = None
+        if actual_source is not None:
+            final_evidence = getattr(actual_source, "quiescence_evidence", None)
+            if final_evidence is None:
+                # The current core keeps its latest checkpoint privately.  Do
+                # not call report() here: snapshot checks must stay shallow,
+                # including with diagnostics disabled.
+                final_evidence = getattr(actual_source, "_quiescence", None)
         if (
             self.pool.poisoned or producers or dispatcher_live or queue_live or handoff_live
-            or events_live or open_readers or slot_live
+            or events_live or open_readers or slot_live or actual_source_inflight
+            or actual_h2d_inflight
+            or (final_evidence is not None and not ActualSourceTelemetry._quiescent(final_evidence))
         ):
             raise TransportError(
                 "snapshot requires an unpoisoned pool with no live producer, dispatcher, "
