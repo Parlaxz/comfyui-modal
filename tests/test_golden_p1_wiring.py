@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tools.v2_control import cli
+from tools.v2_control import backend as backend_mod
 from tools.v2_control.environment import EnvironmentBuilder
 from tools.v2_control.errors import FlagError
 from tools.benchmark_v2_direct import _golden_p1_request_payload
@@ -22,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FLAG = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
 HASH_CHECK_FLAG = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
 ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
+SAGE_RUNTIME_MODE_FLAG = "COMFYMODAL_SAGE_RUNTIME_MODE"
 SAMPLING_DEEP_PROFILE_FLAG = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
 
 
@@ -41,6 +43,43 @@ def test_profile_resolves_flag_true_with_provenance():
     assert flag.registered is True
     assert flag.change_requires == "deploy"
     assert flag.consumed_at == "restore"
+
+
+def test_golden_and_production_sage_runtime_modes_are_explicit_and_distinct():
+    golden = _config("golden_p1").flag(SAGE_RUNTIME_MODE_FLAG)
+    production = _config("production").flag(SAGE_RUNTIME_MODE_FLAG)
+    assert golden is not None
+    assert golden.value == "auto"
+    assert golden.source == "profile:golden_p1"
+    assert production is not None
+    assert production.value == "baked_cuda"
+    assert production.source == "profile:production"
+
+
+def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path):
+    config = _config("golden_p1")
+    result = backend_mod.BackendResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        command="golden",
+        started_at="",
+        ended_at="",
+        elapsed_seconds=0.0,
+        artifacts=backend_mod.ArtifactSet(
+            experiment_identity={
+                "resolved_sage_runtime_mode": "auto",
+            },
+        ),
+    )
+    path = cli.write_run_manifest(
+        tmp_path, config, cli.build_components(ROOT, "golden_p1")[4], {}, result, None,
+    )
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    assert manifest["configured_sage_runtime_mode"] == "auto"
+    assert manifest["resolved_sage_runtime_mode"] == "auto"
+    assert manifest["experiment_identity"]["configured_sage_runtime_mode"] == "auto"
+    assert manifest["experiment_identity"]["resolved_sage_runtime_mode"] == "auto"
 
 
 def test_set_resolution_normalizes_bool_and_carries_provenance():
@@ -88,6 +127,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
         "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
         "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
         FLAG: "1",
+        SAGE_RUNTIME_MODE_FLAG: "auto",
         HASH_CHECK_FLAG: "1",
     }
     effective = {}
@@ -124,6 +164,8 @@ def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector
         "1",
         "--golden-p1-expected-output-sha",
         "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e",
+        "--attention-backend",
+        "pytorch",
     ]
     assert env == {
         "V2_BENCHMARK_MODE": "golden_p1_serial"
@@ -141,7 +183,7 @@ def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector
     assert cli._benchmark_mode(_config("production")) == "e28_single"
 
 
-def test_golden_attention_backend_is_run_only_and_omitted_by_default():
+def test_golden_attention_backend_is_run_only_and_resolved_by_default():
     config = _config("golden_p1")
     flag = config.flag(ATTENTION_BACKEND_FLAG)
     assert flag is not None
@@ -149,7 +191,7 @@ def test_golden_attention_backend_is_run_only_and_omitted_by_default():
     assert flag.source == "default"
     assert flag.change_requires == "run"
     args, _env = cli._validation_backend_args(config)
-    assert "--attention-backend" not in args
+    assert args[-2:] == ["--attention-backend", "pytorch"]
 
     source = {"prompt": {"1": {}}, "extra_data": {}, "modal_options": {}}
     payload = _golden_p1_request_payload(

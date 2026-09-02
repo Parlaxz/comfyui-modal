@@ -855,14 +855,22 @@ def test_discover_artifacts_binds_current_golden_cohort_not_external_run(tmp_pat
     golden_dir.mkdir(parents=True)
     request_id = "golden-p1-0-current"
     (golden_dir / "attempt_0_events.json").write_text("[]", encoding="utf-8")
-    (golden_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (golden_dir / "summary.json").write_text(
+        json.dumps({"v2ctl_invocation_id": "current-invocation"}), encoding="utf-8"
+    )
     (golden_dir / "attempt_0.json").write_text(
-        json.dumps({"request_id": request_id}), encoding="utf-8"
+        json.dumps({
+            "request_id": request_id,
+            "v2ctl_invocation_id": "current-invocation",
+        }), encoding="utf-8"
     )
     (golden_dir / "manifest.json").write_text(
         json.dumps({
             "mode": "golden_p1_serial",
             "method": "run_golden_serial_stream",
+            "v2ctl_invocation_id": "current-invocation",
+            "profile": "golden_p1",
+            "profile_config_fingerprint": "placeholder",
             "target": {
                 "app_name": config.target.app,
                 "class_name": config.target.class_name,
@@ -878,6 +886,9 @@ def test_discover_artifacts_binds_current_golden_cohort_not_external_run(tmp_pat
         json.dumps({"v2ctl_invocation_id": "stale"}), encoding="utf-8"
     )
     fp = FingerprintEngine(config).profile_config_fingerprint()
+    manifest_data = json.loads((golden_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest_data["profile_config_fingerprint"] = fp
+    (golden_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
     stdout = json.dumps({
         "output_dir": str(golden_dir),
         "manifest": str(golden_dir / "manifest.json"),

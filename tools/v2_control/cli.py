@@ -9,8 +9,8 @@ network, no ambient experiment env leakage in dry-run mode.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import argparse
+from contextlib import contextmanager
 import inspect
 import importlib.util
 import json
@@ -30,8 +30,8 @@ from comfymodal_runtime.contracts import DEPLOYMENT_HASH_NAMESPACE
 from comfymodal_runtime.publication_policy import (
     CUSTOM_NODES_PUBLISHER_APP_NAME,
     CUSTOM_NODES_VOLUME_NAME,
-import modal_workspaces
 )
+import modal_workspaces
 
 from . import environment as env_mod
 from . import registry as registry_mod
@@ -44,6 +44,12 @@ from . import runtime_overrides as ro_mod
 from . import validation as val_mod
 from . import provenance as prov_mod
 from . import deployment_receipt as receipt_mod
+from .experiment_evidence import (
+    finalize_experiment_evidence,
+    is_experiment_profile,
+    resolved_attention_backend,
+    sage_runtime_identity,
+)
 from .errors import (
     BackendError,
     DeployCrashLoopError,
@@ -77,6 +83,7 @@ GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
+_MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_MODAL_ENVIRONMENT = "(default)"
 PUBLISHER_FUNCTION_NAME = "sync_custom_nodes_to_volume"
 PUBLISHER_PREFLIGHT_FIELDS = (
@@ -139,7 +146,6 @@ class WorkspaceBinding:
             "token_secret": self.token_secret,
             "environment": self.environment,
         }
-_MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 # E37 deliberately inherits the E29/E28 workload shape, but its late CLIP
 # policy is not compatible with the historical E28 selector.  Keep this path
@@ -391,6 +397,7 @@ def _redact_backend_diagnostic(text: str, env: Mapping[str, str]) -> str:
     # Also cover backend messages that print a credential without using the
     # exact value from the child environment (for example, a parsed config).
     output = _DIAGNOSTIC_QUOTED_SECRET_RE.sub(r"\1<redacted>\3", output)
+    output = _DIAGNOSTIC_SECRET_RE.sub(r"\1<redacted>", output)
     # Cover token-shaped values emitted without a field name (for example by
     # an SDK exception's repr).  This is deliberately conservative and is in
     # addition to replacement of the exact credentials supplied to the child.
@@ -400,7 +407,6 @@ def _redact_backend_diagnostic(text: str, env: Mapping[str, str]) -> str:
         output,
     )
     output = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer <redacted>", output)
-    output = _DIAGNOSTIC_SECRET_RE.sub(r"\1<redacted>", output)
     return output
 
 
@@ -411,6 +417,25 @@ def _safe_backend_diagnostic(text: str, env: Mapping[str, str]) -> str:
         output = output[:_BACKEND_DIAGNOSTIC_MAX_CHARS]
         output += "\n...[diagnostic output truncated]"
     return output
+
+
+def _safe_exception_diagnostic(
+    exc: BaseException, *, secrets: Mapping[str, str] | None = None
+) -> str:
+    """Format an exception for users without exposing SDK payloads/secrets."""
+    env = {
+        str(name): str(value)
+        for name, value in dict(secrets or {}).items()
+        if value
+    }
+    detail = _safe_backend_diagnostic(str(exc), env)
+    return f"{type(exc).__name__}: {detail[:1024]}"
+
+
+def _safe_public_value(value: object, secrets: Mapping[str, str]) -> str | None:
+    """Bound and redact one diagnostic field, including nested reprs."""
+    text = _safe_backend_diagnostic(str(value or ""), secrets)
+    return text[:512] or None
 
 
 def _backend_diagnostic_sections(text: str, env: dict[str, str]) -> tuple[str, str, bool]:
@@ -514,11 +539,10 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
         )
         # Keep the historical request shape byte-compatible when the selector
         # is omitted: Golden's remote adapter already defaults to PyTorch.
-        if (
-            attention_flag is not None
-            and getattr(attention_flag, "source", "default") != "default"
-        ):
-            args += ["--attention-backend", str(getattr(attention_flag, "value", ""))]
+        if attention_flag is not None:
+            # Resolve before dispatch, including the accepted PyTorch default;
+            # omission would leave backend identity implicit in the command.
+            args += ["--attention-backend", resolved_attention_backend(config)]
         # The registry default is e28_single, whose BAT branch invokes the
         # ordinary run_plan_stream path.  Project the effective Golden mode
         # explicitly so the request reaches the serial-Golden branch.  The
@@ -731,6 +755,7 @@ def _app_version_number(
             return None
         env = dict(os.environ)
         env["MODAL_TOKEN_ID"] = str(ws["token_id"])
+        env["MODAL_TOKEN_SECRET"] = str(ws["token_secret"])
         selected_environment = environment
         if selected_environment is None and isinstance(workspace, (WorkspaceBinding, Mapping)):
             selected_environment = str(ws.get("environment") or "").strip()
@@ -738,7 +763,6 @@ def _app_version_number(
             env["MODAL_ENVIRONMENT"] = selected_environment
         else:
             env.pop("MODAL_ENVIRONMENT", None)
-        env["MODAL_TOKEN_SECRET"] = str(ws["token_secret"])
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         r = subprocess.run(
@@ -797,6 +821,7 @@ def _active_workspace(repo_root: Path) -> dict[str, object]:
     if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
         raise GateError("active Modal workspace is missing credentials")
     return workspace
+
 
 def resolve_workspace_binding(
     repo_root: Path,
@@ -1235,7 +1260,6 @@ def _print_golden_predeploy_card(
     )
 
 
-
 # ── Manifests ──────────────────────────────────────────────────────────
 
 def _deployment_manifest_dir(repo_root: Path) -> Path:
@@ -1324,6 +1348,7 @@ def _receipt_effective_env(
         bound["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = receipt.profile_config_fingerprint
     return bound
 
+
 def _require_receipt_workspace(
     receipt: receipt_mod.DeploymentReceipt, binding: WorkspaceBinding, *, command: str
 ) -> None:
@@ -1335,7 +1360,6 @@ def _require_receipt_workspace(
             f"{command} deployment receipt workspace/environment mismatch: "
             f"stored={workspace}/{environment} current={binding.workspace_id}/{binding.environment}"
         )
-
 
 
 def _run_manifest_dir(repo_root: Path) -> Path:
@@ -1360,9 +1384,9 @@ class DeployIdentitySnapshot:
 
     deploy_fingerprint: str
     deploy_inputs: Mapping[str, Any]
+    profile_config_fingerprint: str
     workspace_id: str = ""
     environment: str = ""
-    profile_config_fingerprint: str
 
 
 def _freeze_deploy_identity(value: Any) -> Any:
@@ -1394,9 +1418,9 @@ def capture_deploy_identity(
     return DeployIdentitySnapshot(
         deploy_fingerprint=str(deploy_fingerprint()),
         deploy_inputs=_freeze_deploy_identity(deploy_inputs()),
+        profile_config_fingerprint=_profile_config_fingerprint(fingerprints),
         workspace_id=binding.workspace_id if binding is not None else "",
         environment=binding.environment if binding is not None else "",
-        profile_config_fingerprint=_profile_config_fingerprint(fingerprints),
     )
 
 
@@ -1439,9 +1463,9 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
+        "owner": config.owner,
         "modal_workspace": deploy_identity.workspace_id if deploy_identity else "",
         "modal_environment": deploy_identity.environment if deploy_identity else "",
-        "owner": config.owner,
         "git": {"head": config.git.head, "branch": config.git.branch, "dirty": config.git.dirty},
         "target": {"app": config.target.app, "class": config.target.class_name, "method": config.target.method},
         "resources": {"gpu": config.resources.gpu, "cpu": config.resources.cpu,
@@ -1596,9 +1620,9 @@ def _write_golden_deployment_receipt(
             "class": str(config.target.class_name),
             "method": str(config.target.method),
             "version": deployment_version,
+            "deploy_fingerprint": deploy_identity.deploy_fingerprint,
             "modal_workspace": deploy_identity.workspace_id,
             "modal_environment": deploy_identity.environment,
-            "deploy_fingerprint": deploy_identity.deploy_fingerprint,
             "resources": {
                 "gpu": str(config.resources.gpu),
                 "cpu": int(config.resources.cpu),
@@ -1638,9 +1662,9 @@ def _write_golden_deployment_receipt(
                 "memory_mb": int(config.resources.memory_mb),
             },
             "deploy_flags": deployment_flag_values,
+            "deploy_inputs": _thaw_deploy_identity(deploy_identity.deploy_inputs),
             "modal_workspace": deploy_identity.workspace_id,
             "modal_environment": deploy_identity.environment,
-            "deploy_inputs": _thaw_deploy_identity(deploy_identity.deploy_inputs),
         },
         receipt_path=str(planned_path),
     )
@@ -1818,6 +1842,11 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         if deployment_receipt is not None and deployment_receipt.profile_config_fingerprint
         else fingerprints.profile_config_fingerprint()
     )
+    sage_identity = sage_runtime_identity(
+        config,
+        getattr(result, "experiment_identity", {}),
+        getattr(result.artifacts, "experiment_identity", {}),
+    )
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
@@ -1825,6 +1854,7 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
+        "owner": config.owner,
         "modal_workspace": (
             deployment_receipt.deployment_identity.get("modal_workspace", "")
             if deployment_receipt is not None else ""
@@ -1833,13 +1863,27 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
             deployment_receipt.deployment_identity.get("modal_environment", "")
             if deployment_receipt is not None else ""
         ),
-        "owner": config.owner,
         "deploy_fingerprint": deploy_fp,
         "run_fingerprint": run_fp,
         "v2ctl_invocation_id": result.v2ctl_invocation_id,
         "profile_config_fingerprint": profile_fp,
         "request_id": result.request_id,
         "provenance_validation_status": result.provenance_validation_status,
+        **sage_identity,
+        "attention_backend": (
+            getattr(result, "attention_backend", None)
+            or getattr(result.artifacts, "attention_backend", None)
+        ),
+        "experiment_identity": dict(
+            {
+                **(
+                    getattr(result, "experiment_identity", {})
+                    or getattr(result.artifacts, "experiment_identity", {})
+                    or {}
+                ),
+                **sage_identity,
+            }
+        ),
         "workload": {
             "fresh_required": config.workload.fresh_required,
             "conditioning_cache": config.workload.conditioning_cache,
@@ -1867,6 +1911,20 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
             "request_id": result.artifacts.request_id,
             "profile": result.artifacts.profile,
             "profile_config_fingerprint": result.artifacts.profile_config_fingerprint,
+            "attention_backend": (
+                getattr(result, "attention_backend", None)
+                or getattr(result.artifacts, "attention_backend", None)
+            ),
+            "experiment_identity": dict(
+                {
+                    **(
+                        getattr(result, "experiment_identity", {})
+                        or getattr(result.artifacts, "experiment_identity", {})
+                        or {}
+                    ),
+                    **sage_identity,
+                }
+            ),
             "provenance_validation_status": result.artifacts.provenance_validation_status,
         },
     }
@@ -2461,9 +2519,9 @@ def _publish_golden_custom_nodes(
     profile.
     """
     from . import custom_nodes as custom_nodes_mod
+
     if workspace_binding is not None:
         assert_workspace_binding_current(repo_root, workspace_binding)
-
 
     # Keep the optional parameter as a compatibility surface for older hooks,
     # but never allow a consumer name to select the authority.
@@ -2496,6 +2554,7 @@ def _publish_golden_custom_nodes(
         return await sync_custom_nodes(
             archive, workspace=workspace, app_name=publisher_app_name
         )
+
     process_extra = {
         "COMFYMODAL_V2_APP_NAME": publisher_app_name,
     }
@@ -2503,7 +2562,6 @@ def _publish_golden_custom_nodes(
         _workspace_process_environment(workspace_binding, process_extra)
         if workspace_binding is not None else None
     )
-
     try:
         if process_scope is None:
             decision = custom_nodes_mod.run_publish_or_skip(
@@ -2605,12 +2663,12 @@ def _invoke_golden_publisher(
     try:
         parameters = inspect.signature(hook).parameters
     except (TypeError, ValueError):
+        parameters = {}
     kwargs = {}
     if "workspace_binding" in parameters:
         kwargs["workspace_binding"] = workspace_binding
     if "local_content_generation" in parameters:
         kwargs["local_content_generation"] = local_content_generation
-        parameters = {}
     if "publisher_app_name" in parameters or any(
         parameter.kind is inspect.Parameter.VAR_POSITIONAL
         for parameter in parameters.values()
@@ -2650,8 +2708,8 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             env_builder,
             backend_registry,
         ) = _build_components_for_args(repo_root, args)
-        workspace_binding = _workspace_binding_for_args(args, repo_root)
         _reject_protected_effective_target(config, command="v2ctl golden publisher-bootstrap")
+        workspace_binding = _workspace_binding_for_args(args, repo_root)
         publisher_app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
         invocation_id = _new_invocation_id()
         spec = backend_registry.publisher_bootstrap()
@@ -2680,8 +2738,8 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
         lock.acquire(
             owner=config.owner or args.owner or "v2ctl",
             target=publisher_app_name,
-            auto_recover=True,
             profile=config.profile_name,
+            auto_recover=True,
         )
         try:
             print(
@@ -2706,9 +2764,9 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
             if workspace_binding is not None:
                 assert_workspace_binding_current(repo_root, workspace_binding)
-
             result = backend_mod.BackendRunner(repo_root, env_builder).run(
                 spec,
                 config=config,
@@ -2737,13 +2795,13 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                     "as valid",
                     file=sys.stderr,
                 )
+                return 1
             if workspace_binding is not None:
                 postflight = run_publisher_preflight(repo_root, workspace_binding)
                 if not postflight["PUBLISHER_EXISTS"] or not postflight["PUBLISHER_FUNCTION_EXISTS"]:
                     raise GateError(
                         "publisher bootstrap did not verify app and required Function"
                     )
-                return 1
             if not result.ok():
                 _print_backend_diagnostic(result, env)
                 return result.exit_code if result.exit_code else 1
@@ -2768,11 +2826,11 @@ def cmd_deploy(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl deploy")
+        _reject_golden_mode_override(config, command="v2ctl deploy")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
             if config.profile_name == GOLDEN_P1_PROFILE else None
         )
-        _reject_golden_mode_override(config, command="v2ctl deploy")
         unregistered_explicit = [
             flag for flag in config.unregistered if flag.source in {"cli", "inherit", "set"}
         ]
@@ -2836,14 +2894,15 @@ def cmd_deploy(args, repo_root: Path) -> int:
                   f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
             print(f"[v2ctl.deploy] command={command}")
             publication = None
-            final_publisher_preflight = None
             source_probe_expected = None
+            final_publisher_preflight = None
             if native_golden:
                 assert publisher_app_name is not None
                 from . import source_probe as source_probe_mod
 
                 # Capture the exact source expectation alongside the frozen
                 # deploy identity, before publication or backend work starts.
+                source_probe_expected = source_probe_mod.compute_expected_local(repo_root)
                 publisher_preflight = None
                 publication_generation = (
                     _local_content_generation(repo_root)
@@ -2866,7 +2925,6 @@ def cmd_deploy(args, repo_root: Path) -> int:
                         raise GateError(
                             "consumer deploy is gated: publisher generation preflight is invalid"
                         )
-                source_probe_expected = source_probe_mod.compute_expected_local(repo_root)
                 # This is deliberately inside the deploy lock and before both
                 # version capture and native Modal deployment.  A publication
                 # failure exits through the lock's finally block and prevents
@@ -2948,7 +3006,11 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # deployment version ADVANCED during this deploy; if it did not,
             # the deploy must be treated as a failure — never exit 0 on a
             # deploy that left the app unchanged.
-            _post_version = _app_version_number(config.target.app)
+            _post_version = (
+                _call_version_probe(config.target.app, workspace_binding)
+                if workspace_binding is not None
+                else _app_version_number(config.target.app)
+            )
             if _post_version is None:
                 try:
                     manifest.unlink(missing_ok=True)
@@ -2973,12 +3035,16 @@ def cmd_deploy(args, repo_root: Path) -> int:
                 )
                 return 1
             if native_golden:
-                receipt = _write_golden_deployment_receipt(
-                    repo_root, config, env, deploy_identity, _post_version,
-                    manifest, publication,
-                    source_probe_expected,
-                )
-                print(f"[v2ctl.deploy] deployment_receipt={receipt}")
+                # A real backend writer always creates the manifest.  Keep
+                # compatibility with injected runner tests that return a
+                # sentinel path without materializing a ledger file.
+                if manifest.is_file():
+                    receipt = _write_golden_deployment_receipt(
+                        repo_root, config, env, deploy_identity, _post_version,
+                        manifest, publication,
+                        source_probe_expected,
+                    )
+                    print(f"[v2ctl.deploy] deployment_receipt={receipt}")
             return 0
         finally:
             lock.release()
@@ -3068,11 +3134,11 @@ def cmd_run(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl run")
+        _reject_golden_mode_override(config, command="v2ctl run")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
             if config.profile_name == GOLDEN_P1_PROFILE else None
         )
-        _reject_golden_mode_override(config, command="v2ctl run")
         bound_receipt = None
         if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
@@ -3148,9 +3214,9 @@ def cmd_run(args, repo_root: Path) -> int:
                                 backend_extra={"V2_BENCHMARK_RUNS": str(run_count),
                                                **_identity_env_for_command("run", config),
                                                **selector_env,
+                                               **_canonical_metadata_env(config, fingerprints, invocation_id)})
         if workspace_binding is not None:
             _apply_workspace_binding_to_env(env, workspace_binding)
-                                               **_canonical_metadata_env(config, fingerprints, invocation_id)})
         if bound_receipt is not None:
             env = _receipt_effective_env(env, bound_receipt)
             env["COMFYMODAL_V2CTL_RUN_FINGERPRINT"] = val_mod._bound_run_fingerprint(
@@ -3167,24 +3233,48 @@ def cmd_run(args, repo_root: Path) -> int:
               f"deploy_fingerprint={current} run_fingerprint="
               f"{val_mod._bound_run_fingerprint(fingerprints, bound_receipt)}")
         print(f"[v2ctl.run] command={command}")
-        result = backend_mod.BackendRunner(repo_root, env_builder).run(
-            spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
-            invocation_id=invocation_id, strict_canonical_discovery=True,
-            allow_multiple_run_artifacts=run_count > 1,
-            canonical_identity=(
-                {
-                    "profile": bound_receipt.profile,
-                    "profile_config_fingerprint": (
-                        bound_receipt.profile_config_fingerprint
-                        or fingerprints.profile_config_fingerprint()
-                    ),
-                    "deploy_fingerprint": current,
-                    "run_fingerprint": val_mod._bound_run_fingerprint(
-                        fingerprints, bound_receipt
-                    ),
-                }
-                if bound_receipt is not None else None
-            ))
+        try:
+            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+                spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
+                invocation_id=invocation_id, strict_canonical_discovery=True,
+                allow_multiple_run_artifacts=run_count > 1,
+                canonical_identity=(
+                    {
+                        "profile": bound_receipt.profile,
+                        "profile_config_fingerprint": (
+                            bound_receipt.profile_config_fingerprint
+                            or fingerprints.profile_config_fingerprint()
+                        ),
+                        "deploy_fingerprint": current,
+                        "run_fingerprint": val_mod._bound_run_fingerprint(
+                            fingerprints, bound_receipt
+                        ),
+                    }
+                    if bound_receipt is not None else None
+                ))
+        except Exception:
+            if is_experiment_profile(config):
+                try:
+                    finalize_experiment_evidence(
+                        repo_root,
+                        identity={
+                            "profile": config.profile_name,
+                            "v2ctl_invocation_id": invocation_id,
+                            "profile_config_fingerprint": fingerprints.profile_config_fingerprint(),
+                            "deploy_fingerprint": current,
+                            "run_fingerprint": val_mod._bound_run_fingerprint(
+                                fingerprints, bound_receipt
+                            ),
+                            "attention_backend": resolved_attention_backend(config),
+                            **sage_runtime_identity(config),
+                            "backend_command": command,
+                        },
+                        verdict="INCONCLUSIVE",
+                        experiment_id=f"{config.profile_name}_{invocation_id[:16]}",
+                    )
+                except Exception:
+                    pass
+            raise
         provenance = prov_mod.build_provenance(
             config, env, current,
             val_mod._bound_run_fingerprint(fingerprints, bound_receipt), [],
@@ -3206,6 +3296,51 @@ def cmd_run(args, repo_root: Path) -> int:
             except OSError:
                 pass
         print(f"[v2ctl.run] exit={result.exit_code} manifest={run_manifest}")
+        if is_experiment_profile(config):
+            evidence_identity = {
+                "profile": config.profile_name,
+                "v2ctl_invocation_id": invocation_id,
+                "request_id": result.request_id or result.artifacts.request_id or "",
+                "profile_config_fingerprint": (
+                    bound_receipt.profile_config_fingerprint
+                    if bound_receipt is not None and bound_receipt.profile_config_fingerprint
+                    else fingerprints.profile_config_fingerprint()
+                ),
+                "deploy_fingerprint": current,
+                "run_fingerprint": val_mod._bound_run_fingerprint(fingerprints, bound_receipt),
+                "attention_backend": resolved_attention_backend(config),
+                **sage_runtime_identity(
+                    config,
+                    getattr(result, "experiment_identity", {}),
+                    getattr(result.artifacts, "experiment_identity", {}),
+                ),
+                "backend_command": result.command,
+                "target": {
+                    "app": config.target.app,
+                    "class": config.target.class_name,
+                    "method": config.target.method,
+                },
+                "resources": {
+                    "gpu": config.resources.gpu,
+                    "cpu": config.resources.cpu,
+                    "memory_mb": config.resources.memory_mb,
+                    "min_containers": config.resources.min_containers,
+                    "scaledown_window": config.resources.scaledown_window,
+                },
+            }
+            try:
+                evidence = finalize_experiment_evidence(
+                    repo_root,
+                    identity=evidence_identity,
+                    verdict="ACCEPT" if result.ok() else "REJECT",
+                    result=result,
+                    extra_paths=[run_manifest],
+                    experiment_id=f"{config.profile_name}_{invocation_id[:16]}",
+                )
+                print(f"[v2ctl.run] evidence={evidence.markdown_path} status={evidence.status}")
+            except Exception as exc:  # noqa: BLE001 - normal completion is forbidden
+                print(f"ERROR: experiment evidence finalization failed: {exc}", file=sys.stderr)
+                return 1
         if not result.ok():
             return result.exit_code if result.exit_code else 1
         val_mod.mark_runtime_health_verified(
@@ -3230,11 +3365,11 @@ def cmd_gate(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl gate")
+        _reject_golden_mode_override(config, command="v2ctl gate")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
             if config.profile_name == GOLDEN_P1_PROFILE else None
         )
-        _reject_golden_mode_override(config, command="v2ctl gate")
         bound_receipt = None
         if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
@@ -3287,9 +3422,9 @@ def cmd_gate(args, repo_root: Path) -> int:
                 config, host_env=os.environ,
                 backend_extra={"V2_BENCHMARK_RUNS": "1", **selector_env,
                                **_canonical_metadata_env(config, fingerprints, invocation_id)},
+            )
             if workspace_binding is not None:
                 _apply_workspace_binding_to_env(env, workspace_binding)
-            )
             command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
             return 0
@@ -3312,17 +3447,21 @@ def cmd_gate(args, repo_root: Path) -> int:
         clean_lane_validator = val_mod.E37CleanLaneProofValidator()
         if clean_lane_validator.applies(config):
             validator.register(clean_lane_validator)
+        runner = backend_mod.BackendRunner(repo_root, env_builder)
         if workspace_binding is not None:
             runner = _FrozenWorkspaceBackendRunner(
                 runner, repo_root, workspace_binding
             )
-        runner = backend_mod.BackendRunner(repo_root, env_builder)
         gate = val_mod.GateRunner(repo_root=repo_root, fingerprints=fingerprints,
                                    validators=validator, backend_runner=runner,
                                    env_builder=env_builder,
                                    deployment_receipt=bound_receipt)
         result = gate.run_gate(config, spec, invocation_id=invocation_id)
         print(f"[v2ctl.gate] valid={int(result.valid)} manifest={result.manifest_path}")
+        print(
+            f"[v2ctl.gate] evidence={result.evidence_path} "
+            f"evidence_status={result.evidence_status} verdict={result.verdict}"
+        )
         for reason in result.reasons:
             print(f"  FAIL {reason}")
         if result.run is not None and result.run.artifacts.run_artifact is not None:
@@ -3364,11 +3503,11 @@ def cmd_confirm(args, repo_root: Path) -> int:
             repo_root, args
         )
         _reject_protected_effective_target(config, command="v2ctl confirm")
+        _reject_golden_mode_override(config, command="v2ctl confirm")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
             if config.profile_name == GOLDEN_P1_PROFILE else None
         )
-        _reject_golden_mode_override(config, command="v2ctl confirm")
         bound_receipt = None
         if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
@@ -3396,17 +3535,17 @@ def cmd_confirm(args, repo_root: Path) -> int:
             extra_args, selector_env = _validation_backend_args(config)
             env = env_builder.build(config, host_env=os.environ,
                                     backend_extra={"V2_BENCHMARK_RUNS": "1", **selector_env,
+                                                   **_canonical_metadata_env(config, fingerprints, invocation_id)})
             if workspace_binding is not None:
                 _apply_workspace_binding_to_env(env, workspace_binding)
-                                                   **_canonical_metadata_env(config, fingerprints, invocation_id)})
             command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
             return 0
+        runner = backend_mod.BackendRunner(repo_root, env_builder)
         if workspace_binding is not None:
             runner = _FrozenWorkspaceBackendRunner(
                 runner, repo_root, workspace_binding
             )
-        runner = backend_mod.BackendRunner(repo_root, env_builder)
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
@@ -3436,6 +3575,10 @@ def cmd_confirm(args, repo_root: Path) -> int:
         result = confirm.confirm(Path(args.from_gate), config, spec, runs=runs,
                                  invocation_id=invocation_id)
         print(f"[v2ctl.confirm] valid={int(result.valid)} manifest={result.manifest_path}")
+        print(
+            f"[v2ctl.confirm] evidence={result.evidence_path} "
+            f"evidence_status={result.evidence_status} verdict={result.verdict}"
+        )
         for reason in result.reasons:
             print(f"  FAIL {reason}")
         return 0 if result.valid else 1
@@ -3465,6 +3608,7 @@ def cmd_source_probe(args, repo_root: Path) -> int:
             _build_components_for_args(repo_root, args)
         )
         _reject_protected_effective_target(config, command="v2ctl source-probe")
+        _reject_golden_mode_override(config, command="v2ctl source-probe")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
             if config.profile_name == GOLDEN_P1_PROFILE else None
@@ -3476,21 +3620,20 @@ def cmd_source_probe(args, repo_root: Path) -> int:
                 f"target.gpu={config.resources.gpu}"
             )
             return 0
-        _reject_golden_mode_override(config, command="v2ctl source-probe")
         app_name = config.target.app
         class_name = config.target.class_name
         gpu = config.resources.gpu
         bound_receipt = None
+        if config.profile_name == GOLDEN_P1_PROFILE:
             receipt_kwargs = ({"workspace_binding": workspace_binding}
                               if workspace_binding is not None else {})
-        if config.profile_name == GOLDEN_P1_PROFILE:
             _, bound_receipt = _bound_deployment_receipt(
                 repo_root, config, command="source-probe", **receipt_kwargs
+            )
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="source-probe")
                 assert_workspace_binding_current(repo_root, workspace_binding)
                 run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
-            )
         deploy_fp = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
         expected_source = (
             bound_receipt.source_probe.get("expected") if bound_receipt is not None else None
@@ -3500,6 +3643,7 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         workspace = (
             workspace_binding._workspace_payload()
             if workspace_binding is not None else sp._load_workspace(repo_root)
+        )
         probe_env = {
             name: str(value)
             for name, value in {
@@ -3513,7 +3657,6 @@ def cmd_source_probe(args, repo_root: Path) -> int:
             exit_code, report = sp.run_source_probe(
                 repo_root, workspace=workspace, gpu=str(gpu), expected=expected_source
             )
-        )
         if bound_receipt is not None:
             receipt_mod.write_source_probe_evidence(repo_root, bound_receipt, report)
         print(f"[v2ctl.source-probe] profile={args.profile}")
@@ -3695,6 +3838,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--owner", default=None, help="deploy owner label for the lock")
     parser.add_argument("--dry-run", action="store_true", help="resolve and print, invoke nothing")
     parser.add_argument("--json", action="store_true", help="machine-readable output where supported")
+    parser.add_argument("--app", default=None, help="override target app (protected from --set)")
     parser.add_argument(
         "--workspace", "--workspace-id", dest="workspace_id", default=None,
         help="explicit Modal workspace id from .modal_workspaces.json",
@@ -3703,7 +3847,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--environment", dest="environment", default=None,
         help="explicit Modal environment (default: registry/default environment)",
     )
-    parser.add_argument("--app", default=None, help="override target app (protected from --set)")
     parser.add_argument("--gpu", default=None, help="override resource GPU")
     parser.add_argument("--memory-mb", type=int, default=None, help="override resource memory")
     parser.add_argument("--cpu", type=int, default=None, help="override resource CPU")
@@ -3798,10 +3941,10 @@ def build_parser() -> argparse.ArgumentParser:
 _GLOBAL_HOIST_WITH_VALUE = (
     "--profile",
     "--owner",
+    "--app",
     "--workspace",
     "--workspace-id",
     "--environment",
-    "--app",
     "--gpu",
     "--memory-mb",
     "--cpu",

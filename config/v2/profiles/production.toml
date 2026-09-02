@@ -55,3 +55,7 @@ COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA = "0"
 COMFYMODAL_V2_INPUT_TYPES_WARM = "1"
 COMFYMODAL_V2_UNET_FORENSICS = "0"
 COMFYMODAL_V2_C9QD_EXTRAS = "0"
+# Production uses the baked SageAttention CUDA path by default.  The v2ctl
+# profile environment is propagated to the runtime without changing the
+# runtime's explicit fallback and PyTorch selector behavior.
+COMFYMODAL_SAGE_RUNTIME_MODE = "baked_cuda"

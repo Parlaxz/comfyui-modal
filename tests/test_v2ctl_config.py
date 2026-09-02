@@ -20,6 +20,7 @@ from tools.v2_control.config import (
     compute_git_state,
 )
 from tools.v2_control.errors import FlagError
+from tools.v2_control.environment import EnvironmentBuilder
 from tools.v2_control.profiles import Profiles
 from tools.v2_control.registry import FlagRegistry
 
@@ -74,6 +75,20 @@ def test_resolve_production_defaults(resolver):
     assert flag.value == "12"
     assert flag.source == "profile:production"
     assert flag.registered is True
+
+
+def test_production_sage_runtime_mode_reaches_child_environment(resolver):
+    config = resolver.resolve(profile_name="production")
+    flag = _flag(config, "COMFYMODAL_SAGE_RUNTIME_MODE")
+    assert flag is not None
+    assert flag.value == "baked_cuda"
+    assert flag.source == "profile:production"
+
+    child_env = EnvironmentBuilder().build(
+        config,
+        host_env={"COMFYMODAL_SAGE_RUNTIME_MODE": "triton_fallback"},
+    )
+    assert child_env["COMFYMODAL_SAGE_RUNTIME_MODE"] == "baked_cuda"
 
 
 def test_default_flags_present_with_default_source(resolver):

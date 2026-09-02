@@ -38,6 +38,13 @@ from typing import Any, Protocol
 
 from .backend import detect_crash_loop
 from .errors import GateError
+from .experiment_evidence import (
+    configured_sage_runtime_mode,
+    finalize_experiment_evidence,
+    is_experiment_profile,
+    resolved_attention_backend,
+    resolved_sage_runtime_mode,
+)
 
 try:  # Keep direct-script/package imports usable in both test and CLI paths.
     from tools.golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
@@ -165,6 +172,9 @@ class RunRecord:
     profile_config_fingerprint: str = ""
     provenance_validation_status: str = ""
     backend_exit_code: int | None = None
+    attention_backend: str = ""
+    experiment_identity: dict[str, Any] = field(default_factory=dict)
+    backend_command: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -184,6 +194,9 @@ class RunRecord:
             "request_id": self.request_id,
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "provenance_validation_status": self.provenance_validation_status,
+            "attention_backend": self.attention_backend,
+            "experiment_identity": dict(self.experiment_identity),
+            "backend_command": self.backend_command,
         }
 
 
@@ -214,6 +227,113 @@ class GateResult:
     reasons: list[str]
     manifest_path: Path | None = None
     run: RunRecord | None = None
+    evidence_path: Path | None = None
+    evidence_status: str = "not_run"
+    verdict: str = "INCONCLUSIVE"
+
+
+def _experiment_identity(
+    record: RunRecord | None,
+    config: Any,
+    deploy_fp: str,
+    run_fp: str,
+    result: Any | None = None,
+) -> dict[str, Any]:
+    identity = dict(record.experiment_identity if record is not None else {})
+    identity.update({
+        "profile": str(getattr(config, "profile_name", "") or ""),
+        "deploy_fingerprint": deploy_fp,
+        "run_fingerprint": run_fp,
+        "configured_sage_runtime_mode": configured_sage_runtime_mode(config),
+        "resolved_sage_runtime_mode": resolved_sage_runtime_mode(identity),
+        "attention_backend": str(
+            (record.attention_backend if record is not None else "")
+            or resolved_attention_backend(config)
+        ),
+    })
+    if record is not None:
+        identity.setdefault("v2ctl_invocation_id", record.v2ctl_invocation_id)
+        identity.setdefault("request_id", record.request_id)
+        identity.setdefault("profile_config_fingerprint", record.profile_config_fingerprint)
+    if result is not None:
+        identity["backend_command"] = str(getattr(result, "command", "") or "")
+        identity["backend_exit_code"] = getattr(result, "exit_code", None)
+    elif record is not None and record.backend_command:
+        identity["backend_command"] = record.backend_command
+    target = getattr(config, "target", None)
+    resources = getattr(config, "resources", None)
+    identity["target"] = {
+        "app": str(getattr(target, "app", "") or ""),
+        "class": str(getattr(target, "class_name", "") or ""),
+        "method": str(getattr(target, "method", "") or ""),
+    }
+    identity["resources"] = {
+        name: getattr(resources, name, "")
+        for name in ("gpu", "cpu", "memory_mb", "min_containers", "scaledown_window")
+    }
+    return identity
+
+
+def _finalize_evidence(
+    repo_root: Path,
+    *,
+    record: RunRecord | None,
+    config: Any,
+    deploy_fp: str,
+    run_fp: str,
+    result: Any | None,
+    verdict: str,
+    gate_manifest: Path | None = None,
+    confirmation_manifest: Path | None = None,
+    records: list[RunRecord] | None = None,
+    invocation_id: str = "",
+) -> tuple[Path | None, str, str, str | None]:
+    """Finalize evidence and convert any finalizer failure to INCONCLUSIVE."""
+    if not is_experiment_profile(config):
+        return None, "not_applicable", verdict, None
+    try:
+        identity = _experiment_identity(record, config, deploy_fp, run_fp, result)
+        if invocation_id:
+            identity["v2ctl_invocation_id"] = invocation_id
+        evidence = finalize_experiment_evidence(
+            repo_root,
+            identity=identity,
+            verdict=verdict,
+            result=result,
+            records=records or ([record] if record is not None else []),
+            gate_manifest=gate_manifest,
+            confirmation_manifest=confirmation_manifest,
+        )
+        return evidence.markdown_path, evidence.status, evidence.verdict, None
+    except Exception as exc:  # noqa: BLE001 - evidence failure is an explicit verdict
+        return None, "FAILED", "INCONCLUSIVE", f"experiment evidence finalization failed: {exc}"
+
+
+def _invalidate_evidence_manifest(path: Path | None, reason: str) -> None:
+    """Prevent a control manifest from remaining valid after evidence failure."""
+    if path is None:
+        return
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return
+        manifest["gate_valid"] = False
+        reasons = manifest.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        if reason not in reasons:
+            reasons.append(reason)
+        manifest["reasons"] = reasons
+        manifest["evidence_status"] = "FAILED"
+        manifest["verdict"] = "INCONCLUSIVE"
+        path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError):
+        # The finalizer already reports the primary failure.  Do not mask it
+        # with a best-effort control-manifest repair error.
+        return
 
 
 def mark_runtime_health_verified(
@@ -1073,14 +1193,18 @@ class GoldenCohortValidator(ValidatorPlugin):
         artifacts = record.artifacts
         manifest_path = getattr(artifacts, "campaign_manifest", None)
         attempt_path = getattr(artifacts, "run_artifact", None)
+        summary_path = getattr(artifacts, "summary_artifact", None)
         manifest = self._load(manifest_path)
         attempt = self._load(attempt_path)
+        summary = self._load(summary_path)
         if manifest is None or manifest_path is None or not Path(manifest_path).is_file():
             failures.append("Golden cohort manifest missing or unreadable")
             return failures
         if attempt is None or attempt_path is None or not Path(attempt_path).is_file():
             failures.append("Golden attempt artifact missing or unreadable")
             return failures
+        if summary is None or summary_path is None or not Path(summary_path).is_file():
+            failures.append("Golden summary artifact missing or unreadable")
         if not record.backend_ok:
             failures.append(
                 "Golden backend invocation did not complete successfully"
@@ -1109,6 +1233,30 @@ class GoldenCohortValidator(ValidatorPlugin):
                 break
         if Path(manifest_path).resolve().parent != Path(attempt_path).resolve().parent:
             failures.append("Golden manifest and attempt artifacts are from different cohorts")
+        if summary_path is not None and Path(summary_path).resolve().parent != Path(attempt_path).resolve().parent:
+            failures.append("Golden summary and attempt artifacts are from different cohorts")
+
+        # The v2ctl invocation is the root of the binding chain.  Do not let a
+        # valid-looking neighboring cohort satisfy this request.
+        expected_invocation = str(record.v2ctl_invocation_id or "").strip()
+        nested_manifest = manifest.get("v2ctl")
+        observed_invocation = str(
+            manifest.get("v2ctl_invocation_id")
+            or (nested_manifest.get("invocation_id", "")
+                if isinstance(nested_manifest, dict) else "")
+        ).strip()
+        if not observed_invocation:
+            failures.append("Golden manifest invocation ID is missing")
+        elif expected_invocation and observed_invocation != expected_invocation:
+            failures.append("Golden manifest invocation ID does not match v2ctl binding")
+        for label, data in (("summary", summary), ("attempt", attempt)):
+            if not isinstance(data, dict):
+                continue
+            observed = str(data.get("v2ctl_invocation_id") or "").strip()
+            if not observed:
+                failures.append(f"Golden {label} invocation ID is missing")
+            elif expected_invocation and observed != expected_invocation:
+                failures.append(f"Golden {label} invocation ID does not match v2ctl binding")
 
         target = getattr(config, "target", None)
         resources = getattr(config, "resources", None)
@@ -1275,6 +1423,39 @@ class GoldenCohortValidator(ValidatorPlugin):
             failures.append("effective provenance missing profile_config_fingerprint")
         if record.provenance_validation_status != "validated":
             failures.append("effective provenance was not canonically validated")
+
+        # Backend selection is resolved before dispatch and must be observable
+        # in the persisted cohort.  Selector-less historical fixtures remain
+        # readable, but identity-bound modern cohorts fail closed.
+        expected_backend = str(record.attention_backend or "").strip().lower()
+        if not expected_backend:
+            try:
+                expected_backend = resolved_attention_backend(config)
+            except ValueError as exc:
+                failures.append(str(exc))
+                expected_backend = ""
+        observed_backends: set[str] = set()
+        if record.attention_backend:
+            # The control-plane command/env is the resolved pre-dispatch
+            # authority when an older Golden writer does not repeat the
+            # selector in its cohort JSON.  Any contradictory cohort value is
+            # still rejected below.
+            observed_backends.add(record.attention_backend.strip().lower())
+        for data in (manifest, summary, attempt):
+            if not isinstance(data, dict):
+                continue
+            for key in ("attention_backend", "resolved_attention_backend"):
+                if data.get(key) not in (None, ""):
+                    observed_backends.add(str(data[key]).strip().lower())
+            telemetry = data.get("golden_telemetry")
+            if isinstance(telemetry, dict) and telemetry.get("attention_backend") not in (None, ""):
+                observed_backends.add(str(telemetry["attention_backend"]).strip().lower())
+        if len(observed_backends) > 1:
+            failures.append("Golden cohort contains mixed attention backends")
+        elif observed_backends and expected_backend and observed_backends != {expected_backend}:
+            failures.append("Golden attention backend does not match resolved experiment identity")
+        elif expected_invocation and not observed_backends:
+            failures.append("Golden attention backend evidence is missing")
         return failures
 
 
@@ -2109,8 +2290,33 @@ def build_run_record_from_result(
                     candidate = golden_shas[0]
                     if isinstance(candidate, str) and candidate.strip():
                         output_sha = candidate.strip()
+            if "attention_backend" in data:
+                telemetry["attention_backend"] = str(data["attention_backend"])
+            if "resolved_attention_backend" in data:
+                telemetry["resolved_attention_backend"] = str(data["resolved_attention_backend"])
+            golden_telemetry = data.get("golden_telemetry")
+            if isinstance(golden_telemetry, dict) and golden_telemetry.get("attention_backend"):
+                telemetry["attention_backend"] = str(golden_telemetry["attention_backend"])
     target = getattr(config, "target", None)
     workload = _config_workload(config)
+    try:
+        attention_backend = resolved_attention_backend(config)
+    except ValueError:
+        attention_backend = ""
+    artifact_identity = getattr(artifacts, "experiment_identity", {}) or {}
+    experiment_identity = {
+        "profile": getattr(config, "profile_name", "") or "",
+        "v2ctl_invocation_id": str(getattr(artifacts, "v2ctl_invocation_id", "") or ""),
+        "request_id": str(getattr(artifacts, "request_id", "") or telemetry.get("request_id", "") or ""),
+        "profile_config_fingerprint": str(
+            getattr(artifacts, "profile_config_fingerprint", "") or ""
+        ),
+        "deploy_fingerprint": deploy_fingerprint,
+        "run_fingerprint": run_fingerprint,
+        "attention_backend": str(telemetry.get("attention_backend") or attention_backend),
+    }
+    if isinstance(artifact_identity, dict):
+        experiment_identity.update(artifact_identity)
     return RunRecord(
         run_fingerprint=run_fingerprint,
         deploy_fingerprint=deploy_fingerprint,
@@ -2132,6 +2338,9 @@ def build_run_record_from_result(
         provenance_validation_status=str(
             getattr(artifacts, "provenance_validation_status", "") or ""
         ),
+        attention_backend=str(telemetry.get("attention_backend") or attention_backend),
+        experiment_identity=experiment_identity,
+        backend_command=str(getattr(result, "command", "") or ""),
     )
 
 
@@ -2418,6 +2627,11 @@ class GateRunner:
             detail = str(exc)
             if "no canonical run artifact" in detail.lower():
                 detail = f"no persisted run artifact was discovered; {detail}"
+            _finalize_evidence(
+                self._repo_root, record=None, config=config, deploy_fp=deploy_fp,
+                run_fp=run_fp, result=None, verdict="INCONCLUSIVE",
+                invocation_id=invocation_id,
+            )
             raise GateError(f"gate backend invocation failed before completing: {detail}") from exc
 
         # ── Crash-loop guard: a container that repeats the same traceback in
@@ -2440,7 +2654,17 @@ class GateRunner:
             )
             path = self._persist_manifest(config, run_fp, manifest)
             LOG.warning("gate manifest written (crash-loop, invalid): %s", path)
-            return GateResult(valid=False, reasons=reasons, manifest_path=path, run=record)
+            evidence_path, evidence_status, evidence_verdict, evidence_reason = _finalize_evidence(
+                self._repo_root, record=record, config=config, deploy_fp=deploy_fp,
+                run_fp=run_fp, result=result, verdict="REJECT", gate_manifest=path,
+            )
+            if evidence_reason:
+                reasons.append(evidence_reason)
+            return GateResult(
+                valid=False, reasons=reasons, manifest_path=path, run=record,
+                evidence_path=evidence_path, evidence_status=evidence_status,
+                verdict=evidence_verdict,
+            )
 
         record = build_run_record_from_result(result, config, deploy_fp, run_fp)
         reasons = self._validators.run(record, config)
@@ -2462,8 +2686,22 @@ class GateRunner:
                 bound_receipt=self._deployment_receipt,
             )
 
+        evidence_path, evidence_status, evidence_verdict, evidence_reason = _finalize_evidence(
+            self._repo_root, record=record, config=config, deploy_fp=deploy_fp,
+            run_fp=run_fp, result=result,
+            verdict="ACCEPT" if valid else "REJECT", gate_manifest=path,
+        )
+        if evidence_reason:
+            reasons.append(evidence_reason)
+            valid = False
+            _invalidate_evidence_manifest(path, evidence_reason)
+
         LOG.info("gate manifest written: %s (valid=%s)", path, valid)
-        return GateResult(valid=valid, reasons=reasons, manifest_path=path, run=record)
+        return GateResult(
+            valid=valid, reasons=reasons, manifest_path=path, run=record,
+            evidence_path=evidence_path, evidence_status=evidence_status,
+            verdict="INCONCLUSIVE" if evidence_reason else evidence_verdict,
+        )
 
     def latest_gate(self) -> Path | None:
         gates_dir = self._repo_root / ".v2ctl" / "gates"
@@ -2682,6 +2920,12 @@ class ConfirmRunner:
                 detail = str(exc)
                 if "no canonical run artifact" in detail.lower():
                     detail = f"no persisted run artifact was discovered; {detail}"
+                _finalize_evidence(
+                    self._repo_root, record=records[-1] if records else None,
+                    config=config, deploy_fp=deploy_fp, run_fp=run_fp,
+                    result=None, verdict="INCONCLUSIVE", gate_manifest=path,
+                    records=records, invocation_id=run_invocation_id,
+                )
                 raise GateError(
                     f"confirm backend invocation {index + 1} failed before completing: {detail}"
                 ) from exc
@@ -2699,7 +2943,21 @@ class ConfirmRunner:
         manifest["confirm_runs"] = runs
         manifest["gate_manifest"] = str(path)
         manifest_path = self._persist_manifest(config, run_fp, manifest, kind="confirm")
-        return GateResult(valid=valid, reasons=all_reasons, manifest_path=manifest_path, run=combined)
+        evidence_path, evidence_status, evidence_verdict, evidence_reason = _finalize_evidence(
+            self._repo_root, record=combined, config=config, deploy_fp=deploy_fp,
+            run_fp=run_fp, result=None,
+            verdict="ACCEPT" if valid else "REJECT",
+            gate_manifest=path, confirmation_manifest=manifest_path, records=records,
+        )
+        if evidence_reason:
+            all_reasons.append(evidence_reason)
+            valid = False
+            _invalidate_evidence_manifest(manifest_path, evidence_reason)
+        return GateResult(
+            valid=valid, reasons=all_reasons, manifest_path=manifest_path, run=combined,
+            evidence_path=evidence_path, evidence_status=evidence_status,
+            verdict="INCONCLUSIVE" if evidence_reason else evidence_verdict,
+        )
 
     # -- helpers ------------------------------------------------------------
 
@@ -2824,6 +3082,9 @@ def _build_manifest(
         "config_snapshot": snapshot,
         "created_at": _now_utc().isoformat(),
     }
+    if record is not None:
+        manifest["attention_backend"] = record.attention_backend
+        manifest["experiment_identity"] = dict(record.experiment_identity)
     if deployment_receipt is not None:
         receipt_data = (
             deployment_receipt.to_dict()

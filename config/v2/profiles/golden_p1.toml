@@ -44,6 +44,9 @@ COMFYMODAL_V2_VAE_SNAPSHOT = "0"
 COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
 COMFYMODAL_V2_SNAPSHOT_MANIFEST = "1"
 COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "0"
+# Golden deliberately keeps the runtime selector on its auto policy instead of
+# inheriting production's baked_cuda default.
+COMFYMODAL_SAGE_RUNTIME_MODE = "auto"
 
 # Modal memory snapshots remain enabled by the runtime default.  The
 # COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT control is not in the v2ctl flag

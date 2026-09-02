@@ -234,6 +234,8 @@ class ArtifactSet:
     request_ids: list[str] = field(default_factory=list)
     profile: str | None = None
     profile_config_fingerprint: str | None = None
+    attention_backend: str | None = None
+    experiment_identity: dict[str, str] = field(default_factory=dict)
     provenance_validation_status: str = "not_checked"
 
 
@@ -256,6 +258,8 @@ class BackendResult:
     profile_config_fingerprint: str | None = None
     provenance_validation_status: str = "not_checked"
     crash_loop: dict | None = None
+    attention_backend: str | None = None
+    experiment_identity: dict[str, str] = field(default_factory=dict)
 
     def ok(self) -> bool:
         return self.exit_code == 0
@@ -573,6 +577,17 @@ class BackendRunner:
             "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": deploy_fp,
             "COMFYMODAL_V2CTL_RUN_FINGERPRINT": run_fp,
         })
+        if _is_golden_config(config):
+            # The accepted PyTorch default is explicit at the dispatch
+            # boundary; the child must not resolve a different backend later.
+            try:
+                from .experiment_evidence import resolved_attention_backend
+
+                child_env["COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"] = (
+                    resolved_attention_backend(config)
+                )
+            except ValueError as exc:
+                raise BackendError(str(exc)) from exc
 
         command = self.build_command_line(spec, list(extra_args))
         started_mono = time.monotonic()
@@ -697,6 +712,8 @@ class BackendRunner:
             profile=artifacts.profile,
             profile_config_fingerprint=artifacts.profile_config_fingerprint,
             crash_loop=_crash_loop,
+            attention_backend=getattr(artifacts, "attention_backend", None),
+            experiment_identity=dict(getattr(artifacts, "experiment_identity", {}) or {}),
             provenance_validation_status=artifacts.provenance_validation_status,
         )
 
@@ -1152,7 +1169,10 @@ class BackendRunner:
                 "Golden backend did not identify the current cohort output directory"
             )
 
-        cohort_dir = next(iter(cohort_paths)).resolve()
+        cohort_dir = next(iter(cohort_paths))
+        if not cohort_dir.is_absolute():
+            cohort_dir = self._repo_root / cohort_dir
+        cohort_dir = cohort_dir.resolve()
         expected_root = (
             self._repo_root / "artifacts" / "phase_p1_serial_golden_v1"
         ).resolve()
@@ -1174,6 +1194,42 @@ class BackendRunner:
             raise ProvenanceError(f"Golden cohort manifest is unreadable: {manifest}") from exc
         if not isinstance(manifest_data, dict):
             raise ProvenanceError(f"Golden cohort manifest is not an object: {manifest}")
+
+        def manifest_value(*names: str) -> str:
+            nested = manifest_data.get("v2ctl")
+            sources = (manifest_data, nested) if isinstance(nested, dict) else (manifest_data,)
+            for source in sources:
+                for name in names:
+                    value = source.get(name)
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+            return ""
+
+        expected_invocation = str(invocation_id or "").strip()
+        observed_invocation = manifest_value("v2ctl_invocation_id", "invocation_id")
+        if observed_invocation != expected_invocation:
+            raise ProvenanceError(
+                "Golden cohort manifest invocation ID mismatch: "
+                f"expected {expected_invocation!r}, observed {observed_invocation or '(missing)'} "
+                f"at {manifest}"
+            )
+        expected_profile_value = expected_profile or "golden_p1"
+        observed_profile = manifest_value("profile", "profile_name")
+        if observed_profile != expected_profile_value:
+            raise ProvenanceError(
+                "Golden cohort manifest profile mismatch: "
+                f"expected {expected_profile_value!r}, observed {observed_profile or '(missing)'}"
+            )
+        if expected_profile_config_fingerprint:
+            observed_profile_fp = manifest_value(
+                "profile_config_fingerprint", "config_fingerprint", "profile_fingerprint"
+            )
+            if observed_profile_fp != expected_profile_config_fingerprint:
+                raise ProvenanceError(
+                    "Golden cohort manifest profile/config fingerprint mismatch: "
+                    f"expected {expected_profile_config_fingerprint!r}, "
+                    f"observed {observed_profile_fp or '(missing)'}"
+                )
 
         target = getattr(config, "target", None)
         expected_target = {
@@ -1201,6 +1257,17 @@ class BackendRunner:
             (p for p in cohort_dir.glob("attempt_*.json") if not p.stem.endswith("_events")),
             key=lambda p: p.name.casefold(),
         )
+        missing_expected = []
+        if not attempt_files:
+            missing_expected.append("attempt_*.json")
+        if not (cohort_dir / "summary.json").is_file():
+            missing_expected.append("summary.json")
+        if missing_expected:
+            raise ProvenanceError(
+                "Golden expected artifacts missing: "
+                + ", ".join(missing_expected)
+                + f" at {cohort_dir}"
+            )
         if len(attempt_files) != 1:
             raise ProvenanceError(
                 f"Golden cohort must contain exactly one attempt artifact: {cohort_dir}"
@@ -1217,6 +1284,72 @@ class BackendRunner:
             raise ProvenanceError(
                 f"Golden cohort attempt/request identity is incomplete or inconsistent: {attempt}"
             )
+
+        summary = cohort_dir / "summary.json"
+        if not summary.is_file():
+            raise ProvenanceError(
+                f"Golden expected artifact missing: summary.json at {summary}"
+            )
+        try:
+            summary_data = json.loads(summary.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ProvenanceError(f"Golden summary artifact is unreadable: {summary}") from exc
+        if not isinstance(summary_data, dict):
+            raise ProvenanceError(f"Golden summary artifact is not an object: {summary}")
+        if not expected_invocation:
+            raise ProvenanceError(
+                "Golden cohort invocation ID is missing from the v2ctl binding"
+            )
+        for label, data in (("summary", summary_data), ("attempt", attempt_data)):
+            observed = str(data.get("v2ctl_invocation_id") or "").strip()
+            if not observed:
+                raise ProvenanceError(
+                    f"Golden {label} invocation ID is missing: "
+                    f"{summary if label == 'summary' else attempt}"
+                )
+            if observed != expected_invocation:
+                raise ProvenanceError(
+                    f"Golden {label} invocation ID mismatch: expected {expected_invocation!r}, "
+                    f"observed {observed!r} at {summary if label == 'summary' else attempt}"
+                )
+            observed_request = str(data.get("request_id") or "").strip()
+            if observed_request and observed_request != request_id:
+                raise ProvenanceError(
+                    f"Golden {label} request ID mismatch: expected {request_id!r}, "
+                    f"observed {observed_request!r}"
+                )
+
+        expected_backend = "pytorch"
+        try:
+            flag = config.flag("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND")
+            if flag is not None:
+                expected_backend = str(getattr(flag, "value", flag)).strip().lower()
+        except Exception:
+            pass
+        observed_backends: set[str] = set()
+        for data in (manifest_data, summary_data, attempt_data):
+            for key in ("attention_backend", "resolved_attention_backend"):
+                value = data.get(key)
+                if value not in (None, ""):
+                    observed_backends.add(str(value).strip().lower())
+            nested = data.get("golden_telemetry")
+            if isinstance(nested, dict) and nested.get("attention_backend") not in (None, ""):
+                observed_backends.add(str(nested["attention_backend"]).strip().lower())
+        if len(observed_backends) > 1:
+            raise ProvenanceError(
+                "Golden cohort contains mixed attention backends: "
+                + ", ".join(sorted(observed_backends))
+            )
+        if observed_backends and observed_backends != {expected_backend}:
+            raise ProvenanceError(
+                "Golden attention backend mismatch: "
+                f"expected {expected_backend!r}, observed {sorted(observed_backends)}"
+            )
+        from .experiment_evidence import sage_runtime_identity
+
+        sage_identity = sage_runtime_identity(
+            config, manifest_data, summary_data, attempt_data,
+        )
         stdout_request_ids = {
             value.strip()
             for value in re.findall(
@@ -1240,7 +1373,7 @@ class BackendRunner:
         return ArtifactSet(
             output_dir=cohort_dir,
             run_artifact=attempt,
-            summary_artifact=cohort_dir / "summary.json",
+            summary_artifact=summary,
             campaign_manifest=manifest,
             run_artifacts=[attempt],
             v2ctl_invocation_id=invocation_id,
@@ -1248,5 +1381,14 @@ class BackendRunner:
             request_ids=[request_id],
             profile=expected_profile or "golden_p1",
             profile_config_fingerprint=expected_profile_config_fingerprint,
+            attention_backend=next(iter(observed_backends), expected_backend),
+            experiment_identity={
+                "v2ctl_invocation_id": expected_invocation,
+                "request_id": request_id,
+                "profile": expected_profile_value,
+                "profile_config_fingerprint": expected_profile_config_fingerprint or "",
+                "attention_backend": next(iter(observed_backends), expected_backend),
+                **sage_identity,
+            },
             provenance_validation_status="validated",
         )

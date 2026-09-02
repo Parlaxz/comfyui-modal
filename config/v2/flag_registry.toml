@@ -743,6 +743,16 @@ enum_values = ["v0", "v1"]
 description = "VAE memory/restore policy (v1 is production)."
 
 [[flag]]
+name = "COMFYMODAL_SAGE_RUNTIME_MODE"
+type = "enum"
+default = "auto"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["auto", "baked_cuda", "triton_fallback"]
+description = "SageAttention runtime selector; production pins the baked CUDA dispatcher."
+
+[[flag]]
 name = "COMFYMODAL_V2_SINGLE_USE_CONTAINERS"
 type = "bool"
 default = "0"
