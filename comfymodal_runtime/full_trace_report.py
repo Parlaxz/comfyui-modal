@@ -418,11 +418,150 @@ def _parse_milestones(session_dir: Path) -> list[dict[str, Any]]:
 
 
 def _parse_session_events(session_dir: Path) -> list[dict[str, Any]]:
-    """Parse session_events.jsonl."""
+    """Parse and normalize ``session_events.jsonl`` records.
+
+    ``RuntimeTrace`` writes records as ``{"event": ..., "data": ...}``,
+    while older fixtures stored the data fields at the top level.  Keep the
+    latter shape working, but flatten the current shape and pair operation
+    records by their opaque operation id before consumers see them.
+    """
     path = session_dir / "raw" / "session_events.jsonl"
     if not path.exists():
         return []
-    return _jsonl_load(path)
+    return _pair_session_events(_jsonl_load(path))
+
+
+def _session_timestamp_ms(record: Mapping[str, Any]) -> float | None:
+    """Convert a session record's wall-clock timestamp to milliseconds."""
+    for key in ("timestamp_ms", "start_ms", "time_ms", "wall_unix_ms"):
+        value = _safe_float(record.get(key), None)
+        if value is not None:
+            return value
+    timestamp = _safe_float(record.get("timestamp"), None)
+    return timestamp * 1000.0 if timestamp is not None else None
+
+
+def _normalize_session_event(record: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one current or legacy session-event record.
+
+    Missing timestamps and identifiers remain absent/``None``.  In
+    particular, a missing wall timestamp is not represented as epoch zero.
+    """
+    if not isinstance(record.get("data"), dict) or "event" not in record:
+        return dict(record)
+
+    event_type = str(record.get("event", ""))
+    data = dict(record["data"])
+    normalized = dict(data)
+    normalized["event"] = event_type
+    normalized["event_type"] = event_type
+    for key in ("timestamp", "timestamp_iso", "monotonic_ns"):
+        if key in record:
+            normalized[key] = record[key]
+
+    timestamp_ms = _session_timestamp_ms(record)
+    if timestamp_ms is not None:
+        normalized.setdefault("timestamp_ms", timestamp_ms)
+        normalized.setdefault("time_ms", timestamp_ms)
+
+    # The runtime calls this field native_thread_id and uses asyncio_task_id;
+    # report consumers use the shorter context names used by VizTracer calls.
+    if "tid" not in normalized and "native_thread_id" in normalized:
+        normalized["tid"] = normalized["native_thread_id"]
+    if "task_id" not in normalized and "asyncio_task_id" in normalized:
+        normalized["task_id"] = str(normalized["asyncio_task_id"])
+    if "metadata" in normalized and "args" not in normalized and isinstance(normalized["metadata"], dict):
+        normalized["args"] = normalized["metadata"]
+    return normalized
+
+
+def _pair_session_events(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten session events and pair operation starts/ends by operation id."""
+    normalized = [_normalize_session_event(record) for record in records]
+    pending: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    replacements: dict[int, dict[str, Any]] = {}
+    consumed_end_indexes: set[int] = set()
+
+    for index, record in enumerate(normalized):
+        event_type = str(record.get("event_type", record.get("event", "")))
+        operation_id = record.get("operation_id")
+        if not operation_id:
+            continue
+        operation_id = str(operation_id)
+        if event_type == "operation_start":
+            pending[operation_id].append((index, record))
+            continue
+        if event_type != "operation_end":
+            continue
+
+        starts = pending.get(operation_id, [])
+        if not starts:
+            # Retain an unmatched end as incomplete evidence.
+            continue
+        start_index, start = starts.pop(0)
+        consumed_end_indexes.add(index)
+        paired = dict(start)
+        paired["event"] = "operation"
+        paired["event_type"] = "operation"
+        paired["operation_id"] = operation_id
+        paired["operation_end"] = dict(record)
+
+        # End metadata is authoritative for completion/status, but does not
+        # replace the start timestamp or start-side operation identity.
+        for key in ("operation_type", "semantic_key_hash", "request_id", "restore_session_id",
+                    "pid", "tid", "task_id"):
+            if paired.get(key) in (None, "") and record.get(key) not in (None, ""):
+                paired[key] = record[key]
+        if isinstance(start.get("metadata"), dict) or isinstance(record.get("metadata"), dict):
+            metadata = dict(start.get("metadata") or {})
+            metadata.update(record.get("metadata") or {})
+            paired["metadata"] = metadata
+            paired.setdefault("args", metadata)
+        paired["status"] = record.get("status") or start.get("status", "started")
+        paired["end_monotonic_ns"] = record.get("end_monotonic_ns")
+        paired["end_timestamp_ms"] = _session_timestamp_ms(record)
+
+        start_ms = _session_timestamp_ms(start)
+        end_ms = _session_timestamp_ms(record)
+        if end_ms is None:
+            end_ms = _safe_float(record.get("end_ms"), None)
+        duration_ms = _safe_float(record.get("wall_ms"), None)
+        if duration_ms is None and start_ms is not None and end_ms is not None:
+            duration_ms = end_ms - start_ms
+        paired["wall_ms"] = duration_ms
+        paired["start_ms"] = start_ms
+        paired["timestamp_ms"] = start_ms
+        paired["time_ms"] = start_ms
+        paired["duration_ms"] = duration_ms
+        paired["end_ms"] = end_ms if end_ms is not None else (
+            start_ms + duration_ms if start_ms is not None and duration_ms is not None else None
+        )
+        paired["complete"] = (
+            start_ms is not None
+            and paired["end_ms"] is not None
+            and duration_ms is not None
+        )
+        replacements[start_index] = paired
+
+    result: list[dict[str, Any]] = []
+    for index, record in enumerate(normalized):
+        if index in consumed_end_indexes:
+            continue
+        if str(record.get("event_type", record.get("event", ""))) == "operation_end":
+            # An end without its matching start is retained, but its end
+            # timestamp must never be mistaken for a fabricated start.
+            record = dict(record)
+            end_timestamp_ms = _session_timestamp_ms(record)
+            if end_timestamp_ms is None:
+                end_timestamp_ms = _safe_float(record.get("end_ms"), None)
+            record["start_ms"] = None
+            record["timestamp_ms"] = None
+            record["time_ms"] = None
+            record["duration_ms"] = None
+            record["end_ms"] = end_timestamp_ms
+            record["complete"] = False
+        result.append(replacements.get(index, record))
+    return result
 
 
 def _parse_wrapper_snapshots(session_dir: Path) -> list[dict[str, Any]]:
@@ -949,9 +1088,14 @@ def _build_critical_timeline(
             "evidence_source": evidence,
         })
 
-    # Add semantic operations from session events
+    # Add semantic operations from session events.  Paired RuntimeTrace
+    # records have operation_type; lifecycle records (mark/state transition)
+    # are emitted separately below so they are not misclassified as semantic
+    # operations.
     for ev in sessions:
         op_type = str(ev.get("operation_type", ev.get("event_type", "")))
+        if not ev.get("operation_type"):
+            continue
         start_ms_raw = next((ev[k] for k in ("start_ms", "timestamp_ms", "time_ms") if k in ev), None)
         duration_raw = ev.get("duration_ms") if "duration_ms" in ev else None
         start_ms = _safe_float(start_ms_raw, None)
@@ -960,8 +1104,8 @@ def _build_critical_timeline(
             continue
         if dur_ms is None:
             dur_ms = 0.0
-        pid = _safe_int(ev.get("pid", 0))
-        tid = _safe_int(ev.get("tid", 0))
+        pid = _safe_int(ev.get("pid"), None)
+        tid = _safe_int(ev.get("tid"), None)
         task_id = str(ev.get("task_id", ""))
         phase = str(ev.get("phase", ""))
         timeline.append({
@@ -975,6 +1119,48 @@ def _build_critical_timeline(
             "task_id": task_id,
             "parent": "",
             "lifecycle_phase": phase,
+            "evidence_source": "session_events",
+        })
+
+    # Current RuntimeTrace lifecycle evidence is also wrapped in
+    # session_events.jsonl.  Keep it as point evidence without inventing a
+    # duration or a missing timestamp.
+    for ev in sessions:
+        if ev.get("operation_type"):
+            continue
+        event_type = str(ev.get("event_type", ev.get("event", "")))
+        if event_type not in {"mark", "state_transition", "request_claimed", "identity_updated"}:
+            continue
+        start_ms = _safe_float(
+            next((ev[k] for k in ("timestamp_ms", "time_ms") if k in ev), None),
+            None,
+        )
+        if start_ms is None:
+            continue
+        name = str(ev.get("name", ""))
+        if not name and event_type == "state_transition":
+            name = str(ev.get("to", event_type))
+        if not name:
+            name = event_type
+        pid = _safe_int(ev.get("pid"), None)
+        tid = _safe_int(ev.get("tid"), None)
+        timeline.append({
+            "start_ms": round(start_ms, 3),
+            "end_ms": round(start_ms, 3),
+            "duration_ms": 0.0,
+            "owner_type": "milestone" if event_type == "mark" else "lifecycle",
+            "owner_name": name,
+            "pid": pid,
+            "tid": tid,
+            "task_id": str(ev.get("task_id", "")),
+            "parent": "",
+            "lifecycle_phase": str(
+                ev.get(
+                    "phase",
+                    (ev.get("metadata", {}).get("phase", event_type)
+                     if isinstance(ev.get("metadata"), dict) else event_type),
+                )
+            ),
             "evidence_source": "session_events",
         })
 
@@ -1155,6 +1341,9 @@ def _compute_semantic_key_hash(event: dict[str, Any]) -> str:
     Uses canonical JSON encoding of the event's key, semantic_key, or identity
     args if present.  Falls back to name + operation_type if no explicit key.
     """
+    explicit_hash = event.get("semantic_key_hash")
+    if isinstance(explicit_hash, str) and explicit_hash:
+        return explicit_hash
     args = event.get("args", {}) if isinstance(event.get("args"), dict) else {}
     for key_field in ("key", "semantic_key", "identity"):
         val = args.get(key_field)
@@ -1175,8 +1364,8 @@ def _extract_request_session_ids(
 ) -> tuple[str, str]:
     """Extract request_id and restore_session_id from event args or config."""
     args = event.get("args", {}) if isinstance(event.get("args"), dict) else {}
-    req = str(args.get("request_id", trace_config.get("request_id", "")))
-    sess = str(args.get("restore_session_id", trace_config.get("restore_session_id", "")))
+    req = str(event.get("request_id", args.get("request_id", trace_config.get("request_id", ""))))
+    sess = str(event.get("restore_session_id", args.get("restore_session_id", trace_config.get("restore_session_id", ""))))
     return req, sess
 
 
@@ -1211,9 +1400,17 @@ def _build_semantic_ops(
     for ev in sessions:
         op_type = str(ev.get("operation_type", ""))
         if op_type:
-            start_ms = _safe_float(ev.get("start_ms", 0.0), 0.0)
-            dur_ms = _safe_float(ev.get("duration_ms", 0.0), 0.0)
-            start_us = start_ms * 1000.0
+            start_ms = _safe_float(
+                next((ev[k] for k in ("start_ms", "timestamp_ms", "time_ms") if k in ev), None),
+                None,
+            )
+            dur_ms = _safe_float(ev.get("duration_ms"), None)
+            if start_ms is None:
+                start_us = None
+                end_us = None
+            else:
+                start_us = start_ms * 1000.0
+                end_us = start_us + dur_ms * 1000.0 if dur_ms is not None else None
             req, sess = _extract_request_session_ids(ev, trace_config)
             sk_hash = _compute_semantic_key_hash(ev)
             ops.append({
@@ -1224,10 +1421,10 @@ def _build_semantic_ops(
                 "source": "session_event",
                 "name": str(ev.get("name", "")),
                 "start_us": start_us,
-                "end_us": start_us + dur_ms * 1000.0,
-                "duration_us": dur_ms * 1000.0,
-                "pid": _safe_int(ev.get("pid", 0)),
-                "tid": _safe_int(ev.get("tid", 0)),
+                "end_us": end_us,
+                "duration_us": dur_ms * 1000.0 if dur_ms is not None else None,
+                "pid": _safe_int(ev.get("pid"), None),
+                "tid": _safe_int(ev.get("tid"), None),
                 "task_id": str(ev.get("task_id", "")),
             })
     return ops
@@ -2254,8 +2451,8 @@ def _build_async_tasks(
         task_id = str(ev.get("task_id", ""))
         if not task_id:
             return
+        ts = _safe_float(ev.get("timestamp_ms", ev.get("wall_unix_ms")), None)
         if task_id not in tasks:
-            ts = _safe_float(ev.get("timestamp_ms", ev.get("wall_unix_ms", 0.0)), 0.0)
             tasks[task_id] = {
                 "task_id": task_id,
                 "task_name": str(ev.get("task_name", ev.get("name", ""))),
@@ -2263,7 +2460,7 @@ def _build_async_tasks(
                 "cancelled": False,
                 "coroutine_qualname": str(ev.get("coroutine_name", ev.get("coroutine_qualname", ""))),
                 "top_stack_file": str(ev.get("stack_file", "")),
-                "top_stack_line": _safe_int(ev.get("stack_line", 0)),
+                "top_stack_line": _safe_int(ev.get("stack_line"), None),
                 "top_stack_function": str(ev.get("stack_function", "")),
                 "first_seen_ms": ts,
                 "last_seen_ms": ts,
@@ -2271,14 +2468,20 @@ def _build_async_tasks(
                 "source": event_source,
             }
         entry = tasks[task_id]
-        ts = _safe_float(ev.get("timestamp_ms", ev.get("wall_unix_ms", 0.0)), 0.0)
-        entry["last_seen_ms"] = max(entry["last_seen_ms"], ts)
+        if ts is not None:
+            entry["last_seen_ms"] = (
+                ts if entry["last_seen_ms"] is None
+                else max(entry["last_seen_ms"], ts)
+            )
         if ev.get("done"):
             entry["done"] = True
         if ev.get("cancelled"):
             entry["cancelled"] = True
-        if ev.get("milestone_start"):
-            entry["first_seen_ms"] = min(entry["first_seen_ms"], ts)
+        if ev.get("milestone_start") and ts is not None:
+            entry["first_seen_ms"] = (
+                ts if entry["first_seen_ms"] is None
+                else min(entry["first_seen_ms"], ts)
+            )
 
         # Check boundary crossing
         for bname in LIFECYCLE_BOUNDARIES:
@@ -2304,8 +2507,14 @@ def _build_async_tasks(
             "top_stack_file": info["top_stack_file"],
             "top_stack_line": info["top_stack_line"],
             "top_stack_function": info["top_stack_function"],
-            "first_seen_ms": round(info["first_seen_ms"], 3),
-            "last_seen_ms": round(info["last_seen_ms"], 3),
+            "first_seen_ms": (
+                round(info["first_seen_ms"], 3)
+                if info["first_seen_ms"] is not None else MEASUREMENT_UNAVAILABLE
+            ),
+            "last_seen_ms": (
+                round(info["last_seen_ms"], 3)
+                if info["last_seen_ms"] is not None else MEASUREMENT_UNAVAILABLE
+            ),
             "boundaries_crossed": ";".join(info["boundaries_crossed"]),
         })
     return rows
@@ -2325,6 +2534,600 @@ _BOUNDARY_DISPLAY_NAMES = {
     "sampling_start": "sampling start",
     "trace_stop": "trace stop",
 }
+
+# Golden profiling deliberately lives in this report pipeline rather than in a
+# second parser.  These names mirror golden_serial.STAGE_ORDER, but are kept
+# local so that offline report generation remains stdlib-only.
+_GOLDEN_ROOT_NAME = "golden_serial_execute"
+_GOLDEN_STAGE_NAMES = (
+    "golden_restore",
+    "golden_request_setup",
+    "golden_clip_load",
+    "golden_clip_forward",
+    "golden_unet_load",
+    "golden_sampler_prepare",
+    "golden_vae_load",
+    "golden_sampling",
+    "golden_sampler_tail",
+    "golden_vae_decode",
+    "golden_output",
+    "golden_durable_commit",
+)
+_GOLDEN_PROFILE_THRESHOLD_MS = 50.0
+_GOLDEN_PROFILE_RESIDUAL_MS = 25.0
+_GOLDEN_PROFILE_RESIDUAL_PERCENT = 2.0
+
+
+def _basename(name: Any) -> str:
+    """Return the final component of a qualified trace name."""
+    return str(name or "").rsplit(".", 1)[-1]
+
+
+def _golden_span(start_us: Any, end_us: Any) -> tuple[float, float] | None:
+    """Return a valid interval, without manufacturing missing timestamps."""
+    start = _safe_float(start_us, None)
+    end = _safe_float(end_us, None)
+    if start is None or end is None or end < start:
+        return None
+    return start, end
+
+
+def _golden_same_context(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Return whether two trace records share the complete execution context."""
+    if left.get("pid") is None or right.get("pid") is None:
+        return False
+    if left.get("tid") is None or right.get("tid") is None:
+        return False
+    return (
+        left.get("pid") == right.get("pid")
+        and left.get("tid") == right.get("tid")
+        and str(left.get("task_id", "") or "") == str(right.get("task_id", "") or "")
+    )
+
+
+def _golden_union_ms(calls: Sequence[dict[str, Any]]) -> float:
+    intervals = [
+        (float(c["start_us"]), float(c["end_us"]))
+        for c in calls
+        if _golden_span(c.get("start_us"), c.get("end_us")) is not None
+    ]
+    return _ms(_total_interval_length(intervals))
+
+
+def _golden_required_stages(
+    trace_config: Mapping[str, Any],
+    calls: Sequence[dict[str, Any]],
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Resolve explicitly applicable canonical stages.
+
+    A generic trace containing a function named ``golden_serial_execute`` is
+    not assumed to have exercised every stage.  Producers can make the
+    contract explicit with any of the established config spellings.  If a
+    canonical stage is present, the trace is also treated as a canonical-stage
+    claim and all non-durability stages are required.
+    """
+    configured: Any = None
+    for key in (
+        "required_canonical_stages",
+        "golden_required_stages",
+        "canonical_stages_required",
+    ):
+        if key in trace_config:
+            configured = trace_config[key]
+            break
+    if isinstance(configured, (list, tuple)):
+        requested = {_basename(v) for v in configured if str(v)}
+        return [name for name in _GOLDEN_STAGE_NAMES if name in requested]
+    if trace_config.get("golden_profile_require_canonical_stages") is True:
+        strict = str(
+            trace_config.get("output_durability_mode", trace_config.get("output_durability", ""))
+        ).lower() == "strict"
+        return [n for n in _GOLDEN_STAGE_NAMES if strict or n != "golden_durable_commit"]
+
+    evidence_calls = (
+        [c for c in calls if context is None or _golden_same_context(c, context)]
+    )
+    observed = {_basename(c.get("name")) for c in evidence_calls}
+    if observed.intersection(_GOLDEN_STAGE_NAMES):
+        strict = str(
+            trace_config.get("output_durability_mode", trace_config.get("output_durability", ""))
+        ).lower() == "strict"
+        return [n for n in _GOLDEN_STAGE_NAMES if strict or n != "golden_durable_commit"]
+    return []
+
+
+def _golden_node(
+    item: dict[str, Any],
+    *,
+    root_start_us: float,
+    children: Sequence[dict[str, Any]],
+    kind: str,
+    parent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one auditable Golden profile span from an existing interval."""
+    start = float(item["start_us"])
+    end = float(item["end_us"])
+    wall_ms = _ms(max(0.0, end - start))
+    measured_children = [
+        child for child in children
+        if _golden_span(child.get("start_us"), child.get("end_us")) is not None
+    ]
+    child_sum_ms = sum(
+        _ms(max(0.0, float(child["end_us"]) - float(child["start_us"])))
+        for child in measured_children
+    )
+    child_union_ms = _golden_union_ms(measured_children)
+    child_overlap_ms = child_sum_ms - child_union_ms
+    residual_ms = wall_ms - child_union_ms
+    coverage_pct = (child_union_ms / wall_ms * 100.0) if wall_ms > 0 else None
+    subthreshold = [
+        child for child in measured_children
+        if _ms(max(0.0, float(child["end_us"]) - float(child["start_us"]))) <= _GOLDEN_PROFILE_THRESHOLD_MS
+    ]
+    source = item.get("source_file") or (
+        "session_events" if kind == "semantic" and item.get("source") == "session_event"
+        else ("trace_call" if kind == "semantic" else "viztracer")
+    )
+    task_id = str(item.get("task_id", "") or "")
+    pid = item.get("pid")
+    tid = item.get("tid")
+    thread_task = f"{pid}:{tid}" if pid is not None or tid is not None else ""
+    if task_id:
+        thread_task = f"{thread_task}/task:{task_id}" if thread_task else f"task:{task_id}"
+    name = str(item.get("operation_type") if kind == "semantic" else item.get("name", ""))
+    complete = bool(item.get("complete", True)) and _golden_span(start, end) is not None
+    needs_decomposition = (
+        residual_ms > _GOLDEN_PROFILE_RESIDUAL_MS
+        or (wall_ms > 0 and residual_ms / wall_ms * 100.0 > _GOLDEN_PROFILE_RESIDUAL_PERCENT)
+    )
+    return {
+        "kind": kind,
+        "name": name,
+        "source": source,
+        "source_file": item.get("source_file") or source,
+        "source_line": item.get("source_line"),
+        "event_index": item.get("event_index"),
+        "parent_event_index": item.get("parent_event_index"),
+        "parent_name": item.get("parent_name", "") if parent else "",
+        "start_offset_ms": round(_ms(start - root_start_us), 3),
+        "start_offset": round(_ms(start - root_start_us), 3),
+        "start_offset_us": round(start - root_start_us, 3),
+        "start_ms": round(_ms(start), 3),
+        "end_ms": round(_ms(end), 3),
+        "wall_ms": round(wall_ms, 3),
+        "direct_child_sum_ms": round(child_sum_ms, 3),
+        "direct_child_union_ms": round(child_union_ms, 3),
+        "child_overlap_ms": round(child_overlap_ms, 3),
+        "direct_children_sum_ms": round(child_sum_ms, 3),
+        "direct_children_union_ms": round(child_union_ms, 3),
+        "overlap_ms": round(child_overlap_ms, 3),
+        "exclusive_residual_ms": round(residual_ms, 3),
+        "residual_ms": round(residual_ms, 3),
+        "coverage_pct": round(coverage_pct, 3) if coverage_pct is not None else MEASUREMENT_UNAVAILABLE,
+        "coverage": round(coverage_pct, 3) if coverage_pct is not None else MEASUREMENT_UNAVAILABLE,
+        "coverage_ms": round(child_union_ms, 3),
+        "subthreshold_children_union_ms": round(_golden_union_ms(subthreshold), 3),
+        "pid": pid,
+        "tid": tid,
+        "task_id": task_id,
+        "depth": item.get("depth", 0),
+        "thread_task": thread_task,
+        "complete": complete,
+        "completeness": "complete" if complete else "incomplete",
+        "needs_decomposition": needs_decomposition,
+        "flag": "NEEDS_DECOMPOSITION" if needs_decomposition else "",
+        "children": [],
+    }
+
+
+def _golden_semantic_span(op: dict[str, Any]) -> dict[str, Any] | None:
+    span = _golden_span(op.get("start_us"), op.get("end_us"))
+    if span is None:
+        return None
+    start, end = span
+    return {
+        "operation_type": op.get("operation_type", ""),
+        "name": op.get("operation_type", op.get("name", "")),
+        "source": op.get("source", "semantic"),
+        "source_file": op.get("source", "semantic"),
+        "source_line": None,
+        "start_us": start,
+        "end_us": end,
+        "duration_us": end - start,
+        "pid": op.get("pid"),
+        "tid": op.get("tid"),
+        "task_id": op.get("task_id", ""),
+        "complete": True,
+    }
+
+
+def _build_golden_profile(
+    calls: list[dict[str, Any]],
+    semantic_ops: list[dict[str, Any]],
+    torch_events: list[dict[str, Any]],
+    trace_config: Mapping[str, Any],
+    *,
+    trace_truncated: bool,
+    raw_trace_nonempty: bool,
+) -> dict[str, Any]:
+    """Analyze one and only one claimed Golden serial root call."""
+    roots = [c for c in calls if _basename(c.get("name")) == _GOLDEN_ROOT_NAME]
+    configured_torch_enabled = trace_config.get("torch_enabled")
+    if isinstance(configured_torch_enabled, bool):
+        # An explicit setting is authoritative, including false.  A trace
+        # artifact can exist as an empty/placeholder file without profiling
+        # having been enabled.
+        torch_enabled = configured_torch_enabled
+    else:
+        # Offline sessions from before torch_enabled was recorded use parsed
+        # events (or the configured trace path) as the compatibility signal.
+        torch_enabled = bool(torch_events) or bool(trace_config.get("torch_trace_path"))
+    torch_disabled = not torch_enabled
+    torch_state = "DISABLED" if torch_disabled else "ENABLED"
+    reason = "complete"
+    complete = True
+    root: dict[str, Any] | None = None
+    if len(roots) == 0:
+        complete, reason = False, "missing golden_serial_execute root call"
+    elif len(roots) != 1:
+        complete, reason = False, f"ambiguous golden_serial_execute root call: found {len(roots)}"
+    else:
+        root = roots[0]
+        if not bool(root.get("complete")) or _golden_span(root.get("start_us"), root.get("end_us")) is None:
+            complete, reason = False, "incomplete golden_serial_execute root call"
+        elif not raw_trace_nonempty:
+            complete, reason = False, "raw VizTracer trace is empty"
+        elif trace_truncated:
+            complete, reason = False, "VizTracer trace is truncated"
+        elif not torch_disabled and not torch_events:
+            complete, reason = False, "Torch analysis failed: enabled trace is empty or invalid"
+
+    if root is not None and complete:
+        root_start = float(root["start_us"])
+        root_end = float(root["end_us"])
+        descendants = [
+            c for c in calls
+            if c is not root
+            and c.get("start_us") is not None
+            and c.get("end_us") is not None
+            and root_start <= float(c["start_us"])
+            and float(c["end_us"]) <= root_end
+        ]
+        incomplete_inside = [
+            c for c in calls
+            if c is not root and not c.get("complete", True)
+            and (
+                (c.get("start_us") is not None and root_start <= float(c["start_us"]) <= root_end)
+                or (c.get("end_us") is not None and root_start <= float(c["end_us"]) <= root_end)
+            )
+        ]
+        if incomplete_inside:
+            bad = sorted(incomplete_inside, key=lambda c: (c.get("event_index", 0), c.get("name", "")))[0]
+            complete = False
+            reason = f"incomplete root-corrupting call: {bad.get('name', '')}"
+
+        ambiguous = [
+            c for c in descendants
+            if c.get("parent_event_index") is None
+            and c.get("pid") == root.get("pid")
+            and c.get("tid") == root.get("tid")
+            and abs(float(c["start_us"]) - root_start) < 0.001
+            and abs(float(c["end_us"]) - root_end) < 0.001
+        ]
+        if complete and ambiguous:
+            complete = False
+            reason = f"ambiguous parenthood for call: {ambiguous[0].get('name', '')}"
+
+        root_context_calls = [c for c in calls if _golden_same_context(c, root)]
+        required = _golden_required_stages(
+            trace_config,
+            root_context_calls,
+            context=root,
+        )
+        observed_stages = {
+            _basename(c.get("name")) for c in descendants
+            if _golden_same_context(c, root)
+            and _basename(c.get("name")) in _GOLDEN_STAGE_NAMES
+        }
+        missing = [stage for stage in required if stage not in observed_stages]
+        if complete and missing:
+            complete = False
+            reason = f"missing required canonical stage: {missing[0]}"
+
+        parented_root_children = [
+            c for c in descendants
+            if c.get("parent_event_index") == root.get("event_index")
+            and _golden_same_context(c, root)
+        ]
+        # Interval containment is useful accounting evidence even when the
+        # existing reconstruction intentionally leaves an overlapping sibling
+        # unparented.  Keep that call's parent blank; this is not async
+        # ownership inference.  Cross-thread calls are excluded because their
+        # relationship to this root is not established by the trace.
+        ambiguous_root_children = [
+            c for c in descendants
+            if c.get("parent_event_index") is None
+            and _golden_same_context(c, root)
+            and c not in parented_root_children
+        ]
+        unparented_contained = [
+            c for c in descendants
+            if c.get("parent_event_index") is None and c not in parented_root_children
+            and c.get("pid") == root.get("pid")
+            and c.get("tid") == root.get("tid")
+            and c.get("task_id", "") == root.get("task_id", "")
+        ]
+        root_children = parented_root_children + ambiguous_root_children
+        root_intervals = [
+            (float(c["start_us"]), float(c["end_us"]))
+            for c in root_children
+            if _golden_span(c.get("start_us"), c.get("end_us")) is not None
+        ]
+        root_union_ms = _ms(_total_interval_length(root_intervals))
+        if complete and (root_end - root_start) < 0 or root_union_ms > _ms(root_end - root_start) + 0.001:
+            complete = False
+            reason = "invalid accounting: direct child union exceeds root wall"
+
+        root_node = _golden_node(root, root_start_us=root_start, children=root_children, kind="python")
+
+        calls_by_event_index = {
+            c["event_index"]: c
+            for c in calls
+            if isinstance(c.get("event_index"), int)
+        }
+        children_by_parent: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for child in descendants:
+            parent_index = child.get("parent_event_index")
+            parent = calls_by_event_index.get(parent_index) if isinstance(parent_index, int) else None
+            if parent is not None and _golden_same_context(child, parent):
+                children_by_parent[parent_index].append(child)
+
+        def build_children(parent: dict[str, Any], parent_node: dict[str, Any]) -> None:
+            direct = sorted(
+                children_by_parent.get(parent.get("event_index"), [])
+                + (unparented_contained if parent is root else []),
+                key=lambda c: (float(c.get("start_us", 0)), float(c.get("end_us", 0)), str(c.get("name", "")), int(c.get("event_index", 0))),
+            )
+            for child in direct:
+                duration_ms = _ms(float(child["end_us"]) - float(child["start_us"]))
+                if duration_ms <= _GOLDEN_PROFILE_THRESHOLD_MS:
+                    continue
+                child_node = _golden_node(
+                    child,
+                    root_start_us=root_start,
+                    children=children_by_parent.get(child.get("event_index"), []),
+                    kind="python",
+                    parent=parent,
+                )
+                build_children(child, child_node)
+                parent_node["children"].append(child_node)
+
+        build_children(root, root_node)
+        semantic_nodes: list[dict[str, Any]] = []
+        for op in semantic_ops:
+            span = _golden_semantic_span(op)
+            if span is None:
+                continue
+            if not (root_start <= span["start_us"] and span["end_us"] <= root_end):
+                continue
+            if _ms(span["end_us"] - span["start_us"]) <= _GOLDEN_PROFILE_THRESHOLD_MS:
+                continue
+            semantic_nodes.append(
+                _golden_node(span, root_start_us=root_start, children=[], kind="semantic")
+            )
+        semantic_nodes.sort(key=lambda n: (n["start_offset_ms"], n["end_ms"], n["name"], n.get("source", "")))
+        canonical_spans = []
+        for stage in _GOLDEN_STAGE_NAMES:
+            for candidate in descendants:
+                if not _golden_same_context(candidate, root):
+                    continue
+                if _basename(candidate.get("name")) != stage:
+                    continue
+                canonical_spans.append(
+                    _golden_node(
+                        candidate,
+                        root_start_us=root_start,
+                        children=children_by_parent.get(candidate.get("event_index"), []),
+                        kind="python",
+                    )
+                )
+        canonical_spans.sort(key=lambda n: (n["start_offset_ms"], n["end_ms"], n["name"], n.get("event_index", 0)))
+        return {
+            "GOLDEN_PROFILE_COMPLETE": "YES" if complete else "NO",
+            "GOLDEN_PROFILE_REASON": reason,
+            "GOLDEN_PROFILE_TORCH": torch_state,
+            "root": root_node,
+            "nodes": root_node["children"] + semantic_nodes,
+            "semantic_spans": semantic_nodes,
+            "canonical_spans": canonical_spans,
+            "required_canonical_stages": required,
+            "observed_canonical_stages": sorted(observed_stages),
+            "torch_cpu_ops": _build_torch_cpu_ops(torch_events),
+            "torch_cuda_ops": _build_torch_cuda_ops(torch_events),
+            "trace_truncated": trace_truncated,
+            "raw_trace_nonempty": raw_trace_nonempty,
+        }
+
+    return {
+        "GOLDEN_PROFILE_COMPLETE": "NO",
+        "GOLDEN_PROFILE_REASON": reason,
+        "GOLDEN_PROFILE_TORCH": torch_state,
+        "root": None,
+        "nodes": [],
+        "semantic_spans": [],
+        "canonical_spans": [],
+        "required_canonical_stages": [],
+        "observed_canonical_stages": [],
+        "torch_cpu_ops": _build_torch_cpu_ops(torch_events),
+        "torch_cuda_ops": _build_torch_cuda_ops(torch_events),
+        "trace_truncated": trace_truncated,
+        "raw_trace_nonempty": raw_trace_nonempty,
+    }
+
+
+def _golden_profile_json(profile: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable, JSON-facing Golden profile shape."""
+    root = profile.get("root") or {}
+    root_summary = {
+        key: root.get(key, MEASUREMENT_UNAVAILABLE)
+        for key in (
+            "kind", "name", "source", "start_offset_ms", "start_offset", "wall_ms", "direct_child_sum_ms",
+            "direct_child_union_ms", "child_overlap_ms", "direct_children_sum_ms",
+            "direct_children_union_ms", "overlap_ms", "exclusive_residual_ms",
+            "residual_ms", "coverage_pct", "coverage", "subthreshold_children_union_ms",
+            "thread_task", "completeness", "needs_decomposition", "flag",
+        )
+    }
+    if root:
+        root_summary["children"] = root.get("children", [])
+    complete = profile["GOLDEN_PROFILE_COMPLETE"] == "YES"
+    root_wall = root.get("wall_ms") if root else MEASUREMENT_UNAVAILABLE
+    needs_decomposition = bool(root.get("needs_decomposition")) if root else False
+
+    def count_nodes(node_list: Sequence[dict[str, Any]]) -> int:
+        return sum(1 + count_nodes(node.get("children", [])) for node in node_list)
+
+    span_count = count_nodes(profile.get("nodes", []))
+    return {
+        "schema_version": "golden-profile/1",
+        "GOLDEN_PROFILE_COMPLETE": profile["GOLDEN_PROFILE_COMPLETE"],
+        "GOLDEN_PROFILE_REASON": profile["GOLDEN_PROFILE_REASON"],
+        "GOLDEN_PROFILE_TORCH": profile["GOLDEN_PROFILE_TORCH"],
+        "complete": complete,
+        "reason": profile["GOLDEN_PROFILE_REASON"],
+        "torch": profile["GOLDEN_PROFILE_TORCH"],
+        "GOLDEN_PROFILE_ROOT_NAME": root.get("name") if root else MEASUREMENT_UNAVAILABLE,
+        "GOLDEN_PROFILE_ROOT_WALL_MS": root_wall,
+        "GOLDEN_PROFILE_SPAN_COUNT": span_count,
+        "GOLDEN_PROFILE_NEEDS_DECOMPOSITION": needs_decomposition,
+        "root": root_summary if root else None,
+        "nodes": profile.get("nodes", []),
+        "semantic_spans": profile.get("semantic_spans", []),
+        "canonical_spans": profile.get("canonical_spans", []),
+        "required_canonical_stages": profile.get("required_canonical_stages", []),
+        "observed_canonical_stages": profile.get("observed_canonical_stages", []),
+        "completeness": {
+            "complete": complete,
+            "reason": profile["GOLDEN_PROFILE_REASON"],
+            "trace_truncated": profile.get("trace_truncated", False),
+            "raw_trace_nonempty": profile.get("raw_trace_nonempty", False),
+        },
+    }
+
+
+def _golden_bar(start_ms: float, end_ms: float, root_start_ms: float, root_end_ms: float) -> str:
+    """Render a deterministic 100-column inclusive timeline bar."""
+    width = 100
+    span = root_end_ms - root_start_ms
+    if span <= 0:
+        return "█" + (" " * (width - 1))
+    lo = max(0, min(width - 1, int(((start_ms - root_start_ms) / span) * width)))
+    hi = max(lo + 1, min(width, int(((end_ms - root_start_ms) / span) * width + 0.999999)))
+    return " " * lo + "█" * (hi - lo) + " " * (width - hi)
+
+
+def _golden_profile_gantt(profile: dict[str, Any]) -> str:
+    """Build the text Gantt while keeping unaligned Torch clocks separate."""
+    lines = [
+        "GOLDEN_PROFILE_COMPLETE=" + profile["GOLDEN_PROFILE_COMPLETE"],
+        "GOLDEN_PROFILE_REASON=" + profile["GOLDEN_PROFILE_REASON"],
+        "GOLDEN_PROFILE_TORCH=" + profile["GOLDEN_PROFILE_TORCH"],
+        "# Golden profile Gantt",
+        "TIMELINE_COLUMNS=100",
+    ]
+    root = profile.get("root")
+    if root:
+        root_start = float(root["start_ms"])
+        root_end = float(root["end_ms"])
+        rows: list[tuple[int, float, float, str, str]] = [(0, root_start, root_end, root["name"], "root")]
+        selected: dict[tuple[Any, ...], tuple[int, float, float, str, str]] = {}
+        def select_node(node: dict[str, Any], level: int, *, preserve_existing: bool = False) -> None:
+            key = (node.get("kind"), node.get("event_index"), node.get("name"), node.get("start_ms"))
+            if not preserve_existing or key not in selected:
+                selected[key] = (level, float(node["start_ms"]), float(node["end_ms"]), node["name"], node.get("kind", ""))
+            for child in node.get("children", []):
+                select_node(child, level + 1)
+
+        for node in profile.get("nodes", []):
+            select_node(node, 1)
+        for node in profile.get("canonical_spans", []):
+            select_node(node, max(1, int(node.get("depth", 1) or 1)), preserve_existing=True)
+        # Canonical stages are included even when they are below the 50 ms
+        # reporting threshold.
+        rows.extend(selected.values())
+        rows.sort(key=lambda row: (0 if row[4] == "root" else 1, row[0], row[1], row[2], row[3]))
+        for level, start_ms, end_ms, name, kind in rows:
+            label = ("  " * level) + name
+            lines.append(f"{label} |{_golden_bar(start_ms, end_ms, root_start, root_end)}|")
+    else:
+        lines.append("(no Golden root interval; timeline unavailable)")
+
+    lines.extend([
+        "",
+        "Torch lanes (clock alignment unproven; shown as a separate table, not plotted):",
+        "| lane | operator/kernel | total_ms |",
+        "|---|---|---|",
+    ])
+    for op in profile.get("torch_cpu_ops", []):
+        lines.append(f"| CPU | {op['operator']} | {op['total_cpu_ms']} |")
+    for op in profile.get("torch_cuda_ops", []):
+        lines.append(f"| CUDA | {op['kernel_or_memcpy']} | {op['total_cuda_ms']} |")
+    if not profile.get("torch_cpu_ops") and not profile.get("torch_cuda_ops"):
+        lines.append("| (none) | (Torch trace unavailable) | measurement_unavailable |")
+    return "\n".join(lines) + "\n"
+
+
+def _generate_golden_profile_report(profile: dict[str, Any]) -> str:
+    """Generate the standalone Golden profile report."""
+    data = _golden_profile_json(profile)
+    lines = [
+        "GOLDEN_PROFILE_COMPLETE=" + data["GOLDEN_PROFILE_COMPLETE"],
+        "GOLDEN_PROFILE_REASON=" + data["GOLDEN_PROFILE_REASON"],
+        "GOLDEN_PROFILE_TORCH=" + data["GOLDEN_PROFILE_TORCH"],
+        "GOLDEN_PROFILE_ROOT_NAME=" + str(data["GOLDEN_PROFILE_ROOT_NAME"]),
+        "GOLDEN_PROFILE_ROOT_WALL_MS=" + str(data["GOLDEN_PROFILE_ROOT_WALL_MS"]),
+        "GOLDEN_PROFILE_SPAN_COUNT=" + str(data["GOLDEN_PROFILE_SPAN_COUNT"]),
+        "GOLDEN_PROFILE_NEEDS_DECOMPOSITION=" + str(data["GOLDEN_PROFILE_NEEDS_DECOMPOSITION"]),
+        "# Golden execution profile",
+        "",
+        "## Summary",
+        f"- Root: {data['root']['name'] if data['root'] else MEASUREMENT_UNAVAILABLE}",
+        f"- Required canonical stages: {', '.join(data['required_canonical_stages']) or '(none claimed)' }",
+        f"- Observed canonical stages: {', '.join(data['observed_canonical_stages']) or '(none)' }",
+        "",
+        "## Spans over 50.000 ms",
+        "",
+        "| Name | Kind | Source | Start offset (ms) | Wall (ms) | Direct child sum (ms) | Direct child union (ms) | Child overlap (ms) | Residual (ms) | Coverage (%) | Thread/task | Completeness |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|",
+    ]
+    def add_node(node: dict[str, Any], level: int = 0) -> None:
+        indent = "  " * level
+        lines.append(
+            f"| {indent}{node['name']} | {node['kind']} | {node['source']} | {node['start_offset_ms']} "
+            f"| {node['wall_ms']} | {node['direct_child_sum_ms']} | {node['direct_child_union_ms']} "
+            f"| {node['child_overlap_ms']} | {node['exclusive_residual_ms']} | {node['coverage_pct']} "
+            f"| {node['thread_task']} | {node['completeness']} "
+            f"{node['flag']} (subthreshold_children_union_ms={node['subthreshold_children_union_ms']}) |"
+        )
+        for child in node.get("children", []):
+            add_node(child, level + 1)
+    if data["root"]:
+        add_node(data["root"])
+        for node in data["semantic_spans"]:
+            add_node(node, 1)
+    else:
+        lines.append("| (none) | (none) | (none) | measurement_unavailable | measurement_unavailable | measurement_unavailable | measurement_unavailable | measurement_unavailable | measurement_unavailable | measurement_unavailable | measurement_unavailable | incomplete |")
+    lines.extend([
+        "",
+        "Residual is not causal. child_overlap=child_sum-child_union; exclusive_residual=parent_wall-direct_child_union.",
+        "",
+        "## Torch analysis",
+        "",
+        "Torch CPU/CUDA clock alignment is unproven; the Gantt keeps those lanes in a separate table.",
+    ])
+    return "\n".join(lines) + "\n"
 
 
 def _generate_report_md(
@@ -2350,6 +3153,7 @@ def _generate_report_md(
     derived_files: dict[str, Any],
     overlaps: list[dict[str, Any]],
     milestones: list[dict[str, Any]],
+    golden_profile: dict[str, Any] | None = None,
 ) -> str:
     """Generate the full markdown report."""
     lines: list[str] = []
@@ -2390,6 +3194,16 @@ def _generate_report_md(
         for w in warnings:
             _w(f"- {w}")
     _w("")
+
+    # ── Golden serial profile ──
+    if golden_profile is not None:
+        _w("## Golden serial profile")
+        _w("")
+        _w(f"- **GOLDEN_PROFILE_COMPLETE**: {golden_profile.get('GOLDEN_PROFILE_COMPLETE', 'NO')}")
+        _w(f"- **GOLDEN_PROFILE_REASON**: {golden_profile.get('GOLDEN_PROFILE_REASON', '')}")
+        _w(f"- **GOLDEN_PROFILE_TORCH**: {golden_profile.get('GOLDEN_PROFILE_TORCH', 'DISABLED')}")
+        _w(f"- Profile spans over 50 ms: {len(golden_profile.get('nodes', []))}")
+        _w("")
 
     # ── Runtime configuration ──
     _w("## Runtime configuration")
@@ -2752,6 +3566,7 @@ def _build_report_data(
     async_tasks: list[dict[str, Any]],
     # Derived files info
     derived_files: dict[str, Any],
+    golden_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured report_data.json."""
     data: dict[str, Any] = {
@@ -2797,6 +3612,17 @@ def _build_report_data(
         "session_events": sessions,
         "trace_config": trace_config,
         "runtime_result": runtime_result,
+        "derived_files": derived_files.get("files", []),
+        "golden_profile": _golden_profile_json(golden_profile) if golden_profile is not None else None,
+        "golden_profile_complete": (
+            golden_profile.get("GOLDEN_PROFILE_COMPLETE") if golden_profile is not None else "NO"
+        ),
+        "golden_profile_reason": (
+            golden_profile.get("GOLDEN_PROFILE_REASON") if golden_profile is not None else "not_generated"
+        ),
+        "golden_profile_torch": (
+            golden_profile.get("GOLDEN_PROFILE_TORCH") if golden_profile is not None else "DISABLED"
+        ),
     }
 
     # Add resource samples if available
@@ -2913,6 +3739,16 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     # ── Torch analysis ──
     torch_cpu_ops = _build_torch_cpu_ops(torch_events)
     torch_cuda_ops = _build_torch_cuda_ops(torch_events)
+
+    # ── Golden serial profile (reuses all normalized/derived evidence above) ──
+    golden_profile = _build_golden_profile(
+        calls,
+        semantic_ops,
+        torch_events,
+        trace_config,
+        trace_truncated=truncated,
+        raw_trace_nonempty=bool(trace_events),
+    )
 
     # ── Async tasks ──
     async_tasks = _build_async_tasks(milestones, sessions)
@@ -3040,6 +3876,24 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "operation", "expected", "observed", "classification",
     ])
 
+    # Golden profile artifacts are generated before the existing reports so
+    # their paths and hashes participate in the normal inventory/manifest path.
+    golden_summary_path = derived_dir / "golden_profile_summary.json"
+    golden_report_path = derived_dir / "golden_profile_report.md"
+    golden_gantt_path = derived_dir / "golden_profile_gantt.txt"
+    _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+    try:
+        golden_report_path.write_text(_generate_golden_profile_report(golden_profile), encoding="utf-8")
+        golden_gantt_path.write_text(_golden_profile_gantt(golden_profile), encoding="utf-8")
+    except Exception as exc:
+        golden_profile["GOLDEN_PROFILE_COMPLETE"] = "NO"
+        golden_profile["GOLDEN_PROFILE_REASON"] = f"derived generation failed: {exc.__class__.__name__}"
+        _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+    if not all(path.is_file() for path in (golden_summary_path, golden_report_path, golden_gantt_path)):
+        golden_profile["GOLDEN_PROFILE_COMPLETE"] = "NO"
+        golden_profile["GOLDEN_PROFILE_REASON"] = "derived generation failed: missing Golden artifact"
+        _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+
     # ── Generate report.md ──
     derived_files_info = {
         "trace_entry_count": entry_count,
@@ -3072,6 +3926,7 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         derived_files=derived_files_info,
         overlaps=overlaps,
         milestones=milestones,
+        golden_profile=golden_profile,
     )
 
     report_path = derived_dir / "report.md"
@@ -3105,6 +3960,7 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         stack_issues=stack_issues,
         async_tasks=async_tasks,
         derived_files=derived_files_info,
+        golden_profile=golden_profile,
     ))
 
     # ── Generate manifest.json (built AFTER all derived files exist, including report_data.json) ──
@@ -3134,6 +3990,12 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "trace_entry_count": entry_count,
         "trace_entry_capacity": entry_capacity,
         "trace_truncated": truncated,
+        "golden_profile_complete": golden_profile["GOLDEN_PROFILE_COMPLETE"],
+        "golden_profile_reason": golden_profile["GOLDEN_PROFILE_REASON"],
+        "golden_profile_torch": golden_profile["GOLDEN_PROFILE_TORCH"],
+        "golden_profile_summary_path": str(golden_summary_path).replace("\\", "/"),
+        "golden_profile_report_path": str(golden_report_path).replace("\\", "/"),
+        "golden_profile_gantt_path": str(golden_gantt_path).replace("\\", "/"),
     }
 
 

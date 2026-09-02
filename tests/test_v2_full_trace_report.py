@@ -25,7 +25,10 @@ from typing import Any
 
 import pytest
 
-from comfymodal_runtime.full_trace_report import generate_full_trace_report
+from comfymodal_runtime.full_trace_report import (
+    _build_golden_profile,
+    generate_full_trace_report,
+)
 
 
 # =========================================================================
@@ -571,6 +574,71 @@ class TestSemanticOperations:
         clip_dups = [d for d in sem_dups if d["operation_type"] == "clip_graph_encode"]
         assert len(clip_dups) == 1
         assert int(clip_dups[0]["call_count"]) >= 2
+
+    def test_wrapped_session_events_pair_operations_and_preserve_lifecycle(self, tmp_path: Path):
+        """RuntimeTrace's wrapped records become one measured operation plus lifecycle evidence."""
+        session_events = [
+            {
+                "timestamp": 1000.000,
+                "event": "mark",
+                "data": {"name": "request_entry", "pid": 7, "native_thread_id": 9},
+            },
+            {
+                "timestamp": 1000.100,
+                "event": "operation_start",
+                "data": {
+                    "operation_id": "op-1",
+                    "operation_type": "clip_graph_encode",
+                    "semantic_key_hash": "a" * 64,
+                    "request_id": "request-1",
+                    "restore_session_id": "restore-1",
+                    "pid": 7,
+                    "native_thread_id": 9,
+                    "asyncio_task_id": 11,
+                    "start_monotonic_ns": 1,
+                },
+            },
+            {
+                "timestamp": 1000.225,
+                "event": "operation_end",
+                "data": {
+                    "operation_id": "op-1",
+                    "pid": 7,
+                    "native_thread_id": 9,
+                    "asyncio_task_id": 11,
+                    "wall_ms": 125.0,
+                    "status": "ok",
+                },
+            },
+        ]
+        session_dir = _make_session(
+            tmp_path,
+            viztracer_events=[X("main", 1000, 500)],
+            session_events=session_events,
+        )
+        generate_full_trace_report(session_dir)
+        report_data = json.loads(
+            (session_dir / "derived" / "report_data.json").read_text("utf-8")
+        )
+
+        normalized = report_data["session_events"]
+        operations = [event for event in normalized if event.get("operation_type")]
+        assert len(operations) == 1
+        assert operations[0]["operation_id"] == "op-1"
+        assert operations[0]["start_ms"] == pytest.approx(1_000_100.0)
+        assert operations[0]["duration_ms"] == pytest.approx(125.0)
+        assert operations[0]["end_ms"] == pytest.approx(1_000_225.0)
+
+        semantic = [
+            event for event in report_data["timeline"]
+            if event["owner_type"] == "semantic_operation"
+        ]
+        assert any(event["owner_name"] == "clip_graph_encode" for event in semantic)
+        assert any(
+            event["owner_type"] == "milestone"
+            and event["owner_name"] == "request_entry"
+            for event in report_data["timeline"]
+        )
 
 
 class TestExpectedVsObserved:
@@ -1805,6 +1873,251 @@ class TestAdditionalEdgeCases:
                      "functions_summary", "duplicate_calls", "semantic_duplicates",
                      "expected_vs_observed", "torch_cpu_ops", "torch_cuda_ops"):
             assert key in report_data, f"Missing key in report_data.json: {key}"
+
+
+class TestGoldenProfile:
+    """Synthetic, stdlib-only fixtures for the Golden serial profile."""
+
+    def _profile(self, tmp_path: Path, events: list[dict[str, Any]], **kwargs: Any) -> tuple[Path, dict[str, Any]]:
+        session_dir = _make_session(tmp_path, viztracer_events=events, **kwargs)
+        result = generate_full_trace_report(session_dir)
+        summary = json.loads((session_dir / "derived" / "golden_profile_summary.json").read_text("utf-8"))
+        return session_dir, {"result": result, "summary": summary}
+
+    def test_hotspot_over_threshold_and_short_span_exclusion(self, tmp_path: Path):
+        session_dir, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 200_000),
+            X("hotspot", 10_000, 60_000),
+            X("short_span", 80_000, 40_000),
+        ])
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "YES"
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "DISABLED"
+        assert [n["name"] for n in report["summary"]["nodes"]] == ["hotspot"]
+        assert report["summary"]["root"]["direct_child_sum_ms"] == 100.0
+        assert report["summary"]["root"]["subthreshold_children_union_ms"] == 40.0
+        assert "short_span" not in (session_dir / "derived" / "golden_profile_report.md").read_text("utf-8")
+
+    def test_union_and_overlap_accounting(self, tmp_path: Path):
+        _, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 200_000),
+            X("overlap_a", 10_000, 70_000),
+            X("overlap_b", 50_000, 70_000),
+        ])
+        root = report["summary"]["root"]
+        assert root["direct_child_sum_ms"] == 140.0
+        assert root["direct_child_union_ms"] == 110.0
+        assert root["child_overlap_ms"] == 30.0
+
+    def test_cross_context_unparented_span_is_not_root_child(self, tmp_path: Path):
+        """Unparented spans from another execution context stay out of the root tree."""
+        _, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 200_000, pid=1, tid=1,
+              args={"task_id": "root-task"}),
+            X("same_context_child", 10_000, 70_000, pid=1, tid=1,
+              args={"task_id": "root-task"}),
+            X("cross_context_span", 20_000, 160_000, pid=2, tid=2,
+              args={"task_id": "other-task"}),
+        ])
+
+        root = report["summary"]["root"]
+        assert root["direct_child_union_ms"] == 70.0
+        assert [child["name"] for child in root["children"]] == ["same_context_child"]
+
+        def tree_names(nodes: list[dict[str, Any]]) -> set[str]:
+            return {
+                name
+                for node in nodes
+                for name in (node["name"], *tree_names(node["children"]))
+            }
+
+        assert "cross_context_span" not in tree_names(root["children"])
+
+    def test_explicit_cross_context_parent_is_not_attached_recursively(self):
+        """Explicit parent indices do not establish ownership across contexts."""
+        calls = [
+            {
+                "event_index": 0,
+                "name": "golden_serial_execute",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "root-task",
+                "start_us": 0.0,
+                "end_us": 400_000.0,
+                "complete": True,
+                "parent_event_index": None,
+            },
+            {
+                "event_index": 1,
+                "name": "same_context_parent",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "root-task",
+                "start_us": 10_000.0,
+                "end_us": 390_000.0,
+                "complete": True,
+                "parent_event_index": 0,
+            },
+            {
+                "event_index": 2,
+                "name": "same_context_nested",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "root-task",
+                "start_us": 20_000.0,
+                "end_us": 100_000.0,
+                "complete": True,
+                "parent_event_index": 1,
+            },
+            {
+                "event_index": 3,
+                "name": "cross_context_explicit_child",
+                "pid": 2,
+                "tid": 2,
+                "task_id": "other-task",
+                "start_us": 30_000.0,
+                "end_us": 300_000.0,
+                "complete": True,
+                "parent_event_index": 1,
+            },
+        ]
+
+        profile = _build_golden_profile(
+            calls,
+            [],
+            [],
+            {},
+            trace_truncated=False,
+            raw_trace_nonempty=True,
+        )
+        root = profile["root"]
+        assert root is not None
+        assert root["direct_child_sum_ms"] == 380.0
+        assert [child["name"] for child in root["children"]] == ["same_context_parent"]
+        nested = root["children"][0]
+        assert nested["direct_child_sum_ms"] == 80.0
+        assert [child["name"] for child in nested["children"]] == ["same_context_nested"]
+
+        def tree_names(nodes: list[dict[str, Any]]) -> set[str]:
+            return {
+                name
+                for node in nodes
+                for name in (node["name"], *tree_names(node["children"]))
+            }
+
+        assert "cross_context_explicit_child" not in tree_names(root["children"])
+
+    def test_residual_absolute_and_percentage_flag(self, tmp_path: Path):
+        session_dir, report = self._profile(tmp_path, [X("golden_serial_execute", 0, 100_000)])
+        root = report["summary"]["root"]
+        assert root["exclusive_residual_ms"] == 100.0
+        assert root["needs_decomposition"] is True
+        assert "NEEDS_DECOMPOSITION" in (session_dir / "derived" / "golden_profile_report.md").read_text("utf-8")
+
+    def test_ambiguous_root_and_truncation_fail_closed(self, tmp_path: Path):
+        _, ambiguous = self._profile(tmp_path / "ambiguous", [
+            X("golden_serial_execute", 0, 100_000),
+            X("golden_serial_execute", 0, 100_000),
+        ])
+        assert ambiguous["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert ambiguous["summary"]["GOLDEN_PROFILE_REASON"].startswith("ambiguous")
+
+        session_dir = _make_session(tmp_path / "truncated", viztracer_events=[X("golden_serial_execute", 0, 100_000)])
+        raw = json.loads(gzip.decompress((session_dir / "raw" / "viztracer.json.gz").read_bytes()))
+        raw["metadata"]["truncated"] = True
+        (session_dir / "raw" / "viztracer.json.gz").write_bytes(_gzip_json(raw))
+        generate_full_trace_report(session_dir)
+        summary = json.loads((session_dir / "derived" / "golden_profile_summary.json").read_text("utf-8"))
+        assert summary["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert summary["GOLDEN_PROFILE_REASON"] == "VizTracer trace is truncated"
+
+    def test_semantic_spans_and_deterministic_gantt_width(self, tmp_path: Path):
+        session_dir, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 200_000)],
+            session_events=[{"operation_type": "output_encode", "start_ms": 50.0, "duration_ms": 60.0}],
+        )
+        assert report["summary"]["semantic_spans"][0]["name"] == "output_encode"
+        gantt = (session_dir / "derived" / "golden_profile_gantt.txt").read_text("utf-8")
+        bars = [line.split("|")[1] for line in gantt.splitlines() if "|" in line and "█" in line]
+        assert bars and all(len(bar) == 100 for bar in bars)
+
+    def test_required_stage_reason_is_explicit(self, tmp_path: Path):
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            trace_config={"golden_profile_require_canonical_stages": True},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"] == "missing required canonical stage: golden_restore"
+
+    def test_cross_context_canonical_stage_does_not_satisfy_required_evidence(self, tmp_path: Path):
+        """A canonical stage in another pid/tid/task cannot complete this root."""
+        _, report = self._profile(
+            tmp_path,
+            [
+                X(
+                    "golden_serial_execute", 0, 100_000,
+                    pid=1, tid=1, args={"task_id": "root-task"},
+                ),
+                X(
+                    "golden_restore", 10_000, 60_000,
+                    pid=2, tid=2, args={"task_id": "other-task"},
+                ),
+            ],
+            trace_config={
+                "required_canonical_stages": ["golden_restore"],
+            },
+        )
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"] == (
+            "missing required canonical stage: golden_restore"
+        )
+        assert report["summary"]["observed_canonical_stages"] == []
+
+    def test_missing_root_and_incomplete_child_reasons(self, tmp_path: Path):
+        _, missing = self._profile(tmp_path / "missing", [X("ordinary_call", 0, 100_000)])
+        assert missing["summary"]["GOLDEN_PROFILE_REASON"] == "missing golden_serial_execute root call"
+
+        session_dir = _make_session(
+            tmp_path / "incomplete",
+            viztracer_events=[X("golden_serial_execute", 0, 100_000), B("unfinished", 20_000)],
+        )
+        generate_full_trace_report(session_dir)
+        summary = json.loads((session_dir / "derived" / "golden_profile_summary.json").read_text("utf-8"))
+        assert summary["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert summary["GOLDEN_PROFILE_REASON"] == "incomplete root-corrupting call: unfinished"
+
+    def test_enabled_torch_failure_is_not_python_complete(self, tmp_path: Path):
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            trace_config={"torch_enabled": True},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "ENABLED"
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"].startswith("Torch analysis failed")
+
+    def test_explicit_torch_false_ignores_placeholder_trace(self, tmp_path: Path):
+        """An empty trace artifact does not override explicit Torch disablement."""
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            torch_events=[],
+            trace_config={"torch_enabled": False},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "DISABLED"
+
+    def test_explicit_torch_true_with_empty_trace_is_incomplete(self, tmp_path: Path):
+        """Explicit Torch enablement remains enabled when its trace is empty."""
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            torch_events=[],
+            trace_config={"torch_enabled": True},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "ENABLED"
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"].startswith("Torch analysis failed")
 
 
 # =========================================================================

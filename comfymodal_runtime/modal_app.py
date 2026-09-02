@@ -548,6 +548,8 @@ _V2_FULL_TRACE_ENABLED: bool = observability_gate(
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
 _FULL_TRACE_FINALIZED_LOCK = threading.Lock()
 
+_GOLDEN_TRACE_PROFILE_CONTRACT = "direct_golden_serial"
+
 
 def sync_observability_gates() -> None:
     """Re-resolve import-time observability gates from the current env.
@@ -3004,8 +3006,16 @@ def _finalize_full_trace(
                 _resource_sampler_status = "ok"
         # ── 6. Write sanitized runtime summary (allowlist only, write after stop) ──
         _summary = dict(result_summary or {})
-        _allowlist = {"status", "error", "correlation_id", "request_id",
-                       "finalized_at", "trace_id", "elapsed_seconds"}
+        _allowlist = {
+            "status", "error", "correlation_id", "request_id",
+            "finalized_at", "trace_id", "elapsed_seconds",
+            # Scalar projections of the request's explicit Golden profiling
+            # contract.  The ordered stage lists remain in trace_config.json.
+            "golden_profile_contract",
+            "golden_profile_require_canonical_stages",
+            "output_durability_mode",
+            "durability_requested",
+        }
         _sanitized = {k: v for k, v in _summary.items() if k in _allowlist
                       and isinstance(v, (str, int, float, bool, type(None)))}
         _sanitized["finalized_at"] = time.time()
@@ -3030,9 +3040,13 @@ def _finalize_full_trace(
         try:
             from .full_trace_report import generate_full_trace_report as _gen_report
             _report = _gen_report(session.base_dir)
-            if isinstance(_report, dict) and _report.get("status") != "error":
-                _report_ok = True
-                _report_status = "ok"
+            if isinstance(_report, dict):
+                _trace_truncated = bool(_report.get("trace_truncated", False))
+                if _report.get("status") != "error":
+                    _report_ok = True
+                    _report_status = "ok"
+                else:
+                    _report_status = "error"
             else:
                 _report_status = "error"
         except Exception as _report_exc:
@@ -3240,6 +3254,240 @@ def _safe_full_trace_artifact(
             "error_type": _error_type,
             "error": f"safe wrapper: {_error_type}",
         }
+
+
+_GOLDEN_PROFILER_MAX_BLOCK_CHARS = 64 * 1024
+
+
+def _golden_profiler_one_line(value: Any) -> str:
+    """Keep scalar profiler fields on one bounded stdout line."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
+def _golden_profiler_number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _emit_golden_profiler_block(
+    session: Any,
+    artifact: Mapping[str, Any] | None,
+    request_id: str,
+) -> None:
+    """Print the bounded, derived-only profiler block for a Golden request.
+
+    The full-trace finalizer has already generated the two derived profiler
+    files before this function is called.  Reading those files here keeps the
+    request log a projection of the persisted report rather than a second
+    profiler implementation.  This function is deliberately best-effort:
+    diagnostics must never replace a Golden result or error.
+    """
+    if not _V2_FULL_TRACE_ENABLED or not isinstance(artifact, Mapping):
+        return
+    if artifact.get("status") != "ready":
+        return
+
+    try:
+        base_dir = Path(getattr(session, "base_dir"))
+        derived_dir = base_dir / "derived"
+        summary_path = derived_dir / "golden_profile_summary.json"
+        gantt_path = derived_dir / "golden_profile_gantt.txt"
+
+        summary: Mapping[str, Any] | None = None
+        summary_reason = ""
+        try:
+            loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, Mapping):
+                raise ValueError("summary is not a JSON object")
+            summary = loaded
+        except FileNotFoundError:
+            summary_reason = f"missing file: {summary_path}"
+        except Exception as exc:
+            summary_reason = f"{type(exc).__name__}: {exc}"
+
+        gantt: str | None = None
+        gantt_reason = ""
+        try:
+            gantt = gantt_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            gantt_reason = f"missing file: {gantt_path}"
+        except Exception as exc:
+            gantt_reason = f"{type(exc).__name__}: {exc}"
+
+        lines = [
+            "[v2.golden_profiler] BEGIN",
+            f"REQUEST_ID={_golden_profiler_one_line(request_id)}",
+        ]
+        if summary is None:
+            lines.append(f"SUMMARY_AVAILABLE=NO reason={_golden_profiler_one_line(summary_reason)}")
+        else:
+            root = summary.get("root")
+            root = root if isinstance(root, Mapping) else {}
+            lines.extend([
+                f"GOLDEN_PROFILE_COMPLETE={_golden_profiler_one_line(summary.get('GOLDEN_PROFILE_COMPLETE', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_REASON={_golden_profiler_one_line(summary.get('GOLDEN_PROFILE_REASON', 'measurement_unavailable'))}",
+                f"GOLDEN_TOTAL_WALL_MS={_golden_profiler_one_line(root.get('wall_ms', 'measurement_unavailable'))}",
+                f"OVERALL_ACCOUNTED_MS={_golden_profiler_one_line(root.get('direct_child_union_ms', 'measurement_unavailable'))}",
+                f"OVERALL_CHILD_UNION_MS={_golden_profiler_one_line(root.get('direct_child_union_ms', 'measurement_unavailable'))}",
+                f"OVERALL_COVERAGE_PCT={_golden_profiler_one_line(root.get('coverage_pct', 'measurement_unavailable'))}",
+                f"OVERALL_ACCOUNTED_CHILD_UNION_COVERAGE_PCT={_golden_profiler_one_line(root.get('coverage_pct', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_WALL_MS={_golden_profiler_one_line(root.get('wall_ms', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_CHILD_UNION_MS={_golden_profiler_one_line(root.get('direct_child_union_ms', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_COVERAGE_PCT={_golden_profiler_one_line(root.get('coverage_pct', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_RESIDUAL_MS={_golden_profiler_one_line(root.get('exclusive_residual_ms', root.get('residual_ms', 'measurement_unavailable')))}",
+            ])
+
+            spans: list[Mapping[str, Any]] = []
+            if root:
+                spans.append(root)
+
+            def collect_nodes(node_list: Any) -> None:
+                if not isinstance(node_list, list):
+                    return
+                for node in node_list:
+                    if not isinstance(node, Mapping):
+                        continue
+                    spans.append(node)
+                    collect_nodes(node.get("children"))
+
+            collect_nodes(summary.get("nodes"))
+            collect_nodes(summary.get("canonical_spans"))
+
+            largest_residual: tuple[float, Mapping[str, Any] | None] = (-1.0, None)
+            for span in spans:
+                residual = _golden_profiler_number(
+                    span.get("exclusive_residual_ms", span.get("residual_ms"))
+                )
+                if residual is not None and residual > largest_residual[0]:
+                    largest_residual = (residual, span)
+            if largest_residual[1] is None:
+                lines.append("LARGEST_RESIDUAL_MS=measurement_unavailable")
+            else:
+                lines.append(
+                    "LARGEST_RESIDUAL_MS="
+                    + _golden_profiler_one_line(largest_residual[0])
+                    + " span="
+                    + _golden_profiler_one_line(largest_residual[1].get("name", ""))
+                )
+
+            canonical = summary.get("canonical_spans")
+            canonical_rows: list[Mapping[str, Any]] = (
+                [row for row in canonical if isinstance(row, Mapping)]
+                if isinstance(canonical, list) else []
+            )
+            canonical_names: list[str] = []
+            required_names = summary.get("required_canonical_stages", [])
+            observed_names = summary.get("observed_canonical_stages", [])
+            if not isinstance(required_names, list):
+                required_names = []
+            if not isinstance(observed_names, list):
+                observed_names = []
+            for name in required_names + observed_names:
+                if isinstance(name, str) and name not in canonical_names:
+                    canonical_names.append(name)
+            for row in canonical_rows:
+                name = str(row.get("name", ""))
+                if name and name not in canonical_names:
+                    canonical_names.append(name)
+            for name in canonical_names:
+                matches = [row for row in canonical_rows if str(row.get("name", "")) == name]
+                if matches:
+                    for row in matches:
+                        lines.append(
+                            "CANONICAL_STAGE name="
+                            + _golden_profiler_one_line(name)
+                            + " duration_ms="
+                            + _golden_profiler_one_line(row.get("wall_ms", "measurement_unavailable"))
+                        )
+                else:
+                    lines.append(
+                        "CANONICAL_STAGE name="
+                        + _golden_profiler_one_line(name)
+                        + " duration_ms=measurement_unavailable"
+                    )
+
+            seen_spans: set[tuple[Any, ...]] = set()
+            for span in spans:
+                wall = _golden_profiler_number(span.get("wall_ms"))
+                if wall is None or wall <= 50.0:
+                    continue
+                key = (span.get("kind"), span.get("name"), span.get("start_ms"), span.get("end_ms"))
+                if key in seen_spans:
+                    continue
+                seen_spans.add(key)
+                warning = "YES" if bool(span.get("needs_decomposition")) else "NO"
+                lines.append(
+                    "SPAN name="
+                    + _golden_profiler_one_line(span.get("name", ""))
+                    + " duration_ms="
+                    + _golden_profiler_one_line(span.get("wall_ms"))
+                    + " residual_ms="
+                    + _golden_profiler_one_line(span.get("exclusive_residual_ms", span.get("residual_ms", "measurement_unavailable")))
+                    + f" NEEDS_DECOMPOSITION={warning}"
+                )
+
+            torch_status = summary.get("GOLDEN_PROFILE_TORCH", summary.get("torch", "measurement_unavailable"))
+            cuda_ops = summary.get("torch_cuda_ops")
+            cuda_status = "ENABLED" if (
+                isinstance(cuda_ops, list) and cuda_ops
+            ) or (gantt is not None and "| CUDA |" in gantt) else (
+                "DISABLED" if str(torch_status).upper() == "DISABLED" else "UNAVAILABLE"
+            )
+            lines.extend([
+                f"GOLDEN_PROFILE_TORCH={_golden_profiler_one_line(torch_status)}",
+                f"TORCH_STATUS={_golden_profiler_one_line(torch_status)}",
+                f"CUDA_STATUS={cuda_status}",
+            ])
+
+        lines.extend([
+            "ARTIFACT_STATUS=" + _golden_profiler_one_line(artifact.get("status", "")),
+            "ARTIFACT_DESCRIPTOR_PATH=" + _golden_profiler_one_line(artifact.get("remote_descriptor_path", "")),
+            "ARTIFACT_BUNDLE_PATH=" + _golden_profiler_one_line(artifact.get("remote_bundle_path", "")),
+            "ARTIFACT_DESCRIPTOR=" + json.dumps(dict(artifact), sort_keys=True, separators=(",", ":"), default=str),
+            f"GOLDEN_PROFILE_SUMMARY_PATH={_golden_profiler_one_line(summary_path)}",
+            f"GOLDEN_PROFILE_GANTT_PATH={_golden_profiler_one_line(gantt_path)}",
+        ])
+        if gantt is None:
+            lines.append(f"GANTT_AVAILABLE=NO reason={_golden_profiler_one_line(gantt_reason)}")
+        else:
+            lines.append("GANTT_AVAILABLE=YES")
+
+        prefix = "\n".join(lines) + "\n"
+        if gantt is None:
+            block = prefix + "[v2.golden_profiler] END\n"
+        else:
+            block = prefix + "GANTT_BEGIN\n" + gantt
+            if not block.endswith("\n"):
+                block += "\n"
+            block += "GANTT_END\n[v2.golden_profiler] END\n"
+
+        if len(block) > _GOLDEN_PROFILER_MAX_BLOCK_CHARS:
+            # Keep the delimiters visible if a malformed report or descriptor
+            # contains unexpectedly large derived content.
+            marker = "GOLDEN_PROFILER_TRUNCATED=YES reason=profiler block limit exceeded\n"
+            end = "GANTT_END\n[v2.golden_profiler] END\n"
+            if len(prefix) + len(marker) + len(end) > _GOLDEN_PROFILER_MAX_BLOCK_CHARS:
+                prefix_budget = max(0, _GOLDEN_PROFILER_MAX_BLOCK_CHARS - len(marker) - len(end))
+                block = prefix[:prefix_budget] + marker + end
+            else:
+                budget = _GOLDEN_PROFILER_MAX_BLOCK_CHARS - len(prefix) - len(marker) - len(end)
+                block = prefix + marker + (gantt or "")[:budget] + end
+        print(block, end="", flush=True)
+    except Exception as exc:
+        # Diagnostics are strictly subordinate to the request result/error.
+        try:
+            print(
+                "[v2.golden_profiler] BEGIN\n"
+                f"REQUEST_ID={_golden_profiler_one_line(request_id)}\n"
+                f"GOLDEN_PROFILER_RENDER_ERROR={type(exc).__name__}: {_golden_profiler_one_line(exc)}\n"
+                "[v2.golden_profiler] END\n",
+                end="",
+                flush=True,
+            )
+        except Exception:
+            pass
 
 
 def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
@@ -21452,6 +21700,7 @@ class ModalRuntimeEntrypoint:
         # Lazy Golden imports: keep module import cost zero when unused.
         from .golden_serial import (
             GoldenRequest,
+            STAGE_ORDER,
             golden_serial_execute,
             normalize_attention_backend,
             resolve_clip_residency,
@@ -21469,6 +21718,10 @@ class ModalRuntimeEntrypoint:
         golden_call_start_mono_ns: int | None = None
         golden_call_end_wall_ns: int | None = None
         golden_call_end_mono_ns: int | None = None
+        golden_trace_config: dict[str, Any] = {}
+        golden_trace_summary: dict[str, Any] = {}
+        _full_trace_claimed = False
+        _full_trace_op_id = ""
         try:
             if not isinstance(request, Mapping):
                 raise ValueError("golden_request_must_be_mapping")
@@ -21519,6 +21772,31 @@ class ModalRuntimeEntrypoint:
             contract_raw = request.get("contract")
             if contract_raw is not None:
                 raise ValueError("golden_contract_override_not_allowed")
+
+            # Persist the direct adapter's profiling contract before any
+            # readiness, activation, or model work.  The report generator
+            # consumes these top-level config fields to distinguish an
+            # explicit Golden claim from a merely observed function name.
+            _canonical_stage_order = [str(stage) for stage in STAGE_ORDER]
+            _required_canonical_stages = [
+                stage for stage in _canonical_stage_order
+                if output_policy.mode == "strict"
+                or stage != "golden_durable_commit"
+            ]
+            golden_trace_config = {
+                "golden_profile_contract": _GOLDEN_TRACE_PROFILE_CONTRACT,
+                "golden_profile_require_canonical_stages": True,
+                "output_durability_mode": output_policy.mode,
+                "required_canonical_stages": _required_canonical_stages,
+                "canonical_stage_order": _canonical_stage_order,
+            }
+            golden_trace_summary = {
+                key: value for key, value in golden_trace_config.items()
+                if isinstance(value, (str, int, float, bool, type(None)))
+            }
+            golden_trace_summary["durability_requested"] = bool(
+                output_policy.durability_requested
+            )
 
             volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
             if volume is None:
@@ -21573,6 +21851,57 @@ class ModalRuntimeEntrypoint:
                 }
                 return
 
+            if _V2_FULL_TRACE_ENABLED:
+                _ft_config = getattr(self, "_full_trace_session", None)
+                _update_trace_config = getattr(
+                    _ft_config, "update_trace_config", None
+                )
+                if _ft_config is not None and callable(_update_trace_config):
+                    try:
+                        _update_trace_config(golden_trace_config)
+                    except BaseException as _ft_config_exc:
+                        print(
+                            f"[v2.full_trace] stage=golden_profile_contract "
+                            f"status=error error_type={type(_ft_config_exc).__name__}",
+                            flush=True,
+                        )
+
+            # Direct Golden owns its request lifecycle, so claim the full trace
+            # only after the request id has passed containment validation and
+            # immediately before any readiness or model work.
+            if _V2_FULL_TRACE_ENABLED:
+                _ft = getattr(self, "_full_trace_session", None)
+                if _ft is not None:
+                    try:
+                        if _ft.claim_first_request(normalized_request_id):
+                            _full_trace_claimed = True
+                            try:
+                                _ft.capture_milestone("golden_request_entry")
+                            except BaseException as _ft_entry_exc:
+                                print(
+                                    f"[v2.full_trace] stage=golden_request_entry "
+                                    f"status=error error_type={type(_ft_entry_exc).__name__}",
+                                    flush=True,
+                                )
+                            try:
+                                _full_trace_op_id = _ft.operation_start(
+                                    "golden_request_execution",
+                                    semantic_key=normalized_request_id,
+                                    request_id=normalized_request_id,
+                                ) or ""
+                            except BaseException as _ft_op_exc:
+                                print(
+                                    f"[v2.full_trace] stage=golden_request_execution "
+                                    f"status=error error_type={type(_ft_op_exc).__name__}",
+                                    flush=True,
+                                )
+                    except BaseException as _ft_claim_exc:
+                        print(
+                            f"[v2.full_trace] stage=claim_first_request "
+                            f"status=error error_type={type(_ft_claim_exc).__name__}",
+                            flush=True,
+                        )
+
             # Golden bypasses the normal ComfyUI request entrypoints, so it
             # must perform the deferred GPU reattachment check itself.  Use
             # only the API restored for this runtime; silently loading another
@@ -21604,6 +21933,8 @@ class ModalRuntimeEntrypoint:
             try:
                 activation_evidence = activate_golden_dynamic_vram()
             except Exception as exc:
+                if _full_trace_claimed:
+                    raise RuntimeError(f"golden_activation_failed:{exc}") from exc
                 yield {
                     "type": "error",
                     "request_id": normalized_request_id,
@@ -21618,6 +21949,8 @@ class ModalRuntimeEntrypoint:
                 activation_evidence.get("activated")
                 or activation_evidence.get("already_activated")
             ):
+                if _full_trace_claimed:
+                    raise RuntimeError("golden_dynamic_vram_gate_required")
                 yield {
                     "type": "error",
                     "request_id": normalized_request_id,
@@ -21636,6 +21969,18 @@ class ModalRuntimeEntrypoint:
             golden_call_start_wall_ns = time.time_ns()
             golden_call_start_mono_ns = time.monotonic_ns()
             try:
+                # VizTracer/Kineto must begin and end on this same async
+                # caller thread.  This boundary intentionally surrounds only
+                # the actual Golden await; finalization below is not profiled.
+                if _full_trace_claimed:
+                    try:
+                        _ft.start_torch_profiler()
+                    except BaseException as _ft_torch_start_exc:
+                        print(
+                            f"[v2.full_trace] stage=start_torch_profiler "
+                            f"status=error error_type={type(_ft_torch_start_exc).__name__}",
+                            flush=True,
+                        )
                 result = await golden_serial_execute(
                     golden_request,
                     volume=volume,
@@ -21649,14 +21994,82 @@ class ModalRuntimeEntrypoint:
             finally:
                 golden_call_end_wall_ns = time.time_ns()
                 golden_call_end_mono_ns = time.monotonic_ns()
+                if _full_trace_claimed:
+                    try:
+                        _ft.stop_torch_profiler()
+                    except BaseException as _ft_torch_stop_exc:
+                        print(
+                            f"[v2.full_trace] stage=stop_torch_profiler "
+                            f"status=error error_type={type(_ft_torch_stop_exc).__name__}",
+                            flush=True,
+                        )
                 self._golden_execution_active = False
-        except Exception as exc:
+        except BaseException as exc:
             rid = request_id_raw if isinstance(request_id_raw, str) else ""
             error_event: dict[str, Any] = {
                 "type": "error",
                 "request_id": rid,
                 "message": f"{type(exc).__name__}: {exc}"[:2000],
             }
+            if _full_trace_claimed:
+                _error_artifact: dict[str, Any] = {"status": "absent"}
+                try:
+                    _ft_error = getattr(self, "_full_trace_session", None)
+                    if _ft_error is not None:
+                        try:
+                            _ft_error.capture_milestone(
+                                "golden_request_error",
+                                extra={"error_type": type(exc).__name__},
+                            )
+                        except BaseException:
+                            pass
+                        try:
+                            _ft_error.capture_milestone("trace_stop_boundary")
+                        except BaseException:
+                            pass
+                        if _full_trace_op_id:
+                            try:
+                                _ft_error.operation_end(
+                                    _full_trace_op_id,
+                                    status="error",
+                                    error_type=type(exc).__name__,
+                                )
+                            except BaseException:
+                                pass
+                        _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
+                            "profile_volume"
+                        )
+                        _error_artifact = await asyncio.to_thread(
+                            _safe_full_trace_artifact,
+                            _ft_error,
+                            _profile_volume,
+                            rid.strip() if isinstance(rid, str) else rid,
+                            {
+                                "status": "error",
+                                "error": type(exc).__name__,
+                                **golden_trace_summary,
+                            },
+                        )
+                        if _error_artifact.get("status") == "ready":
+                            try:
+                                _emit_golden_profiler_block(
+                                    _ft_error,
+                                    _error_artifact,
+                                    rid.strip() if isinstance(rid, str) else rid,
+                                )
+                            except BaseException:
+                                pass
+                except BaseException as _ft_error_exc:
+                    _error_artifact = {
+                        "status": "error",
+                        "trace_id": getattr(
+                            locals().get("_ft_error", None), "trace_id", ""
+                        ),
+                        "error_type": type(_ft_error_exc).__name__,
+                        "error": "full trace finalization failed",
+                    }
+                error_event["full_trace_artifact"] = _error_artifact
+                _full_trace_claimed = False
             if isinstance(locals().get("activation_evidence"), dict):
                 error_event["golden_activation"] = locals()["activation_evidence"]
             if identity_telemetry:
@@ -21720,6 +22133,8 @@ class ModalRuntimeEntrypoint:
         # result or error documents without relying on stdout.
         result_data["identity"] = dict(identity_telemetry)
         result_data["golden_identity"] = dict(identity_telemetry)
+        if _full_trace_claimed:
+            result_data.update(golden_trace_summary)
         _terminal_timing = {
             "return_wall_unix_ns": _return_wall_unix_ns,
             "return_mono_ns": _return_mono_ns,
@@ -21757,7 +22172,55 @@ class ModalRuntimeEntrypoint:
         if telemetry is not None:
             result_data["golden_telemetry"] = telemetry
             _emit_golden_waterfall(telemetry, timing=timing)
-        elif telemetry_error:
+        if _full_trace_claimed:
+            _artifact_fin: dict[str, Any] = {"status": "absent"}
+            try:
+                _ft_fin = getattr(self, "_full_trace_session", None)
+                if _ft_fin is not None:
+                    try:
+                        _ft_fin.capture_milestone("golden_request_return")
+                    except BaseException:
+                        pass
+                    try:
+                        _ft_fin.capture_milestone("trace_stop_boundary")
+                    except BaseException:
+                        pass
+                    if _full_trace_op_id:
+                        try:
+                            _ft_fin.operation_end(_full_trace_op_id, status="ok")
+                        except BaseException:
+                            pass
+                    _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
+                        "profile_volume"
+                    )
+                    _artifact_fin = await asyncio.to_thread(
+                        _safe_full_trace_artifact,
+                        _ft_fin,
+                        _profile_volume,
+                        normalized_request_id,
+                        result_data,
+                    )
+                    if _artifact_fin.get("status") == "ready":
+                        try:
+                            _emit_golden_profiler_block(
+                                _ft_fin,
+                                _artifact_fin,
+                                normalized_request_id,
+                            )
+                        except BaseException:
+                            pass
+            except BaseException as _ft_fin_exc:
+                _artifact_fin = {
+                    "status": "error",
+                    "trace_id": getattr(
+                        locals().get("_ft_fin", None), "trace_id", ""
+                    ),
+                    "error_type": type(_ft_fin_exc).__name__,
+                    "error": "full trace finalization failed",
+                }
+            result_data["full_trace_artifact"] = _artifact_fin
+            _full_trace_claimed = False
+        if telemetry is None and telemetry_error:
             result_data["golden_telemetry_error"] = telemetry_error
         _yield_wall_unix_ns = time.time_ns()
         _yield_mono_ns = time.monotonic_ns()

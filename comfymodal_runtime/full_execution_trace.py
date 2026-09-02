@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import copy
+import contextlib
 import functools
 import gzip
 import hashlib
@@ -55,6 +56,18 @@ _LEGACY_ENV_RESOURCE_INTERVAL = "FULL_TRACE_RESOURCE_INTERVAL_MS"
 _DEFAULT_VIZTRACER_ENTRIES = 8_000_000
 _DEFAULT_MAX_STACK_DEPTH = 64
 _DEFAULT_RESOURCE_INTERVAL_MS = 50
+
+# Request-bound contract fields may be added to the top-level trace config by
+# an adapter after construction.  Keep this seam deliberately narrow: these
+# fields describe the trace contract, rather than providing a general-purpose
+# mutable session state channel.
+_TRACE_CONFIG_UPDATE_FIELDS: frozenset[str] = frozenset({
+    "golden_profile_contract",
+    "golden_profile_require_canonical_stages",
+    "output_durability_mode",
+    "required_canonical_stages",
+    "canonical_stage_order",
+})
 
 # ── Raw file names ───────────────────────────────────────────────────────────────────
 _REQUIRED_RAW_FILES: tuple[str, ...] = (
@@ -201,6 +214,39 @@ def _env_int_chain(*names: str, default: int) -> int:
             except (TypeError, ValueError):
                 continue
     return default
+
+
+@contextlib.contextmanager
+def golden_trace_span(name: str):
+    """Record a Golden duration event on an already-running global VizTracer.
+
+    This seam is deliberately inert unless a tracer has already been created
+    and registered by the full-trace session.  It never imports or starts
+    VizTracer, and failures in optional tracing are never allowed to affect
+    Golden execution.
+    """
+    event: Any = None
+    try:
+        tracer_module = sys.modules.get("viztracer")
+        get_tracer = getattr(tracer_module, "get_tracer", None)
+        tracer = get_tracer() if callable(get_tracer) else None
+        log_event = getattr(tracer, "log_event", None)
+        event = log_event(str(name)) if callable(log_event) else None
+        enter = getattr(event, "__enter__", None)
+        if not callable(enter):
+            event = None
+        else:
+            enter()
+    except BaseException:
+        event = None
+    try:
+        yield
+    finally:
+        if event is not None:
+            try:
+                event.__exit__(None, None, None)
+            except BaseException:
+                pass
 
 
 def _sanitize_cmdline(cmdline: str) -> str:
@@ -1252,6 +1298,7 @@ class FullExecutionTraceSession:
         self._start_mono_ns = time.monotonic_ns()
         self._result_summary: dict[str, Any] = {}
         self._trace_stopped_result: dict[str, Any] | None = None
+        self._trace_config_lock = threading.Lock()
 
         # Operation tracking (nested stacks, thread/task-safe)
         self._op_lock = threading.Lock()
@@ -1355,6 +1402,9 @@ class FullExecutionTraceSession:
             "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH",
             _DEFAULT_MAX_STACK_DEPTH,
         )
+        torch_enabled = os.environ.get(_ENV_TORCH, "0").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
 
         # VizTracer version detection is deferred to start_restore (lazy import)
         viz_version: str | None = None
@@ -1380,6 +1430,7 @@ class FullExecutionTraceSession:
             "search_roots": inc["search_roots"],
             "viztracer_version": viz_version,
             "entry_capacity": entries,
+            "torch_enabled": torch_enabled,
             "config": {
                 "viztracer_entries": entries,
                 "viztracer_max_stack_depth": stack_depth,
@@ -1408,6 +1459,58 @@ class FullExecutionTraceSession:
                 )
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Cannot update trace_config viztracer_version: %s", exc)
+
+    def update_trace_config(
+        self,
+        updates: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        """Persist a bounded set of request-level trace contract fields.
+
+        This is intentionally not a general session-state mutator.  Adapters
+        use it when a contract is known only after session construction (for
+        example, the direct Golden output durability mode).  Unknown fields
+        and unsafe values are ignored; tracing metadata must never change the
+        execution request or make an optional trace path fail.
+        """
+        if updates is None:
+            updates = fields
+        elif fields:
+            updates = {**dict(updates), **fields}
+        if not isinstance(updates, Mapping):
+            return
+        safe_updates: dict[str, Any] = {}
+        for key, value in updates.items():
+            name = str(key)
+            if name not in _TRACE_CONFIG_UPDATE_FIELDS:
+                continue
+            safe_value = _safe_json_value(value)
+            if name in {"required_canonical_stages", "canonical_stage_order"}:
+                if not isinstance(safe_value, list) or not all(
+                    isinstance(item, str) for item in safe_value
+                ):
+                    continue
+            elif not isinstance(safe_value, (str, int, float, bool, type(None))):
+                continue
+            safe_updates[name] = safe_value
+        if not safe_updates:
+            return
+
+        config_path = self._base_dir / "raw" / "trace_config.json"
+        try:
+            with self._trace_config_lock:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                if not isinstance(config, dict):
+                    return
+                config.update(safe_updates)
+                config_path.write_text(
+                    _safe_json_serialize(config, indent=2), encoding="utf-8",
+                )
+            self._write_event("trace_config_updated", {
+                "fields": sorted(safe_updates),
+            })
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("Cannot update trace config: %s", exc)
 
     def _write_json(self, name: str, data: Any) -> Path:
         path = self._base_dir / "raw" / name

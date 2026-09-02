@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
+import inspect
 import json
 import os
 import tempfile
@@ -140,6 +142,43 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_type"], "UploadError")
 
+    def test_finalizer_retains_golden_contract_scalars(self) -> None:
+        session = MagicMock()
+        session.trace_id = "golden-contract-summary"
+        session.base_dir = self._session_dir
+        session.resource_sampler = None
+        session._viztracer = None
+        session._torch_profiler = None
+        session._torch_profiler_active = False
+        session._result_summary = {}
+        session.set_result_summary.side_effect = (
+            lambda data: session._result_summary.update(data)
+        )
+        profile_volume = _FakeProfileVolume()
+        summary = {
+            "status": "ok",
+            "golden_profile_contract": "direct_golden_serial",
+            "golden_profile_require_canonical_stages": True,
+            "output_durability_mode": "strict",
+            "durability_requested": True,
+            "required_canonical_stages": ["golden_durable_commit"],
+        }
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True):
+            result = modal_app._finalize_full_trace(
+                session, profile_volume, "req-contract", result_summary=summary,
+            )
+        self.assertEqual(result["status"], "ready")
+        persisted = json.loads(
+            (self._session_dir / "raw" / "runtime_result_summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(persisted["golden_profile_contract"], "direct_golden_serial")
+        self.assertIs(persisted["golden_profile_require_canonical_stages"], True)
+        self.assertEqual(persisted["output_durability_mode"], "strict")
+        self.assertIs(persisted["durability_requested"], True)
+        self.assertNotIn("required_canonical_stages", persisted)
+
     def test_disabled_artifact_is_absent(self) -> None:
         with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", False):
             self.assertEqual(
@@ -172,6 +211,24 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
         ]
         for field in required_fields:
             self.assertIn(field, result, f"Missing descriptor field: {field}")
+
+    def test_descriptor_preserves_report_trace_truncated(self) -> None:
+        session = MagicMock()
+        session.trace_id = "trace-truncated"
+        session.base_dir = self._session_dir
+        session.resource_sampler = None
+        session._viztracer = None
+        session._torch_profiler = None
+        session._torch_profiler_active = False
+        profile_volume = _FakeProfileVolume()
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), patch(
+            "comfymodal_runtime.full_trace_report.generate_full_trace_report",
+            return_value={"status": "ready", "trace_truncated": True},
+        ):
+            result = modal_app._finalize_full_trace(
+                session, profile_volume, "req-truncated",
+            )
+        self.assertTrue(result["trace_truncated"])
 
     def test_bundle_path_uses_utc_date(self) -> None:
         """Bundle path includes UTC date and trace_id."""
@@ -555,6 +612,151 @@ class FullTraceV2GapsTest(unittest.TestCase):
                 path.startswith("v2-full-trace/"),
                 f"Path {path!r} does not start with v2-full-trace/",
             )
+
+    def test_direct_golden_trace_wiring_is_before_gpu_readiness(self) -> None:
+        source = inspect.getsource(modal_app.ModalRuntimeEntrypoint.run_golden_serial_stream)
+        containment = source.index("golden_request_id_invalid")
+        claim = source.index("claim_first_request(normalized_request_id)")
+        readiness = source.index("ensure_gpu_ready()")
+        dynamic_vram = source.index("activate_golden_dynamic_vram()")
+        golden_await = source.index("result = await golden_serial_execute(")
+        self.assertLess(containment, claim)
+        self.assertLess(claim, readiness)
+        self.assertLess(readiness, dynamic_vram)
+        self.assertLess(dynamic_vram, golden_await)
+        self.assertNotIn("PromptExecutor", source)
+
+    def test_direct_golden_trace_has_terminal_success_and_error_lifecycles(self) -> None:
+        source = inspect.getsource(modal_app.ModalRuntimeEntrypoint.run_golden_serial_stream)
+        self.assertIn('capture_milestone("golden_request_return")', source)
+        self.assertIn('capture_milestone("golden_request_error"', source)
+        self.assertGreaterEqual(source.count('capture_milestone("trace_stop_boundary")'), 2)
+        self.assertGreaterEqual(source.count("asyncio.to_thread"), 2)
+        self.assertIn('operation_end(_full_trace_op_id, status="ok")', source)
+        self.assertIn('status="error"', source)
+        self.assertEqual(source.count("_emit_golden_profiler_block("), 2)
+        for offset in (
+            source.index("_emit_golden_profiler_block(", source.index("_safe_full_trace_artifact")),
+            source.index("_emit_golden_profiler_block(", source.index("_safe_full_trace_artifact", source.index("_safe_full_trace_artifact") + 1)),
+        ):
+            self.assertGreater(offset, source.rfind("_safe_full_trace_artifact", 0, offset))
+
+    def test_torch_boundary_is_exact_await_finally_on_adapter_thread(self) -> None:
+        source = inspect.getsource(modal_app.ModalRuntimeEntrypoint.run_golden_serial_stream)
+        start = source.index("_ft.start_torch_profiler()")
+        await_call = source.index("result = await golden_serial_execute(")
+        stop = source.index("_ft.stop_torch_profiler()")
+        self.assertLess(start, await_call)
+        self.assertLess(await_call, stop)
+        self.assertIn("finally:", source[start:stop])
+
+    def test_full_trace_off_keeps_clip_timing_inert(self) -> None:
+        from comfymodal_runtime import golden_serial
+
+        with patch.dict(os.environ, {"COMFYMODAL_V2_FULL_TRACE": "0"}, clear=False):
+            timing = golden_serial._ClipTiming(
+                enabled=golden_serial.stage_diagnostics_enabled()
+                or golden_serial._full_trace_active(),
+                trace_prefix="golden.clip_load",
+            )
+            with timing.span("source_open_read"):
+                pass
+        self.assertFalse(timing.enabled)
+        self.assertEqual(timing.phases, [])
+
+    def test_full_trace_clip_timing_mirrors_observed_span(self) -> None:
+        from comfymodal_runtime import golden_serial
+
+        with patch.dict(os.environ, {"COMFYMODAL_V2_FULL_TRACE": "1"}, clear=False), \
+             patch.object(golden_serial, "_golden_trace_span") as make_span:
+            make_span.return_value.__enter__.return_value = None
+            timing = golden_serial._ClipTiming(
+                enabled=True,
+                trace_prefix="golden.clip_forward",
+            )
+            with timing.span("clip_graph_node_wrapper"):
+                pass
+        make_span.assert_called_once_with("golden.clip_forward.clip_graph_node_wrapper")
+        self.assertEqual(len(timing.phases), 1)
+
+    def test_clip_and_unet_full_trace_semantic_event_names_are_explicit(self) -> None:
+        golden_path = Path(modal_app.__file__).with_name("golden_serial.py")
+        source = golden_path.read_text(encoding="utf-8")
+        self.assertIn('trace_prefix="golden.clip_load"', source)
+        self.assertIn('trace_prefix="golden.clip_forward"', source)
+        for name in (
+            "header_config_preflight",
+            "skeleton_patcher_construction",
+            "source_h2d_transport",
+            "assign_adoption",
+            "binding_validation",
+            "transport_quiescence",
+        ):
+            self.assertIn(f'golden.unet.{name}', source)
+        self.assertIn("diagnostics_enabled or _full_trace_active()", source)
+
+    def test_golden_profiler_block_uses_generated_gantt_and_artifact(self) -> None:
+        from comfymodal_runtime.full_trace_report import generate_full_trace_report
+
+        trace = {
+            "traceEvents": [
+                {"ph": "X", "name": "golden_serial_execute", "ts": 0, "dur": 1_200_000, "pid": 1, "tid": 1},
+                *[
+                    {"ph": "X", "name": name, "ts": index * 100_000, "dur": 60_000, "pid": 1, "tid": 1}
+                    for index, name in enumerate((
+                        "golden_restore", "golden_request_setup", "golden_clip_load",
+                        "golden_clip_forward", "golden_unet_load", "golden_sampler_prepare",
+                        "golden_vae_load", "golden_sampling", "golden_sampler_tail",
+                        "golden_vae_decode", "golden_output",
+                    ), start=1)
+                ],
+                {"ph": "X", "name": "deep_stage", "ts": 1_100_000, "dur": 60_000, "pid": 1, "tid": 1},
+            ],
+            "metadata": {"dump_counter": 2, "tracer_args": {"entry_capacity": 10}},
+        }
+        (self._session_dir / "raw" / "viztracer.json.gz").write_bytes(
+            gzip.compress(json.dumps(trace).encode("utf-8"))
+        )
+        generate_full_trace_report(self._session_dir)
+        gantt = (self._session_dir / "derived" / "golden_profile_gantt.txt").read_text("utf-8")
+        session = SimpleNamespace(base_dir=self._session_dir)
+        artifact = {
+            "status": "ready",
+            "trace_id": "deep-trace",
+            "volume_name": "profiles",
+            "remote_descriptor_path": "v2-full-trace/2025-01-01/deep-trace/artifact.json",
+            "remote_bundle_path": "v2-full-trace/2025-01-01/deep-trace/bundle.tar.gz",
+        }
+
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), patch("builtins.print") as mock_print:
+            modal_app._emit_golden_profiler_block(session, artifact, "golden-request")
+
+        block = mock_print.call_args.args[0]
+        self.assertIn("[v2.golden_profiler] BEGIN\n", block)
+        self.assertIn("REQUEST_ID=golden-request", block)
+        self.assertIn("GOLDEN_PROFILE_COMPLETE=YES", block)
+        self.assertIn("NEEDS_DECOMPOSITION=YES", block)
+        self.assertIn("CANONICAL_STAGE name=golden_restore duration_ms=60.0", block)
+        self.assertIn("CANONICAL_STAGE name=golden_output duration_ms=60.0", block)
+        self.assertIn("ARTIFACT_DESCRIPTOR_PATH=" + artifact["remote_descriptor_path"], block)
+        self.assertIn("GANTT_AVAILABLE=YES\nGANTT_BEGIN\n" + gantt + "GANTT_END", block)
+        self.assertTrue(block.endswith("[v2.golden_profiler] END\n"))
+
+    def test_golden_profiler_block_is_inert_when_full_trace_is_off(self) -> None:
+        session = SimpleNamespace(base_dir=self._session_dir)
+        artifact = {"status": "ready", "remote_descriptor_path": "profiles/artifact.json"}
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", False), patch("builtins.print") as mock_print:
+            modal_app._emit_golden_profiler_block(session, artifact, "golden-request")
+        mock_print.assert_not_called()
+
+    def test_golden_profiler_reports_missing_gantt(self) -> None:
+        session = SimpleNamespace(base_dir=self._session_dir)
+        artifact = {"status": "ready", "remote_descriptor_path": "profiles/artifact.json"}
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), patch("builtins.print") as mock_print:
+            modal_app._emit_golden_profiler_block(session, artifact, "golden-request")
+        block = mock_print.call_args.args[0]
+        self.assertIn("GANTT_AVAILABLE=NO reason=missing file:", block)
+        self.assertTrue(block.endswith("[v2.golden_profiler] END\n"))
 
 
 if __name__ == "__main__":

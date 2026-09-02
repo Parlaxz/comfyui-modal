@@ -660,6 +660,50 @@ class RunDownloadTests(unittest.TestCase):
         self.assertTrue((extract_root / "derived/report.md").is_file())
         self.assertTrue((extract_root / "raw/viztracer.json.gz").is_file())
         self.assertTrue((extract_root / "derived/manifest.json").is_file())
+        # New profiler artifacts remain optional for older bundles.
+        self.assertFalse(report["optional_files"]["derived/golden_profile_report.md"])
+        self.assertFalse(report["optional_files"]["derived/golden_profile_gantt.txt"])
+        self.assertFalse(report["optional_files"]["derived/golden_profile_summary.json"])
+        self.assertIsNone(report["golden_profile_report_path"])
+        self.assertIsNone(report["golden_profile_gantt_path"])
+        self.assertIsNone(report["golden_profile_summary_path"])
+
+    def test_golden_profile_artifacts_extract_and_surface_paths(self):
+        profile_files = {
+            "derived/golden_profile_report.md": b"# Golden profile",
+            "derived/golden_profile_gantt.txt": b"0ms | stage",
+            "derived/golden_profile_summary.json": b'{"status":"ok"}',
+        }
+        files = {
+            "derived/report.md": b"# Test Report",
+            "raw/viztracer.json.gz": b"{}",
+            "derived/manifest.json": json.dumps({"version": 1}).encode(),
+            **profile_files,
+        }
+        bundle_data = _make_bundle_tgz(files)
+        descriptor = self._make_descriptor(_sha256_of_bytes(bundle_data))
+        client = MockDownloadClient(MockVolume({descriptor.remote_path: bundle_data}))
+
+        report = run_download(descriptor, download_client=client)
+
+        self.assertEqual(report["status"], "ok")
+        extract_root = Path(report["extract_root"])
+        for rel_path, content in profile_files.items():
+            self.assertEqual((extract_root / rel_path).read_bytes(), content)
+            self.assertTrue(report["optional_files"][rel_path])
+
+        self.assertEqual(
+            report["golden_profile_report_path"],
+            str((extract_root / "derived/golden_profile_report.md").resolve()),
+        )
+        self.assertEqual(
+            report["golden_profile_gantt_path"],
+            str((extract_root / "derived/golden_profile_gantt.txt").resolve()),
+        )
+        self.assertEqual(
+            report["golden_profile_summary_path"],
+            str((extract_root / "derived/golden_profile_summary.json").resolve()),
+        )
 
     def test_sha256_mismatch_fails(self):
         bundle_data = self._make_valid_bundle_bytes()

@@ -54,6 +54,10 @@ REQUIRED_EXTRACTED_FILES: Tuple[str, ...] = (
 
 OPTIONAL_EXTRACTED_FILES: Tuple[str, ...] = (
     "raw/torch_trace.json.gz",
+    # Golden profiler artifacts are optional so older bundles remain valid.
+    "derived/golden_profile_report.md",
+    "derived/golden_profile_gantt.txt",
+    "derived/golden_profile_summary.json",
 )
 
 BLOCK_SIZE = 65536
@@ -542,6 +546,12 @@ def run_download(
         ``viztracer_path`` — absolute path to ``raw/viztracer.json.gz``
         ``manifest_path`` — absolute path to ``derived/manifest.json``
         ``torch_path`` — absolute path to ``raw/torch_trace.json.gz`` or ``None``
+        ``golden_profile_report_path`` — absolute path to the optional
+            ``derived/golden_profile_report.md`` or ``None``
+        ``golden_profile_gantt_path`` — absolute path to the optional
+            ``derived/golden_profile_gantt.txt`` or ``None``
+        ``golden_profile_summary_path`` — absolute path to the optional
+            ``derived/golden_profile_summary.json`` or ``None``
         ``manifest_validation`` — result of manifest entry validation
         ``required_files_missing`` — list of missing required files
         ``optional_files`` — dict of optional-file presence
@@ -619,6 +629,20 @@ def run_download(
         torch_abs = extract_root / "raw/torch_trace.json.gz"
         torch_path: Optional[str] = str(torch_abs.resolve()) if torch_abs.is_file() else None
 
+        def _optional_abs(rel: str) -> Optional[str]:
+            p = extract_root / rel
+            return str(p.resolve()) if p.is_file() else None
+
+        golden_profile_report_path = _optional_abs(
+            "derived/golden_profile_report.md"
+        )
+        golden_profile_gantt_path = _optional_abs(
+            "derived/golden_profile_gantt.txt"
+        )
+        golden_profile_summary_path = _optional_abs(
+            "derived/golden_profile_summary.json"
+        )
+
         # ── Determine overall success --------------------------------
         errors: List[str] = []
         errors.extend(manifest_validation["errors"])
@@ -631,6 +655,9 @@ def run_download(
             "viztracer_path": viztracer_path,
             "manifest_path": manifest_path,
             "torch_path": torch_path,
+            "golden_profile_report_path": golden_profile_report_path,
+            "golden_profile_gantt_path": golden_profile_gantt_path,
+            "golden_profile_summary_path": golden_profile_summary_path,
             "manifest_validation": manifest_validation,
             "required_files_missing": missing_required,
             "optional_files": optional_files,

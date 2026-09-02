@@ -1296,6 +1296,25 @@ def stage_diagnostics_enabled() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _full_trace_active() -> bool:
+    """Return whether the adapter's full-trace session is enabled."""
+    return os.environ.get("COMFYMODAL_V2_FULL_TRACE") == "1"
+
+
+def _golden_trace_span(name: str):
+    """Resolve the narrow optional full-trace span seam without importing it eagerly."""
+    if not _full_trace_active():
+        return contextlib.nullcontext()
+    try:
+        trace_module = importlib.import_module("comfymodal_runtime.full_execution_trace")
+        span = getattr(trace_module, "golden_trace_span", None)
+        if callable(span):
+            return span(name)
+    except BaseException:
+        pass
+    return contextlib.nullcontext()
+
+
 def _stage_diagnostics_enabled() -> bool:
     """Test-compatible private adapter for the public stage selector."""
     return stage_diagnostics_enabled()
@@ -6113,8 +6132,9 @@ class _ClipTiming:
     preferable to manufacturing a boundary from a stage total.
     """
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    def __init__(self, *, enabled: bool = True, trace_prefix: str = "") -> None:
         self.enabled = bool(enabled)
+        self.trace_prefix = str(trace_prefix).strip(".")
         self.started_ns = time.perf_counter_ns() if self.enabled else None
         self.phases: list[dict[str, Any]] = []
         self.qwen_forwards: list[dict[str, Any]] = []
@@ -6127,7 +6147,9 @@ class _ClipTiming:
             return
         start = time.perf_counter_ns()
         try:
-            yield
+            trace_name = f"{self.trace_prefix}.{name}" if self.trace_prefix else str(name)
+            with _golden_trace_span(trace_name):
+                yield
         finally:
             end = time.perf_counter_ns()
             self.phases.append({
@@ -7487,7 +7509,11 @@ async def golden_clip_load(session: GoldenSession) -> Any:
     diagnostics_enabled = stage_diagnostics_enabled()
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
     transports: list[dict] = []
-    clip_timing = _ClipTiming(enabled=diagnostics_enabled)
+    clip_timing_enabled = diagnostics_enabled or _full_trace_active()
+    clip_timing = _ClipTiming(
+        enabled=clip_timing_enabled,
+        trace_prefix="golden.clip_load",
+    )
     clip_transfer: Any = None
     transformed_state_dicts: Optional[list[dict]] = None
     clip_lifecycle_phase = "constructor_preflight"
@@ -8038,7 +8064,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             ) if diagnostics_enabled else {}
         )
         session.clip_load_page_faults = clip_page_faults
-        session.clip_load_timing = clip_timing.finish() if diagnostics_enabled else {}
+        session.clip_load_timing = clip_timing.finish() if clip_timing_enabled else {}
         if diagnostics_enabled:
             rec.event("clip_load_timing", **session.clip_load_timing)
             rec.event("clip_page_faults", **clip_page_faults)
@@ -8160,7 +8186,11 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
     rec.begin_stage("golden_clip_forward")
     diagnostics_enabled = stage_diagnostics_enabled()
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
-    clip_timing = _ClipTiming(enabled=diagnostics_enabled)
+    clip_timing_enabled = diagnostics_enabled or _full_trace_active()
+    clip_timing = _ClipTiming(
+        enabled=clip_timing_enabled,
+        trace_prefix="golden.clip_forward",
+    )
     if diagnostics_enabled:
         # Keep a diagnostic envelope even when setup fails before a compute
         # scope exists; no hooks are installed by this placeholder.
@@ -8404,7 +8434,7 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             "after_encode": after,
             "deferred_forward_materialization": materialization,
         }
-        clip_timing_payload = clip_timing.finish() if diagnostics_enabled else {}
+        clip_timing_payload = clip_timing.finish() if clip_timing_enabled else {}
         if diagnostics_enabled:
             clip_timing_payload["deferred_forward_materialization"] = materialization
             clip_timing_payload["repeated_cast_work"] = repeated_cast_work
@@ -8892,51 +8922,52 @@ async def golden_unet_load(session: GoldenSession) -> Any:
         contract = session.contract
         unet_path = session.model_paths["unet"]
 
-        parsed = parse_safetensors_header(unet_path)
-        if parsed.get("status") != "ok":
-            raise RuntimeError(f"unet_header_invalid:{parsed.get('reason')}")
-        header = parsed["header"]
-        metadata = header.get("__metadata__")
-        entries = build_header_tensor_map(header)
-        if any(".scaled_fp8" in name for name, *_ in entries):
-            raise RuntimeError("scaled_fp8_rejected")
-        dtype_names = {dtype_str for _, dtype_str, *_ in entries}
-        if len(dtype_names) != 1:
-            raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
-        view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
-        if view_dtype is None:
-            raise RuntimeError("unknown_dtype")
+        with _golden_trace_span("golden.unet.header_config_preflight"):
+            parsed = parse_safetensors_header(unet_path)
+            if parsed.get("status") != "ok":
+                raise RuntimeError(f"unet_header_invalid:{parsed.get('reason')}")
+            header = parsed["header"]
+            metadata = header.get("__metadata__")
+            entries = build_header_tensor_map(header)
+            if any(".scaled_fp8" in name for name, *_ in entries):
+                raise RuntimeError("scaled_fp8_rejected")
+            dtype_names = {dtype_str for _, dtype_str, *_ in entries}
+            if len(dtype_names) != 1:
+                raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
+            view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
+            if view_dtype is None:
+                raise RuntimeError("unknown_dtype")
 
-        meta_sd = {
-            name: torch.empty(tuple(shape), dtype=_TORCH_DTYPE[dtype_str], device="meta")
-            for name, dtype_str, shape, _s, _l in entries
-        }
-        prefix_fn = getattr(md, "unet_prefix_from_state_dict", None)
-        strip_fn = getattr(cu, "state_dict_prefix_replace", None)
-        config_fn = getattr(md, "model_config_from_unet", None)
-        quant_fn = getattr(cu, "convert_old_quants", None)
-        if not all(callable(x) for x in (prefix_fn, strip_fn, config_fn)):
-            raise RuntimeError("missing_comfy_helper")
-        detect_sd, detect_meta, prefix = _native_detection_input(
-            meta_sd, metadata, prefix_fn, strip_fn, quant_fn
-        )
-        model_config = config_fn(detect_sd, "", metadata=detect_meta)
-        if model_config is None:
-            raise RuntimeError("model_config_none")
-        rec.event(
-            "unet_model_config_detect",
-            arch=type(model_config).__name__,
-            prefix=str(prefix),
-            raw_key_count=len(meta_sd),
-        )
+            meta_sd = {
+                name: torch.empty(tuple(shape), dtype=_TORCH_DTYPE[dtype_str], device="meta")
+                for name, dtype_str, shape, _s, _l in entries
+            }
+            prefix_fn = getattr(md, "unet_prefix_from_state_dict", None)
+            strip_fn = getattr(cu, "state_dict_prefix_replace", None)
+            config_fn = getattr(md, "model_config_from_unet", None)
+            quant_fn = getattr(cu, "convert_old_quants", None)
+            if not all(callable(x) for x in (prefix_fn, strip_fn, config_fn)):
+                raise RuntimeError("missing_comfy_helper")
+            detect_sd, detect_meta, prefix = _native_detection_input(
+                meta_sd, metadata, prefix_fn, strip_fn, quant_fn
+            )
+            model_config = config_fn(detect_sd, "", metadata=detect_meta)
+            if model_config is None:
+                raise RuntimeError("model_config_none")
+            rec.event(
+                "unet_model_config_detect",
+                arch=type(model_config).__name__,
+                prefix=str(prefix),
+                raw_key_count=len(meta_sd),
+            )
 
-        selected = mm.unet_dtype(supported_dtypes=list(model_config.supported_inference_dtypes))
-        if selected != view_dtype:
-            raise RuntimeError(f"inference_dtype_mismatch:{selected}!={view_dtype}")
-        manual_cast = mm.unet_manual_cast(
-            selected, mm.get_torch_device(), model_config.supported_inference_dtypes
-        )
-        model_config.set_inference_dtype(selected, manual_cast)
+            selected = mm.unet_dtype(supported_dtypes=list(model_config.supported_inference_dtypes))
+            if selected != view_dtype:
+                raise RuntimeError(f"inference_dtype_mismatch:{selected}!={view_dtype}")
+            manual_cast = mm.unet_manual_cast(
+                selected, mm.get_torch_device(), model_config.supported_inference_dtypes
+            )
+            model_config.set_inference_dtype(selected, manual_cast)
         # This identity must hold before constructing even the meta skeleton;
         # otherwise assign=True adoption is not a trustworthy contract.
         dynamic_core = require_dynamic_core_model_patcher(tag="unet")
@@ -8987,10 +9018,11 @@ async def golden_unet_load(session: GoldenSession) -> Any:
         before_skeleton = checkpoint("before_skeleton")
         # Build only a meta skeleton.  The retained QD CUDA owner is the sole
         # physical weight allocation; assign=True later adopts those views.
-        model = model_config.get_model(detect_sd, "", device=torch.device("meta"))
-        patcher = mp.CoreModelPatcher(
-            model, load_device=mm.get_torch_device(), offload_device=mm.unet_offload_device()
-        )
+        with _golden_trace_span("golden.unet.skeleton_patcher_construction"):
+            model = model_config.get_model(detect_sd, "", device=torch.device("meta"))
+            patcher = mp.CoreModelPatcher(
+                model, load_device=mm.get_torch_device(), offload_device=mm.unet_offload_device()
+            )
         if type(patcher) is not dynamic_core:
             raise RuntimeError(f"unet_dynamic_patcher_identity:{type(patcher).__name__}")
         after_skeleton = checkpoint("after_skeleton")
@@ -8998,13 +9030,14 @@ async def golden_unet_load(session: GoldenSession) -> Any:
 
         # The single QD physical producer into CUDA (one read, one H2D).
         reset_peak_stats()
-        with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
-            transport = read_file_qd_gpu(
-                unet_path,
-                role="unet",
-                qd=contract.qd,
-                block_bytes=contract.block_bytes,
-            )
+        with _golden_trace_span("golden.unet.source_h2d_transport"):
+            with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
+                transport = read_file_qd_gpu(
+                    unet_path,
+                    role="unet",
+                    qd=contract.qd,
+                    block_bytes=contract.block_bytes,
+                )
         views = {
             k[len(prefix):] if prefix and k.startswith(prefix) else k: v
             for k, v in transport["sd"].items()
@@ -9026,12 +9059,14 @@ async def golden_unet_load(session: GoldenSession) -> Any:
         # load_model_weights POPS keys from the dict it receives; pass a copy
         # so `views` survives for the identity measurement below.
         reset_peak_stats()
-        result = model.load_model_weights(dict(views), "", assign=True)
-        missing = getattr(result, "missing_keys", None) if result is not None else None
-        if missing:
-            raise RuntimeError(f"unet_missing_keys:{list(missing)[:8]}")
+        with _golden_trace_span("golden.unet.assign_adoption"):
+            result = model.load_model_weights(dict(views), "", assign=True)
+            missing = getattr(result, "missing_keys", None) if result is not None else None
+            if missing:
+                raise RuntimeError(f"unet_missing_keys:{list(missing)[:8]}")
 
-        identity = validate_unet_binding(model, views, expected_count=contract.expected_unet_tensor_count)
+        with _golden_trace_span("golden.unet.binding_validation"):
+            identity = validate_unet_binding(model, views, expected_count=contract.expected_unet_tensor_count)
         after_adoption = checkpoint("after_assign_adoption")
         post_qd_delta = int(after_adoption["allocated_bytes"]) - int(after_qd["allocated_bytes"])
         if post_qd_delta >= int(transport["stats"]["gpu_bytes"]):
@@ -9046,7 +9081,8 @@ async def golden_unet_load(session: GoldenSession) -> Any:
                 raise RuntimeError(f"unet_peak_model_sized_allocation:{adoption_peak_delta}")
         session.unet_cuda_allocation_checkpoints = allocation_checkpoints
         transport["stats"]["cuda_allocation_checkpoints"] = list(allocation_checkpoints)
-        qd_quiescence = _require_transport_quiescence(transport, tag="unet")
+        with _golden_trace_span("golden.unet.transport_quiescence"):
+            qd_quiescence = _require_transport_quiescence(transport, tag="unet")
         rec.event("unet_storage_identity", **{k: v for k, v in identity.items() if k != "ptr_map"})
         session.patcher = patcher
         try:
