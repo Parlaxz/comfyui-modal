@@ -317,6 +317,13 @@ def e27_forensics_enabled() -> bool:
     return _ENABLED
 
 
+def sync_e27_gate() -> bool:
+    """Refresh the gate after Modal applies the runtime environment."""
+    global _ENABLED
+    _ENABLED = env_flag(_E27_FORENSICS_FLAG, default=False)
+    return _ENABLED
+
+
 def _active_trace() -> Any:
     """Resolve the active request trace (or None) without importing cost.
 

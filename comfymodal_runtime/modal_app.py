@@ -580,6 +580,11 @@ def sync_observability_gates() -> None:
         sync_e31_gates()
     except Exception:
         pass
+    try:
+        from .e27_forensics import sync_e27_gate
+        sync_e27_gate()
+    except Exception:
+        pass
 
 # ── Request-carried diagnostic env allowlist ─────────────────────────────
 # The variance benchmark runner may carry bounded diagnostic toggles in
@@ -11638,6 +11643,11 @@ class ModalRuntimeEntrypoint:
         remote_python_resume_mono_ns: int = time.monotonic_ns()
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        # Diagnostic modules can be imported while the image is built, before
+        # Modal applies the deployed runtime environment.  Keep this after the
+        # authoritative resume boundary so it cannot contaminate scheduling
+        # measurements.
+        sync_observability_gates()
         # ── E29: canonical ledger restore boundary ──────────────────────────
         # Record the modal_app restore() entry on the canonical axis (the
         # true first executable line of the remote restore lifecycle), and
@@ -21706,6 +21716,10 @@ class ModalRuntimeEntrypoint:
             resolve_clip_residency,
         )
         from .output_durability import resolve_output_durability
+
+        # Direct Golden bypasses run_plan_stream, where this synchronization
+        # normally occurs.  Refresh before claiming the restore-scoped trace.
+        sync_observability_gates()
 
         # Golden is a direct adapter and does not pass through
         # run_plan_stream's request counter.  Count it at this request entry,

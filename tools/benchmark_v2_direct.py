@@ -11502,6 +11502,9 @@ async def _run_golden_p1(
     os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
     os.environ["COMFYMODAL_V2_GPU"] = gpu
+    invocation_id = str(
+        os.environ.get("COMFYMODAL_V2CTL_INVOCATION_ID", "") or ""
+    ).strip()
     started_iso = datetime.now(timezone.utc).isoformat()
     print(
         f"[v2.golden_p1] mode=start run_count={run_count} gap={gap_seconds}s "
@@ -11571,6 +11574,7 @@ async def _run_golden_p1(
         dispatch_unix_ms = int(time.time() * 1000)
         artifact: dict[str, Any] = {
             "run_index": index,
+            "v2ctl_invocation_id": invocation_id,
             "request_id": req_id,
             "mode": GOLDEN_P1_MODE,
             "method": GOLDEN_P1_REMOTE_METHOD,
@@ -11781,6 +11785,7 @@ async def _run_golden_p1(
         "cohort_dir": str(cohort_dir),
         "attempts": [{
             "run_index": r["run_index"],
+            "v2ctl_invocation_id": r.get("v2ctl_invocation_id", invocation_id),
             "request_id": r["request_id"],
             "dispatch_unix_ms": r["dispatch_unix_ms"],
             "duration_ms": r["duration_ms"],
